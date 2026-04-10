@@ -460,6 +460,11 @@ impl StudioVfs {
             let mut pending = self.state.write_buffer.pending_blocks.lock();
             assign_reserved_object_ids(&mut pending, ino, &mut persisted_blocks, &fresh_object_ids);
         }
+        let persisted_block_count = persisted_blocks.len();
+        let persisted_bytes: u64 = persisted_blocks
+            .iter()
+            .map(|block| block.data.len() as u64)
+            .sum();
 
         // Data hits the local backend before metadata so a successful flush/fsync only
         // returns after local bytes are durable. If any pre-metadata step fails,
@@ -472,21 +477,30 @@ impl StudioVfs {
         let attr_after_commit = attr_for_meta.clone();
 
         let pre_metadata_result: VfsResult<()> = async {
-            for chunk in persisted_blocks.chunks(BLOCK_STORE_PUT_PIPELINE_WIDTH) {
-                let put_results = futures::future::join_all(chunk.iter().map(|block| {
-                    self.block_store_put_async(block.object_id, block.data.clone(), false)
-                }))
-                .await;
-                for result in put_results {
-                    result?;
+            let payload_persist_started = Instant::now();
+            let payload_persist_result: VfsResult<()> = async {
+                for chunk in persisted_blocks.chunks(BLOCK_STORE_PUT_PIPELINE_WIDTH) {
+                    let put_results = futures::future::join_all(chunk.iter().map(|block| {
+                        self.block_store_put_async(block.object_id, block.data.clone(), false)
+                    }))
+                    .await;
+                    for result in put_results {
+                        result?;
+                    }
                 }
+                self.maybe_block_store_sync_data_async(persisted_bytes, local_sync_policy)
+                    .await?;
+                Ok(())
             }
-            let persisted_bytes: u64 = persisted_blocks
-                .iter()
-                .map(|block| block.data.len() as u64)
-                .sum();
-            self.maybe_block_store_sync_data_async(persisted_bytes, local_sync_policy)
-                .await?;
+            .await;
+            if persisted_bytes > 0 {
+                self.record_payload_persist_observability(
+                    persisted_block_count,
+                    persisted_bytes,
+                    payload_persist_started.elapsed(),
+                );
+            }
+            payload_persist_result?;
 
             let mut chunks: std::collections::BTreeMap<u64, Vec<studiofs_meta::schema::SliceRecord>> =
                 std::collections::BTreeMap::new();
@@ -628,7 +642,8 @@ impl StudioVfs {
                 .map(|(k, v)| (studiofs_meta::schema::ChunkId(k), v))
                 .collect();
 
-            run_meta(
+            let metadata_commit_started = Instant::now();
+            let metadata_commit_result = run_meta(
                 self.meta_async.clone(),
                 move |engine: Arc<dyn MetaEngine>| {
                     engine.flush_regular_file_overlay_slices_with_attr(
@@ -638,7 +653,9 @@ impl StudioVfs {
                     )
                 },
             )
-            .await?;
+            .await;
+            self.record_metadata_commit_observability(metadata_commit_started.elapsed());
+            metadata_commit_result?;
             Ok(())
         }
         .await;
@@ -688,7 +705,13 @@ impl StudioVfs {
     async fn apply_write_buffer_backpressure(&self, ino: Ino) -> VfsResult<()> {
         let started = Instant::now();
         let _ = self
-            .flush_dirty_full_write_buffer_blocks(ino, 1, None, LocalSyncPolicy::Opportunistic)
+            .flush_dirty_full_write_buffer_blocks(
+                ino,
+                1,
+                false,
+                None,
+                LocalSyncPolicy::Opportunistic,
+            )
             .await?;
         if self.total_pending_write_buffer_bytes() > self.max_dirty_bytes.load(Ordering::Acquire) {
             self.flush_ordered(ino, LocalSyncPolicy::Opportunistic)
@@ -927,12 +950,22 @@ impl StudioVfs {
         &self,
         ino: Ino,
         minimum_batch_bytes: usize,
+        track_eager_flush_outcomes: bool,
         fallback_content_epoch: Option<u64>,
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<bool> {
         let (full_blocks, full_block_batch_bytes) =
             self.snapshot_dirty_full_write_buffer_blocks(ino);
-        if full_blocks.is_empty() || full_block_batch_bytes < minimum_batch_bytes {
+        if full_blocks.is_empty() {
+            if track_eager_flush_outcomes {
+                self.note_eager_flush_outcome(EagerFlushOutcome::SkippedEmpty);
+            }
+            return Ok(false);
+        }
+        if full_block_batch_bytes < minimum_batch_bytes {
+            if track_eager_flush_outcomes {
+                self.note_eager_flush_outcome(EagerFlushOutcome::SkippedBelowThreshold);
+            }
             return Ok(false);
         }
 
@@ -959,6 +992,9 @@ impl StudioVfs {
         self.commit_persisted_write_buffer_blocks(ino, &persisted_blocks);
         if let Some(attr) = attr_to_clear.as_ref() {
             self.clear_matching_dirty_attr_if_committed(ino, attr);
+        }
+        if track_eager_flush_outcomes && !persisted_blocks.is_empty() {
+            self.note_eager_flush_outcome(EagerFlushOutcome::Triggered);
         }
         Ok(!persisted_blocks.is_empty())
     }
@@ -1261,6 +1297,7 @@ impl StudioVfs {
                 .flush_dirty_full_write_buffer_blocks(
                     ino,
                     self.write_eager_flush_batch_bytes,
+                    true,
                     Some(base_attr.content_epoch),
                     LocalSyncPolicy::Opportunistic,
                 )

@@ -4,6 +4,7 @@
 //! - direct local-cache benchmark mode (`direct-shim`)
 //! - end-to-end benchmark mode (`e2e`) that runs copy/read on a mounted volume
 
+use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
 use crate::cli::test_cache_profile::TestCacheProfileSession;
 use crate::cli::test_cache_profile_types::{TestCacheProfileMode, TestCacheProfileResult};
 use crate::cli::utils::{format_bytes, format_throughput};
@@ -3290,11 +3291,22 @@ pub fn run(
         ResolvedRunMode::DirectShim { .. } => "direct-shim",
         ResolvedRunMode::MountedE2E { .. } => "e2e",
     };
+    let write_path_observability_path = match &resolved_mode {
+        ResolvedRunMode::MountedE2E { cache_path, .. } => cache_path
+            .as_ref()
+            .map(|path| path.join(WRITE_PATH_OBSERVABILITY_FILE)),
+        ResolvedRunMode::DirectShim { .. } => None,
+    };
     let report_dir = json_output
         .as_ref()
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .unwrap_or(std::env::current_dir().context("resolve current directory")?);
-    let profile_session = TestCacheProfileSession::start(profile, &run_id, benchmark_mode)?;
+    let profile_session = TestCacheProfileSession::start(
+        profile,
+        &run_id,
+        benchmark_mode,
+        write_path_observability_path,
+    )?;
 
     let rt = tokio::runtime::Runtime::new().context("create tokio runtime")?;
     let report = rt.block_on(async {

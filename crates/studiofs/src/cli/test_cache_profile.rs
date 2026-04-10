@@ -29,6 +29,7 @@ pub struct TestCacheProfileSession {
     cpu_backend: Option<pyroscope::backend::BackendImpl<BackendReady>>,
     memory_backend: Option<pyroscope::backend::BackendImpl<BackendReady>>,
     endpoint: Option<ProfileEndpoint>,
+    write_path_observability_path: Option<PathBuf>,
     app_name: String,
     warnings: Vec<String>,
 }
@@ -46,6 +47,7 @@ impl TestCacheProfileSession {
         mode: Option<TestCacheProfileMode>,
         run_id: &str,
         benchmark_mode: &str,
+        write_path_observability_path: Option<PathBuf>,
     ) -> Result<Option<Self>> {
         if mode.is_none() {
             return Ok(None);
@@ -82,6 +84,7 @@ impl TestCacheProfileSession {
             cpu_backend,
             memory_backend,
             endpoint,
+            write_path_observability_path,
             app_name,
             warnings,
         }))
@@ -90,6 +93,39 @@ impl TestCacheProfileSession {
     pub fn finish(mut self, output_dir: &Path) -> Result<TestCacheProfileResult> {
         let mut artifacts = Vec::new();
         let finished_at = Utc::now();
+
+        if let Some(metrics_path) = self.write_path_observability_path.as_ref() {
+            match fs::read(metrics_path) {
+                Ok(bytes) => {
+                    let artifact = write_artifact(
+                        output_dir,
+                        &self.run_id,
+                        &self.benchmark_mode,
+                        "write-path-observability",
+                        "json",
+                        &bytes,
+                    )?;
+                    artifacts.push(ProfileArtifactReport {
+                        kind: "write-path-observability".to_string(),
+                        path: artifact.display().to_string(),
+                        bytes: bytes.len() as u64,
+                        sent_to_endpoint: false,
+                    });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    self.warnings.push(format!(
+                        "Write-path observability snapshot not found: {}",
+                        metrics_path.display()
+                    ));
+                }
+                Err(err) => {
+                    self.warnings.push(format!(
+                        "Failed to read write-path observability snapshot '{}': {err}",
+                        metrics_path.display()
+                    ));
+                }
+            }
+        }
 
         if let Some(mut backend) = self.cpu_backend.take() {
             match backend.report() {

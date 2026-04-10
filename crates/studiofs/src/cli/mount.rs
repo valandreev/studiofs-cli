@@ -1,5 +1,6 @@
 //! `studiofs mount` — mount a filesystem volume.
 
+use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
 use chrono::Utc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,7 +16,6 @@ use studiofs_vfs::{StudioVfs, VfsConfigRaw, parse_size_bytes};
 use sysinfo::System;
 use tracing::{debug, info, warn};
 
-const WRITE_PATH_OBSERVABILITY_FILE: &str = "write_path_observability.json";
 const WRITE_PATH_OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(1);
 
 struct WritePathObservabilityPublisher {

@@ -1,5 +1,7 @@
 //! CLI command modules.
 
+pub(crate) const WRITE_PATH_OBSERVABILITY_FILE: &str = "write_path_observability.json";
+
 pub mod cache_layout;
 pub mod destroy;
 pub mod discovery;

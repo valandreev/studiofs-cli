@@ -262,6 +262,28 @@ pub struct VfsWritePathSyncDataStats {
     #[serde(default)]
     pub latency_quantiles_saturated: VfsWritePathLatencyQuantilesSaturated,
     pub latency_histogram: VfsLatencyHistogramSnapshot,
+    #[serde(default)]
+    pub queue_wait_total_ms: f64,
+    #[serde(default)]
+    pub queue_wait_avg_ms: f64,
+    #[serde(default)]
+    pub queue_wait_max_ms: f64,
+    #[serde(default)]
+    pub queue_wait_latency_quantiles_ms: VfsWritePathLatencyQuantilesMs,
+    #[serde(default)]
+    pub queue_wait_latency_quantiles_saturated: VfsWritePathLatencyQuantilesSaturated,
+    #[serde(default)]
+    pub queue_wait_latency_histogram: VfsLatencyHistogramSnapshot,
+    #[serde(default)]
+    pub barrier_interval_avg_ms: f64,
+    #[serde(default)]
+    pub barrier_interval_max_ms: f64,
+    #[serde(default)]
+    pub barrier_interval_quantiles_ms: VfsWritePathLatencyQuantilesMs,
+    #[serde(default)]
+    pub barrier_interval_quantiles_saturated: VfsWritePathLatencyQuantilesSaturated,
+    #[serde(default)]
+    pub barrier_interval_histogram: VfsLatencyHistogramSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -293,6 +315,41 @@ pub struct VfsWritePathBackpressureStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsWritePathBurstStats {
+    pub bursts: u64,
+    pub bursts_per_sec: f64,
+    pub total_blocks: u64,
+    pub total_bytes: u64,
+    pub avg_blocks_per_burst: f64,
+    pub avg_bytes_per_burst: f64,
+    pub max_blocks_per_burst: u64,
+    pub max_bytes_per_burst: u64,
+    pub avg_interval_ms: f64,
+    pub max_interval_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsWritePathStageLatencyStats {
+    pub calls: u64,
+    pub calls_per_sec: f64,
+    pub total_ms: f64,
+    pub avg_ms: f64,
+    pub max_ms: f64,
+    pub latency_quantiles_ms: VfsWritePathLatencyQuantilesMs,
+    #[serde(default)]
+    pub latency_quantiles_saturated: VfsWritePathLatencyQuantilesSaturated,
+    pub latency_histogram: VfsLatencyHistogramSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsWritePathEagerFlushStats {
+    pub checks: u64,
+    pub triggered: u64,
+    pub skipped_empty: u64,
+    pub skipped_below_threshold: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsWritePathObservabilitySnapshot {
     pub generated_unix_ms: u64,
     pub uptime_secs: f64,
@@ -304,6 +361,14 @@ pub struct VfsWritePathObservabilitySnapshot {
     pub local_cache_io: VfsWritePathLocalCacheIoStats,
     pub winfsp_callbacks: VfsWritePathWinfspCallbackStats,
     pub write_backpressure: VfsWritePathBackpressureStats,
+    #[serde(default)]
+    pub payload_burst: VfsWritePathBurstStats,
+    #[serde(default)]
+    pub payload_persist: VfsWritePathStageLatencyStats,
+    #[serde(default)]
+    pub metadata_commit: VfsWritePathStageLatencyStats,
+    #[serde(default)]
+    pub eager_flush: VfsWritePathEagerFlushStats,
 }
 
 /// Compatibility-shaped acceptance decision for a prospective write batch.
@@ -808,6 +873,13 @@ enum LocalSyncTrigger {
     DurableMode,
     BytesThreshold,
     TimeWindow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EagerFlushOutcome {
+    Triggered,
+    SkippedEmpty,
+    SkippedBelowThreshold,
 }
 
 fn local_sync_trigger_for_write_path(
@@ -3550,6 +3622,35 @@ struct MetricsState {
     block_store_sync_data_total_ns: AtomicU64,
     block_store_sync_data_max_ns: AtomicU64,
     block_store_sync_data_histogram: LatencyHistogram,
+    block_store_sync_data_queue_wait_calls: AtomicU64,
+    block_store_sync_data_queue_wait_total_ns: AtomicU64,
+    block_store_sync_data_queue_wait_max_ns: AtomicU64,
+    block_store_sync_data_queue_wait_histogram: LatencyHistogram,
+    block_store_sync_data_last_completed_ns: AtomicU64,
+    block_store_sync_data_interval_total_ns: AtomicU64,
+    block_store_sync_data_interval_max_ns: AtomicU64,
+    block_store_sync_data_interval_histogram: LatencyHistogram,
+    payload_persist_calls: AtomicU64,
+    payload_persist_total_ns: AtomicU64,
+    payload_persist_max_ns: AtomicU64,
+    payload_persist_histogram: LatencyHistogram,
+    payload_burst_count: AtomicU64,
+    payload_burst_total_blocks: AtomicU64,
+    payload_burst_total_bytes: AtomicU64,
+    payload_burst_max_blocks: AtomicU64,
+    payload_burst_max_bytes: AtomicU64,
+    payload_burst_last_completed_ns: AtomicU64,
+    payload_burst_interval_total_ns: AtomicU64,
+    payload_burst_interval_max_ns: AtomicU64,
+    payload_burst_interval_histogram: LatencyHistogram,
+    metadata_commit_calls: AtomicU64,
+    metadata_commit_total_ns: AtomicU64,
+    metadata_commit_max_ns: AtomicU64,
+    metadata_commit_histogram: LatencyHistogram,
+    eager_flush_checks: AtomicU64,
+    eager_flush_triggered: AtomicU64,
+    eager_flush_skipped_empty: AtomicU64,
+    eager_flush_skipped_below_threshold: AtomicU64,
     winfsp_write_callbacks: AtomicU64,
     winfsp_flush_callbacks: AtomicU64,
     winfsp_cleanup_flush_fh_callbacks: AtomicU64,
@@ -3576,6 +3677,35 @@ impl MetricsState {
             block_store_sync_data_total_ns: AtomicU64::new(0),
             block_store_sync_data_max_ns: AtomicU64::new(0),
             block_store_sync_data_histogram: LatencyHistogram::default(),
+            block_store_sync_data_queue_wait_calls: AtomicU64::new(0),
+            block_store_sync_data_queue_wait_total_ns: AtomicU64::new(0),
+            block_store_sync_data_queue_wait_max_ns: AtomicU64::new(0),
+            block_store_sync_data_queue_wait_histogram: LatencyHistogram::default(),
+            block_store_sync_data_last_completed_ns: AtomicU64::new(0),
+            block_store_sync_data_interval_total_ns: AtomicU64::new(0),
+            block_store_sync_data_interval_max_ns: AtomicU64::new(0),
+            block_store_sync_data_interval_histogram: LatencyHistogram::default(),
+            payload_persist_calls: AtomicU64::new(0),
+            payload_persist_total_ns: AtomicU64::new(0),
+            payload_persist_max_ns: AtomicU64::new(0),
+            payload_persist_histogram: LatencyHistogram::default(),
+            payload_burst_count: AtomicU64::new(0),
+            payload_burst_total_blocks: AtomicU64::new(0),
+            payload_burst_total_bytes: AtomicU64::new(0),
+            payload_burst_max_blocks: AtomicU64::new(0),
+            payload_burst_max_bytes: AtomicU64::new(0),
+            payload_burst_last_completed_ns: AtomicU64::new(0),
+            payload_burst_interval_total_ns: AtomicU64::new(0),
+            payload_burst_interval_max_ns: AtomicU64::new(0),
+            payload_burst_interval_histogram: LatencyHistogram::default(),
+            metadata_commit_calls: AtomicU64::new(0),
+            metadata_commit_total_ns: AtomicU64::new(0),
+            metadata_commit_max_ns: AtomicU64::new(0),
+            metadata_commit_histogram: LatencyHistogram::default(),
+            eager_flush_checks: AtomicU64::new(0),
+            eager_flush_triggered: AtomicU64::new(0),
+            eager_flush_skipped_empty: AtomicU64::new(0),
+            eager_flush_skipped_below_threshold: AtomicU64::new(0),
             winfsp_write_callbacks: AtomicU64::new(0),
             winfsp_flush_callbacks: AtomicU64::new(0),
             winfsp_cleanup_flush_fh_callbacks: AtomicU64::new(0),
@@ -7279,7 +7409,9 @@ impl StudioVfs {
             }
         }
 
+        let sync_gate_wait_started = Instant::now();
         let _sync_gate = self.state.write_buffer.local_sync_gate.lock().await;
+        self.record_sync_data_queue_wait(sync_gate_wait_started.elapsed());
         let bytes_to_sync = {
             let mut local_sync_group = self.state.write_buffer.local_sync_group.lock().await;
             let trigger = local_sync_trigger_for_write_path(
@@ -7339,23 +7471,16 @@ impl StudioVfs {
         })
         .await?;
         let _ = timing;
-        let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        self.state
-            .metrics
-            .block_store_sync_data_calls
-            .fetch_add(1, Ordering::Relaxed);
-        self.state
-            .metrics
-            .block_store_sync_data_total_ns
-            .fetch_add(elapsed_ns, Ordering::Relaxed);
-        self.state
-            .metrics
-            .block_store_sync_data_max_ns
-            .fetch_max(elapsed_ns, Ordering::Relaxed);
-        self.state
-            .metrics
-            .block_store_sync_data_histogram
-            .observe_ns(elapsed_ns);
+        let elapsed_ns = Self::duration_ns_u64(started.elapsed());
+        let metrics = &self.state.metrics;
+        Self::observe_latency_counter(
+            &metrics.block_store_sync_data_calls,
+            &metrics.block_store_sync_data_total_ns,
+            &metrics.block_store_sync_data_max_ns,
+            &metrics.block_store_sync_data_histogram,
+            elapsed_ns,
+        );
+        self.record_sync_data_interval();
         Ok(())
     }
 
@@ -8156,6 +8281,176 @@ impl StudioVfs {
         )
     }
 
+    fn duration_ns_u64(duration: Duration) -> u64 {
+        duration.as_nanos().min(u64::MAX as u128) as u64
+    }
+
+    fn observe_latency_counter(
+        calls: &AtomicU64,
+        total_ns: &AtomicU64,
+        max_ns: &AtomicU64,
+        histogram: &LatencyHistogram,
+        elapsed_ns: u64,
+    ) {
+        calls.fetch_add(1, Ordering::Relaxed);
+        total_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+        max_ns.fetch_max(elapsed_ns, Ordering::Relaxed);
+        histogram.observe_ns(elapsed_ns);
+    }
+
+    fn build_stage_latency_stats(
+        calls: u64,
+        total_ns: u64,
+        max_ns: u64,
+        histogram: LatencyHistogramSnapshot,
+        elapsed: Duration,
+    ) -> VfsWritePathStageLatencyStats {
+        let (p50_ns, p50_saturated) = Self::histogram_percentile_ns(&histogram, 0.50);
+        let (p95_ns, p95_saturated) = Self::histogram_percentile_ns(&histogram, 0.95);
+        let (p99_ns, p99_saturated) = Self::histogram_percentile_ns(&histogram, 0.99);
+        VfsWritePathStageLatencyStats {
+            calls,
+            calls_per_sec: Self::per_second(calls, elapsed),
+            total_ms: total_ns as f64 / 1_000_000.0,
+            avg_ms: if calls == 0 {
+                0.0
+            } else {
+                (total_ns as f64 / calls as f64) / 1_000_000.0
+            },
+            max_ms: max_ns as f64 / 1_000_000.0,
+            latency_quantiles_ms: VfsWritePathLatencyQuantilesMs {
+                p50: p50_ns as f64 / 1_000_000.0,
+                p95: p95_ns as f64 / 1_000_000.0,
+                p99: p99_ns as f64 / 1_000_000.0,
+            },
+            latency_quantiles_saturated: VfsWritePathLatencyQuantilesSaturated {
+                p50: p50_saturated,
+                p95: p95_saturated,
+                p99: p99_saturated,
+            },
+            latency_histogram: VfsLatencyHistogramSnapshot {
+                bucket_upper_bounds_ns: histogram.bucket_upper_bounds_ns.clone(),
+                bucket_counts: histogram.bucket_counts.clone(),
+            },
+        }
+    }
+
+    fn record_sync_data_queue_wait(&self, queue_wait: Duration) {
+        let elapsed_ns = Self::duration_ns_u64(queue_wait);
+        let metrics = &self.state.metrics;
+        Self::observe_latency_counter(
+            &metrics.block_store_sync_data_queue_wait_calls,
+            &metrics.block_store_sync_data_queue_wait_total_ns,
+            &metrics.block_store_sync_data_queue_wait_max_ns,
+            &metrics.block_store_sync_data_queue_wait_histogram,
+            elapsed_ns,
+        );
+    }
+
+    fn record_sync_data_interval(&self) {
+        let metrics = &self.state.metrics;
+        let completed_ns = Self::duration_ns_u64(self.write_path_started_at.elapsed());
+        let previous_completed_ns = metrics
+            .block_store_sync_data_last_completed_ns
+            .swap(completed_ns, Ordering::Relaxed);
+        if previous_completed_ns == 0 || completed_ns <= previous_completed_ns {
+            return;
+        }
+        let interval_ns = completed_ns.saturating_sub(previous_completed_ns);
+        metrics
+            .block_store_sync_data_interval_total_ns
+            .fetch_add(interval_ns, Ordering::Relaxed);
+        metrics
+            .block_store_sync_data_interval_max_ns
+            .fetch_max(interval_ns, Ordering::Relaxed);
+        metrics
+            .block_store_sync_data_interval_histogram
+            .observe_ns(interval_ns);
+    }
+
+    pub(super) fn note_eager_flush_outcome(&self, outcome: EagerFlushOutcome) {
+        let metrics = &self.state.metrics;
+        metrics.eager_flush_checks.fetch_add(1, Ordering::Relaxed);
+        match outcome {
+            EagerFlushOutcome::Triggered => {
+                metrics
+                    .eager_flush_triggered
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            EagerFlushOutcome::SkippedEmpty => {
+                metrics
+                    .eager_flush_skipped_empty
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            EagerFlushOutcome::SkippedBelowThreshold => {
+                metrics
+                    .eager_flush_skipped_below_threshold
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub(super) fn record_payload_persist_observability(
+        &self,
+        burst_blocks: usize,
+        burst_bytes: u64,
+        elapsed: Duration,
+    ) {
+        let elapsed_ns = Self::duration_ns_u64(elapsed);
+        let burst_blocks_u64 = u64::try_from(burst_blocks).unwrap_or(u64::MAX);
+        let metrics = &self.state.metrics;
+        Self::observe_latency_counter(
+            &metrics.payload_persist_calls,
+            &metrics.payload_persist_total_ns,
+            &metrics.payload_persist_max_ns,
+            &metrics.payload_persist_histogram,
+            elapsed_ns,
+        );
+        metrics.payload_burst_count.fetch_add(1, Ordering::Relaxed);
+        metrics
+            .payload_burst_total_blocks
+            .fetch_add(burst_blocks_u64, Ordering::Relaxed);
+        metrics
+            .payload_burst_total_bytes
+            .fetch_add(burst_bytes, Ordering::Relaxed);
+        metrics
+            .payload_burst_max_blocks
+            .fetch_max(burst_blocks_u64, Ordering::Relaxed);
+        metrics
+            .payload_burst_max_bytes
+            .fetch_max(burst_bytes, Ordering::Relaxed);
+
+        let completed_ns = Self::duration_ns_u64(self.write_path_started_at.elapsed());
+        let previous_completed_ns = metrics
+            .payload_burst_last_completed_ns
+            .swap(completed_ns, Ordering::Relaxed);
+        if previous_completed_ns == 0 || completed_ns <= previous_completed_ns {
+            return;
+        }
+        let interval_ns = completed_ns.saturating_sub(previous_completed_ns);
+        metrics
+            .payload_burst_interval_total_ns
+            .fetch_add(interval_ns, Ordering::Relaxed);
+        metrics
+            .payload_burst_interval_max_ns
+            .fetch_max(interval_ns, Ordering::Relaxed);
+        metrics
+            .payload_burst_interval_histogram
+            .observe_ns(interval_ns);
+    }
+
+    pub(super) fn record_metadata_commit_observability(&self, elapsed: Duration) {
+        let elapsed_ns = Self::duration_ns_u64(elapsed);
+        let metrics = &self.state.metrics;
+        Self::observe_latency_counter(
+            &metrics.metadata_commit_calls,
+            &metrics.metadata_commit_total_ns,
+            &metrics.metadata_commit_max_ns,
+            &metrics.metadata_commit_histogram,
+            elapsed_ns,
+        );
+    }
+
     fn record_local_cache_io_timing(&self, timing: LocalCacheIoTiming) {
         self.state
             .metrics
@@ -8217,86 +8512,108 @@ impl StudioVfs {
 
     pub fn write_path_observability_snapshot(&self) -> VfsWritePathObservabilitySnapshot {
         let elapsed = self.write_path_started_at.elapsed();
-        let flush_ordered_calls = self
-            .state
-            .metrics
-            .flush_ordered_calls
-            .load(Ordering::Relaxed);
-        let local_cache_io_calls = self
-            .state
-            .metrics
-            .local_cache_io_calls
-            .load(Ordering::Relaxed);
-        let local_cache_handoff_total_ns = self
-            .state
-            .metrics
-            .local_cache_io_handoff_total_ns
-            .load(Ordering::Relaxed);
-        let local_cache_handoff_max_ns = self
-            .state
-            .metrics
-            .local_cache_io_handoff_max_ns
-            .load(Ordering::Relaxed);
+        macro_rules! load_metric {
+            ($field:ident) => {
+                self.state.metrics.$field.load(Ordering::Relaxed)
+            };
+        }
+        macro_rules! load_metrics {
+            ($($name:ident : $field:ident),+ $(,)?) => {
+                $(let $name = load_metric!($field);)+
+            };
+        }
+        load_metrics!(
+            flush_ordered_calls: flush_ordered_calls,
+            local_cache_io_calls: local_cache_io_calls,
+            local_cache_handoff_total_ns: local_cache_io_handoff_total_ns,
+            local_cache_handoff_max_ns: local_cache_io_handoff_max_ns,
+            local_cache_backend_total_ns: local_cache_io_backend_total_ns,
+            local_cache_backend_max_ns: local_cache_io_backend_max_ns,
+            sync_calls: block_store_sync_data_calls,
+            sync_deferred_calls: block_store_sync_data_deferred_calls,
+            sync_bytes: block_store_sync_data_synced_bytes,
+            sync_total_ns: block_store_sync_data_total_ns,
+            sync_max_ns: block_store_sync_data_max_ns,
+            sync_queue_wait_calls: block_store_sync_data_queue_wait_calls,
+            sync_queue_wait_total_ns: block_store_sync_data_queue_wait_total_ns,
+            sync_queue_wait_max_ns: block_store_sync_data_queue_wait_max_ns,
+            sync_interval_total_ns: block_store_sync_data_interval_total_ns,
+            sync_interval_max_ns: block_store_sync_data_interval_max_ns,
+            payload_persist_calls: payload_persist_calls,
+            payload_persist_total_ns: payload_persist_total_ns,
+            payload_persist_max_ns: payload_persist_max_ns,
+            payload_burst_count: payload_burst_count,
+            payload_burst_total_blocks: payload_burst_total_blocks,
+            payload_burst_total_bytes: payload_burst_total_bytes,
+            payload_burst_max_blocks: payload_burst_max_blocks,
+            payload_burst_max_bytes: payload_burst_max_bytes,
+            payload_burst_interval_total_ns: payload_burst_interval_total_ns,
+            payload_burst_interval_max_ns: payload_burst_interval_max_ns,
+            metadata_commit_calls: metadata_commit_calls,
+            metadata_commit_total_ns: metadata_commit_total_ns,
+            metadata_commit_max_ns: metadata_commit_max_ns,
+            eager_flush_checks: eager_flush_checks,
+            eager_flush_triggered: eager_flush_triggered,
+            eager_flush_skipped_empty: eager_flush_skipped_empty,
+            eager_flush_skipped_below_threshold: eager_flush_skipped_below_threshold,
+        );
         let local_cache_handoff_histogram = self
             .state
             .metrics
             .local_cache_io_handoff_histogram
             .snapshot();
-        let local_cache_backend_total_ns = self
-            .state
-            .metrics
-            .local_cache_io_backend_total_ns
-            .load(Ordering::Relaxed);
-        let local_cache_backend_max_ns = self
-            .state
-            .metrics
-            .local_cache_io_backend_max_ns
-            .load(Ordering::Relaxed);
         let local_cache_backend_histogram = self
             .state
             .metrics
             .local_cache_io_backend_histogram
             .snapshot();
-        let sync_calls = self
-            .state
-            .metrics
-            .block_store_sync_data_calls
-            .load(Ordering::Relaxed);
-        let sync_deferred_calls = self
-            .state
-            .metrics
-            .block_store_sync_data_deferred_calls
-            .load(Ordering::Relaxed);
-        let sync_bytes = self
-            .state
-            .metrics
-            .block_store_sync_data_synced_bytes
-            .load(Ordering::Relaxed);
-        let sync_total_ns = self
-            .state
-            .metrics
-            .block_store_sync_data_total_ns
-            .load(Ordering::Relaxed);
-        let sync_max_ns = self
-            .state
-            .metrics
-            .block_store_sync_data_max_ns
-            .load(Ordering::Relaxed);
         let sync_histogram = self
             .state
             .metrics
             .block_store_sync_data_histogram
             .snapshot();
+        let sync_queue_wait_histogram = self
+            .state
+            .metrics
+            .block_store_sync_data_queue_wait_histogram
+            .snapshot();
+        let sync_interval_histogram = self
+            .state
+            .metrics
+            .block_store_sync_data_interval_histogram
+            .snapshot();
+        let payload_persist_histogram = self.state.metrics.payload_persist_histogram.snapshot();
+        let payload_burst_interval_histogram = self
+            .state
+            .metrics
+            .payload_burst_interval_histogram
+            .snapshot();
+        let metadata_commit_histogram = self.state.metrics.metadata_commit_histogram.snapshot();
 
         let (p50_ns, p50_saturated) = Self::histogram_percentile_ns(&sync_histogram, 0.50);
         let (p95_ns, p95_saturated) = Self::histogram_percentile_ns(&sync_histogram, 0.95);
         let (p99_ns, p99_saturated) = Self::histogram_percentile_ns(&sync_histogram, 0.99);
+        let (sync_queue_wait_p50_ns, sync_queue_wait_p50_saturated) =
+            Self::histogram_percentile_ns(&sync_queue_wait_histogram, 0.50);
+        let (sync_queue_wait_p95_ns, sync_queue_wait_p95_saturated) =
+            Self::histogram_percentile_ns(&sync_queue_wait_histogram, 0.95);
+        let (sync_queue_wait_p99_ns, sync_queue_wait_p99_saturated) =
+            Self::histogram_percentile_ns(&sync_queue_wait_histogram, 0.99);
+        let (sync_interval_p50_ns, sync_interval_p50_saturated) =
+            Self::histogram_percentile_ns(&sync_interval_histogram, 0.50);
+        let (sync_interval_p95_ns, sync_interval_p95_saturated) =
+            Self::histogram_percentile_ns(&sync_interval_histogram, 0.95);
+        let (sync_interval_p99_ns, sync_interval_p99_saturated) =
+            Self::histogram_percentile_ns(&sync_interval_histogram, 0.99);
         let synced_gib = sync_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
         let calls_per_gib = if synced_gib > 0.0 {
             sync_calls as f64 / synced_gib
         } else {
             0.0
         };
+        let sync_interval_samples: u64 = sync_interval_histogram.bucket_counts.iter().sum();
+        let payload_burst_interval_samples: u64 =
+            payload_burst_interval_histogram.bucket_counts.iter().sum();
 
         VfsWritePathObservabilitySnapshot {
             generated_unix_ms: Self::now_unix_millis(),
@@ -8331,6 +8648,49 @@ impl StudioVfs {
                 latency_histogram: VfsLatencyHistogramSnapshot {
                     bucket_upper_bounds_ns: sync_histogram.bucket_upper_bounds_ns.clone(),
                     bucket_counts: sync_histogram.bucket_counts.clone(),
+                },
+                queue_wait_total_ms: sync_queue_wait_total_ns as f64 / 1_000_000.0,
+                queue_wait_avg_ms: if sync_queue_wait_calls == 0 {
+                    0.0
+                } else {
+                    (sync_queue_wait_total_ns as f64 / sync_queue_wait_calls as f64) / 1_000_000.0
+                },
+                queue_wait_max_ms: sync_queue_wait_max_ns as f64 / 1_000_000.0,
+                queue_wait_latency_quantiles_ms: VfsWritePathLatencyQuantilesMs {
+                    p50: sync_queue_wait_p50_ns as f64 / 1_000_000.0,
+                    p95: sync_queue_wait_p95_ns as f64 / 1_000_000.0,
+                    p99: sync_queue_wait_p99_ns as f64 / 1_000_000.0,
+                },
+                queue_wait_latency_quantiles_saturated: VfsWritePathLatencyQuantilesSaturated {
+                    p50: sync_queue_wait_p50_saturated,
+                    p95: sync_queue_wait_p95_saturated,
+                    p99: sync_queue_wait_p99_saturated,
+                },
+                queue_wait_latency_histogram: VfsLatencyHistogramSnapshot {
+                    bucket_upper_bounds_ns: sync_queue_wait_histogram
+                        .bucket_upper_bounds_ns
+                        .clone(),
+                    bucket_counts: sync_queue_wait_histogram.bucket_counts.clone(),
+                },
+                barrier_interval_avg_ms: if sync_interval_samples == 0 {
+                    0.0
+                } else {
+                    (sync_interval_total_ns as f64 / sync_interval_samples as f64) / 1_000_000.0
+                },
+                barrier_interval_max_ms: sync_interval_max_ns as f64 / 1_000_000.0,
+                barrier_interval_quantiles_ms: VfsWritePathLatencyQuantilesMs {
+                    p50: sync_interval_p50_ns as f64 / 1_000_000.0,
+                    p95: sync_interval_p95_ns as f64 / 1_000_000.0,
+                    p99: sync_interval_p99_ns as f64 / 1_000_000.0,
+                },
+                barrier_interval_quantiles_saturated: VfsWritePathLatencyQuantilesSaturated {
+                    p50: sync_interval_p50_saturated,
+                    p95: sync_interval_p95_saturated,
+                    p99: sync_interval_p99_saturated,
+                },
+                barrier_interval_histogram: VfsLatencyHistogramSnapshot {
+                    bucket_upper_bounds_ns: sync_interval_histogram.bucket_upper_bounds_ns.clone(),
+                    bucket_counts: sync_interval_histogram.bucket_counts.clone(),
                 },
             },
             local_cache_io: VfsWritePathLocalCacheIoStats {
@@ -8398,6 +8758,51 @@ impl StudioVfs {
                     .write_buffer
                     .fast_backpressure_stall_max_ms
                     .load(Ordering::Relaxed),
+            },
+            payload_burst: VfsWritePathBurstStats {
+                bursts: payload_burst_count,
+                bursts_per_sec: Self::per_second(payload_burst_count, elapsed),
+                total_blocks: payload_burst_total_blocks,
+                total_bytes: payload_burst_total_bytes,
+                avg_blocks_per_burst: if payload_burst_count == 0 {
+                    0.0
+                } else {
+                    payload_burst_total_blocks as f64 / payload_burst_count as f64
+                },
+                avg_bytes_per_burst: if payload_burst_count == 0 {
+                    0.0
+                } else {
+                    payload_burst_total_bytes as f64 / payload_burst_count as f64
+                },
+                max_blocks_per_burst: payload_burst_max_blocks,
+                max_bytes_per_burst: payload_burst_max_bytes,
+                avg_interval_ms: if payload_burst_interval_samples == 0 {
+                    0.0
+                } else {
+                    (payload_burst_interval_total_ns as f64 / payload_burst_interval_samples as f64)
+                        / 1_000_000.0
+                },
+                max_interval_ms: payload_burst_interval_max_ns as f64 / 1_000_000.0,
+            },
+            payload_persist: Self::build_stage_latency_stats(
+                payload_persist_calls,
+                payload_persist_total_ns,
+                payload_persist_max_ns,
+                payload_persist_histogram,
+                elapsed,
+            ),
+            metadata_commit: Self::build_stage_latency_stats(
+                metadata_commit_calls,
+                metadata_commit_total_ns,
+                metadata_commit_max_ns,
+                metadata_commit_histogram,
+                elapsed,
+            ),
+            eager_flush: VfsWritePathEagerFlushStats {
+                checks: eager_flush_checks,
+                triggered: eager_flush_triggered,
+                skipped_empty: eager_flush_skipped_empty,
+                skipped_below_threshold: eager_flush_skipped_below_threshold,
             },
         }
     }
@@ -14650,6 +15055,64 @@ mod tests {
         assert!(
             deferred_after > deferred_before,
             "opportunistic defer should be tracked"
+        );
+    }
+
+    #[test]
+    fn write_path_observability_tracks_burst_shape_and_metadata_commit_stalls() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "write-path-observability-bursts");
+        let block_size = meta.get_format_info().expect("get format info").block_size as usize;
+
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"write-path-burst.bin", 0, 0, 0o644)
+                .expect("create");
+            let first = vec![0x5Au8; block_size];
+            let second = vec![0xA5u8; block_size];
+
+            vfs.write(attr.ino, 0, &first).await.expect("first write");
+            vfs.flush(attr.ino).await.expect("first flush");
+
+            tokio::time::sleep(Duration::from_millis(2)).await;
+
+            vfs.write(attr.ino, block_size as u64, &second)
+                .await
+                .expect("second write");
+            vfs.flush(attr.ino).await.expect("second flush");
+        });
+
+        let snapshot = vfs.write_path_observability_snapshot();
+        assert!(
+            snapshot.payload_burst.bursts >= 2,
+            "two write+flush rounds should yield at least two payload bursts"
+        );
+        assert!(
+            snapshot.payload_burst.total_blocks >= 2,
+            "burst accounting should include persisted full blocks"
+        );
+        assert!(
+            snapshot.payload_burst.total_bytes >= (block_size as u64) * 2,
+            "burst accounting should include persisted payload bytes"
+        );
+        assert!(
+            snapshot.payload_persist.calls >= 2,
+            "payload stage timing should be captured per persisted burst"
+        );
+        assert!(
+            snapshot.metadata_commit.calls >= 2,
+            "metadata commit timing should be captured per persisted burst"
+        );
+        assert!(
+            snapshot.block_store_sync_data.calls >= 1,
+            "sync barrier calls should be surfaced in write-path observability"
+        );
+        assert_eq!(
+            snapshot.eager_flush.checks,
+            snapshot.eager_flush.triggered
+                + snapshot.eager_flush.skipped_empty
+                + snapshot.eager_flush.skipped_below_threshold,
+            "eager flush checks should be partitioned by outcome"
         );
     }
 
