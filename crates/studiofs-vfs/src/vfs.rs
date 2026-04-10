@@ -8416,14 +8416,14 @@ impl StudioVfs {
         let (p50_ns, p50_saturated) = Self::histogram_percentile_ns(&histogram, 0.50);
         let (p95_ns, p95_saturated) = Self::histogram_percentile_ns(&histogram, 0.95);
         let (p99_ns, p99_saturated) = Self::histogram_percentile_ns(&histogram, 0.99);
-        let samples: u64 = histogram.bucket_counts.iter().sum();
+        let completed_intervals = events.saturating_sub(1);
         VfsWritePathCadenceStats {
             events,
             events_per_sec: Self::per_second(events, elapsed),
-            avg_interval_ms: if samples == 0 {
+            avg_interval_ms: if completed_intervals == 0 {
                 0.0
             } else {
-                (interval_total_ns as f64 / samples as f64) / 1_000_000.0
+                (interval_total_ns as f64 / completed_intervals as f64) / 1_000_000.0
             },
             max_interval_ms: interval_max_ns as f64 / 1_000_000.0,
             interval_quantiles_ms: VfsWritePathLatencyQuantilesMs {
@@ -15271,8 +15271,19 @@ mod tests {
             "metadata commit cadence should be captured per completed commit"
         );
         assert!(
-            snapshot.metadata_commit_cadence.max_interval_ms >= 0.0,
-            "metadata commit cadence should expose interval stats"
+            snapshot
+                .metadata_commit_cadence
+                .interval_histogram
+                .bucket_counts
+                .iter()
+                .copied()
+                .sum::<u64>()
+                >= 1,
+            "metadata commit cadence should record at least one interval sample after multiple commits"
+        );
+        assert!(
+            snapshot.metadata_commit_cadence.max_interval_ms > 0.0,
+            "metadata commit cadence should expose a positive interval after multiple commits"
         );
         assert!(
             snapshot.block_store_sync_data.calls >= 1,
@@ -15587,5 +15598,26 @@ mod tests {
         let (value_ns, saturated) = StudioVfs::histogram_percentile_ns(&snapshot, 0.95);
         assert_eq!(value_ns, 2_000_000);
         assert!(!saturated);
+    }
+
+    #[test]
+    fn build_cadence_stats_averages_over_completed_intervals() {
+        let histogram = studiofs_cache::metrics::LatencyHistogramSnapshot {
+            bucket_upper_bounds_ns: vec![10_000_000, 20_000_000],
+            bucket_counts: vec![1, 0, 0],
+        };
+
+        let stats = StudioVfs::build_cadence_stats(
+            3,
+            10_000_000,
+            10_000_000,
+            histogram,
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(
+            stats.avg_interval_ms, 5.0,
+            "cadence averages should divide by completed intervals (events - 1), not raw histogram sample count"
+        );
     }
 }
