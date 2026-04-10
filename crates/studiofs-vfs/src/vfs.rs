@@ -5781,7 +5781,7 @@ impl StudioVfs {
         if has_open_handles {
             self.record_deferred_deleted_local_block(op.ino, op.object_id);
         } else {
-            self.block_store_remove(op.object_id)?;
+            self.block_store_remove_async(op.object_id).await?;
         }
         self.state
             .upload
@@ -6376,7 +6376,9 @@ impl StudioVfs {
         };
         match source {
             PendingOverlayBlockSource::Pending(data) => Ok(Some(data)),
-            PendingOverlayBlockSource::Extent(object_id) => self.block_store_get(object_id),
+            PendingOverlayBlockSource::Extent(object_id) => {
+                self.block_store_get_async(object_id).await
+            }
         }
     }
 
@@ -7163,16 +7165,18 @@ impl StudioVfs {
         cached
     }
 
-    fn block_store_get(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
+    async fn block_store_get_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
         let block_store = self.local_block_backend.clone();
-        let (result, timing) = run_local_cache_io(|| block_store.get(object_id));
+        let (result, timing) =
+            run_local_cache_io_blocking(move || Ok(block_store.get(object_id))).await?;
         self.record_local_cache_io_timing(timing);
         Ok(result)
     }
 
-    fn block_store_get_for_upload(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
+    async fn block_store_get_for_upload_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
         let block_store = self.local_block_backend.clone();
-        let (result, timing) = run_local_cache_io(|| block_store.get_for_upload(object_id));
+        let (result, timing) =
+            run_local_cache_io_blocking(move || Ok(block_store.get_for_upload(object_id))).await?;
         self.record_local_cache_io_timing(timing);
         Ok(result)
     }
@@ -7185,32 +7189,24 @@ impl StudioVfs {
             })
         })
         .await?;
-        self.record_local_cache_io_timing(timing);
+        let _ = timing;
         Ok(())
     }
 
-    async fn block_store_put_batch_parallel(
+    async fn block_store_put_async(
         &self,
-        blocks: Vec<(u64, Bytes)>,
+        object_id: u64,
+        data: Bytes,
         evictable: bool,
     ) -> VfsResult<()> {
-        if blocks.is_empty() {
-            return Ok(());
-        }
-
-        let block_count = blocks.len();
         let block_store = self.local_block_backend.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
-            use rayon::prelude::*;
-
-            blocks.into_par_iter().try_for_each(|(object_id, data)| {
-                block_store
-                    .put(object_id, data.as_ref(), evictable)
-                    .map_err(|error| VfsError::Other(format!("block store put failed: {error}")))
-            })
+            block_store
+                .put(object_id, data.as_ref(), evictable)
+                .map_err(|error| VfsError::Other(format!("block store put failed: {error}")))
         })
         .await?;
-        self.record_local_cache_io_timing_with_units(timing, block_count);
+        self.record_local_cache_io_timing(timing);
         Ok(())
     }
 
@@ -7307,7 +7303,7 @@ impl StudioVfs {
             })
         })
         .await?;
-        self.record_local_cache_io_timing(timing);
+        let _ = timing;
         let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         self.state
             .metrics
@@ -7328,34 +7324,37 @@ impl StudioVfs {
         Ok(())
     }
 
-    fn block_store_mark_uploaded(&self, object_id: u64) -> VfsResult<()> {
+    async fn block_store_mark_uploaded_async(&self, object_id: u64) -> VfsResult<()> {
         let block_store = self.local_block_backend.clone();
-        let (result, timing) = run_local_cache_io(|| {
+        let ((), timing) = run_local_cache_io_blocking(move || {
             block_store.mark_uploaded(object_id);
             Ok(())
-        });
+        })
+        .await?;
         self.record_local_cache_io_timing(timing);
-        result
+        Ok(())
     }
 
-    fn block_store_remove(&self, object_id: u64) -> VfsResult<()> {
+    async fn block_store_remove_async(&self, object_id: u64) -> VfsResult<()> {
         let block_store = self.local_block_backend.clone();
-        let (result, timing) = run_local_cache_io(|| {
+        let ((), timing) = run_local_cache_io_blocking(move || {
             block_store.remove(object_id);
             Ok(())
-        });
+        })
+        .await?;
         self.record_local_cache_io_timing(timing);
-        result
+        Ok(())
     }
 
-    fn block_store_remove_batch(&self, object_ids: Vec<u64>) -> VfsResult<()> {
+    async fn block_store_remove_batch_async(&self, object_ids: Vec<u64>) -> VfsResult<()> {
         let block_store = self.local_block_backend.clone();
-        let (result, timing) = run_local_cache_io(|| {
+        let ((), timing) = run_local_cache_io_blocking(move || {
             block_store.remove_batch(&object_ids);
             Ok(())
-        });
+        })
+        .await?;
         self.record_local_cache_io_timing(timing);
-        result
+        Ok(())
     }
 
     fn transition_upload_state_for_local_mutation(attr: &mut InodeAttr) {
@@ -8123,46 +8122,34 @@ impl StudioVfs {
     }
 
     fn record_local_cache_io_timing(&self, timing: LocalCacheIoTiming) {
-        self.record_local_cache_io_timing_with_units(timing, 1);
-    }
-
-    fn record_local_cache_io_timing_with_units(&self, timing: LocalCacheIoTiming, units: usize) {
-        let units = units.max(1);
-        let units_u64 = units as u64;
         self.state
             .metrics
             .local_cache_io_calls
-            .fetch_add(units_u64, Ordering::Relaxed);
-        let handoff_total_ns = timing.handoff_ns.saturating_mul(units_u64);
+            .fetch_add(1, Ordering::Relaxed);
         self.state
             .metrics
             .local_cache_io_handoff_total_ns
-            .fetch_add(handoff_total_ns, Ordering::Relaxed);
+            .fetch_add(timing.handoff_ns, Ordering::Relaxed);
         self.state
             .metrics
             .local_cache_io_handoff_max_ns
             .fetch_max(timing.handoff_ns, Ordering::Relaxed);
-        for _ in 0..units {
-            self.state
-                .metrics
-                .local_cache_io_handoff_histogram
-                .observe_ns(timing.handoff_ns);
-        }
-        let backend_total_ns = timing.backend_io_ns.saturating_mul(units_u64);
+        self.state
+            .metrics
+            .local_cache_io_handoff_histogram
+            .observe_ns(timing.handoff_ns);
         self.state
             .metrics
             .local_cache_io_backend_total_ns
-            .fetch_add(backend_total_ns, Ordering::Relaxed);
+            .fetch_add(timing.backend_io_ns, Ordering::Relaxed);
         self.state
             .metrics
             .local_cache_io_backend_max_ns
             .fetch_max(timing.backend_io_ns, Ordering::Relaxed);
-        for _ in 0..units {
-            self.state
-                .metrics
-                .local_cache_io_backend_histogram
-                .observe_ns(timing.backend_io_ns);
-        }
+        self.state
+            .metrics
+            .local_cache_io_backend_histogram
+            .observe_ns(timing.backend_io_ns);
     }
 
     pub fn note_winfsp_write_callback(&self) {
@@ -9973,7 +9960,7 @@ impl StudioVfs {
             self.block_cache
                 .remove_batch_with_priority(&evicted, L2IoPriority::Background)
                 .await;
-            if let Err(error) = self.block_store_remove_batch(evicted.clone()) {
+            if let Err(error) = self.block_store_remove_batch_async(evicted.clone()).await {
                 warn!(
                     ino,
                     error = %error,
@@ -10024,7 +10011,7 @@ impl StudioVfs {
             self.block_cache
                 .remove_batch_with_priority(&evicted, L2IoPriority::Background)
                 .await;
-            self.block_store_remove_batch(evicted.clone())?;
+            self.block_store_remove_batch_async(evicted.clone()).await?;
         }
         if !evicted.is_empty() || deferred_pinned > 0 {
             info!(
@@ -10698,7 +10685,7 @@ impl StudioVfs {
                             "assemble_read_plan: object in remote_not_found set, zeroing range (S3 NotFound during prefetch)"
                         );
                         dst.fill(0);
-                    } else if let Some(data) = self.block_store_get(block.object_id)? {
+                    } else if let Some(data) = self.block_store_get_async(block.object_id).await? {
                         self.copy_block_payload_into_range(data.as_ref(), block.offset, dst);
                     } else {
                         match self.fetch_block_for_ref(block, false).await {
@@ -11368,7 +11355,7 @@ impl StudioVfs {
                 "upload cancelled: stale content epoch"
             );
             self.block_cache.cancel_upload(&op, false);
-            self.block_store_remove(op.object_id)?;
+            self.block_store_remove_async(op.object_id).await?;
             self.state
                 .upload
                 .pending_evictions
@@ -11402,7 +11389,7 @@ impl StudioVfs {
                 "upload cancelled: stale block superseded by newer object"
             );
             self.block_cache.cancel_upload(&op, false);
-            self.block_store_remove(op.object_id)?;
+            self.block_store_remove_async(op.object_id).await?;
             self.state
                 .upload
                 .pending_evictions
@@ -11521,7 +11508,7 @@ impl StudioVfs {
                 })?;
             let wait_ns = wait_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
             let read_started = Instant::now();
-            let read_result = self.block_store_get_for_upload(op.object_id)?;
+            let read_result = self.block_store_get_for_upload_async(op.object_id).await?;
             let read_ns = read_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
             drop(upload_io_permit);
             self.state
@@ -11613,7 +11600,7 @@ impl StudioVfs {
                         // genuine error and will be retried.
                         if self.state.upload.deleted_inodes.lock().contains(&op.ino) {
                             self.block_cache.cancel_upload(&op, false);
-                            self.block_store_remove(op.object_id)?;
+                            self.block_store_remove_async(op.object_id).await?;
                             self.state
                                 .upload
                                 .pending_evictions
@@ -11631,7 +11618,7 @@ impl StudioVfs {
                     // unexpected; retry through normal error path.
                     if self.state.upload.deleted_inodes.lock().contains(&op.ino) {
                         self.block_cache.cancel_upload(&op, false);
-                        self.block_store_remove(op.object_id)?;
+                        self.block_store_remove_async(op.object_id).await?;
                         self.state
                             .upload
                             .pending_evictions
@@ -11824,7 +11811,7 @@ impl StudioVfs {
             self.block_cache
                 .remove_with_priority(op.object_id, L2IoPriority::Background)
                 .await;
-            self.block_store_remove(op.object_id)?;
+            self.block_store_remove_async(op.object_id).await?;
             debug!(
                 object_id = op.object_id,
                 "post-upload eviction: block removed (inode deleted)"
@@ -11839,9 +11826,9 @@ impl StudioVfs {
             self.block_cache
                 .remove_with_priority(op.object_id, L2IoPriority::Background)
                 .await;
-            self.block_store_remove(op.object_id)?;
+            self.block_store_remove_async(op.object_id).await?;
         } else {
-            self.block_store_mark_uploaded(op.object_id)?;
+            self.block_store_mark_uploaded_async(op.object_id).await?;
         }
 
         debug!(
@@ -14573,17 +14560,12 @@ mod tests {
             .load(Ordering::Relaxed);
 
         rt.block_on(async {
-            vfs.block_store_put_batch_parallel(
-                vec![
-                    (0xAA55, Bytes::from_static(b"payload")),
-                    (0xAA56, Bytes::from_static(b"payload-2")),
-                ],
-                false,
-            )
-            .await
-            .expect("block store put");
+            vfs.block_store_put_async(0xAA55, Bytes::from_static(b"payload"), false)
+                .await
+                .expect("block store put");
             let payload = vfs
-                .block_store_get(0xAA55)
+                .block_store_get_async(0xAA55)
+                .await
                 .expect("block store get")
                 .expect("cached payload");
             assert_eq!(payload.as_ref(), b"payload");
@@ -14606,8 +14588,8 @@ mod tests {
             .load(Ordering::Relaxed);
 
         assert!(
-            calls_after >= calls_before + 3,
-            "batch put (2 blocks) + get should record at least three local-cache I/O calls"
+            calls_after >= calls_before + 2,
+            "put + get should record at least two local-cache I/O calls"
         );
         assert!(
             handoff_after >= handoff_before,

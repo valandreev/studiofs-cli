@@ -8,12 +8,12 @@
 //!    tokio broadcast), so only one S3 GET is issued per block.
 //! 3. Applies its own retry with exponential backoff per fetch, independent of
 //!    OpenDAL's internal `RetryLayer`.
-//! 4. Executes local cache get/put inline on the active runtime worker to avoid
-//!    per-operation blocking-pool handoffs on hot cache hits.
+//! 4. Routes local cache get/put through Tokio's blocking pool so file-backed
+//!    cache I/O never blocks async worker threads.
 
 use crate::aimd::{AimdConfig, AimdController, AimdPermit};
 use crate::qos::{QosController, TransitMemoryBudget};
-use crate::runtime::{LocalCacheIoTiming, run_local_cache_io};
+use crate::runtime::LocalCacheIoTiming;
 use crate::vfs::VfsConfig;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -26,6 +26,7 @@ use studiofs_cache::v2::LocalBlockBackend;
 use studiofs_data::object::{CLOUD_FRAGMENT_SIZE, read_object, validate_cloud_fragment_layout};
 use studiofs_data::store::{DataError, DataStore};
 use tokio::sync::broadcast;
+use tokio::task;
 use tracing::{debug, error, info, warn};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -285,7 +286,7 @@ impl FetchScheduler {
         class: FetchClass,
     ) -> Result<Bytes, FetchError> {
         // ── Fast path: cache ────────────────────────────────────────
-        if let Some(cached) = self.block_store_get(object_id)? {
+        if let Some(cached) = self.block_store_get_async(object_id).await? {
             self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(cached);
         }
@@ -329,7 +330,7 @@ impl FetchScheduler {
                     match recv {
                         // Fetcher succeeded — grab from cache.
                         Ok(Ok(true)) => {
-                            if let Some(cached) = self.block_store_get(object_id)? {
+                            if let Some(cached) = self.block_store_get_async(object_id).await? {
                                 self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
                                 return Ok(cached);
                             }
@@ -549,27 +550,69 @@ impl FetchScheduler {
         let payload = Bytes::from(assembled);
 
         // Populate cache (L1 + L2) with the reconstructed logical block.
-        self.block_store_put(object_id, payload.clone(), true)?;
+        self.block_store_put_async(object_id, payload.clone(), true)
+            .await?;
 
         Ok(payload)
     }
 
-    fn block_store_get(&self, object_id: u64) -> Result<Option<Bytes>, FetchError> {
+    async fn block_store_get_async(&self, object_id: u64) -> Result<Option<Bytes>, FetchError> {
         let block_store = self.local_block_backend.clone();
-        let (result, timing) = run_local_cache_io(|| block_store.get(object_id));
+        let submitted_at = Instant::now();
+        let (result, timing) = task::spawn_blocking(move || {
+            let io_started = Instant::now();
+            let handoff_ns = io_started
+                .checked_duration_since(submitted_at)
+                .unwrap_or_default()
+                .as_nanos()
+                .min(u64::MAX as u128) as u64;
+            let result = block_store.get(object_id);
+            let backend_io_ns = io_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            (
+                result,
+                LocalCacheIoTiming {
+                    handoff_ns,
+                    backend_io_ns,
+                },
+            )
+        })
+        .await
+        .map_err(|error| {
+            FetchError::CacheAccess(format!("block store get task failed: {error}"))
+        })?;
         self.record_local_cache_io_timing(timing);
         Ok(result)
     }
 
-    fn block_store_put(
+    async fn block_store_put_async(
         &self,
         object_id: u64,
         payload: Bytes,
         evictable: bool,
     ) -> Result<(), FetchError> {
         let block_store = self.local_block_backend.clone();
-        let (result, timing) =
-            run_local_cache_io(|| block_store.put(object_id, payload.as_ref(), evictable));
+        let submitted_at = Instant::now();
+        let (result, timing) = task::spawn_blocking(move || {
+            let io_started = Instant::now();
+            let handoff_ns = io_started
+                .checked_duration_since(submitted_at)
+                .unwrap_or_default()
+                .as_nanos()
+                .min(u64::MAX as u128) as u64;
+            let result = block_store.put(object_id, payload.as_ref(), evictable);
+            let backend_io_ns = io_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            (
+                result,
+                LocalCacheIoTiming {
+                    handoff_ns,
+                    backend_io_ns,
+                },
+            )
+        })
+        .await
+        .map_err(|error| {
+            FetchError::CacheAccess(format!("block store put task failed: {error}"))
+        })?;
         self.record_local_cache_io_timing(timing);
         result.map_err(|error| FetchError::CacheAccess(error.to_string()))
     }
