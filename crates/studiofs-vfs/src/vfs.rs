@@ -7173,23 +7173,31 @@ impl StudioVfs {
         Ok(result)
     }
 
-    fn block_store_read_into(
+    async fn block_store_read_into_async(
         &self,
         object_id: u64,
         data_offset: usize,
         out: &mut [u8],
     ) -> VfsResult<Option<usize>> {
-        let (read, timing) = run_local_cache_io(|| {
-            self.local_block_backend
-                .read_into(object_id, data_offset, out)
-        });
+        let block_store = self.local_block_backend.clone();
+        let out_len = out.len();
+        let (result, timing) = run_local_cache_io_blocking(move || {
+            let mut scratch = vec![0_u8; out_len];
+            let read = block_store.read_into(object_id, data_offset, &mut scratch);
+            Ok((scratch, read))
+        })
+        .await?;
         self.record_local_cache_io_timing(timing);
+        let (scratch, read) = result;
         if let Some(read) = read {
             if read > out.len() {
                 return Err(VfsError::Other(format!(
                     "local backend returned oversized read: object_id={object_id}, read={read}, out_len={}",
                     out.len()
                 )));
+            }
+            if read > 0 {
+                out[..read].copy_from_slice(&scratch[..read]);
             }
             Ok(Some(read))
         } else {
@@ -10759,8 +10767,9 @@ impl StudioVfs {
                             ))
                         })?;
                         let mut span_resolved = false;
-                        if let Some(read) =
-                            self.block_store_read_into(block.object_id, block_offset, dst)?
+                        if let Some(read) = self
+                            .block_store_read_into_async(block.object_id, block_offset, dst)
+                            .await?
                         {
                             if read == dst.len() {
                                 span_resolved = true;
@@ -14729,7 +14738,8 @@ mod tests {
                 .expect("block store put");
             let mut out = [0_u8; 3];
             let read = vfs
-                .block_store_read_into(0xBB66, 2, &mut out)
+                .block_store_read_into_async(0xBB66, 2, &mut out)
+                .await
                 .expect("block store read_into");
             assert_eq!(read, Some(3));
             assert_eq!(&out, b"ylo");
@@ -14759,12 +14769,15 @@ mod tests {
     #[test]
     fn local_cache_read_into_returns_none_for_missing_block() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "local-cache-read-into-missing");
-        let mut out = [0_u8; 8];
-        let read = vfs
-            .block_store_read_into(0xDEADBEEF, 0, &mut out)
-            .expect("read_into should not error on cache miss");
-        assert_eq!(read, None);
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "local-cache-read-into-missing");
+        rt.block_on(async {
+            let mut out = [0_u8; 8];
+            let read = vfs
+                .block_store_read_into_async(0xDEADBEEF, 0, &mut out)
+                .await
+                .expect("read_into should not error on cache miss");
+            assert_eq!(read, None);
+        });
     }
 
     #[test]
@@ -14784,6 +14797,33 @@ mod tests {
             message.contains("committed block payload too short"),
             "error message should highlight short committed payload"
         );
+    }
+
+    #[test]
+    fn assemble_read_plan_reports_written_for_committed_cache_hit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "assemble-read-plan-written");
+        rt.block_on(async {
+            let object_id = 0xCC77;
+            vfs.block_store_put_async(object_id, Bytes::from_static(b"0123456789"), false)
+                .await
+                .expect("block store put");
+
+            let mut block = BlockRef::new_full(object_id, 10);
+            block.offset = 2;
+            block.length = 4;
+            let plan = vec![ReadPlanSpan {
+                range: ReadRange { start: 0, end: 4 },
+                source: ReadPlanSource::Base { block },
+            }];
+            let mut buffer = [0_u8; 4];
+            let written = vfs
+                .assemble_read_plan(0, &plan, &std::collections::HashSet::new(), &mut buffer)
+                .await
+                .expect("assemble read plan");
+            assert_eq!(written, 4);
+            assert_eq!(&buffer, b"2345");
+        });
     }
 
     #[test]
