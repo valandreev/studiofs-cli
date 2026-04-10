@@ -561,13 +561,15 @@ impl StudioFsContext {
 
     fn note_cleanup_non_delete_deferred(&self, ino: Ino, fh: u64) {
         let dirty = self.vfs.inode_has_local_dirty_state(ino);
-        if dirty {
+        let deferred_to_close = fh != 0 && dirty;
+        if deferred_to_close {
             self.deferred_cleanup_inodes.lock().insert(ino);
         }
         trace!(
             ino,
             fh,
-            deferred_dirty = dirty,
+            deferred_dirty = deferred_to_close,
+            dirty,
             "cleanup non-delete deferred to close/release_fh"
         );
     }
@@ -650,44 +652,50 @@ impl StudioFsContext {
 
     fn run_close_callback(&self, ino: Ino, fh: u64) {
         self.vfs.note_winfsp_close_callback();
-        if fh != 0 {
-            // `Close` is a release path, not a distinct WinFSP durability
-            // contract. If non-delete `cleanup` already drained the inode this
-            // should observe a clean release; otherwise `release_fh` still
-            // performs the mandatory last-handle local-state drain before the
-            // handle disappears. This callback still blocks on `release_fh`
-            // because the final-handle fallback barrier, when needed, belongs
-            // to the release path rather than a speculative pre-close guess.
-            let cleanup_deferred = self.deferred_cleanup_inodes.lock().contains(&ino);
-            let vfs = self.vfs.clone();
-            let release_result =
-                self.spawn_wait(async move { vfs.release_fh_with_outcome(fh).await });
-            if let Ok(outcome) = &release_result
-                && outcome.closed_last_handle
-            {
-                let cleanup_deferred = self.take_deferred_cleanup_hint(ino);
-                self.vfs
-                    .note_winfsp_close_barrier_outcome(outcome.flushed_local_dirty_state);
-                if cleanup_deferred && outcome.flushed_local_dirty_state {
-                    debug!(
-                        ino,
-                        fh, "close owned deferred cleanup barrier on the last handle"
-                    );
-                } else if cleanup_deferred {
-                    trace!(
-                        ino,
-                        fh,
-                        "close observed deferred cleanup hint but no last-handle barrier was needed"
-                    );
-                }
-            }
-            if let Err(e) = release_result {
-                let cleanup_deferred = self.take_deferred_cleanup_hint(ino) || cleanup_deferred;
-                error!(
+        if fh == 0 {
+            self.clear_deferred_cleanup_hint(ino);
+            return;
+        }
+
+        // `Close` is a release path, not a distinct WinFSP durability
+        // contract. If non-delete `cleanup` already drained the inode this
+        // should observe a clean release; otherwise `release_fh` still
+        // performs the mandatory last-handle local-state drain before the
+        // handle disappears. This callback still blocks on `release_fh`
+        // because the final-handle fallback barrier, when needed, belongs
+        // to the release path rather than a speculative pre-close guess.
+        let had_cleanup_deferred_hint = self.deferred_cleanup_inodes.lock().contains(&ino);
+        let vfs = self.vfs.clone();
+        let release_result = self.spawn_wait(async move { vfs.release_fh_with_outcome(fh).await });
+        if let Ok(outcome) = &release_result
+            && outcome.closed_last_handle
+        {
+            let hint_was_taken = self.take_deferred_cleanup_hint(ino);
+            self.vfs
+                .note_winfsp_close_barrier_outcome(outcome.flushed_local_dirty_state);
+            if hint_was_taken && outcome.flushed_local_dirty_state {
+                debug!(
                     ino,
-                    fh, cleanup_deferred, "release_fh failed after WinFSP close: {:?}", e
+                    fh, "close owned deferred cleanup barrier on the last handle"
+                );
+            } else if hint_was_taken {
+                trace!(
+                    ino,
+                    fh,
+                    "close observed deferred cleanup hint but no last-handle barrier was needed"
                 );
             }
+        }
+        if let Err(e) = release_result {
+            let hint_was_present_for_log =
+                self.take_deferred_cleanup_hint(ino) || had_cleanup_deferred_hint;
+            error!(
+                ino,
+                fh,
+                cleanup_deferred = hint_was_present_for_log,
+                "release_fh failed after WinFSP close: {:?}",
+                e
+            );
         }
     }
 
@@ -1430,6 +1438,7 @@ mod tests {
     use studiofs_meta::MetaError;
     use studiofs_meta::{
         CURRENT_FORMAT_VERSION, FormatInfo, MetaFormat, MetadataConfig, ROOT_INO, RedbMetaEngine,
+        SetattrArgs, TimeSpec,
     };
     use studiofs_vfs::VfsError;
     use studiofs_vfs::{KernelInvalidator, OpenFlags, StudioVfs, VfsConfig};
@@ -1929,6 +1938,36 @@ mod tests {
             async move { vfs.release_fh(fh).await }
         })
         .expect("release_fh");
+    }
+
+    #[test]
+    fn cleanup_non_delete_with_fh_zero_does_not_record_deferred_close_hint() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_hint_skips_fh_zero");
+        let attr = vfs
+            .mkdir(ROOT_INO, b"cleanup-hint-dir", 0, 0, 0o755)
+            .expect("mkdir");
+
+        vfs.setattr(
+            attr.ino,
+            SetattrArgs {
+                mtime: TimeSpec::Now,
+                ..Default::default()
+            },
+        )
+        .expect("setattr");
+
+        ctx.run_cleanup_non_delete_callback(attr.ino, 0)
+            .expect("cleanup callback");
+        assert!(
+            !ctx.has_deferred_cleanup_hint(attr.ino),
+            "fh==0 cleanup should not leave a deferred-close hint"
+        );
+
+        ctx.run_close_callback(attr.ino, 0);
+        assert!(
+            !ctx.has_deferred_cleanup_hint(attr.ino),
+            "fh==0 close should not retain deferred-cleanup state"
+        );
     }
 
     #[test]

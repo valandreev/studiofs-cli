@@ -80,7 +80,7 @@ Implements `winfsp::filesystem::FileSystemContext` trait.
 | `close` | `release()` |
 | `read` | `read_into_fh_sync_cached()` fast path, then `read_into_fh()` fallback |
 | `write` | `write_fh()` |
-| `cleanup` | observe callback; delete finalizes namespace mutation, non-delete defers barrier to `close` / `release_fh()` |
+| `cleanup` | observe callback; delete finalizes namespace mutation, non-delete file-handle cleanup defers barrier to `close` / `release_fh()` |
 | `flush` | `flush()` |
 | `get_file_info` | `getattr()` |
 | `set_basic_info` | `setattr()` |
@@ -99,7 +99,8 @@ I/O buffer behavior on Windows callbacks:
 WinFSP callback barrier semantics:
 - Explicit `flush(context=Some(..))` remains a mandatory dirty-inode foreground barrier.
 - `cleanup` with delete finalizes `unlink()` / `rmdir()` in the cleanup callback itself.
-- Non-delete `cleanup` is observational only; it records that the callback happened, but any remaining dirty local state is deferred to a later explicit `flush` or the last-handle `close` / `release_fh()` path.
+- Non-delete `cleanup` is observational only; for real file handles it records that the callback happened, but any remaining dirty local state is deferred to a later explicit `flush` or the last-handle `close` / `release_fh()` path.
+- `fh == 0` contexts, such as directories, do not have a `release_fh()` fallback; they stay observational unless an explicit `flush` callback makes local state visible.
 - `overwrite` and EOF-changing `set_file_size` publish the new size before the callback returns; they are not backgroundable flush barriers.
 
 **Attribute mapping:**
