@@ -554,15 +554,35 @@ impl StudioFsContext {
         }
     }
 
+    // WinFSP callback barrier policy (SFS-197):
+    //
+    // Mandatory callback-side barriers:
+    // - `flush(context=Some(..))` must make dirty local state explicit before it
+    //   returns.
+    // - `cleanup(FspCleanupDelete)` must finalize delete in cleanup, not in
+    //   `set_delete`.
+    // - `overwrite`/`set_file_size` must publish the new EOF/attrs before the
+    //   callback returns.
+    //
+    // Optional or already-coalesced callback-side work:
+    // - non-delete `cleanup` currently drains dirty state while the handle is
+    //   still valid so `close` usually becomes release-only. This is
+    //   conservative: `release_fh` still performs the mandatory last-handle
+    //   local-state drain if cleanup is skipped, repeated, or later
+    //   deferred/coalesced.
+    // - repeated `flush`/`cleanup` callbacks on an already clean inode may
+    //   return immediately.
+    // - concurrent `flush`/`cleanup` callbacks for the same dirty inode may
+    //   coalesce behind the per-inode gate below.
     fn flush_callback_path_if_dirty(
         &self,
         ino: Ino,
         fh: Option<u64>,
     ) -> studiofs_vfs::VfsResult<bool> {
-        // WinFSP can arrive here from `Flush` or from non-delete `Cleanup`.
-        // Both paths need to make the current local dirty state explicit while
-        // the handle is still valid; a clean inode should return immediately so
-        // repeated callbacks do not look like anonymous foreground stalls.
+        // Shared helper for the explicit `Flush` callback and the current eager
+        // non-delete `Cleanup` barrier. The helper may skip or coalesce
+        // duplicate work, but it must never let a dirty explicit `Flush`
+        // return before local dirty state is visible to the VFS pipeline.
         if !self.vfs.inode_has_local_dirty_state(ino) {
             return Ok(false);
         }
@@ -612,14 +632,21 @@ impl StudioFsContext {
     fn run_close_callback(&self, ino: Ino, fh: u64) {
         self.vfs.note_winfsp_close_callback();
         if fh != 0 {
-            let close_can_attribute_barrier = self.vfs.open_count(ino) <= 1;
-            let close_sees_dirty_inode =
-                close_can_attribute_barrier && self.vfs.inode_has_local_dirty_state(ino);
+            // `Close` is a release path, not a distinct WinFSP durability
+            // contract. If non-delete `cleanup` already drained the inode this
+            // should observe a clean release; otherwise `release_fh` still
+            // performs the mandatory last-handle local-state drain before the
+            // handle disappears. This callback still blocks on `release_fh`
+            // because the final-handle fallback barrier, when needed, belongs
+            // to the release path rather than a speculative pre-close guess.
             let vfs = self.vfs.clone();
-            let release_result = self.spawn_wait(async move { vfs.release_fh(fh).await });
-            if close_can_attribute_barrier {
+            let release_result =
+                self.spawn_wait(async move { vfs.release_fh_with_outcome(fh).await });
+            if let Ok(outcome) = &release_result
+                && outcome.closed_last_handle
+            {
                 self.vfs
-                    .note_winfsp_close_barrier_outcome(close_sees_dirty_inode);
+                    .note_winfsp_close_barrier_outcome(outcome.flushed_local_dirty_state);
             }
             if let Err(e) = release_result {
                 error!(ino, fh, "release_fh failed: {:?}", e);
@@ -1070,9 +1097,11 @@ impl FileSystemContext for StudioFsContext {
             // Current dirty-handle ordering is:
             //   write/overwrite -> optional flush -> cleanup(non-delete) -> close -> release_fh
             //
-            // The synchronous barrier lives in `cleanup` so the handle still
-            // exists while we drain local dirty state. `close` should normally
-            // observe a clean inode and only release the handle.
+            // Non-delete `cleanup` is intentionally an eager barrier, not the
+            // only correctness barrier. Draining here keeps the handle alive
+            // during the foreground stall and lets `close` normally observe a
+            // clean inode, but `release_fh` still preserves correctness if this
+            // callback is skipped, repeated, or later deferred/coalesced.
             let ino = context.ino;
             let fh = context.fh;
             if let Err(e) = self.run_cleanup_non_delete_barrier(ino, fh) {
@@ -1095,7 +1124,9 @@ impl FileSystemContext for StudioFsContext {
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
         self.vfs.note_winfsp_overwrite_callback();
-        // Truncate to 0
+        // `Overwrite` is an immediate EOF transition, not a backgroundable
+        // flush barrier. Later reads/writes in the same open sequence depend on
+        // size=0 being visible before the callback returns.
         let attr = self
             .vfs
             .setattr(context.ino, SetattrArgs::size_only(0))
@@ -1897,6 +1928,57 @@ mod tests {
             vfs.open_count(attr.ino),
             0,
             "close should release the handle"
+        );
+    }
+
+    #[test]
+    fn dirty_last_handle_close_falls_back_to_release_barrier_when_cleanup_did_not_run() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("dirty_last_handle_close_fallback");
+        let attr = vfs
+            .create(ROOT_INO, b"dirty-close-fallback.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.write(attr.ino, 0, b"dirty").await }
+        })
+        .expect("dirty write");
+
+        let callbacks_before = winfsp_callbacks(&vfs);
+        let barriers_before = winfsp_foreground_flushes(&vfs);
+        let flush_calls_before = flush_ordered_calls(&vfs);
+
+        ctx.run_close_callback(attr.ino, fh);
+
+        let callbacks_after = winfsp_callbacks(&vfs);
+        let barriers_after = winfsp_foreground_flushes(&vfs);
+        let flush_calls_after = flush_ordered_calls(&vfs);
+        assert_eq!(
+            callbacks_after.close,
+            callbacks_before.close + 1,
+            "close should still be counted when it owns the last-handle fallback path"
+        );
+        assert_eq!(
+            barriers_after.close,
+            barriers_before.close + 1,
+            "close should attribute the fallback last-handle barrier when cleanup did not run"
+        );
+        assert_eq!(
+            barriers_after.close_skipped_clean, barriers_before.close_skipped_clean,
+            "dirty last-handle close should not look like a clean release"
+        );
+        assert_eq!(
+            flush_calls_after,
+            flush_calls_before + 1,
+            "release_fh should still drain dirty local state before the last handle disappears"
+        );
+        assert_eq!(
+            vfs.open_count(attr.ino),
+            0,
+            "close should release the last handle even when it performs the fallback barrier"
         );
     }
 
