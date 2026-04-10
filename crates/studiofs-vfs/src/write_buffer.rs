@@ -1,6 +1,5 @@
 use super::*;
-
-const BLOCK_STORE_PUT_PIPELINE_WIDTH: usize = 8;
+use futures::StreamExt;
 
 #[derive(Debug, Clone)]
 pub(super) struct PendingBlock {
@@ -113,6 +112,10 @@ fn assign_reserved_object_ids(
             .next()
             .expect("missing fresh object id for write buffer block");
     }
+}
+
+fn blocks_can_accept_more(selected_bytes: usize, next_block_bytes: usize, limit: usize) -> bool {
+    selected_bytes == 0 || selected_bytes.saturating_add(next_block_bytes) <= limit
 }
 
 fn commit_persisted_block_state(
@@ -417,14 +420,14 @@ impl StudioVfs {
         let persisted_bytes: u64 = persisted_blocks.iter().map(|b| b.data.len() as u64).sum();
         let started = Instant::now();
         let result: VfsResult<()> = async {
-            for chunk in persisted_blocks.chunks(BLOCK_STORE_PUT_PIPELINE_WIDTH) {
-                let put_results = futures::future::join_all(chunk.iter().map(|block| {
-                    self.block_store_put_async(block.object_id, block.data.clone(), false)
-                }))
-                .await;
-                for result in put_results {
-                    result?;
-                }
+            let mut inflight = futures::stream::iter(persisted_blocks.iter().cloned())
+                .map(|block| async move {
+                    self.block_store_put_async(block.object_id, block.data, false)
+                        .await
+                })
+                .buffer_unordered(self.payload_put_concurrency.max(1));
+            while let Some(result) = inflight.next().await {
+                result?;
             }
             self.maybe_block_store_sync_data_async(persisted_bytes, local_sync_policy)
                 .await?;
@@ -844,10 +847,12 @@ impl StudioVfs {
     fn snapshot_dirty_full_write_buffer_blocks(
         &self,
         ino: Ino,
-    ) -> (Vec<DirtyWriteSnapshot>, usize) {
+        max_drain_bytes: Option<usize>,
+    ) -> (Vec<DirtyWriteSnapshot>, usize, usize) {
         let pending = self.state.write_buffer.pending_blocks.lock();
         let indexes = self.state.write_buffer.pending_block_indexes.lock();
-        let mut total_bytes = 0usize;
+        let mut total_available_bytes = 0usize;
+        let mut selected_bytes = 0usize;
         let blocks: Vec<_> = indexes
             .get(&ino)
             .into_iter()
@@ -857,15 +862,21 @@ impl StudioVfs {
                 if !pending.dirty || pending.data.len() < self.block_size as usize {
                     return None;
                 }
+                total_available_bytes = total_available_bytes.saturating_add(pending.data.len());
+                if let Some(limit) = max_drain_bytes
+                    && !blocks_can_accept_more(selected_bytes, pending.data.len(), limit)
+                {
+                    return None;
+                }
                 let data = pending.data.clone().freeze();
-                total_bytes += data.len();
+                selected_bytes = selected_bytes.saturating_add(data.len());
                 Some(DirtyWriteSnapshot {
                     block_index: *block_index,
                     data,
                 })
             })
             .collect();
-        (blocks, total_bytes)
+        (blocks, selected_bytes, total_available_bytes)
     }
 
     fn snapshot_dirty_write_buffer_chunk_slices(
@@ -1013,15 +1024,18 @@ impl StudioVfs {
         fallback_content_epoch: Option<u64>,
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<bool> {
-        let (full_blocks, full_block_batch_bytes) =
-            self.snapshot_dirty_full_write_buffer_blocks(ino);
+        let (full_blocks, _full_block_batch_bytes, total_full_block_bytes) = self
+            .snapshot_dirty_full_write_buffer_blocks(
+                ino,
+                Some(self.write_eager_flush_drain_chunk_bytes),
+            );
         if full_blocks.is_empty() {
             if track_eager_flush_outcomes {
                 self.note_eager_flush_outcome(EagerFlushOutcome::SkippedEmpty);
             }
             return Ok(false);
         }
-        if full_block_batch_bytes < minimum_batch_bytes {
+        if total_full_block_bytes < minimum_batch_bytes {
             if track_eager_flush_outcomes {
                 self.note_eager_flush_outcome(EagerFlushOutcome::SkippedBelowThreshold);
             }

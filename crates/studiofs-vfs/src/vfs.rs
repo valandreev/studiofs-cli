@@ -351,6 +351,15 @@ pub struct VfsWritePathEagerFlushStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsWritePathTuningStats {
+    pub eager_flush_threshold_bytes: usize,
+    pub eager_flush_drain_chunk_bytes: usize,
+    pub payload_put_concurrency: usize,
+    pub sync_group_min_bytes: u64,
+    pub sync_group_max_delay_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsWritePathObservabilitySnapshot {
     pub generated_unix_ms: u64,
     pub uptime_secs: f64,
@@ -370,6 +379,8 @@ pub struct VfsWritePathObservabilitySnapshot {
     pub metadata_commit: VfsWritePathStageLatencyStats,
     #[serde(default)]
     pub eager_flush: VfsWritePathEagerFlushStats,
+    #[serde(default)]
+    pub tuning: VfsWritePathTuningStats,
 }
 
 /// Compatibility-shaped acceptance decision for a prospective write batch.
@@ -821,6 +832,9 @@ const CACHE_RUNTIME_MAX_DIRTY_BYTES_LARGE: usize = 4 * 1024 * 1024 * 1024;
 const CACHE_RUNTIME_MAX_DIRTY_BYTES_HUGE: usize = 8 * 1024 * 1024 * 1024;
 const CACHE_RUNTIME_MIN_WRITE_EAGER_BATCH_BYTES: usize = 16 * 1024 * 1024;
 const CACHE_RUNTIME_MAX_WRITE_EAGER_BATCH_BYTES: usize = 128 * 1024 * 1024;
+const WRITE_EAGER_DRAIN_CHUNK_MAX_BYTES: usize = 32 * 1024 * 1024;
+const PAYLOAD_PUT_CONCURRENCY_TARGET_BYTES: usize = 8 * 1024 * 1024;
+const PAYLOAD_PUT_CONCURRENCY_MAX: usize = 32;
 const FAST_MODE_SYNC_GROUP_MIN_BYTES_FLOOR: u64 = 32 * 1024 * 1024;
 const FAST_MODE_SYNC_GROUP_MIN_BYTES_CEIL: u64 = 256 * 1024 * 1024;
 const FAST_MODE_SYNC_GROUP_MAX_DELAY_MS: u64 = 25;
@@ -3403,8 +3417,32 @@ fn derive_upload_cache_io_foreground_cost_base(upload_cache_io_slots: usize) -> 
         .min(slots)
 }
 
-fn derive_fast_mode_sync_group_min_bytes(write_eager_flush_batch_bytes: usize) -> u64 {
-    let target = (write_eager_flush_batch_bytes as u64).saturating_mul(4);
+fn derive_write_eager_flush_drain_chunk_bytes(
+    write_eager_flush_batch_bytes: usize,
+    block_size: u32,
+) -> usize {
+    let block_size = block_size.max(1) as usize;
+    let threshold = write_eager_flush_batch_bytes.max(block_size);
+    let target = threshold.saturating_div(2).max(block_size);
+    target.clamp(block_size, WRITE_EAGER_DRAIN_CHUNK_MAX_BYTES.min(threshold))
+}
+
+fn derive_payload_put_concurrency(block_size: u32, eager_flush_drain_chunk_bytes: usize) -> usize {
+    let block_size = block_size.max(1) as usize;
+    let chunk_blocks = eager_flush_drain_chunk_bytes.div_ceil(block_size).max(1);
+    PAYLOAD_PUT_CONCURRENCY_TARGET_BYTES
+        .div_ceil(block_size)
+        .clamp(1, PAYLOAD_PUT_CONCURRENCY_MAX)
+        .min(chunk_blocks)
+        .max(1)
+}
+
+fn derive_fast_mode_sync_group_min_bytes(
+    write_eager_flush_batch_bytes: usize,
+    write_eager_flush_drain_chunk_bytes: usize,
+) -> u64 {
+    let target = (write_eager_flush_drain_chunk_bytes as u64).saturating_mul(4);
+    let target = target.max(write_eager_flush_batch_bytes as u64);
     target.clamp(
         FAST_MODE_SYNC_GROUP_MIN_BYTES_FLOOR,
         FAST_MODE_SYNC_GROUP_MIN_BYTES_CEIL,
@@ -3945,6 +3983,10 @@ pub struct StudioVfs {
     /// Minimum dirty full-block batch size before `write()` pays the local
     /// persist boundary for eager block flushes.
     write_eager_flush_batch_bytes: usize,
+    /// Maximum bytes drained by one opportunistic eager-flush attempt.
+    write_eager_flush_drain_chunk_bytes: usize,
+    /// Bounded local payload-put concurrency for one eager drain.
+    payload_put_concurrency: usize,
     /// Configured local cache safety mode for write-path durability behavior.
     cache_safety_mode: CacheSafetyMode,
     /// Fast-mode group-commit minimum bytes before forcing local sync.
@@ -4982,8 +5024,16 @@ impl StudioVfs {
             let distributed_flock = None;
             let max_dirty_bytes = cache_runtime_tuning.max_dirty_bytes;
             let write_eager_flush_batch_bytes = cache_runtime_tuning.write_eager_flush_batch_bytes;
-            let local_sync_group_min_bytes =
-                derive_fast_mode_sync_group_min_bytes(write_eager_flush_batch_bytes);
+            let write_eager_flush_drain_chunk_bytes = derive_write_eager_flush_drain_chunk_bytes(
+                write_eager_flush_batch_bytes,
+                block_size,
+            );
+            let payload_put_concurrency =
+                derive_payload_put_concurrency(block_size, write_eager_flush_drain_chunk_bytes);
+            let local_sync_group_min_bytes = derive_fast_mode_sync_group_min_bytes(
+                write_eager_flush_batch_bytes,
+                write_eager_flush_drain_chunk_bytes,
+            );
             let local_sync_group_max_delay =
                 Duration::from_millis(FAST_MODE_SYNC_GROUP_MAX_DELAY_MS);
             let max_xattr_bytes = config.max_xattr_bytes;
@@ -5213,6 +5263,8 @@ impl StudioVfs {
                 upload_fg_read_latency_sticky_windows,
                 max_dirty_bytes,
                 write_eager_flush_batch_bytes,
+                write_eager_flush_drain_chunk_bytes,
+                payload_put_concurrency,
                 local_sync_group_min_bytes,
                 local_sync_group_max_delay_ms,
                 max_xattr_bytes,
@@ -5279,6 +5331,8 @@ impl StudioVfs {
                 ),
                 max_dirty_bytes: AtomicUsize::new(max_dirty_bytes),
                 write_eager_flush_batch_bytes,
+                write_eager_flush_drain_chunk_bytes,
+                payload_put_concurrency,
                 cache_safety_mode,
                 local_sync_group_min_bytes,
                 local_sync_group_max_delay,
@@ -8796,6 +8850,13 @@ impl StudioVfs {
                 triggered: eager_flush_triggered,
                 skipped_empty: eager_flush_skipped_empty,
                 skipped_below_threshold: eager_flush_skipped_below_threshold,
+            },
+            tuning: VfsWritePathTuningStats {
+                eager_flush_threshold_bytes: self.write_eager_flush_batch_bytes,
+                eager_flush_drain_chunk_bytes: self.write_eager_flush_drain_chunk_bytes,
+                payload_put_concurrency: self.payload_put_concurrency,
+                sync_group_min_bytes: self.local_sync_group_min_bytes,
+                sync_group_max_delay_ms: self.local_sync_group_max_delay.as_millis() as u64,
             },
         }
     }
@@ -15109,6 +15170,50 @@ mod tests {
                 + snapshot.eager_flush.skipped_empty
                 + snapshot.eager_flush.skipped_below_threshold,
             "eager flush checks should be partitioned by outcome"
+        );
+    }
+
+    #[test]
+    fn write_path_observability_reports_active_tuning_knobs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, meta) = make_test_vfs(&tmp, "write-path-observability-tuning");
+        let block_size = meta.get_format_info().expect("get format info").block_size as usize;
+
+        let snapshot = vfs.write_path_observability_snapshot();
+        assert_eq!(
+            snapshot.tuning.eager_flush_threshold_bytes, vfs.write_eager_flush_batch_bytes,
+            "observability should report the active eager flush threshold"
+        );
+        assert!(
+            snapshot.tuning.eager_flush_drain_chunk_bytes > 0,
+            "observability should report a non-zero eager drain chunk"
+        );
+        assert!(
+            snapshot.tuning.eager_flush_drain_chunk_bytes
+                <= snapshot.tuning.eager_flush_threshold_bytes,
+            "eager drain chunk should never exceed the trigger threshold"
+        );
+        assert!(
+            snapshot.tuning.payload_put_concurrency >= 1,
+            "payload put concurrency should be explicit in observability"
+        );
+        assert!(
+            snapshot.tuning.payload_put_concurrency
+                <= snapshot
+                    .tuning
+                    .eager_flush_drain_chunk_bytes
+                    .div_ceil(block_size)
+                    .max(1),
+            "payload put concurrency should be bounded by the eager drain chunk"
+        );
+        assert_eq!(
+            snapshot.tuning.sync_group_min_bytes, vfs.local_sync_group_min_bytes,
+            "observability should report the active sync-data group minimum"
+        );
+        assert_eq!(
+            snapshot.tuning.sync_group_max_delay_ms,
+            vfs.local_sync_group_max_delay.as_millis() as u64,
+            "observability should report the active sync-data delay cap"
         );
     }
 
