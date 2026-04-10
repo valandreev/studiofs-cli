@@ -30,7 +30,7 @@ pub use cache_index::{
     DirtyReplayEntry, EvictionCandidateEntry,
 };
 use eviction::{CacheBudgetGovernor, EVICTION_CANDIDATE_PAGE_SIZE, EVICTION_DELETE_BATCH_SIZE};
-pub use file_payload_store::{FilePayloadStore, FilePayloadStoreError, SyncBarrierSnapshot};
+pub use file_payload_store::{FilePayloadStore, FilePayloadStoreError};
 pub use layout::{
     CACHE_V3_LAYOUT_MARKER_FILE, CACHE_V3_LAYOUT_VERSION, CACHE_V3_PAYLOAD_SHARD_COUNT,
     CACHE_V3_REDB_INDEX_FILE, CACHE_V3_SUBTREE, CacheV3Layout,

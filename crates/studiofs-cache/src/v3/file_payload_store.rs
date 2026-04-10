@@ -286,7 +286,8 @@ impl FilePayloadStore {
         Ok(temp_path)
     }
 
-    pub fn sync_barrier_snapshot(&self) -> SyncBarrierSnapshot {
+    #[cfg(test)]
+    pub(crate) fn sync_barrier_snapshot(&self) -> SyncBarrierSnapshot {
         SyncBarrierSnapshot {
             per_put_file_sync_calls: self
                 .barrier_counters
@@ -455,11 +456,12 @@ impl FilePayloadStore {
         let file = match OpenOptions::new().read(true).write(true).open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                match OpenOptions::new().read(true).open(&path) {
-                    Ok(file) => file,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-                    Err(error) => return Err(error.into()),
-                }
+                warn!(
+                    object_id,
+                    path = %path.display(),
+                    "cache-v3 grouped payload sync skipped because file could not be opened for writing"
+                );
+                return Ok(());
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.into()),
@@ -530,14 +532,15 @@ struct SyncBarrierCounters {
     grouped_dir_sync_calls: AtomicU64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SyncBarrierSnapshot {
-    pub per_put_file_sync_calls: u64,
-    pub per_put_dir_sync_calls: u64,
-    pub grouped_file_sync_calls: u64,
-    pub grouped_dir_sync_calls: u64,
-    pub pending_grouped_file_syncs: usize,
-    pub pending_grouped_dir_syncs: usize,
+pub(crate) struct SyncBarrierSnapshot {
+    pub(crate) per_put_file_sync_calls: u64,
+    pub(crate) per_put_dir_sync_calls: u64,
+    pub(crate) grouped_file_sync_calls: u64,
+    pub(crate) grouped_dir_sync_calls: u64,
+    pub(crate) pending_grouped_file_syncs: usize,
+    pub(crate) pending_grouped_dir_syncs: usize,
 }
 
 #[cfg(test)]
