@@ -463,42 +463,7 @@ impl StudioVfs {
         let mut chunks: std::collections::BTreeMap<u64, Vec<studiofs_meta::schema::SliceRecord>> =
             std::collections::BTreeMap::new();
 
-        if dirty_chunk_slices.is_empty() {
-            for persisted in persisted_blocks {
-                let block_start = (persisted.block_index as u64) * (self.block_size as u64);
-                let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64;
-                let chunk_id = block_start / chunk_size;
-                let chunk_start = chunk_id * chunk_size;
-                let slice_start = (block_start - chunk_start) as u32;
-                let slice_end = slice_start + (persisted.data.len() as u32);
-                let slice_range = studiofs_meta::schema::SliceRange::new(slice_start, slice_end)
-                    .ok_or_else(|| {
-                        crate::VfsError::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!("invalid slice range {}..{}", slice_start, slice_end),
-                        ))
-                    })?;
-                let mut flags = studiofs_meta::schema::BlockFlags::empty();
-                if persisted.data.len() < self.block_size as usize {
-                    flags |= studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK;
-                }
-                chunks
-                    .entry(chunk_id)
-                    .or_default()
-                    .push(studiofs_meta::schema::SliceRecord {
-                        slice_id: studiofs_meta::schema::SliceId::default(),
-                        order: studiofs_meta::schema::SliceOrder::default(),
-                        range: slice_range,
-                        block: Some(studiofs_meta::schema::BlockRef {
-                            object_id: persisted.object_id,
-                            offset: 0,
-                            length: persisted.data.len() as u32,
-                            flags,
-                        }),
-                        block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
-                    });
-            }
-        } else {
+        if !dirty_chunk_slices.is_empty() {
             // Dirty-chunk-slices path: validate per-write-slice invariants but
             // emit ONE full-block SliceRecord per persisted block.
             //
@@ -548,45 +513,46 @@ impl StudioVfs {
                     }
                 }
             }
-            // Write one full-block SliceRecord for every persisted block,
-            // whether or not it had dirty-chunk-slice tracking entries.
-            // The S3 object always contains the complete block payload from
-            // offset 0, so BlockRef.offset=0 and BlockRef.length=data.len()
-            // is the canonical (non-fragmented) representation.
-            for persisted in persisted_blocks {
-                let block_start = (persisted.block_index as u64) * (self.block_size as u64);
-                let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64;
-                let chunk_id = block_start / chunk_size;
-                let chunk_start = chunk_id * chunk_size;
-                let slice_start = (block_start - chunk_start) as u32;
-                let slice_end = slice_start + (persisted.data.len() as u32);
-                let slice_range = studiofs_meta::schema::SliceRange::new(slice_start, slice_end)
-                    .ok_or_else(|| {
-                        crate::VfsError::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!("invalid slice range {}..{}", slice_start, slice_end),
-                        ))
-                    })?;
-                let mut flags = studiofs_meta::schema::BlockFlags::empty();
-                if persisted.data.len() < self.block_size as usize {
-                    flags |= studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK;
-                }
-                chunks
-                    .entry(chunk_id)
-                    .or_default()
-                    .push(studiofs_meta::schema::SliceRecord {
-                        slice_id: studiofs_meta::schema::SliceId::default(),
-                        order: studiofs_meta::schema::SliceOrder::default(),
-                        range: slice_range,
-                        block: Some(studiofs_meta::schema::BlockRef {
-                            object_id: persisted.object_id,
-                            offset: 0,
-                            length: persisted.data.len() as u32,
-                            flags,
-                        }),
-                        block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
-                    });
+        }
+
+        // Write one full-block SliceRecord for every persisted block,
+        // whether or not it had dirty-chunk-slice tracking entries.
+        // The S3 object always contains the complete block payload from
+        // offset 0, so BlockRef.offset=0 and BlockRef.length=data.len()
+        // is the canonical (non-fragmented) representation.
+        for persisted in persisted_blocks {
+            let block_start = (persisted.block_index as u64) * (self.block_size as u64);
+            let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64;
+            let chunk_id = block_start / chunk_size;
+            let chunk_start = chunk_id * chunk_size;
+            let slice_start = (block_start - chunk_start) as u32;
+            let slice_end = slice_start + (persisted.data.len() as u32);
+            let slice_range = studiofs_meta::schema::SliceRange::new(slice_start, slice_end)
+                .ok_or_else(|| {
+                    crate::VfsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid slice range {}..{}", slice_start, slice_end),
+                    ))
+                })?;
+            let mut flags = studiofs_meta::schema::BlockFlags::empty();
+            if persisted.data.len() < self.block_size as usize {
+                flags |= studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK;
             }
+            chunks
+                .entry(chunk_id)
+                .or_default()
+                .push(studiofs_meta::schema::SliceRecord {
+                    slice_id: studiofs_meta::schema::SliceId::default(),
+                    order: studiofs_meta::schema::SliceOrder::default(),
+                    range: slice_range,
+                    block: Some(studiofs_meta::schema::BlockRef {
+                        object_id: persisted.object_id,
+                        offset: 0,
+                        length: persisted.data.len() as u32,
+                        flags,
+                    }),
+                    block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
+                });
         }
 
         for slices in chunks.values_mut() {
@@ -728,7 +694,18 @@ impl StudioVfs {
         // VFS-level pre-transform. On failure, remove the block-store entries
         // written in Phase 1.
         let chunk_slices =
-            self.build_overlay_slice_records(ino, &persisted_blocks, dirty_chunk_slices)?;
+            match self.build_overlay_slice_records(ino, &persisted_blocks, dirty_chunk_slices) {
+                Ok(slices) => slices,
+                Err(error) => {
+                    self.cleanup_uncommitted_block_store_entries(
+                        ino,
+                        &persisted_blocks,
+                        "metadata-build",
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
         let committed_attr = match self
             .commit_overlay_metadata_phase(ino, chunk_slices, attr_to_persist)
             .await

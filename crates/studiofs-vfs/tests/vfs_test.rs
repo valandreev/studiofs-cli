@@ -5885,7 +5885,8 @@ fn startup_recovery_quarantines_fragmented_regular_file_graph_and_preserves_dirt
                     BlockRef::new_partial(object_ids[1], half),
                 ),
             ];
-            meta.flush_regular_file_overlay_slices_with_attr(ino, &[(ChunkId(0), slices)], None)
+            let _ = meta
+                .flush_regular_file_overlay_slices_with_attr(ino, &[(ChunkId(0), slices)], None)
                 .unwrap();
         });
         rt.shutdown_background();
