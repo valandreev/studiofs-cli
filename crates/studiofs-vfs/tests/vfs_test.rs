@@ -599,6 +599,25 @@ fn make_vfs_with_meta(
     vfs
 }
 
+fn make_vfs_with_meta_without_background_workers(
+    meta: Arc<RedbMetaEngine>,
+    format_info: &FormatInfo,
+    cache_dir_str: &str,
+) -> Arc<StudioVfs> {
+    meta.set_format_info(format_info)
+        .expect("failed to set format info");
+    let data_config = DataStoreConfig::from(format_info);
+    StudioVfs::new(
+        meta,
+        &data_config,
+        cache_dir_str,
+        1024 * 1024 * 1024,
+        512 * 1024 * 1024,
+        test_vfs_config_from_env(),
+    )
+    .expect("failed to create StudioVfs")
+}
+
 /// RAII guard that captures and restores all SFS-121 offline test env vars on drop.
 /// The explicit `_lock` field holds the global env lock for the **entire** test
 /// duration, preventing other parallel tests from observing a partially-set env.
@@ -2122,7 +2141,7 @@ fn test_crash_recovery_replays_pending_journal() {
         .unwrap();
     let online_data_config = DataStoreConfig::from(&online_info);
     rt.block_on(async {
-        let _vfs = StudioVfs::new(
+        let vfs = StudioVfs::new(
             meta.clone(),
             &online_data_config,
             &cache_dir_str,
@@ -2131,7 +2150,7 @@ fn test_crash_recovery_replays_pending_journal() {
             test_vfs_config_from_env(),
         )
         .unwrap();
-        _vfs.start()
+        vfs.start()
             .expect("failed to start StudioVfs background workers");
 
         let blocks = meta.get_file_blocks(crash_file_ino).unwrap();
@@ -2149,6 +2168,8 @@ fn test_crash_recovery_replays_pending_journal() {
             .await,
             "recovered uploader should eventually upload object {object_id}"
         );
+
+        vfs.shutdown(Duration::from_secs(15)).await;
     });
 
     // Allow async cleanup to clear DIRTY flags after upload completion.
@@ -3035,8 +3056,11 @@ fn atomic_switch_to_new_incarnation_after_full_commit() {
 
         import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &format_info);
         {
-            let remote_vfs =
-                make_vfs_with_meta(remote_meta.clone(), &format_info, &remote_cache_str);
+            let remote_vfs = make_vfs_with_meta_without_background_workers(
+                remote_meta.clone(),
+                &format_info,
+                &remote_cache_str,
+            );
             let remote_attr = remote_vfs.lookup(1, b"atomic-switch.bin").unwrap();
             assert_eq!(remote_attr.upload_state, UploadState::Updating);
             let remote_blocks_before = remote_meta.get_file_blocks(ino).unwrap();
@@ -3063,7 +3087,11 @@ fn atomic_switch_to_new_incarnation_after_full_commit() {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &format_info);
-            let remote_vfs = make_vfs_with_meta(remote_meta.clone(), &format_info, &remote_cache_str);
+            let remote_vfs = make_vfs_with_meta_without_background_workers(
+                remote_meta.clone(),
+                &format_info,
+                &remote_cache_str,
+            );
             let remote_attr_after = remote_vfs.lookup(1, b"atomic-switch.bin").unwrap();
             let remote_blocks_after = remote_meta.get_file_blocks(ino).unwrap();
             let read_after = remote_vfs
