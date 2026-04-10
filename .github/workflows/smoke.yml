@@ -206,6 +206,7 @@ jobs:
         run: cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --test-threads=1
         timeout-minutes: 5
         env:
+          STUDIOFS_WINFSP_AJA_MIN_THROUGHPUT_MIB_PER_SEC: "64"
           STUDIOFS_WINFSP_TEST_MOUNT_POINT: "Z:"
 
       - name: Capture test output on failure

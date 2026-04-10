@@ -1,7 +1,7 @@
+use crate::cli::test_cache_profile_common::collect_write_path_artifacts;
 use crate::cli::test_cache_profile_types::{
     ProfileArtifactReport, ProfileEndpointReport, TestCacheProfileMode, TestCacheProfileResult,
 };
-use crate::cli::utils::format_bytes;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use flate2::{Compression, write::GzEncoder};
@@ -18,11 +18,9 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use studiofs_vfs::VfsWritePathObservabilitySnapshot;
 
 const DEFAULT_APP_NAME: &str = "studiofs.test-cache";
 const DEFAULT_SAMPLE_RATE: u32 = 100;
-const WINFSP_CLEANUP_REGRESSION_ISSUE: &str = "SFS-192";
 
 pub struct TestCacheProfileSession {
     run_id: String,
@@ -97,63 +95,13 @@ impl TestCacheProfileSession {
         let mut artifacts = Vec::new();
         let finished_at = Utc::now();
 
-        if let Some(metrics_path) = self.write_path_observability_path.as_ref() {
-            match fs::read(metrics_path) {
-                Ok(bytes) => {
-                    let artifact = write_artifact(
-                        output_dir,
-                        &self.run_id,
-                        &self.benchmark_mode,
-                        "write-path-observability",
-                        "json",
-                        &bytes,
-                    )?;
-                    artifacts.push(ProfileArtifactReport {
-                        kind: "write-path-observability".to_string(),
-                        path: artifact.display().to_string(),
-                        bytes: bytes.len() as u64,
-                        sent_to_endpoint: false,
-                    });
-                    match render_write_path_summary(&bytes) {
-                        Ok(summary) => {
-                            let summary_bytes = summary.into_bytes();
-                            let summary_artifact = write_artifact(
-                                output_dir,
-                                &self.run_id,
-                                &self.benchmark_mode,
-                                "write-path-summary",
-                                "txt",
-                                &summary_bytes,
-                            )?;
-                            artifacts.push(ProfileArtifactReport {
-                                kind: "write-path-summary".to_string(),
-                                path: summary_artifact.display().to_string(),
-                                bytes: summary_bytes.len() as u64,
-                                sent_to_endpoint: false,
-                            });
-                        }
-                        Err(err) => {
-                            self.warnings.push(format!(
-                                "Failed to render write-path summary from '{}': {err}",
-                                metrics_path.display()
-                            ));
-                        }
-                    }
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    self.warnings.push(format!(
-                        "Write-path observability snapshot not found: {}",
-                        metrics_path.display()
-                    ));
-                }
-                Err(err) => {
-                    self.warnings.push(format!(
-                        "Failed to read write-path observability snapshot '{}': {err}",
-                        metrics_path.display()
-                    ));
-                }
-            }
-        }
+        artifacts.extend(collect_write_path_artifacts(
+            output_dir,
+            &self.run_id,
+            &self.benchmark_mode,
+            self.write_path_observability_path.as_deref(),
+            &mut self.warnings,
+        )?);
 
         if let Some(mut backend) = self.cpu_backend.take() {
             match backend.report() {
@@ -365,128 +313,6 @@ fn gzip_bytes(input: &[u8]) -> Result<Vec<u8>> {
     Ok(encoder.finish()?)
 }
 
-fn has_cleanup_barrier_attribution(
-    stats: &studiofs_vfs::VfsWritePathWinfspForegroundFlushStats,
-) -> bool {
-    stats.cleanup > 0 || stats.cleanup_skipped_clean > 0
-}
-
-fn winfsp_cleanup_validation_state(snapshot: &VfsWritePathObservabilitySnapshot) -> &'static str {
-    if has_cleanup_barrier_attribution(&snapshot.winfsp_foreground_flushes)
-        || snapshot.winfsp_callbacks.cleanup_flush_fh > 0
-    {
-        "cleanup-follow-up"
-    } else if snapshot.winfsp_callbacks.cleanup > 0 {
-        "cleanup-deferred"
-    } else {
-        "not-observed"
-    }
-}
-
-fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
-    let snapshot: VfsWritePathObservabilitySnapshot =
-        serde_json::from_slice(bytes).context("parse write-path observability snapshot")?;
-    let mut out = String::new();
-    out.push_str(&format!("backend: {}\n", snapshot.backend_tag));
-    out.push_str(&format!(
-        "eager_flush_threshold: {}\n",
-        format_bytes(snapshot.tuning.eager_flush_threshold_bytes as u64)
-    ));
-    out.push_str(&format!(
-        "eager_flush_drain_chunk: {}\n",
-        format_bytes(snapshot.tuning.eager_flush_drain_chunk_bytes as u64)
-    ));
-    out.push_str(&format!(
-        "payload_put_concurrency: {}\n",
-        snapshot.tuning.payload_put_concurrency
-    ));
-    out.push_str(&format!(
-        "sync_group_min: {}\n",
-        format_bytes(snapshot.tuning.sync_group_min_bytes)
-    ));
-    out.push_str(&format!(
-        "sync_group_max_delay_ms: {}\n",
-        snapshot.tuning.sync_group_max_delay_ms
-    ));
-    out.push_str(&format!(
-        "payload_burst_avg: {}\n",
-        format_bytes(snapshot.payload_burst.avg_bytes_per_burst.round() as u64)
-    ));
-    out.push_str(&format!(
-        "payload_burst_max: {}\n",
-        format_bytes(snapshot.payload_burst.max_bytes_per_burst)
-    ));
-    out.push_str(&format!(
-        "payload_persist_p95_ms: {:.2}\n",
-        snapshot.payload_persist.latency_quantiles_ms.p95
-    ));
-    out.push_str(&format!(
-        "metadata_commit_p95_ms: {:.2}\n",
-        snapshot.metadata_commit.latency_quantiles_ms.p95
-    ));
-    out.push_str(&format!(
-        "metadata_commit_interval_avg_ms: {:.2}\n",
-        snapshot.metadata_commit_cadence.avg_interval_ms
-    ));
-    out.push_str(&format!(
-        "metadata_commit_interval_max_ms: {:.2}\n",
-        snapshot.metadata_commit_cadence.max_interval_ms
-    ));
-    out.push_str(&format!(
-        "sync_data_calls_per_gib: {:.2}\n",
-        snapshot.block_store_sync_data.calls_per_gib
-    ));
-    out.push_str(&format!(
-        "winfsp_callbacks: write={} overwrite={} cleanup={} cleanup_flush_fh={} flush={} close={}\n",
-        snapshot.winfsp_callbacks.write,
-        snapshot.winfsp_callbacks.overwrite,
-        snapshot.winfsp_callbacks.cleanup,
-        snapshot.winfsp_callbacks.cleanup_flush_fh,
-        snapshot.winfsp_callbacks.flush,
-        snapshot.winfsp_callbacks.close
-    ));
-    out.push_str(&format!(
-        "winfsp_foreground_flushes: cleanup={} cleanup_skipped_clean={} flush={} flush_skipped_clean={} close={} close_skipped_clean={}\n",
-        snapshot.winfsp_foreground_flushes.cleanup,
-        snapshot.winfsp_foreground_flushes.cleanup_skipped_clean,
-        snapshot.winfsp_foreground_flushes.flush,
-        snapshot.winfsp_foreground_flushes.flush_skipped_clean,
-        snapshot.winfsp_foreground_flushes.close,
-        snapshot.winfsp_foreground_flushes.close_skipped_clean
-    ));
-    out.push_str(&format!(
-        "winfsp_validation: cleanup_non_delete={} cleanup_non_delete_barriers={} cleanup_non_delete_skipped_clean={} cleanup_flush_fh={} flush_barriers={} close_barriers={}\n",
-        winfsp_cleanup_validation_state(&snapshot),
-        snapshot.winfsp_foreground_flushes.cleanup,
-        snapshot.winfsp_foreground_flushes.cleanup_skipped_clean,
-        snapshot.winfsp_callbacks.cleanup_flush_fh,
-        snapshot.winfsp_foreground_flushes.flush,
-        snapshot.winfsp_foreground_flushes.close,
-    ));
-    if snapshot.winfsp_foreground_flushes.cleanup > 0 {
-        out.push_str(&format!(
-            "winfsp_follow_up: non-delete cleanup regression attributed {} foreground barrier(s); record follow-up evidence for {}\n",
-            snapshot.winfsp_foreground_flushes.cleanup,
-            WINFSP_CLEANUP_REGRESSION_ISSUE,
-        ));
-    }
-    if snapshot.winfsp_foreground_flushes.cleanup_skipped_clean > 0 {
-        out.push_str(&format!(
-            "winfsp_follow_up: non-delete cleanup regression attributed {} skipped-clean barrier(s); record follow-up evidence for {}\n",
-            snapshot.winfsp_foreground_flushes.cleanup_skipped_clean,
-            WINFSP_CLEANUP_REGRESSION_ISSUE,
-        ));
-    }
-    if snapshot.winfsp_callbacks.cleanup_flush_fh > 0 {
-        out.push_str(&format!(
-            "winfsp_follow_up: cleanup routed through flush_fh {} time(s); inspect WinFSP callback sequencing and record follow-up evidence for {}\n",
-            snapshot.winfsp_callbacks.cleanup_flush_fh,
-            WINFSP_CLEANUP_REGRESSION_ISSUE,
-        ));
-    }
-    Ok(out)
-}
-
 fn send_profile(
     endpoint: &ProfileEndpoint,
     application_name: &str,
@@ -561,141 +387,4 @@ fn send_profile(
         ));
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::render_write_path_summary;
-    use studiofs_vfs::{
-        VfsWritePathObservabilitySnapshot, VfsWritePathWinfspCallbackStats,
-        VfsWritePathWinfspForegroundFlushStats,
-    };
-
-    #[test]
-    fn render_write_path_summary_includes_winfsp_callback_breakdown() {
-        let snapshot = VfsWritePathObservabilitySnapshot {
-            backend_tag: "cache-v3".to_string(),
-            winfsp_callbacks: VfsWritePathWinfspCallbackStats {
-                write: 11,
-                overwrite: 2,
-                cleanup: 7,
-                cleanup_flush_fh: 0,
-                flush: 5,
-                close: 7,
-                ..Default::default()
-            },
-            winfsp_foreground_flushes: VfsWritePathWinfspForegroundFlushStats {
-                cleanup: 0,
-                flush: 2,
-                close: 3,
-                cleanup_skipped_clean: 0,
-                flush_skipped_clean: 3,
-                close_skipped_clean: 4,
-            },
-            ..Default::default()
-        };
-
-        let bytes = serde_json::to_vec(&snapshot).expect("serialize snapshot");
-        let summary = render_write_path_summary(&bytes).expect("render summary");
-
-        assert!(
-            summary.contains(
-                "winfsp_callbacks: write=11 overwrite=2 cleanup=7 cleanup_flush_fh=0 flush=5 close=7"
-            ),
-            "summary should include the WinFSP callback counts: {summary}"
-        );
-        assert!(
-            summary.contains(
-                "winfsp_foreground_flushes: cleanup=0 cleanup_skipped_clean=0 flush=2 flush_skipped_clean=3 close=3 close_skipped_clean=4"
-            ),
-            "summary should include the WinFSP foreground flush attribution: {summary}"
-        );
-        assert!(
-            summary.contains(
-                "winfsp_validation: cleanup_non_delete=cleanup-deferred cleanup_non_delete_barriers=0 cleanup_non_delete_skipped_clean=0 cleanup_flush_fh=0 flush_barriers=2 close_barriers=3"
-            ),
-            "summary should describe the WinFSP validation posture: {summary}"
-        );
-    }
-
-    #[test]
-    fn render_write_path_summary_emits_follow_up_for_cleanup_barrier_regressions() {
-        let snapshot = VfsWritePathObservabilitySnapshot {
-            backend_tag: "cache-v3".to_string(),
-            winfsp_callbacks: VfsWritePathWinfspCallbackStats {
-                cleanup: 5,
-                ..Default::default()
-            },
-            winfsp_foreground_flushes: VfsWritePathWinfspForegroundFlushStats {
-                cleanup: 2,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let bytes = serde_json::to_vec(&snapshot).expect("serialize snapshot");
-        let summary = render_write_path_summary(&bytes).expect("render summary");
-
-        assert!(
-            summary.contains(
-                "winfsp_follow_up: non-delete cleanup regression attributed 2 foreground barrier(s); record follow-up evidence for SFS-192"
-            ),
-            "summary should flag unexpected cleanup-owned barriers as follow-up evidence: {summary}"
-        );
-    }
-
-    #[test]
-    fn render_write_path_summary_emits_follow_up_for_cleanup_skipped_clean_regressions() {
-        let snapshot = VfsWritePathObservabilitySnapshot {
-            backend_tag: "cache-v3".to_string(),
-            winfsp_callbacks: VfsWritePathWinfspCallbackStats {
-                cleanup: 6,
-                ..Default::default()
-            },
-            winfsp_foreground_flushes: VfsWritePathWinfspForegroundFlushStats {
-                cleanup_skipped_clean: 3,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let bytes = serde_json::to_vec(&snapshot).expect("serialize snapshot");
-        let summary = render_write_path_summary(&bytes).expect("render summary");
-
-        assert!(
-            summary.contains(
-                "winfsp_validation: cleanup_non_delete=cleanup-follow-up cleanup_non_delete_barriers=0 cleanup_non_delete_skipped_clean=3 cleanup_flush_fh=0"
-            ),
-            "summary should classify skipped-clean cleanup attribution as follow-up evidence: {summary}"
-        );
-        assert!(
-            summary.contains(
-                "winfsp_follow_up: non-delete cleanup regression attributed 3 skipped-clean barrier(s); record follow-up evidence for SFS-192"
-            ),
-            "summary should flag skipped-clean cleanup attribution as follow-up evidence: {summary}"
-        );
-    }
-
-    #[test]
-    fn render_write_path_summary_emits_follow_up_for_cleanup_flush_fh_callbacks() {
-        let snapshot = VfsWritePathObservabilitySnapshot {
-            backend_tag: "cache-v3".to_string(),
-            winfsp_callbacks: VfsWritePathWinfspCallbackStats {
-                cleanup: 4,
-                cleanup_flush_fh: 2,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let bytes = serde_json::to_vec(&snapshot).expect("serialize snapshot");
-        let summary = render_write_path_summary(&bytes).expect("render summary");
-
-        assert!(
-            summary.contains(
-                "winfsp_follow_up: cleanup routed through flush_fh 2 time(s); inspect WinFSP callback sequencing and record follow-up evidence for SFS-192"
-            ),
-            "summary should flag unexpected cleanup_flush_fh callbacks as follow-up evidence: {summary}"
-        );
-    }
 }

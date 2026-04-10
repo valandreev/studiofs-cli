@@ -74,6 +74,7 @@ fn test_online_endpoint() -> String {
 
 const DEFAULT_AJA_SEQUENTIAL_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_AJA_SEQUENTIAL_CHUNK_COUNT: usize = 8;
+const DEFAULT_AJA_MIN_THROUGHPUT_MIB_PER_SEC: f64 = 64.0;
 const MAX_AJA_SEQUENTIAL_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 const MAX_AJA_SEQUENTIAL_CHUNK_COUNT: usize = 128;
 const MAX_AJA_SEQUENTIAL_TOTAL_BYTES: usize = 512 * 1024 * 1024;
@@ -87,6 +88,28 @@ fn test_mount_usize_env_var(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn test_mount_f64_env_var(key: &str, default: f64) -> Result<f64, String> {
+    load_test_env();
+    match std::env::var(key) {
+        Ok(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Ok(default);
+            }
+            let parsed = trimmed.parse::<f64>().map_err(|err| {
+                format!("{key} must be a positive MiB/s value, got '{trimmed}': {err}")
+            })?;
+            if !parsed.is_finite() || parsed <= 0.0 {
+                return Err(format!(
+                    "{key} must be a positive MiB/s value, got '{trimmed}'"
+                ));
+            }
+            Ok(parsed)
+        }
+        Err(_) => Ok(default),
+    }
+}
+
 fn aja_sequential_chunk_bytes() -> usize {
     test_mount_usize_env_var(
         "STUDIOFS_WINFSP_AJA_CHUNK_BYTES",
@@ -98,6 +121,13 @@ fn aja_sequential_chunk_count() -> usize {
     test_mount_usize_env_var(
         "STUDIOFS_WINFSP_AJA_CHUNK_COUNT",
         DEFAULT_AJA_SEQUENTIAL_CHUNK_COUNT,
+    )
+}
+
+fn aja_sequential_min_throughput_mib_per_sec() -> Result<f64, String> {
+    test_mount_f64_env_var(
+        "STUDIOFS_WINFSP_AJA_MIN_THROUGHPUT_MIB_PER_SEC",
+        DEFAULT_AJA_MIN_THROUGHPUT_MIB_PER_SEC,
     )
 }
 
@@ -138,6 +168,39 @@ fn validate_aja_sequential_workload(
 
 fn aja_sequential_workload() -> Result<(usize, usize), String> {
     validate_aja_sequential_workload(aja_sequential_chunk_bytes(), aja_sequential_chunk_count())
+}
+
+fn validate_aja_sequential_throughput(
+    total_bytes: usize,
+    elapsed: Duration,
+    min_mib_per_sec: f64,
+) -> Result<f64, String> {
+    if total_bytes == 0 {
+        return Err(
+            "AJA-style mounted sequential writer total_bytes must be greater than 0".to_string(),
+        );
+    }
+    if !min_mib_per_sec.is_finite() || min_mib_per_sec <= 0.0 {
+        return Err(format!(
+            "AJA-style mounted sequential writer minimum throughput must be a positive MiB/s value, got {min_mib_per_sec}"
+        ));
+    }
+    let elapsed_secs = elapsed.as_secs_f64();
+    if elapsed_secs <= 0.0 {
+        return Err(
+            "AJA-style mounted sequential writer elapsed time must be greater than 0".to_string(),
+        );
+    }
+
+    let throughput_mib_per_sec = (total_bytes as f64 / (1024.0 * 1024.0)) / elapsed_secs;
+    if throughput_mib_per_sec < min_mib_per_sec {
+        return Err(format!(
+            "AJA-style mounted sequential writer throughput fell below the required floor: measured {:.2} MiB/s for {} bytes in {:.3} s, expected at least {:.2} MiB/s",
+            throughput_mib_per_sec, total_bytes, elapsed_secs, min_mib_per_sec,
+        ));
+    }
+
+    Ok(throughput_mib_per_sec)
 }
 
 fn endpoint_authority(endpoint: &str) -> Option<String> {
@@ -515,6 +578,36 @@ fn validate_aja_sequential_workload_rejects_excessive_total_bytes() {
 }
 
 #[test]
+fn validate_aja_sequential_throughput_accepts_fast_enough_rate() {
+    let throughput = validate_aja_sequential_throughput(
+        DEFAULT_AJA_SEQUENTIAL_CHUNK_BYTES * DEFAULT_AJA_SEQUENTIAL_CHUNK_COUNT,
+        Duration::from_millis(250),
+        DEFAULT_AJA_MIN_THROUGHPUT_MIB_PER_SEC,
+    )
+    .expect("fast enough throughput should be accepted");
+
+    assert!(
+        throughput >= DEFAULT_AJA_MIN_THROUGHPUT_MIB_PER_SEC,
+        "measured throughput should stay above the configured floor"
+    );
+}
+
+#[test]
+fn validate_aja_sequential_throughput_rejects_slow_rate() {
+    let err = validate_aja_sequential_throughput(
+        DEFAULT_AJA_SEQUENTIAL_CHUNK_BYTES * DEFAULT_AJA_SEQUENTIAL_CHUNK_COUNT,
+        Duration::from_secs(2),
+        DEFAULT_AJA_MIN_THROUGHPUT_MIB_PER_SEC,
+    )
+    .expect_err("slow throughput should be rejected");
+
+    assert!(
+        err.contains("throughput fell below the required floor"),
+        "error should explain the measured throughput shortfall: {err}"
+    );
+}
+
+#[test]
 #[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn winfsp_mount_callback_flush_and_cleanup_observability_smoke() {
     if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
@@ -700,6 +793,13 @@ fn winfsp_mount_aja_style_sequential_writer_validation_smoke() {
             return;
         }
     };
+    let min_throughput_mib_per_sec = match aja_sequential_min_throughput_mib_per_sec() {
+        Ok(value) => value,
+        Err(reason) => {
+            eprintln!("Skipping WinFSP AJA-style sequential writer smoke test: {reason}");
+            return;
+        }
+    };
 
     with_winfsp_mount(vfs, rt, mount_point, event_name, |drive_root| {
         // Approximate a media-style single-handle sequential writer: large
@@ -724,6 +824,8 @@ fn winfsp_mount_aja_style_sequential_writer_validation_smoke() {
             return;
         }
         chunk.resize(chunk_bytes, 0u8);
+        let total_bytes = chunk_bytes * chunk_count;
+        let started_at = std::time::Instant::now();
         for chunk_index in 0..chunk_count {
             let fill = b'A' + (chunk_index % 26) as u8;
             chunk.fill(fill);
@@ -732,24 +834,32 @@ fn winfsp_mount_aja_style_sequential_writer_validation_smoke() {
                 .expect("write sequential chunk through WinFSP mount");
         }
         drop(writer);
+        let elapsed = started_at.elapsed();
+        let throughput_mib_per_sec =
+            validate_aja_sequential_throughput(total_bytes, elapsed, min_throughput_mib_per_sec)
+                .unwrap_or_else(|err| panic!("{err}"));
 
         let snapshot_after = vfs_observer.write_path_observability_snapshot();
         assert!(
             snapshot_after.winfsp_callbacks.write > snapshot_before.winfsp_callbacks.write,
-            "large sequential mounted writes should surface WinFSP write callbacks"
+            "large sequential mounted writes should surface WinFSP write callbacks (measured {:.2} MiB/s)",
+            throughput_mib_per_sec
         );
         assert!(
             snapshot_after.winfsp_callbacks.cleanup > snapshot_before.winfsp_callbacks.cleanup,
-            "dirty sequential writer close should still surface cleanup callbacks"
+            "dirty sequential writer close should still surface cleanup callbacks (measured {:.2} MiB/s)",
+            throughput_mib_per_sec
         );
         assert!(
             snapshot_after.winfsp_callbacks.close > snapshot_before.winfsp_callbacks.close,
-            "dirty sequential writer close should still surface close callbacks"
+            "dirty sequential writer close should still surface close callbacks (measured {:.2} MiB/s)",
+            throughput_mib_per_sec
         );
         assert_eq!(
             snapshot_after.winfsp_foreground_flushes.cleanup,
             snapshot_before.winfsp_foreground_flushes.cleanup,
-            "AJA-style sequential writer should not reintroduce non-delete cleanup barriers"
+            "AJA-style sequential writer should not reintroduce non-delete cleanup barriers (measured {:.2} MiB/s)",
+            throughput_mib_per_sec
         );
         assert_eq!(
             snapshot_after
@@ -758,24 +868,29 @@ fn winfsp_mount_aja_style_sequential_writer_validation_smoke() {
             snapshot_before
                 .winfsp_foreground_flushes
                 .cleanup_skipped_clean,
-            "AJA-style sequential writer should not attribute cleanup as a clean-skip barrier"
+            "AJA-style sequential writer should not attribute cleanup as a clean-skip barrier (measured {:.2} MiB/s)",
+            throughput_mib_per_sec
         );
         assert_eq!(
             snapshot_after.winfsp_callbacks.cleanup_flush_fh,
             snapshot_before.winfsp_callbacks.cleanup_flush_fh,
-            "AJA-style sequential writer should not route cleanup through flush_fh"
+            "AJA-style sequential writer should not route cleanup through flush_fh (measured {:.2} MiB/s)",
+            throughput_mib_per_sec
         );
         assert!(
             snapshot_after.winfsp_foreground_flushes.close
                 > snapshot_before.winfsp_foreground_flushes.close,
-            "dirty sequential writer should attribute the fallback barrier to close/release_fh"
+            "dirty sequential writer should attribute the fallback barrier to close/release_fh (measured {:.2} MiB/s, floor {:.2} MiB/s)",
+            throughput_mib_per_sec,
+            min_throughput_mib_per_sec
         );
         assert_eq!(
             snapshot_after.winfsp_foreground_flushes.close_skipped_clean,
             snapshot_before
                 .winfsp_foreground_flushes
                 .close_skipped_clean,
-            "dirty sequential writer should not look like a clean close"
+            "dirty sequential writer should not look like a clean close (measured {:.2} MiB/s)",
+            throughput_mib_per_sec
         );
     });
 }

@@ -26,6 +26,7 @@ pub mod test_cache_profile;
 #[cfg(not(unix))]
 #[path = "test_cache_profile_stub.rs"]
 pub mod test_cache_profile;
+pub mod test_cache_profile_common;
 pub mod test_cache_profile_types;
 pub mod umount;
 pub mod utils;
