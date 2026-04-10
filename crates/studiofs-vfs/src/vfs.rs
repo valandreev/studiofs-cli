@@ -343,6 +343,18 @@ pub struct VfsWritePathStageLatencyStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsWritePathCadenceStats {
+    pub events: u64,
+    pub events_per_sec: f64,
+    pub avg_interval_ms: f64,
+    pub max_interval_ms: f64,
+    pub interval_quantiles_ms: VfsWritePathLatencyQuantilesMs,
+    #[serde(default)]
+    pub interval_quantiles_saturated: VfsWritePathLatencyQuantilesSaturated,
+    pub interval_histogram: VfsLatencyHistogramSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsWritePathEagerFlushStats {
     pub checks: u64,
     pub triggered: u64,
@@ -377,6 +389,8 @@ pub struct VfsWritePathObservabilitySnapshot {
     pub payload_persist: VfsWritePathStageLatencyStats,
     #[serde(default)]
     pub metadata_commit: VfsWritePathStageLatencyStats,
+    #[serde(default)]
+    pub metadata_commit_cadence: VfsWritePathCadenceStats,
     #[serde(default)]
     pub eager_flush: VfsWritePathEagerFlushStats,
     #[serde(default)]
@@ -3686,6 +3700,11 @@ struct MetricsState {
     metadata_commit_total_ns: AtomicU64,
     metadata_commit_max_ns: AtomicU64,
     metadata_commit_histogram: LatencyHistogram,
+    metadata_commit_completed_calls: AtomicU64,
+    metadata_commit_last_completed_ns: AtomicU64,
+    metadata_commit_interval_total_ns: AtomicU64,
+    metadata_commit_interval_max_ns: AtomicU64,
+    metadata_commit_interval_histogram: LatencyHistogram,
     eager_flush_checks: AtomicU64,
     eager_flush_triggered: AtomicU64,
     eager_flush_skipped_empty: AtomicU64,
@@ -3741,6 +3760,11 @@ impl MetricsState {
             metadata_commit_total_ns: AtomicU64::new(0),
             metadata_commit_max_ns: AtomicU64::new(0),
             metadata_commit_histogram: LatencyHistogram::default(),
+            metadata_commit_completed_calls: AtomicU64::new(0),
+            metadata_commit_last_completed_ns: AtomicU64::new(0),
+            metadata_commit_interval_total_ns: AtomicU64::new(0),
+            metadata_commit_interval_max_ns: AtomicU64::new(0),
+            metadata_commit_interval_histogram: LatencyHistogram::default(),
             eager_flush_checks: AtomicU64::new(0),
             eager_flush_triggered: AtomicU64::new(0),
             eager_flush_skipped_empty: AtomicU64::new(0),
@@ -8382,6 +8406,43 @@ impl StudioVfs {
         }
     }
 
+    fn build_cadence_stats(
+        events: u64,
+        interval_total_ns: u64,
+        interval_max_ns: u64,
+        histogram: LatencyHistogramSnapshot,
+        elapsed: Duration,
+    ) -> VfsWritePathCadenceStats {
+        let (p50_ns, p50_saturated) = Self::histogram_percentile_ns(&histogram, 0.50);
+        let (p95_ns, p95_saturated) = Self::histogram_percentile_ns(&histogram, 0.95);
+        let (p99_ns, p99_saturated) = Self::histogram_percentile_ns(&histogram, 0.99);
+        let samples: u64 = histogram.bucket_counts.iter().sum();
+        VfsWritePathCadenceStats {
+            events,
+            events_per_sec: Self::per_second(events, elapsed),
+            avg_interval_ms: if samples == 0 {
+                0.0
+            } else {
+                (interval_total_ns as f64 / samples as f64) / 1_000_000.0
+            },
+            max_interval_ms: interval_max_ns as f64 / 1_000_000.0,
+            interval_quantiles_ms: VfsWritePathLatencyQuantilesMs {
+                p50: p50_ns as f64 / 1_000_000.0,
+                p95: p95_ns as f64 / 1_000_000.0,
+                p99: p99_ns as f64 / 1_000_000.0,
+            },
+            interval_quantiles_saturated: VfsWritePathLatencyQuantilesSaturated {
+                p50: p50_saturated,
+                p95: p95_saturated,
+                p99: p99_saturated,
+            },
+            interval_histogram: VfsLatencyHistogramSnapshot {
+                bucket_upper_bounds_ns: histogram.bucket_upper_bounds_ns.clone(),
+                bucket_counts: histogram.bucket_counts.clone(),
+            },
+        }
+    }
+
     fn record_sync_data_queue_wait(&self, queue_wait: Duration) {
         let elapsed_ns = Self::duration_ns_u64(queue_wait);
         let metrics = &self.state.metrics;
@@ -8394,25 +8455,49 @@ impl StudioVfs {
         );
     }
 
-    fn record_sync_data_interval(&self) {
-        let metrics = &self.state.metrics;
+    fn record_completion_interval(
+        &self,
+        last_completed_ns: &AtomicU64,
+        interval_total_ns: &AtomicU64,
+        interval_max_ns: &AtomicU64,
+        interval_histogram: &LatencyHistogram,
+    ) {
         let completed_ns = Self::duration_ns_u64(self.write_path_started_at.elapsed());
-        let previous_completed_ns = metrics
-            .block_store_sync_data_last_completed_ns
-            .swap(completed_ns, Ordering::Relaxed);
+        let previous_completed_ns = last_completed_ns.swap(completed_ns, Ordering::Relaxed);
         if previous_completed_ns == 0 || completed_ns <= previous_completed_ns {
             return;
         }
         let interval_ns = completed_ns.saturating_sub(previous_completed_ns);
-        metrics
-            .block_store_sync_data_interval_total_ns
-            .fetch_add(interval_ns, Ordering::Relaxed);
-        metrics
-            .block_store_sync_data_interval_max_ns
-            .fetch_max(interval_ns, Ordering::Relaxed);
-        metrics
-            .block_store_sync_data_interval_histogram
-            .observe_ns(interval_ns);
+        interval_total_ns.fetch_add(interval_ns, Ordering::Relaxed);
+        interval_max_ns.fetch_max(interval_ns, Ordering::Relaxed);
+        interval_histogram.observe_ns(interval_ns);
+    }
+
+    fn note_completed_cadence_event(
+        &self,
+        event_count: &AtomicU64,
+        last_completed_ns: &AtomicU64,
+        interval_total_ns: &AtomicU64,
+        interval_max_ns: &AtomicU64,
+        interval_histogram: &LatencyHistogram,
+    ) {
+        event_count.fetch_add(1, Ordering::Relaxed);
+        self.record_completion_interval(
+            last_completed_ns,
+            interval_total_ns,
+            interval_max_ns,
+            interval_histogram,
+        );
+    }
+
+    fn record_sync_data_interval(&self) {
+        let metrics = &self.state.metrics;
+        self.record_completion_interval(
+            &metrics.block_store_sync_data_last_completed_ns,
+            &metrics.block_store_sync_data_interval_total_ns,
+            &metrics.block_store_sync_data_interval_max_ns,
+            &metrics.block_store_sync_data_interval_histogram,
+        );
     }
 
     pub(super) fn note_eager_flush_outcome(&self, outcome: EagerFlushOutcome) {
@@ -8442,6 +8527,7 @@ impl StudioVfs {
         burst_blocks: usize,
         burst_bytes: u64,
         elapsed: Duration,
+        completed_burst: bool,
     ) {
         let elapsed_ns = Self::duration_ns_u64(elapsed);
         let burst_blocks_u64 = u64::try_from(burst_blocks).unwrap_or(u64::MAX);
@@ -8453,7 +8539,9 @@ impl StudioVfs {
             &metrics.payload_persist_histogram,
             elapsed_ns,
         );
-        metrics.payload_burst_count.fetch_add(1, Ordering::Relaxed);
+        if !completed_burst {
+            return;
+        }
         metrics
             .payload_burst_total_blocks
             .fetch_add(burst_blocks_u64, Ordering::Relaxed);
@@ -8466,27 +8554,20 @@ impl StudioVfs {
         metrics
             .payload_burst_max_bytes
             .fetch_max(burst_bytes, Ordering::Relaxed);
-
-        let completed_ns = Self::duration_ns_u64(self.write_path_started_at.elapsed());
-        let previous_completed_ns = metrics
-            .payload_burst_last_completed_ns
-            .swap(completed_ns, Ordering::Relaxed);
-        if previous_completed_ns == 0 || completed_ns <= previous_completed_ns {
-            return;
-        }
-        let interval_ns = completed_ns.saturating_sub(previous_completed_ns);
-        metrics
-            .payload_burst_interval_total_ns
-            .fetch_add(interval_ns, Ordering::Relaxed);
-        metrics
-            .payload_burst_interval_max_ns
-            .fetch_max(interval_ns, Ordering::Relaxed);
-        metrics
-            .payload_burst_interval_histogram
-            .observe_ns(interval_ns);
+        self.note_completed_cadence_event(
+            &metrics.payload_burst_count,
+            &metrics.payload_burst_last_completed_ns,
+            &metrics.payload_burst_interval_total_ns,
+            &metrics.payload_burst_interval_max_ns,
+            &metrics.payload_burst_interval_histogram,
+        );
     }
 
-    pub(super) fn record_metadata_commit_observability(&self, elapsed: Duration) {
+    pub(super) fn record_metadata_commit_observability(
+        &self,
+        elapsed: Duration,
+        completed_commit: bool,
+    ) {
         let elapsed_ns = Self::duration_ns_u64(elapsed);
         let metrics = &self.state.metrics;
         Self::observe_latency_counter(
@@ -8495,6 +8576,16 @@ impl StudioVfs {
             &metrics.metadata_commit_max_ns,
             &metrics.metadata_commit_histogram,
             elapsed_ns,
+        );
+        if !completed_commit {
+            return;
+        }
+        self.note_completed_cadence_event(
+            &metrics.metadata_commit_completed_calls,
+            &metrics.metadata_commit_last_completed_ns,
+            &metrics.metadata_commit_interval_total_ns,
+            &metrics.metadata_commit_interval_max_ns,
+            &metrics.metadata_commit_interval_histogram,
         );
     }
 
@@ -8599,6 +8690,9 @@ impl StudioVfs {
             metadata_commit_calls: metadata_commit_calls,
             metadata_commit_total_ns: metadata_commit_total_ns,
             metadata_commit_max_ns: metadata_commit_max_ns,
+            metadata_commit_completed_calls: metadata_commit_completed_calls,
+            metadata_commit_interval_total_ns: metadata_commit_interval_total_ns,
+            metadata_commit_interval_max_ns: metadata_commit_interval_max_ns,
             eager_flush_checks: eager_flush_checks,
             eager_flush_triggered: eager_flush_triggered,
             eager_flush_skipped_empty: eager_flush_skipped_empty,
@@ -8636,6 +8730,11 @@ impl StudioVfs {
             .payload_burst_interval_histogram
             .snapshot();
         let metadata_commit_histogram = self.state.metrics.metadata_commit_histogram.snapshot();
+        let metadata_commit_interval_histogram = self
+            .state
+            .metrics
+            .metadata_commit_interval_histogram
+            .snapshot();
 
         let (p50_ns, p50_saturated) = Self::histogram_percentile_ns(&sync_histogram, 0.50);
         let (p95_ns, p95_saturated) = Self::histogram_percentile_ns(&sync_histogram, 0.95);
@@ -8843,6 +8942,13 @@ impl StudioVfs {
                 metadata_commit_total_ns,
                 metadata_commit_max_ns,
                 metadata_commit_histogram,
+                elapsed,
+            ),
+            metadata_commit_cadence: Self::build_cadence_stats(
+                metadata_commit_completed_calls,
+                metadata_commit_interval_total_ns,
+                metadata_commit_interval_max_ns,
+                metadata_commit_interval_histogram,
                 elapsed,
             ),
             eager_flush: VfsWritePathEagerFlushStats {
@@ -15161,6 +15267,14 @@ mod tests {
             "metadata commit timing should be captured per persisted burst"
         );
         assert!(
+            snapshot.metadata_commit_cadence.events >= 2,
+            "metadata commit cadence should be captured per completed commit"
+        );
+        assert!(
+            snapshot.metadata_commit_cadence.max_interval_ms >= 0.0,
+            "metadata commit cadence should expose interval stats"
+        );
+        assert!(
             snapshot.block_store_sync_data.calls >= 1,
             "sync barrier calls should be surfaced in write-path observability"
         );
@@ -15214,6 +15328,32 @@ mod tests {
             snapshot.tuning.sync_group_max_delay_ms,
             vfs.local_sync_group_max_delay.as_millis() as u64,
             "observability should report the active sync-data delay cap"
+        );
+    }
+
+    #[test]
+    fn failed_payload_persist_attempts_do_not_count_as_completed_bursts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-failed-burst");
+
+        vfs.record_payload_persist_observability(4, 16 * 1024, Duration::from_millis(3), false);
+
+        let snapshot = vfs.write_path_observability_snapshot();
+        assert_eq!(
+            snapshot.payload_persist.calls, 1,
+            "payload stage latency should still include failed attempts"
+        );
+        assert_eq!(
+            snapshot.payload_burst.bursts, 0,
+            "failed payload persists must not count as completed bursts"
+        );
+        assert_eq!(
+            snapshot.payload_burst.total_blocks, 0,
+            "failed payload persists must not add completed burst block counts"
+        );
+        assert_eq!(
+            snapshot.payload_burst.total_bytes, 0,
+            "failed payload persists must not add completed burst bytes"
         );
     }
 

@@ -406,6 +406,14 @@ fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
         snapshot.metadata_commit.latency_quantiles_ms.p95
     ));
     out.push_str(&format!(
+        "metadata_commit_interval_avg_ms: {:.2}\n",
+        snapshot.metadata_commit_cadence.avg_interval_ms
+    ));
+    out.push_str(&format!(
+        "metadata_commit_interval_max_ms: {:.2}\n",
+        snapshot.metadata_commit_cadence.max_interval_ms
+    ));
+    out.push_str(&format!(
         "sync_data_calls_per_gib: {:.2}\n",
         snapshot.block_store_sync_data.calls_per_gib
     ));

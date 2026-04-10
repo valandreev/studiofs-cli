@@ -463,6 +463,7 @@ impl StudioVfs {
     ///
     /// Timing is recorded via [`record_payload_persist_observability`] regardless
     /// of success or failure so that error-path latency is also visible in telemetry.
+    /// Successful completions additionally contribute to payload burst cadence.
     ///
     /// [`record_payload_persist_observability`]: StudioVfs::record_payload_persist_observability
     async fn persist_payload_phase(
@@ -490,11 +491,13 @@ impl StudioVfs {
             Ok(())
         }
         .await;
+        let completed_burst = result.is_ok();
         if persisted_bytes > 0 {
             self.record_payload_persist_observability(
                 persisted_blocks.len(),
                 persisted_bytes,
                 started.elapsed(),
+                completed_burst,
             );
         }
         result
@@ -636,7 +639,8 @@ impl StudioVfs {
     /// transaction.
     ///
     /// Timing is recorded via [`record_metadata_commit_observability`] regardless
-    /// of success or failure.
+    /// of success or failure. Successful commits additionally contribute to
+    /// metadata-commit cadence.
     ///
     /// [`record_metadata_commit_observability`]: StudioVfs::record_metadata_commit_observability
     /// Commits overlay slice records and an optional inode attr update in a single
@@ -666,7 +670,7 @@ impl StudioVfs {
             },
         )
         .await;
-        self.record_metadata_commit_observability(started.elapsed());
+        self.record_metadata_commit_observability(started.elapsed(), result.is_ok());
         result
     }
 

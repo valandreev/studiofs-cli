@@ -590,6 +590,11 @@ pub fn run(
                 )
             );
             println!(
+                "  metadata commit interval avg/max: {}/{}",
+                format_ms(snapshot.metadata_commit_cadence.avg_interval_ms),
+                format_ms(snapshot.metadata_commit_cadence.max_interval_ms)
+            );
+            println!(
                 "  eager flush checks/triggered/empty/below-threshold: {}/{}/{}/{}",
                 snapshot.eager_flush.checks,
                 snapshot.eager_flush.triggered,
@@ -748,6 +753,7 @@ mod tests {
             payload_burst: Default::default(),
             payload_persist: Default::default(),
             metadata_commit: Default::default(),
+            metadata_commit_cadence: Default::default(),
             eager_flush: Default::default(),
             tuning: Default::default(),
         };
