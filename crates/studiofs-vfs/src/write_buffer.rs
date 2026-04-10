@@ -493,11 +493,13 @@ impl StudioVfs {
                 Ok(())
             }
             .await;
-            self.record_payload_persist_observability(
-                persisted_block_count,
-                persisted_bytes,
-                payload_persist_started.elapsed(),
-            );
+            if persisted_bytes > 0 {
+                self.record_payload_persist_observability(
+                    persisted_block_count,
+                    persisted_bytes,
+                    payload_persist_started.elapsed(),
+                );
+            }
             payload_persist_result?;
 
             let mut chunks: std::collections::BTreeMap<u64, Vec<studiofs_meta::schema::SliceRecord>> =
