@@ -517,6 +517,22 @@ pub fn run(
                 )
             );
             println!(
+                "  local_cache_io model/calls: {}/{}",
+                snapshot.local_cache_io.execution_model, snapshot.local_cache_io.calls
+            );
+            println!(
+                "  local_cache_io handoff total/avg/max: {}/{}/{}",
+                format_ms(snapshot.local_cache_io.handoff_total_ms),
+                format_ms(snapshot.local_cache_io.handoff_avg_ms),
+                format_ms(snapshot.local_cache_io.handoff_max_ms)
+            );
+            println!(
+                "  local_cache_io backend total/avg/max: {}/{}/{}",
+                format_ms(snapshot.local_cache_io.backend_io_total_ms),
+                format_ms(snapshot.local_cache_io.backend_io_avg_ms),
+                format_ms(snapshot.local_cache_io.backend_io_max_ms)
+            );
+            println!(
                 "  WinFSP callbacks write/flush/cleanup->flush_fh: {}/{}/{}",
                 snapshot.winfsp_callbacks.write,
                 snapshot.winfsp_callbacks.flush,
@@ -646,6 +662,7 @@ mod tests {
             flush_ordered_calls: 11,
             flush_ordered_calls_per_sec: 2.5,
             block_store_sync_data: Default::default(),
+            local_cache_io: Default::default(),
             winfsp_callbacks: Default::default(),
             write_backpressure: Default::default(),
         };

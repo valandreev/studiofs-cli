@@ -8,9 +8,12 @@
 //!    tokio broadcast), so only one S3 GET is issued per block.
 //! 3. Applies its own retry with exponential backoff per fetch, independent of
 //!    OpenDAL's internal `RetryLayer`.
+//! 4. Routes local cache get/put through Tokio's blocking pool so file-backed
+//!    cache I/O never blocks async worker threads.
 
 use crate::aimd::{AimdConfig, AimdController, AimdPermit};
 use crate::qos::{QosController, TransitMemoryBudget};
+use crate::runtime::LocalCacheIoTiming;
 use crate::vfs::VfsConfig;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -23,6 +26,7 @@ use studiofs_cache::v2::LocalBlockBackend;
 use studiofs_data::object::{CLOUD_FRAGMENT_SIZE, read_object, validate_cloud_fragment_layout};
 use studiofs_data::store::{DataError, DataStore};
 use tokio::sync::broadcast;
+use tokio::task;
 use tracing::{debug, error, info, warn};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -82,6 +86,11 @@ pub struct FetchMetrics {
     pub retries: AtomicU64,
     pub bytes_downloaded: AtomicU64,
     pub prefetch_skips: AtomicU64,
+    pub local_cache_io_calls: AtomicU64,
+    pub local_cache_io_handoff_total_ns: AtomicU64,
+    pub local_cache_io_handoff_max_ns: AtomicU64,
+    pub local_cache_io_backend_total_ns: AtomicU64,
+    pub local_cache_io_backend_max_ns: AtomicU64,
 }
 
 impl FetchMetrics {
@@ -94,6 +103,11 @@ impl FetchMetrics {
             retries: AtomicU64::new(0),
             bytes_downloaded: AtomicU64::new(0),
             prefetch_skips: AtomicU64::new(0),
+            local_cache_io_calls: AtomicU64::new(0),
+            local_cache_io_handoff_total_ns: AtomicU64::new(0),
+            local_cache_io_handoff_max_ns: AtomicU64::new(0),
+            local_cache_io_backend_total_ns: AtomicU64::new(0),
+            local_cache_io_backend_max_ns: AtomicU64::new(0),
         }
     }
 }
@@ -102,7 +116,7 @@ impl std::fmt::Display for FetchMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "cache_hits={} s3={} errors={} singleflight={} retries={} bytes={} prefetch_skips={}",
+            "cache_hits={} s3={} errors={} singleflight={} retries={} bytes={} prefetch_skips={} local_cache_io_calls={} local_cache_handoff_max_ms={:.3} local_cache_backend_max_ms={:.3}",
             self.cache_hits.load(Ordering::Relaxed),
             self.s3_fetches.load(Ordering::Relaxed),
             self.s3_errors.load(Ordering::Relaxed),
@@ -110,6 +124,9 @@ impl std::fmt::Display for FetchMetrics {
             self.retries.load(Ordering::Relaxed),
             self.bytes_downloaded.load(Ordering::Relaxed),
             self.prefetch_skips.load(Ordering::Relaxed),
+            self.local_cache_io_calls.load(Ordering::Relaxed),
+            self.local_cache_io_handoff_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            self.local_cache_io_backend_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
         )
     }
 }
@@ -158,6 +175,24 @@ pub struct FetchScheduler {
 }
 
 impl FetchScheduler {
+    fn record_local_cache_io_timing(&self, timing: LocalCacheIoTiming) {
+        self.metrics
+            .local_cache_io_calls
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .local_cache_io_handoff_total_ns
+            .fetch_add(timing.handoff_ns, Ordering::Relaxed);
+        self.metrics
+            .local_cache_io_handoff_max_ns
+            .fetch_max(timing.handoff_ns, Ordering::Relaxed);
+        self.metrics
+            .local_cache_io_backend_total_ns
+            .fetch_add(timing.backend_io_ns, Ordering::Relaxed);
+        self.metrics
+            .local_cache_io_backend_max_ns
+            .fetch_max(timing.backend_io_ns, Ordering::Relaxed);
+    }
+
     /// Create a new fetch scheduler.
     ///
     /// # Arguments
@@ -523,11 +558,30 @@ impl FetchScheduler {
 
     async fn block_store_get_async(&self, object_id: u64) -> Result<Option<Bytes>, FetchError> {
         let block_store = self.local_block_backend.clone();
-        tokio::task::spawn_blocking(move || block_store.get(object_id))
-            .await
-            .map_err(|error| {
-                FetchError::CacheAccess(format!("block store get task failed: {error}"))
-            })
+        let submitted_at = Instant::now();
+        let (result, timing) = task::spawn_blocking(move || {
+            let io_started = Instant::now();
+            let handoff_ns = io_started
+                .checked_duration_since(submitted_at)
+                .unwrap_or_default()
+                .as_nanos()
+                .min(u64::MAX as u128) as u64;
+            let result = block_store.get(object_id);
+            let backend_io_ns = io_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            (
+                result,
+                LocalCacheIoTiming {
+                    handoff_ns,
+                    backend_io_ns,
+                },
+            )
+        })
+        .await
+        .map_err(|error| {
+            FetchError::CacheAccess(format!("block store get task failed: {error}"))
+        })?;
+        self.record_local_cache_io_timing(timing);
+        Ok(result)
     }
 
     async fn block_store_put_async(
@@ -537,12 +591,30 @@ impl FetchScheduler {
         evictable: bool,
     ) -> Result<(), FetchError> {
         let block_store = self.local_block_backend.clone();
-        tokio::task::spawn_blocking(move || block_store.put(object_id, payload.as_ref(), evictable))
-            .await
-            .map_err(|error| {
-                FetchError::CacheAccess(format!("block store put task failed: {error}"))
-            })?
-            .map_err(|error| FetchError::CacheAccess(error.to_string()))
+        let submitted_at = Instant::now();
+        let (result, timing) = task::spawn_blocking(move || {
+            let io_started = Instant::now();
+            let handoff_ns = io_started
+                .checked_duration_since(submitted_at)
+                .unwrap_or_default()
+                .as_nanos()
+                .min(u64::MAX as u128) as u64;
+            let result = block_store.put(object_id, payload.as_ref(), evictable);
+            let backend_io_ns = io_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            (
+                result,
+                LocalCacheIoTiming {
+                    handoff_ns,
+                    backend_io_ns,
+                },
+            )
+        })
+        .await
+        .map_err(|error| {
+            FetchError::CacheAccess(format!("block store put task failed: {error}"))
+        })?;
+        self.record_local_cache_io_timing(timing);
+        result.map_err(|error| FetchError::CacheAccess(error.to_string()))
     }
 
     /// Perform S3 GET for one fragment with retries + AIMD.
