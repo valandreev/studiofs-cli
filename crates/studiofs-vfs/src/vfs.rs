@@ -7173,6 +7173,41 @@ impl StudioVfs {
         Ok(result)
     }
 
+    async fn block_store_read_into_async(
+        &self,
+        object_id: u64,
+        data_offset: usize,
+        out: &mut [u8],
+    ) -> VfsResult<Option<usize>> {
+        let block_store = self.local_block_backend.clone();
+        let out_len = out.len();
+        let (result, timing) = run_local_cache_io_blocking(move || {
+            if !block_store.contains(object_id) {
+                return Ok((Vec::new(), None));
+            }
+            let mut scratch = vec![0_u8; out_len];
+            let read = block_store.read_into(object_id, data_offset, &mut scratch);
+            Ok((scratch, read))
+        })
+        .await?;
+        self.record_local_cache_io_timing(timing);
+        let (scratch, read) = result;
+        if let Some(read) = read {
+            if read > out.len() {
+                return Err(VfsError::Other(format!(
+                    "local backend returned oversized read: object_id={object_id}, read={read}, out_len={}",
+                    out.len()
+                )));
+            }
+            if read > 0 {
+                out[..read].copy_from_slice(&scratch[..read]);
+            }
+            Ok(Some(read))
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn block_store_get_for_upload_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
         let block_store = self.local_block_backend.clone();
         let (result, timing) =
@@ -10655,6 +10690,48 @@ impl StudioVfs {
         }
     }
 
+    fn copy_committed_block_payload_into_range(
+        &self,
+        data: &[u8],
+        block: &BlockRef,
+        file_offset: u64,
+        dst: &mut [u8],
+    ) -> VfsResult<()> {
+        let src_start = usize::try_from(block.offset).map_err(|_| {
+            VfsError::Other(format!(
+                "committed block offset does not fit usize: object_id={}, offset={}",
+                block.object_id, block.offset
+            ))
+        })?;
+        let Some(src_end) = src_start.checked_add(dst.len()) else {
+            return Err(VfsError::Other(format!(
+                "committed block copy range overflow: object_id={}, offset={}, dst_len={}",
+                block.object_id,
+                block.offset,
+                dst.len()
+            )));
+        };
+        if src_end > data.len() {
+            error!(
+                object_id = block.object_id,
+                file_offset,
+                block_offset = block.offset,
+                block_length = block.length,
+                payload_len = data.len(),
+                requested = dst.len(),
+                "committed block payload shorter than requested span"
+            );
+            return Err(VfsError::Other(format!(
+                "committed block payload too short: object_id={}, payload_len={}, required_end={}",
+                block.object_id,
+                data.len(),
+                src_end
+            )));
+        }
+        dst.copy_from_slice(&data[src_start..src_end]);
+        Ok(())
+    }
+
     async fn assemble_read_plan(
         &self,
         offset: u64,
@@ -10685,30 +10762,67 @@ impl StudioVfs {
                             "assemble_read_plan: object in remote_not_found set, zeroing range (S3 NotFound during prefetch)"
                         );
                         dst.fill(0);
-                    } else if let Some(data) = self.block_store_get_async(block.object_id).await? {
-                        self.copy_block_payload_into_range(data.as_ref(), block.offset, dst);
                     } else {
-                        match self.fetch_block_for_ref(block, false).await {
-                            Ok(data) => {
-                                self.copy_block_payload_into_range(
-                                    data.as_ref(),
-                                    block.offset,
-                                    dst,
-                                );
+                        let block_offset = usize::try_from(block.offset).map_err(|_| {
+                            VfsError::Other(format!(
+                                "block offset does not fit usize: object_id={}, offset={}",
+                                block.object_id, block.offset
+                            ))
+                        })?;
+                        let mut span_resolved = false;
+                        if let Some(read) = self
+                            .block_store_read_into_async(block.object_id, block_offset, dst)
+                            .await?
+                        {
+                            if read == dst.len() {
+                                span_resolved = true;
                             }
-                            Err(crate::fetch::FetchError::NotFound { key }) => {
-                                warn!(
+                            if !span_resolved {
+                                error!(
                                     object_id = block.object_id,
-                                    key,
                                     file_offset = span.range.start,
                                     block_offset = block.offset,
-                                    block_length = block.length,
-                                    "assemble_read_plan: S3 object not found during foreground read, zeroing range (upload incomplete or evicted before upload?)"
+                                    requested = dst.len(),
+                                    read,
+                                    "assemble_read_plan: short local backend read for committed block; evicting and refetching"
                                 );
                                 dst.fill(0);
+                                if let Err(evict_error) =
+                                    self.block_store_remove_async(block.object_id).await
+                                {
+                                    warn!(
+                                        object_id = block.object_id,
+                                        error = %evict_error,
+                                        "assemble_read_plan: failed to evict short-read local block before refetch"
+                                    );
+                                }
                             }
-                            Err(error) => {
-                                return Err(VfsError::Fetch(error));
+                        }
+
+                        if !span_resolved {
+                            match self.fetch_block_for_ref(block, false).await {
+                                Ok(data) => {
+                                    self.copy_committed_block_payload_into_range(
+                                        data.as_ref(),
+                                        block,
+                                        span.range.start,
+                                        dst,
+                                    )?;
+                                }
+                                Err(crate::fetch::FetchError::NotFound { key }) => {
+                                    warn!(
+                                        object_id = block.object_id,
+                                        key,
+                                        file_offset = span.range.start,
+                                        block_offset = block.offset,
+                                        block_length = block.length,
+                                        "assemble_read_plan: S3 object not found during foreground read, zeroing range (upload incomplete or evicted before upload?)"
+                                    );
+                                    dst.fill(0);
+                                }
+                                Err(error) => {
+                                    return Err(VfsError::Fetch(error));
+                                }
                             }
                         }
                     }
@@ -14605,6 +14719,115 @@ mod tests {
             snapshot.local_cache_io.execution_model,
             "inline-runtime-worker-with-blocking-isolation"
         );
+    }
+
+    #[test]
+    fn local_cache_io_stats_track_direct_partial_read_into() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "local-cache-read-into-stats");
+        let calls_before = vfs
+            .state
+            .metrics
+            .local_cache_io_calls
+            .load(Ordering::Relaxed);
+        let backend_before = vfs
+            .state
+            .metrics
+            .local_cache_io_backend_total_ns
+            .load(Ordering::Relaxed);
+
+        rt.block_on(async {
+            vfs.block_store_put_async(0xBB66, Bytes::from_static(b"payload"), false)
+                .await
+                .expect("block store put");
+            let mut out = [0_u8; 3];
+            let read = vfs
+                .block_store_read_into_async(0xBB66, 2, &mut out)
+                .await
+                .expect("block store read_into");
+            assert_eq!(read, Some(3));
+            assert_eq!(&out, b"ylo");
+        });
+
+        let calls_after = vfs
+            .state
+            .metrics
+            .local_cache_io_calls
+            .load(Ordering::Relaxed);
+        let backend_after = vfs
+            .state
+            .metrics
+            .local_cache_io_backend_total_ns
+            .load(Ordering::Relaxed);
+
+        assert!(
+            calls_after >= calls_before + 2,
+            "put + read_into should record local-cache I/O calls"
+        );
+        assert!(
+            backend_after >= backend_before,
+            "direct read_into should contribute backend execution timing"
+        );
+    }
+
+    #[test]
+    fn local_cache_read_into_returns_none_for_missing_block() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "local-cache-read-into-missing");
+        rt.block_on(async {
+            let mut out = [0_u8; 8];
+            let read = vfs
+                .block_store_read_into_async(0xDEADBEEF, 0, &mut out)
+                .await
+                .expect("read_into should not error on cache miss");
+            assert_eq!(read, None);
+        });
+    }
+
+    #[test]
+    fn committed_copy_rejects_short_payload() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "committed-copy-short-payload");
+        let block = BlockRef::new_full(42, vfs.block_size);
+        let mut dst = [0_u8; 8];
+        let err = vfs
+            .copy_committed_block_payload_into_range(b"abcd", &block, 0, &mut dst)
+            .expect_err("short committed payload should error");
+        let message = match err {
+            VfsError::Other(message) => message,
+            other => panic!("expected VfsError::Other, got {other}"),
+        };
+        assert!(
+            message.contains("committed block payload too short"),
+            "error message should highlight short committed payload"
+        );
+    }
+
+    #[test]
+    fn assemble_read_plan_reports_written_for_committed_cache_hit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "assemble-read-plan-written");
+        rt.block_on(async {
+            let object_id = 0xCC77;
+            vfs.block_store_put_async(object_id, Bytes::from_static(b"0123456789"), false)
+                .await
+                .expect("block store put");
+
+            let mut block = BlockRef::new_full(object_id, 10);
+            block.offset = 2;
+            block.length = 4;
+            let plan = vec![ReadPlanSpan {
+                range: ReadRange { start: 0, end: 4 },
+                source: ReadPlanSource::Base { block },
+            }];
+            let mut buffer = [0_u8; 4];
+            let written = vfs
+                .assemble_read_plan(0, &plan, &std::collections::HashSet::new(), &mut buffer)
+                .await
+                .expect("assemble read plan");
+            assert_eq!(written, 4);
+            assert_eq!(&buffer, b"2345");
+        });
     }
 
     #[test]
