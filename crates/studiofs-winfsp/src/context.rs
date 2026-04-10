@@ -565,24 +565,22 @@ impl StudioFsContext {
     //   callback returns.
     //
     // Optional or already-coalesced callback-side work:
-    // - non-delete `cleanup` currently drains dirty state while the handle is
-    //   still valid so `close` usually becomes release-only. This is
-    //   conservative: `release_fh` still performs the mandatory last-handle
-    //   local-state drain if cleanup is skipped, repeated, or later
-    //   deferred/coalesced.
-    // - repeated `flush`/`cleanup` callbacks on an already clean inode may
-    //   return immediately.
-    // - concurrent `flush`/`cleanup` callbacks for the same dirty inode may
-    //   coalesce behind the per-inode gate below.
+    // - non-delete `cleanup` is observational only. It no longer drains dirty
+    //   state in the foreground; the last-handle `close`/`release_fh` path
+    //   owns the mandatory fallback local-state drain instead.
+    // - repeated `flush` callbacks on an already clean inode may return
+    //   immediately.
+    // - concurrent `flush` callbacks for the same dirty inode may coalesce
+    //   behind the per-inode gate below.
     fn flush_callback_path_if_dirty(
         &self,
         ino: Ino,
         fh: Option<u64>,
     ) -> studiofs_vfs::VfsResult<bool> {
-        // Shared helper for the explicit `Flush` callback and the current eager
-        // non-delete `Cleanup` barrier. The helper may skip or coalesce
-        // duplicate work, but it must never let a dirty explicit `Flush`
-        // return before local dirty state is visible to the VFS pipeline.
+        // Shared helper for the explicit `Flush` callback. The helper may skip
+        // or coalesce duplicate work, but it must never let a dirty explicit
+        // `Flush` return before local dirty state is visible to the VFS
+        // pipeline.
         if !self.vfs.inode_has_local_dirty_state(ino) {
             return Ok(false);
         }
@@ -604,22 +602,16 @@ impl StudioFsContext {
         })
     }
 
-    fn run_cleanup_non_delete_barrier(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
-        if fh != 0 {
-            self.vfs.note_winfsp_cleanup_flush_fh_callback();
-            let flushed = self.flush_callback_path_if_dirty(ino, Some(fh))?;
-            self.vfs.note_winfsp_cleanup_barrier_outcome(flushed);
-        } else {
-            let flushed = self.flush_callback_path_if_dirty(ino, None)?;
-            self.vfs.note_winfsp_cleanup_barrier_outcome(flushed);
-        }
-        Ok(())
-    }
-
     #[cfg(test)]
     fn run_cleanup_non_delete_callback(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
         self.vfs.note_winfsp_cleanup_callback();
-        self.run_cleanup_non_delete_barrier(ino, fh)
+        trace!(
+            ino,
+            fh,
+            dirty = self.vfs.inode_has_local_dirty_state(ino),
+            "cleanup non-delete deferred to close/release_fh"
+        );
+        Ok(())
     }
 
     fn run_flush_callback(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
@@ -1097,20 +1089,16 @@ impl FileSystemContext for StudioFsContext {
             // Current dirty-handle ordering is:
             //   write/overwrite -> optional flush -> cleanup(non-delete) -> close -> release_fh
             //
-            // Non-delete `cleanup` is intentionally an eager barrier, not the
-            // only correctness barrier. Draining here keeps the handle alive
-            // during the foreground stall and lets `close` normally observe a
-            // clean inode, but `release_fh` still preserves correctness if this
-            // callback is skipped, repeated, or later deferred/coalesced.
-            let ino = context.ino;
-            let fh = context.fh;
-            if let Err(e) = self.run_cleanup_non_delete_barrier(ino, fh) {
-                if fh != 0 {
-                    error!(ino, fh, "cleanup flush_fh failed: {:?}", e);
-                } else {
-                    error!(ino, "cleanup flush failed: {:?}", e);
-                }
-            }
+            // Non-delete `cleanup` no longer owns a foreground barrier. It is
+            // still counted for observability, but dirty local state stays
+            // deferred until an explicit `flush` or the mandatory last-handle
+            // `close`/`release_fh` fallback drain.
+            trace!(
+                ino = context.ino,
+                fh = context.fh,
+                dirty = self.vfs.inode_has_local_dirty_state(context.ino),
+                "cleanup non-delete deferred to close/release_fh"
+            );
         }
     }
 
@@ -1633,8 +1621,8 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_non_delete_flushes_when_inode_is_dirty() {
-        let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_flush_dirty");
+    fn cleanup_non_delete_defers_dirty_inode_flush_to_last_handle_release() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_defer_dirty");
         let attr = vfs
             .create(ROOT_INO, b"dirty-callback.txt", 0, 0, 0o644)
             .expect("create");
@@ -1648,23 +1636,56 @@ mod tests {
         })
         .expect("dirty write");
 
-        let before = flush_ordered_calls(&vfs);
-        let flushed = ctx
-            .flush_callback_path_if_dirty(attr.ino, Some(fh))
-            .expect("callback flush");
-        let after = flush_ordered_calls(&vfs);
-        assert!(flushed, "dirty inode must perform callback-driven flush");
+        let callbacks_before = winfsp_callbacks(&vfs);
+        let barriers_before = winfsp_foreground_flushes(&vfs);
+        let flush_calls_before = flush_ordered_calls(&vfs);
+
+        ctx.run_cleanup_non_delete_callback(attr.ino, fh)
+            .expect("cleanup callback");
+        let callbacks_after_cleanup = winfsp_callbacks(&vfs);
+        let barriers_after_cleanup = winfsp_foreground_flushes(&vfs);
+        let flush_calls_after_cleanup = flush_ordered_calls(&vfs);
         assert_eq!(
-            after,
-            before + 1,
-            "cleanup should run a synchronous flush barrier for dirty inodes"
+            callbacks_after_cleanup.cleanup,
+            callbacks_before.cleanup + 1,
+            "cleanup callback should still be counted for dirty handles"
+        );
+        assert_eq!(
+            barriers_after_cleanup.cleanup, barriers_before.cleanup,
+            "non-delete cleanup should no longer own a foreground barrier"
+        );
+        assert_eq!(
+            barriers_after_cleanup.cleanup_skipped_clean, barriers_before.cleanup_skipped_clean,
+            "dirty cleanup should not be attributed as a clean-skip barrier either"
+        );
+        assert_eq!(
+            flush_calls_after_cleanup, flush_calls_before,
+            "cleanup should not flush local dirty state before close"
         );
 
-        ctx.spawn_wait({
-            let vfs = vfs.clone();
-            async move { vfs.release_fh(fh).await }
-        })
-        .expect("release_fh");
+        ctx.run_close_callback(attr.ino, fh);
+        let callbacks_after_close = winfsp_callbacks(&vfs);
+        let barriers_after_close = winfsp_foreground_flushes(&vfs);
+        let flush_calls_after_close = flush_ordered_calls(&vfs);
+        assert_eq!(
+            callbacks_after_close.close,
+            callbacks_before.close + 1,
+            "close should still be counted after deferred cleanup"
+        );
+        assert_eq!(
+            barriers_after_close.close,
+            barriers_before.close + 1,
+            "last-handle close should own the deferred cleanup barrier"
+        );
+        assert_eq!(
+            barriers_after_close.close_skipped_clean, barriers_before.close_skipped_clean,
+            "dirty last-handle close should not look like a clean release"
+        );
+        assert_eq!(
+            flush_calls_after_close,
+            flush_calls_before + 1,
+            "release fallback should drain local dirty state exactly once"
+        );
     }
 
     #[test]
@@ -1693,8 +1714,8 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_callbacks_coalesce_concurrent_flushes_per_inode() {
-        let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_coalesce");
+    fn concurrent_cleanup_callbacks_do_not_add_foreground_flushes() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_defer_concurrent");
         let attr = vfs
             .create(ROOT_INO, b"coalesce.txt", 0, 0, 0o644)
             .expect("create");
@@ -1714,7 +1735,9 @@ mod tests {
         })
         .expect("seed dirty blocks");
 
-        let before = flush_ordered_calls(&vfs);
+        let callbacks_before = winfsp_callbacks(&vfs);
+        let barriers_before = winfsp_foreground_flushes(&vfs);
+        let flush_calls_before = flush_ordered_calls(&vfs);
         let ctx = Arc::new(ctx);
         let start = Arc::new(Barrier::new(4));
         let mut joins = Vec::new();
@@ -1724,18 +1747,32 @@ mod tests {
             let ino = attr.ino;
             joins.push(std::thread::spawn(move || {
                 start.wait();
-                ctx.flush_callback_path_if_dirty(ino, Some(fh))
-                    .expect("concurrent callback flush");
+                ctx.run_cleanup_non_delete_callback(ino, fh)
+                    .expect("concurrent cleanup callback");
             }));
         }
         for join in joins {
             join.join().expect("cleanup thread join");
         }
-        let after = flush_ordered_calls(&vfs);
+        let callbacks_after_cleanup = winfsp_callbacks(&vfs);
+        let barriers_after_cleanup = winfsp_foreground_flushes(&vfs);
+        let flush_calls_after_cleanup = flush_ordered_calls(&vfs);
         assert_eq!(
-            after,
-            before + 1,
-            "concurrent cleanup callbacks should collapse into one effective flush barrier"
+            callbacks_after_cleanup.cleanup,
+            callbacks_before.cleanup + 4,
+            "all concurrent cleanup callbacks should still be observable"
+        );
+        assert_eq!(
+            barriers_after_cleanup.cleanup, barriers_before.cleanup,
+            "cleanup callbacks should not add foreground barriers"
+        );
+        assert_eq!(
+            barriers_after_cleanup.cleanup_skipped_clean, barriers_before.cleanup_skipped_clean,
+            "cleanup callbacks should not add clean-skip barrier attribution"
+        );
+        assert_eq!(
+            flush_calls_after_cleanup, flush_calls_before,
+            "cleanup callbacks should not trigger foreground flush work"
         );
 
         ctx.spawn_wait({
@@ -1810,7 +1847,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_cleanup_callback_records_barrier_then_clean_skip() {
+    fn repeated_cleanup_callback_records_callbacks_without_foreground_barriers() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_callback_repeated");
         let attr = vfs
             .create(ROOT_INO, b"cleanup-callback-repeated.txt", 0, 0, 0o644)
@@ -1838,13 +1875,12 @@ mod tests {
             "first cleanup callback should be counted"
         );
         assert_eq!(
-            after_first_barriers.cleanup,
-            barriers_before.cleanup + 1,
-            "first cleanup callback should attribute one foreground barrier to the cleanup path"
+            after_first_barriers.cleanup, barriers_before.cleanup,
+            "cleanup callback should no longer attribute a foreground barrier"
         );
         assert_eq!(
             after_first_barriers.cleanup_skipped_clean, barriers_before.cleanup_skipped_clean,
-            "first dirty cleanup should not look like a clean skip"
+            "cleanup callback should not be recorded as a clean-skip barrier either"
         );
 
         ctx.run_cleanup_non_delete_callback(attr.ino, fh)
@@ -1858,23 +1894,31 @@ mod tests {
         );
         assert_eq!(
             after_second_barriers.cleanup, after_first_barriers.cleanup,
-            "second cleanup callback should not add a barrier once the inode is already clean"
+            "repeated cleanup callbacks should not add foreground barriers"
         );
         assert_eq!(
-            after_second_barriers.cleanup_skipped_clean,
-            after_first_barriers.cleanup_skipped_clean + 1,
-            "second cleanup callback should be attributed as a clean skip"
+            after_second_barriers.cleanup_skipped_clean, after_first_barriers.cleanup_skipped_clean,
+            "repeated cleanup callbacks should not create clean-skip attribution"
         );
 
-        ctx.spawn_wait({
-            let vfs = vfs.clone();
-            async move { vfs.release_fh(fh).await }
-        })
-        .expect("release_fh");
+        let flush_calls_before_close = flush_ordered_calls(&vfs);
+        ctx.run_close_callback(attr.ino, fh);
+        let after_close_barriers = winfsp_foreground_flushes(&vfs);
+        let flush_calls_after_close = flush_ordered_calls(&vfs);
+        assert_eq!(
+            after_close_barriers.close,
+            barriers_before.close + 1,
+            "close should own the fallback barrier after repeated cleanup callbacks"
+        );
+        assert_eq!(
+            flush_calls_after_close,
+            flush_calls_before_close + 1,
+            "close fallback should still drain the dirty inode once"
+        );
     }
 
     #[test]
-    fn dirty_handle_lifecycle_attributes_barrier_to_cleanup_before_close() {
+    fn dirty_handle_lifecycle_defers_barrier_from_cleanup_to_close() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("dirty_handle_cleanup_close");
         let attr = vfs
             .create(ROOT_INO, b"dirty-handle-close.txt", 0, 0, 0o644)
@@ -1902,9 +1946,8 @@ mod tests {
             "cleanup should be counted in the dirty-handle lifecycle"
         );
         assert_eq!(
-            after_cleanup_barriers.cleanup,
-            barriers_before.cleanup + 1,
-            "dirty-handle lifecycle should attribute the foreground barrier to cleanup"
+            after_cleanup_barriers.cleanup, barriers_before.cleanup,
+            "dirty-handle lifecycle should not attribute a foreground barrier to cleanup"
         );
 
         ctx.run_close_callback(attr.ino, fh);
@@ -1916,13 +1959,13 @@ mod tests {
             "close should be counted after cleanup"
         );
         assert_eq!(
-            after_close_barriers.close, barriers_before.close,
-            "close should not need another barrier after cleanup already flushed the dirty inode"
+            after_close_barriers.close,
+            barriers_before.close + 1,
+            "close should own the deferred dirty-handle barrier after cleanup returns"
         );
         assert_eq!(
-            after_close_barriers.close_skipped_clean,
-            barriers_before.close_skipped_clean + 1,
-            "close should be attributed as a clean release after cleanup drained the inode"
+            after_close_barriers.close_skipped_clean, barriers_before.close_skipped_clean,
+            "dirty last-handle close should not be attributed as a clean release"
         );
         assert_eq!(
             vfs.open_count(attr.ino),
