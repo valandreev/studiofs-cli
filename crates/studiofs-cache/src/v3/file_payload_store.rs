@@ -249,13 +249,12 @@ impl FilePayloadStore {
     pub fn sync_data(&self) -> Result<(), FilePayloadStoreError> {
         if matches!(self.sync_mode, CacheV3PayloadSyncMode::Fast) {
             let (pending_object_ids, pending_dirs) = self.take_grouped_sync_targets();
-            for object_id in pending_object_ids {
-                self.sync_payload_file_grouped_barrier(object_id)?;
-            }
-            for dir in pending_dirs {
-                self.sync_directory_grouped_barrier(&dir)?;
-            }
-            return Ok(());
+            return self.sync_pending_grouped_targets(
+                pending_object_ids,
+                pending_dirs,
+                |object_id| self.sync_payload_file_grouped_barrier(object_id),
+                |dir| self.sync_directory_grouped_barrier(dir),
+            );
         }
 
         for dir in [
@@ -409,6 +408,43 @@ impl FilePayloadStore {
             directories.drain().collect()
         };
         (object_ids, directories)
+    }
+
+    fn requeue_grouped_sync_targets(&self, object_ids: &[u64], directories: &[PathBuf]) {
+        if !object_ids.is_empty() {
+            let mut pending_object_ids = self.pending_grouped_sync.object_ids.lock();
+            pending_object_ids.extend(object_ids.iter().copied());
+        }
+        if !directories.is_empty() {
+            let mut pending_directories = self.pending_grouped_sync.directories.lock();
+            pending_directories.extend(directories.iter().cloned());
+        }
+    }
+
+    fn sync_pending_grouped_targets<SyncFile, SyncDir>(
+        &self,
+        pending_object_ids: Vec<u64>,
+        pending_dirs: Vec<PathBuf>,
+        mut sync_file: SyncFile,
+        mut sync_dir: SyncDir,
+    ) -> Result<(), FilePayloadStoreError>
+    where
+        SyncFile: FnMut(u64) -> Result<(), FilePayloadStoreError>,
+        SyncDir: FnMut(&Path) -> Result<(), FilePayloadStoreError>,
+    {
+        for &object_id in &pending_object_ids {
+            if let Err(error) = sync_file(object_id) {
+                self.requeue_grouped_sync_targets(&pending_object_ids, &pending_dirs);
+                return Err(error);
+            }
+        }
+        for dir in &pending_dirs {
+            if let Err(error) = sync_dir(dir) {
+                self.requeue_grouped_sync_targets(&pending_object_ids, &pending_dirs);
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     fn sync_payload_file_grouped_barrier(
@@ -687,5 +723,45 @@ mod tests {
             after_sync.grouped_dir_sync_calls >= 1,
             "grouped sync_data should sync queued directories"
         );
+    }
+
+    #[test]
+    fn fast_mode_requeues_grouped_sync_targets_after_grouped_sync_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let store =
+            FilePayloadStore::open_with_sync_mode(layout, CacheV3PayloadSyncMode::Fast).unwrap();
+        store.put(8101, b"one").unwrap();
+        store.put(8102, b"two").unwrap();
+
+        let (pending_object_ids, pending_dirs) = store.take_grouped_sync_targets();
+        assert_eq!(store.sync_barrier_snapshot().pending_grouped_file_syncs, 0);
+        assert_eq!(store.sync_barrier_snapshot().pending_grouped_dir_syncs, 0);
+
+        let mut succeeded_once = false;
+        let error = store
+            .sync_pending_grouped_targets(
+                pending_object_ids.clone(),
+                pending_dirs.clone(),
+                |_object_id| {
+                    if !succeeded_once {
+                        succeeded_once = true;
+                        return Ok(());
+                    }
+                    Err(FilePayloadStoreError::Io(io::Error::other(
+                        "simulated grouped sync failure",
+                    )))
+                },
+                |_dir| Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(error, FilePayloadStoreError::Io(_)));
+
+        let after_failure = store.sync_barrier_snapshot();
+        assert_eq!(
+            after_failure.pending_grouped_file_syncs,
+            pending_object_ids.len()
+        );
+        assert_eq!(after_failure.pending_grouped_dir_syncs, pending_dirs.len());
     }
 }
