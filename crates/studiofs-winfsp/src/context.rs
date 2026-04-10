@@ -584,8 +584,7 @@ impl StudioFsContext {
         })
     }
 
-    fn run_cleanup_non_delete_callback(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
-        self.vfs.note_winfsp_cleanup_callback();
+    fn run_cleanup_non_delete_barrier(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
         if fh != 0 {
             self.vfs.note_winfsp_cleanup_flush_fh_callback();
             let flushed = self.flush_callback_path_if_dirty(ino, Some(fh))?;
@@ -597,6 +596,12 @@ impl StudioFsContext {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn run_cleanup_non_delete_callback(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
+        self.vfs.note_winfsp_cleanup_callback();
+        self.run_cleanup_non_delete_barrier(ino, fh)
+    }
+
     fn run_flush_callback(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
         self.vfs.note_winfsp_flush_callback();
         let flushed = self.flush_callback_path_if_dirty(ino, Some(fh))?;
@@ -606,10 +611,10 @@ impl StudioFsContext {
 
     fn run_close_callback(&self, ino: Ino, fh: u64) {
         self.vfs.note_winfsp_close_callback();
-        let close_can_attribute_barrier = fh != 0 && self.vfs.open_count(ino) <= 1;
-        let close_sees_dirty_inode =
-            close_can_attribute_barrier && self.vfs.inode_has_local_dirty_state(ino);
         if fh != 0 {
+            let close_can_attribute_barrier = self.vfs.open_count(ino) <= 1;
+            let close_sees_dirty_inode =
+                close_can_attribute_barrier && self.vfs.inode_has_local_dirty_state(ino);
             let vfs = self.vfs.clone();
             let release_result = self.spawn_wait(async move { vfs.release_fh(fh).await });
             if close_can_attribute_barrier {
@@ -1023,9 +1028,9 @@ impl FileSystemContext for StudioFsContext {
     }
 
     fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
+        self.vfs.note_winfsp_cleanup_callback();
         // FspCleanupDelete = 0x01
         if flags & 0x01 != 0 {
-            self.vfs.note_winfsp_cleanup_callback();
             if let Some(fname) = file_name {
                 match resolve_parent(&self.vfs, fname) {
                     Ok((parent_ino, name)) => {
@@ -1070,7 +1075,7 @@ impl FileSystemContext for StudioFsContext {
             // observe a clean inode and only release the handle.
             let ino = context.ino;
             let fh = context.fh;
-            if let Err(e) = self.run_cleanup_non_delete_callback(ino, fh) {
+            if let Err(e) = self.run_cleanup_non_delete_barrier(ino, fh) {
                 if fh != 0 {
                     error!(ino, fh, "cleanup flush_fh failed: {:?}", e);
                 } else {
