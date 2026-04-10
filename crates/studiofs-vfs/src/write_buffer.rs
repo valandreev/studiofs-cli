@@ -402,6 +402,215 @@ impl StudioVfs {
         }
     }
 
+    /// Phase 1 of the write-buffer drain: write block payloads to the local block
+    /// store and perform grouped local sync.
+    ///
+    /// Timing is recorded via [`record_payload_persist_observability`] regardless
+    /// of success or failure so that error-path latency is also visible in telemetry.
+    ///
+    /// [`record_payload_persist_observability`]: StudioVfs::record_payload_persist_observability
+    async fn persist_payload_phase(
+        &self,
+        persisted_blocks: &[PersistedWriteBlock],
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<()> {
+        let persisted_bytes: u64 = persisted_blocks.iter().map(|b| b.data.len() as u64).sum();
+        let started = Instant::now();
+        let result: VfsResult<()> = async {
+            for chunk in persisted_blocks.chunks(BLOCK_STORE_PUT_PIPELINE_WIDTH) {
+                let put_results = futures::future::join_all(chunk.iter().map(|block| {
+                    self.block_store_put_async(block.object_id, block.data.clone(), false)
+                }))
+                .await;
+                for result in put_results {
+                    result?;
+                }
+            }
+            self.maybe_block_store_sync_data_async(persisted_bytes, local_sync_policy)
+                .await?;
+            Ok(())
+        }
+        .await;
+        if persisted_bytes > 0 {
+            self.record_payload_persist_observability(
+                persisted_blocks.len(),
+                persisted_bytes,
+                started.elapsed(),
+            );
+        }
+        result
+    }
+
+    /// Pure computation step between Phase 1 and Phase 2: build the overlay
+    /// [`SliceRecord`] list from the freshly persisted blocks.
+    ///
+    /// When dirty-chunk-slice tracking is active this path validates per-write-slice
+    /// invariants but still emits **one full-block `SliceRecord` per persisted
+    /// block**. See the inline comment for the full rationale.
+    ///
+    /// [`SliceRecord`]: studiofs_meta::schema::SliceRecord
+    fn build_overlay_slice_records(
+        &self,
+        ino: Ino,
+        persisted_blocks: &[PersistedWriteBlock],
+        dirty_chunk_slices: std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
+    ) -> VfsResult<
+        Vec<(
+            studiofs_meta::schema::ChunkId,
+            Vec<studiofs_meta::schema::SliceRecord>,
+        )>,
+    > {
+        let mut chunks: std::collections::BTreeMap<u64, Vec<studiofs_meta::schema::SliceRecord>> =
+            std::collections::BTreeMap::new();
+
+        if !dirty_chunk_slices.is_empty() {
+            // Dirty-chunk-slices path: validate per-write-slice invariants but
+            // emit ONE full-block SliceRecord per persisted block.
+            //
+            // Previously this path emitted per-write-slice records with partial
+            // BlockRef.offset/length pointing into the new S3 object.  That left
+            // stale slices from *earlier* objects (with different object_ids) in
+            // the overlay because the "fully_covered" pruning in
+            // flush_regular_file_overlay_slices_with_attr_txn only removes a
+            // prior slice when the incoming slice completely covers its chunk
+            // range.  A partial write slice (e.g. 1MB..1.5MB) never fully covers
+            // an old full-block slice (0..1MB), so both survive in the overlay.
+            // synthesize_block_ref_from_resolved_spans then sees two spans with
+            // different object_ids for block_index=0 and returns
+            // FragmentedBlock, quarantining the inode and making all reads
+            // return zeros.
+            //
+            // The fix: always write a single full-block SliceRecord whose
+            // BlockRef references the NEW object from offset=0 with the full
+            // persisted data length.  This guarantees the incoming slice fully
+            // covers any previous slice for the same block and the overlay
+            // stays consistent.
+            let block_lengths_by_block_index: std::collections::HashMap<u32, usize> =
+                persisted_blocks
+                    .iter()
+                    .map(|persisted| (persisted.block_index, persisted.data.len()))
+                    .collect();
+            for (_chunk_id, mut slices) in dirty_chunk_slices {
+                slices.sort_by_key(|slice| slice.seq);
+                for slice in slices {
+                    let Some(&block_len) = block_lengths_by_block_index.get(&slice.block_index)
+                    else {
+                        continue;
+                    };
+                    let slice_len = slice.range.len();
+                    let block_offset = slice.block_offset;
+                    let block_end = (block_offset as usize).saturating_add(slice_len as usize);
+                    if block_end > block_len {
+                        return Err(crate::VfsError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "dirty slice exceeds block length: ino={}, \
+                                 block_index={}, block_len={}, block_offset={}, \
+                                 slice_len={}",
+                                ino, slice.block_index, block_len, block_offset, slice_len
+                            ),
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Write one full-block SliceRecord for every persisted block,
+        // whether or not it had dirty-chunk-slice tracking entries.
+        // The S3 object always contains the complete block payload from
+        // offset 0, so BlockRef.offset=0 and BlockRef.length=data.len()
+        // is the canonical (non-fragmented) representation.
+        for persisted in persisted_blocks {
+            let block_start = (persisted.block_index as u64) * (self.block_size as u64);
+            let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64;
+            let chunk_id = block_start / chunk_size;
+            let chunk_start = chunk_id * chunk_size;
+            let slice_start = (block_start - chunk_start) as u32;
+            let slice_end = slice_start + (persisted.data.len() as u32);
+            let slice_range = studiofs_meta::schema::SliceRange::new(slice_start, slice_end)
+                .ok_or_else(|| {
+                    crate::VfsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid slice range {}..{}", slice_start, slice_end),
+                    ))
+                })?;
+            let mut flags = studiofs_meta::schema::BlockFlags::empty();
+            if persisted.data.len() < self.block_size as usize {
+                flags |= studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK;
+            }
+            chunks
+                .entry(chunk_id)
+                .or_default()
+                .push(studiofs_meta::schema::SliceRecord {
+                    slice_id: studiofs_meta::schema::SliceId::default(),
+                    order: studiofs_meta::schema::SliceOrder::default(),
+                    range: slice_range,
+                    block: Some(studiofs_meta::schema::BlockRef {
+                        object_id: persisted.object_id,
+                        offset: 0,
+                        length: persisted.data.len() as u32,
+                        flags,
+                    }),
+                    block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
+                });
+        }
+
+        for slices in chunks.values_mut() {
+            let mut next_slice_id = 1u64;
+            let mut next_slice_order = 1u64;
+            for slice in slices.iter_mut() {
+                slice.slice_id = studiofs_meta::schema::SliceId(next_slice_id);
+                slice.order = studiofs_meta::schema::SliceOrder(next_slice_order);
+                next_slice_id = next_slice_id.saturating_add(1);
+                next_slice_order = next_slice_order.saturating_add(1);
+            }
+        }
+
+        Ok(chunks
+            .into_iter()
+            .map(|(k, v)| (studiofs_meta::schema::ChunkId(k), v))
+            .collect())
+    }
+
+    /// Phase 2 of the write-buffer drain: commit overlay chunk slice records and
+    /// optional inode attribute update to the local metadata engine in a single
+    /// transaction.
+    ///
+    /// Timing is recorded via [`record_metadata_commit_observability`] regardless
+    /// of success or failure.
+    ///
+    /// [`record_metadata_commit_observability`]: StudioVfs::record_metadata_commit_observability
+    /// Commits overlay slice records and an optional inode attr update in a single
+    /// metadata transaction, returning the engine-normalized committed attr (if any).
+    ///
+    /// The engine (e.g. redb) applies its own `transition_upload_state_for_local_mutation`
+    /// with accurate `has_committed_manifest` information, so callers must NOT
+    /// pre-transform the attr before passing it here.
+    async fn commit_overlay_metadata_phase(
+        &self,
+        ino: Ino,
+        chunk_slices: Vec<(
+            studiofs_meta::schema::ChunkId,
+            Vec<studiofs_meta::schema::SliceRecord>,
+        )>,
+        attr: Option<InodeAttr>,
+    ) -> VfsResult<Option<InodeAttr>> {
+        let started = Instant::now();
+        let result = run_meta(
+            self.meta_async.clone(),
+            move |engine: Arc<dyn MetaEngine>| {
+                engine.flush_regular_file_overlay_slices_with_attr(
+                    ino,
+                    &chunk_slices,
+                    attr.as_ref(),
+                )
+            },
+        )
+        .await;
+        self.record_metadata_commit_observability(started.elapsed());
+        result
+    }
+
     async fn persist_write_buffer_blocks(
         &self,
         ino: Ino,
@@ -412,16 +621,16 @@ impl StudioVfs {
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<Vec<PersistedWriteBlock>> {
         if blocks.is_empty() {
-            if let Some(mut attr) = attr_to_persist {
-                Self::transition_upload_state_for_local_mutation(&mut attr);
-                let meta = self.meta_async.clone();
-                let attr_for_meta = attr.clone();
-                run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-                    engine.set_attr(&attr_for_meta)
-                })
-                .await?;
-                self.state.namespace.attr_read_cache.lock().remove(ino);
-                self.refresh_inode_incarnation_state_from_attr(ino, &attr);
+            // No payload to persist; commit the attr-only metadata phase so the
+            // engine applies its accurate transition (with has_committed_manifest).
+            if attr_to_persist.is_some() {
+                let committed_attr = self
+                    .commit_overlay_metadata_phase(ino, Vec::new(), attr_to_persist)
+                    .await?;
+                if let Some(attr) = committed_attr {
+                    self.state.namespace.attr_read_cache.lock().remove(ino);
+                    self.refresh_inode_incarnation_state_from_attr(ino, &attr);
+                }
             }
             return Ok(Vec::new());
         }
@@ -460,210 +669,58 @@ impl StudioVfs {
             let mut pending = self.state.write_buffer.pending_blocks.lock();
             assign_reserved_object_ids(&mut pending, ino, &mut persisted_blocks, &fresh_object_ids);
         }
-        let persisted_block_count = persisted_blocks.len();
-        let persisted_bytes: u64 = persisted_blocks
-            .iter()
-            .map(|block| block.data.len() as u64)
-            .sum();
 
         // Data hits the local backend before metadata so a successful flush/fsync only
-        // returns after local bytes are durable. If any pre-metadata step fails,
-        // remove the cache entries again: the canonical retry source remains the
-        // WriteBuffer snapshot guarded by `reserved_object_id`.
-        let mut attr_for_meta = attr_to_persist.clone();
-        if let Some(attr) = attr_for_meta.as_mut() {
-            Self::transition_upload_state_for_local_mutation(attr);
-        }
-        let attr_after_commit = attr_for_meta.clone();
+        // returns after local bytes are durable. The canonical retry source for any
+        // failure remains the WriteBuffer snapshot guarded by `reserved_object_id`.
 
-        let pre_metadata_result: VfsResult<()> = async {
-            let payload_persist_started = Instant::now();
-            let payload_persist_result: VfsResult<()> = async {
-                for chunk in persisted_blocks.chunks(BLOCK_STORE_PUT_PIPELINE_WIDTH) {
-                    let put_results = futures::future::join_all(chunk.iter().map(|block| {
-                        self.block_store_put_async(block.object_id, block.data.clone(), false)
-                    }))
-                    .await;
-                    for result in put_results {
-                        result?;
-                    }
-                }
-                self.maybe_block_store_sync_data_async(persisted_bytes, local_sync_policy)
-                    .await?;
-                Ok(())
-            }
-            .await;
-            if persisted_bytes > 0 {
-                self.record_payload_persist_observability(
-                    persisted_block_count,
-                    persisted_bytes,
-                    payload_persist_started.elapsed(),
-                );
-            }
-            payload_persist_result?;
-
-            let mut chunks: std::collections::BTreeMap<u64, Vec<studiofs_meta::schema::SliceRecord>> =
-                std::collections::BTreeMap::new();
-            let block_lengths_by_block_index: std::collections::HashMap<u32, usize> = persisted_blocks
-                .iter()
-                .map(|persisted| (persisted.block_index, persisted.data.len()))
-                .collect();
-
-            if dirty_chunk_slices.is_empty() {
-                for persisted in &persisted_blocks {
-                    let block_start = (persisted.block_index as u64) * (self.block_size as u64);
-                    let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64;
-                    let chunk_id = block_start / chunk_size;
-                    let chunk_start = chunk_id * chunk_size;
-                    let slice_start = (block_start - chunk_start) as u32;
-                    let slice_end = slice_start + (persisted.data.len() as u32);
-                    let slice_range = studiofs_meta::schema::SliceRange::new(slice_start, slice_end)
-                        .ok_or_else(|| {
-                            crate::VfsError::Io(std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                format!("invalid slice range {}..{}", slice_start, slice_end),
-                            ))
-                        })?;
-                    let mut flags = studiofs_meta::schema::BlockFlags::empty();
-                    if persisted.data.len() < self.block_size as usize {
-                        flags |= studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK;
-                    }
-                    chunks.entry(chunk_id).or_default().push(studiofs_meta::schema::SliceRecord {
-                        slice_id: studiofs_meta::schema::SliceId::default(),
-                        order: studiofs_meta::schema::SliceOrder::default(),
-                        range: slice_range,
-                        block: Some(studiofs_meta::schema::BlockRef {
-                            object_id: persisted.object_id,
-                            offset: 0,
-                            length: persisted.data.len() as u32,
-                            flags,
-                        }),
-                        block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
-                    });
-                }
-            } else {
-                // Dirty-chunk-slices path: validate per-write-slice invariants but
-                // emit ONE full-block SliceRecord per persisted block.
-                //
-                // Previously this path emitted per-write-slice records with partial
-                // BlockRef.offset/length pointing into the new S3 object.  That left
-                // stale slices from *earlier* objects (with different object_ids) in
-                // the overlay because the "fully_covered" pruning in
-                // flush_regular_file_overlay_slices_with_attr_txn only removes a
-                // prior slice when the incoming slice completely covers its chunk
-                // range.  A partial write slice (e.g. 1MB..1.5MB) never fully covers
-                // an old full-block slice (0..1MB), so both survive in the overlay.
-                // synthesize_block_ref_from_resolved_spans then sees two spans with
-                // different object_ids for block_index=0 and returns
-                // FragmentedBlock, quarantining the inode and making all reads
-                // return zeros.
-                //
-                // The fix: always write a single full-block SliceRecord whose
-                // BlockRef references the NEW object from offset=0 with the full
-                // persisted data length.  This guarantees the incoming slice fully
-                // covers any previous slice for the same block and the overlay
-                // stays consistent.
-                let mut validated_blocks = std::collections::HashSet::new();
-                for (_chunk_id, mut slices) in dirty_chunk_slices {
-                    slices.sort_by_key(|slice| slice.seq);
-                    for slice in slices {
-                        let Some(&block_len) = block_lengths_by_block_index.get(&slice.block_index) else {
-                            continue;
-                        };
-                        let slice_len = slice.range.len();
-                        let block_offset = slice.block_offset;
-                        let block_end = (block_offset as usize).saturating_add(slice_len as usize);
-                        if block_end > block_len {
-                            return Err(crate::VfsError::Io(std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                format!(
-                                    "dirty slice exceeds block length: ino={}, block_index={}, block_len={}, block_offset={}, slice_len={}",
-                                    ino, slice.block_index, block_len, block_offset, slice_len
-                                ),
-                            )));
-                        }
-                        validated_blocks.insert(slice.block_index);
-                    }
-                }
-                // Write one full-block SliceRecord for every persisted block,
-                // whether or not it had dirty-chunk-slice tracking entries.
-                // The S3 object always contains the complete block payload from
-                // offset 0, so BlockRef.offset=0 and BlockRef.length=data.len()
-                // is the canonical (non-fragmented) representation.
-                for persisted in &persisted_blocks {
-                    let block_start = (persisted.block_index as u64) * (self.block_size as u64);
-                    let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64;
-                    let chunk_id = block_start / chunk_size;
-                    let chunk_start = chunk_id * chunk_size;
-                    let slice_start = (block_start - chunk_start) as u32;
-                    let slice_end = slice_start + (persisted.data.len() as u32);
-                    let slice_range = studiofs_meta::schema::SliceRange::new(slice_start, slice_end)
-                        .ok_or_else(|| {
-                            crate::VfsError::Io(std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                format!("invalid slice range {}..{}", slice_start, slice_end),
-                            ))
-                        })?;
-                    let mut flags = studiofs_meta::schema::BlockFlags::empty();
-                    if persisted.data.len() < self.block_size as usize {
-                        flags |= studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK;
-                    }
-                    chunks.entry(chunk_id).or_default().push(studiofs_meta::schema::SliceRecord {
-                        slice_id: studiofs_meta::schema::SliceId::default(),
-                        order: studiofs_meta::schema::SliceOrder::default(),
-                        range: slice_range,
-                        block: Some(studiofs_meta::schema::BlockRef {
-                            object_id: persisted.object_id,
-                            offset: 0,
-                            length: persisted.data.len() as u32,
-                            flags,
-                        }),
-                        block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
-                    });
-                }
-            }
-
-            for slices in chunks.values_mut() {
-                let mut next_slice_id = 1u64;
-                let mut next_slice_order = 1u64;
-                for slice in slices.iter_mut() {
-                    slice.slice_id = studiofs_meta::schema::SliceId(next_slice_id);
-                    slice.order = studiofs_meta::schema::SliceOrder(next_slice_order);
-                    next_slice_id = next_slice_id.saturating_add(1);
-                    next_slice_order = next_slice_order.saturating_add(1);
-                }
-            }
-
-            let chunk_slices: Vec<(
-                studiofs_meta::schema::ChunkId,
-                Vec<studiofs_meta::schema::SliceRecord>,
-            )> = chunks
-                .into_iter()
-                .map(|(k, v)| (studiofs_meta::schema::ChunkId(k), v))
-                .collect();
-
-            let metadata_commit_started = Instant::now();
-            let metadata_commit_result = run_meta(
-                self.meta_async.clone(),
-                move |engine: Arc<dyn MetaEngine>| {
-                    engine.flush_regular_file_overlay_slices_with_attr(
-                        ino,
-                        &chunk_slices,
-                        attr_for_meta.as_ref(),
-                    )
-                },
-            )
-            .await;
-            self.record_metadata_commit_observability(metadata_commit_started.elapsed());
-            metadata_commit_result?;
-            Ok(())
-        }
-        .await;
-        if let Err(error) = pre_metadata_result {
-            self.cleanup_uncommitted_block_store_entries(ino, &persisted_blocks, "pre-metadata")
+        // === Phase 1: Payload Persistence ===
+        // Write each block payload to the local block store and perform grouped
+        // local sync. On failure, remove the block-store entries before returning.
+        if let Err(error) = self
+            .persist_payload_phase(&persisted_blocks, local_sync_policy)
+            .await
+        {
+            self.cleanup_uncommitted_block_store_entries(ino, &persisted_blocks, "payload-persist")
                 .await;
             return Err(error);
         }
+
+        // === Phase 2: Overlay Metadata Commit ===
+        // Build overlay slice records from the persisted blocks, then commit them
+        // together with the optional inode attr update in a single metadata
+        // transaction. The engine normalises the attr (applying its accurate
+        // has_committed_manifest check), so we pass the raw attr without a
+        // VFS-level pre-transform. On failure, remove the block-store entries
+        // written in Phase 1.
+        let chunk_slices =
+            match self.build_overlay_slice_records(ino, &persisted_blocks, dirty_chunk_slices) {
+                Ok(slices) => slices,
+                Err(error) => {
+                    self.cleanup_uncommitted_block_store_entries(
+                        ino,
+                        &persisted_blocks,
+                        "metadata-build",
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+        let committed_attr = match self
+            .commit_overlay_metadata_phase(ino, chunk_slices, attr_to_persist)
+            .await
+        {
+            Ok(attr) => attr,
+            Err(error) => {
+                self.cleanup_uncommitted_block_store_entries(
+                    ino,
+                    &persisted_blocks,
+                    "metadata-commit",
+                )
+                .await;
+                return Err(error);
+            }
+        };
 
         let upload_ops: Vec<(u64, u64, u64, u64)> = persisted_blocks
             .iter()
@@ -683,7 +740,7 @@ impl StudioVfs {
         }
         self.record_live_extents(&live_extents);
 
-        if let Some(attr) = attr_after_commit {
+        if let Some(attr) = committed_attr {
             self.state.namespace.attr_read_cache.lock().remove(ino);
             self.refresh_inode_incarnation_state_from_attr(ino, &attr);
         }

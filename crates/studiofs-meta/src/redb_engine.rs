@@ -6834,6 +6834,7 @@ impl MetaBlocks for RedbMetaEngine {
         chunk_slices: &[(ChunkId, Vec<crate::schema::SliceRecord>)],
     ) -> MetaResult<()> {
         self.flush_regular_file_overlay_slices_with_attr_txn(ino, chunk_slices, None)
+            .map(|_| ())
     }
 
     fn has_local_regular_file_overlay(&self, ino: Ino) -> MetaResult<bool> {
@@ -7346,7 +7347,7 @@ impl RedbMetaEngine {
         ino: Ino,
         chunk_slices: &[(ChunkId, Vec<crate::schema::SliceRecord>)],
         attr: Option<&InodeAttr>,
-    ) -> MetaResult<()> {
+    ) -> MetaResult<Option<InodeAttr>> {
         let txn = self
             .db
             .begin_write()
@@ -7490,7 +7491,7 @@ impl RedbMetaEngine {
 
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
+        Ok(normalized_attr)
     }
 
     fn flush_blocks_batch_with_attr_txn(
@@ -8339,7 +8340,7 @@ impl crate::engine::MetaEngine for RedbMetaEngine {
         ino: Ino,
         chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
         attr: Option<&InodeAttr>,
-    ) -> MetaResult<()> {
+    ) -> MetaResult<Option<InodeAttr>> {
         self.flush_regular_file_overlay_slices_with_attr_txn(ino, chunk_slices, attr)
     }
 }
@@ -10997,18 +10998,25 @@ mod tests {
         let mut new_attr = attr.clone();
         new_attr.size = 8192;
         new_attr.content_epoch = 12;
-        engine
+        let committed_attr = engine
             .flush_regular_file_overlay_slices_with_attr(
                 ino,
                 &[(ChunkId(0), incoming)],
                 Some(&new_attr),
             )
-            .unwrap();
+            .unwrap()
+            .expect("committed attr must be returned when attr is provided");
 
+        // The returned attr should reflect the engine-normalised committed state.
+        assert_eq!(committed_attr.size, 8192);
+        assert_eq!(committed_attr.content_epoch, 12);
+        assert_eq!(committed_attr.upload_state, UploadState::Uploading);
+
+        // Cross-check: the stored attr must match what was returned.
         let persisted_attr = engine.get_attr(ino).unwrap();
-        assert_eq!(persisted_attr.size, 8192);
-        assert_eq!(persisted_attr.content_epoch, 12);
-        assert_eq!(persisted_attr.upload_state, UploadState::Uploading);
+        assert_eq!(persisted_attr.size, committed_attr.size);
+        assert_eq!(persisted_attr.content_epoch, committed_attr.content_epoch);
+        assert_eq!(persisted_attr.upload_state, committed_attr.upload_state);
 
         let txn = engine.db.begin_read().unwrap();
         assert!(

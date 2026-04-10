@@ -686,17 +686,28 @@ pub trait MetaEngine:
     /// Flush local regular-file overlay slices and optionally inode attributes
     /// in one logical foreground persist step.
     ///
+    /// Returns the inode attribute that was **actually committed** to durable
+    /// storage, or `None` when no `attr` was provided. Callers should use the
+    /// returned value (rather than the input) for any post-commit in-memory
+    /// state updates, because backends are permitted to normalise fields such
+    /// as `upload_state` inside the commit transaction using information only
+    /// they can observe (e.g. whether a committed S3 manifest already exists).
+    ///
     /// Backends should override this to make the operation atomic if possible.
     fn flush_regular_file_overlay_slices_with_attr(
         &self,
         ino: Ino,
         chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
         attr: Option<&InodeAttr>,
-    ) -> MetaResult<()> {
+    ) -> MetaResult<Option<InodeAttr>> {
         self.flush_regular_file_overlay_slices(ino, chunk_slices)?;
         if let Some(attr) = attr {
+            // `set_attr` normalises `upload_state` (including the
+            // `has_committed_manifest` check) before writing, so we must
+            // re-read the stored value to return the accurate committed form.
             self.set_attr(attr)?;
+            return Ok(Some(self.get_attr(ino)?));
         }
-        Ok(())
+        Ok(None)
     }
 }

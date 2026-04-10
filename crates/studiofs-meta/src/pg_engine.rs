@@ -2341,7 +2341,7 @@ impl crate::engine::MetaEngine for PgMetaEngine {
         ino: Ino,
         chunk_slices: &[(ChunkId, Vec<crate::schema::SliceRecord>)],
         attr: Option<&InodeAttr>,
-    ) -> MetaResult<()> {
+    ) -> MetaResult<Option<InodeAttr>> {
         self.mutate(|local| {
             local.flush_regular_file_overlay_slices_with_attr(ino, chunk_slices, attr)
         })
