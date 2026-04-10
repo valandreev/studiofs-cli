@@ -388,10 +388,7 @@ impl StudioVfs {
             return;
         }
         let object_ids: Vec<u64> = blocks.iter().map(|block| block.object_id).collect();
-        if let Err(error) = self
-            .block_store_remove_batch_async(object_ids.clone())
-            .await
-        {
+        if let Err(error) = self.block_store_remove_batch(object_ids.clone()) {
             warn!(
                 ino,
                 stage,
@@ -473,12 +470,8 @@ impl StudioVfs {
 
         let pre_metadata_result: VfsResult<()> = async {
             for chunk in persisted_blocks.chunks(BLOCK_STORE_PUT_PIPELINE_WIDTH) {
-                let put_results = futures::future::join_all(chunk.iter().map(|block| {
-                    self.block_store_put_async(block.object_id, block.data.clone(), false)
-                }))
-                .await;
-                for result in put_results {
-                    result?;
+                for block in chunk {
+                    self.block_store_put(block.object_id, block.data.clone(), false)?;
                 }
             }
             let persisted_bytes: u64 = persisted_blocks
@@ -1059,7 +1052,7 @@ impl StudioVfs {
             None => return Ok(None),
         };
 
-        if let Some(cached) = self.block_store_get_async(block_ref.object_id).await? {
+        if let Some(cached) = self.block_store_get(block_ref.object_id)? {
             return Ok(Some(cached));
         }
 

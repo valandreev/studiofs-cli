@@ -285,7 +285,7 @@ impl FetchScheduler {
         class: FetchClass,
     ) -> Result<Bytes, FetchError> {
         // ── Fast path: cache ────────────────────────────────────────
-        if let Some(cached) = self.block_store_get_async(object_id).await? {
+        if let Some(cached) = self.block_store_get(object_id)? {
             self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(cached);
         }
@@ -329,7 +329,7 @@ impl FetchScheduler {
                     match recv {
                         // Fetcher succeeded — grab from cache.
                         Ok(Ok(true)) => {
-                            if let Some(cached) = self.block_store_get_async(object_id).await? {
+                            if let Some(cached) = self.block_store_get(object_id)? {
                                 self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
                                 return Ok(cached);
                             }
@@ -549,20 +549,19 @@ impl FetchScheduler {
         let payload = Bytes::from(assembled);
 
         // Populate cache (L1 + L2) with the reconstructed logical block.
-        self.block_store_put_async(object_id, payload.clone(), true)
-            .await?;
+        self.block_store_put(object_id, payload.clone(), true)?;
 
         Ok(payload)
     }
 
-    async fn block_store_get_async(&self, object_id: u64) -> Result<Option<Bytes>, FetchError> {
+    fn block_store_get(&self, object_id: u64) -> Result<Option<Bytes>, FetchError> {
         let block_store = self.local_block_backend.clone();
         let (result, timing) = run_local_cache_io(|| block_store.get(object_id));
         self.record_local_cache_io_timing(timing);
         Ok(result)
     }
 
-    async fn block_store_put_async(
+    fn block_store_put(
         &self,
         object_id: u64,
         payload: Bytes,
