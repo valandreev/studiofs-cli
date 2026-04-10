@@ -1,6 +1,8 @@
 use super::*;
 use futures::StreamExt;
 
+const ORDERED_PAYLOAD_PUT_PIPELINE_WIDTH: usize = 8;
+
 #[derive(Debug, Clone)]
 pub(super) struct PendingBlock {
     pub(super) data: BytesMut,
@@ -36,6 +38,12 @@ struct PersistedWriteBlock {
     block_index: u32,
     object_id: u64,
     data: Bytes,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PayloadPersistConfig {
+    put_concurrency: usize,
+    local_sync_policy: LocalSyncPolicy,
 }
 
 pub(super) struct LocalSyncGroupState {
@@ -116,6 +124,25 @@ fn assign_reserved_object_ids(
 
 fn blocks_can_accept_more(selected_bytes: usize, next_block_bytes: usize, limit: usize) -> bool {
     selected_bytes == 0 || selected_bytes.saturating_add(next_block_bytes) <= limit
+}
+
+async fn drain_buffered_results<T, E, S>(results: S) -> Result<(), E>
+where
+    S: futures::Stream<Item = Result<T, E>>,
+{
+    let mut first_error = None;
+    futures::pin_mut!(results);
+    while let Some(result) = results.next().await {
+        if let Err(error) = result
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn commit_persisted_block_state(
@@ -415,22 +442,23 @@ impl StudioVfs {
     async fn persist_payload_phase(
         &self,
         persisted_blocks: &[PersistedWriteBlock],
-        local_sync_policy: LocalSyncPolicy,
+        persist_config: PayloadPersistConfig,
     ) -> VfsResult<()> {
         let persisted_bytes: u64 = persisted_blocks.iter().map(|b| b.data.len() as u64).sum();
         let started = Instant::now();
         let result: VfsResult<()> = async {
-            let mut inflight = futures::stream::iter(persisted_blocks.iter().cloned())
+            let inflight = futures::stream::iter(persisted_blocks.iter().cloned())
                 .map(|block| async move {
                     self.block_store_put_async(block.object_id, block.data, false)
                         .await
                 })
-                .buffer_unordered(self.payload_put_concurrency.max(1));
-            while let Some(result) = inflight.next().await {
-                result?;
-            }
-            self.maybe_block_store_sync_data_async(persisted_bytes, local_sync_policy)
-                .await?;
+                .buffer_unordered(persist_config.put_concurrency.max(1));
+            drain_buffered_results(inflight).await?;
+            self.maybe_block_store_sync_data_async(
+                persisted_bytes,
+                persist_config.local_sync_policy,
+            )
+            .await?;
             Ok(())
         }
         .await;
@@ -621,7 +649,7 @@ impl StudioVfs {
         dirty_chunk_slices: std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
         content_epoch: u64,
         attr_to_persist: Option<InodeAttr>,
-        local_sync_policy: LocalSyncPolicy,
+        persist_config: PayloadPersistConfig,
     ) -> VfsResult<Vec<PersistedWriteBlock>> {
         if blocks.is_empty() {
             // No payload to persist; commit the attr-only metadata phase so the
@@ -683,7 +711,7 @@ impl StudioVfs {
         // Write each block payload to the local block store and perform grouped
         // local sync. On failure, remove the block-store entries before returning.
         if let Err(error) = self
-            .persist_payload_phase(&persisted_blocks, local_sync_policy)
+            .persist_payload_phase(&persisted_blocks, persist_config)
             .await
         {
             self.cleanup_uncommitted_block_store_entries(ino, &persisted_blocks, "payload-persist")
@@ -1059,7 +1087,10 @@ impl StudioVfs {
                 chunk_slices,
                 content_epoch,
                 dirty_attr,
-                local_sync_policy,
+                PayloadPersistConfig {
+                    put_concurrency: self.payload_put_concurrency,
+                    local_sync_policy,
+                },
             )
             .await?;
         self.commit_persisted_write_buffer_blocks(ino, &persisted_blocks);
@@ -1425,7 +1456,10 @@ impl StudioVfs {
                 chunk_slices,
                 content_epoch,
                 dirty_attr,
-                local_sync_policy,
+                PayloadPersistConfig {
+                    put_concurrency: ORDERED_PAYLOAD_PUT_PIPELINE_WIDTH,
+                    local_sync_policy,
+                },
             )
             .await?;
         self.commit_persisted_write_buffer_blocks(ino, &persisted_blocks);
@@ -1464,6 +1498,8 @@ impl StudioVfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn assign_reserved_object_ids_reuses_existing_ids_and_stores_new_ones() {
@@ -1538,5 +1574,32 @@ mod tests {
         let pending_block = pending.get(&(ino, 3)).unwrap();
         assert_eq!(pending_block.data.as_ref(), b"newer");
         assert_eq!(pending_block.reserved_object_id, None);
+    }
+
+    #[test]
+    fn drain_buffered_results_waits_for_all_started_work_before_returning_error() {
+        let saw_later_item = Arc::new(AtomicBool::new(false));
+        let later_item_flag = saw_later_item.clone();
+        let stream = futures::stream::unfold(0u8, move |state| {
+            let later_item_flag = later_item_flag.clone();
+            async move {
+                match state {
+                    0 => Some((Err("first failure"), 1)),
+                    1 => {
+                        later_item_flag.store(true, Ordering::Release);
+                        Some((Ok::<(), &'static str>(()), 2))
+                    }
+                    _ => None,
+                }
+            }
+        });
+
+        let result = futures::executor::block_on(drain_buffered_results(stream));
+
+        assert_eq!(result, Err("first failure"));
+        assert!(
+            saw_later_item.load(Ordering::Acquire),
+            "the helper should keep polling after the first error so already-started work can finish"
+        );
     }
 }
