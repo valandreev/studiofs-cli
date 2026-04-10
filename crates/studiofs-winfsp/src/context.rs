@@ -568,7 +568,7 @@ impl StudioFsContext {
     // - non-delete `cleanup` currently drains dirty state while the handle is
     //   still valid so `close` usually becomes release-only. This is
     //   conservative: `release_fh` still performs the mandatory last-handle
-    //   dirty-state drain if cleanup is skipped, repeated, or later
+    //   local-state drain if cleanup is skipped, repeated, or later
     //   deferred/coalesced.
     // - repeated `flush`/`cleanup` callbacks on an already clean inode may
     //   return immediately.
@@ -635,16 +635,18 @@ impl StudioFsContext {
             // `Close` is a release path, not a distinct WinFSP durability
             // contract. If non-delete `cleanup` already drained the inode this
             // should observe a clean release; otherwise `release_fh` still
-            // performs the mandatory last-handle dirty-state drain before the
-            // handle disappears.
-            let close_can_attribute_barrier = self.vfs.open_count(ino) <= 1;
-            let close_sees_dirty_inode =
-                close_can_attribute_barrier && self.vfs.inode_has_local_dirty_state(ino);
+            // performs the mandatory last-handle local-state drain before the
+            // handle disappears. This callback still blocks on `release_fh`
+            // because the final-handle fallback barrier, when needed, belongs
+            // to the release path rather than a speculative pre-close guess.
             let vfs = self.vfs.clone();
-            let release_result = self.spawn_wait(async move { vfs.release_fh(fh).await });
-            if close_can_attribute_barrier {
+            let release_result =
+                self.spawn_wait(async move { vfs.release_fh_with_outcome(fh).await });
+            if let Ok(outcome) = &release_result
+                && outcome.closed_last_handle
+            {
                 self.vfs
-                    .note_winfsp_close_barrier_outcome(close_sees_dirty_inode);
+                    .note_winfsp_close_barrier_outcome(outcome.flushed_local_dirty_state);
             }
             if let Err(e) = release_result {
                 error!(ino, fh, "release_fh failed: {:?}", e);

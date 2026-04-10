@@ -925,6 +925,12 @@ pub(super) enum LocalSyncPolicy {
     Strict,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReleaseFhOutcome {
+    pub closed_last_handle: bool,
+    pub flushed_local_dirty_state: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalSyncTrigger {
     Explicit,
@@ -9807,17 +9813,24 @@ impl StudioVfs {
     /// If the inode was unlinked while this handle was open (orphan) and this
     /// was the last open handle, perform the deferred deletion now.
     ///
-    /// This is also the mandatory last-handle drain point for local dirty
-    /// state. If a writable handle reaches release with dirty blocks or attrs
-    /// still pending, `release_fh` must flush them before the handle
-    /// disappears so later opens, open-unlink cleanup, and sticky-error
-    /// reporting all see a coherent inode. WinFSP non-delete `cleanup` may
-    /// choose to drain earlier, but correctness must not depend on that eager
-    /// callback barrier.
+    /// This is also the mandatory last-handle local-state drain point. If a
+    /// writable handle reaches release with dirty blocks or attrs still
+    /// pending, `release_fh` must push that state through the current local
+    /// payload/metadata pipeline before the handle disappears so later opens,
+    /// open-unlink cleanup, and sticky-error reporting all see a coherent
+    /// inode. This is not a strict `fsync` promise in Fast mode: `fsync`
+    /// remains the explicit crash-durability barrier, while `release_fh`
+    /// preserves the existing local-visibility semantics.
     pub async fn release_fh(&self, fh: u64) -> VfsResult<()> {
+        self.release_fh_with_outcome(fh).await.map(|_| ())
+    }
+
+    /// Release a handle and report whether this close owned the actual
+    /// last-handle path, plus whether it had to drain local dirty state there.
+    pub async fn release_fh_with_outcome(&self, fh: u64) -> VfsResult<ReleaseFhOutcome> {
         let Some((open_file, remaining)) = self.handle_table.close(fh) else {
             debug!("release_fh: unknown fh={}", fh);
-            return Ok(());
+            return Ok(ReleaseFhOutcome::default());
         };
         let ino = open_file.ino;
         let stream_id = open_file.stream_id();
@@ -9826,21 +9839,27 @@ impl StudioVfs {
         self.note_file_session_close_handle(ino, remaining);
         self.clear_access_tracking_for_stream(ino, stream_id);
         if remaining > 0 {
-            return Ok(());
+            return Ok(ReleaseFhOutcome::default());
         }
 
         let session = self
             .enter_file_session_op(ino, FileSessionOperation::Release)
             .await;
-        let result: VfsResult<()> = async {
+        let result: VfsResult<ReleaseFhOutcome> = async {
             if self.release_ignored_entry(ino) {
                 let _ = self.handle_table.take_orphan(ino);
-                return Ok(());
+                return Ok(ReleaseFhOutcome {
+                    closed_last_handle: true,
+                    flushed_local_dirty_state: false,
+                });
             }
 
             if self.handle_table.take_orphan(ino) {
                 if self.release_ignored_entry(ino) {
-                    return Ok(());
+                    return Ok(ReleaseFhOutcome {
+                        closed_last_handle: true,
+                        flushed_local_dirty_state: false,
+                    });
                 }
                 // Last handle closed on an unlinked file — final cleanup
                 debug!("orphan cleanup: ino={} (last fd closed)", ino);
@@ -9907,7 +9926,10 @@ impl StudioVfs {
                 self.state.namespace.dirty_attrs.lock().remove(&ino);
                 self.state.namespace.attr_read_cache.lock().remove(ino);
                 self.maybe_clear_deleted_inode_marker(ino);
-                return Ok(());
+                return Ok(ReleaseFhOutcome {
+                    closed_last_handle: true,
+                    flushed_local_dirty_state: false,
+                });
             }
 
             let writable_handle = open_file.flags.contains(OpenFlags::WRONLY)
@@ -9920,7 +9942,10 @@ impl StudioVfs {
             if writable_handle || has_local_dirty_state {
                 self.ensure_no_upload_sticky_error(ino)?;
             }
-            Ok(())
+            Ok(ReleaseFhOutcome {
+                closed_last_handle: true,
+                flushed_local_dirty_state: has_local_dirty_state,
+            })
         }
         .await;
         drop(session);
@@ -14310,6 +14335,43 @@ mod tests {
                 payload.len() as u64,
                 "release_fh must persist local dirty state before reporting sticky EIO"
             );
+        });
+    }
+
+    #[test]
+    fn test_release_fh_with_outcome_distinguishes_nonfinal_and_final_close() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-close-ownership");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs.create(1, b"release-outcome.txt", 0, 0, 0o644).unwrap();
+            let ino = attr.ino;
+            let fh1 = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+            let fh2 = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+            vfs.write(ino, 0, b"payload").await.unwrap();
+
+            let first = vfs.release_fh_with_outcome(fh1).await.unwrap();
+            assert!(
+                !first.closed_last_handle,
+                "closing one of multiple handles must not report last-handle ownership"
+            );
+            assert!(
+                !first.flushed_local_dirty_state,
+                "non-final close should not attribute a local dirty-state drain"
+            );
+            assert_eq!(vfs.open_count(ino), 1, "one handle should remain open");
+
+            let second = vfs.release_fh_with_outcome(fh2).await.unwrap();
+            assert!(
+                second.closed_last_handle,
+                "the final close should report last-handle ownership"
+            );
+            assert!(
+                second.flushed_local_dirty_state,
+                "the final close should report the fallback local dirty-state drain"
+            );
+            assert_eq!(vfs.open_count(ino), 0, "all handles should be closed");
         });
     }
 
