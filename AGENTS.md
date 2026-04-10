@@ -285,7 +285,7 @@ aligned on these rules whenever WinFSP callback sequencing changes:
 - `close` is a release path, not an independent durability contract. It may observe and attribute the fallback release barrier when cleanup did not drain the inode first.
 - `overwrite` and `set_file_size` must publish the new EOF and attrs before returning; they are not backgroundable flush callbacks.
 - `release_fh` must push any remaining local dirty state through the existing local payload/metadata pipeline before the last handle disappears, including open-unlink/orphan lifecycles and sticky upload error reporting. Full crash-durability still belongs to `fsync` / strict local sync barriers.
-- Mounted Windows validation aimed at AJA-style sequential writers should treat any non-zero non-delete `cleanup` foreground barriers or `cleanup_flush_fh` callback counts as concrete follow-up evidence for `SFS-192`, because those indicate avoidable callback-side flush work is still present.
+- Mounted Windows validation aimed at AJA-style sequential writers should treat any non-zero non-delete `cleanup` foreground barriers, `cleanup_skipped_clean`, or `cleanup_flush_fh` callback counts (that is, any cleanup barrier attribution, including skipped-clean) as concrete follow-up evidence for `SFS-192`, because those indicate avoidable callback-side flush work is still present.
 
 Future defer/coalesce work may target non-delete `cleanup`, repeated clean callback
 paths, and duplicate concurrent callback barriers, but it must not weaken explicit

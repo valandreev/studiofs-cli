@@ -72,6 +72,12 @@ fn test_online_endpoint() -> String {
     )
 }
 
+const DEFAULT_AJA_SEQUENTIAL_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_AJA_SEQUENTIAL_CHUNK_COUNT: usize = 8;
+const MAX_AJA_SEQUENTIAL_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+const MAX_AJA_SEQUENTIAL_CHUNK_COUNT: usize = 128;
+const MAX_AJA_SEQUENTIAL_TOTAL_BYTES: usize = 512 * 1024 * 1024;
+
 fn test_mount_usize_env_var(key: &str, default: usize) -> usize {
     load_test_env();
     std::env::var(key)
@@ -82,11 +88,56 @@ fn test_mount_usize_env_var(key: &str, default: usize) -> usize {
 }
 
 fn aja_sequential_chunk_bytes() -> usize {
-    test_mount_usize_env_var("STUDIOFS_WINFSP_AJA_CHUNK_BYTES", 4 * 1024 * 1024)
+    test_mount_usize_env_var(
+        "STUDIOFS_WINFSP_AJA_CHUNK_BYTES",
+        DEFAULT_AJA_SEQUENTIAL_CHUNK_BYTES,
+    )
 }
 
 fn aja_sequential_chunk_count() -> usize {
-    test_mount_usize_env_var("STUDIOFS_WINFSP_AJA_CHUNK_COUNT", 8)
+    test_mount_usize_env_var(
+        "STUDIOFS_WINFSP_AJA_CHUNK_COUNT",
+        DEFAULT_AJA_SEQUENTIAL_CHUNK_COUNT,
+    )
+}
+
+fn validate_aja_sequential_workload(
+    chunk_bytes: usize,
+    chunk_count: usize,
+) -> Result<(usize, usize), String> {
+    if chunk_bytes == 0 {
+        return Err("STUDIOFS_WINFSP_AJA_CHUNK_BYTES must be greater than 0".to_string());
+    }
+    if chunk_bytes > MAX_AJA_SEQUENTIAL_CHUNK_BYTES {
+        return Err(format!(
+            "STUDIOFS_WINFSP_AJA_CHUNK_BYTES={} exceeds the supported max {}; reduce the chunk size for the mounted AJA-style smoke test",
+            chunk_bytes, MAX_AJA_SEQUENTIAL_CHUNK_BYTES
+        ));
+    }
+    if chunk_count == 0 {
+        return Err("STUDIOFS_WINFSP_AJA_CHUNK_COUNT must be greater than 0".to_string());
+    }
+    if chunk_count > MAX_AJA_SEQUENTIAL_CHUNK_COUNT {
+        return Err(format!(
+            "STUDIOFS_WINFSP_AJA_CHUNK_COUNT={} exceeds the supported max {}; reduce the chunk count for the mounted AJA-style smoke test",
+            chunk_count, MAX_AJA_SEQUENTIAL_CHUNK_COUNT
+        ));
+    }
+    let total_bytes = chunk_bytes.checked_mul(chunk_count).ok_or_else(|| {
+        "AJA-style mounted smoke workload overflowed chunk_bytes * chunk_count".to_string()
+    })?;
+    if total_bytes > MAX_AJA_SEQUENTIAL_TOTAL_BYTES {
+        return Err(format!(
+            "AJA-style mounted smoke workload would write {} bytes, exceeding the supported max {}; lower STUDIOFS_WINFSP_AJA_CHUNK_BYTES or STUDIOFS_WINFSP_AJA_CHUNK_COUNT",
+            total_bytes, MAX_AJA_SEQUENTIAL_TOTAL_BYTES
+        ));
+    }
+
+    Ok((chunk_bytes, chunk_count))
+}
+
+fn aja_sequential_workload() -> Result<(usize, usize), String> {
+    validate_aja_sequential_workload(aja_sequential_chunk_bytes(), aja_sequential_chunk_count())
 }
 
 fn endpoint_authority(endpoint: &str) -> Option<String> {
@@ -428,6 +479,42 @@ fn winfsp_mount_write_read_unmount_smoke() {
 }
 
 #[test]
+fn validate_aja_sequential_workload_accepts_defaults() {
+    let workload = validate_aja_sequential_workload(
+        DEFAULT_AJA_SEQUENTIAL_CHUNK_BYTES,
+        DEFAULT_AJA_SEQUENTIAL_CHUNK_COUNT,
+    )
+    .expect("default workload should be accepted");
+    assert_eq!(
+        workload,
+        (
+            DEFAULT_AJA_SEQUENTIAL_CHUNK_BYTES,
+            DEFAULT_AJA_SEQUENTIAL_CHUNK_COUNT
+        )
+    );
+}
+
+#[test]
+fn validate_aja_sequential_workload_rejects_oversized_chunk_bytes() {
+    let err = validate_aja_sequential_workload(MAX_AJA_SEQUENTIAL_CHUNK_BYTES + 1, 1)
+        .expect_err("oversized chunk bytes should be rejected");
+    assert!(
+        err.contains("STUDIOFS_WINFSP_AJA_CHUNK_BYTES"),
+        "error should point at the chunk-bytes env var: {err}"
+    );
+}
+
+#[test]
+fn validate_aja_sequential_workload_rejects_excessive_total_bytes() {
+    let err = validate_aja_sequential_workload(MAX_AJA_SEQUENTIAL_CHUNK_BYTES, 16)
+        .expect_err("oversized total workload should be rejected");
+    assert!(
+        err.contains("lower STUDIOFS_WINFSP_AJA_CHUNK_BYTES or STUDIOFS_WINFSP_AJA_CHUNK_COUNT"),
+        "error should explain how to lower the mounted workload: {err}"
+    );
+}
+
+#[test]
 #[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn winfsp_mount_callback_flush_and_cleanup_observability_smoke() {
     if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
@@ -606,8 +693,13 @@ fn winfsp_mount_aja_style_sequential_writer_validation_smoke() {
         "Local\\StudioFsAjaSequentialWriterSmoke-{}",
         std::process::id()
     );
-    let chunk_bytes = aja_sequential_chunk_bytes();
-    let chunk_count = aja_sequential_chunk_count();
+    let (chunk_bytes, chunk_count) = match aja_sequential_workload() {
+        Ok(workload) => workload,
+        Err(reason) => {
+            eprintln!("Skipping WinFSP AJA-style sequential writer smoke test: {reason}");
+            return;
+        }
+    };
 
     with_winfsp_mount(vfs, rt, mount_point, event_name, |drive_root| {
         // Approximate a media-style single-handle sequential writer: large
@@ -623,7 +715,15 @@ fn winfsp_mount_aja_style_sequential_writer_validation_smoke() {
             .open(&sequential_file)
             .expect("open aja-style sequential writer file through WinFSP mount");
         use std::io::Write;
-        let mut chunk = vec![0u8; chunk_bytes];
+        let mut chunk = Vec::new();
+        if let Err(err) = chunk.try_reserve_exact(chunk_bytes) {
+            eprintln!(
+                "Skipping WinFSP AJA-style sequential writer smoke test: failed to reserve {} bytes for the sequential chunk buffer: {err}",
+                chunk_bytes
+            );
+            return;
+        }
+        chunk.resize(chunk_bytes, 0u8);
         for chunk_index in 0..chunk_count {
             let fill = b'A' + (chunk_index % 26) as u8;
             chunk.fill(fill);
