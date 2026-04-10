@@ -470,9 +470,12 @@ impl StudioVfs {
 
         let pre_metadata_result: VfsResult<()> = async {
             for chunk in persisted_blocks.chunks(BLOCK_STORE_PUT_PIPELINE_WIDTH) {
-                for block in chunk {
-                    self.block_store_put(block.object_id, block.data.clone(), false)?;
-                }
+                let chunk_blocks: Vec<(u64, Bytes)> = chunk
+                    .iter()
+                    .map(|block| (block.object_id, block.data.clone()))
+                    .collect();
+                self.block_store_put_batch_parallel(chunk_blocks, false)
+                    .await?;
             }
             let persisted_bytes: u64 = persisted_blocks
                 .iter()

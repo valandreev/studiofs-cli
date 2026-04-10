@@ -7189,15 +7189,28 @@ impl StudioVfs {
         Ok(())
     }
 
-    fn block_store_put(&self, object_id: u64, data: Bytes, evictable: bool) -> VfsResult<()> {
+    async fn block_store_put_batch_parallel(
+        &self,
+        blocks: Vec<(u64, Bytes)>,
+        evictable: bool,
+    ) -> VfsResult<()> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
         let block_store = self.local_block_backend.clone();
-        let (result, timing) = run_local_cache_io(|| {
-            block_store
-                .put(object_id, data.as_ref(), evictable)
-                .map_err(|error| VfsError::Other(format!("block store put failed: {error}")))
-        });
+        let ((), timing) = run_local_cache_io_blocking(move || {
+            use rayon::prelude::*;
+
+            blocks.into_par_iter().try_for_each(|(object_id, data)| {
+                block_store
+                    .put(object_id, data.as_ref(), evictable)
+                    .map_err(|error| VfsError::Other(format!("block store put failed: {error}")))
+            })
+        })
+        .await?;
         self.record_local_cache_io_timing(timing);
-        result
+        Ok(())
     }
 
     async fn maybe_block_store_sync_data_async(
@@ -14547,8 +14560,12 @@ mod tests {
             .load(Ordering::Relaxed);
 
         rt.block_on(async {
-            vfs.block_store_put(0xAA55, Bytes::from_static(b"payload"), false)
-                .expect("block store put");
+            vfs.block_store_put_batch_parallel(
+                vec![(0xAA55, Bytes::from_static(b"payload"))],
+                false,
+            )
+            .await
+            .expect("block store put");
             let payload = vfs
                 .block_store_get(0xAA55)
                 .expect("block store get")
@@ -14576,9 +14593,9 @@ mod tests {
             calls_after >= calls_before + 2,
             "put + get should record at least two local-cache I/O calls"
         );
-        assert_eq!(
-            handoff_after, handoff_before,
-            "inline model should not accrue scheduler handoff time"
+        assert!(
+            handoff_after >= handoff_before,
+            "blocking-isolated local-cache operations may accrue scheduler handoff time"
         );
         assert!(
             backend_after >= backend_before,
