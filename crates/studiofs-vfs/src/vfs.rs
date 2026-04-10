@@ -15080,6 +15080,9 @@ mod tests {
                 .await
                 .expect("second write");
             vfs.flush(attr.ino).await.expect("second flush");
+
+            // Force a deterministic durability barrier so the sync metric is stable.
+            vfs.fsync(attr.ino, false).await.expect("fsync barrier");
         });
 
         let snapshot = vfs.write_path_observability_snapshot();
