@@ -7198,6 +7198,7 @@ impl StudioVfs {
             return Ok(());
         }
 
+        let block_count = blocks.len();
         let block_store = self.local_block_backend.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
             use rayon::prelude::*;
@@ -7209,7 +7210,7 @@ impl StudioVfs {
             })
         })
         .await?;
-        self.record_local_cache_io_timing(timing);
+        self.record_local_cache_io_timing_with_units(timing, block_count);
         Ok(())
     }
 
@@ -8122,34 +8123,46 @@ impl StudioVfs {
     }
 
     fn record_local_cache_io_timing(&self, timing: LocalCacheIoTiming) {
+        self.record_local_cache_io_timing_with_units(timing, 1);
+    }
+
+    fn record_local_cache_io_timing_with_units(&self, timing: LocalCacheIoTiming, units: usize) {
+        let units = units.max(1);
+        let units_u64 = units as u64;
         self.state
             .metrics
             .local_cache_io_calls
-            .fetch_add(1, Ordering::Relaxed);
+            .fetch_add(units_u64, Ordering::Relaxed);
+        let handoff_total_ns = timing.handoff_ns.saturating_mul(units_u64);
         self.state
             .metrics
             .local_cache_io_handoff_total_ns
-            .fetch_add(timing.handoff_ns, Ordering::Relaxed);
+            .fetch_add(handoff_total_ns, Ordering::Relaxed);
         self.state
             .metrics
             .local_cache_io_handoff_max_ns
             .fetch_max(timing.handoff_ns, Ordering::Relaxed);
-        self.state
-            .metrics
-            .local_cache_io_handoff_histogram
-            .observe_ns(timing.handoff_ns);
+        for _ in 0..units {
+            self.state
+                .metrics
+                .local_cache_io_handoff_histogram
+                .observe_ns(timing.handoff_ns);
+        }
+        let backend_total_ns = timing.backend_io_ns.saturating_mul(units_u64);
         self.state
             .metrics
             .local_cache_io_backend_total_ns
-            .fetch_add(timing.backend_io_ns, Ordering::Relaxed);
+            .fetch_add(backend_total_ns, Ordering::Relaxed);
         self.state
             .metrics
             .local_cache_io_backend_max_ns
             .fetch_max(timing.backend_io_ns, Ordering::Relaxed);
-        self.state
-            .metrics
-            .local_cache_io_backend_histogram
-            .observe_ns(timing.backend_io_ns);
+        for _ in 0..units {
+            self.state
+                .metrics
+                .local_cache_io_backend_histogram
+                .observe_ns(timing.backend_io_ns);
+        }
     }
 
     pub fn note_winfsp_write_callback(&self) {
@@ -14561,7 +14574,10 @@ mod tests {
 
         rt.block_on(async {
             vfs.block_store_put_batch_parallel(
-                vec![(0xAA55, Bytes::from_static(b"payload"))],
+                vec![
+                    (0xAA55, Bytes::from_static(b"payload")),
+                    (0xAA56, Bytes::from_static(b"payload-2")),
+                ],
                 false,
             )
             .await
@@ -14590,8 +14606,8 @@ mod tests {
             .load(Ordering::Relaxed);
 
         assert!(
-            calls_after >= calls_before + 2,
-            "put + get should record at least two local-cache I/O calls"
+            calls_after >= calls_before + 3,
+            "batch put (2 blocks) + get should record at least three local-cache I/O calls"
         );
         assert!(
             handoff_after >= handoff_before,
