@@ -7173,22 +7173,36 @@ impl StudioVfs {
         Ok(result)
     }
 
-    fn block_store_read_into(
+    async fn block_store_read_into_async(
         &self,
         object_id: u64,
         data_offset: usize,
         out: &mut [u8],
-    ) -> Option<usize> {
-        let (result, timing) = run_local_cache_io(|| {
-            self.local_block_backend
-                .read_into(object_id, data_offset, out)
-        });
+    ) -> VfsResult<Option<usize>> {
+        let block_store = self.local_block_backend.clone();
+        let out_len = out.len();
+        let (result, timing) = run_local_cache_io_blocking(move || {
+            let mut scratch = vec![0_u8; out_len];
+            let read = block_store.read_into(object_id, data_offset, &mut scratch);
+            Ok((scratch, read))
+        })
+        .await?;
         self.record_local_cache_io_timing(timing);
-        result
-    }
-
-    fn should_materialize_full_block_for_span(&self, block: &BlockRef, span_len: usize) -> bool {
-        block.offset == 0 && span_len == self.block_size as usize
+        let (scratch, read) = result;
+        if let Some(read) = read {
+            if read > out.len() {
+                return Err(VfsError::Other(format!(
+                    "local backend returned oversized read: object_id={object_id}, read={read}, out_len={}",
+                    out.len()
+                )));
+            }
+            if read > 0 {
+                out[..read].copy_from_slice(&scratch[..read]);
+            }
+            Ok(Some(read))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn block_store_get_for_upload_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
@@ -10704,59 +10718,60 @@ impl StudioVfs {
                         );
                         dst.fill(0);
                     } else {
-                        if !self.should_materialize_full_block_for_span(block, dst.len()) {
-                            let block_offset = usize::try_from(block.offset).map_err(|_| {
-                                VfsError::Other(format!(
-                                    "block offset does not fit usize: object_id={}, offset={}",
-                                    block.object_id, block.offset
-                                ))
-                            })?;
-                            if let Some(read) =
-                                self.block_store_read_into(block.object_id, block_offset, dst)
-                            {
-                                if read < dst.len() {
-                                    debug!(
-                                        object_id = block.object_id,
-                                        file_offset = span.range.start,
-                                        block_offset = block.offset,
-                                        requested = dst.len(),
-                                        read,
-                                        "assemble_read_plan: local backend partial read returned short span, zero-filling tail"
-                                    );
-                                    dst[read..].fill(0);
-                                }
+                        let block_offset = usize::try_from(block.offset).map_err(|_| {
+                            VfsError::Other(format!(
+                                "block offset does not fit usize: object_id={}, offset={}",
+                                block.object_id, block.offset
+                            ))
+                        })?;
+                        if let Some(read) = self
+                            .block_store_read_into_async(block.object_id, block_offset, dst)
+                            .await?
+                        {
+                            if read == dst.len() {
                                 written = written.max(dst_end);
                                 continue;
                             }
+                            error!(
+                                object_id = block.object_id,
+                                file_offset = span.range.start,
+                                block_offset = block.offset,
+                                requested = dst.len(),
+                                read,
+                                "assemble_read_plan: short local backend read for committed block; evicting and refetching"
+                            );
+                            if let Err(evict_error) =
+                                self.block_store_remove_async(block.object_id).await
+                            {
+                                warn!(
+                                    object_id = block.object_id,
+                                    error = %evict_error,
+                                    "assemble_read_plan: failed to evict short-read local block before refetch"
+                                );
+                            }
                         }
 
-                        // Intentional full-block materialization path: only used for aligned
-                        // full-block spans and cache-miss/remote fallback.
-                        if let Some(data) = self.block_store_get_async(block.object_id).await? {
-                            self.copy_block_payload_into_range(data.as_ref(), block.offset, dst);
-                        } else {
-                            match self.fetch_block_for_ref(block, false).await {
-                                Ok(data) => {
-                                    self.copy_block_payload_into_range(
-                                        data.as_ref(),
-                                        block.offset,
-                                        dst,
-                                    );
-                                }
-                                Err(crate::fetch::FetchError::NotFound { key }) => {
-                                    warn!(
-                                        object_id = block.object_id,
-                                        key,
-                                        file_offset = span.range.start,
-                                        block_offset = block.offset,
-                                        block_length = block.length,
-                                        "assemble_read_plan: S3 object not found during foreground read, zeroing range (upload incomplete or evicted before upload?)"
-                                    );
-                                    dst.fill(0);
-                                }
-                                Err(error) => {
-                                    return Err(VfsError::Fetch(error));
-                                }
+                        match self.fetch_block_for_ref(block, false).await {
+                            Ok(data) => {
+                                self.copy_block_payload_into_range(
+                                    data.as_ref(),
+                                    block.offset,
+                                    dst,
+                                );
+                            }
+                            Err(crate::fetch::FetchError::NotFound { key }) => {
+                                warn!(
+                                    object_id = block.object_id,
+                                    key,
+                                    file_offset = span.range.start,
+                                    block_offset = block.offset,
+                                    block_length = block.length,
+                                    "assemble_read_plan: S3 object not found during foreground read, zeroing range (upload incomplete or evicted before upload?)"
+                                );
+                                dst.fill(0);
+                            }
+                            Err(error) => {
+                                return Err(VfsError::Fetch(error));
                             }
                         }
                     }
@@ -14674,11 +14689,14 @@ mod tests {
             vfs.block_store_put_async(0xBB66, Bytes::from_static(b"payload"), false)
                 .await
                 .expect("block store put");
+            let mut out = [0_u8; 3];
+            let read = vfs
+                .block_store_read_into_async(0xBB66, 2, &mut out)
+                .await
+                .expect("block store read_into");
+            assert_eq!(read, Some(3));
+            assert_eq!(&out, b"ylo");
         });
-        let mut out = [0_u8; 3];
-        let read = vfs.block_store_read_into(0xBB66, 2, &mut out);
-        assert_eq!(read, Some(3));
-        assert_eq!(&out, b"ylo");
 
         let calls_after = vfs
             .state
@@ -14702,25 +14720,17 @@ mod tests {
     }
 
     #[test]
-    fn full_block_materialization_policy_is_explicit() {
+    fn local_cache_read_into_async_returns_none_for_missing_block() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "full-block-materialization-policy");
-        let full_block = BlockRef::new_full(1, vfs.block_size);
-        assert!(
-            vfs.should_materialize_full_block_for_span(&full_block, vfs.block_size as usize),
-            "aligned full-block span should keep intentional full-block materialization path"
-        );
-        assert!(
-            !vfs.should_materialize_full_block_for_span(&full_block, 4096),
-            "sub-block spans should prefer direct read_into"
-        );
-
-        let mut shifted = BlockRef::new_full(2, vfs.block_size);
-        shifted.offset = 512;
-        assert!(
-            !vfs.should_materialize_full_block_for_span(&shifted, vfs.block_size as usize),
-            "non-zero block offsets should prefer direct read_into"
-        );
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "local-cache-read-into-missing");
+        rt.block_on(async {
+            let mut out = [0_u8; 8];
+            let read = vfs
+                .block_store_read_into_async(0xDEADBEEF, 0, &mut out)
+                .await
+                .expect("read_into should not error on cache miss");
+            assert_eq!(read, None);
+        });
     }
 
     #[test]
