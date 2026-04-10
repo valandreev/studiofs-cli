@@ -9345,7 +9345,12 @@ impl StudioVfs {
 
     /// Set file attributes (partial update).
     ///
-    /// Accepts `SetattrArgs` — any field set to `None`/`Omit` is left unchanged.
+    /// Accepts `SetattrArgs` - any field set to `None`/`Omit` is left unchanged.
+    ///
+    /// Size/EOF updates are synchronous metadata transitions. WinFSP
+    /// `overwrite` and `set_file_size` callbacks rely on the new size being
+    /// visible before the callback returns, so this path is not a deferred
+    /// flush barrier.
     pub fn setattr(&self, ino: Ino, args: SetattrArgs) -> VfsResult<InodeAttr> {
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
         if let Some(attr) = self.update_ignored_entry(ino, |attr| {
@@ -9801,6 +9806,14 @@ impl StudioVfs {
     ///
     /// If the inode was unlinked while this handle was open (orphan) and this
     /// was the last open handle, perform the deferred deletion now.
+    ///
+    /// This is also the mandatory last-handle drain point for local dirty
+    /// state. If a writable handle reaches release with dirty blocks or attrs
+    /// still pending, `release_fh` must flush them before the handle
+    /// disappears so later opens, open-unlink cleanup, and sticky-error
+    /// reporting all see a coherent inode. WinFSP non-delete `cleanup` may
+    /// choose to drain earlier, but correctness must not depend on that eager
+    /// callback barrier.
     pub async fn release_fh(&self, fh: u64) -> VfsResult<()> {
         let Some((open_file, remaining)) = self.handle_table.close(fh) else {
             debug!("release_fh: unknown fh={}", fh);
@@ -9918,6 +9931,11 @@ impl StudioVfs {
     /// Flush data for a file handle (per-fd close in POSIX).
     ///
     /// Called by FUSE `flush()`. Flushes pending writes for the inode.
+    ///
+    /// This is the explicit per-handle barrier used by FUSE and by WinFSP
+    /// callback paths that decide to make dirty state explicit while the handle
+    /// is still valid. Clean handles should return quickly; dirty handles must
+    /// persist current local state before success or error is reported.
     pub async fn flush_fh(&self, fh: u64) -> VfsResult<()> {
         if let Some(open_file) = self.handle_table.get(fh) {
             let ino = open_file.ino;
@@ -10386,6 +10404,11 @@ impl StudioVfs {
     /// If the file has open handles, the dentry is removed and nlink
     /// decremented, but the inode and blocks are kept alive (orphan).
     /// Actual cleanup happens in `release_fh()` when the last handle closes.
+    ///
+    /// WinFSP delete cleanup calls into this path because delete finalization
+    /// belongs in `Cleanup`. Namespace removal is synchronous here; block and
+    /// inode cleanup may defer to `release_fh()` only when open handles still
+    /// keep the orphan alive.
     pub fn unlink(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
         Self::run_sync_future(self.unlink_inner(parent, name))
     }
@@ -10502,6 +10525,10 @@ impl StudioVfs {
     }
 
     /// Remove a directory.
+    ///
+    /// WinFSP delete cleanup should finalize directory removal here; unlike
+    /// non-delete cleanup this namespace mutation is not a defer/coalesce
+    /// candidate.
     pub fn rmdir(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         if self.unlink_ignored_subtree(parent, name) || self.ignored_dir_attr(parent).is_some() {
@@ -11818,7 +11845,8 @@ impl StudioVfs {
     ///
     /// `write()` may have already coalesced and persisted some full blocks, but
     /// `flush()` is still the definitive "persist everything that is left"
-    /// barrier for the inode.
+    /// barrier for the inode. WinFSP file-scoped `Flush` relies on this
+    /// remaining a mandatory dirty-inode barrier.
     pub async fn flush(&self, ino: Ino) -> VfsResult<()> {
         let session = self
             .enter_file_session_op(ino, FileSessionOperation::Flush)

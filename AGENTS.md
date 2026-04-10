@@ -274,6 +274,23 @@ Tunable at runtime (see `crates/studiofs/src/cli/mount.rs` for full list):
 - Restrict **network access** to application servers
 - Enable **audit logging** for compliance
 
+## WinFSP Barrier Policy (SFS-197)
+
+Keep `crates/studiofs-winfsp/src/context.rs` and `crates/studiofs-vfs/src/vfs.rs`
+aligned on these rules whenever WinFSP callback sequencing changes:
+
+- `flush` for a file handle is a mandatory correctness barrier when the inode still has local dirty state. Repeated clean callbacks may short-circuit, and concurrent duplicate callbacks may coalesce per inode.
+- `cleanup` with `FspCleanupDelete` must finalize delete in cleanup. `set_delete`/`can_delete` only validate intent; they must not delete.
+- Non-delete `cleanup` is currently an eager foreground barrier that usually drains dirty state before `close`, but correctness must not rely on it alone because `release_fh` remains the mandatory last-handle dirty-state drain.
+- `close` is a release path, not an independent durability contract. It may observe and attribute the fallback release barrier when cleanup did not drain the inode first.
+- `overwrite` and `set_file_size` must publish the new EOF and attrs before returning; they are not backgroundable flush callbacks.
+- `release_fh` must persist any remaining local dirty state before the last handle disappears, including open-unlink/orphan lifecycles and sticky upload error reporting.
+
+Future defer/coalesce work may target non-delete `cleanup`, repeated clean callback
+paths, and duplicate concurrent callback barriers, but it must not weaken explicit
+`flush`, delete cleanup, overwrite/EOF transitions, or the VFS last-handle release
+guarantee.
+
 ## Agent-Specific Instructions
 
 ### For AI Code Assistants
