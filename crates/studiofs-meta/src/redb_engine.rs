@@ -6834,6 +6834,7 @@ impl MetaBlocks for RedbMetaEngine {
         chunk_slices: &[(ChunkId, Vec<crate::schema::SliceRecord>)],
     ) -> MetaResult<()> {
         self.flush_regular_file_overlay_slices_with_attr_txn(ino, chunk_slices, None)
+            .map(|_| ())
     }
 
     fn has_local_regular_file_overlay(&self, ino: Ino) -> MetaResult<bool> {
@@ -7346,7 +7347,7 @@ impl RedbMetaEngine {
         ino: Ino,
         chunk_slices: &[(ChunkId, Vec<crate::schema::SliceRecord>)],
         attr: Option<&InodeAttr>,
-    ) -> MetaResult<()> {
+    ) -> MetaResult<Option<InodeAttr>> {
         let txn = self
             .db
             .begin_write()
@@ -7490,7 +7491,7 @@ impl RedbMetaEngine {
 
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(())
+        Ok(normalized_attr)
     }
 
     fn flush_blocks_batch_with_attr_txn(
@@ -8339,7 +8340,7 @@ impl crate::engine::MetaEngine for RedbMetaEngine {
         ino: Ino,
         chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
         attr: Option<&InodeAttr>,
-    ) -> MetaResult<()> {
+    ) -> MetaResult<Option<InodeAttr>> {
         self.flush_regular_file_overlay_slices_with_attr_txn(ino, chunk_slices, attr)
     }
 }

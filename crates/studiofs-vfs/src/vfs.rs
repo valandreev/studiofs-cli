@@ -7517,20 +7517,6 @@ impl StudioVfs {
         Ok(())
     }
 
-    fn transition_upload_state_for_local_mutation(attr: &mut InodeAttr) {
-        if attr.kind != FileType::RegularFile {
-            attr.upload_state = MetaUploadState::Ready;
-            return;
-        }
-        if attr.content_epoch == attr.committed_content_epoch && attr.size == attr.committed_size {
-            attr.upload_state = MetaUploadState::Ready;
-        } else if attr.committed_size > 0 || attr.committed_content_epoch > 0 {
-            attr.upload_state = MetaUploadState::Updating;
-        } else {
-            attr.upload_state = MetaUploadState::Uploading;
-        }
-    }
-
     pub fn upload_stats(&self) -> VfsUploadStats {
         VfsUploadStats {
             pending_uploads: self.block_cache.pending_upload_count(),
