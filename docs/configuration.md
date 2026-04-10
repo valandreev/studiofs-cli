@@ -390,7 +390,7 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_READDIR_ATTR_BATCH_MAX_INODES` | `4096` | Max directory children hydrated into attr cache per `readdir` call |
 | `STUDIOFS_MAX_DRAIN_BATCH` | `1024` | Max dirty `WriteBuffer` blocks persisted per local drain cycle |
 | `STUDIOFS_FUSE_MAX_WRITE_BYTES` | `16777216` | FUSE kernel max single write request size (`fuser::KernelConfig::set_max_write`) |
-| `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` | `16777216` | FUSE kernel max readahead size (`fuser::KernelConfig::set_max_readahead`) |
+| `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` | `16777216` on Linux, `1048576` on macOS | FUSE kernel max readahead size (`fuser::KernelConfig::set_max_readahead`); higher overrides are clamped to the negotiated kernel/libfuse limit |
 | `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` | `1000` | WinFSP FileInfo metadata timeout; accepts milliseconds or `-1` / `max` for NT Cache Manager delegation |
 | `STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS` | `1000` | WinFSP DirInfo metadata timeout; accepts milliseconds or `-1` / `max` |
 | `STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS` | `1000` | WinFSP VolumeInfo metadata timeout; accepts milliseconds or `-1` / `max` |

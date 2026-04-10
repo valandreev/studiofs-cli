@@ -152,7 +152,7 @@ Current signature includes additional policy controls:
 | `auto_unmount` | Yes |
 | `allow_other` | Yes |
 | Kernel `max_write` | `16777216` bytes by default. Override: `STUDIOFS_FUSE_MAX_WRITE_BYTES` |
-| Kernel `max_readahead` | `16777216` bytes by default. Override: `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` |
+| Kernel `max_readahead` | `16777216` bytes on Linux, `1048576` bytes on macOS by default. Override: `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
 

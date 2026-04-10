@@ -26,6 +26,9 @@ use unicode_normalization::UnicodeNormalization;
 
 const TTL: Duration = Duration::from_secs(1);
 const DEFAULT_FUSE_MAX_WRITE_BYTES: u32 = 16 * 1024 * 1024;
+#[cfg(target_os = "macos")]
+const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 1024 * 1024;
+#[cfg(not(target_os = "macos"))]
 const DEFAULT_FUSE_MAX_READAHEAD_BYTES: u32 = 16 * 1024 * 1024;
 
 fn parse_bridge_u32_env(key: &str, default: u32) -> u32 {
@@ -1459,8 +1462,9 @@ impl KernelInvalidator for FuseKernelInvalidator {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_missing_xattr_error, missing_xattr_errno, normalize_unix_mode,
-        posix_flags_to_open_flags, should_log_fuse_invalidation_error, vfs_err_to_errno,
+        DEFAULT_FUSE_MAX_READAHEAD_BYTES, is_missing_xattr_error, missing_xattr_errno,
+        normalize_unix_mode, posix_flags_to_open_flags, should_log_fuse_invalidation_error,
+        vfs_err_to_errno,
     };
     #[cfg(target_os = "macos")]
     use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
@@ -1483,6 +1487,14 @@ mod tests {
         assert_eq!(normalize_unix_mode(0o40755), 0o755);
         assert_eq!(normalize_unix_mode(0o100644), 0o644);
         assert_eq!(normalize_unix_mode(0o100644 | 0o4000), 0o4644);
+    }
+
+    #[test]
+    fn default_fuse_max_readahead_matches_platform_expectation() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(DEFAULT_FUSE_MAX_READAHEAD_BYTES, 1024 * 1024);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(DEFAULT_FUSE_MAX_READAHEAD_BYTES, 16 * 1024 * 1024);
     }
 
     #[test]
