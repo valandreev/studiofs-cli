@@ -517,6 +517,86 @@ pub fn run(
                 )
             );
             println!(
+                "  sync barrier queue wait total/avg/max: {}/{}/{}",
+                format_ms(snapshot.block_store_sync_data.queue_wait_total_ms),
+                format_ms(snapshot.block_store_sync_data.queue_wait_avg_ms),
+                format_ms(snapshot.block_store_sync_data.queue_wait_max_ms)
+            );
+            println!(
+                "  sync barrier interval avg/max: {}/{}",
+                format_ms(snapshot.block_store_sync_data.barrier_interval_avg_ms),
+                format_ms(snapshot.block_store_sync_data.barrier_interval_max_ms)
+            );
+            println!(
+                "  payload bursts count/bytes: {}/{}",
+                snapshot.payload_burst.bursts,
+                format_bytes(snapshot.payload_burst.total_bytes)
+            );
+            println!(
+                "  payload burst avg bytes/max bytes: {}/{}",
+                format_bytes(snapshot.payload_burst.avg_bytes_per_burst as u64),
+                format_bytes(snapshot.payload_burst.max_bytes_per_burst)
+            );
+            println!(
+                "  payload burst avg blocks/max blocks: {:.2}/{}",
+                snapshot.payload_burst.avg_blocks_per_burst,
+                snapshot.payload_burst.max_blocks_per_burst
+            );
+            println!(
+                "  payload burst avg interval/max interval: {}/{}",
+                format_ms(snapshot.payload_burst.avg_interval_ms),
+                format_ms(snapshot.payload_burst.max_interval_ms)
+            );
+            println!(
+                "  payload persist calls/avg/max: {}/{}/{}",
+                snapshot.payload_persist.calls,
+                format_ms(snapshot.payload_persist.avg_ms),
+                format_ms(snapshot.payload_persist.max_ms)
+            );
+            println!(
+                "  payload persist p50/p95/p99: {}/{}/{}",
+                format_quantile_ms(
+                    snapshot.payload_persist.latency_quantiles_ms.p50,
+                    snapshot.payload_persist.latency_quantiles_saturated.p50
+                ),
+                format_quantile_ms(
+                    snapshot.payload_persist.latency_quantiles_ms.p95,
+                    snapshot.payload_persist.latency_quantiles_saturated.p95
+                ),
+                format_quantile_ms(
+                    snapshot.payload_persist.latency_quantiles_ms.p99,
+                    snapshot.payload_persist.latency_quantiles_saturated.p99
+                )
+            );
+            println!(
+                "  metadata commit calls/avg/max: {}/{}/{}",
+                snapshot.metadata_commit.calls,
+                format_ms(snapshot.metadata_commit.avg_ms),
+                format_ms(snapshot.metadata_commit.max_ms)
+            );
+            println!(
+                "  metadata commit p50/p95/p99: {}/{}/{}",
+                format_quantile_ms(
+                    snapshot.metadata_commit.latency_quantiles_ms.p50,
+                    snapshot.metadata_commit.latency_quantiles_saturated.p50
+                ),
+                format_quantile_ms(
+                    snapshot.metadata_commit.latency_quantiles_ms.p95,
+                    snapshot.metadata_commit.latency_quantiles_saturated.p95
+                ),
+                format_quantile_ms(
+                    snapshot.metadata_commit.latency_quantiles_ms.p99,
+                    snapshot.metadata_commit.latency_quantiles_saturated.p99
+                )
+            );
+            println!(
+                "  eager flush checks/triggered/empty/below-threshold: {}/{}/{}/{}",
+                snapshot.eager_flush.checks,
+                snapshot.eager_flush.triggered,
+                snapshot.eager_flush.skipped_empty,
+                snapshot.eager_flush.skipped_below_threshold
+            );
+            println!(
                 "  local_cache_io model/calls: {}/{}",
                 snapshot.local_cache_io.execution_model, snapshot.local_cache_io.calls
             );
@@ -665,6 +745,10 @@ mod tests {
             local_cache_io: Default::default(),
             winfsp_callbacks: Default::default(),
             write_backpressure: Default::default(),
+            payload_burst: Default::default(),
+            payload_persist: Default::default(),
+            metadata_commit: Default::default(),
+            eager_flush: Default::default(),
         };
         std::fs::write(&metrics_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
 

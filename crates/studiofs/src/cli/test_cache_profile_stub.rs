@@ -1,6 +1,6 @@
 use crate::cli::test_cache_profile_types::{TestCacheProfileMode, TestCacheProfileResult};
 use anyhow::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct TestCacheProfileSession;
 
@@ -9,6 +9,7 @@ impl TestCacheProfileSession {
         _mode: Option<TestCacheProfileMode>,
         _run_id: &str,
         _benchmark_mode: &str,
+        _write_path_observability_path: Option<PathBuf>,
     ) -> Result<Option<Self>> {
         Ok(None)
     }

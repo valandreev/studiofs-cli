@@ -3290,11 +3290,22 @@ pub fn run(
         ResolvedRunMode::DirectShim { .. } => "direct-shim",
         ResolvedRunMode::MountedE2E { .. } => "e2e",
     };
+    let write_path_observability_path = match &resolved_mode {
+        ResolvedRunMode::MountedE2E { cache_path, .. } => cache_path
+            .as_ref()
+            .map(|path| path.join("write_path_observability.json")),
+        ResolvedRunMode::DirectShim { .. } => None,
+    };
     let report_dir = json_output
         .as_ref()
         .and_then(|path| path.parent().map(Path::to_path_buf))
         .unwrap_or(std::env::current_dir().context("resolve current directory")?);
-    let profile_session = TestCacheProfileSession::start(profile, &run_id, benchmark_mode)?;
+    let profile_session = TestCacheProfileSession::start(
+        profile,
+        &run_id,
+        benchmark_mode,
+        write_path_observability_path,
+    )?;
 
     let rt = tokio::runtime::Runtime::new().context("create tokio runtime")?;
     let report = rt.block_on(async {

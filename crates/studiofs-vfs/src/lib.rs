@@ -32,7 +32,8 @@ pub use vfs::{
     NamespaceResolver, OpenFile, OpenFlags, StatFs, StudioVfs, VfsConfig, VfsConfigRaw,
     VfsConfigValidated, VfsError, VfsForegroundReadProtectionStats, VfsIngressLane,
     VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot, VfsResult, VfsUploadStats,
-    VfsWritePathBackpressureStats, VfsWritePathLatencyQuantilesMs,
-    VfsWritePathLatencyQuantilesSaturated, VfsWritePathObservabilitySnapshot,
-    VfsWritePathSyncDataStats, VfsWritePathWinfspCallbackStats,
+    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathEagerFlushStats,
+    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
+    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
+    VfsWritePathWinfspCallbackStats,
 };
