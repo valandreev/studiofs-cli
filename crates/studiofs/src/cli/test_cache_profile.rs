@@ -1,6 +1,7 @@
 use crate::cli::test_cache_profile_types::{
     ProfileArtifactReport, ProfileEndpointReport, TestCacheProfileMode, TestCacheProfileResult,
 };
+use crate::cli::utils::format_bytes;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use flate2::{Compression, write::GzEncoder};
@@ -17,6 +18,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use studiofs_vfs::VfsWritePathObservabilitySnapshot;
 
 const DEFAULT_APP_NAME: &str = "studiofs.test-cache";
 const DEFAULT_SAMPLE_RATE: u32 = 100;
@@ -111,6 +113,31 @@ impl TestCacheProfileSession {
                         bytes: bytes.len() as u64,
                         sent_to_endpoint: false,
                     });
+                    match render_write_path_summary(&bytes) {
+                        Ok(summary) => {
+                            let summary_bytes = summary.into_bytes();
+                            let summary_artifact = write_artifact(
+                                output_dir,
+                                &self.run_id,
+                                &self.benchmark_mode,
+                                "write-path-summary",
+                                "txt",
+                                &summary_bytes,
+                            )?;
+                            artifacts.push(ProfileArtifactReport {
+                                kind: "write-path-summary".to_string(),
+                                path: summary_artifact.display().to_string(),
+                                bytes: summary_bytes.len() as u64,
+                                sent_to_endpoint: false,
+                            });
+                        }
+                        Err(err) => {
+                            self.warnings.push(format!(
+                                "Failed to render write-path summary from '{}': {err}",
+                                metrics_path.display()
+                            ));
+                        }
+                    }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     self.warnings.push(format!(
@@ -335,6 +362,54 @@ fn gzip_bytes(input: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(input)?;
     Ok(encoder.finish()?)
+}
+
+fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
+    let snapshot: VfsWritePathObservabilitySnapshot =
+        serde_json::from_slice(bytes).context("parse write-path observability snapshot")?;
+    let mut out = String::new();
+    out.push_str(&format!("backend: {}\n", snapshot.backend_tag));
+    out.push_str(&format!(
+        "eager_flush_threshold: {}\n",
+        format_bytes(snapshot.tuning.eager_flush_threshold_bytes as u64)
+    ));
+    out.push_str(&format!(
+        "eager_flush_drain_chunk: {}\n",
+        format_bytes(snapshot.tuning.eager_flush_drain_chunk_bytes as u64)
+    ));
+    out.push_str(&format!(
+        "payload_put_concurrency: {}\n",
+        snapshot.tuning.payload_put_concurrency
+    ));
+    out.push_str(&format!(
+        "sync_group_min: {}\n",
+        format_bytes(snapshot.tuning.sync_group_min_bytes)
+    ));
+    out.push_str(&format!(
+        "sync_group_max_delay_ms: {}\n",
+        snapshot.tuning.sync_group_max_delay_ms
+    ));
+    out.push_str(&format!(
+        "payload_burst_avg: {}\n",
+        format_bytes(snapshot.payload_burst.avg_bytes_per_burst.round() as u64)
+    ));
+    out.push_str(&format!(
+        "payload_burst_max: {}\n",
+        format_bytes(snapshot.payload_burst.max_bytes_per_burst)
+    ));
+    out.push_str(&format!(
+        "payload_persist_p95_ms: {:.2}\n",
+        snapshot.payload_persist.latency_quantiles_ms.p95
+    ));
+    out.push_str(&format!(
+        "metadata_commit_p95_ms: {:.2}\n",
+        snapshot.metadata_commit.latency_quantiles_ms.p95
+    ));
+    out.push_str(&format!(
+        "sync_data_calls_per_gib: {:.2}\n",
+        snapshot.block_store_sync_data.calls_per_gib
+    ));
+    Ok(out)
 }
 
 fn send_profile(

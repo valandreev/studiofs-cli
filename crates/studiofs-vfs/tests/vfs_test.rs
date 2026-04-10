@@ -8986,7 +8986,7 @@ fn eager_full_block_write_with_offline_s3_keeps_data_locally_committed_and_queue
 }
 
 #[test]
-fn write_eager_flush_batches_full_blocks_until_threshold() {
+fn write_eager_flush_drains_a_bounded_chunk_after_threshold_crossed() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -9009,7 +9009,7 @@ fn write_eager_flush_batches_full_blocks_until_threshold() {
     rt.block_on(async {
         let vfs_config = VfsConfigRaw {
             max_dirty_bytes: Some(16 * 1024 * 1024),
-            write_eager_flush_batch_bytes: Some(block_size * 2),
+            write_eager_flush_batch_bytes: Some(block_size * 4),
             ..VfsConfigRaw::default()
         };
         let vfs = StudioVfs::new(
@@ -9031,6 +9031,8 @@ fn write_eager_flush_batches_full_blocks_until_threshold() {
             .unwrap();
         let first = vec![0x11u8; block_size];
         let second = vec![0x22u8; block_size];
+        let third = vec![0x33u8; block_size];
+        let fourth = vec![0x44u8; block_size];
 
         vfs.write(attr.ino, 0, &first).await.unwrap();
         assert!(
@@ -9051,19 +9053,32 @@ fn write_eager_flush_batches_full_blocks_until_threshold() {
         vfs.write(attr.ino, block_size as u64, &second)
             .await
             .unwrap();
+        vfs.write(attr.ino, (block_size * 2) as u64, &third)
+            .await
+            .unwrap();
+        vfs.write(attr.ino, (block_size * 3) as u64, &fourth)
+            .await
+            .unwrap();
         let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             2,
-            "crossing the eager-flush threshold should commit the accumulated full-block batch"
+            "crossing the eager-flush threshold should drain only the bounded eager chunk, not the whole accumulated batch"
         );
 
         let combined = vfs
-            .read(attr.ino, 0, (block_size * 2) as u32)
+            .read(attr.ino, 0, (block_size * 4) as u32)
             .await
             .unwrap();
         assert_eq!(&combined[..block_size], first.as_slice());
-        assert_eq!(&combined[block_size..], second.as_slice());
+        assert_eq!(&combined[block_size..(block_size * 2)], second.as_slice());
+        assert_eq!(&combined[(block_size * 2)..(block_size * 3)], third.as_slice());
+        assert_eq!(&combined[(block_size * 3)..], fourth.as_slice());
+        assert_eq!(
+            vfs.pending_uploads_for_inode(attr.ino).len(),
+            2,
+            "only the drained eager chunk should be enqueued for upload"
+        );
     });
     rt.shutdown_background();
 }

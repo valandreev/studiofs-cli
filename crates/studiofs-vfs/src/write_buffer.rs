@@ -1,6 +1,7 @@
 use super::*;
+use futures::stream::{FuturesUnordered, StreamExt};
 
-const BLOCK_STORE_PUT_PIPELINE_WIDTH: usize = 8;
+const ORDERED_PAYLOAD_PUT_PIPELINE_WIDTH: usize = 8;
 
 #[derive(Debug, Clone)]
 pub(super) struct PendingBlock {
@@ -37,6 +38,12 @@ struct PersistedWriteBlock {
     block_index: u32,
     object_id: u64,
     data: Bytes,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PayloadPersistConfig {
+    put_concurrency: usize,
+    local_sync_policy: LocalSyncPolicy,
 }
 
 pub(super) struct LocalSyncGroupState {
@@ -112,6 +119,55 @@ fn assign_reserved_object_ids(
         block.object_id = fresh_ids
             .next()
             .expect("missing fresh object id for write buffer block");
+    }
+}
+
+fn blocks_can_accept_more(selected_bytes: usize, next_block_bytes: usize, limit: usize) -> bool {
+    selected_bytes == 0 || selected_bytes.saturating_add(next_block_bytes) <= limit
+}
+
+async fn run_bounded_tasks<I, F, Fut, T, E>(
+    items: I,
+    concurrency: usize,
+    mut make_future: F,
+) -> Result<(), E>
+where
+    I: IntoIterator,
+    F: FnMut(I::Item) -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut items = items.into_iter();
+    let mut inflight = FuturesUnordered::new();
+    let max_inflight = concurrency.max(1);
+    let mut first_error = None;
+
+    while inflight.len() < max_inflight {
+        let Some(item) = items.next() else {
+            break;
+        };
+        inflight.push(make_future(item));
+    }
+
+    while let Some(result) = inflight.next().await {
+        match result {
+            Ok(_) => {
+                if first_error.is_none()
+                    && let Some(item) = items.next()
+                {
+                    inflight.push(make_future(item));
+                }
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -412,22 +468,25 @@ impl StudioVfs {
     async fn persist_payload_phase(
         &self,
         persisted_blocks: &[PersistedWriteBlock],
-        local_sync_policy: LocalSyncPolicy,
+        persist_config: PayloadPersistConfig,
     ) -> VfsResult<()> {
         let persisted_bytes: u64 = persisted_blocks.iter().map(|b| b.data.len() as u64).sum();
         let started = Instant::now();
         let result: VfsResult<()> = async {
-            for chunk in persisted_blocks.chunks(BLOCK_STORE_PUT_PIPELINE_WIDTH) {
-                let put_results = futures::future::join_all(chunk.iter().map(|block| {
-                    self.block_store_put_async(block.object_id, block.data.clone(), false)
-                }))
-                .await;
-                for result in put_results {
-                    result?;
-                }
-            }
-            self.maybe_block_store_sync_data_async(persisted_bytes, local_sync_policy)
-                .await?;
+            run_bounded_tasks(
+                persisted_blocks.iter().cloned(),
+                persist_config.put_concurrency,
+                |block| async move {
+                    self.block_store_put_async(block.object_id, block.data, false)
+                        .await
+                },
+            )
+            .await?;
+            self.maybe_block_store_sync_data_async(
+                persisted_bytes,
+                persist_config.local_sync_policy,
+            )
+            .await?;
             Ok(())
         }
         .await;
@@ -618,7 +677,7 @@ impl StudioVfs {
         dirty_chunk_slices: std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
         content_epoch: u64,
         attr_to_persist: Option<InodeAttr>,
-        local_sync_policy: LocalSyncPolicy,
+        persist_config: PayloadPersistConfig,
     ) -> VfsResult<Vec<PersistedWriteBlock>> {
         if blocks.is_empty() {
             // No payload to persist; commit the attr-only metadata phase so the
@@ -680,7 +739,7 @@ impl StudioVfs {
         // Write each block payload to the local block store and perform grouped
         // local sync. On failure, remove the block-store entries before returning.
         if let Err(error) = self
-            .persist_payload_phase(&persisted_blocks, local_sync_policy)
+            .persist_payload_phase(&persisted_blocks, persist_config)
             .await
         {
             self.cleanup_uncommitted_block_store_entries(ino, &persisted_blocks, "payload-persist")
@@ -844,10 +903,12 @@ impl StudioVfs {
     fn snapshot_dirty_full_write_buffer_blocks(
         &self,
         ino: Ino,
-    ) -> (Vec<DirtyWriteSnapshot>, usize) {
+        max_drain_bytes: Option<usize>,
+    ) -> (Vec<DirtyWriteSnapshot>, usize, usize) {
         let pending = self.state.write_buffer.pending_blocks.lock();
         let indexes = self.state.write_buffer.pending_block_indexes.lock();
-        let mut total_bytes = 0usize;
+        let mut total_available_bytes = 0usize;
+        let mut selected_bytes = 0usize;
         let blocks: Vec<_> = indexes
             .get(&ino)
             .into_iter()
@@ -857,15 +918,21 @@ impl StudioVfs {
                 if !pending.dirty || pending.data.len() < self.block_size as usize {
                     return None;
                 }
+                total_available_bytes = total_available_bytes.saturating_add(pending.data.len());
+                if let Some(limit) = max_drain_bytes
+                    && !blocks_can_accept_more(selected_bytes, pending.data.len(), limit)
+                {
+                    return None;
+                }
                 let data = pending.data.clone().freeze();
-                total_bytes += data.len();
+                selected_bytes = selected_bytes.saturating_add(data.len());
                 Some(DirtyWriteSnapshot {
                     block_index: *block_index,
                     data,
                 })
             })
             .collect();
-        (blocks, total_bytes)
+        (blocks, selected_bytes, total_available_bytes)
     }
 
     fn snapshot_dirty_write_buffer_chunk_slices(
@@ -1013,15 +1080,18 @@ impl StudioVfs {
         fallback_content_epoch: Option<u64>,
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<bool> {
-        let (full_blocks, full_block_batch_bytes) =
-            self.snapshot_dirty_full_write_buffer_blocks(ino);
+        let (full_blocks, _full_block_batch_bytes, total_full_block_bytes) = self
+            .snapshot_dirty_full_write_buffer_blocks(
+                ino,
+                Some(self.write_eager_flush_drain_chunk_bytes),
+            );
         if full_blocks.is_empty() {
             if track_eager_flush_outcomes {
                 self.note_eager_flush_outcome(EagerFlushOutcome::SkippedEmpty);
             }
             return Ok(false);
         }
-        if full_block_batch_bytes < minimum_batch_bytes {
+        if total_full_block_bytes < minimum_batch_bytes {
             if track_eager_flush_outcomes {
                 self.note_eager_flush_outcome(EagerFlushOutcome::SkippedBelowThreshold);
             }
@@ -1045,7 +1115,10 @@ impl StudioVfs {
                 chunk_slices,
                 content_epoch,
                 dirty_attr,
-                local_sync_policy,
+                PayloadPersistConfig {
+                    put_concurrency: self.payload_put_concurrency,
+                    local_sync_policy,
+                },
             )
             .await?;
         self.commit_persisted_write_buffer_blocks(ino, &persisted_blocks);
@@ -1411,7 +1484,10 @@ impl StudioVfs {
                 chunk_slices,
                 content_epoch,
                 dirty_attr,
-                local_sync_policy,
+                PayloadPersistConfig {
+                    put_concurrency: ORDERED_PAYLOAD_PUT_PIPELINE_WIDTH,
+                    local_sync_policy,
+                },
             )
             .await?;
         self.commit_persisted_write_buffer_blocks(ino, &persisted_blocks);
@@ -1450,6 +1526,10 @@ impl StudioVfs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     #[test]
     fn assign_reserved_object_ids_reuses_existing_ids_and_stores_new_ones() {
@@ -1524,5 +1604,47 @@ mod tests {
         let pending_block = pending.get(&(ino, 3)).unwrap();
         assert_eq!(pending_block.data.as_ref(), b"newer");
         assert_eq!(pending_block.reserved_object_id, None);
+    }
+
+    #[test]
+    fn run_bounded_tasks_stops_starting_new_work_after_first_error() {
+        let third_started = Arc::new(AtomicBool::new(false));
+        let third_started_flag = third_started.clone();
+        let (release_tx, release_rx) = futures::channel::oneshot::channel::<()>();
+        let release_rx = Arc::new(StdMutex::new(Some(release_rx)));
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            let _ = release_tx.send(());
+        });
+
+        let result = futures::executor::block_on(run_bounded_tasks([0u8, 1, 2], 2, move |item| {
+            let third_started_flag = third_started_flag.clone();
+            let release_rx = release_rx.clone();
+            async move {
+                match item {
+                    0 => Err("first failure"),
+                    1 => {
+                        let rx = release_rx
+                            .lock()
+                            .expect("release receiver lock")
+                            .take()
+                            .expect("release receiver only used once");
+                        let _ = rx.await;
+                        Ok::<(), &'static str>(())
+                    }
+                    2 => {
+                        third_started_flag.store(true, Ordering::Release);
+                        Ok::<(), &'static str>(())
+                    }
+                    _ => Ok::<(), &'static str>(()),
+                }
+            }
+        }));
+
+        assert_eq!(result, Err("first failure"));
+        assert!(
+            !third_started.load(Ordering::Acquire),
+            "the helper should drain already-started work after the first error without launching more tasks"
+        );
     }
 }
