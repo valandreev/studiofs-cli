@@ -827,14 +827,6 @@ impl StudioVfs {
         Ok(Some(read_context.prefetch_context()))
     }
 
-    pub(super) fn prefetch_read_context_from_attr(
-        &self,
-        ino: Ino,
-        attr: &InodeAttr,
-    ) -> PrefetchReadContext {
-        ReadRequestContext::from_attr(self, ino, attr.clone()).prefetch_context()
-    }
-
     pub(super) async fn read_prefetch_batch(&self, batch: PrefetchBatch) {
         let PrefetchBatch {
             ino,
