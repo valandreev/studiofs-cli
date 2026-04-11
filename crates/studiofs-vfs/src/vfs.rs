@@ -4437,10 +4437,57 @@ enum PrefetchWorkItem {
     Batch(PrefetchBatch),
 }
 
+#[derive(Debug, Clone)]
+struct ReadRequestContext {
+    attr: InodeAttr,
+    pending_content_epoch: Option<u64>,
+}
+
+impl ReadRequestContext {
+    fn from_attr(vfs: &StudioVfs, ino: Ino, attr: InodeAttr) -> Self {
+        let incarnation_state = vfs.refresh_inode_incarnation_state_from_attr(ino, &attr);
+        Self {
+            pending_content_epoch: incarnation_state
+                .pending_incarnation
+                .as_ref()
+                .map(|pending| pending.content_epoch),
+            attr,
+        }
+    }
+
+    fn placeholder_visible(&self, vfs: &StudioVfs, ino: Ino) -> bool {
+        vfs.remote_upload_placeholder_visible(ino, &self.attr)
+    }
+
+    fn read_len(&self, offset: u64, requested_len: usize) -> usize {
+        self.attr
+            .size
+            .min(offset.saturating_add(requested_len as u64))
+            .saturating_sub(offset) as usize
+    }
+
+    fn prefetch_context(&self) -> PrefetchReadContext {
+        PrefetchReadContext {
+            size: self.attr.size,
+            pending_content_epoch: self.pending_content_epoch,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PrefetchReadContext {
     size: u64,
     pending_content_epoch: Option<u64>,
+}
+
+impl PrefetchReadContext {
+    fn eof_block(&self, block_size: u32) -> Option<u32> {
+        if self.size == 0 {
+            None
+        } else {
+            Some(((self.size.saturating_sub(1)) / block_size.max(1) as u64) as u32)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -6430,6 +6477,12 @@ impl<'a> ReadPipeline<'a> {
 struct ReadMetadata {
     attr: InodeAttr,
     resolved_slices: Vec<studiofs_meta::schema::ResolvedSliceSpan>,
+}
+
+struct PreparedForegroundRead {
+    context: ReadRequestContext,
+    resolved_slices: Vec<studiofs_meta::schema::ResolvedSliceSpan>,
+    read_len: usize,
 }
 
 struct ReadMetadataResolver<'a> {
@@ -10854,8 +10907,8 @@ impl StudioVfs {
         }
 
         // Verify the inode exists
-        let attr = self.getattr(ino)?;
-        if self.remote_upload_placeholder_visible(ino, &attr) {
+        let read_context = ReadRequestContext::from_attr(self, ino, self.getattr(ino)?);
+        if read_context.placeholder_visible(self, ino) {
             return Err(VfsError::RemoteContentPending);
         }
 
@@ -10874,8 +10927,8 @@ impl StudioVfs {
 
         // Eager prefetch: when opening a regular file for reading, schedule
         // background prefetch of the first block to hide initial S3 latency.
-        if attr.kind == studiofs_meta::types::FileType::RegularFile
-            && attr.size > 0
+        if read_context.attr.kind == studiofs_meta::types::FileType::RegularFile
+            && read_context.attr.size > 0
             && (flags.contains(OpenFlags::RDONLY) || flags.contains(OpenFlags::RDWR))
         {
             let _ = self
@@ -10883,7 +10936,7 @@ impl StudioVfs {
                 .send(PrefetchWorkItem::Batch(PrefetchBatch::single(
                     ino,
                     0,
-                    Some(self.prefetch_read_context_from_attr(ino, &attr)),
+                    Some(read_context.prefetch_context()),
                 )));
         }
 
@@ -12183,31 +12236,30 @@ impl StudioVfs {
             let len = end.saturating_sub(offset) as usize;
             return Ok(Bytes::from(vec![0; len]));
         }
-        let attr = self.getattr_async(ino).await?;
-        if self.remote_upload_placeholder_visible(ino, &attr) {
+        let prepared = self
+            .prepare_foreground_read(ino, offset, size as usize)
+            .await?;
+        if prepared.context.placeholder_visible(self, ino) {
             return Err(VfsError::RemoteContentPending);
         }
-        self.refresh_inode_incarnation_state_from_attr(ino, &attr);
-        let end = (offset + size as u64).min(attr.size);
-        if offset >= end {
+        if prepared.read_len == 0 {
             if size > 0 && offset > 0 {
                 debug!(
                     ino,
                     offset,
                     size,
-                    attr_size = attr.size,
-                    attr_upload_state = ?attr.upload_state,
-                    attr_committed_size = attr.committed_size,
+                    attr_size = prepared.context.attr.size,
+                    attr_upload_state = ?prepared.context.attr.upload_state,
+                    attr_committed_size = prepared.context.attr.committed_size,
                     "read_ordered: early EOF (offset >= attr.size) — possible stale attr"
                 );
             }
             return Ok(Bytes::new());
         }
-        let effective_size = (end - offset) as usize;
-        let mut buf = vec![0u8; effective_size];
-        // Reuse low-level read helper directly to avoid nested session-gate
-        // acquisition from `read_into()`.
-        let written = self.read_into_impl(None, ino, offset, &mut buf).await?;
+        let mut buf = vec![0u8; prepared.read_len];
+        let written = self
+            .execute_prepared_foreground_read(None, ino, offset, &mut buf, &prepared)
+            .await?;
         buf.truncate(written as usize);
         Ok(Bytes::from(buf))
     }
@@ -12258,45 +12310,71 @@ impl StudioVfs {
         offset: u64,
         buffer: &mut [u8],
     ) -> VfsResult<u32> {
-        let (attr, resolved_slices) = self
-            .resolve_read_metadata_async(ino, offset, buffer.len() as u64)
+        let prepared = self
+            .prepare_foreground_read(ino, offset, buffer.len())
             .await?;
         self.enforce_access_async(ino, AccessLevel::ReadOnly)
             .await?;
-        if self.remote_upload_placeholder_visible(ino, &attr) {
+        if prepared.context.placeholder_visible(self, ino) {
             return Err(VfsError::RemoteContentPending);
         }
-        let incarnation_state = self.refresh_inode_incarnation_state_from_attr(ino, &attr);
-        let pending_content_epoch = incarnation_state
-            .pending_incarnation
-            .as_ref()
-            .map(|pending| pending.content_epoch);
-
-        let read_end = (offset + buffer.len() as u64).min(attr.size);
-        let read_len = read_end.saturating_sub(offset) as usize;
-        if read_len == 0 {
+        if prepared.read_len == 0 {
             if offset < (offset + buffer.len() as u64) && !buffer.is_empty() {
                 // Requested range is beyond attr.size — this is a legitimate
                 // EOF response, but warn when the request was not trivially at
                 // or past EOF so we can detect attr.size mismatches in logs.
                 let req_end = offset.saturating_add(buffer.len() as u64);
-                if req_end > 0 && attr.size < req_end {
+                if req_end > 0 && prepared.context.attr.size < req_end {
                     debug!(
                         ino,
                         offset,
                         requested_end = req_end,
-                        attr_size = attr.size,
-                        attr_upload_state = ?attr.upload_state,
-                        attr_committed_size = attr.committed_size,
-                        attr_content_epoch = attr.content_epoch,
-                        attr_committed_content_epoch = attr.committed_content_epoch,
+                        attr_size = prepared.context.attr.size,
+                        attr_upload_state = ?prepared.context.attr.upload_state,
+                        attr_committed_size = prepared.context.attr.committed_size,
+                        attr_content_epoch = prepared.context.attr.content_epoch,
+                        attr_committed_content_epoch = prepared.context.attr.committed_content_epoch,
                         "read_into_impl: returning 0 bytes because attr.size < requested end (possible stale attr.size)"
                     );
                 }
             }
             return Ok(0);
         }
-        let blocks_needed = self.calculate_blocks_needed(offset, read_len, attr.size);
+        let written = self
+            .execute_prepared_foreground_read(fh, ino, offset, buffer, &prepared)
+            .await?;
+        Ok(written as u32)
+    }
+
+    async fn prepare_foreground_read(
+        &self,
+        ino: Ino,
+        offset: u64,
+        requested_len: usize,
+    ) -> VfsResult<PreparedForegroundRead> {
+        let (attr, resolved_slices) = self
+            .resolve_read_metadata_async(ino, offset, requested_len as u64)
+            .await?;
+        let context = ReadRequestContext::from_attr(self, ino, attr);
+        let read_len = context.read_len(offset, requested_len);
+        Ok(PreparedForegroundRead {
+            context,
+            resolved_slices,
+            read_len,
+        })
+    }
+
+    async fn execute_prepared_foreground_read(
+        &self,
+        fh: Option<u64>,
+        ino: Ino,
+        offset: u64,
+        buffer: &mut [u8],
+        prepared: &PreparedForegroundRead,
+    ) -> VfsResult<usize> {
+        debug_assert!(prepared.read_len > 0);
+        let blocks_needed =
+            self.calculate_blocks_needed(offset, prepared.read_len, prepared.context.attr.size);
         let open_file = fh.and_then(|handle| self.handle_table.get(handle));
         let access = self.state.read.observe_read_access(
             open_file.as_ref(),
@@ -12314,26 +12392,35 @@ impl StudioVfs {
             self,
             ino,
             offset,
-            read_len as u64,
-            pending_content_epoch,
-            Some(resolved_slices.as_slice()),
+            prepared.read_len as u64,
+            prepared.context.pending_content_epoch,
+            Some(prepared.resolved_slices.as_slice()),
         );
         let written = read_pipeline.execute_into(buffer).await?;
 
         self.enqueue_prefetch_hint(ino, access.stream_id, access.policy, &blocks_needed);
         guard.record_bytes(written as u64);
-        Ok(written as u32)
+        Ok(written)
+    }
+
+    async fn resolve_prefetch_batch_context(
+        &self,
+        ino: Ino,
+        read_context: Option<PrefetchReadContext>,
+    ) -> VfsResult<Option<PrefetchReadContext>> {
+        if let Some(read_context) = read_context {
+            return Ok(Some(read_context));
+        }
+        let attr = self.getattr_async(ino).await?;
+        let read_context = ReadRequestContext::from_attr(self, ino, attr);
+        if read_context.placeholder_visible(self, ino) {
+            return Ok(None);
+        }
+        Ok(Some(read_context.prefetch_context()))
     }
 
     fn prefetch_read_context_from_attr(&self, ino: Ino, attr: &InodeAttr) -> PrefetchReadContext {
-        let incarnation_state = self.refresh_inode_incarnation_state_from_attr(ino, attr);
-        PrefetchReadContext {
-            size: attr.size,
-            pending_content_epoch: incarnation_state
-                .pending_incarnation
-                .as_ref()
-                .map(|pending| pending.content_epoch),
-        }
+        ReadRequestContext::from_attr(self, ino, attr.clone()).prefetch_context()
     }
 
     fn contiguous_prefetch_block_ranges(block_indices: &mut Vec<u32>) -> Vec<(u32, u32)> {
@@ -12626,21 +12713,18 @@ impl StudioVfs {
                 return Ok(());
             }
 
-            let context = match read_context {
-                Some(context) => context,
-                None => {
-                    let attr = self.getattr_async(ino).await?;
-                    if self.remote_upload_placeholder_visible(ino, &attr) {
-                        return Ok(());
-                    }
-                    self.prefetch_read_context_from_attr(ino, &attr)
-                }
+            let Some(context) = self
+                .resolve_prefetch_batch_context(ino, read_context)
+                .await?
+            else {
+                return Ok(());
             };
             if context.size == 0 {
                 return Ok(());
             }
-            let eof_block =
-                ((context.size.saturating_sub(1)) / self.block_size.max(1) as u64) as u32;
+            let Some(eof_block) = context.eof_block(self.block_size) else {
+                return Ok(());
+            };
             block_indices.retain(|block_idx| *block_idx <= eof_block);
             if block_indices.is_empty() {
                 return Ok(());
@@ -17216,6 +17300,73 @@ mod tests {
             !vfs.handle_table.take_orphan(ino),
             "sync inode-not-found should clear orphan bookkeeping"
         );
+    }
+
+    #[test]
+    fn remote_upload_placeholder_visible_requires_absent_local_overlay() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "remote-upload-placeholder-visibility");
+        let ino = 9_201;
+        let mut attr = InodeAttr::new_file(ino, ROOT_INO, 1000, 1000, 0o644);
+        attr.upload_state = MetaUploadState::Uploading;
+        attr.size = 0;
+        attr.committed_size = 0;
+
+        assert!(
+            vfs.remote_upload_placeholder_visible(ino, &attr),
+            "zero-sized uploading regular files without local state should surface the remote placeholder"
+        );
+
+        vfs.state.write_buffer.pending_blocks.lock().insert(
+            (ino, 0),
+            PendingBlock {
+                data: BytesMut::from(&b"local"[..]),
+                dirty: true,
+                reserved_object_id: None,
+            },
+        );
+
+        assert!(
+            !vfs.remote_upload_placeholder_visible(ino, &attr),
+            "local overlay state must suppress the remote placeholder so reads stay locally visible"
+        );
+    }
+
+    #[test]
+    fn prefetch_read_context_from_attr_uses_pending_content_epoch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "prefetch-read-context-pending-epoch");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(ROOT_INO, b"prefetch-pending-epoch.bin", 1000, 1000, 0o644)
+                .expect("create file");
+            vfs.write(created.ino, 0, b"pending epoch")
+                .await
+                .expect("stage dirty write");
+
+            let pending_attr = vfs.getattr(created.ino).expect("load pending attr");
+            let expected_pending_epoch = vfs
+                .refresh_inode_incarnation_state_from_attr(created.ino, &pending_attr)
+                .pending_incarnation
+                .as_ref()
+                .map(|pending| pending.content_epoch);
+            let read_context = vfs.prefetch_read_context_from_attr(created.ino, &pending_attr);
+
+            assert!(
+                expected_pending_epoch.is_some(),
+                "dirty writes should produce a pending content epoch for the prefetch context"
+            );
+            assert_eq!(
+                read_context.pending_content_epoch,
+                expected_pending_epoch,
+                "prefetch context should carry the refreshed pending content epoch so prefetch sees the current local incarnation"
+            );
+            assert_eq!(
+                read_context.size, pending_attr.size,
+                "prefetch context should preserve the attr size used to compute EOF bounds"
+            );
+        });
     }
 
     #[test]
