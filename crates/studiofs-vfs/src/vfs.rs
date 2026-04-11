@@ -4241,7 +4241,70 @@ impl ReadRange {
     }
 }
 
-type PendingUploadIndex = HashMap<(Ino, u64), Vec<PendingUpload>>;
+#[derive(Debug, Clone, Default)]
+struct PendingUploadCatalog {
+    by_block: HashMap<(Ino, u64), Vec<PendingUpload>>,
+}
+
+impl PendingUploadCatalog {
+    fn from_ops(ops: impl IntoIterator<Item = PendingUpload>) -> Self {
+        let mut catalog = Self::default();
+        for op in ops {
+            catalog.insert(op);
+        }
+        catalog
+    }
+
+    fn insert(&mut self, op: PendingUpload) {
+        self.by_block
+            .entry((op.ino, op.offset))
+            .or_default()
+            .push(op);
+    }
+
+    fn latest_extent_record(
+        &self,
+        ino: Ino,
+        offset: u64,
+        pending_content_epoch: Option<u64>,
+    ) -> Option<ExtentRecordId> {
+        self.by_block
+            .get(&(ino, offset))
+            .and_then(|ops| Self::latest_matching_op(ops, pending_content_epoch))
+            .map(|op| ExtentRecordId {
+                object_id: op.object_id,
+                content_epoch: op.content_epoch,
+            })
+    }
+
+    fn live_extents(
+        &self,
+        block_size: u32,
+        quarantined_inodes: &HashSet<Ino>,
+    ) -> Vec<(Ino, u32, u64, u64)> {
+        let mut live_extents = Vec::new();
+        for (&(ino, offset), ops) in &self.by_block {
+            if quarantined_inodes.contains(&ino) || offset % block_size as u64 != 0 {
+                continue;
+            }
+            let Some(op) = Self::latest_matching_op(ops, None) else {
+                continue;
+            };
+            let block_index = (offset / block_size as u64) as u32;
+            live_extents.push((ino, block_index, op.object_id, op.content_epoch));
+        }
+        live_extents
+    }
+
+    fn latest_matching_op(
+        ops: &[PendingUpload],
+        pending_content_epoch: Option<u64>,
+    ) -> Option<&PendingUpload> {
+        ops.iter()
+            .filter(|op| pending_content_epoch.is_none_or(|epoch| op.content_epoch == epoch))
+            .max_by_key(|op| (op.content_epoch, op.created_unix_ms, op.object_id))
+    }
+}
 
 #[derive(Debug, Clone)]
 enum ReadPlanSource {
@@ -5041,17 +5104,8 @@ impl StudioVfs {
         pending_uploads: &[PendingUpload],
         quarantined_inodes: &HashSet<Ino>,
     ) {
-        let mut live_extents = Vec::new();
-        for op in pending_uploads {
-            if quarantined_inodes.contains(&op.ino) {
-                continue;
-            }
-            if op.offset % self.block_size as u64 != 0 {
-                continue;
-            }
-            let block_index = (op.offset / self.block_size as u64) as u32;
-            live_extents.push((op.ino, block_index, op.object_id, op.content_epoch));
-        }
+        let live_extents = PendingUploadCatalog::from_ops(pending_uploads.iter().cloned())
+            .live_extents(self.block_size, quarantined_inodes);
         self.record_live_extents(&live_extents);
     }
 
@@ -6604,12 +6658,8 @@ impl StudioVfs {
             })
     }
 
-    fn snapshot_pending_upload_index(&self) -> PendingUploadIndex {
-        let mut index = PendingUploadIndex::new();
-        for op in self.block_cache.snapshot_pending_uploads() {
-            index.entry((op.ino, op.offset)).or_default().push(op);
-        }
-        index
+    fn snapshot_pending_upload_index(&self) -> PendingUploadCatalog {
+        PendingUploadCatalog::from_ops(self.block_cache.snapshot_pending_uploads())
     }
 
     fn pending_live_extent_record(
@@ -6617,7 +6667,7 @@ impl StudioVfs {
         ino: Ino,
         block_index: u32,
         pending_content_epoch: Option<u64>,
-        pending_upload_index: Option<&PendingUploadIndex>,
+        pending_upload_index: Option<&PendingUploadCatalog>,
     ) -> Option<ExtentRecordId> {
         if let Some(extent) = self
             .state
@@ -6634,30 +6684,10 @@ impl StudioVfs {
 
         let block_offset = (block_index as u64).saturating_mul(self.block_size as u64);
         let recovered = if let Some(pending_uploads) = pending_upload_index {
-            pending_uploads
-                .get(&(ino, block_offset))
-                .and_then(|ops| {
-                    ops.iter().find(|op| {
-                        pending_content_epoch.is_none_or(|epoch| op.content_epoch == epoch)
-                    })
-                })
-                .map(|op| ExtentRecordId {
-                    object_id: op.object_id,
-                    content_epoch: op.content_epoch,
-                })
+            pending_uploads.latest_extent_record(ino, block_offset, pending_content_epoch)
         } else {
-            self.block_cache
-                .snapshot_pending_uploads()
-                .into_iter()
-                .find(|op| {
-                    op.ino == ino
-                        && op.offset == block_offset
-                        && pending_content_epoch.is_none_or(|epoch| op.content_epoch == epoch)
-                })
-                .map(|op| ExtentRecordId {
-                    object_id: op.object_id,
-                    content_epoch: op.content_epoch,
-                })
+            PendingUploadCatalog::from_ops(self.block_cache.snapshot_pending_uploads())
+                .latest_extent_record(ino, block_offset, pending_content_epoch)
         }?;
 
         self.state
@@ -6673,7 +6703,7 @@ impl StudioVfs {
         ino: Ino,
         block_index: u32,
         pending_content_epoch: Option<u64>,
-        pending_upload_index: Option<&PendingUploadIndex>,
+        pending_upload_index: Option<&PendingUploadCatalog>,
     ) -> Option<PendingOverlayBlockSource> {
         // Stage 1 — WriteBuffer: newest local bytes not yet represented by
         // committed local-backend metadata.
@@ -6703,7 +6733,7 @@ impl StudioVfs {
         ino: Ino,
         block_index: u32,
         pending_content_epoch: Option<u64>,
-        pending_upload_index: Option<&PendingUploadIndex>,
+        pending_upload_index: Option<&PendingUploadCatalog>,
     ) -> VfsResult<Option<Bytes>> {
         let Some(source) = self.pending_overlay_block_source(
             ino,
@@ -6724,7 +6754,7 @@ impl StudioVfs {
         ino: Ino,
         block_index: u32,
         pending_content_epoch: Option<u64>,
-        pending_upload_index: Option<&PendingUploadIndex>,
+        pending_upload_index: Option<&PendingUploadCatalog>,
     ) -> VfsResult<Option<Bytes>> {
         let Some(source) = self.pending_overlay_block_source(
             ino,
@@ -13715,6 +13745,45 @@ mod tests {
         .expect("create vfs");
         vfs.start().expect("start vfs background workers");
         (rt, vfs, meta)
+    }
+
+    #[test]
+    fn pending_live_extent_record_prefers_latest_pending_upload_for_block() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "pending-live-latest");
+        let ino = 41;
+        let block_index = 0;
+        let block_offset = 0;
+        let pending_upload_index = PendingUploadCatalog::from_ops([
+            PendingUpload {
+                ino,
+                offset: block_offset,
+                object_id: 101,
+                content_epoch: 3,
+                created_unix_ms: 100,
+                retry_count: 0,
+            },
+            PendingUpload {
+                ino,
+                offset: block_offset,
+                object_id: 202,
+                content_epoch: 5,
+                created_unix_ms: 200,
+                retry_count: 0,
+            },
+        ]);
+
+        let recovered = vfs
+            .pending_live_extent_record(ino, block_index, None, Some(&pending_upload_index))
+            .expect("recover pending live extent");
+
+        assert_eq!(
+            recovered,
+            ExtentRecordId {
+                object_id: 202,
+                content_epoch: 5,
+            }
+        );
     }
 
     #[test]

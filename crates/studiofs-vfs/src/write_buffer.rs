@@ -1167,7 +1167,7 @@ impl StudioVfs {
         ino: Ino,
         block_index: u32,
         object_id: u64,
-        pending_upload_index: Option<&PendingUploadIndex>,
+        pending_upload_index: Option<&PendingUploadCatalog>,
     ) -> VfsResult<Option<Bytes>> {
         let pending_content_epoch = self.pending_content_epoch_for_inode(ino);
         if let Some(data) = self.read_pending_overlay_block_sync(
@@ -1211,7 +1211,7 @@ impl StudioVfs {
         &self,
         ino: Ino,
         block_index: u32,
-        pending_upload_index: Option<&PendingUploadIndex>,
+        pending_upload_index: Option<&PendingUploadCatalog>,
     ) -> VfsResult<Option<Bytes>> {
         let pending_content_epoch = self.pending_content_epoch_for_inode(ino);
         if let Some(data) = self
