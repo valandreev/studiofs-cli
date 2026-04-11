@@ -4014,6 +4014,22 @@ impl ReadState {
         self.prefetch_last_hint.lock().remove(&(ino, stream_id));
     }
 
+    fn record_prefetch_hint_range(
+        &self,
+        ino: Ino,
+        stream_id: u64,
+        range: PrefetchHintRange,
+    ) -> bool {
+        let mut last_hints = self.prefetch_last_hint.lock();
+        match range.update_against(last_hints.get(&(ino, stream_id)).copied()) {
+            PrefetchHintUpdate::Suppress => false,
+            PrefetchHintUpdate::Store(stored) => {
+                last_hints.insert((ino, stream_id), stored.as_stored());
+                true
+            }
+        }
+    }
+
     fn active_access_counts(&self) -> [u64; AccessClass::COUNT] {
         std::array::from_fn(|idx| {
             let class = AccessClass::from_index(idx).expect("valid access class index");
@@ -4474,6 +4490,50 @@ impl ReadRequestContext {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrefetchHintRange {
+    first_block: u32,
+    last_block: u32,
+}
+
+enum PrefetchHintUpdate {
+    Suppress,
+    Store(PrefetchHintRange),
+}
+
+impl PrefetchHintRange {
+    fn from_blocks_needed(blocks_needed: &[(u32, usize, usize)]) -> Option<Self> {
+        let first_block = blocks_needed.first().map(|entry| entry.0)?;
+        let last_block = blocks_needed.last().map(|entry| entry.0)?;
+        Some(Self {
+            first_block,
+            last_block,
+        })
+    }
+
+    fn as_stored(self) -> (u32, u32) {
+        (self.first_block, self.last_block)
+    }
+
+    fn update_against(self, previous: Option<(u32, u32)>) -> PrefetchHintUpdate {
+        let Some((prev_first, prev_last)) = previous else {
+            return PrefetchHintUpdate::Store(self);
+        };
+        if self.first_block >= prev_first && self.last_block <= prev_last {
+            return PrefetchHintUpdate::Suppress;
+        }
+        if self.first_block <= prev_last.saturating_add(1)
+            && prev_first <= self.last_block.saturating_add(1)
+        {
+            return PrefetchHintUpdate::Store(Self {
+                first_block: prev_first.min(self.first_block),
+                last_block: prev_last.max(self.last_block),
+            });
+        }
+        PrefetchHintUpdate::Store(self)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PrefetchReadContext {
     size: u64,
@@ -4486,6 +4546,154 @@ impl PrefetchReadContext {
             None
         } else {
             Some(((self.size.saturating_sub(1)) / block_size.max(1) as u64) as u32)
+        }
+    }
+}
+
+struct PrefetchHintPlanner<'a> {
+    vfs: &'a StudioVfs,
+    ino: Ino,
+    stream_id: u64,
+    first_block: u32,
+    last_block: u32,
+    policy: AccessPolicy,
+}
+
+impl<'a> PrefetchHintPlanner<'a> {
+    fn new(
+        vfs: &'a StudioVfs,
+        ino: Ino,
+        stream_id: u64,
+        first_block: u32,
+        last_block: u32,
+        policy: AccessPolicy,
+    ) -> Self {
+        Self {
+            vfs,
+            ino,
+            stream_id,
+            first_block,
+            last_block,
+            policy,
+        }
+    }
+
+    fn plan_batches(&self) -> Vec<PrefetchBatch> {
+        if self.vfs.shutdown_requested()
+            || !self.policy.prefetch_enabled
+            || self.vfs.readahead.width == 0
+        {
+            return Vec::new();
+        }
+        let Some(read_context) = self.resolve_read_context() else {
+            return Vec::new();
+        };
+        let (to_prefetch, siblings) = self.record_prefetch_sources();
+        if self
+            .vfs
+            .fetch_scheduler
+            .recent_send_error(self.vfs.prefetch_pause_on_neterr)
+        {
+            return Vec::new();
+        }
+        let mut budget = self.available_budget();
+        if budget == 0 {
+            return Vec::new();
+        }
+
+        let primary_blocks = Self::primary_blocks_within_budget(
+            to_prefetch,
+            read_context.eof_block(self.vfs.block_size),
+            &mut budget,
+        );
+        let mut planned = Vec::new();
+        if !primary_blocks.is_empty() {
+            planned.push(PrefetchBatch::new(
+                self.ino,
+                primary_blocks,
+                Some(read_context),
+            ));
+        }
+        self.append_sibling_batches(&mut planned, siblings, &mut budget);
+        planned
+    }
+
+    fn resolve_read_context(&self) -> Option<PrefetchReadContext> {
+        match self.vfs.sync_meta().get_attr(self.ino) {
+            Ok(attr) => Some(self.vfs.prefetch_read_context_from_attr(self.ino, &attr)),
+            Err(MetaError::InodeNotFound(_)) => {
+                self.clear_stale_stream_state();
+                None
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn clear_stale_stream_state(&self) {
+        self.vfs.readahead.evict(self.ino);
+        self.vfs
+            .state
+            .read
+            .clear_prefetch_hint_for_stream(self.ino, self.stream_id);
+    }
+
+    fn record_prefetch_sources(&self) -> (Vec<u32>, Vec<Ino>) {
+        let to_prefetch = self.vfs.readahead.record_read_for_stream(
+            ReadStreamKey {
+                ino: self.ino,
+                stream_id: self.stream_id,
+            },
+            self.first_block,
+            self.last_block,
+            self.policy.readahead_policy(),
+        );
+        let siblings = self.vfs.dir_prefetch.on_child_read(self.ino);
+        (to_prefetch, siblings)
+    }
+
+    fn available_budget(&self) -> usize {
+        let window = self.vfs.fetch_scheduler.window().floor().max(1.0) as usize;
+        let in_flight = self.vfs.fetch_scheduler.in_flight();
+        let available = window.saturating_sub(in_flight);
+        let cycle_cap = self.vfs.prefetch_max_per_cycle.max(window / 2).max(1);
+        available
+            .saturating_sub(self.vfs.prefetch_foreground_reserve)
+            .min(cycle_cap)
+    }
+
+    fn primary_blocks_within_budget(
+        to_prefetch: Vec<u32>,
+        eof_block: Option<u32>,
+        budget: &mut usize,
+    ) -> Vec<u32> {
+        let mut primary_blocks = Vec::new();
+        for block_idx in to_prefetch {
+            if *budget == 0 {
+                break;
+            }
+            if let Some(max_block) = eof_block
+                && block_idx > max_block
+            {
+                continue;
+            }
+            primary_blocks.push(block_idx);
+            *budget = budget.saturating_sub(1);
+        }
+        primary_blocks
+    }
+
+    fn append_sibling_batches(
+        &self,
+        planned: &mut Vec<PrefetchBatch>,
+        siblings: Vec<Ino>,
+        budget: &mut usize,
+    ) {
+        for sibling_ino in siblings.into_iter().take(self.vfs.dir_prefetch_max_batch) {
+            if *budget == 0 {
+                break;
+            }
+            planned.push(PrefetchBatch::single(sibling_ino, 0, None));
+            *budget = budget.saturating_sub(1);
         }
     }
 }
@@ -12548,40 +12756,24 @@ impl StudioVfs {
         if !policy.prefetch_enabled {
             self.state
                 .read
-                .prefetch_last_hint
-                .lock()
-                .remove(&(ino, stream_id));
+                .clear_prefetch_hint_for_stream(ino, stream_id);
             return;
         }
-        let first_block = blocks_needed[0].0;
-        let last_block = blocks_needed.last().unwrap().0;
+        let Some(range) = PrefetchHintRange::from_blocks_needed(blocks_needed) else {
+            return;
+        };
+        if !self
+            .state
+            .read
+            .record_prefetch_hint_range(ino, stream_id, range)
         {
-            let mut last_hints = self.state.read.prefetch_last_hint.lock();
-            if let Some((prev_first, prev_last)) = last_hints.get(&(ino, stream_id)).copied() {
-                // Suppress redundant hints fully covered by the previous range.
-                if first_block >= prev_first && last_block <= prev_last {
-                    return;
-                }
-                // Merge overlapping/adjacent ranges to reduce hint churn.
-                if first_block <= prev_last.saturating_add(1)
-                    && prev_first <= last_block.saturating_add(1)
-                {
-                    last_hints.insert(
-                        (ino, stream_id),
-                        (prev_first.min(first_block), prev_last.max(last_block)),
-                    );
-                } else {
-                    last_hints.insert((ino, stream_id), (first_block, last_block));
-                }
-            } else {
-                last_hints.insert((ino, stream_id), (first_block, last_block));
-            }
+            return;
         }
         let _ = self.prefetch_tx.send(PrefetchWorkItem::ReadHint {
             ino,
             stream_id,
-            first_block,
-            last_block,
+            first_block: range.first_block,
+            last_block: range.last_block,
             policy,
         });
     }
@@ -12596,88 +12788,8 @@ impl StudioVfs {
         last_block: u32,
         policy: AccessPolicy,
     ) -> Vec<PrefetchBatch> {
-        if self.shutdown_requested() || !policy.prefetch_enabled || self.readahead.width == 0 {
-            return Vec::new();
-        }
-        // Ignore stale hints for inodes that no longer exist.
-        let attr = match self.sync_meta().get_attr(ino) {
-            Ok(attr) => attr,
-            Err(MetaError::InodeNotFound(_)) => {
-                self.readahead.evict(ino);
-                self.state
-                    .read
-                    .prefetch_last_hint
-                    .lock()
-                    .remove(&(ino, stream_id));
-                return Vec::new();
-            }
-            Err(_) => return Vec::new(),
-        };
-        let read_context = self.prefetch_read_context_from_attr(ino, &attr);
-        let eof_block = if read_context.size == 0 {
-            None
-        } else {
-            Some(((read_context.size.saturating_sub(1)) / self.block_size.max(1) as u64) as u32)
-        };
-        // Keep ReadAhead state consistent even when prefetch budget is zero.
-        let to_prefetch = self.readahead.record_read_for_stream(
-            ReadStreamKey { ino, stream_id },
-            first_block,
-            last_block,
-            policy.readahead_policy(),
-        );
-        // Keep directory-level access state in sync regardless of budget.
-        let siblings = self.dir_prefetch.on_child_read(ino);
-        // After transient transport failures, pause best-effort prefetch briefly
-        // so foreground demand reads can recover the pipeline first.
-        if self
-            .fetch_scheduler
-            .recent_send_error(self.prefetch_pause_on_neterr)
-        {
-            return Vec::new();
-        }
-        // Keep headroom for foreground reads: cap best-effort prefetch by
-        // current fetch window and in-flight load.
-        let window = self.fetch_scheduler.window().floor().max(1.0) as usize;
-        let in_flight = self.fetch_scheduler.in_flight();
-        let available = window.saturating_sub(in_flight);
-        let cycle_cap = self.prefetch_max_per_cycle.max(window / 2).max(1);
-        let mut budget = available
-            .saturating_sub(self.prefetch_foreground_reserve)
-            .min(cycle_cap);
-        if budget == 0 {
-            return Vec::new();
-        }
-
-        let mut primary_blocks = Vec::new();
-        for block_idx in to_prefetch {
-            if budget == 0 {
-                break;
-            }
-            if let Some(max_block) = eof_block
-                && block_idx > max_block
-            {
-                continue;
-            }
-            primary_blocks.push(block_idx);
-            budget = budget.saturating_sub(1);
-        }
-
-        let mut planned = Vec::new();
-        if !primary_blocks.is_empty() {
-            planned.push(PrefetchBatch::new(ino, primary_blocks, Some(read_context)));
-        }
-
-        // Directory-level prefetch: if this child is in a tracked directory
-        // and the threshold is met, prefetch block 0 of sibling files.
-        for sibling_ino in siblings.into_iter().take(self.dir_prefetch_max_batch) {
-            if budget == 0 {
-                break;
-            }
-            planned.push(PrefetchBatch::single(sibling_ino, 0, None));
-            budget = budget.saturating_sub(1);
-        }
-        planned
+        PrefetchHintPlanner::new(self, ino, stream_id, first_block, last_block, policy)
+            .plan_batches()
     }
 
     async fn get_file_block_async(
@@ -17367,6 +17479,89 @@ mod tests {
                 "prefetch context should preserve the attr size used to compute EOF bounds"
             );
         });
+    }
+
+    #[test]
+    fn enqueue_prefetch_hint_merges_adjacent_ranges_and_suppresses_covered_ranges() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-hint-range-merge");
+        let ino = 9_301;
+        let stream_id = 77;
+        let policy =
+            AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_classifier);
+
+        vfs.enqueue_prefetch_hint(ino, stream_id, policy, &[(2, 0, 1), (3, 0, 1)]);
+        assert_eq!(
+            vfs.state
+                .read
+                .prefetch_last_hint
+                .lock()
+                .get(&(ino, stream_id)),
+            Some(&(2, 3)),
+            "first hint should record the observed block range"
+        );
+
+        vfs.enqueue_prefetch_hint(ino, stream_id, policy, &[(4, 0, 1)]);
+        assert_eq!(
+            vfs.state
+                .read
+                .prefetch_last_hint
+                .lock()
+                .get(&(ino, stream_id)),
+            Some(&(2, 4)),
+            "adjacent hints should merge to reduce prefetch hint churn"
+        );
+
+        vfs.enqueue_prefetch_hint(ino, stream_id, policy, &[(3, 0, 1)]);
+        assert_eq!(
+            vfs.state
+                .read
+                .prefetch_last_hint
+                .lock()
+                .get(&(ino, stream_id)),
+            Some(&(2, 4)),
+            "fully covered hints should be suppressed without shrinking the remembered range"
+        );
+    }
+
+    #[test]
+    fn plan_prefetch_batches_from_hint_clears_stale_hint_for_missing_inode() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-planner-missing-inode");
+        let ino = 9_302;
+        let stream_id = 88;
+        let key = ReadStreamKey { ino, stream_id };
+        let policy =
+            AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_classifier);
+
+        let _ = vfs
+            .readahead
+            .record_read_for_stream(key, 0, 0, policy.readahead_policy());
+        vfs.state
+            .read
+            .prefetch_last_hint
+            .lock()
+            .insert((ino, stream_id), (0, 2));
+        assert!(vfs.readahead.debug_has_stream(key));
+
+        let planned = vfs.plan_prefetch_batches_from_hint(ino, stream_id, 0, 2, policy);
+
+        assert!(
+            planned.is_empty(),
+            "stale missing inodes should not produce prefetch work items"
+        );
+        assert!(
+            !vfs.state
+                .read
+                .prefetch_last_hint
+                .lock()
+                .contains_key(&(ino, stream_id)),
+            "missing inodes should clear the remembered hint range for the stream"
+        );
+        assert!(
+            !vfs.readahead.debug_has_stream(key),
+            "missing inodes should evict stale readahead state for the stream"
+        );
     }
 
     #[test]
