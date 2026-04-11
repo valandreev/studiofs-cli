@@ -47,6 +47,7 @@ use opendal::options::WriteOptions;
 use opendal::{Buffer, EntryMode, ErrorKind, Operator};
 use parking_lot::{Condvar, Mutex, RwLock};
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -4030,6 +4031,7 @@ impl PrefetchBatch {
     }
 }
 
+#[derive(Debug)]
 struct StartupChannels {
     prefetch_rx: tokio::sync::mpsc::UnboundedReceiver<PrefetchWorkItem>,
     upload_rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>,
@@ -4072,6 +4074,198 @@ impl StartupState {
             lifecycle_notify: Condvar::new(),
             metadata_invalidation_sync_interval,
         }
+    }
+
+    fn claim_channels_for_start(&self) -> VfsResult<Option<StartupChannels>> {
+        let mut lifecycle = self.lifecycle.lock();
+        loop {
+            match lifecycle.status {
+                StartupStatus::Running => return Ok(None),
+                StartupStatus::Failed => {
+                    return Err(VfsError::Other(
+                        "StudioVfs background worker startup previously failed".to_string(),
+                    ));
+                }
+                StartupStatus::Starting => self.lifecycle_notify.wait(&mut lifecycle),
+                StartupStatus::Uninitialized => {
+                    lifecycle.status = StartupStatus::Starting;
+                    match lifecycle.channels.take() {
+                        Some(channels) => return Ok(Some(channels)),
+                        None => {
+                            lifecycle.status = StartupStatus::Failed;
+                            self.lifecycle_notify.notify_all();
+                            return Err(VfsError::Other(
+                                "StudioVfs startup channels are unavailable".to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish_start(&self, start_result: &VfsResult<()>) {
+        let mut lifecycle = self.lifecycle.lock();
+        lifecycle.status = if start_result.is_ok() {
+            StartupStatus::Running
+        } else {
+            StartupStatus::Failed
+        };
+        self.lifecycle_notify.notify_all();
+    }
+}
+
+fn panic_payload_message(panic_payload: &(dyn Any + Send)) -> Cow<'_, str> {
+    if let Some(msg) = panic_payload.downcast_ref::<&str>() {
+        Cow::Borrowed(*msg)
+    } else if let Some(msg) = panic_payload.downcast_ref::<String>() {
+        Cow::Borrowed(msg.as_str())
+    } else {
+        Cow::Borrowed("unknown panic payload")
+    }
+}
+
+struct PrefetchWorker {
+    vfs: Arc<StudioVfs>,
+    prefetch_rx: tokio::sync::mpsc::UnboundedReceiver<PrefetchWorkItem>,
+    prefetch_sem: Arc<Semaphore>,
+    pending_queue: VecDeque<PrefetchBatch>,
+    pending_set: HashSet<(Ino, u32)>,
+    inflight: JoinSet<()>,
+}
+
+impl PrefetchWorker {
+    fn new(
+        vfs: Arc<StudioVfs>,
+        prefetch_rx: tokio::sync::mpsc::UnboundedReceiver<PrefetchWorkItem>,
+    ) -> Self {
+        let prefetch_limit = vfs.prefetch_concurrency.max(1);
+        Self {
+            vfs,
+            prefetch_rx,
+            prefetch_sem: Arc::new(Semaphore::new(prefetch_limit)),
+            pending_queue: VecDeque::new(),
+            pending_set: HashSet::new(),
+            inflight: JoinSet::new(),
+        }
+    }
+
+    async fn run(mut self) {
+        loop {
+            self.launch_queued_batches();
+
+            tokio::select! {
+                _ = self.vfs.state.shutdown.shutdown_notify.notified() => {
+                    self.shutdown().await;
+                    break;
+                }
+                Some(work_item) = self.prefetch_rx.recv() => {
+                    self.enqueue_work_item(work_item);
+                }
+                joined = self.inflight.join_next(), if !self.inflight.is_empty() => {
+                    if joined.is_none() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn launch_queued_batches(&mut self) {
+        while !self.pending_queue.is_empty() {
+            if self.vfs.shutdown_requested() {
+                self.clear_pending_queue();
+                break;
+            }
+            let permit = match self.prefetch_sem.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => break,
+            };
+            let batch = self.pending_queue.pop_front().expect("batch exists");
+            let PrefetchBatch {
+                ino,
+                block_indices,
+                read_context,
+            } = batch;
+            for block_idx in &block_indices {
+                self.pending_set.remove(&(ino, *block_idx));
+            }
+            self.update_queue_depth_metric();
+
+            let mut started_blocks = Vec::with_capacity(block_indices.len());
+            for block_idx in block_indices {
+                if self.vfs.readahead.start_prefetch(ino, block_idx) {
+                    started_blocks.push(block_idx);
+                }
+            }
+            if started_blocks.is_empty() {
+                continue;
+            }
+
+            let vfs = self.vfs.clone();
+            self.inflight.spawn(async move {
+                let _permit = permit;
+                let _ = vfs
+                    .read_prefetch_batch(PrefetchBatch::new(ino, started_blocks, read_context))
+                    .await;
+            });
+        }
+    }
+
+    fn enqueue_work_item(&mut self, work_item: PrefetchWorkItem) {
+        if self.vfs.shutdown_requested() {
+            return;
+        }
+
+        let planned = match work_item {
+            PrefetchWorkItem::ReadHint {
+                ino,
+                stream_id,
+                first_block,
+                last_block,
+                policy,
+            } => self.vfs.plan_prefetch_batches_from_hint(
+                ino,
+                stream_id,
+                first_block,
+                last_block,
+                policy,
+            ),
+            PrefetchWorkItem::Batch(batch) => vec![batch],
+        };
+
+        for mut batch in planned {
+            let ino = batch.ino;
+            batch
+                .block_indices
+                .retain(|block_idx| self.pending_set.insert((ino, *block_idx)));
+            if !batch.is_empty() {
+                self.pending_queue.push_back(batch);
+            }
+        }
+        self.update_queue_depth_metric();
+    }
+
+    fn clear_pending_queue(&mut self) {
+        self.pending_queue.clear();
+        self.pending_set.clear();
+        self.update_queue_depth_metric();
+    }
+
+    fn update_queue_depth_metric(&self) {
+        self.vfs.state.metrics.prefetch_queue_depth.store(
+            self.pending_queue
+                .iter()
+                .map(|queued| queued.block_count() as u64)
+                .sum(),
+            Ordering::Relaxed,
+        );
+    }
+
+    async fn shutdown(&mut self) {
+        self.clear_pending_queue();
+        self.inflight.abort_all();
+        while self.inflight.join_next().await.is_some() {}
     }
 }
 
@@ -5762,12 +5956,7 @@ impl StudioVfs {
         }
     }
 
-    /// Start background workers for this VFS instance.
-    ///
-    /// `new()` is side-effect free and only builds the object graph. Call
-    /// `start()` once after construction to spawn uploader, prefetch, janitor,
-    /// and other maintenance tasks.
-    pub fn start(self: &Arc<Self>) -> VfsResult<()> {
+    fn ensure_can_start(&self) -> VfsResult<()> {
         if self
             .state
             .shutdown
@@ -5788,245 +5977,117 @@ impl StudioVfs {
                 "StudioVfs::start requires an active Tokio runtime".to_string(),
             ));
         }
+        Ok(())
+    }
 
-        let StartupChannels {
-            mut prefetch_rx,
+    fn spawn_startup_workers(
+        self: &Arc<Self>,
+        StartupChannels {
+            prefetch_rx,
             upload_rx,
-        } = {
-            let mut lifecycle = self.startup.lifecycle.lock();
-            loop {
-                match lifecycle.status {
-                    StartupStatus::Running => return Ok(()),
-                    StartupStatus::Failed => {
-                        return Err(VfsError::Other(
-                            "StudioVfs background worker startup previously failed".to_string(),
-                        ));
-                    }
-                    StartupStatus::Starting => self.startup.lifecycle_notify.wait(&mut lifecycle),
-                    StartupStatus::Uninitialized => {
-                        lifecycle.status = StartupStatus::Starting;
-                        match lifecycle.channels.take() {
-                            Some(channels) => break channels,
-                            None => {
-                                lifecycle.status = StartupStatus::Failed;
-                                self.startup.lifecycle_notify.notify_all();
-                                return Err(VfsError::Other(
-                                    "StudioVfs startup channels are unavailable".to_string(),
-                                ));
-                            }
-                        }
-                    }
-                }
+        }: StartupChannels,
+    ) -> VfsResult<()> {
+        self.block_cache.spawn_background_tasks();
+        self.spawn_prefetch_worker(prefetch_rx);
+        self.spawn_uploader_worker(upload_rx);
+        self.spawn_epoch_finalizer_worker();
+        self.spawn_upload_stats_worker();
+        self.spawn_fetch_warmup_task();
+        self.spawn_gc_worker();
+        self.spawn_metadata_invalidation_worker();
+        self.spawn_janitor_worker();
+        Ok(())
+    }
+
+    fn spawn_prefetch_worker(
+        self: &Arc<Self>,
+        prefetch_rx: tokio::sync::mpsc::UnboundedReceiver<PrefetchWorkItem>,
+    ) {
+        let vfs = self.clone();
+        self.track_background_task(tokio::spawn(async move {
+            let worker = PrefetchWorker::new(vfs, prefetch_rx);
+            if let Err(panic_payload) = std::panic::AssertUnwindSafe(worker.run())
+                .catch_unwind()
+                .await
+            {
+                let panic_msg = panic_payload_message(&*panic_payload);
+                error!("prefetch worker panicked: {}", panic_msg);
             }
+        }));
+    }
+
+    fn spawn_uploader_worker(
+        self: &Arc<Self>,
+        upload_rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>,
+    ) {
+        let vfs = self.clone();
+        self.set_uploader_task(tokio::spawn(async move {
+            vfs.background_uploader(upload_rx).await;
+        }));
+    }
+
+    fn spawn_epoch_finalizer_worker(self: &Arc<Self>) {
+        let vfs = self.clone();
+        self.track_background_task(tokio::spawn(async move {
+            vfs.background_epoch_finalizer().await;
+        }));
+    }
+
+    fn spawn_upload_stats_worker(self: &Arc<Self>) {
+        let vfs = self.clone();
+        self.track_background_task(tokio::spawn(async move {
+            vfs.background_upload_stats().await;
+        }));
+    }
+
+    fn spawn_fetch_warmup_task(self: &Arc<Self>) {
+        let fetch_scheduler = self.fetch_scheduler.clone();
+        let timeout = Duration::from_secs(3);
+        self.track_background_task(tokio::spawn(async move {
+            let _ = fetch_scheduler.warmup(timeout).await;
+        }));
+    }
+
+    fn spawn_gc_worker(self: &Arc<Self>) {
+        let vfs = self.clone();
+        self.track_background_task(tokio::spawn(async move {
+            vfs.background_gc().await;
+        }));
+    }
+
+    fn spawn_metadata_invalidation_worker(self: &Arc<Self>) {
+        let vfs = self.clone();
+        let metadata_invalidation_sync_interval = self.startup.metadata_invalidation_sync_interval;
+        self.track_background_task(tokio::spawn(async move {
+            vfs.background_metadata_invalidation(metadata_invalidation_sync_interval)
+                .await;
+        }));
+    }
+
+    fn spawn_janitor_worker(self: &Arc<Self>) {
+        let vfs = self.clone();
+        self.track_background_task(tokio::spawn(async move {
+            vfs.background_janitor().await;
+        }));
+    }
+
+    /// Start background workers for this VFS instance.
+    ///
+    /// `new()` is side-effect free and only builds the object graph. Call
+    /// `start()` once after construction to spawn uploader, prefetch, janitor,
+    /// and other maintenance tasks.
+    pub fn start(self: &Arc<Self>) -> VfsResult<()> {
+        self.ensure_can_start()?;
+        let Some(channels) = self.startup.claim_channels_for_start()? else {
+            return Ok(());
         };
 
-        let start_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-            || -> VfsResult<()> {
-                self.block_cache.spawn_background_tasks();
-
-                // Spawn prefetch worker — holds Arc<Self> so it can run the
-                // resolver-backed prefetch helper.
-                let vfs_for_prefetch = self.clone();
-                let prefetch_limit = self.prefetch_concurrency.max(1);
-                self.track_background_task(tokio::spawn(async move {
-                    let worker = async {
-                        let prefetch_sem = Arc::new(Semaphore::new(prefetch_limit));
-                        let mut pending_queue: VecDeque<PrefetchBatch> = VecDeque::new();
-                        let mut pending_set: HashSet<(Ino, u32)> = HashSet::new();
-                        let mut inflight = JoinSet::new();
-                        loop {
-                            // Launch as many queued prefetches as permits allow without
-                            // blocking the worker event loop.
-                            while !pending_queue.is_empty() {
-                                if vfs_for_prefetch.shutdown_requested() {
-                                    pending_queue.clear();
-                                    pending_set.clear();
-                                    vfs_for_prefetch
-                                        .state
-                                        .metrics
-                                        .prefetch_queue_depth
-                                        .store(0, Ordering::Relaxed);
-                                    break;
-                                }
-                                let permit = match prefetch_sem.clone().try_acquire_owned() {
-                                    Ok(permit) => permit,
-                                    Err(_) => break,
-                                };
-                                let batch = pending_queue.pop_front().expect("batch exists");
-                                for block_idx in &batch.block_indices {
-                                    pending_set.remove(&(batch.ino, *block_idx));
-                                }
-                                vfs_for_prefetch
-                                    .state
-                                    .metrics
-                                    .prefetch_queue_depth
-                                    .store(
-                                        pending_queue
-                                            .iter()
-                                            .map(|queued| queued.block_count() as u64)
-                                            .sum(),
-                                        Ordering::Relaxed,
-                                    );
-                                let mut started_blocks = Vec::with_capacity(batch.block_count());
-                                for block_idx in batch.block_indices {
-                                    if vfs_for_prefetch.readahead.start_prefetch(batch.ino, block_idx)
-                                    {
-                                        started_blocks.push(block_idx);
-                                    }
-                                }
-                                if started_blocks.is_empty() {
-                                    continue;
-                                }
-                                let v = vfs_for_prefetch.clone();
-                                inflight.spawn(async move {
-                                    let _permit = permit;
-                                    let _ = v
-                                        .read_prefetch_batch(PrefetchBatch::new(
-                                            batch.ino,
-                                            started_blocks,
-                                            batch.read_context,
-                                        ))
-                                        .await;
-                                });
-                            }
-
-                            tokio::select! {
-                                _ = vfs_for_prefetch.state.shutdown.shutdown_notify.notified() => {
-                                    pending_queue.clear();
-                                    pending_set.clear();
-                                    vfs_for_prefetch
-                                        .state
-                                        .metrics
-                                        .prefetch_queue_depth
-                                        .store(0, Ordering::Relaxed);
-                                    inflight.abort_all();
-                                    while inflight.join_next().await.is_some() {}
-                                    break;
-                                }
-                                Some(work_item) = prefetch_rx.recv() => {
-                                    if vfs_for_prefetch.shutdown_requested() {
-                                        continue;
-                                    }
-                                    let planned: Vec<PrefetchBatch> = match work_item {
-                                        PrefetchWorkItem::ReadHint {
-                                            ino,
-                                            stream_id,
-                                            first_block,
-                                            last_block,
-                                            policy,
-                                        } => vfs_for_prefetch.plan_prefetch_batches_from_hint(
-                                            ino,
-                                            stream_id,
-                                            first_block,
-                                            last_block,
-                                            policy,
-                                        ),
-                                        PrefetchWorkItem::Batch(batch) => vec![batch],
-                                    };
-                                    for mut batch in planned {
-                                        let ino = batch.ino;
-                                        batch
-                                            .block_indices
-                                            .retain(|block_idx| pending_set.insert((ino, *block_idx)));
-                                        if !batch.is_empty() {
-                                            pending_queue.push_back(batch);
-                                        }
-                                    }
-                                    vfs_for_prefetch.state.metrics.prefetch_queue_depth
-                                        .store(
-                                            pending_queue
-                                                .iter()
-                                                .map(|queued| queued.block_count() as u64)
-                                                .sum(),
-                                            Ordering::Relaxed,
-                                        );
-                                }
-                                joined = inflight.join_next(), if !inflight.is_empty() => {
-                                    if joined.is_none() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    };
-                    if let Err(panic_payload) =
-                        std::panic::AssertUnwindSafe(worker).catch_unwind().await
-                    {
-                        let panic_msg = if let Some(msg) = panic_payload.downcast_ref::<&str>() {
-                            *msg
-                        } else if let Some(msg) = panic_payload.downcast_ref::<String>() {
-                            msg.as_str()
-                        } else {
-                            "unknown panic payload"
-                        };
-                        error!("prefetch worker panicked: {}", panic_msg);
-                    }
-                }));
-
-                // Spawn Upload Worker
-                let vfs_clone = self.clone();
-                self.set_uploader_task(tokio::spawn(async move {
-                    vfs_clone.background_uploader(upload_rx).await;
-                }));
-
-                let vfs_clone = self.clone();
-                self.track_background_task(tokio::spawn(async move {
-                    vfs_clone.background_epoch_finalizer().await;
-                }));
-
-                // Spawn upload stats logger.
-                let vfs_clone = self.clone();
-                self.track_background_task(tokio::spawn(async move {
-                    vfs_clone.background_upload_stats().await;
-                }));
-
-                // Warm up the HTTP GET connection pool asynchronously.
-                // Avoid blocking here: `Handle::block_on` from another thread can
-                // deadlock when `StudioVfs::new` is called under a current-thread runtime
-                // (which is exactly how several integration tests execute).
-                {
-                    let fs = self.fetch_scheduler.clone();
-                    let timeout = Duration::from_secs(3);
-                    self.track_background_task(tokio::spawn(async move {
-                        let _ = fs.warmup(timeout).await;
-                    }));
-                }
-
-                // Spawn GC Worker
-                let vfs_clone = self.clone();
-                self.track_background_task(tokio::spawn(async move {
-                    vfs_clone.background_gc().await;
-                }));
-
-                // Spawn periodic metadata sync watcher that turns remote metadata
-                // version changes into kernel inode invalidations for the mounted FS.
-                let vfs_clone = self.clone();
-                let metadata_invalidation_sync_interval =
-                    self.startup.metadata_invalidation_sync_interval;
-                self.track_background_task(tokio::spawn(async move {
-                    vfs_clone
-                        .background_metadata_invalidation(metadata_invalidation_sync_interval)
-                        .await;
-                }));
-
-                // Spawn Janitor Worker (automatic orphan scan/cleanup)
-                let vfs_clone = self.clone();
-                self.track_background_task(tokio::spawn(async move {
-                    vfs_clone.background_janitor().await;
-                }));
-
-                Ok(())
-            },
-        )) {
+        let start_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.spawn_startup_workers(channels)
+        })) {
             Ok(result) => result,
             Err(panic_payload) => {
-                let panic_msg = if let Some(msg) = panic_payload.downcast_ref::<&str>() {
-                    *msg
-                } else if let Some(msg) = panic_payload.downcast_ref::<String>() {
-                    msg.as_str()
-                } else {
-                    "unknown panic payload"
-                };
+                let panic_msg = panic_payload_message(&*panic_payload);
                 error!(
                     "StudioVfs::start panicked during background startup: {}",
                     panic_msg
@@ -6036,15 +6097,7 @@ impl StudioVfs {
                 )))
             }
         };
-
-        let mut lifecycle = self.startup.lifecycle.lock();
-        lifecycle.status = if start_result.is_ok() {
-            StartupStatus::Running
-        } else {
-            StartupStatus::Failed
-        };
-        self.startup.lifecycle_notify.notify_all();
-        drop(lifecycle);
+        self.startup.finish_start(&start_result);
         start_result
     }
 
@@ -13875,7 +13928,7 @@ mod tests {
         }
     }
 
-    fn make_test_vfs(
+    fn make_unstarted_test_vfs(
         tmp: &TempDir,
         volume_suffix: &str,
     ) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
@@ -13901,6 +13954,15 @@ mod tests {
                 .expect("default VFS config should validate"),
         )
         .expect("create vfs");
+        (rt, vfs, meta)
+    }
+
+    fn make_test_vfs(
+        tmp: &TempDir,
+        volume_suffix: &str,
+    ) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
+        let (rt, vfs, meta) = make_unstarted_test_vfs(tmp, volume_suffix);
+        let _guard = rt.enter();
         vfs.start().expect("start vfs background workers");
         (rt, vfs, meta)
     }
@@ -14208,6 +14270,148 @@ mod tests {
             "constructor should not spawn uploader task"
         );
         drop(startup);
+    }
+
+    #[test]
+    fn startup_state_claim_channels_transitions_to_starting_and_consumes_channels() {
+        let (_prefetch_tx, prefetch_rx) =
+            tokio::sync::mpsc::unbounded_channel::<PrefetchWorkItem>();
+        let (_upload_tx, upload_rx) = tokio::sync::mpsc::unbounded_channel::<PendingUpload>();
+        let startup = StartupState::new(prefetch_rx, upload_rx, Duration::from_secs(5));
+
+        let claimed = startup
+            .claim_channels_for_start()
+            .expect("claim channels")
+            .expect("channels should be present");
+        drop(claimed);
+
+        let lifecycle = startup.lifecycle.lock();
+        assert!(
+            matches!(lifecycle.status, StartupStatus::Starting),
+            "claiming startup channels should transition lifecycle to Starting"
+        );
+        assert!(
+            lifecycle.channels.is_none(),
+            "claiming startup channels should consume the one-shot channels"
+        );
+    }
+
+    #[test]
+    fn startup_state_claim_channels_marks_failed_when_channels_are_missing() {
+        let (_prefetch_tx, prefetch_rx) =
+            tokio::sync::mpsc::unbounded_channel::<PrefetchWorkItem>();
+        let (_upload_tx, upload_rx) = tokio::sync::mpsc::unbounded_channel::<PendingUpload>();
+        let startup = StartupState::new(prefetch_rx, upload_rx, Duration::from_secs(5));
+        startup.lifecycle.lock().channels = None;
+
+        let error = startup
+            .claim_channels_for_start()
+            .expect_err("missing channels should fail startup");
+
+        assert!(
+            error
+                .to_string()
+                .contains("startup channels are unavailable"),
+            "missing startup channels should map to a clear lifecycle error"
+        );
+        assert!(
+            matches!(startup.lifecycle.lock().status, StartupStatus::Failed),
+            "missing startup channels should move lifecycle into terminal Failed state"
+        );
+    }
+
+    #[test]
+    fn studio_vfs_start_requires_active_tokio_runtime() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "start-requires-runtime");
+
+        let error = vfs
+            .start()
+            .expect_err("starting without an entered Tokio runtime should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("requires an active Tokio runtime"),
+            "start should reject being called outside of a Tokio runtime"
+        );
+    }
+
+    #[test]
+    fn studio_vfs_start_rejects_when_shutdown_is_already_requested() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "start-after-shutdown");
+        vfs.state
+            .shutdown
+            .shutdown_requested
+            .store(true, Ordering::Release);
+
+        let _guard = rt.enter();
+        let error = vfs
+            .start()
+            .expect_err("start should reject after shutdown begins");
+
+        assert!(
+            error.to_string().contains("after shutdown has begun"),
+            "start should fail fast once shutdown has been requested"
+        );
+    }
+
+    #[test]
+    fn studio_vfs_start_failure_marks_failed_and_rejects_retry() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "start-missing-channels");
+        vfs.startup.lifecycle.lock().channels = None;
+
+        let _guard = rt.enter();
+        let first_error = vfs
+            .start()
+            .expect_err("missing startup channels should fail the first start attempt");
+        assert!(
+            first_error
+                .to_string()
+                .contains("startup channels are unavailable"),
+            "missing startup channels should surface a concrete startup failure"
+        );
+        assert!(
+            matches!(vfs.startup.lifecycle.lock().status, StartupStatus::Failed),
+            "failed startup should leave lifecycle in terminal Failed state"
+        );
+
+        let retry_error = vfs
+            .start()
+            .expect_err("failed startup should reject retry attempts");
+        assert!(
+            retry_error
+                .to_string()
+                .contains("startup previously failed"),
+            "retry after failed startup should surface the terminal lifecycle error"
+        );
+    }
+
+    #[test]
+    fn studio_vfs_start_is_idempotent_once_running() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "start-idempotent");
+
+        let _guard = rt.enter();
+        vfs.start().expect("first start");
+        let initial_background_task_count = vfs.state.shutdown.background_tasks.lock().len();
+        assert!(
+            initial_background_task_count > 0,
+            "first start should register background tasks"
+        );
+
+        vfs.start().expect("second start should be a no-op");
+        assert_eq!(
+            vfs.state.shutdown.background_tasks.lock().len(),
+            initial_background_task_count,
+            "second start should not register duplicate background tasks"
+        );
+        assert!(
+            matches!(vfs.startup.lifecycle.lock().status, StartupStatus::Running),
+            "idempotent second start should preserve Running lifecycle state"
+        );
     }
 
     #[test]
