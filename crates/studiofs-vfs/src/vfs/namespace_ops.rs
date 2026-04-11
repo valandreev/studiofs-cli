@@ -118,6 +118,37 @@ impl StudioVfs {
             block_index_from_offset(new_size - 1, self.block_size) + 1
         };
 
+        if new_size == 0 && old_size > 0 {
+            let existing_blocks = self.sync_meta().get_file_blocks(ino)?;
+            let removed_ids: std::collections::HashSet<u64> = self
+                .sync_meta()
+                .remove_file_blocks(ino)?
+                .into_iter()
+                .collect();
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            for block_idx in first_block_to_remove..=old_last_block {
+                self.clear_pending_block(ino, block_idx);
+                self.remove_live_extent(ino, block_idx);
+            }
+
+            for (block_idx, block_ref) in existing_blocks {
+                if removed_ids.contains(&block_ref.object_id) {
+                    self.sync_meta()
+                        .add_pending_deletion(block_ref.object_id, timestamp)?;
+                    debug!(
+                        "marking block {} for deletion (truncate)",
+                        block_ref.object_id
+                    );
+                    self.evict_block_from_caches(ino, block_idx, block_ref.object_id);
+                }
+            }
+            return Ok(());
+        }
+
         for block_idx in first_block_to_remove..=old_last_block {
             self.clear_pending_block(ino, block_idx);
             self.remove_live_extent(ino, block_idx);

@@ -100,10 +100,18 @@ impl StudioVfs {
         offset: u64,
         buffer: &mut [u8],
     ) -> VfsResult<u32> {
+        self.enforce_access_async(ino, AccessLevel::ReadOnly)
+            .await?;
+        if let Some(attr) = self.ignored_entry_attr(ino) {
+            let end = offset.saturating_add(buffer.len() as u64).min(attr.size);
+            let len = end.saturating_sub(offset) as usize;
+            if len > 0 {
+                buffer[..len].fill(0);
+            }
+            return Ok(len as u32);
+        }
         let prepared = self
             .prepare_foreground_read(ino, offset, buffer.len())
-            .await?;
-        self.enforce_access_async(ino, AccessLevel::ReadOnly)
             .await?;
         if prepared.context.placeholder_visible(self, ino) {
             return Err(VfsError::RemoteContentPending);

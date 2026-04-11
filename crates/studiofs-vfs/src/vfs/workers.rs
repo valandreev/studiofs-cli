@@ -1,3 +1,5 @@
+use futures::StreamExt;
+
 use super::*;
 
 impl StudioVfs {
@@ -49,7 +51,7 @@ impl StudioVfs {
                             ino,
                             content_epoch,
                             error = %err,
-                            "epoch finalization failed due invalid regular-file graph, quarantining inode"
+                            "epoch finalization failed due to invalid regular-file graph, quarantining inode"
                         );
                         self.quarantine_invalid_regular_file_graph(ino, attr_size, &err);
                         self.state.file_session.note_background_transition(
@@ -89,8 +91,14 @@ impl StudioVfs {
         content_epoch: u64,
         delay: Duration,
     ) {
+        if self.shutdown_requested() {
+            return;
+        }
         let vfs = self.clone();
         tokio::spawn(async move {
+            if vfs.shutdown_requested() {
+                return;
+            }
             tokio::select! {
                 _ = vfs.state.shutdown.shutdown_notify.notified() => {}
                 _ = tokio::time::sleep(delay) => {
@@ -304,7 +312,7 @@ impl StudioVfs {
                                     object_id = op.object_id,
                                     ino = op.ino,
                                     error = %e,
-                                    "upload failed due invalid regular-file graph, quarantining inode"
+                                    "upload failed due to invalid regular-file graph, quarantining inode"
                                 );
                                 vfs.local_block_backend.mark_upload_failed(op.object_id);
                                 vfs.quarantine_invalid_regular_file_graph(op.ino, attr_size, &e);
@@ -989,10 +997,10 @@ impl StudioVfs {
                     }
                 };
 
-            let entries = match self
+            let mut lister = match self
                 .data_write
                 .operator()
-                .list_with(&self.data_prefix)
+                .lister_with(&self.data_prefix)
                 .recursive(true)
                 .await
             {
@@ -1028,7 +1036,15 @@ impl StudioVfs {
             let mut delete_errors: u64 = 0;
             let mut seen_objects: HashSet<u64> = HashSet::new();
 
-            for entry in entries {
+            let mut list_error = None;
+            while let Some(entry_result) = lister.next().await {
+                let entry = match entry_result {
+                    Ok(entry) => entry,
+                    Err(err) => {
+                        list_error = Some(err);
+                        break;
+                    }
+                };
                 if entry.metadata().mode() != EntryMode::FILE {
                     continue;
                 }
@@ -1094,6 +1110,21 @@ impl StudioVfs {
                     continue;
                 }
                 deleted = deleted.saturating_add(1);
+            }
+
+            if let Some(err) = list_error {
+                let meta = self.meta_async.clone();
+                let _ = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                    engine.release_global_janitor_lock()
+                })
+                .await;
+                warn!(
+                    cycle,
+                    prefix = self.data_prefix,
+                    error = %err,
+                    "janitor cycle failed while streaming data prefix"
+                );
+                continue;
             }
 
             debug!(

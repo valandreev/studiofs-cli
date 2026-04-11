@@ -11,7 +11,8 @@ impl StudioVfs {
         let meta = self.sync_meta();
         let used_inodes = meta.get_counter(counters::TOTAL_INODES)?;
         let used_bytes = meta.get_counter(counters::USED_SPACE)?;
-        let bsize = self.block_size as u64;
+        let bsize = u64::from(self.block_size.max(1));
+        let frsize = self.block_size.max(1);
 
         let total_bytes: u64 = 1024 * 1024 * 1024 * 1024 * 1024;
         let total_blocks = total_bytes / bsize;
@@ -23,10 +24,10 @@ impl StudioVfs {
             bfree: free_blocks,
             bavail: free_blocks,
             files: used_inodes,
-            ffree: u64::MAX - used_inodes,
-            bsize: self.block_size,
+            ffree: u64::MAX.saturating_sub(used_inodes),
+            bsize: frsize,
             namelen: 255,
-            frsize: self.block_size,
+            frsize,
         })
     }
 }

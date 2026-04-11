@@ -97,7 +97,11 @@ impl StudioVfs {
         let acl_namespace_epoch = self.state.acl.acl_namespace_epoch.load(Ordering::Acquire);
         let mut cache = self.state.acl.effective_acl_cache.lock();
         if cache.len() >= self.effective_acl_cache_capacity {
-            cache.clear();
+            let evict_count = (self.effective_acl_cache_capacity / 4).max(1);
+            let keys_to_remove: Vec<Ino> = cache.keys().copied().take(evict_count).collect();
+            for key in keys_to_remove {
+                cache.remove(&key);
+            }
         }
         cache.insert(
             ino,
@@ -118,7 +122,7 @@ impl StudioVfs {
         let mut depth = 0usize;
         let access_level = loop {
             if depth >= 4096 {
-                break AccessLevel::ReadWrite;
+                break AccessLevel::NoAccess;
             }
             if let Some(level) = self.acl_rule_for_inode(current)? {
                 break level;
@@ -145,7 +149,7 @@ impl StudioVfs {
         let mut depth = 0usize;
         loop {
             if depth >= 4096 {
-                return Ok(AccessLevel::ReadWrite);
+                return Ok(AccessLevel::NoAccess);
             }
             if let Some(level) = Self::acl_rule_for_inode_meta(meta, principal, current)? {
                 return Ok(level);
@@ -235,5 +239,107 @@ impl StudioVfs {
         self.bump_acl_epoch();
         meta.request_eager_flush();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{DataStoreConfig, VfsConfig};
+    use super::*;
+    use std::sync::Arc;
+    use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
+    use studiofs_meta::{InodeAttr, MetaFormat, MetaInodes, RedbMetaEngine};
+    use tempfile::TempDir;
+    use tokio::runtime::Runtime;
+
+    fn test_format_info(volume_suffix: &str) -> FormatInfo {
+        let volume_name = format!("acl-{volume_suffix}-{}", std::process::id());
+        FormatInfo {
+            format_version: CURRENT_FORMAT_VERSION,
+            name: volume_name.clone(),
+            uuid: format!("acl-uuid-{volume_suffix}"),
+            endpoint: "http://127.0.0.1:9000".into(),
+            bucket: "studiofs-test".into(),
+            access_key: "test".into(),
+            secret_key: "test".into(),
+            region: "us-east-1".into(),
+            data_prefix: format!("{volume_name}/objects/"),
+            metadata: MetadataConfig::default(),
+            block_size: 4 * 1024 * 1024,
+        }
+    }
+
+    fn make_test_vfs(
+        tmp: &TempDir,
+        volume_suffix: &str,
+        cfg: VfsConfig,
+    ) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
+        let db_path = tmp.path().join("meta.redb");
+        let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
+        meta.init_root(0, 0).expect("init root");
+
+        let format_info = test_format_info(volume_suffix);
+        meta.set_format_info(&format_info).expect("set format info");
+        let data_config = DataStoreConfig::from(&format_info);
+
+        let cache_dir = tmp.path().join("cache");
+        let rt = Arc::new(Runtime::new().expect("runtime"));
+        let _guard = rt.enter();
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            cache_dir.to_str().expect("cache dir str"),
+            64 * 1024 * 1024,
+            32 * 1024 * 1024,
+            cfg.try_into().expect("VFS config should validate"),
+        )
+        .expect("create vfs");
+        vfs.start().expect("start vfs background workers");
+        (rt, vfs, meta)
+    }
+
+    #[test]
+    fn effective_access_level_depth_limit_fails_closed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, meta) =
+            make_test_vfs(&tmp, "depth-limit-fails-closed", VfsConfig::default());
+
+        let mut parent = ROOT_INO;
+        let mut deepest = ROOT_INO;
+        for _ in 0..4097usize {
+            let ino = meta.next_inode().expect("allocate inode");
+            let attr = InodeAttr::new_dir(ino, parent, 1000, 1000, 0o755);
+            meta.set_attr(&attr).expect("set attr for deep chain");
+            parent = ino;
+            deepest = ino;
+        }
+
+        assert_eq!(
+            vfs.effective_access_level(deepest)
+                .expect("compute effective access for deep inode"),
+            AccessLevel::NoAccess
+        );
+    }
+
+    #[test]
+    fn effective_acl_cache_overflow_evicts_partially() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = VfsConfig::default();
+        cfg.effective_acl_cache_capacity = 4;
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "partial-cache-eviction", cfg);
+
+        for ino in 10..=14 {
+            vfs.effective_access_level_cache_insert(ino, AccessLevel::ReadOnly);
+        }
+
+        let cache = vfs.state.acl.effective_acl_cache.lock();
+        assert!(
+            cache.len() > 1 && cache.len() <= 4,
+            "cache overflow should evict partially instead of clearing the whole cache"
+        );
+        assert!(
+            cache.contains_key(&14),
+            "newest entry should still be present after partial eviction"
+        );
     }
 }

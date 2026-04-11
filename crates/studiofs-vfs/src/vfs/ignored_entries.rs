@@ -2,7 +2,7 @@ use super::{
     FileType, Ino, InodeAttr, MetaError, Ordering, ROOT_INO, StudioVfs, VfsError,
     is_blocked_root_macos_metadata, is_ignored_macos_metadata, is_probable_trash_component,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub(super) struct IgnoredEntry {
@@ -15,6 +15,16 @@ pub(super) struct IgnoredEntry {
 pub(super) struct IgnoredEntryRegistry {
     pub(super) by_ino: HashMap<Ino, IgnoredEntry>,
     pub(super) by_name: HashMap<(Ino, Vec<u8>), Ino>,
+    pub(super) children_by_parent: HashMap<Ino, HashSet<Ino>>,
+}
+
+fn remove_parent_child_link(registry: &mut IgnoredEntryRegistry, parent: Ino, child: Ino) {
+    if let Some(children) = registry.children_by_parent.get_mut(&parent) {
+        children.remove(&child);
+        if children.is_empty() {
+            registry.children_by_parent.remove(&parent);
+        }
+    }
 }
 
 impl StudioVfs {
@@ -83,6 +93,11 @@ impl StudioVfs {
             name: key.1.clone(),
         };
         registry.by_name.insert(key, ino);
+        registry
+            .children_by_parent
+            .entry(parent)
+            .or_default()
+            .insert(ino);
         registry.by_ino.insert(ino, ignored);
         attr
     }
@@ -103,6 +118,7 @@ impl StudioVfs {
         let Some(ino) = registry.by_name.remove(&key) else {
             return false;
         };
+        remove_parent_child_link(&mut registry, parent, ino);
 
         if self.handle_table.open_count(ino) > 0 {
             self.handle_table.mark_orphan(ino);
@@ -123,12 +139,9 @@ impl StudioVfs {
         let mut to_remove = Vec::new();
         while let Some(current) = pending.pop() {
             to_remove.push(current);
-            let children: Vec<Ino> = registry
-                .by_ino
-                .iter()
-                .filter_map(|(ino, entry)| (entry.parent == current).then_some(*ino))
-                .collect();
-            pending.extend(children);
+            if let Some(children) = registry.children_by_parent.get(&current) {
+                pending.extend(children.iter().copied());
+            }
         }
 
         for ino in to_remove {
@@ -136,6 +149,8 @@ impl StudioVfs {
                 registry
                     .by_name
                     .remove(&(ignored.parent, ignored.name.clone()));
+                remove_parent_child_link(&mut registry, ignored.parent, ino);
+                registry.children_by_parent.remove(&ino);
                 if self.handle_table.open_count(ino) > 0 {
                     self.handle_table.mark_orphan(ino);
                 } else {
@@ -152,6 +167,8 @@ impl StudioVfs {
             return false;
         };
         registry.by_name.remove(&(ignored.parent, ignored.name));
+        remove_parent_child_link(&mut registry, ignored.parent, ino);
+        registry.children_by_parent.remove(&ino);
         true
     }
 
@@ -360,5 +377,32 @@ mod tests {
             .lookup(trash_child.ino, b"source.txt")
             .expect("ignored trash target should resolve");
         assert_eq!(moved.size, source.size);
+    }
+
+    #[test]
+    fn unlink_ignored_subtree_removes_nested_children() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-subtree-unlink");
+
+        let trash =
+            vfs.create_ignored_entry(ROOT_INO, b".Trash", 1000, 1000, 0o755, FileType::Directory);
+        let user =
+            vfs.create_ignored_entry(trash.ino, b"501", 1000, 1000, 0o755, FileType::Directory);
+        let nested =
+            vfs.create_ignored_entry(user.ino, b"nested", 1000, 1000, 0o755, FileType::Directory);
+        let file = vfs.create_ignored_entry(
+            nested.ino,
+            b"file.txt",
+            1000,
+            1000,
+            0o644,
+            FileType::RegularFile,
+        );
+
+        assert!(vfs.unlink_ignored_subtree(ROOT_INO, b".Trash"));
+        assert!(vfs.ignored_entry(trash.ino).is_none());
+        assert!(vfs.ignored_entry(user.ino).is_none());
+        assert!(vfs.ignored_entry(nested.ino).is_none());
+        assert!(vfs.ignored_entry(file.ino).is_none());
     }
 }
