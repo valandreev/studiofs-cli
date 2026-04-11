@@ -132,6 +132,86 @@ fn open_flags_from_create_options(_create_options: u32) -> OpenFlags {
     OpenFlags::RDWR
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CreateCallbackKind {
+    Symlink(Vec<u8>),
+    Directory,
+    RegularFile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileSizeCallbackAction {
+    KeepLogicalSize,
+    SetLogicalSize(u64),
+}
+
+struct CreateCallbackPlan {
+    parent_ino: Ino,
+    name: Vec<u8>,
+    open_flags: OpenFlags,
+    kind: CreateCallbackKind,
+}
+
+struct RenameCallbackPlan {
+    old_parent: Ino,
+    old_name: Vec<u8>,
+    new_parent: Ino,
+    new_name: Vec<u8>,
+}
+
+fn resolve_create_callback_kind(
+    create_options: u32,
+    extra_buffer: Option<&[u8]>,
+    extra_buffer_is_reparse_point: bool,
+) -> CreateCallbackKind {
+    if extra_buffer_is_reparse_point
+        && let Some(buf) = extra_buffer
+        && let Some(target) = decode_symlink_reparse(buf)
+    {
+        return CreateCallbackKind::Symlink(target);
+    }
+
+    if (create_options & FILE_DIRECTORY_FILE_OPTION) != 0 {
+        CreateCallbackKind::Directory
+    } else {
+        CreateCallbackKind::RegularFile
+    }
+}
+
+fn resolve_file_size_callback_action(
+    new_size: u64,
+    set_allocation_size: bool,
+) -> FileSizeCallbackAction {
+    if set_allocation_size {
+        FileSizeCallbackAction::KeepLogicalSize
+    } else {
+        FileSizeCallbackAction::SetLogicalSize(new_size)
+    }
+}
+
+fn build_basic_info_setattr_args(
+    file_attributes: u32,
+    creation_time: u64,
+    last_access_time: u64,
+    last_write_time: u64,
+) -> SetattrArgs {
+    // WinFSP convention: INVALID_FILE_ATTRIBUTES (0xFFFFFFFF) means "don't
+    // change". 0 also means "don't change" (per MSDN FILE_BASIC_INFO).
+    let win_attrs = if file_attributes != 0 && file_attributes != u32::MAX {
+        Some(file_attributes)
+    } else {
+        None
+    };
+
+    SetattrArgs {
+        atime: filetime_to_timespec(last_access_time),
+        mtime: filetime_to_timespec(last_write_time),
+        crtime: filetime_to_timespec(creation_time),
+        win_attrs,
+        ..SetattrArgs::default()
+    }
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Compute Win32 FILE_ATTRIBUTE_* flags from inode attributes.
@@ -937,6 +1017,123 @@ impl StudioFsContext {
         self.handle_callback_lifecycle().run_close_callback(ino, fh);
     }
 
+    fn open_file_handle_for_attr(
+        &self,
+        attr: &InodeAttr,
+        open_flags: OpenFlags,
+    ) -> winfsp::Result<StudioFileHandle> {
+        let is_dir = attr.kind == FileType::Directory;
+        let fh = if is_dir {
+            0
+        } else {
+            self.vfs
+                .open_file(attr.ino, open_flags, false)
+                .map_err(vfs_to_winfsp_err)?
+        };
+        Ok(StudioFileHandle::new(attr.ino, is_dir, fh, open_flags))
+    }
+
+    fn write_open_file_info(out: &mut OpenFileInfo, attr: &InodeAttr) {
+        *out.as_mut() = attr_to_file_info(attr);
+    }
+
+    fn write_file_info(out: &mut FileInfo, attr: &InodeAttr) {
+        *out = attr_to_file_info(attr);
+    }
+
+    fn resolve_create_callback_plan(
+        &self,
+        file_name: &U16CStr,
+        create_options: u32,
+        extra_buffer: Option<&[u8]>,
+        extra_buffer_is_reparse_point: bool,
+    ) -> winfsp::Result<CreateCallbackPlan> {
+        let (parent_ino, name) = resolve_parent(&self.vfs, file_name)?;
+        Ok(CreateCallbackPlan {
+            parent_ino,
+            name,
+            open_flags: open_flags_from_create_options(create_options),
+            kind: resolve_create_callback_kind(
+                create_options,
+                extra_buffer,
+                extra_buffer_is_reparse_point,
+            ),
+        })
+    }
+
+    fn execute_create_callback_plan(
+        &self,
+        plan: CreateCallbackPlan,
+        file_info: &mut OpenFileInfo,
+    ) -> winfsp::Result<StudioFileHandle> {
+        let opens_symlink = matches!(plan.kind, CreateCallbackKind::Symlink(_));
+        let attr = match &plan.kind {
+            CreateCallbackKind::Symlink(target) => self
+                .vfs
+                .symlink(plan.parent_ino, &plan.name, target, 0, 0)
+                .map_err(vfs_to_winfsp_err)?,
+            CreateCallbackKind::Directory => self
+                .vfs
+                .mkdir(plan.parent_ino, &plan.name, 0, 0, 0o755)
+                .map_err(vfs_to_winfsp_err)?,
+            CreateCallbackKind::RegularFile => self
+                .vfs
+                .create(plan.parent_ino, &plan.name, 0, 0, 0o644)
+                .map_err(vfs_to_winfsp_err)?,
+        };
+        Self::write_open_file_info(file_info, &attr);
+        if opens_symlink {
+            Ok(StudioFileHandle::new(attr.ino, false, 0, plan.open_flags))
+        } else {
+            self.open_file_handle_for_attr(&attr, plan.open_flags)
+        }
+    }
+
+    fn execute_basic_info_callback(
+        &self,
+        ino: Ino,
+        args: SetattrArgs,
+        file_info: &mut FileInfo,
+    ) -> winfsp::Result<()> {
+        let attr = self.vfs.setattr(ino, args).map_err(vfs_to_winfsp_err)?;
+        Self::write_file_info(file_info, &attr);
+        Ok(())
+    }
+
+    fn execute_file_size_callback(
+        &self,
+        ino: Ino,
+        action: FileSizeCallbackAction,
+        file_info: &mut FileInfo,
+    ) -> winfsp::Result<()> {
+        let attr = match action {
+            FileSizeCallbackAction::KeepLogicalSize => {
+                self.vfs.getattr(ino).map_err(vfs_to_winfsp_err)?
+            }
+            FileSizeCallbackAction::SetLogicalSize(new_size) => self
+                .vfs
+                .setattr(ino, SetattrArgs::size_only(new_size))
+                .map_err(vfs_to_winfsp_err)?,
+        };
+        Self::write_file_info(file_info, &attr);
+        Ok(())
+    }
+
+    fn resolve_rename_callback_plan(
+        &self,
+        file_name: &U16CStr,
+        new_file_name: &U16CStr,
+    ) -> winfsp::Result<RenameCallbackPlan> {
+        let (old_parent, old_name) = resolve_parent(&self.vfs, file_name)?;
+        let (new_parent, new_name) = resolve_parent(&self.vfs, new_file_name)?;
+        Ok(RenameCallbackPlan {
+            old_parent,
+            old_name,
+            new_parent,
+            new_name,
+        })
+    }
+
     /// Copy the cached security descriptor into the provided buffer.
     /// Returns the full SD length (even if the buffer was smaller).
     fn copy_sd_to_buffer(&self, buf: Option<&mut [c_void]>) -> u64 {
@@ -1020,26 +1217,18 @@ impl FileSystemContext for StudioFsContext {
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
         let attr = resolve_path(&self.vfs, file_name)?;
-        *file_info.as_mut() = attr_to_file_info(&attr);
         let open_flags = open_flags_from_create_options(create_options);
-
-        let is_dir = attr.kind == FileType::Directory;
-        let fh = if is_dir {
-            0
-        } else {
-            self.vfs
-                .open_file(attr.ino, open_flags, false)
-                .map_err(vfs_to_winfsp_err)?
-        };
+        Self::write_open_file_info(file_info, &attr);
+        let handle = self.open_file_handle_for_attr(&attr, open_flags)?;
 
         debug!(
             ino = attr.ino,
-            fh,
-            is_dir,
+            fh = handle.fh,
+            is_dir = handle.is_dir,
             open_flags = open_flags.bits(),
             "open"
         );
-        Ok(StudioFileHandle::new(attr.ino, is_dir, fh, open_flags))
+        Ok(handle)
     }
 
     fn close(&self, context: Self::FileContext) {
@@ -1060,64 +1249,23 @@ impl FileSystemContext for StudioFsContext {
         extra_buffer_is_reparse_point: bool,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
-        let (parent_ino, name) = resolve_parent(&self.vfs, file_name)?;
-
-        // Handle symlink creation via reparse point buffer
-        if extra_buffer_is_reparse_point
-            && let Some(buf) = extra_buffer
-            && let Some(target) = decode_symlink_reparse(buf)
-        {
-            let attr = self
-                .vfs
-                .symlink(parent_ino, &name, &target, 0, 0)
-                .map_err(vfs_to_winfsp_err)?;
-            let info = attr_to_file_info(&attr);
-            *file_info.as_mut() = info;
-            debug!(
-                ino = attr.ino,
-                "create symlink {:?}",
-                file_name.to_string_lossy()
-            );
-            return Ok(StudioFileHandle::new(
-                attr.ino,
-                false,
-                0,
-                open_flags_from_create_options(create_options),
-            ));
-        }
-
-        let is_dir = (create_options & FILE_DIRECTORY_FILE_OPTION) != 0;
-        let open_flags = open_flags_from_create_options(create_options);
-        let attr = if is_dir {
-            self.vfs
-                .mkdir(parent_ino, &name, 0, 0, 0o755)
-                .map_err(vfs_to_winfsp_err)?
-        } else {
-            self.vfs
-                .create(parent_ino, &name, 0, 0, 0o644)
-                .map_err(vfs_to_winfsp_err)?
-        };
-
-        let fh = if is_dir {
-            0
-        } else {
-            self.vfs
-                .open_file(attr.ino, open_flags, false)
-                .map_err(vfs_to_winfsp_err)?
-        };
-
-        let info = attr_to_file_info(&attr);
-        *file_info.as_mut() = info;
+        let plan = self.resolve_create_callback_plan(
+            file_name,
+            create_options,
+            extra_buffer,
+            extra_buffer_is_reparse_point,
+        )?;
+        let handle = self.execute_create_callback_plan(plan, file_info)?;
 
         debug!(
-            ino = attr.ino,
-            is_dir,
-            fh,
-            open_flags = open_flags.bits(),
+            ino = handle.ino,
+            is_dir = handle.is_dir,
+            fh = handle.fh,
+            open_flags = handle.open_flags.bits(),
             "create {:?}",
             file_name.to_string_lossy()
         );
-        Ok(StudioFileHandle::new(attr.ino, is_dir, fh, open_flags))
+        Ok(handle)
     }
 
     fn get_file_info(
@@ -1362,12 +1510,11 @@ impl FileSystemContext for StudioFsContext {
         // `Overwrite` is an immediate EOF transition, not a backgroundable
         // flush barrier. Later reads/writes in the same open sequence depend on
         // size=0 being visible before the callback returns.
-        let attr = self
-            .vfs
-            .setattr(context.ino, SetattrArgs::size_only(0))
-            .map_err(vfs_to_winfsp_err)?;
-        *file_info = attr_to_file_info(&attr);
-        Ok(())
+        self.execute_file_size_callback(
+            context.ino,
+            FileSizeCallbackAction::SetLogicalSize(0),
+            file_info,
+        )
     }
 
     fn set_basic_info(
@@ -1380,27 +1527,16 @@ impl FileSystemContext for StudioFsContext {
         _last_change_time: u64,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        // WinFSP convention: INVALID_FILE_ATTRIBUTES (0xFFFFFFFF) means "don't change".
-        // 0 also means "don't change" (per MSDN FILE_BASIC_INFO).
-        let win_attrs = if file_attributes != 0 && file_attributes != u32::MAX {
-            Some(file_attributes)
-        } else {
-            None
-        };
-
-        let args = SetattrArgs {
-            atime: filetime_to_timespec(last_access_time),
-            mtime: filetime_to_timespec(last_write_time),
-            crtime: filetime_to_timespec(creation_time),
-            win_attrs,
-            ..SetattrArgs::default()
-        };
-        let attr = self
-            .vfs
-            .setattr(context.ino, args)
-            .map_err(vfs_to_winfsp_err)?;
-        *file_info = attr_to_file_info(&attr);
-        Ok(())
+        self.execute_basic_info_callback(
+            context.ino,
+            build_basic_info_setattr_args(
+                file_attributes,
+                creation_time,
+                last_access_time,
+                last_write_time,
+            ),
+            file_info,
+        )
     }
 
     fn set_file_size(
@@ -1413,15 +1549,11 @@ impl FileSystemContext for StudioFsContext {
         // WinFSP can call this with set_allocation_size=true to reserve capacity
         // without changing logical EOF. We don't track allocation size separately,
         // so treat allocation-size updates as a no-op for file length.
-        let attr = if set_allocation_size {
-            self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?
-        } else {
-            self.vfs
-                .setattr(context.ino, SetattrArgs::size_only(new_size))
-                .map_err(vfs_to_winfsp_err)?
-        };
-        *file_info = attr_to_file_info(&attr);
-        Ok(())
+        self.execute_file_size_callback(
+            context.ino,
+            resolve_file_size_callback_action(new_size, set_allocation_size),
+            file_info,
+        )
     }
 
     fn get_reparse_point_by_name(
@@ -1475,11 +1607,15 @@ impl FileSystemContext for StudioFsContext {
         new_file_name: &U16CStr,
         _replace_if_exists: bool,
     ) -> winfsp::Result<()> {
-        let (old_parent, old_name) = resolve_parent(&self.vfs, file_name)?;
-        let (new_parent, new_name) = resolve_parent(&self.vfs, new_file_name)?;
+        let plan = self.resolve_rename_callback_plan(file_name, new_file_name)?;
 
         self.vfs
-            .rename(old_parent, &old_name, new_parent, &new_name)
+            .rename(
+                plan.old_parent,
+                &plan.old_name,
+                plan.new_parent,
+                &plan.new_name,
+            )
             .map_err(vfs_to_winfsp_err)?;
 
         debug!(
@@ -1623,12 +1759,14 @@ impl NotifyingFileSystemContext<Vec<Ino>> for StudioFsContext {
 mod tests {
     use super::is_benign_cleanup_delete_error;
     use super::{
-        FILE_ACTION_MODIFIED, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME,
-        FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+        CreateCallbackKind, FILE_ACTION_MODIFIED, FILE_DIRECTORY_FILE_OPTION,
+        FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
+        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FileSizeCallbackAction,
         STATUS_ACCESS_DENIED, STATUS_DATA_ERROR, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
         STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND, StudioFsContext, WinfspKernelInvalidator,
-        build_notify_info, ino_to_windows_path, notify_filter_for_kind,
-        open_flags_from_create_options, vfs_to_winfsp_err,
+        build_basic_info_setattr_args, build_notify_info, encode_symlink_reparse,
+        ino_to_windows_path, notify_filter_for_kind, open_flags_from_create_options,
+        resolve_create_callback_kind, resolve_file_size_callback_action, vfs_to_winfsp_err,
     };
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -1740,6 +1878,62 @@ mod tests {
             FILE_NO_INTERMEDIATE_BUFFERING_OPTION | FILE_WRITE_THROUGH_OPTION,
         );
         assert_eq!(unbuffered.bits(), OpenFlags::RDWR.bits());
+    }
+
+    #[test]
+    fn resolve_create_callback_kind_prefers_decoded_reparse_target() {
+        let encoded = encode_symlink_reparse(b"/target/path");
+        assert_eq!(
+            resolve_create_callback_kind(FILE_DIRECTORY_FILE_OPTION, Some(&encoded), true),
+            CreateCallbackKind::Symlink(b"/target/path".to_vec())
+        );
+    }
+
+    #[test]
+    fn resolve_create_callback_kind_falls_back_to_directory_or_file() {
+        assert_eq!(
+            resolve_create_callback_kind(FILE_DIRECTORY_FILE_OPTION, None, false),
+            CreateCallbackKind::Directory
+        );
+        assert_eq!(
+            resolve_create_callback_kind(0, None, false),
+            CreateCallbackKind::RegularFile
+        );
+        assert_eq!(
+            resolve_create_callback_kind(0, Some(&[1, 2, 3]), true),
+            CreateCallbackKind::RegularFile,
+            "invalid reparse payload should fall back to regular file creation"
+        );
+    }
+
+    #[test]
+    fn resolve_file_size_callback_action_distinguishes_allocation_only_requests() {
+        assert_eq!(
+            resolve_file_size_callback_action(123, true),
+            FileSizeCallbackAction::KeepLogicalSize
+        );
+        assert_eq!(
+            resolve_file_size_callback_action(456, false),
+            FileSizeCallbackAction::SetLogicalSize(456)
+        );
+    }
+
+    #[test]
+    fn build_basic_info_setattr_args_ignores_invalid_windows_attributes() {
+        let ignored_zero = build_basic_info_setattr_args(0, 0, 0, 0);
+        assert_eq!(ignored_zero.win_attrs, None);
+        assert!(matches!(ignored_zero.atime, TimeSpec::Omit));
+        assert!(matches!(ignored_zero.mtime, TimeSpec::Omit));
+        assert!(matches!(ignored_zero.crtime, TimeSpec::Omit));
+
+        let ignored_invalid = build_basic_info_setattr_args(u32::MAX, 0, 0, 0);
+        assert_eq!(ignored_invalid.win_attrs, None);
+
+        let populated = build_basic_info_setattr_args(0x20, 1, 2, 3);
+        assert_eq!(populated.win_attrs, Some(0x20));
+        assert!(matches!(populated.crtime, TimeSpec::Set(_)));
+        assert!(matches!(populated.atime, TimeSpec::Set(_)));
+        assert!(matches!(populated.mtime, TimeSpec::Set(_)));
     }
 
     #[test]
