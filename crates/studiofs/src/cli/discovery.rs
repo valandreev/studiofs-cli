@@ -1,11 +1,10 @@
 //! `studiofs discover` — attach local metadata DB to an existing PG volume.
 
-use std::{future::Future, io, path::Path};
+use std::path::Path;
 use studiofs_meta::{
     FormatInfo, MetaFormat, RedbMetaEngine, ensure_studiofs_database, redb_engine::RedbSnapshot,
 };
 use thiserror::Error;
-use tokio::runtime::RuntimeFlavor;
 
 #[derive(Debug, Error)]
 pub enum DiscoveryError {
@@ -60,51 +59,6 @@ fn extract_format_info(snapshot_bytes: &[u8]) -> DiscoveryResult<FormatInfo> {
     Err(DiscoveryError::MissingFormatInfo)
 }
 
-fn run_discovery_future<T, F>(future: F) -> DiscoveryResult<T>
-where
-    T: Send,
-    F: Future<Output = DiscoveryResult<T>> + Send,
-{
-    fn run_on_new_runtime<T, F>(future: F) -> DiscoveryResult<T>
-    where
-        T: Send,
-        F: Future<Output = DiscoveryResult<T>> + Send,
-    {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(future)
-    }
-
-    fn run_on_scoped_thread<T, F>(future: F) -> DiscoveryResult<T>
-    where
-        T: Send,
-        F: Future<Output = DiscoveryResult<T>> + Send,
-    {
-        std::thread::scope(|scope| {
-            let (tx, rx) = std::sync::mpsc::sync_channel(1);
-            scope.spawn(move || {
-                let _ = tx.send(run_on_new_runtime(future));
-            });
-            rx.recv().map_err(|error| {
-                DiscoveryError::Io(io::Error::other(format!(
-                    "failed to receive async discovery result: {error}"
-                )))
-            })?
-        })
-    }
-
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        return match handle.runtime_flavor() {
-            RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| handle.block_on(future)),
-            RuntimeFlavor::CurrentThread => run_on_scoped_thread(future),
-            _ => run_on_scoped_thread(future),
-        };
-    }
-
-    run_on_new_runtime(future)
-}
-
 async fn fetch_remote_snapshot(name: &str, postgres_dsn: &str) -> DiscoveryResult<(i64, Vec<u8>)> {
     let (client, connection) = tokio_postgres::connect(postgres_dsn, tokio_postgres::NoTls)
         .await
@@ -153,14 +107,14 @@ async fn fetch_remote_snapshot(name: &str, postgres_dsn: &str) -> DiscoveryResul
 }
 
 pub fn run(name: &str, meta_dsn: &str, meta_dir: &Path) -> DiscoveryResult<()> {
-    let postgres_dsn = run_discovery_future(async {
+    let postgres_dsn = crate::runtime_bridge::block_on(async {
         ensure_studiofs_database(meta_dsn)
             .await
             .map_err(|e| DiscoveryError::Message(e.to_string()))
     })?
     .metadata_dsn;
     let (volume_id, snapshot): (i64, Vec<u8>) =
-        run_discovery_future(fetch_remote_snapshot(name, &postgres_dsn))?;
+        crate::runtime_bridge::block_on(fetch_remote_snapshot(name, &postgres_dsn))?;
 
     let mut format_info = extract_format_info(&snapshot)?;
     let snapshot_state: RedbSnapshot = serde_json::from_slice(&snapshot)
