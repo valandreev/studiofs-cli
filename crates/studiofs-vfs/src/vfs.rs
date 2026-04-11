@@ -26,6 +26,8 @@
 mod commit;
 mod config;
 mod file_session;
+mod handle_table;
+mod locking;
 #[path = "write_buffer.rs"]
 mod write_buffer;
 
@@ -34,6 +36,7 @@ pub use config::{
     VfsConfigValidated,
 };
 pub use file_session::{OpenFile, OpenFlags, VfsFileSessionStats};
+pub use locking::LockKind;
 
 use config::{
     CACHE_RUNTIME_HUGE_BUDGET_BYTES, CACHE_RUNTIME_LARGE_BUDGET_BYTES,
@@ -42,13 +45,15 @@ use config::{
     CACHE_RUNTIME_MAX_WRITE_EAGER_BATCH_BYTES, CACHE_RUNTIME_MIN_INGRESS_SEGMENT_BYTES,
     CACHE_RUNTIME_MIN_TRANSIT_BUDGET_BYTES, CACHE_RUNTIME_MIN_WRITE_EAGER_BATCH_BYTES,
     CACHE_RUNTIME_SMALL_BUDGET_BYTES, CacheRuntimeTuningOverrides, DeletedInodeCleanup,
-    DirtyAttrPersistPolicy, DistributedFlock, EagerFlushOutcome, FAST_MODE_SYNC_GROUP_MAX_DELAY_MS,
+    DirtyAttrPersistPolicy, EagerFlushOutcome, FAST_MODE_SYNC_GROUP_MAX_DELAY_MS,
     FAST_MODE_SYNC_GROUP_MIN_BYTES_CEIL, FAST_MODE_SYNC_GROUP_MIN_BYTES_FLOOR, FsyncOutcome,
     HandleReleaseContext, LastHandleReleaseAction, LocalSyncBarrierOutcome, LocalSyncPolicy,
-    PAYLOAD_PUT_CONCURRENCY_MAX, PAYLOAD_PUT_CONCURRENCY_TARGET_BYTES, RemoteLockRecord,
-    StickyErrorPolicy, UnlinkTarget, WRITE_EAGER_DRAIN_CHUNK_MAX_BYTES, write_path_sync_trigger,
+    PAYLOAD_PUT_CONCURRENCY_MAX, PAYLOAD_PUT_CONCURRENCY_TARGET_BYTES, StickyErrorPolicy,
+    UnlinkTarget, WRITE_EAGER_DRAIN_CHUNK_MAX_BYTES, write_path_sync_trigger,
 };
 use file_session::{FileSessionOperation, FileSessionState};
+use handle_table::HandleTable;
+use locking::{DistributedFlock, FileLockState};
 
 use crate::access::{
     AccessClass, AccessClassifierConfig, AccessDecision, AccessPolicy, HandleAccessState,
@@ -63,6 +68,7 @@ use crate::runtime::{
     LocalCacheIoTiming, MetaExecutor, TimeoutOrCancel, cache_io_execution_model,
     run_local_cache_io, run_local_cache_io_blocking, run_meta, run_with_timeout_or_cancel,
 };
+use crate::utils::{now_unix_millis, now_unix_secs};
 use crate::vfs::write_buffer::WriteBufferState;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::{FutureExt, future::join_all};
@@ -74,8 +80,8 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::OpenLocalBlockBackendError;
 use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig, CancelUploadMode, L2IoPriority};
@@ -1981,108 +1987,6 @@ impl AttrReadCache {
     }
 }
 
-// =============================================================================
-// File Locking (flock)
-// =============================================================================
-
-/// File-level lock kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LockKind {
-    /// Shared (read) lock.
-    Shared,
-    /// Exclusive (write) lock.
-    Exclusive,
-    /// Unlock.
-    Unlock,
-}
-
-/// Internal state for a file-level lock.
-#[derive(Debug)]
-struct FileLock {
-    kind: LockKind,
-    owner: u64,
-    /// Number of shared locks held (only meaningful when `kind == Shared`).
-    shared_count: u32,
-}
-
-/// Per-VFS handle table tracking all open file descriptors.
-struct HandleTable {
-    /// Monotonically increasing file handle counter.
-    next_fh: AtomicU64,
-    /// All open handles: fh → OpenFile.
-    handles: parking_lot::RwLock<HashMap<u64, OpenFile>>,
-    /// Inode → number of currently open file descriptors.
-    open_counts: Mutex<HashMap<Ino, u32>>,
-    /// Inodes that were unlinked while still open (deferred deletion).
-    orphans: Mutex<std::collections::HashSet<Ino>>,
-}
-
-impl HandleTable {
-    fn new() -> Self {
-        Self {
-            next_fh: AtomicU64::new(1),
-            handles: parking_lot::RwLock::new(HashMap::new()),
-            open_counts: Mutex::new(HashMap::new()),
-            orphans: Mutex::new(std::collections::HashSet::new()),
-        }
-    }
-
-    /// Allocate a new file handle and register it.
-    fn open(&self, ino: Ino, flags: OpenFlags) -> OpenFile {
-        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        let open_file = OpenFile::new(fh, ino, flags);
-        self.handles.write().insert(fh, open_file.clone());
-        *self.open_counts.lock().entry(ino).or_insert(0) += 1;
-        open_file
-    }
-
-    /// Look up an open file handle.
-    fn get(&self, fh: u64) -> Option<OpenFile> {
-        self.handles.read().get(&fh).cloned()
-    }
-
-    /// Close a file handle.  Returns `(ino, remaining_open_count)`.
-    fn close(&self, fh: u64) -> Option<(OpenFile, u32)> {
-        let open_file = self.handles.write().remove(&fh)?;
-        let mut counts = self.open_counts.lock();
-        let count = counts.get_mut(&open_file.ino)?;
-        *count = count.saturating_sub(1);
-        let remaining = *count;
-        if remaining == 0 {
-            counts.remove(&open_file.ino);
-        }
-        Some((open_file, remaining))
-    }
-
-    /// Get the number of open handles for an inode.
-    fn open_count(&self, ino: Ino) -> u32 {
-        self.open_counts.lock().get(&ino).copied().unwrap_or(0)
-    }
-
-    /// Mark an inode as orphan (unlinked while open).
-    fn mark_orphan(&self, ino: Ino) {
-        self.orphans.lock().insert(ino);
-    }
-
-    /// Check if inode is an orphan and remove the mark. Returns true if it was.
-    fn take_orphan(&self, ino: Ino) -> bool {
-        self.orphans.lock().remove(&ino)
-    }
-
-    /// Return the [`AccessClass`] of every currently open file handle.
-    ///
-    /// Used during shutdown to drain `active_access_classes` counters for
-    /// handles that were never explicitly closed via `release_fh` (e.g. the
-    /// kernel unmounted the filesystem without flushing all file descriptors).
-    fn collect_open_access_classes(&self) -> Vec<AccessClass> {
-        self.handles
-            .read()
-            .values()
-            .map(|f| f.current_access_class())
-            .collect()
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ExtentRecordId {
     object_id: u64,
@@ -2943,20 +2847,6 @@ impl ReadState {
         }
         let dominant_class = AccessClass::from_index(dominant_idx)?;
         Some((dominant_class, latest_policy_by_class[dominant_idx]))
-    }
-}
-
-struct FileLockState {
-    file_locks: Mutex<std::collections::HashMap<Ino, FileLock>>,
-    lock_notify: tokio::sync::Notify,
-}
-
-impl FileLockState {
-    fn new() -> Self {
-        Self {
-            file_locks: Mutex::new(std::collections::HashMap::new()),
-            lock_notify: tokio::sync::Notify::new(),
-        }
     }
 }
 
@@ -4449,7 +4339,7 @@ struct ForegroundReadScope<'a> {
 
 impl<'a> ForegroundReadScope<'a> {
     fn new(read_state: &'a ReadState, latency_window: Duration, policy: AccessPolicy) -> Self {
-        let now_ms = StudioVfs::now_unix_millis();
+        let now_ms = now_unix_millis();
         read_state.mark_foreground_read(now_ms);
         let shard_idx = read_state.select_foreground_latency_shard();
         Self {
@@ -4478,7 +4368,7 @@ struct ForegroundReadTelemetry {
 
 impl Drop for ForegroundReadScope<'_> {
     fn drop(&mut self) {
-        let now_ms = StudioVfs::now_unix_millis();
+        let now_ms = now_unix_millis();
         self.read_state.record_foreground_read_latency(
             self.shard_idx,
             ForegroundReadTelemetry {
@@ -6873,22 +6763,8 @@ impl StudioVfs {
         }
     }
 
-    fn now_unix_secs() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
-    }
-
-    fn now_unix_millis() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0)
-    }
-
     fn pending_age_stats_ms(&self) -> (u64, u64) {
-        let now_ms = Self::now_unix_millis();
+        let now_ms = now_unix_millis();
         let mut ages: Vec<u64> = self
             .block_cache
             .snapshot_pending_uploads()
@@ -6948,7 +6824,7 @@ impl StudioVfs {
             .saturating_mul(2u32.saturating_pow(exp));
         let capped = base.min(self.upload_requeue_max);
         let jitter_max = (capped.as_millis() as u64 / 5).max(1);
-        let jitter_seed = op.object_id ^ Self::now_unix_millis();
+        let jitter_seed = op.object_id ^ now_unix_millis();
         let jitter_ms = jitter_seed % jitter_max;
         capped.saturating_add(Duration::from_millis(jitter_ms))
     }
@@ -6978,7 +6854,7 @@ impl StudioVfs {
     }
 
     fn foreground_sticky_p90_latency_ns(&self) -> Option<u64> {
-        let now_ms = Self::now_unix_millis();
+        let now_ms = now_unix_millis();
         let last_at = self
             .state
             .read
@@ -7038,7 +6914,7 @@ impl StudioVfs {
         let foreground_active = self
             .state
             .read
-            .foreground_read_active(Self::now_unix_millis(), self.upload_user_idle_grace);
+            .foreground_read_active(now_unix_millis(), self.upload_user_idle_grace);
         let congested = p90_latency_ns.is_some_and(|p90| p90 > threshold_ns);
         let io_cost = self.update_upload_io_foreground_cost(congested, foreground_active);
         let pressure_boost = u64::from(upload_pressure_boost);
@@ -7993,18 +7869,17 @@ impl StudioVfs {
     }
 
     pub fn foreground_read_protection_stats(&self) -> VfsForegroundReadProtectionStats {
-        let (p90_latency_ns, speedometer_samples, window_bytes, window_coverage_ms) =
-            self.state.read.foreground_speedometer_snapshot(
-                Self::now_unix_millis(),
-                self.upload_fg_read_latency_window,
-            );
+        let (p90_latency_ns, speedometer_samples, window_bytes, window_coverage_ms) = self
+            .state
+            .read
+            .foreground_speedometer_snapshot(now_unix_millis(), self.upload_fg_read_latency_window);
         let throughput_bytes_per_sec = Self::foreground_throughput_bytes_per_sec(
             speedometer_samples,
             window_bytes,
             window_coverage_ms,
         );
         let dominant = self.state.read.foreground_access_pattern_snapshot(
-            Self::now_unix_millis(),
+            now_unix_millis(),
             self.upload_fg_read_latency_window,
         );
         let (dominant_access_class, dominant_policy) = match dominant {
@@ -8105,7 +7980,7 @@ impl StudioVfs {
     }
 
     async fn acquire_janitor_lease(&self, lease: &JanitorLease) -> bool {
-        let now = Self::now_unix_secs();
+        let now = now_unix_secs();
         let lease_until = now.saturating_add(self.janitor_lease_ttl.as_secs() as i64);
 
         let create_payload = Self::encode_lease_record(&lease.owner_id, lease_until, 1);
@@ -8200,200 +8075,6 @@ impl StudioVfs {
             Err(err) => {
                 warn!("janitor lease CAS update failed: {}", err);
                 false
-            }
-        }
-    }
-
-    fn lock_record_path(cfg: &DistributedFlock, ino: Ino) -> String {
-        format!("{}{}.lock", cfg.prefix, ino)
-    }
-
-    fn encode_remote_lock_record(state: &RemoteLockRecord) -> Vec<u8> {
-        let exclusive = state.exclusive_owner.as_deref().unwrap_or("-");
-        let shared = if state.shared_owners.is_empty() {
-            "-".to_string()
-        } else {
-            state
-                .shared_owners
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        format!("{}\n{}\n{}\n", state.lease_until_unix, exclusive, shared).into_bytes()
-    }
-
-    fn decode_remote_lock_record(bytes: &[u8]) -> Option<RemoteLockRecord> {
-        let text = std::str::from_utf8(bytes).ok()?;
-        let mut lines = text.lines();
-        let lease_until_unix = lines.next()?.trim().parse::<i64>().ok()?;
-        let exclusive_raw = lines.next().unwrap_or("-").trim();
-        let shared_raw = lines.next().unwrap_or("-").trim();
-        let exclusive_owner = if exclusive_raw.is_empty() || exclusive_raw == "-" {
-            None
-        } else {
-            Some(exclusive_raw.to_string())
-        };
-        let mut shared_owners = BTreeSet::new();
-        if !shared_raw.is_empty() && shared_raw != "-" {
-            for item in shared_raw.split(',') {
-                let v = item.trim();
-                if !v.is_empty() {
-                    shared_owners.insert(v.to_string());
-                }
-            }
-        }
-        Some(RemoteLockRecord {
-            lease_until_unix,
-            exclusive_owner,
-            shared_owners,
-        })
-    }
-
-    fn normalize_remote_lock_state(state: &mut RemoteLockRecord, now: i64) {
-        if state.lease_until_unix <= now {
-            state.lease_until_unix = 0;
-            state.exclusive_owner = None;
-            state.shared_owners.clear();
-        }
-    }
-
-    async fn acquire_distributed_flock(
-        &self,
-        cfg: &DistributedFlock,
-        ino: Ino,
-        op: LockKind,
-    ) -> VfsResult<bool> {
-        let path = Self::lock_record_path(cfg, ino);
-        let now = Self::now_unix_secs();
-        let lease_until = now.saturating_add(cfg.lease_ttl.as_secs() as i64);
-
-        let mut retries = 0u32;
-        loop {
-            let mut retry_later = false;
-            let (mut state, etag_opt) = match cfg.op.stat(&path).await {
-                Ok(meta) => {
-                    let etag = meta.etag().map(ToString::to_string);
-                    match cfg.op.read(&path).await {
-                        Ok(raw) => {
-                            let parsed = {
-                                let raw_chunk = raw.chunk();
-                                if raw_chunk.len() == raw.remaining() {
-                                    Self::decode_remote_lock_record(raw_chunk)
-                                } else {
-                                    let raw = raw.to_bytes();
-                                    Self::decode_remote_lock_record(&raw)
-                                }
-                            }
-                            .unwrap_or_default();
-                            (parsed, etag)
-                        }
-                        Err(err) if err.is_temporary() || err.kind() == ErrorKind::Unexpected => {
-                            retry_later = true;
-                            (RemoteLockRecord::default(), None)
-                        }
-                        Err(err) => {
-                            return Err(VfsError::Other(format!("lock read failed: {err}")));
-                        }
-                    }
-                }
-                Err(err) if err.kind() == ErrorKind::NotFound => {
-                    (RemoteLockRecord::default(), None)
-                }
-                Err(err) if err.is_temporary() || err.kind() == ErrorKind::Unexpected => {
-                    retry_later = true;
-                    (RemoteLockRecord::default(), None)
-                }
-                Err(err) => return Err(VfsError::Other(format!("lock stat failed: {err}"))),
-            };
-            if retry_later {
-                retries = retries.saturating_add(1);
-                if retries >= 12 {
-                    return Ok(false);
-                }
-                let backoff_ms = (cfg.retry_base_ms.saturating_mul(1u64 << retries.min(6)))
-                    .min(cfg.retry_max_ms);
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                continue;
-            }
-
-            Self::normalize_remote_lock_state(&mut state, now);
-            let mut next_state = state.clone();
-            let client = cfg.client_id.clone();
-
-            let allowed = match op {
-                LockKind::Shared => {
-                    if let Some(excl) = &state.exclusive_owner {
-                        excl == &client
-                    } else {
-                        true
-                    }
-                }
-                LockKind::Exclusive => {
-                    let excl_ok = state
-                        .exclusive_owner
-                        .as_ref()
-                        .map(|v| v == &client)
-                        .unwrap_or(true);
-                    let shared_ok = state.shared_owners.is_empty()
-                        || (state.shared_owners.len() == 1
-                            && state.shared_owners.contains(&client));
-                    excl_ok && shared_ok
-                }
-                LockKind::Unlock => true,
-            };
-
-            if !allowed {
-                return Ok(false);
-            }
-
-            match op {
-                LockKind::Shared => {
-                    next_state.exclusive_owner = None;
-                    next_state.shared_owners.insert(client);
-                }
-                LockKind::Exclusive => {
-                    next_state.exclusive_owner = Some(client);
-                    next_state.shared_owners.clear();
-                }
-                LockKind::Unlock => {
-                    if next_state.exclusive_owner.as_deref() == Some(cfg.client_id.as_str()) {
-                        next_state.exclusive_owner = None;
-                    }
-                    next_state.shared_owners.remove(cfg.client_id.as_str());
-                }
-            }
-            next_state.lease_until_unix = lease_until;
-
-            let mut opts = WriteOptions::default();
-            if let Some(etag) = etag_opt {
-                opts.if_match = Some(etag);
-            } else {
-                opts.if_not_exists = true;
-            }
-
-            let payload = Self::encode_remote_lock_record(&next_state);
-            match cfg.op.write_options(&path, payload, opts).await {
-                Ok(_) => return Ok(true),
-                Err(err) if err.kind() == ErrorKind::ConditionNotMatch => {
-                    retries = retries.saturating_add(1);
-                    if retries >= 12 {
-                        return Ok(false);
-                    }
-                    let backoff_ms = (cfg.retry_base_ms.saturating_mul(1u64 << retries.min(6)))
-                        .min(cfg.retry_max_ms);
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                }
-                Err(err) if err.is_temporary() || err.kind() == ErrorKind::Unexpected => {
-                    retries = retries.saturating_add(1);
-                    if retries >= 12 {
-                        return Ok(false);
-                    }
-                    let backoff_ms = (cfg.retry_base_ms.saturating_mul(1u64 << retries.min(6)))
-                        .min(cfg.retry_max_ms);
-                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                }
-                Err(err) => return Err(VfsError::Other(format!("lock write failed: {err}"))),
             }
         }
     }
@@ -8544,7 +8225,7 @@ impl StudioVfs {
         let last_checkpoint_age_ms = if last_checkpoint_unix_ms == 0 {
             0
         } else {
-            Self::now_unix_millis().saturating_sub(last_checkpoint_unix_ms)
+            now_unix_millis().saturating_sub(last_checkpoint_unix_ms)
         };
 
         VfsIngressStats {
@@ -9126,7 +8807,7 @@ impl StudioVfs {
             payload_burst_interval_histogram.bucket_counts.iter().sum();
 
         VfsWritePathObservabilitySnapshot {
-            generated_unix_ms: Self::now_unix_millis(),
+            generated_unix_ms: now_unix_millis(),
             uptime_secs: elapsed.as_secs_f64(),
             backend_tag: self.write_path_backend_tag.clone(),
             flush_ordered_calls,
@@ -10447,169 +10128,6 @@ impl StudioVfs {
     }
 
     // =========================================================================
-    // File Locking (flock)
-    // =========================================================================
-
-    /// Acquire or release a file-level lock (flock semantics).
-    ///
-    /// - `Shared`: multiple readers allowed, blocks if exclusive lock held by another owner.
-    /// - `Exclusive`: single writer, blocks if any lock held by another owner.
-    /// - `Unlock`: release the lock.
-    ///
-    /// If `blocking` is false and the lock cannot be acquired, returns `VfsError::WouldBlock`.
-    pub async fn flock(&self, ino: Ino, op: LockKind, owner: u64, blocking: bool) -> VfsResult<()> {
-        loop {
-            if op == LockKind::Unlock {
-                let had_local_lock = {
-                    let mut locks = self.state.file_lock.file_locks.lock();
-                    let mut had = false;
-                    if let Some(entry) = locks.get_mut(&ino) {
-                        match entry.kind {
-                            LockKind::Shared => {
-                                had = true;
-                                entry.shared_count = entry.shared_count.saturating_sub(1);
-                                if entry.shared_count == 0 {
-                                    locks.remove(&ino);
-                                }
-                            }
-                            LockKind::Exclusive if entry.owner == owner => {
-                                had = true;
-                                locks.remove(&ino);
-                            }
-                            _ => {}
-                        }
-                    }
-                    had
-                };
-
-                if had_local_lock {
-                    if let Some(cfg) = &self.distributed_flock {
-                        // Bimodal strong mode guarantee:
-                        // flush local data + metadata before releasing distributed lock.
-                        self.flush(ino).await?;
-                        let meta = self.meta_async.clone();
-                        run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-                            engine.flush_metadata()?;
-                            Ok(())
-                        })
-                        .await?;
-                        let _ = self
-                            .acquire_distributed_flock(cfg, ino, LockKind::Unlock)
-                            .await?;
-                    }
-                    self.state.file_lock.lock_notify.notify_waiters();
-                }
-                return Ok(());
-            }
-
-            let local_allowed = {
-                let locks = self.state.file_lock.file_locks.lock();
-                match locks.get(&ino) {
-                    None => true,
-                    Some(entry) => match op {
-                        LockKind::Shared => {
-                            entry.kind == LockKind::Shared
-                                || (entry.kind == LockKind::Exclusive && entry.owner == owner)
-                        }
-                        LockKind::Exclusive => {
-                            entry.kind == LockKind::Unlock
-                                || (entry.kind == LockKind::Exclusive && entry.owner == owner)
-                        }
-                        LockKind::Unlock => true,
-                    },
-                }
-            };
-            if !local_allowed {
-                if !blocking {
-                    return Err(VfsError::WouldBlock);
-                }
-                self.state.file_lock.lock_notify.notified().await;
-                continue;
-            }
-
-            if let Some(cfg) = &self.distributed_flock {
-                let acquired = self.acquire_distributed_flock(cfg, ino, op).await?;
-                if !acquired {
-                    if !blocking {
-                        return Err(VfsError::WouldBlock);
-                    }
-                    tokio::time::sleep(Duration::from_millis(cfg.retry_base_ms)).await;
-                    continue;
-                }
-                // Bimodal strong mode guarantee:
-                // refresh local metadata view before lock is considered granted.
-                let meta = self.meta_async.clone();
-                run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-                    engine.sync_metadata()?;
-                    Ok(())
-                })
-                .await?;
-            }
-
-            let committed = {
-                let mut locks = self.state.file_lock.file_locks.lock();
-                match op {
-                    LockKind::Shared => {
-                        let entry = locks.entry(ino).or_insert(FileLock {
-                            kind: LockKind::Unlock,
-                            owner: 0,
-                            shared_count: 0,
-                        });
-                        match entry.kind {
-                            LockKind::Unlock | LockKind::Shared => {
-                                entry.kind = LockKind::Shared;
-                                entry.shared_count = entry.shared_count.saturating_add(1);
-                                true
-                            }
-                            LockKind::Exclusive if entry.owner == owner => {
-                                entry.kind = LockKind::Shared;
-                                entry.shared_count = 1;
-                                true
-                            }
-                            _ => false,
-                        }
-                    }
-                    LockKind::Exclusive => {
-                        let entry = locks.entry(ino).or_insert(FileLock {
-                            kind: LockKind::Unlock,
-                            owner: 0,
-                            shared_count: 0,
-                        });
-                        match entry.kind {
-                            LockKind::Unlock => {
-                                *entry = FileLock {
-                                    kind: LockKind::Exclusive,
-                                    owner,
-                                    shared_count: 0,
-                                };
-                                true
-                            }
-                            LockKind::Exclusive if entry.owner == owner => true,
-                            _ => false,
-                        }
-                    }
-                    LockKind::Unlock => true,
-                }
-            };
-            if committed {
-                return Ok(());
-            }
-
-            // Local conflict appeared after remote acquisition attempt.
-            // Best-effort release remote lock and retry.
-            if let Some(cfg) = &self.distributed_flock {
-                let _ = self
-                    .acquire_distributed_flock(cfg, ino, LockKind::Unlock)
-                    .await;
-            }
-            if !blocking {
-                return Err(VfsError::WouldBlock);
-            }
-            self.state.file_lock.lock_notify.notified().await;
-        }
-    }
-
-    // =========================================================================
     // Hardlinks
     // =========================================================================
 
@@ -11914,7 +11432,7 @@ impl StudioVfs {
         }
         let mut waited_upload_delay_ms = 0u64;
         if self.upload_delay > Duration::from_millis(0) {
-            let age_ms = Self::now_unix_millis().saturating_sub(op.created_unix_ms);
+            let age_ms = now_unix_millis().saturating_sub(op.created_unix_ms);
             let delay_ms = self.upload_delay.as_millis() as u64;
             if age_ms < delay_ms {
                 waited_upload_delay_ms = delay_ms - age_ms;
@@ -12162,7 +11680,7 @@ impl StudioVfs {
             let upload_io_cost = if self
                 .state
                 .read
-                .foreground_read_active(Self::now_unix_millis(), self.upload_user_idle_grace)
+                .foreground_read_active(now_unix_millis(), self.upload_user_idle_grace)
             {
                 self.state
                     .upload
@@ -14362,8 +13880,8 @@ mod tests {
             "dropping the scope should clear the inflight foreground read"
         );
 
-        let (p90_ns, total_samples, window_bytes, window_coverage_ms) = state
-            .foreground_speedometer_snapshot(StudioVfs::now_unix_millis(), Duration::from_secs(1));
+        let (p90_ns, total_samples, window_bytes, window_coverage_ms) =
+            state.foreground_speedometer_snapshot(now_unix_millis(), Duration::from_secs(1));
         assert!(
             p90_ns.is_some(),
             "dropping the scope should record latency telemetry"
@@ -15379,67 +14897,6 @@ mod tests {
                 "idle read-only session should be collected"
             );
         });
-    }
-
-    // =========================================================================
-    // HandleTable Unit Tests
-    // =========================================================================
-
-    #[test]
-    fn test_handle_table_open_close() {
-        let ht = HandleTable::new();
-        let fh1 = ht.open(10, OpenFlags::RDONLY);
-        let fh2 = ht.open(10, OpenFlags::RDWR);
-        let fh3 = ht.open(20, OpenFlags::WRONLY);
-
-        assert_ne!(fh1.fh, fh2.fh);
-        assert_ne!(fh2.fh, fh3.fh);
-
-        // Open count
-        assert_eq!(ht.open_count(10), 2);
-        assert_eq!(ht.open_count(20), 1);
-        assert_eq!(ht.open_count(99), 0);
-
-        // Get
-        let of1 = ht.get(fh1.fh).unwrap();
-        assert_eq!(of1.ino, 10);
-        assert!(of1.flags.contains(OpenFlags::RDONLY));
-
-        let of3 = ht.get(fh3.fh).unwrap();
-        assert_eq!(of3.ino, 20);
-
-        assert!(ht.get(99999).is_none());
-
-        // Close fh1 — ino 10 still has 1 open
-        let (closed1, remaining) = ht.close(fh1.fh).unwrap();
-        assert_eq!(closed1.ino, 10);
-        assert_eq!(remaining, 1);
-        assert_eq!(ht.open_count(10), 1);
-
-        // Close fh2 — ino 10 now at 0
-        let (closed2, remaining) = ht.close(fh2.fh).unwrap();
-        assert_eq!(closed2.ino, 10);
-        assert_eq!(remaining, 0);
-        assert_eq!(ht.open_count(10), 0);
-
-        // Double-close returns None
-        assert!(ht.close(fh1.fh).is_none());
-    }
-
-    #[test]
-    fn test_handle_table_orphans() {
-        let ht = HandleTable::new();
-        let _fh = ht.open(42, OpenFlags::RDWR);
-
-        // Not an orphan yet
-        assert!(!ht.take_orphan(42));
-
-        // Mark as orphan
-        ht.mark_orphan(42);
-
-        // take_orphan returns true and clears it
-        assert!(ht.take_orphan(42));
-        assert!(!ht.take_orphan(42)); // second call returns false
     }
 
     #[test]

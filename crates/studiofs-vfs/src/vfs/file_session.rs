@@ -1,6 +1,4 @@
-use crate::access::{
-    AccessClass, AccessClassifierConfig, AccessDecision, HandleAccessState,
-};
+use crate::access::{AccessClass, AccessClassifierConfig, AccessDecision, HandleAccessState};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -9,7 +7,7 @@ use std::time::Instant;
 use studiofs_meta::types::Ino;
 use tracing::debug;
 
-use super::StudioVfs;
+use crate::utils::now_unix_millis;
 
 // =============================================================================
 // Open File Handle Tracking
@@ -202,7 +200,7 @@ impl FileSessionEntry {
     fn record_transition(&self, op: FileSessionOperation, phase: &'static str) {
         self.transitions.fetch_add(1, Ordering::Relaxed);
         self.last_transition_unix_ms
-            .store(StudioVfs::now_unix_millis(), Ordering::Relaxed);
+            .store(now_unix_millis(), Ordering::Relaxed);
         *self.last_transition_label.lock() = format!("{}:{phase}", op.as_str());
     }
 

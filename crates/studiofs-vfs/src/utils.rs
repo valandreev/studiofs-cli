@@ -1,5 +1,7 @@
 //! Utility functions for studiofs-vfs
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 /// Parse a human-readable size string into bytes.
 ///
 /// Supports plain bytes and `KB`, `MB`, `GB`, `TB`, `PB`, and `EB` suffixes.
@@ -60,6 +62,20 @@ pub fn parse_size_bytes(raw: &str) -> Option<u64> {
     let scaled_bytes = scaled_num.checked_mul(multiplier)?;
     let bytes = scaled_bytes / scale;
     u64::try_from(bytes).ok()
+}
+
+pub(crate) fn now_unix_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+pub(crate) fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
