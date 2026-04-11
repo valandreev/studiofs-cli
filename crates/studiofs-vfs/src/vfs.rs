@@ -1052,6 +1052,11 @@ struct HandleReleaseContext {
     ino: Ino,
 }
 
+struct UnlinkTarget {
+    ino: Ino,
+    open_handles: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalSyncTrigger {
     Explicit,
@@ -10490,6 +10495,81 @@ impl StudioVfs {
         })
     }
 
+    fn resolve_unlink_target(
+        &self,
+        meta: &Arc<dyn MetaEngine>,
+        parent: Ino,
+        name: &[u8],
+    ) -> VfsResult<UnlinkTarget> {
+        let entry = meta.lookup(parent, name)?;
+        Ok(UnlinkTarget {
+            ino: entry.ino,
+            open_handles: self.handle_table.open_count(entry.ino),
+        })
+    }
+
+    fn queue_pending_deletions_for_object_ids(
+        &self,
+        meta: &Arc<dyn MetaEngine>,
+        removed_ids: &[u64],
+        reason: &str,
+    ) -> VfsResult<()> {
+        if removed_ids.is_empty() {
+            return Ok(());
+        }
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        for &object_id in removed_ids {
+            meta.add_pending_deletion(object_id, timestamp)?;
+            debug!("marking object {} for deletion ({})", object_id, reason);
+        }
+        Ok(())
+    }
+
+    async fn cleanup_deleted_inode_storage(
+        &self,
+        meta: &Arc<dyn MetaEngine>,
+        ino: Ino,
+        used_space_bytes: u64,
+        gc_reason: &str,
+    ) -> VfsResult<()> {
+        self.mark_inode_deleted_for_uploads(ino);
+
+        let removed_ids = meta.remove_file_blocks(ino)?;
+        self.queue_pending_deletions_for_object_ids(meta, &removed_ids, gc_reason)?;
+
+        if used_space_bytes > 0 {
+            meta.decr_counter(studiofs_meta::types::counters::USED_SPACE, used_space_bytes)?;
+        }
+
+        // Deleted inodes should never retain staged writes, even if no committed
+        // block refs existed yet. Preserve the old immediate-unlink contract by
+        // also clearing live extent identities and read-side runtime state even
+        // when no object IDs remain to evict.
+        self.clear_pending_blocks_for_inode(ino);
+        self.remove_live_extents_for_inode(ino);
+        self.readahead.evict(ino);
+        self.clear_access_tracking_for_inode(ino);
+
+        if !removed_ids.is_empty() {
+            self.evict_inode_from_caches(ino, &removed_ids).await;
+        }
+
+        let deferred_local_blocks = self.take_deferred_deleted_local_blocks(ino);
+        if !deferred_local_blocks.is_empty() {
+            self.evict_inode_from_caches(ino, &deferred_local_blocks)
+                .await;
+        }
+
+        self.clear_inode_incarnation(ino);
+        self.state.namespace.dirty_attrs.lock().remove(&ino);
+        self.state.namespace.attr_read_cache.lock().remove(ino);
+        self.maybe_clear_deleted_inode_marker(ino);
+        Ok(())
+    }
+
     /// Release a handle and report whether this close owned the actual
     /// last-handle path, plus whether it had to drain local dirty state there.
     pub async fn release_fh_with_outcome(&self, fh: u64) -> VfsResult<ReleaseFhOutcome> {
@@ -11058,14 +11138,10 @@ impl StudioVfs {
         }
 
         let meta = self.sync_meta();
+        let unlink_target = self.resolve_unlink_target(&meta, parent, name)?;
+        let ino = unlink_target.ino;
 
-        // First, look up the entry to get the ino so we can check open handles.
-        let entry = meta.lookup(parent, name)?;
-        let ino = entry.ino;
-
-        let open_handles = self.handle_table.open_count(ino);
-
-        if open_handles > 0 {
+        if unlink_target.open_handles > 0 {
             // Open-unlink: atomically remove dentry + decrement nlink, keep inode alive.
             let attr = match meta.unlink_open_handle(parent, name) {
                 Ok(attr) => attr,
@@ -11089,7 +11165,7 @@ impl StudioVfs {
             self.handle_table.mark_orphan(ino);
             debug!(
                 "unlink ino={}: {} open handles, deferred cleanup (orphan)",
-                ino, open_handles
+                ino, unlink_target.open_handles
             );
 
             namespace_mutations.record_removal(parent, name, [ino]);
@@ -11105,44 +11181,11 @@ impl StudioVfs {
             };
 
             if attr.nlink == 0 {
-                // Inode fully removed — clean up blocks, caches, pending writes.
-                // Keep this call for idempotency (open-unlink path may have already marked).
-                self.mark_inode_deleted_for_uploads(attr.ino);
-
-                // Remove all blocks and mark for GC
-                let removed_ids = meta.remove_file_blocks(attr.ino)?;
-                info!(
-                    "unlink ino={}: removed {} block refs, object_ids={:?}",
-                    attr.ino,
-                    removed_ids.len(),
-                    removed_ids,
-                );
-
-                // Add to pending deletions (for eventual S3 deletion via background GC)
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-
-                for object_id in &removed_ids {
-                    meta.add_pending_deletion(*object_id, timestamp)?;
-                    debug!("marking object {} for deletion (unlink)", object_id);
-                }
-
-                // Decrement USED_SPACE by the file's logical size
-                if attr.size > 0 {
-                    meta.decr_counter(studiofs_meta::types::counters::USED_SPACE, attr.size)?;
-                }
-
-                // Clear pending blocks buffer
-                self.clear_pending_blocks_for_inode(attr.ino);
-
-                // Immediately evict all cached blocks for this inode — no need to wait for GC.
-                self.evict_inode_from_caches(attr.ino, &removed_ids).await;
-
-                // Clear dirty attrs and read-through cache
-                self.clear_inode_incarnation(attr.ino);
-                self.state.namespace.dirty_attrs.lock().remove(&attr.ino);
+                // Inode fully removed — shared cleanup for local blocks, staged
+                // writes, and cache state. Open-unlink may have already marked
+                // upload cancellation, so keep this idempotent.
+                self.cleanup_deleted_inode_storage(&meta, attr.ino, attr.size, "unlink")
+                    .await?;
             } else {
                 info!(
                     "unlink ino={}: nlink={}, keeping inode alive (hardlink)",
@@ -11276,33 +11319,12 @@ impl StudioVfs {
 
         // If an existing entry was overwritten, schedule GC + evict caches
         if let Some(ino) = rename_result.displaced_ino {
-            self.mark_inode_deleted_for_uploads(ino);
-
             // Compute total bytes for USED_SPACE before removing blocks
             let blocks = meta.get_file_blocks(ino)?;
             let total_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
 
-            let removed_ids = meta.remove_file_blocks(ino)?;
-            if !removed_ids.is_empty() {
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                for &object_id in &removed_ids {
-                    meta.add_pending_deletion(object_id, timestamp)?;
-                }
-                self.clear_pending_blocks_for_inode(ino);
-                self.evict_inode_from_caches(ino, &removed_ids).await;
-            }
-
-            // Decrement USED_SPACE for removed blocks
-            if total_bytes > 0 {
-                meta.decr_counter(studiofs_meta::types::counters::USED_SPACE, total_bytes)?;
-            }
-
-            self.state.namespace.dirty_attrs.lock().remove(&ino);
-            self.state.namespace.attr_read_cache.lock().remove(ino);
-            self.clear_inode_incarnation(ino);
+            self.cleanup_deleted_inode_storage(&meta, ino, total_bytes, "rename overwrite")
+                .await?;
             self.bump_directory_generation(ino);
             self.dentry_cache_invalidate_parent(ino);
         }
@@ -15484,6 +15506,66 @@ mod tests {
             assert!(
                 vfs.getattr(ino).is_err(),
                 "orphan cleanup should remove the inode"
+            );
+        });
+    }
+
+    #[test]
+    fn test_unlink_immediate_cleanup_clears_dirty_local_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "unlink-immediate-cleanup");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"unlink-immediate-cleanup.txt", 0, 0, 0o644)
+                .unwrap();
+            let ino = attr.ino;
+
+            vfs.write(ino, 0, b"payload").await.unwrap();
+            assert!(
+                vfs.inode_has_local_dirty_state(ino),
+                "write should leave local dirty state before unlink"
+            );
+
+            vfs.unlink(1, b"unlink-immediate-cleanup.txt").unwrap();
+
+            assert!(
+                vfs.getattr(ino).is_err(),
+                "unlink should remove the inode immediately"
+            );
+            assert!(
+                !vfs.inode_has_local_dirty_state(ino),
+                "immediate unlink should clear local dirty state for the deleted inode"
+            );
+        });
+    }
+
+    #[test]
+    fn test_rename_over_existing_target_clears_displaced_inode_dirty_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "rename-displaced-cleanup");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let source = vfs.create(1, b"rename-source.txt", 0, 0, 0o644).unwrap();
+            let displaced = vfs.create(1, b"rename-target.txt", 0, 0, 0o644).unwrap();
+
+            vfs.write(source.ino, 0, b"source").await.unwrap();
+            vfs.write(displaced.ino, 0, b"target").await.unwrap();
+            assert!(
+                vfs.inode_has_local_dirty_state(displaced.ino),
+                "target should have local dirty state before it is displaced"
+            );
+
+            vfs.rename(1, b"rename-source.txt", 1, b"rename-target.txt")
+                .unwrap();
+
+            assert!(
+                vfs.getattr(displaced.ino).is_err(),
+                "displaced inode should be removed after rename overwrite"
+            );
+            assert!(
+                !vfs.inode_has_local_dirty_state(displaced.ino),
+                "rename overwrite should clear local dirty state for the displaced inode"
             );
         });
     }
