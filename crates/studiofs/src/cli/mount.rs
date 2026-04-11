@@ -50,7 +50,7 @@ struct MountMetaSession {
     read_only_mount: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct DaemonSpawnPlan {
     current_exe: PathBuf,
     args: Vec<String>,
@@ -75,7 +75,7 @@ impl WritePathObservabilityPublisher {
             .spawn(move || {
                 loop {
                     if let Err(error) =
-                        persist_write_path_observability_snapshot(&vfs, &output_path_for_thread)
+                        persist_mount_path_observability_snapshot(&vfs, &output_path_for_thread)
                     {
                         warn!(
                             path = %output_path_for_thread.display(),
@@ -123,7 +123,7 @@ impl Drop for WritePathObservabilityPublisher {
     }
 }
 
-fn persist_write_path_observability_snapshot(
+fn persist_mount_path_observability_snapshot(
     vfs: &StudioVfs,
     output_path: &Path,
 ) -> std::io::Result<()> {
@@ -1185,6 +1185,8 @@ fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Resul
         use std::os::unix::process::CommandExt;
         // Create a new session so the child is fully detached from the terminal.
         unsafe {
+            // SAFETY: `setsid` is run in the pre-exec hook before `exec`; no Rust
+            // state is touched after this point in the parent process.
             cmd.pre_exec(|| {
                 libc::setsid();
                 Ok(())

@@ -62,6 +62,13 @@ pub async fn ensure_studiofs_database(input: &str) -> MetaResult<StudioPgDsns> {
     }
 
     conn_task.abort();
+    if let Err(err) = conn_task.await
+        && !err.is_cancelled()
+    {
+        return Err(MetaError::Storage(format!(
+            "postgres connection task failed: {err}"
+        )));
+    }
     Ok(dsns)
 }
 

@@ -79,18 +79,22 @@ extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
 /// Spawn a background thread that watches for SIGINT/SIGTERM and triggers
 /// an in-process unmount so `fuser::Session::run` returns cleanly and
 /// the VFS shutdown/drain logic can execute.
-fn spawn_signal_watcher(mount_point: String, mut unmount: fuser::SessionUnmounter) {
+fn spawn_signal_watcher(
+    mount_point: String,
+    mut unmount: fuser::SessionUnmounter,
+) -> std::io::Result<()> {
     let mp = mount_point.to_string();
-    // Install signal handlers (replaces the default "terminate" action).
+    // SAFETY: `libc::signal` mutates process-global signal disposition. We register a
+    // process-lifetime signal handler for shutdown before entering the mount loop.
     unsafe {
-        libc::signal(
-            libc::SIGINT,
-            shutdown_signal_handler as *const () as libc::sighandler_t,
-        );
-        libc::signal(
-            libc::SIGTERM,
-            shutdown_signal_handler as *const () as libc::sighandler_t,
-        );
+        let previous = libc::signal(libc::SIGINT, shutdown_signal_handler as libc::sighandler_t);
+        if previous == libc::SIG_ERR {
+            return Err(std::io::Error::last_os_error());
+        }
+        let previous = libc::signal(libc::SIGTERM, shutdown_signal_handler as libc::sighandler_t);
+        if previous == libc::SIG_ERR {
+            return Err(std::io::Error::last_os_error());
+        }
     }
     std::thread::Builder::new()
         .name("signal-watcher".into())
@@ -102,13 +106,15 @@ fn spawn_signal_watcher(mount_point: String, mut unmount: fuser::SessionUnmounte
             tracing::info!("received shutdown signal, unmounting {mp} …");
             // Restore default signal handlers immediately so a second Ctrl+C
             // force-kills the process in case unmount or shutdown stalls.
+            // SAFETY: we restore the process-global default handlers with libc constants.
             unsafe {
                 libc::signal(libc::SIGINT, libc::SIG_DFL);
                 libc::signal(libc::SIGTERM, libc::SIG_DFL);
             }
             let _ = unmount.unmount();
         })
-        .expect("failed to spawn signal-watcher thread");
+        .map(|_| ())?;
+    Ok(())
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -122,7 +128,7 @@ pub fn mount_and_serve(
     foreground: bool,
     read_only: bool,
     profiling: Option<Box<dyn FnMut()>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::io::Result<()> {
     // Keep a reference for shutdown() after the FUSE session ends
     // (vfs is moved into StudioFuseFs below).
     let vfs_ref = vfs.clone();
@@ -132,7 +138,8 @@ pub fn mount_and_serve(
     // root inode stored with uid=0/gid=0 (historic default), so the kernel
     // would see the mounting user as "other" (r-x only) and block writes.
     // Instead we implement access() -> ok() so the FUSE daemon decides.
-    let options = build_mount_options(volume_name, foreground, read_only)?;
+    let options = build_mount_options(volume_name, foreground, read_only)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
     // macOS-specific options:
     //  volname – display name in Finder
     //
@@ -148,7 +155,7 @@ pub fn mount_and_serve(
     let mut session = fuser::Session::new(fs, mount_point.as_ref() as &std::path::Path, &options)?;
     let unmount = session.unmount_callable();
     // Watch for Ctrl+C / SIGTERM and trigger in-process unmount.
-    spawn_signal_watcher(mount_point.to_string(), unmount);
+    spawn_signal_watcher(mount_point.to_string(), unmount)?;
     let notifier = session.notifier();
 
     // Register the kernel cache invalidator with the VFS.
@@ -215,6 +222,7 @@ mod tests {
     impl EnvVarGuard {
         fn set(key: &'static str, value: &str) -> Self {
             let previous = std::env::var_os(key);
+            // SAFETY: test helpers serialize env updates with a process-global lock.
             unsafe {
                 std::env::set_var(key, value);
             }
@@ -226,12 +234,18 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             match self.previous.take() {
-                Some(value) => unsafe {
-                    std::env::set_var(self.key, value);
-                },
-                None => unsafe {
-                    std::env::remove_var(self.key);
-                },
+                Some(value) => {
+                    // SAFETY: test helpers serialize env updates with a process-global lock.
+                    unsafe {
+                        std::env::set_var(self.key, value);
+                    }
+                }
+                None => {
+                    // SAFETY: test helpers serialize env updates with a process-global lock.
+                    unsafe {
+                        std::env::remove_var(self.key);
+                    }
+                }
             }
         }
     }

@@ -1,12 +1,24 @@
 //! `studiofs snapshot` — create/list immutable metadata snapshots.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use studiofs_meta::{ROOT_INO, open_meta_engine};
+use thiserror::Error;
 
-pub fn create(name: &str, meta_dir: &Path, root_ino: Option<u64>) -> anyhow::Result<()> {
+#[derive(Debug, Error)]
+pub enum SnapshotError {
+    #[error("local metadata DB not found: {path}")]
+    LocalDbNotFound { path: PathBuf },
+
+    #[error(transparent)]
+    Meta(#[from] studiofs_meta::MetaError),
+}
+
+pub type SnapshotResult<T> = std::result::Result<T, SnapshotError>;
+
+pub fn create(name: &str, meta_dir: &Path, root_ino: Option<u64>) -> SnapshotResult<()> {
     let db_path = meta_dir.join(format!("{name}.db"));
     if !db_path.exists() {
-        anyhow::bail!("local metadata DB not found: {}", db_path.display());
+        return Err(SnapshotError::LocalDbNotFound { path: db_path });
     }
 
     let engine = open_meta_engine(&db_path)?;
@@ -21,10 +33,10 @@ pub fn create(name: &str, meta_dir: &Path, root_ino: Option<u64>) -> anyhow::Res
     Ok(())
 }
 
-pub fn list(name: &str, meta_dir: &Path) -> anyhow::Result<()> {
+pub fn list(name: &str, meta_dir: &Path) -> SnapshotResult<()> {
     let db_path = meta_dir.join(format!("{name}.db"));
     if !db_path.exists() {
-        anyhow::bail!("local metadata DB not found: {}", db_path.display());
+        return Err(SnapshotError::LocalDbNotFound { path: db_path });
     }
 
     let engine = open_meta_engine(&db_path)?;

@@ -51,7 +51,7 @@ pub fn parse_size_bytes(raw: &str) -> Option<u64> {
             return None;
         }
         let frac_value = frac_part.parse::<u128>().ok()?;
-        let scale = 10u128.checked_pow(frac_part.len() as u32)?;
+        let scale = 10u128.checked_pow(u32::try_from(frac_part.len()).ok()?)?;
         let scaled_int = int_part.checked_mul(scale)?;
         let scaled_num = scaled_int.checked_add(frac_value)?;
         (scaled_num, scale)

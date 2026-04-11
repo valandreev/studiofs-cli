@@ -6,7 +6,9 @@
 
 use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
 use crate::cli::test_cache_profile::TestCacheProfileSession;
-use crate::cli::test_cache_profile_types::{TestCacheProfileMode, TestCacheProfileResult};
+use crate::cli::test_cache_profile_types::{
+    ProfileArtifactKind, TestCacheProfileMode, TestCacheProfileResult,
+};
 use crate::cli::utils::{format_bytes, format_throughput};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
@@ -16,6 +18,7 @@ use serde::Serialize;
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -37,6 +40,14 @@ const SMALL_FILE_MAX_BYTES: u64 = 10 * 1024;
 const LARGE_FILE_MULTIPLIER: u64 = 8;
 const DEFAULT_SMALL_CLASS_MAX_BYTES: u64 = SMALL_FILE_MAX_BYTES;
 const DEFAULT_TEST_CACHE_BLOCK_SIZE_STR: &str = "16MB";
+static TEST_CACHE_RUNTIME: OnceLock<std::io::Result<tokio::runtime::Runtime>> = OnceLock::new();
+
+fn test_cache_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    TEST_CACHE_RUNTIME
+        .get_or_init(tokio::runtime::Runtime::new)
+        .as_ref()
+        .map_err(|error| anyhow!("create tokio runtime: {error}"))
+}
 
 #[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
 pub enum TestCacheAccessPattern {
@@ -359,7 +370,7 @@ struct ProfileEndpointReport {
 
 #[derive(Debug, Serialize)]
 struct ProfileArtifactSummary {
-    kind: String,
+    kind: ProfileArtifactKind,
     path: String,
     bytes: u64,
     sent_to_endpoint: bool,
@@ -3308,7 +3319,7 @@ pub fn run(
         write_path_observability_path,
     )?;
 
-    let rt = tokio::runtime::Runtime::new().context("create tokio runtime")?;
+    let rt = test_cache_runtime()?;
     let report = rt.block_on(async {
         match &resolved_mode {
             ResolvedRunMode::DirectShim { cache_dir } => run_direct(&params, cache_dir).await,
@@ -3474,7 +3485,7 @@ mod tests {
                     application_name: "studiofs.test-cache.direct-shim".to_string(),
                 }),
                 artifacts: vec![ProfileArtifactSummary {
-                    kind: "cpu".to_string(),
+                    kind: ProfileArtifactKind::Cpu,
                     path: r"D:\test-cache\studiofs-test-cache-direct-shim-run-123-cpu.pprof.gz"
                         .to_string(),
                     bytes: 2048,

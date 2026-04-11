@@ -382,7 +382,12 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
     /// Returns `count` IDs starting from the current counter value.
     /// Default implementation calls `next_block_id()` repeatedly.
     fn next_block_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
-        let mut ids = Vec::with_capacity(count as usize);
+        let count = usize::try_from(count).map_err(|_| {
+            MetaError::Storage(
+                "requested block allocation count exceeds platform limits".to_string(),
+            )
+        })?;
+        let mut ids = Vec::with_capacity(count);
         for _ in 0..count {
             ids.push(self.next_block_id()?);
         }
@@ -411,9 +416,9 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
             };
             let old = self.set_file_block(e.ino, e.block_index, &block_ref)?;
             if let Some(ref old_block) = old {
-                self.decr_counter(counters::USED_SPACE, old_block.length as u64)?;
+                self.decr_counter(counters::USED_SPACE, u64::from(old_block.length))?;
             }
-            self.incr_counter(counters::USED_SPACE, e.length as u64)?;
+            self.incr_counter(counters::USED_SPACE, u64::from(e.length))?;
             results.push(BatchFlushResult { old_block: old });
         }
         Ok(results)

@@ -147,10 +147,12 @@ pub fn is_process_running(pid: u32) -> bool {
             fn CloseHandle(hObject: *mut core::ffi::c_void) -> i32;
         }
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        // SAFETY: `OpenProcess` returns a nullable handle for the PID; null means process unavailable.
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if handle.is_null() {
             false
         } else {
+            // SAFETY: `handle` is non-null and must be closed to release OS resources.
             unsafe { CloseHandle(handle) };
             true
         }
@@ -158,6 +160,7 @@ pub fn is_process_running(pid: u32) -> bool {
 
     #[cfg(unix)]
     {
+        // SAFETY: signal 0 is a portable process existence probe with no delivery side effects.
         unsafe { libc::kill(pid as i32, 0) == 0 }
     }
 }

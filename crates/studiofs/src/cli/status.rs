@@ -35,7 +35,7 @@ struct SpillDirStats {
 #[derive(Debug, Clone)]
 struct SegmentRecordStat {
     seq: u64,
-    len: usize,
+    len: u64,
     created_unix_ms: u64,
 }
 
@@ -53,7 +53,19 @@ fn local_cache_path(meta_dir: &Path, cache_dir: Option<&Path>, volume_uuid: &str
     base.join(volume_uuid)
 }
 
-fn detect_cache_backends_with_fallback(
+#[derive(Debug, Clone, Copy)]
+pub enum Verbosity {
+    Normal,
+    Verbose,
+}
+
+impl Verbosity {
+    fn is_verbose(self) -> bool {
+        matches!(self, Self::Verbose)
+    }
+}
+
+fn detect_backends_or_warn(
     cache_path: &Path,
     detector: impl FnOnce(&Path) -> std::io::Result<CacheBackendDetection>,
 ) -> Option<CacheBackendDetection> {
@@ -69,8 +81,8 @@ fn detect_cache_backends_with_fallback(
     }
 }
 
-fn detect_cache_backends_for_status(cache_path: &Path) -> Option<CacheBackendDetection> {
-    detect_cache_backends_with_fallback(cache_path, detect_cache_backends)
+fn detect_backends(cache_path: &Path) -> Option<CacheBackendDetection> {
+    detect_backends_or_warn(cache_path, detect_cache_backends)
 }
 
 fn format_ms(value: f64) -> String {
@@ -112,7 +124,7 @@ fn read_write_path_observability(
     }
 }
 
-fn map_status_open_local_backend_error(
+fn map_open_local_backend_error(
     cache_dir: &Path,
     source: OpenLocalBlockBackendError,
 ) -> anyhow::Error {
@@ -122,7 +134,7 @@ fn map_status_open_local_backend_error(
     )
 }
 
-fn scan_cache_v3_usage(
+fn scan_v3_cache(
     cache_backend_detection: &CacheBackendDetection,
 ) -> anyhow::Result<CacheUsageStats> {
     // Status is allowed to open the index directly to read aggregate counters.
@@ -140,7 +152,7 @@ fn scan_cache_usage(
 ) -> anyhow::Result<Option<CacheUsageStats>> {
     match cache_backend_detection {
         Some(detection) if detection.runtime_backend() == Some(CacheBackendKind::CacheV3) => {
-            scan_cache_v3_usage(detection).map(Some)
+            scan_v3_cache(detection).map(Some)
         }
         _ => Ok(None),
     }
@@ -189,9 +201,12 @@ fn scan_spill_dir(spill_dir: &Path) -> anyhow::Result<SpillDirStats> {
                 let block_index = u32::from_le_bytes(header[13..17].try_into().unwrap());
                 let seq = u64::from_le_bytes(header[17..25].try_into().unwrap());
                 let created_unix_ms = u64::from_le_bytes(header[25..33].try_into().unwrap());
-                let payload_len = u32::from_le_bytes(header[33..37].try_into().unwrap()) as usize;
+                let payload_len_u32 = u32::from_le_bytes(header[33..37].try_into().unwrap());
+                let payload_len = usize::try_from(payload_len_u32)
+                    .map_err(|_| anyhow::anyhow!("ingress record payload length exceeds usize"))?;
                 if payload_len > 0 {
-                    std::io::Seek::seek(&mut file, std::io::SeekFrom::Current(payload_len as i64))?;
+                    let offset = i64::from(payload_len_u32);
+                    std::io::Seek::seek(&mut file, std::io::SeekFrom::Current(offset))?;
                 }
                 let key = (ino, block_index);
                 match kind {
@@ -205,7 +220,9 @@ fn scan_spill_dir(spill_dir: &Path) -> anyhow::Result<SpillDirStats> {
                                 key,
                                 SegmentRecordStat {
                                     seq,
-                                    len: payload_len,
+                                    len: u64::try_from(payload_len).map_err(|_| {
+                                        anyhow::anyhow!("ingress record payload length too large")
+                                    })?,
                                     created_unix_ms,
                                 },
                             );
@@ -228,7 +245,7 @@ fn scan_spill_dir(spill_dir: &Path) -> anyhow::Result<SpillDirStats> {
 
     for record in live.values() {
         stats.records = stats.records.saturating_add(1);
-        stats.bytes = stats.bytes.saturating_add(record.len as u64);
+        stats.bytes = stats.bytes.saturating_add(record.len);
         let modified = UNIX_EPOCH + std::time::Duration::from_millis(record.created_unix_ms);
         let age_secs = now
             .duration_since(modified)
@@ -274,7 +291,7 @@ fn scan_pending_uploads(
     }
 
     let store = open_local_block_backend(cache_dir, volume_uuid)
-        .map_err(|source| map_status_open_local_backend_error(cache_dir, source))?
+        .map_err(|source| map_open_local_backend_error(cache_dir, source))?
         .backend;
     Ok(store.dirty_object_ids().len())
 }
@@ -283,7 +300,7 @@ pub fn run(
     name: &str,
     meta_dir: &Path,
     cache_dir: Option<&Path>,
-    verbose: bool,
+    verbosity: Verbosity,
 ) -> anyhow::Result<()> {
     let db_path = meta_dir.join(format!("{name}.db"));
 
@@ -302,7 +319,7 @@ pub fn run(
     let next_block = engine.get_counter(counters::NEXT_BLOCK_ID)?;
 
     let cache_path = local_cache_path(meta_dir, cache_dir, &format_info.uuid);
-    let cache_backend_detection = detect_cache_backends_for_status(&cache_path);
+    let cache_backend_detection = detect_backends(&cache_path);
     let spill_stats = scan_spill_dir(&cache_path.join("ingress_spill"))?;
     let pending_uploads = scan_pending_uploads(
         &cache_path,
@@ -319,7 +336,7 @@ pub fn run(
             None
         }
     };
-    let mounted_write_path = if verbose {
+    let mounted_write_path = if verbosity.is_verbose() {
         read_write_path_observability(&cache_path)
     } else {
         None
@@ -445,13 +462,14 @@ pub fn run(
     );
     println!("  Pending uploads:    {}", pending_uploads);
 
-    if verbose {
+    if verbosity.is_verbose() {
         println!("\nMounted Write Path");
         println!("──────────────────");
         if let Some((metrics_path, snapshot)) = mounted_write_path {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+                .ok()
+                .and_then(|d| u64::try_from(d.as_millis()).ok())
                 .unwrap_or(0);
             let snapshot_age_ms = now_ms.saturating_sub(snapshot.generated_unix_ms);
 
@@ -703,7 +721,7 @@ mod tests {
         std::fs::write(&layout.layout_marker, b"v1").unwrap();
         let volume_uuid = Uuid::new_v4();
 
-        let detection = detect_cache_backends_for_status(tmp.path()).unwrap();
+        let detection = detect_backends(tmp.path()).unwrap();
         assert_eq!(detection.runtime_backend(), Some(CacheBackendKind::CacheV3));
         assert_eq!(
             scan_pending_uploads(tmp.path(), &volume_uuid.to_string(), Some(&detection)).unwrap(),
@@ -714,7 +732,7 @@ mod tests {
     #[test]
     fn detect_cache_backends_with_fallback_returns_none_on_error() {
         let tmp = tempfile::tempdir().unwrap();
-        let detection = detect_cache_backends_with_fallback(tmp.path(), |_| {
+        let detection = detect_backends_or_warn(tmp.path(), |_| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "simulated permission error",
@@ -724,9 +742,9 @@ mod tests {
     }
 
     #[test]
-    fn detect_cache_backends_for_status_returns_detection_when_probe_succeeds() {
+    fn detect_backends_returns_detection_when_probe_succeeds() {
         let tmp = tempfile::tempdir().unwrap();
-        let detection = detect_cache_backends_for_status(tmp.path());
+        let detection = detect_backends(tmp.path());
         assert!(detection.is_some());
     }
 

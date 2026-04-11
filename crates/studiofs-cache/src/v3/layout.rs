@@ -67,7 +67,8 @@ impl CacheV3Layout {
     /// not concentrate into a single top-level shard directory.
     pub fn payload_shard(object_id: u64) -> [u8; 2] {
         let hash = splitmix64(object_id);
-        [(hash >> 56) as u8, (hash >> 48) as u8]
+        let bytes = hash.to_be_bytes();
+        [bytes[0], bytes[1]]
     }
 
     /// Resolve the canonical payload block path for an object id.

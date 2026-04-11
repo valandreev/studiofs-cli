@@ -554,11 +554,20 @@ struct ReadHandleStats {
 
 fn read_fd_cache_shard_capacity() -> NonZeroUsize {
     let capacity = READ_FD_CACHE_CAPACITY.div_ceil(READ_FD_CACHE_SHARDS);
-    NonZeroUsize::new(capacity).expect("READ_FD_CACHE_CAPACITY must be non-zero")
+    match NonZeroUsize::new(capacity) {
+        Some(capacity) => capacity,
+        None => unreachable!("READ_FD_CACHE_CAPACITY must be non-zero"),
+    }
 }
 
 fn read_fd_shard(object_id: u64) -> usize {
-    (object_id as usize) & (READ_FD_CACHE_SHARDS - 1)
+    let shard_count = u64::try_from(READ_FD_CACHE_SHARDS)
+        .expect("READ_FD_CACHE_SHARDS must be representable as u64");
+    let shard = object_id % shard_count;
+    match usize::try_from(shard) {
+        Ok(shard) => shard,
+        Err(_) => unreachable!("read-ahead cache shard index must fit usize"),
+    }
 }
 
 fn next_temp_token() -> String {
@@ -660,8 +669,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let layout = CacheV3Layout::from_cache_root(temp.path());
         let store = FilePayloadStore::open(layout).unwrap();
+        let capacity_to_fill = READ_FD_CACHE_CAPACITY.saturating_add(4);
 
-        for object_id in 0..(READ_FD_CACHE_CAPACITY + 4) as u64 {
+        for object_id in 0..u64::try_from(capacity_to_fill).expect("cache capacity fits u64") {
             store.put(object_id, b"x").unwrap();
             let mut out = [0_u8; 1];
             assert_eq!(store.read_into(object_id, 0, &mut out), Some(1));

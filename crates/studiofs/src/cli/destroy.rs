@@ -1,11 +1,51 @@
 //! `studiofs destroy` — permanently delete a volume.
 
 use crate::cli::cache_layout::describe_cache_layout_state;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 use studiofs_cache::v3::{CacheBackendDetection, detect_cache_backends};
-use studiofs_data::{DataStore, DataStoreConfig};
+use studiofs_data::{DataStore, DataStoreConfig, store::DataError};
+use studiofs_meta::engine::MetaError;
+use thiserror::Error;
 use tracing::warn;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DestroyMode {
+    Full,
+    LocalOnly,
+}
+
+impl DestroyMode {
+    const fn should_remove_remote(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum DestroyError {
+    #[error("volume metadata not found at {path}")]
+    MetadataMissing { path: String },
+
+    #[error("metadata operation failed: {0}")]
+    Meta(#[from] MetaError),
+
+    #[error("data store operation failed: {0}")]
+    DataStore(#[from] DataError),
+
+    #[error("postgres operation failed: {0}")]
+    Postgres(#[from] tokio_postgres::Error),
+
+    #[error("object store operation failed: {0}")]
+    ObjectStore(#[from] opendal::Error),
+
+    #[error("spawned async task failed: {0}")]
+    Join(#[from] tokio::task::JoinError),
+
+    #[error("input/output error: {0}")]
+    Io(#[from] io::Error),
+}
+
+type DestroyResult<T> = std::result::Result<T, DestroyError>;
 
 fn describe_destroy_cache_scope(detection: Option<&CacheBackendDetection>) -> &'static str {
     if let Some(detection) = detection {
@@ -19,15 +59,24 @@ fn describe_destroy_cache_scope(detection: Option<&CacheBackendDetection>) -> &'
     }
 }
 
-pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> {
+fn prompt_and_read_line(prompt: &str) -> DestroyResult<String> {
+    print!("{}", prompt);
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
+    Ok(input.trim().to_string())
+}
+
+pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> {
     // 1. Check if volume exists (metadata DB)
     let db_path = meta_dir.join(format!("{name}.db"));
     if !db_path.exists() {
         warn!("volume metadata not found at {:?}", db_path);
-        return Err(anyhow::anyhow!(
-            "Volume '{}' not found (metadata missing)",
-            name
-        ));
+        return Err(DestroyError::MetadataMissing {
+            path: db_path.display().to_string(),
+        });
     }
 
     // 2. Open metadata to get S3 credentials
@@ -47,7 +96,9 @@ pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> 
     };
 
     // 2.1 Validate UUID against remote store if applicable (SFS-95)
-    if !local_only && let Err(e) = live_meta.check_consistency() {
+    if mode.should_remove_remote()
+        && let Err(e) = live_meta.check_consistency()
+    {
         let cleanup = super::utils::format_cleanup_command(name);
         match e {
             studiofs_meta::engine::MetaError::UuidMismatch { local, remote } => {
@@ -78,7 +129,7 @@ pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> 
 
     // 3. Confirm with user
     println!("WARNING: You are about to DESTROY volume '{}'.", name);
-    if local_only {
+    if mode == DestroyMode::LocalOnly {
         println!("This will permanently delete local metadata only:");
         println!("  1. Local metadata files at {:?}", meta_dir);
         println!("Remote data and remote metadata will be kept.");
@@ -129,88 +180,25 @@ pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> 
     );
     println!();
 
-    print!("Do you want to proceed? [y/N]: ");
-    std::io::stdout().flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    if input.trim().to_lowercase() != "y" {
+    if !prompt_and_read_line("Do you want to proceed? [y/N]: ")?.eq_ignore_ascii_case("y") {
         println!("Aborting.");
         return Ok(());
     }
 
-    print!("To confirm, please type the volume name '{}' again: ", name);
-    std::io::stdout().flush()?;
-
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-
-    if input.trim() != name {
+    let confirm_name = prompt_and_read_line(&format!(
+        "To confirm, please type the volume name '{}' again: ",
+        name
+    ))?;
+    if confirm_name != name {
         println!("Confirmation failed. Aborting.");
         return Ok(());
     }
 
-    // 4. Initialize DataStore and delete S3 data (unless local-only)
-    if !local_only {
-        println!("Deleting data from S3...");
-        let data_config = DataStoreConfig::from(&format_info);
-
+    if mode.should_remove_remote() {
+        println!("Deleting data from S3 and metadata backends...");
         let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(async {
-            let ds = DataStore::new(&data_config)?;
-            ds.delete_volume_data().await
-        })?;
-        println!("✓ S3 data deleted.");
-
-        if let Some(pg) = &format_info.metadata.postgres {
-            println!("Deleting PostgreSQL metadata...");
-            rt.block_on(async {
-                let (client, connection) = tokio_postgres::connect(&pg.url, tokio_postgres::NoTls)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
-                let conn_task = tokio::spawn(async move {
-                    let _ = connection.await;
-                });
-
-                client
-                    .execute("DELETE FROM volumes WHERE vol = $1", &[&pg.volume_id])
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to delete postgres metadata: {e}"))?;
-
-                conn_task.abort();
-                Ok::<(), anyhow::Error>(())
-            })?;
-            println!("✓ PostgreSQL metadata deleted.");
-        }
-
-        if let Some(remote) = &format_info.metadata.remote {
-            let mut builder = opendal::services::S3::default()
-                .endpoint(&remote.endpoint)
-                .bucket(&remote.bucket)
-                .access_key_id(&remote.access_key)
-                .secret_access_key(&remote.secret_key)
-                .disable_config_load()
-                .disable_ec2_metadata();
-            if !remote.region.is_empty() {
-                builder = builder.region(&remote.region);
-            } else {
-                builder = builder.region("us-east-1");
-            }
-            let op = opendal::Operator::new(builder)?.finish();
-            let prefix = if remote.prefix.ends_with('/') {
-                remote.prefix.clone()
-            } else {
-                format!("{}/", remote.prefix)
-            };
-            let primary_manifest_path = format!("{}manifest.json", prefix);
-            let _ = rt.block_on(op.delete(&primary_manifest_path));
-            let legacy_manifest_by_name = format!("{}{}.manifest.json", prefix, format_info.name);
-            let _ = rt.block_on(op.delete(&legacy_manifest_by_name));
-            if !format_info.uuid.is_empty() && format_info.uuid != format_info.name {
-                let legacy_manifest_by_uuid =
-                    format!("{}{}.manifest.json", prefix, format_info.uuid);
-                let _ = rt.block_on(op.delete(&legacy_manifest_by_uuid));
-            }
-        }
+        rt.block_on(delete_remote_state(&format_info))?;
+        println!("✓ Remote metadata and data deleted.");
     }
 
     // 5. Delete metadata directory
@@ -224,13 +212,101 @@ pub fn run(name: &str, meta_dir: &Path, local_only: bool) -> anyhow::Result<()> 
         "Reminder: remove custom local cache directories for volume UUID '{}'.",
         format_info.uuid
     );
-    if local_only {
+    if mode == DestroyMode::LocalOnly {
         println!("Volume '{}' detached locally.", name);
     } else {
         println!("Volume '{}' destroyed successfully.", name);
     }
 
     Ok(())
+}
+
+async fn delete_remote_state(format_info: &studiofs_meta::FormatInfo) -> DestroyResult<()> {
+    let data_config = DataStoreConfig::from(format_info);
+    let ds = DataStore::new(&data_config)?;
+    ds.delete_volume_data().await?;
+    println!("✓ S3 data deleted.");
+
+    if let Some(pg) = &format_info.metadata.postgres {
+        println!("Deleting PostgreSQL metadata...");
+        delete_postgres_metadata(&pg.url, pg.volume_id).await?;
+        println!("✓ PostgreSQL metadata deleted.");
+    }
+
+    if let Some(remote) = &format_info.metadata.remote {
+        delete_remote_manifests(remote, &format_info.name, &format_info.uuid).await?;
+    }
+
+    Ok(())
+}
+
+async fn delete_postgres_metadata(pg_url: &str, volume_id: i64) -> DestroyResult<()> {
+    let (client, connection) = tokio_postgres::connect(pg_url, tokio_postgres::NoTls).await?;
+
+    let connection = tokio::spawn(async move { connection.await.map_err(DestroyError::Postgres) });
+
+    let delete_result = client
+        .execute("DELETE FROM volumes WHERE vol = $1", &[&volume_id])
+        .await
+        .map_err(DestroyError::Postgres)?;
+    drop(client);
+
+    match connection.await {
+        Ok(result) => result?,
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => return Err(DestroyError::Join(error)),
+    }
+
+    tracing::debug!("Deleted postgres rows: {delete_result}");
+
+    Ok(())
+}
+
+async fn delete_remote_manifests(
+    remote: &studiofs_meta::RemoteStoreConfig,
+    volume_name: &str,
+    volume_uuid: &str,
+) -> DestroyResult<()> {
+    let mut builder = opendal::services::S3::default()
+        .endpoint(&remote.endpoint)
+        .bucket(&remote.bucket)
+        .access_key_id(&remote.access_key)
+        .secret_access_key(&remote.secret_key)
+        .disable_config_load()
+        .disable_ec2_metadata();
+
+    if !remote.region.is_empty() {
+        builder = builder.region(&remote.region);
+    } else {
+        builder = builder.region("us-east-1");
+    }
+
+    let op = opendal::Operator::new(builder)?.finish();
+    let prefix = if remote.prefix.ends_with('/') {
+        remote.prefix.clone()
+    } else {
+        format!("{}/", remote.prefix)
+    };
+
+    let primary_manifest_path = format!("{}manifest.json", prefix);
+    delete_optional_manifest(&op, &primary_manifest_path).await;
+
+    let legacy_manifest_by_name = format!("{}{}.manifest.json", prefix, volume_name);
+    delete_optional_manifest(&op, &legacy_manifest_by_name).await;
+
+    if !volume_uuid.is_empty() && volume_uuid != volume_name {
+        let legacy_manifest_by_uuid = format!("{}{}.manifest.json", prefix, volume_uuid);
+        delete_optional_manifest(&op, &legacy_manifest_by_uuid).await;
+    }
+
+    Ok(())
+}
+
+async fn delete_optional_manifest(operator: &opendal::Operator, path: &str) {
+    if let Err(error) = operator.delete(path).await {
+        warn!(%path, "failed to delete optional remote manifest (ignored)");
+        warn!("{error}");
+    }
 }
 
 #[cfg(test)]

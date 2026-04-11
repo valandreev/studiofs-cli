@@ -73,7 +73,7 @@ pub struct CacheIndexStats {
     pub evictable_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CacheIndexEntry {
     pub object_id: u64,
     pub payload_key: Vec<u8>,
@@ -84,7 +84,7 @@ pub struct CacheIndexEntry {
     pub access_order: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CacheIndexUpsert {
     pub object_id: u64,
     pub payload_key: Vec<u8>,
@@ -93,7 +93,7 @@ pub struct CacheIndexUpsert {
     pub evictable: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DirtyReplayEntry {
     pub object_id: u64,
     pub payload_key: Vec<u8>,
@@ -765,7 +765,7 @@ impl CacheIndex {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct StoredEntry {
     payload_key: Vec<u8>,
     payload_len: u64,
@@ -1051,7 +1051,7 @@ fn decode_entry(raw: &[u8], object_id: u64) -> Result<StoredEntry, CacheIndexErr
             raw.len()
         )));
     }
-    if raw[ENTRY_OFFSET_VERSION] != ENTRY_ENCODING_VERSION {
+    if !matches!(raw.get(ENTRY_OFFSET_VERSION), Some(&ENTRY_ENCODING_VERSION)) {
         return Err(CacheIndexError::Corruption(format!(
             "unknown entry encoding version for object_id={object_id}: {}",
             raw[ENTRY_OFFSET_VERSION]
@@ -1068,12 +1068,17 @@ fn decode_entry(raw: &[u8], object_id: u64) -> Result<StoredEntry, CacheIndexErr
     let payload_len = read_u64_field(raw, ENTRY_OFFSET_PAYLOAD_LEN, object_id, "payload_len")?;
     let dirty_order_raw = read_u64_field(raw, ENTRY_OFFSET_DIRTY_ORDER, object_id, "dirty_order")?;
     let access_order = read_u64_field(raw, ENTRY_OFFSET_ACCESS_ORDER, object_id, "access_order")?;
-    let payload_key_len = read_u32_field(
+    let payload_key_len = usize::try_from(read_u32_field(
         raw,
         ENTRY_OFFSET_PAYLOAD_KEY_LEN,
         object_id,
         "payload_key_len",
-    )? as usize;
+    )?)
+    .map_err(|_| {
+        CacheIndexError::Corruption(format!(
+            "payload key length does not fit usize for object_id={object_id}"
+        ))
+    })?;
 
     if raw.len() != ENTRY_HEADER_LEN + payload_key_len {
         return Err(CacheIndexError::Corruption(format!(
@@ -1161,12 +1166,18 @@ fn storage_error<E: Into<RedbError>>(error: E) -> CacheIndexError {
 }
 
 fn touch_access_lru_capacity() -> NonZeroUsize {
-    let cap = TOUCH_ACCESS_LRU_CAPACITY.div_ceil(TOUCH_ACCESS_LRU_SHARDS);
-    NonZeroUsize::new(cap).expect("TOUCH_ACCESS_LRU_CAPACITY must be non-zero")
+    const MIN_CAPACITY: NonZeroUsize = NonZeroUsize::new(1).unwrap();
+    let cap = TOUCH_ACCESS_LRU_CAPACITY
+        .div_ceil(TOUCH_ACCESS_LRU_SHARDS)
+        .max(1);
+    // A capacity of zero is never valid for LruCache; we clamp to 1 so behavior
+    // stays defined even under pathological tuning values.
+    NonZeroUsize::new(cap).unwrap_or(MIN_CAPACITY)
 }
 
 fn touch_access_lru_shard(object_id: u64) -> usize {
-    (object_id as usize) & (TOUCH_ACCESS_LRU_SHARDS - 1)
+    let shard = object_id % u64::try_from(TOUCH_ACCESS_LRU_SHARDS).unwrap_or(u64::MAX);
+    usize::try_from(shard).unwrap_or(0)
 }
 
 #[cfg(test)]

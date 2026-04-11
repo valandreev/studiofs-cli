@@ -364,15 +364,15 @@ fn render_cpu_pprof(
         ReportData::Reports(reports) => reports,
         ReportData::RawPprof(bytes) => return Ok(bytes.clone()),
     };
-    let profile = pprof::encode(
-        reports,
-        sample_rate,
-        started_at.timestamp_nanos_opt().unwrap_or_default() as u64,
-        (finished_at - started_at)
-            .num_nanoseconds()
-            .unwrap_or_default()
-            .max(0) as u64,
-    );
+    let start_nanos = started_at
+        .timestamp_nanos_opt()
+        .and_then(|nanos| u64::try_from(nanos).ok())
+        .unwrap_or_default();
+    let elapsed_nanos = (finished_at - started_at)
+        .num_nanoseconds()
+        .and_then(|nanos| u64::try_from(nanos).ok())
+        .unwrap_or_default();
+    let profile = pprof::encode(reports, sample_rate, start_nanos, elapsed_nanos);
     let mut encoded = Vec::new();
     profile.encode(&mut encoded)?;
     gzip_bytes(&encoded)

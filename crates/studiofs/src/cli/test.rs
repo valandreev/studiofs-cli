@@ -6,10 +6,10 @@ use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
 
-fn hmac_sha256_raw(key: &[u8], msg: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can accept any key length");
+fn hmac_sha256_raw(key: &[u8], msg: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut mac = HmacSha256::new_from_slice(key).context("invalid HMAC key length")?;
     mac.update(msg);
-    mac.finalize().into_bytes().to_vec()
+    Ok(mac.finalize().into_bytes().to_vec())
 }
 
 fn sha256_hex_str(data: &[u8]) -> String {
@@ -85,11 +85,11 @@ fn build_signed_headers(
     let scope = format!("{date}/{region}/s3/aws4_request");
     let string_to_sign = format!("AWS4-HMAC-SHA256\n{datetime}\n{scope}\n{cr_hash}");
 
-    let k_date = hmac_sha256_raw(format!("AWS4{secret_key}").as_bytes(), date.as_bytes());
-    let k_region = hmac_sha256_raw(&k_date, region.as_bytes());
-    let k_service = hmac_sha256_raw(&k_region, b"s3");
-    let k_signing = hmac_sha256_raw(&k_service, b"aws4_request");
-    let signature = hex::encode(hmac_sha256_raw(&k_signing, string_to_sign.as_bytes()));
+    let k_date = hmac_sha256_raw(format!("AWS4{secret_key}").as_bytes(), date.as_bytes())?;
+    let k_region = hmac_sha256_raw(&k_date, region.as_bytes())?;
+    let k_service = hmac_sha256_raw(&k_region, b"s3")?;
+    let k_signing = hmac_sha256_raw(&k_service, b"aws4_request")?;
+    let signature = hex::encode(hmac_sha256_raw(&k_signing, string_to_sign.as_bytes())?);
 
     let auth = format!(
         "AWS4-HMAC-SHA256 Credential={access_key}/{scope},SignedHeaders={signed_headers_str},Signature={signature}"

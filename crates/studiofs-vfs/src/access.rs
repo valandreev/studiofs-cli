@@ -5,6 +5,9 @@ const ACCESS_SCORE_MAX: i16 = 12;
 const READ_SEQUENTIAL_PROMOTION_THRESHOLD: i16 = 4;
 const READ_RANDOM_PROMOTION_THRESHOLD: i16 = 3;
 const WRITE_SEQUENTIAL_PROMOTION_THRESHOLD: i16 = 3;
+const DEFAULT_READAHEAD_BASE_WIDTH: u32 = 4;
+const DEFAULT_READAHEAD_MAX_WIDTH: u32 = 32;
+const DEFAULT_READAHEAD_MIN_PREFETCH: u32 = 4;
 /// A read or write spanning ≥ 4 blocks is treated as a "broad scan" — it earns
 /// a triple sequential score bonus and can immediately promote to
 /// `SequentialMediaRead` / `SequentialWriter` without waiting for the normal
@@ -86,9 +89,9 @@ impl Default for AccessPolicy {
             class: AccessClass::RandomInteractiveRead,
             prefetch_enabled: false,
             cache_promotion_on_read: true,
-            readahead_base_width: 1,
-            readahead_max_width: 1,
-            readahead_min_prefetch: 1,
+            readahead_base_width: DEFAULT_READAHEAD_BASE_WIDTH,
+            readahead_max_width: DEFAULT_READAHEAD_MAX_WIDTH,
+            readahead_min_prefetch: DEFAULT_READAHEAD_MIN_PREFETCH,
             upload_pressure_boost: 1,
         }
     }
@@ -99,6 +102,15 @@ impl AccessPolicy {
         let base_width = cfg.readahead_base_width.max(1);
         let max_width = cfg.readahead_max_width.max(base_width);
         let min_prefetch = cfg.readahead_min_prefetch.max(1).min(max_width);
+        let default = Self {
+            class,
+            prefetch_enabled: false,
+            cache_promotion_on_read: true,
+            readahead_base_width: base_width,
+            readahead_max_width: max_width,
+            readahead_min_prefetch: min_prefetch,
+            upload_pressure_boost: 1,
+        };
         match class {
             AccessClass::SequentialMediaRead => Self {
                 class,
@@ -110,31 +122,26 @@ impl AccessPolicy {
                 upload_pressure_boost: 2,
             },
             AccessClass::RandomInteractiveRead => Self {
-                class,
                 prefetch_enabled: false,
                 cache_promotion_on_read: true,
-                readahead_base_width: 1,
+                readahead_base_width: base_width.max(1),
                 readahead_max_width: base_width.clamp(1, 4),
-                readahead_min_prefetch: 1,
+                readahead_min_prefetch: min_prefetch,
                 upload_pressure_boost: 1,
+                ..default
             },
             AccessClass::SequentialWriter => Self {
-                class,
-                prefetch_enabled: false,
-                cache_promotion_on_read: true,
                 readahead_base_width: 1,
                 readahead_max_width: 1,
                 readahead_min_prefetch: 1,
-                upload_pressure_boost: 1,
+                ..default
             },
             AccessClass::RandomWriter => Self {
-                class,
-                prefetch_enabled: false,
                 cache_promotion_on_read: false,
                 readahead_base_width: 1,
                 readahead_max_width: 1,
                 readahead_min_prefetch: 1,
-                upload_pressure_boost: 1,
+                ..default
             },
         }
     }
@@ -348,12 +355,16 @@ fn initial_class(flags: OpenFlags) -> AccessClass {
 
 fn block_span(offset: u64, len: usize, block_size: u64) -> (u32, u32, u32) {
     let block_size = block_size.max(1);
-    let span_len = len.max(1) as u64;
-    let first_block = (offset / block_size).min(u32::MAX as u64) as u32;
+    let span_len = u64::try_from(len).unwrap_or(u64::MAX).max(1);
+    let first_block = clamp_u32(offset / block_size);
     let last_offset = offset.saturating_add(span_len.saturating_sub(1));
-    let last_block = (last_offset / block_size).min(u32::MAX as u64) as u32;
+    let last_block = clamp_u32(last_offset / block_size);
     let span_blocks = last_block.saturating_sub(first_block).saturating_add(1);
     (first_block, last_block, span_blocks)
+}
+
+fn clamp_u32(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]

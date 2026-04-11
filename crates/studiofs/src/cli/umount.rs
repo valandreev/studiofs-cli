@@ -89,10 +89,14 @@ fn unmount_windows(mount_point: &str, pid: u32) -> Result<()> {
         .chain(std::iter::once(0))
         .collect();
 
+    // SAFETY: The wide name comes from UTF-16 encoding of a Rust `String` and remains valid for the
+    // duration of this call.
     let event = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, wide.as_ptr()) };
     if event.is_null() {
         tracing::warn!("could not open shutdown event — will attempt process termination");
     } else {
+        // SAFETY: We only call `SetEvent` and `CloseHandle` on a non-null handle returned by
+        // `OpenEventW`; `CloseHandle` is required to avoid leaking the handle.
         unsafe {
             SetEvent(event);
             CloseHandle(event);
@@ -100,15 +104,19 @@ fn unmount_windows(mount_point: &str, pid: u32) -> Result<()> {
     }
 
     // 2. Wait for the process to exit (up to 15 s)
+    // SAFETY: Opening a process by PID is an OS operation; null handle is handled explicitly.
     let process = unsafe { OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
     if !process.is_null() {
+        // SAFETY: `process` is valid by the null check above and remains valid for this blocking call.
         let wait_result = unsafe { WaitForSingleObject(process, 15_000) };
         if wait_result == WAIT_TIMEOUT {
             tracing::warn!("mount process did not exit within 15 s — force-killing");
+            // SAFETY: `process` is valid and still live until we close it after this block.
             unsafe {
                 TerminateProcess(process, 1);
             }
         }
+        // SAFETY: `process` was returned by `OpenProcess`; closing it is the required cleanup action.
         unsafe { CloseHandle(process) };
     }
 
@@ -122,6 +130,7 @@ fn unmount_unix(pid: u32) -> Result<()> {
     use std::time::{Duration, Instant};
 
     // Send SIGTERM (the FUSE signal-watcher thread will handle it)
+    // SAFETY: `kill` is called with a concrete PID and signal to request termination.
     let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
@@ -135,11 +144,13 @@ fn unmount_unix(pid: u32) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         std::thread::sleep(Duration::from_millis(200));
+        // SAFETY: A zero-signal kill performs an existence check without side effects.
         if unsafe { libc::kill(pid as i32, 0) } != 0 {
             break; // gone
         }
         if Instant::now() > deadline {
             tracing::warn!("mount process did not exit within 15 s — sending SIGKILL");
+            // SAFETY: SIGKILL is used as a forced termination fallback after timeout.
             unsafe { libc::kill(pid as i32, libc::SIGKILL) };
             break;
         }

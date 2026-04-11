@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 #[cfg(unix)]
 fn get_current_ids() -> (u32, u32) {
+    // SAFETY: these libc calls are read-only and safe for trusted process startup.
     unsafe { (libc::getuid(), libc::getgid()) }
 }
 
@@ -144,6 +145,9 @@ fn init_postgres_schema_and_volume(
     block_size: u32,
 ) -> anyhow::Result<i64> {
     rt.block_on(async {
+        let block_size_i32 = i32::try_from(block_size).map_err(|_| {
+            anyhow::anyhow!("block size {block_size} exceeds PostgreSQL INTEGER range")
+        })?;
         let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
             .await
             .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
@@ -243,7 +247,7 @@ fn init_postgres_schema_and_volume(
                     block_size = EXCLUDED.block_size
                 RETURNING vol
                 "#,
-                &[&name, &uuid, &(block_size as i32)],
+                &[&name, &uuid, &block_size_i32],
             )
             .await?;
         let volume_id: i64 = row.get(0);

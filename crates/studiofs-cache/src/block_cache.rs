@@ -8,7 +8,7 @@
 
 use bytes::Bytes;
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,6 +51,12 @@ pub enum CacheReadLevel {
     Miss,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum CancelUploadMode {
+    KeepBlock,
+    RemoveBlock,
+}
+
 #[derive(Debug, Clone)]
 pub struct CacheReadTrace {
     pub level: CacheReadLevel,
@@ -65,9 +71,13 @@ pub struct BlockCacheStats {
 
 #[derive(Debug, Default)]
 struct L1State {
-    by_object: HashMap<ObjectId, Bytes>,
+    by_object: BTreeMap<ObjectId, Bytes>,
     insertion_order: VecDeque<ObjectId>,
     total_bytes: u64,
+}
+
+fn bytes_len(len: usize) -> u64 {
+    u64::try_from(len).unwrap_or(u64::MAX)
 }
 
 impl L1State {
@@ -82,9 +92,9 @@ impl L1State {
     fn insert(&mut self, object_id: ObjectId, data: Bytes, max_bytes: u64) -> u64 {
         let is_new = !self.by_object.contains_key(&object_id);
         if let Some(previous) = self.by_object.remove(&object_id) {
-            self.total_bytes = self.total_bytes.saturating_sub(previous.len() as u64);
+            self.total_bytes = self.total_bytes.saturating_sub(bytes_len(previous.len()));
         }
-        self.total_bytes = self.total_bytes.saturating_add(data.len() as u64);
+        self.total_bytes = self.total_bytes.saturating_add(bytes_len(data.len()));
         self.by_object.insert(object_id, data);
         if is_new {
             self.insertion_order.push_back(object_id);
@@ -96,7 +106,7 @@ impl L1State {
         let Some(removed) = self.by_object.remove(&object_id) else {
             return false;
         };
-        self.total_bytes = self.total_bytes.saturating_sub(removed.len() as u64);
+        self.total_bytes = self.total_bytes.saturating_sub(bytes_len(removed.len()));
         true
     }
 
@@ -107,7 +117,7 @@ impl L1State {
                 break;
             };
             if let Some(removed) = self.by_object.remove(&candidate) {
-                self.total_bytes = self.total_bytes.saturating_sub(removed.len() as u64);
+                self.total_bytes = self.total_bytes.saturating_sub(bytes_len(removed.len()));
                 evicted = evicted.saturating_add(1);
             }
         }
@@ -275,11 +285,11 @@ impl BlockCache {
         queued
     }
 
-    pub fn cancel_upload(&self, op: &PendingUpload, remove_block: bool) {
+    pub fn cancel_upload(&self, op: &PendingUpload, mode: CancelUploadMode) {
         self.upload_queue.cancel(op);
         self.unpin(op.object_id);
         self.metrics.upload_queue.record_cancel();
-        if remove_block {
+        if matches!(mode, CancelUploadMode::RemoveBlock) {
             self.remove_sync(op.object_id);
         }
     }

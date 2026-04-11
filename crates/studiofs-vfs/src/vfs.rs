@@ -55,7 +55,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::OpenLocalBlockBackendError;
-use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig, L2IoPriority};
+use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig, CancelUploadMode, L2IoPriority};
 use studiofs_cache::metrics::{LatencyHistogram, LatencyHistogramSnapshot, MaterializeBatchStats};
 use studiofs_cache::open_local_block_backend_with_budget_and_sync_mode;
 use studiofs_cache::upload_queue::PendingUpload;
@@ -4032,8 +4032,11 @@ impl ReadState {
 
     fn active_access_counts(&self) -> [u64; AccessClass::COUNT] {
         std::array::from_fn(|idx| {
-            let class = AccessClass::from_index(idx).expect("valid access class index");
-            self.active_access_class_count(class)
+            if let Some(class) = AccessClass::from_index(idx) {
+                self.active_access_class_count(class)
+            } else {
+                0
+            }
         })
     }
 
@@ -7995,7 +7998,12 @@ impl StudioVfs {
 
     async fn cancel_upload_for_deleted_inode(&self, op: &PendingUpload) -> VfsResult<()> {
         let has_open_handles = self.handle_table.open_count(op.ino) > 0;
-        self.block_cache.cancel_upload(op, !has_open_handles);
+        let mode = if has_open_handles {
+            CancelUploadMode::KeepBlock
+        } else {
+            CancelUploadMode::RemoveBlock
+        };
+        self.block_cache.cancel_upload(op, mode);
         if has_open_handles {
             self.record_deferred_deleted_local_block(op.ino, op.object_id);
         } else {
@@ -8828,7 +8836,8 @@ impl StudioVfs {
         }
 
         for op in &pending_uploads {
-            self.block_cache.cancel_upload(op, false);
+            self.block_cache
+                .cancel_upload(op, CancelUploadMode::KeepBlock);
         }
 
         let mut pending_evictions = self.state.upload.pending_evictions.lock();
@@ -13276,7 +13285,8 @@ impl StudioVfs {
                 current_epoch = attr.content_epoch,
                 "upload cancelled: stale content epoch"
             );
-            self.block_cache.cancel_upload(&op, false);
+            self.block_cache
+                .cancel_upload(&op, CancelUploadMode::KeepBlock);
             self.block_store_remove_async(op.object_id).await?;
             self.state
                 .upload
@@ -13310,7 +13320,8 @@ impl StudioVfs {
                 block_index,
                 "upload cancelled: stale block superseded by newer object"
             );
-            self.block_cache.cancel_upload(&op, false);
+            self.block_cache
+                .cancel_upload(&op, CancelUploadMode::KeepBlock);
             self.block_store_remove_async(op.object_id).await?;
             self.state
                 .upload
@@ -13525,7 +13536,8 @@ impl StudioVfs {
                         // (race), cancel cleanly. Otherwise this remains a
                         // genuine error and will be retried.
                         if self.state.upload.deleted_inodes.lock().contains(&op.ino) {
-                            self.block_cache.cancel_upload(&op, false);
+                            self.block_cache
+                                .cancel_upload(&op, CancelUploadMode::KeepBlock);
                             self.block_store_remove_async(op.object_id).await?;
                             self.state
                                 .upload
@@ -13543,7 +13555,8 @@ impl StudioVfs {
                     // First attempt without a local persisted block is
                     // unexpected; retry through normal error path.
                     if self.state.upload.deleted_inodes.lock().contains(&op.ino) {
-                        self.block_cache.cancel_upload(&op, false);
+                        self.block_cache
+                            .cancel_upload(&op, CancelUploadMode::KeepBlock);
                         self.block_store_remove_async(op.object_id).await?;
                         self.state
                             .upload

@@ -130,7 +130,8 @@ impl ReadAheadTracker {
             .get_or_init(Instant::now)
             .elapsed()
             .as_micros()
-            .min(u64::MAX as u128) as u64
+            .try_into()
+            .unwrap_or(u64::MAX)
     }
 
     fn velocity_width_target(&self, blocks_per_sec: f64, base_width: u32, max_width: u32) -> u32 {

@@ -113,7 +113,10 @@ mod tests {
         let summary_artifact = result
             .artifacts
             .iter()
-            .find(|artifact| artifact.kind == "write-path-summary")
+            .find(|artifact| {
+                artifact.kind
+                    == crate::cli::test_cache_profile_types::ProfileArtifactKind::WritePathSummary
+            })
             .expect("write-path summary artifact");
         let summary =
             std::fs::read_to_string(&summary_artifact.path).expect("read write-path summary");

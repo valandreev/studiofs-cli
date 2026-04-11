@@ -79,7 +79,7 @@ pub const fn local_cache_io_execution_model() -> LocalCacheIoExecutionModel {
 pub fn run_local_cache_io<T>(operation: impl FnOnce() -> T) -> (T, LocalCacheIoTiming) {
     let io_started = std::time::Instant::now();
     let result = operation();
-    let backend_io_ns = io_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    let backend_io_ns = duration_to_nanos_u64(io_started.elapsed());
     (
         result,
         LocalCacheIoTiming {
@@ -111,10 +111,9 @@ pub async fn run_local_cache_io_blocking<T: Send + 'static>(
         let handoff_ns = io_started_at
             .checked_duration_since(submitted_at)
             .unwrap_or_default()
-            .as_nanos()
-            .min(u64::MAX as u128) as u64;
+            .into_nanos_saturating_u64();
         let result = operation();
-        let backend_io_ns = io_started_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let backend_io_ns = io_started_at.elapsed().into_nanos_saturating_u64();
         result.map(|value| {
             (
                 value,
@@ -126,6 +125,20 @@ pub async fn run_local_cache_io_blocking<T: Send + 'static>(
         })
     })
     .await
+}
+
+trait DurationNanosExt {
+    fn into_nanos_saturating_u64(self) -> u64;
+}
+
+impl DurationNanosExt for std::time::Duration {
+    fn into_nanos_saturating_u64(self) -> u64 {
+        u64::try_from(self.as_nanos()).unwrap_or(u64::MAX)
+    }
+}
+
+fn duration_to_nanos_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Run a metadata-engine closure on the blocking pool.

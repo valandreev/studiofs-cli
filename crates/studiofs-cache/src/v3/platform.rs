@@ -15,7 +15,12 @@ pub fn open_read_only(path: &Path) -> io::Result<File> {
 pub fn pread(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     let mut total = 0;
     while total < buf.len() {
-        let n = pread_raw(file, &mut buf[total..], offset + total as u64)?;
+        let total_offset = u64::try_from(total)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pread offset overflow"))?;
+        let file_offset = offset
+            .checked_add(total_offset)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "pread offset overflow"))?;
+        let n = pread_raw(file, &mut buf[total..], file_offset)?;
         if n == 0 {
             break;
         }
@@ -30,29 +35,26 @@ pub fn pread_exact(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     if read == buf.len() {
         Ok(())
     } else {
+        let read_offset = u64::try_from(read)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pread length overflow"))?;
+        let remaining = buf
+            .len()
+            .checked_sub(read)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "pread length overflow"))?;
         Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             format!(
                 "pread_exact: EOF at offset {} (wanted {} more bytes)",
-                offset + read as u64,
-                buf.len() - read,
+                offset + read_offset,
+                remaining
             ),
         ))
     }
 }
 
 /// Write all bytes to the file.
-pub fn write_all(file: &mut File, mut buf: &[u8]) -> io::Result<()> {
-    while !buf.is_empty() {
-        let n = std::io::Write::write(file, buf)?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "write_all: write returned 0 bytes",
-            ));
-        }
-        buf = &buf[n..];
-    }
+pub fn write_all(file: &mut File, buf: &[u8]) -> io::Result<()> {
+    std::io::Write::write_all(file, buf)?;
     Ok(())
 }
 
@@ -219,6 +221,8 @@ fn is_windows_unsupported_sync_error(error: &io::Error) -> bool {
 fn advise_random_impl(file: &File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
+    // SAFETY: The file descriptor from `as_raw_fd` remains valid for the lifetime of
+    // `file`, and POSIX_FADV_RANDOM is advisory only.
     let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
     if rc == 0 {
         Ok(())
@@ -243,6 +247,8 @@ fn advise_will_need_impl(file: &File, offset: u64, len: u64) -> io::Result<()> {
 
     let offset = u64_to_off_t(offset)?;
     let len = u64_to_off_t(len)?;
+    // SAFETY: The file descriptor is borrowed from a live `File`, and POSIX_WILLNEED
+    // is advisory; arguments are validated against off_t bounds above.
     let rc =
         unsafe { libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_WILLNEED) };
     if rc == 0 {
@@ -264,13 +270,20 @@ fn advise_will_need_impl(_file: &File, _offset: u64, _len: u64) -> io::Result<()
 
 #[cfg(target_os = "linux")]
 fn u64_to_off_t(value: u64) -> io::Result<libc::off_t> {
-    if value > libc::off_t::MAX as u64 {
+    let off_t_max = u64::try_from(libc::off_t::MAX)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "off_t range is negative"))?;
+    if value > off_t_max {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("offset/length exceeds off_t range: {value}"),
         ));
     }
-    Ok(value as libc::off_t)
+    value.try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("offset/length exceeds off_t range: {value}"),
+        )
+    })
 }
 
 #[cfg(test)]

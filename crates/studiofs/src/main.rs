@@ -84,6 +84,9 @@ fn init_tracing(log_level: &str) -> anyhow::Result<Option<WorkerGuard>> {
 fn init_winfsp_dll_path() {
     use std::os::windows::ffi::OsStrExt;
 
+    // SAFETY: This declaration uses the platform ABI for WinFSP's
+    // delay-load entry point; it is only invoked with a trusted native
+    // symbol signature and checked null-terminated UTF-16 arguments.
     unsafe extern "system" {
         fn LoadLibraryW(lpLibFileName: *const u16) -> *mut core::ffi::c_void;
     }
@@ -735,11 +738,21 @@ fn main() -> anyhow::Result<()> {
             verbose,
         } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
-            cli::status::run(&name, &meta_dir, cache_dir.as_deref(), verbose)?;
+            let verbosity = if verbose {
+                cli::status::Verbosity::Verbose
+            } else {
+                cli::status::Verbosity::Normal
+            };
+            cli::status::run(&name, &meta_dir, cache_dir.as_deref(), verbosity)?;
         }
         Commands::Destroy { name, local } => {
             let meta_dir = cli::utils::get_default_meta_dir(&name)?;
-            cli::destroy::run(&name, &meta_dir, local)?;
+            let mode = if local {
+                cli::destroy::DestroyMode::LocalOnly
+            } else {
+                cli::destroy::DestroyMode::Full
+            };
+            cli::destroy::run(&name, &meta_dir, mode)?;
         }
         Commands::Janitor {
             name,

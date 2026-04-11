@@ -63,6 +63,22 @@ impl FsckReport {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum FsckRepairMode {
+    Ask,
+    Auto,
+}
+
+impl From<bool> for FsckRepairMode {
+    fn from(auto_repair: bool) -> Self {
+        if auto_repair {
+            FsckRepairMode::Auto
+        } else {
+            FsckRepairMode::Ask
+        }
+    }
+}
+
 fn scan_namespace(meta: &dyn MetaEngine) -> anyhow::Result<NamespaceScan> {
     let mut scan = NamespaceScan::default();
     let mut stack = vec![ROOT_INO];
@@ -249,7 +265,7 @@ fn ask_should_repair() -> anyhow::Result<bool> {
 fn now_unix_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 
@@ -490,7 +506,11 @@ fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run(name: &str, meta_dir: &Path, auto_repair: bool) -> anyhow::Result<()> {
+pub fn run<AutoRepair>(name: &str, meta_dir: &Path, auto_repair: AutoRepair) -> anyhow::Result<()>
+where
+    AutoRepair: Into<FsckRepairMode>,
+{
+    let auto_repair = auto_repair.into();
     let db_path = meta_dir.join(format!("{name}.db"));
     if !db_path.exists() {
         anyhow::bail!("Volume '{}' not found at {}", name, db_path.display());
@@ -519,11 +539,12 @@ pub fn run(name: &str, meta_dir: &Path, auto_repair: bool) -> anyhow::Result<()>
         return Ok(());
     }
 
-    let should_repair = if auto_repair {
-        true
-    } else {
-        println!();
-        ask_should_repair()?
+    let should_repair = match auto_repair {
+        FsckRepairMode::Auto => true,
+        FsckRepairMode::Ask => {
+            println!();
+            ask_should_repair()?
+        }
     };
     if !should_repair {
         println!("No repairs applied.");

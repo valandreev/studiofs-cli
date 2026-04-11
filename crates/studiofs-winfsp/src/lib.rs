@@ -397,6 +397,9 @@ this usually means Administrator privileges are required, or WinFSP must be conf
             fn CloseHandle(hObject: *mut core::ffi::c_void) -> i32;
         }
 
+        // SAFETY: `wide` is a NUL-terminated UTF-16 buffer derived from
+        // a stable Rust string; `CreateEventW` is a plain FFI call that returns
+        // either a valid event handle or null on failure.
         let event = unsafe {
             CreateEventW(
                 std::ptr::null_mut(),
@@ -412,6 +415,9 @@ this usually means Administrator privileges are required, or WinFSP must be conf
             let handle = event as usize;
             std::thread::Builder::new()
                 .name("shutdown-event-watcher".into())
+                // SAFETY: The watcher thread owns the copied event handle and
+                // only calls Win32 APIs that are valid for that handle until it is
+                // explicitly closed after signaling is complete.
                 .spawn(move || unsafe {
                     let h = handle as *mut core::ffi::c_void;
                     WaitForSingleObject(h, 0xFFFF_FFFF); // INFINITE
@@ -425,6 +431,8 @@ this usually means Administrator privileges are required, or WinFSP must be conf
     }
 
     *SHUTDOWN_TX.lock() = Some(tx);
+    // SAFETY: The handler function pointer is valid for the process lifetime and the
+    // process state is single-instance during mount, so passing it to WinFSP is valid.
     unsafe {
         SetConsoleCtrlHandler(Some(ctrl_handler), 1);
     }
@@ -454,6 +462,8 @@ pub(crate) fn request_shutdown() {
     }
 }
 
+// SAFETY: This is a Win32 API with the documented `"system"` ABI; declaration
+// matches the platform function signature expected by the linker.
 unsafe extern "system" {
     fn SetConsoleCtrlHandler(
         handler: Option<unsafe extern "system" fn(u32) -> i32>,
@@ -461,6 +471,8 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+// SAFETY: This callback is invoked by Win32 with process lifecycle event codes only.
+// We synchronously record shutdown intent and return `TRUE` to acknowledge handling.
 unsafe extern "system" fn ctrl_handler(_ctrl_type: u32) -> i32 {
     request_shutdown();
     1 // TRUE — handled
@@ -495,6 +507,8 @@ mod tests {
     #[test]
     fn parse_mount_options_normalizes_and_sets_defaults() {
         let _guard = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
+        // process environment variables for deterministic parsing behavior.
         unsafe {
             std::env::remove_var("STUDIOFS_WINFSP_SECTOR_SIZE");
             std::env::remove_var("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE");
@@ -522,6 +536,8 @@ mod tests {
     #[test]
     fn parse_mount_options_allows_env_timeout_overrides() {
         let _guard = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
+        // process environment variables for deterministic parsing behavior.
         unsafe {
             std::env::set_var("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS", "240000");
             std::env::set_var("STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS", "-1");
@@ -533,6 +549,8 @@ mod tests {
         assert_eq!(opts.dir_info_timeout_ms, u32::MAX);
         assert_eq!(opts.volume_info_timeout_ms, 480_000);
 
+        // SAFETY: Tests are single-threaded via `_guard` and restore environment
+        // variables that were written earlier in the test.
         unsafe {
             std::env::remove_var("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
             std::env::remove_var("STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS");
@@ -543,6 +561,8 @@ mod tests {
     #[test]
     fn parse_mount_options_invalid_env_value_falls_back_to_default() {
         let _guard = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
+        // process environment variables for deterministic parsing behavior.
         unsafe {
             std::env::set_var("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS", "abc");
         }
@@ -550,6 +570,8 @@ mod tests {
         let opts = parse_mount_options("StudioFS").expect("options");
         assert_eq!(opts.file_info_timeout_ms, DEFAULT_FILE_INFO_TIMEOUT_MS);
 
+        // SAFETY: Tests are single-threaded via `_guard` and restore environment
+        // variables that were written earlier in the test.
         unsafe {
             std::env::remove_var("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
         }
@@ -558,6 +580,8 @@ mod tests {
     #[test]
     fn parse_mount_options_allows_bool_overrides() {
         let _guard = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
+        // process environment variables for deterministic parsing behavior.
         unsafe {
             std::env::set_var("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE", "0");
             std::env::set_var("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP", "true");
@@ -567,6 +591,8 @@ mod tests {
         assert!(!opts.allow_open_in_kernel_mode);
         assert!(opts.flush_and_purge_on_cleanup);
 
+        // SAFETY: Tests are single-threaded via `_guard` and restore environment
+        // variables that were written earlier in the test.
         unsafe {
             std::env::remove_var("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE");
             std::env::remove_var("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP");
@@ -576,6 +602,8 @@ mod tests {
     #[test]
     fn parse_mount_options_invalid_bool_falls_back_to_default() {
         let _guard = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
+        // process environment variables for deterministic parsing behavior.
         unsafe {
             std::env::set_var("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE", "maybe");
             std::env::set_var("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP", "maybe");
@@ -591,6 +619,8 @@ mod tests {
             DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP
         );
 
+        // SAFETY: Tests are single-threaded via `_guard` and restore environment
+        // variables that were written earlier in the test.
         unsafe {
             std::env::remove_var("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE");
             std::env::remove_var("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP");
@@ -600,6 +630,8 @@ mod tests {
     #[test]
     fn parse_mount_options_allows_geometry_overrides() {
         let _guard = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
+        // process environment variables for deterministic parsing behavior.
         unsafe {
             std::env::set_var("STUDIOFS_WINFSP_SECTOR_SIZE", "4096");
             std::env::set_var("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE", "4194304");
@@ -609,6 +641,8 @@ mod tests {
         assert_eq!(opts.sector_size, 4096);
         assert_eq!(opts.sectors_per_allocation_unit, 1024);
 
+        // SAFETY: Tests are single-threaded via `_guard` and restore environment
+        // variables that were written earlier in the test.
         unsafe {
             std::env::remove_var("STUDIOFS_WINFSP_SECTOR_SIZE");
             std::env::remove_var("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE");
@@ -618,6 +652,8 @@ mod tests {
     #[test]
     fn parse_mount_options_invalid_geometry_falls_back_to_defaults() {
         let _guard = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
+        // process environment variables for deterministic parsing behavior.
         unsafe {
             std::env::set_var("STUDIOFS_WINFSP_SECTOR_SIZE", "3000");
             std::env::set_var("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE", "1048576");
@@ -630,6 +666,8 @@ mod tests {
             DEFAULT_SECTORS_PER_ALLOCATION_UNIT
         );
 
+        // SAFETY: Tests are single-threaded via `_guard` and restore environment
+        // variables that were written earlier in the test.
         unsafe {
             std::env::remove_var("STUDIOFS_WINFSP_SECTOR_SIZE");
             std::env::remove_var("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE");

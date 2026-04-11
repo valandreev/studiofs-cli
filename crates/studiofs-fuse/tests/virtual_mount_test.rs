@@ -33,10 +33,10 @@ fn load_test_env() {
     });
 }
 
-fn workspace_dotenv_vars() -> &'static std::collections::HashMap<String, String> {
-    static VARS: OnceLock<std::collections::HashMap<String, String>> = OnceLock::new();
+fn workspace_dotenv_vars() -> &'static std::collections::BTreeMap<String, String> {
+    static VARS: OnceLock<std::collections::BTreeMap<String, String>> = OnceLock::new();
     VARS.get_or_init(|| {
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         let env_path = workspace_env_path();
         if let Ok(iter) = dotenvy::from_path_iter(&env_path) {
             for item in iter.flatten() {

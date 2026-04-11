@@ -1,6 +1,7 @@
 use crate::cli::test_cache_profile_common::collect_write_path_artifacts;
 use crate::cli::test_cache_profile_types::{
-    ProfileArtifactReport, ProfileEndpointReport, TestCacheProfileMode, TestCacheProfileResult,
+    ProfileArtifactKind, ProfileArtifactReport, ProfileEndpointReport, TestCacheProfileMode,
+    TestCacheProfileResult,
 };
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -135,7 +136,7 @@ impl TestCacheProfileSession {
                                 None => false,
                             };
                             artifacts.push(ProfileArtifactReport {
-                                kind: "cpu".to_string(),
+                                kind: ProfileArtifactKind::Cpu,
                                 path: artifact.display().to_string(),
                                 bytes: bytes.len() as u64,
                                 sent_to_endpoint: sent,
@@ -185,7 +186,7 @@ impl TestCacheProfileSession {
                         None => false,
                     };
                     artifacts.push(ProfileArtifactReport {
-                        kind: "memory".to_string(),
+                        kind: ProfileArtifactKind::Memory,
                         path: artifact.display().to_string(),
                         bytes: bytes.len() as u64,
                         sent_to_endpoint: sent,

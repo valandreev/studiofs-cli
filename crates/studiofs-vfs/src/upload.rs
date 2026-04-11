@@ -266,9 +266,12 @@ impl UploadScheduler {
         }
 
         self.metrics.exhausted.fetch_add(1, Ordering::Relaxed);
+        let source = last_err.unwrap_or_else(|| {
+            DataError::Storage("upload exhausted without any captured error".to_string())
+        });
         Err(UploadError::Exhausted {
             attempts: self.max_attempts,
-            source: last_err.expect("at least one error"),
+            source,
         })
     }
 

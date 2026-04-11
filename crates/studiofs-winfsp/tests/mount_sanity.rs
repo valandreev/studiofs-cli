@@ -337,9 +337,14 @@ fn signal_named_event(name: &str) {
     use windows::core::HSTRING;
 
     let wide = HSTRING::from(name);
+    // SAFETY: `wide` is a valid event name buffer; this is the standard
+    // `OpenEventW` query path and failure is handled explicitly.
     let event = unsafe { OpenEventW(EVENT_MODIFY_STATE, false, &wide) };
     let Ok(event) = event else { return };
+    // SAFETY: `event` is valid on this branch and can be signaled by this process.
     let _ = unsafe { SetEvent(event) };
+    // SAFETY: Ownership of `event` stays with this function; closing it once here
+    // avoids handle leaks.
     let _ = unsafe { CloseHandle(event) };
 }
 
@@ -1331,6 +1336,7 @@ fn winfsp_mount_mmap_reader_during_upload_stays_readable_after_finalize_smoke() 
 
         let reader = std::fs::File::open(&target_file)
             .expect("open mmap reader handle during pending upload through WinFSP mount");
+        // SAFETY: `reader` is open for read and remains valid for mapping during this test.
         let mapping = unsafe {
             CreateFileMappingW(
                 HANDLE(reader.as_raw_handle()),
@@ -1342,12 +1348,16 @@ fn winfsp_mount_mmap_reader_during_upload_stays_readable_after_finalize_smoke() 
             )
         }
         .expect("create read-only file mapping through WinFSP mount");
+        // SAFETY: `mapping` is valid and the requested view maps exactly `payload.len()`
+        // bytes to a readable region in this process.
         let view = unsafe { MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, payload.len()) };
         assert!(
             !view.Value.is_null(),
             "MapViewOfFile returned a null view for WinFSP mmap smoke"
         );
 
+        // SAFETY: `view.Value` points into the mapped read-only region, and the
+        // byte range is bounded to `payload.len()`.
         let mapped = unsafe { std::slice::from_raw_parts(view.Value as *const u8, payload.len()) };
         assert_eq!(
             &mapped[..256 * 1024],
@@ -1369,6 +1379,7 @@ fn winfsp_mount_mmap_reader_during_upload_stays_readable_after_finalize_smoke() 
             "memory-mapped reader opened during pending upload must remain readable after publish"
         );
 
+        // SAFETY: The mapped view and handle are valid and no longer used below.
         unsafe {
             UnmapViewOfFile(view).expect("unmap WinFSP mmap view");
             CloseHandle(mapping).expect("close WinFSP mmap mapping handle");

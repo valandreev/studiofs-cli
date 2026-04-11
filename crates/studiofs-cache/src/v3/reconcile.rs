@@ -119,7 +119,7 @@ fn prune_missing_payload_for_dirty_entries(
         for chunk in stale_ids.chunks(INDEX_REMOVE_BATCH_SIZE) {
             index.remove_batch(chunk)?;
         }
-        removed_total = removed_total.saturating_add(stale_ids.len() as u64);
+        removed_total = removed_total.saturating_add(usize_to_u64(stale_ids.len()));
     }
 
     Ok(removed_total)
@@ -150,9 +150,13 @@ fn prune_missing_payload_for_all_entries(
         for chunk in stale_ids.chunks(INDEX_REMOVE_BATCH_SIZE) {
             index.remove_batch(chunk)?;
         }
-        removed_total = removed_total.saturating_add(stale_ids.len() as u64);
+        removed_total = removed_total.saturating_add(usize_to_u64(stale_ids.len()));
     }
     Ok(removed_total)
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn remove_temp_files(layout: &CacheV3Layout) -> Result<u64, io::Error> {

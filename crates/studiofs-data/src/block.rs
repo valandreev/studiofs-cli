@@ -7,22 +7,23 @@ use studiofs_meta::DEFAULT_BLOCK_SIZE;
 ///
 /// Returns a list of (block_index, block_data) pairs.
 pub fn split_into_blocks(data: &[u8], start_offset: u32) -> Vec<(u32, Bytes)> {
-    let bs = DEFAULT_BLOCK_SIZE as usize;
+    let bs = usize::try_from(DEFAULT_BLOCK_SIZE).expect("block size must fit usize");
     let mut blocks = Vec::new();
 
-    // Calculate the first block index and offset within that block
-    let first_block_idx = start_offset as usize / bs;
-    let offset_in_first_block = start_offset as usize % bs;
+    // Calculate the first block index and offset within that block.
+    let first_block_idx = start_offset / DEFAULT_BLOCK_SIZE;
+    let offset_in_first_block = start_offset % DEFAULT_BLOCK_SIZE;
 
     let mut remaining = data;
     let mut block_idx = first_block_idx;
-    let mut offset_in_block = offset_in_first_block;
+    let mut offset_in_block =
+        usize::try_from(offset_in_first_block).expect("block offset must fit usize");
 
     while !remaining.is_empty() {
-        let available_in_block = bs - offset_in_block;
+        let available_in_block = bs.saturating_sub(offset_in_block);
         let take = remaining.len().min(available_in_block);
 
-        blocks.push((block_idx as u32, Bytes::copy_from_slice(&remaining[..take])));
+        blocks.push((block_idx, Bytes::copy_from_slice(&remaining[..take])));
 
         remaining = &remaining[take..];
         block_idx += 1;
@@ -68,7 +69,8 @@ mod tests {
     fn test_split_with_offset() {
         let bs = DEFAULT_BLOCK_SIZE as usize;
         let data = vec![0u8; bs / 2]; // 0.5 MiB
-        let blocks = split_into_blocks(&data, (3 * bs) as u32); // starting at block 3
+        let offset = u32::try_from(3 * bs).expect("test offset must fit u32");
+        let blocks = split_into_blocks(&data, offset); // starting at block 3
         // offset 3 MiB is in block 3, with the full block available
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].0, 3);

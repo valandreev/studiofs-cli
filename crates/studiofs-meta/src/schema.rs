@@ -155,10 +155,14 @@ pub struct InodeAttr {
 impl InodeAttr {
     /// Get current time as nanoseconds since Unix epoch.
     pub fn now_nanos() -> i64 {
-        SystemTime::now()
+        let elapsed = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0)
+            .unwrap_or_default();
+        let nanos = elapsed
+            .as_secs()
+            .saturating_mul(1_000_000_000)
+            .saturating_add(u64::from(elapsed.subsec_nanos()));
+        i64::try_from(nanos).unwrap_or(i64::MAX)
     }
 
     /// Create attributes for a new directory.
@@ -229,14 +233,15 @@ impl InodeAttr {
     /// Create attributes for a new symlink.
     pub fn new_symlink(ino: Ino, parent: Ino, uid: u32, gid: u32, target_len: usize) -> Self {
         let now = Self::now_nanos();
+        let target_len = u64::try_from(target_len).unwrap_or(u64::MAX);
         Self {
             ino,
             kind: FileType::Symlink,
             mode: 0o777,
             uid,
             gid,
-            size: target_len as u64,
-            committed_size: target_len as u64,
+            size: target_len,
+            committed_size: target_len,
             nlink: 1,
             mtime: now,
             ctime: now,

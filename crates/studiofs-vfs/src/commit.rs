@@ -1,4 +1,5 @@
 use super::*;
+use studiofs_data::object::format_object_fragment_keys;
 
 pub(super) struct CommitCoordinator;
 
@@ -70,7 +71,7 @@ impl CommitCoordinator {
                     .enumerate()
                     .map(|(idx, object_id)| {
                         (
-                            idx as u32,
+                            u32::try_from(idx).unwrap_or(u32::MAX),
                             ExtentRecordId {
                                 object_id: *object_id,
                                 content_epoch,
@@ -271,7 +272,7 @@ async fn requeue_missing_manifest_uploads(
         .collect();
 
     for (block_index, block_ref) in required_blocks {
-        let offset = (*block_index as u64).saturating_mul(vfs.block_size as u64);
+        let offset = u64::from(*block_index).saturating_mul(u64::from(vfs.block_size));
         if pending_keys.contains(&(offset, block_ref.object_id)) {
             continue;
         }

@@ -1,3 +1,4 @@
+use crate::cli::test_cache_profile_types::ProfileArtifactKind;
 use crate::cli::test_cache_profile_types::ProfileArtifactReport;
 use crate::cli::utils::format_bytes;
 use anyhow::{Context, Result};
@@ -30,7 +31,7 @@ pub(crate) fn collect_write_path_artifacts(
                 &bytes,
             )?;
             artifacts.push(ProfileArtifactReport {
-                kind: "write-path-observability".to_string(),
+                kind: ProfileArtifactKind::WritePathObservability,
                 path: artifact.display().to_string(),
                 bytes: bytes.len() as u64,
                 sent_to_endpoint: false,
@@ -47,7 +48,7 @@ pub(crate) fn collect_write_path_artifacts(
                         &summary_bytes,
                     )?;
                     artifacts.push(ProfileArtifactReport {
-                        kind: "write-path-summary".to_string(),
+                        kind: ProfileArtifactKind::WritePathSummary,
                         path: summary_artifact.display().to_string(),
                         bytes: summary_bytes.len() as u64,
                         sent_to_endpoint: false,
@@ -216,6 +217,7 @@ pub(crate) fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{collect_write_path_artifacts, render_write_path_summary};
+    use crate::cli::test_cache_profile_types::ProfileArtifactKind;
     use studiofs_vfs::{
         VfsWritePathObservabilitySnapshot, VfsWritePathWinfspCallbackStats,
         VfsWritePathWinfspForegroundFlushStats,
@@ -351,8 +353,11 @@ mod tests {
 
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert_eq!(artifacts.len(), 2);
-        assert_eq!(artifacts[0].kind, "write-path-observability");
-        assert_eq!(artifacts[1].kind, "write-path-summary");
+        assert_eq!(
+            artifacts[0].kind,
+            ProfileArtifactKind::WritePathObservability
+        );
+        assert_eq!(artifacts[1].kind, ProfileArtifactKind::WritePathSummary);
         let summary = std::fs::read_to_string(&artifacts[1].path).expect("read summary");
         assert!(summary.contains("winfsp_validation: cleanup_non_delete=cleanup-deferred"));
     }

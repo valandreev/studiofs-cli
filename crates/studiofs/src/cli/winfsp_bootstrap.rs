@@ -1,5 +1,5 @@
-use anyhow::Context;
-use std::io::IsTerminal;
+use std::fmt::{Display, Formatter};
+use std::io::{self, IsTerminal};
 use std::process::Command;
 use winreg::RegKey;
 use winreg::enums::HKEY_LOCAL_MACHINE;
@@ -17,14 +17,56 @@ fn mountmgr_from_fsd_enabled() -> bool {
     })
 }
 
-fn set_mountmgr_from_fsd_enabled() -> anyhow::Result<()> {
+#[derive(Debug)]
+pub enum MountmgrBootstrapError {
+    Registry {
+        op: &'static str,
+        path: &'static str,
+        detail: String,
+    },
+    Process(io::Error),
+    ExitNotZero(Option<i32>),
+    NonInteractiveTerminal,
+}
+
+impl Display for MountmgrBootstrapError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Registry { op, path, detail } => {
+                write!(f, "{op} registry path {path} failed: {detail}")
+            }
+            Self::Process(err) => write!(f, "bootstrap process failed: {err}"),
+            Self::ExitNotZero(code) => write!(
+                f,
+                "one-time WinFSP bootstrap failed or was canceled (exit code {code:?})"
+            ),
+            Self::NonInteractiveTerminal => write!(
+                f,
+                "WinFSP one-time bootstrap requires an interactive terminal for UAC approval"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MountmgrBootstrapError {}
+
+fn set_mountmgr_enabled() -> Result<(), MountmgrBootstrapError> {
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
     for path in WINFSP_REG_PATHS {
-        let (key, _) = hklm
-            .create_subkey(path)
-            .with_context(|| format!("failed to open/create HKLM\\{path}"))?;
-        key.set_value(MOUNTMGR_VALUE_NAME, &1u32)
-            .with_context(|| format!("failed to set HKLM\\{path}\\{MOUNTMGR_VALUE_NAME}=1"))?;
+        let (key, _) =
+            hklm.create_subkey(path)
+                .map_err(|err| MountmgrBootstrapError::Registry {
+                    op: "open/create",
+                    path,
+                    detail: err.to_string(),
+                })?;
+        key.set_value(MOUNTMGR_VALUE_NAME, &1u32).map_err(|err| {
+            MountmgrBootstrapError::Registry {
+                op: "set",
+                path,
+                detail: err.to_string(),
+            }
+        })?;
     }
     Ok(())
 }
@@ -33,8 +75,8 @@ fn ps_single_quote(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-fn run_elevated_bootstrap_process() -> anyhow::Result<()> {
-    let exe = std::env::current_exe().context("failed to resolve current executable path")?;
+fn run_elevated_mountmgr_bootstrap() -> Result<(), MountmgrBootstrapError> {
+    let exe = std::env::current_exe().map_err(MountmgrBootstrapError::Process)?;
     let exe = ps_single_quote(&exe.to_string_lossy());
 
     let script = format!(
@@ -58,19 +100,16 @@ try {{ \
             &script,
         ])
         .status()
-        .context("failed to spawn elevated WinFSP bootstrap process")?;
+        .map_err(MountmgrBootstrapError::Process)?;
 
     if !status.success() {
-        anyhow::bail!(
-            "one-time WinFSP bootstrap failed or was canceled (exit code {:?})",
-            status.code()
-        );
+        return Err(MountmgrBootstrapError::ExitNotZero(status.code()));
     }
 
     Ok(())
 }
 
-pub fn ensure_mountmgr_bootstrap() -> anyhow::Result<()> {
+pub fn ensure_mountmgr_bootstrap() -> Result<(), MountmgrBootstrapError> {
     if mountmgr_from_fsd_enabled() {
         return Ok(());
     }
@@ -79,28 +118,27 @@ pub fn ensure_mountmgr_bootstrap() -> anyhow::Result<()> {
         && !std::io::stdout().is_terminal()
         && !std::io::stderr().is_terminal()
     {
-        anyhow::bail!(
-            "WinFSP one-time bootstrap requires an interactive terminal for UAC approval. \
-please run `studiofs mount` once in an interactive Administrator session, or set MountUseMountmgrFromFSD=1 manually in the registry."
-        );
+        return Err(MountmgrBootstrapError::NonInteractiveTerminal);
     }
 
     eprintln!(
         "Windows one-time setup: requesting Administrator approval to enable WinFSP Mount Manager integration (MountUseMountmgrFromFSD=1)."
     );
-    run_elevated_bootstrap_process()?;
+    run_elevated_mountmgr_bootstrap()?;
 
     if !mountmgr_from_fsd_enabled() {
-        anyhow::bail!(
-            "WinFSP one-time bootstrap did not persist MountUseMountmgrFromFSD=1. Please rerun mount as Administrator once."
-        );
+        return Err(MountmgrBootstrapError::Registry {
+            op: "read",
+            path: "HKLM\\SOFTWARE\\WOW6432Node\\WinFsp / HKLM\\SOFTWARE\\WinFsp",
+            detail: "mount manager flag did not persist after bootstrap".into(),
+        });
     }
 
     eprintln!("WinFSP one-time setup completed. Continuing mount...");
     Ok(())
 }
 
-pub fn run_internal_bootstrap_mountmgr() -> anyhow::Result<()> {
-    set_mountmgr_from_fsd_enabled()?;
+pub fn run_internal_bootstrap_mountmgr() -> Result<(), MountmgrBootstrapError> {
+    set_mountmgr_enabled()?;
     Ok(())
 }

@@ -119,6 +119,8 @@ async fn put_and_get_block() {
     let payload = Bytes::from(vec![0xABu8; 1024]);
     let slice_id = unique_slice_id();
     let block_idx = 0;
+    let payload_size =
+        u32::try_from(payload.len()).expect("payload size must fit u32 for S3 block test payload");
 
     // Upload
     store
@@ -128,14 +130,14 @@ async fn put_and_get_block() {
 
     // Download
     let got = store
-        .get_block(slice_id, block_idx, payload.len() as u32)
+        .get_block(slice_id, block_idx, payload_size)
         .await
         .unwrap();
     assert_eq!(got, payload, "downloaded block must match uploaded data");
 
     // Cleanup
     store
-        .delete_block(slice_id, block_idx, payload.len() as u32)
+        .delete_block(slice_id, block_idx, payload_size)
         .await
         .unwrap();
 }
@@ -151,7 +153,8 @@ async fn get_block_range() {
     let payload = Bytes::from(data.clone());
     let slice_id = unique_slice_id();
     let block_idx = 0;
-    let block_size = payload.len() as u32;
+    let block_size =
+        u32::try_from(payload.len()).expect("payload size must fit u32 for S3 block test payload");
 
     store.put_block(slice_id, block_idx, payload).await.unwrap();
 
@@ -180,7 +183,8 @@ async fn block_exists_lifecycle() {
     let slice_id = unique_slice_id();
     let block_idx = 0;
     let payload = Bytes::from(vec![1u8; 512]);
-    let block_size = payload.len() as u32;
+    let block_size =
+        u32::try_from(payload.len()).expect("payload size must fit u32 for S3 block test payload");
 
     // Should not exist initially (unique slice ID guarantees this)
     assert!(
@@ -221,7 +225,8 @@ async fn delete_block_idempotent() {
     let slice_id = unique_slice_id();
     let block_idx = 0;
     let payload = Bytes::from(vec![9u8; 256]);
-    let block_size = payload.len() as u32;
+    let block_size =
+        u32::try_from(payload.len()).expect("payload size must fit u32 for S3 block test payload");
 
     store.put_block(slice_id, block_idx, payload).await.unwrap();
     store
@@ -251,16 +256,22 @@ async fn large_multiblock_write() {
     }
 
     // Read back each block and verify
+    let block_size = 1024usize * 1024;
+    let block_size_u32 =
+        u32::try_from(block_size).expect("test block size must fit u32 for storage API");
     for idx in 0u32..3 {
-        let block = store.get_block(slice_id, idx, 1024 * 1024).await.unwrap();
-        assert_eq!(block.len(), 1024 * 1024);
+        let block = store
+            .get_block(slice_id, idx, block_size_u32)
+            .await
+            .unwrap();
+        assert_eq!(block.len(), block_size);
         assert!(block.iter().all(|&b| b == (idx as u8) + 0xA0));
     }
 
     // Cleanup
     for idx in 0u32..3 {
         store
-            .delete_block(slice_id, idx, 1024 * 1024)
+            .delete_block(slice_id, idx, block_size_u32)
             .await
             .unwrap();
     }

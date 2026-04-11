@@ -102,7 +102,7 @@ fn open_cache_v3_backend_with_budget(
         }
     }
 
-    unreachable!("retry loop must return or error before exhausting attempts")
+    unreachable!("cache-v3 open loop must return on success or terminal error")
 }
 
 fn provision_cache_v3_layout(layout: &v3::CacheV3Layout) -> std::io::Result<()> {

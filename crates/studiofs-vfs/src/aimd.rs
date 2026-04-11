@@ -110,14 +110,16 @@ pub struct AimdController {
 impl AimdController {
     /// Create a new controller from the given configuration.
     pub fn new(cfg: AimdConfig) -> Self {
-        let initial = cfg.initial_window.clamp(cfg.min_window, cfg.max_window);
+        let min_window = sanitize_window_min(cfg.min_window);
+        let max_window = sanitize_window_max(cfg.max_window, min_window);
+        let initial = cfg.initial_window.clamp(min_window, max_window);
         let now = Instant::now();
         Self {
             state: Mutex::new(AimdState {
                 window: initial,
                 in_flight: 0,
-                min_window: cfg.min_window,
-                max_window: cfg.max_window,
+                min_window,
+                max_window,
                 increase_step: cfg.increase_step,
                 decrease_factor: cfg.decrease_factor,
                 // Large cooldown values (e.g. bad env/config) can underflow here.
@@ -140,7 +142,7 @@ impl AimdController {
             let notified = self.notify.notified();
             {
                 let mut st = self.state.lock();
-                let limit = (st.window.floor() as usize).max(st.min_window as usize);
+                let limit = effective_limit_from_state(&st);
                 if st.in_flight < limit {
                     st.in_flight += 1;
                     return AimdPermit {
@@ -157,7 +159,7 @@ impl AimdController {
     /// window is fully utilised.
     pub fn try_acquire(&self) -> Option<AimdPermit<'_>> {
         let mut st = self.state.lock();
-        let limit = (st.window.floor() as usize).max(st.min_window as usize);
+        let limit = effective_limit_from_state(&st);
         if st.in_flight < limit {
             st.in_flight += 1;
             Some(AimdPermit {
@@ -188,9 +190,9 @@ impl AimdController {
         {
             let mut st = self.state.lock();
             st.in_flight = st.in_flight.saturating_sub(1);
-            let old_floor = st.window.floor() as usize;
+            let old_floor = floor_to_usize(st.window);
             st.window = (st.window + st.increase_step).min(st.max_window);
-            let new_floor = st.window.floor() as usize;
+            let new_floor = floor_to_usize(st.window);
             grew = new_floor > old_floor;
         }
         // If the window grew, multiple waiters may now be able to proceed.
@@ -249,7 +251,7 @@ impl AimdController {
     /// Effective concurrency limit (floor of window, clamped to min_window).
     pub fn effective_limit(&self) -> usize {
         let st = self.state.lock();
-        (st.window.floor() as usize).max(st.min_window as usize)
+        effective_limit_from_state(&st)
     }
 
     /// Total successful completions since creation.
@@ -260,6 +262,54 @@ impl AimdController {
     /// Total failed completions since creation.
     pub fn total_failures(&self) -> u64 {
         self.failures.load(Ordering::Relaxed)
+    }
+}
+
+fn sanitize_window_min(raw_min_window: f64) -> f64 {
+    if raw_min_window.is_finite() {
+        raw_min_window.max(1.0)
+    } else {
+        1.0
+    }
+}
+
+fn sanitize_window_max(raw_max_window: f64, min_window: f64) -> f64 {
+    if raw_max_window.is_finite() {
+        raw_max_window.max(min_window).max(1.0)
+    } else {
+        min_window.max(1.0)
+    }
+}
+
+fn effective_limit_from_state(st: &AimdState) -> usize {
+    let window_floor = st.window.max(1.0).floor();
+    if !window_floor.is_finite() {
+        return 1;
+    }
+    if window_floor >= usize::MAX as f64 {
+        usize::MAX
+    } else {
+        let limit_u64 = window_floor as u64;
+        usize::try_from(limit_u64).unwrap_or(usize::MAX)
+    }
+}
+
+fn floor_to_usize(value: f64) -> usize {
+    if !value.is_finite() {
+        return 0;
+    }
+    if value <= 0.0 {
+        return 0;
+    }
+    if value >= usize::MAX as f64 {
+        usize::MAX
+    } else {
+        let floored = value.floor();
+        if floored >= usize::MAX as f64 {
+            usize::MAX
+        } else {
+            floored as usize
+        }
     }
 }
 
@@ -429,18 +479,22 @@ mod tests {
     async fn concurrent_acquire_blocks_at_limit() {
         let c = AimdController::new(test_config());
         // Hold 2 permits (the limit)
-        let p1 = c.acquire().await;
-        let _p2 = c.acquire().await;
+        let p1 = c.try_acquire().unwrap();
+        let p2 = c.try_acquire().unwrap();
 
-        // Without releasing, a third acquire should time out
-        let result = tokio::time::timeout(Duration::from_millis(50), c.acquire()).await;
-        assert!(result.is_err(), "acquire should have timed out");
+        // Without releasing, a third acquire should be rejected by the fast path.
+        assert!(
+            c.try_acquire().is_none(),
+            "acquire should be blocked at limit"
+        );
 
         // Release one — now acquire should succeed
-        p1.success();
-        let p3 = tokio::time::timeout(Duration::from_millis(100), c.acquire())
-            .await
+        drop(p1);
+        let p3 = c
+            .try_acquire()
             .expect("acquire should succeed after release");
         p3.success();
+
+        p2.success();
     }
 }

@@ -7,7 +7,7 @@
 //!   cargo test -p studiofs --test destroy_test -- --ignored --nocapture --test-threads=1
 
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -55,10 +55,10 @@ fn workspace_env_path() -> PathBuf {
     workspace_root().join(".env")
 }
 
-fn workspace_dotenv_vars() -> &'static HashMap<String, String> {
-    static VARS: OnceLock<HashMap<String, String>> = OnceLock::new();
+fn workspace_dotenv_vars() -> &'static BTreeMap<String, String> {
+    static VARS: OnceLock<BTreeMap<String, String>> = OnceLock::new();
     VARS.get_or_init(|| {
-        let mut vars = HashMap::new();
+        let mut vars = BTreeMap::new();
         let env_path = workspace_env_path();
         if let Ok(iter) = dotenvy::from_path_iter(&env_path) {
             for item in iter.flatten() {

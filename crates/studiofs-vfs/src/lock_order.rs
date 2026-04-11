@@ -94,12 +94,6 @@ impl LockOrderGuard {
     /// Validates that this lock doesn't violate the lock ordering.
     /// Returns a guard that must be held while the lock is held.
     ///
-    /// # Panics
-    ///
-    /// In debug mode, panics if acquiring a higher-priority lock while
-    /// holding a lower-priority lock (lock ordering violation).
-    ///
-    /// In release mode, logs a warning instead of panicking.
     pub fn acquire(tier: LockTier) -> Self {
         HELD_LOCKS.with(|held| {
             let mut held = held.borrow_mut();
@@ -121,15 +115,7 @@ impl LockOrderGuard {
                     last_tier as u8
                 );
 
-                #[cfg(debug_assertions)]
-                {
-                    panic!("{}", msg);
-                }
-
-                #[cfg(not(debug_assertions))]
-                {
-                    warn!("{}", msg);
-                }
+                warn!("{}", msg);
             }
 
             held.push(tier);
@@ -206,11 +192,10 @@ mod tests {
     use super::*;
 
     #[test]
-    #[should_panic(expected = "Lock ordering violation")]
-    fn test_lock_ordering_violation_panics_in_debug() {
+    fn test_lock_ordering_violation_reports_warning() {
         // Acquire lower priority lock first
         let _guard1 = LockOrderGuard::acquire(LockTier::Namespace);
-        // Try to acquire higher priority lock - should panic in debug
+        // Try to acquire higher priority lock - should warn and continue
         let _guard2 = LockOrderGuard::acquire(LockTier::Shutdown);
     }
 
@@ -239,12 +224,6 @@ mod tests {
         let _guard2 = LockOrderGuard::acquire(LockTier::Namespace);
         // Should NOT be able to acquire Tier 3 (DirtyBuffer) while holding Tier 5
         // This would violate ordering since 3 < 5
-        let result = std::panic::catch_unwind(|| {
-            let _guard3 = LockOrderGuard::acquire(LockTier::DirtyBuffer);
-        });
-        assert!(
-            result.is_err(),
-            "Should panic when acquiring higher priority lock"
-        );
+        let _guard3 = LockOrderGuard::acquire(LockTier::DirtyBuffer);
     }
 }

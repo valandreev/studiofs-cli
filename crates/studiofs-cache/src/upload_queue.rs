@@ -5,7 +5,7 @@
 //! startup replay is reconstructed from the local backend + metadata mapping.
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -47,8 +47,8 @@ pub struct UploadQueue {
 /// never observes an inconsistent state where a block exists in the
 /// object-id index but the per-inode counter has not yet been bumped.
 struct PendingState {
-    by_object: HashMap<u64, PendingUpload>,
-    ino_counts: HashMap<Ino, usize>,
+    by_object: BTreeMap<u64, PendingUpload>,
+    ino_counts: BTreeMap<Ino, usize>,
 }
 
 impl UploadQueue {
@@ -69,8 +69,8 @@ impl UploadQueue {
             sender: tx,
             pending_count: AtomicUsize::new(0),
             pending_state: Mutex::new(PendingState {
-                by_object: HashMap::new(),
-                ino_counts: HashMap::new(),
+                by_object: BTreeMap::new(),
+                ino_counts: BTreeMap::new(),
             }),
             idle_notify,
         });
@@ -199,7 +199,7 @@ impl UploadQueue {
     fn remove_pending(&self, object_id: u64) -> bool {
         let mut state = self.pending_state.lock();
         if let Some(removed) = state.by_object.remove(&object_id)
-            && let std::collections::hash_map::Entry::Occupied(mut e) =
+            && let std::collections::btree_map::Entry::Occupied(mut e) =
                 state.ino_counts.entry(removed.ino)
         {
             *e.get_mut() -= 1;
@@ -215,7 +215,8 @@ impl UploadQueue {
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
         .unwrap_or(0)
 }
 

@@ -105,7 +105,10 @@ fn note_critical_vfs_error(e: &VfsError) {
 
 #[cfg(target_os = "macos")]
 fn merge_xattr_write(existing: Option<Vec<u8>>, position: u32, value: &[u8]) -> Vec<u8> {
-    let offset = position as usize;
+    let offset = match usize::try_from(position) {
+        Ok(offset) => offset,
+        Err(_) => unreachable!("xattr position must fit usize"),
+    };
     let existing_len = existing.as_ref().map_or(0, Vec::len);
     let new_len = existing_len.max(offset.saturating_add(value.len()));
     let mut merged = vec![0; new_len];
@@ -133,7 +136,16 @@ fn normalize_macos_xattr_flags(flags: i32) -> u32 {
 
 fn normalize_unix_mode(mode: u32) -> u16 {
     // VFS stores only Unix permission bits; file type is tracked separately.
-    (mode & 0o7777) as u16
+    u16::try_from(mode & 0o7777).unwrap_or(0)
+}
+
+fn system_time_to_timespec(time: SystemTime) -> TimeSpec {
+    let secs = time
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_nanos()).ok())
+        .unwrap_or(i64::MAX);
+    TimeSpec::Set(secs)
 }
 
 #[cfg(target_os = "macos")]
@@ -272,14 +284,18 @@ fn vfs_err_to_errno(e: &VfsError) -> i32 {
 fn to_fuse_attr(attr: &studiofs_meta::InodeAttr, mount_uid: u32, mount_gid: u32) -> FileAttr {
     let uid = if attr.uid == 0 { mount_uid } else { attr.uid };
     let gid = if attr.gid == 0 { mount_gid } else { attr.gid };
+    let atime = u64::try_from(attr.atime.max(0)).unwrap_or(0);
+    let mtime = u64::try_from(attr.mtime.max(0)).unwrap_or(0);
+    let ctime = u64::try_from(attr.ctime.max(0)).unwrap_or(0);
+    let crtime = u64::try_from(attr.effective_crtime().max(0)).unwrap_or(0);
     FileAttr {
         ino: attr.ino,
         size: attr.size,
         blocks: attr.size.div_ceil(512),
-        atime: UNIX_EPOCH + Duration::from_nanos(attr.atime.max(0) as u64),
-        mtime: UNIX_EPOCH + Duration::from_nanos(attr.mtime.max(0) as u64),
-        ctime: UNIX_EPOCH + Duration::from_nanos(attr.ctime.max(0) as u64),
-        crtime: UNIX_EPOCH + Duration::from_nanos(attr.effective_crtime().max(0) as u64),
+        atime: UNIX_EPOCH + Duration::from_nanos(atime),
+        mtime: UNIX_EPOCH + Duration::from_nanos(mtime),
+        ctime: UNIX_EPOCH + Duration::from_nanos(ctime),
+        crtime: UNIX_EPOCH + Duration::from_nanos(crtime),
         kind: match attr.kind {
             FileType::RegularFile => FuseFileType::RegularFile,
             FileType::Directory => FuseFileType::Directory,
@@ -293,6 +309,14 @@ fn to_fuse_attr(attr: &studiofs_meta::InodeAttr, mount_uid: u32, mount_gid: u32)
         blksize: 512,
         flags: 0,
     }
+}
+
+fn to_u64_offset(offset: i64) -> Result<u64, libc::c_int> {
+    u64::try_from(offset).map_err(|_| libc::EINVAL)
+}
+
+fn clamp_offset_to_usize(offset: i64) -> Result<usize, libc::c_int> {
+    usize::try_from(offset).map_err(|_| libc::EINVAL)
 }
 
 fn fuse_file_type(kind: FileType) -> FuseFileType {
@@ -317,7 +341,10 @@ pub struct StudioFuseFs {
 
 impl StudioFuseFs {
     pub fn new(vfs: Arc<StudioVfs>, rt: Arc<Runtime>) -> Self {
+        // SAFETY: getuid/getgid read process-wide credential values from libc and are
+        // side-effect-free.
         let mount_uid = unsafe { libc::getuid() };
+        // SAFETY: same safety rationale as getuid.
         let mount_gid = unsafe { libc::getgid() };
         Self {
             vfs,
@@ -776,11 +803,25 @@ impl Filesystem for StudioFuseFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        let offset = match to_u64_offset(offset) {
+            Ok(offset) => offset,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
         let clamped_size = match self.vfs.getattr(ino) {
-            Ok(attr) => attr.size.saturating_sub(offset as u64).min(u64::from(size)) as u32,
+            Ok(attr) => attr.size.saturating_sub(offset).min(u64::from(size)),
             Err(e) => {
                 error!("read getattr({ino}, off={offset}, sz={size}) -> {e}");
                 reply.error(vfs_err_to_errno(&e));
+                return;
+            }
+        };
+        let clamped_size = match usize::try_from(clamped_size) {
+            Ok(clamped_size) => clamped_size,
+            Err(_) => {
+                reply.error(libc::EOVERFLOW);
                 return;
             }
         };
@@ -789,12 +830,15 @@ impl Filesystem for StudioFuseFs {
             return;
         }
 
-        let mut out = vec![0u8; clamped_size as usize];
+        let mut out = vec![0u8; clamped_size];
         match self
             .rt
-            .block_on(self.vfs.read_into_fh(fh, ino, offset as u64, &mut out))
+            .block_on(self.vfs.read_into_fh(fh, ino, offset, &mut out))
         {
-            Ok(n) => reply.data(&out[..n as usize]),
+            Ok(n) => {
+                let n = usize::from(n);
+                reply.data(&out[..n]);
+            }
             Err(e) => {
                 error!("read({ino}, off={offset}, sz={size}) -> {e}");
                 reply.error(vfs_err_to_errno(&e));
@@ -814,10 +858,14 @@ impl Filesystem for StudioFuseFs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        match self
-            .rt
-            .block_on(self.vfs.write_fh(fh, ino, offset as u64, data))
-        {
+        let offset = match to_u64_offset(offset) {
+            Ok(offset) => offset,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
+        match self.rt.block_on(self.vfs.write_fh(fh, ino, offset, data)) {
             Ok(written) => reply.written(written),
             Err(e) => {
                 error!("write({ino}, off={offset}) -> {e}");
@@ -902,7 +950,13 @@ impl Filesystem for StudioFuseFs {
         };
 
         // Offset-based iteration (offset 0 = ".", 1 = "..", 2+ = entries)
-        let mut idx = offset as usize;
+        let mut idx = match clamp_offset_to_usize(offset) {
+            Ok(offset) => offset,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
         if idx == 0 {
             if reply.add(ino, 1, FuseFileType::Directory, ".") {
                 reply.ok();
@@ -929,12 +983,14 @@ impl Filesystem for StudioFuseFs {
             let entry_name = normalize_macos_readdir_name(&entry.name);
             #[cfg(not(target_os = "macos"))]
             let entry_name = entry.name.clone();
-            if reply.add(
-                entry.ino,
-                (entry_idx + 1) as i64,
-                ft,
-                OsStr::from_bytes(&entry_name),
-            ) {
+            let next_offset = match i64::try_from(entry_idx + 1) {
+                Ok(next_offset) => next_offset,
+                Err(_) => {
+                    reply.error(libc::EOVERFLOW);
+                    return;
+                }
+            };
+            if reply.add(entry.ino, next_offset, ft, OsStr::from_bytes(&entry_name)) {
                 break;
             }
         }
@@ -959,7 +1015,13 @@ impl Filesystem for StudioFuseFs {
             }
         };
 
-        let mut idx = offset as usize;
+        let mut idx = match clamp_offset_to_usize(offset) {
+            Ok(offset) => offset,
+            Err(errno) => {
+                reply.error(errno);
+                return;
+            }
+        };
 
         // "." entry
         if idx == 0 {
@@ -999,6 +1061,13 @@ impl Filesystem for StudioFuseFs {
             if entry_idx < idx {
                 continue;
             }
+            let next_offset = match i64::try_from(entry_idx + 1) {
+                Ok(next_offset) => next_offset,
+                Err(_) => {
+                    reply.error(libc::EOVERFLOW);
+                    return;
+                }
+            };
             let fattr = match self.vfs.getattr(entry.ino) {
                 Ok(a) => to_fuse_attr(&a, self.mount_uid, self.mount_gid),
                 Err(_) => continue, // skip entries we can't stat
@@ -1009,7 +1078,7 @@ impl Filesystem for StudioFuseFs {
             let entry_name = entry.name.clone();
             if reply.add(
                 entry.ino,
-                (entry_idx + 1) as i64,
+                next_offset,
                 OsStr::from_bytes(&entry_name),
                 &TTL,
                 &fattr,
@@ -1046,29 +1115,17 @@ impl Filesystem for StudioFuseFs {
             uid,
             gid,
             atime: match atime {
-                Some(fuser::TimeOrNow::SpecificTime(st)) => TimeSpec::Set(
-                    st.duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as i64)
-                        .unwrap_or(0),
-                ),
+                Some(fuser::TimeOrNow::SpecificTime(st)) => system_time_to_timespec(st),
                 Some(fuser::TimeOrNow::Now) => TimeSpec::Now,
                 None => TimeSpec::Omit,
             },
             mtime: match mtime {
-                Some(fuser::TimeOrNow::SpecificTime(st)) => TimeSpec::Set(
-                    st.duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as i64)
-                        .unwrap_or(0),
-                ),
+                Some(fuser::TimeOrNow::SpecificTime(st)) => system_time_to_timespec(st),
                 Some(fuser::TimeOrNow::Now) => TimeSpec::Now,
                 None => TimeSpec::Omit,
             },
             crtime: match _crtime {
-                Some(st) => TimeSpec::Set(
-                    st.duration_since(UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as i64)
-                        .unwrap_or(0),
-                ),
+                Some(st) => system_time_to_timespec(st),
                 None => TimeSpec::Omit,
             },
             win_attrs: None,
@@ -1121,9 +1178,12 @@ impl Filesystem for StudioFuseFs {
     fn getxtimes(&mut self, _req: &Request<'_>, ino: u64, reply: fuser::ReplyXTimes) {
         match self.vfs.getattr(ino) {
             Ok(attr) => {
-                let crtime =
-                    UNIX_EPOCH + Duration::from_nanos(attr.effective_crtime().max(0) as u64);
-                let bkuptime = UNIX_EPOCH + Duration::from_nanos(attr.mtime.max(0) as u64);
+                let crtime = UNIX_EPOCH
+                    + Duration::from_nanos(
+                        u64::try_from(attr.effective_crtime().max(0)).unwrap_or(0),
+                    );
+                let bkuptime = UNIX_EPOCH
+                    + Duration::from_nanos(u64::try_from(attr.mtime.max(0)).unwrap_or(0));
                 reply.xtimes(bkuptime, crtime);
             }
             Err(e) => {
@@ -1181,7 +1241,14 @@ impl Filesystem for StudioFuseFs {
         match self.vfs.get_xattr(ino, key) {
             Ok(Some(val)) => {
                 if size == 0 {
-                    reply.size(val.len() as u32);
+                    let data_len = match u32::try_from(val.len()) {
+                        Ok(data_len) => data_len,
+                        Err(_) => {
+                            reply.error(libc::EOVERFLOW);
+                            return;
+                        }
+                    };
+                    reply.size(data_len);
                 } else if val.len() <= size as usize {
                     reply.data(&val);
                 } else {
@@ -1219,7 +1286,13 @@ impl Filesystem for StudioFuseFs {
         #[cfg(target_os = "macos")]
         let normalized_flags = normalize_macos_xattr_flags(flags);
         #[cfg(not(target_os = "macos"))]
-        let normalized_flags = flags as u32;
+        let normalized_flags = match u32::try_from(flags) {
+            Ok(normalized_flags) => normalized_flags,
+            Err(_) => {
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
 
         #[cfg(target_os = "macos")]
         let value_buf = if _position > 0 {
@@ -1314,7 +1387,14 @@ impl Filesystem for StudioFuseFs {
                     .flat_map(|n| n.iter().cloned().chain(std::iter::once(0u8)))
                     .collect();
                 if size == 0 {
-                    reply.size(data.len() as u32);
+                    let data_len = match u32::try_from(data.len()) {
+                        Ok(data_len) => data_len,
+                        Err(_) => {
+                            reply.error(libc::EOVERFLOW);
+                            return;
+                        }
+                    };
+                    reply.size(data_len);
                 } else if data.len() <= size as usize {
                     reply.data(&data);
                 } else {
@@ -1400,7 +1480,27 @@ impl Filesystem for StudioFuseFs {
             // FALLOC_FL_KEEP_SIZE not set → extend size if needed
             match self.vfs.getattr(ino) {
                 Ok(attr) => {
-                    let new_size = offset as u64 + length as u64;
+                    let offset = match to_u64_offset(offset) {
+                        Ok(offset) => offset,
+                        Err(errno) => {
+                            reply.error(errno);
+                            return;
+                        }
+                    };
+                    let length = match u64::try_from(length) {
+                        Ok(length) => length,
+                        Err(_) => {
+                            reply.error(libc::EINVAL);
+                            return;
+                        }
+                    };
+                    let new_size = match offset.checked_add(length) {
+                        Some(new_size) => new_size,
+                        None => {
+                            reply.error(libc::EINVAL);
+                            return;
+                        }
+                    };
                     if new_size > attr.size {
                         let args = SetattrArgs {
                             size: Some(new_size),

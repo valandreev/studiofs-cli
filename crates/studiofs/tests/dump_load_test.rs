@@ -3,7 +3,7 @@
 //! Requires RustFS/S3 + PostgreSQL test env (ignored by default).
 
 use bytes::{Bytes, BytesMut};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
@@ -42,10 +42,10 @@ fn workspace_env_path() -> PathBuf {
     workspace_root().join(".env")
 }
 
-fn workspace_dotenv_vars() -> &'static HashMap<String, String> {
-    static VARS: OnceLock<HashMap<String, String>> = OnceLock::new();
+fn workspace_dotenv_vars() -> &'static BTreeMap<String, String> {
+    static VARS: OnceLock<BTreeMap<String, String>> = OnceLock::new();
     VARS.get_or_init(|| {
-        let mut vars = HashMap::new();
+        let mut vars = BTreeMap::new();
         if let Ok(iter) = dotenvy::from_path_iter(workspace_env_path()) {
             for item in iter.flatten() {
                 vars.insert(item.0, item.1);
@@ -269,7 +269,7 @@ fn verify_payload_from_discovered(home: &Path, disk_name: &str, expected: &[u8])
 
         let store = DataStore::new(&DataStoreConfig::from(&format_info)).expect("datastore");
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        let mut object_cache: HashMap<u64, Bytes> = HashMap::new();
+        let mut object_cache: BTreeMap<u64, Bytes> = BTreeMap::new();
         let mut decoded = vec![0_u8; expected.len()];
         let mut covered = vec![false; expected.len()];
 

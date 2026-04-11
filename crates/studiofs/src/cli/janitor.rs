@@ -49,10 +49,12 @@ async fn run_one_cycle(ctx: JanitorCycleContext<'_>) -> anyhow::Result<JanitorSt
     let mut stats = JanitorStats::default();
     let mut seen_objects = HashSet::new();
     let now = SystemTime::now();
-    let now_unix = now
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|_| Duration::from_secs(0))
-        .as_secs() as i64;
+    let now_unix = i64::try_from(
+        now.duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_secs(),
+    )
+    .unwrap_or(i64::MAX);
 
     let entries = ctx.op.list_with(ctx.prefix).recursive(true).await?;
     for entry in entries {
@@ -87,9 +89,14 @@ async fn run_one_cycle(ctx: JanitorCycleContext<'_>) -> anyhow::Result<JanitorSt
         }
 
         if let Some(pending_ts) = ctx.pending.get(&object_id) {
-            let age_secs = now_unix.saturating_sub(*pending_ts) as u64;
-            if age_secs < ctx.skip_newer_than_secs {
-                stats.skipped_young = stats.skipped_young.saturating_add(1);
+            let age_secs = u64::try_from(now_unix.saturating_sub(*pending_ts));
+            if let Ok(age_secs) = age_secs {
+                if age_secs < ctx.skip_newer_than_secs {
+                    stats.skipped_young = stats.skipped_young.saturating_add(1);
+                    continue;
+                }
+            } else {
+                stats.skipped_unknown_age = stats.skipped_unknown_age.saturating_add(1);
                 continue;
             }
         } else {

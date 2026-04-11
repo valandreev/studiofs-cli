@@ -13,8 +13,9 @@ pub mod mount;
 #[cfg(unix)]
 pub mod mount_profile;
 #[cfg(not(unix))]
-#[path = "mount_profile_stub.rs"]
-pub mod mount_profile;
+pub mod mount_profile_stub;
+#[cfg(not(unix))]
+pub use self::mount_profile_stub as mount_profile;
 pub mod mount_profile_types;
 pub mod settings;
 pub mod snapshot;

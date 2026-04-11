@@ -3,6 +3,7 @@
 use bytes::Bytes;
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
 use opendal::{Buffer, Operator, services::S3};
+use std::fmt;
 use std::time::Duration;
 use studiofs_meta::FormatInfo;
 use thiserror::Error;
@@ -20,7 +21,7 @@ pub enum DataError {
 pub type DataResult<T> = Result<T, DataError>;
 
 /// Configuration for the data store.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DataStoreConfig {
     pub endpoint: String,
     pub bucket: String,
@@ -28,6 +29,19 @@ pub struct DataStoreConfig {
     pub secret_key: String,
     pub region: String,
     pub volume_name: String,
+}
+
+impl fmt::Debug for DataStoreConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DataStoreConfig")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("access_key", &"<redacted>")
+            .field("secret_key", &"<redacted>")
+            .field("region", &self.region)
+            .field("volume_name", &self.volume_name)
+            .finish()
+    }
 }
 
 /// I/O profile that tunes timeout and concurrency settings per use-case.
@@ -270,7 +284,8 @@ impl DataStore {
 
     /// Upload a block to S3.
     pub async fn put_block(&self, slice_id: u64, block_index: u32, data: Bytes) -> DataResult<()> {
-        let block_size = data.len() as u32;
+        let block_size = u32::try_from(data.len())
+            .map_err(|_| DataError::Storage("block payload size exceeds u32".into()))?;
         let key = self.block_key(slice_id, block_index, block_size);
         debug!("uploading block: {key} ({block_size} bytes)");
 
@@ -303,11 +318,14 @@ impl DataStore {
     ) -> DataResult<Bytes> {
         let key = self.block_key(slice_id, block_index, block_size);
         debug!("downloading block range: {key} offset={offset} len={length}");
+        let range_end = offset
+            .checked_add(length)
+            .ok_or_else(|| DataError::Storage("block range offset + length overflow".into()))?;
 
         let data = self
             .op
             .read_with(&key)
-            .range(offset..offset + length)
+            .range(offset..range_end)
             .await?
             .to_bytes();
         Ok(data)

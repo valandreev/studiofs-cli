@@ -3668,6 +3668,7 @@ dependencies = [
  "studiofs-winfsp",
  "sysinfo",
  "tempfile",
+ "thiserror",
  "tokio",
  "tokio-postgres",
  "toml",

@@ -283,15 +283,16 @@ pub fn create_object(data: &[u8]) -> Result<Vec<u8>, ObjectError> {
     note = "Use create_object_buffer_with_flags to avoid full payload copying on hot paths"
 )]
 pub fn create_object_with_flags(data: &[u8], flags: ObjectFlags) -> Result<Vec<u8>, ObjectError> {
-    if data.len() > MAX_OBJECT_SIZE as usize {
-        return Err(ObjectError::ObjectTooLarge(data.len() as u64));
+    let data_len = u64::try_from(data.len()).map_err(|_| ObjectError::ObjectTooLarge(u64::MAX))?;
+    if data_len > u64::from(MAX_OBJECT_SIZE) {
+        return Err(ObjectError::ObjectTooLarge(data_len));
     }
     if flags.contains(ObjectFlags::LEGACY_LZ4_COMPRESSED) {
         return Err(ObjectError::LegacyCompressionUnsupported);
     }
 
     let checksum = xxh64(data, 0);
-    let size = data.len() as u32;
+    let size = u32::try_from(data_len).map_err(|_| ObjectError::ObjectTooLarge(data_len))?;
     let header = ObjectHeader::with_flags(size, size, checksum, flags);
     let mut object = Vec::with_capacity(ObjectHeader::SIZE + data.len());
     object.extend_from_slice(&header.to_bytes());
@@ -314,15 +315,16 @@ pub fn create_object_buffer_with_flags(
     data: Bytes,
     flags: ObjectFlags,
 ) -> Result<Buffer, ObjectError> {
-    if data.len() > MAX_OBJECT_SIZE as usize {
-        return Err(ObjectError::ObjectTooLarge(data.len() as u64));
+    let data_len = u64::try_from(data.len()).map_err(|_| ObjectError::ObjectTooLarge(u64::MAX))?;
+    if data_len > u64::from(MAX_OBJECT_SIZE) {
+        return Err(ObjectError::ObjectTooLarge(data_len));
     }
     if flags.contains(ObjectFlags::LEGACY_LZ4_COMPRESSED) {
         return Err(ObjectError::LegacyCompressionUnsupported);
     }
 
     let checksum = xxh64(data.as_ref(), 0);
-    let size = data.len() as u32;
+    let size = u32::try_from(data_len).map_err(|_| ObjectError::ObjectTooLarge(data_len))?;
     let header = ObjectHeader::with_flags(size, size, checksum, flags).to_bytes();
 
     // Chunk the data into 1MB pieces for better network transmission behavior.
@@ -370,7 +372,9 @@ pub fn read_object(data: impl Into<Buffer>) -> Result<Bytes, ObjectError> {
     let payload = data.slice(ObjectHeader::SIZE..);
 
     // Validate payload size
-    if payload.len() != header.compressed_size as usize {
+    let compressed_size = usize::try_from(header.compressed_size)
+        .map_err(|_| ObjectError::InvalidFragmentLayout("compressed size overflow".into()))?;
+    if payload.len() != compressed_size {
         tracing::warn!(
             "Payload size mismatch: expected {}, got {}",
             header.compressed_size,
@@ -457,7 +461,7 @@ pub fn format_object_key(data_prefix: &str, object_id: u64) -> String {
 /// Key format: `{data_prefix}{prefix}/{object_id}/{fragment_index}`
 pub fn format_object_fragment_key(data_prefix: &str, object_id: u64, fragment_index: u8) -> String {
     assert!(
-        (fragment_index as usize) < CLOUD_FRAGMENT_COUNT,
+        usize::from(fragment_index) < CLOUD_FRAGMENT_COUNT,
         "fragment index out of range"
     );
     format!(
@@ -472,7 +476,10 @@ pub fn format_object_fragment_keys(
     data_prefix: &str,
     object_id: u64,
 ) -> [String; CLOUD_FRAGMENT_COUNT] {
-    std::array::from_fn(|idx| format_object_fragment_key(data_prefix, object_id, idx as u8))
+    std::array::from_fn(|idx| {
+        let idx = u8::try_from(idx).expect("fragment index is constrained by CLOUD_FRAGMENT_COUNT");
+        format_object_fragment_key(data_prefix, object_id, idx)
+    })
 }
 
 /// Validate cloud fragment shape and return reconstructed logical payload size.
@@ -537,8 +544,8 @@ pub fn parse_object_id_from_key(key: &str) -> Result<u64, ObjectError> {
         .ok_or_else(|| ObjectError::InvalidObjectId(key.to_string()))?;
 
     // Try fragmented key first: .../{object_id}/{fragment_index}
-    if let Ok(fragment_index) = tail.parse::<usize>()
-        && fragment_index < CLOUD_FRAGMENT_COUNT
+    if let Ok(fragment_index) = tail.parse::<u64>()
+        && fragment_index < u64::try_from(CLOUD_FRAGMENT_COUNT).unwrap_or(u64::MAX)
     {
         let hex_id = parts
             .get(parts.len().saturating_sub(2))
@@ -637,9 +644,10 @@ impl ObjectPayload {
 
     /// Find child object covering the given offset.
     pub fn find_child(&self, offset: u64) -> Option<&Objectlink> {
-        self.children
-            .iter()
-            .find(|link| offset >= link.offset && offset < link.offset + link.length as u64)
+        self.children.iter().find(|link| {
+            let end = link.offset.saturating_add(link.length as u64);
+            offset >= link.offset && offset < end
+        })
     }
 }
 

@@ -1,6 +1,10 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+fn saturating_u64_from_u128(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 const LATENCY_BUCKET_UPPER_NS: [u64; 16] = [
     50_000,
     100_000,
@@ -55,7 +59,7 @@ impl LatencyHistogram {
     }
 
     pub fn observe_duration(&self, elapsed: Duration) {
-        let ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+        let ns = saturating_u64_from_u128(elapsed.as_nanos());
         self.observe_ns(ns);
     }
 
@@ -233,7 +237,7 @@ impl BlockingTaskStats {
     }
 
     pub fn record_start(&self, queue_wait: Duration) -> BlockingTaskExecutionGuard<'_> {
-        let wait_ns = queue_wait.as_nanos().min(u64::MAX as u128) as u64;
+        let wait_ns = saturating_u64_from_u128(queue_wait.as_nanos());
         self.started.fetch_add(1, Ordering::Relaxed);
         self.queue_wait_total_ns
             .fetch_add(wait_ns, Ordering::Relaxed);
@@ -288,7 +292,7 @@ impl BlockingTaskStats {
 impl Drop for BlockingTaskExecutionGuard<'_> {
     fn drop(&mut self) {
         self.stats.completed.fetch_add(1, Ordering::Relaxed);
-        let elapsed_ns = self.started_at.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let elapsed_ns = saturating_u64_from_u128(self.started_at.elapsed().as_nanos());
         self.stats
             .execution_total_ns
             .fetch_add(elapsed_ns, Ordering::Relaxed);

@@ -175,7 +175,7 @@ pub struct FetchScheduler {
 }
 
 impl FetchScheduler {
-    fn record_local_cache_io_timing(&self, timing: LocalCacheIoTiming) {
+    fn record_local_cache_io(&self, timing: LocalCacheIoTiming) {
         self.metrics
             .local_cache_io_calls
             .fetch_add(1, Ordering::Relaxed);
@@ -413,7 +413,7 @@ impl FetchScheduler {
             }
             Err(_) => {
                 warn!(
-                    timeout_ms = timeout.as_millis() as u64,
+                    timeout_ms = duration_to_millis_u64(timeout),
                     "FetchScheduler: warmup timed out (reads will retry)"
                 );
                 Err("warmup timed out".into())
@@ -458,6 +458,12 @@ impl FetchScheduler {
     /// Adjust the prefetch acquire-wait timeout at runtime.
     /// `0` means "skip immediately" — prefetch attempts will not wait at all.
     pub fn set_prefetch_acquire_wait_ms(&self, ms: u64) {
+        self.set_prefetch_wait_ms(ms);
+    }
+
+    /// Adjust the prefetch acquire-wait timeout at runtime.
+    /// `0` means "skip immediately" — prefetch attempts will not wait at all.
+    pub fn set_prefetch_wait_ms(&self, ms: u64) {
         self.prefetch_acquire_wait_ms.store(ms, Ordering::Release);
     }
 
@@ -467,7 +473,7 @@ impl FetchScheduler {
         if ts == 0 {
             return false;
         }
-        now_millis().saturating_sub(ts) <= within.as_millis() as u64
+        now_millis().saturating_sub(ts) <= duration_to_millis_u64(within)
     }
 
     // ── Internal ────────────────────────────────────────────────────
@@ -564,10 +570,9 @@ impl FetchScheduler {
             let handoff_ns = io_started
                 .checked_duration_since(submitted_at)
                 .unwrap_or_default()
-                .as_nanos()
-                .min(u64::MAX as u128) as u64;
+                .to_nanos_u64();
             let result = block_store.get(object_id);
-            let backend_io_ns = io_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            let backend_io_ns = io_started.elapsed().to_nanos_u64();
             (
                 result,
                 LocalCacheIoTiming {
@@ -580,7 +585,7 @@ impl FetchScheduler {
         .map_err(|error| {
             FetchError::CacheAccess(format!("block store get task failed: {error}"))
         })?;
-        self.record_local_cache_io_timing(timing);
+        self.record_local_cache_io(timing);
         Ok(result)
     }
 
@@ -597,10 +602,9 @@ impl FetchScheduler {
             let handoff_ns = io_started
                 .checked_duration_since(submitted_at)
                 .unwrap_or_default()
-                .as_nanos()
-                .min(u64::MAX as u128) as u64;
+                .to_nanos_u64();
             let result = block_store.put(object_id, payload.as_ref(), evictable);
-            let backend_io_ns = io_started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            let backend_io_ns = io_started.elapsed().to_nanos_u64();
             (
                 result,
                 LocalCacheIoTiming {
@@ -613,7 +617,7 @@ impl FetchScheduler {
         .map_err(|error| {
             FetchError::CacheAccess(format!("block store put task failed: {error}"))
         })?;
-        self.record_local_cache_io_timing(timing);
+        self.record_local_cache_io(timing);
         result.map_err(|error| FetchError::CacheAccess(error.to_string()))
     }
 
@@ -665,7 +669,7 @@ impl FetchScheduler {
                 self.qos.acquire_fetch().await.map_err(|e| {
                     FetchError::CacheAccess(format!("fetch qos permit failed: {e}"))
                 })?;
-            let wait_ms = wait_start.elapsed().as_millis();
+            let wait_ms = duration_to_millis_u64(wait_start.elapsed());
             if wait_ms > 100 {
                 debug!(
                     object_id,
@@ -680,7 +684,7 @@ impl FetchScheduler {
             let req_start = Instant::now();
             let get_result =
                 tokio::time::timeout(self.request_timeout, self.data_store.get_by_key(key)).await;
-            let req_ms = req_start.elapsed().as_millis();
+            let req_ms = duration_to_millis_u64(req_start.elapsed());
 
             match get_result {
                 Ok(Ok(compressed)) => {
@@ -696,7 +700,7 @@ impl FetchScheduler {
                         key,
                         bytes = compressed.len(),
                         req_ms,
-                        total_ms = overall_start.elapsed().as_millis() as u64,
+                        total_ms = duration_to_millis_u64(overall_start.elapsed()),
                         attempt,
                         "S3 GET ok"
                     );
@@ -763,7 +767,7 @@ impl FetchScheduler {
                                 key,
                                 fragment_index,
                                 req_ms,
-                                delay_ms = delay.as_millis() as u64,
+                                delay_ms = duration_to_millis_u64(delay),
                                 is_server_overload,
                                 is_send_error,
                                 error = %e,
@@ -776,13 +780,14 @@ impl FetchScheduler {
                                 key,
                                 fragment_index,
                                 req_ms,
-                                delay_ms = delay.as_millis() as u64,
+                                delay_ms = duration_to_millis_u64(delay),
                                 is_server_overload,
                                 is_send_error,
                                 error = %e,
                                 "fetch failed, retrying"
                             );
                         }
+                        drop(_fetch_qos);
                         tokio::time::sleep(delay).await;
                     } else {
                         if matches!(class, FetchClass::Prefetch) {
@@ -791,7 +796,7 @@ impl FetchScheduler {
                                 key,
                                 fragment_index,
                                 req_ms,
-                                total_ms = overall_start.elapsed().as_millis() as u64,
+                                total_ms = duration_to_millis_u64(overall_start.elapsed()),
                                 error = %e,
                                 "prefetch exhausted retries"
                             );
@@ -801,7 +806,7 @@ impl FetchScheduler {
                                 key,
                                 fragment_index,
                                 req_ms,
-                                total_ms = overall_start.elapsed().as_millis() as u64,
+                                total_ms = duration_to_millis_u64(overall_start.elapsed()),
                                 error = %e,
                                 "fetch exhausted all retries"
                             );
@@ -835,7 +840,7 @@ impl FetchScheduler {
                                 key,
                                 fragment_index,
                                 timeout_s = self.request_timeout.as_secs(),
-                                delay_ms = delay.as_millis() as u64,
+                                delay_ms = duration_to_millis_u64(delay),
                                 "prefetch timed out, retrying"
                             );
                         } else {
@@ -845,10 +850,11 @@ impl FetchScheduler {
                                 key,
                                 fragment_index,
                                 timeout_s = self.request_timeout.as_secs(),
-                                delay_ms = delay.as_millis() as u64,
+                                delay_ms = duration_to_millis_u64(delay),
                                 "fetch timed out, retrying (AIMD window unchanged)"
                             );
                         }
+                        drop(_fetch_qos);
                         tokio::time::sleep(delay).await;
                     } else {
                         if matches!(class, FetchClass::Prefetch) {
@@ -856,7 +862,7 @@ impl FetchScheduler {
                                 attempts = max_attempts,
                                 key,
                                 fragment_index,
-                                total_ms = overall_start.elapsed().as_millis() as u64,
+                                total_ms = duration_to_millis_u64(overall_start.elapsed()),
                                 "prefetch timed out, retries exhausted"
                             );
                         } else {
@@ -864,7 +870,7 @@ impl FetchScheduler {
                                 attempts = max_attempts,
                                 key,
                                 fragment_index,
-                                total_ms = overall_start.elapsed().as_millis() as u64,
+                                total_ms = duration_to_millis_u64(overall_start.elapsed()),
                                 "fetch timed out, all retries exhausted"
                             );
                         }
@@ -901,8 +907,22 @@ impl FetchScheduler {
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
+        .map(duration_to_millis_u64)
         .unwrap_or(0)
+}
+
+trait DurationToU64 {
+    fn to_nanos_u64(self) -> u64;
+}
+
+impl DurationToU64 for Duration {
+    fn to_nanos_u64(self) -> u64 {
+        u64::try_from(self.as_nanos()).unwrap_or(u64::MAX)
+    }
+}
+
+fn duration_to_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn is_send_request_error(err: &DataError) -> bool {
@@ -919,7 +939,7 @@ fn is_send_request_error(err: &DataError) -> bool {
 }
 
 fn jittered_delay(base: Duration, object_id: u64, attempt: u32) -> Duration {
-    let base_ms = base.as_millis() as u64;
+    let base_ms = duration_to_millis_u64(base);
     if base_ms == 0 {
         return base;
     }
