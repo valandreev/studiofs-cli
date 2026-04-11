@@ -137,7 +137,7 @@ fn volume_name_exists(rt: &tokio::runtime::Runtime, dsn: &str, name: &str) -> an
     })
 }
 
-fn init_postgres_schema_and_volume(
+fn init_pg_schema_and_volume(
     rt: &tokio::runtime::Runtime,
     dsn: &str,
     name: &str,
@@ -272,7 +272,7 @@ fn init_postgres_schema_and_volume(
     })
 }
 
-fn seed_postgres_metadata_state(
+fn seed_pg_metadata_state(
     rt: &tokio::runtime::Runtime,
     dsn: &str,
     volume_id: i64,
@@ -406,7 +406,7 @@ pub fn run(
 
     let data_prefix = format!("{name}/objects/");
     let postgres_volume_id =
-        init_postgres_schema_and_volume(&rt, &postgres_dsn, name, &volume_uuid, actual_block_size)?;
+        init_pg_schema_and_volume(&rt, &postgres_dsn, name, &volume_uuid, actual_block_size)?;
 
     // ── 6. Persist format info ────────────────────────────────────────────────
     let format_info = FormatInfo {
@@ -436,7 +436,7 @@ pub fn run(
     engine.init_root(uid, gid)?;
     let snapshot = engine.export_snapshot()?;
     let snapshot_json = serde_json::to_vec(&snapshot)?;
-    seed_postgres_metadata_state(&rt, &postgres_dsn, postgres_volume_id, &snapshot_json)?;
+    seed_pg_metadata_state(&rt, &postgres_dsn, postgres_volume_id, &snapshot_json)?;
     drop(engine);
 
     // ── 7. Report success ─────────────────────────────────────────────────────

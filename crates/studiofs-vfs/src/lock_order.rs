@@ -57,6 +57,21 @@ pub enum LockTier {
 }
 
 impl LockTier {
+    pub const fn level(self) -> u8 {
+        match self {
+            LockTier::Shutdown => 1,
+            LockTier::WriteBuffer => 2,
+            LockTier::DirtyBuffer => 3,
+            LockTier::Ingress => 4,
+            LockTier::Namespace => 5,
+            LockTier::Incarnation => 6,
+            LockTier::Upload => 7,
+            LockTier::Acl => 8,
+            LockTier::FileLock => 9,
+            LockTier::Metrics => 10,
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             LockTier::Shutdown => "Shutdown",
@@ -110,9 +125,9 @@ impl LockOrderGuard {
                 let msg = format!(
                     "Lock ordering violation: trying to acquire {} (tier {}) while holding {} (tier {})",
                     tier.name(),
-                    tier as u8,
+                    tier.level(),
                     last_tier.name(),
-                    last_tier as u8
+                    last_tier.level()
                 );
 
                 warn!("{}", msg);

@@ -124,10 +124,7 @@ fn read_write_path_observability(
     }
 }
 
-fn map_open_local_backend_error(
-    cache_dir: &Path,
-    source: OpenLocalBlockBackendError,
-) -> anyhow::Error {
+fn map_cache_backend_error(cache_dir: &Path, source: OpenLocalBlockBackendError) -> anyhow::Error {
     anyhow::anyhow!(
         "failed to open local cache backend at '{}': {source}",
         cache_dir.display()
@@ -291,7 +288,7 @@ fn scan_pending_uploads(
     }
 
     let store = open_local_block_backend(cache_dir, volume_uuid)
-        .map_err(|source| map_open_local_backend_error(cache_dir, source))?
+        .map_err(|source| map_cache_backend_error(cache_dir, source))?
         .backend;
     Ok(store.dirty_object_ids().len())
 }

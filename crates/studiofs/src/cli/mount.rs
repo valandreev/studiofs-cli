@@ -74,9 +74,7 @@ impl WritePathObservabilityPublisher {
             .name("studiofs-write-path-observability".to_string())
             .spawn(move || {
                 loop {
-                    if let Err(error) =
-                        persist_mount_path_observability_snapshot(&vfs, &output_path_for_thread)
-                    {
+                    if let Err(error) = persist_mount_path_snapshot(&vfs, &output_path_for_thread) {
                         warn!(
                             path = %output_path_for_thread.display(),
                             error = %error,
@@ -123,10 +121,7 @@ impl Drop for WritePathObservabilityPublisher {
     }
 }
 
-fn persist_mount_path_observability_snapshot(
-    vfs: &StudioVfs,
-    output_path: &Path,
-) -> std::io::Result<()> {
+fn persist_mount_path_snapshot(vfs: &StudioVfs, output_path: &Path) -> std::io::Result<()> {
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -254,10 +249,10 @@ fn build_mount_config_from_raw(
     vfs_config_raw: VfsConfigRaw,
     principal: Option<&str>,
 ) -> anyhow::Result<ResolvedMountConfig> {
-    build_mount_config_from_raw_with(vfs_config_raw, principal, overlay_vfs_env)
+    build_mount_config_with(vfs_config_raw, principal, overlay_vfs_env)
 }
 
-fn build_mount_config_from_raw_with<F>(
+fn build_mount_config_with<F>(
     vfs_config_raw: VfsConfigRaw,
     principal: Option<&str>,
     overlay_config: F,
@@ -290,7 +285,7 @@ fn resolve_mount_launch_mode(detach: bool) -> MountLaunchMode {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_mount_startup_context(
+fn resolve_mount_startup(
     name: &str,
     meta_dir: &Path,
     settings_config: super::settings::StudioFsConfig,
@@ -315,7 +310,7 @@ fn resolve_mount_startup_context(
 
     validate_endpoint_override(endpoint)?;
     let mount_point = resolve_runtime_mount_point(resolved_settings.mount_point);
-    let actual_mount_path = prepare_actual_mount_path(name, &mount_point)?;
+    let actual_mount_path = prepare_mount_path(name, &mount_point)?;
 
     Ok(MountStartupContext {
         actual_mount_path,
@@ -357,27 +352,27 @@ where
 fn resolve_runtime_mount_point(mount_point: String) -> String {
     #[cfg(windows)]
     {
-        resolve_runtime_mount_point_with("STUDIOFS_DAEMON_MOUNT_POINT_INTERNAL", mount_point)
+        resolve_runtime_mount_point_env("STUDIOFS_DAEMON_MOUNT_POINT_INTERNAL", mount_point)
     }
 
     #[cfg(not(windows))]
     {
-        resolve_runtime_mount_point_with("STUDIOFS_DAEMON_MOUNT_POINT", mount_point)
+        resolve_runtime_mount_point_env("STUDIOFS_DAEMON_MOUNT_POINT", mount_point)
     }
 }
 
-fn resolve_runtime_mount_point_with(env_key: &str, mount_point: String) -> String {
-    resolve_runtime_mount_point_from(env_key, mount_point, |env_key| std::env::var(env_key))
+fn resolve_runtime_mount_point_env(env_key: &str, mount_point: String) -> String {
+    resolve_runtime_mount_point_or(env_key, mount_point, |env_key| std::env::var(env_key))
 }
 
-fn resolve_runtime_mount_point_from<F>(env_key: &str, mount_point: String, read_var: F) -> String
+fn resolve_runtime_mount_point_or<F>(env_key: &str, mount_point: String, read_var: F) -> String
 where
     F: FnOnce(&str) -> Result<String, std::env::VarError>,
 {
     read_var(env_key).unwrap_or(mount_point)
 }
 
-fn validate_mount_point_for_platform(mount_point: &str) -> anyhow::Result<()> {
+fn validate_mount_point(mount_point: &str) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         if !super::utils::is_drive_root(mount_point) {
@@ -391,8 +386,8 @@ fn validate_mount_point_for_platform(mount_point: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn prepare_actual_mount_path(name: &str, mount_point: &str) -> anyhow::Result<String> {
-    validate_mount_point_for_platform(mount_point)?;
+fn prepare_mount_path(name: &str, mount_point: &str) -> anyhow::Result<String> {
+    validate_mount_point(mount_point)?;
 
     let mut actual_mount_path = resolve_mount_path(name, mount_point)
         .to_string_lossy()
@@ -445,10 +440,7 @@ fn prepare_actual_mount_path(name: &str, mount_point: &str) -> anyhow::Result<St
     Ok(actual_mount_path)
 }
 
-fn prepare_runtime_cache_path(
-    cache_dir: &Path,
-    volume_uuid: &str,
-) -> anyhow::Result<(PathBuf, String)> {
+fn prepare_cache_path(cache_dir: &Path, volume_uuid: &str) -> anyhow::Result<(PathBuf, String)> {
     std::fs::create_dir_all(cache_dir)?;
     let cache_path = cache_dir.join(volume_uuid);
     prepare_cache3_runtime(&cache_path)?;
@@ -733,7 +725,7 @@ impl PreparedMountRuntime {
             requested_name,
             std::process::id(),
             Some(&self.cache_path),
-            super::utils::write_pid_file_with_cache_path,
+            super::utils::write_pid_file_with_cache,
         );
     }
 
@@ -1037,7 +1029,7 @@ fn prepare_mount_runtime(
     let data_config = DataStoreConfig::from(&format_info);
     let block_cache_l1_limit = initial_cache_bytes();
     let cache_size_bytes = parse_positive_size_arg(cache_size)?;
-    let (cache_path, cache_path_str) = prepare_runtime_cache_path(cache_dir, &format_info.uuid)?;
+    let (cache_path, cache_path_str) = prepare_cache_path(cache_dir, &format_info.uuid)?;
     let profiling =
         build_mount_profile_finish(profile, name, cache_mode, &cache_path, run_in_foreground);
 
@@ -1091,7 +1083,7 @@ pub fn run(
     snapshot_id: Option<&str>,
     endpoint: Option<&str>,
 ) -> anyhow::Result<()> {
-    let startup = resolve_mount_startup_context(
+    let startup = resolve_mount_startup(
         name,
         meta_dir,
         super::settings::load_studiofs_config()?,
@@ -1363,7 +1355,7 @@ mod tests {
     #[test]
     fn resolve_runtime_mount_point_from_prefers_env_override() {
         assert_eq!(
-            resolve_runtime_mount_point_from(
+            resolve_runtime_mount_point_or(
                 "STUDIOFS_TEST_MOUNT_POINT",
                 "/mnt/demo".to_string(),
                 |_| Ok("/mnt/daemon".to_string())
@@ -1375,7 +1367,7 @@ mod tests {
     #[test]
     fn resolve_runtime_mount_point_from_falls_back_when_env_is_missing() {
         assert_eq!(
-            resolve_runtime_mount_point_from(
+            resolve_runtime_mount_point_or(
                 "STUDIOFS_TEST_MOUNT_POINT",
                 "/mnt/demo".to_string(),
                 |_| Err(std::env::VarError::NotPresent)
@@ -1409,7 +1401,7 @@ mod tests {
     fn prepare_runtime_cache_path_scopes_layout_by_volume_uuid() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (cache_path, cache_path_str) =
-            prepare_runtime_cache_path(temp.path(), "volume-uuid").expect("cache path prepared");
+            prepare_cache_path(temp.path(), "volume-uuid").expect("cache path prepared");
 
         assert_eq!(cache_path, temp.path().join("volume-uuid"));
         assert_eq!(cache_path_str, cache_path.to_string_lossy());
@@ -1426,7 +1418,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let mount_point = temp.path().join("mnt");
         let actual_mount_path =
-            prepare_actual_mount_path("projectfs", mount_point.to_str().expect("utf8 path"))
+            prepare_mount_path("projectfs", mount_point.to_str().expect("utf8 path"))
                 .expect("mount path prepared");
 
         let expected = std::fs::canonicalize(mount_point.join("projectfs")).expect("canonical");
@@ -1477,7 +1469,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn prepare_actual_mount_path_rejects_windows_directory_mount_points() {
-        let err = prepare_actual_mount_path("projectfs", r"C:\temp\studiofs")
+        let err = prepare_mount_path("projectfs", r"C:\temp\studiofs")
             .expect_err("windows helper should reject directory mount points");
         assert!(err.to_string().contains("drive letters"));
     }
@@ -1575,7 +1567,7 @@ mod tests {
             ..VfsConfigRaw::default()
         };
 
-        let resolved = build_mount_config_from_raw_with(raw, Some("from-cli"), |mut cfg| {
+        let resolved = build_mount_config_with(raw, Some("from-cli"), |mut cfg| {
             cfg.principal = Some("from-env".to_string());
             cfg
         })
@@ -1593,13 +1585,16 @@ mod tests {
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
         let db_path = meta_dir.join(format!("{name}.db"));
         let engine = Arc::new(RedbMetaEngine::open(&db_path).expect("open redb"));
-        let format_info = FormatInfo {
-            name: name.to_string(),
-            uuid: format!("{name}-uuid"),
-            endpoint: "https://storage.example".to_string(),
-            bucket: "bucket-demo".to_string(),
-            ..FormatInfo::default()
-        };
+        let format_info = FormatInfo::new(
+            name.to_string(),
+            format!("{name}-uuid"),
+            "https://storage.example".to_string(),
+            "bucket-demo".to_string(),
+            "access-key".to_string(),
+            "secret-key".to_string(),
+            String::new(),
+            16,
+        );
         engine
             .set_format_info(&format_info)
             .expect("set format info");
@@ -1720,7 +1715,7 @@ mod tests {
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
         let cli_mount_point = startup_mount_point(&temp);
 
-        let startup = resolve_mount_startup_context(
+        let startup = resolve_mount_startup(
             "projectfs",
             &meta_dir,
             startup_settings_config(cli_mount_point.clone(), None, Some("64GB")),
@@ -1763,7 +1758,7 @@ mod tests {
         let cli_mount_point = startup_mount_point(&temp);
         let configured_cache_dir = temp.path().join("configured-cache");
 
-        let startup = resolve_mount_startup_context(
+        let startup = resolve_mount_startup(
             "projectfs",
             &meta_dir,
             startup_settings_config(
@@ -1795,7 +1790,7 @@ mod tests {
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
         let cli_mount_point = startup_mount_point(&temp);
 
-        let err = resolve_mount_startup_context(
+        let err = resolve_mount_startup(
             "projectfs",
             &meta_dir,
             startup_settings_config(cli_mount_point.clone(), None, Some("64GB")),
@@ -1822,11 +1817,16 @@ mod tests {
 
     #[test]
     fn build_ready_banner_lines_includes_storage_and_optional_snapshot() {
-        let format_info = FormatInfo {
-            endpoint: "https://storage.example".to_string(),
-            bucket: "bucket-demo".to_string(),
-            ..FormatInfo::default()
-        };
+        let format_info = FormatInfo::new(
+            "demo".to_string(),
+            "demo-uuid".to_string(),
+            "https://storage.example".to_string(),
+            "bucket-demo".to_string(),
+            "access-key".to_string(),
+            "secret-key".to_string(),
+            String::new(),
+            16,
+        );
 
         let lines = build_ready_banner_lines(
             "demo",

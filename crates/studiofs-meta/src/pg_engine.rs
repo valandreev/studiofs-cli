@@ -242,8 +242,53 @@ impl PgMetaEngine {
 
     fn run_async_once<T, F>(fut: F) -> MetaResult<T>
     where
-        F: std::future::Future<Output = MetaResult<T>>,
+        T: Send,
+        F: std::future::Future<Output = MetaResult<T>> + Send,
     {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            return match handle.runtime_flavor() {
+                RuntimeFlavor::MultiThread => {
+                    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
+                }
+                RuntimeFlavor::CurrentThread => std::thread::scope(|scope| {
+                    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                    scope.spawn(move || {
+                        let result = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| {
+                                MetaError::Storage(format!("failed to build tokio runtime: {e}"))
+                            })
+                            .and_then(|rt| rt.block_on(fut));
+                        let _ = tx.send(result);
+                    });
+                    rx.recv().map_err(|e| {
+                        MetaError::Storage(format!(
+                            "failed to receive result from fallback runtime: {e}"
+                        ))
+                    })?
+                }),
+                _ => std::thread::scope(|scope| {
+                    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                    scope.spawn(move || {
+                        let result = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| {
+                                MetaError::Storage(format!("failed to build tokio runtime: {e}"))
+                            })
+                            .and_then(|rt| rt.block_on(fut));
+                        let _ = tx.send(result);
+                    });
+                    rx.recv().map_err(|e| {
+                        MetaError::Storage(format!(
+                            "failed to receive result from fallback runtime: {e}"
+                        ))
+                    })?
+                }),
+            };
+        }
+
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

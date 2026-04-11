@@ -68,8 +68,7 @@ pub fn rename_atomic(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
-/// Returns true when a rename failed because source and destination live on
-/// different filesystems/devices.
+/// Returns `true` when a rename crossed filesystem/device boundaries.
 pub fn is_cross_device_link_error(error: &io::Error) -> bool {
     #[cfg(unix)]
     {
@@ -131,7 +130,7 @@ fn sync_directory_impl(path: &Path) -> io::Result<()> {
 
     match dir.sync_all() {
         Ok(()) => Ok(()),
-        Err(error) if is_windows_unsupported_sync_error(&error) => {
+        Err(error) if is_windows_sync_unsupported_error(&error) => {
             if !LOGGED_UNSUPPORTED_DIRECTORY_SYNC.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
                     path = %path.display(),
@@ -200,11 +199,11 @@ fn is_benign_best_effort_error(error: &io::Error) -> bool {
 
 #[cfg(windows)]
 fn is_benign_best_effort_error(error: &io::Error) -> bool {
-    is_windows_unsupported_sync_error(error)
+    is_windows_sync_unsupported_error(error)
 }
 
 #[cfg(windows)]
-fn is_windows_unsupported_sync_error(error: &io::Error) -> bool {
+fn is_windows_sync_unsupported_error(error: &io::Error) -> bool {
     matches!(
         error.raw_os_error(),
         Some(
@@ -247,10 +246,11 @@ fn advise_will_need_impl(file: &File, offset: u64, len: u64) -> io::Result<()> {
 
     let offset = u64_to_off_t(offset)?;
     let len = u64_to_off_t(len)?;
-    // SAFETY: The file descriptor is borrowed from a live `File`, and POSIX_WILLNEED
-    // is advisory; arguments are validated against off_t bounds above.
-    let rc =
-        unsafe { libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_WILLNEED) };
+    let rc = unsafe {
+        // SAFETY: The file descriptor is borrowed from a live `File`, and POSIX_WILLNEED
+        // is advisory; arguments are validated against off_t bounds above.
+        libc::posix_fadvise(file.as_raw_fd(), offset, len, libc::POSIX_FADV_WILLNEED)
+    };
     if rc == 0 {
         Ok(())
     } else {
@@ -314,11 +314,11 @@ mod tests {
     #[test]
     fn windows_unsupported_directory_sync_errors_are_classified_as_benign() {
         for code in [1, 5, 50, 87, 120] {
-            assert!(is_windows_unsupported_sync_error(
+            assert!(is_windows_sync_unsupported_error(
                 &io::Error::from_raw_os_error(code)
             ));
         }
-        assert!(!is_windows_unsupported_sync_error(
+        assert!(!is_windows_sync_unsupported_error(
             &io::Error::from_raw_os_error(32)
         ));
     }

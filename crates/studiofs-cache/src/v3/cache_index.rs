@@ -137,7 +137,7 @@ impl CacheIndex {
             db_path: path,
             db: Arc::new(db),
             last_touch_access_shards: array::from_fn(|_| {
-                Mutex::new(LruCache::new(touch_access_lru_capacity()))
+                Mutex::new(LruCache::new(touch_access_lru_cap()))
             }),
         };
         index.initialize_schema()?;
@@ -179,7 +179,7 @@ impl CacheIndex {
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
-            let old = read_entry_from_blocks_write(&blocks, update.object_id)?;
+            let old = read_entry_write(&blocks, update.object_id)?;
             let mut new = StoredEntry {
                 payload_key: update.payload_key,
                 payload_len: update.payload_len,
@@ -212,24 +212,24 @@ impl CacheIndex {
     }
 
     /// Batch access-order updates in a single transaction.
-    pub fn touch_access_if_stale_many(
+    pub fn touch_access_many(
         &self,
         object_ids: &[u64],
         min_interval: Duration,
     ) -> Result<usize, CacheIndexError> {
-        self.touch_access_if_stale_many_impl(object_ids, min_interval, false)
+        self.touch_access_many_impl(object_ids, min_interval, false)
     }
 
     /// Variant for callers that already guarantee uniqueness.
-    pub fn touch_access_if_stale_many_unique(
+    pub fn touch_access_many_unique(
         &self,
         object_ids: &[u64],
         min_interval: Duration,
     ) -> Result<usize, CacheIndexError> {
-        self.touch_access_if_stale_many_impl(object_ids, min_interval, true)
+        self.touch_access_many_impl(object_ids, min_interval, true)
     }
 
-    fn touch_access_if_stale_many_impl(
+    fn touch_access_many_impl(
         &self,
         object_ids: &[u64],
         min_interval: Duration,
@@ -274,7 +274,7 @@ impl CacheIndex {
         object_id: u64,
         min_interval: Duration,
     ) -> Result<bool, CacheIndexError> {
-        Ok(self.touch_access_if_stale_many(&[object_id], min_interval)? == 1)
+        Ok(self.touch_access_many(&[object_id], min_interval)? == 1)
     }
 
     fn touch_access_batch(&self, object_ids: &[u64]) -> Result<(), CacheIndexError> {
@@ -290,7 +290,7 @@ impl CacheIndex {
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
             for object_id in object_ids {
-                let Some(old) = read_entry_from_blocks_write(&blocks, *object_id)? else {
+                let Some(old) = read_entry_write(&blocks, *object_id)? else {
                     continue;
                 };
                 let mut new = old.clone();
@@ -320,7 +320,7 @@ impl CacheIndex {
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
-            let Some(old) = read_entry_from_blocks_write(&blocks, object_id)? else {
+            let Some(old) = read_entry_write(&blocks, object_id)? else {
                 return Ok(());
             };
             if old.lifecycle != LocalBlockLifecycleState::Dirty {
@@ -357,7 +357,7 @@ impl CacheIndex {
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
-            let Some(old) = read_entry_from_blocks_write(&blocks, object_id)? else {
+            let Some(old) = read_entry_write(&blocks, object_id)? else {
                 return Ok(());
             };
             if old.lifecycle != LocalBlockLifecycleState::Uploading {
@@ -392,7 +392,7 @@ impl CacheIndex {
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
-            let Some(old) = read_entry_from_blocks_write(&blocks, object_id)? else {
+            let Some(old) = read_entry_write(&blocks, object_id)? else {
                 return Ok(());
             };
             let mut new = old.clone();
@@ -423,7 +423,7 @@ impl CacheIndex {
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
-            let Some(old) = read_entry_from_blocks_write(&blocks, object_id)? else {
+            let Some(old) = read_entry_write(&blocks, object_id)? else {
                 return Ok(());
             };
 
@@ -458,7 +458,7 @@ impl CacheIndex {
             let mut batch_delta = AccountingDelta::default();
 
             for object_id in object_ids {
-                let Some(old) = read_entry_from_blocks_write(&blocks, *object_id)? else {
+                let Some(old) = read_entry_write(&blocks, *object_id)? else {
                     continue;
                 };
                 remove_order_link(&mut dirty_order, old.dirty_order, *object_id, "dirty")?;
@@ -561,7 +561,7 @@ impl CacheIndex {
         let mut cursor = None;
         let mut out = Vec::new();
         loop {
-            let page = self.access_order_object_ids_page(cursor, LIST_PAGE_SIZE)?;
+            let page = self.access_order_page(cursor, LIST_PAGE_SIZE)?;
             if page.is_empty() {
                 break;
             }
@@ -572,7 +572,7 @@ impl CacheIndex {
     }
 
     /// Page access-order ids by sequence; returns `(object_id, access_order_seq)`.
-    pub fn access_order_object_ids_page(
+    pub fn access_order_page(
         &self,
         start_after: Option<u64>,
         limit: usize,
@@ -608,6 +608,14 @@ impl CacheIndex {
         Ok(ordered)
     }
 
+    pub fn access_order_object_ids_page(
+        &self,
+        start_after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<(u64, u64)>, CacheIndexError> {
+        self.access_order_page(start_after, limit)
+    }
+
     /// Page uploaded+evictable candidates in deterministic access order.
     pub fn eviction_candidates_page(
         &self,
@@ -615,12 +623,12 @@ impl CacheIndex {
         limit: usize,
     ) -> Result<Vec<EvictionCandidateEntry>, CacheIndexError> {
         Ok(self
-            .eviction_candidates_page_with_stats(start_after, limit)?
+            .eviction_candidates_page_stats(start_after, limit)?
             .entries)
     }
 
     /// Page uploaded+evictable candidates and include scan stats.
-    pub fn eviction_candidates_page_with_stats(
+    pub fn eviction_candidates_page_stats(
         &self,
         start_after: Option<u64>,
         limit: usize,
@@ -800,7 +808,7 @@ fn read_entry_from_blocks(
         .transpose()
 }
 
-fn read_entry_from_blocks_write(
+fn read_entry_write(
     blocks: &redb::Table<'_, u64, &[u8]>,
     object_id: u64,
 ) -> Result<Option<StoredEntry>, CacheIndexError> {
@@ -1165,14 +1173,13 @@ fn storage_error<E: Into<RedbError>>(error: E) -> CacheIndexError {
     CacheIndexError::Storage(error.into())
 }
 
-fn touch_access_lru_capacity() -> NonZeroUsize {
-    const MIN_CAPACITY: NonZeroUsize = NonZeroUsize::new(1).unwrap();
+fn touch_access_lru_cap() -> NonZeroUsize {
     let cap = TOUCH_ACCESS_LRU_CAPACITY
         .div_ceil(TOUCH_ACCESS_LRU_SHARDS)
         .max(1);
     // A capacity of zero is never valid for LruCache; we clamp to 1 so behavior
     // stays defined even under pathological tuning values.
-    NonZeroUsize::new(cap).unwrap_or(MIN_CAPACITY)
+    NonZeroUsize::new(cap).expect("touch access LRU capacity must be non-zero")
 }
 
 fn touch_access_lru_shard(object_id: u64) -> usize {
@@ -1442,11 +1449,9 @@ mod tests {
             vec![3, 4]
         );
 
-        let access1 = index.access_order_object_ids_page(None, 3).unwrap();
+        let access1 = index.access_order_page(None, 3).unwrap();
         let access_cursor = access1.last().map(|(_, seq)| *seq);
-        let access2 = index
-            .access_order_object_ids_page(access_cursor, 3)
-            .unwrap();
+        let access2 = index.access_order_page(access_cursor, 3).unwrap();
         assert_eq!(
             access1.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             vec![1, 2, 3]
@@ -1494,16 +1499,14 @@ mod tests {
         assert_eq!(index.access_order_object_ids().unwrap(), vec![1, 2, 3]);
 
         assert_eq!(
-            index
-                .touch_access_if_stale_many(&[3, 3, 1], Duration::ZERO)
-                .unwrap(),
+            index.touch_access_many(&[3, 3, 1], Duration::ZERO).unwrap(),
             2
         );
         assert_eq!(index.access_order_object_ids().unwrap(), vec![2, 3, 1]);
 
         assert_eq!(
             index
-                .touch_access_if_stale_many(&[3, 1], Duration::from_secs(60))
+                .touch_access_many(&[3, 1], Duration::from_secs(60))
                 .unwrap(),
             0
         );
@@ -1556,7 +1559,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids_after_touch, vec![3, 1]);
 
-        let page = index.eviction_candidates_page_with_stats(None, 16).unwrap();
+        let page = index.eviction_candidates_page_stats(None, 16).unwrap();
         assert_eq!(page.skipped_non_evictable, 1);
         assert_eq!(page.scanned_rows, 3);
     }

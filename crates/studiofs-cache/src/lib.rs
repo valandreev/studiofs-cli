@@ -59,7 +59,7 @@ fn open_cache_v3_backend(
     cache_root_display: &str,
     volume_uuid: &str,
 ) -> Result<Arc<dyn v2::LocalBlockBackend>, OpenLocalBlockBackendError> {
-    open_cache_v3_backend_with_budget(
+    open_cache_v3_backend_budgeted(
         cache_root,
         cache_root_display,
         volume_uuid,
@@ -68,21 +68,23 @@ fn open_cache_v3_backend(
     )
 }
 
-fn open_cache_v3_backend_with_budget(
+fn open_cache_v3_backend_budgeted(
     cache_root: &Path,
     cache_root_display: &str,
     volume_uuid: &str,
     cache_budget_bytes: Option<u64>,
     payload_sync_mode: v3::CacheV3PayloadSyncMode,
 ) -> Result<Arc<dyn v2::LocalBlockBackend>, OpenLocalBlockBackendError> {
-    let config = v3::CacheV3LocalBlockBackendConfig {
-        cache_root: cache_root.to_path_buf(),
-        volume_uuid: v2::derive_local_backend_volume_uuid(volume_uuid),
-    };
+    let volume_uuid = v2::derive_backend_volume_uuid(volume_uuid);
+    let mut last_conflict: Option<Box<v3::CacheV3LocalBlockBackendError>> = None;
 
     for attempt in 0..=CACHE_V3_OPEN_LOCK_RETRY_ATTEMPTS {
+        let config = v3::CacheV3LocalBlockBackendConfig {
+            cache_root: cache_root.to_path_buf(),
+            volume_uuid,
+        };
         match v3::CacheV3LocalBlockBackend::open_with_budget_and_sync_mode(
-            config.clone(),
+            config,
             cache_budget_bytes,
             payload_sync_mode,
         ) {
@@ -91,6 +93,7 @@ fn open_cache_v3_backend_with_budget(
                 if source.is_transient_open_lock_conflict()
                     && attempt < CACHE_V3_OPEN_LOCK_RETRY_ATTEMPTS =>
             {
+                last_conflict = Some(Box::new(source));
                 std::thread::sleep(CACHE_V3_OPEN_LOCK_RETRY_DELAY);
             }
             Err(source) => {
@@ -102,7 +105,12 @@ fn open_cache_v3_backend_with_budget(
         }
     }
 
-    unreachable!("cache-v3 open loop must return on success or terminal error")
+    let source =
+        last_conflict.expect("cache-v3 open loop must capture the final transient conflict");
+    Err(OpenLocalBlockBackendError::OpenCacheV3Backend {
+        cache_root: cache_root_display.to_owned(),
+        source,
+    })
 }
 
 fn provision_cache_v3_layout(layout: &v3::CacheV3Layout) -> std::io::Result<()> {
@@ -115,7 +123,7 @@ fn provision_cache_v3_layout(layout: &v3::CacheV3Layout) -> std::io::Result<()> 
     Ok(())
 }
 
-fn cache_v3_layout_needs_provisioning(
+fn needs_v3_layout_provisioning(
     detection: &v3::CacheBackendDetection,
 ) -> Result<bool, std::io::Error> {
     Ok(!detection.v3_layout_marker_exists
@@ -129,7 +137,7 @@ pub fn open_local_block_backend(
     cache_root: impl AsRef<Path>,
     volume_uuid: &str,
 ) -> Result<OpenedLocalBlockBackend, OpenLocalBlockBackendError> {
-    open_local_block_backend_with_budget_impl(
+    open_local_block_backend_budgeted(
         cache_root.as_ref(),
         volume_uuid,
         None,
@@ -159,7 +167,7 @@ pub fn open_local_block_backend_with_budget_and_sync_mode(
     cache_budget_bytes: u64,
     payload_sync_mode: v3::CacheV3PayloadSyncMode,
 ) -> Result<OpenedLocalBlockBackend, OpenLocalBlockBackendError> {
-    open_local_block_backend_with_budget_impl(
+    open_local_block_backend_budgeted(
         cache_root.as_ref(),
         volume_uuid,
         Some(cache_budget_bytes),
@@ -167,7 +175,7 @@ pub fn open_local_block_backend_with_budget_and_sync_mode(
     )
 }
 
-fn open_local_block_backend_with_budget_impl(
+fn open_local_block_backend_budgeted(
     cache_root: &Path,
     volume_uuid: &str,
     cache_budget_bytes: Option<u64>,
@@ -181,7 +189,7 @@ fn open_local_block_backend_with_budget_impl(
             source,
         }
     })?;
-    if cache_v3_layout_needs_provisioning(&detection).map_err(|source| {
+    if needs_v3_layout_provisioning(&detection).map_err(|source| {
         OpenLocalBlockBackendError::DetectCacheBackend {
             cache_root: cache_root_display.clone(),
             source,
@@ -202,7 +210,7 @@ fn open_local_block_backend_with_budget_impl(
     }
     let backend_kind = v3::CacheBackendKind::CacheV3;
     let backend = match cache_budget_bytes {
-        Some(cache_budget_bytes) => open_cache_v3_backend_with_budget(
+        Some(cache_budget_bytes) => open_cache_v3_backend_budgeted(
             cache_root,
             &cache_root_display,
             volume_uuid,

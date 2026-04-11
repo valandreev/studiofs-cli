@@ -29,6 +29,7 @@
 
 use dashmap::DashMap;
 use std::collections::HashSet;
+use std::convert::TryFrom;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -215,9 +216,12 @@ impl ReadAheadTracker {
             state.last_block != u32::MAX && first_block == state.last_block.saturating_add(1);
 
         let span_blocks = last_block.saturating_sub(first_block).saturating_add(1);
-        let seq_gain = (self.sequential_step as u32)
-            .saturating_mul(span_blocks)
-            .min(MAX_SCORE as u32) as u8;
+        let seq_gain = u8::try_from(
+            (self.sequential_step as u32)
+                .saturating_mul(span_blocks)
+                .min(MAX_SCORE as u32),
+        )
+        .unwrap_or(MAX_SCORE);
 
         if is_sequential {
             state.score = state.score.saturating_add(seq_gain);
@@ -445,7 +449,7 @@ impl ReadAheadTracker {
         !found_stream
     }
 
-    pub fn is_prefetch_relevant_for_stream(&self, key: ReadStreamKey, block: u32) -> bool {
+    pub fn stream_prefetch_relevant(&self, key: ReadStreamKey, block: u32) -> bool {
         let Some(state) = self.states.get(&key) else {
             return true;
         };
@@ -686,8 +690,8 @@ mod tests {
         let _ = tracker.record_read_for_stream(live, 1, 1, policy);
         let _ = tracker.record_read_for_stream(stale, 1024, 1024, policy);
 
-        assert!(!tracker.is_prefetch_relevant_for_stream(stale, 2));
-        assert!(tracker.is_prefetch_relevant_for_stream(live, 2));
+        assert!(!tracker.stream_prefetch_relevant(stale, 2));
+        assert!(tracker.stream_prefetch_relevant(live, 2));
         assert!(tracker.is_prefetch_relevant(99, 2));
     }
 
@@ -1028,7 +1032,7 @@ impl DirAccessTracker {
         }
     }
 
-    fn remove_child_mapping_if_unchanged(&self, child_ino: Ino, expected: (Ino, u64)) {
+    fn remove_child_mapping_if_same(&self, child_ino: Ino, expected: (Ino, u64)) {
         if let Some(current) = self.child_to_dir.get(&child_ino)
             && *current.value() == expected
         {
@@ -1082,13 +1086,13 @@ impl DirAccessTracker {
             None => {
                 // Reverse map can become stale after bounded eviction.
                 // Remove only if no newer readdir mapping replaced it.
-                self.remove_child_mapping_if_unchanged(child_ino, (dir_ino, mapping_touch));
+                self.remove_child_mapping_if_same(child_ino, (dir_ino, mapping_touch));
                 return Vec::new();
             }
         };
         if state.readdir_touch != mapping_touch {
             // Stale mapping observed during concurrent readdir refresh.
-            self.remove_child_mapping_if_unchanged(child_ino, (dir_ino, mapping_touch));
+            self.remove_child_mapping_if_same(child_ino, (dir_ino, mapping_touch));
             return Vec::new();
         }
         state.last_touch = touch;
@@ -1240,7 +1244,7 @@ mod dir_prefetch_tests {
         assert_ne!(stale.1, fresh.1, "touch stamp should advance on refresh");
 
         // Simulate stale cleanup path: must not delete the fresh mapping.
-        tracker.remove_child_mapping_if_unchanged(10, stale);
+        tracker.remove_child_mapping_if_same(10, stale);
         assert!(
             tracker.child_to_dir.get(&10).is_some(),
             "fresh mapping must survive stale compare-and-remove"

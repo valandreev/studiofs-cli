@@ -151,52 +151,46 @@ async fn get_fragmented_object(
     Ok(payload.freeze())
 }
 
-fn resolved_pg_dsn(raw: &str) -> String {
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(async { ensure_studiofs_database(raw).await })
+async fn resolved_pg_dsn(raw: &str) -> String {
+    ensure_studiofs_database(raw)
+        .await
         .expect("resolve pg dsn")
         .metadata_dsn
 }
 
-fn delete_volume_by_name(pg_dsn: &str, name: &str) {
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(async {
-        let (client, connection) = tokio_postgres::connect(pg_dsn, tokio_postgres::NoTls)
-            .await
-            .expect("connect postgres");
-        let conn_task = tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        client
-            .execute("DELETE FROM volumes WHERE name = $1", &[&name])
-            .await
-            .expect("delete volume by name");
-        conn_task.abort();
+async fn delete_volume_by_name(pg_dsn: &str, name: &str) {
+    let (client, connection) = tokio_postgres::connect(pg_dsn, tokio_postgres::NoTls)
+        .await
+        .expect("connect postgres");
+    let conn_task = tokio::spawn(async move {
+        let _ = connection.await;
     });
+    client
+        .execute("DELETE FROM volumes WHERE name = $1", &[&name])
+        .await
+        .expect("delete volume by name");
+    conn_task.abort();
 }
 
-fn volume_exists(pg_dsn: &str, name: &str) -> bool {
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(async {
-        let (client, connection) = tokio_postgres::connect(pg_dsn, tokio_postgres::NoTls)
-            .await
-            .expect("connect postgres");
-        let conn_task = tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        let row = client
-            .query_one(
-                "SELECT EXISTS(SELECT 1 FROM volumes WHERE name = $1)",
-                &[&name],
-            )
-            .await
-            .expect("query volume exists");
-        conn_task.abort();
-        row.get::<_, bool>(0)
-    })
+async fn volume_exists(pg_dsn: &str, name: &str) -> bool {
+    let (client, connection) = tokio_postgres::connect(pg_dsn, tokio_postgres::NoTls)
+        .await
+        .expect("connect postgres");
+    let conn_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let row = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM volumes WHERE name = $1)",
+            &[&name],
+        )
+        .await
+        .expect("query volume exists");
+    conn_task.abort();
+    row.get::<_, bool>(0)
 }
 
-fn seed_remote_file(home: &Path, disk_name: &str, payload: &[u8]) {
+async fn seed_remote_file(home: &Path, disk_name: &str, payload: &[u8]) {
     let db_path = default_meta_dir(home, disk_name).join(format!("{disk_name}.db"));
     {
         let meta = open_meta_engine_with_options(
@@ -226,16 +220,13 @@ fn seed_remote_file(home: &Path, disk_name: &str, payload: &[u8]) {
         meta.set_attr(&attr).expect("set attr");
 
         let store = DataStore::new(&DataStoreConfig::from(&format_info)).expect("datastore");
-        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        rt.block_on(async {
-            put_fragmented_object(
-                &store,
-                &format_info.data_prefix,
-                object_id,
-                Bytes::copy_from_slice(payload),
-            )
-            .await
-        })
+        put_fragmented_object(
+            &store,
+            &format_info.data_prefix,
+            object_id,
+            Bytes::copy_from_slice(payload),
+        )
+        .await
         .expect("put object");
 
         meta.flush_metadata().expect("flush metadata");
@@ -245,7 +236,7 @@ fn seed_remote_file(home: &Path, disk_name: &str, payload: &[u8]) {
     }
 }
 
-fn verify_payload_from_discovered(home: &Path, disk_name: &str, expected: &[u8]) {
+async fn verify_payload_from_discovered(home: &Path, disk_name: &str, expected: &[u8]) {
     let db_path = default_meta_dir(home, disk_name).join(format!("{disk_name}.db"));
     {
         let meta = open_meta_engine_with_options(
@@ -268,7 +259,6 @@ fn verify_payload_from_discovered(home: &Path, disk_name: &str, expected: &[u8])
         spans.sort_by_key(|span| (span.chunk_id.0, span.range.start, span.range.end));
 
         let store = DataStore::new(&DataStoreConfig::from(&format_info)).expect("datastore");
-        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let mut object_cache: BTreeMap<u64, Bytes> = BTreeMap::new();
         let mut decoded = vec![0_u8; expected.len()];
         let mut covered = vec![false; expected.len()];
@@ -304,12 +294,10 @@ fn verify_payload_from_discovered(home: &Path, disk_name: &str, expected: &[u8])
             let object = if let Some(cached) = object_cache.get(&block.object_id) {
                 cached.clone()
             } else {
-                let fetched = rt
-                    .block_on(async {
-                        get_fragmented_object(&store, &format_info.data_prefix, block.object_id)
-                            .await
-                    })
-                    .expect("get object");
+                let fetched =
+                    get_fragmented_object(&store, &format_info.data_prefix, block.object_id)
+                        .await
+                        .expect("get object");
                 object_cache.insert(block.object_id, fetched.clone());
                 fetched
             };
@@ -327,9 +315,9 @@ fn verify_payload_from_discovered(home: &Path, disk_name: &str, expected: &[u8])
     }
 }
 
-#[test]
+#[tokio::test]
 #[ignore]
-fn dump_load_restores_volume_and_discovery_reads_data() {
+async fn dump_load_restores_volume_and_discovery_reads_data() {
     let Some(env) = load_test_env() else {
         eprintln!("skipping: env not ready");
         return;
@@ -365,7 +353,7 @@ fn dump_load_restores_volume_and_discovery_reads_data() {
     );
     assert_ok(&init, "init");
 
-    seed_remote_file(home_a.path(), &disk_name, payload);
+    seed_remote_file(home_a.path(), &disk_name, payload).await;
 
     let dump = run_studiofs(
         home_a.path(),
@@ -378,10 +366,10 @@ fn dump_load_restores_volume_and_discovery_reads_data() {
     );
     assert_ok(&dump, "dump");
 
-    let pg_dsn = resolved_pg_dsn(&raw_pg);
-    delete_volume_by_name(&pg_dsn, &disk_name);
+    let pg_dsn = resolved_pg_dsn(&raw_pg).await;
+    delete_volume_by_name(&pg_dsn, &disk_name).await;
     assert!(
-        !volume_exists(&pg_dsn, &disk_name),
+        !volume_exists(&pg_dsn, &disk_name).await,
         "volume must be deleted"
     );
 
@@ -397,19 +385,19 @@ fn dump_load_restores_volume_and_discovery_reads_data() {
     );
     assert_ok(&load, "load");
     assert!(
-        volume_exists(&pg_dsn, &disk_name),
+        volume_exists(&pg_dsn, &disk_name).await,
         "volume must be restored"
     );
 
     let home_b = tempfile::tempdir().expect("home_b");
     let discover = run_studiofs(home_b.path(), &["discover", &disk_name, "--meta", &raw_pg]);
     assert_ok(&discover, "discover after load");
-    verify_payload_from_discovered(home_b.path(), &disk_name, payload);
+    verify_payload_from_discovered(home_b.path(), &disk_name, payload).await;
 }
 
-#[test]
+#[tokio::test]
 #[ignore]
-fn dump_load_restores_target_volume_without_breaking_other_volumes() {
+async fn dump_load_restores_target_volume_without_breaking_other_volumes() {
     let Some(env) = load_test_env() else {
         eprintln!("skipping: env not ready");
         return;
@@ -446,7 +434,7 @@ fn dump_load_restores_target_volume_without_breaking_other_volumes() {
         ],
     );
     assert_ok(&init_target, "init target");
-    seed_remote_file(home.path(), &target, payload);
+    seed_remote_file(home.path(), &target, payload).await;
 
     let dump = run_studiofs(
         home.path(),
@@ -459,8 +447,8 @@ fn dump_load_restores_target_volume_without_breaking_other_volumes() {
     );
     assert_ok(&dump, "dump target");
 
-    let pg_dsn = resolved_pg_dsn(&raw_pg);
-    delete_volume_by_name(&pg_dsn, &target);
+    let pg_dsn = resolved_pg_dsn(&raw_pg).await;
+    delete_volume_by_name(&pg_dsn, &target).await;
 
     for disk in [&extra1, &extra2] {
         let out = run_studiofs(
@@ -503,7 +491,7 @@ fn dump_load_restores_target_volume_without_breaking_other_volumes() {
         &["discover", &target, "--meta", &raw_pg],
     );
     assert_ok(&discover_target, "discover restored target");
-    verify_payload_from_discovered(verify_home.path(), &target, payload);
+    verify_payload_from_discovered(verify_home.path(), &target, payload).await;
 
     for disk in [&extra1, &extra2] {
         let out = run_studiofs(verify_home.path(), &["discover", disk, "--meta", &raw_pg]);

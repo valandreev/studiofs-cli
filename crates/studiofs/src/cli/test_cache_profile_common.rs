@@ -2,6 +2,7 @@ use crate::cli::test_cache_profile_types::ProfileArtifactKind;
 use crate::cli::test_cache_profile_types::ProfileArtifactReport;
 use crate::cli::utils::format_bytes;
 use anyhow::{Context, Result};
+use std::convert::TryFrom;
 use std::fs;
 use std::path::Path;
 use studiofs_vfs::VfsWritePathObservabilitySnapshot;
@@ -33,7 +34,8 @@ pub(crate) fn collect_write_path_artifacts(
             artifacts.push(ProfileArtifactReport {
                 kind: ProfileArtifactKind::WritePathObservability,
                 path: artifact.display().to_string(),
-                bytes: bytes.len() as u64,
+                bytes: u64::try_from(bytes.len())
+                    .context("write-path observability artifact is too large")?,
                 sent_to_endpoint: false,
             });
             match render_write_path_summary(&bytes) {
@@ -50,7 +52,8 @@ pub(crate) fn collect_write_path_artifacts(
                     artifacts.push(ProfileArtifactReport {
                         kind: ProfileArtifactKind::WritePathSummary,
                         path: summary_artifact.display().to_string(),
-                        bytes: summary_bytes.len() as u64,
+                        bytes: u64::try_from(summary_bytes.len())
+                            .context("write-path summary artifact is too large")?,
                         sent_to_endpoint: false,
                     });
                 }
@@ -117,11 +120,19 @@ pub(crate) fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
     out.push_str(&format!("backend: {}\n", snapshot.backend_tag));
     out.push_str(&format!(
         "eager_flush_threshold: {}\n",
-        format_bytes(snapshot.tuning.eager_flush_threshold_bytes as u64)
+        format_bytes(
+            u64::try_from(snapshot.tuning.eager_flush_threshold_bytes)
+                .context("eager flush threshold does not fit in u64")
+                .unwrap_or(u64::MAX)
+        )
     ));
     out.push_str(&format!(
         "eager_flush_drain_chunk: {}\n",
-        format_bytes(snapshot.tuning.eager_flush_drain_chunk_bytes as u64)
+        format_bytes(
+            u64::try_from(snapshot.tuning.eager_flush_drain_chunk_bytes)
+                .context("eager flush drain chunk does not fit in u64")
+                .unwrap_or(u64::MAX)
+        )
     ));
     out.push_str(&format!(
         "payload_put_concurrency: {}\n",

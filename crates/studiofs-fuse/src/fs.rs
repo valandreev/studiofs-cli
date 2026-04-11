@@ -105,10 +105,7 @@ fn note_critical_vfs_error(e: &VfsError) {
 
 #[cfg(target_os = "macos")]
 fn merge_xattr_write(existing: Option<Vec<u8>>, position: u32, value: &[u8]) -> Vec<u8> {
-    let offset = match usize::try_from(position) {
-        Ok(offset) => offset,
-        Err(_) => unreachable!("xattr position must fit usize"),
-    };
+    let offset = position as usize;
     let existing_len = existing.as_ref().map_or(0, Vec::len);
     let new_len = existing_len.max(offset.saturating_add(value.len()));
     let mut merged = vec![0; new_len];
@@ -1539,7 +1536,7 @@ impl FuseKernelInvalidator {
     }
 }
 
-fn should_log_fuse_invalidation_error(err: &std::io::Error) -> bool {
+fn should_log_invalidation_error(err: &std::io::Error) -> bool {
     !matches!(
         err.kind(),
         std::io::ErrorKind::NotFound | std::io::ErrorKind::NotConnected
@@ -1552,7 +1549,7 @@ impl KernelInvalidator for FuseKernelInvalidator {
         // cached page data / directory listing).
         if let Err(e) = self.notifier.inval_inode(ino, 0, -1) {
             // ENOENT is harmless (kernel already evicted the entry).
-            if should_log_fuse_invalidation_error(&e) {
+            if should_log_invalidation_error(&e) {
                 warn!(ino, error = %e, "FUSE notify_inval_inode failed");
             }
         }
@@ -1563,7 +1560,7 @@ impl KernelInvalidator for FuseKernelInvalidator {
 mod tests {
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, is_missing_xattr_error, missing_xattr_errno,
-        normalize_unix_mode, posix_flags_to_open_flags, should_log_fuse_invalidation_error,
+        normalize_unix_mode, posix_flags_to_open_flags, should_log_invalidation_error,
         vfs_err_to_errno,
     };
     #[cfg(target_os = "macos")]
@@ -1603,9 +1600,9 @@ mod tests {
         let not_connected = std::io::Error::from(std::io::ErrorKind::NotConnected);
         let other = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
 
-        assert!(!should_log_fuse_invalidation_error(&not_found));
-        assert!(!should_log_fuse_invalidation_error(&not_connected));
-        assert!(should_log_fuse_invalidation_error(&other));
+        assert!(!should_log_invalidation_error(&not_found));
+        assert!(!should_log_invalidation_error(&not_connected));
+        assert!(should_log_invalidation_error(&other));
     }
 
     #[test]

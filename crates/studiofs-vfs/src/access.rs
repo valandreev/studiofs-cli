@@ -102,15 +102,6 @@ impl AccessPolicy {
         let base_width = cfg.readahead_base_width.max(1);
         let max_width = cfg.readahead_max_width.max(base_width);
         let min_prefetch = cfg.readahead_min_prefetch.max(1).min(max_width);
-        let default = Self {
-            class,
-            prefetch_enabled: false,
-            cache_promotion_on_read: true,
-            readahead_base_width: base_width,
-            readahead_max_width: max_width,
-            readahead_min_prefetch: min_prefetch,
-            upload_pressure_boost: 1,
-        };
         match class {
             AccessClass::SequentialMediaRead => Self {
                 class,
@@ -122,26 +113,31 @@ impl AccessPolicy {
                 upload_pressure_boost: 2,
             },
             AccessClass::RandomInteractiveRead => Self {
+                class,
                 prefetch_enabled: false,
                 cache_promotion_on_read: true,
                 readahead_base_width: base_width.max(1),
                 readahead_max_width: base_width.clamp(1, 4),
                 readahead_min_prefetch: min_prefetch,
                 upload_pressure_boost: 1,
-                ..default
             },
             AccessClass::SequentialWriter => Self {
+                class,
+                prefetch_enabled: false,
+                cache_promotion_on_read: true,
                 readahead_base_width: 1,
                 readahead_max_width: 1,
                 readahead_min_prefetch: 1,
-                ..default
+                upload_pressure_boost: 1,
             },
             AccessClass::RandomWriter => Self {
+                class,
+                prefetch_enabled: false,
                 cache_promotion_on_read: false,
                 readahead_base_width: 1,
                 readahead_max_width: 1,
                 readahead_min_prefetch: 1,
-                ..default
+                upload_pressure_boost: 1,
             },
         }
     }

@@ -43,10 +43,9 @@ fn extract_format_info(snapshot_bytes: &[u8]) -> DiscoveryResult<FormatInfo> {
         if pair.len() != 2 {
             continue;
         }
-        let key = pair[0].as_str().unwrap_or_default();
-        if key != "format" {
+        let Some("format") = pair[0].as_str() else {
             continue;
-        }
+        };
         let arr = pair[1].as_array().ok_or(DiscoveryError::PayloadNotArray)?;
         let mut bytes = Vec::with_capacity(arr.len());
         for n in arr {

@@ -145,7 +145,21 @@ fn parse_geometry_env() -> (u16, u16) {
         return (DEFAULT_SECTOR_SIZE, DEFAULT_SECTORS_PER_ALLOCATION_UNIT);
     }
 
-    (sector_size, sectors as u16)
+    let sectors = match u16::try_from(sectors) {
+        Ok(value) => value,
+        Err(_) => {
+            tracing::warn!(
+                env_key = "STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE",
+                env_value = allocation_unit_raw,
+                sector_size,
+                fallback_value = DEFAULT_ALLOCATION_UNIT_SIZE,
+                "WinFSP sectors-per-allocation-unit overflowed u16; using default"
+            );
+            return (DEFAULT_SECTOR_SIZE, DEFAULT_SECTORS_PER_ALLOCATION_UNIT);
+        }
+    };
+
+    (sector_size, sectors)
 }
 
 fn parse_positive_u32_env(key: &str, default: u32) -> u32 {
@@ -294,6 +308,10 @@ fn mount_manager_mount_point(mount_point: &str) -> Result<String, MountOptionErr
     Ok(format!(r"\\.\{drive}"))
 }
 
+fn invalid_input_io_error(err: MountOptionError) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, err)
+}
+
 fn shutdown_upload_drain_timeout() -> std::time::Duration {
     let secs = std::env::var("STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS")
         .ok()
@@ -316,11 +334,11 @@ pub fn mount_and_serve(
     read_only: bool,
     shutdown_event_name: Option<&str>,
     profiling: Option<Box<dyn FnMut()>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> std::io::Result<()> {
     use studiofs_meta::Ino;
     use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 
-    let options = parse_mount_options(volume_label)?;
+    let options = parse_mount_options(volume_label).map_err(invalid_input_io_error)?;
     let mut volume_params = VolumeParams::new();
     volume_params.case_sensitive_search(true);
     volume_params.case_preserved_names(true);
@@ -336,7 +354,8 @@ pub fn mount_and_serve(
     // WinFSP layer tuning:
     // - per-timeout environment overrides are supported for runtime tuning.
     // - local-drive geometry is explicit for tooling that queries sector info.
-    apply_volume_params(&mut volume_params, &options, mount_point)?;
+    apply_volume_params(&mut volume_params, &options, mount_point)
+        .map_err(invalid_input_io_error)?;
 
     // Keep a reference for shutdown() (vfs is moved into context).
     let vfs_ref = vfs.clone();
@@ -355,8 +374,10 @@ pub fn mount_and_serve(
     let mut host = FileSystemHost::new_with_timer::<Vec<Ino>, 250>(
         FileSystemParams::default_params(volume_params),
         context,
-    )?;
-    let mount_manager_path = mount_manager_mount_point(mount_point)?;
+    )
+    .map_err(|err| std::io::Error::other(format!("failed to initialize WinFSP host: {err}")))?;
+    let mount_manager_path =
+        mount_manager_mount_point(mount_point).map_err(invalid_input_io_error)?;
     host.mount(&mount_manager_path).map_err(|err| {
         std::io::Error::other(format!(
             "failed to mount '{mount_point}' via WinFSP Mount Manager path '{mount_manager_path}': {err}. \
@@ -370,7 +391,8 @@ this usually means Administrator privileges are required, or WinFSP must be conf
     vfs.set_kernel_invalidator(invalidator);
 
     tracing::info!("mounted StudioFS at {mount_point}, press Ctrl+C to unmount");
-    host.start()?;
+    host.start()
+        .map_err(|err| std::io::Error::other(format!("failed to start WinFSP host: {err}")))?;
 
     // Block until Ctrl+C or external shutdown event
     let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -409,9 +431,9 @@ this usually means Administrator privileges are required, or WinFSP must be conf
             )
         };
         if !event.is_null() {
-            // SAFETY: `event` is a valid handle; the thread takes ownership and
-            // closes it after WaitForSingleObject returns.  We round-trip through
-            // usize so the captured value is `Send`.
+            // SAFETY: `event` is a valid opaque Win32 handle; we move it
+            // across thread boundaries as an integer token and reconstruct the
+            // raw handle inside the watcher thread before invoking Win32 APIs.
             let handle = event as usize;
             std::thread::Builder::new()
                 .name("shutdown-event-watcher".into())
@@ -419,10 +441,10 @@ this usually means Administrator privileges are required, or WinFSP must be conf
                 // only calls Win32 APIs that are valid for that handle until it is
                 // explicitly closed after signaling is complete.
                 .spawn(move || unsafe {
-                    let h = handle as *mut core::ffi::c_void;
-                    WaitForSingleObject(h, 0xFFFF_FFFF); // INFINITE
+                    let handle = handle as *mut core::ffi::c_void;
+                    WaitForSingleObject(handle, 0xFFFF_FFFF); // INFINITE
                     let _ = tx_event.send(());
-                    CloseHandle(h);
+                    CloseHandle(handle);
                 })
                 .ok();
         } else {
@@ -430,7 +452,7 @@ this usually means Administrator privileges are required, or WinFSP must be conf
         }
     }
 
-    *SHUTDOWN_TX.lock() = Some(tx);
+    *shutdown_tx().lock() = Some(tx);
     // SAFETY: The handler function pointer is valid for the process lifetime and the
     // process state is single-instance during mount, so passing it to WinFSP is valid.
     unsafe {
@@ -452,11 +474,15 @@ this usually means Administrator privileges are required, or WinFSP must be conf
     Ok(())
 }
 
-static SHUTDOWN_TX: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>> =
-    parking_lot::Mutex::new(None);
+fn shutdown_tx() -> &'static parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>> {
+    static SHUTDOWN_TX: std::sync::OnceLock<
+        parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    > = std::sync::OnceLock::new();
+    SHUTDOWN_TX.get_or_init(|| parking_lot::Mutex::new(None))
+}
 
 pub(crate) fn request_shutdown() {
-    let guard = SHUTDOWN_TX.lock();
+    let guard = shutdown_tx().lock();
     if let Some(tx) = guard.as_ref() {
         let _ = tx.send(());
     }

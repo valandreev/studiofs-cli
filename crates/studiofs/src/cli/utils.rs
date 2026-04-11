@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use std::convert::TryFrom;
 use std::path::{Path, PathBuf};
 
 pub fn get_default_meta_dir(volume_name: &str) -> Result<PathBuf> {
@@ -58,11 +59,11 @@ pub fn pid_file_path(mount_point: &str) -> Result<PathBuf> {
 
 /// Write a JSON PID file for a mount.
 pub fn write_pid_file(mount_point: &str, volume: &str, pid: u32) -> Result<()> {
-    write_pid_file_with_cache_path(mount_point, volume, pid, None)
+    write_pid_file_with_cache(mount_point, volume, pid, None)
 }
 
 /// Write a JSON PID file for a mount, optionally including the resolved cache path.
-pub fn write_pid_file_with_cache_path(
+pub fn write_pid_file_with_cache(
     mount_point: &str,
     volume: &str,
     pid: u32,
@@ -88,9 +89,12 @@ pub fn read_pid_file(mount_point: &str) -> Result<(u32, String, String)> {
     let data = std::fs::read_to_string(&path)
         .map_err(|_| anyhow!("No mount found for '{mount_point}'. Is it mounted?"))?;
     let v: serde_json::Value = serde_json::from_str(&data)?;
-    let pid = v["pid"]
-        .as_u64()
-        .ok_or_else(|| anyhow!("corrupt PID file"))? as u32;
+    let pid = u32::try_from(
+        v["pid"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("corrupt PID file"))?,
+    )
+    .map_err(|_| anyhow!("corrupt PID file"))?;
     let mp = v["mount_point"].as_str().unwrap_or(&normalized).to_string();
     let vol = v["volume"].as_str().unwrap_or("unknown").to_string();
     Ok((pid, mp, vol))

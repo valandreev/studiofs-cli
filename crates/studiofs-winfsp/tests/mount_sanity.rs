@@ -36,10 +36,10 @@ fn load_test_env() {
     });
 }
 
-fn workspace_dotenv_vars() -> &'static std::collections::HashMap<String, String> {
-    static VARS: OnceLock<std::collections::HashMap<String, String>> = OnceLock::new();
+fn workspace_dotenv_vars() -> &'static std::collections::BTreeMap<String, String> {
+    static VARS: OnceLock<std::collections::BTreeMap<String, String>> = OnceLock::new();
     VARS.get_or_init(|| {
-        let mut vars = std::collections::HashMap::new();
+        let mut vars = std::collections::BTreeMap::new();
         let env_path = workspace_env_path();
         if let Ok(iter) = dotenvy::from_path_iter(&env_path) {
             for item in iter.flatten() {
@@ -769,6 +769,8 @@ fn winfsp_mount_callback_flush_and_cleanup_observability_smoke() {
 #[test]
 #[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn winfsp_mount_aja_style_sequential_writer_validation_smoke() {
+    use std::io::Write;
+
     if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
         return;
     }
@@ -812,14 +814,14 @@ fn winfsp_mount_aja_style_sequential_writer_validation_smoke() {
         // dirty handle close.
         let snapshot_before = vfs_observer.write_path_observability_snapshot();
         let sequential_file = std::path::PathBuf::from(drive_root).join("aja-sequential.bin");
-        let mut writer = std::fs::OpenOptions::new()
+        let writer = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(true)
             .open(&sequential_file)
             .expect("open aja-style sequential writer file through WinFSP mount");
-        use std::io::Write;
+        let mut writer = std::io::BufWriter::new(writer);
         let mut chunk = Vec::new();
         if let Err(err) = chunk.try_reserve_exact(chunk_bytes) {
             eprintln!(
@@ -838,6 +840,9 @@ fn winfsp_mount_aja_style_sequential_writer_validation_smoke() {
                 .write_all(&chunk)
                 .expect("write sequential chunk through WinFSP mount");
         }
+        writer
+            .flush()
+            .expect("flush sequential writer buffer through WinFSP mount");
         drop(writer);
         let elapsed = started_at.elapsed();
         let throughput_mib_per_sec =

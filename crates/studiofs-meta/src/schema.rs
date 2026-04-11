@@ -618,10 +618,8 @@ pub struct RegularFileBaseState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RegularFileChunkState {
     /// Next slice id to allocate for this chunk.
-    #[serde(default)]
     pub next_slice_id: SliceId,
     /// Next slice order to allocate for this chunk.
-    #[serde(default)]
     pub next_slice_order: SliceOrder,
     /// Slice records keyed by slice identity.
     #[serde(default)]
@@ -957,6 +955,7 @@ pub fn resolve_chunk_slice_spans(
 ///
 /// Created at volume initialization, immutable thereafter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FormatInfo {
     /// Schema format version for compatibility checks.
     pub format_version: u16,
@@ -995,6 +994,7 @@ pub enum MetadataBackend {
 
 /// Connection details for remote metadata object store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RemoteStoreConfig {
     pub endpoint: String,
     pub bucket: String,
@@ -1005,21 +1005,9 @@ pub struct RemoteStoreConfig {
     pub prefix: String,
 }
 
-impl Default for RemoteStoreConfig {
-    fn default() -> Self {
-        Self {
-            endpoint: String::new(),
-            bucket: String::new(),
-            access_key: String::new(),
-            secret_key: String::new(),
-            region: String::new(),
-            prefix: default_metadata_prefix(),
-        }
-    }
-}
-
 /// Metadata runtime settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct MetadataConfig {
     #[serde(default)]
     pub backend: MetadataBackend,
@@ -1029,18 +1017,9 @@ pub struct MetadataConfig {
     pub postgres: Option<PostgresConfig>,
 }
 
-impl Default for MetadataConfig {
-    fn default() -> Self {
-        Self {
-            backend: MetadataBackend::RedbLocal,
-            remote: None,
-            postgres: None,
-        }
-    }
-}
-
 /// Connection details for PostgreSQL metadata backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PostgresConfig {
     /// PostgreSQL server DSN (e.g. postgres://user:pass@host:5432).
     /// StudioFS rewrites it to database `studiofs`.
@@ -1051,24 +1030,6 @@ pub struct PostgresConfig {
 
 fn default_metadata_prefix() -> String {
     "metadata/".to_string()
-}
-
-impl Default for FormatInfo {
-    fn default() -> Self {
-        Self {
-            format_version: CURRENT_FORMAT_VERSION,
-            name: String::new(),
-            uuid: String::new(),
-            endpoint: String::new(),
-            bucket: String::new(),
-            access_key: String::new(),
-            secret_key: String::new(),
-            region: String::new(),
-            data_prefix: String::new(),
-            metadata: MetadataConfig::default(),
-            block_size: DEFAULT_BLOCK_SIZE,
-        }
-    }
 }
 
 impl FormatInfo {
@@ -1205,7 +1166,6 @@ pub struct MetadataSnapshot {
     /// Replication state.
     pub state: SnapshotState,
     /// Object ids pinned by this snapshot.
-    #[serde(default)]
     pub pinned_object_ids: Vec<u64>,
     /// Serialized metadata payload for historical mounts.
     #[serde(default)]

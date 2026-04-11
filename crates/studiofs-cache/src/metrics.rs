@@ -190,11 +190,11 @@ pub struct BlockingTaskStatsSnapshot {
     pub submitted: u64,
     pub started: u64,
     pub completed: u64,
-    pub queue_wait_total_ns: u64,
-    pub queue_wait_max_ns: u64,
+    pub queue_wait_total: Duration,
+    pub queue_wait_max: Duration,
     pub queue_wait_histogram: LatencyHistogramSnapshot,
-    pub execution_total_ns: u64,
-    pub execution_max_ns: u64,
+    pub execution_total: Duration,
+    pub execution_max: Duration,
     pub execution_histogram: LatencyHistogramSnapshot,
 }
 
@@ -260,20 +260,16 @@ impl BlockingTaskStats {
             submitted: self.submitted.load(Ordering::Relaxed),
             started: self.started.load(Ordering::Relaxed),
             completed: self.completed.load(Ordering::Relaxed),
-            queue_wait_total_ns: self.queue_wait_total_ns.load(Ordering::Relaxed),
-            queue_wait_max_ns: self.queue_wait_max_ns.load(Ordering::Relaxed),
+            queue_wait_total: duration_from_ns(self.queue_wait_total_ns.load(Ordering::Relaxed)),
+            queue_wait_max: duration_from_ns(self.queue_wait_max_ns.load(Ordering::Relaxed)),
             queue_wait_histogram: self.queue_wait_histogram.snapshot(),
-            execution_total_ns: self.execution_total_ns.load(Ordering::Relaxed),
-            execution_max_ns: self.execution_max_ns.load(Ordering::Relaxed),
+            execution_total: duration_from_ns(self.execution_total_ns.load(Ordering::Relaxed)),
+            execution_max: duration_from_ns(self.execution_max_ns.load(Ordering::Relaxed)),
             execution_histogram: self.execution_histogram.snapshot(),
         }
     }
 
-    /// Best-effort reset for observability counters.
-    ///
-    /// This method intentionally uses per-field relaxed stores. Concurrent task
-    /// start/finish events can interleave with reset, so snapshots immediately
-    /// after reset may be transiently inconsistent.
+    /// Best-effort reset of observability counters.
     pub fn reset(&self) {
         self.active.store(0, Ordering::Relaxed);
         self.active_peak.store(0, Ordering::Relaxed);
@@ -328,7 +324,7 @@ impl CachePipelineMetrics {
         CachePipelineMetricsSnapshot {
             materialize_batches: self.materialize_batches.snapshot(),
             upload_queue: self.upload_queue.snapshot(pending_uploads),
-            blocking_tasks: empty_blocking_task_metrics_snapshot(),
+            blocking_tasks: empty_blocking_task_metrics(),
         }
     }
 }
@@ -340,25 +336,29 @@ fn empty_latency_histogram_snapshot() -> LatencyHistogramSnapshot {
     }
 }
 
-fn empty_blocking_task_stats_snapshot() -> BlockingTaskStatsSnapshot {
+fn duration_from_ns(ns: u64) -> Duration {
+    Duration::from_nanos(ns)
+}
+
+fn empty_blocking_task_stats() -> BlockingTaskStatsSnapshot {
     BlockingTaskStatsSnapshot {
         active: 0,
         active_peak: 0,
         submitted: 0,
         started: 0,
         completed: 0,
-        queue_wait_total_ns: 0,
-        queue_wait_max_ns: 0,
+        queue_wait_total: Duration::ZERO,
+        queue_wait_max: Duration::ZERO,
         queue_wait_histogram: empty_latency_histogram_snapshot(),
-        execution_total_ns: 0,
-        execution_max_ns: 0,
+        execution_total: Duration::ZERO,
+        execution_max: Duration::ZERO,
         execution_histogram: empty_latency_histogram_snapshot(),
     }
 }
 
-fn empty_blocking_task_metrics_snapshot() -> BlockingTaskMetricsSnapshot {
+fn empty_blocking_task_metrics() -> BlockingTaskMetricsSnapshot {
     BlockingTaskMetricsSnapshot {
-        total: empty_blocking_task_stats_snapshot(),
+        total: empty_blocking_task_stats(),
         by_kind: Vec::new(),
     }
 }

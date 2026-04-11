@@ -6,6 +6,7 @@ use crate::aimd::{AimdConfig, AimdController};
 use crate::runtime::{TimeoutOrCancel, run_with_timeout_or_cancel, sleep_or_cancel};
 use crate::vfs::VfsConfig;
 use opendal::{Buffer, ErrorKind};
+use std::convert::TryFrom;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -113,7 +114,7 @@ impl UploadScheduler {
     }
 
     pub fn set_adaptive_penalty(&self, delay: Duration) {
-        let penalty_ms = delay.as_millis().clamp(0, u64::MAX as u128) as u64;
+        let penalty_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
         self.adaptive_penalty_ms
             .store(penalty_ms, Ordering::Relaxed);
     }
@@ -122,11 +123,7 @@ impl UploadScheduler {
         self.adaptive_penalty_ms.load(Ordering::Relaxed)
     }
 
-    /// Upload object bytes to `key` with adaptive concurrency + retries.
-    ///
-    /// Note: foreground-aware adaptive cool-down is intentionally applied at
-    /// the VFS worker level before local L2 disk reads. Keep this method
-    /// focused on network/S3 request scheduling and retry behavior.
+    /// Upload object bytes to `key` with adaptive retries.
     pub async fn put(
         &self,
         key: &str,

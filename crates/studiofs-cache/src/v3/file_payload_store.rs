@@ -63,9 +63,7 @@ impl FilePayloadStore {
             layout,
             sync_mode,
             read_handles: Arc::new(ReadHandleCache {
-                shards: array::from_fn(|_| {
-                    Mutex::new(LruCache::new(read_fd_cache_shard_capacity()))
-                }),
+                shards: array::from_fn(|_| Mutex::new(LruCache::new(read_fd_cache_shard_cap()))),
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
                 evictions: AtomicU64::new(0),
@@ -252,7 +250,7 @@ impl FilePayloadStore {
             return self.sync_pending_grouped_targets(
                 pending_object_ids,
                 pending_dirs,
-                |object_id| self.sync_payload_file_grouped_barrier(object_id),
+                |object_id| self.sync_payload_file_grouped(object_id),
                 |dir| self.sync_directory_grouped_barrier(dir),
             );
         }
@@ -346,7 +344,7 @@ impl FilePayloadStore {
     }
 
     fn cached_read_handle(&self, object_id: u64, path: &Path) -> io::Result<Arc<File>> {
-        let shard = read_fd_shard(object_id);
+        let shard = read_fd_shard_idx(object_id);
         if let Some(file) = self.read_handles.shards[shard]
             .lock()
             .get(&object_id)
@@ -381,7 +379,7 @@ impl FilePayloadStore {
     }
 
     fn invalidate_cached_read_handle(&self, object_id: u64) {
-        self.read_handles.shards[read_fd_shard(object_id)]
+        self.read_handles.shards[read_fd_shard_idx(object_id)]
             .lock()
             .pop(&object_id);
     }
@@ -448,10 +446,7 @@ impl FilePayloadStore {
         Ok(())
     }
 
-    fn sync_payload_file_grouped_barrier(
-        &self,
-        object_id: u64,
-    ) -> Result<(), FilePayloadStoreError> {
+    fn sync_payload_file_grouped(&self, object_id: u64) -> Result<(), FilePayloadStoreError> {
         let path = self.layout.payload_block_path(object_id);
         let file = match OpenOptions::new().read(true).write(true).open(&path) {
             Ok(file) => file,
@@ -552,22 +547,15 @@ struct ReadHandleStats {
     cached: usize,
 }
 
-fn read_fd_cache_shard_capacity() -> NonZeroUsize {
+fn read_fd_cache_shard_cap() -> NonZeroUsize {
     let capacity = READ_FD_CACHE_CAPACITY.div_ceil(READ_FD_CACHE_SHARDS);
-    match NonZeroUsize::new(capacity) {
-        Some(capacity) => capacity,
-        None => unreachable!("READ_FD_CACHE_CAPACITY must be non-zero"),
-    }
+    NonZeroUsize::new(capacity.max(1)).expect("READ_FD_CACHE_CAPACITY must be non-zero")
 }
 
-fn read_fd_shard(object_id: u64) -> usize {
-    let shard_count = u64::try_from(READ_FD_CACHE_SHARDS)
-        .expect("READ_FD_CACHE_SHARDS must be representable as u64");
+fn read_fd_shard_idx(object_id: u64) -> usize {
+    let shard_count = u64::try_from(READ_FD_CACHE_SHARDS).unwrap_or(u64::MAX);
     let shard = object_id % shard_count;
-    match usize::try_from(shard) {
-        Ok(shard) => shard,
-        Err(_) => unreachable!("read-ahead cache shard index must fit usize"),
-    }
+    usize::try_from(shard).unwrap_or(0)
 }
 
 fn next_temp_token() -> String {

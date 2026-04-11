@@ -37,7 +37,7 @@ use crate::qos::{FairInodeScheduler, QosController, TransitMemoryBudget};
 use crate::readahead::{DirAccessTracker, ReadAheadTracker, ReadStreamKey};
 
 use crate::runtime::{
-    LocalCacheIoTiming, MetaExecutor, TimeoutOrCancel, local_cache_io_execution_model,
+    LocalCacheIoTiming, MetaExecutor, TimeoutOrCancel, cache_io_execution_model,
     run_local_cache_io, run_local_cache_io_blocking, run_meta, run_with_timeout_or_cancel,
 };
 use crate::vfs::write_buffer::WriteBufferState;
@@ -840,11 +840,11 @@ fn is_probable_trash_component(name: &[u8]) -> bool {
     matches!(name, b".Trash" | b".Trashes") || name.starts_with(b".Trash-")
 }
 
-fn is_ignored_macos_metadata_name(name: &[u8]) -> bool {
+fn is_ignored_macos_metadata(name: &[u8]) -> bool {
     name == b".DS_Store" || (name.len() > 2 && name.starts_with(b"._"))
 }
 
-fn is_blocked_root_macos_metadata_dir(name: &[u8]) -> bool {
+fn is_blocked_root_macos_metadata(name: &[u8]) -> bool {
     matches!(name, b".Spotlight-V100" | b".fseventsd")
 }
 
@@ -1085,7 +1085,7 @@ pub(super) enum EagerFlushOutcome {
     SkippedBelowThreshold,
 }
 
-fn local_sync_trigger_for_write_path(
+fn write_path_sync_trigger(
     cache_safety_mode: CacheSafetyMode,
     local_sync_policy: LocalSyncPolicy,
     pending_bytes: u64,
@@ -1432,7 +1432,7 @@ impl TryFrom<VfsConfig> for VfsConfigValidated {
     type Error = VfsError;
 
     fn try_from(value: VfsConfig) -> Result<Self, Self::Error> {
-        normalize_and_validate_config(
+        normalize_vfs_config(
             value,
             CacheRuntimeTuningOverrides {
                 max_dirty_bytes: true,
@@ -1562,11 +1562,11 @@ impl VfsConfigRaw {
 
     pub fn validate(self) -> VfsResult<VfsConfigValidated> {
         let (cfg, overrides) = self.resolve_defaults();
-        normalize_and_validate_config(cfg, overrides)
+        normalize_vfs_config(cfg, overrides)
     }
 }
 
-fn normalize_and_validate_config(
+fn normalize_vfs_config(
     mut cfg: VfsConfig,
     cache_runtime_overrides: CacheRuntimeTuningOverrides,
 ) -> VfsResult<VfsConfigValidated> {
@@ -2699,7 +2699,7 @@ struct DentryCachePolicy {
 }
 
 impl DentryCachePolicy {
-    fn estimate_entry_charge_for_name(name_len: usize) -> usize {
+    fn estimate_name_entry_charge(name_len: usize) -> usize {
         std::mem::size_of::<DentryCacheKey>()
             .saturating_add(std::mem::size_of::<
                 TwoTierEntry<DentryCacheValue, DentryCacheMeta>,
@@ -2749,7 +2749,7 @@ impl CachePolicy<DentryCacheKey, DentryCacheValue> for DentryCachePolicy {
         _value: &DentryCacheValue,
         _meta: &Self::Meta,
     ) -> usize {
-        Self::estimate_entry_charge_for_name(key.name.len())
+        Self::estimate_name_entry_charge(key.name.len())
     }
 
     fn is_negative(&self, value: &DentryCacheValue) -> bool {
@@ -2787,7 +2787,7 @@ impl DentryCache {
 
     #[cfg(test)]
     fn estimate_entry_charge(name: &[u8]) -> usize {
-        DentryCachePolicy::estimate_entry_charge_for_name(name.len())
+        DentryCachePolicy::estimate_name_entry_charge(name.len())
     }
 
     fn metrics(&self) -> DentryCacheMetrics {
@@ -4002,7 +4002,7 @@ impl ReadState {
         decision
     }
 
-    fn clear_access_tracking_for_inode(&self, ino: Ino) {
+    fn clear_access_tracking(&self, ino: Ino) {
         self.prefetch_last_hint
             .lock()
             .retain(|(tracked_ino, _), _| *tracked_ino != ino);
@@ -4010,7 +4010,7 @@ impl ReadState {
         self.write_access_fallback.lock().remove(&ino);
     }
 
-    fn clear_prefetch_hint_for_stream(&self, ino: Ino, stream_id: u64) {
+    fn clear_prefetch_hint(&self, ino: Ino, stream_id: u64) {
         self.prefetch_last_hint.lock().remove(&(ino, stream_id));
     }
 
@@ -4637,7 +4637,7 @@ impl<'a> PrefetchHintPlanner<'a> {
         self.vfs
             .state
             .read
-            .clear_prefetch_hint_for_stream(self.ino, self.stream_id);
+            .clear_prefetch_hint(self.ino, self.stream_id);
     }
 
     fn record_prefetch_sources(&self) -> (Vec<u32>, Vec<Ino>) {
@@ -6089,16 +6089,16 @@ impl<'a> StartupReplayCoordinator<'a> {
             return;
         }
         if !self.quarantined_inodes.is_empty() {
-            self.warn_preserved_orphan_dirty_blocks();
+            self.warn_orphan_dirty_blocks();
             return;
         }
-        if !self.filter_out_metadata_reachable_dirty_blocks() {
+        if !self.retain_non_metadata_reachable_dirty_blocks() {
             return;
         }
         self.remove_orphan_dirty_blocks();
     }
 
-    fn filter_out_metadata_reachable_dirty_blocks(&mut self) -> bool {
+    fn retain_non_metadata_reachable_dirty_blocks(&mut self) -> bool {
         // Cache the sync handle once so the recovery error path does
         // not re-enter metadata lookup while we are already cleaning up.
         let meta = self.vfs.sync_meta();
@@ -6151,7 +6151,7 @@ impl<'a> StartupReplayCoordinator<'a> {
         );
     }
 
-    fn warn_preserved_orphan_dirty_blocks(&self) {
+    fn warn_orphan_dirty_blocks(&self) {
         warn!(
             quarantined_inodes = self.quarantined_inodes.len(),
             orphan_dirty_blocks = self.dirty_set.len(),
@@ -6259,7 +6259,7 @@ impl<'a> ReadPipeline<'a> {
     }
 
     async fn build_plan(&self) -> VfsResult<Vec<ReadPlanSpan>> {
-        Self::build_plan_with(
+        Self::build_read_plan_with(
             self.vfs,
             self.ino,
             self.offset,
@@ -6270,7 +6270,7 @@ impl<'a> ReadPipeline<'a> {
         .await
     }
 
-    async fn build_plan_with(
+    async fn build_read_plan_with(
         vfs: &StudioVfs,
         ino: Ino,
         offset: u64,
@@ -7095,11 +7095,11 @@ impl StudioVfs {
     }
 
     fn is_blocked_root_metadata_path(&self, parent: Ino, name: &[u8]) -> bool {
-        parent == ROOT_INO && is_blocked_root_macos_metadata_dir(name)
+        parent == ROOT_INO && is_blocked_root_macos_metadata(name)
     }
 
     fn should_ignore_regular_file_path(&self, parent: Ino, name: &[u8]) -> bool {
-        is_ignored_macos_metadata_name(name)
+        is_ignored_macos_metadata(name)
             || self.is_blocked_root_metadata_path(parent, name)
             || self.ignored_dir_attr(parent).is_some()
     }
@@ -8707,14 +8707,12 @@ impl StudioVfs {
         self.state.file_session.gc_if_idle(ino);
     }
 
-    fn clear_access_tracking_for_inode(&self, ino: Ino) {
-        self.state.read.clear_access_tracking_for_inode(ino);
+    fn clear_access_tracking(&self, ino: Ino) {
+        self.state.read.clear_access_tracking(ino);
     }
 
     fn clear_access_tracking_for_stream(&self, ino: Ino, stream_id: u64) {
-        self.state
-            .read
-            .clear_prefetch_hint_for_stream(ino, stream_id);
+        self.state.read.clear_prefetch_hint(ino, stream_id);
         self.readahead
             .evict_stream(ReadStreamKey { ino, stream_id });
     }
@@ -9102,7 +9100,7 @@ impl StudioVfs {
                 .pending_bytes
                 .saturating_add(persisted_bytes);
 
-            let trigger = local_sync_trigger_for_write_path(
+            let trigger = write_path_sync_trigger(
                 self.cache_safety_mode,
                 local_sync_policy,
                 local_sync_group.pending_bytes,
@@ -9126,7 +9124,7 @@ impl StudioVfs {
         self.record_sync_data_queue_wait(sync_gate_wait_started.elapsed());
         let bytes_to_sync = {
             let mut local_sync_group = self.state.write_buffer.local_sync_group.lock().await;
-            let trigger = local_sync_trigger_for_write_path(
+            let trigger = write_path_sync_trigger(
                 self.cache_safety_mode,
                 local_sync_policy,
                 local_sync_group.pending_bytes,
@@ -10462,7 +10460,7 @@ impl StudioVfs {
                 },
             },
             local_cache_io: VfsWritePathLocalCacheIoStats {
-                execution_model: local_cache_io_execution_model().as_str().to_string(),
+                execution_model: cache_io_execution_model().as_str().to_string(),
                 calls: local_cache_io_calls,
                 handoff_total_ms: local_cache_handoff_total_ns as f64 / 1_000_000.0,
                 handoff_avg_ms: if local_cache_io_calls == 0 {
@@ -10995,7 +10993,7 @@ impl StudioVfs {
 
         let mut entries = self.sync_meta().readdir(ino)?;
         if ino == ROOT_INO {
-            entries.retain(|entry| !is_blocked_root_macos_metadata_dir(&entry.name));
+            entries.retain(|entry| !is_blocked_root_macos_metadata(&entry.name));
         }
 
         let mut cache_updates: Vec<(Ino, AccessLevel)> = Vec::with_capacity(entries.len());
@@ -11470,7 +11468,7 @@ impl StudioVfs {
         self.clear_pending_blocks_for_inode(ino);
         self.remove_live_extents_for_inode(ino);
         self.readahead.evict(ino);
-        self.clear_access_tracking_for_inode(ino);
+        self.clear_access_tracking(ino);
 
         if removed_ids_len > 0 {
             self.evict_inode_from_caches(ino, &removed_ids).await;
@@ -12306,7 +12304,7 @@ impl StudioVfs {
 
         // Invalidate readahead state for this inode.
         self.readahead.evict(ino);
-        self.clear_access_tracking_for_inode(ino);
+        self.clear_access_tracking(ino);
     }
 
     async fn evict_file_cache_only(&self, ino: Ino) -> VfsResult<()> {
@@ -12348,7 +12346,7 @@ impl StudioVfs {
             );
         }
         self.readahead.evict(ino);
-        self.clear_access_tracking_for_inode(ino);
+        self.clear_access_tracking(ino);
         Ok(())
     }
 
@@ -12763,9 +12761,7 @@ impl StudioVfs {
             return;
         }
         if !policy.prefetch_enabled {
-            self.state
-                .read
-                .clear_prefetch_hint_for_stream(ino, stream_id);
+            self.state.read.clear_prefetch_hint(ino, stream_id);
             return;
         }
         let Some(range) = PrefetchHintRange::from_blocks_needed(blocks_needed) else {
@@ -15869,7 +15865,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_access_tracking_for_inode_clears_fallback_states_and_hints() {
+    fn clear_access_tracking_clears_fallback_states_and_hints() {
         let tmp = TempDir::new().expect("tempdir");
         let (rt, vfs, _meta) = make_test_vfs(&tmp, "clear-access-tracking");
         let _guard = rt.enter();
@@ -15917,7 +15913,7 @@ mod tests {
                     .contains_key(&(ino, 77))
             );
 
-            vfs.clear_access_tracking_for_inode(ino);
+            vfs.clear_access_tracking(ino);
 
             assert!(
                 !vfs.state
@@ -18050,7 +18046,7 @@ mod tests {
 
     #[test]
     fn local_sync_policy_strict_always_triggers_sync() {
-        let trigger = local_sync_trigger_for_write_path(
+        let trigger = write_path_sync_trigger(
             CacheSafetyMode::Fast,
             LocalSyncPolicy::Strict,
             1,
@@ -18063,7 +18059,7 @@ mod tests {
 
     #[test]
     fn local_sync_policy_durable_mode_always_triggers_sync() {
-        let trigger = local_sync_trigger_for_write_path(
+        let trigger = write_path_sync_trigger(
             CacheSafetyMode::Durable,
             LocalSyncPolicy::Opportunistic,
             1,
@@ -18076,7 +18072,7 @@ mod tests {
 
     #[test]
     fn local_sync_policy_fast_mode_waits_until_threshold_or_window() {
-        let bytes_trigger = local_sync_trigger_for_write_path(
+        let bytes_trigger = write_path_sync_trigger(
             CacheSafetyMode::Fast,
             LocalSyncPolicy::Opportunistic,
             64 * 1024 * 1024,
@@ -18086,7 +18082,7 @@ mod tests {
         );
         assert_eq!(bytes_trigger, Some(LocalSyncTrigger::BytesThreshold));
 
-        let window_trigger = local_sync_trigger_for_write_path(
+        let window_trigger = write_path_sync_trigger(
             CacheSafetyMode::Fast,
             LocalSyncPolicy::Opportunistic,
             1024,
@@ -18096,7 +18092,7 @@ mod tests {
         );
         assert_eq!(window_trigger, Some(LocalSyncTrigger::TimeWindow));
 
-        let deferred = local_sync_trigger_for_write_path(
+        let deferred = write_path_sync_trigger(
             CacheSafetyMode::Fast,
             LocalSyncPolicy::Opportunistic,
             1024,

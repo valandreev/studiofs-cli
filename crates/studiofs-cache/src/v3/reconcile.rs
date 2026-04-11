@@ -74,15 +74,13 @@ pub fn reconcile_startup_state(
 ) -> Result<CacheV3StartupReconcileReport, CacheV3StartupReconcileError> {
     let temp_files_removed = remove_temp_files(layout)?;
     let stale_index_entries_removed = match mode {
-        CacheV3StartupReconcileMode::Lightweight => {
-            prune_missing_payload_for_dirty_entries(layout, index)?
-        }
-        CacheV3StartupReconcileMode::Full => prune_missing_payload_for_all_entries(layout, index)?,
+        CacheV3StartupReconcileMode::Lightweight => prune_dirty_payloads(layout, index)?,
+        CacheV3StartupReconcileMode::Full => prune_all_payloads(layout, index)?,
     };
     let (additional_temp_files_removed, orphan_payload_files_removed) = match mode {
         CacheV3StartupReconcileMode::Lightweight => (0, 0),
         CacheV3StartupReconcileMode::Full => {
-            remove_orphan_payload_and_legacy_temp_files(layout, index)?
+            remove_orphan_payloads_and_legacy_temps(layout, index)?
         }
     };
 
@@ -93,7 +91,7 @@ pub fn reconcile_startup_state(
     })
 }
 
-fn prune_missing_payload_for_dirty_entries(
+fn prune_dirty_payloads(
     layout: &CacheV3Layout,
     index: &CacheIndex,
 ) -> Result<u64, CacheV3StartupReconcileError> {
@@ -125,7 +123,7 @@ fn prune_missing_payload_for_dirty_entries(
     Ok(removed_total)
 }
 
-fn prune_missing_payload_for_all_entries(
+fn prune_all_payloads(
     layout: &CacheV3Layout,
     index: &CacheIndex,
 ) -> Result<u64, CacheV3StartupReconcileError> {
@@ -170,7 +168,7 @@ fn remove_temp_files(layout: &CacheV3Layout) -> Result<u64, io::Error> {
     Ok(removed)
 }
 
-fn remove_orphan_payload_and_legacy_temp_files(
+fn remove_orphan_payloads_and_legacy_temps(
     layout: &CacheV3Layout,
     index: &CacheIndex,
 ) -> Result<(u64, u64), CacheV3StartupReconcileError> {

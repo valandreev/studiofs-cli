@@ -272,7 +272,7 @@ impl ObjectHeader {
     note = "Use create_object_buffer to avoid full payload copying on hot paths"
 )]
 pub fn create_object(data: &[u8]) -> Result<Vec<u8>, ObjectError> {
-    create_object_with_flags(data, ObjectFlags::empty())
+    create_object_with(data, ObjectFlags::empty())
 }
 
 /// Create an object with custom flags.
@@ -282,7 +282,7 @@ pub fn create_object(data: &[u8]) -> Result<Vec<u8>, ObjectError> {
     since = "0.1.1",
     note = "Use create_object_buffer_with_flags to avoid full payload copying on hot paths"
 )]
-pub fn create_object_with_flags(data: &[u8], flags: ObjectFlags) -> Result<Vec<u8>, ObjectError> {
+pub fn create_object_with(data: &[u8], flags: ObjectFlags) -> Result<Vec<u8>, ObjectError> {
     let data_len = u64::try_from(data.len()).map_err(|_| ObjectError::ObjectTooLarge(u64::MAX))?;
     if data_len > u64::from(MAX_OBJECT_SIZE) {
         return Err(ObjectError::ObjectTooLarge(data_len));
@@ -305,16 +305,13 @@ pub fn create_object_with_flags(data: &[u8], flags: ObjectFlags) -> Result<Vec<u
 /// This is intended for upload paths where the payload is already owned as `Bytes`.
 /// The returned `Buffer` keeps header and payload as separate chunks.
 pub fn create_object_buffer(data: Bytes) -> Result<Buffer, ObjectError> {
-    create_object_buffer_with_flags(data, ObjectFlags::empty())
+    create_object_buffer_with(data, ObjectFlags::empty())
 }
 
 /// Create an object buffer with custom flags without copying payload bytes.
 ///
 /// Compression flags are not supported in this build.
-pub fn create_object_buffer_with_flags(
-    data: Bytes,
-    flags: ObjectFlags,
-) -> Result<Buffer, ObjectError> {
+pub fn create_object_buffer_with(data: Bytes, flags: ObjectFlags) -> Result<Buffer, ObjectError> {
     let data_len = u64::try_from(data.len()).map_err(|_| ObjectError::ObjectTooLarge(u64::MAX))?;
     if data_len > u64::from(MAX_OBJECT_SIZE) {
         return Err(ObjectError::ObjectTooLarge(data_len));
@@ -346,6 +343,9 @@ pub fn create_object_buffer_with_flags(
 
     Ok(Buffer::from(chunks))
 }
+
+pub use create_object_buffer_with as create_object_buffer_with_flags;
+pub use create_object_with as create_object_with_flags;
 
 /// Read and validate an object.
 ///
@@ -472,15 +472,14 @@ pub fn format_object_fragment_key(data_prefix: &str, object_id: u64, fragment_in
 }
 
 /// Format all cloud fragment keys for an object in stable order [0..N).
-pub fn format_object_fragment_keys(
-    data_prefix: &str,
-    object_id: u64,
-) -> [String; CLOUD_FRAGMENT_COUNT] {
+pub fn format_fragment_keys(data_prefix: &str, object_id: u64) -> [String; CLOUD_FRAGMENT_COUNT] {
     std::array::from_fn(|idx| {
-        let idx = u8::try_from(idx).expect("fragment index is constrained by CLOUD_FRAGMENT_COUNT");
+        let idx = idx as u8;
         format_object_fragment_key(data_prefix, object_id, idx)
     })
 }
+
+pub use format_fragment_keys as format_object_fragment_keys;
 
 /// Validate cloud fragment shape and return reconstructed logical payload size.
 ///
@@ -545,7 +544,7 @@ pub fn parse_object_id_from_key(key: &str) -> Result<u64, ObjectError> {
 
     // Try fragmented key first: .../{object_id}/{fragment_index}
     if let Ok(fragment_index) = tail.parse::<u64>()
-        && fragment_index < u64::try_from(CLOUD_FRAGMENT_COUNT).unwrap_or(u64::MAX)
+        && fragment_index < CLOUD_FRAGMENT_COUNT as u64
     {
         let hex_id = parts
             .get(parts.len().saturating_sub(2))
@@ -645,7 +644,7 @@ impl ObjectPayload {
     /// Find child object covering the given offset.
     pub fn find_child(&self, offset: u64) -> Option<&Objectlink> {
         self.children.iter().find(|link| {
-            let end = link.offset.saturating_add(link.length as u64);
+            let end = link.offset.saturating_add(u64::from(link.length));
             offset >= link.offset && offset < end
         })
     }

@@ -69,11 +69,47 @@ pub struct BlockCacheStats {
     pub l1_bytes: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct BytesTracked(u64);
+
+impl BytesTracked {
+    fn add_len(&mut self, len: usize) {
+        self.0 = self.0.saturating_add(bytes_len(len));
+    }
+
+    fn sub_len(&mut self, len: usize) {
+        self.0 = self.0.saturating_sub(bytes_len(len));
+    }
+
+    fn get(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Debug, Default)]
 struct L1State {
     by_object: BTreeMap<ObjectId, Bytes>,
     insertion_order: VecDeque<ObjectId>,
-    total_bytes: u64,
+    total_bytes: BytesTracked,
+}
+
+#[derive(Debug, Default)]
+struct PinnedState {
+    objects: HashSet<ObjectId>,
+}
+
+impl PinnedState {
+    fn insert(&mut self, object_id: ObjectId) {
+        self.objects.insert(object_id);
+    }
+
+    fn contains(&self, object_id: ObjectId) -> bool {
+        self.objects.contains(&object_id)
+    }
+
+    fn remove(&mut self, object_id: ObjectId) {
+        self.objects.remove(&object_id);
+    }
 }
 
 fn bytes_len(len: usize) -> u64 {
@@ -92,9 +128,9 @@ impl L1State {
     fn insert(&mut self, object_id: ObjectId, data: Bytes, max_bytes: u64) -> u64 {
         let is_new = !self.by_object.contains_key(&object_id);
         if let Some(previous) = self.by_object.remove(&object_id) {
-            self.total_bytes = self.total_bytes.saturating_sub(bytes_len(previous.len()));
+            self.total_bytes.sub_len(previous.len());
         }
-        self.total_bytes = self.total_bytes.saturating_add(bytes_len(data.len()));
+        self.total_bytes.add_len(data.len());
         self.by_object.insert(object_id, data);
         if is_new {
             self.insertion_order.push_back(object_id);
@@ -106,18 +142,18 @@ impl L1State {
         let Some(removed) = self.by_object.remove(&object_id) else {
             return false;
         };
-        self.total_bytes = self.total_bytes.saturating_sub(bytes_len(removed.len()));
+        self.total_bytes.sub_len(removed.len());
         true
     }
 
     fn evict_to_limit(&mut self, max_bytes: u64) -> u64 {
         let mut evicted = 0u64;
-        while self.total_bytes > max_bytes {
+        while self.total_bytes.get() > max_bytes {
             let Some(candidate) = self.insertion_order.pop_front() else {
                 break;
             };
             if let Some(removed) = self.by_object.remove(&candidate) {
-                self.total_bytes = self.total_bytes.saturating_sub(bytes_len(removed.len()));
+                self.total_bytes.sub_len(removed.len());
                 evicted = evicted.saturating_add(1);
             }
         }
@@ -138,7 +174,7 @@ pub struct BlockCache {
     config: BlockCacheConfig,
     l1: Mutex<L1State>,
     l1_max_bytes: AtomicU64,
-    pinned: Mutex<HashSet<ObjectId>>,
+    pinned: Mutex<PinnedState>,
     upload_queue: Arc<UploadQueue>,
     metrics: CachePipelineMetrics,
     background_tasks_started: AtomicBool,
@@ -154,7 +190,7 @@ impl BlockCache {
         let cache = Arc::new(Self {
             l1: Mutex::new(L1State::default()),
             l1_max_bytes: AtomicU64::new(config.l1_size.max(1)),
-            pinned: Mutex::new(HashSet::new()),
+            pinned: Mutex::new(PinnedState::default()),
             upload_queue,
             metrics: CachePipelineMetrics::default(),
             background_tasks_started: AtomicBool::new(false),
@@ -244,11 +280,11 @@ impl BlockCache {
     }
 
     pub fn is_pinned(&self, object_id: ObjectId) -> bool {
-        self.pinned.lock().contains(&object_id) || self.upload_queue.has_pending_object(object_id)
+        self.pinned.lock().contains(object_id) || self.upload_queue.has_pending_object(object_id)
     }
 
     pub fn unpin(&self, object_id: ObjectId) {
-        self.pinned.lock().remove(&object_id);
+        self.pinned.lock().remove(object_id);
     }
 
     pub fn stage_l1(&self, object_id: ObjectId, data: Bytes) {
@@ -321,7 +357,7 @@ impl BlockCache {
     }
 
     pub fn l1_bytes(&self) -> u64 {
-        self.l1.lock().total_bytes
+        self.l1.lock().total_bytes.get()
     }
 
     pub fn l1_max_bytes(&self) -> u64 {
@@ -337,6 +373,7 @@ impl BlockCache {
     }
 
     pub async fn shutdown(&self) {
+        self.upload_queue.shutdown();
         self.flush_upload_journal().await;
         self.shutdown_notify.notify_waiters();
     }

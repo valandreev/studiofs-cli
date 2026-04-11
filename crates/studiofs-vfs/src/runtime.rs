@@ -72,7 +72,7 @@ pub struct LocalCacheIoTiming {
     pub backend_io_ns: u64,
 }
 
-pub const fn local_cache_io_execution_model() -> LocalCacheIoExecutionModel {
+pub const fn cache_io_execution_model() -> LocalCacheIoExecutionModel {
     LocalCacheIoExecutionModel::InlineRuntimeWorkerWithBlockingIsolation
 }
 
@@ -176,14 +176,14 @@ pub async fn sleep_or_cancel(cancel_token: &CancellationToken, delay: Duration) 
 
 #[cfg(test)]
 mod tests {
-    use super::{MetaExecutor, local_cache_io_execution_model, run_local_cache_io};
+    use super::{MetaExecutor, cache_io_execution_model, run_local_cache_io};
     use std::sync::Arc;
     use studiofs_meta::{FormatInfo, MetaError, MetaFormat, RedbMetaEngine, SyncMetaEngineAdapter};
 
     #[test]
-    fn local_cache_io_execution_model_is_inline_runtime_worker() {
+    fn cache_io_execution_model_is_inline_runtime_worker() {
         assert_eq!(
-            local_cache_io_execution_model().as_str(),
+            cache_io_execution_model().as_str(),
             "inline-runtime-worker-with-blocking-isolation"
         );
     }
@@ -200,11 +200,16 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("meta.redb");
         let engine = Arc::new(RedbMetaEngine::open(&path).expect("open redb"));
-        let info = FormatInfo {
-            name: "runtime-meta".to_string(),
-            uuid: "runtime-meta-uuid".to_string(),
-            ..Default::default()
-        };
+        let info = FormatInfo::new(
+            "runtime-meta".to_string(),
+            "runtime-meta-uuid".to_string(),
+            "http://127.0.0.1:9000".to_string(),
+            "runtime-meta-bucket".to_string(),
+            "runtime-access-key".to_string(),
+            "runtime-secret-key".to_string(),
+            String::new(),
+            16,
+        );
         engine.set_format_info(&info).expect("set format info");
 
         let executor = MetaExecutor::new(Arc::new(SyncMetaEngineAdapter::new(engine)));
@@ -220,11 +225,16 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("meta.redb");
         let engine = Arc::new(RedbMetaEngine::open(&path).expect("open redb"));
-        let info = FormatInfo {
-            name: "runtime-meta".to_string(),
-            uuid: "runtime-meta-uuid".to_string(),
-            ..Default::default()
-        };
+        let info = FormatInfo::new(
+            "runtime-meta".to_string(),
+            "runtime-meta-uuid".to_string(),
+            "http://127.0.0.1:9000".to_string(),
+            "runtime-meta-bucket".to_string(),
+            "runtime-access-key".to_string(),
+            "runtime-secret-key".to_string(),
+            String::new(),
+            16,
+        );
         engine.set_format_info(&info).expect("set format info");
 
         let executor = MetaExecutor::new(Arc::new(SyncMetaEngineAdapter::new(engine)));

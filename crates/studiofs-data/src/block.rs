@@ -7,7 +7,7 @@ use studiofs_meta::DEFAULT_BLOCK_SIZE;
 ///
 /// Returns a list of (block_index, block_data) pairs.
 pub fn split_into_blocks(data: &[u8], start_offset: u32) -> Vec<(u32, Bytes)> {
-    let bs = usize::try_from(DEFAULT_BLOCK_SIZE).expect("block size must fit usize");
+    let bs = DEFAULT_BLOCK_SIZE as usize;
     let mut blocks = Vec::new();
 
     // Calculate the first block index and offset within that block.
@@ -16,8 +16,7 @@ pub fn split_into_blocks(data: &[u8], start_offset: u32) -> Vec<(u32, Bytes)> {
 
     let mut remaining = data;
     let mut block_idx = first_block_idx;
-    let mut offset_in_block =
-        usize::try_from(offset_in_first_block).expect("block offset must fit usize");
+    let mut offset_in_block = offset_in_first_block as usize;
 
     while !remaining.is_empty() {
         let available_in_block = bs.saturating_sub(offset_in_block);

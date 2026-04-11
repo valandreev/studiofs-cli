@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, mpsc};
 use tracing::debug;
@@ -39,6 +39,8 @@ pub struct UploadQueue {
     pending_count: AtomicUsize,
     pending_state: Mutex<PendingState>,
     idle_notify: Arc<Notify>,
+    shutdown_requested: AtomicBool,
+    shutdown_notify: Notify,
 }
 
 /// Atomically-consistent index of in-flight uploads.
@@ -73,6 +75,8 @@ impl UploadQueue {
                 ino_counts: BTreeMap::new(),
             }),
             idle_notify,
+            shutdown_requested: AtomicBool::new(false),
+            shutdown_notify: Notify::new(),
         });
 
         (queue, rx)
@@ -129,11 +133,12 @@ impl UploadQueue {
     pub async fn wait_for_idle(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
+            if self.shutdown_requested.load(Ordering::Acquire) {
+                return false;
+            }
             // Register interest BEFORE checking the count. This prevents a
             // TOCTOU race where mark_done() fires notify_waiters() between our
             // load() and .notified().await.
-            let notified = self.idle_notify.notified();
-
             if self.pending_count.load(Ordering::Acquire) == 0 {
                 return true;
             }
@@ -142,8 +147,14 @@ impl UploadQueue {
                 return false;
             }
             let remaining = deadline.saturating_duration_since(now);
-            if tokio::time::timeout(remaining, notified).await.is_err() {
-                return self.pending_count.load(Ordering::Acquire) == 0;
+            let notified = self.idle_notify.notified();
+            tokio::select! {
+                _ = self.shutdown_notify.notified() => return false,
+                result = tokio::time::timeout(remaining, notified) => {
+                    if result.is_err() {
+                        return self.pending_count.load(Ordering::Acquire) == 0;
+                    }
+                }
             }
         }
     }
@@ -169,6 +180,11 @@ impl UploadQueue {
     /// O(1) check whether a specific object id is currently pending upload.
     pub fn has_pending_object(&self, object_id: u64) -> bool {
         self.pending_state.lock().by_object.contains_key(&object_id)
+    }
+
+    pub fn shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::Release);
+        self.shutdown_notify.notify_waiters();
     }
 
     fn mark_done(&self) {

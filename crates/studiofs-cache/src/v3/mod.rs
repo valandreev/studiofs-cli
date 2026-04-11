@@ -91,9 +91,7 @@ impl CacheBackendDetection {
     }
 }
 
-/// Detect backend contracts for a per-volume cache root using read-only probes.
-///
-/// This function never creates, removes, or mutates filesystem entries.
+/// Detect backend contracts for a per-volume cache root.
 pub fn detect_cache_backends(cache_root: &Path) -> io::Result<CacheBackendDetection> {
     let layout = CacheV3Layout::from_cache_root(cache_root);
     let v3_layout_marker_exists = layout.layout_marker.try_exists()?;
@@ -354,7 +352,7 @@ impl CacheV3LocalBlockBackend {
         Some(DirtyValidationGuard { backend: self })
     }
 
-    fn remove_orphaned_index_entries_batch(&self, object_ids: &[u64], operation: &'static str) {
+    fn remove_orphaned_index_entries(&self, object_ids: &[u64], operation: &'static str) {
         if object_ids.is_empty() {
             return;
         }
@@ -396,7 +394,7 @@ impl CacheV3LocalBlockBackend {
     fn flush_access_touch_ids(&self, pending_ids: Vec<u64>, operation: &'static str) {
         if let Err(error) = self
             .index
-            .touch_access_if_stale_many_unique(&pending_ids, ACCESS_TOUCH_MIN_INTERVAL)
+            .touch_access_many_unique(&pending_ids, ACCESS_TOUCH_MIN_INTERVAL)
         {
             warn!(
                 operation,
@@ -419,7 +417,7 @@ impl CacheV3LocalBlockBackend {
         pending.forget_many(object_ids);
     }
 
-    fn evict_to_target_bytes_locked(
+    fn evict_to_target_bytes_impl(
         &self,
         target_bytes: u64,
         operation: &'static str,
@@ -443,7 +441,7 @@ impl CacheV3LocalBlockBackend {
 
             let page = self
                 .index
-                .eviction_candidates_page_with_stats(cursor, EVICTION_CANDIDATE_PAGE_SIZE)
+                .eviction_candidates_page_stats(cursor, EVICTION_CANDIDATE_PAGE_SIZE)
                 .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
             if page.entries.is_empty() {
                 break;
@@ -504,7 +502,7 @@ impl CacheV3LocalBlockBackend {
         operation: &'static str,
     ) -> Result<u64, LocalBlockBackendError> {
         let _eviction_guard = self.eviction_pass_lock.lock();
-        self.evict_to_target_bytes_locked(target_bytes, operation)
+        self.evict_to_target_bytes_impl(target_bytes, operation)
     }
 
     fn try_evict_to_target_bytes(
@@ -515,7 +513,7 @@ impl CacheV3LocalBlockBackend {
         let Some(_eviction_guard) = self.eviction_pass_lock.try_lock() else {
             return Ok(None);
         };
-        self.evict_to_target_bytes_locked(target_bytes, operation)
+        self.evict_to_target_bytes_impl(target_bytes, operation)
             .map(Some)
     }
 
@@ -770,7 +768,7 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
                         object_ids.push(entry.object_id);
                     }
                 }
-                self.remove_orphaned_index_entries_batch(&orphaned_ids, "dirty_object_ids");
+                self.remove_orphaned_index_entries(&orphaned_ids, "dirty_object_ids");
                 object_ids
             }
             Err(error) => {

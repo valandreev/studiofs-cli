@@ -132,6 +132,8 @@ fn init_winfsp_dll_path() {
         // SAFETY: LoadLibraryW with a valid, null-terminated UTF-16 path.
         // Pre-loading the DLL means the delay-load resolver will find it
         // already in memory without needing to search PATH.
+        // SAFETY: `wide` is a null-terminated UTF-16 buffer that lives across
+        // the FFI call, and `LoadLibraryW` is invoked with the documented Win32 ABI.
         let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
         if handle.is_null() {
             eprintln!("warning: failed to load winfsp-x64.dll from {:?}", path);

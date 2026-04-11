@@ -14,6 +14,7 @@ use pyroscope::encode::r#gen::push::{PushRequest, RawProfileSeries, RawSample};
 use pyroscope::encode::r#gen::types::LabelPair;
 use pyroscope::encode::pprof;
 use reqwest::Url;
+use std::convert::TryFrom;
 use std::env;
 use std::fs;
 use std::io::Write as _;
@@ -36,7 +37,7 @@ pub struct TestCacheProfileSession {
     warnings: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ProfileEndpoint {
     url: String,
     username: Option<String>,
@@ -138,7 +139,8 @@ impl TestCacheProfileSession {
                             artifacts.push(ProfileArtifactReport {
                                 kind: ProfileArtifactKind::Cpu,
                                 path: artifact.display().to_string(),
-                                bytes: bytes.len() as u64,
+                                bytes: u64::try_from(bytes.len())
+                                    .context("CPU profile artifact is too large")?,
                                 sent_to_endpoint: sent,
                             });
                         }
@@ -188,7 +190,8 @@ impl TestCacheProfileSession {
                     artifacts.push(ProfileArtifactReport {
                         kind: ProfileArtifactKind::Memory,
                         path: artifact.display().to_string(),
-                        bytes: bytes.len() as u64,
+                        bytes: u64::try_from(bytes.len())
+                            .context("memory profile artifact is too large")?,
                         sent_to_endpoint: sent,
                     });
                 }
@@ -282,15 +285,16 @@ fn render_cpu_pprof(
         ReportData::Reports(reports) => reports,
         ReportData::RawPprof(bytes) => return Ok(bytes.clone()),
     };
-    let profile = pprof::encode(
-        reports,
-        sample_rate,
-        started_at.timestamp_nanos_opt().unwrap_or_default() as u64,
+    let started_at_ns = u64::try_from(started_at.timestamp_nanos_opt().unwrap_or_default())
+        .context("profile start timestamp is before the Unix epoch")?;
+    let elapsed_ns = u64::try_from(
         (finished_at - started_at)
             .num_nanoseconds()
             .unwrap_or_default()
-            .max(0) as u64,
-    );
+            .max(0),
+    )
+    .context("profile duration exceeds u64::MAX nanoseconds")?;
+    let profile = pprof::encode(reports, sample_rate, started_at_ns, elapsed_ns);
     let mut encoded = Vec::new();
     profile.encode(&mut encoded)?;
     gzip_bytes(&encoded)

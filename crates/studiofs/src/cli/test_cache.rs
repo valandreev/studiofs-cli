@@ -423,15 +423,15 @@ impl From<CachePipelineMetricsSnapshot> for CachePipelineReport {
                 queue_wait_avg_ms: if stats.started == 0 {
                     0.0
                 } else {
-                    stats.queue_wait_total_ns as f64 / stats.started as f64 / 1_000_000.0
+                    stats.queue_wait_total.as_secs_f64() * 1_000.0 / stats.started as f64
                 },
-                queue_wait_max_ms: stats.queue_wait_max_ns as f64 / 1_000_000.0,
+                queue_wait_max_ms: stats.queue_wait_max.as_secs_f64() * 1_000.0,
                 execution_avg_ms: if stats.completed == 0 {
                     0.0
                 } else {
-                    stats.execution_total_ns as f64 / stats.completed as f64 / 1_000_000.0
+                    stats.execution_total.as_secs_f64() * 1_000.0 / stats.completed as f64
                 },
-                execution_max_ms: stats.execution_max_ns as f64 / 1_000_000.0,
+                execution_max_ms: stats.execution_max.as_secs_f64() * 1_000.0,
             }
         };
         let mut by_kind: Vec<BlockingTaskKindStatsReport> = snapshot
