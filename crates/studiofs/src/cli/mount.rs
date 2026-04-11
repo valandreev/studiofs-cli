@@ -703,6 +703,17 @@ struct PreparedMountRuntime {
 }
 
 impl PreparedMountRuntime {
+    fn launch(
+        self,
+        requested_name: &str,
+        cache_size: &str,
+        snapshot_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.print_ready(requested_name, cache_size, snapshot_id);
+        self.write_pid_file(requested_name);
+        self.serve()
+    }
+
     fn print_ready(&self, requested_name: &str, cache_size: &str, snapshot_id: Option<&str>) {
         for line in build_ready_banner_lines(
             requested_name,
@@ -717,57 +728,60 @@ impl PreparedMountRuntime {
     }
 
     fn write_pid_file(&self, requested_name: &str) {
-        let _ = super::utils::write_pid_file_with_cache_path(
+        persist_mount_pid_file_best_effort_with(
             &self.actual_mount_path,
             requested_name,
             std::process::id(),
             Some(&self.cache_path),
+            super::utils::write_pid_file_with_cache_path,
         );
     }
 
     fn serve(mut self) -> anyhow::Result<()> {
         #[cfg(windows)]
         {
-            let event_name = super::utils::shutdown_event_name(&self.actual_mount_path);
-            info!("starting WinFSP mount at {}", self.actual_mount_path);
-            let mount_result = studiofs_winfsp::mount_and_serve(
-                self.vfs.clone(),
-                self.rt.clone(),
-                &self.actual_mount_path,
-                &self.format_info.name,
-                self.run_in_foreground,
-                self.read_only_mount,
-                Some(&event_name),
-                self.profiling.take(),
-            );
-            self.write_path_observability_publisher.stop_and_join();
-            finalize_mount_serve_result(
+            serve_with_backend(
                 "WinFSP",
                 &self.actual_mount_path,
                 true,
-                mount_result,
+                || {
+                    let event_name = super::utils::shutdown_event_name(&self.actual_mount_path);
+                    info!("starting WinFSP mount at {}", self.actual_mount_path);
+                    studiofs_winfsp::mount_and_serve(
+                        self.vfs.clone(),
+                        self.rt.clone(),
+                        &self.actual_mount_path,
+                        &self.format_info.name,
+                        self.run_in_foreground,
+                        self.read_only_mount,
+                        Some(&event_name),
+                        self.profiling.take(),
+                    )
+                },
+                || self.write_path_observability_publisher.stop_and_join(),
                 super::utils::remove_pid_file,
             )?;
         }
 
         #[cfg(unix)]
         {
-            info!("starting FUSE mount at {}", self.actual_mount_path);
-            let mount_result = studiofs_fuse::mount_and_serve(
-                self.vfs.clone(),
-                self.rt.clone(),
-                &self.actual_mount_path,
-                &self.format_info.name,
-                self.run_in_foreground,
-                self.read_only_mount,
-                self.profiling.take(),
-            );
-            self.write_path_observability_publisher.stop_and_join();
-            finalize_mount_serve_result(
+            serve_with_backend(
                 "FUSE",
                 &self.actual_mount_path,
                 false,
-                mount_result,
+                || {
+                    info!("starting FUSE mount at {}", self.actual_mount_path);
+                    studiofs_fuse::mount_and_serve(
+                        self.vfs.clone(),
+                        self.rt.clone(),
+                        &self.actual_mount_path,
+                        &self.format_info.name,
+                        self.run_in_foreground,
+                        self.read_only_mount,
+                        self.profiling.take(),
+                    )
+                },
+                || self.write_path_observability_publisher.stop_and_join(),
                 super::utils::remove_pid_file,
             )?;
             // Note: FUSE mount_and_serve calls process::exit(0), so this is unreachable.
@@ -840,6 +854,43 @@ fn build_ready_banner_lines(
         lines.push(format!("  Snapshot:     {snapshot_id} (read-only)"));
     }
     lines
+}
+
+fn persist_mount_pid_file_best_effort_with<WritePid>(
+    actual_mount_path: &str,
+    requested_name: &str,
+    pid: u32,
+    cache_path: Option<&Path>,
+    write_pid_file: WritePid,
+) where
+    WritePid: FnOnce(&str, &str, u32, Option<&Path>) -> anyhow::Result<()>,
+{
+    let _ = write_pid_file(actual_mount_path, requested_name, pid, cache_path);
+}
+
+fn serve_with_backend<E, Serve, Stop, RemovePid>(
+    backend_name: &str,
+    actual_mount_path: &str,
+    remove_pid_on_success: bool,
+    serve_backend: Serve,
+    stop_observability: Stop,
+    remove_pid_file: RemovePid,
+) -> anyhow::Result<()>
+where
+    E: std::fmt::Display,
+    Serve: FnOnce() -> Result<(), E>,
+    Stop: FnOnce(),
+    RemovePid: FnOnce(&str) -> anyhow::Result<()>,
+{
+    let result = serve_backend();
+    stop_observability();
+    finalize_mount_serve_result(
+        backend_name,
+        actual_mount_path,
+        remove_pid_on_success,
+        result,
+        remove_pid_file,
+    )
 }
 
 fn finalize_mount_serve_result<E, RemovePid>(
@@ -1091,9 +1142,7 @@ pub fn run(
         run_in_foreground,
     )?;
 
-    runtime.print_ready(name, &cache_size, snapshot_id);
-    runtime.write_pid_file(name);
-    runtime.serve()
+    runtime.launch(name, &cache_size, snapshot_id)
 }
 
 // ─── Daemon spawn ────────────────────────────────────────────────────────────
@@ -1808,6 +1857,55 @@ mod tests {
     }
 
     #[test]
+    fn persist_mount_pid_file_best_effort_with_passes_cache_path() {
+        let captured = std::cell::RefCell::new(None);
+
+        persist_mount_pid_file_best_effort_with(
+            "/mnt/demo",
+            "demo",
+            4242,
+            Some(Path::new("/cache/demo")),
+            |mount_point, volume, pid, cache_path| {
+                *captured.borrow_mut() = Some((
+                    mount_point.to_string(),
+                    volume.to_string(),
+                    pid,
+                    cache_path.map(|path| path.to_string_lossy().into_owned()),
+                ));
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            captured.into_inner(),
+            Some((
+                "/mnt/demo".to_string(),
+                "demo".to_string(),
+                4242,
+                Some("/cache/demo".to_string()),
+            ))
+        );
+    }
+
+    #[test]
+    fn persist_mount_pid_file_best_effort_with_swallows_write_errors() {
+        let called = std::cell::Cell::new(false);
+
+        persist_mount_pid_file_best_effort_with(
+            "/mnt/demo",
+            "demo",
+            4242,
+            Some(Path::new("/cache/demo")),
+            |_, _, _, _| {
+                called.set(true);
+                Err(anyhow::anyhow!("boom"))
+            },
+        );
+
+        assert!(called.get(), "pid writer should still be invoked");
+    }
+
+    #[test]
     fn finalize_mount_serve_result_cleans_pid_on_success() {
         let mut cleaned = None;
         finalize_mount_serve_result(
@@ -1842,6 +1940,67 @@ mod tests {
 
         assert!(err.to_string().contains("FUSE error: boom"));
         assert!(!cleaned, "cleanup should not run on failed mount serve");
+    }
+
+    #[test]
+    fn serve_with_backend_stops_observability_and_cleans_pid_on_success() {
+        let events = std::cell::RefCell::new(Vec::<String>::new());
+
+        serve_with_backend(
+            "WinFSP",
+            "/mnt/demo",
+            true,
+            || {
+                events.borrow_mut().push("serve".to_string());
+                Ok::<(), std::io::Error>(())
+            },
+            || {
+                events.borrow_mut().push("stop".to_string());
+            },
+            |path| {
+                events.borrow_mut().push(format!("remove:{path}"));
+                Ok(())
+            },
+        )
+        .expect("serve success");
+
+        assert_eq!(
+            events.into_inner(),
+            vec![
+                "serve".to_string(),
+                "stop".to_string(),
+                "remove:/mnt/demo".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn serve_with_backend_stops_observability_and_skips_pid_cleanup_on_error() {
+        let events = std::cell::RefCell::new(Vec::<String>::new());
+
+        let err = serve_with_backend(
+            "FUSE",
+            "/mnt/demo",
+            true,
+            || {
+                events.borrow_mut().push("serve".to_string());
+                Err::<(), _>(std::io::Error::other("boom"))
+            },
+            || {
+                events.borrow_mut().push("stop".to_string());
+            },
+            |path| {
+                events.borrow_mut().push(format!("remove:{path}"));
+                Ok(())
+            },
+        )
+        .expect_err("serve error should bubble");
+
+        assert!(err.to_string().contains("FUSE error: boom"));
+        assert_eq!(
+            events.into_inner(),
+            vec!["serve".to_string(), "stop".to_string()]
+        );
     }
 
     #[test]
