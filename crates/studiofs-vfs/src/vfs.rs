@@ -696,6 +696,63 @@ impl<'a> NamespaceResolver<'a> {
     }
 }
 
+struct NamespaceMutationOps<'a> {
+    vfs: &'a StudioVfs,
+}
+
+impl<'a> NamespaceMutationOps<'a> {
+    fn new(vfs: &'a StudioVfs) -> Self {
+        Self { vfs }
+    }
+
+    fn record_insertion(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        child: Ino,
+        attr_invalidations: impl IntoIterator<Item = Ino>,
+    ) {
+        let mut invalidated = vec![parent];
+        invalidated.extend(attr_invalidations);
+        self.vfs.invalidate_attr_read_cache(invalidated);
+        self.vfs.bump_namespace_for_parents([parent]);
+        self.vfs.dentry_cache_insert_positive(parent, name, child);
+    }
+
+    fn record_removal(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        attr_invalidations: impl IntoIterator<Item = Ino>,
+    ) {
+        let mut invalidated = vec![parent];
+        invalidated.extend(attr_invalidations);
+        self.vfs.invalidate_attr_read_cache(invalidated);
+        self.vfs.bump_namespace_for_parents([parent]);
+        self.vfs.dentry_cache_insert_negative(parent, name);
+    }
+
+    fn record_rename(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+        moved_ino: Ino,
+    ) {
+        let invalidated = if parent == new_parent {
+            vec![parent]
+        } else {
+            vec![parent, new_parent]
+        };
+        self.vfs.invalidate_attr_read_cache(invalidated);
+        self.vfs.bump_namespace_for_parents([parent, new_parent]);
+        self.vfs.dentry_cache_insert_negative(parent, name);
+        self.vfs
+            .dentry_cache_insert_positive(new_parent, new_name, moved_ino);
+    }
+}
+
 // =============================================================================
 // Kernel Cache Invalidation
 // =============================================================================
@@ -4213,6 +4270,10 @@ fn map_open_local_block_backend_error(
 impl StudioVfs {
     pub fn namespace_resolver(&self, style: NamespacePathStyle) -> NamespaceResolver<'_> {
         NamespaceResolver::new(self, style)
+    }
+
+    fn namespace_mutations(&self) -> NamespaceMutationOps<'_> {
+        NamespaceMutationOps::new(self)
     }
 
     fn ignored_entry_attr(&self, ino: Ino) -> Option<InodeAttr> {
@@ -10230,6 +10291,7 @@ impl StudioVfs {
 
     /// Create a hard link: add a new directory entry pointing to an existing inode.
     pub fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> VfsResult<InodeAttr> {
+        let namespace_mutations = self.namespace_mutations();
         self.enforce_access(ino, AccessLevel::ReadOnly)?;
         self.enforce_access(new_parent, AccessLevel::ReadWrite)?;
         validate_name(new_name)?;
@@ -10257,11 +10319,8 @@ impl StudioVfs {
             return Ok(ignored);
         }
         let attr = self.sync_meta().link(ino, new_parent, new_name)?;
-        self.bump_namespace_for_parents([new_parent]);
+        namespace_mutations.record_insertion(new_parent, new_name, ino, [ino]);
         self.bump_acl_namespace_epoch();
-        self.dentry_cache_insert_positive(new_parent, new_name, ino);
-        // Invalidate attr caches (nlink changed)
-        self.state.namespace.attr_read_cache.lock().remove(ino);
         self.state.namespace.dirty_attrs.lock().remove(&ino);
         self.sync_meta().request_eager_flush();
         Ok(attr)
@@ -10276,6 +10335,7 @@ impl StudioVfs {
         gid: u32,
         mode: u16,
     ) -> VfsResult<InodeAttr> {
+        let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         validate_name(name)?;
         if self.should_ignore_regular_file_path(parent, name) {
@@ -10299,10 +10359,7 @@ impl StudioVfs {
                 upload_state: VfsUploadState::Uploading,
             },
         );
-        self.bump_namespace_for_parents([parent]);
-        self.dentry_cache_insert_positive(parent, name, attr.ino);
-        // Invalidate parent directory's read-through cache (entry count changed)
-        self.state.namespace.attr_read_cache.lock().remove(parent);
+        namespace_mutations.record_insertion(parent, name, attr.ino, std::iter::empty());
         self.sync_meta().request_eager_flush();
         Ok(attr)
     }
@@ -10316,6 +10373,7 @@ impl StudioVfs {
         gid: u32,
         mode: u16,
     ) -> VfsResult<InodeAttr> {
+        let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         validate_name(name)?;
         if self.should_ignore_directory_path(parent, name) {
@@ -10326,10 +10384,7 @@ impl StudioVfs {
         let attr = self
             .sync_meta()
             .create_dir(parent, name, uid, gid, mode & 0o7777)?;
-        self.bump_namespace_for_parents([parent]);
-        self.dentry_cache_insert_positive(parent, name, attr.ino);
-        // Invalidate parent directory's read-through cache (entry count changed)
-        self.state.namespace.attr_read_cache.lock().remove(parent);
+        namespace_mutations.record_insertion(parent, name, attr.ino, std::iter::empty());
         self.sync_meta().request_eager_flush();
         Ok(attr)
     }
@@ -10343,6 +10398,7 @@ impl StudioVfs {
         uid: u32,
         gid: u32,
     ) -> VfsResult<InodeAttr> {
+        let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         validate_name(name)?;
         if self.should_ignore_regular_file_path(parent, name) {
@@ -10353,9 +10409,7 @@ impl StudioVfs {
         let attr = self
             .sync_meta()
             .create_symlink(parent, name, target, uid, gid)?;
-        self.bump_namespace_for_parents([parent]);
-        self.dentry_cache_insert_positive(parent, name, attr.ino);
-        self.state.namespace.attr_read_cache.lock().remove(parent);
+        namespace_mutations.record_insertion(parent, name, attr.ino, std::iter::empty());
         self.sync_meta().request_eager_flush();
         Ok(attr)
     }
@@ -10442,10 +10496,10 @@ impl StudioVfs {
     }
 
     async fn unlink_inner(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+        let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         if self.unlink_ignored_entry(parent, name) || self.ignored_dir_attr(parent).is_some() {
-            self.bump_namespace_for_parents([parent]);
-            self.dentry_cache_insert_negative(parent, name);
+            namespace_mutations.record_removal(parent, name, std::iter::empty());
             return Ok(());
         }
 
@@ -10484,8 +10538,7 @@ impl StudioVfs {
                 ino, open_handles
             );
 
-            // Invalidate read-through cache (name no longer resolves)
-            self.state.namespace.attr_read_cache.lock().remove(ino);
+            namespace_mutations.record_removal(parent, name, [ino]);
         } else {
             // No open handles — immediate full cleanup via meta.unlink()
             let attr = match meta.unlink(parent, name) {
@@ -10543,10 +10596,8 @@ impl StudioVfs {
                 );
             }
 
-            self.state.namespace.attr_read_cache.lock().remove(attr.ino);
+            namespace_mutations.record_removal(parent, name, [attr.ino]);
         }
-        self.bump_namespace_for_parents([parent]);
-        self.dentry_cache_insert_negative(parent, name);
 
         meta.request_eager_flush();
         Ok(())
@@ -10558,10 +10609,10 @@ impl StudioVfs {
     /// non-delete cleanup this namespace mutation is not a defer/coalesce
     /// candidate.
     pub fn rmdir(&self, parent: Ino, name: &[u8]) -> VfsResult<()> {
+        let namespace_mutations = self.namespace_mutations();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         if self.unlink_ignored_subtree(parent, name) || self.ignored_dir_attr(parent).is_some() {
-            self.bump_namespace_for_parents([parent]);
-            self.dentry_cache_insert_negative(parent, name);
+            namespace_mutations.record_removal(parent, name, std::iter::empty());
             return Ok(());
         }
         let removed = self
@@ -10570,13 +10621,10 @@ impl StudioVfs {
             .ok()
             .map(|entry| entry.ino);
         self.sync_meta().rmdir(parent, name)?;
-        self.bump_namespace_for_parents([parent]);
+        namespace_mutations.record_removal(parent, name, std::iter::empty());
         if let Some(removed_ino) = removed {
             self.bump_directory_generation(removed_ino);
         }
-        self.dentry_cache_insert_negative(parent, name);
-        // Invalidate parent directory's read-through cache (entry count changed)
-        self.state.namespace.attr_read_cache.lock().remove(parent);
         self.sync_meta().request_eager_flush();
         Ok(())
     }
@@ -10603,6 +10651,7 @@ impl StudioVfs {
         new_parent: Ino,
         new_name: &[u8],
     ) -> VfsResult<()> {
+        let namespace_mutations = self.namespace_mutations();
         let meta = self.sync_meta();
         self.enforce_access(parent, AccessLevel::ReadWrite)?;
         self.enforce_access(new_parent, AccessLevel::ReadWrite)?;
@@ -10660,10 +10709,14 @@ impl StudioVfs {
             return self.unlink_inner(parent, name).await;
         }
         let rename_result = meta.rename_atomic(parent, name, new_parent, new_name)?;
-        self.bump_namespace_for_parents([parent, new_parent]);
+        namespace_mutations.record_rename(
+            parent,
+            name,
+            new_parent,
+            new_name,
+            rename_result.moved_ino,
+        );
         self.bump_acl_namespace_epoch();
-        self.dentry_cache_insert_negative(parent, name);
-        self.dentry_cache_insert_positive(new_parent, new_name, rename_result.moved_ino);
         let moved_attr = meta.get_attr(rename_result.moved_ino)?;
         let moved_into_trash = moved_attr.kind == FileType::RegularFile
             && self.directory_has_probable_trash_ancestor(new_parent)?;
@@ -10703,16 +10756,6 @@ impl StudioVfs {
 
         if moved_into_trash {
             self.evict_file_cache_only(rename_result.moved_ino).await?;
-        }
-
-        // Invalidate source and dest parent directory caches
-        self.state.namespace.attr_read_cache.lock().remove(parent);
-        if parent != new_parent {
-            self.state
-                .namespace
-                .attr_read_cache
-                .lock()
-                .remove(new_parent);
         }
         meta.request_eager_flush();
         Ok(())
@@ -15044,6 +15087,56 @@ mod tests {
             let cache = vfs.state.namespace.dentry_cache.lock();
             assert_eq!(cache.entry_value(&key), Some(DentryCacheValue::Negative));
         }
+    }
+
+    #[test]
+    fn unlink_invalidates_parent_attr_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "unlink-invalidates-parent-attr-cache");
+        let dir = vfs
+            .mkdir(ROOT_INO, b"dir", 1000, 1000, 0o755)
+            .expect("mkdir dir");
+        vfs.create(dir.ino, b"gone.txt", 1000, 1000, 0o644)
+            .expect("create file");
+
+        let _ = vfs.getattr(dir.ino).expect("prime parent attr cache");
+        assert!(
+            vfs.state.namespace.attr_read_cache.lock().contains(dir.ino),
+            "parent dir should be cached before unlink"
+        );
+
+        vfs.unlink(dir.ino, b"gone.txt").expect("unlink file");
+
+        assert!(
+            !vfs.state.namespace.attr_read_cache.lock().contains(dir.ino),
+            "unlink should invalidate parent directory attr cache"
+        );
+    }
+
+    #[test]
+    fn link_invalidates_new_parent_attr_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "link-invalidates-parent-attr-cache");
+        let source = vfs
+            .create(ROOT_INO, b"source.txt", 1000, 1000, 0o644)
+            .expect("create source");
+        let dir = vfs
+            .mkdir(ROOT_INO, b"links", 1000, 1000, 0o755)
+            .expect("mkdir links");
+
+        let _ = vfs.getattr(dir.ino).expect("prime new parent attr cache");
+        assert!(
+            vfs.state.namespace.attr_read_cache.lock().contains(dir.ino),
+            "new parent dir should be cached before link"
+        );
+
+        vfs.link(source.ino, dir.ino, b"linked.txt")
+            .expect("create hardlink");
+
+        assert!(
+            !vfs.state.namespace.attr_read_cache.lock().contains(dir.ino),
+            "link should invalidate destination parent attr cache"
+        );
     }
 
     #[test]
