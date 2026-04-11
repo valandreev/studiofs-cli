@@ -27,6 +27,7 @@ mod bootstrap;
 #[path = "commit.rs"]
 mod commit;
 mod config;
+mod deletion_cleanup;
 mod file_session;
 mod handle_table;
 mod ignored_entries;
@@ -34,6 +35,7 @@ mod locking;
 mod metrics;
 mod namespace;
 mod namespace_ops;
+mod overlay;
 mod prefetch;
 mod read_path;
 mod startup;
@@ -78,6 +80,7 @@ use handle_table::HandleTable;
 use ignored_entries::IgnoredEntryRegistry;
 use locking::{DistributedFlock, FileLockState};
 use namespace::{DentryCacheValue, NamespaceState};
+use overlay::{ExtentRecordId, PendingUploadCatalog};
 use prefetch::{
     PrefetchBatch, PrefetchHintRange, PrefetchHintUpdate, PrefetchReadContext, PrefetchWorkItem,
     PrefetchWorker,
@@ -880,12 +883,6 @@ impl AttrReadCache {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ExtentRecordId {
-    object_id: u64,
-    content_epoch: u64,
-}
-
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn ingress_checkpoint_due_with_policy(
@@ -1341,12 +1338,6 @@ impl IncarnationState {
             live_extent_records: Mutex::new(std::collections::HashMap::new()),
         }
     }
-}
-
-#[derive(Debug, Clone)]
-enum PendingOverlayBlockSource {
-    Pending(Bytes),
-    Extent(u64),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2252,71 +2243,6 @@ impl Drop for ForegroundReadScope<'_> {
             self.latency_window,
         );
         self.read_state.unmark_foreground_read(now_ms);
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct PendingUploadCatalog {
-    by_block: HashMap<(Ino, u64), Vec<PendingUpload>>,
-}
-
-impl PendingUploadCatalog {
-    fn from_ops(ops: impl IntoIterator<Item = PendingUpload>) -> Self {
-        let mut catalog = Self::default();
-        for op in ops {
-            catalog.insert(op);
-        }
-        catalog
-    }
-
-    fn insert(&mut self, op: PendingUpload) {
-        self.by_block
-            .entry((op.ino, op.offset))
-            .or_default()
-            .push(op);
-    }
-
-    fn latest_extent_record(
-        &self,
-        ino: Ino,
-        offset: u64,
-        pending_content_epoch: Option<u64>,
-    ) -> Option<ExtentRecordId> {
-        self.by_block
-            .get(&(ino, offset))
-            .and_then(|ops| Self::latest_matching_op(ops, pending_content_epoch))
-            .map(|op| ExtentRecordId {
-                object_id: op.object_id,
-                content_epoch: op.content_epoch,
-            })
-    }
-
-    fn live_extents(
-        &self,
-        block_size: u32,
-        quarantined_inodes: &HashSet<Ino>,
-    ) -> Vec<(Ino, u32, u64, u64)> {
-        let mut live_extents = Vec::new();
-        for (&(ino, offset), ops) in &self.by_block {
-            if quarantined_inodes.contains(&ino) || offset % block_size as u64 != 0 {
-                continue;
-            }
-            let Some(op) = Self::latest_matching_op(ops, None) else {
-                continue;
-            };
-            let block_index = (offset / block_size as u64) as u32;
-            live_extents.push((ino, block_index, op.object_id, op.content_epoch));
-        }
-        live_extents
-    }
-
-    fn latest_matching_op(
-        ops: &[PendingUpload],
-        pending_content_epoch: Option<u64>,
-    ) -> Option<&PendingUpload> {
-        ops.iter()
-            .filter(|op| pending_content_epoch.is_none_or(|epoch| op.content_epoch == epoch))
-            .max_by_key(|op| (op.content_epoch, op.created_unix_ms, op.object_id))
     }
 }
 
@@ -3255,169 +3181,6 @@ impl StudioVfs {
         };
         self.upload_scheduler
             .set_adaptive_penalty(Duration::from_millis(next_penalty_ms));
-    }
-
-    async fn current_content_epoch_async(&self, ino: Ino) -> VfsResult<u64> {
-        if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino) {
-            return Ok(attr.content_epoch);
-        }
-        let meta = self.meta_async.clone();
-        run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-            Ok(engine.get_attr(ino)?.content_epoch)
-        })
-        .await
-    }
-
-    fn pending_content_epoch_for_inode(&self, ino: Ino) -> Option<u64> {
-        self.state
-            .incarnation
-            .inode_incarnations
-            .lock()
-            .get(&ino)
-            .and_then(|state| {
-                state
-                    .pending_incarnation
-                    .as_ref()
-                    .map(|pending| pending.content_epoch)
-            })
-    }
-
-    fn snapshot_pending_upload_index(&self) -> PendingUploadCatalog {
-        PendingUploadCatalog::from_ops(self.block_cache.snapshot_pending_uploads())
-    }
-
-    fn pending_live_extent_record(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        pending_content_epoch: Option<u64>,
-        pending_upload_index: Option<&PendingUploadCatalog>,
-    ) -> Option<ExtentRecordId> {
-        if let Some(extent) = self
-            .state
-            .incarnation
-            .live_extent_records
-            .lock()
-            .get(&(ino, block_index))
-            .copied()
-        {
-            if pending_content_epoch.is_none_or(|epoch| extent.content_epoch == epoch) {
-                return Some(extent);
-            }
-        }
-
-        let block_offset = (block_index as u64).saturating_mul(self.block_size as u64);
-        let recovered = if let Some(pending_uploads) = pending_upload_index {
-            pending_uploads.latest_extent_record(ino, block_offset, pending_content_epoch)
-        } else {
-            PendingUploadCatalog::from_ops(self.block_cache.snapshot_pending_uploads())
-                .latest_extent_record(ino, block_offset, pending_content_epoch)
-        }?;
-
-        self.state
-            .incarnation
-            .live_extent_records
-            .lock()
-            .insert((ino, block_index), recovered);
-        Some(recovered)
-    }
-
-    fn pending_overlay_block_source(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        pending_content_epoch: Option<u64>,
-        pending_upload_index: Option<&PendingUploadCatalog>,
-    ) -> Option<PendingOverlayBlockSource> {
-        // Stage 1 — WriteBuffer: newest local bytes not yet represented by
-        // committed local-backend metadata.
-        if let Some(pending_block) = self
-            .state
-            .write_buffer
-            .pending_blocks
-            .lock()
-            .get(&(ino, block_index))
-        {
-            return Some(PendingOverlayBlockSource::Pending(
-                pending_block.data.clone().freeze(),
-            ));
-        }
-        // Stage 2 — committed local cache state for the pending epoch.
-        self.pending_live_extent_record(
-            ino,
-            block_index,
-            pending_content_epoch,
-            pending_upload_index,
-        )
-        .map(|extent| PendingOverlayBlockSource::Extent(extent.object_id))
-    }
-
-    fn read_pending_overlay_block_sync(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        pending_content_epoch: Option<u64>,
-        pending_upload_index: Option<&PendingUploadCatalog>,
-    ) -> VfsResult<Option<Bytes>> {
-        let Some(source) = self.pending_overlay_block_source(
-            ino,
-            block_index,
-            pending_content_epoch,
-            pending_upload_index,
-        ) else {
-            return Ok(None);
-        };
-        Ok(match source {
-            PendingOverlayBlockSource::Pending(data) => Some(data),
-            PendingOverlayBlockSource::Extent(object_id) => self.local_block_backend.get(object_id),
-        })
-    }
-
-    async fn read_pending_overlay_block_async(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        pending_content_epoch: Option<u64>,
-        pending_upload_index: Option<&PendingUploadCatalog>,
-    ) -> VfsResult<Option<Bytes>> {
-        let Some(source) = self.pending_overlay_block_source(
-            ino,
-            block_index,
-            pending_content_epoch,
-            pending_upload_index,
-        ) else {
-            return Ok(None);
-        };
-        match source {
-            PendingOverlayBlockSource::Pending(data) => Ok(Some(data)),
-            PendingOverlayBlockSource::Extent(object_id) => {
-                self.block_store_get_async(object_id).await
-            }
-        }
-    }
-
-    fn inode_has_local_overlay(&self, ino: Ino) -> bool {
-        if self
-            .state
-            .write_buffer
-            .pending_blocks
-            .lock()
-            .keys()
-            .any(|(candidate, _)| *candidate == ino)
-        {
-            return true;
-        }
-        if self
-            .state
-            .incarnation
-            .live_extent_records
-            .lock()
-            .keys()
-            .any(|(candidate, _)| *candidate == ino)
-        {
-            return true;
-        }
-        false
     }
 
     fn inode_has_unmaterialized_overlay_for_finalize(&self, ino: Ino) -> bool {
@@ -5552,141 +5315,6 @@ impl StudioVfs {
         self.execute_last_handle_release_action(ino, action).await
     }
 
-    fn queue_pending_deletions_for_object_ids(
-        &self,
-        meta: &Arc<dyn MetaEngine>,
-        removed_ids: &[u64],
-        reason: &str,
-    ) -> VfsResult<()> {
-        if removed_ids.is_empty() {
-            return Ok(());
-        }
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        for &object_id in removed_ids {
-            meta.add_pending_deletion(object_id, timestamp)?;
-            debug!("marking object {} for deletion ({})", object_id, reason);
-        }
-        Ok(())
-    }
-
-    fn collect_deleted_inode_cleanup(
-        &self,
-        meta: &Arc<dyn MetaEngine>,
-        ino: Ino,
-        used_space_bytes: u64,
-        gc_reason: &str,
-    ) -> VfsResult<DeletedInodeCleanup> {
-        self.mark_inode_deleted_for_uploads(ino);
-
-        let removed_ids = meta.remove_file_blocks(ino)?;
-        self.queue_pending_deletions_for_object_ids(meta, &removed_ids, gc_reason)?;
-
-        if used_space_bytes > 0 {
-            meta.decr_counter(studiofs_meta::types::counters::USED_SPACE, used_space_bytes)?;
-        }
-
-        Ok(DeletedInodeCleanup {
-            removed_ids,
-            freed_bytes: used_space_bytes,
-        })
-    }
-
-    async fn collect_orphan_deleted_inode_cleanup(
-        &self,
-        ino: Ino,
-    ) -> VfsResult<DeletedInodeCleanup> {
-        self.mark_inode_deleted_for_uploads(ino);
-
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let meta = self.meta_async.clone();
-        run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-            let blocks = match engine.get_file_blocks(ino) {
-                Ok(blocks) => blocks,
-                Err(MetaError::InodeNotFound(_)) => Vec::new(),
-                Err(err) => return Err(err),
-            };
-            let freed_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
-
-            let removed_ids = match engine.remove_file_blocks(ino) {
-                Ok(ids) => ids,
-                Err(MetaError::InodeNotFound(_)) => Vec::new(),
-                Err(err) => return Err(err),
-            };
-            for &object_id in &removed_ids {
-                engine.add_pending_deletion(object_id, timestamp)?;
-            }
-
-            if freed_bytes > 0 {
-                engine.decr_counter(studiofs_meta::types::counters::USED_SPACE, freed_bytes)?;
-            }
-
-            match engine.remove_attr(ino) {
-                Ok(()) | Err(MetaError::InodeNotFound(_)) => {}
-                Err(err) => return Err(err),
-            }
-            let _ = engine.remove_deferred_delete(ino);
-
-            Ok(DeletedInodeCleanup {
-                removed_ids,
-                freed_bytes,
-            })
-        })
-        .await
-    }
-
-    async fn finalize_deleted_inode_runtime_cleanup(
-        &self,
-        ino: Ino,
-        removed_ids: Vec<u64>,
-    ) -> usize {
-        let removed_ids_len = removed_ids.len();
-
-        // Deleted inodes should never retain staged writes, even if no committed
-        // block refs existed yet. Preserve the old immediate-unlink contract by
-        // also clearing live extent identities and read-side runtime state even
-        // when no object IDs remain to evict.
-        self.clear_pending_blocks_for_inode(ino);
-        self.remove_live_extents_for_inode(ino);
-        self.readahead.evict(ino);
-        self.clear_access_tracking(ino);
-
-        if removed_ids_len > 0 {
-            self.evict_inode_from_caches(ino, &removed_ids).await;
-        }
-
-        let deferred_local_blocks = self.take_deferred_deleted_local_blocks(ino);
-        let deferred_local_blocks_len = deferred_local_blocks.len();
-        if deferred_local_blocks_len > 0 {
-            self.evict_inode_from_caches(ino, &deferred_local_blocks)
-                .await;
-        }
-
-        self.clear_inode_incarnation(ino);
-        self.state.namespace.dirty_attrs.lock().remove(&ino);
-        self.state.namespace.attr_read_cache.lock().remove(ino);
-        self.maybe_clear_deleted_inode_marker(ino);
-        deferred_local_blocks_len
-    }
-
-    async fn cleanup_deleted_inode_storage(
-        &self,
-        meta: &Arc<dyn MetaEngine>,
-        ino: Ino,
-        used_space_bytes: u64,
-        gc_reason: &str,
-    ) -> VfsResult<()> {
-        let cleanup = self.collect_deleted_inode_cleanup(meta, ino, used_space_bytes, gc_reason)?;
-        self.finalize_deleted_inode_runtime_cleanup(ino, cleanup.removed_ids)
-            .await;
-        Ok(())
-    }
-
     /// Release a handle and report whether this close owned the actual
     /// last-handle path, plus whether it had to drain local dirty state there.
     pub async fn release_fh_with_outcome(&self, fh: u64) -> VfsResult<ReleaseFhOutcome> {
@@ -5954,110 +5582,6 @@ impl StudioVfs {
                 .expect("failed to create tokio runtime for synchronous VFS operation")
                 .block_on(future)
         }
-    }
-
-    // =========================================================================
-    // Cache Eviction Helpers
-    // =========================================================================
-
-    /// Immediately evict **all** blocks for `ino` from every cache tier.
-    ///
-    /// Called by `unlink()` so that deleted file data is no longer occupying
-    /// disk / RAM space without waiting for the next background GC run.
-    async fn evict_inode_from_caches(&self, ino: Ino, object_ids: &[u64]) {
-        // L1.5 — dirty memory buffer: drain blocks buffered post-flush.
-        self.clear_pending_blocks_for_inode(ino);
-
-        self.remove_live_extents_for_inode(ino);
-
-        // Committed cache + L1/L2 upload cache: remove each object.
-        // Blocks with a pending upload are pinned — schedule deferred eviction
-        // so they are cleaned up once the upload completes (or is cancelled by
-        // the uploader when it detects the inode is deleted).
-        let mut evicted = Vec::new();
-        let mut deferred_pinned = Vec::new();
-        for &object_id in object_ids {
-            if self.block_cache.is_pinned(object_id) {
-                // Record for post-upload cleanup instead of silently skipping.
-                deferred_pinned.push(object_id);
-            } else {
-                evicted.push(object_id);
-            }
-        }
-        if !deferred_pinned.is_empty() {
-            let mut pending_evictions = self.state.upload.pending_evictions.lock();
-            for object_id in deferred_pinned.iter() {
-                pending_evictions.insert(*object_id);
-            }
-        }
-        if !evicted.is_empty() {
-            self.block_cache
-                .remove_batch_with_priority(&evicted, L2IoPriority::Background)
-                .await;
-            if let Err(error) = self.block_store_remove_batch_async(evicted.clone()).await {
-                warn!(
-                    ino,
-                    error = %error,
-                    evicted_blocks = evicted.len(),
-                        "evict_inode: local backend batch removal failed"
-                );
-            }
-        }
-        if !evicted.is_empty() || !deferred_pinned.is_empty() {
-            debug!(
-                "evict_inode: ino={} evicted {} blocks, deferred pinned={}",
-                ino,
-                evicted.len(),
-                deferred_pinned.len()
-            );
-        }
-
-        // Invalidate readahead state for this inode.
-        self.readahead.evict(ino);
-        self.clear_access_tracking(ino);
-    }
-
-    async fn evict_file_cache_only(&self, ino: Ino) -> VfsResult<()> {
-        let object_ids: Vec<u64> = self
-            .sync_meta()
-            .get_file_blocks(ino)?
-            .into_iter()
-            .map(|(_, block_ref)| block_ref.object_id)
-            .collect();
-        let mut evicted = Vec::new();
-        let mut deferred_pinned = 0;
-        let mut pending_evictions_to_add = Vec::new();
-        for object_id in object_ids {
-            if self.block_cache.is_pinned(object_id) {
-                pending_evictions_to_add.push(object_id);
-                deferred_pinned += 1;
-                continue;
-            }
-            evicted.push(object_id);
-        }
-        if !pending_evictions_to_add.is_empty() {
-            let mut pending_evictions = self.state.upload.pending_evictions.lock();
-            for object_id in pending_evictions_to_add {
-                pending_evictions.insert(object_id);
-            }
-        }
-        if !evicted.is_empty() {
-            self.block_cache
-                .remove_batch_with_priority(&evicted, L2IoPriority::Background)
-                .await;
-            self.block_store_remove_batch_async(evicted.clone()).await?;
-        }
-        if !evicted.is_empty() || deferred_pinned > 0 {
-            info!(
-                "trash-move cache eviction: ino={} evicted {} blocks, deferred pinned={}",
-                ino,
-                evicted.len(),
-                deferred_pinned
-            );
-        }
-        self.readahead.evict(ino);
-        self.clear_access_tracking(ino);
-        Ok(())
     }
 
     fn directory_has_probable_trash_ancestor(&self, dir_ino: Ino) -> VfsResult<bool> {
@@ -7269,45 +6793,6 @@ mod tests {
         let _guard = rt.enter();
         vfs.start().expect("start vfs background workers");
         (rt, vfs, meta)
-    }
-
-    #[test]
-    fn pending_live_extent_record_prefers_latest_pending_upload_for_block() {
-        let tmp = TempDir::new().expect("tempdir");
-        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "pending-live-latest");
-        let ino = 41;
-        let block_index = 0;
-        let block_offset = 0;
-        let pending_upload_index = PendingUploadCatalog::from_ops([
-            PendingUpload {
-                ino,
-                offset: block_offset,
-                object_id: 101,
-                content_epoch: 3,
-                created_unix_ms: 100,
-                retry_count: 0,
-            },
-            PendingUpload {
-                ino,
-                offset: block_offset,
-                object_id: 202,
-                content_epoch: 5,
-                created_unix_ms: 200,
-                retry_count: 0,
-            },
-        ]);
-
-        let recovered = vfs
-            .pending_live_extent_record(ino, block_index, None, Some(&pending_upload_index))
-            .expect("recover pending live extent");
-
-        assert_eq!(
-            recovered,
-            ExtentRecordId {
-                object_id: 202,
-                content_epoch: 5,
-            }
-        );
     }
 
     #[test]
