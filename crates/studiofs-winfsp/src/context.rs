@@ -700,12 +700,49 @@ impl StudioFsContext {
         })
     }
 
-    #[cfg(test)]
     fn run_cleanup_non_delete_callback(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
         self.vfs.note_winfsp_cleanup_callback();
         self.callback_barrier_state
             .note_cleanup_non_delete_deferred(&self.vfs, ino, fh);
         Ok(())
+    }
+
+    fn run_cleanup_delete_callback(&self, context: &StudioFileHandle, file_name: Option<&U16CStr>) {
+        if let Some(fname) = file_name {
+            match resolve_parent(&self.vfs, fname) {
+                Ok((parent_ino, name)) => {
+                    let res = if context.is_dir {
+                        self.vfs.rmdir(parent_ino, &name)
+                    } else {
+                        self.vfs.unlink(parent_ino, &name)
+                    };
+
+                    match res {
+                        Ok(()) => {
+                            debug!(ino = context.ino, "cleanup delete");
+                        }
+                        Err(e) if is_benign_cleanup_delete_error(&e, context.is_dir) => {
+                            debug!(
+                                ino = context.ino,
+                                is_dir = context.is_dir,
+                                error = ?e,
+                                "cleanup delete skipped stale race"
+                            );
+                        }
+                        Err(e) => {
+                            error!("cleanup delete failed: {:?}", e);
+                        }
+                    }
+                }
+                Err(_) => {
+                    debug!(
+                        ino = context.ino,
+                        is_dir = context.is_dir,
+                        "cleanup delete skipped: path already gone"
+                    );
+                }
+            }
+        }
     }
 
     fn run_flush_callback(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
@@ -1152,44 +1189,10 @@ impl FileSystemContext for StudioFsContext {
     }
 
     fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
-        self.vfs.note_winfsp_cleanup_callback();
         // FspCleanupDelete = 0x01
         if flags & 0x01 != 0 {
-            if let Some(fname) = file_name {
-                match resolve_parent(&self.vfs, fname) {
-                    Ok((parent_ino, name)) => {
-                        let res = if context.is_dir {
-                            self.vfs.rmdir(parent_ino, &name)
-                        } else {
-                            self.vfs.unlink(parent_ino, &name)
-                        };
-
-                        match res {
-                            Ok(()) => {
-                                debug!(ino = context.ino, "cleanup delete");
-                            }
-                            Err(e) if is_benign_cleanup_delete_error(&e, context.is_dir) => {
-                                debug!(
-                                    ino = context.ino,
-                                    is_dir = context.is_dir,
-                                    error = ?e,
-                                    "cleanup delete skipped stale race"
-                                );
-                            }
-                            Err(e) => {
-                                error!("cleanup delete failed: {:?}", e);
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        debug!(
-                            ino = context.ino,
-                            is_dir = context.is_dir,
-                            "cleanup delete skipped: path already gone"
-                        );
-                    }
-                }
-            }
+            self.vfs.note_winfsp_cleanup_callback();
+            self.run_cleanup_delete_callback(context, file_name);
         } else {
             // Current dirty-handle ordering is:
             //   write/overwrite -> optional flush -> cleanup(non-delete) -> close -> release_fh
@@ -1198,8 +1201,7 @@ impl FileSystemContext for StudioFsContext {
             // still counted for observability, but dirty local state stays
             // deferred until an explicit `flush` or the mandatory last-handle
             // `close`/`release_fh` fallback drain.
-            self.callback_barrier_state
-                .note_cleanup_non_delete_deferred(&self.vfs, context.ino, context.fh);
+            let _ = self.run_cleanup_non_delete_callback(context.ino, context.fh);
         }
     }
 
@@ -2152,6 +2154,107 @@ mod tests {
             vfs.open_count(attr.ino),
             0,
             "close should still release the last handle after the explicit flush path"
+        );
+    }
+
+    #[test]
+    fn nonfinal_close_preserves_deferred_cleanup_hint_until_last_handle() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_nonfinal_close_then_final");
+        let attr = vfs
+            .create(
+                ROOT_INO,
+                b"cleanup-nonfinal-close-then-final.txt",
+                0,
+                0,
+                0o644,
+            )
+            .expect("create");
+        let fh1 = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open first handle");
+        let fh2 = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open second handle");
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.write(attr.ino, 0, b"dirty").await }
+        })
+        .expect("dirty write");
+
+        let callbacks_before = winfsp_callbacks(&vfs);
+        let barriers_before = winfsp_foreground_flushes(&vfs);
+        let flush_calls_before = flush_ordered_calls(&vfs);
+
+        ctx.run_cleanup_non_delete_callback(attr.ino, fh1)
+            .expect("cleanup callback");
+        assert!(
+            ctx.has_deferred_cleanup_hint(attr.ino),
+            "cleanup should defer the barrier until the final handle closes"
+        );
+
+        ctx.run_close_callback(attr.ino, fh1);
+        let callbacks_after_first_close = winfsp_callbacks(&vfs);
+        let barriers_after_first_close = winfsp_foreground_flushes(&vfs);
+        let flush_calls_after_first_close = flush_ordered_calls(&vfs);
+        assert!(
+            ctx.has_deferred_cleanup_hint(attr.ino),
+            "closing a non-final handle must preserve the deferred cleanup hint"
+        );
+        assert_eq!(
+            callbacks_after_first_close.close,
+            callbacks_before.close + 1,
+            "non-final close should still be counted"
+        );
+        assert_eq!(
+            barriers_after_first_close.close, barriers_before.close,
+            "non-final close must not claim the last-handle fallback barrier"
+        );
+        assert_eq!(
+            barriers_after_first_close.close_skipped_clean, barriers_before.close_skipped_clean,
+            "non-final close should not look like a clean last-handle release"
+        );
+        assert_eq!(
+            flush_calls_after_first_close, flush_calls_before,
+            "non-final close must not drain dirty local state"
+        );
+        assert_eq!(
+            vfs.open_count(attr.ino),
+            1,
+            "one writable handle should remain open after the non-final close"
+        );
+
+        ctx.run_close_callback(attr.ino, fh2);
+        let callbacks_after_second_close = winfsp_callbacks(&vfs);
+        let barriers_after_second_close = winfsp_foreground_flushes(&vfs);
+        let flush_calls_after_second_close = flush_ordered_calls(&vfs);
+        assert!(
+            !ctx.has_deferred_cleanup_hint(attr.ino),
+            "the final close should consume the deferred cleanup hint"
+        );
+        assert_eq!(
+            callbacks_after_second_close.close,
+            callbacks_before.close + 2,
+            "both close callbacks should be observable"
+        );
+        assert_eq!(
+            barriers_after_second_close.close,
+            barriers_before.close + 1,
+            "the final close should own the deferred cleanup barrier"
+        );
+        assert_eq!(
+            barriers_after_second_close.close_skipped_clean, barriers_before.close_skipped_clean,
+            "dirty final close should not be classified as a clean skip"
+        );
+        assert_eq!(
+            flush_calls_after_second_close,
+            flush_calls_before + 1,
+            "the final close should drain dirty local state exactly once"
+        );
+        assert_eq!(
+            vfs.open_count(attr.ino),
+            0,
+            "all handles should be closed after the final close"
         );
     }
 
