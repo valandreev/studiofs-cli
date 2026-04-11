@@ -1017,6 +1017,12 @@ enum StickyErrorPolicy {
     Report,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirtyAttrPersistPolicy {
+    Ignore,
+    PersistIfPresent,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ReleaseFhOutcome {
     pub closed_last_handle: bool,
@@ -1026,6 +1032,19 @@ pub struct ReleaseFhOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ExplicitFlushOutcome {
     pub flushed_local_dirty_state: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct FsyncOutcome {
+    flushed_file_data: bool,
+    persisted_dirty_attrs: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct LocalSyncBarrierOutcome {
+    had_local_dirty_state: bool,
+    flushed_file_data: bool,
+    persisted_dirty_attrs: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10465,6 +10484,52 @@ impl StudioVfs {
         result
     }
 
+    async fn local_sync_barrier_with_outcome(
+        &self,
+        ino: Ino,
+        local_sync_policy: LocalSyncPolicy,
+        sticky_error_policy: StickyErrorPolicy,
+        dirty_attr_persist_policy: DirtyAttrPersistPolicy,
+    ) -> VfsResult<LocalSyncBarrierOutcome> {
+        let flushed_file_data = self.has_pending_write_buffer_blocks_for_inode(ino);
+        let had_local_dirty_state = self.inode_has_local_dirty_state(ino);
+        if had_local_dirty_state {
+            self.flush_ordered(ino, local_sync_policy).await?;
+        }
+        if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
+            self.maybe_block_store_sync_data_async(0, LocalSyncPolicy::Strict)
+                .await?;
+        }
+
+        let dirty_attr = match dirty_attr_persist_policy {
+            DirtyAttrPersistPolicy::Ignore => None,
+            DirtyAttrPersistPolicy::PersistIfPresent => {
+                self.state.namespace.dirty_attrs.lock().remove(&ino)
+            }
+        };
+        let persisted_dirty_attrs = if let Some(attr) = dirty_attr {
+            let meta = self.meta_async.clone();
+            run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                engine.set_attr(&attr)
+            })
+            .await?;
+            self.state.namespace.attr_read_cache.lock().remove(ino);
+            true
+        } else {
+            false
+        };
+
+        if matches!(sticky_error_policy, StickyErrorPolicy::Report) {
+            self.ensure_no_upload_sticky_error(ino)?;
+        }
+
+        Ok(LocalSyncBarrierOutcome {
+            had_local_dirty_state,
+            flushed_file_data,
+            persisted_dirty_attrs,
+        })
+    }
+
     async fn flush_inode_barrier_with_outcome(
         &self,
         ino: Ino,
@@ -10474,16 +10539,16 @@ impl StudioVfs {
             .enter_file_session_op(ino, FileSessionOperation::Flush)
             .await;
         let result: VfsResult<ExplicitFlushOutcome> = async {
-            let had_local_dirty_state = self.inode_has_local_dirty_state(ino);
-            if had_local_dirty_state {
-                self.flush_ordered(ino, LocalSyncPolicy::Opportunistic)
-                    .await?;
-            }
-            if matches!(sticky_error_policy, StickyErrorPolicy::Report) {
-                self.ensure_no_upload_sticky_error(ino)?;
-            }
+            let outcome = self
+                .local_sync_barrier_with_outcome(
+                    ino,
+                    LocalSyncPolicy::Opportunistic,
+                    sticky_error_policy,
+                    DirtyAttrPersistPolicy::Ignore,
+                )
+                .await?;
             Ok(ExplicitFlushOutcome {
-                flushed_local_dirty_state: had_local_dirty_state,
+                flushed_local_dirty_state: outcome.had_local_dirty_state,
             })
         }
         .await;
@@ -10512,6 +10577,39 @@ impl StudioVfs {
         self.flush_fh_with_outcome(fh).await.map(|_| ())
     }
 
+    async fn fsync_with_outcome(&self, ino: Ino, datasync: bool) -> VfsResult<FsyncOutcome> {
+        let session = self
+            .enter_file_session_op(ino, FileSessionOperation::Fsync)
+            .await;
+        let result: VfsResult<FsyncOutcome> = async {
+            self.enforce_access(ino, AccessLevel::ReadOnly)?;
+            if self.ignored_entry_attr(ino).is_some() {
+                return Ok(FsyncOutcome::default());
+            }
+
+            let outcome = self
+                .local_sync_barrier_with_outcome(
+                    ino,
+                    LocalSyncPolicy::Strict,
+                    StickyErrorPolicy::Report,
+                    if datasync {
+                        DirtyAttrPersistPolicy::Ignore
+                    } else {
+                        DirtyAttrPersistPolicy::PersistIfPresent
+                    },
+                )
+                .await?;
+            Ok(FsyncOutcome {
+                flushed_file_data: outcome.flushed_file_data,
+                persisted_dirty_attrs: outcome.persisted_dirty_attrs,
+            })
+        }
+        .await;
+        drop(session);
+        self.maybe_gc_file_session(ino);
+        result
+    }
+
     /// fsync — flush data (and optionally metadata) to durable storage.
     ///
     /// 1. Flushes pending write buffer to the dirty-mem / slab pipeline.
@@ -10519,41 +10617,7 @@ impl StudioVfs {
     ///
     /// S3 upload remains async — same as LucidLink behaviour.
     pub async fn fsync(&self, ino: Ino, datasync: bool) -> VfsResult<()> {
-        let session = self
-            .enter_file_session_op(ino, FileSessionOperation::Fsync)
-            .await;
-        let result: VfsResult<()> = async {
-            self.enforce_access(ino, AccessLevel::ReadOnly)?;
-            if self.ignored_entry_attr(ino).is_some() {
-                return Ok(());
-            }
-
-            // Flush pending write buffer
-            self.flush_ordered(ino, LocalSyncPolicy::Strict).await?;
-            self.maybe_block_store_sync_data_async(0, LocalSyncPolicy::Strict)
-                .await?;
-
-            // If full fsync (not datasync), also persist dirty attributes to redb
-            let dirty_attr = if datasync {
-                None
-            } else {
-                self.state.namespace.dirty_attrs.lock().remove(&ino)
-            };
-            if let Some(attr) = dirty_attr {
-                let meta = self.meta_async.clone();
-                run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-                    engine.set_attr(&attr)
-                })
-                .await?;
-                self.state.namespace.attr_read_cache.lock().remove(ino);
-            }
-            self.ensure_no_upload_sticky_error(ino)?;
-            Ok(())
-        }
-        .await;
-        drop(session);
-        self.maybe_gc_file_session(ino);
-        result
+        self.fsync_with_outcome(ino, datasync).await.map(|_| ())
     }
 
     /// Get information about an open file handle.
@@ -15413,6 +15477,80 @@ mod tests {
                 after.size,
                 payload.len() as u64,
                 "flush_with_outcome should still persist current dirty attrs"
+            );
+        });
+    }
+
+    #[test]
+    fn test_fsync_with_outcome_distinguishes_clean_and_dirty_data_barriers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "fsync-outcome-clean-data");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"fsync-outcome-clean-data.txt", 0, 0, 0o644)
+                .unwrap();
+            let ino = attr.ino;
+
+            let clean = vfs.fsync_with_outcome(ino, false).await.unwrap();
+            assert!(
+                !clean.flushed_file_data,
+                "clean fsync should not report a file-data barrier"
+            );
+            assert!(
+                !clean.persisted_dirty_attrs,
+                "clean fsync should not report metadata persistence work"
+            );
+
+            let payload = b"payload";
+            vfs.write(ino, 0, payload).await.unwrap();
+
+            let dirty = vfs.fsync_with_outcome(ino, false).await.unwrap();
+            assert!(
+                dirty.flushed_file_data,
+                "dirty fsync should report draining file data"
+            );
+        });
+    }
+
+    #[test]
+    fn test_datasync_with_outcome_treats_already_persisted_metadata_as_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "datasync-outcome-persisted-metadata");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"datasync-outcome-persisted-metadata.txt", 0, 0, 0o644)
+                .unwrap();
+            let ino = attr.ino;
+
+            vfs.setattr(
+                ino,
+                SetattrArgs {
+                    mtime: studiofs_meta::types::TimeSpec::Now,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            let datasync = vfs.fsync_with_outcome(ino, true).await.unwrap();
+            assert!(
+                !datasync.flushed_file_data,
+                "metadata-only datasync should not report a file-data barrier"
+            );
+            assert!(
+                !datasync.persisted_dirty_attrs,
+                "datasync should not report metadata persistence when setattr already committed it"
+            );
+
+            let full = vfs.fsync_with_outcome(ino, false).await.unwrap();
+            assert!(
+                !full.flushed_file_data,
+                "full fsync after already-persisted metadata should stay data-clean"
+            );
+            assert!(
+                !full.persisted_dirty_attrs,
+                "full fsync should not invent metadata persistence work after setattr already committed it"
             );
         });
     }
