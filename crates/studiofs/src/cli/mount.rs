@@ -26,6 +26,16 @@ struct ResolvedMountConfig {
     cache_mode: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonSpawnPlan {
+    current_exe: PathBuf,
+    args: Vec<String>,
+    log_stem: String,
+    log_path: PathBuf,
+    mount_point: String,
+    mount_point_env_key: &'static str,
+}
+
 struct WritePathObservabilityPublisher {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -216,9 +226,22 @@ fn validate_endpoint_override(endpoint: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_mount_config(principal: Option<&str>) -> anyhow::Result<ResolvedMountConfig> {
-    let mut vfs_config_raw = super::settings::load_studiofs_config()?.vfs;
-    vfs_config_raw = overlay_vfs_env(vfs_config_raw);
+fn build_mount_config_from_raw(
+    vfs_config_raw: VfsConfigRaw,
+    principal: Option<&str>,
+) -> anyhow::Result<ResolvedMountConfig> {
+    build_mount_config_from_raw_with(vfs_config_raw, principal, overlay_vfs_env)
+}
+
+fn build_mount_config_from_raw_with<F>(
+    vfs_config_raw: VfsConfigRaw,
+    principal: Option<&str>,
+    overlay_config: F,
+) -> anyhow::Result<ResolvedMountConfig>
+where
+    F: FnOnce(VfsConfigRaw) -> VfsConfigRaw,
+{
+    let mut vfs_config_raw = overlay_config(vfs_config_raw);
     if let Some(principal) = principal {
         vfs_config_raw.principal = Some(principal.to_string());
     }
@@ -842,17 +865,23 @@ pub fn run(
     snapshot_id: Option<&str>,
     endpoint: Option<&str>,
 ) -> anyhow::Result<()> {
-    let (mount_point, resolved_cache_dir, cache_size) =
-        super::settings::resolve_studiofs_config_for_mount(mount_point, cache_dir, cache_size)?;
+    let settings_config = super::settings::load_studiofs_config()?;
+    let resolved_settings = super::settings::resolve_mount_runtime_settings(
+        &settings_config,
+        mount_point,
+        cache_dir,
+        cache_size,
+    )?;
 
-    let cache_dir = resolved_cache_dir;
+    let cache_dir = resolved_settings.cache_dir;
+    let cache_size = resolved_settings.cache_size;
     let ResolvedMountConfig {
         vfs_config,
         cache_mode,
-    } = build_mount_config(principal)?;
+    } = build_mount_config_from_raw(settings_config.vfs, principal)?;
 
     validate_endpoint_override(endpoint)?;
-    let mount_point = resolve_runtime_mount_point(mount_point);
+    let mount_point = resolve_runtime_mount_point(resolved_settings.mount_point);
     let actual_mount_path = prepare_actual_mount_path(name, &mount_point)?;
 
     // ── Daemon mode: re-spawn in background and exit ────────────────────────
@@ -894,23 +923,24 @@ pub fn run(
 /// Re-execute the current process without `-d`/`--detach`, detached from the
 /// terminal. The child enables daily-rotated tracing logs under `~/.studiofs/logs/`.
 fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Result<()> {
-    // Reconstruct args, stripping the detach flag
-    let args: Vec<String> = std::env::args()
-        .skip(1) // skip program name
-        .filter(|a| a != "-d" && a != "--detach")
-        .map(|arg| arg.to_string())
-        .collect();
-
     let logs_dir = super::utils::get_logs_dir()?;
     let log_stem = daemon_log_stem(name, meta_dir)?;
-    let today = Utc::now().format("%Y-%m-%d");
-    let log_path = logs_dir.join(format!("{log_stem}.log.{today}"));
+    let today = Utc::now().format("%Y-%m-%d").to_string();
+    let current_exe = std::env::current_exe()?;
+    let plan = build_daemon_spawn_plan(
+        std::env::args().skip(1),
+        &logs_dir,
+        current_exe,
+        mount_point,
+        log_stem,
+        &today,
+    );
 
-    let exe = std::env::current_exe()?;
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.args(&args)
-        .env("STUDIOFS_DAEMON_LOG_STEM", &log_stem)
+    let mut cmd = std::process::Command::new(&plan.current_exe);
+    cmd.args(&plan.args)
+        .env("STUDIOFS_DAEMON_LOG_STEM", &plan.log_stem)
         .env("STUDIOFS_DAEMON_LOG_DIR", &logs_dir)
+        .env(plan.mount_point_env_key, &plan.mount_point)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -920,13 +950,7 @@ fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Resul
         use std::os::windows::process::CommandExt;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.env("STUDIOFS_DAEMON_MOUNT_POINT_INTERNAL", mount_point);
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
-
-    #[cfg(not(windows))]
-    {
-        cmd.env("STUDIOFS_DAEMON_MOUNT_POINT", mount_point);
     }
 
     #[cfg(unix)]
@@ -953,21 +977,67 @@ fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Resul
         "✓ Volume '{}' mounting at '{}' in background (PID: {})",
         name, mount_point, pid
     );
-    println!("  Log file: {}", log_path.display());
+    println!("  Log file: {}", plan.log_path.display());
     println!("  To unmount: studiofs umount \"{}\"", mount_point);
 
     Ok(())
+}
+
+fn build_daemon_spawn_plan<I>(
+    raw_args: I,
+    logs_dir: &Path,
+    current_exe: PathBuf,
+    mount_point: &str,
+    log_stem: String,
+    today: &str,
+) -> DaemonSpawnPlan
+where
+    I: IntoIterator<Item = String>,
+{
+    DaemonSpawnPlan {
+        current_exe,
+        args: daemon_cli_args_from(raw_args),
+        log_path: daemon_log_path(logs_dir, &log_stem, today),
+        log_stem,
+        mount_point: mount_point.to_string(),
+        mount_point_env_key: daemon_mount_point_env_key(),
+    }
+}
+
+fn daemon_cli_args_from<I>(args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    args.into_iter()
+        .filter(|arg| arg != "-d" && arg != "--detach")
+        .collect()
+}
+
+fn daemon_log_path(logs_dir: &Path, log_stem: &str, today: &str) -> PathBuf {
+    logs_dir.join(format!("{log_stem}.log.{today}"))
+}
+
+fn daemon_mount_point_env_key() -> &'static str {
+    #[cfg(windows)]
+    {
+        "STUDIOFS_DAEMON_MOUNT_POINT_INTERNAL"
+    }
+
+    #[cfg(not(windows))]
+    {
+        "STUDIOFS_DAEMON_MOUNT_POINT"
+    }
 }
 
 fn daemon_log_stem(name: &str, meta_dir: &Path) -> anyhow::Result<String> {
     let db_path = meta_dir.join(format!("{name}.db"));
     let meta = open_meta_engine(&db_path)?;
     let format_info = meta.get_format_info()?;
-    Ok(format!(
-        "{}-{}",
-        sanitize_log_component(name),
-        format_info.uuid
-    ))
+    Ok(compose_daemon_log_stem(name, &format_info.uuid))
+}
+
+fn compose_daemon_log_stem(name: &str, volume_uuid: &str) -> String {
+    format!("{}-{volume_uuid}", sanitize_log_component(name))
 }
 
 fn sanitize_log_component(raw: &str) -> String {
@@ -1170,6 +1240,109 @@ mod tests {
         let err = prepare_actual_mount_path("projectfs", r"C:\temp\studiofs")
             .expect_err("windows helper should reject directory mount points");
         assert!(err.to_string().contains("drive letters"));
+    }
+
+    #[test]
+    fn daemon_cli_args_from_strips_detach_flags_only() {
+        let args = daemon_cli_args_from(vec![
+            "mount".to_string(),
+            "demo".to_string(),
+            "-d".to_string(),
+            "--cache-size".to_string(),
+            "10GB".to_string(),
+            "--detach".to_string(),
+            "--foreground".to_string(),
+        ]);
+
+        assert_eq!(
+            args,
+            vec![
+                "mount".to_string(),
+                "demo".to_string(),
+                "--cache-size".to_string(),
+                "10GB".to_string(),
+                "--foreground".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn compose_daemon_log_stem_sanitizes_name_and_appends_uuid() {
+        assert_eq!(
+            compose_daemon_log_stem("demo volume/01", "abc-123"),
+            "demo_volume_01-abc-123"
+        );
+        assert_eq!(compose_daemon_log_stem("", "abc-123"), "volume-abc-123");
+    }
+
+    #[test]
+    fn daemon_log_path_uses_log_stem_and_date() {
+        let logs_dir = Path::new("/tmp/studiofs-logs");
+        assert_eq!(
+            daemon_log_path(logs_dir, "demo-uuid", "2026-04-11"),
+            logs_dir.join("demo-uuid.log.2026-04-11")
+        );
+    }
+
+    #[test]
+    fn build_daemon_spawn_plan_strips_detach_and_builds_log_contract() {
+        let plan = build_daemon_spawn_plan(
+            vec![
+                "mount".to_string(),
+                "demo".to_string(),
+                "-d".to_string(),
+                "--cache-size".to_string(),
+                "10GB".to_string(),
+                "--detach".to_string(),
+            ],
+            Path::new("/tmp/studiofs-logs"),
+            PathBuf::from("/tmp/studiofs.exe"),
+            "/mnt/demo",
+            "demo-uuid".to_string(),
+            "2026-04-11",
+        );
+
+        assert_eq!(plan.current_exe, PathBuf::from("/tmp/studiofs.exe"));
+        assert_eq!(
+            plan.args,
+            vec![
+                "mount".to_string(),
+                "demo".to_string(),
+                "--cache-size".to_string(),
+                "10GB".to_string(),
+            ]
+        );
+        assert_eq!(plan.log_stem, "demo-uuid");
+        assert_eq!(
+            plan.log_path,
+            Path::new("/tmp/studiofs-logs").join("demo-uuid.log.2026-04-11")
+        );
+        assert_eq!(plan.mount_point, "/mnt/demo");
+        if cfg!(windows) {
+            assert_eq!(
+                plan.mount_point_env_key,
+                "STUDIOFS_DAEMON_MOUNT_POINT_INTERNAL"
+            );
+        } else {
+            assert_eq!(plan.mount_point_env_key, "STUDIOFS_DAEMON_MOUNT_POINT");
+        }
+    }
+
+    #[test]
+    fn build_mount_config_from_raw_with_applies_principal_after_overlay_and_derives_cache_mode() {
+        let raw = VfsConfigRaw {
+            principal: Some("from-raw".to_string()),
+            ..VfsConfigRaw::default()
+        };
+
+        let resolved = build_mount_config_from_raw_with(raw, Some("from-cli"), |mut cfg| {
+            cfg.principal = Some("from-env".to_string());
+            cfg
+        })
+        .expect("config should validate");
+
+        assert_eq!(resolved.vfs_config.principal, "from-cli");
+        assert_eq!(resolved.cache_mode, "fast");
     }
 
     #[test]
