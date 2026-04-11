@@ -679,6 +679,22 @@ struct HandleCallbackLifecycle<'a> {
     context: &'a StudioFsContext,
 }
 
+struct CleanupDeleteTarget<'a> {
+    context: &'a StudioFileHandle,
+    file_name: &'a U16CStr,
+}
+
+enum CleanupCallbackAction<'a> {
+    Delete(CleanupDeleteTarget<'a>),
+    SkipDeletePath { ino: Ino, is_dir: bool },
+    NonDelete { ino: Ino, fh: u64 },
+}
+
+enum CloseCallbackAction {
+    ClearDeferredHintOnly,
+    ReleaseHandle { had_cleanup_deferred_hint: bool },
+}
+
 impl<'a> HandleCallbackLifecycle<'a> {
     fn new(context: &'a StudioFsContext) -> Self {
         Self { context }
@@ -730,39 +746,57 @@ impl<'a> HandleCallbackLifecycle<'a> {
         Ok(())
     }
 
-    fn run_close_callback(&self, ino: Ino, fh: u64) {
-        self.context.vfs.note_winfsp_close_callback();
+    fn resolve_close_callback_action(&self, ino: Ino, fh: u64) -> CloseCallbackAction {
         if fh == 0 {
-            self.context.clear_deferred_cleanup_hint(ino);
-            return;
+            return CloseCallbackAction::ClearDeferredHintOnly;
         }
 
-        let had_cleanup_deferred_hint = self
-            .context
-            .callback_barrier_state
-            .had_deferred_cleanup_hint(ino);
-        let vfs = self.context.vfs.clone();
-        let release_result = self
-            .context
-            .spawn_wait(async move { vfs.release_fh_with_outcome(fh).await });
-        if let Ok(outcome) = &release_result {
-            self.context
-                .callback_barrier_state
-                .note_close_release_success(&self.context.vfs, ino, fh, outcome);
-        }
-        if let Err(e) = release_result {
-            let hint_was_present_for_log = self
+        CloseCallbackAction::ReleaseHandle {
+            had_cleanup_deferred_hint: self
                 .context
                 .callback_barrier_state
-                .take_close_error_hint(ino, had_cleanup_deferred_hint);
-            error!(
-                ino,
-                fh,
-                cleanup_deferred = hint_was_present_for_log,
-                "release_fh failed after WinFSP close: {:?}",
-                e
-            );
+                .had_deferred_cleanup_hint(ino),
         }
+    }
+
+    fn execute_close_callback_action(&self, ino: Ino, fh: u64, action: CloseCallbackAction) {
+        match action {
+            CloseCallbackAction::ClearDeferredHintOnly => {
+                self.context.clear_deferred_cleanup_hint(ino);
+            }
+            CloseCallbackAction::ReleaseHandle {
+                had_cleanup_deferred_hint,
+            } => {
+                let vfs = self.context.vfs.clone();
+                let release_result = self
+                    .context
+                    .spawn_wait(async move { vfs.release_fh_with_outcome(fh).await });
+                if let Ok(outcome) = &release_result {
+                    self.context
+                        .callback_barrier_state
+                        .note_close_release_success(&self.context.vfs, ino, fh, outcome);
+                }
+                if let Err(e) = release_result {
+                    let hint_was_present_for_log = self
+                        .context
+                        .callback_barrier_state
+                        .take_close_error_hint(ino, had_cleanup_deferred_hint);
+                    error!(
+                        ino,
+                        fh,
+                        cleanup_deferred = hint_was_present_for_log,
+                        "release_fh failed after WinFSP close: {:?}",
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    fn run_close_callback(&self, ino: Ino, fh: u64) {
+        self.context.vfs.note_winfsp_close_callback();
+        let action = self.resolve_close_callback_action(ino, fh);
+        self.execute_close_callback_action(ino, fh, action);
     }
 }
 
@@ -815,41 +849,83 @@ impl StudioFsContext {
             .run_cleanup_non_delete_callback(ino, fh)
     }
 
-    fn run_cleanup_delete_callback(&self, context: &StudioFileHandle, file_name: Option<&U16CStr>) {
-        if let Some(fname) = file_name {
-            match resolve_parent(&self.vfs, fname) {
-                Ok((parent_ino, name)) => {
-                    let res = if context.is_dir {
-                        self.vfs.rmdir(parent_ino, &name)
-                    } else {
-                        self.vfs.unlink(parent_ino, &name)
-                    };
+    fn resolve_cleanup_callback_action<'a>(
+        &self,
+        context: &'a StudioFileHandle,
+        file_name: Option<&'a U16CStr>,
+        flags: u32,
+    ) -> CleanupCallbackAction<'a> {
+        if flags & 0x01 != 0 {
+            if let Some(file_name) = file_name {
+                return CleanupCallbackAction::Delete(CleanupDeleteTarget { context, file_name });
+            }
+            return CleanupCallbackAction::SkipDeletePath {
+                ino: context.ino,
+                is_dir: context.is_dir,
+            };
+        }
 
-                    match res {
-                        Ok(()) => {
-                            debug!(ino = context.ino, "cleanup delete");
-                        }
-                        Err(e) if is_benign_cleanup_delete_error(&e, context.is_dir) => {
-                            debug!(
-                                ino = context.ino,
-                                is_dir = context.is_dir,
-                                error = ?e,
-                                "cleanup delete skipped stale race"
-                            );
-                        }
-                        Err(e) => {
-                            error!("cleanup delete failed: {:?}", e);
-                        }
+        CleanupCallbackAction::NonDelete {
+            ino: context.ino,
+            fh: context.fh,
+        }
+    }
+
+    fn execute_cleanup_delete_target(&self, target: CleanupDeleteTarget<'_>) {
+        match resolve_parent(&self.vfs, target.file_name) {
+            Ok((parent_ino, name)) => {
+                let res = if target.context.is_dir {
+                    self.vfs.rmdir(parent_ino, &name)
+                } else {
+                    self.vfs.unlink(parent_ino, &name)
+                };
+
+                match res {
+                    Ok(()) => {
+                        debug!(ino = target.context.ino, "cleanup delete");
+                    }
+                    Err(e) if is_benign_cleanup_delete_error(&e, target.context.is_dir) => {
+                        debug!(
+                            ino = target.context.ino,
+                            is_dir = target.context.is_dir,
+                            error = ?e,
+                            "cleanup delete skipped stale race"
+                        );
+                    }
+                    Err(e) => {
+                        error!("cleanup delete failed: {:?}", e);
                     }
                 }
-                Err(_) => {
-                    debug!(
-                        ino = context.ino,
-                        is_dir = context.is_dir,
-                        "cleanup delete skipped: path already gone"
-                    );
-                }
             }
+            Err(_) => {
+                debug!(
+                    ino = target.context.ino,
+                    is_dir = target.context.is_dir,
+                    "cleanup delete skipped: path already gone"
+                );
+            }
+        }
+    }
+
+    fn execute_cleanup_callback_action(&self, action: CleanupCallbackAction<'_>) {
+        match action {
+            CleanupCallbackAction::Delete(target) => {
+                self.vfs.note_winfsp_cleanup_callback();
+                self.run_cleanup_delete_callback(target.context, Some(target.file_name));
+            }
+            CleanupCallbackAction::SkipDeletePath { ino, is_dir } => {
+                self.vfs.note_winfsp_cleanup_callback();
+                debug!(ino, is_dir, "cleanup delete skipped: no path provided");
+            }
+            CleanupCallbackAction::NonDelete { ino, fh } => {
+                let _ = self.run_cleanup_non_delete_callback(ino, fh);
+            }
+        }
+    }
+
+    fn run_cleanup_delete_callback(&self, context: &StudioFileHandle, file_name: Option<&U16CStr>) {
+        if let Some(file_name) = file_name {
+            self.execute_cleanup_delete_target(CleanupDeleteTarget { context, file_name });
         }
     }
 
@@ -1262,20 +1338,15 @@ impl FileSystemContext for StudioFsContext {
     }
 
     fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
-        // FspCleanupDelete = 0x01
-        if flags & 0x01 != 0 {
-            self.vfs.note_winfsp_cleanup_callback();
-            self.run_cleanup_delete_callback(context, file_name);
-        } else {
-            // Current dirty-handle ordering is:
-            //   write/overwrite -> optional flush -> cleanup(non-delete) -> close -> release_fh
-            //
-            // Non-delete `cleanup` no longer owns a foreground barrier. It is
-            // still counted for observability, but dirty local state stays
-            // deferred until an explicit `flush` or the mandatory last-handle
-            // `close`/`release_fh` fallback drain.
-            let _ = self.run_cleanup_non_delete_callback(context.ino, context.fh);
-        }
+        // Current dirty-handle ordering is:
+        //   write/overwrite -> optional flush -> cleanup(non-delete) -> close -> release_fh
+        //
+        // Non-delete `cleanup` no longer owns a foreground barrier. It is
+        // still counted for observability, but dirty local state stays
+        // deferred until an explicit `flush` or the mandatory last-handle
+        // `close`/`release_fh` fallback drain.
+        let action = self.resolve_cleanup_callback_action(context, file_name, flags);
+        self.execute_cleanup_callback_action(action);
     }
 
     fn overwrite(
