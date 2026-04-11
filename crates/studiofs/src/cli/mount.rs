@@ -44,6 +44,12 @@ struct MountStartupContext {
     launch_mode: MountLaunchMode,
 }
 
+struct MountMetaSession {
+    meta: Arc<dyn MetaEngine>,
+    format_info: FormatInfo,
+    read_only_mount: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DaemonSpawnPlan {
     current_exe: PathBuf,
@@ -698,19 +704,15 @@ struct PreparedMountRuntime {
 
 impl PreparedMountRuntime {
     fn print_ready(&self, requested_name: &str, cache_size: &str, snapshot_id: Option<&str>) {
-        println!(
-            "✓ Volume '{}' ready to mount at '{}'",
-            requested_name, self.actual_mount_path
-        );
-        println!("  Cache size:   {}", cache_size);
-        println!("  Cache path:   {}", self.cache_path_str);
-        println!(
-            "  Storage:      {} / {}",
-            self.format_info.endpoint, self.format_info.bucket
-        );
-        println!("  Invalidation: PostgreSQL sync");
-        if let Some(snapshot_id) = snapshot_id {
-            println!("  Snapshot:     {} (read-only)", snapshot_id);
+        for line in build_ready_banner_lines(
+            requested_name,
+            &self.actual_mount_path,
+            cache_size,
+            &self.cache_path_str,
+            &self.format_info,
+            snapshot_id,
+        ) {
+            println!("{line}");
         }
     }
 
@@ -739,8 +741,13 @@ impl PreparedMountRuntime {
                 self.profiling.take(),
             );
             self.write_path_observability_publisher.stop_and_join();
-            mount_result.map_err(|e| anyhow::anyhow!("WinFSP error: {e}"))?;
-            let _ = super::utils::remove_pid_file(&self.actual_mount_path);
+            finalize_mount_serve_result(
+                "WinFSP",
+                &self.actual_mount_path,
+                true,
+                mount_result,
+                super::utils::remove_pid_file,
+            )?;
         }
 
         #[cfg(unix)]
@@ -756,7 +763,13 @@ impl PreparedMountRuntime {
                 self.profiling.take(),
             );
             self.write_path_observability_publisher.stop_and_join();
-            mount_result.map_err(|e| anyhow::anyhow!("FUSE error: {e}"))?;
+            finalize_mount_serve_result(
+                "FUSE",
+                &self.actual_mount_path,
+                false,
+                mount_result,
+                super::utils::remove_pid_file,
+            )?;
             // Note: FUSE mount_and_serve calls process::exit(0), so this is unreachable.
             // PID file is cleaned up by the umount command or overwritten on next mount.
         }
@@ -802,20 +815,55 @@ where
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn prepare_mount_runtime(
+fn build_ready_banner_lines(
+    requested_name: &str,
+    actual_mount_path: &str,
+    cache_size: &str,
+    cache_path_str: &str,
+    format_info: &FormatInfo,
+    snapshot_id: Option<&str>,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!(
+            "✓ Volume '{}' ready to mount at '{}'",
+            requested_name, actual_mount_path
+        ),
+        format!("  Cache size:   {cache_size}"),
+        format!("  Cache path:   {cache_path_str}"),
+        format!(
+            "  Storage:      {} / {}",
+            format_info.endpoint, format_info.bucket
+        ),
+        "  Invalidation: PostgreSQL sync".to_string(),
+    ];
+    if let Some(snapshot_id) = snapshot_id {
+        lines.push(format!("  Snapshot:     {snapshot_id} (read-only)"));
+    }
+    lines
+}
+
+fn finalize_mount_serve_result<E, RemovePid>(
+    backend_name: &str,
+    actual_mount_path: &str,
+    remove_pid_on_success: bool,
+    result: Result<(), E>,
+    remove_pid_file: RemovePid,
+) -> anyhow::Result<()>
+where
+    E: std::fmt::Display,
+    RemovePid: FnOnce(&str) -> anyhow::Result<()>,
+{
+    result.map_err(|error| anyhow::anyhow!("{backend_name} error: {error}"))?;
+    if remove_pid_on_success {
+        let _ = remove_pid_file(actual_mount_path);
+    }
+    Ok(())
+}
+
+fn open_live_mount_meta(
     name: &str,
     meta_dir: &Path,
-    cache_dir: &Path,
-    cache_size: &str,
-    profile: Option<super::mount_profile_types::MountProfileMode>,
-    snapshot_id: Option<&str>,
-    endpoint: Option<&str>,
-    cache_mode: &str,
-    vfs_config: studiofs_vfs::VfsConfigValidated,
-    actual_mount_path: &str,
-    run_in_foreground: bool,
-) -> anyhow::Result<PreparedMountRuntime> {
+) -> anyhow::Result<(Arc<dyn MetaEngine>, FormatInfo)> {
     let db_path = meta_dir.join(format!("{name}.db"));
     debug!("opening volume {name:?} from {db_path:?}");
     let live_meta = open_meta_engine(&db_path)?;
@@ -834,34 +882,49 @@ fn prepare_mount_runtime(
         return Err(anyhow::anyhow!("metadata consistency check failed: {e}"));
     }
 
-    let mut format_info = live_meta.get_format_info()?;
-    let (meta, read_only_mount) = if let Some(snapshot_id) = snapshot_id {
-        let snapshot = live_meta
-            .get_snapshot(snapshot_id)?
-            .ok_or_else(|| anyhow::anyhow!("snapshot '{snapshot_id}' not found"))?;
-        if snapshot.snapshot_payload.is_empty() {
-            anyhow::bail!("snapshot '{snapshot_id}' payload is empty");
-        }
-        let snapshot_state: RedbSnapshot = serde_json::from_slice(&snapshot.snapshot_payload)
-            .map_err(|e| anyhow::anyhow!("invalid snapshot payload for '{snapshot_id}': {e}"))?;
+    let format_info = live_meta.get_format_info()?;
+    Ok((live_meta, format_info))
+}
 
-        let snapshot_dir = meta_dir.join("snapshots");
-        std::fs::create_dir_all(&snapshot_dir)?;
-        let snapshot_db_path = snapshot_dir.join(format!("{name}.{snapshot_id}.db"));
-        if snapshot_db_path.exists() {
-            let _ = std::fs::remove_file(&snapshot_db_path);
-        }
-        let snapshot_engine = RedbMetaEngine::open(&snapshot_db_path)?;
-        format_info.metadata.backend = MetadataBackend::RedbLocal;
-        format_info.metadata.postgres = None;
-        snapshot_engine.set_format_info(&format_info)?;
-        snapshot_engine.import_snapshot(&snapshot_state)?;
+fn materialize_snapshot_mount_meta(
+    name: &str,
+    meta_dir: &Path,
+    live_meta: Arc<dyn MetaEngine>,
+    mut format_info: FormatInfo,
+    snapshot_id: &str,
+) -> anyhow::Result<MountMetaSession> {
+    let snapshot = live_meta
+        .get_snapshot(snapshot_id)?
+        .ok_or_else(|| anyhow::anyhow!("snapshot '{snapshot_id}' not found"))?;
+    if snapshot.snapshot_payload.is_empty() {
+        anyhow::bail!("snapshot '{snapshot_id}' payload is empty");
+    }
+    let snapshot_state: RedbSnapshot = serde_json::from_slice(&snapshot.snapshot_payload)
+        .map_err(|e| anyhow::anyhow!("invalid snapshot payload for '{snapshot_id}': {e}"))?;
 
-        (Arc::new(snapshot_engine) as Arc<dyn MetaEngine>, true)
-    } else {
-        (live_meta, false)
-    };
+    let snapshot_dir = meta_dir.join("snapshots");
+    std::fs::create_dir_all(&snapshot_dir)?;
+    let snapshot_db_path = snapshot_dir.join(format!("{name}.{snapshot_id}.db"));
+    if snapshot_db_path.exists() {
+        let _ = std::fs::remove_file(&snapshot_db_path);
+    }
+    let snapshot_engine = RedbMetaEngine::open(&snapshot_db_path)?;
+    format_info.metadata.backend = MetadataBackend::RedbLocal;
+    format_info.metadata.postgres = None;
+    snapshot_engine.set_format_info(&format_info)?;
+    snapshot_engine.import_snapshot(&snapshot_state)?;
 
+    Ok(MountMetaSession {
+        meta: Arc::new(snapshot_engine),
+        format_info,
+        read_only_mount: true,
+    })
+}
+
+fn apply_mount_endpoint_override(
+    mut format_info: FormatInfo,
+    endpoint: Option<&str>,
+) -> FormatInfo {
     if let Some(endpoint) = endpoint {
         info!(
             original_endpoint = %format_info.endpoint,
@@ -870,11 +933,55 @@ fn prepare_mount_runtime(
         );
         format_info.endpoint = endpoint.to_string();
     }
+    format_info
+}
+
+fn resolve_mount_meta_session(
+    name: &str,
+    meta_dir: &Path,
+    snapshot_id: Option<&str>,
+    endpoint: Option<&str>,
+) -> anyhow::Result<MountMetaSession> {
+    let (live_meta, format_info) = open_live_mount_meta(name, meta_dir)?;
+    let mut session = if let Some(snapshot_id) = snapshot_id {
+        materialize_snapshot_mount_meta(name, meta_dir, live_meta, format_info, snapshot_id)?
+    } else {
+        MountMetaSession {
+            meta: live_meta,
+            format_info,
+            read_only_mount: false,
+        }
+    };
+
+    session.format_info = apply_mount_endpoint_override(session.format_info, endpoint);
 
     info!(
         "mounting volume '{}' (storage: endpoint={}, bucket={})",
-        format_info.name, format_info.endpoint, format_info.bucket
+        session.format_info.name, session.format_info.endpoint, session.format_info.bucket
     );
+
+    Ok(session)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_mount_runtime(
+    name: &str,
+    meta_dir: &Path,
+    cache_dir: &Path,
+    cache_size: &str,
+    profile: Option<super::mount_profile_types::MountProfileMode>,
+    snapshot_id: Option<&str>,
+    endpoint: Option<&str>,
+    cache_mode: &str,
+    vfs_config: studiofs_vfs::VfsConfigValidated,
+    actual_mount_path: &str,
+    run_in_foreground: bool,
+) -> anyhow::Result<PreparedMountRuntime> {
+    let MountMetaSession {
+        meta,
+        format_info,
+        read_only_mount,
+    } = resolve_mount_meta_session(name, meta_dir, snapshot_id, endpoint)?;
 
     let data_config = DataStoreConfig::from(&format_info);
     let block_cache_l1_limit = initial_cache_bytes();
@@ -1134,6 +1241,7 @@ mod tests {
     use super::*;
     use crate::cli::settings;
     use crate::cli::utils;
+    use studiofs_meta::{MetaFormat, MetaSnapshots, ROOT_INO, RedbMetaEngine};
 
     #[test]
     fn validate_endpoint_override_accepts_http_urls_and_bare_host_port() {
@@ -1426,6 +1534,111 @@ mod tests {
         assert_eq!(resolved.cache_mode, "fast");
     }
 
+    fn seed_mount_meta_db(
+        temp: &tempfile::TempDir,
+        name: &str,
+    ) -> (PathBuf, Arc<RedbMetaEngine>, FormatInfo) {
+        let meta_dir = temp.path().join("meta");
+        std::fs::create_dir_all(&meta_dir).expect("create meta dir");
+        let db_path = meta_dir.join(format!("{name}.db"));
+        let engine = Arc::new(RedbMetaEngine::open(&db_path).expect("open redb"));
+        let format_info = FormatInfo {
+            name: name.to_string(),
+            uuid: format!("{name}-uuid"),
+            endpoint: "https://storage.example".to_string(),
+            bucket: "bucket-demo".to_string(),
+            ..FormatInfo::default()
+        };
+        engine
+            .set_format_info(&format_info)
+            .expect("set format info");
+        engine.init_root(0, 0).expect("init root");
+        (meta_dir, engine, format_info)
+    }
+
+    #[test]
+    fn mount_meta_session_uses_live_metadata_when_snapshot_id_is_none() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (meta_dir, engine, format_info) = seed_mount_meta_db(&temp, "demo");
+        drop(engine);
+
+        let session =
+            resolve_mount_meta_session("demo", &meta_dir, None, None).expect("resolve live meta");
+
+        assert!(!session.read_only_mount);
+        assert_eq!(session.format_info.uuid, format_info.uuid);
+        assert_eq!(session.format_info.endpoint, format_info.endpoint);
+        let observed = session.meta.get_format_info().expect("meta format info");
+        assert_eq!(observed.uuid, format_info.uuid);
+    }
+
+    #[test]
+    fn mount_meta_session_materializes_snapshot_engine_and_marks_read_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (meta_dir, engine, format_info) = seed_mount_meta_db(&temp, "demo");
+        let snapshot = engine.create_snapshot(ROOT_INO).expect("create snapshot");
+        drop(engine);
+
+        let session = resolve_mount_meta_session("demo", &meta_dir, Some(&snapshot.id), None)
+            .expect("resolve snapshot meta");
+
+        assert!(session.read_only_mount);
+        assert_eq!(session.format_info.uuid, format_info.uuid);
+        assert_eq!(
+            session.format_info.metadata.backend,
+            MetadataBackend::RedbLocal
+        );
+        assert!(session.format_info.metadata.postgres.is_none());
+        assert!(
+            meta_dir
+                .join("snapshots")
+                .join(format!("demo.{}.db", snapshot.id))
+                .exists(),
+            "snapshot helper should materialize a local redb mount db"
+        );
+        let observed = session
+            .meta
+            .get_format_info()
+            .expect("snapshot format info");
+        assert_eq!(observed.metadata.backend, MetadataBackend::RedbLocal);
+        assert!(observed.metadata.postgres.is_none());
+    }
+
+    #[test]
+    fn mount_meta_session_rejects_missing_snapshot_id_before_runtime_bootstrap() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (meta_dir, engine, _format_info) = seed_mount_meta_db(&temp, "demo");
+        drop(engine);
+
+        let err =
+            match resolve_mount_meta_session("demo", &meta_dir, Some("missing-snapshot"), None) {
+                Ok(_) => panic!("missing snapshot should fail"),
+                Err(err) => err,
+            };
+
+        assert!(
+            err.to_string()
+                .contains("snapshot 'missing-snapshot' not found")
+        );
+        assert!(
+            !meta_dir.join("snapshots").exists(),
+            "missing snapshot should fail before snapshot db materialization"
+        );
+    }
+
+    #[test]
+    fn mount_meta_session_applies_endpoint_override_to_runtime_format_info() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (meta_dir, engine, _format_info) = seed_mount_meta_db(&temp, "demo");
+        drop(engine);
+
+        let session =
+            resolve_mount_meta_session("demo", &meta_dir, None, Some("http://127.0.0.1:9000"))
+                .expect("resolve meta with endpoint override");
+
+        assert_eq!(session.format_info.endpoint, "http://127.0.0.1:9000");
+    }
+
     fn startup_settings_config(
         mount_point: String,
         cache_dir: Option<PathBuf>,
@@ -1554,6 +1767,81 @@ mod tests {
                 "invalid endpoint should fail before mount-path materialization"
             );
         }
+    }
+
+    #[test]
+    fn build_ready_banner_lines_includes_storage_and_optional_snapshot() {
+        let format_info = FormatInfo {
+            endpoint: "https://storage.example".to_string(),
+            bucket: "bucket-demo".to_string(),
+            ..FormatInfo::default()
+        };
+
+        let lines = build_ready_banner_lines(
+            "demo",
+            "/mnt/demo",
+            "64GB",
+            "/cache/demo",
+            &format_info,
+            Some("snap-1"),
+        );
+
+        assert_eq!(lines[0], "✓ Volume 'demo' ready to mount at '/mnt/demo'");
+        assert_eq!(lines[1], "  Cache size:   64GB");
+        assert_eq!(lines[2], "  Cache path:   /cache/demo");
+        assert_eq!(
+            lines[3],
+            "  Storage:      https://storage.example / bucket-demo"
+        );
+        assert_eq!(lines[4], "  Invalidation: PostgreSQL sync");
+        assert_eq!(lines[5], "  Snapshot:     snap-1 (read-only)");
+
+        let no_snapshot = build_ready_banner_lines(
+            "demo",
+            "/mnt/demo",
+            "64GB",
+            "/cache/demo",
+            &format_info,
+            None,
+        );
+        assert_eq!(no_snapshot.len(), 5);
+    }
+
+    #[test]
+    fn finalize_mount_serve_result_cleans_pid_on_success() {
+        let mut cleaned = None;
+        finalize_mount_serve_result(
+            "WinFSP",
+            "/mnt/demo",
+            true,
+            Ok::<(), std::io::Error>(()),
+            |path| {
+                cleaned = Some(path.to_string());
+                Ok(())
+            },
+        )
+        .expect("serve success");
+
+        assert_eq!(cleaned.as_deref(), Some("/mnt/demo"));
+    }
+
+    #[test]
+    fn finalize_mount_serve_result_maps_errors_without_cleanup() {
+        let mut cleaned = false;
+        let err = finalize_mount_serve_result(
+            "FUSE",
+            "/mnt/demo",
+            true,
+            Err::<(), _>(std::io::Error::other("boom")),
+            |_| {
+                cleaned = true;
+                Ok(())
+            },
+        )
+        .expect_err("serve error should bubble");
+
+        assert!(err.to_string().contains("FUSE error: boom"));
+        assert!(!cleaned, "cleanup should not run on failed mount serve");
     }
 
     #[test]
