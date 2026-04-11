@@ -37,8 +37,8 @@ use crate::qos::{FairInodeScheduler, QosController, TransitMemoryBudget};
 use crate::readahead::{DirAccessTracker, ReadAheadTracker, ReadStreamKey};
 
 use crate::runtime::{
-    LocalCacheIoTiming, TimeoutOrCancel, local_cache_io_execution_model, run_local_cache_io,
-    run_local_cache_io_blocking, run_meta, run_with_timeout_or_cancel,
+    LocalCacheIoTiming, MetaExecutor, TimeoutOrCancel, local_cache_io_execution_model,
+    run_local_cache_io, run_local_cache_io_blocking, run_meta, run_with_timeout_or_cancel,
 };
 use crate::vfs::write_buffer::WriteBufferState;
 use bytes::{Buf, Bytes, BytesMut};
@@ -3998,6 +3998,8 @@ impl StartupState {
 pub struct StudioVfs {
     /// Async boundary for metadata operations.
     meta_async: Arc<dyn AsyncMetaEngine>,
+    /// Preferred metadata execution boundary for new call sites.
+    meta: MetaExecutor,
     /// Data store for writes (uploads, deletes, GC).
     data_write: Arc<DataStore>,
     /// Shared local block backend used by the foreground read path.
@@ -5357,6 +5359,7 @@ impl StudioVfs {
             );
 
             let vfs = Arc::new(Self {
+                meta: MetaExecutor::new(meta_async.clone()),
                 meta_async,
                 data_write,
                 local_block_backend: block_store,
@@ -8167,10 +8170,10 @@ impl StudioVfs {
     /// acceptable (for example, inside `run_meta` closures, sync VFS entrypoints,
     /// or guarded `block_in_place` sections).
     ///
-    /// In async paths, prefer `run_meta(...)` with `self.meta_async.clone()` so
-    /// blocking work stays behind the explicit async boundary.
+    /// In async paths, prefer `self.meta.run(...)` so blocking work stays behind
+    /// one explicit metadata boundary.
     fn sync_meta(&self) -> Arc<dyn MetaEngine> {
-        self.meta_async.sync_engine()
+        self.meta.sync_view()
     }
 
     /// Get metadata engine reference.
@@ -8180,14 +8183,14 @@ impl StudioVfs {
 
     /// Get volume name.
     pub fn volume_name(&self) -> VfsResult<String> {
-        let meta = self.sync_meta();
-        Ok(meta.get_format_info()?.name)
+        self.meta
+            .run_sync(|meta| meta.get_format_info().map(|format| format.name))
     }
 
     /// Get volume UUID.
     pub fn uuid(&self) -> VfsResult<String> {
-        let meta = self.sync_meta();
-        Ok(meta.get_format_info()?.uuid)
+        self.meta
+            .run_sync(|meta| meta.get_format_info().map(|format| format.uuid))
     }
 
     /// Get block size.

@@ -11,12 +11,15 @@ use studiofs_cache::block_cache::DEFAULT_L1_SIZE;
 use studiofs_cache::v3::CacheV3Layout;
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
-use studiofs_meta::{MetaEngine, MetaFormat, MetadataBackend, RedbMetaEngine, open_meta_engine};
+use studiofs_meta::{
+    FormatInfo, MetaEngine, MetaFormat, MetadataBackend, RedbMetaEngine, open_meta_engine,
+};
 use studiofs_vfs::{StudioVfs, VfsConfigRaw, parse_size_bytes};
 use sysinfo::System;
 use tracing::{debug, info, warn};
 
 const WRITE_PATH_OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(1);
+type MountProfileFinish = Box<dyn FnMut()>;
 
 struct WritePathObservabilityPublisher {
     stop: Arc<AtomicBool>,
@@ -179,6 +182,33 @@ fn ensure_cache3_layout(cache_root: &Path) -> anyhow::Result<()> {
 
 fn prepare_cache3_runtime(cache_root: &Path) -> anyhow::Result<()> {
     ensure_cache3_layout(cache_root)
+}
+
+fn validate_endpoint_override(endpoint: Option<&str>) -> anyhow::Result<()> {
+    let Some(ep) = endpoint else {
+        return Ok(());
+    };
+
+    let parsed = url::Url::parse(ep)
+        .ok()
+        .or_else(|| url::Url::parse(&format!("http://{ep}")).ok());
+
+    let valid = parsed
+        .map(|url| {
+            let scheme = url.scheme();
+            let has_host = url.host().is_some();
+            matches!(scheme, "http" | "https") && has_host
+        })
+        .unwrap_or(false);
+
+    if !valid {
+        anyhow::bail!(
+            "invalid S3 endpoint '{}': must be an HTTP(S) URL with a host (e.g., http://192.168.1.50:9000)",
+            ep
+        );
+    }
+
+    Ok(())
 }
 
 fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
@@ -373,6 +403,247 @@ fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
     config
 }
 
+struct PreparedMountRuntime {
+    actual_mount_path: String,
+    cache_path: PathBuf,
+    cache_path_str: String,
+    format_info: FormatInfo,
+    read_only_mount: bool,
+    run_in_foreground: bool,
+    vfs: Arc<StudioVfs>,
+    rt: Arc<tokio::runtime::Runtime>,
+    profiling: Option<MountProfileFinish>,
+    write_path_observability_publisher: WritePathObservabilityPublisher,
+}
+
+impl PreparedMountRuntime {
+    fn print_ready(&self, requested_name: &str, cache_size: &str, snapshot_id: Option<&str>) {
+        println!(
+            "✓ Volume '{}' ready to mount at '{}'",
+            requested_name, self.actual_mount_path
+        );
+        println!("  Cache size:   {}", cache_size);
+        println!("  Cache path:   {}", self.cache_path_str);
+        println!(
+            "  Storage:      {} / {}",
+            self.format_info.endpoint, self.format_info.bucket
+        );
+        println!("  Invalidation: PostgreSQL sync");
+        if let Some(snapshot_id) = snapshot_id {
+            println!("  Snapshot:     {} (read-only)", snapshot_id);
+        }
+    }
+
+    fn write_pid_file(&self, requested_name: &str) {
+        let _ = super::utils::write_pid_file_with_cache_path(
+            &self.actual_mount_path,
+            requested_name,
+            std::process::id(),
+            Some(&self.cache_path),
+        );
+    }
+
+    fn serve(mut self) -> anyhow::Result<()> {
+        #[cfg(windows)]
+        {
+            let event_name = super::utils::shutdown_event_name(&self.actual_mount_path);
+            info!("starting WinFSP mount at {}", self.actual_mount_path);
+            let mount_result = studiofs_winfsp::mount_and_serve(
+                self.vfs.clone(),
+                self.rt.clone(),
+                &self.actual_mount_path,
+                &self.format_info.name,
+                self.run_in_foreground,
+                self.read_only_mount,
+                Some(&event_name),
+                self.profiling.take(),
+            );
+            self.write_path_observability_publisher.stop_and_join();
+            mount_result.map_err(|e| anyhow::anyhow!("WinFSP error: {e}"))?;
+            let _ = super::utils::remove_pid_file(&self.actual_mount_path);
+        }
+
+        #[cfg(unix)]
+        {
+            info!("starting FUSE mount at {}", self.actual_mount_path);
+            let mount_result = studiofs_fuse::mount_and_serve(
+                self.vfs.clone(),
+                self.rt.clone(),
+                &self.actual_mount_path,
+                &self.format_info.name,
+                self.run_in_foreground,
+                self.read_only_mount,
+                self.profiling.take(),
+            );
+            self.write_path_observability_publisher.stop_and_join();
+            mount_result.map_err(|e| anyhow::anyhow!("FUSE error: {e}"))?;
+            // Note: FUSE mount_and_serve calls process::exit(0), so this is unreachable.
+            // PID file is cleaned up by the umount command or overwritten on next mount.
+        }
+
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_mount_runtime(
+    name: &str,
+    meta_dir: &Path,
+    cache_dir: &Path,
+    cache_size: &str,
+    profile: Option<super::mount_profile_types::MountProfileMode>,
+    snapshot_id: Option<&str>,
+    endpoint: Option<&str>,
+    cache_mode: &str,
+    vfs_config: studiofs_vfs::VfsConfigValidated,
+    actual_mount_path: &str,
+    run_in_foreground: bool,
+) -> anyhow::Result<PreparedMountRuntime> {
+    let db_path = meta_dir.join(format!("{name}.db"));
+    debug!("opening volume {name:?} from {db_path:?}");
+    let live_meta = open_meta_engine(&db_path)?;
+
+    if let Err(e) = live_meta.check_consistency() {
+        if let studiofs_meta::engine::MetaError::UuidMismatch { local, remote } = &e {
+            let cleanup = super::utils::format_cleanup_command(name);
+            anyhow::bail!(
+                "Disk '{}' has been recreated. Your local metadata is stale and incompatible with the current remote disk.\nLocal UUID: {}\nRemote UUID: {}\n\nTo resolve this, please run the following command to clean up your local state:\n  {}",
+                name,
+                local,
+                remote,
+                cleanup
+            );
+        }
+        return Err(anyhow::anyhow!("metadata consistency check failed: {e}"));
+    }
+
+    let mut format_info = live_meta.get_format_info()?;
+    let (meta, read_only_mount) = if let Some(snapshot_id) = snapshot_id {
+        let snapshot = live_meta
+            .get_snapshot(snapshot_id)?
+            .ok_or_else(|| anyhow::anyhow!("snapshot '{snapshot_id}' not found"))?;
+        if snapshot.snapshot_payload.is_empty() {
+            anyhow::bail!("snapshot '{snapshot_id}' payload is empty");
+        }
+        let snapshot_state: RedbSnapshot = serde_json::from_slice(&snapshot.snapshot_payload)
+            .map_err(|e| anyhow::anyhow!("invalid snapshot payload for '{snapshot_id}': {e}"))?;
+
+        let snapshot_dir = meta_dir.join("snapshots");
+        std::fs::create_dir_all(&snapshot_dir)?;
+        let snapshot_db_path = snapshot_dir.join(format!("{name}.{snapshot_id}.db"));
+        if snapshot_db_path.exists() {
+            let _ = std::fs::remove_file(&snapshot_db_path);
+        }
+        let snapshot_engine = RedbMetaEngine::open(&snapshot_db_path)?;
+        format_info.metadata.backend = MetadataBackend::RedbLocal;
+        format_info.metadata.postgres = None;
+        snapshot_engine.set_format_info(&format_info)?;
+        snapshot_engine.import_snapshot(&snapshot_state)?;
+
+        (Arc::new(snapshot_engine) as Arc<dyn MetaEngine>, true)
+    } else {
+        (live_meta, false)
+    };
+
+    if let Some(endpoint) = endpoint {
+        info!(
+            original_endpoint = %format_info.endpoint,
+            override_endpoint = %endpoint,
+            "overriding S3 endpoint for this mount session"
+        );
+        format_info.endpoint = endpoint.to_string();
+    }
+
+    info!(
+        "mounting volume '{}' (storage: endpoint={}, bucket={})",
+        format_info.name, format_info.endpoint, format_info.bucket
+    );
+
+    let data_config = DataStoreConfig::from(&format_info);
+    let block_cache_l1_limit = initial_cache_bytes();
+    let cache_size_bytes = parse_positive_size_arg(cache_size)?;
+    std::fs::create_dir_all(cache_dir)?;
+
+    let cache_path = cache_dir.join(&format_info.uuid);
+    prepare_cache3_runtime(&cache_path)?;
+
+    let cache_path_str = cache_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid cache path"))?
+        .to_string();
+
+    let mount_mode = if run_in_foreground {
+        "foreground"
+    } else {
+        "daemon"
+    };
+
+    #[cfg(windows)]
+    let platform = "windows";
+    #[cfg(target_os = "macos")]
+    let platform = "macos";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let platform = "linux";
+
+    #[cfg(windows)]
+    let bridge = "winfsp";
+    #[cfg(unix)]
+    let bridge = "fuse";
+
+    let profiling = super::mount_profile::MountProfileSession::start(
+        profile,
+        name,
+        platform,
+        bridge,
+        mount_mode,
+        cache_mode,
+        &cache_path,
+    );
+    let profiling = profiling.map(|profiling| {
+        let mut profiling = Some(profiling);
+        Box::new(move || {
+            if let Some(profiling) = profiling.take() {
+                profiling.finish();
+            }
+        }) as MountProfileFinish
+    });
+
+    let rt = Arc::new(
+        tokio::runtime::Runtime::new()
+            .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?,
+    );
+    let _guard = rt.enter();
+
+    let vfs = StudioVfs::new(
+        meta,
+        &data_config,
+        &cache_path_str,
+        cache_size_bytes,
+        block_cache_l1_limit,
+        vfs_config,
+    )
+    .map_err(|e| anyhow::anyhow!("failed to init vfs: {e}"))?;
+    vfs.start()
+        .map_err(|e| anyhow::anyhow!("failed to start vfs background workers: {e}"))?;
+    let write_path_observability_publisher = WritePathObservabilityPublisher::new(
+        vfs.clone(),
+        cache_path.join(WRITE_PATH_OBSERVABILITY_FILE),
+    );
+
+    Ok(PreparedMountRuntime {
+        actual_mount_path: actual_mount_path.to_string(),
+        cache_path,
+        cache_path_str,
+        format_info,
+        read_only_mount,
+        run_in_foreground,
+        vfs,
+        rt,
+        profiling,
+        write_path_observability_publisher,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     name: &str,
@@ -402,28 +673,7 @@ pub fn run(
         .map_err(|e| anyhow::anyhow!("invalid VFS config: {e}"))?;
     let cache_mode = format!("{:?}", vfs_config.cache_safety_mode).to_ascii_lowercase();
 
-    // Validate endpoint override before any mount operations (SFS-95)
-    if let Some(ep) = endpoint {
-        // Try parsing as-is, then with http:// prefix
-        let parsed = url::Url::parse(ep)
-            .ok()
-            .or_else(|| url::Url::parse(&format!("http://{ep}")).ok());
-
-        let valid = parsed
-            .map(|url| {
-                let scheme = url.scheme();
-                let has_host = url.host().is_some();
-                matches!(scheme, "http" | "https") && has_host
-            })
-            .unwrap_or(false);
-
-        if !valid {
-            anyhow::bail!(
-                "invalid S3 endpoint '{}': must be an HTTP(S) URL with a host (e.g., http://192.168.1.50:9000)",
-                ep
-            );
-        }
-    }
+    validate_endpoint_override(endpoint)?;
 
     #[cfg(windows)]
     let mount_point = {
@@ -504,23 +754,6 @@ pub fn run(
     }
 
     let run_in_foreground = foreground || !detach;
-    let mount_mode = if run_in_foreground {
-        "foreground"
-    } else {
-        "daemon"
-    };
-
-    #[cfg(windows)]
-    let platform = "windows";
-    #[cfg(target_os = "macos")]
-    let platform = "macos";
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let platform = "linux";
-
-    #[cfg(windows)]
-    let bridge = "winfsp";
-    #[cfg(unix)]
-    let bridge = "fuse";
 
     if let Some(principal) = principal {
         // SAFETY: this happens before Tokio runtime creation, so no runtime
@@ -547,194 +780,24 @@ pub fn run(
         let _ = super::utils::remove_pid_file(&actual_mount_path);
     }
 
-    let db_path = meta_dir.join(format!("{name}.db"));
-    debug!("opening volume {name:?} from {db_path:?}");
-    let live_meta = open_meta_engine(&db_path)?;
-
-    // Validate UUID against remote store if applicable (SFS-95)
-    if let Err(e) = live_meta.check_consistency() {
-        if let studiofs_meta::engine::MetaError::UuidMismatch { local, remote } = &e {
-            let cleanup = super::utils::format_cleanup_command(name);
-            anyhow::bail!(
-                "Disk '{}' has been recreated. Your local metadata is stale and incompatible with the current remote disk.\nLocal UUID: {}\nRemote UUID: {}\n\nTo resolve this, please run the following command to clean up your local state:\n  {}",
-                name,
-                local,
-                remote,
-                cleanup
-            );
-        }
-        return Err(anyhow::anyhow!("metadata consistency check failed: {e}"));
-    }
-
-    let mut format_info = live_meta.get_format_info()?;
-    let (meta, read_only_mount) = if let Some(snapshot_id) = snapshot_id {
-        let snapshot = live_meta
-            .get_snapshot(snapshot_id)?
-            .ok_or_else(|| anyhow::anyhow!("snapshot '{snapshot_id}' not found"))?;
-        if snapshot.snapshot_payload.is_empty() {
-            anyhow::bail!("snapshot '{snapshot_id}' payload is empty");
-        }
-        let snapshot_state: RedbSnapshot = serde_json::from_slice(&snapshot.snapshot_payload)
-            .map_err(|e| anyhow::anyhow!("invalid snapshot payload for '{snapshot_id}': {e}"))?;
-
-        let snapshot_dir = meta_dir.join("snapshots");
-        std::fs::create_dir_all(&snapshot_dir)?;
-        let snapshot_db_path = snapshot_dir.join(format!("{name}.{snapshot_id}.db"));
-        if snapshot_db_path.exists() {
-            let _ = std::fs::remove_file(&snapshot_db_path);
-        }
-        let snapshot_engine = RedbMetaEngine::open(&snapshot_db_path)?;
-        format_info.metadata.backend = MetadataBackend::RedbLocal;
-        format_info.metadata.postgres = None;
-        snapshot_engine.set_format_info(&format_info)?;
-        snapshot_engine.import_snapshot(&snapshot_state)?;
-
-        (Arc::new(snapshot_engine) as Arc<dyn MetaEngine>, true)
-    } else {
-        (live_meta, false)
-    };
-
-    // Apply runtime S3 endpoint override if provided (SFS-95)
-    if let Some(endpoint) = endpoint {
-        info!(
-            original_endpoint = %format_info.endpoint,
-            override_endpoint = %endpoint,
-            "overriding S3 endpoint for this mount session"
-        );
-        format_info.endpoint = endpoint.to_string();
-    }
-
-    info!(
-        "mounting volume '{}' (storage: endpoint={}, bucket={})",
-        format_info.name, format_info.endpoint, format_info.bucket
-    );
-
-    // Set up data store config (StudioVfs creates Read + Write connections directly)
-    let data_config = DataStoreConfig::from(&format_info);
-
-    // Set up caches
-    let block_cache_l1_limit = initial_cache_bytes();
-    let cache_size_bytes = parse_positive_size_arg(&cache_size)?;
     let base_cache_path = cache_dir.unwrap_or_else(|| meta_dir.join("cache"));
-    std::fs::create_dir_all(&base_cache_path)?;
-
-    // Cache state for this volume (local backend + cache metadata) lives in this UUID dir.
-    let cache_path = base_cache_path.join(&format_info.uuid);
-    prepare_cache3_runtime(&cache_path)?;
-
-    let cache_path_str = cache_path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("invalid cache path"))?;
-
-    let profiling = super::mount_profile::MountProfileSession::start(
+    let runtime = prepare_mount_runtime(
+        name,
+        meta_dir,
+        &base_cache_path,
+        &cache_size,
         profile,
-        name,
-        platform,
-        bridge,
-        mount_mode,
+        snapshot_id,
+        endpoint,
         &cache_mode,
-        &cache_path,
-    );
-    let profiling = profiling.map(|profiling| {
-        let mut profiling = Some(profiling);
-        Box::new(move || {
-            if let Some(profiling) = profiling.take() {
-                profiling.finish();
-            }
-        }) as Box<dyn FnMut()>
-    });
-
-    // Create a tokio runtime for async ops in FUSE callbacks and background tasks
-    let rt = Arc::new(
-        tokio::runtime::Runtime::new()
-            .map_err(|e| anyhow::anyhow!("failed to create tokio runtime: {e}"))?,
-    );
-    let _guard = rt.enter();
-
-    // Create VFS.
-    let vfs = StudioVfs::new(
-        meta.clone(),
-        &data_config,
-        cache_path_str,
-        cache_size_bytes,
-        block_cache_l1_limit,
         vfs_config,
-    )
-    .map_err(|e| anyhow::anyhow!("failed to init vfs: {e}"))?;
-    vfs.start()
-        .map_err(|e| anyhow::anyhow!("failed to start vfs background workers: {e}"))?;
-    let mut write_path_observability_publisher = WritePathObservabilityPublisher::new(
-        vfs.clone(),
-        cache_path.join(WRITE_PATH_OBSERVABILITY_FILE),
-    );
-
-    println!(
-        "✓ Volume '{}' ready to mount at '{}'",
-        name, actual_mount_path
-    );
-    println!("  Cache size:   {}", cache_size);
-    println!("  Cache path:   {}", cache_path_str);
-    println!(
-        "  Storage:      {} / {}",
-        format_info.endpoint, format_info.bucket
-    );
-    println!("  Invalidation: PostgreSQL sync");
-    if let Some(snapshot_id) = snapshot_id {
-        println!("  Snapshot:     {} (read-only)", snapshot_id);
-    }
-
-    // Background tasks are started explicitly after StudioVfs construction.
-
-    // Write PID file so `studiofs umount` can find us
-    let _ = super::utils::write_pid_file_with_cache_path(
         &actual_mount_path,
-        name,
-        std::process::id(),
-        Some(&cache_path),
-    );
+        run_in_foreground,
+    )?;
 
-    // Start platform-specific FUSE mount
-    #[cfg(windows)]
-    {
-        // Named event for external graceful shutdown (used by `studiofs umount`).
-        let event_name = super::utils::shutdown_event_name(&actual_mount_path);
-        info!("starting WinFSP mount at {actual_mount_path}");
-        let mount_result = studiofs_winfsp::mount_and_serve(
-            vfs,
-            rt,
-            &actual_mount_path,
-            &format_info.name,
-            run_in_foreground,
-            read_only_mount,
-            Some(&event_name),
-            profiling,
-        );
-        write_path_observability_publisher.stop_and_join();
-        mount_result.map_err(|e| anyhow::anyhow!("WinFSP error: {e}"))?;
-
-        // WinFSP returns normally — clean up PID file
-        let _ = super::utils::remove_pid_file(&actual_mount_path);
-    }
-
-    #[cfg(unix)]
-    {
-        info!("starting FUSE mount at {actual_mount_path}");
-        let mount_result = studiofs_fuse::mount_and_serve(
-            vfs,
-            rt,
-            &actual_mount_path,
-            &format_info.name,
-            run_in_foreground,
-            read_only_mount,
-            profiling,
-        );
-        write_path_observability_publisher.stop_and_join();
-        mount_result.map_err(|e| anyhow::anyhow!("FUSE error: {e}"))?;
-        // Note: FUSE mount_and_serve calls process::exit(0), so this is unreachable.
-        // PID file is cleaned up by the umount command or overwritten on next mount.
-    }
-
-    Ok(())
+    runtime.print_ready(name, &cache_size, snapshot_id);
+    runtime.write_pid_file(name);
+    runtime.serve()
 }
 
 // ─── Daemon spawn ────────────────────────────────────────────────────────────
@@ -839,6 +902,22 @@ fn sanitize_log_component(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_endpoint_override_accepts_http_urls_and_bare_host_port() {
+        validate_endpoint_override(Some("http://127.0.0.1:9000")).expect("full url");
+        validate_endpoint_override(Some("127.0.0.1:9000")).expect("host:port");
+        validate_endpoint_override(None).expect("none");
+    }
+
+    #[test]
+    fn validate_endpoint_override_rejects_invalid_urls() {
+        for endpoint in ["ftp://127.0.0.1:9000", "://missing-scheme"] {
+            let err =
+                validate_endpoint_override(Some(endpoint)).expect_err("invalid endpoint rejected");
+            assert!(err.to_string().contains("invalid S3 endpoint"));
+        }
+    }
 
     #[test]
     fn prepare_cache3_runtime_creates_contract_paths() {

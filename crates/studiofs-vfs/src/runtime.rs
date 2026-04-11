@@ -6,6 +6,38 @@ use tokio_util::sync::CancellationToken;
 
 use super::{VfsError, VfsResult};
 
+#[derive(Clone)]
+pub struct MetaExecutor {
+    backend: Arc<dyn AsyncMetaEngine>,
+}
+
+impl MetaExecutor {
+    pub fn new(backend: Arc<dyn AsyncMetaEngine>) -> Self {
+        Self { backend }
+    }
+
+    pub fn sync_view(&self) -> Arc<dyn MetaEngine> {
+        self.backend.sync_engine()
+    }
+
+    pub fn run_sync<T>(
+        &self,
+        operation: impl FnOnce(Arc<dyn MetaEngine>) -> MetaResult<T>,
+    ) -> VfsResult<T> {
+        operation(self.sync_view()).map_err(VfsError::Meta)
+    }
+
+    pub async fn run<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(Arc<dyn MetaEngine>) -> MetaResult<T> + Send + 'static,
+    ) -> VfsResult<T> {
+        execute_sync_meta(self.backend.clone(), operation)
+            .await
+            .map_err(VfsError::Join)?
+            .map_err(VfsError::Meta)
+    }
+}
+
 pub enum TimeoutOrCancel<T> {
     Completed(T),
     TimedOut,
@@ -101,12 +133,7 @@ pub async fn run_meta<T: Send + 'static>(
     engine: Arc<dyn AsyncMetaEngine>,
     operation: impl FnOnce(Arc<dyn MetaEngine>) -> MetaResult<T> + Send + 'static,
 ) -> VfsResult<T> {
-    // Keep runtime/task failures distinct from metadata-engine domain failures.
-    // A JoinError generally indicates panic/cancellation at the execution layer.
-    execute_sync_meta(engine, operation)
-        .await
-        .map_err(VfsError::Join)?
-        .map_err(VfsError::Meta)
+    MetaExecutor::new(engine).run(operation).await
 }
 
 /// Race an async operation against timeout and cancellation.
@@ -136,7 +163,9 @@ pub async fn sleep_or_cancel(cancel_token: &CancellationToken, delay: Duration) 
 
 #[cfg(test)]
 mod tests {
-    use super::{local_cache_io_execution_model, run_local_cache_io};
+    use super::{MetaExecutor, local_cache_io_execution_model, run_local_cache_io};
+    use std::sync::Arc;
+    use studiofs_meta::{FormatInfo, MetaError, MetaFormat, RedbMetaEngine, SyncMetaEngineAdapter};
 
     #[test]
     fn local_cache_io_execution_model_is_inline_runtime_worker() {
@@ -151,5 +180,51 @@ mod tests {
         let (value, timing) = run_local_cache_io(|| 42usize);
         assert_eq!(value, 42);
         assert_eq!(timing.handoff_ns, 0);
+    }
+
+    #[test]
+    fn meta_executor_run_sync_reads_from_sync_engine() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("meta.redb");
+        let engine = Arc::new(RedbMetaEngine::open(&path).expect("open redb"));
+        let info = FormatInfo {
+            name: "runtime-meta".to_string(),
+            uuid: "runtime-meta-uuid".to_string(),
+            ..Default::default()
+        };
+        engine.set_format_info(&info).expect("set format info");
+
+        let executor = MetaExecutor::new(Arc::new(SyncMetaEngineAdapter::new(engine)));
+        let observed = executor
+            .run_sync(|meta| meta.get_format_info().map(|format| format.name))
+            .expect("sync metadata call");
+
+        assert_eq!(observed, "runtime-meta");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn meta_executor_run_maps_meta_errors() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("meta.redb");
+        let engine = Arc::new(RedbMetaEngine::open(&path).expect("open redb"));
+        let info = FormatInfo {
+            name: "runtime-meta".to_string(),
+            uuid: "runtime-meta-uuid".to_string(),
+            ..Default::default()
+        };
+        engine.set_format_info(&info).expect("set format info");
+
+        let executor = MetaExecutor::new(Arc::new(SyncMetaEngineAdapter::new(engine)));
+        let err = executor
+            .run::<()>(|_| Err(MetaError::Storage("boom".to_string())))
+            .await
+            .expect_err("metadata error must bubble");
+
+        match err {
+            super::super::VfsError::Meta(MetaError::Storage(message)) => {
+                assert_eq!(message, "boom")
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }
