@@ -3,7 +3,8 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use studiofs_meta::{ensure_studiofs_database, open_meta_engine};
+use studiofs_meta::{ensure_studiofs_database, open_meta_engine, MetaError};
+use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DumpVolume {
@@ -50,7 +51,23 @@ struct MetadataDump {
     snapshots: Vec<DumpSnapshot>,
 }
 
-async fn ensure_pg_schema(client: &tokio_postgres::Client) -> anyhow::Result<()> {
+#[derive(Debug, Error)]
+pub enum DumpLoadError {
+    #[error("input/output error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("postgres operation failed: {0}")]
+    Postgres(#[from] tokio_postgres::Error),
+    #[error("metadata operation failed: {0}")]
+    Meta(#[from] MetaError),
+    #[error("json serialization failed: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    Message(String),
+}
+
+type DumpLoadResult<T> = std::result::Result<T, DumpLoadError>;
+
+async fn ensure_pg_schema(client: &tokio_postgres::Client) -> DumpLoadResult<()> {
     client
         .batch_execute(
             r#"
@@ -120,17 +137,138 @@ async fn ensure_pg_schema(client: &tokio_postgres::Client) -> anyhow::Result<()>
                     ON event_log(vol, seq_id);
                 CREATE INDEX IF NOT EXISTS idx_event_log_vol_batch_seq
                     ON event_log(vol, batch_version, seq_id);
-                "#,
+        "#,
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to ensure PG schema: {e}"))?;
+        .await?;
     Ok(())
 }
 
-pub fn dump(name: &str, meta_dir: &Path, output: &Path) -> anyhow::Result<()> {
+fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDump> {
+    crate::runtime_bridge::block_on(async move {
+        let metadata_dsn = ensure_studiofs_database(meta_dsn)
+            .await
+            .map_err(|e| DumpLoadError::Message(e.to_string()))?
+            .metadata_dsn;
+        let (mut client, connection) = tokio_postgres::connect(&metadata_dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| DumpLoadError::Message(format!("cannot connect to postgres: {e}")))?;
+        let connection_task = tokio::spawn(async move { connection.await });
+
+        let dump = async {
+            let row = client
+                .query_opt(
+                    r#"
+            SELECT v.vol, v.name, v.uuid, v.block_size, ms.version, ms.snapshot
+            FROM volumes v
+            JOIN metadata_state ms ON ms.vol = v.vol
+            WHERE v.vol = $1
+            "#,
+                    &[&volume_id],
+                )
+                .await
+                .map_err(|e| DumpLoadError::Message(format!("failed to query metadata_state: {e}")))?;
+
+            let row = row.ok_or_else(|| {
+                DumpLoadError::Message(format!("volume {volume_id} not found in postgres"))
+            })?;
+
+            let volume = DumpVolume {
+                vol: row.get(0),
+                name: row.get(1),
+                uuid: row.get(2),
+                block_size: row.get(3),
+            };
+            let state_version: i64 = row.get(4);
+            let state_snapshot: Vec<u8> = row.get(5);
+
+            let counter_rows = client
+                .query(
+                    "SELECT name, value FROM counters WHERE vol = $1 ORDER BY name",
+                    &[&volume.vol],
+                )
+                .await
+                .map_err(|e| DumpLoadError::Message(format!("failed to query counters: {e}")))?;
+            let counters = counter_rows
+                .into_iter()
+                .map(|r| DumpCounter {
+                    name: r.get(0),
+                    value: r.get(1),
+                })
+                .collect();
+
+            let event_rows = client
+                .query(
+                    r#"
+            SELECT batch_version, event_type, event_payload, client_id, client_timestamp
+            FROM event_log
+            WHERE vol = $1
+            ORDER BY seq_id
+            "#,
+                    &[&volume.vol],
+                )
+                .await
+                .map_err(|e| DumpLoadError::Message(format!("failed to query event_log: {e}")))?;
+            let event_log = event_rows
+                .into_iter()
+                .map(|r| DumpEvent {
+                    batch_version: r.get(0),
+                    event_type: r.get(1),
+                    event_payload: r.get(2),
+                    client_id: r.get(3),
+                    client_timestamp: r.get(4),
+                })
+                .collect();
+
+            let snapshot_rows = client
+                .query(
+                    r#"
+            SELECT id, root_ino, created_at, state, pinned_object_ids, snapshot_payload
+            FROM snapshots
+            WHERE vol = $1
+            ORDER BY created_at DESC, id ASC
+            "#,
+                    &[&volume.vol],
+                )
+                .await
+                .map_err(|e| DumpLoadError::Message(format!("failed to query snapshots: {e}")))?;
+            let snapshots = snapshot_rows
+                .into_iter()
+                .map(|r| DumpSnapshot {
+                    id: r.get(0),
+                    root_ino: r.get(1),
+                    created_at: r.get(2),
+                    state: r.get(3),
+                    pinned_object_ids: r.get(4),
+                    snapshot_payload: r.get(5),
+                })
+                .collect();
+
+            Ok(MetadataDump {
+                dump_version: 1,
+                volume,
+                metadata_state_version: state_version,
+                metadata_state_snapshot: state_snapshot,
+                counters,
+                event_log,
+                snapshots,
+            })
+        }
+        .await;
+
+        drop(client);
+        connection_task.abort();
+        let _ = connection_task.await;
+        dump
+    })
+}
+
+pub fn dump(name: &str, meta_dir: &Path, output: &Path) -> DumpLoadResult<()> {
     let db_path = meta_dir.join(format!("{name}.db"));
     if !db_path.exists() {
-        anyhow::bail!("local metadata DB not found: {}", db_path.display());
+        return Err(DumpLoadError::Message(format!(
+            "local metadata DB not found: {}",
+            db_path.display()
+        )));
     }
 
     // Ensure local pending mutations are flushed to PG before dumping from PG.
@@ -143,118 +281,9 @@ pub fn dump(name: &str, meta_dir: &Path, output: &Path) -> anyhow::Result<()> {
         .metadata
         .postgres
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("volume is not postgres-backed"))?;
+        .ok_or_else(|| DumpLoadError::Message("volume is not postgres-backed".to_string()))?;
 
-    let rt = tokio::runtime::Runtime::new()?;
-    let dsn = rt
-        .block_on(async { ensure_studiofs_database(&pg.url).await })
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?
-        .metadata_dsn;
-
-    let dump = rt.block_on(async {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-            .await
-            .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
-        let conn_task = tokio::spawn(async move {
-            let _ = connection.await;
-        });
-
-        let row = client
-            .query_opt(
-                r#"
-                SELECT v.vol, v.name, v.uuid, v.block_size, ms.version, ms.snapshot
-                FROM volumes v
-                JOIN metadata_state ms ON ms.vol = v.vol
-                WHERE v.vol = $1
-                "#,
-                &[&pg.volume_id],
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to query metadata_state: {e}"))?
-            .ok_or_else(|| anyhow::anyhow!("volume {} not found in postgres", pg.volume_id))?;
-
-        let volume = DumpVolume {
-            vol: row.get(0),
-            name: row.get(1),
-            uuid: row.get(2),
-            block_size: row.get(3),
-        };
-        let state_version: i64 = row.get(4);
-        let state_snapshot: Vec<u8> = row.get(5);
-
-        let counter_rows = client
-            .query(
-                "SELECT name, value FROM counters WHERE vol = $1 ORDER BY name",
-                &[&volume.vol],
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to query counters: {e}"))?;
-        let counters = counter_rows
-            .into_iter()
-            .map(|r| DumpCounter {
-                name: r.get(0),
-                value: r.get(1),
-            })
-            .collect();
-
-        let event_rows = client
-            .query(
-                r#"
-                SELECT batch_version, event_type, event_payload, client_id, client_timestamp
-                FROM event_log
-                WHERE vol = $1
-                ORDER BY seq_id
-                "#,
-                &[&volume.vol],
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to query event_log: {e}"))?;
-        let event_log = event_rows
-            .into_iter()
-            .map(|r| DumpEvent {
-                batch_version: r.get(0),
-                event_type: r.get(1),
-                event_payload: r.get(2),
-                client_id: r.get(3),
-                client_timestamp: r.get(4),
-            })
-            .collect();
-
-        let snapshot_rows = client
-            .query(
-                r#"
-                SELECT id, root_ino, created_at, state, pinned_object_ids, snapshot_payload
-                FROM snapshots
-                WHERE vol = $1
-                ORDER BY created_at DESC, id ASC
-                "#,
-                &[&volume.vol],
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to query snapshots: {e}"))?;
-        let snapshots = snapshot_rows
-            .into_iter()
-            .map(|r| DumpSnapshot {
-                id: r.get(0),
-                root_ino: r.get(1),
-                created_at: r.get(2),
-                state: r.get(3),
-                pinned_object_ids: r.get(4),
-                snapshot_payload: r.get(5),
-            })
-            .collect();
-
-        conn_task.abort();
-        Ok::<MetadataDump, anyhow::Error>(MetadataDump {
-            dump_version: 1,
-            volume,
-            metadata_state_version: state_version,
-            metadata_state_snapshot: state_snapshot,
-            counters,
-            event_log,
-            snapshots,
-        })
-    })?;
+    let dump = load_remote_dump(&pg.url, pg.volume_id)?;
 
     if let Some(parent) = output.parent()
         && !parent.as_os_str().is_empty()
@@ -269,145 +298,154 @@ pub fn dump(name: &str, meta_dir: &Path, output: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn load(input: &Path, postgres_address: &str) -> anyhow::Result<()> {
+fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64> {
+    crate::runtime_bridge::block_on(async move {
+        let metadata_dsn = ensure_studiofs_database(postgres_address)
+            .await
+            .map_err(|e| DumpLoadError::Message(e.to_string()))?
+            .metadata_dsn;
+        let (mut client, connection) = tokio_postgres::connect(&metadata_dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| DumpLoadError::Message(format!("cannot connect to postgres: {e}")))?;
+        let connection_task = tokio::spawn(async move { connection.await });
+
+        let result = async {
+            ensure_pg_schema(&client).await?;
+            let tx = client
+                .transaction()
+                .await
+                .map_err(|e| DumpLoadError::Message(format!("postgres transaction failed: {e}")))?;
+            tx.execute("SELECT pg_advisory_xact_lock($1)", &[&902_202_603_i64])
+                .await
+                .map_err(|e| DumpLoadError::Message(format!("postgres advisory lock failed: {e}")))?;
+
+            let row = tx
+                .query_one(
+                    r#"
+            INSERT INTO volumes (name, uuid, block_size)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (uuid) DO UPDATE
+            SET name = EXCLUDED.name,
+                block_size = EXCLUDED.block_size
+            RETURNING vol
+            "#,
+                    &[&dump.volume.name, &dump.volume.uuid, &dump.volume.block_size],
+                )
+                .await
+                .map_err(|e| DumpLoadError::Message(format!("upsert volume failed: {e}")))?;
+            let target_vol: i64 = row.get(0);
+
+            tx.execute("DELETE FROM counters WHERE vol = $1", &[&target_vol])
+                .await
+                .map_err(|e| DumpLoadError::Message(format!("clear counters failed: {e}")))?;
+            tx.execute("DELETE FROM event_log WHERE vol = $1", &[&target_vol])
+                .await
+                .map_err(|e| DumpLoadError::Message(format!("clear event log failed: {e}")))?;
+            tx.execute("DELETE FROM metadata_state WHERE vol = $1", &[&target_vol])
+                .await
+                .map_err(|e| DumpLoadError::Message(format!("clear metadata_state failed: {e}")))?;
+            tx.execute("DELETE FROM snapshots WHERE vol = $1", &[&target_vol])
+                .await
+                .map_err(|e| DumpLoadError::Message(format!("clear snapshots failed: {e}")))?;
+
+            tx.execute(
+                "INSERT INTO metadata_state (vol, version, snapshot) VALUES ($1, $2, $3)",
+                &[&target_vol, &dump.metadata_state_version, &dump.metadata_state_snapshot],
+            )
+            .await
+            .map_err(|e| DumpLoadError::Message(format!("insert metadata_state failed: {e}")))?;
+
+            for counter in &dump.counters {
+                tx.execute(
+                    "INSERT INTO counters (vol, name, value) VALUES ($1, $2, $3)",
+                    &[&target_vol, &counter.name, &counter.value],
+                )
+                .await
+                .map_err(|e| {
+                    DumpLoadError::Message(format!("insert counter '{}' failed: {e}", counter.name))
+                })?;
+            }
+
+            for event in &dump.event_log {
+                tx.execute(
+                    r#"
+            INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id, client_timestamp)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+                    &[
+                        &target_vol,
+                        &event.batch_version,
+                        &event.event_type,
+                        &event.event_payload,
+                        &event.client_id,
+                        &event.client_timestamp,
+                    ],
+                )
+                .await
+                .map_err(|e| DumpLoadError::Message("insert event_log row failed".to_string()))?;
+            }
+
+            for snapshot in &dump.snapshots {
+                tx.execute(
+                    r#"
+            INSERT INTO snapshots (
+                vol,
+                id,
+                root_ino,
+                created_at,
+                state,
+                pinned_object_ids,
+                snapshot_payload
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "#,
+                    &[
+                        &target_vol,
+                        &snapshot.id,
+                        &snapshot.root_ino,
+                        &snapshot.created_at,
+                        &snapshot.state,
+                        &snapshot.pinned_object_ids,
+                        &snapshot.snapshot_payload,
+                    ],
+                )
+                .await
+                .map_err(|e| DumpLoadError::Message("insert snapshots row failed".to_string()))?;
+            }
+
+            tx.commit()
+                .await
+                .map_err(|e| DumpLoadError::Message(format!("postgres commit failed: {e}")))?;
+
+            Ok::<i64, DumpLoadError>(target_vol)
+        }
+        .await;
+
+        drop(client);
+        connection_task.abort();
+        let _ = connection_task.await;
+        result
+    })
+}
+
+pub fn load(input: &Path, postgres_address: &str) -> DumpLoadResult<()> {
     let bytes = std::fs::read(input)
-        .map_err(|e| anyhow::anyhow!("failed to read dump {}: {e}", input.display()))?;
+        .map_err(|e| DumpLoadError::Message(format!("failed to read dump {}: {e}", input.display())))?;
     let dump: MetadataDump = serde_json::from_slice(&bytes)
-        .map_err(|e| anyhow::anyhow!("failed to parse dump {}: {e}", input.display()))?;
+        .map_err(|e| DumpLoadError::Message(format!("failed to parse dump {}: {e}", input.display())))?;
+    let volume_name = dump.volume.name.clone();
 
     if dump.dump_version != 1 {
-        anyhow::bail!("unsupported dump version: {}", dump.dump_version);
+        return Err(DumpLoadError::Message(format!(
+            "unsupported dump version: {}",
+            dump.dump_version
+        )));
     }
 
-    let rt = tokio::runtime::Runtime::new()?;
-    let dsn = rt
-        .block_on(async { ensure_studiofs_database(postgres_address).await })
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?
-        .metadata_dsn;
-
-    rt.block_on(async {
-        let (mut client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-            .await
-            .map_err(|e| anyhow::anyhow!("cannot connect to postgres: {e}"))?;
-        let conn_task = tokio::spawn(async move {
-            let _ = connection.await;
-        });
-
-        ensure_pg_schema(&client).await?;
-
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| anyhow::anyhow!("postgres transaction failed: {e}"))?;
-        tx.execute("SELECT pg_advisory_xact_lock($1)", &[&902_202_603_i64])
-            .await
-            .map_err(|e| anyhow::anyhow!("postgres advisory lock failed: {e}"))?;
-
-        let row = tx
-            .query_one(
-                r#"
-                INSERT INTO volumes (name, uuid, block_size)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (uuid) DO UPDATE
-                SET name = EXCLUDED.name,
-                    block_size = EXCLUDED.block_size
-                RETURNING vol
-                "#,
-                &[&dump.volume.name, &dump.volume.uuid, &dump.volume.block_size],
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("upsert volume failed: {e}"))?;
-        let target_vol: i64 = row.get(0);
-
-        tx.execute("DELETE FROM counters WHERE vol = $1", &[&target_vol])
-            .await
-            .map_err(|e| anyhow::anyhow!("clear counters failed: {e}"))?;
-        tx.execute("DELETE FROM event_log WHERE vol = $1", &[&target_vol])
-            .await
-            .map_err(|e| anyhow::anyhow!("clear event log failed: {e}"))?;
-        tx.execute("DELETE FROM metadata_state WHERE vol = $1", &[&target_vol])
-            .await
-            .map_err(|e| anyhow::anyhow!("clear metadata_state failed: {e}"))?;
-        tx.execute("DELETE FROM snapshots WHERE vol = $1", &[&target_vol])
-            .await
-            .map_err(|e| anyhow::anyhow!("clear snapshots failed: {e}"))?;
-
-        tx.execute(
-            "INSERT INTO metadata_state (vol, version, snapshot) VALUES ($1, $2, $3)",
-            &[
-                &target_vol,
-                &dump.metadata_state_version,
-                &dump.metadata_state_snapshot,
-            ],
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("insert metadata_state failed: {e}"))?;
-
-        for counter in &dump.counters {
-            tx.execute(
-                "INSERT INTO counters (vol, name, value) VALUES ($1, $2, $3)",
-                &[&target_vol, &counter.name, &counter.value],
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("insert counter '{}' failed: {e}", counter.name))?;
-        }
-
-        for event in &dump.event_log {
-            tx.execute(
-                r#"
-                INSERT INTO event_log (vol, batch_version, event_type, event_payload, client_id, client_timestamp)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                "#,
-                &[
-                    &target_vol,
-                    &event.batch_version,
-                    &event.event_type,
-                    &event.event_payload,
-                    &event.client_id,
-                    &event.client_timestamp,
-                ],
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("insert event_log row failed: {e}"))?;
-        }
-
-        for snapshot in &dump.snapshots {
-            tx.execute(
-                r#"
-                INSERT INTO snapshots (
-                    vol,
-                    id,
-                    root_ino,
-                    created_at,
-                    state,
-                    pinned_object_ids,
-                    snapshot_payload
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                "#,
-                &[
-                    &target_vol,
-                    &snapshot.id,
-                    &snapshot.root_ino,
-                    &snapshot.created_at,
-                    &snapshot.state,
-                    &snapshot.pinned_object_ids,
-                    &snapshot.snapshot_payload,
-                ],
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("insert snapshots row failed: {e}"))?;
-        }
-
-        tx.commit()
-            .await
-            .map_err(|e| anyhow::anyhow!("postgres commit failed: {e}"))?;
-        conn_task.abort();
-        Ok::<i64, anyhow::Error>(target_vol)
-    })?;
+    apply_dump(postgres_address, dump)?;
 
     println!("✓ Dump loaded into PostgreSQL");
-    println!("  Volume: {}", dump.volume.name);
+    println!("  Volume: {}", volume_name);
     println!("  Source: {}", input.display());
     Ok(())
 }

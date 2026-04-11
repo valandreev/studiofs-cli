@@ -6,9 +6,10 @@ use std::path::Path;
 
 use studiofs_meta::engine::UndoLogKind;
 use studiofs_meta::{
-    FileType, MetaEngine, MetaError, MetaOpenOptions, MetadataBackend, ROOT_INO,
-    open_meta_engine_with_options,
+    open_meta_engine_with_options, FileType, MetaEngine, MetaError, MetaOpenOptions, MetadataBackend,
+    ROOT_INO,
 };
+use thiserror::Error;
 
 #[derive(Debug, Clone)]
 struct DanglingDentry {
@@ -79,11 +80,32 @@ impl From<bool> for FsckRepairMode {
     }
 }
 
-fn scan_namespace(meta: &dyn MetaEngine) -> anyhow::Result<NamespaceScan> {
+#[derive(Debug, Error)]
+pub enum FsckError {
+    #[error("volume not found at {path}")]
+    LocalDbNotFound { path: String },
+
+    #[error("metadata operation failed: {0}")]
+    Meta(#[from] MetaError),
+
+    #[error("input/output error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("{0}")]
+    Message(String),
+}
+
+type FsckResult<T> = std::result::Result<T, FsckError>;
+
+fn scan_namespace(meta: &dyn MetaEngine) -> FsckResult<NamespaceScan> {
     let mut scan = NamespaceScan::default();
+    let reachable_inodes = &mut scan.reachable_inodes;
+    let incoming_links = &mut scan.incoming_links;
+    let child_dir_counts = &mut scan.child_dir_counts;
+    let dangling = &mut scan.dangling;
     let mut stack = vec![ROOT_INO];
     let mut visited_dirs = HashSet::new();
-    scan.reachable_inodes.insert(ROOT_INO);
+    reachable_inodes.insert(ROOT_INO);
 
     while let Some(parent) = stack.pop() {
         if !visited_dirs.insert(parent) {
@@ -93,31 +115,36 @@ fn scan_namespace(meta: &dyn MetaEngine) -> anyhow::Result<NamespaceScan> {
         let entries = match meta.readdir(parent) {
             Ok(entries) => entries,
             Err(MetaError::InodeNotFound(_)) => continue,
-            Err(err) => return Err(anyhow::anyhow!("readdir failed for parent {parent}: {err}")),
+            Err(err) => {
+                return Err(FsckError::Message(format!(
+                    "readdir failed for parent {parent}: {err}"
+                )));
+            }
         };
 
         for entry in entries {
-            match meta.get_attr(entry.ino) {
+            let entry_ino = entry.ino;
+            let entry_name = entry.name;
+            match meta.get_attr(entry_ino) {
                 Ok(attr) => {
-                    scan.reachable_inodes.insert(attr.ino);
-                    *scan.incoming_links.entry(attr.ino).or_insert(0) += 1;
-                    if attr.kind == FileType::Directory {
-                        *scan.child_dir_counts.entry(parent).or_insert(0) += 1;
-                        stack.push(attr.ino);
+                    let ino = attr.ino;
+                    let kind = attr.kind;
+                    reachable_inodes.insert(ino);
+                    *incoming_links.entry(ino).or_insert(0) += 1;
+                    if kind == FileType::Directory {
+                        *child_dir_counts.entry(parent).or_insert(0) += 1;
+                        stack.push(ino);
                     }
                 }
-                Err(MetaError::InodeNotFound(_)) => scan.dangling.push(DanglingDentry {
+                Err(MetaError::InodeNotFound(_)) => dangling.push(DanglingDentry {
                     parent,
-                    ino: entry.ino,
-                    name: entry.name,
+                    ino: entry_ino,
+                    name: entry_name,
                 }),
                 Err(err) => {
-                    return Err(anyhow::anyhow!(
-                        "get_attr failed for ino {} under parent {}: {}",
-                        entry.ino,
-                        parent,
-                        err
-                    ));
+                    return Err(FsckError::Message(format!(
+                        "get_attr failed for ino {entry_ino} under parent {parent}: {err}"
+                    )));
                 }
             }
         }
@@ -129,7 +156,7 @@ fn scan_namespace(meta: &dyn MetaEngine) -> anyhow::Result<NamespaceScan> {
 fn collect_report_with_progress(
     meta: &dyn MetaEngine,
     progress: bool,
-) -> anyhow::Result<FsckReport> {
+) -> FsckResult<FsckReport> {
     if progress {
         println!("Collecting fsck inputs...");
         println!("  reading pending create records...");
@@ -151,6 +178,9 @@ fn collect_report_with_progress(
         println!("  scanning reachable namespace from root...");
     }
     let scan = scan_namespace(meta)?;
+    let reachable_inodes = &scan.reachable_inodes;
+    let incoming_links = &scan.incoming_links;
+    let child_dir_counts = &scan.child_dir_counts;
     if progress {
         println!(
             "  namespace scan complete: reachable_inodes={} dangling_dentries={}",
@@ -168,24 +198,24 @@ fn collect_report_with_progress(
     };
 
     for attr in &all_inodes {
-        if attr.ino != ROOT_INO && !scan.reachable_inodes.contains(&attr.ino) {
-            report.orphan_inodes.push(OrphanInode {
-                ino: attr.ino,
-                kind: attr.kind,
-                nlink: attr.nlink,
-            });
+        let ino = attr.ino;
+        let kind = attr.kind;
+        let nlink = attr.nlink;
+
+        if ino != ROOT_INO && !reachable_inodes.contains(&ino) {
+            report.orphan_inodes.push(OrphanInode { ino, kind, nlink });
         }
 
-        let actual_nlink = if attr.kind == FileType::Directory {
-            2 + scan.child_dir_counts.get(&attr.ino).copied().unwrap_or(0)
+        let actual_nlink = if kind == FileType::Directory {
+            2 + child_dir_counts.get(&ino).copied().unwrap_or(0)
         } else {
-            scan.incoming_links.get(&attr.ino).copied().unwrap_or(0)
+            incoming_links.get(&ino).copied().unwrap_or(0)
         };
-        if attr.nlink != actual_nlink {
+        if nlink != actual_nlink {
             report.nlink_mismatches.push(NlinkMismatch {
-                ino: attr.ino,
-                kind: attr.kind,
-                expected_nlink: attr.nlink,
+                ino,
+                kind,
+                expected_nlink: nlink,
                 actual_links: actual_nlink,
             });
         }
@@ -201,12 +231,12 @@ fn collect_report_with_progress(
     Ok(report)
 }
 
-fn collect_report(meta: &dyn MetaEngine) -> anyhow::Result<FsckReport> {
+fn collect_report(meta: &dyn MetaEngine) -> FsckResult<FsckReport> {
     collect_report_with_progress(meta, false)
 }
 
 fn print_report(name: &str, report: &FsckReport) {
-    println!("FSCK report for volume '{}'", name);
+    println!("FSCK report for volume '{name}'");
     println!("────────────────────────────");
     println!("  dangling dentries:    {}", report.dangling.len());
     println!("  orphan inodes:        {}", report.orphan_inodes.len());
@@ -220,8 +250,7 @@ fn print_report(name: &str, report: &FsckReport) {
         println!();
         println!("Dangling dentries (up to 25):");
         for d in report.dangling.iter().take(25) {
-            let name = String::from_utf8_lossy(&d.name);
-            println!("  parent={} name='{}' ino={}", d.parent, name, d.ino);
+            println!("  parent={} name={:?} ino={}", d.parent, d.name, d.ino);
         }
         if report.dangling.len() > 25 {
             println!("  ... and {} more", report.dangling.len() - 25);
@@ -254,7 +283,7 @@ fn print_report(name: &str, report: &FsckReport) {
     }
 }
 
-fn ask_should_repair() -> anyhow::Result<bool> {
+fn ask_should_repair() -> FsckResult<bool> {
     print!("Repair all detected issues now? [y/N]: ");
     std::io::stdout().flush()?;
     let mut input = String::new();
@@ -274,16 +303,14 @@ fn remove_orphan_file(
     ino: u64,
     orphan_blocks_pending_gc: &mut usize,
     removed_orphans: &mut usize,
-) -> anyhow::Result<()> {
+) -> FsckResult<()> {
     let removed_ids = match meta.remove_file_blocks(ino) {
         Ok(ids) => ids,
         Err(MetaError::InodeNotFound(_)) => Vec::new(),
         Err(err) => {
-            return Err(anyhow::anyhow!(
-                "failed to remove orphan blocks for ino {}: {}",
-                ino,
-                err
-            ));
+            return Err(FsckError::Message(format!(
+                "failed to remove orphan blocks for ino {ino}: {err}"
+            )));
         }
     };
 
@@ -298,11 +325,9 @@ fn remove_orphan_file(
     match meta.remove_attr(ino) {
         Ok(()) | Err(MetaError::InodeNotFound(_)) => *removed_orphans += 1,
         Err(err) => {
-            return Err(anyhow::anyhow!(
-                "failed to remove orphan inode {}: {}",
-                ino,
-                err
-            ));
+            return Err(FsckError::Message(format!(
+                "failed to remove orphan inode {ino}: {err}"
+            )));
         }
     }
 
@@ -316,7 +341,7 @@ fn repair_orphan_directory(
     orphan_blocks_pending_gc: &mut usize,
     skipped_hardlink_orphans: &mut usize,
     processed: &mut HashSet<u64>,
-) -> anyhow::Result<()> {
+) -> FsckResult<()> {
     if !processed.insert(ino) {
         return Ok(());
     }
@@ -325,26 +350,30 @@ fn repair_orphan_directory(
         Ok(entries) => entries,
         Err(MetaError::InodeNotFound(_)) => return Ok(()),
         Err(err) => {
-            return Err(anyhow::anyhow!(
-                "readdir failed for orphan dir {}: {}",
-                ino,
-                err
-            ));
+            return Err(FsckError::Message(format!(
+                "readdir failed for orphan dir {ino}: {err}"
+            )));
         }
     };
+    let removed_orphans_out = removed_orphans;
+    let orphan_blocks_pending_gc_out = orphan_blocks_pending_gc;
+    let skipped_hardlink_orphans_out = skipped_hardlink_orphans;
+    let processed_out = processed;
 
     for entry in entries {
+        let entry_ino = entry.ino;
+        let entry_name = entry.name;
         match entry.kind {
             FileType::Directory => {
                 repair_orphan_directory(
                     meta,
-                    entry.ino,
-                    removed_orphans,
-                    orphan_blocks_pending_gc,
-                    skipped_hardlink_orphans,
-                    processed,
+                    entry_ino,
+                    &mut *removed_orphans_out,
+                    &mut *orphan_blocks_pending_gc_out,
+                    &mut *skipped_hardlink_orphans_out,
+                    &mut *processed_out,
                 )?;
-                match meta.rmdir(ino, &entry.name) {
+                match meta.rmdir(ino, &entry_name) {
                     Ok(()) | Err(MetaError::EntryNotFound { .. }) => {
                         *removed_orphans += 1;
                     }
@@ -353,67 +382,61 @@ fn repair_orphan_directory(
                     }
                     Err(MetaError::DirNotEmpty(_)) => {}
                     Err(err) => {
-                        return Err(anyhow::anyhow!(
-                            "failed to remove orphan dir entry parent={} child={}: {}",
-                            ino,
-                            entry.ino,
-                            err
-                        ));
+                        return Err(FsckError::Message(format!(
+                            "failed to remove orphan dir entry parent={ino} child={entry_ino}: {err}"
+                        )));
                     }
                 }
             }
             _ => {
-                let attr = match meta.get_attr(entry.ino) {
+                let attr = match meta.get_attr(entry_ino) {
                     Ok(attr) => Some(attr),
                     Err(MetaError::InodeNotFound(_)) => None,
                     Err(err) => {
-                        return Err(anyhow::anyhow!(
-                            "get_attr failed for orphan child ino {} under parent {}: {}",
-                            entry.ino,
-                            ino,
-                            err
-                        ));
+                        return Err(FsckError::Message(format!(
+                            "get_attr failed for orphan child ino {entry_ino} under parent {ino}: {err}"
+                        )));
                     }
                 };
                 if attr.as_ref().is_some_and(|attr| attr.nlink > 1) {
-                    *skipped_hardlink_orphans += 1;
+                    *skipped_hardlink_orphans_out += 1;
                     continue;
                 }
 
-                match meta.remove_entry(ino, &entry.name) {
+                match meta.remove_entry(ino, &entry_name) {
                     Ok(_) | Err(MetaError::EntryNotFound { .. }) => {}
                     Err(err) => {
-                        return Err(anyhow::anyhow!(
-                            "failed to remove orphan child entry parent={} child={}: {}",
-                            ino,
-                            entry.ino,
-                            err
-                        ));
+                        return Err(FsckError::Message(format!(
+                            "failed to remove orphan child entry parent={ino} child={entry_ino}: {err}"
+                        )));
                     }
                 }
 
                 if attr.is_some() {
-                    remove_orphan_file(meta, entry.ino, orphan_blocks_pending_gc, removed_orphans)?;
+                    remove_orphan_file(
+                        meta,
+                        entry_ino,
+                        orphan_blocks_pending_gc_out,
+                        removed_orphans_out,
+                    )?;
                 }
-                processed.insert(entry.ino);
+                processed_out.insert(entry_ino);
             }
         }
     }
 
     match meta.remove_attr(ino) {
-        Ok(()) | Err(MetaError::InodeNotFound(_)) => *removed_orphans += 1,
+        Ok(()) | Err(MetaError::InodeNotFound(_)) => *removed_orphans_out += 1,
         Err(err) => {
-            return Err(anyhow::anyhow!(
-                "failed to remove orphan directory inode {}: {}",
-                ino,
-                err
-            ));
+            return Err(FsckError::Message(format!(
+                "failed to remove orphan directory inode {ino}: {err}"
+            )));
         }
     }
     Ok(())
 }
 
-fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> anyhow::Result<()> {
+fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> FsckResult<()> {
     let replayed = meta.recover_undo_logs()?;
     if !replayed.is_empty() {
         println!(
@@ -424,17 +447,18 @@ fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> anyhow::Result<()> {
 
     let mut removed_dangling = 0usize;
     let mut dangling_already_gone = 0usize;
-    for d in &report.dangling {
+    let dangling = &report.dangling;
+    let orphan_inodes = &report.orphan_inodes;
+
+    for d in dangling {
         match meta.remove_entry(d.parent, &d.name) {
             Ok(_) => removed_dangling += 1,
             Err(MetaError::EntryNotFound { .. }) => dangling_already_gone += 1,
             Err(err) => {
-                return Err(anyhow::anyhow!(
-                    "failed to remove dangling dentry parent={} ino={}: {}",
-                    d.parent,
-                    d.ino,
-                    err
-                ));
+                return Err(FsckError::Message(format!(
+                    "failed to remove dangling dentry parent={} ino={}: {err}",
+                    d.parent, d.ino
+                )));
             }
         }
     }
@@ -445,7 +469,7 @@ fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> anyhow::Result<()> {
     let mut orphan_blocks_pending_gc = 0usize;
     let mut processed_orphans = HashSet::new();
 
-    for orphan in &report.orphan_inodes {
+    for orphan in orphan_inodes {
         if processed_orphans.contains(&orphan.ino) {
             continue;
         }
@@ -476,16 +500,16 @@ fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> anyhow::Result<()> {
 
     let mut repaired_nlinks = 0usize;
     let post_cleanup = collect_report(meta)?;
-    for mismatch in &post_cleanup.nlink_mismatches {
+    let nlink_mismatches = &post_cleanup.nlink_mismatches;
+    for mismatch in nlink_mismatches {
         let mut attr = match meta.get_attr(mismatch.ino) {
             Ok(attr) => attr,
             Err(MetaError::InodeNotFound(_)) => continue,
             Err(err) => {
-                return Err(anyhow::anyhow!(
-                    "failed to read inode {} before nlink repair: {}",
-                    mismatch.ino,
-                    err
-                ));
+                return Err(FsckError::Message(format!(
+                    "failed to read inode {} before nlink repair: {err}",
+                    mismatch.ino
+                )));
             }
         };
         attr.nlink = mismatch.actual_links;
@@ -503,17 +527,22 @@ fn repair(meta: &dyn MetaEngine, report: &FsckReport) -> anyhow::Result<()> {
     println!("  orphan dirs skipped: {}", skipped_dir_orphans);
     println!("  orphan hardlinks skipped: {}", skipped_hardlink_orphans);
     println!("  nlink mismatches repaired: {}", repaired_nlinks);
+    if skipped_dir_orphans > 0 {
+        println!("  skipped orphan dirs: {skipped_dir_orphans}");
+    }
     Ok(())
 }
 
-pub fn run<AutoRepair>(name: &str, meta_dir: &Path, auto_repair: AutoRepair) -> anyhow::Result<()>
+pub fn run<AutoRepair>(name: &str, meta_dir: &Path, auto_repair: AutoRepair) -> FsckResult<()>
 where
     AutoRepair: Into<FsckRepairMode>,
 {
     let auto_repair = auto_repair.into();
     let db_path = meta_dir.join(format!("{name}.db"));
     if !db_path.exists() {
-        anyhow::bail!("Volume '{}' not found at {}", name, db_path.display());
+        return Err(FsckError::LocalDbNotFound {
+            path: db_path.display().to_string(),
+        });
     }
 
     let meta = open_meta_engine_with_options(

@@ -23,4 +23,4 @@ test*.txt
 /.kilocode/*
 /.qwen/*
 .worktrees/
-deslop.txt
+deslop*.txt
