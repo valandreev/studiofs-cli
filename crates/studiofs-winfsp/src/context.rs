@@ -497,6 +497,10 @@ pub struct StudioFsContext {
     /// `WinfspKernelInvalidator` so metadata refresh events can enqueue inodes
     /// and the WinFSP timer can drain them).
     invalidation_queue: Arc<Mutex<Vec<Ino>>>,
+    callback_barrier_state: CallbackBarrierState,
+}
+
+struct CallbackBarrierState {
     /// Per-inode gates used to collapse concurrent callback-driven flush
     /// barriers into one effective in-flight flush.
     flush_gates: Mutex<HashMap<Ino, Arc<tokio::sync::Mutex<()>>>>,
@@ -506,36 +510,9 @@ pub struct StudioFsContext {
     deferred_cleanup_inodes: Mutex<HashSet<Ino>>,
 }
 
-struct FlushGateRelease<'a> {
-    ctx: &'a StudioFsContext,
-    ino: Ino,
-    gate: Arc<tokio::sync::Mutex<()>>,
-}
-
-impl<'a> FlushGateRelease<'a> {
-    fn new(ctx: &'a StudioFsContext, ino: Ino, gate: Arc<tokio::sync::Mutex<()>>) -> Self {
-        Self { ctx, ino, gate }
-    }
-}
-
-impl Drop for FlushGateRelease<'_> {
-    fn drop(&mut self) {
-        self.ctx.maybe_release_flush_gate(self.ino, &self.gate);
-    }
-}
-
-impl StudioFsContext {
-    pub fn new(
-        vfs: Arc<StudioVfs>,
-        rt: Arc<Runtime>,
-        invalidation_queue: Arc<Mutex<Vec<Ino>>>,
-    ) -> Self {
-        let default_sd = create_default_security_descriptor();
+impl CallbackBarrierState {
+    fn new() -> Self {
         Self {
-            vfs,
-            rt,
-            default_sd,
-            invalidation_queue,
             flush_gates: Mutex::new(HashMap::new()),
             deferred_cleanup_inodes: Mutex::new(HashSet::new()),
         }
@@ -559,8 +536,8 @@ impl StudioFsContext {
         }
     }
 
-    fn note_cleanup_non_delete_deferred(&self, ino: Ino, fh: u64) {
-        let dirty = self.vfs.inode_has_local_dirty_state(ino);
+    fn note_cleanup_non_delete_deferred(&self, vfs: &StudioVfs, ino: Ino, fh: u64) {
+        let dirty = vfs.inode_has_local_dirty_state(ino);
         let deferred_to_close = fh != 0 && dirty;
         if deferred_to_close {
             self.deferred_cleanup_inodes.lock().insert(ino);
@@ -582,9 +559,97 @@ impl StudioFsContext {
         self.deferred_cleanup_inodes.lock().remove(&ino)
     }
 
+    fn had_deferred_cleanup_hint(&self, ino: Ino) -> bool {
+        self.deferred_cleanup_inodes.lock().contains(&ino)
+    }
+
+    fn note_close_release_success(
+        &self,
+        vfs: &StudioVfs,
+        ino: Ino,
+        fh: u64,
+        outcome: &studiofs_vfs::vfs::ReleaseFhOutcome,
+    ) {
+        if !outcome.closed_last_handle {
+            return;
+        }
+
+        let hint_was_taken = self.take_deferred_cleanup_hint(ino);
+        vfs.note_winfsp_close_barrier_outcome(outcome.flushed_local_dirty_state);
+        if hint_was_taken && outcome.flushed_local_dirty_state {
+            debug!(
+                ino,
+                fh, "close owned deferred cleanup barrier on the last handle"
+            );
+        } else if hint_was_taken {
+            trace!(
+                ino,
+                fh, "close observed deferred cleanup hint but no last-handle barrier was needed"
+            );
+        }
+    }
+
+    fn take_close_error_hint(&self, ino: Ino, had_cleanup_deferred_hint: bool) -> bool {
+        self.take_deferred_cleanup_hint(ino) || had_cleanup_deferred_hint
+    }
+
     #[cfg(test)]
     fn has_deferred_cleanup_hint(&self, ino: Ino) -> bool {
         self.deferred_cleanup_inodes.lock().contains(&ino)
+    }
+
+    #[cfg(test)]
+    fn flush_gate_count(&self) -> usize {
+        self.flush_gates.lock().len()
+    }
+}
+
+struct FlushGateRelease<'a> {
+    state: &'a CallbackBarrierState,
+    ino: Ino,
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl<'a> FlushGateRelease<'a> {
+    fn new(state: &'a CallbackBarrierState, ino: Ino, gate: Arc<tokio::sync::Mutex<()>>) -> Self {
+        Self { state, ino, gate }
+    }
+}
+
+impl Drop for FlushGateRelease<'_> {
+    fn drop(&mut self) {
+        self.state.maybe_release_flush_gate(self.ino, &self.gate);
+    }
+}
+
+impl StudioFsContext {
+    pub fn new(
+        vfs: Arc<StudioVfs>,
+        rt: Arc<Runtime>,
+        invalidation_queue: Arc<Mutex<Vec<Ino>>>,
+    ) -> Self {
+        let default_sd = create_default_security_descriptor();
+        Self {
+            vfs,
+            rt,
+            default_sd,
+            invalidation_queue,
+            callback_barrier_state: CallbackBarrierState::new(),
+        }
+    }
+
+    fn clear_deferred_cleanup_hint(&self, ino: Ino) {
+        self.callback_barrier_state.clear_deferred_cleanup_hint(ino);
+    }
+
+    #[cfg(test)]
+    fn has_deferred_cleanup_hint(&self, ino: Ino) -> bool {
+        self.callback_barrier_state.has_deferred_cleanup_hint(ino)
+    }
+
+    #[cfg(test)]
+    fn flush_gate_count(&self) -> usize {
+        self.callback_barrier_state.flush_gate_count()
     }
 
     // WinFSP callback barrier policy (SFS-197):
@@ -617,8 +682,8 @@ impl StudioFsContext {
         if !self.vfs.inode_has_local_dirty_state(ino) {
             return Ok(false);
         }
-        let gate = self.flush_gate_for_inode(ino);
-        let _gate_release = FlushGateRelease::new(self, ino, gate.clone());
+        let gate = self.callback_barrier_state.flush_gate_for_inode(ino);
+        let _gate_release = FlushGateRelease::new(&self.callback_barrier_state, ino, gate.clone());
         let gate_task = gate.clone();
         let vfs = self.vfs.clone();
         self.spawn_wait(async move {
@@ -638,7 +703,8 @@ impl StudioFsContext {
     #[cfg(test)]
     fn run_cleanup_non_delete_callback(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
         self.vfs.note_winfsp_cleanup_callback();
-        self.note_cleanup_non_delete_deferred(ino, fh);
+        self.callback_barrier_state
+            .note_cleanup_non_delete_deferred(&self.vfs, ino, fh);
         Ok(())
     }
 
@@ -664,31 +730,17 @@ impl StudioFsContext {
         // handle disappears. This callback still blocks on `release_fh`
         // because the final-handle fallback barrier, when needed, belongs
         // to the release path rather than a speculative pre-close guess.
-        let had_cleanup_deferred_hint = self.deferred_cleanup_inodes.lock().contains(&ino);
+        let had_cleanup_deferred_hint = self.callback_barrier_state.had_deferred_cleanup_hint(ino);
         let vfs = self.vfs.clone();
         let release_result = self.spawn_wait(async move { vfs.release_fh_with_outcome(fh).await });
-        if let Ok(outcome) = &release_result
-            && outcome.closed_last_handle
-        {
-            let hint_was_taken = self.take_deferred_cleanup_hint(ino);
-            self.vfs
-                .note_winfsp_close_barrier_outcome(outcome.flushed_local_dirty_state);
-            if hint_was_taken && outcome.flushed_local_dirty_state {
-                debug!(
-                    ino,
-                    fh, "close owned deferred cleanup barrier on the last handle"
-                );
-            } else if hint_was_taken {
-                trace!(
-                    ino,
-                    fh,
-                    "close observed deferred cleanup hint but no last-handle barrier was needed"
-                );
-            }
+        if let Ok(outcome) = &release_result {
+            self.callback_barrier_state
+                .note_close_release_success(&self.vfs, ino, fh, outcome);
         }
         if let Err(e) = release_result {
-            let hint_was_present_for_log =
-                self.take_deferred_cleanup_hint(ino) || had_cleanup_deferred_hint;
+            let hint_was_present_for_log = self
+                .callback_barrier_state
+                .take_close_error_hint(ino, had_cleanup_deferred_hint);
             error!(
                 ino,
                 fh,
@@ -1146,7 +1198,8 @@ impl FileSystemContext for StudioFsContext {
             // still counted for observability, but dirty local state stays
             // deferred until an explicit `flush` or the mandatory last-handle
             // `close`/`release_fh` fallback drain.
-            self.note_cleanup_non_delete_deferred(context.ino, context.fh);
+            self.callback_barrier_state
+                .note_cleanup_non_delete_deferred(&self.vfs, context.ino, context.fh);
         }
     }
 
@@ -1650,7 +1703,7 @@ mod tests {
         .expect("pre-clean flush");
 
         assert!(
-            ctx.flush_gates.lock().is_empty(),
+            ctx.flush_gate_count() == 0,
             "test setup should not have lingering gates"
         );
         let flushed = ctx
@@ -1658,7 +1711,7 @@ mod tests {
             .expect("callback flush guard");
         assert!(!flushed, "clean inode should skip flush");
         assert!(
-            ctx.flush_gates.lock().is_empty(),
+            ctx.flush_gate_count() == 0,
             "fast path should not allocate per-inode flush gates"
         );
 
@@ -2008,6 +2061,98 @@ mod tests {
             async move { vfs.release_fh(fh).await }
         })
         .expect("release_fh");
+    }
+
+    #[test]
+    fn cleanup_then_flush_then_close_turns_final_close_into_clean_skip() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_flush_close_clean_skip");
+        let attr = vfs
+            .create(ROOT_INO, b"cleanup-flush-close-clean-skip.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.write(attr.ino, 0, b"dirty").await }
+        })
+        .expect("dirty write");
+
+        let callbacks_before = winfsp_callbacks(&vfs);
+        let barriers_before = winfsp_foreground_flushes(&vfs);
+        let flush_calls_before = flush_ordered_calls(&vfs);
+
+        ctx.run_cleanup_non_delete_callback(attr.ino, fh)
+            .expect("cleanup callback");
+        let callbacks_after_cleanup = winfsp_callbacks(&vfs);
+        let barriers_after_cleanup = winfsp_foreground_flushes(&vfs);
+        assert!(
+            ctx.has_deferred_cleanup_hint(attr.ino),
+            "cleanup should leave a deferred-close hint before the explicit flush"
+        );
+        assert_eq!(
+            callbacks_after_cleanup.cleanup,
+            callbacks_before.cleanup + 1,
+            "cleanup should be observable in the callback counters"
+        );
+        assert_eq!(
+            barriers_after_cleanup.cleanup, barriers_before.cleanup,
+            "cleanup should not claim a foreground barrier before the explicit flush"
+        );
+
+        ctx.run_flush_callback(attr.ino, fh)
+            .expect("explicit flush callback");
+        let callbacks_after_flush = winfsp_callbacks(&vfs);
+        let barriers_after_flush = winfsp_foreground_flushes(&vfs);
+        let flush_calls_after_flush = flush_ordered_calls(&vfs);
+        assert!(
+            !ctx.has_deferred_cleanup_hint(attr.ino),
+            "explicit flush should clear the deferred cleanup hint before close"
+        );
+        assert_eq!(
+            callbacks_after_flush.flush,
+            callbacks_before.flush + 1,
+            "explicit flush should be counted as a WinFSP flush callback"
+        );
+        assert_eq!(
+            barriers_after_flush.flush,
+            barriers_before.flush + 1,
+            "explicit flush should own one foreground barrier"
+        );
+        assert_eq!(
+            flush_calls_after_flush,
+            flush_calls_before + 1,
+            "explicit flush should drain the dirty inode exactly once"
+        );
+
+        ctx.run_close_callback(attr.ino, fh);
+        let callbacks_after_close = winfsp_callbacks(&vfs);
+        let barriers_after_close = winfsp_foreground_flushes(&vfs);
+        let flush_calls_after_close = flush_ordered_calls(&vfs);
+        assert_eq!(
+            callbacks_after_close.close,
+            callbacks_before.close + 1,
+            "close should still be observed after cleanup and explicit flush"
+        );
+        assert_eq!(
+            barriers_after_close.close, barriers_before.close,
+            "final close should not claim a fallback barrier once explicit flush drained the inode"
+        );
+        assert_eq!(
+            barriers_after_close.close_skipped_clean,
+            barriers_before.close_skipped_clean + 1,
+            "final close should be attributed as a clean skip after the explicit flush"
+        );
+        assert_eq!(
+            flush_calls_after_close, flush_calls_after_flush,
+            "final close should not trigger another ordered flush after the explicit flush"
+        );
+        assert_eq!(
+            vfs.open_count(attr.ino),
+            0,
+            "close should still release the last handle after the explicit flush path"
+        );
     }
 
     #[test]
