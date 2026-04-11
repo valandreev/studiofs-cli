@@ -11763,6 +11763,66 @@ mod tests {
     }
 
     #[test]
+    fn current_or_legacy_manifest_falls_back_to_legacy_rows_when_graph_is_empty() {
+        let engine = temp_engine();
+        let file = engine
+            .create_file(ROOT_INO, b"legacy-manifest-fallback.bin", 1000, 1000, 0o644)
+            .unwrap();
+        let current_block = BlockRef::new_partial(901, 4096);
+        let committed_block = BlockRef::new_partial(902, 2048);
+
+        let txn = engine.db.begin_write().unwrap();
+        {
+            let mut file_blocks = txn.open_table(FILE_BLOCKS_TABLE).unwrap();
+            let key = encode_file_block_key(file.ino, 1);
+            let value = encode(&current_block).unwrap();
+            file_blocks
+                .insert(key.as_slice(), value.as_slice())
+                .unwrap();
+        }
+        {
+            let mut committed = txn.open_table(COMMITTED_FILE_BLOCKS_TABLE).unwrap();
+            let key = encode_file_block_key(file.ino, 3);
+            let value = encode(&committed_block).unwrap();
+            committed.insert(key.as_slice(), value.as_slice()).unwrap();
+        }
+
+        let manifest = RedbMetaEngine::current_or_legacy_manifest_in_txn(&txn, file.ino).unwrap();
+        assert_eq!(manifest, vec![(1, current_block), (3, committed_block)]);
+    }
+
+    #[test]
+    fn current_or_legacy_manifest_prefers_current_graph_over_legacy_rows() {
+        let engine = temp_engine();
+        let file = engine
+            .create_file(
+                ROOT_INO,
+                b"current-manifest-preferred.bin",
+                1000,
+                1000,
+                0o644,
+            )
+            .unwrap();
+        let current_block = BlockRef::new_partial(911, 4096);
+        let stale_legacy_block = BlockRef::new_partial(999, 4096);
+
+        engine.set_file_block(file.ino, 0, &current_block).unwrap();
+
+        let txn = engine.db.begin_write().unwrap();
+        {
+            let mut file_blocks = txn.open_table(FILE_BLOCKS_TABLE).unwrap();
+            let key = encode_file_block_key(file.ino, 0);
+            let value = encode(&stale_legacy_block).unwrap();
+            file_blocks
+                .insert(key.as_slice(), value.as_slice())
+                .unwrap();
+        }
+
+        let manifest = RedbMetaEngine::current_or_legacy_manifest_in_txn(&txn, file.ino).unwrap();
+        assert_eq!(manifest, vec![(0, current_block)]);
+    }
+
+    #[test]
     fn redb_upload_state_transitions_follow_inode_fields() {
         let engine = temp_engine();
 

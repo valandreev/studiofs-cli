@@ -2,7 +2,7 @@
 
 use std::path::Path;
 use studiofs_meta::{
-    FormatInfo, RedbMetaEngine, ensure_studiofs_database, redb_engine::RedbSnapshot,
+    FormatInfo, MetaFormat, RedbMetaEngine, ensure_studiofs_database, redb_engine::RedbSnapshot,
 };
 use thiserror::Error;
 
@@ -99,7 +99,7 @@ async fn fetch_remote_snapshot(name: &str, postgres_dsn: &str) -> DiscoveryResul
     let (client, connection) = tokio_postgres::connect(postgres_dsn, tokio_postgres::NoTls)
         .await
         .map_err(|e| DiscoveryError::Message(format!("cannot connect to postgres: {e}")))?;
-    let conn_task = tokio::spawn(async move { connection.await });
+    let conn_task = tokio::spawn(connection);
 
     let result = async {
         let row = client
@@ -133,7 +133,11 @@ async fn fetch_remote_snapshot(name: &str, postgres_dsn: &str) -> DiscoveryResul
     result
 }
 
-fn create_local_snapshot(name: &str, meta_dir: &Path, state: DiscoveredState) -> DiscoveryResult<std::path::PathBuf> {
+fn create_local_snapshot(
+    name: &str,
+    meta_dir: &Path,
+    state: DiscoveredState,
+) -> DiscoveryResult<std::path::PathBuf> {
     std::fs::create_dir_all(meta_dir)?;
     let db_path = meta_dir.join(format!("{name}.db"));
     if db_path.exists() {

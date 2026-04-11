@@ -949,6 +949,48 @@ mod tests {
     }
 
     #[test]
+    fn mount_parses_startup_contract_flags_together() {
+        let cli = parse(&[
+            "mount",
+            "vol",
+            "/mnt/studio",
+            "--cache-dir",
+            "/tmp/studio-cache",
+            "--cache-size",
+            "200GB",
+            "--principal",
+            "alice",
+            "--endpoint",
+            "http://127.0.0.1:9000",
+            "--foreground",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Mount {
+                name,
+                mount_point,
+                cache_dir,
+                cache_size,
+                principal,
+                foreground,
+                detach,
+                endpoint,
+                ..
+            } => {
+                assert_eq!(name, "vol");
+                assert_eq!(mount_point.as_deref(), Some("/mnt/studio"));
+                assert_eq!(cache_dir, Some(PathBuf::from("/tmp/studio-cache")));
+                assert_eq!(cache_size.as_deref(), Some("200GB"));
+                assert_eq!(principal.as_deref(), Some("alice"));
+                assert_eq!(endpoint.as_deref(), Some("http://127.0.0.1:9000"));
+                assert!(foreground);
+                assert!(!detach);
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn mount_block_cache_alias_is_rejected() {
         let err = match parse(&["mount", "vol", "Z:", "--block-cache", "raw-file"]) {
             Ok(_) => panic!("expected alias to be rejected"),

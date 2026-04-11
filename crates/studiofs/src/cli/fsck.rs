@@ -6,8 +6,8 @@ use std::path::Path;
 
 use studiofs_meta::engine::UndoLogKind;
 use studiofs_meta::{
-    open_meta_engine_with_options, FileType, MetaEngine, MetaError, MetaOpenOptions, MetadataBackend,
-    ROOT_INO,
+    FileType, MetaEngine, MetaError, MetaOpenOptions, MetadataBackend, ROOT_INO,
+    open_meta_engine_with_options,
 };
 use thiserror::Error;
 
@@ -153,10 +153,7 @@ fn scan_namespace(meta: &dyn MetaEngine) -> FsckResult<NamespaceScan> {
     Ok(scan)
 }
 
-fn collect_report_with_progress(
-    meta: &dyn MetaEngine,
-    progress: bool,
-) -> FsckResult<FsckReport> {
+fn collect_report_with_progress(meta: &dyn MetaEngine, progress: bool) -> FsckResult<FsckReport> {
     if progress {
         println!("Collecting fsck inputs...");
         println!("  reading pending create records...");
@@ -355,11 +352,6 @@ fn repair_orphan_directory(
             )));
         }
     };
-    let removed_orphans_out = removed_orphans;
-    let orphan_blocks_pending_gc_out = orphan_blocks_pending_gc;
-    let skipped_hardlink_orphans_out = skipped_hardlink_orphans;
-    let processed_out = processed;
-
     for entry in entries {
         let entry_ino = entry.ino;
         let entry_name = entry.name;
@@ -368,10 +360,10 @@ fn repair_orphan_directory(
                 repair_orphan_directory(
                     meta,
                     entry_ino,
-                    &mut *removed_orphans_out,
-                    &mut *orphan_blocks_pending_gc_out,
-                    &mut *skipped_hardlink_orphans_out,
-                    &mut *processed_out,
+                    removed_orphans,
+                    orphan_blocks_pending_gc,
+                    skipped_hardlink_orphans,
+                    processed,
                 )?;
                 match meta.rmdir(ino, &entry_name) {
                     Ok(()) | Err(MetaError::EntryNotFound { .. }) => {
@@ -399,7 +391,7 @@ fn repair_orphan_directory(
                     }
                 };
                 if attr.as_ref().is_some_and(|attr| attr.nlink > 1) {
-                    *skipped_hardlink_orphans_out += 1;
+                    *skipped_hardlink_orphans += 1;
                     continue;
                 }
 
@@ -413,20 +405,15 @@ fn repair_orphan_directory(
                 }
 
                 if attr.is_some() {
-                    remove_orphan_file(
-                        meta,
-                        entry_ino,
-                        orphan_blocks_pending_gc_out,
-                        removed_orphans_out,
-                    )?;
+                    remove_orphan_file(meta, entry_ino, orphan_blocks_pending_gc, removed_orphans)?;
                 }
-                processed_out.insert(entry_ino);
+                processed.insert(entry_ino);
             }
         }
     }
 
     match meta.remove_attr(ino) {
-        Ok(()) | Err(MetaError::InodeNotFound(_)) => *removed_orphans_out += 1,
+        Ok(()) | Err(MetaError::InodeNotFound(_)) => *removed_orphans += 1,
         Err(err) => {
             return Err(FsckError::Message(format!(
                 "failed to remove orphan directory inode {ino}: {err}"
