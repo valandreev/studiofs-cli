@@ -485,6 +485,43 @@ impl PreparedMountRuntime {
     }
 }
 
+fn guard_mount_pid_file(actual_mount_path: &str) -> anyhow::Result<()> {
+    guard_mount_pid_file_with(
+        actual_mount_path,
+        std::process::id(),
+        super::utils::read_pid_file,
+        super::utils::remove_pid_file,
+        super::utils::is_process_running,
+    )
+}
+
+fn guard_mount_pid_file_with<ReadPid, RemovePid, IsRunning>(
+    actual_mount_path: &str,
+    current_pid: u32,
+    read_pid_file: ReadPid,
+    remove_pid_file: RemovePid,
+    is_process_running: IsRunning,
+) -> anyhow::Result<()>
+where
+    ReadPid: Fn(&str) -> anyhow::Result<(u32, String, String)>,
+    RemovePid: Fn(&str) -> anyhow::Result<()>,
+    IsRunning: Fn(u32) -> bool,
+{
+    if let Ok((pid, _, _)) = read_pid_file(actual_mount_path) {
+        if pid != current_pid && is_process_running(pid) {
+            anyhow::bail!(
+                "Already mounted at '{}' (PID {}). Run `studiofs umount \"{}\"` first.",
+                actual_mount_path,
+                pid,
+                actual_mount_path
+            );
+        }
+        // Stale PID file (or the pre-written entry from the parent) — clean up.
+        let _ = remove_pid_file(actual_mount_path);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_mount_runtime(
     name: &str,
@@ -767,18 +804,7 @@ pub fn run(
     // Note: when launched via `mount -d`, the parent pre-writes the PID file
     // with the child's PID before the child starts.  The child must therefore
     // ignore a PID file that points to itself.
-    if let Ok((pid, _, _)) = super::utils::read_pid_file(&actual_mount_path) {
-        if pid != std::process::id() && super::utils::is_process_running(pid) {
-            anyhow::bail!(
-                "Already mounted at '{}' (PID {}). Run `studiofs umount \"{}\"` first.",
-                actual_mount_path,
-                pid,
-                actual_mount_path
-            );
-        }
-        // Stale PID file (or the pre-written entry from the parent) — clean up
-        let _ = super::utils::remove_pid_file(&actual_mount_path);
-    }
+    guard_mount_pid_file(&actual_mount_path)?;
 
     let base_cache_path = cache_dir.unwrap_or_else(|| meta_dir.join("cache"));
     let runtime = prepare_mount_runtime(
@@ -902,6 +928,7 @@ fn sanitize_log_component(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::utils;
 
     #[test]
     fn validate_endpoint_override_accepts_http_urls_and_bare_host_port() {
@@ -990,5 +1017,55 @@ mod tests {
             normalize_windows_mount_path(r"\\?\UNC\server\share\vol"),
             r"\\server\share\vol"
         );
+    }
+
+    #[test]
+    fn pid_guard_ignores_self_pid_and_removes_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mount_point = "/tmp/studiofs-self-pid";
+        utils::write_pid_file_in(temp.path(), mount_point, "demo", 4242).expect("write pid file");
+
+        guard_mount_pid_file_with(
+            mount_point,
+            4242,
+            |mount_point| utils::read_pid_file_in(temp.path(), mount_point),
+            |mount_point| utils::remove_pid_file_in(temp.path(), mount_point),
+            |_| true,
+        )
+        .expect("self pid should be ignored");
+
+        let err = utils::read_pid_file_in(temp.path(), mount_point)
+            .expect_err("guard should remove the stale/self pid file");
+        assert!(
+            err.to_string().contains("No mount found"),
+            "pid guard should remove the file after accepting the self pid"
+        );
+    }
+
+    #[test]
+    fn pid_guard_rejects_live_foreign_process_without_removing_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mount_point = "/tmp/studiofs-live-foreign-pid";
+        utils::write_pid_file_in(temp.path(), mount_point, "demo", 7777).expect("write pid file");
+
+        let err = guard_mount_pid_file_with(
+            mount_point,
+            4242,
+            |mount_point| utils::read_pid_file_in(temp.path(), mount_point),
+            |mount_point| utils::remove_pid_file_in(temp.path(), mount_point),
+            |pid| pid == 7777,
+        )
+        .expect_err("live foreign pid should block the mount");
+
+        assert!(
+            err.to_string().contains("Already mounted"),
+            "pid guard should reject an active foreign mount owner"
+        );
+
+        let (pid, recorded_mount_point, volume) =
+            utils::read_pid_file_in(temp.path(), mount_point).expect("pid file should remain");
+        assert_eq!(pid, 7777);
+        assert_eq!(recorded_mount_point, mount_point);
+        assert_eq!(volume, "demo");
     }
 }
