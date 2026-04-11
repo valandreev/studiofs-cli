@@ -21,6 +21,11 @@ use tracing::{debug, info, warn};
 const WRITE_PATH_OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(1);
 type MountProfileFinish = Box<dyn FnMut()>;
 
+struct ResolvedMountConfig {
+    vfs_config: studiofs_vfs::VfsConfigValidated,
+    cache_mode: String,
+}
+
 struct WritePathObservabilityPublisher {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -209,6 +214,190 @@ fn validate_endpoint_override(endpoint: Option<&str>) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn build_mount_config(principal: Option<&str>) -> anyhow::Result<ResolvedMountConfig> {
+    let mut vfs_config_raw = super::settings::load_studiofs_config()?.vfs;
+    vfs_config_raw = overlay_vfs_env(vfs_config_raw);
+    if let Some(principal) = principal {
+        vfs_config_raw.principal = Some(principal.to_string());
+    }
+
+    let vfs_config = vfs_config_raw
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid VFS config: {e}"))?;
+    let cache_mode = format!("{:?}", vfs_config.cache_safety_mode).to_ascii_lowercase();
+
+    Ok(ResolvedMountConfig {
+        vfs_config,
+        cache_mode,
+    })
+}
+
+fn resolve_run_in_foreground(foreground: bool, detach: bool) -> bool {
+    foreground || !detach
+}
+
+fn export_mount_principal(principal: Option<&str>) {
+    export_mount_principal_with(principal, |key, value| {
+        // SAFETY: this happens before Tokio runtime creation, so no runtime
+        // worker threads are alive to race on process environment access.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    });
+}
+
+fn export_mount_principal_with<F>(principal: Option<&str>, set_var: F)
+where
+    F: FnOnce(&str, &str),
+{
+    if let Some(principal) = principal {
+        set_var("STUDIOFS_PRINCIPAL", principal);
+    }
+}
+
+fn resolve_runtime_mount_point(mount_point: String) -> String {
+    #[cfg(windows)]
+    {
+        resolve_runtime_mount_point_with("STUDIOFS_DAEMON_MOUNT_POINT_INTERNAL", mount_point)
+    }
+
+    #[cfg(not(windows))]
+    {
+        resolve_runtime_mount_point_with("STUDIOFS_DAEMON_MOUNT_POINT", mount_point)
+    }
+}
+
+fn resolve_runtime_mount_point_with(env_key: &str, mount_point: String) -> String {
+    resolve_runtime_mount_point_from(env_key, mount_point, |env_key| std::env::var(env_key))
+}
+
+fn resolve_runtime_mount_point_from<F>(env_key: &str, mount_point: String, read_var: F) -> String
+where
+    F: FnOnce(&str) -> Result<String, std::env::VarError>,
+{
+    read_var(env_key).unwrap_or(mount_point)
+}
+
+fn validate_mount_point_for_platform(mount_point: &str) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        if !super::utils::is_drive_root(mount_point) {
+            anyhow::bail!(
+                "Invalid mount point '{}': Windows mount is supported only on drive letters (for example `Z:`). Directory mount points are not supported.",
+                mount_point
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn prepare_actual_mount_path(name: &str, mount_point: &str) -> anyhow::Result<String> {
+    validate_mount_point_for_platform(mount_point)?;
+
+    let mut actual_mount_path = resolve_mount_path(name, mount_point)
+        .to_string_lossy()
+        .into_owned();
+    #[cfg(windows)]
+    let is_drive_root = super::utils::is_drive_root(&actual_mount_path);
+
+    #[cfg(not(windows))]
+    let is_drive_root = false;
+
+    if !is_drive_root && let Err(err) = std::fs::create_dir_all(&actual_mount_path) {
+        #[cfg(target_os = "macos")]
+        if err.kind() == std::io::ErrorKind::PermissionDenied
+            && actual_mount_path.contains("/Volumes")
+        {
+            anyhow::bail!(
+                "Failed to create mount point '{}'. You can grant mount access with:\n  sudo mkdir -p '{}'\n  sudo chown $(id -un):$(id -gn) '{}'",
+                actual_mount_path,
+                actual_mount_path,
+                actual_mount_path
+            );
+        }
+
+        return Err(err.into());
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Ok(abs_path) = std::fs::canonicalize(&actual_mount_path) {
+            actual_mount_path = abs_path.to_string_lossy().into_owned();
+        }
+    }
+
+    #[cfg(windows)]
+    if !is_drive_root && let Ok(abs_path) = std::fs::canonicalize(&actual_mount_path) {
+        actual_mount_path = normalize_windows_mount_path(&abs_path.to_string_lossy());
+    }
+
+    #[cfg(windows)]
+    if !is_drive_root {
+        let mut entries = std::fs::read_dir(&actual_mount_path)?;
+        if entries.next().is_some() {
+            anyhow::bail!(
+                "Mount point '{}' must be empty to mount a volume.",
+                actual_mount_path
+            );
+        }
+    }
+
+    Ok(actual_mount_path)
+}
+
+fn prepare_runtime_cache_path(
+    cache_dir: &Path,
+    volume_uuid: &str,
+) -> anyhow::Result<(PathBuf, String)> {
+    std::fs::create_dir_all(cache_dir)?;
+    let cache_path = cache_dir.join(volume_uuid);
+    prepare_cache3_runtime(&cache_path)?;
+    let cache_path_str = cache_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("invalid cache path"))?
+        .to_string();
+    Ok((cache_path, cache_path_str))
+}
+
+fn build_mount_profile_finish(
+    profile: Option<super::mount_profile_types::MountProfileMode>,
+    name: &str,
+    cache_mode: &str,
+    cache_path: &Path,
+    run_in_foreground: bool,
+) -> Option<MountProfileFinish> {
+    let mount_mode = if run_in_foreground {
+        "foreground"
+    } else {
+        "daemon"
+    };
+
+    #[cfg(windows)]
+    let platform = "windows";
+    #[cfg(target_os = "macos")]
+    let platform = "macos";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let platform = "linux";
+
+    #[cfg(windows)]
+    let bridge = "winfsp";
+    #[cfg(unix)]
+    let bridge = "fuse";
+
+    let profiling = super::mount_profile::MountProfileSession::start(
+        profile, name, platform, bridge, mount_mode, cache_mode, cache_path,
+    );
+    profiling.map(|profiling| {
+        let mut profiling = Some(profiling);
+        Box::new(move || {
+            if let Some(profiling) = profiling.take() {
+                profiling.finish();
+            }
+        }) as MountProfileFinish
+    })
 }
 
 fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
@@ -599,51 +788,9 @@ fn prepare_mount_runtime(
     let data_config = DataStoreConfig::from(&format_info);
     let block_cache_l1_limit = initial_cache_bytes();
     let cache_size_bytes = parse_positive_size_arg(cache_size)?;
-    std::fs::create_dir_all(cache_dir)?;
-
-    let cache_path = cache_dir.join(&format_info.uuid);
-    prepare_cache3_runtime(&cache_path)?;
-
-    let cache_path_str = cache_path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("invalid cache path"))?
-        .to_string();
-
-    let mount_mode = if run_in_foreground {
-        "foreground"
-    } else {
-        "daemon"
-    };
-
-    #[cfg(windows)]
-    let platform = "windows";
-    #[cfg(target_os = "macos")]
-    let platform = "macos";
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let platform = "linux";
-
-    #[cfg(windows)]
-    let bridge = "winfsp";
-    #[cfg(unix)]
-    let bridge = "fuse";
-
-    let profiling = super::mount_profile::MountProfileSession::start(
-        profile,
-        name,
-        platform,
-        bridge,
-        mount_mode,
-        cache_mode,
-        &cache_path,
-    );
-    let profiling = profiling.map(|profiling| {
-        let mut profiling = Some(profiling);
-        Box::new(move || {
-            if let Some(profiling) = profiling.take() {
-                profiling.finish();
-            }
-        }) as MountProfileFinish
-    });
+    let (cache_path, cache_path_str) = prepare_runtime_cache_path(cache_dir, &format_info.uuid)?;
+    let profiling =
+        build_mount_profile_finish(profile, name, cache_mode, &cache_path, run_in_foreground);
 
     let rt = Arc::new(
         tokio::runtime::Runtime::new()
@@ -699,106 +846,22 @@ pub fn run(
         super::settings::resolve_studiofs_config_for_mount(mount_point, cache_dir, cache_size)?;
 
     let cache_dir = resolved_cache_dir;
-    let mut vfs_config_raw = super::settings::load_studiofs_config()?.vfs;
-    vfs_config_raw = overlay_vfs_env(vfs_config_raw);
-    if let Some(principal) = principal {
-        vfs_config_raw.principal = Some(principal.to_string());
-    }
-
-    let vfs_config = vfs_config_raw
-        .validate()
-        .map_err(|e| anyhow::anyhow!("invalid VFS config: {e}"))?;
-    let cache_mode = format!("{:?}", vfs_config.cache_safety_mode).to_ascii_lowercase();
+    let ResolvedMountConfig {
+        vfs_config,
+        cache_mode,
+    } = build_mount_config(principal)?;
 
     validate_endpoint_override(endpoint)?;
-
-    #[cfg(windows)]
-    let mount_point = {
-        if let Ok(from_env) = std::env::var("STUDIOFS_DAEMON_MOUNT_POINT_INTERNAL") {
-            from_env
-        } else {
-            mount_point.to_string()
-        }
-    };
-
-    #[cfg(not(windows))]
-    let mount_point = std::env::var("STUDIOFS_DAEMON_MOUNT_POINT").unwrap_or(mount_point);
-
-    #[cfg(windows)]
-    {
-        if !super::utils::is_drive_root(&mount_point) {
-            anyhow::bail!(
-                "Invalid mount point '{}': Windows mount is supported only on drive letters (for example `Z:`). Directory mount points are not supported.",
-                mount_point
-            );
-        }
-    }
-
-    let mut actual_mount_path = resolve_mount_path(name, &mount_point)
-        .to_string_lossy()
-        .into_owned();
-    #[cfg(windows)]
-    let is_drive_root = super::utils::is_drive_root(&actual_mount_path);
-
-    #[cfg(not(windows))]
-    let is_drive_root = false;
-
-    if !is_drive_root && let Err(err) = std::fs::create_dir_all(&actual_mount_path) {
-        #[cfg(target_os = "macos")]
-        if err.kind() == std::io::ErrorKind::PermissionDenied
-            && actual_mount_path.contains("/Volumes")
-        {
-            anyhow::bail!(
-                "Failed to create mount point '{}'. You can grant mount access with:\n  sudo mkdir -p '{}'\n  sudo chown $(id -un):$(id -gn) '{}'",
-                actual_mount_path,
-                actual_mount_path,
-                actual_mount_path
-            );
-        }
-
-        return Err(err.into());
-    }
-
-    // Canonicalize the mount point here for detached mode, where the daemon may run
-    // from a different working directory.
-    #[cfg(not(windows))]
-    {
-        if let Ok(abs_path) = std::fs::canonicalize(&actual_mount_path) {
-            actual_mount_path = abs_path.to_string_lossy().into_owned();
-        }
-    }
-
-    #[cfg(windows)]
-    if !is_drive_root && let Ok(abs_path) = std::fs::canonicalize(&actual_mount_path) {
-        actual_mount_path = normalize_windows_mount_path(&abs_path.to_string_lossy());
-    }
-
-    let actual_mount_path = actual_mount_path;
-    #[cfg(windows)]
-    if !is_drive_root {
-        let mut entries = std::fs::read_dir(&actual_mount_path)?;
-        if entries.next().is_some() {
-            anyhow::bail!(
-                "Mount point '{}' must be empty to mount a volume.",
-                actual_mount_path
-            );
-        }
-    }
+    let mount_point = resolve_runtime_mount_point(mount_point);
+    let actual_mount_path = prepare_actual_mount_path(name, &mount_point)?;
 
     // ── Daemon mode: re-spawn in background and exit ────────────────────────
     if detach {
         return spawn_daemon(name, &actual_mount_path, meta_dir);
     }
 
-    let run_in_foreground = foreground || !detach;
-
-    if let Some(principal) = principal {
-        // SAFETY: this happens before Tokio runtime creation, so no runtime
-        // worker threads are alive to race on process environment access.
-        unsafe {
-            std::env::set_var("STUDIOFS_PRINCIPAL", principal);
-        }
-    }
+    let run_in_foreground = resolve_run_in_foreground(foreground, detach);
+    export_mount_principal(principal);
 
     // ── Guard against double-mount ──────────────────────────────────────────
     // Note: when launched via `mount -d`, the parent pre-writes the PID file
@@ -979,6 +1042,88 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_run_in_foreground_covers_mode_combinations() {
+        assert!(resolve_run_in_foreground(false, false));
+        assert!(resolve_run_in_foreground(true, false));
+        assert!(resolve_run_in_foreground(true, true));
+        assert!(!resolve_run_in_foreground(false, true));
+    }
+
+    #[test]
+    fn resolve_runtime_mount_point_from_prefers_env_override() {
+        assert_eq!(
+            resolve_runtime_mount_point_from(
+                "STUDIOFS_TEST_MOUNT_POINT",
+                "/mnt/demo".to_string(),
+                |_| Ok("/mnt/daemon".to_string())
+            ),
+            "/mnt/daemon"
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_mount_point_from_falls_back_when_env_is_missing() {
+        assert_eq!(
+            resolve_runtime_mount_point_from(
+                "STUDIOFS_TEST_MOUNT_POINT",
+                "/mnt/demo".to_string(),
+                |_| Err(std::env::VarError::NotPresent)
+            ),
+            "/mnt/demo"
+        );
+    }
+
+    #[test]
+    fn export_mount_principal_with_sets_value_only_when_present() {
+        let mut captured = None;
+        export_mount_principal_with(Some("alice"), |key, value| {
+            captured = Some((key.to_string(), value.to_string()));
+        });
+        assert_eq!(
+            captured,
+            Some(("STUDIOFS_PRINCIPAL".to_string(), "alice".to_string()))
+        );
+
+        let mut missing = false;
+        export_mount_principal_with(None, |_, _| {
+            missing = true;
+        });
+        assert!(
+            !missing,
+            "principal export helper should skip env mutation when unset"
+        );
+    }
+
+    #[test]
+    fn prepare_runtime_cache_path_scopes_layout_by_volume_uuid() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (cache_path, cache_path_str) =
+            prepare_runtime_cache_path(temp.path(), "volume-uuid").expect("cache path prepared");
+
+        assert_eq!(cache_path, temp.path().join("volume-uuid"));
+        assert_eq!(cache_path_str, cache_path.to_string_lossy());
+        let layout = CacheV3Layout::from_cache_root(&cache_path);
+        assert!(layout.layout_marker.exists());
+        assert!(layout.tmp_dir.exists());
+        assert!(layout.payload_blocks_dir.exists());
+        assert!(layout.index_dir.exists());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn prepare_actual_mount_path_creates_and_canonicalizes_mount_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mount_point = temp.path().join("mnt");
+        let actual_mount_path =
+            prepare_actual_mount_path("projectfs", mount_point.to_str().expect("utf8 path"))
+                .expect("mount path prepared");
+
+        let expected = std::fs::canonicalize(mount_point.join("projectfs")).expect("canonical");
+        assert_eq!(PathBuf::from(&actual_mount_path), expected);
+        assert!(expected.is_dir());
+    }
+
     #[cfg(windows)]
     #[test]
     fn test_resolve_mount_path_on_windows_drive_root() {
@@ -1017,6 +1162,14 @@ mod tests {
             normalize_windows_mount_path(r"\\?\UNC\server\share\vol"),
             r"\\server\share\vol"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prepare_actual_mount_path_rejects_windows_directory_mount_points() {
+        let err = prepare_actual_mount_path("projectfs", r"C:\temp\studiofs")
+            .expect_err("windows helper should reject directory mount points");
+        assert!(err.to_string().contains("drive letters"));
     }
 
     #[test]
@@ -1067,5 +1220,28 @@ mod tests {
         assert_eq!(pid, 7777);
         assert_eq!(recorded_mount_point, mount_point);
         assert_eq!(volume, "demo");
+    }
+
+    #[test]
+    fn pid_guard_allows_stale_foreign_pid_and_removes_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mount_point = "/tmp/studiofs-stale-foreign-pid";
+        utils::write_pid_file_in(temp.path(), mount_point, "demo", 7777).expect("write pid file");
+
+        guard_mount_pid_file_with(
+            mount_point,
+            4242,
+            |mount_point| utils::read_pid_file_in(temp.path(), mount_point),
+            |mount_point| utils::remove_pid_file_in(temp.path(), mount_point),
+            |_| false,
+        )
+        .expect("stale foreign pid should be cleaned up");
+
+        let err = utils::read_pid_file_in(temp.path(), mount_point)
+            .expect_err("stale foreign pid file should be removed");
+        assert!(
+            err.to_string().contains("No mount found"),
+            "guard should remove stale foreign pid files after accepting them"
+        );
     }
 }
