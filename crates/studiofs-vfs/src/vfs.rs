@@ -2105,6 +2105,123 @@ impl FileSessionState {
             .fetch_add(1, Ordering::Relaxed);
         session
     }
+
+    fn gc_if_idle(&self, ino: Ino) {
+        let mut sessions = self.sessions.lock();
+        if sessions.get(&ino).and_then(Weak::upgrade).is_none() {
+            sessions.remove(&ino);
+            self.counters
+                .active_sessions
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(1))
+                })
+                .ok();
+            debug!(ino, "file session gc removed idle session");
+        }
+    }
+
+    async fn enter_op(&self, ino: Ino, op: FileSessionOperation) -> FileSessionPermit {
+        let session = self.session(ino);
+        let counters = self.counters.clone();
+        let queue_depth = session.queued_ops.fetch_add(1, Ordering::Relaxed) + 1;
+        session.update_max_queue_depth(queue_depth);
+        let global_queue_depth = counters.queued_ops.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = counters.max_queue_depth.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| (global_queue_depth > current).then_some(global_queue_depth),
+        );
+
+        let wait_started = Instant::now();
+        let (read_guard, write_guard) = if op.read_lock() {
+            (Some(session.gate.clone().read_owned().await), None)
+        } else {
+            (None, Some(session.gate.clone().write_owned().await))
+        };
+        session.queued_ops.fetch_sub(1, Ordering::Relaxed);
+        counters
+            .queued_ops
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .ok();
+
+        let waited_ms = wait_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        if waited_ms > 0 {
+            session.wait_events.fetch_add(1, Ordering::Relaxed);
+            session.wait_ms.fetch_add(waited_ms, Ordering::Relaxed);
+            counters.wait_events.fetch_add(1, Ordering::Relaxed);
+            counters.wait_ms.fetch_add(waited_ms, Ordering::Relaxed);
+            counters.note_wait_reason(op);
+        }
+
+        counters.note_transition();
+        session.record_transition(op, "start");
+        FileSessionPermit {
+            _read_gate: read_guard,
+            _write_gate: write_guard,
+            counters,
+            session,
+            op,
+        }
+    }
+
+    fn note_open_handle(&self, ino: Ino) -> u32 {
+        let session = self.session(ino);
+        let next = session.open_handles.fetch_add(1, Ordering::Relaxed) + 1;
+        self.counters.open_handles.fetch_add(1, Ordering::Relaxed);
+        self.counters.note_transition();
+        session.record_transition(FileSessionOperation::Read, "open");
+        debug!(ino, open_handles = next, "file session open handle");
+        next
+    }
+
+    fn note_close_handle(&self, ino: Ino, remaining: u32) {
+        let session = self.session(ino);
+        session.open_handles.store(remaining, Ordering::Relaxed);
+        self.counters
+            .open_handles
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .ok();
+        self.counters.note_transition();
+        session.record_transition(FileSessionOperation::Release, "handle_close");
+        debug!(ino, open_handles = remaining, "file session close handle");
+        if remaining == 0 {
+            self.gc_if_idle(ino);
+        }
+    }
+
+    fn note_background_transition(&self, ino: Ino, op: FileSessionOperation, phase: &'static str) {
+        self.counters.note_transition();
+        self.session(ino).record_transition(op, phase);
+        if matches!(phase, "complete" | "published" | "recovered" | "skipped") {
+            self.gc_if_idle(ino);
+        }
+    }
+
+    fn stats(&self) -> VfsFileSessionStats {
+        let counters = self.counters.clone();
+        let mut stats = VfsFileSessionStats {
+            active_sessions: counters.active_sessions.load(Ordering::Relaxed) as usize,
+            open_handles: counters.open_handles.load(Ordering::Relaxed),
+            queued_ops: counters.queued_ops.load(Ordering::Relaxed),
+            max_queue_depth: counters.max_queue_depth.load(Ordering::Relaxed),
+            wait_events: counters.wait_events.load(Ordering::Relaxed),
+            wait_ms: counters.wait_ms.load(Ordering::Relaxed),
+            transitions: counters.transitions.load(Ordering::Relaxed),
+            wait_reasons: Vec::new(),
+        };
+        for idx in 0..FileSessionOperation::COUNT {
+            let Some(op) = FileSessionOperation::from_index(idx) else {
+                continue;
+            };
+            let count = counters.wait_reasons[idx].load(Ordering::Relaxed);
+            stats.wait_reasons.push((op.as_str().to_string(), count));
+        }
+        stats
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -7463,105 +7580,7 @@ impl StudioVfs {
             .remove(&ino);
         self.state.upload.upload_sticky_errors.lock().remove(&ino);
         self.remove_pending_epoch_finalizations_for_inode(ino);
-        self.maybe_gc_file_session(ino);
-    }
-
-    fn file_session_for_inode(&self, ino: Ino) -> Arc<FileSessionEntry> {
-        self.state.file_session.session(ino)
-    }
-
-    fn maybe_gc_file_session(&self, ino: Ino) {
-        let mut sessions = self.state.file_session.sessions.lock();
-        if sessions.get(&ino).and_then(Weak::upgrade).is_none() {
-            sessions.remove(&ino);
-            self.state
-                .file_session
-                .counters
-                .active_sessions
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(1))
-                })
-                .ok();
-            debug!(ino, "file session gc removed idle session");
-        }
-    }
-
-    async fn enter_file_session_op(&self, ino: Ino, op: FileSessionOperation) -> FileSessionPermit {
-        let session = self.file_session_for_inode(ino);
-        let counters = self.state.file_session.counters.clone();
-        let queue_depth = session.queued_ops.fetch_add(1, Ordering::Relaxed) + 1;
-        session.update_max_queue_depth(queue_depth);
-        let global_queue_depth = counters.queued_ops.fetch_add(1, Ordering::Relaxed) + 1;
-        let _ = counters.max_queue_depth.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| (global_queue_depth > current).then_some(global_queue_depth),
-        );
-
-        let wait_started = Instant::now();
-        let (read_guard, write_guard) = if op.read_lock() {
-            (Some(session.gate.clone().read_owned().await), None)
-        } else {
-            (None, Some(session.gate.clone().write_owned().await))
-        };
-        session.queued_ops.fetch_sub(1, Ordering::Relaxed);
-        counters
-            .queued_ops
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
-            })
-            .ok();
-
-        let waited_ms = wait_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-        if waited_ms > 0 {
-            session.wait_events.fetch_add(1, Ordering::Relaxed);
-            session.wait_ms.fetch_add(waited_ms, Ordering::Relaxed);
-            counters.wait_events.fetch_add(1, Ordering::Relaxed);
-            counters.wait_ms.fetch_add(waited_ms, Ordering::Relaxed);
-            counters.note_wait_reason(op);
-        }
-
-        counters.note_transition();
-        session.record_transition(op, "start");
-        FileSessionPermit {
-            _read_gate: read_guard,
-            _write_gate: write_guard,
-            counters,
-            session,
-            op,
-        }
-    }
-
-    fn note_file_session_open_handle(&self, ino: Ino) {
-        let session = self.file_session_for_inode(ino);
-        let next = session.open_handles.fetch_add(1, Ordering::Relaxed) + 1;
-        self.state
-            .file_session
-            .counters
-            .open_handles
-            .fetch_add(1, Ordering::Relaxed);
-        self.state.file_session.counters.note_transition();
-        session.record_transition(FileSessionOperation::Read, "open");
-        debug!(ino, open_handles = next, "file session open handle");
-    }
-
-    fn note_file_session_close_handle(&self, ino: Ino, remaining: u32) {
-        let session = self.file_session_for_inode(ino);
-        session.open_handles.store(remaining, Ordering::Relaxed);
-        self.state
-            .file_session
-            .counters
-            .open_handles
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
-            })
-            .ok();
-        self.state.file_session.counters.note_transition();
-        session.record_transition(FileSessionOperation::Release, "handle_close");
-        debug!(ino, open_handles = remaining, "file session close handle");
-        if remaining == 0 {
-            self.maybe_gc_file_session(ino);
-        }
+        self.state.file_session.gc_if_idle(ino);
     }
 
     fn fallback_access_state(&self, ino: Ino, is_write: bool) -> Arc<Mutex<HandleAccessState>> {
@@ -7696,12 +7715,9 @@ impl StudioVfs {
         op: FileSessionOperation,
         phase: &'static str,
     ) {
-        self.state.file_session.counters.note_transition();
-        self.file_session_for_inode(ino)
-            .record_transition(op, phase);
-        if matches!(phase, "complete" | "published" | "recovered" | "skipped") {
-            self.maybe_gc_file_session(ino);
-        }
+        self.state
+            .file_session
+            .note_background_transition(ino, op, phase);
     }
 
     fn mark_upload_sticky_error(&self, ino: Ino, error: &VfsError) {
@@ -8227,25 +8243,7 @@ impl StudioVfs {
     }
 
     pub fn file_session_stats(&self) -> VfsFileSessionStats {
-        let counters = self.state.file_session.counters.clone();
-        let mut stats = VfsFileSessionStats {
-            active_sessions: counters.active_sessions.load(Ordering::Relaxed) as usize,
-            open_handles: counters.open_handles.load(Ordering::Relaxed),
-            queued_ops: counters.queued_ops.load(Ordering::Relaxed),
-            max_queue_depth: counters.max_queue_depth.load(Ordering::Relaxed),
-            wait_events: counters.wait_events.load(Ordering::Relaxed),
-            wait_ms: counters.wait_ms.load(Ordering::Relaxed),
-            transitions: counters.transitions.load(Ordering::Relaxed),
-            wait_reasons: Vec::new(),
-        };
-        for idx in 0..FileSessionOperation::COUNT {
-            let Some(op) = FileSessionOperation::from_index(idx) else {
-                continue;
-            };
-            let count = counters.wait_reasons[idx].load(Ordering::Relaxed);
-            stats.wait_reasons.push((op.as_str().to_string(), count));
-        }
-        stats
+        self.state.file_session.stats()
     }
 
     pub fn foreground_read_protection_stats(&self) -> VfsForegroundReadProtectionStats {
@@ -10316,7 +10314,7 @@ impl StudioVfs {
         if self.ignored_entry_attr(ino).is_some() {
             let open_file = self.handle_table.open(ino, flags);
             let fh = open_file.fh;
-            self.note_file_session_open_handle(ino);
+            self.state.file_session.note_open_handle(ino);
             self.increment_active_access_class(open_file.current_access_class());
             debug!(
                 "open_file ignored ino={} fh={} flags={:#x}",
@@ -10340,7 +10338,7 @@ impl StudioVfs {
 
         let open_file = self.handle_table.open(ino, flags);
         let fh = open_file.fh;
-        self.note_file_session_open_handle(ino);
+        self.state.file_session.note_open_handle(ino);
         self.increment_active_access_class(open_file.current_access_class());
         debug!("open_file ino={} fh={} flags={:#x}", ino, fh, flags.bits());
 
@@ -10388,7 +10386,7 @@ impl StudioVfs {
         let stream_id = open_file.stream_id();
         self.decrement_active_access_class(open_file.current_access_class());
         debug!("release_fh fh={} ino={} remaining={}", fh, ino, remaining);
-        self.note_file_session_close_handle(ino, remaining);
+        self.state.file_session.note_close_handle(ino, remaining);
         self.clear_access_tracking_for_stream(ino, stream_id);
         if remaining > 0 {
             return None;
@@ -10712,11 +10710,13 @@ impl StudioVfs {
         let ino = context.ino;
 
         let session = self
-            .enter_file_session_op(ino, FileSessionOperation::Release)
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Release)
             .await;
         let result = self.release_last_handle_with_outcome(context).await;
         drop(session);
-        self.maybe_gc_file_session(ino);
+        self.state.file_session.gc_if_idle(ino);
         result
     }
 
@@ -10772,7 +10772,9 @@ impl StudioVfs {
         sticky_error_policy: StickyErrorPolicy,
     ) -> VfsResult<ExplicitFlushOutcome> {
         let session = self
-            .enter_file_session_op(ino, FileSessionOperation::Flush)
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Flush)
             .await;
         let result: VfsResult<ExplicitFlushOutcome> = async {
             let outcome = self
@@ -10789,7 +10791,7 @@ impl StudioVfs {
         }
         .await;
         drop(session);
-        self.maybe_gc_file_session(ino);
+        self.state.file_session.gc_if_idle(ino);
         result
     }
 
@@ -10815,7 +10817,9 @@ impl StudioVfs {
 
     async fn fsync_with_outcome(&self, ino: Ino, datasync: bool) -> VfsResult<FsyncOutcome> {
         let session = self
-            .enter_file_session_op(ino, FileSessionOperation::Fsync)
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Fsync)
             .await;
         let result: VfsResult<FsyncOutcome> = async {
             self.enforce_access(ino, AccessLevel::ReadOnly)?;
@@ -10842,7 +10846,7 @@ impl StudioVfs {
         }
         .await;
         drop(session);
-        self.maybe_gc_file_session(ino);
+        self.state.file_session.gc_if_idle(ino);
         result
     }
 
@@ -10875,11 +10879,13 @@ impl StudioVfs {
         buffer: &mut [u8],
     ) -> VfsResult<u32> {
         let session = self
-            .enter_file_session_op(ino, FileSessionOperation::Read)
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Read)
             .await;
         let result = self.read_into_impl(Some(fh), ino, offset, buffer).await;
         drop(session);
-        self.maybe_gc_file_session(ino);
+        self.state.file_session.gc_if_idle(ino);
         result
     }
 
@@ -11621,11 +11627,13 @@ impl StudioVfs {
     /// Read file data at the given offset.
     pub async fn read(&self, ino: Ino, offset: u64, size: u32) -> VfsResult<Bytes> {
         let session = self
-            .enter_file_session_op(ino, FileSessionOperation::Read)
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Read)
             .await;
         let result = self.read_ordered(ino, offset, size).await;
         drop(session);
-        self.maybe_gc_file_session(ino);
+        self.state.file_session.gc_if_idle(ino);
         result
     }
 
@@ -11671,11 +11679,13 @@ impl StudioVfs {
     /// Returns the number of bytes written.
     pub async fn read_into(&self, ino: Ino, offset: u64, buffer: &mut [u8]) -> VfsResult<u32> {
         let session = self
-            .enter_file_session_op(ino, FileSessionOperation::Read)
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Read)
             .await;
         let result = self.read_into_impl(None, ino, offset, buffer).await;
         drop(session);
-        self.maybe_gc_file_session(ino);
+        self.state.file_session.gc_if_idle(ino);
         result
     }
 
@@ -12566,11 +12576,13 @@ impl StudioVfs {
     /// block while `flush()` still handles any remaining tail blocks.
     pub async fn write(&self, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
         let session = self
-            .enter_file_session_op(ino, FileSessionOperation::Write)
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Write)
             .await;
         let result = self.write_ordered(ino, offset, data).await;
         drop(session);
-        self.maybe_gc_file_session(ino);
+        self.state.file_session.gc_if_idle(ino);
         result
     }
 
@@ -15882,15 +15894,19 @@ mod tests {
                 .create(1, b"session-observability.txt", 0, 0, 0o644)
                 .unwrap();
             let ino = attr.ino;
-            let _pin = vfs.file_session_for_inode(ino);
+            let _pin = vfs.state.file_session.session(ino);
 
             let session_guard = vfs
-                .enter_file_session_op(ino, FileSessionOperation::Write)
+                .state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Write)
                 .await;
             let vfs_clone = vfs.clone();
             let waiter = tokio::spawn(async move {
                 let _queued = vfs_clone
-                    .enter_file_session_op(ino, FileSessionOperation::Read)
+                    .state
+                    .file_session
+                    .enter_op(ino, FileSessionOperation::Read)
                     .await;
             });
 
@@ -15945,12 +15961,16 @@ mod tests {
             let ino = attr.ino;
 
             let read_guard = vfs
-                .enter_file_session_op(ino, FileSessionOperation::Read)
+                .state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Read)
                 .await;
             let vfs_clone = vfs.clone();
             let second_reader = tokio::spawn(async move {
                 let _second = vfs_clone
-                    .enter_file_session_op(ino, FileSessionOperation::Read)
+                    .state
+                    .file_session
+                    .enter_op(ino, FileSessionOperation::Read)
                     .await;
             });
 
@@ -15959,6 +15979,59 @@ mod tests {
                 .expect("parallel read lock acquisition should not block")
                 .unwrap();
             drop(read_guard);
+        });
+    }
+
+    #[test]
+    fn test_file_session_open_handle_stats_track_release_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-open-handle-stats");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"session-open-handle-stats.txt", 0, 0, 0o644)
+                .unwrap();
+            let ino = attr.ino;
+
+            let fh1 = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+            let after_first = vfs.file_session_stats();
+            assert_eq!(
+                after_first.active_sessions, 1,
+                "opening the first handle should materialize one file session"
+            );
+            assert_eq!(
+                after_first.open_handles, 1,
+                "opening the first handle should increment open-handle tracking"
+            );
+
+            let fh2 = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+            let after_second = vfs.file_session_stats();
+            assert_eq!(
+                after_second.open_handles, 2,
+                "opening a second handle should keep both handles observable"
+            );
+
+            vfs.release_fh(fh1).await.unwrap();
+            let after_first_release = vfs.file_session_stats();
+            assert_eq!(
+                after_first_release.active_sessions, 1,
+                "the session should stay alive until the last handle closes"
+            );
+            assert_eq!(
+                after_first_release.open_handles, 1,
+                "releasing one of two handles should decrement the handle count only once"
+            );
+
+            vfs.release_fh(fh2).await.unwrap();
+            let final_stats = vfs.file_session_stats();
+            assert_eq!(
+                final_stats.open_handles, 0,
+                "last-handle release should clear file-session open-handle tracking"
+            );
+            assert_eq!(
+                final_stats.active_sessions, 0,
+                "last-handle release should collect the idle file session"
+            );
         });
     }
 
