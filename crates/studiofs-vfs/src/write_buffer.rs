@@ -1245,7 +1245,13 @@ impl StudioVfs {
 
     pub(super) async fn write_ordered(&self, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
-        let _ = self.observe_write_access(None, ino, offset, data.len());
+        let _ = self.state.read.observe_write_access(
+            None,
+            ino,
+            offset,
+            data.len(),
+            self.access_classifier,
+        );
         if self.ignored_entry_attr(ino).is_some() {
             let size = offset.saturating_add(data.len() as u64);
             let _ = self.update_ignored_entry(ino, |attr| {

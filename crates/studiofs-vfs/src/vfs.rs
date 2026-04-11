@@ -3964,6 +3964,44 @@ impl ReadState {
         }
     }
 
+    fn observe_read_access(
+        &self,
+        open_file: Option<&OpenFile>,
+        ino: Ino,
+        offset: u64,
+        len: usize,
+        classifier: AccessClassifierConfig,
+    ) -> AccessDecision {
+        if let Some(open_file) = open_file {
+            let decision = open_file.observe_read(offset, len, classifier);
+            self.record_access_class_transition(decision.previous_class, decision.class, true);
+            return decision;
+        }
+        let state = self.fallback_access_state(ino, false);
+        let decision = state.lock().observe_read(offset, len, classifier);
+        self.record_access_class_transition(decision.previous_class, decision.class, false);
+        decision
+    }
+
+    fn observe_write_access(
+        &self,
+        open_file: Option<&OpenFile>,
+        ino: Ino,
+        offset: u64,
+        len: usize,
+        classifier: AccessClassifierConfig,
+    ) -> AccessDecision {
+        if let Some(open_file) = open_file {
+            let decision = open_file.observe_write(offset, len, classifier);
+            self.record_access_class_transition(decision.previous_class, decision.class, true);
+            return decision;
+        }
+        let state = self.fallback_access_state(ino, true);
+        let decision = state.lock().observe_write(offset, len, classifier);
+        self.record_access_class_transition(decision.previous_class, decision.class, false);
+        decision
+    }
+
     fn clear_access_tracking_for_inode(&self, ino: Ino) {
         self.prefetch_last_hint
             .lock()
@@ -3974,6 +4012,174 @@ impl ReadState {
 
     fn clear_prefetch_hint_for_stream(&self, ino: Ino, stream_id: u64) {
         self.prefetch_last_hint.lock().remove(&(ino, stream_id));
+    }
+
+    fn active_access_counts(&self) -> [u64; AccessClass::COUNT] {
+        std::array::from_fn(|idx| {
+            let class = AccessClass::from_index(idx).expect("valid access class index");
+            self.active_access_class_count(class)
+        })
+    }
+
+    fn trim_foreground_latency_samples(
+        samples: &mut VecDeque<ForegroundReadSample>,
+        now_ms: u64,
+        window: Duration,
+    ) {
+        let window_ms = window.as_millis().min(u64::MAX as u128) as u64;
+        let cutoff = now_ms.saturating_sub(window_ms);
+        while samples
+            .front()
+            .is_some_and(|sample| sample.timestamp_ms < cutoff)
+        {
+            samples.pop_front();
+        }
+        while samples.len() > FOREGROUND_READ_SPEEDOMETER_MAX_SAMPLES {
+            samples.pop_front();
+        }
+    }
+
+    fn select_foreground_latency_shard(&self) -> usize {
+        if self.foreground_read_latency_shards.is_empty() {
+            return 0;
+        }
+        let next = self
+            .foreground_read_shard_cursor
+            .fetch_add(1, Ordering::Relaxed);
+        (next as usize) % self.foreground_read_latency_shards.len()
+    }
+
+    fn mark_foreground_read(&self, now_ms: u64) {
+        self.foreground_reads_inflight
+            .fetch_add(1, Ordering::Relaxed);
+        self.last_foreground_read_ms
+            .store(now_ms, Ordering::Relaxed);
+    }
+
+    fn unmark_foreground_read(&self, now_ms: u64) {
+        self.foreground_reads_inflight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .ok();
+        self.last_foreground_read_ms
+            .store(now_ms, Ordering::Relaxed);
+    }
+
+    fn foreground_read_active(&self, now_ms: u64, idle_grace: Duration) -> bool {
+        if self.foreground_reads_inflight.load(Ordering::Relaxed) > 0 {
+            return true;
+        }
+        let last = self.last_foreground_read_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        now_ms.saturating_sub(last) <= idle_grace.as_millis().min(u64::MAX as u128) as u64
+    }
+
+    fn record_foreground_read_latency(
+        &self,
+        shard_idx: usize,
+        telemetry: ForegroundReadTelemetry,
+        now_ms: u64,
+        window: Duration,
+    ) {
+        let Some(shard) = self.foreground_read_latency_shards.get(shard_idx) else {
+            return;
+        };
+        let latency_ns = telemetry.elapsed.as_nanos().clamp(1, u64::MAX as u128) as u64;
+        let mut samples = shard.lock();
+        samples.push_back(ForegroundReadSample {
+            timestamp_ms: now_ms,
+            latency_ns,
+            bytes_read: telemetry.bytes_read,
+            access_class: telemetry.access_class,
+            policy: telemetry.policy,
+        });
+        Self::trim_foreground_latency_samples(&mut samples, now_ms, window);
+        self.upload_fg_read_last_p90_ns
+            .store(latency_ns, Ordering::Release);
+        self.upload_fg_read_last_p90_at_ms
+            .store(now_ms, Ordering::Release);
+    }
+
+    fn foreground_speedometer_snapshot(
+        &self,
+        now_ms: u64,
+        window: Duration,
+    ) -> (Option<u64>, usize, u64, u64) {
+        let mut ages = Vec::new();
+        let mut total_samples = 0usize;
+        let mut window_bytes = 0u64;
+        let mut oldest_start_ms = u64::MAX;
+        let mut newest_end_ms = 0u64;
+
+        for shard in &self.foreground_read_latency_shards {
+            let mut samples = shard.lock();
+            Self::trim_foreground_latency_samples(&mut samples, now_ms, window);
+            total_samples += samples.len();
+            for sample in samples.iter() {
+                ages.push(sample.latency_ns);
+                window_bytes = window_bytes.saturating_add(sample.bytes_read);
+                oldest_start_ms = oldest_start_ms.min(sample.timestamp_ms);
+                newest_end_ms = newest_end_ms.max(sample.timestamp_ms);
+            }
+        }
+
+        if ages.is_empty() {
+            let sticky_p90 = self.upload_fg_read_last_p90_ns.load(Ordering::Acquire);
+            let sticky_at = self.upload_fg_read_last_p90_at_ms.load(Ordering::Acquire);
+            let sticky_window_ms = window.as_millis().min(u64::MAX as u128) as u64;
+            let sticky_valid = sticky_p90 > 0
+                && sticky_at > 0
+                && now_ms.saturating_sub(sticky_at) <= sticky_window_ms;
+            return (sticky_valid.then_some(sticky_p90), 0, 0, 0);
+        }
+
+        ages.sort_unstable();
+        let p90_idx = ((ages.len() - 1).saturating_mul(90)) / 100;
+        let p90_ns = Some(ages[p90_idx]);
+        self.upload_fg_read_last_p90_ns
+            .store(ages[p90_idx], Ordering::Release);
+        self.upload_fg_read_last_p90_at_ms
+            .store(now_ms, Ordering::Release);
+        let window_coverage_ms = if total_samples == 0 {
+            0
+        } else {
+            newest_end_ms.saturating_sub(oldest_start_ms).max(1)
+        };
+        (p90_ns, total_samples, window_bytes, window_coverage_ms)
+    }
+
+    fn foreground_access_pattern_snapshot(
+        &self,
+        now_ms: u64,
+        window: Duration,
+    ) -> Option<(AccessClass, AccessPolicy)> {
+        let mut bytes_by_class = [0u64; AccessClass::COUNT];
+        let mut latest_policy_by_class = [AccessPolicy::default(); AccessClass::COUNT];
+
+        for shard in &self.foreground_read_latency_shards {
+            let mut samples = shard.lock();
+            Self::trim_foreground_latency_samples(&mut samples, now_ms, window);
+            for sample in samples.iter() {
+                let class_idx = sample.access_class.index();
+                bytes_by_class[class_idx] =
+                    bytes_by_class[class_idx].saturating_add(sample.bytes_read.max(1));
+                latest_policy_by_class[class_idx] = sample.policy;
+            }
+        }
+
+        let (dominant_idx, dominant_bytes) = bytes_by_class
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by_key(|&(_, bytes)| bytes)?;
+        if dominant_bytes == 0 {
+            return None;
+        }
+        let dominant_class = AccessClass::from_index(dominant_idx)?;
+        Some((dominant_class, latest_policy_by_class[dominant_idx]))
     }
 }
 
@@ -5230,7 +5436,8 @@ pub struct StudioVfs {
 }
 
 struct ForegroundReadScope<'a> {
-    vfs: &'a StudioVfs,
+    read_state: &'a ReadState,
+    latency_window: Duration,
     started: Instant,
     shard_idx: usize,
     bytes_read: u64,
@@ -5239,11 +5446,13 @@ struct ForegroundReadScope<'a> {
 }
 
 impl<'a> ForegroundReadScope<'a> {
-    fn new(vfs: &'a StudioVfs, policy: AccessPolicy) -> Self {
-        vfs.mark_foreground_read();
-        let shard_idx = vfs.select_foreground_latency_shard();
+    fn new(read_state: &'a ReadState, latency_window: Duration, policy: AccessPolicy) -> Self {
+        let now_ms = StudioVfs::now_unix_millis();
+        read_state.mark_foreground_read(now_ms);
+        let shard_idx = read_state.select_foreground_latency_shard();
         Self {
-            vfs,
+            read_state,
+            latency_window,
             started: Instant::now(),
             shard_idx,
             bytes_read: 0,
@@ -5257,16 +5466,29 @@ impl<'a> ForegroundReadScope<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ForegroundReadTelemetry {
+    bytes_read: u64,
+    elapsed: Duration,
+    access_class: AccessClass,
+    policy: AccessPolicy,
+}
+
 impl Drop for ForegroundReadScope<'_> {
     fn drop(&mut self) {
-        self.vfs.record_foreground_read_latency(
+        let now_ms = StudioVfs::now_unix_millis();
+        self.read_state.record_foreground_read_latency(
             self.shard_idx,
-            self.bytes_read,
-            self.started.elapsed(),
-            self.access_class,
-            self.policy,
+            ForegroundReadTelemetry {
+                bytes_read: self.bytes_read,
+                elapsed: self.started.elapsed(),
+                access_class: self.access_class,
+                policy: self.policy,
+            },
+            now_ms,
+            self.latency_window,
         );
-        self.vfs.unmark_foreground_read();
+        self.read_state.unmark_foreground_read(now_ms);
     }
 }
 
@@ -7031,6 +7253,7 @@ impl StudioVfs {
         capped.saturating_add(Duration::from_millis(jitter_ms))
     }
 
+    #[cfg(test)]
     fn p90_ns(mut values: Vec<u64>) -> Option<u64> {
         if values.is_empty() {
             return None;
@@ -7038,136 +7261,6 @@ impl StudioVfs {
         values.sort_unstable();
         let idx = ((values.len() - 1) * 90) / 100;
         values.get(idx).copied()
-    }
-
-    fn trim_foreground_latency_samples(
-        samples: &mut VecDeque<ForegroundReadSample>,
-        now_ms: u64,
-        window: Duration,
-    ) {
-        let window_ms = window.as_millis().clamp(1, u64::MAX as u128) as u64;
-        let cutoff = now_ms.saturating_sub(window_ms);
-        while samples
-            .front()
-            .is_some_and(|sample| sample.timestamp_ms < cutoff)
-        {
-            samples.pop_front();
-        }
-        while samples.len() > FOREGROUND_READ_SPEEDOMETER_MAX_SAMPLES {
-            samples.pop_front();
-        }
-    }
-
-    fn select_foreground_latency_shard(&self) -> usize {
-        let shard_count = self.state.read.foreground_read_latency_shards.len().max(1);
-        (self
-            .state
-            .read
-            .foreground_read_shard_cursor
-            .fetch_add(1, Ordering::Relaxed) as usize)
-            % shard_count
-    }
-
-    fn record_foreground_read_latency(
-        &self,
-        shard_idx: usize,
-        bytes_read: u64,
-        elapsed: Duration,
-        access_class: AccessClass,
-        policy: AccessPolicy,
-    ) {
-        let now_ms = Self::now_unix_millis();
-        let elapsed_ns = elapsed.as_nanos().clamp(1, u64::MAX as u128) as u64;
-        let shard_count = self.state.read.foreground_read_latency_shards.len().max(1);
-        let idx = shard_idx % shard_count;
-        let mut samples = self.state.read.foreground_read_latency_shards[idx].lock();
-        Self::trim_foreground_latency_samples(
-            &mut samples,
-            now_ms,
-            self.upload_fg_read_latency_window,
-        );
-        samples.push_back(ForegroundReadSample {
-            timestamp_ms: now_ms,
-            latency_ns: elapsed_ns,
-            bytes_read,
-            access_class,
-            policy,
-        });
-    }
-
-    fn foreground_speedometer_snapshot(&self) -> (Option<u64>, usize, u64, u64) {
-        let now_ms = Self::now_unix_millis();
-        let mut samples_all = Vec::with_capacity(FOREGROUND_READ_SPEEDOMETER_MAX_SAMPLES);
-        let mut total_samples = 0usize;
-        let mut window_bytes = 0u64;
-        let mut oldest_start_ms = u64::MAX;
-        let mut newest_end_ms = 0u64;
-        for shard in &self.state.read.foreground_read_latency_shards {
-            let mut samples = shard.lock();
-            Self::trim_foreground_latency_samples(
-                &mut samples,
-                now_ms,
-                self.upload_fg_read_latency_window,
-            );
-            total_samples = total_samples.saturating_add(samples.len());
-            for sample in samples.iter() {
-                samples_all.push(sample.latency_ns);
-                window_bytes = window_bytes.saturating_add(sample.bytes_read);
-                let latency_ms = sample.latency_ns.saturating_div(1_000_000).max(1);
-                oldest_start_ms =
-                    oldest_start_ms.min(sample.timestamp_ms.saturating_sub(latency_ms));
-                newest_end_ms = newest_end_ms.max(sample.timestamp_ms);
-            }
-        }
-        let p90_ns = Self::p90_ns(samples_all);
-        if let Some(p90) = p90_ns {
-            self.state
-                .read
-                .upload_fg_read_last_p90_ns
-                .store(p90, Ordering::Release);
-            self.state
-                .read
-                .upload_fg_read_last_p90_at_ms
-                .store(now_ms, Ordering::Release);
-        }
-        let window_coverage_ms = if total_samples == 0 {
-            0
-        } else {
-            newest_end_ms.saturating_sub(oldest_start_ms).max(1)
-        };
-        (p90_ns, total_samples, window_bytes, window_coverage_ms)
-    }
-
-    fn foreground_access_pattern_snapshot(&self) -> Option<(AccessClass, AccessPolicy)> {
-        let now_ms = Self::now_unix_millis();
-        let mut bytes_by_class = [0u64; AccessClass::COUNT];
-        let mut latest_policy_by_class = [AccessPolicy::default(); AccessClass::COUNT];
-
-        for shard in &self.state.read.foreground_read_latency_shards {
-            let mut samples = shard.lock();
-            Self::trim_foreground_latency_samples(
-                &mut samples,
-                now_ms,
-                self.upload_fg_read_latency_window,
-            );
-            for sample in samples.iter() {
-                let class_idx = sample.access_class.index();
-                bytes_by_class[class_idx] =
-                    bytes_by_class[class_idx].saturating_add(sample.bytes_read.max(1));
-                latest_policy_by_class[class_idx] = sample.policy;
-            }
-        }
-
-        let (dominant_idx, dominant_bytes) = bytes_by_class
-            .iter()
-            .copied()
-            .enumerate()
-            .max_by_key(|(_, bytes)| *bytes)?;
-        if dominant_bytes == 0 {
-            return None;
-        }
-        let class = AccessClass::from_index(dominant_idx)?;
-        Some((class, latest_policy_by_class[dominant_idx]))
     }
 
     fn foreground_throughput_bytes_per_sec(
@@ -7242,7 +7335,10 @@ impl StudioVfs {
     ) {
         let p90_latency_ns = p90_latency_ns.or_else(|| self.foreground_sticky_p90_latency_ns());
         let threshold_ns = self.upload_fg_read_latency_target_ns.max(1);
-        let foreground_active = self.foreground_read_active();
+        let foreground_active = self
+            .state
+            .read
+            .foreground_read_active(Self::now_unix_millis(), self.upload_user_idle_grace);
         let congested = p90_latency_ns.is_some_and(|p90| p90 > threshold_ns);
         let io_cost = self.update_upload_io_foreground_cost(congested, foreground_active);
         let pressure_boost = u64::from(upload_pressure_boost);
@@ -7653,62 +7749,6 @@ impl StudioVfs {
         self.state.upload.upload_sticky_errors.lock().remove(&ino);
         self.remove_pending_epoch_finalizations_for_inode(ino);
         self.state.file_session.gc_if_idle(ino);
-    }
-
-    fn observe_read_access(
-        &self,
-        fh: Option<u64>,
-        ino: Ino,
-        offset: u64,
-        len: usize,
-    ) -> AccessDecision {
-        if let Some(open_file) = fh.and_then(|handle| self.handle_table.get(handle)) {
-            let decision = open_file.observe_read(offset, len, self.access_classifier);
-            self.state.read.record_access_class_transition(
-                decision.previous_class,
-                decision.class,
-                true,
-            );
-            return decision;
-        }
-        let state = self.state.read.fallback_access_state(ino, false);
-        let decision = state
-            .lock()
-            .observe_read(offset, len, self.access_classifier);
-        self.state.read.record_access_class_transition(
-            decision.previous_class,
-            decision.class,
-            false,
-        );
-        decision
-    }
-
-    fn observe_write_access(
-        &self,
-        fh: Option<u64>,
-        ino: Ino,
-        offset: u64,
-        len: usize,
-    ) -> AccessDecision {
-        if let Some(open_file) = fh.and_then(|handle| self.handle_table.get(handle)) {
-            let decision = open_file.observe_write(offset, len, self.access_classifier);
-            self.state.read.record_access_class_transition(
-                decision.previous_class,
-                decision.class,
-                true,
-            );
-            return decision;
-        }
-        let state = self.state.read.fallback_access_state(ino, true);
-        let decision = state
-            .lock()
-            .observe_write(offset, len, self.access_classifier);
-        self.state.read.record_access_class_transition(
-            decision.previous_class,
-            decision.class,
-            false,
-        );
-        decision
     }
 
     fn clear_access_tracking_for_inode(&self, ino: Ino) {
@@ -8255,17 +8295,25 @@ impl StudioVfs {
 
     pub fn foreground_read_protection_stats(&self) -> VfsForegroundReadProtectionStats {
         let (p90_latency_ns, speedometer_samples, window_bytes, window_coverage_ms) =
-            self.foreground_speedometer_snapshot();
+            self.state.read.foreground_speedometer_snapshot(
+                Self::now_unix_millis(),
+                self.upload_fg_read_latency_window,
+            );
         let throughput_bytes_per_sec = Self::foreground_throughput_bytes_per_sec(
             speedometer_samples,
             window_bytes,
             window_coverage_ms,
         );
-        let dominant = self.foreground_access_pattern_snapshot();
+        let dominant = self.state.read.foreground_access_pattern_snapshot(
+            Self::now_unix_millis(),
+            self.upload_fg_read_latency_window,
+        );
         let (dominant_access_class, dominant_policy) = match dominant {
             Some((class, policy)) => (Some(class.as_str().to_string()), policy),
             None => (None, AccessPolicy::default()),
         };
+
+        let active_counts = self.state.read.active_access_counts();
 
         VfsForegroundReadProtectionStats {
             p90_latency_ns,
@@ -8280,22 +8328,11 @@ impl StudioVfs {
             dominant_readahead_max_width: dominant_policy.readahead_max_width,
             dominant_readahead_min_prefetch: dominant_policy.readahead_min_prefetch,
             dominant_upload_pressure_boost: dominant_policy.upload_pressure_boost,
-            active_sequential_media_reads: self
-                .state
-                .read
-                .active_access_class_count(AccessClass::SequentialMediaRead),
-            active_random_interactive_reads: self
-                .state
-                .read
-                .active_access_class_count(AccessClass::RandomInteractiveRead),
-            active_sequential_writers: self
-                .state
-                .read
-                .active_access_class_count(AccessClass::SequentialWriter),
-            active_random_writers: self
-                .state
-                .read
-                .active_access_class_count(AccessClass::RandomWriter),
+            active_sequential_media_reads: active_counts[AccessClass::SequentialMediaRead.index()],
+            active_random_interactive_reads: active_counts
+                [AccessClass::RandomInteractiveRead.index()],
+            active_sequential_writers: active_counts[AccessClass::SequentialWriter.index()],
+            active_random_writers: active_counts[AccessClass::RandomWriter.index()],
             upload_fallback_deferrals: self
                 .state
                 .upload
@@ -8353,56 +8390,6 @@ impl StudioVfs {
         file_size
             .saturating_sub(block_start)
             .min(self.block_size as u64) as usize
-    }
-
-    #[inline]
-    fn mark_foreground_read(&self) {
-        self.state
-            .read
-            .foreground_reads_inflight
-            .fetch_add(1, Ordering::Relaxed);
-        self.state
-            .read
-            .last_foreground_read_ms
-            .store(Self::now_unix_millis(), Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn unmark_foreground_read(&self) {
-        self.state
-            .read
-            .foreground_reads_inflight
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(1))
-            })
-            .ok();
-        self.state
-            .read
-            .last_foreground_read_ms
-            .store(Self::now_unix_millis(), Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn foreground_read_active(&self) -> bool {
-        if self
-            .state
-            .read
-            .foreground_reads_inflight
-            .load(Ordering::Relaxed)
-            > 0
-        {
-            return true;
-        }
-        let last = self
-            .state
-            .read
-            .last_foreground_read_ms
-            .load(Ordering::Relaxed);
-        if last == 0 {
-            return false;
-        }
-        Self::now_unix_millis().saturating_sub(last)
-            <= self.upload_user_idle_grace.as_millis() as u64
     }
 
     fn encode_lease_record(owner_id: &str, lease_until_unix: i64, fencing_token: u64) -> Vec<u8> {
@@ -10913,7 +10900,14 @@ impl StudioVfs {
 
     /// Write file data using the buffered write path.
     pub async fn write_fh(&self, fh: u64, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
-        let _ = self.observe_write_access(Some(fh), ino, offset, data.len());
+        let open_file = self.handle_table.get(fh);
+        let _ = self.state.read.observe_write_access(
+            open_file.as_ref(),
+            ino,
+            offset,
+            data.len(),
+            self.access_classifier,
+        );
         self.write(ino, offset, data).await
     }
 
@@ -11780,8 +11774,19 @@ impl StudioVfs {
             return Ok(0);
         }
         let blocks_needed = self.calculate_blocks_needed(offset, read_len, attr.size);
-        let access = self.observe_read_access(fh, ino, offset, buffer.len());
-        let mut guard = ForegroundReadScope::new(self, access.policy);
+        let open_file = fh.and_then(|handle| self.handle_table.get(handle));
+        let access = self.state.read.observe_read_access(
+            open_file.as_ref(),
+            ino,
+            offset,
+            buffer.len(),
+            self.access_classifier,
+        );
+        let mut guard = ForegroundReadScope::new(
+            &self.state.read,
+            self.upload_fg_read_latency_window,
+            access.policy,
+        );
         let mut read_plan = self
             .build_read_plan(
                 ino,
@@ -13112,7 +13117,11 @@ impl StudioVfs {
             // phase. This path must continue making progress during foreground
             // activity because startup replay reconstructs pending uploads from
             // metadata + persisted local blocks.
-            let upload_io_cost = if self.foreground_read_active() {
+            let upload_io_cost = if self
+                .state
+                .read
+                .foreground_read_active(Self::now_unix_millis(), self.upload_user_idle_grace)
+            {
                 self.state
                     .upload
                     .upload_cache_io_foreground_cost
@@ -15319,12 +15328,74 @@ mod tests {
                 ),
             },
         ]);
-        StudioVfs::trim_foreground_latency_samples(&mut samples, 400, Duration::from_millis(150));
+        ReadState::trim_foreground_latency_samples(&mut samples, 400, Duration::from_millis(150));
         let kept: Vec<(u64, u64, u64)> = samples
             .into_iter()
             .map(|sample| (sample.timestamp_ms, sample.latency_ns, sample.bytes_read))
             .collect();
         assert_eq!(kept, vec![(350, 30, 4_096)]);
+    }
+
+    #[test]
+    fn foreground_read_active_respects_idle_grace_after_last_read() {
+        let state = ReadState::new(1);
+        let grace = Duration::from_millis(50);
+
+        state.mark_foreground_read(100);
+        assert!(state.foreground_read_active(100, grace));
+
+        state.unmark_foreground_read(120);
+        assert!(
+            state.foreground_read_active(169, grace),
+            "idle grace should keep reads active shortly after scope exit"
+        );
+        assert!(
+            !state.foreground_read_active(171, grace),
+            "foreground read activity should expire after the configured idle grace"
+        );
+    }
+
+    #[test]
+    fn foreground_read_scope_records_sample_and_clears_inflight() {
+        let state = ReadState::new(1);
+
+        {
+            let mut scope = ForegroundReadScope::new(
+                &state,
+                Duration::from_secs(1),
+                AccessPolicy::from_class(
+                    AccessClass::SequentialMediaRead,
+                    AccessClassifierConfig {
+                        block_size: 4096,
+                        readahead_base_width: 8,
+                        readahead_max_width: 32,
+                        readahead_min_prefetch: 2,
+                    },
+                ),
+            );
+            scope.record_bytes(4096);
+            assert_eq!(
+                state.foreground_reads_inflight.load(Ordering::Relaxed),
+                1,
+                "creating a scope should mark one active foreground read"
+            );
+        }
+
+        assert_eq!(
+            state.foreground_reads_inflight.load(Ordering::Relaxed),
+            0,
+            "dropping the scope should clear the inflight foreground read"
+        );
+
+        let (p90_ns, total_samples, window_bytes, window_coverage_ms) = state
+            .foreground_speedometer_snapshot(StudioVfs::now_unix_millis(), Duration::from_secs(1));
+        assert!(
+            p90_ns.is_some(),
+            "dropping the scope should record latency telemetry"
+        );
+        assert_eq!(total_samples, 1);
+        assert_eq!(window_bytes, 4096);
+        assert!(window_coverage_ms >= 1);
     }
 
     #[test]
@@ -15388,7 +15459,15 @@ mod tests {
             let mut last = AccessClass::RandomInteractiveRead;
             for step in 0..4u64 {
                 last = vfs
-                    .observe_read_access(None, ino, step * block as u64, block)
+                    .state
+                    .read
+                    .observe_read_access(
+                        None,
+                        ino,
+                        step * block as u64,
+                        block,
+                        vfs.access_classifier,
+                    )
                     .class;
             }
 
@@ -15417,6 +15496,74 @@ mod tests {
     }
 
     #[test]
+    fn handle_read_access_tracking_promotes_active_class_counts() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "handle-access-tracking");
+        let _guard = rt.enter();
+
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"handle-access-tracking.bin", 0, 0, 0o644)
+                .unwrap();
+            let ino = attr.ino;
+            let fh = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+            let block = vfs.access_classifier.block_size as usize;
+
+            assert_eq!(
+                vfs.state
+                    .read
+                    .active_access_class_count(AccessClass::RandomInteractiveRead),
+                1,
+                "new read handle should start in the random-interactive class"
+            );
+            assert_eq!(
+                vfs.state
+                    .read
+                    .active_access_class_count(AccessClass::SequentialMediaRead),
+                0
+            );
+
+            let mut last = AccessClass::RandomInteractiveRead;
+            for step in 0..4u64 {
+                let open_file = vfs.get_open_file(fh).expect("open file");
+                last = vfs
+                    .state
+                    .read
+                    .observe_read_access(
+                        Some(&open_file),
+                        ino,
+                        step * block as u64,
+                        block,
+                        vfs.access_classifier,
+                    )
+                    .class;
+            }
+
+            assert_eq!(
+                last,
+                AccessClass::SequentialMediaRead,
+                "contiguous handle reads should promote the handle into sequential classification"
+            );
+            assert_eq!(
+                vfs.state
+                    .read
+                    .active_access_class_count(AccessClass::RandomInteractiveRead),
+                0,
+                "promotion should decrement the previous active class"
+            );
+            assert_eq!(
+                vfs.state
+                    .read
+                    .active_access_class_count(AccessClass::SequentialMediaRead),
+                1,
+                "promotion should increment the new active class"
+            );
+
+            vfs.release_fh(fh).await.unwrap();
+        });
+    }
+
+    #[test]
     fn clear_access_tracking_for_inode_clears_fallback_states_and_hints() {
         let tmp = TempDir::new().expect("tempdir");
         let (rt, vfs, _meta) = make_test_vfs(&tmp, "clear-access-tracking");
@@ -15429,8 +15576,14 @@ mod tests {
             let ino = attr.ino;
             let block = vfs.access_classifier.block_size as usize;
 
-            let _ = vfs.observe_read_access(None, ino, 0, block);
-            let _ = vfs.observe_write_access(None, ino, 0, block);
+            let _ = vfs
+                .state
+                .read
+                .observe_read_access(None, ino, 0, block, vfs.access_classifier);
+            let _ = vfs
+                .state
+                .read
+                .observe_write_access(None, ino, 0, block, vfs.access_classifier);
             vfs.state
                 .read
                 .prefetch_last_hint
