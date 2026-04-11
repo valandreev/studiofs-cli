@@ -324,8 +324,10 @@ mod tests {
     #[test]
     fn effective_acl_cache_overflow_evicts_partially() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mut cfg = VfsConfig::default();
-        cfg.effective_acl_cache_capacity = 4;
+        let cfg = VfsConfig {
+            effective_acl_cache_capacity: 4,
+            ..VfsConfig::default()
+        };
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "partial-cache-eviction", cfg);
 
         for ino in 10..=14 {
