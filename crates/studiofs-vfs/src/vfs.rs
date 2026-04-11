@@ -1057,6 +1057,11 @@ struct UnlinkTarget {
     open_handles: u32,
 }
 
+struct DeletedInodeCleanup {
+    removed_ids: Vec<u64>,
+    freed_bytes: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalSyncTrigger {
     Explicit,
@@ -10393,64 +10398,16 @@ impl StudioVfs {
         // Last handle closed on an unlinked file — final cleanup
         debug!("orphan cleanup: ino={} (last fd closed)", ino);
 
-        self.mark_inode_deleted_for_uploads(ino);
-
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let meta = self.meta_async.clone();
-        let (removed_ids, total_bytes) = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-            let blocks = match engine.get_file_blocks(ino) {
-                Ok(blocks) => blocks,
-                Err(MetaError::InodeNotFound(_)) => Vec::new(),
-                Err(err) => return Err(err),
-            };
-            let total_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
-
-            let removed_ids = match engine.remove_file_blocks(ino) {
-                Ok(ids) => ids,
-                Err(MetaError::InodeNotFound(_)) => Vec::new(),
-                Err(err) => return Err(err),
-            };
-            for &object_id in &removed_ids {
-                engine.add_pending_deletion(object_id, timestamp)?;
-            }
-
-            if total_bytes > 0 {
-                engine.decr_counter(studiofs_meta::types::counters::USED_SPACE, total_bytes)?;
-            }
-
-            match engine.remove_attr(ino) {
-                Ok(()) | Err(MetaError::InodeNotFound(_)) => {}
-                Err(err) => return Err(err),
-            }
-            let _ = engine.remove_deferred_delete(ino);
-            Ok((removed_ids, total_bytes))
-        })
-        .await?;
-
-        if !removed_ids.is_empty() {
-            self.clear_pending_blocks_for_inode(ino);
-            self.evict_inode_from_caches(ino, &removed_ids).await;
-        }
-        let deferred_local_blocks = self.take_deferred_deleted_local_blocks(ino);
-        if !deferred_local_blocks.is_empty() {
-            self.clear_pending_blocks_for_inode(ino);
-            self.evict_inode_from_caches(ino, &deferred_local_blocks)
-                .await;
-        }
+        let cleanup = self.collect_orphan_deleted_inode_cleanup(ino).await?;
+        let removed_blocks = cleanup.removed_ids.len();
+        let freed_bytes = cleanup.freed_bytes;
+        let deferred_local_blocks = self
+            .finalize_deleted_inode_runtime_cleanup(ino, cleanup.removed_ids)
+            .await;
         debug!(
             "orphan cleanup complete: ino={} removed_blocks={} deferred_local_blocks={} freed_bytes={}",
-            ino,
-            removed_ids.len(),
-            deferred_local_blocks.len(),
-            total_bytes
+            ino, removed_blocks, deferred_local_blocks, freed_bytes
         );
-        self.clear_inode_incarnation(ino);
-        self.state.namespace.dirty_attrs.lock().remove(&ino);
-        self.state.namespace.attr_read_cache.lock().remove(ino);
-        self.maybe_clear_deleted_inode_marker(ino);
         Ok(ReleaseFhOutcome {
             closed_last_handle: true,
             flushed_local_dirty_state: false,
@@ -10528,13 +10485,13 @@ impl StudioVfs {
         Ok(())
     }
 
-    async fn cleanup_deleted_inode_storage(
+    fn collect_deleted_inode_cleanup(
         &self,
         meta: &Arc<dyn MetaEngine>,
         ino: Ino,
         used_space_bytes: u64,
         gc_reason: &str,
-    ) -> VfsResult<()> {
+    ) -> VfsResult<DeletedInodeCleanup> {
         self.mark_inode_deleted_for_uploads(ino);
 
         let removed_ids = meta.remove_file_blocks(ino)?;
@@ -10543,6 +10500,65 @@ impl StudioVfs {
         if used_space_bytes > 0 {
             meta.decr_counter(studiofs_meta::types::counters::USED_SPACE, used_space_bytes)?;
         }
+
+        Ok(DeletedInodeCleanup {
+            removed_ids,
+            freed_bytes: used_space_bytes,
+        })
+    }
+
+    async fn collect_orphan_deleted_inode_cleanup(
+        &self,
+        ino: Ino,
+    ) -> VfsResult<DeletedInodeCleanup> {
+        self.mark_inode_deleted_for_uploads(ino);
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let meta = self.meta_async.clone();
+        run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+            let blocks = match engine.get_file_blocks(ino) {
+                Ok(blocks) => blocks,
+                Err(MetaError::InodeNotFound(_)) => Vec::new(),
+                Err(err) => return Err(err),
+            };
+            let freed_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
+
+            let removed_ids = match engine.remove_file_blocks(ino) {
+                Ok(ids) => ids,
+                Err(MetaError::InodeNotFound(_)) => Vec::new(),
+                Err(err) => return Err(err),
+            };
+            for &object_id in &removed_ids {
+                engine.add_pending_deletion(object_id, timestamp)?;
+            }
+
+            if freed_bytes > 0 {
+                engine.decr_counter(studiofs_meta::types::counters::USED_SPACE, freed_bytes)?;
+            }
+
+            match engine.remove_attr(ino) {
+                Ok(()) | Err(MetaError::InodeNotFound(_)) => {}
+                Err(err) => return Err(err),
+            }
+            let _ = engine.remove_deferred_delete(ino);
+
+            Ok(DeletedInodeCleanup {
+                removed_ids,
+                freed_bytes,
+            })
+        })
+        .await
+    }
+
+    async fn finalize_deleted_inode_runtime_cleanup(
+        &self,
+        ino: Ino,
+        removed_ids: Vec<u64>,
+    ) -> usize {
+        let removed_ids_len = removed_ids.len();
 
         // Deleted inodes should never retain staged writes, even if no committed
         // block refs existed yet. Preserve the old immediate-unlink contract by
@@ -10553,12 +10569,13 @@ impl StudioVfs {
         self.readahead.evict(ino);
         self.clear_access_tracking_for_inode(ino);
 
-        if !removed_ids.is_empty() {
+        if removed_ids_len > 0 {
             self.evict_inode_from_caches(ino, &removed_ids).await;
         }
 
         let deferred_local_blocks = self.take_deferred_deleted_local_blocks(ino);
-        if !deferred_local_blocks.is_empty() {
+        let deferred_local_blocks_len = deferred_local_blocks.len();
+        if deferred_local_blocks_len > 0 {
             self.evict_inode_from_caches(ino, &deferred_local_blocks)
                 .await;
         }
@@ -10567,6 +10584,19 @@ impl StudioVfs {
         self.state.namespace.dirty_attrs.lock().remove(&ino);
         self.state.namespace.attr_read_cache.lock().remove(ino);
         self.maybe_clear_deleted_inode_marker(ino);
+        deferred_local_blocks_len
+    }
+
+    async fn cleanup_deleted_inode_storage(
+        &self,
+        meta: &Arc<dyn MetaEngine>,
+        ino: Ino,
+        used_space_bytes: u64,
+        gc_reason: &str,
+    ) -> VfsResult<()> {
+        let cleanup = self.collect_deleted_inode_cleanup(meta, ino, used_space_bytes, gc_reason)?;
+        self.finalize_deleted_inode_runtime_cleanup(ino, cleanup.removed_ids)
+            .await;
         Ok(())
     }
 
@@ -15506,6 +15536,39 @@ mod tests {
             assert!(
                 vfs.getattr(ino).is_err(),
                 "orphan cleanup should remove the inode"
+            );
+        });
+    }
+
+    #[test]
+    fn test_release_fh_orphan_cleanup_clears_live_extents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-orphan-live-extents");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"release-orphan-live-extents.txt", 0, 0, 0o644)
+                .unwrap();
+            let ino = attr.ino;
+            let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+            vfs.write(ino, 0, b"payload").await.unwrap();
+            vfs.flush(ino).await.unwrap();
+            assert!(
+                !vfs.live_extent_records_for_inode(ino).is_empty(),
+                "flush should materialize live extents before orphan cleanup"
+            );
+
+            vfs.unlink(1, b"release-orphan-live-extents.txt").unwrap();
+            assert!(
+                !vfs.live_extent_records_for_inode(ino).is_empty(),
+                "open-unlink should keep live extents available until the last handle closes"
+            );
+
+            vfs.release_fh(fh).await.unwrap();
+            assert!(
+                vfs.live_extent_records_for_inode(ino).is_empty(),
+                "orphan cleanup should clear live extent identities on final close"
             );
         });
     }
