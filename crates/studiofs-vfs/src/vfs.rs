@@ -3903,6 +3903,78 @@ impl ReadState {
             access_class_transitions: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
+
+    fn fallback_access_state(&self, ino: Ino, is_write: bool) -> Arc<Mutex<HandleAccessState>> {
+        let states = if is_write {
+            &self.write_access_fallback
+        } else {
+            &self.read_access_fallback
+        };
+        let mut states = states.lock();
+        states
+            .entry(ino)
+            .or_insert_with(|| {
+                let flags = if is_write {
+                    OpenFlags::WRONLY
+                } else {
+                    OpenFlags::RDONLY
+                };
+                let stream_id = if is_write { u64::MAX } else { 0 };
+                Arc::new(Mutex::new(HandleAccessState::new(stream_id, flags)))
+            })
+            .clone()
+    }
+
+    fn increment_active_access_class(&self, class: AccessClass) {
+        self.active_access_classes[class.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn decrement_active_access_class(&self, class: AccessClass) {
+        self.active_access_classes[class.index()]
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            })
+            .ok();
+    }
+
+    fn transition_active_access_class(&self, from: AccessClass, to: AccessClass) {
+        if from == to {
+            return;
+        }
+        self.decrement_active_access_class(from);
+        self.increment_active_access_class(to);
+    }
+
+    fn active_access_class_count(&self, class: AccessClass) -> u64 {
+        self.active_access_classes[class.index()].load(Ordering::Relaxed)
+    }
+
+    fn record_access_class_transition(
+        &self,
+        previous: AccessClass,
+        next: AccessClass,
+        update_active_handles: bool,
+    ) {
+        if previous == next {
+            return;
+        }
+        self.access_class_transitions[next.index()].fetch_add(1, Ordering::Relaxed);
+        if update_active_handles {
+            self.transition_active_access_class(previous, next);
+        }
+    }
+
+    fn clear_access_tracking_for_inode(&self, ino: Ino) {
+        self.prefetch_last_hint
+            .lock()
+            .retain(|(tracked_ino, _), _| *tracked_ino != ino);
+        self.read_access_fallback.lock().remove(&ino);
+        self.write_access_fallback.lock().remove(&ino);
+    }
+
+    fn clear_prefetch_hint_for_stream(&self, ino: Ino, stream_id: u64) {
+        self.prefetch_last_hint.lock().remove(&(ino, stream_id));
+    }
 }
 
 struct FileLockState {
@@ -6460,21 +6532,21 @@ impl StudioVfs {
 
             match commit::CommitCoordinator::finalize_inode_epoch(&self, ino, content_epoch).await {
                 Ok(commit::EpochFinalizeStatus::Published) => {
-                    self.note_file_session_background_transition(
+                    self.state.file_session.note_background_transition(
                         ino,
                         FileSessionOperation::Finalize,
                         "published",
                     );
                 }
                 Ok(commit::EpochFinalizeStatus::Skipped) => {
-                    self.note_file_session_background_transition(
+                    self.state.file_session.note_background_transition(
                         ino,
                         FileSessionOperation::Finalize,
                         "skipped",
                     );
                 }
                 Ok(commit::EpochFinalizeStatus::Deferred) => {
-                    self.note_file_session_background_transition(
+                    self.state.file_session.note_background_transition(
                         ino,
                         FileSessionOperation::Finalize,
                         "deferred",
@@ -6499,7 +6571,7 @@ impl StudioVfs {
                             "epoch finalization failed due invalid regular-file graph, quarantining inode"
                         );
                         self.quarantine_invalid_regular_file_graph(ino, attr_size, &err);
-                        self.note_file_session_background_transition(
+                        self.state.file_session.note_background_transition(
                             ino,
                             FileSessionOperation::Finalize,
                             "failed",
@@ -6509,7 +6581,7 @@ impl StudioVfs {
                     if self.shutdown_requested() {
                         break;
                     }
-                    self.note_file_session_background_transition(
+                    self.state.file_session.note_background_transition(
                         ino,
                         FileSessionOperation::Finalize,
                         "failed",
@@ -7583,72 +7655,6 @@ impl StudioVfs {
         self.state.file_session.gc_if_idle(ino);
     }
 
-    fn fallback_access_state(&self, ino: Ino, is_write: bool) -> Arc<Mutex<HandleAccessState>> {
-        let states = if is_write {
-            &self.state.read.write_access_fallback
-        } else {
-            &self.state.read.read_access_fallback
-        };
-        let mut states = states.lock();
-        states
-            .entry(ino)
-            .or_insert_with(|| {
-                let flags = if is_write {
-                    OpenFlags::WRONLY
-                } else {
-                    OpenFlags::RDONLY
-                };
-                let stream_id = if is_write { u64::MAX } else { 0 };
-                Arc::new(Mutex::new(HandleAccessState::new(stream_id, flags)))
-            })
-            .clone()
-    }
-
-    fn increment_active_access_class(&self, class: AccessClass) {
-        self.state.read.active_access_classes[class.index()].fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn decrement_active_access_class(&self, class: AccessClass) {
-        self.state.read.active_access_classes[class.index()]
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(value.saturating_sub(1))
-            })
-            .ok();
-    }
-
-    /// Atomically transition the active-handle count from `from` to `to`.
-    ///
-    /// Performing both operations in a single helper avoids a window where the
-    /// decrement has landed but the increment has not, which could briefly make
-    /// policy decisions based on misleading class counts (e.g. SequentialMedia
-    /// momentarily showing 0 active handles mid-transition).
-    fn transition_active_access_class(&self, from: AccessClass, to: AccessClass) {
-        if from == to {
-            return;
-        }
-        self.decrement_active_access_class(from);
-        self.increment_active_access_class(to);
-    }
-
-    fn access_class_active_count(&self, class: AccessClass) -> u64 {
-        self.state.read.active_access_classes[class.index()].load(Ordering::Relaxed)
-    }
-
-    fn record_access_class_transition(
-        &self,
-        previous: AccessClass,
-        next: AccessClass,
-        update_active_handles: bool,
-    ) {
-        if previous == next {
-            return;
-        }
-        self.state.read.access_class_transitions[next.index()].fetch_add(1, Ordering::Relaxed);
-        if update_active_handles {
-            self.transition_active_access_class(previous, next);
-        }
-    }
-
     fn observe_read_access(
         &self,
         fh: Option<u64>,
@@ -7658,14 +7664,22 @@ impl StudioVfs {
     ) -> AccessDecision {
         if let Some(open_file) = fh.and_then(|handle| self.handle_table.get(handle)) {
             let decision = open_file.observe_read(offset, len, self.access_classifier);
-            self.record_access_class_transition(decision.previous_class, decision.class, true);
+            self.state.read.record_access_class_transition(
+                decision.previous_class,
+                decision.class,
+                true,
+            );
             return decision;
         }
-        let state = self.fallback_access_state(ino, false);
+        let state = self.state.read.fallback_access_state(ino, false);
         let decision = state
             .lock()
             .observe_read(offset, len, self.access_classifier);
-        self.record_access_class_transition(decision.previous_class, decision.class, false);
+        self.state.read.record_access_class_transition(
+            decision.previous_class,
+            decision.class,
+            false,
+        );
         decision
     }
 
@@ -7678,46 +7692,35 @@ impl StudioVfs {
     ) -> AccessDecision {
         if let Some(open_file) = fh.and_then(|handle| self.handle_table.get(handle)) {
             let decision = open_file.observe_write(offset, len, self.access_classifier);
-            self.record_access_class_transition(decision.previous_class, decision.class, true);
+            self.state.read.record_access_class_transition(
+                decision.previous_class,
+                decision.class,
+                true,
+            );
             return decision;
         }
-        let state = self.fallback_access_state(ino, true);
+        let state = self.state.read.fallback_access_state(ino, true);
         let decision = state
             .lock()
             .observe_write(offset, len, self.access_classifier);
-        self.record_access_class_transition(decision.previous_class, decision.class, false);
+        self.state.read.record_access_class_transition(
+            decision.previous_class,
+            decision.class,
+            false,
+        );
         decision
     }
 
     fn clear_access_tracking_for_inode(&self, ino: Ino) {
-        self.state
-            .read
-            .prefetch_last_hint
-            .lock()
-            .retain(|(tracked_ino, _), _| *tracked_ino != ino);
-        self.state.read.read_access_fallback.lock().remove(&ino);
-        self.state.read.write_access_fallback.lock().remove(&ino);
+        self.state.read.clear_access_tracking_for_inode(ino);
     }
 
     fn clear_access_tracking_for_stream(&self, ino: Ino, stream_id: u64) {
         self.state
             .read
-            .prefetch_last_hint
-            .lock()
-            .remove(&(ino, stream_id));
+            .clear_prefetch_hint_for_stream(ino, stream_id);
         self.readahead
             .evict_stream(ReadStreamKey { ino, stream_id });
-    }
-
-    pub(crate) fn note_file_session_background_transition(
-        &self,
-        ino: Ino,
-        op: FileSessionOperation,
-        phase: &'static str,
-    ) {
-        self.state
-            .file_session
-            .note_background_transition(ino, op, phase);
     }
 
     fn mark_upload_sticky_error(&self, ino: Ino, error: &VfsError) {
@@ -7735,7 +7738,11 @@ impl StudioVfs {
                 "recorded sticky async upload error for inode"
             );
         }
-        self.note_file_session_background_transition(ino, FileSessionOperation::Upload, "failed");
+        self.state.file_session.note_background_transition(
+            ino,
+            FileSessionOperation::Upload,
+            "failed",
+        );
     }
 
     fn clear_upload_sticky_error(&self, ino: Ino) {
@@ -7749,7 +7756,7 @@ impl StudioVfs {
         {
             info!(ino, "cleared sticky async upload error for inode");
         }
-        self.note_file_session_background_transition(
+        self.state.file_session.note_background_transition(
             ino,
             FileSessionOperation::Upload,
             "recovered",
@@ -7791,7 +7798,7 @@ impl StudioVfs {
             .lock()
             .insert((ino, content_epoch));
         if inserted {
-            self.note_file_session_background_transition(
+            self.state.file_session.note_background_transition(
                 ino,
                 FileSessionOperation::Finalize,
                 "queued",
@@ -7850,7 +7857,7 @@ impl StudioVfs {
             .lock()
             .pop_first();
         if let Some((ino, _)) = next {
-            self.note_file_session_background_transition(
+            self.state.file_session.note_background_transition(
                 ino,
                 FileSessionOperation::Finalize,
                 "dequeued",
@@ -8274,12 +8281,21 @@ impl StudioVfs {
             dominant_readahead_min_prefetch: dominant_policy.readahead_min_prefetch,
             dominant_upload_pressure_boost: dominant_policy.upload_pressure_boost,
             active_sequential_media_reads: self
-                .access_class_active_count(AccessClass::SequentialMediaRead),
+                .state
+                .read
+                .active_access_class_count(AccessClass::SequentialMediaRead),
             active_random_interactive_reads: self
-                .access_class_active_count(AccessClass::RandomInteractiveRead),
+                .state
+                .read
+                .active_access_class_count(AccessClass::RandomInteractiveRead),
             active_sequential_writers: self
-                .access_class_active_count(AccessClass::SequentialWriter),
-            active_random_writers: self.access_class_active_count(AccessClass::RandomWriter),
+                .state
+                .read
+                .active_access_class_count(AccessClass::SequentialWriter),
+            active_random_writers: self
+                .state
+                .read
+                .active_access_class_count(AccessClass::RandomWriter),
             upload_fallback_deferrals: self
                 .state
                 .upload
@@ -10315,7 +10331,9 @@ impl StudioVfs {
             let open_file = self.handle_table.open(ino, flags);
             let fh = open_file.fh;
             self.state.file_session.note_open_handle(ino);
-            self.increment_active_access_class(open_file.current_access_class());
+            self.state
+                .read
+                .increment_active_access_class(open_file.current_access_class());
             debug!(
                 "open_file ignored ino={} fh={} flags={:#x}",
                 ino,
@@ -10339,7 +10357,9 @@ impl StudioVfs {
         let open_file = self.handle_table.open(ino, flags);
         let fh = open_file.fh;
         self.state.file_session.note_open_handle(ino);
-        self.increment_active_access_class(open_file.current_access_class());
+        self.state
+            .read
+            .increment_active_access_class(open_file.current_access_class());
         debug!("open_file ino={} fh={} flags={:#x}", ino, fh, flags.bits());
 
         // Eager prefetch: when opening a regular file for reading, schedule
@@ -10384,7 +10404,9 @@ impl StudioVfs {
         };
         let ino = open_file.ino;
         let stream_id = open_file.stream_id();
-        self.decrement_active_access_class(open_file.current_access_class());
+        self.state
+            .read
+            .decrement_active_access_class(open_file.current_access_class());
         debug!("release_fh fh={} ino={} remaining={}", fh, ino, remaining);
         self.state.file_session.note_close_handle(ino, remaining);
         self.clear_access_tracking_for_stream(ino, stream_id);
@@ -12828,7 +12850,11 @@ impl StudioVfs {
             ino: op.ino,
         };
         let block_index = block_index_from_offset(op.offset, self.block_size);
-        self.note_file_session_background_transition(op.ino, FileSessionOperation::Upload, "start");
+        self.state.file_session.note_background_transition(
+            op.ino,
+            FileSessionOperation::Upload,
+            "start",
+        );
         let upload_cancel_token = self.uploader_cancel_token_for_inode(op.ino);
         debug!(
             ino = op.ino,
@@ -13436,7 +13462,7 @@ impl StudioVfs {
             elapsed_ms = t0.elapsed().as_millis() as u64,
             "background upload complete"
         );
-        self.note_file_session_background_transition(
+        self.state.file_session.note_background_transition(
             op.ino,
             FileSessionOperation::Upload,
             "complete",
@@ -14202,7 +14228,7 @@ impl StudioVfs {
         // The shutdown flag is already set, so no new open_file() calls can
         // increment the counters after this point.
         for class in self.handle_table.collect_open_access_classes() {
-            self.decrement_active_access_class(class);
+            self.state.read.decrement_active_access_class(class);
         }
 
         // Phase 1: flush pending WriteBuffer state inline into the local backend +
@@ -15347,6 +15373,119 @@ mod tests {
     }
 
     #[test]
+    fn fallback_read_access_tracking_does_not_increment_active_handle_counts() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "fallback-access-tracking");
+        let _guard = rt.enter();
+
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"fallback-access-tracking.bin", 0, 0, 0o644)
+                .unwrap();
+            let ino = attr.ino;
+            let block = vfs.access_classifier.block_size as usize;
+
+            let mut last = AccessClass::RandomInteractiveRead;
+            for step in 0..4u64 {
+                last = vfs
+                    .observe_read_access(None, ino, step * block as u64, block)
+                    .class;
+            }
+
+            assert_eq!(
+                last,
+                AccessClass::SequentialMediaRead,
+                "contiguous fallback reads should still classify as sequential"
+            );
+
+            let stats = vfs.foreground_read_protection_stats();
+            assert_eq!(
+                stats.active_sequential_media_reads, 0,
+                "fallback tracking must not pretend there is an active handle"
+            );
+            assert_eq!(
+                stats.active_random_interactive_reads, 0,
+                "fallback tracking must not perturb active read-handle counts"
+            );
+            assert!(
+                vfs.state.read.access_class_transitions[AccessClass::SequentialMediaRead.index()]
+                    .load(Ordering::Relaxed)
+                    >= 1,
+                "fallback tracking should still contribute access-class transition telemetry"
+            );
+        });
+    }
+
+    #[test]
+    fn clear_access_tracking_for_inode_clears_fallback_states_and_hints() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "clear-access-tracking");
+        let _guard = rt.enter();
+
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"clear-access-tracking.bin", 0, 0, 0o644)
+                .unwrap();
+            let ino = attr.ino;
+            let block = vfs.access_classifier.block_size as usize;
+
+            let _ = vfs.observe_read_access(None, ino, 0, block);
+            let _ = vfs.observe_write_access(None, ino, 0, block);
+            vfs.state
+                .read
+                .prefetch_last_hint
+                .lock()
+                .insert((ino, 77), (4, 2));
+
+            assert!(
+                vfs.state
+                    .read
+                    .read_access_fallback
+                    .lock()
+                    .contains_key(&ino)
+            );
+            assert!(
+                vfs.state
+                    .read
+                    .write_access_fallback
+                    .lock()
+                    .contains_key(&ino)
+            );
+            assert!(
+                vfs.state
+                    .read
+                    .prefetch_last_hint
+                    .lock()
+                    .contains_key(&(ino, 77))
+            );
+
+            vfs.clear_access_tracking_for_inode(ino);
+
+            assert!(
+                !vfs.state
+                    .read
+                    .read_access_fallback
+                    .lock()
+                    .contains_key(&ino)
+            );
+            assert!(
+                !vfs.state
+                    .read
+                    .write_access_fallback
+                    .lock()
+                    .contains_key(&ino)
+            );
+            assert!(
+                !vfs.state
+                    .read
+                    .prefetch_last_hint
+                    .lock()
+                    .contains_key(&(ino, 77))
+            );
+        });
+    }
+
+    #[test]
     fn foreground_throughput_uses_minimum_coverage_floor_for_short_windows() {
         let throughput = StudioVfs::foreground_throughput_bytes_per_sec(1, 1_048_576, 10);
         assert_eq!(throughput, 10_485_760.0);
@@ -16031,6 +16170,39 @@ mod tests {
             assert_eq!(
                 final_stats.active_sessions, 0,
                 "last-handle release should collect the idle file session"
+            );
+        });
+    }
+
+    #[test]
+    fn test_file_session_background_complete_gc_removes_idle_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-background-gc");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"session-background-gc.txt", 0, 0, 0o644)
+                .unwrap();
+            let ino = attr.ino;
+
+            let _pin = vfs.state.file_session.session(ino);
+            assert_eq!(
+                vfs.file_session_stats().active_sessions,
+                1,
+                "pinning a session should materialize it for the test"
+            );
+
+            drop(_pin);
+            vfs.state.file_session.note_background_transition(
+                ino,
+                FileSessionOperation::Upload,
+                "complete",
+            );
+
+            assert_eq!(
+                vfs.file_session_stats().active_sessions,
+                0,
+                "background completion should collect an otherwise idle session"
             );
         });
     }

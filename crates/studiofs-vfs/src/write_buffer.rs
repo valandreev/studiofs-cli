@@ -812,7 +812,7 @@ impl StudioVfs {
 
         self.block_cache.submit_uploads_batch(&upload_ops);
         for (upload_ino, _, _, _) in &upload_ops {
-            self.note_file_session_background_transition(
+            self.state.file_session.note_background_transition(
                 *upload_ino,
                 FileSessionOperation::Upload,
                 "queued",
