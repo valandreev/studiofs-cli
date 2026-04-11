@@ -5953,6 +5953,480 @@ struct ReadPlanSpan {
     source: ReadPlanSource,
 }
 
+struct ReadPipeline<'a> {
+    vfs: &'a StudioVfs,
+    ino: Ino,
+    offset: u64,
+    length: u64,
+    pending_content_epoch: Option<u64>,
+    resolved_regular_file_slices: Option<&'a [studiofs_meta::schema::ResolvedSliceSpan]>,
+}
+
+impl<'a> ReadPipeline<'a> {
+    fn new(
+        vfs: &'a StudioVfs,
+        ino: Ino,
+        offset: u64,
+        length: u64,
+        pending_content_epoch: Option<u64>,
+        resolved_regular_file_slices: Option<&'a [studiofs_meta::schema::ResolvedSliceSpan]>,
+    ) -> Self {
+        Self {
+            vfs,
+            ino,
+            offset,
+            length,
+            pending_content_epoch,
+            resolved_regular_file_slices,
+        }
+    }
+
+    async fn execute_into(&self, buffer: &mut [u8]) -> VfsResult<usize> {
+        let mut plan = self.build_plan().await?;
+        plan.sort_by_key(|span| span.range.start);
+        let missing_remote = Self::prefetch_remote_blocks(self.vfs, &plan, false).await?;
+        let written =
+            Self::assemble_into(self.vfs, self.offset, &plan, &missing_remote, buffer).await?;
+        // Drop the plan as soon as the copy is complete so dirty Bytes do not
+        // stay alive across the remaining bookkeeping work.
+        drop(plan);
+        Ok(written)
+    }
+
+    async fn prefetch_only(&self, prefetch: bool) -> VfsResult<()> {
+        let mut plan = self.build_plan().await?;
+        plan.sort_by_key(|span| span.range.start);
+        let _ = Self::prefetch_remote_blocks(self.vfs, &plan, prefetch).await?;
+        Ok(())
+    }
+
+    async fn build_plan(&self) -> VfsResult<Vec<ReadPlanSpan>> {
+        Self::build_plan_with(
+            self.vfs,
+            self.ino,
+            self.offset,
+            self.length,
+            self.pending_content_epoch,
+            self.resolved_regular_file_slices,
+        )
+        .await
+    }
+
+    async fn build_plan_with(
+        vfs: &StudioVfs,
+        ino: Ino,
+        offset: u64,
+        length: u64,
+        pending_content_epoch: Option<u64>,
+        resolved_regular_file_slices: Option<&[studiofs_meta::schema::ResolvedSliceSpan]>,
+    ) -> VfsResult<Vec<ReadPlanSpan>> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(read_end) = offset.checked_add(length) else {
+            return Err(VfsError::Other(format!(
+                "read range overflow: ino={ino}, offset={offset}, length={length}"
+            )));
+        };
+        let requested = ReadRange {
+            start: offset,
+            end: read_end,
+        };
+        let mut unresolved = vec![requested];
+        let mut plan = Vec::new();
+        let pending_upload_index = vfs.snapshot_pending_upload_index();
+
+        let dirty_spans = vfs.snapshot_pending_dirty_slice_read_spans(ino, offset, length);
+        for dirty in dirty_spans {
+            if unresolved.is_empty() {
+                break;
+            }
+            let dirty_range = ReadRange {
+                start: dirty.start,
+                end: dirty.end,
+            };
+            let (next_unresolved, claimed) = Self::claim_unresolved_ranges(unresolved, dirty_range);
+            unresolved = next_unresolved;
+            for overlap in claimed {
+                let delta = overlap.start.saturating_sub(dirty.start);
+                let Some(delta_u32) = u32::try_from(delta).ok() else {
+                    continue;
+                };
+                let Some(block_offset) = dirty.block_offset.checked_add(delta_u32) else {
+                    continue;
+                };
+                plan.push(ReadPlanSpan {
+                    range: overlap,
+                    source: ReadPlanSource::Dirty {
+                        data: dirty.data.clone(),
+                        block_offset,
+                    },
+                });
+            }
+        }
+
+        if !unresolved.is_empty() {
+            let mut candidate_blocks = BTreeSet::new();
+            for range in &unresolved {
+                let start_block = block_index_from_offset(range.start, vfs.block_size);
+                let end_block =
+                    block_index_from_offset(range.end.saturating_sub(1), vfs.block_size);
+                for block_index in start_block..=end_block {
+                    candidate_blocks.insert(block_index);
+                }
+            }
+            for block_index in candidate_blocks {
+                if unresolved.is_empty() {
+                    break;
+                }
+                let Some(data) = vfs
+                    .read_pending_overlay_block_async(
+                        ino,
+                        block_index,
+                        pending_content_epoch,
+                        Some(&pending_upload_index),
+                    )
+                    .await?
+                else {
+                    continue;
+                };
+                let block_start = (block_index as u64).saturating_mul(vfs.block_size as u64);
+                let block_end = block_start.saturating_add(vfs.block_size as u64);
+                let (next_unresolved, claimed) = Self::claim_unresolved_ranges(
+                    unresolved,
+                    ReadRange {
+                        start: block_start,
+                        end: block_end,
+                    },
+                );
+                unresolved = next_unresolved;
+                for overlap in claimed {
+                    let delta = overlap.start.saturating_sub(block_start);
+                    let Some(block_offset) = u32::try_from(delta).ok() else {
+                        continue;
+                    };
+                    plan.push(ReadPlanSpan {
+                        range: overlap,
+                        source: ReadPlanSource::PendingOverlay {
+                            data: data.clone(),
+                            block_offset,
+                        },
+                    });
+                }
+            }
+        }
+
+        if !unresolved.is_empty() {
+            if let Some(resolved) = resolved_regular_file_slices {
+                unresolved = Self::claim_meta_spans_into_plan(
+                    resolved.iter(),
+                    unresolved,
+                    &mut plan,
+                    requested,
+                    ResolvedSliceSource::Overlay,
+                    |block| ReadPlanSource::Overlay { block },
+                );
+                unresolved = Self::claim_meta_spans_into_plan(
+                    resolved.iter(),
+                    unresolved,
+                    &mut plan,
+                    requested,
+                    ResolvedSliceSource::Base,
+                    |block| ReadPlanSource::Base { block },
+                );
+            } else {
+                let meta = vfs.meta_async.clone();
+                let resolved = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                    engine.lookup_regular_file_slices(ino, offset, length)
+                })
+                .await?;
+                unresolved = Self::claim_meta_spans_into_plan(
+                    resolved.iter(),
+                    unresolved,
+                    &mut plan,
+                    requested,
+                    ResolvedSliceSource::Overlay,
+                    |block| ReadPlanSource::Overlay { block },
+                );
+                unresolved = Self::claim_meta_spans_into_plan(
+                    resolved.iter(),
+                    unresolved,
+                    &mut plan,
+                    requested,
+                    ResolvedSliceSource::Base,
+                    |block| ReadPlanSource::Base { block },
+                );
+            }
+        }
+
+        for gap in unresolved {
+            plan.push(ReadPlanSpan {
+                range: gap,
+                source: ReadPlanSource::Zero,
+            });
+        }
+        Ok(plan)
+    }
+
+    fn claim_unresolved_ranges(
+        unresolved: Vec<ReadRange>,
+        candidate: ReadRange,
+    ) -> (Vec<ReadRange>, Vec<ReadRange>) {
+        let mut next_unresolved = Vec::new();
+        let mut claimed = Vec::new();
+        for range in unresolved {
+            let Some(overlap) = range.intersection(candidate) else {
+                next_unresolved.push(range);
+                continue;
+            };
+            if range.start < overlap.start {
+                next_unresolved.push(ReadRange {
+                    start: range.start,
+                    end: overlap.start,
+                });
+            }
+            claimed.push(overlap);
+            if overlap.end < range.end {
+                next_unresolved.push(ReadRange {
+                    start: overlap.end,
+                    end: range.end,
+                });
+            }
+        }
+        (next_unresolved, claimed)
+    }
+
+    fn claim_meta_spans_into_plan<'b, I, F>(
+        resolved: I,
+        unresolved: Vec<ReadRange>,
+        plan: &mut Vec<ReadPlanSpan>,
+        requested: ReadRange,
+        source_filter: ResolvedSliceSource,
+        source_ctor: F,
+    ) -> Vec<ReadRange>
+    where
+        I: Iterator<Item = &'b studiofs_meta::schema::ResolvedSliceSpan>,
+        F: Fn(BlockRef) -> ReadPlanSource + Copy,
+    {
+        let mut unresolved = unresolved;
+        for span in resolved {
+            if unresolved.is_empty() {
+                break;
+            }
+            if span.source != source_filter {
+                continue;
+            }
+            let Some(block) = span.block.as_ref() else {
+                continue;
+            };
+            let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
+            let span_range = ReadRange {
+                start: chunk_base.saturating_add(span.range.start as u64),
+                end: chunk_base.saturating_add(span.range.end as u64),
+            };
+            let Some(clipped) = span_range.intersection(requested) else {
+                continue;
+            };
+            let (next_unresolved, claimed) = Self::claim_unresolved_ranges(unresolved, clipped);
+            unresolved = next_unresolved;
+            for overlap in claimed {
+                let delta = overlap.start.saturating_sub(span_range.start);
+                let Some(delta_u32) = u32::try_from(delta).ok() else {
+                    continue;
+                };
+                let Some(block_offset) = block.offset.checked_add(delta_u32) else {
+                    continue;
+                };
+                let length = overlap.end.saturating_sub(overlap.start);
+                let Some(block_length) = u32::try_from(length).ok() else {
+                    continue;
+                };
+                let mut planned_block = block.clone();
+                planned_block.offset = block_offset;
+                planned_block.length = block_length;
+                plan.push(ReadPlanSpan {
+                    range: overlap,
+                    source: source_ctor(planned_block),
+                });
+            }
+        }
+        unresolved
+    }
+
+    fn collect_data_block_refs(plan: &[ReadPlanSpan]) -> BTreeMap<u64, BlockRef> {
+        let mut block_refs = BTreeMap::new();
+        for span in plan {
+            let block = match &span.source {
+                ReadPlanSource::Overlay { block } | ReadPlanSource::Base { block } => block,
+                ReadPlanSource::Dirty { .. }
+                | ReadPlanSource::PendingOverlay { .. }
+                | ReadPlanSource::Zero => continue,
+            };
+            block_refs
+                .entry(block.object_id)
+                .or_insert_with(|| block.clone());
+        }
+        block_refs
+    }
+
+    async fn prefetch_remote_blocks(
+        vfs: &StudioVfs,
+        plan: &[ReadPlanSpan],
+        prefetch: bool,
+    ) -> VfsResult<HashSet<u64>> {
+        let mut cached = BTreeSet::new();
+        let mut missing = BTreeMap::new();
+        for (object_id, block) in Self::collect_data_block_refs(plan) {
+            if vfs.local_block_backend.contains(object_id) {
+                cached.insert(object_id);
+            } else {
+                missing.insert(object_id, block);
+            }
+        }
+        for object_id in cached {
+            vfs.local_block_backend.advise_will_need(object_id);
+        }
+        if missing.is_empty() {
+            return Ok(HashSet::new());
+        }
+        // Prefetch is best-effort warming, so NotFound is recorded for the
+        // caller but otherwise ignored here.
+        let fetches = missing.into_iter().map(|(object_id, block)| async move {
+            match vfs.fetch_block_for_ref(&block, prefetch).await {
+                Ok(_) => Ok::<(u64, bool), VfsError>((object_id, false)),
+                Err(crate::fetch::FetchError::NotFound { ref key }) => {
+                    warn!(
+                        object_id,
+                        key,
+                        block_offset = block.offset,
+                        block_length = block.length,
+                        "prefetch_remote_blocks_for_plan: S3 object not found during read prefetch — object missing from S3 (upload not complete or evicted?)"
+                    );
+                    Ok::<(u64, bool), VfsError>((object_id, true))
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        object_id,
+                        error = %error,
+                        "read planner prefetch failed; falling back to on-demand resolution"
+                    );
+                    Ok::<(u64, bool), VfsError>((object_id, false))
+                }
+            }
+        });
+        let mut not_found = HashSet::new();
+        for result in join_all(fetches).await {
+            let (object_id, was_not_found) = result?;
+            if was_not_found {
+                not_found.insert(object_id);
+            }
+        }
+        Ok(not_found)
+    }
+
+    async fn assemble_into(
+        vfs: &StudioVfs,
+        offset: u64,
+        plan: &[ReadPlanSpan],
+        remote_not_found: &HashSet<u64>,
+        buffer: &mut [u8],
+    ) -> VfsResult<usize> {
+        let mut written = 0usize;
+        for span in plan {
+            let dst_start = span.range.start.saturating_sub(offset) as usize;
+            let dst_end = span.range.end.saturating_sub(offset) as usize;
+            if dst_start >= buffer.len() || dst_end > buffer.len() || dst_start >= dst_end {
+                continue;
+            }
+            let dst = &mut buffer[dst_start..dst_end];
+            match &span.source {
+                ReadPlanSource::Dirty { data, block_offset } => {
+                    vfs.copy_block_payload_into_range(data.as_ref(), *block_offset, dst);
+                }
+                ReadPlanSource::PendingOverlay { data, block_offset } => {
+                    vfs.copy_block_payload_into_range(data.as_ref(), *block_offset, dst);
+                }
+                ReadPlanSource::Overlay { block } | ReadPlanSource::Base { block } => {
+                    if remote_not_found.contains(&block.object_id) {
+                        warn!(
+                            object_id = block.object_id,
+                            file_offset = span.range.start,
+                            "assemble_read_plan: object in remote_not_found set, zeroing range (S3 NotFound during prefetch)"
+                        );
+                        dst.fill(0);
+                    } else {
+                        let block_offset = usize::try_from(block.offset).map_err(|_| {
+                            VfsError::Other(format!(
+                                "block offset does not fit usize: object_id={}, offset={}",
+                                block.object_id, block.offset
+                            ))
+                        })?;
+                        let mut span_resolved = false;
+                        if let Some(read) = vfs
+                            .block_store_read_into_async(block.object_id, block_offset, dst)
+                            .await?
+                        {
+                            if read == dst.len() {
+                                span_resolved = true;
+                            }
+                            if !span_resolved {
+                                error!(
+                                    object_id = block.object_id,
+                                    file_offset = span.range.start,
+                                    block_offset = block.offset,
+                                    requested = dst.len(),
+                                    read,
+                                    "assemble_read_plan: short local backend read for committed block; evicting and refetching"
+                                );
+                                dst.fill(0);
+                                if let Err(evict_error) =
+                                    vfs.block_store_remove_async(block.object_id).await
+                                {
+                                    warn!(
+                                        object_id = block.object_id,
+                                        error = %evict_error,
+                                        "assemble_read_plan: failed to evict short-read local block before refetch"
+                                    );
+                                }
+                            }
+                        }
+
+                        if !span_resolved {
+                            match vfs.fetch_block_for_ref(block, false).await {
+                                Ok(data) => {
+                                    vfs.copy_committed_block_payload_into_range(
+                                        data.as_ref(),
+                                        block,
+                                        span.range.start,
+                                        dst,
+                                    )?;
+                                }
+                                Err(crate::fetch::FetchError::NotFound { key }) => {
+                                    warn!(
+                                        object_id = block.object_id,
+                                        key,
+                                        file_offset = span.range.start,
+                                        block_offset = block.offset,
+                                        block_length = block.length,
+                                        "assemble_read_plan: S3 object not found during foreground read, zeroing range (upload incomplete or evicted before upload?)"
+                                    );
+                                    dst.fill(0);
+                                }
+                                Err(error) => {
+                                    return Err(VfsError::Fetch(error));
+                                }
+                            }
+                        }
+                    }
+                }
+                ReadPlanSource::Zero => dst.fill(0),
+            }
+            written = written.max(dst_end);
+        }
+        Ok(written)
+    }
+}
+
 macro_rules! with_sync_meta {
     ($self:expr, |$meta:ident| $body:block) => {{
         let $meta = $self.sync_meta();
@@ -11787,287 +12261,19 @@ impl StudioVfs {
             self.upload_fg_read_latency_window,
             access.policy,
         );
-        let mut read_plan = self
-            .build_read_plan(
-                ino,
-                offset,
-                read_len as u64,
-                pending_content_epoch,
-                Some(resolved_slices.as_slice()),
-            )
-            .await?;
-        read_plan.sort_by_key(|span| span.range.start);
-        let missing_remote = self
-            .prefetch_remote_blocks_for_plan(&read_plan, false)
-            .await?;
-        let written = self
-            .assemble_read_plan(offset, &read_plan, &missing_remote, buffer)
-            .await?;
-        // Drop the plan as soon as the copy is complete so dirty Bytes do not
-        // stay alive across the remaining bookkeeping work.
-        drop(read_plan);
+        let read_pipeline = ReadPipeline::new(
+            self,
+            ino,
+            offset,
+            read_len as u64,
+            pending_content_epoch,
+            Some(resolved_slices.as_slice()),
+        );
+        let written = read_pipeline.execute_into(buffer).await?;
 
         self.enqueue_prefetch_hint(ino, access.stream_id, access.policy, &blocks_needed);
         guard.record_bytes(written as u64);
         Ok(written as u32)
-    }
-
-    fn claim_unresolved_ranges(
-        unresolved: Vec<ReadRange>,
-        candidate: ReadRange,
-    ) -> (Vec<ReadRange>, Vec<ReadRange>) {
-        let mut next_unresolved = Vec::new();
-        let mut claimed = Vec::new();
-        for range in unresolved {
-            let Some(overlap) = range.intersection(candidate) else {
-                next_unresolved.push(range);
-                continue;
-            };
-            if range.start < overlap.start {
-                next_unresolved.push(ReadRange {
-                    start: range.start,
-                    end: overlap.start,
-                });
-            }
-            claimed.push(overlap);
-            if overlap.end < range.end {
-                next_unresolved.push(ReadRange {
-                    start: overlap.end,
-                    end: range.end,
-                });
-            }
-        }
-        (next_unresolved, claimed)
-    }
-
-    async fn build_read_plan(
-        &self,
-        ino: Ino,
-        offset: u64,
-        length: u64,
-        pending_content_epoch: Option<u64>,
-        resolved_regular_file_slices: Option<&[studiofs_meta::schema::ResolvedSliceSpan]>,
-    ) -> VfsResult<Vec<ReadPlanSpan>> {
-        if length == 0 {
-            return Ok(Vec::new());
-        }
-        let Some(read_end) = offset.checked_add(length) else {
-            return Err(VfsError::Other(format!(
-                "read range overflow: ino={ino}, offset={offset}, length={length}"
-            )));
-        };
-        let requested = ReadRange {
-            start: offset,
-            end: read_end,
-        };
-        let mut unresolved = vec![requested];
-        let mut plan = Vec::new();
-        let pending_upload_index = self.snapshot_pending_upload_index();
-
-        let dirty_spans = self.snapshot_pending_dirty_slice_read_spans(ino, offset, length);
-        for dirty in dirty_spans {
-            if unresolved.is_empty() {
-                break;
-            }
-            let dirty_range = ReadRange {
-                start: dirty.start,
-                end: dirty.end,
-            };
-            let (next_unresolved, claimed) = Self::claim_unresolved_ranges(unresolved, dirty_range);
-            unresolved = next_unresolved;
-            for overlap in claimed {
-                let delta = overlap.start.saturating_sub(dirty.start);
-                let Some(delta_u32) = u32::try_from(delta).ok() else {
-                    continue;
-                };
-                let Some(block_offset) = dirty.block_offset.checked_add(delta_u32) else {
-                    continue;
-                };
-                plan.push(ReadPlanSpan {
-                    range: overlap,
-                    source: ReadPlanSource::Dirty {
-                        data: dirty.data.clone(),
-                        block_offset,
-                    },
-                });
-            }
-        }
-
-        if !unresolved.is_empty() {
-            let mut candidate_blocks = BTreeSet::new();
-            for range in &unresolved {
-                let start_block = block_index_from_offset(range.start, self.block_size);
-                let end_block =
-                    block_index_from_offset(range.end.saturating_sub(1), self.block_size);
-                for block_index in start_block..=end_block {
-                    candidate_blocks.insert(block_index);
-                }
-            }
-            for block_index in candidate_blocks {
-                if unresolved.is_empty() {
-                    break;
-                }
-                let Some(data) = self
-                    .read_pending_overlay_block_async(
-                        ino,
-                        block_index,
-                        pending_content_epoch,
-                        Some(&pending_upload_index),
-                    )
-                    .await?
-                else {
-                    continue;
-                };
-                let block_start = (block_index as u64).saturating_mul(self.block_size as u64);
-                let block_end = block_start.saturating_add(self.block_size as u64);
-                let (next_unresolved, claimed) = Self::claim_unresolved_ranges(
-                    unresolved,
-                    ReadRange {
-                        start: block_start,
-                        end: block_end,
-                    },
-                );
-                unresolved = next_unresolved;
-                for overlap in claimed {
-                    let delta = overlap.start.saturating_sub(block_start);
-                    let Some(block_offset) = u32::try_from(delta).ok() else {
-                        continue;
-                    };
-                    plan.push(ReadPlanSpan {
-                        range: overlap,
-                        source: ReadPlanSource::PendingOverlay {
-                            data: data.clone(),
-                            block_offset,
-                        },
-                    });
-                }
-            }
-        }
-
-        if !unresolved.is_empty() {
-            if let Some(resolved) = resolved_regular_file_slices {
-                unresolved = self.claim_meta_spans_into_plan(
-                    resolved.iter(),
-                    unresolved,
-                    &mut plan,
-                    requested,
-                    ResolvedSliceSource::Overlay,
-                    |block| ReadPlanSource::Overlay { block },
-                );
-                unresolved = self.claim_meta_spans_into_plan(
-                    resolved.iter(),
-                    unresolved,
-                    &mut plan,
-                    requested,
-                    ResolvedSliceSource::Base,
-                    |block| ReadPlanSource::Base { block },
-                );
-            } else {
-                let meta = self.meta_async.clone();
-                let resolved = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-                    engine.lookup_regular_file_slices(ino, offset, length)
-                })
-                .await?;
-                unresolved = self.claim_meta_spans_into_plan(
-                    resolved.iter(),
-                    unresolved,
-                    &mut plan,
-                    requested,
-                    ResolvedSliceSource::Overlay,
-                    |block| ReadPlanSource::Overlay { block },
-                );
-                unresolved = self.claim_meta_spans_into_plan(
-                    resolved.iter(),
-                    unresolved,
-                    &mut plan,
-                    requested,
-                    ResolvedSliceSource::Base,
-                    |block| ReadPlanSource::Base { block },
-                );
-            }
-        }
-
-        for gap in unresolved {
-            plan.push(ReadPlanSpan {
-                range: gap,
-                source: ReadPlanSource::Zero,
-            });
-        }
-        Ok(plan)
-    }
-
-    fn claim_meta_spans_into_plan<'a, I, F>(
-        &self,
-        resolved: I,
-        unresolved: Vec<ReadRange>,
-        plan: &mut Vec<ReadPlanSpan>,
-        requested: ReadRange,
-        source_filter: ResolvedSliceSource,
-        source_ctor: F,
-    ) -> Vec<ReadRange>
-    where
-        I: Iterator<Item = &'a studiofs_meta::schema::ResolvedSliceSpan>,
-        F: Fn(BlockRef) -> ReadPlanSource + Copy,
-    {
-        let mut unresolved = unresolved;
-        for span in resolved {
-            if unresolved.is_empty() {
-                break;
-            }
-            if span.source != source_filter {
-                continue;
-            }
-            let Some(block) = span.block.as_ref() else {
-                continue;
-            };
-            let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
-            let span_range = ReadRange {
-                start: chunk_base.saturating_add(span.range.start as u64),
-                end: chunk_base.saturating_add(span.range.end as u64),
-            };
-            let Some(clipped) = span_range.intersection(requested) else {
-                continue;
-            };
-            let (next_unresolved, claimed) = Self::claim_unresolved_ranges(unresolved, clipped);
-            unresolved = next_unresolved;
-            for overlap in claimed {
-                let delta = overlap.start.saturating_sub(span_range.start);
-                let Some(delta_u32) = u32::try_from(delta).ok() else {
-                    continue;
-                };
-                let Some(block_offset) = block.offset.checked_add(delta_u32) else {
-                    continue;
-                };
-                let length = overlap.end.saturating_sub(overlap.start);
-                let Some(block_length) = u32::try_from(length).ok() else {
-                    continue;
-                };
-                let mut planned_block = block.clone();
-                planned_block.offset = block_offset;
-                planned_block.length = block_length;
-                plan.push(ReadPlanSpan {
-                    range: overlap,
-                    source: source_ctor(planned_block),
-                });
-            }
-        }
-        unresolved
-    }
-
-    fn collect_data_block_refs(plan: &[ReadPlanSpan]) -> BTreeMap<u64, BlockRef> {
-        let mut block_refs = BTreeMap::new();
-        for span in plan {
-            let block = match &span.source {
-                ReadPlanSource::Overlay { block } | ReadPlanSource::Base { block } => block,
-                ReadPlanSource::Dirty { .. }
-                | ReadPlanSource::PendingOverlay { .. }
-                | ReadPlanSource::Zero => continue,
-            };
-            block_refs
-                .entry(block.object_id)
-                .or_insert_with(|| block.clone());
-        }
-        block_refs
     }
 
     fn prefetch_read_context_from_attr(&self, ino: Ino, attr: &InodeAttr) -> PrefetchReadContext {
@@ -12118,61 +12324,6 @@ impl StudioVfs {
                 .fetch_block(block.object_id, &keys)
                 .await
         }
-    }
-
-    async fn prefetch_remote_blocks_for_plan(
-        &self,
-        plan: &[ReadPlanSpan],
-        prefetch: bool,
-    ) -> VfsResult<HashSet<u64>> {
-        let mut cached = BTreeSet::new();
-        let mut missing = BTreeMap::new();
-        for (object_id, block) in Self::collect_data_block_refs(plan) {
-            if self.local_block_backend.contains(object_id) {
-                cached.insert(object_id);
-            } else {
-                missing.insert(object_id, block);
-            }
-        }
-        for object_id in cached {
-            self.local_block_backend.advise_will_need(object_id);
-        }
-        if missing.is_empty() {
-            return Ok(HashSet::new());
-        }
-        // Prefetch is best-effort warming, so NotFound is recorded for the
-        // caller but otherwise ignored here.
-        let fetches = missing.into_iter().map(|(object_id, block)| async move {
-            match self.fetch_block_for_ref(&block, prefetch).await {
-                Ok(_) => Ok::<(u64, bool), VfsError>((object_id, false)),
-                Err(crate::fetch::FetchError::NotFound { ref key }) => {
-                    warn!(
-                        object_id,
-                        key,
-                        block_offset = block.offset,
-                        block_length = block.length,
-                        "prefetch_remote_blocks_for_plan: S3 object not found during read prefetch — object missing from S3 (upload not complete or evicted?)"
-                    );
-                    Ok::<(u64, bool), VfsError>((object_id, true))
-                }
-                Err(error) => {
-                    tracing::debug!(
-                        object_id,
-                        error = %error,
-                        "read planner prefetch failed; falling back to on-demand resolution"
-                    );
-                    Ok::<(u64, bool), VfsError>((object_id, false))
-                }
-            }
-        });
-        let mut not_found = HashSet::new();
-        for result in join_all(fetches).await {
-            let (object_id, was_not_found) = result?;
-            if was_not_found {
-                not_found.insert(object_id);
-            }
-        }
-        Ok(not_found)
     }
 
     fn copy_block_payload_into_range(&self, data: &[u8], block_offset: u32, dst: &mut [u8]) {
@@ -12243,108 +12394,6 @@ impl StudioVfs {
         }
         dst.copy_from_slice(&data[src_start..src_end]);
         Ok(())
-    }
-
-    async fn assemble_read_plan(
-        &self,
-        offset: u64,
-        plan: &[ReadPlanSpan],
-        remote_not_found: &HashSet<u64>,
-        buffer: &mut [u8],
-    ) -> VfsResult<usize> {
-        let mut written = 0usize;
-        for span in plan {
-            let dst_start = span.range.start.saturating_sub(offset) as usize;
-            let dst_end = span.range.end.saturating_sub(offset) as usize;
-            if dst_start >= buffer.len() || dst_end > buffer.len() || dst_start >= dst_end {
-                continue;
-            }
-            let dst = &mut buffer[dst_start..dst_end];
-            match &span.source {
-                ReadPlanSource::Dirty { data, block_offset } => {
-                    self.copy_block_payload_into_range(data.as_ref(), *block_offset, dst);
-                }
-                ReadPlanSource::PendingOverlay { data, block_offset } => {
-                    self.copy_block_payload_into_range(data.as_ref(), *block_offset, dst);
-                }
-                ReadPlanSource::Overlay { block } | ReadPlanSource::Base { block } => {
-                    if remote_not_found.contains(&block.object_id) {
-                        warn!(
-                            object_id = block.object_id,
-                            file_offset = span.range.start,
-                            "assemble_read_plan: object in remote_not_found set, zeroing range (S3 NotFound during prefetch)"
-                        );
-                        dst.fill(0);
-                    } else {
-                        let block_offset = usize::try_from(block.offset).map_err(|_| {
-                            VfsError::Other(format!(
-                                "block offset does not fit usize: object_id={}, offset={}",
-                                block.object_id, block.offset
-                            ))
-                        })?;
-                        let mut span_resolved = false;
-                        if let Some(read) = self
-                            .block_store_read_into_async(block.object_id, block_offset, dst)
-                            .await?
-                        {
-                            if read == dst.len() {
-                                span_resolved = true;
-                            }
-                            if !span_resolved {
-                                error!(
-                                    object_id = block.object_id,
-                                    file_offset = span.range.start,
-                                    block_offset = block.offset,
-                                    requested = dst.len(),
-                                    read,
-                                    "assemble_read_plan: short local backend read for committed block; evicting and refetching"
-                                );
-                                dst.fill(0);
-                                if let Err(evict_error) =
-                                    self.block_store_remove_async(block.object_id).await
-                                {
-                                    warn!(
-                                        object_id = block.object_id,
-                                        error = %evict_error,
-                                        "assemble_read_plan: failed to evict short-read local block before refetch"
-                                    );
-                                }
-                            }
-                        }
-
-                        if !span_resolved {
-                            match self.fetch_block_for_ref(block, false).await {
-                                Ok(data) => {
-                                    self.copy_committed_block_payload_into_range(
-                                        data.as_ref(),
-                                        block,
-                                        span.range.start,
-                                        dst,
-                                    )?;
-                                }
-                                Err(crate::fetch::FetchError::NotFound { key }) => {
-                                    warn!(
-                                        object_id = block.object_id,
-                                        key,
-                                        file_offset = span.range.start,
-                                        block_offset = block.offset,
-                                        block_length = block.length,
-                                        "assemble_read_plan: S3 object not found during foreground read, zeroing range (upload incomplete or evicted before upload?)"
-                                    );
-                                    dst.fill(0);
-                                }
-                                Err(error) => {
-                                    return Err(VfsError::Fetch(error));
-                                }
-                            }
-                        }
-                    }
-                }
-                ReadPlanSource::Zero => dst.fill(0),
-            }
-            written = written.max(dst_end);
-        }
-        Ok(written)
     }
 
     /// Enqueue a read hint for background prefetch planning and execution.
@@ -12559,18 +12608,15 @@ impl StudioVfs {
                 if block_len == 0 {
                     continue;
                 }
-                let plan = self
-                    .build_read_plan(
-                        ino,
-                        block_start,
-                        block_len,
-                        context.pending_content_epoch,
-                        None,
-                    )
-                    .await?;
-                // Prefetch is best-effort warming, so we intentionally drop the
-                // NotFound set here; foreground reads still resolve the final path.
-                let _ = self.prefetch_remote_blocks_for_plan(&plan, true).await?;
+                let read_pipeline = ReadPipeline::new(
+                    self,
+                    ino,
+                    block_start,
+                    block_len,
+                    context.pending_content_epoch,
+                    None,
+                );
+                read_pipeline.prefetch_only(true).await?;
             }
             Ok::<(), VfsError>(())
         }
@@ -15279,7 +15325,7 @@ mod tests {
             },
         ];
 
-        let refs = StudioVfs::collect_data_block_refs(&plan);
+        let refs = ReadPipeline::collect_data_block_refs(&plan);
         assert_eq!(refs.len(), 1);
         let block = refs.get(&42).expect("collected block ref");
         assert_eq!(block, &first, "first ref should win when object ids match");
@@ -17882,12 +17928,102 @@ mod tests {
                 source: ReadPlanSource::Base { block },
             }];
             let mut buffer = [0_u8; 4];
-            let written = vfs
-                .assemble_read_plan(0, &plan, &std::collections::HashSet::new(), &mut buffer)
-                .await
-                .expect("assemble read plan");
+            let written = ReadPipeline::assemble_into(
+                &vfs,
+                0,
+                &plan,
+                &std::collections::HashSet::new(),
+                &mut buffer,
+            )
+            .await
+            .expect("assemble read plan");
             assert_eq!(written, 4);
             assert_eq!(&buffer, b"2345");
+        });
+    }
+
+    #[test]
+    fn build_read_plan_prefers_dirty_span_over_committed_base_coverage() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "build-read-plan-dirty-over-base");
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"dirty-over-base.bin", 0, 0, 0o644)
+                .expect("create test file");
+            let ino = attr.ino;
+            let object_id = 0xA11CE;
+            vfs.block_store_put_async(object_id, Bytes::from_static(b"abcdefgh"), false)
+                .await
+                .expect("seed committed block");
+
+            let mut staged_attr = meta.get_attr(ino).expect("load staged attr");
+            staged_attr.size = 8;
+            staged_attr.committed_size = 8;
+            staged_attr.upload_state = MetaUploadState::Ready;
+            meta.set_attr(&staged_attr).expect("persist committed attr");
+            meta.set_file_block(ino, 0, &BlockRef::new_partial(object_id, 8))
+                .expect("persist committed block");
+
+            vfs.write(ino, 2, b"XY").await.expect("stage dirty patch");
+
+            let pending_attr = vfs.getattr(ino).expect("load pending attr");
+            let pending_content_epoch = vfs
+                .refresh_inode_incarnation_state_from_attr(ino, &pending_attr)
+                .pending_incarnation
+                .as_ref()
+                .map(|pending| pending.content_epoch);
+            let plan = ReadPipeline::new(&vfs, ino, 0, 8, pending_content_epoch, None)
+                .build_plan()
+                .await
+                .expect("build read plan");
+
+            assert!(
+                plan.iter().any(|span| matches!(
+                    &span.source,
+                    ReadPlanSource::Dirty { .. }
+                        if span.range.start == 2 && span.range.end == 4
+                )),
+                "planner should surface the dirty patch as its own span"
+            );
+            assert!(
+                !plan.iter().any(|span| {
+                    matches!(
+                        &span.source,
+                        ReadPlanSource::Overlay { .. } | ReadPlanSource::Base { .. }
+                    ) && span.range.start < 4
+                        && span.range.end > 2
+                }),
+                "committed metadata spans must not overlap the dirty range"
+            );
+        });
+    }
+
+    #[test]
+    fn assemble_read_plan_zero_fills_remote_not_found_committed_span() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "assemble-read-plan-not-found");
+        rt.block_on(async {
+            let object_id = 0xF404;
+            let plan = vec![ReadPlanSpan {
+                range: ReadRange { start: 0, end: 4 },
+                source: ReadPlanSource::Base {
+                    block: BlockRef::new_partial(object_id, 4),
+                },
+            }];
+            let mut remote_not_found = HashSet::new();
+            remote_not_found.insert(object_id);
+            let mut buffer = [0xAB_u8; 4];
+
+            let written =
+                ReadPipeline::assemble_into(&vfs, 0, &plan, &remote_not_found, &mut buffer)
+                    .await
+                    .expect("assemble read plan");
+
+            assert_eq!(written, 4);
+            assert_eq!(
+                buffer, [0_u8; 4],
+                "remote-not-found committed spans should zero-fill the destination range"
+            );
         });
     }
 
