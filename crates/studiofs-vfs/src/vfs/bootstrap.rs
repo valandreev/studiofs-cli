@@ -1,0 +1,808 @@
+use super::*;
+
+#[derive(Debug, Clone)]
+pub(super) struct VfsBootstrapPlan {
+    format_info: FormatInfo,
+    block_cache_l1_limit: u64,
+    pub(super) data_prefix: String,
+    cache_runtime_tuning: CacheRuntimeTuning,
+    pub(super) minimum_local_backend_budget_bytes: u64,
+    pub(super) local_backend_budget_bytes: u64,
+    payload_sync_mode: CacheV3PayloadSyncMode,
+    pub(super) access_classifier: AccessClassifierConfig,
+    readahead_base_width: u32,
+    pub(super) readahead_max_width: u32,
+    readahead_min_prefetch: u32,
+    readahead_seq_step: u8,
+    readahead_random_penalty: u8,
+    fetch_aimd_config: crate::aimd::AimdConfig,
+    upload_aimd_config: crate::aimd::AimdConfig,
+    max_dirty_bytes: usize,
+    write_eager_flush_batch_bytes: usize,
+    write_eager_flush_drain_chunk_bytes: usize,
+    payload_put_concurrency: usize,
+    local_sync_group_min_bytes: u64,
+    local_sync_group_max_delay: Duration,
+    upload_cache_io_foreground_cost_base: u32,
+    upload_cache_io_foreground_cost_step: u32,
+    upload_fg_read_latency_target_ns: u64,
+    upload_fg_read_latency_window: Duration,
+    upload_fg_read_latency_sticky_window: Duration,
+    janitor_interval: Duration,
+    janitor_skip_newer_than: Duration,
+    janitor_max_deletes_per_run: u64,
+    janitor_lease_ttl: Duration,
+    metadata_invalidation_sync_interval: Duration,
+    max_xattr_bytes: usize,
+    effective_acl_cache_capacity: usize,
+    cache_safety_mode: CacheSafetyMode,
+    acl_principal: String,
+    upload_delay: Duration,
+    upload_requeue_base: Duration,
+    upload_requeue_max: Duration,
+    upload_stats_interval: Duration,
+    shutdown_metadata_flush_timeout: Duration,
+    upload_user_idle_grace: Duration,
+    upload_worker_count: usize,
+    publish_visibility_timeout: Duration,
+    prefetch_concurrency: usize,
+    dir_prefetch_max_batch: usize,
+    readdir_attr_batch_chunk: usize,
+    readdir_attr_batch_max_inodes: usize,
+    prefetch_foreground_reserve: usize,
+    prefetch_max_per_cycle: usize,
+    prefetch_pause_on_neterr: Duration,
+}
+
+impl VfsBootstrapPlan {
+    pub(super) fn build(
+        format_info: FormatInfo,
+        cache_size: u64,
+        block_cache_l1_limit: u64,
+        config: &VfsConfigValidated,
+    ) -> VfsResult<Self> {
+        let data_prefix = normalize_data_prefix(&format_info);
+        let block_size = format_info.block_size;
+        let cache_runtime_tuning = resolve_cache_runtime_tuning_overrides(
+            derive_cache_runtime_tuning(cache_size, block_size, block_cache_l1_limit),
+            config,
+            config.cache_runtime_overrides(),
+        );
+        let minimum_local_backend_budget_bytes =
+            minimum_local_backend_budget_bytes(block_size, cache_runtime_tuning);
+        let local_backend_budget_bytes =
+            derive_local_backend_budget_bytes(cache_size, block_size, cache_runtime_tuning);
+        if local_backend_budget_bytes > cache_size {
+            warn!(
+                configured_cache_size_bytes = cache_size,
+                minimum_required_cache_v3_budget_bytes = minimum_local_backend_budget_bytes,
+                effective_cache_v3_budget_bytes = local_backend_budget_bytes,
+                block_size,
+                max_dirty_bytes = cache_runtime_tuning.max_dirty_bytes,
+                write_eager_flush_batch_bytes = cache_runtime_tuning.write_eager_flush_batch_bytes,
+                "configured cache_size is below Cache 3.0 local durability requirements; clamping local backend budget upward"
+            );
+        }
+        validate_volume_block_size(block_size)?;
+        warn_small_block_addressability(block_size);
+
+        let readahead_base_width = config.readahead_width;
+        let readahead_max_width =
+            derive_readahead_max_width(config.read_buffer_mb, block_size, readahead_base_width);
+        let readahead_min_prefetch = config.readahead_min_prefetch;
+        let access_classifier = AccessClassifierConfig {
+            block_size,
+            readahead_base_width,
+            readahead_max_width,
+            readahead_min_prefetch,
+        };
+
+        let max_dirty_bytes = cache_runtime_tuning.max_dirty_bytes;
+        let write_eager_flush_batch_bytes = cache_runtime_tuning.write_eager_flush_batch_bytes;
+        let write_eager_flush_drain_chunk_bytes =
+            derive_write_eager_flush_drain_chunk_bytes(write_eager_flush_batch_bytes, block_size);
+        let payload_put_concurrency =
+            derive_payload_put_concurrency(block_size, write_eager_flush_drain_chunk_bytes);
+        let local_sync_group_min_bytes = derive_fast_mode_sync_group_min_bytes(
+            write_eager_flush_batch_bytes,
+            write_eager_flush_drain_chunk_bytes,
+        );
+        let upload_cache_io_foreground_cost_base =
+            derive_upload_cache_io_foreground_cost_base(cache_runtime_tuning.upload_cache_io_slots);
+        let upload_cache_io_foreground_cost_step =
+            derive_upload_cache_io_foreground_cost_step(cache_runtime_tuning.upload_cache_io_slots);
+        let upload_fg_read_latency_window =
+            Duration::from_millis(config.upload_fg_read_latency_window_ms);
+        let upload_fg_read_latency_sticky_window = Duration::from_millis(
+            config
+                .upload_fg_read_latency_window_ms
+                .saturating_mul(config.upload_fg_read_latency_sticky_windows),
+        );
+
+        Ok(Self {
+            format_info,
+            block_cache_l1_limit,
+            data_prefix,
+            cache_runtime_tuning,
+            minimum_local_backend_budget_bytes,
+            local_backend_budget_bytes,
+            payload_sync_mode: if matches!(config.cache_safety_mode, CacheSafetyMode::Durable) {
+                CacheV3PayloadSyncMode::Durable
+            } else {
+                CacheV3PayloadSyncMode::Fast
+            },
+            access_classifier,
+            readahead_base_width,
+            readahead_max_width,
+            readahead_min_prefetch,
+            readahead_seq_step: config.readahead_seq_step,
+            readahead_random_penalty: config.readahead_random_penalty,
+            fetch_aimd_config: build_fetch_aimd_config(readahead_max_width, config),
+            upload_aimd_config: build_upload_aimd_config(config),
+            max_dirty_bytes,
+            write_eager_flush_batch_bytes,
+            write_eager_flush_drain_chunk_bytes,
+            payload_put_concurrency,
+            local_sync_group_min_bytes,
+            local_sync_group_max_delay: Duration::from_millis(FAST_MODE_SYNC_GROUP_MAX_DELAY_MS),
+            upload_cache_io_foreground_cost_base,
+            upload_cache_io_foreground_cost_step,
+            upload_fg_read_latency_target_ns: Duration::from_millis(
+                config.upload_fg_read_latency_target_ms,
+            )
+            .as_nanos()
+            .clamp(1, u64::MAX as u128) as u64,
+            upload_fg_read_latency_window,
+            upload_fg_read_latency_sticky_window,
+            janitor_interval: Duration::from_secs(config.janitor_interval_secs),
+            janitor_skip_newer_than: Duration::from_secs(config.janitor_skip_newer_secs),
+            janitor_max_deletes_per_run: config.janitor_max_deletes,
+            janitor_lease_ttl: Duration::from_secs(config.janitor_lease_ttl_secs),
+            metadata_invalidation_sync_interval: Duration::from_millis(
+                config.metadata_invalidation_sync_interval_ms,
+            ),
+            max_xattr_bytes: config.max_xattr_bytes,
+            effective_acl_cache_capacity: config.effective_acl_cache_capacity,
+            cache_safety_mode: config.cache_safety_mode,
+            acl_principal: config.principal.clone(),
+            upload_delay: Duration::from_millis(config.upload_delay_ms),
+            upload_requeue_base: Duration::from_millis(config.upload_requeue_base_ms),
+            upload_requeue_max: Duration::from_millis(config.upload_requeue_max_ms),
+            upload_stats_interval: Duration::from_secs(config.upload_stats_interval_secs),
+            shutdown_metadata_flush_timeout: Duration::from_secs(
+                config.shutdown_metadata_flush_timeout_secs,
+            ),
+            upload_user_idle_grace: Duration::from_millis(config.upload_user_idle_grace_ms),
+            upload_worker_count: config.upload_worker_count,
+            publish_visibility_timeout: Duration::from_secs(config.publish_visibility_timeout_secs),
+            prefetch_concurrency: config.prefetch_concurrency,
+            dir_prefetch_max_batch: config.dir_prefetch_max_batch,
+            readdir_attr_batch_chunk: config.readdir_attr_batch_chunk,
+            readdir_attr_batch_max_inodes: config.readdir_attr_batch_max_inodes,
+            prefetch_foreground_reserve: config.prefetch_foreground_reserve,
+            prefetch_max_per_cycle: config.prefetch_max_per_cycle,
+            prefetch_pause_on_neterr: Duration::from_millis(config.prefetch_pause_on_neterr_ms),
+        })
+    }
+
+    pub(super) fn block_size(&self) -> u32 {
+        self.format_info.block_size
+    }
+
+    fn log_summary(&self, cache_size: u64, config: &VfsConfigValidated) {
+        debug!(
+            writeback = true,
+            cache_size_bytes = cache_size,
+            minimum_local_backend_budget_bytes = self.minimum_local_backend_budget_bytes,
+            local_backend_budget_bytes = self.local_backend_budget_bytes,
+            upload_delay_ms = self.upload_delay.as_millis() as u64,
+            requeue_base_ms = self.upload_requeue_base.as_millis() as u64,
+            requeue_max_ms = self.upload_requeue_max.as_millis() as u64,
+            upload_stats_interval_secs = self.upload_stats_interval.as_secs(),
+            ingress_checkpoint_interval_secs =
+                self.cache_runtime_tuning.ingress_checkpoint_interval_secs,
+            ingress_checkpoint_min_append_bytes = self
+                .cache_runtime_tuning
+                .ingress_checkpoint_min_append_bytes,
+            ingress_checkpoint_min_mutations =
+                self.cache_runtime_tuning.ingress_checkpoint_min_mutations,
+            ingress_checkpoint_max_segment_lag =
+                self.cache_runtime_tuning.ingress_checkpoint_max_segment_lag,
+            ingress_checkpoint_max_live_segments = self
+                .cache_runtime_tuning
+                .ingress_checkpoint_max_live_segments,
+            upload_cache_io_slots = self.cache_runtime_tuning.upload_cache_io_slots,
+            upload_cache_io_foreground_cost_base = self.upload_cache_io_foreground_cost_base,
+            upload_cache_io_foreground_cost_step = self.upload_cache_io_foreground_cost_step,
+            transit_memory_budget_bytes = self.cache_runtime_tuning.transit_memory_budget_bytes,
+            upload_user_idle_grace_ms = self.upload_user_idle_grace.as_millis() as u64,
+            upload_fg_read_latency_target_ms = config.upload_fg_read_latency_target_ms,
+            upload_fg_read_latency_window_ms =
+                self.upload_fg_read_latency_window.as_millis() as u64,
+            upload_fg_read_latency_sticky_windows = config.upload_fg_read_latency_sticky_windows,
+            max_dirty_bytes = self.max_dirty_bytes,
+            write_eager_flush_batch_bytes = self.write_eager_flush_batch_bytes,
+            write_eager_flush_drain_chunk_bytes = self.write_eager_flush_drain_chunk_bytes,
+            payload_put_concurrency = self.payload_put_concurrency,
+            local_sync_group_min_bytes = self.local_sync_group_min_bytes,
+            local_sync_group_max_delay_ms = self.local_sync_group_max_delay.as_millis() as u64,
+            max_xattr_bytes = self.max_xattr_bytes,
+            dentry_cache_capacity = config.dentry_cache_capacity,
+            dentry_cache_bytes = config.dentry_cache_bytes,
+            path_shortcut_cache_capacity = config.path_shortcut_cache_capacity,
+            path_shortcut_cache_bytes = config.path_shortcut_cache_bytes,
+            attr_read_cache_capacity = config.attr_read_cache_capacity,
+            attr_read_cache_bytes = config.attr_read_cache_bytes,
+            readdir_attr_batch_chunk = self.readdir_attr_batch_chunk,
+            readdir_attr_batch_max_inodes = self.readdir_attr_batch_max_inodes,
+            "upload pipeline v2 enabled"
+        );
+    }
+}
+
+struct VfsBootstrapResources {
+    ingress_wal: IngressWal,
+    initial_checkpoint_meta: Option<(u64, u64, u64)>,
+    local_block_backend: Arc<dyn LocalBlockBackend>,
+    block_cache: Arc<BlockCache>,
+    readahead: Arc<ReadAheadTracker>,
+    dir_prefetch: Arc<DirAccessTracker>,
+    prefetch_tx: tokio::sync::mpsc::UnboundedSender<PrefetchWorkItem>,
+    startup_channels: startup::StartupChannels,
+    data_write: Arc<DataStore>,
+    qos: Arc<QosController>,
+    transit_memory_budget: Arc<TransitMemoryBudget>,
+    fetch_scheduler: Arc<crate::fetch::FetchScheduler>,
+    upload_scheduler: Arc<crate::upload::UploadScheduler>,
+}
+
+impl VfsBootstrapResources {
+    fn open(
+        data_config: &DataStoreConfig,
+        cache_dir: &str,
+        plan: &VfsBootstrapPlan,
+        config: &VfsConfigValidated,
+    ) -> VfsResult<Self> {
+        let ingress_wal = IngressWal::new(
+            PathBuf::from(cache_dir).join("ingress_spill"),
+            plan.cache_runtime_tuning.max_ingress_segment_bytes,
+        );
+        std::fs::create_dir_all(ingress_wal.spill_dir()).map_err(VfsError::Io)?;
+        std::fs::create_dir_all(ingress_wal.segment_dir()).map_err(VfsError::Io)?;
+        std::fs::create_dir_all(ingress_wal.checkpoint_dir()).map_err(VfsError::Io)?;
+        let initial_checkpoint_meta =
+            init_ingress_recovery_state(plan.cache_safety_mode, &ingress_wal)?;
+
+        let opened_local_backend = open_local_block_backend_with_budget_and_sync_mode(
+            Path::new(cache_dir),
+            &plan.format_info.uuid,
+            plan.local_backend_budget_bytes,
+            plan.payload_sync_mode,
+        )
+        .map_err(|source| map_open_local_block_backend_error(cache_dir, source))?;
+        if opened_local_backend.detection.has_cache_v3_contract() {
+            info!(
+                cache_root = %opened_local_backend.detection.layout.cache_root.display(),
+                layout_marker = %opened_local_backend.detection.layout.layout_marker.display(),
+                cache_v3_root = %opened_local_backend.detection.layout.v3_root.display(),
+                "using Cache 3.0 file-per-block local backend under the v3 subtree"
+            );
+        }
+        let local_block_backend = opened_local_backend.backend;
+
+        let (block_cache, upload_rx) =
+            BlockCache::open(BlockCacheConfig::new(cache_dir, plan.block_cache_l1_limit))
+                .map_err(VfsError::Io)?;
+
+        let readahead = Arc::new(ReadAheadTracker::new_with_bounds(
+            plan.readahead_base_width,
+            plan.readahead_max_width,
+            plan.readahead_min_prefetch,
+            plan.readahead_seq_step,
+            plan.readahead_random_penalty,
+            4,
+        ));
+        let dir_prefetch = Arc::new(DirAccessTracker::new(2));
+        let (prefetch_tx, prefetch_rx) = tokio::sync::mpsc::unbounded_channel::<PrefetchWorkItem>();
+
+        let data_read = Arc::new(
+            DataStore::with_profile(data_config, IoProfile::Read)
+                .map_err(|e| VfsError::Other(format!("failed to create read data store: {e}")))?,
+        );
+        let data_write = Arc::new(
+            DataStore::with_profile(data_config, IoProfile::Write)
+                .map_err(|e| VfsError::Other(format!("failed to create write data store: {e}")))?,
+        );
+
+        let qos = Arc::new(QosController::from_config(config));
+        let transit_memory_budget =
+            TransitMemoryBudget::new(plan.cache_runtime_tuning.transit_memory_budget_bytes);
+        let fetch_scheduler = Arc::new(crate::fetch::FetchScheduler::new(
+            data_read,
+            local_block_backend.clone(),
+            plan.fetch_aimd_config.clone(),
+            plan.prefetch_foreground_reserve,
+            qos.clone(),
+            transit_memory_budget.clone(),
+            config,
+        ));
+        let upload_scheduler = Arc::new(crate::upload::UploadScheduler::new(
+            data_write.clone(),
+            plan.upload_aimd_config.clone(),
+            config,
+        ));
+
+        Ok(Self {
+            ingress_wal,
+            initial_checkpoint_meta,
+            local_block_backend,
+            block_cache,
+            readahead,
+            dir_prefetch,
+            prefetch_tx,
+            startup_channels: startup::StartupChannels {
+                prefetch_rx,
+                upload_rx,
+            },
+            data_write,
+            qos,
+            transit_memory_budget,
+            fetch_scheduler,
+            upload_scheduler,
+        })
+    }
+}
+
+struct VfsBootstrap {
+    meta_async: Arc<dyn AsyncMetaEngine>,
+    config: VfsConfigValidated,
+    plan: VfsBootstrapPlan,
+    resources: VfsBootstrapResources,
+}
+
+impl VfsBootstrap {
+    fn prepare(
+        meta: Arc<dyn MetaEngine>,
+        data_config: &DataStoreConfig,
+        cache_dir: &str,
+        cache_size: u64,
+        block_cache_l1_limit: u64,
+        config: VfsConfigValidated,
+    ) -> VfsResult<Self> {
+        let meta_async: Arc<dyn AsyncMetaEngine> =
+            Arc::new(SyncMetaEngineAdapter::new(meta.clone()));
+        let plan = VfsBootstrapPlan::build(
+            meta.get_format_info()?,
+            cache_size,
+            block_cache_l1_limit,
+            &config,
+        )?;
+        plan.log_summary(cache_size, &config);
+        let resources = VfsBootstrapResources::open(data_config, cache_dir, &plan, &config)?;
+        Ok(Self {
+            meta_async,
+            config,
+            plan,
+            resources,
+        })
+    }
+
+    fn assemble(self) -> Arc<StudioVfs> {
+        let Self {
+            meta_async,
+            config,
+            plan,
+            resources,
+        } = self;
+        let block_size = plan.block_size();
+        let upload_cache_io_slots = plan.cache_runtime_tuning.upload_cache_io_slots;
+
+        Arc::new(StudioVfs {
+            meta: MetaExecutor::new(meta_async.clone()),
+            meta_async,
+            data_write: resources.data_write,
+            local_block_backend: resources.local_block_backend,
+            block_cache: resources.block_cache,
+            block_size,
+            data_prefix: plan.data_prefix,
+            acl_principal: plan.acl_principal,
+            effective_acl_cache_capacity: plan.effective_acl_cache_capacity,
+            state: Arc::new(VfsState::new(
+                resources.initial_checkpoint_meta,
+                block_size,
+                &config,
+                plan.upload_cache_io_foreground_cost_base,
+            )),
+            upload_scheduler: resources.upload_scheduler,
+            upload_delay: plan.upload_delay,
+            upload_requeue_base: plan.upload_requeue_base,
+            upload_requeue_max: plan.upload_requeue_max,
+            upload_stats_interval: plan.upload_stats_interval,
+            shutdown_metadata_flush_timeout: plan.shutdown_metadata_flush_timeout,
+            upload_cache_io_slots: Arc::new(Semaphore::new(upload_cache_io_slots)),
+            upload_cache_io_slots_max: {
+                debug_assert!(upload_cache_io_slots <= u32::MAX as usize);
+                upload_cache_io_slots as u32
+            },
+            transit_memory_budget: resources.transit_memory_budget,
+            qos: resources.qos,
+            upload_cache_io_foreground_cost_base: plan.upload_cache_io_foreground_cost_base,
+            upload_cache_io_foreground_cost_step: plan.upload_cache_io_foreground_cost_step,
+            upload_fg_read_latency_target_ns: plan.upload_fg_read_latency_target_ns,
+            upload_fg_read_latency_window: plan.upload_fg_read_latency_window,
+            upload_fg_read_latency_sticky_window: plan.upload_fg_read_latency_sticky_window,
+            access_classifier: plan.access_classifier,
+            upload_user_idle_grace: plan.upload_user_idle_grace,
+            upload_worker_count: plan.upload_worker_count,
+            publish_visibility_timeout: plan.publish_visibility_timeout,
+            readahead: resources.readahead,
+            dir_prefetch: resources.dir_prefetch,
+            prefetch_tx: resources.prefetch_tx,
+            startup: startup::StartupState::new(
+                resources.startup_channels.prefetch_rx,
+                resources.startup_channels.upload_rx,
+                plan.metadata_invalidation_sync_interval,
+            ),
+            max_dirty_bytes: AtomicUsize::new(plan.max_dirty_bytes),
+            write_eager_flush_batch_bytes: plan.write_eager_flush_batch_bytes,
+            write_eager_flush_drain_chunk_bytes: plan.write_eager_flush_drain_chunk_bytes,
+            payload_put_concurrency: plan.payload_put_concurrency,
+            cache_safety_mode: plan.cache_safety_mode,
+            local_sync_group_min_bytes: plan.local_sync_group_min_bytes,
+            local_sync_group_max_delay: plan.local_sync_group_max_delay,
+            max_xattr_bytes: plan.max_xattr_bytes,
+            ingress_wal: resources.ingress_wal,
+            handle_table: HandleTable::new(),
+            janitor_lease: None,
+            janitor_interval: plan.janitor_interval,
+            janitor_skip_newer_than: plan.janitor_skip_newer_than,
+            janitor_max_deletes_per_run: plan.janitor_max_deletes_per_run,
+            janitor_lease_ttl: plan.janitor_lease_ttl,
+            prefetch_concurrency: plan.prefetch_concurrency,
+            dir_prefetch_max_batch: plan.dir_prefetch_max_batch,
+            readdir_attr_batch_chunk: plan.readdir_attr_batch_chunk,
+            readdir_attr_batch_max_inodes: plan.readdir_attr_batch_max_inodes,
+            prefetch_foreground_reserve: plan.prefetch_foreground_reserve,
+            prefetch_max_per_cycle: plan.prefetch_max_per_cycle,
+            prefetch_pause_on_neterr: plan.prefetch_pause_on_neterr,
+            fetch_scheduler: resources.fetch_scheduler,
+            distributed_flock: None,
+            kernel_invalidator: RwLock::new(None),
+            write_path_backend_tag: "cache-v3".to_string(),
+            write_path_started_at: Instant::now(),
+        })
+    }
+
+    fn finish(self) -> VfsResult<Arc<StudioVfs>> {
+        let vfs = self.assemble();
+        vfs.finalize_constructor_bootstrap()?;
+        Ok(vfs)
+    }
+}
+
+impl StudioVfs {
+    fn finalize_constructor_bootstrap(&self) -> VfsResult<()> {
+        let pending_uploads = self.block_cache.snapshot_pending_uploads();
+        let attrs = self.sync_meta().list_inode_attrs()?;
+        self.replay_dirty_uploads_from_local_backend(pending_uploads.as_slice(), attrs.as_slice());
+        Ok(())
+    }
+
+    /// Create a new VFS instance using the current local block backend contract.
+    pub fn new(
+        meta: Arc<dyn MetaEngine>,
+        data_config: &DataStoreConfig,
+        cache_dir: &str,
+        cache_size: u64,
+        block_cache_l1_limit: u64,
+        config: VfsConfigValidated,
+    ) -> VfsResult<Arc<Self>> {
+        Self::new_impl(
+            meta,
+            data_config,
+            cache_dir,
+            cache_size,
+            block_cache_l1_limit,
+            config,
+        )
+    }
+
+    fn new_impl(
+        meta: Arc<dyn MetaEngine>,
+        data_config: &DataStoreConfig,
+        cache_dir: &str,
+        cache_size: u64,
+        block_cache_l1_limit: u64,
+        config: VfsConfigValidated,
+    ) -> VfsResult<Arc<Self>> {
+        VfsBootstrap::prepare(
+            meta,
+            data_config,
+            cache_dir,
+            cache_size,
+            block_cache_l1_limit,
+            config,
+        )?
+        .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, MetadataConfig};
+    use studiofs_meta::{MetaFormat, RedbMetaEngine};
+    use tempfile::TempDir;
+    use tokio::runtime::Runtime;
+
+    fn test_format_info(volume_suffix: &str) -> FormatInfo {
+        let volume_name = format!("namespace-resolver-{volume_suffix}-{}", std::process::id());
+        FormatInfo {
+            format_version: CURRENT_FORMAT_VERSION,
+            name: volume_name.clone(),
+            uuid: format!("namespace-resolver-uuid-{volume_suffix}"),
+            endpoint: "http://127.0.0.1:9000".into(),
+            bucket: "studiofs-test".into(),
+            access_key: "test".into(),
+            secret_key: "test".into(),
+            region: "us-east-1".into(),
+            data_prefix: format!("{volume_name}/objects/"),
+            metadata: MetadataConfig::default(),
+            block_size: 4 * 1024 * 1024,
+        }
+    }
+
+    #[test]
+    fn open_local_block_backend_detection_errors_map_to_structured_vfs_error() {
+        let source = OpenLocalBlockBackendError::DetectCacheBackend {
+            cache_root: "ignored".to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "simulated permission error",
+            ),
+        };
+        let mapped = map_open_local_block_backend_error("E:\\cache-root", source);
+        match mapped {
+            VfsError::CacheBackendDetection { cache_root, source } => {
+                assert_eq!(cache_root, "E:\\cache-root");
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn open_local_block_backend_provision_errors_surface_clear_runtime_message() {
+        let source = OpenLocalBlockBackendError::ProvisionCacheV3Layout {
+            cache_root: "E:\\cache-root\\v3".to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "simulated permission error",
+            ),
+        };
+        let mapped = map_open_local_block_backend_error("E:\\cache-root", source);
+        match mapped {
+            VfsError::Other(message) => {
+                assert!(message.contains("failed to provision cache-v3 layout"));
+                assert!(message.contains("E:\\cache-root\\v3"));
+            }
+            other => panic!("unexpected error variant: {other}"),
+        }
+    }
+
+    #[test]
+    fn studio_vfs_new_selects_cache_v3_placeholder_backend_for_v3_only_layout() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("meta.redb");
+        let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
+        meta.init_root(0, 0).expect("init root");
+
+        let format_info = test_format_info("cache-v3-bootstrap");
+        meta.set_format_info(&format_info).expect("set format info");
+        let data_config = DataStoreConfig::from(&format_info);
+        let cache_dir = tmp.path().join("cache");
+        let layout = studiofs_cache::v3::CacheV3Layout::from_cache_root(&cache_dir);
+        std::fs::create_dir_all(&layout.v3_root).expect("create v3 root");
+        std::fs::write(&layout.layout_marker, b"v1").expect("create v3 marker");
+
+        let rt = Runtime::new().expect("runtime");
+        let _guard = rt.enter();
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            cache_dir.to_str().expect("cache dir str"),
+            64 * 1024 * 1024,
+            32 * 1024 * 1024,
+            VfsConfig::default()
+                .try_into()
+                .expect("default VFS config should validate"),
+        )
+        .expect("create vfs");
+
+        assert!(
+            vfs.local_block_backend()
+                .as_any()
+                .is::<studiofs_cache::v3::CacheV3LocalBlockBackend>(),
+            "v3-only layout should select the cache-v3 placeholder backend"
+        );
+    }
+
+    #[test]
+    fn studio_vfs_new_does_not_spawn_background_workers() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("meta.redb");
+        let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
+        meta.init_root(0, 0).expect("init root");
+
+        let format_info = test_format_info("new-no-start");
+        meta.set_format_info(&format_info).expect("set format info");
+        let data_config = DataStoreConfig::from(&format_info);
+        let cache_dir = tmp.path().join("cache");
+        let rt = Runtime::new().expect("runtime");
+        let _guard = rt.enter();
+
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            cache_dir.to_str().expect("cache dir str"),
+            64 * 1024 * 1024,
+            32 * 1024 * 1024,
+            VfsConfig::default()
+                .try_into()
+                .expect("default VFS config should validate"),
+        )
+        .expect("create vfs");
+
+        let startup = vfs.startup.lifecycle.lock();
+        assert!(
+            matches!(startup.status, startup::StartupStatus::Uninitialized),
+            "constructor should keep startup lifecycle uninitialized"
+        );
+        assert!(
+            vfs.state.shutdown.background_tasks.lock().is_empty(),
+            "constructor should not spawn background tasks"
+        );
+        assert!(
+            vfs.state.shutdown.uploader_task.lock().is_none(),
+            "constructor should not spawn uploader task"
+        );
+        drop(startup);
+    }
+
+    #[test]
+    fn studio_vfs_new_applies_bootstrap_plan_fields_to_constructed_vfs() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("meta.redb");
+        let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
+        meta.init_root(0, 0).expect("init root");
+
+        let mut format_info = test_format_info("constructor-bootstrap-fields");
+        format_info.data_prefix = "tenant/demo".to_string();
+        meta.set_format_info(&format_info).expect("set format info");
+        let data_config = DataStoreConfig::from(&format_info);
+        let cache_dir = tmp.path().join("cache");
+        let rt = Runtime::new().expect("runtime");
+        let _guard = rt.enter();
+
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            cache_dir.to_str().expect("cache dir str"),
+            64 * 1024 * 1024,
+            32 * 1024 * 1024,
+            VfsConfig {
+                principal: "dev-user".to_string(),
+                ..VfsConfig::default()
+            }
+            .try_into()
+            .expect("custom VFS config should validate"),
+        )
+        .expect("create vfs");
+
+        assert_eq!(
+            vfs.data_prefix, "tenant/demo/",
+            "constructor should materialize normalized data_prefix from the bootstrap plan"
+        );
+        assert_eq!(
+            vfs.acl_principal, "dev-user",
+            "constructor should carry bootstrap ACL principal into the assembled VFS"
+        );
+        assert_eq!(
+            vfs.write_path_backend_tag, "cache-v3",
+            "constructor should preserve the cache-v3 write-path backend tag in the assembled VFS"
+        );
+    }
+
+    #[test]
+    fn build_vfs_bootstrap_plan_normalizes_data_prefix_and_derives_tuning() {
+        let config: VfsConfigValidated = VfsConfig::default()
+            .try_into()
+            .expect("default VFS config should validate");
+
+        let mut empty_prefix = test_format_info("bootstrap-empty-prefix");
+        empty_prefix.data_prefix.clear();
+        let empty_plan = VfsBootstrapPlan::build(
+            empty_prefix.clone(),
+            64 * 1024 * 1024,
+            32 * 1024 * 1024,
+            &config,
+        )
+        .expect("build bootstrap plan with empty prefix");
+        assert_eq!(
+            empty_plan.data_prefix,
+            format!("{}/objects/", empty_prefix.name),
+            "empty data prefix should normalize to <volume>/objects/"
+        );
+
+        let mut missing_slash = test_format_info("bootstrap-missing-slash");
+        missing_slash.data_prefix = "tenant/demo".to_string();
+        let missing_slash_plan =
+            VfsBootstrapPlan::build(missing_slash, 64 * 1024 * 1024, 32 * 1024 * 1024, &config)
+                .expect("build bootstrap plan with missing trailing slash");
+        assert_eq!(
+            missing_slash_plan.data_prefix, "tenant/demo/",
+            "non-empty data prefix should end with a single trailing slash"
+        );
+        assert_eq!(
+            missing_slash_plan.access_classifier.block_size,
+            missing_slash_plan.block_size(),
+            "bootstrap plan should thread normalized block size into access classification"
+        );
+        assert!(
+            missing_slash_plan.local_backend_budget_bytes
+                >= missing_slash_plan.minimum_local_backend_budget_bytes,
+            "bootstrap plan should never under-provision local backend budget"
+        );
+        assert!(
+            missing_slash_plan.readahead_max_width >= 256,
+            "bootstrap plan should preserve the minimum readahead expansion floor"
+        );
+    }
+
+    #[test]
+    fn build_vfs_bootstrap_plan_rejects_oversized_block_size() {
+        let config: VfsConfigValidated = VfsConfig::default()
+            .try_into()
+            .expect("default VFS config should validate");
+        let mut format_info = test_format_info("bootstrap-invalid-block-size");
+        format_info.block_size = (CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT + 1)
+            .try_into()
+            .expect("fragment capacity should fit in u32 for tests");
+
+        let error =
+            VfsBootstrapPlan::build(format_info, 64 * 1024 * 1024, 32 * 1024 * 1024, &config)
+                .expect_err("oversized block size should fail before bootstrap IO starts");
+
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds 4x4 cloud fragment capacity"),
+            "bootstrap plan should reject volumes whose block size cannot fit in the cloud fragment layout"
+        );
+    }
+
+    #[test]
+    fn build_vfs_bootstrap_plan_clamps_local_backend_budget_for_tiny_cache() {
+        let config: VfsConfigValidated = VfsConfig::default()
+            .try_into()
+            .expect("default VFS config should validate");
+        let tiny_cache_size = 4 * 1024;
+        let plan = VfsBootstrapPlan::build(
+            test_format_info("bootstrap-tiny-cache"),
+            tiny_cache_size,
+            32 * 1024 * 1024,
+            &config,
+        )
+        .expect("build bootstrap plan for tiny cache budget");
+
+        assert!(
+            plan.local_backend_budget_bytes > tiny_cache_size,
+            "bootstrap plan should clamp tiny cache budgets upward to protect local durability"
+        );
+        assert_eq!(
+            plan.local_backend_budget_bytes, plan.minimum_local_backend_budget_bytes,
+            "when clamped, bootstrap plan should use the computed minimum local backend budget"
+        );
+    }
+}
