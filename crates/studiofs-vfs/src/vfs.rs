@@ -4306,6 +4306,128 @@ impl PendingUploadCatalog {
     }
 }
 
+#[derive(Debug, Default)]
+struct StartupReplayState {
+    dirty_set: HashSet<u64>,
+    quarantined_inodes: HashSet<Ino>,
+    quarantined_object_ids: HashSet<u64>,
+    replay_ops: Vec<(u64, u64, u64, u64)>,
+    live_extents: HashMap<(Ino, u32), ExtentRecordId>,
+    pending_epoch_finalizations: Vec<(Ino, u64)>,
+    restored_live_extents: usize,
+}
+
+impl StartupReplayState {
+    fn new(dirty_object_ids: impl IntoIterator<Item = u64>) -> Self {
+        Self {
+            dirty_set: dirty_object_ids.into_iter().collect(),
+            ..Self::default()
+        }
+    }
+
+    fn needs_scan(&self, attr: &InodeAttr) -> bool {
+        !self.dirty_set.is_empty() || StudioVfs::needs_epoch_finalization(attr)
+    }
+
+    fn has_dirty_objects(&self) -> bool {
+        !self.dirty_set.is_empty()
+    }
+
+    fn take_dirty_object(&mut self, object_id: u64) -> bool {
+        self.dirty_set.remove(&object_id)
+    }
+
+    fn record_quarantine(&mut self, ino: Ino, protected_object_ids: HashSet<u64>) {
+        self.quarantined_inodes.insert(ino);
+        self.quarantined_object_ids.extend(protected_object_ids);
+    }
+
+    fn discard_quarantined_dirty_objects(&mut self) {
+        if self.quarantined_object_ids.is_empty() {
+            return;
+        }
+        self.dirty_set
+            .retain(|object_id| !self.quarantined_object_ids.contains(object_id));
+    }
+
+    fn record_replayed_block(
+        &mut self,
+        ino: Ino,
+        block_index: u32,
+        object_id: u64,
+        content_epoch: u64,
+        block_size: u32,
+    ) {
+        let offset = (block_index as u64).saturating_mul(block_size as u64);
+        self.replay_ops
+            .push((ino, offset, object_id, content_epoch));
+        self.record_live_extent(ino, block_index, object_id, content_epoch);
+        self.restored_live_extents = self.restored_live_extents.saturating_add(1);
+    }
+
+    fn record_epoch_finalization(
+        &mut self,
+        ino: Ino,
+        content_epoch: u64,
+        blocks: &[(u32, BlockRef)],
+    ) {
+        for (block_index, block_ref) in blocks {
+            self.record_live_extent(ino, *block_index, block_ref.object_id, content_epoch);
+        }
+        self.pending_epoch_finalizations.push((ino, content_epoch));
+    }
+
+    fn merge_pending_live_extents(
+        &mut self,
+        pending_catalog: &PendingUploadCatalog,
+        block_size: u32,
+    ) {
+        let live_extents = pending_catalog.live_extents(block_size, &self.quarantined_inodes);
+        for (ino, block_index, object_id, content_epoch) in live_extents {
+            self.record_live_extent(ino, block_index, object_id, content_epoch);
+        }
+    }
+
+    fn live_extents_batch(&self) -> Vec<(Ino, u32, u64, u64)> {
+        let mut extents: Vec<_> = self
+            .live_extents
+            .iter()
+            .map(|(&(ino, block_index), extent)| {
+                (ino, block_index, extent.object_id, extent.content_epoch)
+            })
+            .collect();
+        extents.sort_by_key(|(ino, block_index, _, _)| (*ino, *block_index));
+        extents
+    }
+
+    fn queued_epoch_count(&self) -> usize {
+        self.pending_epoch_finalizations.len()
+    }
+
+    fn record_live_extent(
+        &mut self,
+        ino: Ino,
+        block_index: u32,
+        object_id: u64,
+        content_epoch: u64,
+    ) {
+        let next = ExtentRecordId {
+            object_id,
+            content_epoch,
+        };
+        match self.live_extents.entry((ino, block_index)) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(next);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if next.content_epoch >= entry.get().content_epoch {
+                    entry.insert(next);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum ReadPlanSource {
     Dirty { data: Bytes, block_offset: u32 },
@@ -4909,19 +5031,13 @@ impl StudioVfs {
         pending_uploads: &[PendingUpload],
         attrs: &[InodeAttr],
     ) {
-        let dirty_object_ids = self.local_block_backend.dirty_object_ids();
-        let mut dirty_set: HashSet<u64> = dirty_object_ids.into_iter().collect();
-        let mut quarantined_inodes = HashSet::new();
-        let mut quarantined_object_ids = HashSet::new();
-        let mut replay_ops: Vec<(u64, u64, u64, u64)> = Vec::new();
-        let mut live_extents: Vec<(Ino, u32, u64, u64)> = Vec::new();
-        let mut restored_live_extents = 0usize;
-        let mut queued_epochs = 0usize;
+        let pending_catalog = PendingUploadCatalog::from_ops(pending_uploads.iter().cloned());
+        let mut replay = StartupReplayState::new(self.local_block_backend.dirty_object_ids());
 
         for attr in attrs {
             let ino = attr.ino;
             let needs_finalization = Self::needs_epoch_finalization(attr);
-            if dirty_set.is_empty() && !needs_finalization {
+            if !replay.needs_scan(attr) {
                 continue;
             }
 
@@ -4935,12 +5051,11 @@ impl StudioVfs {
                             error = %error,
                             "quarantining invalid regular-file graph during startup recovery"
                         );
-                        quarantined_inodes.insert(ino);
                         let protected = self
                             .quarantine_invalid_regular_file_graph_for_startup_recovery(
                                 ino, attr.size, &error,
                             );
-                        quarantined_object_ids.extend(protected);
+                        replay.record_quarantine(ino, protected);
                     } else {
                         warn!(
                             ino,
@@ -4952,26 +5067,22 @@ impl StudioVfs {
                 }
             };
 
-            if !dirty_set.is_empty() {
-                let mut attr_live_extents: Vec<(Ino, u32, u64, u64)> = Vec::new();
-
+            if replay.has_dirty_objects() {
                 for (block_index, block_ref) in &blocks {
-                    if !dirty_set.remove(&block_ref.object_id) {
+                    if !replay.take_dirty_object(block_ref.object_id) {
                         continue;
                     }
 
-                    let offset = (*block_index as u64).saturating_mul(self.block_size as u64);
-                    replay_ops.push((ino, offset, block_ref.object_id, attr.content_epoch));
-                    attr_live_extents.push((
+                    replay.record_replayed_block(
                         ino,
                         *block_index,
                         block_ref.object_id,
                         attr.content_epoch,
-                    ));
-                    restored_live_extents = restored_live_extents.saturating_add(1);
+                        self.block_size,
+                    );
                 }
 
-                if !dirty_set.is_empty() && attr.size > 0 {
+                if replay.has_dirty_objects() && attr.size > 0 {
                     match self
                         .sync_meta()
                         .lookup_regular_file_slices(ino, 0, attr.size)
@@ -4981,7 +5092,7 @@ impl StudioVfs {
                                 let Some(block) = span.block else {
                                     continue;
                                 };
-                                if !dirty_set.remove(&block.object_id) {
+                                if !replay.take_dirty_object(block.object_id) {
                                     continue;
                                 }
                                 let chunk_base =
@@ -4990,16 +5101,13 @@ impl StudioVfs {
                                     chunk_base.saturating_add(span.range.start as u64);
                                 let block_index =
                                     block_index_from_offset(absolute_start, self.block_size);
-                                let offset =
-                                    (block_index as u64).saturating_mul(self.block_size as u64);
-                                replay_ops.push((ino, offset, block.object_id, attr.content_epoch));
-                                attr_live_extents.push((
+                                replay.record_replayed_block(
                                     ino,
                                     block_index,
                                     block.object_id,
                                     attr.content_epoch,
-                                ));
-                                restored_live_extents = restored_live_extents.saturating_add(1);
+                                    self.block_size,
+                                );
                             }
                         }
                         Err(e) => {
@@ -5011,41 +5119,42 @@ impl StudioVfs {
                         }
                     }
                 }
-
-                if !attr_live_extents.is_empty() {
-                    live_extents.extend(attr_live_extents);
-                }
             }
 
             if needs_finalization {
-                self.seed_live_extents_from_file_blocks(ino, attr.content_epoch, blocks.as_slice());
-                self.queue_epoch_finalization(ino, attr.content_epoch);
-                queued_epochs = queued_epochs.saturating_add(1);
+                replay.record_epoch_finalization(ino, attr.content_epoch, blocks.as_slice());
             }
         }
 
-        if !quarantined_object_ids.is_empty() {
-            dirty_set.retain(|object_id| !quarantined_object_ids.contains(object_id));
-        }
+        replay.discard_quarantined_dirty_objects();
+        replay.merge_pending_live_extents(&pending_catalog, self.block_size);
 
-        if !replay_ops.is_empty() {
-            self.block_cache.submit_uploads_batch(&replay_ops);
+        if !replay.replay_ops.is_empty() {
+            self.block_cache.submit_uploads_batch(&replay.replay_ops);
             info!(
-                replayed_dirty_blocks = replay_ops.len(),
-                restored_live_extents, "replayed dirty local backend blocks into upload queue"
+                replayed_dirty_blocks = replay.replay_ops.len(),
+                restored_live_extents = replay.restored_live_extents,
+                "replayed dirty local backend blocks into upload queue"
             );
         }
 
+        let live_extents = replay.live_extents_batch();
         if !live_extents.is_empty() {
             self.record_live_extents(&live_extents);
         }
 
-        if queued_epochs > 0 {
-            info!(queued_epochs, "seeded epoch finalizer queue from metadata");
+        for (ino, content_epoch) in &replay.pending_epoch_finalizations {
+            self.queue_epoch_finalization(*ino, *content_epoch);
+        }
+        if replay.queued_epoch_count() > 0 {
+            info!(
+                queued_epochs = replay.queued_epoch_count(),
+                "seeded epoch finalizer queue from metadata"
+            );
         }
 
-        if !dirty_set.is_empty() {
-            if quarantined_inodes.is_empty() {
+        if !replay.dirty_set.is_empty() {
+            if replay.quarantined_inodes.is_empty() {
                 // Cache the sync handle once so the recovery error path does
                 // not re-enter metadata lookup while we are already cleaning up.
                 let meta = self.sync_meta();
@@ -5060,14 +5169,16 @@ impl StudioVfs {
                     }
                 };
                 if let Some(reachable_object_ids) = reachable_object_ids {
-                    dirty_set.retain(|object_id| !reachable_object_ids.contains(object_id));
+                    replay
+                        .dirty_set
+                        .retain(|object_id| !reachable_object_ids.contains(object_id));
                 } else {
-                    dirty_set.clear();
+                    replay.dirty_set.clear();
                 }
 
-                if !dirty_set.is_empty() {
-                    let orphan_count = dirty_set.len() as u64;
-                    for object_id in &dirty_set {
+                if !replay.dirty_set.is_empty() {
+                    let orphan_count = replay.dirty_set.len() as u64;
+                    for object_id in &replay.dirty_set {
                         warn!(
                             object_id,
                             "removing orphan dirty block without metadata reference"
@@ -5080,33 +5191,22 @@ impl StudioVfs {
                         .upload_canceled_stale
                         .fetch_add(orphan_count, Ordering::Relaxed);
                     info!(
-                        orphan_dirty_blocks = dirty_set.len(),
+                        orphan_dirty_blocks = replay.dirty_set.len(),
                         "startup cleanup removed orphan dirty local backend entries"
                     );
                 }
             } else {
                 warn!(
-                    quarantined_inodes = quarantined_inodes.len(),
-                    orphan_dirty_blocks = dirty_set.len(),
+                    quarantined_inodes = replay.quarantined_inodes.len(),
+                    orphan_dirty_blocks = replay.dirty_set.len(),
                     "startup recovery preserved dirty local backend entries because invalid graphs were quarantined"
                 );
             }
         }
 
-        self.seed_live_extents_from_pending_uploads(pending_uploads, &quarantined_inodes);
-        if !quarantined_inodes.is_empty() {
-            self.cancel_pending_uploads_for_inodes(&quarantined_inodes);
+        if !replay.quarantined_inodes.is_empty() {
+            self.cancel_pending_uploads_for_inodes(&replay.quarantined_inodes);
         }
-    }
-
-    fn seed_live_extents_from_pending_uploads(
-        &self,
-        pending_uploads: &[PendingUpload],
-        quarantined_inodes: &HashSet<Ino>,
-    ) {
-        let live_extents = PendingUploadCatalog::from_ops(pending_uploads.iter().cloned())
-            .live_extents(self.block_size, quarantined_inodes);
-        self.record_live_extents(&live_extents);
     }
 
     /// Create a new VFS instance using the current local block backend contract.
@@ -7413,19 +7513,6 @@ impl StudioVfs {
                 },
             );
         }
-    }
-
-    fn seed_live_extents_from_file_blocks(
-        &self,
-        ino: Ino,
-        content_epoch: u64,
-        blocks: &[(u32, BlockRef)],
-    ) {
-        let mut extents = Vec::with_capacity(blocks.len());
-        for (block_index, block_ref) in blocks {
-            extents.push((ino, *block_index, block_ref.object_id, content_epoch));
-        }
-        self.record_live_extents(&extents);
     }
 
     fn collect_regular_file_object_ids_for_recovery(&self, ino: Ino, size: u64) -> HashSet<u64> {
@@ -13695,6 +13782,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use studiofs_meta::engine::MetaFsOps;
+    use studiofs_meta::engine::{MetaBlocks, MetaInodes};
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
     use studiofs_meta::{MetaFormat, RedbMetaEngine};
     use tempfile::TempDir;
@@ -13783,6 +13871,43 @@ mod tests {
                 object_id: 202,
                 content_epoch: 5,
             }
+        );
+    }
+
+    #[test]
+    fn startup_replay_does_not_override_current_epoch_live_extent_with_stale_pending_upload() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (_rt, vfs, meta) = make_test_vfs(&tmp, "startup-replay-stale-pending");
+
+        let created = vfs
+            .create(1, b"startup-stale-pending.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = created.ino;
+        let mut attr = meta.get_attr(ino).expect("load test attr");
+        attr.size = 4096;
+        attr.committed_size = 4096;
+        attr.content_epoch = 5;
+        attr.committed_content_epoch = 4;
+        attr.upload_state = MetaUploadState::Uploading;
+        meta.set_attr(&attr).expect("persist staged attr");
+        meta.set_file_block(ino, 0, &BlockRef::new_partial(9001, 4096))
+            .expect("persist current file block");
+
+        let pending_uploads = vec![PendingUpload {
+            ino,
+            offset: 0,
+            object_id: 7001,
+            content_epoch: 4,
+            created_unix_ms: 100,
+            retry_count: 0,
+        }];
+
+        vfs.replay_dirty_uploads_from_local_backend(&pending_uploads, &[attr]);
+
+        assert_eq!(
+            vfs.live_extent_records_for_inode(ino),
+            vec![(0, 9001, 5)],
+            "startup replay must preserve the current metadata epoch instead of overwriting it with stale pending uploads"
         );
     }
 
