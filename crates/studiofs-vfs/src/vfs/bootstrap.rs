@@ -713,4 +713,96 @@ mod tests {
             "constructor should preserve the cache-v3 write-path backend tag in the assembled VFS"
         );
     }
+
+    #[test]
+    fn build_vfs_bootstrap_plan_normalizes_data_prefix_and_derives_tuning() {
+        let config: VfsConfigValidated = VfsConfig::default()
+            .try_into()
+            .expect("default VFS config should validate");
+
+        let mut empty_prefix = test_format_info("bootstrap-empty-prefix");
+        empty_prefix.data_prefix.clear();
+        let empty_plan = VfsBootstrapPlan::build(
+            empty_prefix.clone(),
+            64 * 1024 * 1024,
+            32 * 1024 * 1024,
+            &config,
+        )
+        .expect("build bootstrap plan with empty prefix");
+        assert_eq!(
+            empty_plan.data_prefix,
+            format!("{}/objects/", empty_prefix.name),
+            "empty data prefix should normalize to <volume>/objects/"
+        );
+
+        let mut missing_slash = test_format_info("bootstrap-missing-slash");
+        missing_slash.data_prefix = "tenant/demo".to_string();
+        let missing_slash_plan =
+            VfsBootstrapPlan::build(missing_slash, 64 * 1024 * 1024, 32 * 1024 * 1024, &config)
+                .expect("build bootstrap plan with missing trailing slash");
+        assert_eq!(
+            missing_slash_plan.data_prefix, "tenant/demo/",
+            "non-empty data prefix should end with a single trailing slash"
+        );
+        assert_eq!(
+            missing_slash_plan.access_classifier.block_size,
+            missing_slash_plan.block_size(),
+            "bootstrap plan should thread normalized block size into access classification"
+        );
+        assert!(
+            missing_slash_plan.local_backend_budget_bytes
+                >= missing_slash_plan.minimum_local_backend_budget_bytes,
+            "bootstrap plan should never under-provision local backend budget"
+        );
+        assert!(
+            missing_slash_plan.readahead_max_width >= 256,
+            "bootstrap plan should preserve the minimum readahead expansion floor"
+        );
+    }
+
+    #[test]
+    fn build_vfs_bootstrap_plan_rejects_oversized_block_size() {
+        let config: VfsConfigValidated = VfsConfig::default()
+            .try_into()
+            .expect("default VFS config should validate");
+        let mut format_info = test_format_info("bootstrap-invalid-block-size");
+        format_info.block_size = (CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT + 1)
+            .try_into()
+            .expect("fragment capacity should fit in u32 for tests");
+
+        let error =
+            VfsBootstrapPlan::build(format_info, 64 * 1024 * 1024, 32 * 1024 * 1024, &config)
+                .expect_err("oversized block size should fail before bootstrap IO starts");
+
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds 4x4 cloud fragment capacity"),
+            "bootstrap plan should reject volumes whose block size cannot fit in the cloud fragment layout"
+        );
+    }
+
+    #[test]
+    fn build_vfs_bootstrap_plan_clamps_local_backend_budget_for_tiny_cache() {
+        let config: VfsConfigValidated = VfsConfig::default()
+            .try_into()
+            .expect("default VFS config should validate");
+        let tiny_cache_size = 4 * 1024;
+        let plan = VfsBootstrapPlan::build(
+            test_format_info("bootstrap-tiny-cache"),
+            tiny_cache_size,
+            32 * 1024 * 1024,
+            &config,
+        )
+        .expect("build bootstrap plan for tiny cache budget");
+
+        assert!(
+            plan.local_backend_budget_bytes > tiny_cache_size,
+            "bootstrap plan should clamp tiny cache budgets upward to protect local durability"
+        );
+        assert_eq!(
+            plan.local_backend_budget_bytes, plan.minimum_local_backend_budget_bytes,
+            "when clamped, bootstrap plan should use the computed minimum local backend budget"
+        );
+    }
 }

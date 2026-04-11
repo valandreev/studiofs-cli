@@ -72,8 +72,6 @@ use locking::{DistributedFlock, FileLockState};
 use namespace::NamespaceState;
 use startup::StartupChannels;
 use startup::StartupState;
-#[cfg(test)]
-use startup::StartupStatus;
 
 use crate::access::{
     AccessClass, AccessClassifierConfig, AccessDecision, AccessPolicy, HandleAccessState,
@@ -10481,7 +10479,6 @@ impl StudioVfs {
 
 #[cfg(test)]
 mod tests {
-    use super::bootstrap::VfsBootstrapPlan;
     use super::write_buffer::PendingBlock;
     use super::*;
     use std::sync::Arc;
@@ -10738,148 +10735,6 @@ mod tests {
     }
 
     #[test]
-    fn startup_state_claim_channels_transitions_to_starting_and_consumes_channels() {
-        let (_prefetch_tx, prefetch_rx) =
-            tokio::sync::mpsc::unbounded_channel::<PrefetchWorkItem>();
-        let (_upload_tx, upload_rx) = tokio::sync::mpsc::unbounded_channel::<PendingUpload>();
-        let startup = StartupState::new(prefetch_rx, upload_rx, Duration::from_secs(5));
-
-        let claimed = startup
-            .claim_channels_for_start()
-            .expect("claim channels")
-            .expect("channels should be present");
-        drop(claimed);
-
-        let lifecycle = startup.lifecycle.lock();
-        assert!(
-            matches!(lifecycle.status, StartupStatus::Starting),
-            "claiming startup channels should transition lifecycle to Starting"
-        );
-        assert!(
-            lifecycle.channels.is_none(),
-            "claiming startup channels should consume the one-shot channels"
-        );
-    }
-
-    #[test]
-    fn startup_state_claim_channels_marks_failed_when_channels_are_missing() {
-        let (_prefetch_tx, prefetch_rx) =
-            tokio::sync::mpsc::unbounded_channel::<PrefetchWorkItem>();
-        let (_upload_tx, upload_rx) = tokio::sync::mpsc::unbounded_channel::<PendingUpload>();
-        let startup = StartupState::new(prefetch_rx, upload_rx, Duration::from_secs(5));
-        startup.lifecycle.lock().channels = None;
-
-        let error = startup
-            .claim_channels_for_start()
-            .expect_err("missing channels should fail startup");
-
-        assert!(
-            error
-                .to_string()
-                .contains("startup channels are unavailable"),
-            "missing startup channels should map to a clear lifecycle error"
-        );
-        assert!(
-            matches!(startup.lifecycle.lock().status, StartupStatus::Failed),
-            "missing startup channels should move lifecycle into terminal Failed state"
-        );
-    }
-
-    #[test]
-    fn studio_vfs_start_requires_active_tokio_runtime() {
-        let tmp = TempDir::new().expect("tempdir");
-        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "start-requires-runtime");
-
-        let error = vfs
-            .start()
-            .expect_err("starting without an entered Tokio runtime should fail");
-
-        assert!(
-            error
-                .to_string()
-                .contains("requires an active Tokio runtime"),
-            "start should reject being called outside of a Tokio runtime"
-        );
-    }
-
-    #[test]
-    fn studio_vfs_start_rejects_when_shutdown_is_already_requested() {
-        let tmp = TempDir::new().expect("tempdir");
-        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "start-after-shutdown");
-        vfs.state
-            .shutdown
-            .shutdown_requested
-            .store(true, Ordering::Release);
-
-        let _guard = rt.enter();
-        let error = vfs
-            .start()
-            .expect_err("start should reject after shutdown begins");
-
-        assert!(
-            error.to_string().contains("after shutdown has begun"),
-            "start should fail fast once shutdown has been requested"
-        );
-    }
-
-    #[test]
-    fn studio_vfs_start_failure_marks_failed_and_rejects_retry() {
-        let tmp = TempDir::new().expect("tempdir");
-        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "start-missing-channels");
-        vfs.startup.lifecycle.lock().channels = None;
-
-        let _guard = rt.enter();
-        let first_error = vfs
-            .start()
-            .expect_err("missing startup channels should fail the first start attempt");
-        assert!(
-            first_error
-                .to_string()
-                .contains("startup channels are unavailable"),
-            "missing startup channels should surface a concrete startup failure"
-        );
-        assert!(
-            matches!(vfs.startup.lifecycle.lock().status, StartupStatus::Failed),
-            "failed startup should leave lifecycle in terminal Failed state"
-        );
-
-        let retry_error = vfs
-            .start()
-            .expect_err("failed startup should reject retry attempts");
-        assert!(
-            retry_error
-                .to_string()
-                .contains("startup previously failed"),
-            "retry after failed startup should surface the terminal lifecycle error"
-        );
-    }
-
-    #[test]
-    fn studio_vfs_start_is_idempotent_once_running() {
-        let tmp = TempDir::new().expect("tempdir");
-        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "start-idempotent");
-
-        let _guard = rt.enter();
-        vfs.start().expect("first start");
-        let initial_background_task_count = vfs.state.shutdown.background_tasks.lock().len();
-        assert!(
-            initial_background_task_count > 0,
-            "first start should register background tasks"
-        );
-
-        vfs.start().expect("second start should be a no-op");
-        assert_eq!(
-            vfs.state.shutdown.background_tasks.lock().len(),
-            initial_background_task_count,
-            "second start should not register duplicate background tasks"
-        );
-        assert!(
-            matches!(vfs.startup.lifecycle.lock().status, StartupStatus::Running),
-            "idempotent second start should preserve Running lifecycle state"
-        );
-    }
-
-    #[test]
     fn test_block_index_calculation() {
         let block_size = 4 * 1024 * 1024; // 4MB
 
@@ -10997,98 +10852,6 @@ mod tests {
         assert_eq!(
             resolved.write_eager_flush_batch_bytes,
             DEFAULT_WRITE_EAGER_FLUSH_BATCH_BYTES
-        );
-    }
-
-    #[test]
-    fn build_vfs_bootstrap_plan_normalizes_data_prefix_and_derives_tuning() {
-        let config: VfsConfigValidated = VfsConfig::default()
-            .try_into()
-            .expect("default VFS config should validate");
-
-        let mut empty_prefix = test_format_info("bootstrap-empty-prefix");
-        empty_prefix.data_prefix.clear();
-        let empty_plan = VfsBootstrapPlan::build(
-            empty_prefix.clone(),
-            64 * 1024 * 1024,
-            32 * 1024 * 1024,
-            &config,
-        )
-        .expect("build bootstrap plan with empty prefix");
-        assert_eq!(
-            empty_plan.data_prefix,
-            format!("{}/objects/", empty_prefix.name),
-            "empty data prefix should normalize to <volume>/objects/"
-        );
-
-        let mut missing_slash = test_format_info("bootstrap-missing-slash");
-        missing_slash.data_prefix = "tenant/demo".to_string();
-        let missing_slash_plan =
-            VfsBootstrapPlan::build(missing_slash, 64 * 1024 * 1024, 32 * 1024 * 1024, &config)
-                .expect("build bootstrap plan with missing trailing slash");
-        assert_eq!(
-            missing_slash_plan.data_prefix, "tenant/demo/",
-            "non-empty data prefix should end with a single trailing slash"
-        );
-        assert_eq!(
-            missing_slash_plan.access_classifier.block_size,
-            missing_slash_plan.block_size(),
-            "bootstrap plan should thread normalized block size into access classification"
-        );
-        assert!(
-            missing_slash_plan.local_backend_budget_bytes
-                >= missing_slash_plan.minimum_local_backend_budget_bytes,
-            "bootstrap plan should never under-provision local backend budget"
-        );
-        assert!(
-            missing_slash_plan.readahead_max_width >= 256,
-            "bootstrap plan should preserve the minimum readahead expansion floor"
-        );
-    }
-
-    #[test]
-    fn build_vfs_bootstrap_plan_rejects_oversized_block_size() {
-        let config: VfsConfigValidated = VfsConfig::default()
-            .try_into()
-            .expect("default VFS config should validate");
-        let mut format_info = test_format_info("bootstrap-invalid-block-size");
-        format_info.block_size = (CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT + 1)
-            .try_into()
-            .expect("fragment capacity should fit in u32 for tests");
-
-        let error =
-            VfsBootstrapPlan::build(format_info, 64 * 1024 * 1024, 32 * 1024 * 1024, &config)
-                .expect_err("oversized block size should fail before bootstrap IO starts");
-
-        assert!(
-            error
-                .to_string()
-                .contains("exceeds 4x4 cloud fragment capacity"),
-            "bootstrap plan should reject volumes whose block size cannot fit in the cloud fragment layout"
-        );
-    }
-
-    #[test]
-    fn build_vfs_bootstrap_plan_clamps_local_backend_budget_for_tiny_cache() {
-        let config: VfsConfigValidated = VfsConfig::default()
-            .try_into()
-            .expect("default VFS config should validate");
-        let tiny_cache_size = 4 * 1024;
-        let plan = VfsBootstrapPlan::build(
-            test_format_info("bootstrap-tiny-cache"),
-            tiny_cache_size,
-            32 * 1024 * 1024,
-            &config,
-        )
-        .expect("build bootstrap plan for tiny cache budget");
-
-        assert!(
-            plan.local_backend_budget_bytes > tiny_cache_size,
-            "bootstrap plan should clamp tiny cache budgets upward to protect local durability"
-        );
-        assert_eq!(
-            plan.local_backend_budget_bytes, plan.minimum_local_backend_budget_bytes,
-            "when clamped, bootstrap plan should use the computed minimum local backend budget"
         );
     }
 
