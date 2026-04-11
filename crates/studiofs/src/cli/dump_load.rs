@@ -385,7 +385,12 @@ fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64>
                     ],
                 )
                 .await
-                .map_err(|_| DumpLoadError::Message("insert event_log row failed".to_string()))?;
+                .map_err(|e| {
+                    DumpLoadError::Message(format!(
+                        "insert event_log row failed for vol={} batch_version={} event_type={}: {e}",
+                        target_vol, event.batch_version, event.event_type
+                    ))
+                })?;
             }
 
             for snapshot in &dump.snapshots {
@@ -413,7 +418,12 @@ fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64>
                     ],
                 )
                 .await
-                .map_err(|_| DumpLoadError::Message("insert snapshots row failed".to_string()))?;
+                .map_err(|e| {
+                    DumpLoadError::Message(format!(
+                        "insert snapshots row failed for vol={} snapshot_id={}: {e}",
+                        target_vol, snapshot.id
+                    ))
+                })?;
             }
 
             tx.commit()
