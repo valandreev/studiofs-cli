@@ -26,6 +26,24 @@ struct ResolvedMountConfig {
     cache_mode: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MountLaunchMode {
+    Foreground,
+    Daemon,
+}
+
+#[derive(Debug)]
+struct MountStartupContext {
+    actual_mount_path: String,
+    base_cache_path: PathBuf,
+    cache_size: String,
+    cache_mode: String,
+    vfs_config: studiofs_vfs::VfsConfigValidated,
+    principal_to_export: Option<String>,
+    run_in_foreground: bool,
+    launch_mode: MountLaunchMode,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DaemonSpawnPlan {
     current_exe: PathBuf,
@@ -254,6 +272,56 @@ where
     Ok(ResolvedMountConfig {
         vfs_config,
         cache_mode,
+    })
+}
+
+fn resolve_mount_launch_mode(detach: bool) -> MountLaunchMode {
+    if detach {
+        MountLaunchMode::Daemon
+    } else {
+        MountLaunchMode::Foreground
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_mount_startup_context(
+    name: &str,
+    meta_dir: &Path,
+    settings_config: super::settings::StudioFsConfig,
+    cli_mount_point: Option<&str>,
+    cli_cache_dir: Option<&Path>,
+    cli_cache_size: Option<&str>,
+    principal: Option<&str>,
+    foreground: bool,
+    detach: bool,
+    endpoint: Option<&str>,
+) -> anyhow::Result<MountStartupContext> {
+    let resolved_settings = super::settings::resolve_mount_runtime_settings(
+        &settings_config,
+        cli_mount_point,
+        cli_cache_dir,
+        cli_cache_size,
+    )?;
+    let ResolvedMountConfig {
+        vfs_config,
+        cache_mode,
+    } = build_mount_config_from_raw(settings_config.vfs, principal)?;
+
+    validate_endpoint_override(endpoint)?;
+    let mount_point = resolve_runtime_mount_point(resolved_settings.mount_point);
+    let actual_mount_path = prepare_actual_mount_path(name, &mount_point)?;
+
+    Ok(MountStartupContext {
+        actual_mount_path,
+        base_cache_path: resolved_settings
+            .cache_dir
+            .unwrap_or_else(|| meta_dir.join("cache")),
+        cache_size: resolved_settings.cache_size,
+        cache_mode,
+        vfs_config,
+        principal_to_export: principal.map(str::to_string),
+        run_in_foreground: resolve_run_in_foreground(foreground, detach),
+        launch_mode: resolve_mount_launch_mode(detach),
     })
 }
 
@@ -865,32 +933,36 @@ pub fn run(
     snapshot_id: Option<&str>,
     endpoint: Option<&str>,
 ) -> anyhow::Result<()> {
-    let settings_config = super::settings::load_studiofs_config()?;
-    let resolved_settings = super::settings::resolve_mount_runtime_settings(
-        &settings_config,
+    let startup = resolve_mount_startup_context(
+        name,
+        meta_dir,
+        super::settings::load_studiofs_config()?,
         mount_point,
         cache_dir,
         cache_size,
+        principal,
+        foreground,
+        detach,
+        endpoint,
     )?;
 
-    let cache_dir = resolved_settings.cache_dir;
-    let cache_size = resolved_settings.cache_size;
-    let ResolvedMountConfig {
+    let MountStartupContext {
+        actual_mount_path,
+        base_cache_path,
+        cache_size,
         vfs_config,
         cache_mode,
-    } = build_mount_config_from_raw(settings_config.vfs, principal)?;
-
-    validate_endpoint_override(endpoint)?;
-    let mount_point = resolve_runtime_mount_point(resolved_settings.mount_point);
-    let actual_mount_path = prepare_actual_mount_path(name, &mount_point)?;
+        principal_to_export,
+        run_in_foreground,
+        launch_mode,
+    } = startup;
 
     // ── Daemon mode: re-spawn in background and exit ────────────────────────
-    if detach {
+    if matches!(launch_mode, MountLaunchMode::Daemon) {
         return spawn_daemon(name, &actual_mount_path, meta_dir);
     }
 
-    let run_in_foreground = resolve_run_in_foreground(foreground, detach);
-    export_mount_principal(principal);
+    export_mount_principal(principal_to_export.as_deref());
 
     // ── Guard against double-mount ──────────────────────────────────────────
     // Note: when launched via `mount -d`, the parent pre-writes the PID file
@@ -898,7 +970,6 @@ pub fn run(
     // ignore a PID file that points to itself.
     guard_mount_pid_file(&actual_mount_path)?;
 
-    let base_cache_path = cache_dir.unwrap_or_else(|| meta_dir.join("cache"));
     let runtime = prepare_mount_runtime(
         name,
         meta_dir,
@@ -1061,6 +1132,7 @@ fn sanitize_log_component(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::settings;
     use crate::cli::utils;
 
     #[test]
@@ -1118,6 +1190,15 @@ mod tests {
         assert!(resolve_run_in_foreground(true, false));
         assert!(resolve_run_in_foreground(true, true));
         assert!(!resolve_run_in_foreground(false, true));
+    }
+
+    #[test]
+    fn resolve_mount_launch_mode_tracks_detach_choice() {
+        assert_eq!(
+            resolve_mount_launch_mode(false),
+            MountLaunchMode::Foreground
+        );
+        assert_eq!(resolve_mount_launch_mode(true), MountLaunchMode::Daemon);
     }
 
     #[test]
@@ -1343,6 +1424,136 @@ mod tests {
 
         assert_eq!(resolved.vfs_config.principal, "from-cli");
         assert_eq!(resolved.cache_mode, "fast");
+    }
+
+    fn startup_settings_config(
+        mount_point: String,
+        cache_dir: Option<PathBuf>,
+        cache_size: Option<&str>,
+    ) -> settings::StudioFsConfig {
+        settings::StudioFsConfig {
+            mount_point: Some(mount_point),
+            cache_dir: cache_dir.map(|path| path.to_string_lossy().into_owned()),
+            cache_size: cache_size.map(str::to_string),
+            vfs: VfsConfigRaw::default(),
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn startup_mount_point(temp: &tempfile::TempDir) -> String {
+        temp.path().join("mnt").to_string_lossy().into_owned()
+    }
+
+    #[cfg(windows)]
+    fn startup_mount_point(_: &tempfile::TempDir) -> String {
+        "Z:".to_string()
+    }
+
+    #[test]
+    fn resolve_mount_startup_context_defaults_to_meta_cache_and_foreground_launch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let meta_dir = temp.path().join("meta");
+        std::fs::create_dir_all(&meta_dir).expect("create meta dir");
+        let cli_mount_point = startup_mount_point(&temp);
+
+        let startup = resolve_mount_startup_context(
+            "projectfs",
+            &meta_dir,
+            startup_settings_config(cli_mount_point.clone(), None, Some("64GB")),
+            Some(cli_mount_point.as_str()),
+            None,
+            None,
+            Some("alice"),
+            false,
+            false,
+            Some("127.0.0.1:9000"),
+        )
+        .expect("startup context resolved");
+
+        assert_eq!(startup.base_cache_path, meta_dir.join("cache"));
+        assert_eq!(startup.cache_size, "64GB");
+        assert_eq!(startup.cache_mode, "fast");
+        assert_eq!(startup.principal_to_export.as_deref(), Some("alice"));
+        assert_eq!(startup.launch_mode, MountLaunchMode::Foreground);
+        assert!(startup.run_in_foreground);
+        assert_eq!(startup.vfs_config.principal, "alice");
+
+        #[cfg(not(windows))]
+        {
+            let expected = std::fs::canonicalize(temp.path().join("mnt").join("projectfs"))
+                .expect("canonical");
+            assert_eq!(PathBuf::from(&startup.actual_mount_path), expected);
+        }
+
+        #[cfg(windows)]
+        {
+            assert_eq!(startup.actual_mount_path, "Z:");
+        }
+    }
+
+    #[test]
+    fn resolve_mount_startup_context_uses_configured_cache_dir_for_daemon_launch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let meta_dir = temp.path().join("meta");
+        std::fs::create_dir_all(&meta_dir).expect("create meta dir");
+        let cli_mount_point = startup_mount_point(&temp);
+        let configured_cache_dir = temp.path().join("configured-cache");
+
+        let startup = resolve_mount_startup_context(
+            "projectfs",
+            &meta_dir,
+            startup_settings_config(
+                cli_mount_point.clone(),
+                Some(configured_cache_dir.clone()),
+                Some("32GB"),
+            ),
+            Some(cli_mount_point.as_str()),
+            None,
+            None,
+            None,
+            false,
+            true,
+            None,
+        )
+        .expect("startup context resolved");
+
+        assert_eq!(startup.base_cache_path, configured_cache_dir);
+        assert_eq!(startup.cache_size, "32GB");
+        assert_eq!(startup.principal_to_export, None);
+        assert_eq!(startup.launch_mode, MountLaunchMode::Daemon);
+        assert!(!startup.run_in_foreground);
+    }
+
+    #[test]
+    fn resolve_mount_startup_context_rejects_invalid_endpoint() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let meta_dir = temp.path().join("meta");
+        std::fs::create_dir_all(&meta_dir).expect("create meta dir");
+        let cli_mount_point = startup_mount_point(&temp);
+
+        let err = resolve_mount_startup_context(
+            "projectfs",
+            &meta_dir,
+            startup_settings_config(cli_mount_point.clone(), None, Some("64GB")),
+            Some(cli_mount_point.as_str()),
+            None,
+            None,
+            None,
+            false,
+            false,
+            Some("ftp://127.0.0.1:9000"),
+        )
+        .expect_err("invalid endpoint should be rejected");
+
+        assert!(err.to_string().contains("invalid S3 endpoint"));
+
+        #[cfg(not(windows))]
+        {
+            assert!(
+                !temp.path().join("mnt").exists(),
+                "invalid endpoint should fail before mount-path materialization"
+            );
+        }
     }
 
     #[test]
