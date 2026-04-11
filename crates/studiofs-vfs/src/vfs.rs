@@ -22,18 +22,21 @@
 //! 3. Fall back to remote fetch
 //! 4. Validate object payload + checksum and assemble response
 
+mod acl;
 mod bootstrap;
 #[path = "commit.rs"]
 mod commit;
 mod config;
 mod file_session;
 mod handle_table;
+mod ignored_entries;
 mod locking;
 mod metrics;
 mod namespace;
 mod prefetch;
 mod read_path;
 mod startup;
+mod statfs;
 mod workers;
 #[path = "write_buffer.rs"]
 mod write_buffer;
@@ -55,6 +58,7 @@ pub use metrics::{
 };
 pub use namespace::{KernelInvalidator, NamespaceParent, NamespacePathStyle, NamespaceResolver};
 
+use acl::AclState;
 use config::{
     CACHE_RUNTIME_HUGE_BUDGET_BYTES, CACHE_RUNTIME_LARGE_BUDGET_BYTES,
     CACHE_RUNTIME_MAX_DIRTY_BYTES_HUGE, CACHE_RUNTIME_MAX_DIRTY_BYTES_LARGE,
@@ -70,6 +74,7 @@ use config::{
 };
 use file_session::{FileSessionOperation, FileSessionState};
 use handle_table::HandleTable;
+use ignored_entries::IgnoredEntryRegistry;
 use locking::{DistributedFlock, FileLockState};
 use namespace::NamespaceState;
 use prefetch::{
@@ -362,19 +367,6 @@ const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
 const CACHE_RUNTIME_MIN_DIRTY_BYTES: usize = 256 * 1024 * 1024;
 const CACHE_RUNTIME_MAX_DIRTY_BYTES_BASE: usize = 2 * 1024 * 1024 * 1024;
-#[derive(Debug, Clone)]
-struct IgnoredEntry {
-    attr: InodeAttr,
-    parent: Ino,
-    name: Vec<u8>,
-}
-
-#[derive(Debug, Default)]
-struct IgnoredEntryRegistry {
-    by_ino: HashMap<Ino, IgnoredEntry>,
-    by_name: HashMap<(Ino, Vec<u8>), Ino>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TwoTierSegment {
     Probationary,
@@ -1824,22 +1816,6 @@ impl UploadState {
     }
 }
 
-struct AclState {
-    effective_acl_cache: Mutex<std::collections::HashMap<Ino, EffectiveAclCacheEntry>>,
-    acl_epoch: AtomicU64,
-    acl_namespace_epoch: AtomicU64,
-}
-
-impl AclState {
-    fn new() -> Self {
-        Self {
-            effective_acl_cache: Mutex::new(std::collections::HashMap::new()),
-            acl_epoch: AtomicU64::new(0),
-            acl_namespace_epoch: AtomicU64::new(0),
-        }
-    }
-}
-
 struct IncarnationState {
     inode_incarnations: Mutex<std::collections::HashMap<Ino, InodeIncarnationState>>,
     live_extent_records: Mutex<std::collections::HashMap<(Ino, u32), ExtentRecordId>>,
@@ -2422,13 +2398,6 @@ struct JanitorLease {
     op: Operator,
     lock_path: String,
     owner_id: String,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct EffectiveAclCacheEntry {
-    access_level: AccessLevel,
-    acl_epoch: u64,
-    acl_namespace_epoch: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -3205,13 +3174,6 @@ impl<'a> StartupReplayCoordinator<'a> {
     }
 }
 
-macro_rules! with_sync_meta {
-    ($self:expr, |$meta:ident| $body:block) => {{
-        let $meta = $self.sync_meta();
-        $body
-    }};
-}
-
 fn map_cache_backend_detection_error(cache_dir: &str, source: std::io::Error) -> VfsError {
     VfsError::CacheBackendDetection {
         cache_root: cache_dir.to_string(),
@@ -3243,164 +3205,6 @@ fn map_open_local_block_backend_error(
 }
 
 impl StudioVfs {
-    fn ignored_entry_attr(&self, ino: Ino) -> Option<InodeAttr> {
-        self.state
-            .metrics
-            .ignored_entries
-            .lock()
-            .by_ino
-            .get(&ino)
-            .map(|ignored| ignored.attr.clone())
-    }
-
-    fn ignored_dir_attr(&self, ino: Ino) -> Option<InodeAttr> {
-        self.ignored_entry_attr(ino)
-            .filter(|attr| attr.kind == FileType::Directory)
-    }
-
-    fn ignored_entry_lookup(&self, parent: Ino, name: &[u8]) -> Option<IgnoredEntry> {
-        let key = (parent, name.to_vec());
-        let registry = self.state.metrics.ignored_entries.lock();
-        let ino = registry.by_name.get(&key).copied()?;
-        registry.by_ino.get(&ino).cloned()
-    }
-
-    fn ignored_entry(&self, ino: Ino) -> Option<IgnoredEntry> {
-        self.state
-            .metrics
-            .ignored_entries
-            .lock()
-            .by_ino
-            .get(&ino)
-            .cloned()
-    }
-
-    fn create_ignored_entry(
-        &self,
-        parent: Ino,
-        name: &[u8],
-        uid: u32,
-        gid: u32,
-        mode: u16,
-        kind: FileType,
-    ) -> InodeAttr {
-        let mut registry = self.state.metrics.ignored_entries.lock();
-        let key = (parent, name.to_vec());
-        if let Some(ino) = registry.by_name.get(&key).copied()
-            && let Some(existing) = registry.by_ino.get(&ino)
-        {
-            return existing.attr.clone();
-        }
-
-        let ino = self
-            .state
-            .metrics
-            .next_ignored_ino
-            .fetch_add(1, Ordering::Relaxed);
-        let attr = match kind {
-            FileType::Directory => InodeAttr::new_dir(ino, parent, uid, gid, mode & 0o7777),
-            FileType::RegularFile => InodeAttr::new_file(ino, parent, uid, gid, mode & 0o7777),
-            FileType::Symlink => InodeAttr::new_symlink(ino, parent, uid, gid, 0),
-        };
-        let ignored = IgnoredEntry {
-            attr: attr.clone(),
-            parent,
-            name: key.1.clone(),
-        };
-        registry.by_name.insert(key, ino);
-        registry.by_ino.insert(ino, ignored);
-        attr
-    }
-
-    fn update_ignored_entry<F>(&self, ino: Ino, update: F) -> Option<InodeAttr>
-    where
-        F: FnOnce(&mut InodeAttr),
-    {
-        let mut registry = self.state.metrics.ignored_entries.lock();
-        let ignored = registry.by_ino.get_mut(&ino)?;
-        update(&mut ignored.attr);
-        Some(ignored.attr.clone())
-    }
-
-    fn unlink_ignored_entry(&self, parent: Ino, name: &[u8]) -> bool {
-        let key = (parent, name.to_vec());
-        let mut registry = self.state.metrics.ignored_entries.lock();
-        let Some(ino) = registry.by_name.remove(&key) else {
-            return false;
-        };
-
-        if self.handle_table.open_count(ino) > 0 {
-            self.handle_table.mark_orphan(ino);
-        } else {
-            registry.by_ino.remove(&ino);
-        }
-        true
-    }
-
-    fn unlink_ignored_subtree(&self, parent: Ino, name: &[u8]) -> bool {
-        let key = (parent, name.to_vec());
-        let mut registry = self.state.metrics.ignored_entries.lock();
-        let Some(root_ino) = registry.by_name.remove(&key) else {
-            return false;
-        };
-
-        let mut pending = vec![root_ino];
-        let mut to_remove = Vec::new();
-        while let Some(current) = pending.pop() {
-            to_remove.push(current);
-            let children: Vec<Ino> = registry
-                .by_ino
-                .iter()
-                .filter_map(|(ino, entry)| (entry.parent == current).then_some(*ino))
-                .collect();
-            pending.extend(children);
-        }
-
-        for ino in to_remove {
-            if let Some(ignored) = registry.by_ino.get(&ino).cloned() {
-                registry
-                    .by_name
-                    .remove(&(ignored.parent, ignored.name.clone()));
-                if self.handle_table.open_count(ino) > 0 {
-                    self.handle_table.mark_orphan(ino);
-                } else {
-                    registry.by_ino.remove(&ino);
-                }
-            }
-        }
-        true
-    }
-
-    fn release_ignored_entry(&self, ino: Ino) -> bool {
-        let mut registry = self.state.metrics.ignored_entries.lock();
-        let Some(ignored) = registry.by_ino.remove(&ino) else {
-            return false;
-        };
-        registry.by_name.remove(&(ignored.parent, ignored.name));
-        true
-    }
-
-    fn ignored_entry_not_found(parent: Ino, name: &[u8]) -> VfsError {
-        VfsError::Meta(MetaError::EntryNotFound {
-            parent,
-            name: String::from_utf8_lossy(name).into_owned(),
-        })
-    }
-
-    fn is_blocked_root_metadata_path(&self, parent: Ino, name: &[u8]) -> bool {
-        parent == ROOT_INO && is_blocked_root_macos_metadata(name)
-    }
-
-    fn should_ignore_regular_file_path(&self, parent: Ino, name: &[u8]) -> bool {
-        is_ignored_macos_metadata(name)
-            || self.is_blocked_root_metadata_path(parent, name)
-            || self.ignored_dir_attr(parent).is_some()
-    }
-
-    fn should_ignore_directory_path(&self, parent: Ino, name: &[u8]) -> bool {
-        self.is_blocked_root_metadata_path(parent, name) || self.ignored_dir_attr(parent).is_some()
-    }
-
     fn namespace_cache_token_for_parent(&self, parent: Ino) -> NamespaceCacheToken {
         let parent_generation = self
             .state
@@ -3454,211 +3258,6 @@ impl StudioVfs {
             }
             generations.insert(parent, next);
         }
-    }
-
-    fn bump_acl_epoch(&self) {
-        self.state
-            .acl
-            .acl_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_add(1))
-            })
-            .ok();
-    }
-
-    fn bump_acl_namespace_epoch(&self) {
-        self.state
-            .acl
-            .acl_namespace_epoch
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_add(1))
-            })
-            .ok();
-    }
-
-    fn acl_rule_for_inode(&self, ino: Ino) -> VfsResult<Option<AccessLevel>> {
-        let meta = self.sync_meta();
-        if let Some(level) = meta.get_acl_rule(ino, &self.acl_principal)? {
-            return Ok(Some(level));
-        }
-        if self.acl_principal != "*" {
-            return Ok(meta.get_acl_rule(ino, "*")?);
-        }
-        Ok(None)
-    }
-
-    fn acl_rule_for_inode_meta(
-        meta: &dyn MetaEngine,
-        principal: &str,
-        ino: Ino,
-    ) -> MetaResult<Option<AccessLevel>> {
-        if let Some(level) = meta.get_acl_rule(ino, principal)? {
-            return Ok(Some(level));
-        }
-        if principal != "*" {
-            return meta.get_acl_rule(ino, "*");
-        }
-        Ok(None)
-    }
-
-    fn access_satisfies(actual: AccessLevel, required: AccessLevel) -> bool {
-        (actual as u8) >= (required as u8)
-    }
-
-    fn effective_access_level_cached(&self, ino: Ino) -> Option<AccessLevel> {
-        let acl_epoch = self.state.acl.acl_epoch.load(Ordering::Acquire);
-        let acl_namespace_epoch = self.state.acl.acl_namespace_epoch.load(Ordering::Acquire);
-        self.state
-            .acl
-            .effective_acl_cache
-            .lock()
-            .get(&ino)
-            .copied()
-            .filter(|entry| {
-                entry.acl_epoch == acl_epoch && entry.acl_namespace_epoch == acl_namespace_epoch
-            })
-            .map(|entry| entry.access_level)
-    }
-
-    fn effective_access_level_cache_insert(&self, ino: Ino, access_level: AccessLevel) {
-        let acl_epoch = self.state.acl.acl_epoch.load(Ordering::Acquire);
-        let acl_namespace_epoch = self.state.acl.acl_namespace_epoch.load(Ordering::Acquire);
-        let mut cache = self.state.acl.effective_acl_cache.lock();
-        if cache.len() >= self.effective_acl_cache_capacity {
-            cache.clear();
-        }
-        cache.insert(
-            ino,
-            EffectiveAclCacheEntry {
-                access_level,
-                acl_epoch,
-                acl_namespace_epoch,
-            },
-        );
-    }
-
-    fn effective_access_level(&self, ino: Ino) -> VfsResult<AccessLevel> {
-        if let Some(access_level) = self.effective_access_level_cached(ino) {
-            return Ok(access_level);
-        }
-
-        let mut current = ino;
-        let mut depth = 0usize;
-        let access_level = loop {
-            if depth >= 4096 {
-                break AccessLevel::ReadWrite;
-            }
-            if let Some(level) = self.acl_rule_for_inode(current)? {
-                break level;
-            }
-
-            let attr = self.getattr_unchecked(current)?;
-            if current == ROOT_INO || attr.parent == 0 || attr.parent == current {
-                break AccessLevel::ReadWrite;
-            }
-            current = attr.parent;
-            depth += 1;
-        };
-
-        self.effective_access_level_cache_insert(ino, access_level);
-        Ok(access_level)
-    }
-
-    fn effective_access_level_meta(
-        meta: &dyn MetaEngine,
-        principal: &str,
-        ino: Ino,
-    ) -> MetaResult<AccessLevel> {
-        let mut current = ino;
-        let mut depth = 0usize;
-        loop {
-            if depth >= 4096 {
-                return Ok(AccessLevel::ReadWrite);
-            }
-            if let Some(level) = Self::acl_rule_for_inode_meta(meta, principal, current)? {
-                return Ok(level);
-            }
-            let attr = meta.get_attr(current)?;
-            if current == ROOT_INO || attr.parent == 0 || attr.parent == current {
-                return Ok(AccessLevel::ReadWrite);
-            }
-            current = attr.parent;
-            depth += 1;
-        }
-    }
-
-    fn enforce_access(&self, ino: Ino, required: AccessLevel) -> VfsResult<()> {
-        let actual = self.effective_access_level(ino)?;
-        if Self::access_satisfies(actual, required) {
-            return Ok(());
-        }
-        if actual == AccessLevel::NoAccess {
-            return Err(VfsError::Meta(MetaError::InodeNotFound(ino)));
-        }
-        Err(VfsError::Meta(MetaError::AccessDenied {
-            ino,
-            principal: self.acl_principal.clone(),
-            required,
-            actual,
-        }))
-    }
-
-    async fn enforce_access_async(&self, ino: Ino, required: AccessLevel) -> VfsResult<()> {
-        if let Some(actual) = self.effective_access_level_cached(ino) {
-            if Self::access_satisfies(actual, required) {
-                return Ok(());
-            }
-            if actual == AccessLevel::NoAccess {
-                return Err(VfsError::Meta(MetaError::InodeNotFound(ino)));
-            }
-            return Err(VfsError::Meta(MetaError::AccessDenied {
-                ino,
-                principal: self.acl_principal.clone(),
-                required,
-                actual,
-            }));
-        }
-
-        let meta = self.meta_async.clone();
-        let principal = self.acl_principal.clone();
-        let actual = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-            Self::effective_access_level_meta(engine.as_ref(), &principal, ino)
-        })
-        .await?;
-        self.effective_access_level_cache_insert(ino, actual);
-        if Self::access_satisfies(actual, required) {
-            return Ok(());
-        }
-        if actual == AccessLevel::NoAccess {
-            return Err(VfsError::Meta(MetaError::InodeNotFound(ino)));
-        }
-        Err(VfsError::Meta(MetaError::AccessDenied {
-            ino,
-            principal: self.acl_principal.clone(),
-            required,
-            actual,
-        }))
-    }
-
-    pub fn set_acl_rule(
-        &self,
-        ino: Ino,
-        principal: &str,
-        access_level: AccessLevel,
-    ) -> VfsResult<()> {
-        let meta = self.sync_meta();
-        meta.set_acl_rule(ino, principal, access_level)?;
-        self.bump_acl_epoch();
-        meta.request_eager_flush();
-        Ok(())
-    }
-
-    pub fn remove_acl_rule(&self, ino: Ino, principal: &str) -> VfsResult<()> {
-        let meta = self.sync_meta();
-        meta.remove_acl_rule(ino, principal)?;
-        self.bump_acl_epoch();
-        meta.request_eager_flush();
-        Ok(())
     }
 
     fn dentry_cache_lookup(&self, parent: Ino, name: &[u8]) -> Option<DentryCacheValue> {
@@ -5537,38 +5136,6 @@ impl StudioVfs {
     /// cross-client reads.
     pub async fn wait_for_uploads_idle(&self, timeout: Duration) -> bool {
         self.block_cache.wait_for_uploads_idle(timeout).await
-    }
-
-    /// Get filesystem statistics.
-    ///
-    /// Returns real inode count and used space from redb counters.
-    /// Total capacity is virtual (1 PB) since the backing store is cloud.
-    pub fn statfs(&self) -> VfsResult<StatFs> {
-        use studiofs_meta::types::counters;
-        let (used_inodes, used_bytes) = with_sync_meta!(self, |meta| {
-            (
-                meta.get_counter(counters::TOTAL_INODES)?,
-                meta.get_counter(counters::USED_SPACE)?,
-            )
-        });
-        let bsize = self.block_size as u64;
-
-        // Virtual capacity: 1 PB
-        let total_bytes: u64 = 1024 * 1024 * 1024 * 1024 * 1024; // 1 PB
-        let total_blocks = total_bytes / bsize;
-        let used_blocks = used_bytes / bsize;
-        let free_blocks = total_blocks.saturating_sub(used_blocks);
-
-        Ok(StatFs {
-            blocks: total_blocks,
-            bfree: free_blocks,
-            bavail: free_blocks,
-            files: used_inodes,
-            ffree: u64::MAX - used_inodes,
-            bsize: self.block_size,
-            namelen: 255,
-            frsize: self.block_size,
-        })
     }
 
     /// Snapshot accepted local-ingress state for diagnostics and backpressure
@@ -7978,22 +7545,6 @@ impl StudioVfs {
             }
         }
         Ok(trash_roots)
-    }
-
-    fn ignored_directory_has_probable_trash_ancestor(&self, dir_ino: Ino) -> bool {
-        let mut current = dir_ino;
-        let mut hops = 0usize;
-        while current != 0 && hops < 1024 {
-            let Some(entry) = self.ignored_entry(current) else {
-                break;
-            };
-            if entry.parent == ROOT_INO && is_probable_trash_component(&entry.name) {
-                return true;
-            }
-            current = entry.parent;
-            hops += 1;
-        }
-        false
     }
 
     /// Immediately evict a single block from every cache tier.
@@ -11222,134 +10773,6 @@ mod tests {
             !vfs.state.namespace.attr_read_cache.lock().contains(dir.ino),
             "link should invalidate destination parent attr cache"
         );
-    }
-
-    #[test]
-    fn ignored_create_invalidates_parent_attr_cache() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-create-invalidates-parent-attr-cache");
-        let dir = vfs
-            .mkdir(ROOT_INO, b"dir", 1000, 1000, 0o755)
-            .expect("mkdir dir");
-
-        let _ = vfs.getattr(dir.ino).expect("prime parent attr cache");
-        assert!(
-            vfs.state.namespace.attr_read_cache.lock().contains(dir.ino),
-            "parent dir should be cached before ignored create"
-        );
-
-        let _ignored = vfs
-            .create(dir.ino, b".fseventsd", 1000, 1000, 0o644)
-            .expect("create ignored file");
-
-        assert!(
-            !vfs.state.namespace.attr_read_cache.lock().contains(dir.ino),
-            "ignored create should invalidate parent directory attr cache"
-        );
-    }
-
-    #[test]
-    fn ignored_link_invalidates_new_parent_attr_cache() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-link-invalidates-parent-attr-cache");
-        let source = vfs
-            .create(ROOT_INO, b"source.txt", 1000, 1000, 0o644)
-            .expect("create source");
-        let dir = vfs
-            .mkdir(ROOT_INO, b"links", 1000, 1000, 0o755)
-            .expect("mkdir links");
-
-        let _ = vfs.getattr(dir.ino).expect("prime new parent attr cache");
-        assert!(
-            vfs.state.namespace.attr_read_cache.lock().contains(dir.ino),
-            "new parent dir should be cached before ignored link"
-        );
-
-        let _ignored = vfs
-            .link(source.ino, dir.ino, b".fseventsd")
-            .expect("create ignored hardlink");
-
-        assert!(
-            !vfs.state.namespace.attr_read_cache.lock().contains(dir.ino),
-            "ignored link should invalidate destination parent attr cache"
-        );
-    }
-
-    #[test]
-    fn rename_between_ignored_names_invalidates_parent_attr_cache() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-rename-invalidates-parent-attr-cache");
-        vfs.mkdir(ROOT_INO, b".Spotlight-V100", 1000, 1000, 0o755)
-            .expect("create ignored dir");
-
-        let _ = vfs.getattr(ROOT_INO).expect("prime root attr cache");
-        assert!(
-            vfs.state
-                .namespace
-                .attr_read_cache
-                .lock()
-                .contains(ROOT_INO),
-            "root dir should be cached before ignored rename"
-        );
-
-        vfs.rename(ROOT_INO, b".Spotlight-V100", ROOT_INO, b".fseventsd")
-            .expect("rename ignored entry");
-
-        assert!(
-            !vfs.state
-                .namespace
-                .attr_read_cache
-                .lock()
-                .contains(ROOT_INO),
-            "ignored rename should invalidate parent directory attr cache"
-        );
-        assert!(vfs.lookup(ROOT_INO, b".Spotlight-V100").is_err());
-        assert!(vfs.lookup(ROOT_INO, b".fseventsd").is_ok());
-    }
-
-    #[test]
-    fn rename_into_ignored_trash_invalidates_destination_parent_attr_cache() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let (_rt, vfs, _meta) =
-            make_test_vfs(&tmp, "ignored-trash-rename-invalidates-parent-attr-cache");
-        let source = vfs
-            .create(ROOT_INO, b"source.txt", 1000, 1000, 0o644)
-            .expect("create source");
-        let trash_root = vfs
-            .mkdir(ROOT_INO, b".Trash", 1000, 1000, 0o755)
-            .expect("create ignored trash root");
-        let trash_child = vfs
-            .mkdir(trash_root.ino, b"501", 1000, 1000, 0o755)
-            .expect("create ignored trash child");
-
-        let _ = vfs
-            .getattr(trash_child.ino)
-            .expect("prime destination parent attr cache");
-        assert!(
-            vfs.state
-                .namespace
-                .attr_read_cache
-                .lock()
-                .contains(trash_child.ino),
-            "destination ignored parent should be cached before rename"
-        );
-
-        vfs.rename(ROOT_INO, b"source.txt", trash_child.ino, b"source.txt")
-            .expect("rename into ignored trash subtree");
-
-        assert!(
-            !vfs.state
-                .namespace
-                .attr_read_cache
-                .lock()
-                .contains(trash_child.ino),
-            "rename into ignored trash should invalidate destination parent attr cache"
-        );
-        assert!(vfs.lookup(ROOT_INO, b"source.txt").is_err());
-        let moved = vfs
-            .lookup(trash_child.ino, b"source.txt")
-            .expect("ignored trash target should resolve");
-        assert_eq!(moved.size, source.size);
     }
 
     #[test]
