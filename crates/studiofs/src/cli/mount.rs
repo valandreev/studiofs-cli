@@ -1577,6 +1577,23 @@ mod tests {
         assert_eq!(resolved.cache_mode, "fast");
     }
 
+    #[test]
+    fn build_mount_config_from_raw_with_keeps_overlay_principal_when_cli_missing() {
+        let raw = VfsConfigRaw {
+            principal: Some("from-raw".to_string()),
+            ..VfsConfigRaw::default()
+        };
+
+        let resolved = build_mount_config_with(raw, None, |mut cfg| {
+            cfg.principal = Some("from-env".to_string());
+            cfg
+        })
+        .expect("config should validate");
+
+        assert_eq!(resolved.vfs_config.principal, "from-env");
+        assert_eq!(resolved.cache_mode, "fast");
+    }
+
     fn seed_mount_meta_db(
         temp: &tempfile::TempDir,
         name: &str,
@@ -1781,6 +1798,57 @@ mod tests {
         assert_eq!(startup.principal_to_export, None);
         assert_eq!(startup.launch_mode, MountLaunchMode::Daemon);
         assert!(!startup.run_in_foreground);
+    }
+
+    #[test]
+    fn resolve_mount_startup_context_prefers_cli_runtime_settings_over_stored_defaults() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let meta_dir = temp.path().join("meta");
+        std::fs::create_dir_all(&meta_dir).expect("create meta dir");
+        let configured_cache_dir = temp.path().join("configured-cache");
+        let cli_cache_dir = temp.path().join("cli-cache");
+        let settings_mount_point = startup_mount_point(&temp);
+
+        #[cfg(not(windows))]
+        let cli_mount_point = temp.path().join("cli-mnt").to_string_lossy().into_owned();
+
+        #[cfg(windows)]
+        let cli_mount_point = "Y:".to_string();
+
+        let startup = resolve_mount_startup(
+            "projectfs",
+            &meta_dir,
+            startup_settings_config(
+                settings_mount_point,
+                Some(configured_cache_dir),
+                Some("32GB"),
+            ),
+            Some(cli_mount_point.as_str()),
+            Some(cli_cache_dir.as_path()),
+            Some("96GB"),
+            None,
+            true,
+            false,
+            None,
+        )
+        .expect("startup context resolved");
+
+        assert_eq!(startup.base_cache_path, cli_cache_dir);
+        assert_eq!(startup.cache_size, "96GB");
+        assert_eq!(startup.launch_mode, MountLaunchMode::Foreground);
+        assert!(startup.run_in_foreground);
+
+        #[cfg(not(windows))]
+        {
+            let expected = std::fs::canonicalize(temp.path().join("cli-mnt").join("projectfs"))
+                .expect("canonical");
+            assert_eq!(PathBuf::from(&startup.actual_mount_path), expected);
+        }
+
+        #[cfg(windows)]
+        {
+            assert_eq!(startup.actual_mount_path, "Y:");
+        }
     }
 
     #[test]

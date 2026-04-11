@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use studiofs_meta::{ensure_studiofs_database, open_meta_engine, MetaError};
+use studiofs_meta::{MetaError, ensure_studiofs_database, open_meta_engine};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,10 +149,10 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
             .await
             .map_err(|e| DumpLoadError::Message(e.to_string()))?
             .metadata_dsn;
-        let (mut client, connection) = tokio_postgres::connect(&metadata_dsn, tokio_postgres::NoTls)
+        let (client, connection) = tokio_postgres::connect(&metadata_dsn, tokio_postgres::NoTls)
             .await
             .map_err(|e| DumpLoadError::Message(format!("cannot connect to postgres: {e}")))?;
-        let connection_task = tokio::spawn(async move { connection.await });
+        let connection_task = tokio::spawn(connection);
 
         let dump = async {
             let row = client
@@ -166,7 +166,9 @@ fn load_remote_dump(meta_dsn: &str, volume_id: i64) -> DumpLoadResult<MetadataDu
                     &[&volume_id],
                 )
                 .await
-                .map_err(|e| DumpLoadError::Message(format!("failed to query metadata_state: {e}")))?;
+                .map_err(|e| {
+                    DumpLoadError::Message(format!("failed to query metadata_state: {e}"))
+                })?;
 
             let row = row.ok_or_else(|| {
                 DumpLoadError::Message(format!("volume {volume_id} not found in postgres"))
@@ -304,10 +306,11 @@ fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64>
             .await
             .map_err(|e| DumpLoadError::Message(e.to_string()))?
             .metadata_dsn;
-        let (mut client, connection) = tokio_postgres::connect(&metadata_dsn, tokio_postgres::NoTls)
-            .await
-            .map_err(|e| DumpLoadError::Message(format!("cannot connect to postgres: {e}")))?;
-        let connection_task = tokio::spawn(async move { connection.await });
+        let (mut client, connection) =
+            tokio_postgres::connect(&metadata_dsn, tokio_postgres::NoTls)
+                .await
+                .map_err(|e| DumpLoadError::Message(format!("cannot connect to postgres: {e}")))?;
+        let connection_task = tokio::spawn(connection);
 
         let result = async {
             ensure_pg_schema(&client).await?;
@@ -382,7 +385,12 @@ fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64>
                     ],
                 )
                 .await
-                .map_err(|e| DumpLoadError::Message("insert event_log row failed".to_string()))?;
+                .map_err(|e| {
+                    DumpLoadError::Message(format!(
+                        "insert event_log row failed for vol={} batch_version={} event_type={}: {e}",
+                        target_vol, event.batch_version, event.event_type
+                    ))
+                })?;
             }
 
             for snapshot in &dump.snapshots {
@@ -410,7 +418,12 @@ fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64>
                     ],
                 )
                 .await
-                .map_err(|e| DumpLoadError::Message("insert snapshots row failed".to_string()))?;
+                .map_err(|e| {
+                    DumpLoadError::Message(format!(
+                        "insert snapshots row failed for vol={} snapshot_id={}: {e}",
+                        target_vol, snapshot.id
+                    ))
+                })?;
             }
 
             tx.commit()
@@ -429,10 +442,12 @@ fn apply_dump(postgres_address: &str, dump: MetadataDump) -> DumpLoadResult<i64>
 }
 
 pub fn load(input: &Path, postgres_address: &str) -> DumpLoadResult<()> {
-    let bytes = std::fs::read(input)
-        .map_err(|e| DumpLoadError::Message(format!("failed to read dump {}: {e}", input.display())))?;
-    let dump: MetadataDump = serde_json::from_slice(&bytes)
-        .map_err(|e| DumpLoadError::Message(format!("failed to parse dump {}: {e}", input.display())))?;
+    let bytes = std::fs::read(input).map_err(|e| {
+        DumpLoadError::Message(format!("failed to read dump {}: {e}", input.display()))
+    })?;
+    let dump: MetadataDump = serde_json::from_slice(&bytes).map_err(|e| {
+        DumpLoadError::Message(format!("failed to parse dump {}: {e}", input.display()))
+    })?;
     let volume_name = dump.volume.name.clone();
 
     if dump.dump_version != 1 {

@@ -1847,7 +1847,23 @@ fn normalize_path_for_compare(path: &Path) -> Option<String> {
 
 fn cleanup_stale_mounts() -> Result<()> {
     let mounts_dir = super::utils::get_mounts_dir()?;
-    for entry in std::fs::read_dir(&mounts_dir)
+    cleanup_stale_mounts_in(
+        &mounts_dir,
+        super::utils::is_process_running,
+        super::utils::remove_pid_file,
+    )
+}
+
+fn cleanup_stale_mounts_in<F, R>(
+    mounts_dir: &Path,
+    is_process_running: F,
+    mut remove_pid_file: R,
+) -> Result<()>
+where
+    F: Fn(u32) -> bool,
+    R: FnMut(&str) -> Result<()>,
+{
+    for entry in std::fs::read_dir(mounts_dir)
         .with_context(|| format!("read mounts dir {}", mounts_dir.display()))?
     {
         let entry = entry?;
@@ -1868,8 +1884,8 @@ fn cleanup_stale_mounts() -> Result<()> {
         else {
             continue;
         };
-        if !super::utils::is_process_running(pid as u32) {
-            let _ = super::utils::remove_pid_file(mount_point);
+        if !is_process_running(pid as u32) {
+            let _ = remove_pid_file(mount_point);
         }
     }
     Ok(())
@@ -1890,8 +1906,15 @@ fn is_path_under_mount(target: &Path, mount_point: &Path) -> bool {
 
 fn active_mounts() -> Result<Vec<ActiveMount>> {
     let mounts_dir = super::utils::get_mounts_dir()?;
+    active_mounts_in(&mounts_dir, super::utils::is_process_running)
+}
+
+fn active_mounts_in<F>(mounts_dir: &Path, is_process_running: F) -> Result<Vec<ActiveMount>>
+where
+    F: Fn(u32) -> bool,
+{
     let mut mounts = Vec::new();
-    for entry in std::fs::read_dir(&mounts_dir)
+    for entry in std::fs::read_dir(mounts_dir)
         .with_context(|| format!("read mounts dir {}", mounts_dir.display()))?
     {
         let entry = entry?;
@@ -1920,7 +1943,7 @@ fn active_mounts() -> Result<Vec<ActiveMount>> {
             .get("cache_path")
             .and_then(serde_json::Value::as_str)
             .map(PathBuf::from);
-        if !super::utils::is_process_running(pid as u32) {
+        if !is_process_running(pid as u32) {
             continue;
         }
         mounts.push(ActiveMount {
@@ -3606,6 +3629,29 @@ mod tests {
         }
     }
 
+    fn write_mount_pid_json(
+        dir: &Path,
+        file_name: &str,
+        pid: u64,
+        mount_point: &str,
+        volume: &str,
+        cache_path: Option<&str>,
+    ) {
+        let mut payload = serde_json::json!({
+            "pid": pid,
+            "mount_point": mount_point,
+            "volume": volume,
+        });
+        if let Some(cache_path) = cache_path {
+            payload["cache_path"] = serde_json::Value::String(cache_path.to_string());
+        }
+        std::fs::write(
+            dir.join(file_name),
+            serde_json::to_string_pretty(&payload).expect("serialize pid json"),
+        )
+        .expect("write pid json");
+    }
+
     #[test]
     fn workload_profile_has_expected_tiers() {
         let block_size = DEFAULT_BLOCK_SIZE as u64;
@@ -3772,6 +3818,69 @@ mod tests {
         let mount = PathBuf::from(r"\\server\share\studiofs");
         let target = PathBuf::from(r"\\?\UNC\server\share\studiofs\bench");
         assert!(is_path_under_mount(&target, &mount));
+    }
+
+    #[test]
+    fn cleanup_stale_mounts_removes_only_dead_process_entries() {
+        let temp = tempdir().unwrap();
+        write_mount_pid_json(
+            temp.path(),
+            "dead.json",
+            41,
+            "/mnt/stale",
+            "stale-vol",
+            None,
+        );
+        write_mount_pid_json(temp.path(), "live.json", 42, "/mnt/live", "live-vol", None);
+        std::fs::write(
+            temp.path().join("missing-pid.json"),
+            serde_json::json!({
+                "mount_point": "/mnt/ignored",
+                "volume": "ignored-vol",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let removed = std::cell::RefCell::new(Vec::new());
+        cleanup_stale_mounts_in(
+            temp.path(),
+            |pid| pid == 42,
+            |mount_point| {
+                removed.borrow_mut().push(mount_point.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(removed.into_inner(), vec!["/mnt/stale".to_string()]);
+    }
+
+    #[test]
+    fn active_mounts_filters_dead_processes_and_preserves_runtime_metadata() {
+        let temp = tempdir().unwrap();
+        write_mount_pid_json(
+            temp.path(),
+            "live.json",
+            77,
+            "/mnt/live",
+            "live-vol",
+            Some("/cache/live"),
+        );
+        write_mount_pid_json(
+            temp.path(),
+            "dead.json",
+            78,
+            "/mnt/dead",
+            "dead-vol",
+            Some("/cache/dead"),
+        );
+
+        let mounts = active_mounts_in(temp.path(), |pid| pid == 77).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].mount_point, PathBuf::from("/mnt/live"));
+        assert_eq!(mounts[0].volume, "live-vol");
+        assert_eq!(mounts[0].cache_path, Some(PathBuf::from("/cache/live")));
     }
 
     #[test]

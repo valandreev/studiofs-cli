@@ -49,7 +49,7 @@ where
             let _ = tx.send(block_on_shared_runtime(future));
         });
         rx.recv().map_err(|error| {
-            io::Error::other(format!("failed to receive async task result: {error}")).into()
+            io::Error::other(format!("failed to receive async task result: {error}"))
         })?
     })
 }

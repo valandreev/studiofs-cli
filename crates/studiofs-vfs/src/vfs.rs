@@ -16172,6 +16172,35 @@ mod tests {
     }
 
     #[test]
+    fn flush_then_release_keeps_written_bytes_visible_to_reopened_reader() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-release-reopen-read");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"flush-release-read.txt", 0, 0, 0o644)
+                .unwrap();
+            let ino = attr.ino;
+            let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+            let payload = b"flush-close-contract";
+
+            vfs.write(ino, 0, payload).await.unwrap();
+            vfs.flush_fh(fh).await.unwrap();
+            let outcome = vfs.release_fh_with_outcome(fh).await.unwrap();
+            assert!(outcome.closed_last_handle);
+            assert!(
+                !outcome.flushed_local_dirty_state,
+                "explicit flush should leave release as a clean close"
+            );
+
+            let reopened = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
+            let bytes = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
+            assert_eq!(bytes.as_ref(), payload);
+            vfs.release_fh(reopened).await.unwrap();
+        });
+    }
+
+    #[test]
     fn test_release_fh_with_outcome_orphan_cleanup_does_not_report_flush_barrier() {
         let tmp = tempfile::tempdir().unwrap();
         let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-orphan-cleanup");
