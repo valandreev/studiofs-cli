@@ -4306,8 +4306,9 @@ impl PendingUploadCatalog {
     }
 }
 
-#[derive(Debug, Default)]
-struct StartupReplayState {
+struct StartupReplayCoordinator<'a> {
+    vfs: &'a StudioVfs,
+    pending_catalog: PendingUploadCatalog,
     dirty_set: HashSet<u64>,
     quarantined_inodes: HashSet<Ino>,
     quarantined_object_ids: HashSet<u64>,
@@ -4317,12 +4318,124 @@ struct StartupReplayState {
     restored_live_extents: usize,
 }
 
-impl StartupReplayState {
-    fn new(dirty_object_ids: impl IntoIterator<Item = u64>) -> Self {
+impl<'a> StartupReplayCoordinator<'a> {
+    fn new(vfs: &'a StudioVfs, pending_uploads: &[PendingUpload]) -> Self {
         Self {
-            dirty_set: dirty_object_ids.into_iter().collect(),
-            ..Self::default()
+            vfs,
+            pending_catalog: PendingUploadCatalog::from_ops(pending_uploads.iter().cloned()),
+            dirty_set: vfs
+                .local_block_backend
+                .dirty_object_ids()
+                .into_iter()
+                .collect(),
+            quarantined_inodes: HashSet::new(),
+            quarantined_object_ids: HashSet::new(),
+            replay_ops: Vec::new(),
+            live_extents: HashMap::new(),
+            pending_epoch_finalizations: Vec::new(),
+            restored_live_extents: 0,
         }
+    }
+
+    fn run(mut self, attrs: &[InodeAttr]) {
+        for attr in attrs {
+            self.process_attr(attr);
+        }
+        self.finish();
+    }
+
+    fn process_attr(&mut self, attr: &InodeAttr) {
+        let ino = attr.ino;
+        let needs_finalization = StudioVfs::needs_epoch_finalization(attr);
+        if !self.needs_scan(attr) {
+            return;
+        }
+
+        let blocks = match self.vfs.sync_meta().get_file_blocks(ino) {
+            Ok(blocks) => blocks,
+            Err(error) => {
+                let error = VfsError::Meta(error);
+                if StudioVfs::is_invalid_regular_file_graph_error(&error) {
+                    self.handle_quarantine(ino, attr.size, &error);
+                } else {
+                    warn!(
+                        ino,
+                        error = %error,
+                        "failed to enumerate file blocks during startup recovery"
+                    );
+                }
+                return;
+            }
+        };
+
+        if self.has_dirty_objects() {
+            for (block_index, block_ref) in &blocks {
+                if !self.take_dirty_object(block_ref.object_id) {
+                    continue;
+                }
+
+                self.record_replayed_block(
+                    ino,
+                    *block_index,
+                    block_ref.object_id,
+                    attr.content_epoch,
+                    self.vfs.block_size,
+                );
+            }
+
+            if self.has_dirty_objects() && attr.size > 0 {
+                match self
+                    .vfs
+                    .sync_meta()
+                    .lookup_regular_file_slices(ino, 0, attr.size)
+                {
+                    Ok(spans) => {
+                        for span in spans {
+                            let Some(block) = span.block else {
+                                continue;
+                            };
+                            if !self.take_dirty_object(block.object_id) {
+                                continue;
+                            }
+                            let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
+                            let absolute_start = chunk_base.saturating_add(span.range.start as u64);
+                            let block_index =
+                                block_index_from_offset(absolute_start, self.vfs.block_size);
+                            self.record_replayed_block(
+                                ino,
+                                block_index,
+                                block.object_id,
+                                attr.content_epoch,
+                                self.vfs.block_size,
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            ino,
+                            error = %error,
+                            "failed to enumerate regular-file slices during startup recovery"
+                        );
+                    }
+                }
+            }
+        }
+
+        if needs_finalization {
+            self.record_epoch_finalization(ino, attr.content_epoch, blocks.as_slice());
+        }
+    }
+
+    fn handle_quarantine(&mut self, ino: Ino, size: u64, error: &VfsError) {
+        warn!(
+            ino,
+            error = %error,
+            "quarantining invalid regular-file graph during startup recovery"
+        );
+        let protected = self
+            .vfs
+            .quarantine_invalid_regular_file_graph_for_startup_recovery(ino, size, error);
+        self.record_quarantine(ino, protected);
     }
 
     fn needs_scan(&self, attr: &InodeAttr) -> bool {
@@ -4377,14 +4490,12 @@ impl StartupReplayState {
         self.pending_epoch_finalizations.push((ino, content_epoch));
     }
 
-    fn merge_pending_live_extents(
-        &mut self,
-        pending_catalog: &PendingUploadCatalog,
-        block_size: u32,
-    ) {
-        let live_extents = pending_catalog.live_extents(block_size, &self.quarantined_inodes);
+    fn merge_pending_live_extents(&mut self) {
+        let live_extents = self
+            .pending_catalog
+            .live_extents(self.vfs.block_size, &self.quarantined_inodes);
         for (ino, block_index, object_id, content_epoch) in live_extents {
-            self.record_live_extent(ino, block_index, object_id, content_epoch);
+            self.record_pending_live_extent(ino, block_index, object_id, content_epoch);
         }
     }
 
@@ -4424,6 +4535,119 @@ impl StartupReplayState {
                     entry.insert(next);
                 }
             }
+        }
+    }
+
+    fn record_pending_live_extent(
+        &mut self,
+        ino: Ino,
+        block_index: u32,
+        object_id: u64,
+        content_epoch: u64,
+    ) {
+        let next = ExtentRecordId {
+            object_id,
+            content_epoch,
+        };
+        match self.live_extents.entry((ino, block_index)) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(next);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if next.content_epoch > entry.get().content_epoch {
+                    entry.insert(next);
+                }
+            }
+        }
+    }
+
+    fn finish(mut self) {
+        self.discard_quarantined_dirty_objects();
+        self.merge_pending_live_extents();
+
+        if !self.replay_ops.is_empty() {
+            self.vfs.block_cache.submit_uploads_batch(&self.replay_ops);
+            info!(
+                replayed_dirty_blocks = self.replay_ops.len(),
+                restored_live_extents = self.restored_live_extents,
+                "replayed dirty local backend blocks into upload queue"
+            );
+        }
+
+        let live_extents = self.live_extents_batch();
+        if !live_extents.is_empty() {
+            self.vfs.record_live_extents(&live_extents);
+        }
+
+        for (ino, content_epoch) in &self.pending_epoch_finalizations {
+            self.vfs.queue_epoch_finalization(*ino, *content_epoch);
+        }
+        if self.queued_epoch_count() > 0 {
+            info!(
+                queued_epochs = self.queued_epoch_count(),
+                "seeded epoch finalizer queue from metadata"
+            );
+        }
+
+        if !self.dirty_set.is_empty() {
+            if self.quarantined_inodes.is_empty() {
+                // Cache the sync handle once so the recovery error path does
+                // not re-enter metadata lookup while we are already cleaning up.
+                let meta = self.vfs.sync_meta();
+                let reachable_object_ids = match meta.get_referenced_object_ids() {
+                    Ok(ids) => Some(ids),
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            "failed to enumerate metadata reachability during startup recovery; preserving dirty blocks"
+                        );
+                        None
+                    }
+                };
+                if let Some(reachable_object_ids) = reachable_object_ids {
+                    self.dirty_set
+                        .retain(|object_id| !reachable_object_ids.contains(object_id));
+                } else {
+                    self.dirty_set.clear();
+                }
+
+                if !self.dirty_set.is_empty() {
+                    let orphan_count = self.dirty_set.len() as u64;
+                    for object_id in &self.dirty_set {
+                        warn!(
+                            object_id,
+                            "removing orphan dirty block without metadata reference"
+                        );
+                        self.vfs.local_block_backend.remove(*object_id);
+                        self.vfs
+                            .state
+                            .upload
+                            .pending_evictions
+                            .lock()
+                            .remove(object_id);
+                    }
+                    self.vfs
+                        .state
+                        .upload
+                        .upload_canceled_stale
+                        .fetch_add(orphan_count, Ordering::Relaxed);
+                    info!(
+                        orphan_dirty_blocks = self.dirty_set.len(),
+                        "startup cleanup removed orphan dirty local backend entries"
+                    );
+                }
+            } else {
+                warn!(
+                    quarantined_inodes = self.quarantined_inodes.len(),
+                    orphan_dirty_blocks = self.dirty_set.len(),
+                    "startup recovery preserved dirty local backend entries because invalid graphs were quarantined"
+                );
+            }
+        }
+
+        if !self.quarantined_inodes.is_empty() {
+            self.vfs
+                .cancel_pending_uploads_for_inodes(&self.quarantined_inodes);
         }
     }
 }
@@ -5031,182 +5255,7 @@ impl StudioVfs {
         pending_uploads: &[PendingUpload],
         attrs: &[InodeAttr],
     ) {
-        let pending_catalog = PendingUploadCatalog::from_ops(pending_uploads.iter().cloned());
-        let mut replay = StartupReplayState::new(self.local_block_backend.dirty_object_ids());
-
-        for attr in attrs {
-            let ino = attr.ino;
-            let needs_finalization = Self::needs_epoch_finalization(attr);
-            if !replay.needs_scan(attr) {
-                continue;
-            }
-
-            let blocks = match self.sync_meta().get_file_blocks(ino) {
-                Ok(blocks) => blocks,
-                Err(e) => {
-                    let error = VfsError::Meta(e);
-                    if Self::is_invalid_regular_file_graph_error(&error) {
-                        warn!(
-                            ino,
-                            error = %error,
-                            "quarantining invalid regular-file graph during startup recovery"
-                        );
-                        let protected = self
-                            .quarantine_invalid_regular_file_graph_for_startup_recovery(
-                                ino, attr.size, &error,
-                            );
-                        replay.record_quarantine(ino, protected);
-                    } else {
-                        warn!(
-                            ino,
-                            error = %error,
-                            "failed to enumerate file blocks during startup recovery"
-                        );
-                    }
-                    continue;
-                }
-            };
-
-            if replay.has_dirty_objects() {
-                for (block_index, block_ref) in &blocks {
-                    if !replay.take_dirty_object(block_ref.object_id) {
-                        continue;
-                    }
-
-                    replay.record_replayed_block(
-                        ino,
-                        *block_index,
-                        block_ref.object_id,
-                        attr.content_epoch,
-                        self.block_size,
-                    );
-                }
-
-                if replay.has_dirty_objects() && attr.size > 0 {
-                    match self
-                        .sync_meta()
-                        .lookup_regular_file_slices(ino, 0, attr.size)
-                    {
-                        Ok(spans) => {
-                            for span in spans {
-                                let Some(block) = span.block else {
-                                    continue;
-                                };
-                                if !replay.take_dirty_object(block.object_id) {
-                                    continue;
-                                }
-                                let chunk_base =
-                                    chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
-                                let absolute_start =
-                                    chunk_base.saturating_add(span.range.start as u64);
-                                let block_index =
-                                    block_index_from_offset(absolute_start, self.block_size);
-                                replay.record_replayed_block(
-                                    ino,
-                                    block_index,
-                                    block.object_id,
-                                    attr.content_epoch,
-                                    self.block_size,
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            warn!(
-                                ino,
-                                error = %e,
-                                "failed to enumerate regular-file slices during startup recovery"
-                            );
-                        }
-                    }
-                }
-            }
-
-            if needs_finalization {
-                replay.record_epoch_finalization(ino, attr.content_epoch, blocks.as_slice());
-            }
-        }
-
-        replay.discard_quarantined_dirty_objects();
-        replay.merge_pending_live_extents(&pending_catalog, self.block_size);
-
-        if !replay.replay_ops.is_empty() {
-            self.block_cache.submit_uploads_batch(&replay.replay_ops);
-            info!(
-                replayed_dirty_blocks = replay.replay_ops.len(),
-                restored_live_extents = replay.restored_live_extents,
-                "replayed dirty local backend blocks into upload queue"
-            );
-        }
-
-        let live_extents = replay.live_extents_batch();
-        if !live_extents.is_empty() {
-            self.record_live_extents(&live_extents);
-        }
-
-        for (ino, content_epoch) in &replay.pending_epoch_finalizations {
-            self.queue_epoch_finalization(*ino, *content_epoch);
-        }
-        if replay.queued_epoch_count() > 0 {
-            info!(
-                queued_epochs = replay.queued_epoch_count(),
-                "seeded epoch finalizer queue from metadata"
-            );
-        }
-
-        if !replay.dirty_set.is_empty() {
-            if replay.quarantined_inodes.is_empty() {
-                // Cache the sync handle once so the recovery error path does
-                // not re-enter metadata lookup while we are already cleaning up.
-                let meta = self.sync_meta();
-                let reachable_object_ids = match meta.get_referenced_object_ids() {
-                    Ok(ids) => Some(ids),
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            "failed to enumerate metadata reachability during startup recovery; preserving dirty blocks"
-                        );
-                        None
-                    }
-                };
-                if let Some(reachable_object_ids) = reachable_object_ids {
-                    replay
-                        .dirty_set
-                        .retain(|object_id| !reachable_object_ids.contains(object_id));
-                } else {
-                    replay.dirty_set.clear();
-                }
-
-                if !replay.dirty_set.is_empty() {
-                    let orphan_count = replay.dirty_set.len() as u64;
-                    for object_id in &replay.dirty_set {
-                        warn!(
-                            object_id,
-                            "removing orphan dirty block without metadata reference"
-                        );
-                        self.local_block_backend.remove(*object_id);
-                        self.state.upload.pending_evictions.lock().remove(object_id);
-                    }
-                    self.state
-                        .upload
-                        .upload_canceled_stale
-                        .fetch_add(orphan_count, Ordering::Relaxed);
-                    info!(
-                        orphan_dirty_blocks = replay.dirty_set.len(),
-                        "startup cleanup removed orphan dirty local backend entries"
-                    );
-                }
-            } else {
-                warn!(
-                    quarantined_inodes = replay.quarantined_inodes.len(),
-                    orphan_dirty_blocks = replay.dirty_set.len(),
-                    "startup recovery preserved dirty local backend entries because invalid graphs were quarantined"
-                );
-            }
-        }
-
-        if !replay.quarantined_inodes.is_empty() {
-            self.cancel_pending_uploads_for_inodes(&replay.quarantined_inodes);
-        }
+        StartupReplayCoordinator::new(self, pending_uploads).run(attrs);
     }
 
     /// Create a new VFS instance using the current local block backend contract.
@@ -13908,6 +13957,43 @@ mod tests {
             vfs.live_extent_records_for_inode(ino),
             vec![(0, 9001, 5)],
             "startup replay must preserve the current metadata epoch instead of overwriting it with stale pending uploads"
+        );
+    }
+
+    #[test]
+    fn startup_replay_keeps_metadata_live_extent_when_pending_upload_has_same_epoch() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (_rt, vfs, meta) = make_test_vfs(&tmp, "startup-replay-same-epoch");
+
+        let created = vfs
+            .create(1, b"startup-same-epoch.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = created.ino;
+        let mut attr = meta.get_attr(ino).expect("load test attr");
+        attr.size = 4096;
+        attr.committed_size = 4096;
+        attr.content_epoch = 5;
+        attr.committed_content_epoch = 4;
+        attr.upload_state = MetaUploadState::Uploading;
+        meta.set_attr(&attr).expect("persist staged attr");
+        meta.set_file_block(ino, 0, &BlockRef::new_partial(9001, 4096))
+            .expect("persist current file block");
+
+        let pending_uploads = vec![PendingUpload {
+            ino,
+            offset: 0,
+            object_id: 7001,
+            content_epoch: 5,
+            created_unix_ms: 100,
+            retry_count: 0,
+        }];
+
+        vfs.replay_dirty_uploads_from_local_backend(&pending_uploads, &[attr]);
+
+        assert_eq!(
+            vfs.live_extent_records_for_inode(ino),
+            vec![(0, 9001, 5)],
+            "startup replay must keep the metadata-derived block when pending upload only matches the same epoch"
         );
     }
 
