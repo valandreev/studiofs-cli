@@ -6442,6 +6442,19 @@ impl<'a> ReadMetadataResolver<'a> {
         Self { vfs, ino }
     }
 
+    fn resolve_attr_sync(&self) -> VfsResult<InodeAttr> {
+        if let Some(attr) = self.ignored_attr() {
+            return Ok(attr);
+        }
+        if let Some(attr) = self.dirty_attr() {
+            return Ok(attr);
+        }
+        if let Some(attr) = self.cached_attr() {
+            return Ok(attr);
+        }
+        self.load_attr_from_meta_sync()
+    }
+
     async fn resolve_attr(&self) -> VfsResult<InodeAttr> {
         if let Some(attr) = self.ignored_attr() {
             return Ok(attr);
@@ -6579,6 +6592,16 @@ impl<'a> ReadMetadataResolver<'a> {
                 return Err(self.stale_inode_not_found());
             }
             Err(err) => return Err(err),
+        };
+        self.cache_attr(&attr);
+        Ok(attr)
+    }
+
+    fn load_attr_from_meta_sync(&self) -> VfsResult<InodeAttr> {
+        let attr = match self.vfs.sync_meta().get_attr(self.ino) {
+            Ok(attr) => attr,
+            Err(MetaError::InodeNotFound(_)) => return Err(self.stale_inode_not_found()),
+            Err(err) => return Err(VfsError::Meta(err)),
         };
         self.cache_attr(&attr);
         Ok(attr)
@@ -10371,43 +10394,7 @@ impl StudioVfs {
     // =========================================================================
 
     fn getattr_unchecked(&self, ino: Ino) -> VfsResult<InodeAttr> {
-        if let Some(attr) = self.ignored_entry_attr(ino) {
-            return Ok(attr);
-        }
-
-        if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino).cloned() {
-            return Ok(attr);
-        }
-
-        if let Some(attr) = self
-            .state
-            .namespace
-            .attr_read_cache
-            .lock()
-            .get(ino, Instant::now())
-        {
-            return Ok(attr);
-        }
-
-        let attr = match self.sync_meta().get_attr(ino) {
-            Ok(attr) => attr,
-            Err(MetaError::InodeNotFound(_)) => {
-                self.clear_pending_blocks_for_inode(ino);
-                self.clear_inode_incarnation(ino);
-                self.state.namespace.dirty_attrs.lock().remove(&ino);
-                self.state.namespace.attr_read_cache.lock().remove(ino);
-                let _ = self.handle_table.take_orphan(ino);
-                return Err(VfsError::Meta(MetaError::InodeNotFound(ino)));
-            }
-            Err(err) => return Err(VfsError::Meta(err)),
-        };
-        self.state.namespace.attr_read_cache.lock().put(
-            ino,
-            attr.clone(),
-            ATTR_CACHE_TTL,
-            Instant::now(),
-        );
-        Ok(attr)
+        ReadMetadataResolver::new(self, ino).resolve_attr_sync()
     }
 
     async fn getattr_async_unchecked(&self, ino: Ino) -> VfsResult<InodeAttr> {
@@ -17058,6 +17045,42 @@ mod tests {
     }
 
     #[test]
+    fn getattr_unchecked_prefers_dirty_attr_over_cached_attr() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, meta) = make_test_vfs(&tmp, "getattr-dirty-over-cache");
+        let created = vfs
+            .create(ROOT_INO, b"getattr-dirty-over-cache.txt", 1000, 1000, 0o644)
+            .expect("create file");
+        let ino = created.ino;
+
+        let mut cached_attr = meta.get_attr(ino).expect("load cached attr baseline");
+        cached_attr.size = 1;
+        vfs.state.namespace.attr_read_cache.lock().put(
+            ino,
+            cached_attr,
+            ATTR_CACHE_TTL,
+            Instant::now(),
+        );
+
+        let mut dirty_attr = meta.get_attr(ino).expect("load dirty attr baseline");
+        dirty_attr.size = 7;
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(ino, dirty_attr.clone());
+
+        let resolved_attr = vfs
+            .getattr_unchecked(ino)
+            .expect("getattr_unchecked should resolve");
+
+        assert_eq!(
+            resolved_attr.size, 7,
+            "sync getattr should prefer dirty attrs over stale attr-read cache entries"
+        );
+    }
+
+    #[test]
     fn resolve_read_metadata_async_clears_stale_runtime_state_when_inode_is_missing() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (rt, vfs, _meta) = make_test_vfs(&tmp, "read-metadata-stale-cache-missing-ino");
@@ -17126,6 +17149,73 @@ mod tests {
                 "inode-not-found should clear orphan bookkeeping"
             );
         });
+    }
+
+    #[test]
+    fn getattr_unchecked_clears_stale_runtime_state_when_inode_is_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "getattr-stale-runtime-missing-ino");
+        let ino = 9_101;
+        let mut cached_attr = InodeAttr::new_file(ino, ROOT_INO, 1000, 1000, 0o644);
+        cached_attr.size = 5;
+        vfs.state.write_buffer.pending_blocks.lock().insert(
+            (ino, 0),
+            PendingBlock {
+                data: BytesMut::from(&b"stale"[..]),
+                dirty: true,
+                reserved_object_id: None,
+            },
+        );
+        vfs.state
+            .write_buffer
+            .pending_block_indexes
+            .lock()
+            .entry(ino)
+            .or_default()
+            .insert(0);
+        vfs.state
+            .write_buffer
+            .pending_bytes
+            .fetch_add(5, AtomicOrdering::Relaxed);
+        vfs.refresh_inode_incarnation_state_from_attr(ino, &cached_attr);
+        vfs.handle_table.mark_orphan(ino);
+
+        let err = vfs
+            .getattr_unchecked(ino)
+            .expect_err("missing inode should fail through sync metadata lookup");
+
+        assert!(
+            matches!(err, VfsError::Meta(MetaError::InodeNotFound(found)) if found == ino),
+            "sync getattr should surface inode-not-found with the requested inode id"
+        );
+        assert!(
+            !vfs.state.namespace.attr_read_cache.lock().contains(ino),
+            "sync inode-not-found should leave no attr cache entry behind for the missing inode"
+        );
+        assert!(
+            !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+            "sync inode-not-found should clear dirty attr state"
+        );
+        assert!(
+            !vfs.state
+                .write_buffer
+                .pending_blocks
+                .lock()
+                .contains_key(&(ino, 0)),
+            "sync inode-not-found should clear pending write blocks"
+        );
+        assert!(
+            !vfs.state
+                .incarnation
+                .inode_incarnations
+                .lock()
+                .contains_key(&ino),
+            "sync inode-not-found should clear incarnation state"
+        );
+        assert!(
+            !vfs.handle_table.take_orphan(ino),
+            "sync inode-not-found should clear orphan bookkeeping"
+        );
     }
 
     #[test]
