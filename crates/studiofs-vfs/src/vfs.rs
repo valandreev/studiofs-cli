@@ -4561,6 +4561,81 @@ impl<'a> StartupReplayCoordinator<'a> {
         }
     }
 
+    fn cleanup_orphan_dirty_blocks(&mut self) {
+        if self.dirty_set.is_empty() {
+            return;
+        }
+        if !self.quarantined_inodes.is_empty() {
+            self.warn_preserved_orphan_dirty_blocks();
+            return;
+        }
+        if !self.filter_out_metadata_reachable_dirty_blocks() {
+            return;
+        }
+        self.remove_orphan_dirty_blocks();
+    }
+
+    fn filter_out_metadata_reachable_dirty_blocks(&mut self) -> bool {
+        // Cache the sync handle once so the recovery error path does
+        // not re-enter metadata lookup while we are already cleaning up.
+        let meta = self.vfs.sync_meta();
+        let reachable_object_ids = match meta.get_referenced_object_ids() {
+            Ok(ids) => Some(ids),
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "failed to enumerate metadata reachability during startup recovery; preserving dirty blocks"
+                );
+                None
+            }
+        };
+        if let Some(reachable_object_ids) = reachable_object_ids {
+            self.dirty_set
+                .retain(|object_id| !reachable_object_ids.contains(object_id));
+            true
+        } else {
+            self.dirty_set.clear();
+            false
+        }
+    }
+
+    fn remove_orphan_dirty_blocks(&mut self) {
+        if self.dirty_set.is_empty() {
+            return;
+        }
+        let orphan_count = self.dirty_set.len() as u64;
+        for object_id in &self.dirty_set {
+            warn!(
+                object_id,
+                "removing orphan dirty block without metadata reference"
+            );
+            self.vfs.local_block_backend.remove(*object_id);
+            self.vfs
+                .state
+                .upload
+                .pending_evictions
+                .lock()
+                .remove(object_id);
+        }
+        self.vfs
+            .state
+            .upload
+            .upload_canceled_stale
+            .fetch_add(orphan_count, Ordering::Relaxed);
+        info!(
+            orphan_dirty_blocks = self.dirty_set.len(),
+            "startup cleanup removed orphan dirty local backend entries"
+        );
+    }
+
+    fn warn_preserved_orphan_dirty_blocks(&self) {
+        warn!(
+            quarantined_inodes = self.quarantined_inodes.len(),
+            orphan_dirty_blocks = self.dirty_set.len(),
+            "startup recovery preserved dirty local backend entries because invalid graphs were quarantined"
+        );
+    }
+
     fn finish(mut self) {
         self.discard_quarantined_dirty_objects();
         self.merge_pending_live_extents();
@@ -4589,61 +4664,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             );
         }
 
-        if !self.dirty_set.is_empty() {
-            if self.quarantined_inodes.is_empty() {
-                // Cache the sync handle once so the recovery error path does
-                // not re-enter metadata lookup while we are already cleaning up.
-                let meta = self.vfs.sync_meta();
-                let reachable_object_ids = match meta.get_referenced_object_ids() {
-                    Ok(ids) => Some(ids),
-                    Err(error) => {
-                        warn!(
-                            error = %error,
-                            "failed to enumerate metadata reachability during startup recovery; preserving dirty blocks"
-                        );
-                        None
-                    }
-                };
-                if let Some(reachable_object_ids) = reachable_object_ids {
-                    self.dirty_set
-                        .retain(|object_id| !reachable_object_ids.contains(object_id));
-                } else {
-                    self.dirty_set.clear();
-                }
-
-                if !self.dirty_set.is_empty() {
-                    let orphan_count = self.dirty_set.len() as u64;
-                    for object_id in &self.dirty_set {
-                        warn!(
-                            object_id,
-                            "removing orphan dirty block without metadata reference"
-                        );
-                        self.vfs.local_block_backend.remove(*object_id);
-                        self.vfs
-                            .state
-                            .upload
-                            .pending_evictions
-                            .lock()
-                            .remove(object_id);
-                    }
-                    self.vfs
-                        .state
-                        .upload
-                        .upload_canceled_stale
-                        .fetch_add(orphan_count, Ordering::Relaxed);
-                    info!(
-                        orphan_dirty_blocks = self.dirty_set.len(),
-                        "startup cleanup removed orphan dirty local backend entries"
-                    );
-                }
-            } else {
-                warn!(
-                    quarantined_inodes = self.quarantined_inodes.len(),
-                    orphan_dirty_blocks = self.dirty_set.len(),
-                    "startup recovery preserved dirty local backend entries because invalid graphs were quarantined"
-                );
-            }
-        }
+        self.cleanup_orphan_dirty_blocks();
 
         if !self.quarantined_inodes.is_empty() {
             self.vfs
@@ -13994,6 +14015,65 @@ mod tests {
             vfs.live_extent_records_for_inode(ino),
             vec![(0, 9001, 5)],
             "startup replay must keep the metadata-derived block when pending upload only matches the same epoch"
+        );
+    }
+
+    #[test]
+    fn startup_replay_removes_orphan_dirty_blocks_and_clears_pending_evictions() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "startup-replay-orphan-cleanup");
+        let object_id = 991_337;
+
+        vfs.local_block_backend()
+            .put(object_id, b"orphan-dirty-block", false)
+            .expect("persist orphan dirty block");
+        vfs.local_block_backend()
+            .sync_data()
+            .expect("sync orphan dirty block");
+        vfs.state.upload.pending_evictions.lock().insert(object_id);
+
+        assert!(
+            vfs.local_block_backend()
+                .dirty_object_ids()
+                .contains(&object_id),
+            "test setup should expose orphan as dirty before replay"
+        );
+        assert!(
+            vfs.state
+                .upload
+                .pending_evictions
+                .lock()
+                .contains(&object_id),
+            "test setup should seed pending eviction before replay"
+        );
+
+        vfs.replay_dirty_uploads_from_local_backend(&[], &[]);
+
+        assert!(
+            !vfs.local_block_backend().contains(object_id),
+            "startup replay should remove orphan dirty block without metadata reference"
+        );
+        assert!(
+            !vfs.local_block_backend()
+                .dirty_object_ids()
+                .contains(&object_id),
+            "startup replay should clear orphan dirty block from dirty index"
+        );
+        assert!(
+            !vfs.state
+                .upload
+                .pending_evictions
+                .lock()
+                .contains(&object_id),
+            "startup replay should clear pending eviction bookkeeping for removed orphan"
+        );
+        assert_eq!(
+            vfs.state
+                .upload
+                .upload_canceled_stale
+                .load(Ordering::Relaxed),
+            1,
+            "startup replay should attribute removed orphan to stale-upload cleanup"
         );
     }
 
