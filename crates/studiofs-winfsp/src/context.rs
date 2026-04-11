@@ -705,12 +705,12 @@ impl<'a> HandleCallbackLifecycle<'a> {
             if !vfs.inode_has_local_dirty_state(ino) {
                 return Ok(false);
             }
-            if let Some(handle) = fh.filter(|candidate| *candidate != 0) {
-                vfs.flush_fh(handle).await?;
+            let outcome = if let Some(handle) = fh.filter(|candidate| *candidate != 0) {
+                vfs.flush_fh_with_outcome(handle).await?
             } else {
-                vfs.flush(ino).await?;
-            }
-            Ok(true)
+                vfs.flush_with_outcome(ino).await?
+            };
+            Ok(outcome.flushed_local_dirty_state)
         })
     }
 

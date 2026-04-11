@@ -1011,9 +1011,20 @@ pub(super) enum LocalSyncPolicy {
     Strict,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StickyErrorPolicy {
+    Ignore,
+    Report,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ReleaseFhOutcome {
     pub closed_last_handle: bool,
+    pub flushed_local_dirty_state: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExplicitFlushOutcome {
     pub flushed_local_dirty_state: bool,
 }
 
@@ -10454,6 +10465,33 @@ impl StudioVfs {
         result
     }
 
+    async fn flush_inode_barrier_with_outcome(
+        &self,
+        ino: Ino,
+        sticky_error_policy: StickyErrorPolicy,
+    ) -> VfsResult<ExplicitFlushOutcome> {
+        let session = self
+            .enter_file_session_op(ino, FileSessionOperation::Flush)
+            .await;
+        let result: VfsResult<ExplicitFlushOutcome> = async {
+            let had_local_dirty_state = self.inode_has_local_dirty_state(ino);
+            if had_local_dirty_state {
+                self.flush_ordered(ino, LocalSyncPolicy::Opportunistic)
+                    .await?;
+            }
+            if matches!(sticky_error_policy, StickyErrorPolicy::Report) {
+                self.ensure_no_upload_sticky_error(ino)?;
+            }
+            Ok(ExplicitFlushOutcome {
+                flushed_local_dirty_state: had_local_dirty_state,
+            })
+        }
+        .await;
+        drop(session);
+        self.maybe_gc_file_session(ino);
+        result
+    }
+
     /// Flush data for a file handle (per-fd close in POSIX).
     ///
     /// Called by FUSE `flush()`. Flushes pending writes for the inode.
@@ -10462,24 +10500,16 @@ impl StudioVfs {
     /// callback paths that decide to make dirty state explicit while the handle
     /// is still valid. Clean handles should return quickly; dirty handles must
     /// persist current local state before success or error is reported.
+    pub async fn flush_fh_with_outcome(&self, fh: u64) -> VfsResult<ExplicitFlushOutcome> {
+        let Some(open_file) = self.handle_table.get(fh) else {
+            return Ok(ExplicitFlushOutcome::default());
+        };
+        self.flush_inode_barrier_with_outcome(open_file.ino, StickyErrorPolicy::Report)
+            .await
+    }
+
     pub async fn flush_fh(&self, fh: u64) -> VfsResult<()> {
-        if let Some(open_file) = self.handle_table.get(fh) {
-            let ino = open_file.ino;
-            let session = self
-                .enter_file_session_op(ino, FileSessionOperation::Flush)
-                .await;
-            let result: VfsResult<()> = async {
-                self.flush_ordered(ino, LocalSyncPolicy::Opportunistic)
-                    .await?;
-                self.ensure_no_upload_sticky_error(ino)?;
-                Ok(())
-            }
-            .await;
-            drop(session);
-            self.maybe_gc_file_session(ino);
-            result?;
-        }
-        Ok(())
+        self.flush_fh_with_outcome(fh).await.map(|_| ())
     }
 
     /// fsync — flush data (and optionally metadata) to durable storage.
@@ -12354,16 +12384,13 @@ impl StudioVfs {
     /// `flush()` is still the definitive "persist everything that is left"
     /// barrier for the inode. WinFSP file-scoped `Flush` relies on this
     /// remaining a mandatory dirty-inode barrier.
+    pub async fn flush_with_outcome(&self, ino: Ino) -> VfsResult<ExplicitFlushOutcome> {
+        self.flush_inode_barrier_with_outcome(ino, StickyErrorPolicy::Ignore)
+            .await
+    }
+
     pub async fn flush(&self, ino: Ino) -> VfsResult<()> {
-        let session = self
-            .enter_file_session_op(ino, FileSessionOperation::Flush)
-            .await;
-        let result = self
-            .flush_ordered(ino, LocalSyncPolicy::Opportunistic)
-            .await;
-        drop(session);
-        self.maybe_gc_file_session(ino);
-        result
+        self.flush_with_outcome(ino).await.map(|_| ())
     }
 
     // =========================================================================
@@ -15314,6 +15341,79 @@ mod tests {
                 "the final close should report the fallback local dirty-state drain"
             );
             assert_eq!(vfs.open_count(ino), 0, "all handles should be closed");
+        });
+    }
+
+    #[test]
+    fn test_flush_fh_with_outcome_distinguishes_clean_and_dirty_barriers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-handle-outcome");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"flush-handle-outcome.txt", 0, 0, 0o644)
+                .unwrap();
+            let ino = attr.ino;
+            let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+            let clean = vfs.flush_fh_with_outcome(fh).await.unwrap();
+            assert!(
+                !clean.flushed_local_dirty_state,
+                "clean handle flush should report a clean skip"
+            );
+
+            let payload = b"payload";
+            vfs.write(ino, 0, payload).await.unwrap();
+
+            let dirty = vfs.flush_fh_with_outcome(fh).await.unwrap();
+            assert!(
+                dirty.flushed_local_dirty_state,
+                "dirty handle flush should report that it drained local dirty state"
+            );
+
+            let after = vfs.getattr(ino).unwrap();
+            assert_eq!(
+                after.size,
+                payload.len() as u64,
+                "flush_fh_with_outcome should still persist current dirty attrs"
+            );
+
+            vfs.release_fh(fh).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_flush_with_outcome_distinguishes_clean_and_dirty_inode_barriers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-inode-outcome");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"flush-inode-outcome.txt", 0, 0, 0o644)
+                .unwrap();
+            let ino = attr.ino;
+
+            let clean = vfs.flush_with_outcome(ino).await.unwrap();
+            assert!(
+                !clean.flushed_local_dirty_state,
+                "clean inode flush should report a clean skip"
+            );
+
+            let payload = b"payload";
+            vfs.write(ino, 0, payload).await.unwrap();
+
+            let dirty = vfs.flush_with_outcome(ino).await.unwrap();
+            assert!(
+                dirty.flushed_local_dirty_state,
+                "dirty inode flush should report that it drained local dirty state"
+            );
+
+            let after = vfs.getattr(ino).unwrap();
+            assert_eq!(
+                after.size,
+                payload.len() as u64,
+                "flush_with_outcome should still persist current dirty attrs"
+            );
         });
     }
 
