@@ -1,8 +1,31 @@
-use super::*;
+use crate::access::{
+    AccessClass, AccessClassifierConfig, AccessDecision, HandleAccessState,
+};
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Instant;
+use studiofs_meta::types::Ino;
+use tracing::debug;
+
+use super::StudioVfs;
 
 // =============================================================================
 // Open File Handle Tracking
 // =============================================================================
+
+#[derive(Debug, Clone, Default)]
+pub struct VfsFileSessionStats {
+    pub active_sessions: usize,
+    pub open_handles: u64,
+    pub queued_ops: u64,
+    pub max_queue_depth: u64,
+    pub wait_events: u64,
+    pub wait_ms: u64,
+    pub transitions: u64,
+    pub wait_reasons: Vec<(String, u64)>,
+}
 
 /// Flags associated with an open file descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

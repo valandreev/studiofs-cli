@@ -24,9 +24,7 @@
 
 #[path = "commit.rs"]
 mod commit;
-#[path = "vfs/config.rs"]
 mod config;
-#[path = "vfs/file_session.rs"]
 mod file_session;
 #[path = "write_buffer.rs"]
 mod write_buffer;
@@ -35,7 +33,7 @@ pub use config::{
     CacheSafetyMode, ExplicitFlushOutcome, ReleaseFhOutcome, VfsConfig, VfsConfigRaw,
     VfsConfigValidated,
 };
-pub use file_session::{OpenFile, OpenFlags};
+pub use file_session::{OpenFile, OpenFlags, VfsFileSessionStats};
 
 use config::{
     CACHE_RUNTIME_HUGE_BUDGET_BYTES, CACHE_RUNTIME_LARGE_BUDGET_BYTES,
@@ -77,7 +75,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::OpenLocalBlockBackendError;
 use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig, CancelUploadMode, L2IoPriority};
@@ -479,18 +477,6 @@ pub struct VfsUploadStats {
     pub upload_requeues: u64,
     pub canceled_deleted: u64,
     pub canceled_stale: u64,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct VfsFileSessionStats {
-    pub active_sessions: usize,
-    pub open_handles: u64,
-    pub queued_ops: u64,
-    pub max_queue_depth: u64,
-    pub wait_events: u64,
-    pub wait_ms: u64,
-    pub transitions: u64,
-    pub wait_reasons: Vec<(String, u64)>,
 }
 
 #[derive(Debug, Clone, Default)]
