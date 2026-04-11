@@ -1,12 +1,14 @@
 //! `studiofs destroy` — permanently delete a volume.
 
 use crate::cli::cache_layout::describe_cache_layout_state;
+use std::future::Future;
 use std::io::{self, Write};
 use std::path::Path;
 use studiofs_cache::v3::{CacheBackendDetection, detect_cache_backends};
 use studiofs_data::{DataStore, DataStoreConfig, store::DataError};
 use studiofs_meta::engine::MetaError;
 use thiserror::Error;
+use tokio::runtime::RuntimeFlavor;
 use tracing::warn;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +69,51 @@ fn prompt_and_read_line(prompt: &str) -> DestroyResult<String> {
     io::stdin().read_line(&mut input)?;
 
     Ok(input.trim().to_string())
+}
+
+fn run_destroy_future<T, F>(future: F) -> DestroyResult<T>
+where
+    T: Send,
+    F: Future<Output = DestroyResult<T>> + Send,
+{
+    fn run_on_new_runtime<T, F>(future: F) -> DestroyResult<T>
+    where
+        T: Send,
+        F: Future<Output = DestroyResult<T>> + Send,
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(future)
+    }
+
+    fn run_on_scoped_thread<T, F>(future: F) -> DestroyResult<T>
+    where
+        T: Send,
+        F: Future<Output = DestroyResult<T>> + Send,
+    {
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            scope.spawn(move || {
+                let _ = tx.send(run_on_new_runtime(future));
+            });
+            rx.recv().map_err(|error| {
+                DestroyError::Io(io::Error::other(format!(
+                    "failed to receive async destroy result: {error}"
+                )))
+            })?
+        })
+    }
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return match handle.runtime_flavor() {
+            RuntimeFlavor::MultiThread => tokio::task::block_in_place(|| handle.block_on(future)),
+            RuntimeFlavor::CurrentThread => run_on_scoped_thread(future),
+            _ => run_on_scoped_thread(future),
+        };
+    }
+
+    run_on_new_runtime(future)
 }
 
 pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> {
@@ -196,8 +243,7 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
 
     if mode.should_remove_remote() {
         println!("Deleting data from S3 and metadata backends...");
-        let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(delete_remote_state(&format_info))?;
+        run_destroy_future(delete_remote_state(&format_info))?;
         println!("✓ Remote metadata and data deleted.");
     }
 
