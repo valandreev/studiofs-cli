@@ -719,6 +719,17 @@ impl<'a> NamespaceMutationOps<'a> {
         self.vfs.dentry_cache_insert_positive(parent, name, child);
     }
 
+    fn record_ignored_insertion(
+        &self,
+        parent: Ino,
+        attr_invalidations: impl IntoIterator<Item = Ino>,
+    ) {
+        let mut invalidated = vec![parent];
+        invalidated.extend(attr_invalidations);
+        self.vfs.invalidate_attr_read_cache(invalidated);
+        self.vfs.bump_namespace_for_parents([parent]);
+    }
+
     fn record_removal(
         &self,
         parent: Ino,
@@ -729,6 +740,23 @@ impl<'a> NamespaceMutationOps<'a> {
         invalidated.extend(attr_invalidations);
         self.vfs.invalidate_attr_read_cache(invalidated);
         self.vfs.bump_namespace_for_parents([parent]);
+        self.vfs.dentry_cache_insert_negative(parent, name);
+    }
+
+    fn record_ignored_rename(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        attr_invalidations: impl IntoIterator<Item = Ino>,
+    ) {
+        let mut invalidated = vec![parent];
+        if parent != new_parent {
+            invalidated.push(new_parent);
+        }
+        invalidated.extend(attr_invalidations);
+        self.vfs.invalidate_attr_read_cache(invalidated);
+        self.vfs.bump_namespace_for_parents([parent, new_parent]);
         self.vfs.dentry_cache_insert_negative(parent, name);
     }
 
@@ -10315,7 +10343,7 @@ impl StudioVfs {
                     attr.crtime = source_attr.crtime;
                 })
                 .unwrap_or(ignored);
-            self.bump_namespace_for_parents([new_parent]);
+            namespace_mutations.record_ignored_insertion(new_parent, std::iter::empty());
             return Ok(ignored);
         }
         let attr = self.sync_meta().link(ino, new_parent, new_name)?;
@@ -10341,7 +10369,7 @@ impl StudioVfs {
         if self.should_ignore_regular_file_path(parent, name) {
             let attr =
                 self.create_ignored_entry(parent, name, uid, gid, mode, FileType::RegularFile);
-            self.bump_namespace_for_parents([parent]);
+            namespace_mutations.record_ignored_insertion(parent, std::iter::empty());
             return Ok(attr);
         }
         let attr = self
@@ -10378,7 +10406,7 @@ impl StudioVfs {
         validate_name(name)?;
         if self.should_ignore_directory_path(parent, name) {
             let attr = self.create_ignored_entry(parent, name, uid, gid, mode, FileType::Directory);
-            self.bump_namespace_for_parents([parent]);
+            namespace_mutations.record_ignored_insertion(parent, std::iter::empty());
             return Ok(attr);
         }
         let attr = self
@@ -10403,7 +10431,7 @@ impl StudioVfs {
         validate_name(name)?;
         if self.should_ignore_regular_file_path(parent, name) {
             let attr = self.create_ignored_entry(parent, name, uid, gid, 0o777, FileType::Symlink);
-            self.bump_namespace_for_parents([parent]);
+            namespace_mutations.record_ignored_insertion(parent, std::iter::empty());
             return Ok(attr);
         }
         let attr = self
@@ -10664,7 +10692,7 @@ impl StudioVfs {
             || self.should_ignore_directory_path(new_parent, new_name);
         if let Some(source) = source_ignored {
             if target_is_ignored {
-                let _ = self.create_ignored_entry(
+                self.create_ignored_entry(
                     new_parent,
                     new_name,
                     source.attr.uid,
@@ -10674,9 +10702,8 @@ impl StudioVfs {
                 );
             }
             self.unlink_ignored_subtree(parent, name);
-            self.bump_namespace_for_parents([parent, new_parent]);
             self.bump_acl_namespace_epoch();
-            self.dentry_cache_insert_negative(parent, name);
+            namespace_mutations.record_ignored_rename(parent, name, new_parent, std::iter::empty());
             return Ok(());
         }
         if target_is_ignored {
@@ -15137,6 +15164,134 @@ mod tests {
             !vfs.state.namespace.attr_read_cache.lock().contains(dir.ino),
             "link should invalidate destination parent attr cache"
         );
+    }
+
+    #[test]
+    fn ignored_create_invalidates_parent_attr_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-create-invalidates-parent-attr-cache");
+        let dir = vfs
+            .mkdir(ROOT_INO, b"dir", 1000, 1000, 0o755)
+            .expect("mkdir dir");
+
+        let _ = vfs.getattr(dir.ino).expect("prime parent attr cache");
+        assert!(
+            vfs.state.namespace.attr_read_cache.lock().contains(dir.ino),
+            "parent dir should be cached before ignored create"
+        );
+
+        let _ignored = vfs
+            .create(dir.ino, b".fseventsd", 1000, 1000, 0o644)
+            .expect("create ignored file");
+
+        assert!(
+            !vfs.state.namespace.attr_read_cache.lock().contains(dir.ino),
+            "ignored create should invalidate parent directory attr cache"
+        );
+    }
+
+    #[test]
+    fn ignored_link_invalidates_new_parent_attr_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-link-invalidates-parent-attr-cache");
+        let source = vfs
+            .create(ROOT_INO, b"source.txt", 1000, 1000, 0o644)
+            .expect("create source");
+        let dir = vfs
+            .mkdir(ROOT_INO, b"links", 1000, 1000, 0o755)
+            .expect("mkdir links");
+
+        let _ = vfs.getattr(dir.ino).expect("prime new parent attr cache");
+        assert!(
+            vfs.state.namespace.attr_read_cache.lock().contains(dir.ino),
+            "new parent dir should be cached before ignored link"
+        );
+
+        let _ignored = vfs
+            .link(source.ino, dir.ino, b".fseventsd")
+            .expect("create ignored hardlink");
+
+        assert!(
+            !vfs.state.namespace.attr_read_cache.lock().contains(dir.ino),
+            "ignored link should invalidate destination parent attr cache"
+        );
+    }
+
+    #[test]
+    fn rename_between_ignored_names_invalidates_parent_attr_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-rename-invalidates-parent-attr-cache");
+        vfs.mkdir(ROOT_INO, b".Spotlight-V100", 1000, 1000, 0o755)
+            .expect("create ignored dir");
+
+        let _ = vfs.getattr(ROOT_INO).expect("prime root attr cache");
+        assert!(
+            vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(ROOT_INO),
+            "root dir should be cached before ignored rename"
+        );
+
+        vfs.rename(ROOT_INO, b".Spotlight-V100", ROOT_INO, b".fseventsd")
+            .expect("rename ignored entry");
+
+        assert!(
+            !vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(ROOT_INO),
+            "ignored rename should invalidate parent directory attr cache"
+        );
+        assert!(vfs.lookup(ROOT_INO, b".Spotlight-V100").is_err());
+        assert!(vfs.lookup(ROOT_INO, b".fseventsd").is_ok());
+    }
+
+    #[test]
+    fn rename_into_ignored_trash_invalidates_destination_parent_attr_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) =
+            make_test_vfs(&tmp, "ignored-trash-rename-invalidates-parent-attr-cache");
+        let source = vfs
+            .create(ROOT_INO, b"source.txt", 1000, 1000, 0o644)
+            .expect("create source");
+        let trash_root = vfs
+            .mkdir(ROOT_INO, b".Trash", 1000, 1000, 0o755)
+            .expect("create ignored trash root");
+        let trash_child = vfs
+            .mkdir(trash_root.ino, b"501", 1000, 1000, 0o755)
+            .expect("create ignored trash child");
+
+        let _ = vfs
+            .getattr(trash_child.ino)
+            .expect("prime destination parent attr cache");
+        assert!(
+            vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(trash_child.ino),
+            "destination ignored parent should be cached before rename"
+        );
+
+        vfs.rename(ROOT_INO, b"source.txt", trash_child.ino, b"source.txt")
+            .expect("rename into ignored trash subtree");
+
+        assert!(
+            !vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(trash_child.ino),
+            "rename into ignored trash should invalidate destination parent attr cache"
+        );
+        assert!(vfs.lookup(ROOT_INO, b"source.txt").is_err());
+        let moved = vfs
+            .lookup(trash_child.ino, b"source.txt")
+            .expect("ignored trash target should resolve");
+        assert_eq!(moved.size, source.size);
     }
 
     #[test]
