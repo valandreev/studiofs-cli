@@ -1062,6 +1062,14 @@ struct DeletedInodeCleanup {
     freed_bytes: u64,
 }
 
+enum LastHandleReleaseAction {
+    IgnoredEntry,
+    OrphanCleanup,
+    LocalSync {
+        sticky_error_policy: StickyErrorPolicy,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalSyncTrigger {
     Explicit,
@@ -10414,21 +10422,18 @@ impl StudioVfs {
         })
     }
 
-    async fn release_last_handle_with_outcome(
+    fn take_last_handle_release_action(
         &self,
-        context: HandleReleaseContext,
-    ) -> VfsResult<ReleaseFhOutcome> {
+        context: &HandleReleaseContext,
+    ) -> LastHandleReleaseAction {
         let ino = context.ino;
         if self.release_ignored_entry(ino) {
             let _ = self.handle_table.take_orphan(ino);
-            return Ok(ReleaseFhOutcome {
-                closed_last_handle: true,
-                flushed_local_dirty_state: false,
-            });
+            return LastHandleReleaseAction::IgnoredEntry;
         }
 
         if self.handle_table.take_orphan(ino) {
-            return self.cleanup_orphan_on_last_handle_close(ino).await;
+            return LastHandleReleaseAction::OrphanCleanup;
         }
 
         let sticky_error_policy = if context.open_file.flags.contains(OpenFlags::WRONLY)
@@ -10438,18 +10443,50 @@ impl StudioVfs {
         } else {
             StickyErrorPolicy::Ignore
         };
-        let outcome = self
-            .local_sync_barrier_with_outcome(
-                ino,
-                LocalSyncPolicy::Opportunistic,
+        LastHandleReleaseAction::LocalSync {
+            sticky_error_policy,
+        }
+    }
+
+    async fn execute_last_handle_release_action(
+        &self,
+        ino: Ino,
+        action: LastHandleReleaseAction,
+    ) -> VfsResult<ReleaseFhOutcome> {
+        match action {
+            LastHandleReleaseAction::IgnoredEntry => Ok(ReleaseFhOutcome {
+                closed_last_handle: true,
+                flushed_local_dirty_state: false,
+            }),
+            LastHandleReleaseAction::OrphanCleanup => {
+                self.cleanup_orphan_on_last_handle_close(ino).await
+            }
+            LastHandleReleaseAction::LocalSync {
                 sticky_error_policy,
-                DirtyAttrPersistPolicy::Ignore,
-            )
-            .await?;
-        Ok(ReleaseFhOutcome {
-            closed_last_handle: true,
-            flushed_local_dirty_state: outcome.had_local_dirty_state,
-        })
+            } => {
+                let outcome = self
+                    .local_sync_barrier_with_outcome(
+                        ino,
+                        LocalSyncPolicy::Opportunistic,
+                        sticky_error_policy,
+                        DirtyAttrPersistPolicy::Ignore,
+                    )
+                    .await?;
+                Ok(ReleaseFhOutcome {
+                    closed_last_handle: true,
+                    flushed_local_dirty_state: outcome.had_local_dirty_state,
+                })
+            }
+        }
+    }
+
+    async fn release_last_handle_with_outcome(
+        &self,
+        context: HandleReleaseContext,
+    ) -> VfsResult<ReleaseFhOutcome> {
+        let ino = context.ino;
+        let action = self.take_last_handle_release_action(&context);
+        self.execute_last_handle_release_action(ino, action).await
     }
 
     fn resolve_unlink_target(
@@ -10463,6 +10500,72 @@ impl StudioVfs {
             ino: entry.ino,
             open_handles: self.handle_table.open_count(entry.ino),
         })
+    }
+
+    fn unlink_with_open_handles(
+        &self,
+        meta: &Arc<dyn MetaEngine>,
+        parent: Ino,
+        name: &[u8],
+        target: UnlinkTarget,
+    ) -> VfsResult<Option<Ino>> {
+        let attr = match meta.unlink_open_handle(parent, name) {
+            Ok(attr) => attr,
+            Err(MetaError::InodeNotFound(_)) => {
+                self.heal_orphaned_dentry(parent, name, Some(target.ino));
+                return Ok(None);
+            }
+            Err(MetaError::IsADirectory(_)) => {
+                return Err(VfsError::Meta(MetaError::IsADirectory(target.ino)));
+            }
+            Err(err) => return Err(VfsError::Meta(err)),
+        };
+        if attr.nlink == 0 {
+            // Open-unlink still removes the final namespace reference right away.
+            // Cancel pending uploads immediately while deferred inode cleanup waits
+            // for the last open handle to close.
+            self.mark_inode_deleted_for_uploads(attr.ino);
+        }
+
+        // Mark as orphan — release_fh will do the real cleanup.
+        self.handle_table.mark_orphan(target.ino);
+        debug!(
+            "unlink ino={}: {} open handles, deferred cleanup (orphan)",
+            target.ino, target.open_handles
+        );
+        Ok(Some(target.ino))
+    }
+
+    async fn unlink_without_open_handles(
+        &self,
+        meta: &Arc<dyn MetaEngine>,
+        parent: Ino,
+        name: &[u8],
+        target: UnlinkTarget,
+    ) -> VfsResult<Option<Ino>> {
+        let attr = match meta.unlink(parent, name) {
+            Ok(attr) => attr,
+            Err(MetaError::InodeNotFound(_)) => {
+                self.heal_orphaned_dentry(parent, name, Some(target.ino));
+                return Ok(None);
+            }
+            Err(err) => return Err(VfsError::Meta(err)),
+        };
+
+        if attr.nlink == 0 {
+            // Inode fully removed — shared cleanup for local blocks, staged
+            // writes, and cache state. Open-unlink may have already marked
+            // upload cancellation, so keep this idempotent.
+            self.cleanup_deleted_inode_storage(meta, attr.ino, attr.size, "unlink")
+                .await?;
+        } else {
+            info!(
+                "unlink ino={}: nlink={}, keeping inode alive (hardlink)",
+                attr.ino, attr.nlink
+            );
+        }
+
+        Ok(Some(attr.ino))
     }
 
     fn queue_pending_deletions_for_object_ids(
@@ -11169,62 +11272,16 @@ impl StudioVfs {
 
         let meta = self.sync_meta();
         let unlink_target = self.resolve_unlink_target(&meta, parent, name)?;
-        let ino = unlink_target.ino;
-
-        if unlink_target.open_handles > 0 {
-            // Open-unlink: atomically remove dentry + decrement nlink, keep inode alive.
-            let attr = match meta.unlink_open_handle(parent, name) {
-                Ok(attr) => attr,
-                Err(MetaError::InodeNotFound(_)) => {
-                    self.heal_orphaned_dentry(parent, name, Some(ino));
-                    return Ok(());
-                }
-                Err(MetaError::IsADirectory(_)) => {
-                    return Err(VfsError::Meta(MetaError::IsADirectory(ino)));
-                }
-                Err(err) => return Err(VfsError::Meta(err)),
-            };
-            if attr.nlink == 0 {
-                // Open-unlink still removes the final namespace reference right away.
-                // Cancel pending uploads immediately while deferred inode cleanup waits
-                // for the last open handle to close.
-                self.mark_inode_deleted_for_uploads(attr.ino);
-            }
-
-            // Mark as orphan — release_fh will do the real cleanup
-            self.handle_table.mark_orphan(ino);
-            debug!(
-                "unlink ino={}: {} open handles, deferred cleanup (orphan)",
-                ino, unlink_target.open_handles
-            );
-
-            namespace_mutations.record_removal(parent, name, [ino]);
+        let Some(removed_ino) = (if unlink_target.open_handles > 0 {
+            self.unlink_with_open_handles(&meta, parent, name, unlink_target)?
         } else {
-            // No open handles — immediate full cleanup via meta.unlink()
-            let attr = match meta.unlink(parent, name) {
-                Ok(attr) => attr,
-                Err(MetaError::InodeNotFound(_)) => {
-                    self.heal_orphaned_dentry(parent, name, Some(ino));
-                    return Ok(());
-                }
-                Err(err) => return Err(VfsError::Meta(err)),
-            };
+            self.unlink_without_open_handles(&meta, parent, name, unlink_target)
+                .await?
+        }) else {
+            return Ok(());
+        };
 
-            if attr.nlink == 0 {
-                // Inode fully removed — shared cleanup for local blocks, staged
-                // writes, and cache state. Open-unlink may have already marked
-                // upload cancellation, so keep this idempotent.
-                self.cleanup_deleted_inode_storage(&meta, attr.ino, attr.size, "unlink")
-                    .await?;
-            } else {
-                info!(
-                    "unlink ino={}: nlink={}, keeping inode alive (hardlink)",
-                    attr.ino, attr.nlink
-                );
-            }
-
-            namespace_mutations.record_removal(parent, name, [attr.ino]);
-        }
+        namespace_mutations.record_removal(parent, name, [removed_ino]);
 
         meta.request_eager_flush();
         Ok(())
@@ -15569,6 +15626,41 @@ mod tests {
             assert!(
                 vfs.live_extent_records_for_inode(ino).is_empty(),
                 "orphan cleanup should clear live extent identities on final close"
+            );
+        });
+    }
+
+    #[test]
+    fn test_release_fh_orphan_cleanup_waits_for_final_handle_before_clearing_live_extents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-orphan-final-handle-live-extents");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"release-orphan-final-handle.txt", 0, 0, 0o644)
+                .unwrap();
+            let ino = attr.ino;
+            let fh1 = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+            let fh2 = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+            vfs.write(ino, 0, b"payload").await.unwrap();
+            vfs.flush(ino).await.unwrap();
+            assert!(
+                !vfs.live_extent_records_for_inode(ino).is_empty(),
+                "flush should materialize live extents before orphan cleanup"
+            );
+
+            vfs.unlink(1, b"release-orphan-final-handle.txt").unwrap();
+            vfs.release_fh(fh1).await.unwrap();
+            assert!(
+                !vfs.live_extent_records_for_inode(ino).is_empty(),
+                "non-final close must not clear orphan live extents"
+            );
+
+            vfs.release_fh(fh2).await.unwrap();
+            assert!(
+                vfs.live_extent_records_for_inode(ino).is_empty(),
+                "final orphan close must clear live extents"
             );
         });
     }
