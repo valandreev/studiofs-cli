@@ -6427,6 +6427,196 @@ impl<'a> ReadPipeline<'a> {
     }
 }
 
+struct ReadMetadata {
+    attr: InodeAttr,
+    resolved_slices: Vec<studiofs_meta::schema::ResolvedSliceSpan>,
+}
+
+struct ReadMetadataResolver<'a> {
+    vfs: &'a StudioVfs,
+    ino: Ino,
+}
+
+impl<'a> ReadMetadataResolver<'a> {
+    fn new(vfs: &'a StudioVfs, ino: Ino) -> Self {
+        Self { vfs, ino }
+    }
+
+    async fn resolve_attr(&self) -> VfsResult<InodeAttr> {
+        if let Some(attr) = self.ignored_attr() {
+            return Ok(attr);
+        }
+        if let Some(attr) = self.dirty_attr() {
+            return Ok(attr);
+        }
+        if let Some(attr) = self.cached_attr() {
+            return Ok(attr);
+        }
+        self.load_attr_from_meta().await
+    }
+
+    async fn resolve_for_read(&self, offset: u64, buffer_len: u64) -> VfsResult<ReadMetadata> {
+        if let Some(attr) = self.ignored_attr() {
+            return Ok(ReadMetadata {
+                attr,
+                resolved_slices: Vec::new(),
+            });
+        }
+        if let Some(attr) = self.dirty_attr() {
+            let resolved_slices = self
+                .resolve_slices_for_attr(&attr, offset, buffer_len)
+                .await?;
+            return Ok(ReadMetadata {
+                attr,
+                resolved_slices,
+            });
+        }
+        if let Some(attr) = self.cached_attr() {
+            let resolved_slices = self
+                .resolve_slices_for_attr(&attr, offset, buffer_len)
+                .await?;
+            return Ok(ReadMetadata {
+                attr,
+                resolved_slices,
+            });
+        }
+        self.load_attr_and_slices_from_meta(offset, buffer_len)
+            .await
+    }
+
+    fn ignored_attr(&self) -> Option<InodeAttr> {
+        self.vfs.ignored_entry_attr(self.ino)
+    }
+
+    fn dirty_attr(&self) -> Option<InodeAttr> {
+        self.vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&self.ino)
+            .cloned()
+    }
+
+    fn cached_attr(&self) -> Option<InodeAttr> {
+        self.vfs
+            .state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .get(self.ino, Instant::now())
+    }
+
+    fn cache_attr(&self, attr: &InodeAttr) {
+        self.vfs.state.namespace.attr_read_cache.lock().put(
+            self.ino,
+            attr.clone(),
+            ATTR_CACHE_TTL,
+            Instant::now(),
+        );
+    }
+
+    fn clear_stale_state(&self) {
+        self.vfs.clear_pending_blocks_for_inode(self.ino);
+        self.vfs.clear_inode_incarnation(self.ino);
+        self.vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .remove(&self.ino);
+        self.vfs
+            .state
+            .namespace
+            .attr_read_cache
+            .lock()
+            .remove(self.ino);
+        let _ = self.vfs.handle_table.take_orphan(self.ino);
+    }
+
+    fn stale_inode_not_found(&self) -> VfsError {
+        self.clear_stale_state();
+        VfsError::Meta(MetaError::InodeNotFound(self.ino))
+    }
+
+    fn read_len_for_attr(&self, attr: &InodeAttr, offset: u64, buffer_len: u64) -> u64 {
+        attr.size.saturating_sub(offset).min(buffer_len)
+    }
+
+    async fn resolve_slices_for_attr(
+        &self,
+        attr: &InodeAttr,
+        offset: u64,
+        buffer_len: u64,
+    ) -> VfsResult<Vec<studiofs_meta::schema::ResolvedSliceSpan>> {
+        let read_len = self.read_len_for_attr(attr, offset, buffer_len);
+        if read_len == 0 {
+            return Ok(Vec::new());
+        }
+        let ino = self.ino;
+        let meta = self.vfs.meta_async.clone();
+        match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+            engine.lookup_regular_file_slices(ino, offset, read_len)
+        })
+        .await
+        {
+            Ok(resolved) => Ok(resolved),
+            Err(VfsError::Meta(MetaError::InodeNotFound(_))) => Err(self.stale_inode_not_found()),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn load_attr_from_meta(&self) -> VfsResult<InodeAttr> {
+        let ino = self.ino;
+        let meta = self.vfs.meta_async.clone();
+        let attr = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+            engine.get_attr(ino)
+        })
+        .await
+        {
+            Ok(attr) => attr,
+            Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
+                return Err(self.stale_inode_not_found());
+            }
+            Err(err) => return Err(err),
+        };
+        self.cache_attr(&attr);
+        Ok(attr)
+    }
+
+    async fn load_attr_and_slices_from_meta(
+        &self,
+        offset: u64,
+        buffer_len: u64,
+    ) -> VfsResult<ReadMetadata> {
+        let ino = self.ino;
+        let meta = self.vfs.meta_async.clone();
+        let (attr, resolved_slices) = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+            let attr = engine.get_attr(ino)?;
+            let read_len = attr.size.saturating_sub(offset).min(buffer_len);
+            let resolved_slices = if read_len == 0 {
+                Vec::new()
+            } else {
+                engine.lookup_regular_file_slices(ino, offset, read_len)?
+            };
+            Ok((attr, resolved_slices))
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
+                return Err(self.stale_inode_not_found());
+            }
+            Err(err) => return Err(err),
+        };
+        self.cache_attr(&attr);
+        Ok(ReadMetadata {
+            attr,
+            resolved_slices,
+        })
+    }
+}
+
 macro_rules! with_sync_meta {
     ($self:expr, |$meta:ident| $body:block) => {{
         let $meta = $self.sync_meta();
@@ -10221,48 +10411,7 @@ impl StudioVfs {
     }
 
     async fn getattr_async_unchecked(&self, ino: Ino) -> VfsResult<InodeAttr> {
-        if let Some(attr) = self.ignored_entry_attr(ino) {
-            return Ok(attr);
-        }
-
-        if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino) {
-            return Ok(attr.clone());
-        }
-
-        if let Some(attr) = self
-            .state
-            .namespace
-            .attr_read_cache
-            .lock()
-            .get(ino, Instant::now())
-        {
-            return Ok(attr);
-        }
-
-        let meta = self.meta_async.clone();
-        let attr = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-            engine.get_attr(ino)
-        })
-        .await
-        {
-            Ok(attr) => attr,
-            Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
-                self.clear_pending_blocks_for_inode(ino);
-                self.clear_inode_incarnation(ino);
-                self.state.namespace.dirty_attrs.lock().remove(&ino);
-                self.state.namespace.attr_read_cache.lock().remove(ino);
-                let _ = self.handle_table.take_orphan(ino);
-                return Err(VfsError::Meta(MetaError::InodeNotFound(ino)));
-            }
-            Err(err) => return Err(err),
-        };
-        self.state.namespace.attr_read_cache.lock().put(
-            ino,
-            attr.clone(),
-            ATTR_CACHE_TTL,
-            Instant::now(),
-        );
-        Ok(attr)
+        ReadMetadataResolver::new(self, ino).resolve_attr().await
     }
 
     /// Get file attributes.
@@ -10279,103 +10428,16 @@ impl StudioVfs {
         Ok(attr)
     }
 
-    fn clear_stale_read_state_for_inode(&self, ino: Ino) {
-        self.clear_pending_blocks_for_inode(ino);
-        self.clear_inode_incarnation(ino);
-        self.state.namespace.dirty_attrs.lock().remove(&ino);
-        self.state.namespace.attr_read_cache.lock().remove(ino);
-        let _ = self.handle_table.take_orphan(ino);
-    }
-
-    async fn lookup_regular_file_slices_async(
-        &self,
-        ino: Ino,
-        offset: u64,
-        length: u64,
-    ) -> VfsResult<Vec<studiofs_meta::schema::ResolvedSliceSpan>> {
-        let meta = self.meta_async.clone();
-        match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-            engine.lookup_regular_file_slices(ino, offset, length)
-        })
-        .await
-        {
-            Ok(resolved) => Ok(resolved),
-            Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
-                self.clear_stale_read_state_for_inode(ino);
-                Err(VfsError::Meta(MetaError::InodeNotFound(ino)))
-            }
-            Err(err) => Err(err),
-        }
-    }
-
     async fn resolve_read_metadata_async(
         &self,
         ino: Ino,
         offset: u64,
         buffer_len: u64,
     ) -> VfsResult<(InodeAttr, Vec<studiofs_meta::schema::ResolvedSliceSpan>)> {
-        if let Some(attr) = self.ignored_entry_attr(ino) {
-            return Ok((attr, Vec::new()));
-        }
-
-        let dirty_attr = {
-            let dirty_attrs = self.state.namespace.dirty_attrs.lock();
-            dirty_attrs.get(&ino).cloned()
-        };
-        if let Some(attr) = dirty_attr {
-            let read_len = attr.size.saturating_sub(offset).min(buffer_len) as usize;
-            let resolved = if read_len == 0 {
-                Vec::new()
-            } else {
-                self.lookup_regular_file_slices_async(ino, offset, read_len as u64)
-                    .await?
-            };
-            return Ok((attr, resolved));
-        }
-
-        let cached_attr = {
-            let mut attr_cache = self.state.namespace.attr_read_cache.lock();
-            attr_cache.get(ino, Instant::now())
-        };
-        if let Some(attr) = cached_attr {
-            let read_len = attr.size.saturating_sub(offset).min(buffer_len) as usize;
-            let resolved = if read_len == 0 {
-                Vec::new()
-            } else {
-                self.lookup_regular_file_slices_async(ino, offset, read_len as u64)
-                    .await?
-            };
-            return Ok((attr, resolved));
-        }
-
-        let meta = self.meta_async.clone();
-        let (attr, resolved) = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-            let attr = engine.get_attr(ino)?;
-            let read_len = attr.size.saturating_sub(offset).min(buffer_len) as usize;
-            let resolved = if read_len == 0 {
-                Vec::new()
-            } else {
-                engine.lookup_regular_file_slices(ino, offset, read_len as u64)?
-            };
-            Ok((attr, resolved))
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
-                self.clear_stale_read_state_for_inode(ino);
-                return Err(VfsError::Meta(MetaError::InodeNotFound(ino)));
-            }
-            Err(err) => return Err(err),
-        };
-
-        self.state.namespace.attr_read_cache.lock().put(
-            ino,
-            attr.clone(),
-            ATTR_CACHE_TTL,
-            Instant::now(),
-        );
-        Ok((attr, resolved))
+        let resolved = ReadMetadataResolver::new(self, ino)
+            .resolve_for_read(offset, buffer_len)
+            .await?;
+        Ok((resolved.attr, resolved.resolved_slices))
     }
 
     /// Set file attributes (partial update).
@@ -14386,6 +14448,7 @@ impl StudioVfs {
 
 #[cfg(test)]
 mod tests {
+    use super::write_buffer::PendingBlock;
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -16948,6 +17011,121 @@ mod tests {
             after.hits > before.hits,
             "follow-up getattr should hit attr cache after readdir hydration"
         );
+    }
+
+    #[test]
+    fn resolve_read_metadata_async_prefers_dirty_attr_over_cached_attr() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "read-metadata-dirty-over-cache");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(ROOT_INO, b"dirty-over-cache.txt", 1000, 1000, 0o644)
+                .expect("create file");
+            let ino = created.ino;
+
+            let mut cached_attr = meta.get_attr(ino).expect("load cached attr baseline");
+            cached_attr.size = 1;
+            vfs.state.namespace.attr_read_cache.lock().put(
+                ino,
+                cached_attr,
+                ATTR_CACHE_TTL,
+                Instant::now(),
+            );
+
+            let mut dirty_attr = meta.get_attr(ino).expect("load dirty attr baseline");
+            dirty_attr.size = 5;
+            vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .insert(ino, dirty_attr.clone());
+
+            let (resolved_attr, resolved_slices) = vfs
+                .resolve_read_metadata_async(ino, 0, 0)
+                .await
+                .expect("resolve read metadata");
+
+            assert_eq!(
+                resolved_attr.size, 5,
+                "read metadata should prefer dirty attrs over stale attr-read cache entries"
+            );
+            assert!(
+                resolved_slices.is_empty(),
+                "zero-length metadata probes should not resolve slice spans"
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_read_metadata_async_clears_stale_runtime_state_when_inode_is_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "read-metadata-stale-cache-missing-ino");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let ino = 9_001;
+            let mut cached_attr = InodeAttr::new_file(ino, ROOT_INO, 1000, 1000, 0o644);
+            cached_attr.size = 5;
+            vfs.state.write_buffer.pending_blocks.lock().insert(
+                (ino, 0),
+                PendingBlock {
+                    data: BytesMut::from(&b"stale"[..]),
+                    dirty: true,
+                    reserved_object_id: None,
+                },
+            );
+            vfs.state
+                .write_buffer
+                .pending_block_indexes
+                .lock()
+                .entry(ino)
+                .or_default()
+                .insert(0);
+            vfs.state
+                .write_buffer
+                .pending_bytes
+                .fetch_add(5, AtomicOrdering::Relaxed);
+            vfs.refresh_inode_incarnation_state_from_attr(ino, &cached_attr);
+            vfs.handle_table.mark_orphan(ino);
+
+            let err = vfs
+                .resolve_read_metadata_async(ino, 0, 16)
+                .await
+                .expect_err("missing inode should fail through metadata lookup");
+
+            assert!(
+                matches!(err, VfsError::Meta(MetaError::InodeNotFound(found)) if found == ino),
+                "resolver should surface inode-not-found with the requested inode id"
+            );
+            assert!(
+                !vfs.state.namespace.attr_read_cache.lock().contains(ino),
+                "inode-not-found should leave no attr cache entry behind for the missing inode"
+            );
+            assert!(
+                !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+                "inode-not-found should clear dirty attr state"
+            );
+            assert!(
+                !vfs.state
+                    .write_buffer
+                    .pending_blocks
+                    .lock()
+                    .contains_key(&(ino, 0)),
+                "inode-not-found should clear pending write blocks"
+            );
+            assert!(
+                !vfs.state
+                    .incarnation
+                    .inode_incarnations
+                    .lock()
+                    .contains_key(&ino),
+                "inode-not-found should clear incarnation state"
+            );
+            assert!(
+                !vfs.handle_table.take_orphan(ino),
+                "inode-not-found should clear orphan bookkeeping"
+            );
+        });
     }
 
     #[test]
