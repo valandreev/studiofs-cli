@@ -1047,6 +1047,11 @@ struct LocalSyncBarrierOutcome {
     persisted_dirty_attrs: bool,
 }
 
+struct HandleReleaseContext {
+    open_file: OpenFile,
+    ino: Ino,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalSyncTrigger {
     Explicit,
@@ -10356,12 +10361,10 @@ impl StudioVfs {
         self.release_fh_with_outcome(fh).await.map(|_| ())
     }
 
-    /// Release a handle and report whether this close owned the actual
-    /// last-handle path, plus whether it had to drain local dirty state there.
-    pub async fn release_fh_with_outcome(&self, fh: u64) -> VfsResult<ReleaseFhOutcome> {
+    fn close_handle_for_release(&self, fh: u64) -> Option<HandleReleaseContext> {
         let Some((open_file, remaining)) = self.handle_table.close(fh) else {
             debug!("release_fh: unknown fh={}", fh);
-            return Ok(ReleaseFhOutcome::default());
+            return None;
         };
         let ino = open_file.ino;
         let stream_id = open_file.stream_id();
@@ -10370,115 +10373,135 @@ impl StudioVfs {
         self.note_file_session_close_handle(ino, remaining);
         self.clear_access_tracking_for_stream(ino, stream_id);
         if remaining > 0 {
-            return Ok(ReleaseFhOutcome::default());
+            return None;
         }
+        Some(HandleReleaseContext { open_file, ino })
+    }
+
+    async fn cleanup_orphan_on_last_handle_close(&self, ino: Ino) -> VfsResult<ReleaseFhOutcome> {
+        if self.release_ignored_entry(ino) {
+            return Ok(ReleaseFhOutcome {
+                closed_last_handle: true,
+                flushed_local_dirty_state: false,
+            });
+        }
+        // Last handle closed on an unlinked file — final cleanup
+        debug!("orphan cleanup: ino={} (last fd closed)", ino);
+
+        self.mark_inode_deleted_for_uploads(ino);
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let meta = self.meta_async.clone();
+        let (removed_ids, total_bytes) = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+            let blocks = match engine.get_file_blocks(ino) {
+                Ok(blocks) => blocks,
+                Err(MetaError::InodeNotFound(_)) => Vec::new(),
+                Err(err) => return Err(err),
+            };
+            let total_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
+
+            let removed_ids = match engine.remove_file_blocks(ino) {
+                Ok(ids) => ids,
+                Err(MetaError::InodeNotFound(_)) => Vec::new(),
+                Err(err) => return Err(err),
+            };
+            for &object_id in &removed_ids {
+                engine.add_pending_deletion(object_id, timestamp)?;
+            }
+
+            if total_bytes > 0 {
+                engine.decr_counter(studiofs_meta::types::counters::USED_SPACE, total_bytes)?;
+            }
+
+            match engine.remove_attr(ino) {
+                Ok(()) | Err(MetaError::InodeNotFound(_)) => {}
+                Err(err) => return Err(err),
+            }
+            let _ = engine.remove_deferred_delete(ino);
+            Ok((removed_ids, total_bytes))
+        })
+        .await?;
+
+        if !removed_ids.is_empty() {
+            self.clear_pending_blocks_for_inode(ino);
+            self.evict_inode_from_caches(ino, &removed_ids).await;
+        }
+        let deferred_local_blocks = self.take_deferred_deleted_local_blocks(ino);
+        if !deferred_local_blocks.is_empty() {
+            self.clear_pending_blocks_for_inode(ino);
+            self.evict_inode_from_caches(ino, &deferred_local_blocks)
+                .await;
+        }
+        debug!(
+            "orphan cleanup complete: ino={} removed_blocks={} deferred_local_blocks={} freed_bytes={}",
+            ino,
+            removed_ids.len(),
+            deferred_local_blocks.len(),
+            total_bytes
+        );
+        self.clear_inode_incarnation(ino);
+        self.state.namespace.dirty_attrs.lock().remove(&ino);
+        self.state.namespace.attr_read_cache.lock().remove(ino);
+        self.maybe_clear_deleted_inode_marker(ino);
+        Ok(ReleaseFhOutcome {
+            closed_last_handle: true,
+            flushed_local_dirty_state: false,
+        })
+    }
+
+    async fn release_last_handle_with_outcome(
+        &self,
+        context: HandleReleaseContext,
+    ) -> VfsResult<ReleaseFhOutcome> {
+        let ino = context.ino;
+        if self.release_ignored_entry(ino) {
+            let _ = self.handle_table.take_orphan(ino);
+            return Ok(ReleaseFhOutcome {
+                closed_last_handle: true,
+                flushed_local_dirty_state: false,
+            });
+        }
+
+        if self.handle_table.take_orphan(ino) {
+            return self.cleanup_orphan_on_last_handle_close(ino).await;
+        }
+
+        let sticky_error_policy = if context.open_file.flags.contains(OpenFlags::WRONLY)
+            || context.open_file.flags.contains(OpenFlags::RDWR)
+        {
+            StickyErrorPolicy::Report
+        } else {
+            StickyErrorPolicy::Ignore
+        };
+        let outcome = self
+            .local_sync_barrier_with_outcome(
+                ino,
+                LocalSyncPolicy::Opportunistic,
+                sticky_error_policy,
+                DirtyAttrPersistPolicy::Ignore,
+            )
+            .await?;
+        Ok(ReleaseFhOutcome {
+            closed_last_handle: true,
+            flushed_local_dirty_state: outcome.had_local_dirty_state,
+        })
+    }
+
+    /// Release a handle and report whether this close owned the actual
+    /// last-handle path, plus whether it had to drain local dirty state there.
+    pub async fn release_fh_with_outcome(&self, fh: u64) -> VfsResult<ReleaseFhOutcome> {
+        let Some(context) = self.close_handle_for_release(fh) else {
+            return Ok(ReleaseFhOutcome::default());
+        };
+        let ino = context.ino;
 
         let session = self
             .enter_file_session_op(ino, FileSessionOperation::Release)
             .await;
-        let result: VfsResult<ReleaseFhOutcome> = async {
-            if self.release_ignored_entry(ino) {
-                let _ = self.handle_table.take_orphan(ino);
-                return Ok(ReleaseFhOutcome {
-                    closed_last_handle: true,
-                    flushed_local_dirty_state: false,
-                });
-            }
-
-            if self.handle_table.take_orphan(ino) {
-                if self.release_ignored_entry(ino) {
-                    return Ok(ReleaseFhOutcome {
-                        closed_last_handle: true,
-                        flushed_local_dirty_state: false,
-                    });
-                }
-                // Last handle closed on an unlinked file — final cleanup
-                debug!("orphan cleanup: ino={} (last fd closed)", ino);
-
-                self.mark_inode_deleted_for_uploads(ino);
-
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                let meta = self.meta_async.clone();
-                let (removed_ids, total_bytes) =
-                    run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-                        let blocks = match engine.get_file_blocks(ino) {
-                            Ok(blocks) => blocks,
-                            Err(MetaError::InodeNotFound(_)) => Vec::new(),
-                            Err(err) => return Err(err),
-                        };
-                        let total_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
-
-                        let removed_ids = match engine.remove_file_blocks(ino) {
-                            Ok(ids) => ids,
-                            Err(MetaError::InodeNotFound(_)) => Vec::new(),
-                            Err(err) => return Err(err),
-                        };
-                        for &object_id in &removed_ids {
-                            engine.add_pending_deletion(object_id, timestamp)?;
-                        }
-
-                        if total_bytes > 0 {
-                            engine.decr_counter(
-                                studiofs_meta::types::counters::USED_SPACE,
-                                total_bytes,
-                            )?;
-                        }
-
-                        match engine.remove_attr(ino) {
-                            Ok(()) | Err(MetaError::InodeNotFound(_)) => {}
-                            Err(err) => return Err(err),
-                        }
-                        let _ = engine.remove_deferred_delete(ino);
-                        Ok((removed_ids, total_bytes))
-                    })
-                    .await?;
-
-                if !removed_ids.is_empty() {
-                    self.clear_pending_blocks_for_inode(ino);
-                    self.evict_inode_from_caches(ino, &removed_ids).await;
-                }
-                let deferred_local_blocks = self.take_deferred_deleted_local_blocks(ino);
-                if !deferred_local_blocks.is_empty() {
-                    self.clear_pending_blocks_for_inode(ino);
-                    self.evict_inode_from_caches(ino, &deferred_local_blocks)
-                        .await;
-                }
-                debug!(
-                    "orphan cleanup complete: ino={} removed_blocks={} deferred_local_blocks={} freed_bytes={}",
-                    ino,
-                    removed_ids.len(),
-                    deferred_local_blocks.len(),
-                    total_bytes
-                );
-                self.clear_inode_incarnation(ino);
-                self.state.namespace.dirty_attrs.lock().remove(&ino);
-                self.state.namespace.attr_read_cache.lock().remove(ino);
-                self.maybe_clear_deleted_inode_marker(ino);
-                return Ok(ReleaseFhOutcome {
-                    closed_last_handle: true,
-                    flushed_local_dirty_state: false,
-                });
-            }
-
-            let writable_handle = open_file.flags.contains(OpenFlags::WRONLY)
-                || open_file.flags.contains(OpenFlags::RDWR);
-            let has_local_dirty_state = self.inode_has_local_dirty_state(ino);
-            if has_local_dirty_state {
-                self.flush_ordered(ino, LocalSyncPolicy::Opportunistic)
-                    .await?;
-            }
-            if writable_handle || has_local_dirty_state {
-                self.ensure_no_upload_sticky_error(ino)?;
-            }
-            Ok(ReleaseFhOutcome {
-                closed_last_handle: true,
-                flushed_local_dirty_state: has_local_dirty_state,
-            })
-        }
-        .await;
+        let result = self.release_last_handle_with_outcome(context).await;
         drop(session);
         self.maybe_gc_file_session(ino);
         result
@@ -15405,6 +15428,63 @@ mod tests {
                 "the final close should report the fallback local dirty-state drain"
             );
             assert_eq!(vfs.open_count(ino), 0, "all handles should be closed");
+        });
+    }
+
+    #[test]
+    fn test_release_fh_with_outcome_reports_clean_skip_after_explicit_flush() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-clean-skip");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs.create(1, b"release-outcome-clean-skip.txt", 0, 0, 0o644).unwrap();
+            let ino = attr.ino;
+            let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+            vfs.write(ino, 0, b"payload").await.unwrap();
+            vfs.flush_fh(fh).await.unwrap();
+
+            let outcome = vfs.release_fh_with_outcome(fh).await.unwrap();
+            assert!(
+                outcome.closed_last_handle,
+                "the only handle should still be reported as the last-handle close"
+            );
+            assert!(
+                !outcome.flushed_local_dirty_state,
+                "release should report a clean skip after explicit flush already drained local state"
+            );
+            assert_eq!(vfs.open_count(ino), 0, "release should still close the handle");
+        });
+    }
+
+    #[test]
+    fn test_release_fh_with_outcome_orphan_cleanup_does_not_report_flush_barrier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-orphan-cleanup");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"release-outcome-orphan.txt", 0, 0, 0o644)
+                .unwrap();
+            let ino = attr.ino;
+            let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+            vfs.write(ino, 0, b"payload").await.unwrap();
+            vfs.unlink(1, b"release-outcome-orphan.txt").unwrap();
+
+            let outcome = vfs.release_fh_with_outcome(fh).await.unwrap();
+            assert!(
+                outcome.closed_last_handle,
+                "orphan cleanup should still be owned by the last-handle release"
+            );
+            assert!(
+                !outcome.flushed_local_dirty_state,
+                "orphan cleanup should not be reported as a normal release flush barrier"
+            );
+            assert!(
+                vfs.getattr(ino).is_err(),
+                "orphan cleanup should remove the inode"
+            );
         });
     }
 
