@@ -5,6 +5,7 @@
 //! The command validates basic storage connectivity and PostgreSQL availability
 //! before writing local metadata state.
 
+use clap::Args;
 use std::io::Write;
 use std::path::Path;
 use studiofs_data::{DataStore, DataStoreConfig};
@@ -26,6 +27,112 @@ fn get_current_ids() -> (u32, u32) {
 #[cfg(windows)]
 fn get_current_ids() -> (u32, u32) {
     (0, 0)
+}
+
+#[derive(Debug, Args)]
+#[command(about = "Initialize a new filesystem volume")]
+#[command(long_about = "\
+Initialize a new filesystem volume by validating S3 object storage, creating \
+shared PostgreSQL metadata state, and bootstrapping the local metadata cache \
+for the current client.
+
+Path layout is fixed by disk name:
+  • Data objects: <disk-name>/objects/...
+
+`--meta` is required and must point at the PostgreSQL server. StudioFS always \
+stores metadata in database `studiofs`; it will create that database during \
+`init` when the server allows it.
+
+The target S3 bucket is created automatically if it does not exist and the \
+provided credentials allow it.")]
+#[command(after_help = "\
+EXAMPLES:
+  AWS S3 + PostgreSQL:
+    studiofs init prod --endpoint https://s3.amazonaws.com \
+      --bucket my-bucket --access-key AKIA... --secret-key wJal... \
+      --region us-east-1 --meta postgres://user:pass@db:5432
+
+  RustFS (local) + PostgreSQL:
+    studiofs init dev --endpoint http://127.0.0.1:9000 \
+      --bucket test-bucket --access-key studiofs --secret-key studiofs123 \
+      --meta postgres://studiofs:studiofs@127.0.0.1:5432
+
+RUNTIME POLICY:
+  PG batching / sync cadence is configured per client at mount/runtime, not
+  stored in the volume. Use environment variables such as:
+    STUDIOFS_PG_FLUSH_INTERVAL_SECS
+    STUDIOFS_PG_FLUSH_OPS_THRESHOLD
+    STUDIOFS_PG_FLUSH_IDLE_MS
+    STUDIOFS_PG_SYNC_POLL_SECS
+")]
+pub(crate) struct InitArgs {
+    /// Disk name (used in object paths like `<name>/objects`)
+    name: String,
+
+    /// S3 endpoint URL (e.g. <https://s3.amazonaws.com>, <http://127.0.0.1:9000>)
+    #[arg(long)]
+    endpoint: String,
+
+    /// S3 bucket name for file data (created if missing when permissions allow)
+    #[arg(long)]
+    bucket: String,
+
+    /// S3 access key ID
+    #[arg(long)]
+    access_key: String,
+
+    /// S3 secret access key
+    #[arg(long)]
+    secret_key: String,
+
+    /// S3 region (defaults to us-east-1 for local S3-compatible services)
+    #[arg(long, default_value = "")]
+    region: String,
+
+    /// Deprecated option. Metadata is PostgreSQL-only now.
+    #[arg(long, hide = true)]
+    metadata_endpoint: Option<String>,
+
+    /// PostgreSQL server DSN; StudioFS uses database `studiofs`
+    #[arg(long = "meta", required = true)]
+    meta: Option<String>,
+
+    /// Deprecated option. Metadata is PostgreSQL-only now.
+    #[arg(long, hide = true)]
+    metadata_bucket: Option<String>,
+
+    /// Deprecated option. Metadata is PostgreSQL-only now.
+    #[arg(long, hide = true)]
+    metadata_access_key: Option<String>,
+
+    /// Deprecated option. Metadata is PostgreSQL-only now.
+    #[arg(long, hide = true)]
+    metadata_secret_key: Option<String>,
+
+    /// Deprecated option. Metadata is PostgreSQL-only now.
+    #[arg(long, hide = true)]
+    metadata_region: Option<String>,
+}
+
+impl InitArgs {
+    pub(crate) fn dispatch(self) -> anyhow::Result<()> {
+        let meta_dir = super::utils::get_default_meta_dir(&self.name)?;
+        run(
+            &self.name,
+            &self.endpoint,
+            &self.bucket,
+            &self.access_key,
+            &self.secret_key,
+            &self.region,
+            self.meta.as_deref(),
+            self.metadata_endpoint.as_deref(),
+            self.metadata_bucket.as_deref(),
+            self.metadata_access_key.as_deref(),
+            self.metadata_secret_key.as_deref(),
+            self.metadata_region.as_deref(),
+            &meta_dir,
+        )
+    }
 }
 
 /// Ensure a bucket is accessible, creating it if necessary.
@@ -460,4 +567,33 @@ pub fn run(
     println!("Run `studiofs mount {} <mount-point>` to mount.", name);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::error::ErrorKind;
+
+    #[test]
+    fn init_rejects_block_size_flag() {
+        let err = match crate::cli::parse_for_test(&[
+            "init",
+            "vol",
+            "--endpoint",
+            "http://127.0.0.1:9000",
+            "--bucket",
+            "test",
+            "--access-key",
+            "ak",
+            "--secret-key",
+            "sk",
+            "--meta",
+            "postgres://u:p@127.0.0.1:5432",
+            "--block-size",
+            "4MB",
+        ]) {
+            Ok(_) => panic!("expected clap error for removed --block-size"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+    }
 }

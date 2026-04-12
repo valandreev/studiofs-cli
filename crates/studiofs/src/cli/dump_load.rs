@@ -1,6 +1,7 @@
 //! `studiofs dump` / `studiofs load` — PostgreSQL metadata manifest backup/restore.
 
-use std::path::Path;
+use clap::Args;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use studiofs_meta::{MetaError, ensure_studiofs_database, open_meta_engine};
@@ -66,6 +67,44 @@ pub enum DumpLoadError {
 }
 
 type DumpLoadResult<T> = std::result::Result<T, DumpLoadError>;
+
+#[derive(Debug, Args)]
+#[command(about = "Dump metadata manifest from PostgreSQL (source of truth)")]
+pub(crate) struct DumpArgs {
+    /// Disk/volume name
+    name: String,
+
+    /// Output dump path (JSON)
+    #[arg(long = "path-to-dump")]
+    path_to_dump: PathBuf,
+}
+
+impl DumpArgs {
+    pub(crate) fn dispatch(self) -> anyhow::Result<()> {
+        let meta_dir = super::utils::get_default_meta_dir(&self.name)?;
+        dump(&self.name, &meta_dir, &self.path_to_dump)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Args)]
+#[command(about = "Load metadata manifest into PostgreSQL")]
+pub(crate) struct LoadArgs {
+    /// Input dump path (JSON)
+    #[arg(long = "path-to-dump")]
+    path_to_dump: PathBuf,
+
+    /// PostgreSQL address/DSN
+    #[arg(long = "postgresql-adress", alias = "postgresql-address")]
+    postgresql_adress: String,
+}
+
+impl LoadArgs {
+    pub(crate) fn dispatch(self) -> anyhow::Result<()> {
+        load(&self.path_to_dump, &self.postgresql_adress)?;
+        Ok(())
+    }
+}
 
 async fn ensure_pg_schema(client: &tokio_postgres::Client) -> DumpLoadResult<()> {
     client

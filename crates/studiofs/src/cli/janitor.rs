@@ -1,5 +1,6 @@
 //! `studiofs janitor` — remove orphaned data objects not referenced by metadata.
 
+use clap::Args;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -30,6 +31,54 @@ struct JanitorCycleContext<'a> {
     dry_run: bool,
     skip_newer_than_secs: u64,
     max_deletes: u64,
+}
+
+#[derive(Debug, Args)]
+#[command(about = "Scan data objects and remove orphaned ones (Phase 6 prototype)")]
+#[command(after_help = "\
+EXAMPLES:
+  studiofs janitor myvolume --dry-run
+  studiofs janitor myvolume --max-deletes 500 --skip-newer-minutes 15
+  studiofs janitor myvolume --loop --interval-minutes 30
+")]
+pub(crate) struct JanitorArgs {
+    /// Volume name
+    name: String,
+
+    /// Do not delete, only report what would be deleted
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Run continuously with a sleep interval between cycles
+    #[arg(long)]
+    r#loop: bool,
+
+    /// Interval between cycles in loop mode
+    #[arg(long, default_value_t = 30)]
+    interval_minutes: u64,
+
+    /// Skip objects newer than this many minutes
+    #[arg(long, default_value_t = 15)]
+    skip_newer_minutes: u64,
+
+    /// Maximum objects to delete per cycle
+    #[arg(long, default_value_t = 500)]
+    max_deletes: u64,
+}
+
+impl JanitorArgs {
+    pub(crate) fn dispatch(self) -> anyhow::Result<()> {
+        let meta_dir = super::utils::get_default_meta_dir(&self.name)?;
+        run(
+            &self.name,
+            &meta_dir,
+            self.dry_run,
+            self.r#loop,
+            self.interval_minutes,
+            self.skip_newer_minutes,
+            self.max_deletes,
+        )
+    }
 }
 
 fn normalize_prefix(format_info: &studiofs_meta::FormatInfo) -> String {

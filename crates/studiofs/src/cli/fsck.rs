@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
+use clap::Args;
 use studiofs_meta::engine::UndoLogKind;
 use studiofs_meta::{
     FileType, MetaEngine, MetaError, MetaOpenOptions, MetadataBackend, ROOT_INO,
@@ -96,6 +97,30 @@ pub enum FsckError {
 }
 
 type FsckResult<T> = std::result::Result<T, FsckError>;
+
+#[derive(Debug, Args)]
+#[command(about = "Check and optionally repair metadata inconsistencies")]
+#[command(after_help = "\
+EXAMPLES:
+  studiofs fsck myvolume
+  studiofs fsck myvolume --repair
+")]
+pub(crate) struct FsckArgs {
+    /// Volume name
+    name: String,
+
+    /// Repair findings immediately without interactive confirmation
+    #[arg(long)]
+    repair: bool,
+}
+
+impl FsckArgs {
+    pub(crate) fn dispatch(self) -> anyhow::Result<()> {
+        let meta_dir = super::utils::get_default_meta_dir(&self.name)?;
+        run(&self.name, &meta_dir, self.repair)?;
+        Ok(())
+    }
+}
 
 fn scan_namespace(meta: &dyn MetaEngine) -> FsckResult<NamespaceScan> {
     let mut scan = NamespaceScan::default();
@@ -623,5 +648,26 @@ mod tests {
         let post = collect_report(&engine).expect("collect post-repair report");
         assert!(post.orphan_inodes.is_empty());
         assert!(post.nlink_mismatches.is_empty());
+    }
+
+    #[test]
+    fn fsck_parses_defaults() {
+        let cli = crate::cli::parse_for_test(&["fsck", "vol"]).unwrap();
+        match cli.command {
+            crate::cli::Commands::Fsck(FsckArgs { name, repair }) => {
+                assert_eq!(name, "vol");
+                assert!(!repair);
+            }
+            other => panic!("expected Fsck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fsck_parses_repair_flag() {
+        let cli = crate::cli::parse_for_test(&["fsck", "vol", "--repair"]).unwrap();
+        match cli.command {
+            crate::cli::Commands::Fsck(FsckArgs { repair, .. }) => assert!(repair),
+            other => panic!("expected Fsck, got {other:?}"),
+        }
     }
 }

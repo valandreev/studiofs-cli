@@ -3,6 +3,7 @@
 use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
 use crate::cli::cache_layout::describe_cache_layout_state;
 use crate::cli::utils::format_bytes;
+use clap::Args;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -62,6 +63,39 @@ pub enum Verbosity {
 impl Verbosity {
     fn is_verbose(self) -> bool {
         matches!(self, Self::Verbose)
+    }
+}
+
+#[derive(Debug, Args)]
+#[command(about = "Show volume status, PostgreSQL metadata binding, and local counters")]
+#[command(after_help = "\
+EXAMPLES:
+  studiofs status myvolume
+  studiofs status myvolume --verbose
+  studiofs status myvolume --cache-dir D:\\cache\\studiofs
+")]
+pub(crate) struct StatusArgs {
+    /// Volume name
+    name: String,
+
+    /// Override local cache base directory (defaults to `<meta-dir>/cache`)
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+
+    /// Include mounted write-path bottleneck metrics when available
+    #[arg(long)]
+    verbose: bool,
+}
+
+impl StatusArgs {
+    pub(crate) fn dispatch(self) -> anyhow::Result<()> {
+        let meta_dir = super::utils::get_default_meta_dir(&self.name)?;
+        let verbosity = if self.verbose {
+            Verbosity::Verbose
+        } else {
+            Verbosity::Normal
+        };
+        run(&self.name, &meta_dir, self.cache_dir.as_deref(), verbosity)
     }
 }
 
@@ -785,5 +819,41 @@ mod tests {
     fn format_quantile_ms_marks_saturated_values() {
         assert_eq!(format_quantile_ms(5000.0, true), "5000.000ms+ (saturated)");
         assert_eq!(format_quantile_ms(120.5, false), "120.500ms");
+    }
+
+    #[test]
+    fn status_parses_cache_dir() {
+        let cli =
+            crate::cli::parse_for_test(&["status", "vol", "--cache-dir", "D:\\cache\\studiofs"])
+                .unwrap();
+        match cli.command {
+            crate::cli::Commands::Status(StatusArgs {
+                name,
+                cache_dir,
+                verbose,
+            }) => {
+                assert_eq!(name, "vol");
+                assert_eq!(cache_dir.unwrap(), PathBuf::from("D:\\cache\\studiofs"));
+                assert!(!verbose);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn status_parses_verbose_flag() {
+        let cli = crate::cli::parse_for_test(&["status", "vol", "--verbose"]).unwrap();
+        match cli.command {
+            crate::cli::Commands::Status(StatusArgs {
+                name,
+                cache_dir,
+                verbose,
+            }) => {
+                assert_eq!(name, "vol");
+                assert!(cache_dir.is_none());
+                assert!(verbose);
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
     }
 }

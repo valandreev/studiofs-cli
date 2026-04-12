@@ -1,6 +1,7 @@
 //! `studiofs destroy` — permanently delete a volume.
 
 use crate::cli::cache_layout::describe_cache_layout_state;
+use clap::Args;
 use std::io::{self, Write};
 use std::path::Path;
 use studiofs_cache::v3::{CacheBackendDetection, detect_cache_backends};
@@ -46,6 +47,36 @@ pub enum DestroyError {
 }
 
 type DestroyResult<T> = std::result::Result<T, DestroyError>;
+
+#[derive(Debug, Args)]
+#[command(about = "Permanently destroy a volume")]
+#[command(long_about = "\
+Permanently destroy a volume, deleting all data objects from S3, removing the \
+shared PostgreSQL metadata for that volume, and deleting local metadata/cache \
+for this client.
+
+WARNING: This action is irreversible.")]
+pub(crate) struct DestroyArgs {
+    /// Volume name to destroy
+    name: String,
+
+    /// Remove only local cache/config; keep remote metadata and data.
+    #[arg(long)]
+    local: bool,
+}
+
+impl DestroyArgs {
+    pub(crate) fn dispatch(self) -> anyhow::Result<()> {
+        let meta_dir = super::utils::get_default_meta_dir(&self.name)?;
+        let mode = if self.local {
+            DestroyMode::LocalOnly
+        } else {
+            DestroyMode::Full
+        };
+        run(&self.name, &meta_dir, mode)?;
+        Ok(())
+    }
+}
 
 fn describe_destroy_cache_scope(detection: Option<&CacheBackendDetection>) -> &'static str {
     if let Some(detection) = detection {

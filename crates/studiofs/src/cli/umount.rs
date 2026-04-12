@@ -1,6 +1,7 @@
 //! `studiofs umount` — unmount a previously mounted filesystem volume.
 
 use anyhow::Result;
+use clap::Args;
 
 #[cfg(unix)]
 use anyhow::anyhow;
@@ -8,6 +9,24 @@ use anyhow::anyhow;
 type ReadPidFn = fn(&str) -> Result<(u32, String, String)>;
 type RemovePidFn = fn(&str) -> Result<()>;
 type IsRunningFn = fn(u32) -> bool;
+
+#[derive(Debug, Args)]
+#[command(about = "Unmount a previously mounted filesystem volume")]
+#[command(after_help = "\
+EXAMPLES:
+  studiofs umount Z:
+  studiofs umount /mnt/studio
+")]
+pub(crate) struct UmountArgs {
+    /// Mount point to unmount (e.g. Z: on Windows, /mnt/studio on Linux/macOS)
+    mount_point: String,
+}
+
+impl UmountArgs {
+    pub(crate) fn dispatch(self) -> anyhow::Result<()> {
+        run(&self.mount_point)
+    }
+}
 
 fn run_with(
     mount_point: &str,
@@ -207,6 +226,34 @@ mod tests {
             msg.contains("No mount found") || msg.contains("Is it mounted?"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn umount_parses_mount_point() {
+        let cli = crate::cli::parse_for_test(&["umount", "Z:"]).unwrap();
+        match cli.command {
+            crate::cli::Commands::Umount(UmountArgs { mount_point }) => {
+                assert_eq!(mount_point, "Z:");
+            }
+            other => panic!("expected Umount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn umount_unix_path() {
+        let cli = crate::cli::parse_for_test(&["umount", "/mnt/studio"]).unwrap();
+        match cli.command {
+            crate::cli::Commands::Umount(UmountArgs { mount_point }) => {
+                assert_eq!(mount_point, "/mnt/studio");
+            }
+            other => panic!("expected Umount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn umount_requires_mount_point() {
+        let result = crate::cli::parse_for_test(&["umount"]);
+        assert!(result.is_err());
     }
 
     /// If a PID file exists but the process is dead, `umount` should clean it up.

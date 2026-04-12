@@ -2,6 +2,7 @@
 
 use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
 use chrono::Utc;
+use clap::Args;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +28,122 @@ use crate::cli::mount_runtime::{
 
 const WRITE_PATH_OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(1);
 type MountProfileFinish = Box<dyn FnMut()>;
+
+#[derive(Debug, Args)]
+#[command(about = "Mount a filesystem volume as a local drive")]
+#[command(long_about = "\
+Mount a previously initialized volume. On Windows, the mount point is a drive \
+letter (e.g. Z:). On Linux/macOS, it is an existing directory path.
+
+The local client uses its cached metadata database while synchronizing shared \
+state through PostgreSQL.
+
+The process blocks while the filesystem is mounted. Press Ctrl+C to unmount.")]
+#[command(after_help = "\
+EXAMPLES:
+  Basic mount (Windows):
+    studiofs mount myvolume Z:
+
+  Basic mount (Linux/macOS):
+    studiofs mount myvolume /mnt/studio
+
+  Cache 3.0 two-knob mount (location + size):
+    studiofs mount myvolume Z: --cache-dir D:\\cache\\studiofs --cache-size 500GB
+
+  Debug logging:
+    studiofs --log-level debug mount myvolume /mnt/studio
+
+PYROSCOPE PROFILING:
+  studiofs mount myvolume /mnt/studio --profile
+  studiofs mount myvolume /mnt/studio --profile=off
+  STUDIOFS_PROFILE=pyroscope|off
+  STUDIOFS_PYROSCOPE_URL=http://localhost:4040
+  STUDIOFS_PYROSCOPE_APP_NAME=studiofs.mount
+  STUDIOFS_PYROSCOPE_SAMPLE_RATE=100
+  STUDIOFS_PYROSCOPE_TAGS=team=vfx,cache_mode=durable
+
+SIZE FORMATS:
+  --cache-size accepts: KB, MB, GB, TB (e.g. 512MB, 4GB, 1TB)
+
+RUNTIME PG POLICY:
+  PG batching / sync cadence is client-side and can be tuned per mount via:
+    STUDIOFS_PG_FLUSH_INTERVAL_SECS
+    STUDIOFS_PG_FLUSH_OPS_THRESHOLD
+    STUDIOFS_PG_FLUSH_IDLE_MS
+    STUDIOFS_PG_SYNC_POLL_SECS
+
+ACL PRINCIPAL:
+  By default, the mount uses STUDIOFS_PRINCIPAL (or '*' when unset).
+  You can override it per mount with:
+    --principal alice
+")]
+pub(crate) struct MountArgs {
+    /// Volume name (must be initialized first via `studiofs init`)
+    name: String,
+
+    /// Mount point: drive letter on Windows (Z:), directory path on Unix (/mnt/studio)
+    mount_point: Option<String>,
+
+    /// Disk cache directory (defaults to `<meta-dir>/cache`)
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
+
+    /// Maximum disk cache size (e.g. 100GB, 50GB, 1TB)
+    #[arg(long)]
+    cache_size: Option<String>,
+
+    /// Principal identity used for ACL checks in this mount instance.
+    #[arg(long)]
+    principal: Option<String>,
+
+    /// Run in foreground (keep terminal attached, default behavior)
+    #[arg(long, conflicts_with = "detach")]
+    foreground: bool,
+
+    /// Detach and run mount in the background (daemon mode).
+    /// Logs are written to ~/.studiofs/logs/.
+    /// Use `studiofs umount <mount_point>` to stop.
+    #[arg(short = 'd', long, conflicts_with = "foreground")]
+    detach: bool,
+
+    /// Enable or disable Pyroscope profiling for the mount runtime.
+    #[arg(long, num_args = 0..=1, default_missing_value = "pyroscope", value_enum)]
+    profile: Option<super::mount_profile_types::MountProfileMode>,
+
+    /// Mount a historical snapshot id as read-only.
+    #[arg(long)]
+    snapshot_id: Option<String>,
+
+    /// Override the S3 endpoint URL for this mount session.
+    ///
+    /// Useful for mounting via a local IP address (e.g. http://192.168.1.50:9000)
+    /// instead of the public endpoint configured during `studiofs init`.
+    /// This override only applies to the current process and is NOT saved.
+    #[arg(long)]
+    endpoint: Option<String>,
+}
+
+impl MountArgs {
+    pub(crate) fn dispatch(self) -> anyhow::Result<()> {
+        #[cfg(windows)]
+        super::winfsp_bootstrap::ensure_mountmgr_bootstrap()?;
+
+        let meta_dir = super::utils::get_default_meta_dir(&self.name)?;
+        run(
+            &self.name,
+            self.mount_point.as_deref(),
+            &meta_dir,
+            self.cache_dir.as_deref(),
+            self.cache_size.as_deref(),
+            self.principal.as_deref(),
+            self.foreground,
+            self.detach,
+            self.profile,
+            self.snapshot_id.as_deref(),
+            self.endpoint.as_deref(),
+        )
+    }
+}
 
 trait MountOpenMeta: Send + Sync + MetaFormat + MetaReplication {}
 impl<T> MountOpenMeta for T where T: ?Sized + Send + Sync + MetaFormat + MetaReplication {}
@@ -1335,6 +1452,7 @@ mod tests {
     use super::*;
     use crate::cli::settings;
     use crate::cli::utils;
+    use clap::error::ErrorKind;
     use studiofs_meta::engine::MetadataReplicationBacklog;
     use studiofs_meta::{
         MetaFormat, MetaReplication, MetaResult, MetaSnapshots, MetadataSnapshot, ROOT_INO,
@@ -2428,6 +2546,246 @@ mod tests {
         assert!(
             err.to_string().contains("No mount found"),
             "guard should remove stale foreign pid files after accepting them"
+        );
+    }
+
+    #[test]
+    fn mount_short_detach_flag() {
+        let cli = crate::cli::parse_for_test(&["mount", "vol", "Z:", "-d"]).unwrap();
+        match cli.command {
+            crate::cli::Commands::Mount(MountArgs {
+                detach,
+                foreground,
+                name,
+                mount_point,
+                ..
+            }) => {
+                assert!(detach);
+                assert!(!foreground);
+                assert!(!resolve_run_in_foreground(foreground, detach));
+                assert_eq!(name, "vol");
+                assert_eq!(mount_point.as_deref(), Some("Z:"));
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_long_detach_flag() {
+        let cli = crate::cli::parse_for_test(&["mount", "vol", "/mnt/x", "--detach"]).unwrap();
+        match cli.command {
+            crate::cli::Commands::Mount(MountArgs { detach, .. }) => assert!(detach),
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_no_detach_by_default() {
+        let cli = crate::cli::parse_for_test(&["mount", "vol", "Z:"]).unwrap();
+        match cli.command {
+            crate::cli::Commands::Mount(MountArgs {
+                detach, foreground, ..
+            }) => {
+                assert!(!detach);
+                assert!(!foreground);
+                assert!(resolve_run_in_foreground(foreground, detach));
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_foreground_and_detach_together() {
+        let err = match crate::cli::parse_for_test(&["mount", "vol", "Z:", "--foreground", "-d"]) {
+            Ok(_) => panic!("expected clap conflict error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+        let rendered = err.to_string();
+        assert!(rendered.contains("--foreground"));
+        assert!(rendered.contains("--detach") || rendered.contains("-d"));
+    }
+
+    #[test]
+    fn mount_with_options_and_detach() {
+        let cli =
+            crate::cli::parse_for_test(&["mount", "vol", "Z:", "--cache-size", "200GB", "-d"])
+                .unwrap();
+        match cli.command {
+            crate::cli::Commands::Mount(MountArgs {
+                detach, cache_size, ..
+            }) => {
+                assert!(detach);
+                assert_eq!(cache_size.unwrap(), "200GB");
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_parses_startup_contract_flags_together() {
+        let cli = crate::cli::parse_for_test(&[
+            "mount",
+            "vol",
+            "/mnt/studio",
+            "--cache-dir",
+            "/tmp/studio-cache",
+            "--cache-size",
+            "200GB",
+            "--principal",
+            "alice",
+            "--endpoint",
+            "http://127.0.0.1:9000",
+            "--foreground",
+        ])
+        .unwrap();
+        match cli.command {
+            crate::cli::Commands::Mount(MountArgs {
+                name,
+                mount_point,
+                cache_dir,
+                cache_size,
+                principal,
+                foreground,
+                detach,
+                endpoint,
+                ..
+            }) => {
+                assert_eq!(name, "vol");
+                assert_eq!(mount_point.as_deref(), Some("/mnt/studio"));
+                assert_eq!(cache_dir, Some(PathBuf::from("/tmp/studio-cache")));
+                assert_eq!(cache_size.as_deref(), Some("200GB"));
+                assert_eq!(principal.as_deref(), Some("alice"));
+                assert_eq!(endpoint.as_deref(), Some("http://127.0.0.1:9000"));
+                assert!(foreground);
+                assert!(!detach);
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_block_cache_alias_is_rejected() {
+        let err = match crate::cli::parse_for_test(&[
+            "mount",
+            "vol",
+            "Z:",
+            "--block-cache",
+            "raw-file",
+        ]) {
+            Ok(_) => panic!("expected alias to be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        assert!(err.to_string().contains("--block-cache"));
+    }
+
+    #[test]
+    fn mount_block_backend_is_rejected() {
+        let err = match crate::cli::parse_for_test(&[
+            "mount",
+            "vol",
+            "Z:",
+            "--block-backend",
+            "raw-file",
+        ]) {
+            Ok(_) => panic!("expected unknown argument error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        assert!(err.to_string().contains("--block-backend"));
+    }
+
+    #[test]
+    fn mount_cache3_flag_is_rejected() {
+        let err = match crate::cli::parse_for_test(&["mount", "vol", "Z:", "--cache3"]) {
+            Ok(_) => panic!("expected unknown argument error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        assert!(err.to_string().contains("--cache3"));
+    }
+
+    #[test]
+    fn mount_parses_profile_shorthand() {
+        let cli = crate::cli::parse_for_test(&["mount", "vol", "Z:", "--profile"]).unwrap();
+        match cli.command {
+            crate::cli::Commands::Mount(MountArgs { profile, .. }) => {
+                assert!(matches!(
+                    profile,
+                    Some(crate::cli::mount_profile_types::MountProfileMode::Pyroscope)
+                ));
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_parses_profile_off() {
+        let cli = crate::cli::parse_for_test(&["mount", "vol", "Z:", "--profile=off"]).unwrap();
+        match cli.command {
+            crate::cli::Commands::Mount(MountArgs { profile, .. }) => {
+                assert!(matches!(
+                    profile,
+                    Some(crate::cli::mount_profile_types::MountProfileMode::Off)
+                ));
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_principal_option_parses() {
+        let cli =
+            crate::cli::parse_for_test(&["mount", "vol", "Z:", "--principal", "alice"]).unwrap();
+        match cli.command {
+            crate::cli::Commands::Mount(MountArgs { principal, .. }) => {
+                assert_eq!(principal.as_deref(), Some("alice"));
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_endpoint_override_parses() {
+        let cli = crate::cli::parse_for_test(&[
+            "mount",
+            "vol",
+            "Z:",
+            "--endpoint",
+            "http://192.168.1.50:9000",
+        ])
+        .unwrap();
+        match cli.command {
+            crate::cli::Commands::Mount(MountArgs { endpoint, .. }) => {
+                assert_eq!(endpoint.as_deref(), Some("http://192.168.1.50:9000"));
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_endpoint_default_is_none() {
+        let cli = crate::cli::parse_for_test(&["mount", "vol", "Z:"]).unwrap();
+        match cli.command {
+            crate::cli::Commands::Mount(MountArgs { endpoint, .. }) => {
+                assert_eq!(endpoint, None);
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_subcommand_has_no_direct_io_flag() {
+        let err = crate::cli::parse_for_test(&["mount", "vol", "Z:", "--direct-io"]);
+        assert!(
+            err.is_err(),
+            "mount --direct-io must be rejected: direct-I/O mode has been removed (SFS-121)"
+        );
+        let err = crate::cli::parse_for_test(&["mount", "vol", "Z:", "--no-buffering"]);
+        assert!(
+            err.is_err(),
+            "mount --no-buffering must be rejected: direct-I/O mode has been removed (SFS-121)"
         );
     }
 }

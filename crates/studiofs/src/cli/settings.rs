@@ -26,6 +26,12 @@ pub struct StudioFsConfig {
 }
 
 #[derive(Debug, Args, Default)]
+#[command(about = "Manage defaults for `studiofs mount`.")]
+#[command(after_help = "\
+Examples:
+  Persist default mount + cache settings for quick mount commands:
+    studiofs settings --mount-point /mnt/studio
+    studiofs settings --cache-dir ~/.cache/studiofs --cache-size 1TB")]
 pub struct SettingsArgs {
     /// Default mount point used by `studiofs mount` when omitted.
     #[arg(long)]
@@ -38,6 +44,12 @@ pub struct SettingsArgs {
     /// Default max disk cache size used by `studiofs mount` when omitted.
     #[arg(long)]
     pub cache_size: Option<String>,
+}
+
+impl SettingsArgs {
+    pub(crate) fn dispatch(self) -> anyhow::Result<()> {
+        run(self)
+    }
 }
 
 fn config_file_path() -> anyhow::Result<PathBuf> {
@@ -250,6 +262,7 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::error::ErrorKind;
 
     fn config_with_mount_defaults() -> StudioFsConfig {
         StudioFsConfig {
@@ -370,5 +383,61 @@ mod tests {
         let err = resolve_mount_runtime_settings(&config, Some(r"C:\mounts\studiofs"), None, None)
             .expect_err("windows mount should reject directory mount points");
         assert!(err.to_string().contains("drive letter mount"));
+    }
+
+    #[test]
+    fn settings_parses_mount_point() {
+        let cli =
+            crate::cli::parse_for_test(&["settings", "--mount-point", "/mnt/studio"]).unwrap();
+        match cli.command {
+            crate::cli::Commands::Settings(SettingsArgs { mount_point, .. }) => {
+                assert_eq!(mount_point.unwrap(), "/mnt/studio");
+            }
+            other => panic!("expected Settings, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_parses_cache_options() {
+        let cli = crate::cli::parse_for_test(&[
+            "settings",
+            "--cache-dir",
+            "/tmp/studio-cache",
+            "--cache-size",
+            "100GB",
+        ])
+        .unwrap();
+        match cli.command {
+            crate::cli::Commands::Settings(SettingsArgs {
+                cache_dir,
+                cache_size,
+                ..
+            }) => {
+                assert_eq!(cache_dir.unwrap(), PathBuf::from("/tmp/studio-cache"));
+                assert_eq!(cache_size.unwrap(), "100GB");
+            }
+            other => panic!("expected Settings, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_rejects_cache_safety_mode_flag() {
+        let err = match crate::cli::parse_for_test(&["settings", "--cache-safety-mode", "durable"])
+        {
+            Ok(_) => panic!("expected unknown argument for removed cache-safety-mode flag"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        assert!(err.to_string().contains("--cache-safety-mode"));
+    }
+
+    #[test]
+    fn settings_rejects_slab_flush_interval_flag() {
+        let err = match crate::cli::parse_for_test(&["settings", "--slab-flush-interval", "100"]) {
+            Ok(_) => panic!("expected unknown argument for removed slab-flush-interval flag"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        assert!(err.to_string().contains("--slab-flush-interval"));
     }
 }

@@ -1,5 +1,6 @@
 //! `studiofs discover` — attach local metadata DB to an existing PG volume.
 
+use clap::Args;
 use std::path::Path;
 use studiofs_meta::{
     FormatInfo, MetaFormat, RedbMetaEngine, ensure_studiofs_database, redb_engine::RedbSnapshot,
@@ -27,6 +28,40 @@ pub enum DiscoveryError {
 }
 
 pub type DiscoveryResult<T> = std::result::Result<T, DiscoveryError>;
+
+#[derive(Debug, Args)]
+#[command(
+    about = "Discover an existing PostgreSQL-backed volume and create local metadata for this client"
+)]
+#[command(long_about = "\
+Download the latest PostgreSQL checkpoint for an existing shared volume and \
+create the local metadata cache for this client.
+
+Use this on additional machines or user profiles after the volume was created \
+with `studiofs init`. Runtime convergence after discovery continues through \
+PostgreSQL delta batches.")]
+#[command(after_help = "\
+EXAMPLES:
+  Discover a volume from PostgreSQL:
+    studiofs discover myvolume \
+      --meta postgres://studiofs:studiofs@127.0.0.1:5432
+")]
+pub(crate) struct DiscoverArgs {
+    /// Volume name to discover
+    name: String,
+
+    /// PostgreSQL server DSN; StudioFS uses database `studiofs`
+    #[arg(long = "meta")]
+    meta: String,
+}
+
+impl DiscoverArgs {
+    pub(crate) fn dispatch(self) -> anyhow::Result<()> {
+        let meta_dir = super::utils::get_default_meta_dir(&self.name)?;
+        run(&self.name, &self.meta, &meta_dir)?;
+        Ok(())
+    }
+}
 
 struct DiscoveredState {
     volume_id: i64,
