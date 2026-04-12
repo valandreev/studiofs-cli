@@ -1,0 +1,1157 @@
+impl RedbMetaEngine {
+    fn lookup_in_opened_dentry_table<T>(
+        table: &T,
+        parent: Ino,
+        name: &[u8],
+    ) -> MetaResult<Option<DirEntryValue>>
+    where
+        T: ReadableTable<&'static [u8], &'static [u8]>,
+    {
+        let key = encode_dentry_key(parent, name);
+
+        if let Ok(Some(entry)) = table.get(key.as_slice()) {
+            return decode(entry.value()).map(Some);
+        }
+
+        let name_lower = String::from_utf8_lossy(name).to_lowercase();
+        let prefix = dentry_prefix(parent);
+        let mut range_end = prefix.to_vec();
+        *range_end.last_mut().unwrap() += 1;
+
+        let iter = table
+            .range(prefix.as_slice()..range_end.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        for result in iter {
+            let (k, v) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let key_bytes = k.value();
+            let (decoded_parent, stored_name) = decode_dentry_key(key_bytes);
+            if decoded_parent != parent {
+                break;
+            }
+            let stored_name_lower = String::from_utf8_lossy(stored_name).to_lowercase();
+            if stored_name_lower == name_lower {
+                return decode(v.value()).map(Some);
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn readdir_from_opened_dentry_table<T>(table: &T, parent: Ino) -> MetaResult<Vec<DirEntry>>
+    where
+        T: ReadableTable<&'static [u8], &'static [u8]>,
+    {
+        let prefix = dentry_prefix(parent);
+        let mut entries = Vec::new();
+        let range_start = prefix.as_slice();
+        let mut range_end = prefix.to_vec();
+        *range_end.last_mut().unwrap() += 1;
+
+        let iter = table
+            .range(range_start..range_end.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        for result in iter {
+            let (key, value) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let key_bytes = key.value();
+            let (decoded_parent, name) = decode_dentry_key(key_bytes);
+            if decoded_parent != parent {
+                break;
+            }
+            let entry_val: DirEntryValue = decode(value.value())?;
+            entries.push(DirEntry {
+                name: name.to_vec(),
+                ino: entry_val.ino,
+                kind: entry_val.kind,
+            });
+        }
+
+        Ok(entries)
+    }
+
+    fn collect_overlay_dentries_from_tables<TCurrent, TBase, TTombstones>(
+        current: &TCurrent,
+        base: &TBase,
+        tombstones: &TTombstones,
+    ) -> MetaResult<HashSet<Vec<u8>>>
+    where
+        TCurrent: ReadableTable<&'static [u8], &'static [u8]>,
+        TBase: ReadableTable<&'static [u8], &'static [u8]>,
+        TTombstones: ReadableTable<&'static [u8], u8>,
+    {
+        let mut overlay = HashSet::new();
+
+        for row in current.iter().map_err(|e| MetaError::Storage(e.to_string()))? {
+            let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let key_bytes = key.value().to_vec();
+            match base
+                .get(key_bytes.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(base_value) if base_value.value() == value.value() => {}
+                _ => {
+                    overlay.insert(key_bytes);
+                }
+            }
+        }
+
+        for row in tombstones
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            overlay.insert(key.value().to_vec());
+        }
+
+        Ok(overlay)
+    }
+
+    fn lookup_merged_from_opened_tables<TBase, TCurrent, TTombstones>(
+        base: &TBase,
+        current: &TCurrent,
+        tombstones: &TTombstones,
+        parent: Ino,
+        name: &[u8],
+        overlay_dentries: &HashSet<Vec<u8>>,
+    ) -> MetaResult<Option<DirEntryValue>>
+    where
+        TBase: ReadableTable<&'static [u8], &'static [u8]>,
+        TCurrent: ReadableTable<&'static [u8], &'static [u8]>,
+        TTombstones: ReadableTable<&'static [u8], u8>,
+    {
+        let key = encode_dentry_key(parent, name);
+        if tombstones
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .is_some()
+        {
+            return Ok(None);
+        }
+
+        if overlay_dentries.contains(&key) {
+            return Self::lookup_in_opened_dentry_table(current, parent, name);
+        }
+
+        if let Some(entry) = Self::lookup_in_opened_dentry_table(base, parent, name)? {
+            return Ok(Some(entry));
+        }
+
+        Self::lookup_in_opened_dentry_table(current, parent, name)
+    }
+
+    fn readdir_merged_from_opened_tables<TBase, TCurrent, TTombstones>(
+        base: &TBase,
+        current: &TCurrent,
+        tombstones: &TTombstones,
+        parent: Ino,
+        overlay_dentries: &HashSet<Vec<u8>>,
+    ) -> MetaResult<Vec<DirEntry>>
+    where
+        TBase: ReadableTable<&'static [u8], &'static [u8]>,
+        TCurrent: ReadableTable<&'static [u8], &'static [u8]>,
+        TTombstones: ReadableTable<&'static [u8], u8>,
+    {
+        let mut merged = std::collections::BTreeMap::<Vec<u8>, DirEntry>::new();
+        for entry in Self::readdir_from_opened_dentry_table(base, parent)? {
+            merged.insert(entry.name.clone(), entry);
+        }
+
+        let prefix = dentry_prefix(parent);
+        let mut range_end = prefix.to_vec();
+        *range_end.last_mut().unwrap() += 1;
+        for row in tombstones
+            .range(prefix.as_slice()..range_end.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let (decoded_parent, name) = decode_dentry_key(key.value());
+            if decoded_parent != parent {
+                break;
+            }
+            merged.remove(name);
+        }
+
+        for entry in Self::readdir_from_opened_dentry_table(current, parent)? {
+            let key = encode_dentry_key(parent, &entry.name);
+            if overlay_dentries.contains(&key) {
+                merged.insert(entry.name.clone(), entry);
+            }
+        }
+
+        let base_names: std::collections::HashSet<Vec<u8>> =
+            Self::readdir_from_opened_dentry_table(base, parent)?
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+        for key in overlay_dentries {
+            let (overlay_parent, overlay_name) = decode_dentry_key(key);
+            if overlay_parent != parent {
+                continue;
+            }
+            if !base_names.contains(overlay_name)
+                && let Some(entry) =
+                    Self::lookup_in_opened_dentry_table(current, parent, overlay_name)?
+            {
+                merged.insert(
+                    overlay_name.to_vec(),
+                    DirEntry {
+                        name: overlay_name.to_vec(),
+                        ino: entry.ino,
+                        kind: entry.kind,
+                    },
+                );
+            }
+            if base_names.contains(overlay_name)
+                && Self::lookup_in_opened_dentry_table(current, parent, overlay_name)?.is_none()
+            {
+                merged.remove(overlay_name);
+            }
+        }
+
+        Ok(merged.into_values().collect())
+    }
+
+    fn get_attr_from_opened_table<T>(table: &T, ino: Ino) -> MetaResult<Option<InodeAttr>>
+    where
+        T: ReadableTable<u64, &'static [u8]>,
+    {
+        table
+            .get(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|entry| decode(entry.value()))
+            .transpose()
+    }
+
+    fn lookup_in_write_table(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<&[u8], &[u8]>,
+        parent: Ino,
+        name: &[u8],
+    ) -> MetaResult<Option<DirEntryValue>> {
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Self::lookup_in_opened_dentry_table(&table, parent, name)
+    }
+
+    fn get_attr_from_table(
+        txn: &redb::ReadTransaction,
+        table_def: TableDefinition<u64, &[u8]>,
+        ino: Ino,
+    ) -> MetaResult<Option<InodeAttr>> {
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Self::get_attr_from_opened_table(&table, ino)
+    }
+
+    fn get_attr_from_write_table(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<u64, &[u8]>,
+        ino: Ino,
+    ) -> MetaResult<Option<InodeAttr>> {
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Self::get_attr_from_opened_table(&table, ino)
+    }
+
+    fn append_event_in_txn(
+        txn: &redb::WriteTransaction,
+        event: &crate::events::MetaEvent,
+    ) -> MetaResult<()> {
+        let mut counters = txn
+            .open_table(COUNTERS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        // Get the next sequence ID for the event log
+        let seq_id = match counters
+            .get("nextEventSeq")
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            Some(v) => v.value(),
+            None => 1,
+        };
+        counters
+            .insert("nextEventSeq", seq_id + 1)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        // Encode and insert the event
+        let mut events = txn
+            .open_table(EVENT_LOG_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let data = encode(event)?;
+        events
+            .insert(seq_id, data.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        Ok(())
+    }
+
+    fn remove_all_committed_blocks_in_txn(
+        committed: &mut redb::Table<'_, &[u8], &[u8]>,
+        ino: Ino,
+    ) -> MetaResult<Vec<u64>> {
+        let prefix = file_block_prefix(ino);
+        let mut range_end = prefix.to_vec();
+        *range_end.last_mut().unwrap() += 1;
+        let rows: Vec<(Vec<u8>, u64)> = {
+            let iter = committed
+                .range(prefix.as_slice()..range_end.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            iter.filter_map(|r| r.ok())
+                .filter_map(|(k, v)| {
+                    let block: BlockRef = decode(v.value()).ok()?;
+                    Some((k.value().to_vec(), block.object_id))
+                })
+                .collect()
+        };
+        for (key, _) in &rows {
+            let _ = committed.remove(key.as_slice());
+        }
+        Ok(rows.into_iter().map(|(_, object_id)| object_id).collect())
+    }
+
+    fn remove_all_file_blocks_in_txn(
+        blocks: &mut redb::Table<'_, &[u8], &[u8]>,
+        ino: Ino,
+    ) -> MetaResult<Vec<u64>> {
+        let prefix = file_block_prefix(ino);
+        let mut range_end = prefix.to_vec();
+        *range_end.last_mut().unwrap() += 1;
+        let rows: Vec<(Vec<u8>, u64)> = {
+            let iter = blocks
+                .range(prefix.as_slice()..range_end.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            iter.filter_map(|r| r.ok())
+                .filter_map(|(k, v)| {
+                    let block: BlockRef = decode(v.value()).ok()?;
+                    Some((k.value().to_vec(), block.object_id))
+                })
+                .collect()
+        };
+        for (key, _) in &rows {
+            let _ = blocks.remove(key.as_slice());
+        }
+        Ok(rows.into_iter().map(|(_, object_id)| object_id).collect())
+    }
+
+
+    fn has_u64_marker_in_write(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<u64, u8>,
+        key: u64,
+    ) -> MetaResult<bool> {
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(table
+            .get(key)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .is_some())
+    }
+
+    fn lookup_merged_in_write_txn(
+        txn: &redb::WriteTransaction,
+        parent: Ino,
+        name: &[u8],
+    ) -> MetaResult<Option<DirEntryValue>> {
+        let current = txn
+            .open_table(DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base = txn
+            .open_table(BASE_DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let tombstones = txn
+            .open_table(DENTRY_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let overlay_dentries = Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
+
+        Self::lookup_merged_from_opened_tables(
+            &base,
+            &current,
+            &tombstones,
+            parent,
+            name,
+            &overlay_dentries,
+        )
+    }
+
+    fn get_attr_merged_in_write_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<InodeAttr> {
+        if Self::has_u64_marker_in_write(txn, INODE_TOMBSTONES_TABLE, ino)? {
+            return Err(MetaError::InodeNotFound(ino));
+        }
+        if let Some(attr) = Self::get_attr_from_write_table(txn, INODES_TABLE, ino)? {
+            return Ok(attr);
+        }
+        if let Some(attr) = Self::get_attr_from_write_table(txn, BASE_INODES_TABLE, ino)? {
+            return Ok(attr);
+        }
+        Err(MetaError::InodeNotFound(ino))
+    }
+
+    fn readdir_merged_in_write_txn(
+        txn: &redb::WriteTransaction,
+        parent: Ino,
+    ) -> MetaResult<Vec<DirEntry>> {
+        let current = txn
+            .open_table(DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base = txn
+            .open_table(BASE_DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let tombstones = txn
+            .open_table(DENTRY_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let overlay_dentries = Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
+
+        Self::readdir_merged_from_opened_tables(
+            &base,
+            &current,
+            &tombstones,
+            parent,
+            &overlay_dentries,
+        )
+    }
+
+    fn get_bytes_from_table_u64(
+        txn: &redb::ReadTransaction,
+        table_def: TableDefinition<u64, &[u8]>,
+        key: u64,
+    ) -> MetaResult<Option<Vec<u8>>> {
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(table
+            .get(key)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|entry| entry.value().to_vec()))
+    }
+
+    fn get_bytes_from_table_slice(
+        txn: &redb::ReadTransaction,
+        table_def: TableDefinition<&[u8], &[u8]>,
+        key: &[u8],
+    ) -> MetaResult<Option<Vec<u8>>> {
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(table
+            .get(key)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|entry| entry.value().to_vec()))
+    }
+
+    fn has_u64_marker(
+        txn: &redb::ReadTransaction,
+        table_def: TableDefinition<u64, u8>,
+        key: u64,
+    ) -> MetaResult<bool> {
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(table
+            .get(key)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .is_some())
+    }
+
+    fn has_slice_marker(
+        txn: &redb::ReadTransaction,
+        table_def: TableDefinition<&[u8], u8>,
+        key: &[u8],
+    ) -> MetaResult<bool> {
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(table
+            .get(key)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .is_some())
+    }
+
+    fn keys_for_inode_in_table(
+        txn: &redb::ReadTransaction,
+        table_def: TableDefinition<&[u8], &[u8]>,
+        ino: Ino,
+    ) -> MetaResult<Vec<Vec<u8>>> {
+        let prefix = xattr_prefix(ino);
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let range = table
+            .range(prefix.as_ref()..)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut keys = Vec::new();
+        for item in range {
+            let (k, _v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let key_bytes = k.value();
+            if !key_bytes.starts_with(&prefix) {
+                break;
+            }
+            keys.push(key_bytes.to_vec());
+        }
+        Ok(keys)
+    }
+
+    fn keys_for_inode_in_write_table(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<&[u8], &[u8]>,
+        ino: Ino,
+    ) -> MetaResult<Vec<Vec<u8>>> {
+        let prefix = xattr_prefix(ino);
+        let table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let range = table
+            .range(prefix.as_ref()..)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut keys = Vec::new();
+        for item in range {
+            let (k, _v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let key_bytes = k.value();
+            if !key_bytes.starts_with(&prefix) {
+                break;
+            }
+            keys.push(key_bytes.to_vec());
+        }
+        Ok(keys)
+    }
+
+    fn merged_symlink_target(
+        &self,
+        txn: &redb::ReadTransaction,
+        ino: Ino,
+    ) -> MetaResult<Option<Vec<u8>>> {
+        if Self::has_u64_marker(txn, SYMLINK_TOMBSTONES_TABLE, ino)? {
+            return Ok(None);
+        }
+        if let Some(target) = Self::get_bytes_from_table_u64(txn, SYMLINKS_TABLE, ino)? {
+            return Ok(Some(target));
+        }
+        Self::get_bytes_from_table_u64(txn, BASE_SYMLINKS_TABLE, ino)
+    }
+
+    fn merged_xattr_value(
+        &self,
+        txn: &redb::ReadTransaction,
+        ino: Ino,
+        name: &[u8],
+    ) -> MetaResult<Option<Vec<u8>>> {
+        let key = encode_xattr_key(ino, name);
+        if Self::has_slice_marker(txn, XATTR_TOMBSTONES_TABLE, key.as_slice())? {
+            return Ok(None);
+        }
+        if let Some(value) = Self::get_bytes_from_table_slice(txn, XATTRS_TABLE, key.as_slice())? {
+            return Ok(Some(decode_xattr_value_from_storage_owned(name, value)));
+        }
+        Ok(
+            Self::get_bytes_from_table_slice(txn, BASE_XATTRS_TABLE, key.as_slice())?
+                .map(|value| decode_xattr_value_from_storage_owned(name, value)),
+        )
+    }
+
+    fn set_xattr_value_in_table_in_txn(
+        txn: &redb::WriteTransaction,
+        table: TableDefinition<&[u8], &[u8]>,
+        ino: Ino,
+        name: &[u8],
+        value: &[u8],
+    ) -> MetaResult<()> {
+        let key = encode_xattr_key(ino, name);
+        let stored = encode_xattr_value_for_storage(name, value);
+        let mut xattrs = txn
+            .open_table(table)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        xattrs
+            .insert(key.as_slice(), stored.as_ref())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn set_inode_overlay_in_txn(txn: &redb::WriteTransaction, attr: &InodeAttr) -> MetaResult<()> {
+        let mut tombstones = txn
+            .open_table(INODE_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = tombstones.remove(attr.ino);
+        drop(tombstones);
+
+        let data = encode(attr)?;
+        let mut inodes = txn
+            .open_table(INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        inodes
+            .insert(attr.ino, data.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_inode_overlay_in_txn(txn: &redb::WriteTransaction, ino: Ino) -> MetaResult<()> {
+        let mut inodes = txn
+            .open_table(INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = inodes.remove(ino);
+        drop(inodes);
+
+        let has_base = txn
+            .open_table(BASE_INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .get(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .is_some();
+
+        let mut tombstones = txn
+            .open_table(INODE_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        if has_base {
+            tombstones
+                .insert(ino, 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        } else {
+            let _ = tombstones.remove(ino);
+        }
+        Ok(())
+    }
+
+    fn set_dentry_overlay_in_txn(
+        txn: &redb::WriteTransaction,
+        parent: Ino,
+        name: &[u8],
+        entry: &DirEntryValue,
+    ) -> MetaResult<()> {
+        let key = encode_dentry_key(parent, name);
+        let mut tombstones = txn
+            .open_table(DENTRY_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = tombstones.remove(key.as_slice());
+        drop(tombstones);
+
+        let data = encode(entry)?;
+        let mut dentries = txn
+            .open_table(DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        dentries
+            .insert(key.as_slice(), data.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_dentry_overlay_in_txn(
+        txn: &redb::WriteTransaction,
+        parent: Ino,
+        name: &[u8],
+    ) -> MetaResult<()> {
+        let key = encode_dentry_key(parent, name);
+        let mut dentries = txn
+            .open_table(DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = dentries.remove(key.as_slice());
+        drop(dentries);
+
+        let has_base = txn
+            .open_table(BASE_DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .is_some();
+
+        let mut tombstones = txn
+            .open_table(DENTRY_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        if has_base {
+            tombstones
+                .insert(key.as_slice(), 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        } else {
+            let _ = tombstones.remove(key.as_slice());
+        }
+        Ok(())
+    }
+
+    fn set_inode_mirror_in_txn(txn: &redb::WriteTransaction, attr: &InodeAttr) -> MetaResult<()> {
+        let mut tombstones = txn
+            .open_table(INODE_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = tombstones.remove(attr.ino);
+        drop(tombstones);
+
+        let data = encode(attr)?;
+        let mut inodes = txn
+            .open_table(INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        inodes
+            .insert(attr.ino, data.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_inode_mirror_in_txn(txn: &redb::WriteTransaction, ino: Ino) -> MetaResult<()> {
+        let mut inodes = txn
+            .open_table(INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = inodes.remove(ino);
+        drop(inodes);
+
+        let mut tombstones = txn
+            .open_table(INODE_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = tombstones.remove(ino);
+        Ok(())
+    }
+
+    fn set_dentry_mirror_in_txn(
+        txn: &redb::WriteTransaction,
+        parent: Ino,
+        name: &[u8],
+        entry: &DirEntryValue,
+    ) -> MetaResult<()> {
+        let key = encode_dentry_key(parent, name);
+        let mut tombstones = txn
+            .open_table(DENTRY_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = tombstones.remove(key.as_slice());
+        drop(tombstones);
+
+        let data = encode(entry)?;
+        let mut dentries = txn
+            .open_table(DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        dentries
+            .insert(key.as_slice(), data.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_dentry_mirror_in_txn(
+        txn: &redb::WriteTransaction,
+        parent: Ino,
+        name: &[u8],
+    ) -> MetaResult<()> {
+        let key = encode_dentry_key(parent, name);
+        let mut dentries = txn
+            .open_table(DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = dentries.remove(key.as_slice());
+        drop(dentries);
+
+        let mut tombstones = txn
+            .open_table(DENTRY_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = tombstones.remove(key.as_slice());
+        Ok(())
+    }
+
+    fn set_symlink_mirror_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+        target: &[u8],
+    ) -> MetaResult<()> {
+        let mut tombstones = txn
+            .open_table(SYMLINK_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = tombstones.remove(ino);
+        drop(tombstones);
+
+        let mut symlinks = txn
+            .open_table(SYMLINKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        symlinks
+            .insert(ino, target)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_symlink_mirror_in_txn(txn: &redb::WriteTransaction, ino: Ino) -> MetaResult<()> {
+        let mut symlinks = txn
+            .open_table(SYMLINKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = symlinks.remove(ino);
+        drop(symlinks);
+
+        let mut tombstones = txn
+            .open_table(SYMLINK_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = tombstones.remove(ino);
+        Ok(())
+    }
+
+    fn set_xattr_mirror_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+        name: &[u8],
+        value: &[u8],
+    ) -> MetaResult<()> {
+        let key = encode_xattr_key(ino, name);
+        let mut tombstones = txn
+            .open_table(XATTR_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = tombstones.remove(key.as_slice());
+        drop(tombstones);
+
+        Self::set_xattr_value_in_table_in_txn(txn, XATTRS_TABLE, ino, name, value)?;
+        Ok(())
+    }
+
+    fn remove_xattr_mirror_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+        name: &[u8],
+    ) -> MetaResult<()> {
+        let key = encode_xattr_key(ino, name);
+        let mut xattrs = txn
+            .open_table(XATTRS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = xattrs.remove(key.as_slice());
+        drop(xattrs);
+
+        let mut tombstones = txn
+            .open_table(XATTR_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = tombstones.remove(key.as_slice());
+        Ok(())
+    }
+
+    fn set_symlink_overlay_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+        target: &[u8],
+    ) -> MetaResult<()> {
+        let mut tombstones = txn
+            .open_table(SYMLINK_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = tombstones.remove(ino);
+        drop(tombstones);
+
+        let mut symlinks = txn
+            .open_table(SYMLINKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        symlinks
+            .insert(ino, target)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_symlink_overlay_in_txn(txn: &redb::WriteTransaction, ino: Ino) -> MetaResult<()> {
+        let mut symlinks = txn
+            .open_table(SYMLINKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = symlinks.remove(ino);
+        drop(symlinks);
+
+        let has_base = txn
+            .open_table(BASE_SYMLINKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .get(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .is_some();
+
+        let mut tombstones = txn
+            .open_table(SYMLINK_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        if has_base {
+            tombstones
+                .insert(ino, 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        } else {
+            let _ = tombstones.remove(ino);
+        }
+        Ok(())
+    }
+
+    fn set_xattr_overlay_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+        name: &[u8],
+        value: &[u8],
+    ) -> MetaResult<()> {
+        let key = encode_xattr_key(ino, name);
+        let mut tombstones = txn
+            .open_table(XATTR_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = tombstones.remove(key.as_slice());
+        drop(tombstones);
+
+        Self::set_xattr_value_in_table_in_txn(txn, XATTRS_TABLE, ino, name, value)?;
+        Ok(())
+    }
+
+    fn remove_xattr_overlay_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+        name: &[u8],
+    ) -> MetaResult<()> {
+        let key = encode_xattr_key(ino, name);
+        let mut xattrs = txn
+            .open_table(XATTRS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = xattrs.remove(key.as_slice());
+        drop(xattrs);
+
+        let has_base = txn
+            .open_table(BASE_XATTRS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .get(key.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .is_some();
+
+        let mut tombstones = txn
+            .open_table(XATTR_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        if has_base {
+            tombstones
+                .insert(key.as_slice(), 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        } else {
+            let _ = tombstones.remove(key.as_slice());
+        }
+        Ok(())
+    }
+
+
+    fn next_undo_op_id_in_txn(txn: &redb::WriteTransaction) -> MetaResult<u64> {
+        let mut counters = txn
+            .open_table(COUNTERS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let current = match counters
+            .get(NEXT_UNDO_OP_ID_COUNTER)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            Some(v) => v.value(),
+            None => 1,
+        };
+        let next = current.saturating_add(1);
+        counters
+            .insert(NEXT_UNDO_OP_ID_COUNTER, next)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(current)
+    }
+
+    fn append_undo_log_in_txn(
+        txn: &redb::WriteTransaction,
+        record: &UndoLogRecord,
+    ) -> MetaResult<()> {
+        let mut table = txn
+            .open_table(UNDO_LOG_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let encoded = encode(record)?;
+        table
+            .insert(record.op_id, encoded.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn remove_undo_logs_for_in_txn(
+        txn: &redb::WriteTransaction,
+        kind: UndoLogKind,
+        ino: Ino,
+    ) -> MetaResult<()> {
+        Self::set_undo_log_phase_for_in_txn(txn, kind, ino, UndoLogPhase::Completed)?;
+        Ok(())
+    }
+
+    fn set_undo_log_phase_for(
+        &self,
+        kind: UndoLogKind,
+        ino: Ino,
+        phase: UndoLogPhase,
+    ) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            Self::set_undo_log_phase_for_in_txn(&txn, kind, ino, phase)?;
+        }
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn set_undo_log_phase_for_in_txn(
+        txn: &redb::WriteTransaction,
+        kind: UndoLogKind,
+        ino: Ino,
+        phase: UndoLogPhase,
+    ) -> MetaResult<()> {
+        let mut table = txn
+            .open_table(UNDO_LOG_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut updates: Vec<(u64, UndoLogRecord)> = Vec::new();
+        for row in table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut record: UndoLogRecord = decode(v.value())?;
+            if record.kind == kind && record.ino == ino {
+                record.phase = phase;
+                updates.push((k.value(), record));
+            }
+        }
+        for (key, record) in updates {
+            let encoded = encode(&record)?;
+            table
+                .insert(key, encoded.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn update_counter_in_txn<F>(
+        txn: &redb::WriteTransaction,
+        name: &str,
+        update: F,
+    ) -> MetaResult<u64>
+    where
+        F: FnOnce(u64) -> u64,
+    {
+        let mut table = txn
+            .open_table(COUNTERS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let current = match table
+            .get(name)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            Some(v) => v.value(),
+            None => 0,
+        };
+        let new_val = update(current);
+        table
+            .insert(name, new_val)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(new_val)
+    }
+
+    fn clear_inode_overlay_aux_in_txn_with_options(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+        clear_regular_file_graph: bool,
+    ) -> MetaResult<()> {
+        Self::remove_symlink_overlay_in_txn(txn, ino)?;
+
+        let current_keys = {
+            let txn_read = txn
+                .open_table(XATTRS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let prefix = xattr_prefix(ino);
+            let range = txn_read
+                .range(prefix.as_ref()..)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut keys = Vec::new();
+            for item in range {
+                let (k, _v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
+                let key_bytes = k.value();
+                if !key_bytes.starts_with(&prefix) {
+                    break;
+                }
+                keys.push(key_bytes.to_vec());
+            }
+            keys
+        };
+        for key in current_keys {
+            let name = xattr_name_from_key(&key).to_vec();
+            Self::remove_xattr_overlay_in_txn(txn, ino, &name)?;
+        }
+
+        if clear_regular_file_graph {
+            Self::clear_regular_file_graph_in_txn(txn, ino)?;
+        }
+
+        let base_keys = {
+            let txn_read = txn
+                .open_table(BASE_XATTRS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let prefix = xattr_prefix(ino);
+            let range = txn_read
+                .range(prefix.as_ref()..)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut keys = Vec::new();
+            for item in range {
+                let (k, _v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
+                let key_bytes = k.value();
+                if !key_bytes.starts_with(&prefix) {
+                    break;
+                }
+                keys.push(key_bytes.to_vec());
+            }
+            keys
+        };
+        for key in base_keys {
+            let mut tombstones = txn
+                .open_table(XATTR_TOMBSTONES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            tombstones
+                .insert(key.as_slice(), 1)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+
+        let acl_keys = {
+            let table = txn
+                .open_table(ACL_RULES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let prefix = acl_rule_prefix(ino);
+            let range = table
+                .range(prefix.as_ref()..)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut keys = Vec::new();
+            for item in range {
+                let (k, _v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
+                let key_bytes = k.value();
+                if !key_bytes.starts_with(&prefix) {
+                    break;
+                }
+                keys.push(key_bytes.to_vec());
+            }
+            keys
+        };
+        if !acl_keys.is_empty() {
+            let mut table = txn
+                .open_table(ACL_RULES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for key in &acl_keys {
+                let _ = table.remove(key.as_slice());
+            }
+            drop(table);
+        }
+
+        let base_acl_keys = {
+            let table = txn
+                .open_table(BASE_ACL_RULES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let prefix = acl_rule_prefix(ino);
+            let range = table
+                .range(prefix.as_ref()..)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut keys = Vec::new();
+            for item in range {
+                let (k, _v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
+                let key_bytes = k.value();
+                if !key_bytes.starts_with(&prefix) {
+                    break;
+                }
+                keys.push(key_bytes.to_vec());
+            }
+            keys
+        };
+        if !base_acl_keys.is_empty() {
+            let mut tombstones = txn
+                .open_table(ACL_RULE_TOMBSTONES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for key in base_acl_keys {
+                tombstones
+                    .insert(key.as_slice(), 1)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn clear_inode_overlay_aux_in_txn(txn: &redb::WriteTransaction, ino: Ino) -> MetaResult<()> {
+        Self::clear_inode_overlay_aux_in_txn_with_options(txn, ino, true)
+    }
+}

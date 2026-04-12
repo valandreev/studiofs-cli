@@ -1,0 +1,1049 @@
+impl RedbMetaEngine {
+    pub fn export_remote_snapshot(&self) -> MetaResult<RedbSnapshot> {
+        let mut snapshot = self.export_snapshot()?;
+
+        let mut projected_inodes = Vec::with_capacity(snapshot.inodes.len());
+        for (ino, bytes) in snapshot.inodes.drain(..) {
+            let mut attr: InodeAttr = decode(&bytes)?;
+            if attr.kind == FileType::RegularFile {
+                attr.size = attr.committed_size;
+            }
+            projected_inodes.push((ino, encode(&attr)?));
+        }
+        snapshot.inodes = projected_inodes;
+
+        let mut referenced_objects = BTreeMap::new();
+        for (_, bytes) in &snapshot.committed_file_blocks {
+            let block: BlockRef = decode(bytes)?;
+            referenced_objects
+                .entry(block.object_id)
+                .or_insert(block.length as u64);
+        }
+        for (_, bytes) in &snapshot.regular_file_base {
+            let regular: RegularFileBaseState = decode(bytes)?;
+            for chunk in regular.chunks.values() {
+                for slice in chunk.slices.values() {
+                    if let Some(block) = slice.block.as_ref() {
+                        referenced_objects
+                            .entry(block.object_id)
+                            .or_insert(block.length as u64);
+                    }
+                }
+            }
+        }
+        let committed_used_space = referenced_objects
+            .values()
+            .fold(0_u64, |acc, len| acc.saturating_add(*len));
+
+        snapshot.file_blocks = snapshot.committed_file_blocks.clone();
+        snapshot.regular_file_overlay = snapshot.regular_file_base.clone();
+        snapshot.event_log.clear();
+        snapshot
+            .counters
+            .retain(|(name, _)| name.as_str() != "nextEventSeq");
+        if let Some((_, value)) = snapshot
+            .counters
+            .iter_mut()
+            .find(|(name, _)| name.as_str() == counters::USED_SPACE)
+        {
+            *value = committed_used_space;
+        } else {
+            snapshot
+                .counters
+                .push((counters::USED_SPACE.to_string(), committed_used_space));
+        }
+
+        snapshot.snapshots.retain(|(_id, raw)| {
+            decode::<MetadataSnapshot>(raw)
+                .map(|snapshot| snapshot.state == SnapshotState::Synced)
+                .unwrap_or(false)
+        });
+
+        Ok(snapshot)
+    }
+
+    pub fn local_overlay_symlink_inodes(&self) -> MetaResult<HashSet<Ino>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let current = txn
+            .open_table(SYMLINKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base = txn
+            .open_table(BASE_SYMLINKS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let tombstones = txn
+            .open_table(SYMLINK_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let mut overlay = HashSet::new();
+        for row in current
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (ino, current_bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let ino = ino.value();
+            match base
+                .get(ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(base_bytes) if base_bytes.value() == current_bytes.value() => {}
+                _ => {
+                    overlay.insert(ino);
+                }
+            }
+        }
+        for row in tombstones
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (ino, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            overlay.insert(ino.value());
+        }
+        Ok(overlay)
+    }
+
+    pub fn local_overlay_xattr_keys(&self) -> MetaResult<HashSet<Vec<u8>>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let current = txn
+            .open_table(XATTRS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base = txn
+            .open_table(BASE_XATTRS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let tombstones = txn
+            .open_table(XATTR_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let mut overlay = HashSet::new();
+        for row in current
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, current_value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let key_bytes = key.value().to_vec();
+            match base
+                .get(key_bytes.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(base_value) if base_value.value() == current_value.value() => {}
+                _ => {
+                    overlay.insert(key_bytes);
+                }
+            }
+        }
+        for row in tombstones
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            overlay.insert(key.value().to_vec());
+        }
+
+        Ok(overlay)
+    }
+
+    pub fn local_overlay_xattr_inodes(&self) -> MetaResult<HashSet<Ino>> {
+        Ok(self
+            .local_overlay_xattr_keys()?
+            .into_iter()
+            .map(|key| u64::from_le_bytes(key[..8].try_into().unwrap()))
+            .collect())
+    }
+
+    pub fn local_overlay_acl_keys(&self) -> MetaResult<HashSet<Vec<u8>>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let current = txn
+            .open_table(ACL_RULES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base = txn
+            .open_table(BASE_ACL_RULES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let tombstones = txn
+            .open_table(ACL_RULE_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let mut overlay = HashSet::new();
+        for row in current
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, current_value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let key_bytes = key.value().to_vec();
+            match base
+                .get(key_bytes.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(base_value) if base_value.value() == current_value.value() => {}
+                _ => {
+                    overlay.insert(key_bytes);
+                }
+            }
+        }
+        for row in tombstones
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            overlay.insert(key.value().to_vec());
+        }
+        Ok(overlay)
+    }
+
+    /// Returns true if local metadata still contains overlay state that is not
+    /// yet remote-visible in the base view.
+    pub fn has_local_overlay_state(&self) -> MetaResult<bool> {
+        if !self.local_overlay_inodes()?.is_empty() {
+            return Ok(true);
+        }
+
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let has_base_metadata = txn
+            .open_table(BASE_INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .next()
+            .is_some()
+            || txn
+                .open_table(BASE_DENTRIES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .next()
+                .is_some()
+            || txn
+                .open_table(REGULAR_FILE_BASE_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .next()
+                .is_some()
+            || txn
+                .open_table(BASE_SYMLINKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .next()
+                .is_some()
+            || txn
+                .open_table(BASE_XATTRS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .next()
+                .is_some()
+            || txn
+                .open_table(BASE_ACL_RULES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .next()
+                .is_some();
+
+        if !has_base_metadata {
+            return Ok(false);
+        }
+
+        Ok(!self.local_overlay_attr_inodes()?.is_empty()
+            || !self.local_overlay_dentries()?.is_empty()
+            || !self.local_overlay_symlink_inodes()?.is_empty()
+            || !self.local_overlay_xattr_keys()?.is_empty()
+            || !self.local_overlay_acl_keys()?.is_empty())
+    }
+
+    /// Read decoded events from local event log in [start_seq, end_seq).
+    pub fn read_events_range(
+        &self,
+        start_seq: u64,
+        end_seq: u64,
+    ) -> MetaResult<Vec<crate::events::MetaEvent>> {
+        if end_seq <= start_seq {
+            return Ok(Vec::new());
+        }
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(EVENT_LOG_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut out = Vec::new();
+        for row in table
+            .range(start_seq..end_seq)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_seq, bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let ev: crate::events::MetaEvent = decode(bytes.value())?;
+            out.push(ev);
+        }
+        Ok(out)
+    }
+
+    /// Apply only remote-visible auxiliary state from foreign replica events
+    /// without re-appending it to the local event log. Namespace/attr state is
+    /// kept in `base_*`.
+    pub fn apply_replica_aux_state(&self, events: &[crate::events::MetaEvent]) -> MetaResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        for event in events {
+            match event {
+                crate::events::MetaEvent::SetAttr { .. } => {}
+                crate::events::MetaEvent::RemoveAttr { ino } => {
+                    let mut symlinks = txn
+                        .open_table(BASE_SYMLINKS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let _ = symlinks.remove(*ino);
+                    drop(symlinks);
+
+                    let mut xattrs = txn
+                        .open_table(BASE_XATTRS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let prefix = xattr_prefix(*ino);
+                    let keys_to_remove: Vec<Vec<u8>> = {
+                        let range = xattrs
+                            .range(prefix.as_ref()..)
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                        range
+                            .take_while(|r| {
+                                r.as_ref()
+                                    .map(|(k, _)| k.value().starts_with(&prefix))
+                                    .unwrap_or(false)
+                            })
+                            .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
+                            .collect()
+                    };
+                    for key in keys_to_remove {
+                        let _ = xattrs.remove(key.as_slice());
+                    }
+
+                    let mut blocks = txn
+                        .open_table(FILE_BLOCKS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let _ = Self::remove_all_file_blocks_in_txn(&mut blocks, *ino)?;
+                    drop(blocks);
+                    let mut committed = txn
+                        .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let _ = Self::remove_all_committed_blocks_in_txn(&mut committed, *ino)?;
+                    drop(committed);
+                    Self::clear_regular_file_graph_in_txn(&txn, *ino)?;
+                }
+                crate::events::MetaEvent::AddEntry { .. } => {}
+                crate::events::MetaEvent::RemoveEntry { .. } => {}
+                crate::events::MetaEvent::RenameEntry { .. } => {}
+                crate::events::MetaEvent::SetFileBlock { .. } => {}
+                crate::events::MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
+                    for (chunk_id, slices) in chunk_slices {
+                        Self::set_regular_file_chunk_state_in_txn(
+                            &txn,
+                            REGULAR_FILE_BASE_TABLE,
+                            false,
+                            *ino,
+                            *chunk_id,
+                            slices,
+                        )?;
+                    }
+                }
+
+                crate::events::MetaEvent::RemoveFileBlock { ino, block_index } => {
+                    let key = encode_file_block_key(*ino, *block_index);
+                    let mut committed = txn
+                        .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let _ = committed.remove(key.as_slice());
+                    let committed_manifest = Self::committed_manifest_in_txn(&committed, *ino)?;
+                    drop(committed);
+                    let block_size = Self::regular_file_graph_block_size_from_write_txn(&txn)?;
+                    Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+                        &txn,
+                        REGULAR_FILE_BASE_TABLE,
+                        *ino,
+                        committed_manifest.as_slice(),
+                        block_size,
+                        true,
+                        false,
+                    )?;
+                }
+                crate::events::MetaEvent::RemoveFileBlocks { ino } => {
+                    let mut blocks = txn
+                        .open_table(FILE_BLOCKS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let _ = Self::remove_all_file_blocks_in_txn(&mut blocks, *ino)?;
+                    drop(blocks);
+                    let mut committed = txn
+                        .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let _ = Self::remove_all_committed_blocks_in_txn(&mut committed, *ino)?;
+                    drop(committed);
+                    Self::clear_regular_file_graph_in_txn(&txn, *ino)?;
+                }
+                crate::events::MetaEvent::SetFileBlocksBatch { .. } => {}
+                crate::events::MetaEvent::CommitFileBlock {
+                    ino,
+                    block_index,
+                    block,
+                } => {
+                    let key = encode_file_block_key(*ino, *block_index);
+                    let data = encode(block)?;
+
+                    let mut committed = txn
+                        .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    committed
+                        .insert(key.as_slice(), data.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let committed_manifest = Self::committed_manifest_in_txn(&committed, *ino)?;
+                    drop(committed);
+                    let block_size = Self::regular_file_graph_block_size_from_write_txn(&txn)?;
+                    Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+                        &txn,
+                        REGULAR_FILE_BASE_TABLE,
+                        *ino,
+                        committed_manifest.as_slice(),
+                        block_size,
+                        true,
+                        false,
+                    )?;
+                }
+                crate::events::MetaEvent::PublishFileManifest { ino, blocks } => {
+                    let mut committed = txn
+                        .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let _ = Self::remove_all_committed_blocks_in_txn(&mut committed, *ino)?;
+                    for (block_index, block) in blocks {
+                        let key = encode_file_block_key(*ino, *block_index);
+                        let data = encode(block)?;
+                        committed
+                            .insert(key.as_slice(), data.as_slice())
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    }
+                    drop(committed);
+                    let block_size = Self::regular_file_graph_block_size_from_write_txn(&txn)?;
+                    Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+                        &txn,
+                        REGULAR_FILE_BASE_TABLE,
+                        *ino,
+                        blocks.as_slice(),
+                        block_size,
+                        true,
+                        false,
+                    )?;
+                }
+                crate::events::MetaEvent::SetSymlinkTarget { ino, target } => {
+                    let mut table = txn
+                        .open_table(BASE_SYMLINKS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    table
+                        .insert(*ino, target.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
+                crate::events::MetaEvent::SetXattr {
+                    ino, name, value, ..
+                } => {
+                    Self::set_xattr_value_in_table_in_txn(
+                        &txn,
+                        BASE_XATTRS_TABLE,
+                        *ino,
+                        name,
+                        value,
+                    )?;
+                }
+                crate::events::MetaEvent::RemoveXattr { ino, name } => {
+                    let mut table = txn
+                        .open_table(BASE_XATTRS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let key = encode_xattr_key(*ino, name);
+                    let _ = table.remove(key.as_slice());
+                }
+                crate::events::MetaEvent::SetAclRule {
+                    ino,
+                    principal,
+                    access_level,
+                } => {
+                    let mut table = txn
+                        .open_table(BASE_ACL_RULES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let key = encode_acl_rule_key(*ino, principal);
+                    table
+                        .insert(key.as_slice(), *access_level as u8)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
+                crate::events::MetaEvent::RemoveAclRule { ino, principal } => {
+                    let mut table = txn
+                        .open_table(BASE_ACL_RULES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let key = encode_acl_rule_key(*ino, principal);
+                    let _ = table.remove(key.as_slice());
+                }
+                crate::events::MetaEvent::AddPendingDeletion {
+                    object_id,
+                    timestamp,
+                } => {
+                    let mut table = txn
+                        .open_table(PENDING_DELETIONS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    table
+                        .insert(*object_id, *timestamp)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
+                crate::events::MetaEvent::RemovePendingDeletion { object_id } => {
+                    let mut table = txn
+                        .open_table(PENDING_DELETIONS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let _ = table.remove(*object_id);
+                }
+                crate::events::MetaEvent::CreateSnapshot { snapshot } => {
+                    let mut table = txn
+                        .open_table(SNAPSHOTS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let bytes = encode(snapshot)?;
+                    table
+                        .insert(snapshot.id.as_str(), bytes.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
+                crate::events::MetaEvent::UpdateSnapshotState { id, state } => {
+                    let mut table = txn
+                        .open_table(SNAPSHOTS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let existing_bytes = table
+                        .get(id.as_str())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?
+                        .map(|existing| existing.value().to_vec());
+                    if let Some(existing_bytes) = existing_bytes {
+                        let mut snapshot: MetadataSnapshot = decode(existing_bytes.as_slice())?;
+                        snapshot.state = *state;
+                        let bytes = encode(&snapshot)?;
+                        table
+                            .insert(id.as_str(), bytes.as_slice())
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    }
+                }
+            }
+        }
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Apply only namespace/attr portions of replica events into the remote-visible base view.
+    pub fn apply_replica_events_to_base(
+        &self,
+        events: &[crate::events::MetaEvent],
+    ) -> MetaResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        for event in events {
+            match event {
+                crate::events::MetaEvent::SetAttr { attr } => {
+                    let data = encode(attr)?;
+                    let mut table = txn
+                        .open_table(BASE_INODES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    table
+                        .insert(attr.ino, data.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
+                crate::events::MetaEvent::RemoveAttr { ino } => {
+                    let mut table = txn
+                        .open_table(BASE_INODES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let _ = table.remove(*ino);
+
+                    let mut symlinks = txn
+                        .open_table(BASE_SYMLINKS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let _ = symlinks.remove(*ino);
+                    drop(symlinks);
+
+                    let mut xattrs = txn
+                        .open_table(BASE_XATTRS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let prefix = xattr_prefix(*ino);
+                    let keys_to_remove: Vec<Vec<u8>> = {
+                        let range = xattrs
+                            .range(prefix.as_ref()..)
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                        range
+                            .take_while(|r| {
+                                r.as_ref()
+                                    .map(|(k, _)| k.value().starts_with(&prefix))
+                                    .unwrap_or(false)
+                            })
+                            .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
+                            .collect()
+                    };
+                    for key in keys_to_remove {
+                        let _ = xattrs.remove(key.as_slice());
+                    }
+
+                    let mut acl = txn
+                        .open_table(BASE_ACL_RULES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let prefix = acl_rule_prefix(*ino);
+                    let keys_to_remove: Vec<Vec<u8>> = {
+                        let range = acl
+                            .range(prefix.as_ref()..)
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                        range
+                            .take_while(|r| {
+                                r.as_ref()
+                                    .map(|(k, _)| k.value().starts_with(&prefix))
+                                    .unwrap_or(false)
+                            })
+                            .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
+                            .collect()
+                    };
+                    for key in keys_to_remove {
+                        let _ = acl.remove(key.as_slice());
+                    }
+                }
+                crate::events::MetaEvent::AddEntry {
+                    parent,
+                    name,
+                    entry,
+                } => {
+                    let key = encode_dentry_key(*parent, name);
+                    let data = encode(entry)?;
+                    let mut table = txn
+                        .open_table(BASE_DENTRIES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    table
+                        .insert(key.as_slice(), data.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
+                crate::events::MetaEvent::RemoveEntry { parent, name } => {
+                    let key = encode_dentry_key(*parent, name);
+                    let mut table = txn
+                        .open_table(BASE_DENTRIES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let _ = table.remove(key.as_slice());
+                }
+                crate::events::MetaEvent::RenameEntry {
+                    parent,
+                    name,
+                    new_parent,
+                    new_name,
+                    entry,
+                    displaced_set_attr,
+                    displaced_remove_attr_ino,
+                    moved_dir_attr,
+                    old_parent_attr,
+                    new_parent_attr,
+                } => {
+                    let src_key = encode_dentry_key(*parent, name);
+                    let dst_key = encode_dentry_key(*new_parent, new_name);
+
+                    let mut dentries = txn
+                        .open_table(BASE_DENTRIES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let src_matches = dentries
+                        .get(src_key.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?
+                        .map(|value| decode::<DirEntryValue>(value.value()))
+                        .transpose()?
+                        .map(|current| current.ino == entry.ino && current.kind == entry.kind)
+                        .unwrap_or(false);
+                    if !src_matches {
+                        continue;
+                    }
+                    let _ = dentries.remove(src_key.as_slice());
+                    let _ = dentries.remove(dst_key.as_slice());
+                    let data = encode(entry)?;
+                    dentries
+                        .insert(dst_key.as_slice(), data.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    drop(dentries);
+
+                    let mut inodes = txn
+                        .open_table(BASE_INODES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    if let Some(attr) = displaced_set_attr.as_ref() {
+                        let data = encode(attr)?;
+                        inodes
+                            .insert(attr.ino, data.as_slice())
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    }
+                    if let Some(ino) = displaced_remove_attr_ino {
+                        let _ = inodes.remove(*ino);
+                    }
+                    if let Some(attr) = moved_dir_attr.as_ref() {
+                        let data = encode(attr)?;
+                        inodes
+                            .insert(attr.ino, data.as_slice())
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    }
+                    if let Some(attr) = old_parent_attr.as_ref() {
+                        let data = encode(attr)?;
+                        inodes
+                            .insert(attr.ino, data.as_slice())
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    }
+                    if let Some(attr) = new_parent_attr.as_ref() {
+                        let data = encode(attr)?;
+                        inodes
+                            .insert(attr.ino, data.as_slice())
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    }
+                }
+                crate::events::MetaEvent::SetSymlinkTarget { ino, target } => {
+                    let mut table = txn
+                        .open_table(BASE_SYMLINKS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    table
+                        .insert(*ino, target.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
+                crate::events::MetaEvent::SetXattr {
+                    ino, name, value, ..
+                } => {
+                    Self::set_xattr_value_in_table_in_txn(
+                        &txn,
+                        BASE_XATTRS_TABLE,
+                        *ino,
+                        name,
+                        value,
+                    )?;
+                }
+                crate::events::MetaEvent::RemoveXattr { ino, name } => {
+                    let mut table = txn
+                        .open_table(BASE_XATTRS_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let key = encode_xattr_key(*ino, name);
+                    let _ = table.remove(key.as_slice());
+                }
+                crate::events::MetaEvent::SetAclRule {
+                    ino,
+                    principal,
+                    access_level,
+                } => {
+                    let mut table = txn
+                        .open_table(BASE_ACL_RULES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let key = encode_acl_rule_key(*ino, principal);
+                    table
+                        .insert(key.as_slice(), *access_level as u8)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
+                crate::events::MetaEvent::RemoveAclRule { ino, principal } => {
+                    let mut table = txn
+                        .open_table(BASE_ACL_RULES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let key = encode_acl_rule_key(*ino, principal);
+                    let _ = table.remove(key.as_slice());
+                }
+                crate::events::MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
+                    for (chunk_id, slices) in chunk_slices {
+                        Self::set_regular_file_chunk_state_in_txn(
+                            &txn,
+                            REGULAR_FILE_BASE_TABLE,
+                            false,
+                            *ino,
+                            *chunk_id,
+                            slices,
+                        )?;
+                    }
+                }
+                crate::events::MetaEvent::SetFileBlock { .. }
+                | crate::events::MetaEvent::RemoveFileBlock { .. }
+                | crate::events::MetaEvent::RemoveFileBlocks { .. }
+                | crate::events::MetaEvent::SetFileBlocksBatch { .. }
+                | crate::events::MetaEvent::CommitFileBlock { .. }
+                | crate::events::MetaEvent::PublishFileManifest { .. }
+                | crate::events::MetaEvent::AddPendingDeletion { .. }
+                | crate::events::MetaEvent::RemovePendingDeletion { .. }
+                | crate::events::MetaEvent::CreateSnapshot { .. }
+                | crate::events::MetaEvent::UpdateSnapshotState { .. } => {}
+            }
+        }
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Sync the foreground serving tables to a remote-visible state for objects
+    /// that do not currently have local overlay conflicts.
+    pub fn apply_replica_serving_state(
+        &self,
+        events: &[crate::events::MetaEvent],
+    ) -> MetaResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        for event in events {
+            match event {
+                crate::events::MetaEvent::SetAttr { attr } => {
+                    Self::set_inode_mirror_in_txn(&txn, attr)?;
+                }
+                crate::events::MetaEvent::RemoveAttr { ino } => {
+                    Self::remove_inode_mirror_in_txn(&txn, *ino)?;
+                    Self::remove_symlink_mirror_in_txn(&txn, *ino)?;
+
+                    let current_keys =
+                        Self::keys_for_inode_in_write_table(&txn, XATTRS_TABLE, *ino)?;
+                    for key in current_keys {
+                        let name = xattr_name_from_key(&key).to_vec();
+                        Self::remove_xattr_mirror_in_txn(&txn, *ino, &name)?;
+                    }
+                    let base_keys =
+                        Self::keys_for_inode_in_write_table(&txn, BASE_XATTRS_TABLE, *ino)?;
+                    for key in base_keys {
+                        let name = xattr_name_from_key(&key).to_vec();
+                        Self::remove_xattr_mirror_in_txn(&txn, *ino, &name)?;
+                    }
+
+                    let prefix = acl_rule_prefix(*ino);
+                    let mut acl_rules = txn
+                        .open_table(ACL_RULES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let acl_rule_keys: Vec<Vec<u8>> = {
+                        let range = acl_rules
+                            .range(prefix.as_ref()..)
+                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                        range
+                            .take_while(|r| {
+                                r.as_ref()
+                                    .map(|(k, _)| k.value().starts_with(&prefix))
+                                    .unwrap_or(false)
+                            })
+                            .filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
+                            .collect()
+                    };
+                    for key in acl_rule_keys {
+                        let _ = acl_rules.remove(key.as_slice());
+                    }
+                }
+                crate::events::MetaEvent::AddEntry {
+                    parent,
+                    name,
+                    entry,
+                } => {
+                    Self::set_dentry_mirror_in_txn(&txn, *parent, name, entry)?;
+                }
+                crate::events::MetaEvent::RemoveEntry { parent, name } => {
+                    Self::remove_dentry_mirror_in_txn(&txn, *parent, name)?;
+                }
+                crate::events::MetaEvent::RenameEntry {
+                    parent,
+                    name,
+                    new_parent,
+                    new_name,
+                    entry,
+                    displaced_set_attr,
+                    displaced_remove_attr_ino,
+                    moved_dir_attr,
+                    old_parent_attr,
+                    new_parent_attr,
+                } => {
+                    let src_key = encode_dentry_key(*parent, name);
+                    let src_matches = txn
+                        .open_table(DENTRIES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?
+                        .get(src_key.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?
+                        .map(|value| decode::<DirEntryValue>(value.value()))
+                        .transpose()?
+                        .map(|current| current.ino == entry.ino && current.kind == entry.kind)
+                        .unwrap_or(false);
+                    if !src_matches {
+                        continue;
+                    }
+
+                    Self::remove_dentry_mirror_in_txn(&txn, *parent, name)?;
+                    Self::remove_dentry_mirror_in_txn(&txn, *new_parent, new_name)?;
+                    Self::set_dentry_mirror_in_txn(&txn, *new_parent, new_name, entry)?;
+
+                    if let Some(attr) = displaced_set_attr.as_ref() {
+                        Self::set_inode_mirror_in_txn(&txn, attr)?;
+                    }
+                    if let Some(ino) = displaced_remove_attr_ino {
+                        Self::remove_inode_mirror_in_txn(&txn, *ino)?;
+                    }
+                    if let Some(attr) = moved_dir_attr.as_ref() {
+                        Self::set_inode_mirror_in_txn(&txn, attr)?;
+                    }
+                    if let Some(attr) = old_parent_attr.as_ref() {
+                        Self::set_inode_mirror_in_txn(&txn, attr)?;
+                    }
+                    if let Some(attr) = new_parent_attr.as_ref() {
+                        Self::set_inode_mirror_in_txn(&txn, attr)?;
+                    }
+                }
+                crate::events::MetaEvent::SetSymlinkTarget { ino, target } => {
+                    Self::set_symlink_mirror_in_txn(&txn, *ino, target)?;
+                }
+                crate::events::MetaEvent::SetXattr {
+                    ino, name, value, ..
+                } => {
+                    Self::set_xattr_mirror_in_txn(&txn, *ino, name, value)?;
+                }
+                crate::events::MetaEvent::RemoveXattr { ino, name } => {
+                    Self::remove_xattr_mirror_in_txn(&txn, *ino, name)?;
+                }
+                crate::events::MetaEvent::SetAclRule {
+                    ino,
+                    principal,
+                    access_level,
+                } => {
+                    let mut rules = txn
+                        .open_table(ACL_RULES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let mut tombstones = txn
+                        .open_table(ACL_RULE_TOMBSTONES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let key = encode_acl_rule_key(*ino, principal);
+                    let _ = tombstones.remove(key.as_slice());
+                    rules
+                        .insert(key.as_slice(), *access_level as u8)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
+                crate::events::MetaEvent::RemoveAclRule { ino, principal } => {
+                    let mut rules = txn
+                        .open_table(ACL_RULES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let mut tombstones = txn
+                        .open_table(ACL_RULE_TOMBSTONES_TABLE)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let key = encode_acl_rule_key(*ino, principal);
+                    let _ = rules.remove(key.as_slice());
+                    tombstones
+                        .insert(key.as_slice(), 1)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
+                crate::events::MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
+                    for (chunk_id, slices) in chunk_slices {
+                        Self::set_regular_file_chunk_state_in_txn(
+                            &txn,
+                            REGULAR_FILE_OVERLAY_TABLE,
+                            true,
+                            *ino,
+                            *chunk_id,
+                            slices,
+                        )?;
+                    }
+                }
+                crate::events::MetaEvent::SetFileBlock { .. }
+                | crate::events::MetaEvent::RemoveFileBlock { .. }
+                | crate::events::MetaEvent::RemoveFileBlocks { .. }
+                | crate::events::MetaEvent::SetFileBlocksBatch { .. }
+                | crate::events::MetaEvent::CommitFileBlock { .. }
+                | crate::events::MetaEvent::PublishFileManifest { .. }
+                | crate::events::MetaEvent::AddPendingDeletion { .. }
+                | crate::events::MetaEvent::RemovePendingDeletion { .. }
+                | crate::events::MetaEvent::CreateSnapshot { .. }
+                | crate::events::MetaEvent::UpdateSnapshotState { .. } => {}
+            }
+        }
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn reconcile_serving_rename_from_base(
+        &self,
+        parent: Ino,
+        name: &[u8],
+        new_parent: Ino,
+        new_name: &[u8],
+        entry: &DirEntryValue,
+    ) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        let src_in_base = Self::lookup_in_write_table(&txn, BASE_DENTRIES_TABLE, parent, name)?
+            .map(|value| value.ino == entry.ino && value.kind == entry.kind)
+            .unwrap_or(false);
+        let dst_in_base =
+            Self::lookup_in_write_table(&txn, BASE_DENTRIES_TABLE, new_parent, new_name)?
+                .map(|value| value.ino == entry.ino && value.kind == entry.kind)
+                .unwrap_or(false);
+
+        if dst_in_base {
+            Self::remove_dentry_mirror_in_txn(&txn, parent, name)?;
+            Self::remove_dentry_mirror_in_txn(&txn, new_parent, new_name)?;
+            Self::set_dentry_mirror_in_txn(&txn, new_parent, new_name, entry)?;
+        } else if src_in_base {
+            Self::remove_dentry_mirror_in_txn(&txn, new_parent, new_name)?;
+            Self::set_dentry_mirror_in_txn(&txn, parent, name, entry)?;
+        } else {
+            Self::remove_dentry_mirror_in_txn(&txn, parent, name)?;
+            Self::remove_dentry_mirror_in_txn(&txn, new_parent, new_name)?;
+        }
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+}
+
+impl MetaReplication for RedbMetaEngine {
+    fn check_consistency(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
+    fn flush_metadata(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
+    fn sync_metadata(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
+    fn invalidation_sender_id(&self) -> Option<String> {
+        None
+    }
+
+    fn request_eager_flush(&self) {}
+
+    fn metadata_version_token(&self) -> Option<String> {
+        None
+    }
+
+    fn namespace_version_token(&self) -> Option<String> {
+        self.metadata_version_token()
+    }
+
+    fn replication_backlog(&self) -> MetadataReplicationBacklog {
+        MetadataReplicationBacklog::default()
+    }
+
+    fn remote_metadata_size(&self) -> MetaResult<Option<u64>> {
+        Ok(None)
+    }
+}

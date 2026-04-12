@@ -1,0 +1,383 @@
+// ─── Table Definitions ──────────────────────────────────────────────────────
+
+/// Format info: "format" -> JSON bytes
+const SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("settings");
+
+/// Counters: counter_name -> u64 (as bytes)
+const COUNTERS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("counters");
+
+/// Inodes: ino (u64) -> InodeAttr (postcard)
+const INODES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("inodes");
+
+/// Remote-visible base attrs imported from checkpoint + foreign PG apply.
+const BASE_INODES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("base_inodes");
+
+/// Local tombstones hiding remote-visible base attrs.
+const INODE_TOMBSTONES_TABLE: TableDefinition<u64, u8> = TableDefinition::new("inode_tombstones");
+
+/// Directory entries: (parent_ino, name) as bytes -> DirEntryValue (postcard)
+const DENTRIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("dentries");
+
+/// Remote-visible base dentries imported from checkpoint + foreign PG apply.
+const BASE_DENTRIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("base_dentries");
+
+/// Local tombstones hiding remote-visible base dentries.
+const DENTRY_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> =
+    TableDefinition::new("dentry_tombstones");
+
+/// File Blocks: (ino, block_index) -> BlockRef (postcard)
+/// Key encoding: ino (8 bytes LE) + block_index (4 bytes LE)
+const FILE_BLOCKS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("file_blocks");
+
+/// Remote-visible committed file blocks: (ino, block_index) -> BlockRef.
+const COMMITTED_FILE_BLOCKS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("committed_file_blocks");
+
+/// Local overlay regular-file chunk rows: (ino, chunk_id) -> RegularFileChunkState.
+const REGULAR_FILE_OVERLAY_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("regular_file_overlay");
+
+/// Remote-visible base regular-file chunk rows: (ino, chunk_id) -> RegularFileChunkState.
+const REGULAR_FILE_BASE_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("regular_file_base");
+
+/// Pending overlay chunk compaction work: (ino, chunk_id) -> marker.
+const PENDING_REGULAR_FILE_COMPACTION_TABLE: TableDefinition<&[u8], u8> =
+    TableDefinition::new("pending_regular_file_compaction");
+
+type RegularFileChunkSignature = Vec<(SliceRange, Option<BlockRef>)>;
+type RegularFileGraphSignature = BTreeMap<ChunkId, RegularFileChunkSignature>;
+
+/// Pending Deletions (GC): object_id (u64) -> deletion_timestamp (i64)
+const PENDING_DELETIONS_TABLE: TableDefinition<u64, i64> =
+    TableDefinition::new("pending_deletions");
+
+/// Pending create intents: ino -> CreateIntent (postcard)
+const PENDING_CREATES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("pending_creates");
+
+/// Deferred deletes (open-unlink orphans): ino -> DeferredDeleteRecord (postcard)
+const DEFERRED_DELETES_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("deferred_deletes");
+
+/// Generic undo-log records: op_id -> UndoLogRecord (postcard)
+const UNDO_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("undo_log");
+const NEXT_UNDO_OP_ID_COUNTER: &str = "next_undo_op_id";
+
+/// Symlink targets: ino (u64) -> target path (&[u8])
+const SYMLINKS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("symlinks");
+
+/// Remote-visible base symlink targets imported from checkpoint + foreign apply.
+const BASE_SYMLINKS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("base_symlinks");
+
+/// Local tombstones hiding remote-visible base symlink targets.
+const SYMLINK_TOMBSTONES_TABLE: TableDefinition<u64, u8> =
+    TableDefinition::new("symlink_tombstones");
+
+/// Extended attributes: (ino(8) + name_bytes) -> value_bytes
+const XATTRS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("xattrs");
+
+/// Remote-visible base xattrs imported from checkpoint + foreign apply.
+const BASE_XATTRS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("base_xattrs");
+
+/// Local tombstones hiding remote-visible base xattrs.
+const XATTR_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> = TableDefinition::new("xattr_tombstones");
+
+/// ACL rules: (ino(8) + principal_bytes) -> access level (u8).
+const ACL_RULES_TABLE: TableDefinition<&[u8], u8> = TableDefinition::new("acl_rules");
+
+/// Remote-visible base ACL rules imported from checkpoint + foreign apply.
+const BASE_ACL_RULES_TABLE: TableDefinition<&[u8], u8> = TableDefinition::new("base_acl_rules");
+
+/// Local tombstones hiding remote-visible base ACL rules.
+const ACL_RULE_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> =
+    TableDefinition::new("acl_rule_tombstones");
+
+const REGULAR_FILE_MIGRATION_NAME: &str = "regular_files_v2_to_v3";
+const MIGRATION_STATUS_STARTED: u8 = 1;
+const MIGRATION_STATUS_COMPLETED: u8 = 2;
+
+/// Event Log: sequence_id (u64) -> MetaEvent (postcard)
+const EVENT_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("event_log");
+
+/// Snapshot definitions: snapshot_id (uuid text) -> MetadataSnapshot (postcard)
+const SNAPSHOTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots");
+
+/// Migration status: migration_name -> status (u8)
+/// Used to track migration progress and detect interrupted migrations
+const MIGRATION_STATUS_TABLE: TableDefinition<&str, u8> = TableDefinition::new("migration_status");
+
+/// Serializable full snapshot of redb metadata state.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct RedbSnapshot {
+    pub settings: Vec<(String, Vec<u8>)>,
+    pub counters: Vec<(String, u64)>,
+    pub inodes: Vec<(u64, Vec<u8>)>,
+    pub dentries: Vec<(Vec<u8>, Vec<u8>)>,
+    pub file_blocks: Vec<(Vec<u8>, Vec<u8>)>,
+    pub committed_file_blocks: Vec<(Vec<u8>, Vec<u8>)>,
+    #[serde(default)]
+    pub regular_file_overlay: Vec<(u64, Vec<u8>)>,
+    #[serde(default)]
+    pub regular_file_base: Vec<(u64, Vec<u8>)>,
+    pub pending_deletions: Vec<(u64, i64)>,
+    pub symlinks: Vec<(u64, Vec<u8>)>,
+    pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+    pub acl_rules: Vec<(Vec<u8>, u8)>,
+    pub event_log: Vec<(u64, Vec<u8>)>,
+    pub snapshots: Vec<(String, Vec<u8>)>,
+}
+
+fn encode_dentry_key(parent: Ino, name: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8 + name.len());
+    key.extend_from_slice(&parent.to_le_bytes());
+    key.extend_from_slice(name);
+    key
+}
+
+/// Decode a dentry key back to (parent_ino, name).
+fn decode_dentry_key(key: &[u8]) -> (Ino, &[u8]) {
+    let parent = u64::from_le_bytes(key[..8].try_into().unwrap());
+    let name = &key[8..];
+    (parent, name)
+}
+
+/// The prefix for scanning all dentries of a parent inode.
+fn dentry_prefix(parent: Ino) -> [u8; 8] {
+    parent.to_le_bytes()
+}
+
+/// Encode a file block key: ino (8 bytes LE) + block_index (4 bytes LE).
+fn encode_file_block_key(ino: Ino, block_index: u32) -> [u8; 12] {
+    let mut buf = [0u8; 12];
+    buf[..8].copy_from_slice(&ino.to_le_bytes());
+    buf[8..12].copy_from_slice(&block_index.to_le_bytes());
+    buf
+}
+
+/// Decode a file block key back to (ino, block_index).
+fn decode_file_block_key(key: &[u8]) -> (Ino, u32) {
+    let ino = u64::from_le_bytes(key[..8].try_into().unwrap());
+    let block_index = u32::from_le_bytes(key[8..12].try_into().unwrap());
+    (ino, block_index)
+}
+
+/// The prefix for scanning all blocks of an inode.
+fn file_block_prefix(ino: Ino) -> [u8; 8] {
+    ino.to_le_bytes()
+}
+
+/// Encode a regular-file chunk key: ino (8 bytes LE) + chunk_id (8 bytes LE).
+fn encode_regular_file_chunk_key(ino: Ino, chunk_id: ChunkId) -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(&ino.to_le_bytes());
+    buf[8..16].copy_from_slice(&chunk_id.0.to_le_bytes());
+    buf
+}
+
+/// Decode a regular-file chunk key back to (ino, chunk_id).
+fn decode_regular_file_chunk_key(key: &[u8]) -> (Ino, ChunkId) {
+    let ino = u64::from_le_bytes(key[..8].try_into().unwrap());
+    let chunk_id = u64::from_le_bytes(key[8..16].try_into().unwrap());
+    (ino, ChunkId(chunk_id))
+}
+
+/// The prefix for scanning all chunk rows of an inode.
+fn regular_file_chunk_prefix(ino: Ino) -> [u8; 8] {
+    ino.to_le_bytes()
+}
+
+/// Encode an xattr key: ino (8 bytes LE) + name bytes.
+fn encode_xattr_key(ino: Ino, name: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(8 + name.len());
+    key.extend_from_slice(&ino.to_le_bytes());
+    key.extend_from_slice(name);
+    key
+}
+
+/// The prefix for scanning all xattrs of an inode.
+fn xattr_prefix(ino: Ino) -> [u8; 8] {
+    ino.to_le_bytes()
+}
+
+fn xattr_name_from_key(key: &[u8]) -> &[u8] {
+    &key[8..]
+}
+
+const RESOURCE_FORK_XATTR_NAME: &[u8] = b"com.apple.ResourceFork";
+const RESOURCE_FORK_ENCODING_MAGIC: &[u8; 4] = b"SFRF";
+const RESOURCE_FORK_ENCODING_VERSION: u8 = 1;
+const RESOURCE_FORK_ENCODING_SCHEME_RLE: u8 = 1;
+const RESOURCE_FORK_REPEAT_RUN_THRESHOLD: usize = 4;
+
+fn resource_fork_checksum(bytes: &[u8]) -> u32 {
+    // FNV-1a checksum for light framing validation.
+    let mut hash = 0x811c_9dc5u32;
+    for byte in bytes {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+fn rle_compress(input: &[u8]) -> Vec<u8> {
+    if input.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < input.len() {
+        let run_byte = input[i];
+        let mut run_len = 1usize;
+        while i + run_len < input.len() && input[i + run_len] == run_byte && run_len < 128 {
+            run_len += 1;
+        }
+
+        if run_len >= RESOURCE_FORK_REPEAT_RUN_THRESHOLD {
+            out.push(0x80 | (run_len as u8 - 1));
+            out.push(run_byte);
+            i += run_len;
+            continue;
+        }
+
+        let literal_start = i;
+        let mut literal_len = run_len;
+        i += run_len;
+        while i < input.len() && literal_len < 128 {
+            let probe_byte = input[i];
+            let mut probe_run = 1usize;
+            while i + probe_run < input.len()
+                && input[i + probe_run] == probe_byte
+                && probe_run < 128
+            {
+                probe_run += 1;
+            }
+            if probe_run >= RESOURCE_FORK_REPEAT_RUN_THRESHOLD {
+                break;
+            }
+            let take = probe_run.min(128 - literal_len);
+            literal_len += take;
+            i += take;
+        }
+        out.push(literal_len as u8 - 1);
+        out.extend_from_slice(&input[literal_start..literal_start + literal_len]);
+    }
+
+    out
+}
+
+fn rle_decompress(input: &[u8], expected_len: usize) -> Option<Vec<u8>> {
+    let initial_capacity = expected_len.min(64 * 1024);
+    let mut out = Vec::with_capacity(initial_capacity);
+    let mut i = 0usize;
+    while i < input.len() {
+        let token = input[i];
+        i += 1;
+        let len = ((token & 0x7f) as usize) + 1;
+        if token & 0x80 != 0 {
+            let value = *input.get(i)?;
+            i += 1;
+            out.extend(std::iter::repeat_n(value, len));
+        } else {
+            let end = i.checked_add(len)?;
+            let literal = input.get(i..end)?;
+            out.extend_from_slice(literal);
+            i = end;
+        }
+        if out.len() > expected_len {
+            return None;
+        }
+    }
+    if out.len() == expected_len {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn encode_resource_fork_value_for_storage(value: &[u8]) -> Vec<u8> {
+    let Ok(len_u32) = u32::try_from(value.len()) else {
+        return value.to_vec();
+    };
+    let compressed = rle_compress(value);
+    let header_len = 4 + 1 + 1 + 4 + 4;
+    if compressed.len() + header_len >= value.len() {
+        return value.to_vec();
+    }
+
+    let mut framed = Vec::with_capacity(header_len + compressed.len());
+    framed.extend_from_slice(RESOURCE_FORK_ENCODING_MAGIC);
+    framed.push(RESOURCE_FORK_ENCODING_VERSION);
+    framed.push(RESOURCE_FORK_ENCODING_SCHEME_RLE);
+    framed.extend_from_slice(&len_u32.to_le_bytes());
+    framed.extend_from_slice(&resource_fork_checksum(value).to_le_bytes());
+    framed.extend_from_slice(&compressed);
+    framed
+}
+
+fn decode_resource_fork_value_from_storage(stored: &[u8]) -> Vec<u8> {
+    let header_len = 4 + 1 + 1 + 4 + 4;
+    if stored.len() < header_len {
+        return stored.to_vec();
+    }
+    if &stored[..4] != RESOURCE_FORK_ENCODING_MAGIC {
+        return stored.to_vec();
+    }
+    if stored[4] != RESOURCE_FORK_ENCODING_VERSION || stored[5] != RESOURCE_FORK_ENCODING_SCHEME_RLE
+    {
+        return stored.to_vec();
+    }
+    let expected_len = u32::from_le_bytes([stored[6], stored[7], stored[8], stored[9]]) as usize;
+    let expected_checksum = u32::from_le_bytes([stored[10], stored[11], stored[12], stored[13]]);
+    let payload = &stored[header_len..];
+    match rle_decompress(payload, expected_len) {
+        Some(decoded) if resource_fork_checksum(&decoded) == expected_checksum => decoded,
+        _ => stored.to_vec(),
+    }
+}
+
+fn encode_xattr_value_for_storage<'a>(name: &[u8], value: &'a [u8]) -> Cow<'a, [u8]> {
+    if name == RESOURCE_FORK_XATTR_NAME {
+        Cow::Owned(encode_resource_fork_value_for_storage(value))
+    } else {
+        Cow::Borrowed(value)
+    }
+}
+
+fn decode_xattr_value_from_storage(name: &[u8], stored: &[u8]) -> Vec<u8> {
+    if name == RESOURCE_FORK_XATTR_NAME {
+        decode_resource_fork_value_from_storage(stored)
+    } else {
+        stored.to_vec()
+    }
+}
+
+fn decode_xattr_value_from_storage_owned(name: &[u8], stored: Vec<u8>) -> Vec<u8> {
+    if name == RESOURCE_FORK_XATTR_NAME {
+        decode_resource_fork_value_from_storage(stored.as_slice())
+    } else {
+        stored
+    }
+}
+
+fn encode_acl_rule_key(ino: Ino, principal: &str) -> Vec<u8> {
+    let principal_bytes = principal.as_bytes();
+    let mut key = Vec::with_capacity(8 + principal_bytes.len());
+    key.extend_from_slice(&ino.to_le_bytes());
+    key.extend_from_slice(principal_bytes);
+    key
+}
+
+fn acl_rule_prefix(ino: Ino) -> [u8; 8] {
+    ino.to_le_bytes()
+}
+
+// ─── Postcard helpers ────────────────────────────────────────────────────────
+
+fn encode<T: serde::Serialize>(val: &T) -> MetaResult<Vec<u8>> {
+    postcard::to_stdvec(val).map_err(|e| MetaError::Serialization(e.to_string()))
+}
+
+fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> MetaResult<T> {
+    postcard::from_bytes(bytes).map_err(|e| MetaError::Serialization(e.to_string()))
+}
