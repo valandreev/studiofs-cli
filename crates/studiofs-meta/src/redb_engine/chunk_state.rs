@@ -410,14 +410,19 @@ impl RedbMetaEngine {
             chunk_id: ChunkId,
             current: &RegularFileChunkState,
             lower_precedence: Option<&RegularFileChunkState>,
+            queries: &[SliceRange],
         ) -> Vec<SliceRange> {
-            let full_chunk =
-                SliceRange::new(0, DEFAULT_CHUNK_SIZE).expect("full chunk range should be valid");
-            let visible =
-                resolve_chunk_slice_spans(chunk_id, full_chunk, Some(current), lower_precedence)
-                    .into_iter()
-                    .filter_map(|span| span.block.map(|_| span.range))
-                    .collect::<Vec<_>>();
+            if queries.is_empty() {
+                return Vec::new();
+            }
+            let mut visible = Vec::new();
+            for query in queries {
+                visible.extend(
+                    resolve_chunk_slice_spans(chunk_id, *query, Some(current), lower_precedence)
+                        .into_iter()
+                        .filter_map(|span| span.block.map(|_| span.range)),
+                );
+            }
             if visible.len() <= 1 {
                 visible
             } else {
@@ -487,7 +492,19 @@ impl RedbMetaEngine {
             } else {
                 None
             };
-            let visible_ranges = visible_data_ranges(*chunk_id, &state, lower_precedence.as_ref());
+            let tombstone_queries = merge_covered_ranges(
+                &new_slices
+                    .iter()
+                    .filter(|slice| slice.block.is_none())
+                    .map(|slice| slice.range)
+                    .collect::<Vec<_>>(),
+            );
+            let visible_ranges = visible_data_ranges(
+                *chunk_id,
+                &state,
+                lower_precedence.as_ref(),
+                tombstone_queries.as_slice(),
+            );
             let mut effective_new_slices = Vec::new();
             for new_slice in new_slices.iter().cloned() {
                 if new_slice.block.is_some() {
