@@ -29,6 +29,8 @@ pub struct PendingUpload {
     pub content_epoch: u64,
     /// Enqueue timestamp in unix milliseconds.
     pub created_unix_ms: u64,
+    /// Earliest unix-millis timestamp when the upload may be retried.
+    pub not_before_unix_ms: u64,
     /// In-memory retry attempt counter for cooldown requeue logic.
     pub retry_count: u32,
 }
@@ -90,6 +92,7 @@ impl UploadQueue {
             object_id,
             content_epoch,
             created_unix_ms: now_unix_ms(),
+            not_before_unix_ms: 0,
             retry_count: 0,
         };
 

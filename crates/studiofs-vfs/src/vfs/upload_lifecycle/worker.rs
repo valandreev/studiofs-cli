@@ -9,6 +9,7 @@ use bytes::Bytes;
 use futures::future::join_all;
 use opendal::Buffer;
 use std::borrow::Cow;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -16,11 +17,14 @@ use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 const UPLOAD_WORKER_YIELD_EVERY_OPS: u32 = super::super::UPLOAD_WORKER_YIELD_EVERY_OPS;
+
+type DelayedUploads = BTreeMap<u64, VecDeque<PendingUpload>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UploadOutcome {
@@ -213,25 +217,25 @@ where
                 let mut retry_op = op;
                 retry_op.retry_count = retry_op.retry_count.saturating_add(1);
                 let delay = self.upload_requeue_delay(&retry_op);
+                retry_op.not_before_unix_ms = now_unix_millis()
+                    .saturating_add(delay.as_millis().clamp(0, u64::MAX as u128) as u64);
                 self.shutdown.record_requeue();
                 warn!(
                     object_id = retry_op.object_id,
                     ino = retry_op.ino,
                     retry_count = retry_op.retry_count,
                     delay_ms = delay.as_millis() as u64,
-                    "upload processing error, will requeue: {error}"
+                    not_before_unix_ms = retry_op.not_before_unix_ms,
+                    "upload processing error, scheduled for delayed requeue: {error}"
                 );
 
-                let shutdown_token = self.shutdown.shutdown_token();
-                let should_requeue = tokio::select! {
-                    _ = shutdown_token.cancelled() => false,
-                    _ = tokio::time::sleep(delay) => !self.shutdown.uploader_shutdown_requested(),
-                };
-                if should_requeue && !self.coordinator.requeue_upload(retry_op) {
+                if !self.shutdown.uploader_shutdown_requested()
+                    && !self.coordinator.requeue_upload(retry_op)
+                {
                     error!("failed to requeue upload op after error");
                 }
 
-                if should_requeue {
+                if !self.shutdown.uploader_shutdown_requested() {
                     UploadOutcome::Requeued
                 } else {
                     UploadOutcome::Shutdown
@@ -784,11 +788,14 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
         fragment_keys: &[String],
         cancel_token: &CancellationToken,
     ) -> UploadPutOutcome {
-        let _transit_credit = self
+        let Some(_transit_credit) = self
             .vfs
             .transit_memory_budget
-            .acquire_background(raw_payload.len().max(1))
-            .await;
+            .acquire_background_cancelable(raw_payload.len().max(1), cancel_token)
+            .await
+        else {
+            return UploadPutOutcome::Cancelled;
+        };
         let object_bytes = match Self::build_fragments(raw_payload) {
             Ok(fragments) => fragments,
             Err(error) => return UploadPutOutcome::Failed(error),
@@ -991,68 +998,134 @@ impl UploadLifecycleWorker {
     pub(crate) async fn run(self, mut rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>) {
         info!("background uploader started");
         let worker_count = self.vfs.upload_worker_count.max(1);
-
-        let dispatch_capacity = worker_count.max(1) * 2;
-        let (worker_tx, worker_rx) = tokio::sync::mpsc::channel::<PendingUpload>(dispatch_capacity);
-        let worker_rx = Arc::new(tokio::sync::Mutex::new(worker_rx));
+        let permits = Arc::new(Semaphore::new(worker_count));
         let mut workers = JoinSet::new();
         info!(
             upload_worker_count = worker_count,
-            dispatch_capacity, "upload worker pool started"
+            "upload worker pool started"
         );
 
-        for _ in 0..worker_count {
-            let rx = worker_rx.clone();
-            let worker = self.clone();
-            workers.spawn(async move {
-                worker.run_single_worker(rx).await;
-            });
-        }
-
         let mut fair = crate::qos::FairInodeScheduler::<PendingUpload>::default();
+        let mut delayed = DelayedUploads::default();
         let mut dispatched_since_yield = 0u32;
         let mut inbound_closed = false;
         loop {
-            if self.vfs.uploader_shutdown_requested() || (inbound_closed && fair.is_empty()) {
+            Self::promote_ready_uploads(&mut fair, &mut delayed);
+
+            while !fair.is_empty() {
+                let Some(permit) = permits.clone().try_acquire_owned().ok() else {
+                    break;
+                };
+                let Some(op) = fair.pop() else {
+                    drop(permit);
+                    break;
+                };
+                debug!(
+                    ino = op.ino,
+                    object_id = op.object_id,
+                    offset = op.offset,
+                    content_epoch = op.content_epoch,
+                    retry_count = op.retry_count,
+                    not_before_unix_ms = op.not_before_unix_ms,
+                    "uploader dispatch op"
+                );
+                let worker = self.clone();
+                workers.spawn(async move {
+                    worker.run_single_upload(op, permit).await;
+                });
+                dispatched_since_yield = dispatched_since_yield.saturating_add(1);
+                if dispatched_since_yield >= UPLOAD_WORKER_YIELD_EVERY_OPS {
+                    dispatched_since_yield = 0;
+                    tokio::task::yield_now().await;
+                    Self::promote_ready_uploads(&mut fair, &mut delayed);
+                }
+            }
+
+            if self.vfs.uploader_shutdown_requested() {
                 break;
             }
+            if inbound_closed && fair.is_empty() && delayed.is_empty() && workers.is_empty() {
+                break;
+            }
+
+            let next_delayed_wait = if fair.is_empty() {
+                Self::next_delayed_wait(&delayed)
+            } else {
+                None
+            };
+            let sleep_until_ready = async {
+                match next_delayed_wait {
+                    Some(delay) => tokio::time::sleep(delay).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(sleep_until_ready);
 
             tokio::select! {
                 biased;
                 _ = self.vfs.state.shutdown.uploader_shutdown_token.cancelled() => break,
-                permit = worker_tx.reserve(), if !fair.is_empty() => {
-                    match permit {
-                        Ok(permit) => {
-                            if let Some(op) = fair.pop() {
-                                debug!(
-                                    ino = op.ino,
-                                    object_id = op.object_id,
-                                    offset = op.offset,
-                                    content_epoch = op.content_epoch,
-                                    retry_count = op.retry_count,
-                                    "uploader dispatch op"
-                                );
-                                permit.send(op);
-                                dispatched_since_yield = dispatched_since_yield.saturating_add(1);
-                                if dispatched_since_yield >= UPLOAD_WORKER_YIELD_EVERY_OPS {
-                                    dispatched_since_yield = 0;
-                                    tokio::task::yield_now().await;
-                                }
-                            }
-                        }
-                        Err(_) => break,
+                Some(join_result) = workers.join_next(), if !workers.is_empty() => {
+                    match join_result {
+                        Ok(()) => {}
+                        Err(error) if error.is_cancelled() => {}
+                        Err(error) => warn!(error = %error, "uploader worker join failed"),
                     }
                 }
                 inbound = rx.recv(), if !inbound_closed => {
                     match inbound {
-                        Some(op) => fair.push(op.ino, op),
+                        Some(op) => Self::enqueue_pending_upload(&mut fair, &mut delayed, op),
                         None => inbound_closed = true,
                     }
                 }
+                _ = &mut sleep_until_ready => {}
             }
         }
 
-        drop(worker_tx);
+        self.drain_workers(&mut workers).await;
+    }
+
+    fn enqueue_pending_upload(
+        fair: &mut crate::qos::FairInodeScheduler<PendingUpload>,
+        delayed: &mut DelayedUploads,
+        op: PendingUpload,
+    ) {
+        if op.not_before_unix_ms > now_unix_millis() {
+            delayed
+                .entry(op.not_before_unix_ms)
+                .or_default()
+                .push_back(op);
+        } else {
+            fair.push(op.ino, op);
+        }
+    }
+
+    fn promote_ready_uploads(
+        fair: &mut crate::qos::FairInodeScheduler<PendingUpload>,
+        delayed: &mut DelayedUploads,
+    ) {
+        loop {
+            let Some((&not_before_unix_ms, _)) = delayed.first_key_value() else {
+                break;
+            };
+            if not_before_unix_ms > now_unix_millis() {
+                break;
+            }
+            let Some((_, mut ready_ops)) = delayed.pop_first() else {
+                break;
+            };
+            while let Some(op) = ready_ops.pop_front() {
+                fair.push(op.ino, op);
+            }
+        }
+    }
+
+    fn next_delayed_wait(delayed: &DelayedUploads) -> Option<Duration> {
+        delayed.first_key_value().map(|(&not_before_unix_ms, _)| {
+            Duration::from_millis(not_before_unix_ms.saturating_sub(now_unix_millis()))
+        })
+    }
+
+    async fn drain_workers(&self, workers: &mut JoinSet<()>) {
         let join_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
             if workers.is_empty() {
@@ -1080,57 +1153,33 @@ impl UploadLifecycleWorker {
         }
     }
 
-    async fn run_single_worker(
-        &self,
-        rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<PendingUpload>>>,
-    ) {
-        let mut ops_since_yield = 0u32;
-        loop {
-            let op = tokio::select! {
-                _ = self.vfs.state.shutdown.uploader_shutdown_token.cancelled() => None,
-                op = async {
-                    let mut rx = rx.lock().await;
-                    rx.recv().await
-                } => op,
-            };
-            let Some(op) = op else {
-                break;
-            };
-            if self.vfs.uploader_shutdown_requested() {
-                break;
-            }
+    async fn run_single_upload(&self, op: PendingUpload, _permit: OwnedSemaphorePermit) {
+        if self.vfs.uploader_shutdown_requested() {
+            return;
+        }
 
+        self.vfs.state.file_session.note_background_transition(
+            op.ino,
+            FileSessionOperation::Upload,
+            "start",
+        );
+        debug!(
+            ino = op.ino,
+            object_id = op.object_id,
+            offset = op.offset,
+            content_epoch = op.content_epoch,
+            retry_count = op.retry_count,
+            not_before_unix_ms = op.not_before_unix_ms,
+            "process_upload start"
+        );
+
+        let outcome = self.processor.process_upload(op.clone()).await;
+        if outcome == UploadOutcome::Completed {
             self.vfs.state.file_session.note_background_transition(
                 op.ino,
                 FileSessionOperation::Upload,
-                "start",
+                "complete",
             );
-            debug!(
-                ino = op.ino,
-                object_id = op.object_id,
-                offset = op.offset,
-                content_epoch = op.content_epoch,
-                retry_count = op.retry_count,
-                "process_upload start"
-            );
-
-            let outcome = self.processor.process_upload(op.clone()).await;
-            if outcome == UploadOutcome::Completed {
-                self.vfs.state.file_session.note_background_transition(
-                    op.ino,
-                    FileSessionOperation::Upload,
-                    "complete",
-                );
-            }
-            if outcome == UploadOutcome::Shutdown && self.vfs.uploader_shutdown_requested() {
-                break;
-            }
-
-            ops_since_yield = ops_since_yield.saturating_add(1);
-            if ops_since_yield >= UPLOAD_WORKER_YIELD_EVERY_OPS {
-                ops_since_yield = 0;
-                tokio::task::yield_now().await;
-            }
         }
     }
 }
@@ -1144,6 +1193,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     type FakeBlockMap = HashMap<(Ino, u32), Option<BlockRef>>;
+    type FakePendingInodes = Arc<Mutex<HashSet<Ino>>>;
     type FakeProcessor = UploadProcessor<
         FakeCoordinator,
         FakeLocalBlocks,
@@ -1158,11 +1208,13 @@ mod tests {
         completed: Arc<Mutex<Vec<u64>>>,
         cancelled: Arc<Mutex<Vec<u64>>>,
         requeued: Arc<Mutex<Vec<PendingUpload>>>,
+        pending_inodes: FakePendingInodes,
     }
 
     impl UploadCoordinatorPort for FakeCoordinator {
         fn complete_upload(&self, op: &PendingUpload) {
             self.completed.lock().push(op.object_id);
+            self.pending_inodes.lock().remove(&op.ino);
         }
 
         fn requeue_upload(&self, op: PendingUpload) -> bool {
@@ -1172,6 +1224,7 @@ mod tests {
 
         fn cancel_upload(&self, op: &PendingUpload) {
             self.cancelled.lock().push(op.object_id);
+            self.pending_inodes.lock().remove(&op.ino);
         }
     }
 
@@ -1325,6 +1378,7 @@ mod tests {
     struct FakeShutdown {
         shutdown_requested: Arc<AtomicBool>,
         deleted_inodes: Arc<Mutex<HashSet<Ino>>>,
+        pending_inodes: FakePendingInodes,
         cleared_deleted: Arc<Mutex<Vec<Ino>>>,
         released_tokens: Arc<Mutex<Vec<Ino>>>,
         canceled_deleted: Arc<AtomicU64>,
@@ -1338,6 +1392,7 @@ mod tests {
             Self {
                 shutdown_requested: Arc::new(AtomicBool::new(false)),
                 deleted_inodes: Arc::new(Mutex::new(HashSet::new())),
+                pending_inodes: Arc::new(Mutex::new(HashSet::new())),
                 cleared_deleted: Arc::new(Mutex::new(Vec::new())),
                 released_tokens: Arc::new(Mutex::new(Vec::new())),
                 canceled_deleted: Arc::new(AtomicU64::new(0)),
@@ -1362,7 +1417,9 @@ mod tests {
         }
 
         fn maybe_release_upload_cancel_token(&self, ino: Ino) {
-            self.released_tokens.lock().push(ino);
+            if !self.pending_inodes.lock().contains(&ino) {
+                self.released_tokens.lock().push(ino);
+            }
         }
 
         fn deleted_inode_marked(&self, ino: Ino) -> bool {
@@ -1434,11 +1491,18 @@ mod tests {
         FakeShutdown,
         FakePolicy,
     ) {
-        let coordinator = FakeCoordinator::default();
+        let pending_inodes = Arc::new(Mutex::new(HashSet::new()));
+        let coordinator = FakeCoordinator {
+            pending_inodes: pending_inodes.clone(),
+            ..FakeCoordinator::default()
+        };
         let local_blocks = FakeLocalBlocks::default();
         let meta = FakeMeta::default();
         let remote = FakeRemote::default();
-        let shutdown = FakeShutdown::default();
+        let shutdown = FakeShutdown {
+            pending_inodes: pending_inodes.clone(),
+            ..FakeShutdown::default()
+        };
         let policy = FakePolicy::default();
         let processor = UploadProcessor {
             coordinator: coordinator.clone(),
@@ -1470,15 +1534,20 @@ mod tests {
             object_id: 77,
             content_epoch: 3,
             created_unix_ms: 0,
+            not_before_unix_ms: 0,
             retry_count: 0,
         }
     }
 
     #[tokio::test]
     async fn process_upload_requeues_transient_failures() {
-        let (processor, coordinator, local_blocks, meta, remote, shutdown, policy) =
+        let (mut processor, coordinator, local_blocks, meta, remote, shutdown, policy) =
             processor_fixture();
         let op = make_pending_upload();
+        let before_retry = now_unix_millis();
+        processor.upload_requeue_base = Duration::from_millis(50);
+        processor.upload_requeue_max = Duration::from_millis(50);
+        coordinator.pending_inodes.lock().insert(op.ino);
         meta.attrs
             .lock()
             .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
@@ -1497,6 +1566,8 @@ mod tests {
         let requeued = coordinator.requeued.lock();
         assert_eq!(requeued.len(), 1);
         assert_eq!(requeued[0].retry_count, 1);
+        assert!(requeued[0].not_before_unix_ms >= before_retry.saturating_add(40));
+        assert!(shutdown.released_tokens.lock().is_empty());
     }
 
     #[tokio::test]
@@ -1504,6 +1575,7 @@ mod tests {
         let (processor, coordinator, local_blocks, _meta, _remote, shutdown, _policy) =
             processor_fixture();
         let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
         shutdown.deleted_inodes.lock().insert(op.ino);
 
         let outcome = processor.process_upload(op).await;
@@ -1512,6 +1584,7 @@ mod tests {
         assert_eq!(coordinator.cancelled.lock().as_slice(), &[77]);
         assert_eq!(local_blocks.removed.lock().as_slice(), &[77]);
         assert_eq!(shutdown.canceled_deleted.load(Ordering::Relaxed), 1);
+        assert_eq!(shutdown.released_tokens.lock().as_slice(), &[11]);
     }
 
     #[tokio::test]
@@ -1519,6 +1592,7 @@ mod tests {
         let (processor, coordinator, local_blocks, meta, _remote, shutdown, _policy) =
             processor_fixture();
         let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
         meta.attrs
             .lock()
             .insert(op.ino, Some(make_attr(op.ino, op.content_epoch + 1)));
@@ -1529,5 +1603,29 @@ mod tests {
         assert_eq!(coordinator.cancelled.lock().as_slice(), &[77]);
         assert_eq!(local_blocks.removed.lock().as_slice(), &[77]);
         assert_eq!(shutdown.canceled_stale.load(Ordering::Relaxed), 1);
+        assert_eq!(shutdown.released_tokens.lock().as_slice(), &[11]);
+    }
+
+    #[tokio::test]
+    async fn delayed_retry_ops_wait_until_due_before_dispatch() {
+        let mut fair = crate::qos::FairInodeScheduler::<PendingUpload>::default();
+        let mut delayed = DelayedUploads::default();
+        let mut op = make_pending_upload();
+        op.not_before_unix_ms = now_unix_millis().saturating_add(20);
+
+        UploadLifecycleWorker::enqueue_pending_upload(&mut fair, &mut delayed, op.clone());
+        UploadLifecycleWorker::promote_ready_uploads(&mut fair, &mut delayed);
+
+        assert!(fair.is_empty());
+        assert_eq!(delayed.len(), 1);
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        UploadLifecycleWorker::promote_ready_uploads(&mut fair, &mut delayed);
+
+        let Some(ready) = fair.pop() else {
+            panic!("expected delayed upload to become dispatchable");
+        };
+        assert_eq!(ready.object_id, op.object_id);
+        assert!(delayed.is_empty());
     }
 }

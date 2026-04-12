@@ -88,6 +88,7 @@ fn startup_replay_does_not_override_current_epoch_live_extent_with_stale_pending
         object_id: 7001,
         content_epoch: 4,
         created_unix_ms: 100,
+        not_before_unix_ms: 0,
         retry_count: 0,
     }];
 
@@ -125,6 +126,7 @@ fn startup_replay_keeps_metadata_live_extent_when_pending_upload_has_same_epoch(
         object_id: 7001,
         content_epoch: 5,
         created_unix_ms: 100,
+        not_before_unix_ms: 0,
         retry_count: 0,
     }];
 
