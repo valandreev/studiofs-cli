@@ -10,6 +10,7 @@ use std::time::Duration;
 use studiofs_cache::block_cache::DEFAULT_L1_SIZE;
 use studiofs_cache::v3::CacheV3Layout;
 use studiofs_data::DataStoreConfig;
+#[cfg(test)]
 use studiofs_meta::redb_engine::RedbSnapshot;
 use studiofs_meta::{
     FormatInfo, MetaEngine, MetaFormat, MetaReplication, MetaSnapshots, MetadataBackend,
@@ -968,7 +969,7 @@ fn materialize_snapshot_mount_meta<M: ?Sized + SnapshotSourceMeta>(
     if snapshot.snapshot_payload.is_empty() {
         anyhow::bail!("snapshot '{snapshot_id}' payload is empty");
     }
-    let snapshot_state: RedbSnapshot = serde_json::from_slice(&snapshot.snapshot_payload)
+    let snapshot_state = RedbMetaEngine::decode_snapshot_payload(&snapshot.snapshot_payload)
         .map_err(|e| anyhow::anyhow!("invalid snapshot payload for '{snapshot_id}': {e}"))?;
 
     let snapshot_dir = meta_dir.join("snapshots");
@@ -1842,7 +1843,7 @@ mod tests {
             created_at: 1,
             state: SnapshotState::Synced,
             pinned_object_ids: Vec::new(),
-            snapshot_payload: serde_json::to_vec(&RedbSnapshot::default())
+            snapshot_payload: RedbMetaEngine::encode_snapshot_payload(&RedbSnapshot::default())
                 .expect("serialize empty redb snapshot"),
         };
         let source = Arc::new(SnapshotOnlyMeta { snapshot });
