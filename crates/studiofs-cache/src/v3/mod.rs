@@ -16,7 +16,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use tracing::{debug, warn};
 
-use crate::v2::{LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState};
+use crate::local::{LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState};
 
 pub mod cache_index;
 pub mod eviction;
@@ -925,8 +925,8 @@ impl PendingAccessTouches {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::local_block_backend::contract_tests::assert_local_block_backend_contract;
-    use crate::v2::{LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState};
+    use crate::local::contract_tests::assert_local_block_backend_contract;
+    use crate::local::{LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState};
 
     fn create_v3_marker(layout: &CacheV3Layout) {
         std::fs::create_dir_all(&layout.v3_root).unwrap();

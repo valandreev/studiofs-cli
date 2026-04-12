@@ -22,7 +22,7 @@ use opendal::ErrorKind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use studiofs_cache::v2::LocalBlockBackend;
+use studiofs_cache::local::LocalBlockBackend;
 use studiofs_data::object::{CLOUD_FRAGMENT_SIZE, read_object, validate_cloud_fragment_layout};
 use studiofs_data::store::{DataError, DataStore};
 use tokio::sync::broadcast;

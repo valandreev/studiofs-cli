@@ -9,7 +9,6 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use studiofs_cache::block_cache::{CancelUploadMode, L2IoPriority};
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
@@ -100,12 +99,7 @@ impl StudioVfs {
         op: &PendingUpload,
     ) -> VfsResult<()> {
         let has_open_handles = self.handle_table.open_count(op.ino) > 0;
-        let mode = if has_open_handles {
-            CancelUploadMode::KeepBlock
-        } else {
-            CancelUploadMode::RemoveBlock
-        };
-        self.block_cache.cancel_upload(op, mode);
+        self.upload_coordinator.cancel_upload(op);
         if has_open_handles {
             self.record_deferred_deleted_local_block(op.ino, op.object_id);
         } else {
@@ -142,7 +136,7 @@ impl StudioVfs {
         if self.handle_table.open_count(ino) > 0 {
             return;
         }
-        if self.block_cache.has_pending_uploads_for_ino(ino) {
+        if self.upload_coordinator.has_pending_uploads_for_ino(ino) {
             return;
         }
         // Only clear after inode metadata is actually gone. This keeps the
@@ -155,7 +149,7 @@ impl StudioVfs {
 
     pub(super) fn maybe_release_upload_cancel_token(&self, ino: Ino) {
         let mut tokens = self.state.upload.upload_cancel_tokens.lock();
-        if self.block_cache.has_pending_uploads_for_ino(ino) {
+        if self.upload_coordinator.has_pending_uploads_for_ino(ino) {
             return;
         }
         tokens.remove(&ino);
@@ -237,7 +231,7 @@ impl StudioVfs {
     pub(super) fn pending_age_stats_ms(&self) -> (u64, u64) {
         let now_ms = now_unix_millis();
         let mut ages: Vec<u64> = self
-            .block_cache
+            .upload_coordinator
             .snapshot_pending_uploads()
             .into_iter()
             .map(|op| now_ms.saturating_sub(op.created_unix_ms))
@@ -450,8 +444,7 @@ impl StudioVfs {
                 current_epoch = attr.content_epoch,
                 "upload cancelled: stale content epoch"
             );
-            self.block_cache
-                .cancel_upload(&op, CancelUploadMode::KeepBlock);
+            self.upload_coordinator.cancel_upload(&op);
             self.block_store_remove_async(op.object_id).await?;
             self.state
                 .upload
@@ -485,8 +478,7 @@ impl StudioVfs {
                 block_index,
                 "upload cancelled: stale block superseded by newer object"
             );
-            self.block_cache
-                .cancel_upload(&op, CancelUploadMode::KeepBlock);
+            self.upload_coordinator.cancel_upload(&op);
             self.block_store_remove_async(op.object_id).await?;
             self.state
                 .upload
@@ -701,8 +693,7 @@ impl StudioVfs {
                         // (race), cancel cleanly. Otherwise this remains a
                         // genuine error and will be retried.
                         if self.state.upload.deleted_inodes.lock().contains(&op.ino) {
-                            self.block_cache
-                                .cancel_upload(&op, CancelUploadMode::KeepBlock);
+                            self.upload_coordinator.cancel_upload(&op);
                             self.block_store_remove_async(op.object_id).await?;
                             self.state
                                 .upload
@@ -720,8 +711,7 @@ impl StudioVfs {
                     // First attempt without a local persisted block is
                     // unexpected; retry through normal error path.
                     if self.state.upload.deleted_inodes.lock().contains(&op.ino) {
-                        self.block_cache
-                            .cancel_upload(&op, CancelUploadMode::KeepBlock);
+                        self.upload_coordinator.cancel_upload(&op);
                         self.block_store_remove_async(op.object_id).await?;
                         self.state
                             .upload
@@ -863,7 +853,7 @@ impl StudioVfs {
                     .await
                     .unwrap_or(false) =>
             {
-                self.block_cache.complete_upload(&op);
+                self.upload_coordinator.complete_upload(&op);
                 debug!(
                     ino = op.ino,
                     object_id = op.object_id,
@@ -882,7 +872,7 @@ impl StudioVfs {
                     block_index,
                     "upload completed for stale block, marked for deletion"
                 );
-                self.block_cache.complete_upload(&op);
+                self.upload_coordinator.complete_upload(&op);
                 debug!(
                     ino = op.ino,
                     object_id = op.object_id,
@@ -912,9 +902,6 @@ impl StudioVfs {
             .lock()
             .remove(&op.object_id)
         {
-            self.block_cache
-                .remove_with_priority(op.object_id, L2IoPriority::Background)
-                .await;
             self.block_store_remove_async(op.object_id).await?;
             debug!(
                 object_id = op.object_id,
@@ -926,9 +913,6 @@ impl StudioVfs {
         .await
             && current.object_id != op.object_id
         {
-            self.block_cache
-                .remove_with_priority(op.object_id, L2IoPriority::Background)
-                .await;
             self.block_store_remove_async(op.object_id).await?;
         } else {
             self.block_store_mark_uploaded_async(op.object_id).await?;
@@ -949,19 +933,20 @@ impl StudioVfs {
 
     /// Persist the cache checkpoint to disk.
     ///
-    /// Called at shutdown so the LRU state survives across remounts.
+    /// Called at shutdown so pending-upload state and local backend metadata
+    /// stay consistent across remounts.
     pub async fn persist_cache(&self) {
-        self.block_cache.shutdown().await;
+        self.upload_coordinator.shutdown().await;
         if let Err(error) = self.local_block_backend.sync_data() {
             warn!(error = %error, "local cache backend sync failed during shutdown");
         } else {
             tracing::info!("local cache backend sync persisted");
         }
-        tracing::info!("block cache checkpoint persisted");
+        tracing::info!("upload coordinator checkpoint persisted");
     }
 
     /// Best-effort graceful shutdown: drain dirty buffers, persist final
-    /// checkpoint state, cancel uploader tasks, then persist cache checkpoint.
+    /// checkpoint state, cancel uploader tasks, then persist upload state.
     pub async fn shutdown(&self, upload_drain_timeout: Duration) {
         if self
             .state
@@ -1012,12 +997,12 @@ impl StudioVfs {
         let dirty_before = self.total_pending_write_buffer_bytes();
         info!(
             dirty_bytes = dirty_before,
-            pending_uploads = self.block_cache.pending_upload_count(),
+            pending_uploads = self.upload_coordinator.pending_upload_count(),
             "VFS shutdown: flushing pending write buffer"
         );
         self.flush_pending_blocks_for_shutdown().await;
         info!(
-            pending_uploads = self.block_cache.pending_upload_count(),
+            pending_uploads = self.upload_coordinator.pending_upload_count(),
             elapsed_ms = t0.elapsed().as_millis() as u64,
             "VFS shutdown: write buffer drain complete"
         );
@@ -1030,7 +1015,7 @@ impl StudioVfs {
 
         // Phase 2: attempt graceful upload drain (bounded by user timeout),
         // then cancel uploader work so network-blocked requests are aborted.
-        let pending = self.block_cache.pending_upload_count();
+        let pending = self.upload_coordinator.pending_upload_count();
         let mut drained = pending == 0;
         if pending > 0 {
             if upload_drain_timeout.is_zero() {
@@ -1045,7 +1030,7 @@ impl StudioVfs {
                     "VFS shutdown: waiting for uploads to drain before forced cancellation"
                 );
                 drained = self
-                    .block_cache
+                    .upload_coordinator
                     .wait_for_uploads_idle(upload_drain_timeout)
                     .await;
             }
@@ -1054,11 +1039,11 @@ impl StudioVfs {
         self.request_uploader_shutdown();
 
         if !drained {
-            let pending_ops = self.block_cache.snapshot_pending_uploads();
+            let pending_ops = self.upload_coordinator.snapshot_pending_uploads();
             let sample_object_ids: Vec<u64> =
                 pending_ops.iter().take(8).map(|op| op.object_id).collect();
             info!(
-                pending = self.block_cache.pending_upload_count(),
+                pending = self.upload_coordinator.pending_upload_count(),
                 pending_queue_ops = pending_ops.len(),
                 pending_object_ids_sample = ?sample_object_ids,
                 "VFS shutdown: uploader cancelled; remaining dirty uploads will replay on next startup"

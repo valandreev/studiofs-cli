@@ -361,7 +361,9 @@ impl StudioVfs {
                                     _ = vfs.state.shutdown.uploader_shutdown_token.cancelled() => false,
                                     _ = tokio::time::sleep(delay) => !vfs.uploader_shutdown_requested(),
                                 };
-                                if should_requeue && !vfs.block_cache.requeue_upload(retry_op) {
+                                if should_requeue
+                                    && !vfs.upload_coordinator.requeue_upload(retry_op)
+                                {
                                     error!("failed to requeue upload op after error");
                                 }
                             }
@@ -464,7 +466,7 @@ impl StudioVfs {
             if let Err(error) = self.block_store_run_pressure_maintenance_async().await {
                 warn!(error = %error, "background local backend pressure maintenance failed");
             }
-            let pending = self.block_cache.pending_upload_count();
+            let pending = self.upload_coordinator.pending_upload_count();
             let pending_upload_bytes = pending as u64 * u64::from(self.block_size);
             let metadata_backlog = self.sync_meta().replication_backlog();
             let pending_metadata_ops = metadata_backlog.total_ops();
@@ -498,7 +500,10 @@ impl StudioVfs {
             let (p95_ms, max_ms) = self.pending_age_stats_ms();
             let ingress = self.ingress_stats();
             let materialize_batches = self.state.metrics.materialize_batch_stats.snapshot();
-            let upload_queue = self.block_cache.cache_pipeline_metrics().upload_queue;
+            let upload_queue = self
+                .upload_coordinator
+                .cache_pipeline_metrics()
+                .upload_queue;
             let foreground_read_protection = self.foreground_read_protection_stats();
             self.adjust_upload_backpressure_from_metrics(
                 foreground_read_protection.p90_latency_ns,

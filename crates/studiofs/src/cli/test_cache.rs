@@ -24,9 +24,10 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
-use studiofs_cache::block_cache::{CacheReadLevel, DEFAULT_L1_SIZE};
 use studiofs_cache::metrics::CachePipelineMetricsSnapshot;
-use studiofs_cache::{BlockCache, BlockCacheConfig};
+use studiofs_cache::{
+    BenchmarkCache, BenchmarkCacheConfig, CacheReadLevel, DEFAULT_MEMORY_CACHE_SIZE,
+};
 use studiofs_vfs::parse_size_bytes;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1353,7 +1354,7 @@ fn phase_telemetry_to_report(telemetry: &PhaseTelemetry, wall_elapsed: Duration)
 }
 
 async fn run_shim_writes(
-    cache: Arc<BlockCache>,
+    cache: Arc<BenchmarkCache>,
     sizes: &[u64],
     order: &[usize],
     io_depth: usize,
@@ -1432,7 +1433,7 @@ async fn run_shim_writes(
 }
 
 async fn run_shim_reads(
-    cache: Arc<BlockCache>,
+    cache: Arc<BenchmarkCache>,
     sizes: &[u64],
     order: &[usize],
     io_depth: usize,
@@ -1526,7 +1527,7 @@ async fn run_shim_reads(
 }
 
 async fn run_shim_writes_sequential_streams(
-    cache: Arc<BlockCache>,
+    cache: Arc<BenchmarkCache>,
     sizes: &[u64],
     order: &[usize],
     stream_count: usize,
@@ -1588,7 +1589,7 @@ async fn run_shim_writes_sequential_streams(
 }
 
 async fn run_shim_reads_sequential_streams(
-    cache: Arc<BlockCache>,
+    cache: Arc<BenchmarkCache>,
     sizes: &[u64],
     order: &[usize],
     stream_count: usize,
@@ -2177,10 +2178,9 @@ fn cpu_utilization_percent(cpu: Duration, wall: Duration) -> f64 {
 }
 
 async fn run_direct(params: &TestCacheParams, cache_dir: &Path) -> Result<BenchmarkReport> {
-    let cache_config = BlockCacheConfig::new(cache_dir, params.l1_limit);
-    let (cache, _rx) = BlockCache::open(cache_config)
+    let cache_config = BenchmarkCacheConfig::new(cache_dir, params.l1_limit);
+    let cache = BenchmarkCache::open(cache_config)
         .with_context(|| format!("open cache dir {}", cache_dir.display()))?;
-    cache.spawn_background_tasks();
 
     let size_class_bounds = SizeClassBounds {
         small_max: params.size_class_small_max,
@@ -3359,7 +3359,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
             .unwrap_or(DEFAULT_TEST_CACHE_BLOCK_SIZE_STR),
     )?;
     let block_size_default = block_size.to_string();
-    let l1_limit_default = DEFAULT_L1_SIZE.to_string();
+    let l1_limit_default = DEFAULT_MEMORY_CACHE_SIZE.to_string();
     let small_max_default = DEFAULT_SMALL_CLASS_MAX_BYTES.to_string();
     let medium_max_default = block_size.to_string();
     let read_size = parse_size_arg(

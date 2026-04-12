@@ -1,6 +1,5 @@
 use super::{DeletedInodeCleanup, Ino, MetaError, StudioVfs, VfsMeta, VfsResult};
 use std::sync::Arc;
-use studiofs_cache::block_cache::L2IoPriority;
 use tracing::{debug, info, warn};
 
 use crate::runtime::run_meta;
@@ -158,7 +157,7 @@ impl StudioVfs {
         let mut evicted = Vec::new();
         let mut deferred_pinned = Vec::new();
         for &object_id in object_ids {
-            if self.block_cache.is_pinned(object_id) {
+            if self.upload_coordinator.is_pinned(object_id) {
                 // Record for post-upload cleanup instead of silently skipping.
                 deferred_pinned.push(object_id);
             } else {
@@ -172,9 +171,6 @@ impl StudioVfs {
             }
         }
         if !evicted.is_empty() {
-            self.block_cache
-                .remove_batch_with_priority(&evicted, L2IoPriority::Background)
-                .await;
             if let Err(error) = self.block_store_remove_batch_async(evicted.clone()).await {
                 warn!(
                     ino,
@@ -209,7 +205,7 @@ impl StudioVfs {
         let mut deferred_pinned = 0;
         let mut pending_evictions_to_add = Vec::new();
         for object_id in object_ids {
-            if self.block_cache.is_pinned(object_id) {
+            if self.upload_coordinator.is_pinned(object_id) {
                 pending_evictions_to_add.push(object_id);
                 deferred_pinned += 1;
                 continue;
@@ -223,9 +219,6 @@ impl StudioVfs {
             }
         }
         if !evicted.is_empty() {
-            self.block_cache
-                .remove_batch_with_priority(&evicted, L2IoPriority::Background)
-                .await;
             self.block_store_remove_batch_async(evicted.clone()).await?;
         }
         if !evicted.is_empty() || deferred_pinned > 0 {

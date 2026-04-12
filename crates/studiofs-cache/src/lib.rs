@@ -1,24 +1,29 @@
 //! StudioFS Cache Layer.
 //!
-//! `block_cache` provides upload-queue and pending-upload tracking at the
-//! write-path boundary.
+//! `upload_coordinator` provides upload-queue and pending-upload tracking at
+//! the write-path boundary.
+//! `benchmark_cache` provides the lightweight in-memory benchmark surface used
+//! by `studiofs test-cache`.
 //! `v3` provides contract detection plus the file-per-block local backend.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub mod block_cache;
+pub mod benchmark_cache;
+pub mod local;
 pub mod metrics;
+pub mod upload_coordinator;
 pub mod upload_queue;
-
-// --- Cache v2: single-file local block backend ---
-pub mod v2;
 // --- Cache v3: contract detection + file-per-block backend ---
 pub mod v3;
 
 // --- Re-exports ---
-pub use block_cache::{BlockCache, BlockCacheConfig, L2IoPriority};
+pub use benchmark_cache::{
+    BenchmarkCache, BenchmarkCacheConfig, BenchmarkCacheStats, CacheReadLevel, CacheReadTrace,
+    DEFAULT_MEMORY_CACHE_SIZE,
+};
+pub use upload_coordinator::{UploadCoordinator, UploadCoordinatorConfig};
 pub use upload_queue::PendingUpload;
 
 const CACHE_V3_OPEN_LOCK_RETRY_ATTEMPTS: usize = 40;
@@ -28,7 +33,7 @@ const CACHE_V3_OPEN_LOCK_RETRY_DELAY: Duration = Duration::from_millis(25);
 pub struct OpenedLocalBlockBackend {
     pub detection: v3::CacheBackendDetection,
     pub backend_kind: v3::CacheBackendKind,
-    pub backend: Arc<dyn v2::LocalBlockBackend>,
+    pub backend: Arc<dyn local::LocalBlockBackend>,
 }
 
 /// Prepared cache-v3 runtime state for a per-volume cache root.
@@ -140,7 +145,7 @@ fn open_cache_v3_backend(
     cache_root: &Path,
     cache_root_display: &str,
     volume_uuid: &str,
-) -> Result<Arc<dyn v2::LocalBlockBackend>, OpenLocalBlockBackendError> {
+) -> Result<Arc<dyn local::LocalBlockBackend>, OpenLocalBlockBackendError> {
     open_cache_v3_backend_budgeted(
         cache_root,
         cache_root_display,
@@ -156,8 +161,8 @@ fn open_cache_v3_backend_budgeted(
     volume_uuid: &str,
     cache_budget_bytes: Option<u64>,
     payload_sync_mode: v3::CacheV3PayloadSyncMode,
-) -> Result<Arc<dyn v2::LocalBlockBackend>, OpenLocalBlockBackendError> {
-    let volume_uuid = v2::derive_backend_volume_uuid(volume_uuid);
+) -> Result<Arc<dyn local::LocalBlockBackend>, OpenLocalBlockBackendError> {
+    let volume_uuid = local::derive_backend_volume_uuid(volume_uuid);
     let mut last_conflict: Option<Box<v3::CacheV3LocalBlockBackendError>> = None;
 
     for attempt in 0..=CACHE_V3_OPEN_LOCK_RETRY_ATTEMPTS {
@@ -170,7 +175,7 @@ fn open_cache_v3_backend_budgeted(
             cache_budget_bytes,
             payload_sync_mode,
         ) {
-            Ok(backend) => return Ok(Arc::new(backend) as Arc<dyn v2::LocalBlockBackend>),
+            Ok(backend) => return Ok(Arc::new(backend) as Arc<dyn local::LocalBlockBackend>),
             Err(source)
                 if source.is_transient_open_lock_conflict()
                     && attempt < CACHE_V3_OPEN_LOCK_RETRY_ATTEMPTS =>
