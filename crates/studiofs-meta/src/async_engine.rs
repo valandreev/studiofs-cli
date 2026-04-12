@@ -6,24 +6,24 @@ use crate::MetaResult;
 
 /// Adapter that exposes a synchronous metadata principal through an async API.
 pub struct SyncMetaEngineAdapter<M: ?Sized> {
-    engine: Arc<M>,
+    inner: Arc<M>,
 }
 
 impl<M: ?Sized> Clone for SyncMetaEngineAdapter<M> {
     fn clone(&self) -> Self {
         Self {
-            engine: self.engine.clone(),
+            inner: self.inner.clone(),
         }
     }
 }
 
 impl<M: ?Sized> SyncMetaEngineAdapter<M> {
     pub fn new(engine: Arc<M>) -> Self {
-        Self { engine }
+        Self { inner: engine }
     }
 
     pub fn sync_engine(&self) -> Arc<M> {
-        self.engine.clone()
+        self.inner.clone()
     }
 }
 
@@ -41,8 +41,9 @@ mod tests {
     use super::{SyncMetaEngineAdapter, execute_sync_meta};
     use crate::{FormatInfo, MetaError, MetaFormat, RedbMetaEngine};
     use std::sync::Arc;
+    use tempfile::TempDir;
 
-    fn seed_format_engine() -> Arc<RedbMetaEngine> {
+    fn seed_format_engine() -> (TempDir, Arc<RedbMetaEngine>) {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("meta.redb");
         let engine = Arc::new(RedbMetaEngine::open(&path).expect("open redb"));
@@ -57,13 +58,12 @@ mod tests {
             16,
         );
         engine.set_format_info(&info).expect("set format info");
-        std::mem::forget(temp);
-        engine
+        (temp, engine)
     }
 
     #[test]
     fn sync_meta_engine_adapter_accepts_narrow_capability_principal() {
-        let engine = seed_format_engine();
+        let (_temp, engine) = seed_format_engine();
         let narrow: Arc<dyn MetaFormat> = engine;
         let adapter = SyncMetaEngineAdapter::new(narrow.clone());
         let observed = adapter
@@ -75,7 +75,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn execute_sync_meta_supports_typed_narrow_capability_calls() {
-        let engine = seed_format_engine();
+        let (_temp, engine) = seed_format_engine();
         let narrow: Arc<dyn MetaFormat> = engine;
         let adapter = SyncMetaEngineAdapter::new(narrow);
         let observed = execute_sync_meta(adapter, |meta| {
@@ -89,7 +89,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn execute_sync_meta_preserves_meta_errors_for_narrow_principals() {
-        let engine = seed_format_engine();
+        let (_temp, engine) = seed_format_engine();
         let narrow: Arc<dyn MetaFormat> = engine;
         let adapter = SyncMetaEngineAdapter::new(narrow);
         let err = execute_sync_meta(adapter, |_| {

@@ -372,6 +372,12 @@ impl<M: ?Sized + MetaReplication> MetaReplication for RuntimeMetaHandle<M> {
     forward_method!(fn prepare_for_close(&self));
 }
 
+/// Wrap a metadata principal in a local runtime handle that exposes the
+/// `VfsMeta` bundle as a trait object.
+///
+/// This keeps `StudioVfs` internals on a narrowed bundle even when callers
+/// still construct VFS from `Arc<dyn MetaEngine>`, and works around the lack of
+/// trait-object upcasting from one dyn supertrait composition to another.
 pub fn into_vfs_meta<M>(meta: Arc<M>) -> Arc<dyn VfsMeta>
 where
     M: ?Sized + VfsMeta + 'static,
