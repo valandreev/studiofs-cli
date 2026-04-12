@@ -183,10 +183,7 @@ mod tests {
         );
 
         let timed_out = crate::VfsError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
-        assert_eq!(
-            classify_vfs_error(&timed_out),
-            BridgeVfsErrorKind::TimedOut
-        );
+        assert_eq!(classify_vfs_error(&timed_out), BridgeVfsErrorKind::TimedOut);
 
         let invalid = crate::VfsError::InvalidName("bad".into());
         assert_eq!(

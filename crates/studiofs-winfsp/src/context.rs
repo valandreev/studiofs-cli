@@ -1732,8 +1732,7 @@ mod tests {
         attr_to_file_info, build_basic_info_setattr_args, build_notify_info,
         encode_symlink_reparse, ino_to_windows_path, notify_filter_for_kind,
         open_flags_from_create_options, resolve_create_callback_kind,
-        resolve_file_size_callback_action, vfs_to_winfsp_err,
-        unix_nanos_to_filetime,
+        resolve_file_size_callback_action, unix_nanos_to_filetime, vfs_to_winfsp_err,
     };
     use parking_lot::Mutex;
     use std::sync::Arc;
