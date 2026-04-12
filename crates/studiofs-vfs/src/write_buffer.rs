@@ -46,6 +46,107 @@ struct PayloadPersistConfig {
     local_sync_policy: LocalSyncPolicy,
 }
 
+trait BlockIdAllocatorPort {
+    async fn next_block_ids(&self, count: u32) -> VfsResult<Vec<u64>>;
+}
+
+trait LocalBlockWriterPort {
+    async fn persist_payload(
+        &self,
+        persisted_blocks: &[PersistedWriteBlock],
+        persist_config: PayloadPersistConfig,
+    ) -> VfsResult<()>;
+
+    async fn cleanup_uncommitted(
+        &self,
+        ino: Ino,
+        blocks: &[PersistedWriteBlock],
+        stage: &'static str,
+    );
+}
+
+trait OverlayCommitPort {
+    async fn commit_overlay(
+        &self,
+        ino: Ino,
+        chunk_slices: Vec<(
+            studiofs_meta::schema::ChunkId,
+            Vec<studiofs_meta::schema::SliceRecord>,
+        )>,
+        attr: Option<InodeAttr>,
+    ) -> VfsResult<Option<InodeAttr>>;
+}
+
+trait UploadSubmissionPort {
+    // Upload publication is a post-commit step. Implementations must absorb
+    // their own durability / retry mechanics so the drain core does not expose
+    // a fallible post-commit boundary.
+    async fn submit_uploads(
+        &self,
+        ino: Ino,
+        persisted_blocks: &[PersistedWriteBlock],
+        content_epoch: u64,
+    );
+}
+
+trait DrainCommitObserverPort {
+    fn on_metadata_committed(&self, ino: Ino, committed_attr: Option<&InodeAttr>);
+}
+
+struct WriteBufferDrainCore<L, C, B, U, O> {
+    local_blocks: L,
+    commit_meta: C,
+    block_ids: B,
+    uploads: U,
+    observer: O,
+    block_size: u32,
+    put_concurrency: usize,
+}
+
+type WriteBufferDrain<'a> = WriteBufferDrainCore<
+    VfsLocalBlockWriter<'a>,
+    VfsOverlayCommitter<'a>,
+    VfsBlockIdAllocator<'a>,
+    VfsUploadSubmitter<'a>,
+    VfsDrainCommitObserver<'a>,
+>;
+
+struct OrderedWriteSession<'a> {
+    ino: Ino,
+    vfs: &'a StudioVfs,
+    drain: WriteBufferDrain<'a>,
+}
+
+#[derive(Debug)]
+struct DrainOutcome {
+    persisted_blocks: Vec<PersistedWriteBlock>,
+}
+
+#[derive(Clone, Copy)]
+struct VfsLocalBlockWriter<'a> {
+    vfs: &'a StudioVfs,
+}
+
+#[derive(Clone, Copy)]
+struct VfsOverlayCommitter<'a> {
+    vfs: &'a StudioVfs,
+}
+
+#[derive(Clone, Copy)]
+struct VfsBlockIdAllocator<'a> {
+    vfs: &'a StudioVfs,
+}
+
+#[derive(Clone, Copy)]
+struct VfsUploadSubmitter<'a> {
+    vfs: &'a StudioVfs,
+}
+
+#[derive(Clone, Copy)]
+struct VfsDrainCommitObserver<'a> {
+    vfs: &'a StudioVfs,
+}
+
 pub(super) struct LocalSyncGroupState {
     pub(super) pending_bytes: u64,
     pub(super) last_sync_at: Instant,
@@ -91,6 +192,7 @@ impl WriteBufferState {
     }
 }
 
+#[cfg(test)]
 fn assign_reserved_object_ids(
     pending: &mut std::collections::HashMap<(Ino, u32), PendingBlock>,
     ino: Ino,
@@ -195,7 +297,832 @@ fn commit_persisted_block_state(
     (removed_bytes, removed_block_indexes)
 }
 
+impl<L, C, B, U, O> WriteBufferDrainCore<L, C, B, U, O>
+where
+    L: LocalBlockWriterPort,
+    C: OverlayCommitPort,
+    B: BlockIdAllocatorPort,
+    U: UploadSubmissionPort,
+    O: DrainCommitObserverPort,
+{
+    async fn allocate_block_ids(&self, count: u32) -> VfsResult<Vec<u64>> {
+        if count == 0 {
+            Ok(Vec::new())
+        } else {
+            self.block_ids.next_block_ids(count).await
+        }
+    }
+
+    fn additional_object_id_count_needed(
+        pending: &std::collections::HashMap<(Ino, u32), PendingBlock>,
+        ino: Ino,
+        blocks: &[DirtyWriteSnapshot],
+    ) -> usize {
+        blocks
+            .iter()
+            .filter(|block| {
+                pending
+                    .get(&(ino, block.block_index))
+                    .filter(|current| current.data.as_ref() == block.data.as_ref())
+                    .and_then(|current| current.reserved_object_id)
+                    .is_none()
+            })
+            .count()
+    }
+
+    fn try_prepare_persisted_blocks(
+        &self,
+        pending: &mut std::collections::HashMap<(Ino, u32), PendingBlock>,
+        ino: Ino,
+        blocks: &[DirtyWriteSnapshot],
+        fresh_object_ids: &mut std::collections::VecDeque<u64>,
+    ) -> Result<Vec<PersistedWriteBlock>, usize> {
+        let fresh_needed = Self::additional_object_id_count_needed(pending, ino, blocks);
+        let additional_needed = fresh_needed.saturating_sub(fresh_object_ids.len());
+        if additional_needed > 0 {
+            return Err(additional_needed);
+        }
+
+        let mut persisted_blocks = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            let key = (ino, block.block_index);
+            if let Some(current) = pending.get_mut(&key)
+                && current.data.as_ref() == block.data.as_ref()
+            {
+                let object_id = if let Some(object_id) = current.reserved_object_id {
+                    object_id
+                } else {
+                    let object_id = fresh_object_ids
+                        .pop_front()
+                        .expect("fresh object ids prevalidated");
+                    current.reserved_object_id = Some(object_id);
+                    object_id
+                };
+                persisted_blocks.push(PersistedWriteBlock {
+                    block_index: block.block_index,
+                    object_id,
+                    data: block.data.clone(),
+                });
+                continue;
+            }
+
+            let object_id = fresh_object_ids
+                .pop_front()
+                .expect("fresh object ids prevalidated");
+            persisted_blocks.push(PersistedWriteBlock {
+                block_index: block.block_index,
+                object_id,
+                data: block.data.clone(),
+            });
+        }
+
+        Ok(persisted_blocks)
+    }
+
+    fn build_overlay_slice_records(
+        &self,
+        ino: Ino,
+        persisted_blocks: &[PersistedWriteBlock],
+        dirty_chunk_slices: std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
+    ) -> VfsResult<
+        Vec<(
+            studiofs_meta::schema::ChunkId,
+            Vec<studiofs_meta::schema::SliceRecord>,
+        )>,
+    > {
+        let mut chunks: std::collections::BTreeMap<u64, Vec<studiofs_meta::schema::SliceRecord>> =
+            std::collections::BTreeMap::new();
+
+        if !dirty_chunk_slices.is_empty() {
+            // Dirty-chunk-slices path: validate per-write-slice invariants but
+            // emit ONE full-block SliceRecord per persisted block.
+            //
+            // Previously this path emitted per-write-slice records with partial
+            // BlockRef.offset/length pointing into the new S3 object.  That left
+            // stale slices from *earlier* objects (with different object_ids) in
+            // the overlay because the "fully_covered" pruning in
+            // flush_regular_file_overlay_slices_with_attr_txn only removes a
+            // prior slice when the incoming slice completely covers its chunk
+            // range.  A partial write slice (e.g. 1MB..1.5MB) never fully covers
+            // an old full-block slice (0..1MB), so both survive in the overlay.
+            // synthesize_block_ref_from_resolved_spans then sees two spans with
+            // different object_ids for block_index=0 and returns
+            // FragmentedBlock, quarantining the inode and making all reads
+            // return zeros.
+            //
+            // The fix: always write a single full-block SliceRecord whose
+            // BlockRef references the NEW object from offset=0 with the full
+            // persisted data length.  This guarantees the incoming slice fully
+            // covers any previous slice for the same block and the overlay
+            // stays consistent.
+            let block_lengths_by_block_index: std::collections::HashMap<u32, usize> =
+                persisted_blocks
+                    .iter()
+                    .map(|persisted| (persisted.block_index, persisted.data.len()))
+                    .collect();
+            for (_chunk_id, mut slices) in dirty_chunk_slices {
+                slices.sort_by_key(|slice| slice.seq);
+                for slice in slices {
+                    let Some(&block_len) = block_lengths_by_block_index.get(&slice.block_index)
+                    else {
+                        continue;
+                    };
+                    let slice_len = slice.range.len();
+                    let block_offset = slice.block_offset;
+                    let block_end = (block_offset as usize).saturating_add(slice_len as usize);
+                    if block_end > block_len {
+                        return Err(crate::VfsError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "dirty slice exceeds block length: ino={}, \
+                                 block_index={}, block_len={}, block_offset={}, \
+                                 slice_len={}",
+                                ino, slice.block_index, block_len, block_offset, slice_len
+                            ),
+                        )));
+                    }
+                }
+            }
+        }
+
+        for persisted in persisted_blocks {
+            let block_start = (persisted.block_index as u64) * (self.block_size as u64);
+            let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64;
+            let chunk_id = block_start / chunk_size;
+            let chunk_start = chunk_id * chunk_size;
+            let slice_start = (block_start - chunk_start) as u32;
+            let slice_end = slice_start + (persisted.data.len() as u32);
+            let slice_range = studiofs_meta::schema::SliceRange::new(slice_start, slice_end)
+                .ok_or_else(|| {
+                    crate::VfsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid slice range {}..{}", slice_start, slice_end),
+                    ))
+                })?;
+            let mut flags = studiofs_meta::schema::BlockFlags::empty();
+            if persisted.data.len() < self.block_size as usize {
+                flags |= studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK;
+            }
+            chunks
+                .entry(chunk_id)
+                .or_default()
+                .push(studiofs_meta::schema::SliceRecord {
+                    slice_id: studiofs_meta::schema::SliceId::default(),
+                    order: studiofs_meta::schema::SliceOrder::default(),
+                    range: slice_range,
+                    block: Some(studiofs_meta::schema::BlockRef {
+                        object_id: persisted.object_id,
+                        offset: 0,
+                        length: persisted.data.len() as u32,
+                        flags,
+                    }),
+                    block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
+                });
+        }
+
+        for slices in chunks.values_mut() {
+            let mut next_slice_id = 1u64;
+            let mut next_slice_order = 1u64;
+            for slice in slices.iter_mut() {
+                slice.slice_id = studiofs_meta::schema::SliceId(next_slice_id);
+                slice.order = studiofs_meta::schema::SliceOrder(next_slice_order);
+                next_slice_id = next_slice_id.saturating_add(1);
+                next_slice_order = next_slice_order.saturating_add(1);
+            }
+        }
+
+        Ok(chunks
+            .into_iter()
+            .map(|(k, v)| (studiofs_meta::schema::ChunkId(k), v))
+            .collect())
+    }
+
+    async fn execute_drain(
+        &self,
+        ino: Ino,
+        persisted_blocks: Vec<PersistedWriteBlock>,
+        dirty_chunk_slices: std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
+        content_epoch: u64,
+        attr_to_persist: Option<InodeAttr>,
+        persist_config: PayloadPersistConfig,
+    ) -> VfsResult<DrainOutcome> {
+        if persisted_blocks.is_empty() {
+            if let Some(attr) = attr_to_persist {
+                let committed_attr = self
+                    .commit_meta
+                    .commit_overlay(ino, Vec::new(), Some(attr))
+                    .await?;
+                self.observer
+                    .on_metadata_committed(ino, committed_attr.as_ref());
+            }
+            return Ok(DrainOutcome {
+                persisted_blocks: Vec::new(),
+            });
+        }
+
+        if let Err(error) = self
+            .local_blocks
+            .persist_payload(&persisted_blocks, persist_config)
+            .await
+        {
+            self.local_blocks
+                .cleanup_uncommitted(ino, &persisted_blocks, "payload-persist")
+                .await;
+            return Err(error);
+        }
+
+        let chunk_slices =
+            match self.build_overlay_slice_records(ino, &persisted_blocks, dirty_chunk_slices) {
+                Ok(slices) => slices,
+                Err(error) => {
+                    self.local_blocks
+                        .cleanup_uncommitted(ino, &persisted_blocks, "metadata-build")
+                        .await;
+                    return Err(error);
+                }
+            };
+        let committed_attr = match self
+            .commit_meta
+            .commit_overlay(ino, chunk_slices, attr_to_persist)
+            .await
+        {
+            Ok(attr) => attr,
+            Err(error) => {
+                self.local_blocks
+                    .cleanup_uncommitted(ino, &persisted_blocks, "metadata-commit")
+                    .await;
+                return Err(error);
+            }
+        };
+
+        self.observer
+            .on_metadata_committed(ino, committed_attr.as_ref());
+        self.uploads
+            .submit_uploads(ino, &persisted_blocks, content_epoch)
+            .await;
+
+        Ok(DrainOutcome { persisted_blocks })
+    }
+}
+
+impl<'a> WriteBufferDrain<'a> {
+    fn for_inode(self, vfs: &'a StudioVfs, ino: Ino) -> OrderedWriteSession<'a> {
+        OrderedWriteSession {
+            ino,
+            vfs,
+            drain: self,
+        }
+    }
+}
+
+impl BlockIdAllocatorPort for VfsBlockIdAllocator<'_> {
+    async fn next_block_ids(&self, count: u32) -> VfsResult<Vec<u64>> {
+        run_meta(self.vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            engine.next_block_ids(count)
+        })
+        .await
+    }
+}
+
+impl LocalBlockWriterPort for VfsLocalBlockWriter<'_> {
+    async fn persist_payload(
+        &self,
+        persisted_blocks: &[PersistedWriteBlock],
+        persist_config: PayloadPersistConfig,
+    ) -> VfsResult<()> {
+        let persisted_bytes: u64 = persisted_blocks.iter().map(|b| b.data.len() as u64).sum();
+        let started = Instant::now();
+        let result: VfsResult<()> = async {
+            run_bounded_tasks(
+                persisted_blocks.iter().cloned(),
+                persist_config.put_concurrency,
+                |block| async move {
+                    self.vfs
+                        .block_store_put_async(block.object_id, block.data, false)
+                        .await
+                },
+            )
+            .await?;
+            self.vfs
+                .maybe_block_store_sync_data_async(
+                    persisted_bytes,
+                    persist_config.local_sync_policy,
+                )
+                .await?;
+            Ok(())
+        }
+        .await;
+        let completed_burst = result.is_ok();
+        if persisted_bytes > 0 {
+            self.vfs.record_payload_persist_observability(
+                persisted_blocks.len(),
+                persisted_bytes,
+                started.elapsed(),
+                completed_burst,
+            );
+        }
+        result
+    }
+
+    async fn cleanup_uncommitted(
+        &self,
+        ino: Ino,
+        blocks: &[PersistedWriteBlock],
+        stage: &'static str,
+    ) {
+        if blocks.is_empty() {
+            return;
+        }
+        let object_ids: Vec<u64> = blocks.iter().map(|block| block.object_id).collect();
+        if let Err(error) = self
+            .vfs
+            .block_store_remove_batch_async(object_ids.clone())
+            .await
+        {
+            warn!(
+                ino,
+                stage,
+                object_count = object_ids.len(),
+                error = %error,
+                "write-buffer cleanup of uncommitted block-store entries failed"
+            );
+        }
+    }
+}
+
+impl OverlayCommitPort for VfsOverlayCommitter<'_> {
+    async fn commit_overlay(
+        &self,
+        ino: Ino,
+        chunk_slices: Vec<(
+            studiofs_meta::schema::ChunkId,
+            Vec<studiofs_meta::schema::SliceRecord>,
+        )>,
+        attr: Option<InodeAttr>,
+    ) -> VfsResult<Option<InodeAttr>> {
+        let started = Instant::now();
+        let result = run_meta(self.vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            engine.flush_regular_file_overlay_slices_with_attr(ino, &chunk_slices, attr.as_ref())
+        })
+        .await;
+        self.vfs
+            .record_metadata_commit_observability(started.elapsed(), result.is_ok());
+        result
+    }
+}
+
+impl UploadSubmissionPort for VfsUploadSubmitter<'_> {
+    async fn submit_uploads(
+        &self,
+        ino: Ino,
+        persisted_blocks: &[PersistedWriteBlock],
+        content_epoch: u64,
+    ) {
+        let upload_ops: Vec<(u64, u64, u64, u64)> = persisted_blocks
+            .iter()
+            .map(|block| {
+                (
+                    ino,
+                    (block.block_index as u64).saturating_mul(self.vfs.block_size as u64),
+                    block.object_id,
+                    content_epoch,
+                )
+            })
+            .collect();
+
+        self.vfs
+            .upload_coordinator
+            .submit_uploads_batch(&upload_ops);
+        for (upload_ino, _, _, _) in &upload_ops {
+            self.vfs.state.file_session.note_background_transition(
+                *upload_ino,
+                FileSessionOperation::Upload,
+                "queued",
+            );
+        }
+        if !upload_ops.is_empty() {
+            self.vfs.upload_coordinator.flush_upload_journal().await;
+        }
+
+        let mut live_extents = Vec::with_capacity(persisted_blocks.len());
+        for block in persisted_blocks {
+            live_extents.push((ino, block.block_index, block.object_id, content_epoch));
+        }
+        self.vfs.record_live_extents(&live_extents);
+    }
+}
+
+impl DrainCommitObserverPort for VfsDrainCommitObserver<'_> {
+    fn on_metadata_committed(&self, ino: Ino, committed_attr: Option<&InodeAttr>) {
+        if let Some(attr) = committed_attr {
+            self.vfs.state.namespace.attr_read_cache.lock().remove(ino);
+            self.vfs
+                .refresh_inode_incarnation_state_from_attr(ino, attr);
+        }
+    }
+}
+
+impl<'a> OrderedWriteSession<'a> {
+    async fn drain_snapshot(
+        &self,
+        blocks: Vec<DirtyWriteSnapshot>,
+        dirty_chunk_slices: std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
+        content_epoch: u64,
+        attr_to_persist: Option<InodeAttr>,
+        persist_config: PayloadPersistConfig,
+    ) -> VfsResult<Vec<PersistedWriteBlock>> {
+        let mut fresh_object_ids = std::collections::VecDeque::new();
+        let persisted_blocks = loop {
+            let prepare_result = {
+                let mut pending = self.vfs.state.write_buffer.pending_blocks.lock();
+                self.drain.try_prepare_persisted_blocks(
+                    &mut pending,
+                    self.ino,
+                    &blocks,
+                    &mut fresh_object_ids,
+                )
+            };
+            match prepare_result {
+                Ok(persisted_blocks) => break persisted_blocks,
+                Err(additional_needed) => {
+                    let additional_needed = u32::try_from(additional_needed).map_err(|_| {
+                        VfsError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "requested additional block-id count {} exceeds u32::MAX",
+                                additional_needed
+                            ),
+                        ))
+                    })?;
+                    let additional_ids = self.drain.allocate_block_ids(additional_needed).await?;
+                    fresh_object_ids.extend(additional_ids);
+                }
+            }
+        };
+        let attr_to_clear = attr_to_persist.clone();
+        let outcome = self
+            .drain
+            .execute_drain(
+                self.ino,
+                persisted_blocks,
+                dirty_chunk_slices,
+                content_epoch,
+                attr_to_persist,
+                persist_config,
+            )
+            .await?;
+        self.vfs
+            .commit_persisted_write_buffer_blocks(self.ino, &outcome.persisted_blocks);
+        if let Some(attr) = attr_to_clear.as_ref() {
+            self.vfs
+                .clear_matching_dirty_attr_if_committed(self.ino, attr);
+        }
+        Ok(outcome.persisted_blocks)
+    }
+
+    async fn flush_dirty_full_blocks(
+        &self,
+        minimum_batch_bytes: usize,
+        track_eager_flush_outcomes: bool,
+        fallback_content_epoch: Option<u64>,
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<bool> {
+        let (full_blocks, _full_block_batch_bytes, total_full_block_bytes) =
+            self.vfs.snapshot_dirty_full_write_buffer_blocks(
+                self.ino,
+                Some(self.vfs.write_eager_flush_drain_chunk_bytes),
+            );
+        if full_blocks.is_empty() {
+            if track_eager_flush_outcomes {
+                self.vfs
+                    .note_eager_flush_outcome(EagerFlushOutcome::SkippedEmpty);
+            }
+            return Ok(false);
+        }
+        if total_full_block_bytes < minimum_batch_bytes {
+            if track_eager_flush_outcomes {
+                self.vfs
+                    .note_eager_flush_outcome(EagerFlushOutcome::SkippedBelowThreshold);
+            }
+            return Ok(false);
+        }
+
+        let dirty_attr = {
+            self.vfs
+                .state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .get(&self.ino)
+                .cloned()
+        };
+        let content_epoch = if let Some(attr) = dirty_attr.as_ref() {
+            attr.content_epoch
+        } else if let Some(content_epoch) = fallback_content_epoch {
+            content_epoch
+        } else {
+            self.vfs.current_content_epoch_async(self.ino).await?
+        };
+        let chunk_slices = self
+            .vfs
+            .snapshot_dirty_write_buffer_chunk_slices(self.ino, &full_blocks);
+        let persisted_blocks = self
+            .drain_snapshot(
+                full_blocks,
+                chunk_slices,
+                content_epoch,
+                dirty_attr,
+                PayloadPersistConfig {
+                    put_concurrency: self.drain.put_concurrency,
+                    local_sync_policy,
+                },
+            )
+            .await?;
+        if track_eager_flush_outcomes && !persisted_blocks.is_empty() {
+            self.vfs
+                .note_eager_flush_outcome(EagerFlushOutcome::Triggered);
+        }
+        Ok(!persisted_blocks.is_empty())
+    }
+
+    async fn flush(&self, local_sync_policy: LocalSyncPolicy) -> VfsResult<()> {
+        self.vfs
+            .state
+            .metrics
+            .flush_ordered_calls
+            .fetch_add(1, Ordering::Relaxed);
+        self.vfs.enforce_access(self.ino, AccessLevel::ReadWrite)?;
+        if self.vfs.ignored_entry_attr(self.ino).is_some() {
+            return Ok(());
+        }
+
+        let blocks_to_buffer = self.vfs.snapshot_dirty_write_buffer_blocks(self.ino);
+        let dirty_attr = {
+            self.vfs
+                .state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .get(&self.ino)
+                .cloned()
+        };
+        let content_epoch = if let Some(attr) = dirty_attr.as_ref() {
+            attr.content_epoch
+        } else {
+            self.vfs.current_content_epoch_async(self.ino).await?
+        };
+        let chunk_slices = self
+            .vfs
+            .snapshot_dirty_write_buffer_chunk_slices(self.ino, &blocks_to_buffer);
+        self.drain_snapshot(
+            blocks_to_buffer,
+            chunk_slices,
+            content_epoch,
+            dirty_attr,
+            PayloadPersistConfig {
+                put_concurrency: ORDERED_PAYLOAD_PUT_PIPELINE_WIDTH,
+                local_sync_policy,
+            },
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn write(&self, offset: u64, data: &[u8]) -> VfsResult<u32> {
+        self.vfs.enforce_access(self.ino, AccessLevel::ReadWrite)?;
+        let _ = self.vfs.state.read.observe_write_access(
+            None,
+            self.ino,
+            offset,
+            data.len(),
+            self.vfs.access_classifier,
+        );
+        if self.vfs.ignored_entry_attr(self.ino).is_some() {
+            let size = offset.saturating_add(data.len() as u64);
+            let _ = self.vfs.update_ignored_entry(self.ino, |attr| {
+                if size > attr.size {
+                    attr.size = size;
+                    attr.committed_size = size;
+                }
+                attr.touch_mtime();
+            });
+            return Ok(data.len() as u32);
+        }
+
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let initial_attr = self.vfs.getattr_async(self.ino).await?;
+        let current_size = initial_attr.size;
+        self.vfs
+            .refresh_inode_incarnation_state_from_attr(self.ino, &initial_attr);
+        let pending_before_write = self.vfs.total_pending_write_buffer_bytes();
+        let mut written = 0u64;
+        let mut remaining = data.len();
+        let mut current_offset = offset;
+        let mut data_offset = 0;
+        let mut has_full_blocks = false;
+        let mut inserted_block_indexes = Vec::new();
+        let mut pending_slices_batch: Vec<(
+            studiofs_meta::schema::ChunkId,
+            studiofs_meta::schema::SliceRange,
+            u32,
+            u32,
+        )> = Vec::new();
+        let pending_upload_index = self.vfs.snapshot_pending_upload_index();
+
+        while remaining > 0 {
+            let block_index = block_index_from_offset(current_offset, self.vfs.block_size);
+            let offset_in_block = offset_within_block(current_offset, self.vfs.block_size) as usize;
+            let space_in_block = self.vfs.block_size as usize - offset_in_block;
+            let to_write = remaining.min(space_in_block);
+            let write_start = current_offset;
+            let write_end = current_offset.saturating_add(to_write as u64);
+
+            let need_load = {
+                let pending = self.vfs.state.write_buffer.pending_blocks.lock();
+                !pending.contains_key(&(self.ino, block_index))
+            };
+            let existing_data = if need_load {
+                Some(
+                    match self
+                        .vfs
+                        .read_block_if_exists(self.ino, block_index, Some(&pending_upload_index))
+                        .await
+                    {
+                        Ok(Some(data)) => {
+                            let logical_len = self.vfs.logical_block_len(current_size, block_index);
+                            if data.len() > logical_len {
+                                data.slice(0..logical_len)
+                            } else {
+                                data
+                            }
+                        }
+                        _ => Bytes::new(),
+                    },
+                )
+            } else {
+                None
+            };
+
+            {
+                let mut pending = self.vfs.state.write_buffer.pending_blocks.lock();
+                let pending_block = match pending.entry((self.ino, block_index)) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let existing_data = existing_data.clone().unwrap_or_default();
+                        let inserted_bytes = existing_data.len();
+                        let pending_block = entry.insert(PendingBlock {
+                            data: BytesMut::from(existing_data.as_ref()),
+                            dirty: false,
+                            reserved_object_id: None,
+                        });
+                        inserted_block_indexes.push(block_index);
+                        self.vfs.add_pending_write_buffer_bytes(inserted_bytes);
+                        pending_block
+                    }
+                };
+
+                self.vfs.remove_live_extent(self.ino, block_index);
+
+                let end_pos = offset_in_block + to_write;
+                if pending_block.data.len() < end_pos {
+                    let old_len = pending_block.data.len();
+                    pending_block.data.resize(end_pos, 0);
+                    self.vfs
+                        .add_pending_write_buffer_bytes(pending_block.data.len() - old_len);
+                }
+
+                pending_block.data[offset_in_block..end_pos]
+                    .copy_from_slice(&data[data_offset..data_offset + to_write]);
+                pending_block.dirty = true;
+
+                if pending_block.data.len() >= self.vfs.block_size as usize {
+                    has_full_blocks = true;
+                }
+            }
+            let mut slice_cursor = write_start;
+            while slice_cursor < write_end {
+                let chunk_id = studiofs_meta::schema::chunk_id_from_offset(
+                    slice_cursor,
+                    studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
+                );
+                let chunk_start = studiofs_meta::schema::chunk_start_offset(
+                    chunk_id,
+                    studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
+                );
+                let chunk_end = chunk_start + studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64;
+                let slice_file_end = write_end.min(chunk_end);
+                let slice_start = studiofs_meta::schema::offset_within_chunk(
+                    slice_cursor,
+                    studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
+                );
+                let mut slice_end = studiofs_meta::schema::offset_within_chunk(
+                    slice_file_end,
+                    studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
+                );
+                if slice_end == 0 && slice_file_end > slice_cursor {
+                    slice_end = studiofs_meta::schema::DEFAULT_CHUNK_SIZE;
+                }
+                let range = studiofs_meta::schema::SliceRange::new(slice_start, slice_end)
+                    .ok_or_else(|| {
+                        VfsError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "invalid dirty slice range during write: ino={}, offset={}..{}, chunk_id={}, range={}..{}",
+                                self.ino, slice_cursor, slice_file_end, chunk_id.0, slice_start, slice_end
+                            ),
+                        ))
+                    })?;
+                let slice_block_offset = (offset_in_block as u64) + (slice_cursor - write_start);
+                let slice_block_offset = u32::try_from(slice_block_offset).map_err(|_| {
+                    VfsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "dirty slice block offset overflow: ino={}, block_index={}, offset={}",
+                            self.ino, block_index, slice_block_offset
+                        ),
+                    ))
+                })?;
+                pending_slices_batch.push((chunk_id, range, block_index, slice_block_offset));
+                slice_cursor = slice_file_end;
+            }
+
+            written += to_write as u64;
+            remaining -= to_write;
+            current_offset += to_write as u64;
+            data_offset += to_write;
+        }
+        if !inserted_block_indexes.is_empty() {
+            self.vfs
+                .add_pending_write_buffer_block_indexes(self.ino, inserted_block_indexes);
+        }
+        self.vfs
+            .record_pending_dirty_slices_batch(self.ino, &pending_slices_batch)?;
+
+        let mut base_attr = self.vfs.getattr_async(self.ino).await?;
+        self.vfs.begin_pending_incarnation(self.ino, &mut base_attr);
+        {
+            let mut dirty = self.vfs.state.namespace.dirty_attrs.lock();
+            let attr = dirty.entry(self.ino).or_insert_with(|| base_attr.clone());
+            attr.content_epoch = base_attr.content_epoch;
+            if current_offset > attr.size {
+                attr.size = current_offset;
+                attr.touch_mtime();
+            }
+            self.vfs
+                .update_pending_incarnation_size(self.ino, attr.size);
+        }
+
+        if has_full_blocks
+            && !self
+                .flush_dirty_full_blocks(
+                    self.vfs.write_eager_flush_batch_bytes,
+                    true,
+                    Some(base_attr.content_epoch),
+                    LocalSyncPolicy::Opportunistic,
+                )
+                .await?
+        {
+            let pending_after_write = self.vfs.total_pending_write_buffer_bytes();
+            if pending_before_write > 0
+                && pending_after_write > self.vfs.max_dirty_bytes.load(Ordering::Acquire)
+            {
+                self.vfs.apply_write_buffer_backpressure(self.ino).await?;
+            }
+            return Ok(written as u32);
+        }
+
+        let pending_after_write = self.vfs.total_pending_write_buffer_bytes();
+        if pending_before_write > 0
+            && pending_after_write > self.vfs.max_dirty_bytes.load(Ordering::Acquire)
+        {
+            self.vfs.apply_write_buffer_backpressure(self.ino).await?;
+        }
+
+        Ok(written as u32)
+    }
+}
+
 impl StudioVfs {
+    fn write_buffer_drain(&self) -> WriteBufferDrain<'_> {
+        WriteBufferDrainCore {
+            local_blocks: VfsLocalBlockWriter { vfs: self },
+            commit_meta: VfsOverlayCommitter { vfs: self },
+            block_ids: VfsBlockIdAllocator { vfs: self },
+            uploads: VfsUploadSubmitter { vfs: self },
+            observer: VfsDrainCommitObserver { vfs: self },
+            block_size: self.block_size,
+            put_concurrency: self.payload_put_concurrency,
+        }
+    }
+
+    fn ordered_write_session(&self, ino: Ino) -> OrderedWriteSession<'_> {
+        self.write_buffer_drain().for_inode(self, ino)
+    }
+
     pub(super) fn total_pending_write_buffer_bytes(&self) -> usize {
         self.state
             .write_buffer
@@ -432,388 +1359,6 @@ impl StudioVfs {
         drop(pending);
         self.subtract_pending_write_buffer_bytes(removed_bytes);
         self.clear_pending_dirty_slices_for_inode(ino);
-    }
-
-    async fn cleanup_uncommitted_block_store_entries(
-        &self,
-        ino: Ino,
-        blocks: &[PersistedWriteBlock],
-        stage: &'static str,
-    ) {
-        if blocks.is_empty() {
-            return;
-        }
-        let object_ids: Vec<u64> = blocks.iter().map(|block| block.object_id).collect();
-        if let Err(error) = self
-            .block_store_remove_batch_async(object_ids.clone())
-            .await
-        {
-            warn!(
-                ino,
-                stage,
-                object_count = object_ids.len(),
-                error = %error,
-                "write-buffer cleanup of uncommitted block-store entries failed"
-            );
-        }
-    }
-
-    /// Phase 1 of the write-buffer drain: write block payloads to the local block
-    /// store and perform grouped local sync.
-    ///
-    /// Timing is recorded via [`record_payload_persist_observability`] regardless
-    /// of success or failure so that error-path latency is also visible in telemetry.
-    /// Successful completions additionally contribute to payload burst cadence.
-    ///
-    /// [`record_payload_persist_observability`]: StudioVfs::record_payload_persist_observability
-    async fn persist_payload_phase(
-        &self,
-        persisted_blocks: &[PersistedWriteBlock],
-        persist_config: PayloadPersistConfig,
-    ) -> VfsResult<()> {
-        let persisted_bytes: u64 = persisted_blocks.iter().map(|b| b.data.len() as u64).sum();
-        let started = Instant::now();
-        let result: VfsResult<()> = async {
-            run_bounded_tasks(
-                persisted_blocks.iter().cloned(),
-                persist_config.put_concurrency,
-                |block| async move {
-                    self.block_store_put_async(block.object_id, block.data, false)
-                        .await
-                },
-            )
-            .await?;
-            self.maybe_block_store_sync_data_async(
-                persisted_bytes,
-                persist_config.local_sync_policy,
-            )
-            .await?;
-            Ok(())
-        }
-        .await;
-        let completed_burst = result.is_ok();
-        if persisted_bytes > 0 {
-            self.record_payload_persist_observability(
-                persisted_blocks.len(),
-                persisted_bytes,
-                started.elapsed(),
-                completed_burst,
-            );
-        }
-        result
-    }
-
-    /// Pure computation step between Phase 1 and Phase 2: build the overlay
-    /// [`SliceRecord`] list from the freshly persisted blocks.
-    ///
-    /// When dirty-chunk-slice tracking is active this path validates per-write-slice
-    /// invariants but still emits **one full-block `SliceRecord` per persisted
-    /// block**. See the inline comment for the full rationale.
-    ///
-    /// [`SliceRecord`]: studiofs_meta::schema::SliceRecord
-    fn build_overlay_slice_records(
-        &self,
-        ino: Ino,
-        persisted_blocks: &[PersistedWriteBlock],
-        dirty_chunk_slices: std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
-    ) -> VfsResult<
-        Vec<(
-            studiofs_meta::schema::ChunkId,
-            Vec<studiofs_meta::schema::SliceRecord>,
-        )>,
-    > {
-        let mut chunks: std::collections::BTreeMap<u64, Vec<studiofs_meta::schema::SliceRecord>> =
-            std::collections::BTreeMap::new();
-
-        if !dirty_chunk_slices.is_empty() {
-            // Dirty-chunk-slices path: validate per-write-slice invariants but
-            // emit ONE full-block SliceRecord per persisted block.
-            //
-            // Previously this path emitted per-write-slice records with partial
-            // BlockRef.offset/length pointing into the new S3 object.  That left
-            // stale slices from *earlier* objects (with different object_ids) in
-            // the overlay because the "fully_covered" pruning in
-            // flush_regular_file_overlay_slices_with_attr_txn only removes a
-            // prior slice when the incoming slice completely covers its chunk
-            // range.  A partial write slice (e.g. 1MB..1.5MB) never fully covers
-            // an old full-block slice (0..1MB), so both survive in the overlay.
-            // synthesize_block_ref_from_resolved_spans then sees two spans with
-            // different object_ids for block_index=0 and returns
-            // FragmentedBlock, quarantining the inode and making all reads
-            // return zeros.
-            //
-            // The fix: always write a single full-block SliceRecord whose
-            // BlockRef references the NEW object from offset=0 with the full
-            // persisted data length.  This guarantees the incoming slice fully
-            // covers any previous slice for the same block and the overlay
-            // stays consistent.
-            let block_lengths_by_block_index: std::collections::HashMap<u32, usize> =
-                persisted_blocks
-                    .iter()
-                    .map(|persisted| (persisted.block_index, persisted.data.len()))
-                    .collect();
-            for (_chunk_id, mut slices) in dirty_chunk_slices {
-                slices.sort_by_key(|slice| slice.seq);
-                for slice in slices {
-                    let Some(&block_len) = block_lengths_by_block_index.get(&slice.block_index)
-                    else {
-                        continue;
-                    };
-                    let slice_len = slice.range.len();
-                    let block_offset = slice.block_offset;
-                    let block_end = (block_offset as usize).saturating_add(slice_len as usize);
-                    if block_end > block_len {
-                        return Err(crate::VfsError::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!(
-                                "dirty slice exceeds block length: ino={}, \
-                                 block_index={}, block_len={}, block_offset={}, \
-                                 slice_len={}",
-                                ino, slice.block_index, block_len, block_offset, slice_len
-                            ),
-                        )));
-                    }
-                }
-            }
-        }
-
-        // Write one full-block SliceRecord for every persisted block,
-        // whether or not it had dirty-chunk-slice tracking entries.
-        // The S3 object always contains the complete block payload from
-        // offset 0, so BlockRef.offset=0 and BlockRef.length=data.len()
-        // is the canonical (non-fragmented) representation.
-        for persisted in persisted_blocks {
-            let block_start = (persisted.block_index as u64) * (self.block_size as u64);
-            let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64;
-            let chunk_id = block_start / chunk_size;
-            let chunk_start = chunk_id * chunk_size;
-            let slice_start = (block_start - chunk_start) as u32;
-            let slice_end = slice_start + (persisted.data.len() as u32);
-            let slice_range = studiofs_meta::schema::SliceRange::new(slice_start, slice_end)
-                .ok_or_else(|| {
-                    crate::VfsError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("invalid slice range {}..{}", slice_start, slice_end),
-                    ))
-                })?;
-            let mut flags = studiofs_meta::schema::BlockFlags::empty();
-            if persisted.data.len() < self.block_size as usize {
-                flags |= studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK;
-            }
-            chunks
-                .entry(chunk_id)
-                .or_default()
-                .push(studiofs_meta::schema::SliceRecord {
-                    slice_id: studiofs_meta::schema::SliceId::default(),
-                    order: studiofs_meta::schema::SliceOrder::default(),
-                    range: slice_range,
-                    block: Some(studiofs_meta::schema::BlockRef {
-                        object_id: persisted.object_id,
-                        offset: 0,
-                        length: persisted.data.len() as u32,
-                        flags,
-                    }),
-                    block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
-                });
-        }
-
-        for slices in chunks.values_mut() {
-            let mut next_slice_id = 1u64;
-            let mut next_slice_order = 1u64;
-            for slice in slices.iter_mut() {
-                slice.slice_id = studiofs_meta::schema::SliceId(next_slice_id);
-                slice.order = studiofs_meta::schema::SliceOrder(next_slice_order);
-                next_slice_id = next_slice_id.saturating_add(1);
-                next_slice_order = next_slice_order.saturating_add(1);
-            }
-        }
-
-        Ok(chunks
-            .into_iter()
-            .map(|(k, v)| (studiofs_meta::schema::ChunkId(k), v))
-            .collect())
-    }
-
-    /// Phase 2 of the write-buffer drain: commit overlay chunk slice records and
-    /// optional inode attribute update to the local metadata engine in a single
-    /// transaction.
-    ///
-    /// Timing is recorded via [`record_metadata_commit_observability`] regardless
-    /// of success or failure. Successful commits additionally contribute to
-    /// metadata-commit cadence.
-    ///
-    /// [`record_metadata_commit_observability`]: StudioVfs::record_metadata_commit_observability
-    /// Commits overlay slice records and an optional inode attr update in a single
-    /// metadata transaction, returning the engine-normalized committed attr (if any).
-    ///
-    /// The engine (e.g. redb) applies its own `transition_upload_state_for_local_mutation`
-    /// with accurate `has_committed_manifest` information, so callers must NOT
-    /// pre-transform the attr before passing it here.
-    async fn commit_overlay_metadata_phase(
-        &self,
-        ino: Ino,
-        chunk_slices: Vec<(
-            studiofs_meta::schema::ChunkId,
-            Vec<studiofs_meta::schema::SliceRecord>,
-        )>,
-        attr: Option<InodeAttr>,
-    ) -> VfsResult<Option<InodeAttr>> {
-        let started = Instant::now();
-        let result = run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-            engine.flush_regular_file_overlay_slices_with_attr(ino, &chunk_slices, attr.as_ref())
-        })
-        .await;
-        self.record_metadata_commit_observability(started.elapsed(), result.is_ok());
-        result
-    }
-
-    async fn persist_write_buffer_blocks(
-        &self,
-        ino: Ino,
-        blocks: Vec<DirtyWriteSnapshot>,
-        dirty_chunk_slices: std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
-        content_epoch: u64,
-        attr_to_persist: Option<InodeAttr>,
-        persist_config: PayloadPersistConfig,
-    ) -> VfsResult<Vec<PersistedWriteBlock>> {
-        if blocks.is_empty() {
-            // No payload to persist; commit the attr-only metadata phase so the
-            // engine applies its accurate transition (with has_committed_manifest).
-            if attr_to_persist.is_some() {
-                let committed_attr = self
-                    .commit_overlay_metadata_phase(ino, Vec::new(), attr_to_persist)
-                    .await?;
-                if let Some(attr) = committed_attr {
-                    self.state.namespace.attr_read_cache.lock().remove(ino);
-                    self.refresh_inode_incarnation_state_from_attr(ino, &attr);
-                }
-            }
-            return Ok(Vec::new());
-        }
-
-        let mut persisted_blocks: Vec<PersistedWriteBlock> = blocks
-            .into_iter()
-            .map(|block| PersistedWriteBlock {
-                block_index: block.block_index,
-                object_id: 0,
-                data: block.data,
-            })
-            .collect();
-        let missing_object_id_count = {
-            let pending = self.state.write_buffer.pending_blocks.lock();
-            persisted_blocks
-                .iter()
-                .filter(|block| {
-                    pending
-                        .get(&(ino, block.block_index))
-                        .filter(|current| current.data.as_ref() == block.data.as_ref())
-                        .and_then(|current| current.reserved_object_id)
-                        .is_none()
-                })
-                .count() as u32
-        };
-        let fresh_object_ids = if missing_object_id_count == 0 {
-            Vec::new()
-        } else {
-            run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-                engine.next_block_ids(missing_object_id_count)
-            })
-            .await?
-        };
-        {
-            let mut pending = self.state.write_buffer.pending_blocks.lock();
-            assign_reserved_object_ids(&mut pending, ino, &mut persisted_blocks, &fresh_object_ids);
-        }
-
-        // Data hits the local backend before metadata. In durable mode this keeps
-        // payload barriers on the foreground put path; in fast mode barriers are
-        // intentionally grouped behind `sync_data()` cadence. In both modes, the
-        // canonical retry source for failure remains the WriteBuffer snapshot
-        // guarded by `reserved_object_id`.
-
-        // === Phase 1: Payload Persistence ===
-        // Write each block payload to the local block store and perform grouped
-        // local sync. On failure, remove the block-store entries before returning.
-        if let Err(error) = self
-            .persist_payload_phase(&persisted_blocks, persist_config)
-            .await
-        {
-            self.cleanup_uncommitted_block_store_entries(ino, &persisted_blocks, "payload-persist")
-                .await;
-            return Err(error);
-        }
-
-        // === Phase 2: Overlay Metadata Commit ===
-        // Build overlay slice records from the persisted blocks, then commit them
-        // together with the optional inode attr update in a single metadata
-        // transaction. The engine normalises the attr (applying its accurate
-        // has_committed_manifest check), so we pass the raw attr without a
-        // VFS-level pre-transform. On failure, remove the block-store entries
-        // written in Phase 1.
-        let chunk_slices =
-            match self.build_overlay_slice_records(ino, &persisted_blocks, dirty_chunk_slices) {
-                Ok(slices) => slices,
-                Err(error) => {
-                    self.cleanup_uncommitted_block_store_entries(
-                        ino,
-                        &persisted_blocks,
-                        "metadata-build",
-                    )
-                    .await;
-                    return Err(error);
-                }
-            };
-        let committed_attr = match self
-            .commit_overlay_metadata_phase(ino, chunk_slices, attr_to_persist)
-            .await
-        {
-            Ok(attr) => attr,
-            Err(error) => {
-                self.cleanup_uncommitted_block_store_entries(
-                    ino,
-                    &persisted_blocks,
-                    "metadata-commit",
-                )
-                .await;
-                return Err(error);
-            }
-        };
-
-        let upload_ops: Vec<(u64, u64, u64, u64)> = persisted_blocks
-            .iter()
-            .map(|block| {
-                (
-                    ino,
-                    (block.block_index as u64).saturating_mul(self.block_size as u64),
-                    block.object_id,
-                    content_epoch,
-                )
-            })
-            .collect();
-
-        let mut live_extents = Vec::with_capacity(persisted_blocks.len());
-        for block in &persisted_blocks {
-            live_extents.push((ino, block.block_index, block.object_id, content_epoch));
-        }
-        self.record_live_extents(&live_extents);
-
-        if let Some(attr) = committed_attr {
-            self.state.namespace.attr_read_cache.lock().remove(ino);
-            self.refresh_inode_incarnation_state_from_attr(ino, &attr);
-        }
-
-        self.upload_coordinator.submit_uploads_batch(&upload_ops);
-        for (upload_ino, _, _, _) in &upload_ops {
-            self.state.file_session.note_background_transition(
-                *upload_ino,
-                FileSessionOperation::Upload,
-                "queued",
-            );
-        }
-        if !upload_ops.is_empty() {
-            self.upload_coordinator.flush_upload_journal().await;
-        }
-        Ok(persisted_blocks)
     }
 
     async fn apply_write_buffer_backpressure(&self, ino: Ino) -> VfsResult<()> {
@@ -1076,55 +1621,14 @@ impl StudioVfs {
         fallback_content_epoch: Option<u64>,
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<bool> {
-        let (full_blocks, _full_block_batch_bytes, total_full_block_bytes) = self
-            .snapshot_dirty_full_write_buffer_blocks(
-                ino,
-                Some(self.write_eager_flush_drain_chunk_bytes),
-            );
-        if full_blocks.is_empty() {
-            if track_eager_flush_outcomes {
-                self.note_eager_flush_outcome(EagerFlushOutcome::SkippedEmpty);
-            }
-            return Ok(false);
-        }
-        if total_full_block_bytes < minimum_batch_bytes {
-            if track_eager_flush_outcomes {
-                self.note_eager_flush_outcome(EagerFlushOutcome::SkippedBelowThreshold);
-            }
-            return Ok(false);
-        }
-
-        let dirty_attr = { self.state.namespace.dirty_attrs.lock().get(&ino).cloned() };
-        let content_epoch = if let Some(attr) = dirty_attr.as_ref() {
-            attr.content_epoch
-        } else if let Some(content_epoch) = fallback_content_epoch {
-            content_epoch
-        } else {
-            self.current_content_epoch_async(ino).await?
-        };
-        let chunk_slices = self.snapshot_dirty_write_buffer_chunk_slices(ino, &full_blocks);
-        let attr_to_clear = dirty_attr.clone();
-        let persisted_blocks = self
-            .persist_write_buffer_blocks(
-                ino,
-                full_blocks,
-                chunk_slices,
-                content_epoch,
-                dirty_attr,
-                PayloadPersistConfig {
-                    put_concurrency: self.payload_put_concurrency,
-                    local_sync_policy,
-                },
+        self.ordered_write_session(ino)
+            .flush_dirty_full_blocks(
+                minimum_batch_bytes,
+                track_eager_flush_outcomes,
+                fallback_content_epoch,
+                local_sync_policy,
             )
-            .await?;
-        self.commit_persisted_write_buffer_blocks(ino, &persisted_blocks);
-        if let Some(attr) = attr_to_clear.as_ref() {
-            self.clear_matching_dirty_attr_if_committed(ino, attr);
-        }
-        if track_eager_flush_outcomes && !persisted_blocks.is_empty() {
-            self.note_eager_flush_outcome(EagerFlushOutcome::Triggered);
-        }
-        Ok(!persisted_blocks.is_empty())
+            .await
     }
 
     pub(super) fn trim_local_block_staging(
@@ -1236,224 +1740,7 @@ impl StudioVfs {
     }
 
     pub(super) async fn write_ordered(&self, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
-        self.enforce_access(ino, AccessLevel::ReadWrite)?;
-        let _ = self.state.read.observe_write_access(
-            None,
-            ino,
-            offset,
-            data.len(),
-            self.access_classifier,
-        );
-        if self.ignored_entry_attr(ino).is_some() {
-            let size = offset.saturating_add(data.len() as u64);
-            let _ = self.update_ignored_entry(ino, |attr| {
-                if size > attr.size {
-                    attr.size = size;
-                    attr.committed_size = size;
-                }
-                attr.touch_mtime();
-            });
-            return Ok(data.len() as u32);
-        }
-
-        if data.is_empty() {
-            return Ok(0);
-        }
-
-        let initial_attr = self.getattr_async(ino).await?;
-        let current_size = initial_attr.size;
-        self.refresh_inode_incarnation_state_from_attr(ino, &initial_attr);
-        // Keep ingress policy consistent with `ingress_pressure_for`: allow
-        // the first dirty payload to land in RAM; start backpressure only when
-        // dirty state already existed before this write.
-        let pending_before_write = self.total_pending_write_buffer_bytes();
-        let mut written = 0u64;
-        let mut remaining = data.len();
-        let mut current_offset = offset;
-        let mut data_offset = 0;
-        let mut has_full_blocks = false;
-        let mut inserted_block_indexes = Vec::new();
-        let mut pending_slices_batch: Vec<(
-            studiofs_meta::schema::ChunkId,
-            studiofs_meta::schema::SliceRange,
-            u32,
-            u32,
-        )> = Vec::new();
-        let pending_upload_index = self.snapshot_pending_upload_index();
-
-        while remaining > 0 {
-            let block_index = block_index_from_offset(current_offset, self.block_size);
-            let offset_in_block = offset_within_block(current_offset, self.block_size) as usize;
-            let space_in_block = self.block_size as usize - offset_in_block;
-            let to_write = remaining.min(space_in_block);
-            let write_start = current_offset;
-            let write_end = current_offset.saturating_add(to_write as u64);
-
-            let need_load = !self
-                .state
-                .write_buffer
-                .pending_blocks
-                .lock()
-                .contains_key(&(ino, block_index));
-            if need_load {
-                let existing_data = match self
-                    .read_block_if_exists(ino, block_index, Some(&pending_upload_index))
-                    .await
-                {
-                    Ok(Some(d)) => d,
-                    _ => Bytes::new(),
-                };
-                let logical_len = self.logical_block_len(current_size, block_index);
-                let existing_data = if existing_data.len() > logical_len {
-                    existing_data.slice(0..logical_len)
-                } else {
-                    existing_data
-                };
-                let (inserted_block, inserted_bytes) = {
-                    let mut pending = self.state.write_buffer.pending_blocks.lock();
-                    match pending.entry((ino, block_index)) {
-                        std::collections::hash_map::Entry::Occupied(_) => (false, 0),
-                        std::collections::hash_map::Entry::Vacant(entry) => {
-                            entry.insert(PendingBlock {
-                                data: BytesMut::from(existing_data.as_ref()),
-                                dirty: false,
-                                reserved_object_id: None,
-                            });
-                            (true, existing_data.len())
-                        }
-                    }
-                };
-                if inserted_block {
-                    inserted_block_indexes.push(block_index);
-                }
-                self.add_pending_write_buffer_bytes(inserted_bytes);
-            }
-
-            {
-                let mut pending = self.state.write_buffer.pending_blocks.lock();
-                let pending_block = pending.get_mut(&(ino, block_index)).ok_or_else(|| {
-                    VfsError::Io(std::io::Error::other(format!(
-                        "pending write-buffer block missing during write: ino={}, block_index={}",
-                        ino, block_index
-                    )))
-                })?;
-                self.remove_live_extent(ino, block_index);
-
-                let end_pos = offset_in_block + to_write;
-                if pending_block.data.len() < end_pos {
-                    let old_len = pending_block.data.len();
-                    pending_block.data.resize(end_pos, 0);
-                    self.add_pending_write_buffer_bytes(pending_block.data.len() - old_len);
-                }
-
-                pending_block.data[offset_in_block..end_pos]
-                    .copy_from_slice(&data[data_offset..data_offset + to_write]);
-                pending_block.dirty = true;
-
-                if pending_block.data.len() >= self.block_size as usize {
-                    has_full_blocks = true;
-                }
-            }
-            let mut slice_cursor = write_start;
-            while slice_cursor < write_end {
-                let chunk_id = studiofs_meta::schema::chunk_id_from_offset(
-                    slice_cursor,
-                    studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
-                );
-                let chunk_start = studiofs_meta::schema::chunk_start_offset(
-                    chunk_id,
-                    studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
-                );
-                let chunk_end = chunk_start + studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64;
-                let slice_file_end = write_end.min(chunk_end);
-                let slice_start = studiofs_meta::schema::offset_within_chunk(
-                    slice_cursor,
-                    studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
-                );
-                let mut slice_end = studiofs_meta::schema::offset_within_chunk(
-                    slice_file_end,
-                    studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
-                );
-                if slice_end == 0 && slice_file_end > slice_cursor {
-                    slice_end = studiofs_meta::schema::DEFAULT_CHUNK_SIZE;
-                }
-                let range =
-                    studiofs_meta::schema::SliceRange::new(slice_start, slice_end).ok_or_else(
-                        || {
-                            VfsError::Io(std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
-                                format!(
-                                    "invalid dirty slice range during write: ino={}, offset={}..{}, chunk_id={}, range={}..{}",
-                                    ino, slice_cursor, slice_file_end, chunk_id.0, slice_start, slice_end
-                                ),
-                            ))
-                        },
-                    )?;
-                let slice_block_offset = (offset_in_block as u64) + (slice_cursor - write_start);
-                let slice_block_offset = u32::try_from(slice_block_offset).map_err(|_| {
-                    VfsError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "dirty slice block offset overflow: ino={}, block_index={}, offset={}",
-                            ino, block_index, slice_block_offset
-                        ),
-                    ))
-                })?;
-                pending_slices_batch.push((chunk_id, range, block_index, slice_block_offset));
-                slice_cursor = slice_file_end;
-            }
-
-            written += to_write as u64;
-            remaining -= to_write;
-            current_offset += to_write as u64;
-            data_offset += to_write;
-        }
-        if !inserted_block_indexes.is_empty() {
-            self.add_pending_write_buffer_block_indexes(ino, inserted_block_indexes);
-        }
-        self.record_pending_dirty_slices_batch(ino, &pending_slices_batch)?;
-
-        let mut base_attr = self.getattr_async(ino).await?;
-        self.begin_pending_incarnation(ino, &mut base_attr);
-        {
-            let mut dirty = self.state.namespace.dirty_attrs.lock();
-            let attr = dirty.entry(ino).or_insert_with(|| base_attr.clone());
-            attr.content_epoch = base_attr.content_epoch;
-            if current_offset > attr.size {
-                attr.size = current_offset;
-                attr.touch_mtime();
-            }
-            self.update_pending_incarnation_size(ino, attr.size);
-        }
-
-        if has_full_blocks
-            && !self
-                .flush_dirty_full_write_buffer_blocks(
-                    ino,
-                    self.write_eager_flush_batch_bytes,
-                    true,
-                    Some(base_attr.content_epoch),
-                    LocalSyncPolicy::Opportunistic,
-                )
-                .await?
-        {
-            let pending_after_write = self.total_pending_write_buffer_bytes();
-            if pending_before_write > 0
-                && pending_after_write > self.max_dirty_bytes.load(Ordering::Acquire)
-            {
-                self.apply_write_buffer_backpressure(ino).await?;
-            }
-            return Ok(written as u32);
-        }
-
-        let pending_after_write = self.total_pending_write_buffer_bytes();
-        if pending_before_write > 0
-            && pending_after_write > self.max_dirty_bytes.load(Ordering::Acquire)
-        {
-            self.apply_write_buffer_backpressure(ino).await?;
-        }
-
-        Ok(written as u32)
+        self.ordered_write_session(ino).write(offset, data).await
     }
 
     pub(super) async fn flush_ordered(
@@ -1461,43 +1748,9 @@ impl StudioVfs {
         ino: Ino,
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<()> {
-        self.state
-            .metrics
-            .flush_ordered_calls
-            .fetch_add(1, Ordering::Relaxed);
-        self.enforce_access(ino, AccessLevel::ReadWrite)?;
-        if self.ignored_entry_attr(ino).is_some() {
-            return Ok(());
-        }
-
-        let blocks_to_buffer = self.snapshot_dirty_write_buffer_blocks(ino);
-        let dirty_attr = { self.state.namespace.dirty_attrs.lock().get(&ino).cloned() };
-        let content_epoch = if let Some(attr) = dirty_attr.as_ref() {
-            attr.content_epoch
-        } else {
-            self.current_content_epoch_async(ino).await?
-        };
-        let chunk_slices = self.snapshot_dirty_write_buffer_chunk_slices(ino, &blocks_to_buffer);
-        let attr_to_clear = dirty_attr.clone();
-        let persisted_blocks = self
-            .persist_write_buffer_blocks(
-                ino,
-                blocks_to_buffer,
-                chunk_slices,
-                content_epoch,
-                dirty_attr,
-                PayloadPersistConfig {
-                    put_concurrency: ORDERED_PAYLOAD_PUT_PIPELINE_WIDTH,
-                    local_sync_policy,
-                },
-            )
-            .await?;
-        self.commit_persisted_write_buffer_blocks(ino, &persisted_blocks);
-        if let Some(attr) = attr_to_clear.as_ref() {
-            self.clear_matching_dirty_attr_if_committed(ino, attr);
-        }
-
-        Ok(())
+        self.ordered_write_session(ino)
+            .flush(local_sync_policy)
+            .await
     }
 
     pub(super) async fn flush_pending_blocks_for_shutdown(&self) {
@@ -1532,6 +1785,35 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    type UploadRecord = (u64, u64, u64, u64);
+    type SharedUploads = Arc<StdMutex<Vec<UploadRecord>>>;
+    type SharedInodes = Arc<StdMutex<Vec<Ino>>>;
+
+    fn single_block_fixture(
+        ino: Ino,
+        block_index: u32,
+        data: &'static [u8],
+        reserved_object_id: Option<u64>,
+    ) -> (
+        std::collections::HashMap<(Ino, u32), PendingBlock>,
+        Vec<DirtyWriteSnapshot>,
+    ) {
+        (
+            std::collections::HashMap::from([(
+                (ino, block_index),
+                PendingBlock {
+                    data: BytesMut::from(data),
+                    dirty: true,
+                    reserved_object_id,
+                },
+            )]),
+            vec![DirtyWriteSnapshot {
+                block_index,
+                data: Bytes::from_static(data),
+            }],
+        )
+    }
 
     #[test]
     fn assign_reserved_object_ids_reuses_existing_ids_and_stores_new_ones() {
@@ -1606,6 +1888,339 @@ mod tests {
         let pending_block = pending.get(&(ino, 3)).unwrap();
         assert_eq!(pending_block.data.as_ref(), b"newer");
         assert_eq!(pending_block.reserved_object_id, None);
+    }
+
+    #[derive(Clone, Default)]
+    struct EventLog {
+        entries: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl EventLog {
+        fn push(&self, entry: impl Into<String>) {
+            self.entries
+                .lock()
+                .expect("event log lock")
+                .push(entry.into());
+        }
+
+        fn snapshot(&self) -> Vec<String> {
+            self.entries.lock().expect("event log lock").clone()
+        }
+    }
+
+    struct PanicBlockIds;
+
+    impl BlockIdAllocatorPort for PanicBlockIds {
+        async fn next_block_ids(&self, _count: u32) -> VfsResult<Vec<u64>> {
+            panic!("block id allocator should not be used in this test")
+        }
+    }
+
+    struct TestLocalBlockWriter {
+        events: EventLog,
+        fail_persist: bool,
+    }
+
+    impl LocalBlockWriterPort for TestLocalBlockWriter {
+        async fn persist_payload(
+            &self,
+            _persisted_blocks: &[PersistedWriteBlock],
+            _persist_config: PayloadPersistConfig,
+        ) -> VfsResult<()> {
+            self.events.push("payload");
+            if self.fail_persist {
+                Err(VfsError::Io(std::io::Error::other("payload failure")))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn cleanup_uncommitted(
+            &self,
+            _ino: Ino,
+            _blocks: &[PersistedWriteBlock],
+            stage: &'static str,
+        ) {
+            self.events.push(format!("cleanup:{stage}"));
+        }
+    }
+
+    struct TestOverlayCommitter {
+        events: EventLog,
+        fail_commit: bool,
+        committed_attr: Option<InodeAttr>,
+    }
+
+    impl OverlayCommitPort for TestOverlayCommitter {
+        async fn commit_overlay(
+            &self,
+            _ino: Ino,
+            _chunk_slices: Vec<(
+                studiofs_meta::schema::ChunkId,
+                Vec<studiofs_meta::schema::SliceRecord>,
+            )>,
+            _attr: Option<InodeAttr>,
+        ) -> VfsResult<Option<InodeAttr>> {
+            self.events.push("metadata");
+            if self.fail_commit {
+                Err(VfsError::Io(std::io::Error::other("metadata failure")))
+            } else {
+                Ok(self.committed_attr.clone())
+            }
+        }
+    }
+
+    struct TestUploadSubmitter {
+        events: EventLog,
+        uploads: SharedUploads,
+    }
+
+    impl UploadSubmissionPort for TestUploadSubmitter {
+        async fn submit_uploads(
+            &self,
+            ino: Ino,
+            persisted_blocks: &[PersistedWriteBlock],
+            content_epoch: u64,
+        ) {
+            self.events.push("upload");
+            let ops: Vec<_> = persisted_blocks
+                .iter()
+                .map(|block| {
+                    (
+                        ino,
+                        block.block_index as u64,
+                        block.object_id,
+                        content_epoch,
+                    )
+                })
+                .collect();
+            self.uploads.lock().expect("uploads lock").extend(ops);
+        }
+    }
+
+    struct TestDrainObserver {
+        events: EventLog,
+        committed_ino: SharedInodes,
+    }
+
+    impl DrainCommitObserverPort for TestDrainObserver {
+        fn on_metadata_committed(&self, ino: Ino, _committed_attr: Option<&InodeAttr>) {
+            self.events.push("observer");
+            self.committed_ino.lock().expect("observer lock").push(ino);
+        }
+    }
+
+    fn test_drain(
+        events: EventLog,
+        fail_persist: bool,
+        fail_commit: bool,
+        committed_attr: Option<InodeAttr>,
+        uploads: SharedUploads,
+        observed_inodes: SharedInodes,
+    ) -> WriteBufferDrainCore<
+        TestLocalBlockWriter,
+        TestOverlayCommitter,
+        PanicBlockIds,
+        TestUploadSubmitter,
+        TestDrainObserver,
+    > {
+        WriteBufferDrainCore {
+            local_blocks: TestLocalBlockWriter {
+                events: events.clone(),
+                fail_persist,
+            },
+            commit_meta: TestOverlayCommitter {
+                events: events.clone(),
+                fail_commit,
+                committed_attr,
+            },
+            block_ids: PanicBlockIds,
+            uploads: TestUploadSubmitter {
+                events: events.clone(),
+                uploads,
+            },
+            observer: TestDrainObserver {
+                events,
+                committed_ino: observed_inodes,
+            },
+            block_size: 4096,
+            put_concurrency: 4,
+        }
+    }
+
+    #[test]
+    fn drain_core_orders_payload_then_metadata_then_upload() {
+        let ino = 11;
+        let events = EventLog::default();
+        let uploads = Arc::new(StdMutex::new(Vec::new()));
+        let observed_inodes = Arc::new(StdMutex::new(Vec::new()));
+        let drain = test_drain(
+            events.clone(),
+            false,
+            false,
+            None,
+            uploads.clone(),
+            observed_inodes.clone(),
+        );
+        let (mut pending, blocks) = single_block_fixture(ino, 0, b"alpha", None);
+        let mut fresh_object_ids = std::collections::VecDeque::from([111]);
+        let persisted_blocks = drain
+            .try_prepare_persisted_blocks(&mut pending, ino, &blocks, &mut fresh_object_ids)
+            .expect("prepare persisted blocks");
+
+        futures::executor::block_on(drain.execute_drain(
+            ino,
+            persisted_blocks,
+            std::collections::BTreeMap::new(),
+            9,
+            None,
+            PayloadPersistConfig {
+                put_concurrency: 4,
+                local_sync_policy: LocalSyncPolicy::Opportunistic,
+            },
+        ))
+        .expect("drain succeeds");
+
+        assert_eq!(
+            pending
+                .get(&(ino, 0))
+                .and_then(|block| block.reserved_object_id),
+            Some(111)
+        );
+        assert_eq!(
+            events.snapshot(),
+            vec![
+                "payload".to_string(),
+                "metadata".to_string(),
+                "observer".to_string(),
+                "upload".to_string(),
+            ]
+        );
+        assert_eq!(
+            *uploads.lock().expect("uploads lock"),
+            vec![(ino, 0, 111, 9)]
+        );
+        assert_eq!(*observed_inodes.lock().expect("observer lock"), vec![ino]);
+    }
+
+    #[test]
+    fn drain_core_cleans_up_after_metadata_failure() {
+        let ino = 12;
+        let events = EventLog::default();
+        let uploads = Arc::new(StdMutex::new(Vec::new()));
+        let observed_inodes = Arc::new(StdMutex::new(Vec::new()));
+        let drain = test_drain(
+            events.clone(),
+            false,
+            true,
+            None,
+            uploads.clone(),
+            observed_inodes.clone(),
+        );
+        let (mut pending, blocks) = single_block_fixture(ino, 1, b"beta", None);
+        let mut fresh_object_ids = std::collections::VecDeque::from([222]);
+        let persisted_blocks = drain
+            .try_prepare_persisted_blocks(&mut pending, ino, &blocks, &mut fresh_object_ids)
+            .expect("prepare persisted blocks");
+
+        let error = futures::executor::block_on(drain.execute_drain(
+            ino,
+            persisted_blocks,
+            std::collections::BTreeMap::new(),
+            5,
+            None,
+            PayloadPersistConfig {
+                put_concurrency: 4,
+                local_sync_policy: LocalSyncPolicy::Opportunistic,
+            },
+        ))
+        .expect_err("drain should fail");
+
+        assert!(
+            matches!(error, VfsError::Io(_)),
+            "expected metadata failure to bubble up"
+        );
+        assert_eq!(
+            events.snapshot(),
+            vec![
+                "payload".to_string(),
+                "metadata".to_string(),
+                "cleanup:metadata-commit".to_string(),
+            ]
+        );
+        assert!(uploads.lock().expect("uploads lock").is_empty());
+        assert!(observed_inodes.lock().expect("observer lock").is_empty());
+    }
+
+    #[test]
+    fn prepare_persisted_blocks_requests_more_ids_when_snapshot_goes_stale() {
+        let ino = 21;
+        let events = EventLog::default();
+        let uploads = Arc::new(StdMutex::new(Vec::new()));
+        let observed_inodes = Arc::new(StdMutex::new(Vec::new()));
+        let drain = test_drain(events, false, false, None, uploads, observed_inodes);
+        let (mut pending, blocks) = single_block_fixture(ino, 0, b"alpha", Some(700));
+        let mut fresh_object_ids = std::collections::VecDeque::new();
+
+        pending.insert(
+            (ino, 0),
+            PendingBlock {
+                data: BytesMut::from(&b"newer"[..]),
+                dirty: true,
+                reserved_object_id: Some(700),
+            },
+        );
+
+        assert!(matches!(
+            drain.try_prepare_persisted_blocks(&mut pending, ino, &blocks, &mut fresh_object_ids),
+            Err(1)
+        ));
+
+        fresh_object_ids.push_back(701);
+        let persisted_blocks = drain
+            .try_prepare_persisted_blocks(&mut pending, ino, &blocks, &mut fresh_object_ids)
+            .expect("prepare stale snapshot");
+        assert_eq!(persisted_blocks[0].object_id, 701);
+        let pending_block = pending.get(&(ino, 0)).expect("pending block");
+        assert_eq!(pending_block.data.as_ref(), b"newer");
+        assert_eq!(pending_block.reserved_object_id, Some(700));
+    }
+
+    #[test]
+    fn drain_core_commits_attr_only_without_uploading() {
+        let ino = 13;
+        let events = EventLog::default();
+        let uploads = Arc::new(StdMutex::new(Vec::new()));
+        let observed_inodes = Arc::new(StdMutex::new(Vec::new()));
+        let drain = test_drain(
+            events.clone(),
+            false,
+            false,
+            Some(InodeAttr::new_file(ino, 1, 1000, 1000, 0o644)),
+            uploads.clone(),
+            observed_inodes.clone(),
+        );
+
+        let outcome = futures::executor::block_on(drain.execute_drain(
+            ino,
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            4,
+            Some(InodeAttr::new_file(ino, 1, 1000, 1000, 0o644)),
+            PayloadPersistConfig {
+                put_concurrency: 4,
+                local_sync_policy: LocalSyncPolicy::Opportunistic,
+            },
+        ))
+        .expect("attr-only drain succeeds");
+
+        assert!(outcome.persisted_blocks.is_empty());
+        assert_eq!(
+            events.snapshot(),
+            vec!["metadata".to_string(), "observer".to_string()]
+        );
+        assert!(uploads.lock().expect("uploads lock").is_empty());
+        assert_eq!(*observed_inodes.lock().expect("observer lock"), vec![ino]);
     }
 
     #[test]
