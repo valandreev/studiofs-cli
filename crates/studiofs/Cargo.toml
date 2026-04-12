@@ -26,9 +26,7 @@ thiserror.workspace = true
 directories = "6"
 serde_json.workspace = true
 serde.workspace = true
-serde_derive = "1"
 toml = "1.0.7"
-postcard.workspace = true
 uuid.workspace = true
 home.workspace = true
 libc.workspace = true
@@ -53,6 +51,10 @@ winreg = "0.55"
 
 [target.'cfg(windows)'.build-dependencies]
 winfsp.workspace = true
+
+[package.metadata.cargo-machete]
+# cargo-machete does not model the Windows-only build.rs usage here.
+ignored = ["winfsp"]
 
 [dev-dependencies]
 tempfile.workspace = true

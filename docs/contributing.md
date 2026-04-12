@@ -253,6 +253,7 @@ Types: `feat`, `fix`, `docs`, `refactor`, `test`, `perf`, `ci`
 - [ ] `cargo fmt --all` applied
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes
 - [ ] `cargo test --workspace --all-targets -- --nocapture` passes
+- [ ] `cargo machete --with-metadata` reviewed when direct dependencies change; false positives belong in `[package.metadata.cargo-machete].ignored` with a short justification comment near the manifest entry
 - [ ] New or changed platform-specific code explains how it is verified (see rules above)
 - [ ] New public items have `///` doc comments
 - [ ] `docs/tests.md` regression list updated if new named regressions are added

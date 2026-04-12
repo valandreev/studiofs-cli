@@ -1,4 +1,5 @@
 target/
+cargo-audit.json
 *.db
 *.db-shm
 *.db-wal

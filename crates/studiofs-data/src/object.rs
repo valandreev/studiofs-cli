@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! StudioFS S3 Object Format
 //!
 //! Defines the binary format for objects stored in S3.
@@ -257,49 +256,6 @@ impl ObjectHeader {
 // Object Creation and Reading
 // =============================================================================
 
-/// Create a full object (Header + Payload).
-///
-/// This is the primary function for creating S3 objects.
-/// The returned bytes are ready to be uploaded to S3.
-///
-/// # Arguments
-/// * `data` - Raw block payload to store
-///
-/// # Returns
-/// Complete object bytes (header + payload)
-#[deprecated(
-    since = "0.1.1",
-    note = "Use create_object_buffer to avoid full payload copying on hot paths"
-)]
-pub fn create_object(data: &[u8]) -> Result<Vec<u8>, ObjectError> {
-    create_object_with(data, ObjectFlags::empty())
-}
-
-/// Create an object with custom flags.
-///
-/// Compression flags are not supported in this build.
-#[deprecated(
-    since = "0.1.1",
-    note = "Use create_object_buffer_with_flags to avoid full payload copying on hot paths"
-)]
-pub fn create_object_with(data: &[u8], flags: ObjectFlags) -> Result<Vec<u8>, ObjectError> {
-    let data_len = u64::try_from(data.len()).map_err(|_| ObjectError::ObjectTooLarge(u64::MAX))?;
-    if data_len > u64::from(MAX_OBJECT_SIZE) {
-        return Err(ObjectError::ObjectTooLarge(data_len));
-    }
-    if flags.contains(ObjectFlags::LEGACY_LZ4_COMPRESSED) {
-        return Err(ObjectError::LegacyCompressionUnsupported);
-    }
-
-    let checksum = xxh64(data, 0);
-    let size = u32::try_from(data_len).map_err(|_| ObjectError::ObjectTooLarge(data_len))?;
-    let header = ObjectHeader::with_flags(size, size, checksum, flags);
-    let mut object = Vec::with_capacity(ObjectHeader::SIZE + data.len());
-    object.extend_from_slice(&header.to_bytes());
-    object.extend_from_slice(data);
-    Ok(object)
-}
-
 /// Create a full object buffer (Header + Payload) without copying payload bytes.
 ///
 /// This is intended for upload paths where the payload is already owned as `Bytes`.
@@ -345,7 +301,6 @@ pub fn create_object_buffer_with(data: Bytes, flags: ObjectFlags) -> Result<Buff
 }
 
 pub use create_object_buffer_with as create_object_buffer_with_flags;
-pub use create_object_with as create_object_with_flags;
 
 /// Read and validate an object.
 ///
@@ -560,103 +515,19 @@ pub fn parse_object_id_from_key(key: &str) -> Result<u64, ObjectError> {
 }
 
 // =============================================================================
-// Legacy Types (Deprecated - for backward compatibility during migration)
-// =============================================================================
-
-/// Legacy: Object kind enumeration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[deprecated(since = "0.2.0", note = "New architecture uses simple block storage")]
-pub enum ObjectKind {
-    /// Leaf object containing actual file data.
-    Data,
-    /// Metadata object containing pointers to other objects.
-    Meta,
-}
-
-/// Legacy: Entry in a metadata object.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[deprecated(since = "0.2.0", note = "New architecture uses BlockRef instead")]
-pub struct Objectlink {
-    /// Logical offset in the file.
-    pub offset: u64,
-    /// Length of data covered by this object.
-    pub length: u32,
-    /// Object ID (hash/uuid).
-    pub object_id: String,
-}
-
-/// Legacy: Payload structure for metadata objects.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[deprecated(since = "0.2.0", note = "New architecture uses simple block storage")]
-pub struct ObjectPayload {
-    /// Kind of object.
-    pub kind: ObjectKind,
-    /// For Data objects: the actual data.
-    pub data: Vec<u8>,
-    /// Child links (for Meta objects).
-    pub children: Vec<Objectlink>,
-}
-
-#[allow(deprecated)]
-impl ObjectPayload {
-    /// Create a new data payload.
-    pub fn new_data(data: Vec<u8>) -> Self {
-        Self {
-            kind: ObjectKind::Data,
-            data,
-            children: Vec::new(),
-        }
-    }
-
-    /// Create a new metadata payload.
-    pub fn new_meta(children: Vec<Objectlink>) -> Self {
-        Self {
-            kind: ObjectKind::Meta,
-            data: Vec::new(),
-            children,
-        }
-    }
-
-    /// Serialize to bytes.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
-        // Simple serialization for backward compatibility
-        postcard::to_stdvec(&(self.kind as u8, &self.data, &self.children))
-    }
-
-    /// Deserialize from bytes.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, postcard::Error> {
-        let (kind_u8, data, children): (u8, Vec<u8>, Vec<Objectlink>) =
-            postcard::from_bytes(bytes)?;
-
-        let kind = match kind_u8 {
-            0 => ObjectKind::Data,
-            1 => ObjectKind::Meta,
-            _ => ObjectKind::Data,
-        };
-
-        Ok(Self {
-            kind,
-            data,
-            children,
-        })
-    }
-
-    /// Find child object covering the given offset.
-    pub fn find_child(&self, offset: u64) -> Option<&Objectlink> {
-        self.children.iter().find(|link| {
-            let end = link.offset.saturating_add(u64::from(link.length));
-            offset >= link.offset && offset < end
-        })
-    }
-}
-
-// =============================================================================
 // Tests
 // =============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn create_test_object_bytes(data: &[u8], flags: ObjectFlags) -> Vec<u8> {
+        create_object_buffer_with(Bytes::copy_from_slice(data), flags)
+            .expect("create test object buffer")
+            .to_bytes()
+            .to_vec()
+    }
 
     #[test]
     fn test_header_size() {
@@ -687,7 +558,7 @@ mod tests {
     fn test_object_roundtrip() {
         let original_data = b"Hello, StudioFS! This is a test of the object format.";
 
-        let object = create_object(original_data).unwrap();
+        let object = create_test_object_bytes(original_data, ObjectFlags::empty());
         let decoded = read_object(Bytes::from(object)).unwrap();
 
         assert_eq!(original_data.as_slice(), decoded.as_ref());
@@ -698,7 +569,7 @@ mod tests {
         // Test with data larger than typical compression overhead
         let original_data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 256) as u8).collect();
 
-        let object = create_object(&original_data).unwrap();
+        let object = create_test_object_bytes(&original_data, ObjectFlags::empty());
         let decoded = read_object(Bytes::from(object)).unwrap();
 
         assert_eq!(original_data.as_slice(), decoded.as_ref());
@@ -707,7 +578,7 @@ mod tests {
     #[test]
     fn test_checksum_validation() {
         let original_data = b"Test data for checksum validation";
-        let mut object = create_object(original_data).unwrap();
+        let mut object = create_test_object_bytes(original_data, ObjectFlags::empty());
 
         // Corrupt the checksum in the header
         object[20] ^= 0xFF; // Flip some bits in checksum
@@ -818,7 +689,7 @@ mod tests {
         let data = b"Uncompressed test data";
         let flags = ObjectFlags::empty();
 
-        let object = create_object_with_flags(data, flags).unwrap();
+        let object = create_test_object_bytes(data, flags);
         let decoded = read_object(Bytes::from(object)).unwrap();
 
         assert_eq!(data.as_slice(), decoded.as_ref());

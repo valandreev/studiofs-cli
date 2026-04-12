@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 studiofs-vfs.workspace = true
 studiofs-meta.workspace = true
-studiofs-cache.workspace = true
 studiofs-data.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -22,8 +21,6 @@ libc.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-bytes.workspace = true
-parking_lot.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
