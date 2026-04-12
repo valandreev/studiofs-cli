@@ -983,13 +983,25 @@ pub struct FormatInfo {
     pub block_size: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct FormatInfoDataStore {
     pub endpoint: String,
     pub bucket: String,
     pub access_key: String,
     pub secret_key: String,
     pub region: String,
+}
+
+impl std::fmt::Debug for FormatInfoDataStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FormatInfoDataStore")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("access_key", &"***")
+            .field("secret_key", &"***")
+            .field("region", &self.region)
+            .finish()
+    }
 }
 
 /// Metadata backend selection.
