@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use studiofs_vfs::VfsConfigRaw;
 
 const CONFIG_FILE_NAME: &str = "config.toml";
-const DEFAULT_CACHE_SIZE: &str = "100GB";
+pub(crate) const DEFAULT_CACHE_SIZE: &str = "100GB";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct StudioFsConfig {

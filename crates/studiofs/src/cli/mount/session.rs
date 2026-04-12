@@ -432,7 +432,7 @@ fn resolve_cache_size_for_mount(
 ) -> String {
     non_empty_trimmed(cli_cache_size)
         .or_else(|| non_empty_trimmed(config.cache_size.as_deref()))
-        .unwrap_or("100GB")
+        .unwrap_or(settings::DEFAULT_CACHE_SIZE)
         .to_string()
 }
 
@@ -851,6 +851,14 @@ fn shutdown_upload_drain_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+fn runtime_shutdown_timeout() -> Duration {
+    let secs = std::env::var("STUDIOFS_RUNTIME_SHUTDOWN_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(5);
+    Duration::from_secs(secs)
+}
+
 impl MountSession {
     pub(crate) fn prepare(command: MountCommand) -> anyhow::Result<Self> {
         Self::prepare_with_backend_factory(
@@ -906,23 +914,22 @@ impl MountSession {
             command.snapshot_id.as_deref(),
             command.endpoint.as_deref(),
         )?;
-        let data_config = DataStoreConfig::from(&format_info);
-        let memory_cache_budget_bytes = initial_cache_bytes();
-        let PreparedVolumeCacheRuntime {
-            cache_path,
-            cache_path_str,
-            cache_runtime,
-        } = prepare_volume_cache_runtime(&base_cache_path, &format_info.uuid)?;
-        let cache_size_bytes = parse_positive_size_arg(&cache_size)?;
-        let profiling = build_mount_profile_finish(
-            command.profile,
-            &command.name,
-            &cache_mode,
-            &cache_path,
-            run_in_foreground,
-        );
-
         let prepared_foreground = (|| -> anyhow::Result<PreparedForegroundSession> {
+            let data_config = DataStoreConfig::from(&format_info);
+            let memory_cache_budget_bytes = initial_cache_bytes();
+            let PreparedVolumeCacheRuntime {
+                cache_path,
+                cache_path_str,
+                cache_runtime,
+            } = prepare_volume_cache_runtime(&base_cache_path, &format_info.uuid)?;
+            let cache_size_bytes = parse_positive_size_arg(&cache_size)?;
+            let profiling = build_mount_profile_finish(
+                command.profile,
+                &command.name,
+                &cache_mode,
+                &cache_path,
+                run_in_foreground,
+            );
             let runtime = Runtime::new()
                 .map_err(|error| anyhow::anyhow!("failed to create tokio runtime: {error}"))?;
             let _guard = runtime.enter();
@@ -1064,7 +1071,7 @@ impl MountSession {
         drop(vfs);
         let _ = utils::remove_pid_file(&self.actual_mount_path);
         cleanup_snapshot_mount_db(self.snapshot_mount_db_path.take().as_deref());
-        runtime.shutdown_background();
+        runtime.shutdown_timeout(runtime_shutdown_timeout());
 
         serve_result.map_err(|error| anyhow::anyhow!("{backend_name} error: {error}"))?;
         Ok(())
@@ -1222,11 +1229,15 @@ fn materialize_snapshot_mount_meta<M: ?Sized + SnapshotSourceMeta>(
     std::fs::create_dir_all(&snapshot_dir)?;
     let snapshot_db_path = snapshot_dir.join(format!("{name}.{snapshot_id}.db"));
     cleanup_snapshot_mount_db(Some(snapshot_db_path.as_path()));
-    let snapshot_engine = Arc::new(RedbMetaEngine::open(&snapshot_db_path)?);
-    format_info.metadata.backend = MetadataBackend::RedbLocal;
-    format_info.metadata.postgres = None;
-    snapshot_engine.set_format_info(&format_info)?;
-    snapshot_engine.import_snapshot(&snapshot_state)?;
+    let snapshot_engine = (|| -> anyhow::Result<Arc<RedbMetaEngine>> {
+        let snapshot_engine = Arc::new(RedbMetaEngine::open(&snapshot_db_path)?);
+        format_info.metadata.backend = MetadataBackend::RedbLocal;
+        format_info.metadata.postgres = None;
+        snapshot_engine.set_format_info(&format_info)?;
+        snapshot_engine.import_snapshot(&snapshot_state)?;
+        Ok(snapshot_engine)
+    })()
+    .inspect_err(|_| cleanup_snapshot_mount_db(Some(snapshot_db_path.as_path())))?;
 
     Ok(MountMetaSession {
         meta: into_vfs_meta(snapshot_engine),
@@ -1326,7 +1337,9 @@ fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Resul
             // SAFETY: `setsid` is run in the pre-exec hook before `exec`; no Rust
             // state is touched after this point in the parent process.
             cmd.pre_exec(|| {
-                libc::setsid();
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }

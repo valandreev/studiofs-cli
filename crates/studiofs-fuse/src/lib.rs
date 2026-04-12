@@ -160,7 +160,7 @@ pub fn mount_and_serve(
 
     // Session::run returns when the filesystem is unmounted.
     vfs.clear_kernel_invalidator();
-    tracing::info!("unmounted, draining uploads …");
+    tracing::info!("unmounted, finalizing FUSE session cleanup …");
     // If we arrived here without SIGINT/SIGTERM, the mount point was most
     // likely detached by Finder/umount. In that case skip dropping the session
     // object to avoid a second unmount attempt during Drop (EINVAL on macOS).
