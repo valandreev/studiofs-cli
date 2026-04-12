@@ -5,10 +5,10 @@ use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
-use studiofs_meta::MetaEngine;
 use studiofs_meta::types::Ino;
 
 use super::{StudioVfs, VfsError, VfsResult};
+use crate::VfsMeta;
 use crate::runtime::run_meta;
 use crate::utils::now_unix_secs;
 
@@ -301,8 +301,8 @@ impl StudioVfs {
                 if had_local_lock {
                     if release_remote_lock && let Some(cfg) = &self.distributed_flock {
                         self.flush(ino).await?;
-                        let meta = self.meta_async.clone();
-                        run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                        let meta = self.meta.clone();
+                        run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
                             engine.flush_metadata()?;
                             Ok(())
                         })
@@ -354,8 +354,8 @@ impl StudioVfs {
                     tokio::time::sleep(Duration::from_millis(cfg.retry_base_ms)).await;
                     continue;
                 }
-                let meta = self.meta_async.clone();
-                run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                let meta = self.meta.clone();
+                run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
                     engine.sync_metadata()?;
                     Ok(())
                 })

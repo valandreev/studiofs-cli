@@ -1,4 +1,4 @@
-use super::{DeletedInodeCleanup, Ino, MetaEngine, MetaError, StudioVfs, VfsResult};
+use super::{DeletedInodeCleanup, Ino, MetaError, StudioVfs, VfsMeta, VfsResult};
 use std::sync::Arc;
 use studiofs_cache::block_cache::L2IoPriority;
 use tracing::{debug, info, warn};
@@ -8,7 +8,7 @@ use crate::runtime::run_meta;
 impl StudioVfs {
     pub(super) fn queue_pending_deletions_for_object_ids(
         &self,
-        meta: &Arc<dyn MetaEngine>,
+        meta: &Arc<dyn VfsMeta>,
         removed_ids: &[u64],
         reason: &str,
     ) -> VfsResult<()> {
@@ -28,7 +28,7 @@ impl StudioVfs {
 
     pub(super) fn collect_deleted_inode_cleanup(
         &self,
-        meta: &Arc<dyn MetaEngine>,
+        meta: &Arc<dyn VfsMeta>,
         ino: Ino,
         used_space_bytes: u64,
         gc_reason: &str,
@@ -58,8 +58,8 @@ impl StudioVfs {
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let meta = self.meta_async.clone();
-        run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+        let meta = self.meta.clone();
+        run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
             let blocks = match engine.get_file_blocks(ino) {
                 Ok(blocks) => blocks,
                 Err(MetaError::InodeNotFound(_)) => Vec::new(),
@@ -130,7 +130,7 @@ impl StudioVfs {
 
     pub(super) async fn cleanup_deleted_inode_storage(
         &self,
-        meta: &Arc<dyn MetaEngine>,
+        meta: &Arc<dyn VfsMeta>,
         ino: Ino,
         used_space_bytes: u64,
         gc_reason: &str,

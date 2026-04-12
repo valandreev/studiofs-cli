@@ -659,16 +659,9 @@ impl StudioVfs {
         attr: Option<InodeAttr>,
     ) -> VfsResult<Option<InodeAttr>> {
         let started = Instant::now();
-        let result = run_meta(
-            self.meta_async.clone(),
-            move |engine: Arc<dyn MetaEngine>| {
-                engine.flush_regular_file_overlay_slices_with_attr(
-                    ino,
-                    &chunk_slices,
-                    attr.as_ref(),
-                )
-            },
-        )
+        let result = run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            engine.flush_regular_file_overlay_slices_with_attr(ino, &chunk_slices, attr.as_ref())
+        })
         .await;
         self.record_metadata_commit_observability(started.elapsed(), result.is_ok());
         result
@@ -722,10 +715,9 @@ impl StudioVfs {
         let fresh_object_ids = if missing_object_id_count == 0 {
             Vec::new()
         } else {
-            run_meta(
-                self.meta_async.clone(),
-                move |engine: Arc<dyn MetaEngine>| engine.next_block_ids(missing_object_id_count),
-            )
+            run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                engine.next_block_ids(missing_object_id_count)
+            })
             .await?
         };
         {

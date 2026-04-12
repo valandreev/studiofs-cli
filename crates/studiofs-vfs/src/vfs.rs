@@ -102,8 +102,8 @@ use crate::qos::{FairInodeScheduler, QosController, TransitMemoryBudget};
 use crate::readahead::{DirAccessTracker, ReadAheadTracker, ReadStreamKey};
 
 use crate::runtime::{
-    LocalCacheIoTiming, MetaExecutor, cache_io_execution_model, run_local_cache_io,
-    run_local_cache_io_blocking, run_meta,
+    LocalCacheIoTiming, MetaExecutor, VfsMeta, cache_io_execution_model, into_vfs_meta,
+    run_local_cache_io, run_local_cache_io_blocking, run_meta,
 };
 use crate::utils::{now_unix_millis, now_unix_secs};
 use crate::vfs::write_buffer::WriteBufferState;
@@ -140,7 +140,7 @@ use studiofs_meta::types::{
     AccessLevel, BlockFlags as MetaBlockFlags, BlockRef, FileType, Ino, InodeAttr,
     block_index_from_offset, offset_within_block,
 };
-use studiofs_meta::{AsyncMetaEngine, MetaEngine, MetaError, MetaResult, SyncMetaEngineAdapter};
+use studiofs_meta::{MetaError, MetaResult};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
@@ -929,7 +929,7 @@ fn run_sync_with_timeout<T: Send + 'static>(
         }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             // The operation is still running.  We must NOT abandon the thread
-            // because it holds `Arc<dyn MetaEngine>` (and transitively
+            // because it holds `Arc<dyn VfsMeta>` (and transitively
             // `Arc<redb::Database>`).  If the process exits before that Arc
             // drops, `Database::drop()` never runs and redb is left in an
             // unclean state.  Wait with a generous secondary cap so the
@@ -2088,10 +2088,8 @@ fn panic_payload_message(panic_payload: &(dyn Any + Send)) -> Cow<'_, str> {
 
 /// The core VFS - satisfies filesystem operations using metadata + data + cache.
 pub struct StudioVfs {
-    /// Async boundary for metadata operations.
-    meta_async: Arc<dyn AsyncMetaEngine>,
-    /// Preferred metadata execution boundary for new call sites.
-    meta: MetaExecutor,
+    /// Preferred metadata execution boundary for hot-path call sites.
+    meta: MetaExecutor<dyn VfsMeta>,
     /// Data store for writes (uploads, deletes, GC).
     data_write: Arc<DataStore>,
     /// Shared local block backend used by the foreground read path.
@@ -3903,12 +3901,12 @@ impl StudioVfs {
     ///
     /// In async paths, prefer `self.meta.run(...)` so blocking work stays behind
     /// one explicit metadata boundary.
-    fn sync_meta(&self) -> Arc<dyn MetaEngine> {
+    fn sync_meta(&self) -> Arc<dyn VfsMeta> {
         self.meta.sync_view()
     }
 
     /// Get metadata engine reference.
-    pub fn meta(&self) -> Arc<dyn MetaEngine> {
+    pub fn meta(&self) -> Arc<dyn VfsMeta> {
         self.sync_meta()
     }
 

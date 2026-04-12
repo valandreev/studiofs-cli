@@ -354,23 +354,25 @@ impl VfsBootstrapResources {
 }
 
 struct VfsBootstrap {
-    meta_async: Arc<dyn AsyncMetaEngine>,
+    meta: Arc<dyn VfsMeta>,
     config: VfsConfigValidated,
     plan: VfsBootstrapPlan,
     resources: VfsBootstrapResources,
 }
 
 impl VfsBootstrap {
-    fn prepare(
-        meta: Arc<dyn MetaEngine>,
+    fn prepare<M>(
+        meta: Arc<M>,
         data_config: &DataStoreConfig,
         cache_dir: &str,
         cache_size: u64,
         block_cache_l1_limit: u64,
         config: VfsConfigValidated,
-    ) -> VfsResult<Self> {
-        let meta_async: Arc<dyn AsyncMetaEngine> =
-            Arc::new(SyncMetaEngineAdapter::new(meta.clone()));
+    ) -> VfsResult<Self>
+    where
+        M: ?Sized + VfsMeta + 'static,
+    {
+        let meta = into_vfs_meta(meta);
         let plan = VfsBootstrapPlan::build(
             meta.get_format_info()?,
             cache_size,
@@ -380,7 +382,7 @@ impl VfsBootstrap {
         plan.log_summary(cache_size, &config);
         let resources = VfsBootstrapResources::open(data_config, cache_dir, &plan, &config)?;
         Ok(Self {
-            meta_async,
+            meta,
             config,
             plan,
             resources,
@@ -389,7 +391,7 @@ impl VfsBootstrap {
 
     fn assemble(self) -> Arc<StudioVfs> {
         let Self {
-            meta_async,
+            meta,
             config,
             plan,
             resources,
@@ -398,8 +400,7 @@ impl VfsBootstrap {
         let upload_cache_io_slots = plan.cache_runtime_tuning.upload_cache_io_slots;
 
         Arc::new(StudioVfs {
-            meta: MetaExecutor::new(meta_async.clone()),
-            meta_async,
+            meta: MetaExecutor::new(meta),
             data_write: resources.data_write,
             local_block_backend: resources.local_block_backend,
             block_cache: resources.block_cache,
@@ -489,14 +490,17 @@ impl StudioVfs {
     }
 
     /// Create a new VFS instance using the current local block backend contract.
-    pub fn new(
-        meta: Arc<dyn MetaEngine>,
+    pub fn new<M>(
+        meta: Arc<M>,
         data_config: &DataStoreConfig,
         cache_dir: &str,
         cache_size: u64,
         block_cache_l1_limit: u64,
         config: VfsConfigValidated,
-    ) -> VfsResult<Arc<Self>> {
+    ) -> VfsResult<Arc<Self>>
+    where
+        M: ?Sized + VfsMeta + 'static,
+    {
         Self::new_impl(
             meta,
             data_config,
@@ -507,14 +511,17 @@ impl StudioVfs {
         )
     }
 
-    fn new_impl(
-        meta: Arc<dyn MetaEngine>,
+    fn new_impl<M>(
+        meta: Arc<M>,
         data_config: &DataStoreConfig,
         cache_dir: &str,
         cache_size: u64,
         block_cache_l1_limit: u64,
         config: VfsConfigValidated,
-    ) -> VfsResult<Arc<Self>> {
+    ) -> VfsResult<Arc<Self>>
+    where
+        M: ?Sized + VfsMeta + 'static,
+    {
         VfsBootstrap::prepare(
             meta,
             data_config,
@@ -532,7 +539,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, MetadataConfig};
-    use studiofs_meta::{MetaFormat, RedbMetaEngine};
+    use studiofs_meta::{MetaEngine, MetaFormat, RedbMetaEngine};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
@@ -668,6 +675,39 @@ mod tests {
             "constructor should not spawn uploader task"
         );
         drop(startup);
+    }
+
+    #[test]
+    fn studio_vfs_new_accepts_metaengine_compatibility_shim() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("meta.redb");
+        let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
+        meta.init_root(0, 0).expect("init root");
+
+        let format_info = test_format_info("new-metaengine-shim");
+        meta.set_format_info(&format_info).expect("set format info");
+        let data_config = DataStoreConfig::from(&format_info);
+        let cache_dir = tmp.path().join("cache");
+        let meta: Arc<dyn MetaEngine> = meta;
+        let rt = Runtime::new().expect("runtime");
+        let _guard = rt.enter();
+
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            cache_dir.to_str().expect("cache dir str"),
+            64 * 1024 * 1024,
+            32 * 1024 * 1024,
+            VfsConfig::default()
+                .try_into()
+                .expect("default VFS config should validate"),
+        )
+        .expect("create vfs from MetaEngine compatibility shim");
+
+        assert_eq!(
+            vfs.sync_meta().get_format_info().expect("format info").uuid,
+            format_info.uuid
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ pub mod types;
 use std::path::Path;
 use std::sync::Arc;
 
-pub use async_engine::{AsyncMetaEngine, SyncMetaEngineAdapter, execute_sync_meta};
+pub use async_engine::{SyncMetaEngineAdapter, execute_sync_meta};
 pub use engine::{
     BatchFlushEntry, BatchFlushResult, MetaAcl, MetaBlocks, MetaEngine, MetaEngineCore, MetaError,
     MetaFormat, MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaRecovery, MetaReplication,

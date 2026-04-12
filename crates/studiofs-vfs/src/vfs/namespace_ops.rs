@@ -1,7 +1,7 @@
 use super::{
     ATTR_CACHE_TTL, AccessLevel, Arc, DirEntry, FileType, Ino, InodeAttr, InodeIncarnationState,
-    Instant, MetaBlockFlags, MetaEngine, MetaError, NamespacePathStyle, PendingIncarnation,
-    SetattrArgs, StudioVfs, UnlinkTarget, VfsError, VfsResult, VfsState, VfsUploadState,
+    Instant, MetaBlockFlags, MetaError, NamespacePathStyle, PendingIncarnation, SetattrArgs,
+    StudioVfs, UnlinkTarget, VfsError, VfsMeta, VfsResult, VfsState, VfsUploadState,
     block_index_from_offset, debug, info, offset_within_block, validate_name, warn,
 };
 
@@ -369,7 +369,7 @@ impl StudioVfs {
     }
 
     fn hydrate_readdir_attr_cache_batches(
-        meta: Arc<dyn MetaEngine>,
+        meta: Arc<dyn VfsMeta>,
         state: Arc<VfsState>,
         inodes: Vec<Ino>,
         chunk_size: usize,
@@ -401,7 +401,7 @@ impl StudioVfs {
 
     fn resolve_unlink_target(
         &self,
-        meta: &Arc<dyn MetaEngine>,
+        meta: &Arc<dyn VfsMeta>,
         parent: Ino,
         name: &[u8],
     ) -> VfsResult<UnlinkTarget> {
@@ -414,7 +414,7 @@ impl StudioVfs {
 
     fn unlink_with_open_handles(
         &self,
-        meta: &Arc<dyn MetaEngine>,
+        meta: &Arc<dyn VfsMeta>,
         parent: Ino,
         name: &[u8],
         target: UnlinkTarget,
@@ -444,7 +444,7 @@ impl StudioVfs {
 
     async fn unlink_without_open_handles(
         &self,
-        meta: &Arc<dyn MetaEngine>,
+        meta: &Arc<dyn VfsMeta>,
         parent: Ino,
         name: &[u8],
         target: UnlinkTarget,

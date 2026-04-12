@@ -1,9 +1,9 @@
 # Metadata Engine
 
 `studiofs-meta` exposes synchronous metadata operations through `MetaEngine`.
-`studiofs-vfs` consumes metadata through an explicit async boundary:
-- `AsyncMetaEngine` (object-safe runtime boundary)
-- `SyncMetaEngineAdapter` (bridges sync engines via blocking execution)
+`studiofs-vfs` consumes metadata through a typed async boundary:
+- `SyncMetaEngineAdapter<M>` (bridges any sync metadata principal via blocking execution)
+- `execute_sync_meta(...)` (typed `tokio::task::spawn_blocking` helper; no `Any` downcast bridge)
 - `run_meta(...)` in VFS (maps runtime `JoinError` separately from metadata-domain errors)
 
 `MetaEngine` now acts as an aggregate capability contract built from focused
@@ -27,6 +27,35 @@ operations are split across capability traits. Consumers can depend on narrower
 contracts instead of a single god-object surface. Capability traits are opt-in
 per backend (`impl MetaNamespace for ...`, etc.), so incomplete backend
 contracts fail at compile time.
+
+## Capability Dependency Map
+
+`MetaEngine` is retained as the compatibility aggregate for engine factories
+such as `open_meta_engine(...)`, but it is no longer the default dependency for
+mount/VFS hot paths.
+
+Consumer-local bundles now define the active execution boundaries:
+- mount open/session bootstrap:
+  - `MountOpenMeta = MetaFormat + MetaReplication`
+  - used for UUID consistency checks and initial `FormatInfo` loading
+- snapshot mount source:
+  - `SnapshotSourceMeta = MetaSnapshots`
+  - used only to resolve and materialize snapshot payloads before VFS startup
+- mount runtime handoff:
+  - `MountRuntimeMeta` narrows the post-resolution dependency to the VFS-facing
+    runtime bundle instead of carrying `MetaEngine` through the mount path
+- VFS shared runtime:
+  - `VfsMeta` is the common executor surface for `run_meta(...)`
+- VFS helper bundles:
+  - `ReadPathMeta` for lookup/getattr/block-resolution helpers
+  - `AclMeta` for effective ACL traversal helpers
+  - `UploadMeta` for upload/commit helpers
+  - `JanitorMeta` for GC/recovery/janitor helpers
+
+Dependency rule:
+- use the smallest consumer-local bundle that matches the operation boundary
+- keep `MetaEngine` at compatibility-oriented entrypoints only
+- do not reintroduce a service-locator-style aggregate wrapper around metadata
 
 ## Engines
 

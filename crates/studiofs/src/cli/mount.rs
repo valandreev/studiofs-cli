@@ -12,9 +12,10 @@ use studiofs_cache::v3::CacheV3Layout;
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::redb_engine::RedbSnapshot;
 use studiofs_meta::{
-    FormatInfo, MetaEngine, MetaFormat, MetadataBackend, RedbMetaEngine, open_meta_engine,
+    FormatInfo, MetaEngine, MetaFormat, MetaReplication, MetaSnapshots, MetadataBackend,
+    RedbMetaEngine, open_meta_engine,
 };
-use studiofs_vfs::{StudioVfs, VfsConfigRaw, parse_size_bytes};
+use studiofs_vfs::{StudioVfs, VfsConfigRaw, VfsMeta, into_vfs_meta, parse_size_bytes};
 use sysinfo::System;
 use tracing::{debug, info, warn};
 
@@ -44,8 +45,23 @@ struct MountStartupContext {
     launch_mode: MountLaunchMode,
 }
 
-struct MountMetaSession {
-    meta: Arc<dyn MetaEngine>,
+trait MountOpenMeta: Send + Sync + MetaFormat + MetaReplication {}
+impl<T> MountOpenMeta for T where T: ?Sized + Send + Sync + MetaFormat + MetaReplication {}
+
+trait SnapshotSourceMeta: Send + Sync + MetaSnapshots {}
+impl<T> SnapshotSourceMeta for T where T: ?Sized + Send + Sync + MetaSnapshots {}
+
+trait MountRuntimeMeta: Send + Sync + VfsMeta {}
+impl<T> MountRuntimeMeta for T where T: ?Sized + Send + Sync + VfsMeta {}
+
+struct OpenedLiveMountMeta<M: ?Sized + MountOpenMeta> {
+    source_meta: Arc<M>,
+    runtime_meta: Arc<dyn VfsMeta>,
+    format_info: FormatInfo,
+}
+
+struct MountMetaSession<M: ?Sized + MountRuntimeMeta> {
+    meta: Arc<M>,
     format_info: FormatInfo,
     read_only_mount: bool,
 }
@@ -903,39 +919,49 @@ where
     Ok(())
 }
 
-fn open_live_mount_meta(
+fn read_live_mount_format_info<M: ?Sized + MountOpenMeta>(
     name: &str,
-    meta_dir: &Path,
-) -> anyhow::Result<(Arc<dyn MetaEngine>, FormatInfo)> {
-    let db_path = meta_dir.join(format!("{name}.db"));
-    debug!("opening volume {name:?} from {db_path:?}");
-    let live_meta = open_meta_engine(&db_path)?;
-
+    live_meta: &M,
+) -> anyhow::Result<FormatInfo> {
     if let Err(e) = live_meta.check_consistency() {
         if let studiofs_meta::engine::MetaError::UuidMismatch { local, remote } = &e {
-            let cleanup = super::utils::format_cleanup_command(name);
             anyhow::bail!(
                 "Disk '{}' has been recreated. Your local metadata is stale and incompatible with the current remote disk.\nLocal UUID: {}\nRemote UUID: {}\n\nTo resolve this, please run the following command to clean up your local state:\n  {}",
                 name,
                 local,
                 remote,
-                cleanup
+                super::utils::format_cleanup_command(name)
             );
         }
         return Err(anyhow::anyhow!("metadata consistency check failed: {e}"));
     }
 
-    let format_info = live_meta.get_format_info()?;
-    Ok((live_meta, format_info))
+    Ok(live_meta.get_format_info()?)
 }
 
-fn materialize_snapshot_mount_meta(
+fn open_live_mount_meta(
     name: &str,
     meta_dir: &Path,
-    live_meta: Arc<dyn MetaEngine>,
+) -> anyhow::Result<OpenedLiveMountMeta<dyn MetaEngine>> {
+    let db_path = meta_dir.join(format!("{name}.db"));
+    debug!("opening volume {name:?} from {db_path:?}");
+    let source_meta = open_meta_engine(&db_path)?;
+    let format_info = read_live_mount_format_info(name, source_meta.as_ref())?;
+    let runtime_meta = into_vfs_meta(source_meta.clone());
+    Ok(OpenedLiveMountMeta {
+        source_meta,
+        runtime_meta,
+        format_info,
+    })
+}
+
+fn materialize_snapshot_mount_meta<M: ?Sized + SnapshotSourceMeta>(
+    name: &str,
+    meta_dir: &Path,
+    live_meta: Arc<M>,
     mut format_info: FormatInfo,
     snapshot_id: &str,
-) -> anyhow::Result<MountMetaSession> {
+) -> anyhow::Result<MountMetaSession<dyn VfsMeta>> {
     let snapshot = live_meta
         .get_snapshot(snapshot_id)?
         .ok_or_else(|| anyhow::anyhow!("snapshot '{snapshot_id}' not found"))?;
@@ -951,14 +977,14 @@ fn materialize_snapshot_mount_meta(
     if snapshot_db_path.exists() {
         let _ = std::fs::remove_file(&snapshot_db_path);
     }
-    let snapshot_engine = RedbMetaEngine::open(&snapshot_db_path)?;
+    let snapshot_engine = Arc::new(RedbMetaEngine::open(&snapshot_db_path)?);
     format_info.metadata.backend = MetadataBackend::RedbLocal;
     format_info.metadata.postgres = None;
     snapshot_engine.set_format_info(&format_info)?;
     snapshot_engine.import_snapshot(&snapshot_state)?;
 
     Ok(MountMetaSession {
-        meta: Arc::new(snapshot_engine),
+        meta: into_vfs_meta(snapshot_engine),
         format_info,
         read_only_mount: true,
     })
@@ -984,13 +1010,17 @@ fn resolve_mount_meta_session(
     meta_dir: &Path,
     snapshot_id: Option<&str>,
     endpoint: Option<&str>,
-) -> anyhow::Result<MountMetaSession> {
-    let (live_meta, format_info) = open_live_mount_meta(name, meta_dir)?;
+) -> anyhow::Result<MountMetaSession<dyn VfsMeta>> {
+    let OpenedLiveMountMeta {
+        source_meta,
+        runtime_meta,
+        format_info,
+    } = open_live_mount_meta(name, meta_dir)?;
     let mut session = if let Some(snapshot_id) = snapshot_id {
-        materialize_snapshot_mount_meta(name, meta_dir, live_meta, format_info, snapshot_id)?
+        materialize_snapshot_mount_meta(name, meta_dir, source_meta, format_info, snapshot_id)?
     } else {
         MountMetaSession {
-            meta: live_meta,
+            meta: runtime_meta,
             format_info,
             read_only_mount: false,
         }
@@ -1284,7 +1314,11 @@ mod tests {
     use super::*;
     use crate::cli::settings;
     use crate::cli::utils;
-    use studiofs_meta::{MetaFormat, MetaSnapshots, ROOT_INO, RedbMetaEngine};
+    use studiofs_meta::engine::MetadataReplicationBacklog;
+    use studiofs_meta::{
+        MetaFormat, MetaReplication, MetaResult, MetaSnapshots, MetadataSnapshot, ROOT_INO,
+        RedbMetaEngine, SnapshotState,
+    };
 
     #[test]
     fn validate_endpoint_override_accepts_http_urls_and_bare_host_port() {
@@ -1619,6 +1653,104 @@ mod tests {
         (meta_dir, engine, format_info)
     }
 
+    struct FormatReplicationOnlyMeta {
+        format_info: FormatInfo,
+        consistency_ok: bool,
+    }
+
+    impl MetaFormat for FormatReplicationOnlyMeta {
+        fn set_format_info(&self, _info: &FormatInfo) -> MetaResult<()> {
+            Ok(())
+        }
+
+        fn get_format_info(&self) -> MetaResult<FormatInfo> {
+            Ok(self.format_info.clone())
+        }
+    }
+
+    impl MetaReplication for FormatReplicationOnlyMeta {
+        fn check_consistency(&self) -> MetaResult<()> {
+            if self.consistency_ok {
+                Ok(())
+            } else {
+                Err(studiofs_meta::MetaError::Storage(
+                    "consistency failed".to_string(),
+                ))
+            }
+        }
+
+        fn flush_metadata(&self) -> MetaResult<()> {
+            Ok(())
+        }
+
+        fn sync_metadata(&self) -> MetaResult<()> {
+            Ok(())
+        }
+
+        fn invalidation_sender_id(&self) -> Option<String> {
+            None
+        }
+
+        fn request_eager_flush(&self) {}
+
+        fn metadata_version_token(&self) -> Option<String> {
+            None
+        }
+
+        fn replication_backlog(&self) -> MetadataReplicationBacklog {
+            MetadataReplicationBacklog::default()
+        }
+
+        fn remote_metadata_size(&self) -> MetaResult<Option<u64>> {
+            Ok(None)
+        }
+    }
+
+    struct SnapshotOnlyMeta {
+        snapshot: MetadataSnapshot,
+    }
+
+    impl MetaSnapshots for SnapshotOnlyMeta {
+        fn create_snapshot(&self, _root_ino: u64) -> MetaResult<MetadataSnapshot> {
+            Ok(self.snapshot.clone())
+        }
+
+        fn list_snapshots(&self) -> MetaResult<Vec<MetadataSnapshot>> {
+            Ok(vec![self.snapshot.clone()])
+        }
+
+        fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>> {
+            if snapshot_id == self.snapshot.id {
+                Ok(Some(self.snapshot.clone()))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    #[test]
+    fn read_live_mount_format_info_accepts_mount_open_capability_only() {
+        let format_info = FormatInfo::new(
+            "demo".to_string(),
+            "demo-uuid".to_string(),
+            "https://storage.example".to_string(),
+            "bucket-demo".to_string(),
+            "access-key".to_string(),
+            "secret-key".to_string(),
+            String::new(),
+            16,
+        );
+        let meta = FormatReplicationOnlyMeta {
+            format_info: format_info.clone(),
+            consistency_ok: true,
+        };
+
+        let observed = read_live_mount_format_info("demo", &meta).expect("read format info");
+
+        assert_eq!(observed.uuid, format_info.uuid);
+        assert_eq!(observed.endpoint, format_info.endpoint);
+    }
+
     #[test]
     fn mount_meta_session_uses_live_metadata_when_snapshot_id_is_none() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1687,6 +1819,44 @@ mod tests {
             !meta_dir.join("snapshots").exists(),
             "missing snapshot should fail before snapshot db materialization"
         );
+    }
+
+    #[test]
+    fn materialize_snapshot_mount_meta_accepts_snapshot_capability_only_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let meta_dir = temp.path().join("meta");
+        std::fs::create_dir_all(&meta_dir).expect("create meta dir");
+        let format_info = FormatInfo::new(
+            "demo".to_string(),
+            "demo-uuid".to_string(),
+            "https://storage.example".to_string(),
+            "bucket-demo".to_string(),
+            "access-key".to_string(),
+            "secret-key".to_string(),
+            String::new(),
+            16,
+        );
+        let snapshot = MetadataSnapshot {
+            id: "snap-1".to_string(),
+            root_ino: ROOT_INO,
+            created_at: 1,
+            state: SnapshotState::Synced,
+            pinned_object_ids: Vec::new(),
+            snapshot_payload: serde_json::to_vec(&RedbSnapshot::default())
+                .expect("serialize empty redb snapshot"),
+        };
+        let source = Arc::new(SnapshotOnlyMeta { snapshot });
+
+        let session =
+            materialize_snapshot_mount_meta("demo", &meta_dir, source, format_info, "snap-1")
+                .expect("materialize snapshot using snapshot-only source");
+
+        assert!(session.read_only_mount);
+        assert_eq!(
+            session.format_info.metadata.backend,
+            MetadataBackend::RedbLocal
+        );
+        assert!(meta_dir.join("snapshots").join("demo.snap-1.db").exists());
     }
 
     #[test]

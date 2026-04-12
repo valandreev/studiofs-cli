@@ -21,10 +21,9 @@ impl CommitCoordinator {
             .await
             .map_err(|e| VfsError::Other(format!("commit qos permit failed: {e}")))?;
 
-        let attr = match run_meta(
-            vfs.meta_async.clone(),
-            move |engine: Arc<dyn MetaEngine>| engine.get_attr(ino),
-        )
+        let attr = match run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            engine.get_attr(ino)
+        })
         .await
         {
             Ok(attr) => attr,
@@ -54,16 +53,14 @@ impl CommitCoordinator {
             return Ok(EpochFinalizeStatus::Deferred);
         }
 
-        let has_persisted_overlay = run_meta(
-            vfs.meta_async.clone(),
-            move |engine: Arc<dyn MetaEngine>| engine.has_local_regular_file_overlay(ino),
-        )
+        let has_persisted_overlay = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            engine.has_local_regular_file_overlay(ino)
+        })
         .await?;
         let published = if has_persisted_overlay {
-            let overlay_object_ids = run_meta(
-                vfs.meta_async.clone(),
-                move |engine: Arc<dyn MetaEngine>| engine.get_regular_file_overlay_object_ids(ino),
-            )
+            let overlay_object_ids = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                engine.get_regular_file_overlay_object_ids(ino)
+            })
             .await?;
             if !overlay_object_ids.is_empty() {
                 let extents_to_verify: Vec<(u32, ExtentRecordId)> = overlay_object_ids
@@ -81,18 +78,14 @@ impl CommitCoordinator {
                     .collect();
                 Self::wait_until_remote_objects_visible(vfs, &extents_to_verify).await?;
             }
-            run_meta(
-                vfs.meta_async.clone(),
-                move |engine: Arc<dyn MetaEngine>| {
-                    engine.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
-                },
-            )
+            run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                engine.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
+            })
             .await?
         } else {
-            let required_blocks = run_meta(
-                vfs.meta_async.clone(),
-                move |engine: Arc<dyn MetaEngine>| engine.get_file_blocks(ino),
-            )
+            let required_blocks = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                engine.get_file_blocks(ino)
+            })
             .await?;
             if !required_blocks.is_empty() {
                 let extents_to_verify: Vec<(u32, ExtentRecordId)> = required_blocks
@@ -117,23 +110,19 @@ impl CommitCoordinator {
             }
 
             let expected_manifest = required_blocks.clone();
-            run_meta(
-                vfs.meta_async.clone(),
-                move |engine: Arc<dyn MetaEngine>| {
-                    engine.publish_file_manifest_if_matches(
-                        ino,
-                        content_epoch,
-                        expected_manifest.as_slice(),
-                    )
-                },
-            )
+            run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                engine.publish_file_manifest_if_matches(
+                    ino,
+                    content_epoch,
+                    expected_manifest.as_slice(),
+                )
+            })
             .await?
         };
         if !published {
-            let latest_attr = match run_meta(
-                vfs.meta_async.clone(),
-                move |engine: Arc<dyn MetaEngine>| engine.get_attr(ino),
-            )
+            let latest_attr = match run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                engine.get_attr(ino)
+            })
             .await
             {
                 Ok(attr) => attr,
@@ -187,10 +176,9 @@ impl CommitCoordinator {
             }
         }
 
-        if let Ok(attr) = run_meta(
-            vfs.meta_async.clone(),
-            move |engine: Arc<dyn MetaEngine>| engine.get_attr(ino),
-        )
+        if let Ok(attr) = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            engine.get_attr(ino)
+        })
         .await
         {
             vfs.refresh_inode_incarnation_state_from_attr(ino, &attr);

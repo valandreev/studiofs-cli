@@ -1,7 +1,7 @@
 use super::{
-    AccessLevel, BlockRef, Bytes, ExplicitFlushOutcome, FileSessionOperation, Ino, MetaEngine,
-    StickyErrorPolicy, StudioVfs, VfsError, VfsResult, block_index_from_offset, debug, error,
-    format_object_fragment_keys, offset_within_block, run_meta, warn,
+    AccessLevel, BlockRef, Bytes, ExplicitFlushOutcome, FileSessionOperation, Ino,
+    StickyErrorPolicy, StudioVfs, VfsError, VfsMeta, VfsResult, block_index_from_offset, debug,
+    error, format_object_fragment_keys, offset_within_block, run_meta, warn,
 };
 use std::sync::Arc;
 
@@ -241,8 +241,8 @@ impl StudioVfs {
         ino: Ino,
         block_index: u32,
     ) -> VfsResult<Option<BlockRef>> {
-        let meta = self.meta_async.clone();
-        run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+        let meta = self.meta.clone();
+        run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
             engine.get_file_block(ino, block_index)
         })
         .await
