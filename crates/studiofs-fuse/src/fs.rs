@@ -817,7 +817,13 @@ impl Filesystem for StudioFuseFs {
             .block_on(self.vfs.read_into_fh(fh, ino, offset, &mut out))
         {
             Ok(n) => {
-                let n = usize::from(n);
+                let n = match usize::try_from(n) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        reply.error(libc::EOVERFLOW);
+                        return;
+                    }
+                };
                 reply.data(&out[..n]);
             }
             Err(e) => {

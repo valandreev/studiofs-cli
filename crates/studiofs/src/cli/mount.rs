@@ -601,6 +601,8 @@ fn validate_mount_point(mount_point: &str) -> anyhow::Result<()> {
             );
         }
     }
+    #[cfg(not(windows))]
+    let _ = mount_point;
 
     Ok(())
 }

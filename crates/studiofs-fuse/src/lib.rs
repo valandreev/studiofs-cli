@@ -87,11 +87,17 @@ fn spawn_signal_watcher(
     // SAFETY: `libc::signal` mutates process-global signal disposition. We register a
     // process-lifetime signal handler for shutdown before entering the mount loop.
     unsafe {
-        let previous = libc::signal(libc::SIGINT, shutdown_signal_handler as libc::sighandler_t);
+        let previous = libc::signal(
+            libc::SIGINT,
+            shutdown_signal_handler as *const () as libc::sighandler_t,
+        );
         if previous == libc::SIG_ERR {
             return Err(std::io::Error::last_os_error());
         }
-        let previous = libc::signal(libc::SIGTERM, shutdown_signal_handler as libc::sighandler_t);
+        let previous = libc::signal(
+            libc::SIGTERM,
+            shutdown_signal_handler as *const () as libc::sighandler_t,
+        );
         if previous == libc::SIG_ERR {
             return Err(std::io::Error::last_os_error());
         }

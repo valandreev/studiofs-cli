@@ -15,13 +15,14 @@ impl InternalArgs {
             InternalAction::WinfspBootstrapMountmgr => {
                 #[cfg(windows)]
                 {
-                    super::winfsp_bootstrap::run_internal_bootstrap_mountmgr()?;
+                    super::winfsp_bootstrap::run_internal_bootstrap_mountmgr()
                 }
                 #[cfg(not(windows))]
                 {
-                    anyhow::bail!("internal WinFSP bootstrap is only supported on Windows");
+                    Err(anyhow::anyhow!(
+                        "internal WinFSP bootstrap is only supported on Windows"
+                    ))
                 }
-                Ok(())
             }
         }
     }
