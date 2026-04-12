@@ -42,6 +42,23 @@ const DEFAULT_SMALL_CLASS_MAX_BYTES: u64 = SMALL_FILE_MAX_BYTES;
 const DEFAULT_TEST_CACHE_BLOCK_SIZE_STR: &str = "16MB";
 static TEST_CACHE_RUNTIME: OnceLock<std::io::Result<tokio::runtime::Runtime>> = OnceLock::new();
 
+struct TestCacheRunRequest {
+    target: PathBuf,
+    block_size: Option<String>,
+    read_size: Option<String>,
+    small_max: Option<String>,
+    medium_max: Option<String>,
+    concurrency: usize,
+    sequential_streams: bool,
+    io_depth: usize,
+    warmup_runs: u32,
+    sizes: Option<String>,
+    access_pattern: TestCacheAccessPattern,
+    l1_limit: Option<String>,
+    profile: Option<TestCacheProfileMode>,
+    json_output: Option<PathBuf>,
+}
+
 fn test_cache_runtime() -> Result<&'static tokio::runtime::Runtime> {
     TEST_CACHE_RUNTIME
         .get_or_init(tokio::runtime::Runtime::new)
@@ -118,22 +135,22 @@ pub(crate) struct TestCacheArgs {
 
 impl TestCacheArgs {
     pub(crate) fn dispatch(self) -> anyhow::Result<()> {
-        run(
-            self.path,
-            self.block_size,
-            self.read_size,
-            self.small_max,
-            self.medium_max,
-            self.concurrency,
-            self.sequential_streams,
-            self.io_depth,
-            self.warmup_runs,
-            self.sizes,
-            self.access_pattern,
-            self.l1_limit,
-            self.profile,
-            self.json_output,
-        )
+        run(TestCacheRunRequest {
+            target: self.path,
+            block_size: self.block_size,
+            read_size: self.read_size,
+            small_max: self.small_max,
+            medium_max: self.medium_max,
+            concurrency: self.concurrency,
+            sequential_streams: self.sequential_streams,
+            io_depth: self.io_depth,
+            warmup_runs: self.warmup_runs,
+            sizes: self.sizes,
+            access_pattern: self.access_pattern,
+            l1_limit: self.l1_limit,
+            profile: self.profile,
+            json_output: self.json_output,
+        })
     }
 }
 
@@ -3306,23 +3323,23 @@ fn merge_profile_report(
     report
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    target: PathBuf,
-    block_size: Option<String>,
-    read_size: Option<String>,
-    small_max: Option<String>,
-    medium_max: Option<String>,
-    concurrency: usize,
-    sequential_streams: bool,
-    io_depth: usize,
-    warmup_runs: u32,
-    sizes: Option<String>,
-    access_pattern: TestCacheAccessPattern,
-    l1_limit: Option<String>,
-    profile: Option<TestCacheProfileMode>,
-    json_output: Option<PathBuf>,
-) -> Result<()> {
+fn run(request: TestCacheRunRequest) -> Result<()> {
+    let TestCacheRunRequest {
+        target,
+        block_size,
+        read_size,
+        small_max,
+        medium_max,
+        concurrency,
+        sequential_streams,
+        io_depth,
+        warmup_runs,
+        sizes,
+        access_pattern,
+        l1_limit,
+        profile,
+        json_output,
+    } = request;
     if io_depth == 0 {
         return Err(anyhow!("--io-depth must be >= 1"));
     }

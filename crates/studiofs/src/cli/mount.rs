@@ -29,6 +29,51 @@ use crate::cli::mount_runtime::{
 const WRITE_PATH_OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(1);
 type MountProfileFinish = Box<dyn FnMut()>;
 
+#[derive(Clone)]
+struct MountStartupOverrides {
+    mount_point: Option<String>,
+    cache_dir: Option<PathBuf>,
+    cache_size: Option<String>,
+    principal: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct MountLaunchOptions {
+    foreground: bool,
+    detach: bool,
+}
+
+#[derive(Clone)]
+struct MountSessionOptions {
+    profile: Option<super::mount_profile_types::MountProfileMode>,
+    snapshot_id: Option<String>,
+    endpoint: Option<String>,
+}
+
+struct MountRunRequest {
+    name: String,
+    meta_dir: PathBuf,
+    startup_overrides: MountStartupOverrides,
+    launch: MountLaunchOptions,
+    session: MountSessionOptions,
+}
+
+struct MountStartupRequest {
+    name: String,
+    meta_dir: PathBuf,
+    settings_config: super::settings::StudioFsConfig,
+    overrides: MountStartupOverrides,
+    launch: MountLaunchOptions,
+    endpoint: Option<String>,
+}
+
+struct MountRuntimeRequest {
+    name: String,
+    meta_dir: PathBuf,
+    startup: ResolvedMountStartup,
+    session: MountSessionOptions,
+}
+
 #[derive(Debug, Args)]
 #[command(about = "Mount a filesystem volume as a local drive")]
 #[command(long_about = "\
@@ -129,19 +174,50 @@ impl MountArgs {
         super::winfsp_bootstrap::ensure_mountmgr_bootstrap()?;
 
         let meta_dir = super::utils::get_default_meta_dir(&self.name)?;
-        run(
-            &self.name,
-            self.mount_point.as_deref(),
-            &meta_dir,
-            self.cache_dir.as_deref(),
-            self.cache_size.as_deref(),
-            self.principal.as_deref(),
-            self.foreground,
-            self.detach,
-            self.profile,
-            self.snapshot_id.as_deref(),
-            self.endpoint.as_deref(),
-        )
+        run(MountRunRequest {
+            name: self.name,
+            meta_dir,
+            startup_overrides: MountStartupOverrides {
+                mount_point: self.mount_point,
+                cache_dir: self.cache_dir,
+                cache_size: self.cache_size,
+                principal: self.principal,
+            },
+            launch: MountLaunchOptions {
+                foreground: self.foreground,
+                detach: self.detach,
+            },
+            session: MountSessionOptions {
+                profile: self.profile,
+                snapshot_id: self.snapshot_id,
+                endpoint: self.endpoint,
+            },
+        })
+    }
+}
+
+impl MountRunRequest {
+    fn startup_request(
+        &self,
+        settings_config: super::settings::StudioFsConfig,
+    ) -> MountStartupRequest {
+        MountStartupRequest {
+            name: self.name.clone(),
+            meta_dir: self.meta_dir.clone(),
+            settings_config,
+            overrides: self.startup_overrides.clone(),
+            launch: self.launch,
+            endpoint: self.session.endpoint.clone(),
+        }
+    }
+
+    fn runtime_request(&self, startup: ResolvedMountStartup) -> MountRuntimeRequest {
+        MountRuntimeRequest {
+            name: self.name.clone(),
+            meta_dir: self.meta_dir.clone(),
+            startup,
+            session: self.session.clone(),
+        }
     }
 }
 
@@ -425,33 +501,29 @@ fn resolve_mount_launch_mode(detach: bool) -> MountLaunchMode {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn resolve_mount_startup(
-    name: &str,
-    meta_dir: &Path,
-    settings_config: super::settings::StudioFsConfig,
-    cli_mount_point: Option<&str>,
-    cli_cache_dir: Option<&Path>,
-    cli_cache_size: Option<&str>,
-    principal: Option<&str>,
-    foreground: bool,
-    detach: bool,
-    endpoint: Option<&str>,
-) -> anyhow::Result<ResolvedMountStartup> {
+fn resolve_mount_startup(request: MountStartupRequest) -> anyhow::Result<ResolvedMountStartup> {
+    let MountStartupRequest {
+        name,
+        meta_dir,
+        settings_config,
+        overrides,
+        launch,
+        endpoint,
+    } = request;
     let resolved_settings = super::settings::resolve_mount_runtime_settings(
         &settings_config,
-        cli_mount_point,
-        cli_cache_dir,
-        cli_cache_size,
+        overrides.mount_point.as_deref(),
+        overrides.cache_dir.as_deref(),
+        overrides.cache_size.as_deref(),
     )?;
     let ResolvedMountConfig {
         vfs_config,
         cache_mode,
-    } = build_mount_config_from_raw(settings_config.vfs, principal)?;
+    } = build_mount_config_from_raw(settings_config.vfs, overrides.principal.as_deref())?;
 
-    validate_endpoint_override(endpoint)?;
+    validate_endpoint_override(endpoint.as_deref())?;
     let mount_point = resolve_runtime_mount_point(resolved_settings.mount_point);
-    let actual_mount_path = prepare_mount_path(name, &mount_point)?;
+    let actual_mount_path = prepare_mount_path(&name, &mount_point)?;
 
     Ok(ResolvedMountStartup {
         actual_mount_path,
@@ -461,9 +533,9 @@ fn resolve_mount_startup(
         cache_size: resolved_settings.cache_size,
         cache_mode,
         vfs_config,
-        principal_to_export: principal.map(str::to_string),
-        run_in_foreground: resolve_run_in_foreground(foreground, detach),
-        launch_mode: resolve_mount_launch_mode(detach),
+        principal_to_export: overrides.principal,
+        run_in_foreground: resolve_run_in_foreground(launch.foreground, launch.detach),
+        launch_mode: resolve_mount_launch_mode(launch.detach),
     })
 }
 
@@ -828,6 +900,7 @@ struct PreparedMountRuntime {
     cache_path_str: String,
     format_info: FormatInfo,
     read_only_mount: bool,
+    #[cfg(unix)]
     run_in_foreground: bool,
     vfs: Arc<StudioVfs>,
     rt: Arc<tokio::runtime::Runtime>,
@@ -880,16 +953,15 @@ impl PreparedMountRuntime {
                 || {
                     let event_name = super::utils::shutdown_event_name(&self.actual_mount_path);
                     info!("starting WinFSP mount at {}", self.actual_mount_path);
-                    studiofs_winfsp::mount_and_serve(
-                        self.vfs.clone(),
-                        self.rt.clone(),
-                        &self.actual_mount_path,
-                        &self.format_info.name,
-                        self.run_in_foreground,
-                        self.read_only_mount,
-                        Some(&event_name),
-                        self.profiling.take(),
-                    )
+                    studiofs_winfsp::mount_and_serve(studiofs_winfsp::WinfspMountRequest {
+                        vfs: self.vfs.clone(),
+                        rt: self.rt.clone(),
+                        mount_point: self.actual_mount_path.clone(),
+                        volume_label: self.format_info.name.clone(),
+                        read_only: self.read_only_mount,
+                        shutdown_event_name: Some(event_name),
+                        profiling: self.profiling.take(),
+                    })
                 },
                 || self.write_path_observability_publisher.stop_and_join(),
                 super::utils::remove_pid_file,
@@ -1161,20 +1233,23 @@ fn resolve_mount_meta_session(
     Ok(session)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn prepare_mount_runtime(
-    name: &str,
-    meta_dir: &Path,
-    startup: ResolvedMountStartup,
-    profile: Option<super::mount_profile_types::MountProfileMode>,
-    snapshot_id: Option<&str>,
-    endpoint: Option<&str>,
-) -> anyhow::Result<PreparedMountRuntime> {
+fn prepare_mount_runtime(request: MountRuntimeRequest) -> anyhow::Result<PreparedMountRuntime> {
+    let MountRuntimeRequest {
+        name,
+        meta_dir,
+        startup,
+        session,
+    } = request;
     let MountMetaSession {
         meta,
         format_info,
         read_only_mount,
-    } = resolve_mount_meta_session(name, meta_dir, snapshot_id, endpoint)?;
+    } = resolve_mount_meta_session(
+        &name,
+        &meta_dir,
+        session.snapshot_id.as_deref(),
+        session.endpoint.as_deref(),
+    )?;
 
     let data_config = DataStoreConfig::from(&format_info);
     let block_cache_l1_limit = initial_cache_bytes();
@@ -1193,8 +1268,13 @@ fn prepare_mount_runtime(
         run_in_foreground,
         launch_mode: _launch_mode,
     } = runtime_plan;
-    let profiling =
-        build_mount_profile_finish(profile, name, &cache_mode, &cache_path, run_in_foreground);
+    let profiling = build_mount_profile_finish(
+        session.profile,
+        &name,
+        &cache_mode,
+        &cache_path,
+        run_in_foreground,
+    );
 
     let rt = Arc::new(
         tokio::runtime::Runtime::new()
@@ -1225,6 +1305,7 @@ fn prepare_mount_runtime(
         cache_path_str,
         format_info,
         read_only_mount,
+        #[cfg(unix)]
         run_in_foreground,
         vfs,
         rt,
@@ -1233,32 +1314,9 @@ fn prepare_mount_runtime(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    name: &str,
-    mount_point: Option<&str>,
-    meta_dir: &Path,
-    cache_dir: Option<&Path>,
-    cache_size: Option<&str>,
-    principal: Option<&str>,
-    foreground: bool,
-    detach: bool,
-    profile: Option<super::mount_profile_types::MountProfileMode>,
-    snapshot_id: Option<&str>,
-    endpoint: Option<&str>,
-) -> anyhow::Result<()> {
-    let startup = resolve_mount_startup(
-        name,
-        meta_dir,
-        super::settings::load_studiofs_config()?,
-        mount_point,
-        cache_dir,
-        cache_size,
-        principal,
-        foreground,
-        detach,
-        endpoint,
-    )?;
+fn run(request: MountRunRequest) -> anyhow::Result<()> {
+    let startup =
+        resolve_mount_startup(request.startup_request(super::settings::load_studiofs_config()?))?;
 
     let ResolvedMountStartup {
         actual_mount_path,
@@ -1273,7 +1331,7 @@ pub fn run(
 
     // ── Daemon mode: re-spawn in background and exit ────────────────────────
     if matches!(launch_mode, MountLaunchMode::Daemon) {
-        return spawn_daemon(name, &actual_mount_path, meta_dir);
+        return spawn_daemon(&request.name, &actual_mount_path, &request.meta_dir);
     }
 
     export_mount_principal(principal_to_export.as_deref());
@@ -1284,25 +1342,22 @@ pub fn run(
     // ignore a PID file that points to itself.
     guard_mount_pid_file(&actual_mount_path)?;
 
-    let runtime = prepare_mount_runtime(
-        name,
-        meta_dir,
-        ResolvedMountStartup {
-            actual_mount_path,
-            base_cache_path,
-            cache_size: cache_size.clone(),
-            cache_mode,
-            vfs_config,
-            principal_to_export,
-            run_in_foreground,
-            launch_mode,
-        },
-        profile,
-        snapshot_id,
-        endpoint,
-    )?;
+    let runtime = prepare_mount_runtime(request.runtime_request(ResolvedMountStartup {
+        actual_mount_path,
+        base_cache_path,
+        cache_size: cache_size.clone(),
+        cache_mode,
+        vfs_config,
+        principal_to_export,
+        run_in_foreground,
+        launch_mode,
+    }))?;
 
-    runtime.launch(name, &cache_size, snapshot_id)
+    runtime.launch(
+        &request.name,
+        &cache_size,
+        request.session.snapshot_id.as_deref(),
+    )
 }
 
 // ─── Daemon spawn ────────────────────────────────────────────────────────────
@@ -1662,18 +1717,22 @@ mod tests {
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
         let cli_mount_point = startup_mount_point(&temp);
 
-        let startup = resolve_mount_startup(
+        let startup = resolve_mount_startup(startup_request(
             "projectfs",
             &meta_dir,
             startup_settings_config(cli_mount_point.clone(), None, Some("64GB")),
-            Some(cli_mount_point.as_str()),
+            MountStartupOverrides {
+                mount_point: Some(cli_mount_point),
+                cache_dir: None,
+                cache_size: None,
+                principal: None,
+            },
+            MountLaunchOptions {
+                foreground: false,
+                detach: false,
+            },
             None,
-            None,
-            None,
-            false,
-            false,
-            None,
-        )
+        ))
         .expect("startup context resolved");
 
         assert_eq!(startup.cache_mode, "fast");
@@ -1872,11 +1931,13 @@ mod tests {
         let format_info = FormatInfo::new(
             name.to_string(),
             format!("{name}-uuid"),
-            "https://storage.example".to_string(),
-            "bucket-demo".to_string(),
-            "access-key".to_string(),
-            "secret-key".to_string(),
-            String::new(),
+            studiofs_meta::FormatInfoDataStore {
+                endpoint: "https://storage.example".to_string(),
+                bucket: "bucket-demo".to_string(),
+                access_key: "access-key".to_string(),
+                secret_key: "secret-key".to_string(),
+                region: String::new(),
+            },
             16,
         );
         engine
@@ -1966,11 +2027,13 @@ mod tests {
         let format_info = FormatInfo::new(
             "demo".to_string(),
             "demo-uuid".to_string(),
-            "https://storage.example".to_string(),
-            "bucket-demo".to_string(),
-            "access-key".to_string(),
-            "secret-key".to_string(),
-            String::new(),
+            studiofs_meta::FormatInfoDataStore {
+                endpoint: "https://storage.example".to_string(),
+                bucket: "bucket-demo".to_string(),
+                access_key: "access-key".to_string(),
+                secret_key: "secret-key".to_string(),
+                region: String::new(),
+            },
             16,
         );
         let meta = FormatReplicationOnlyMeta {
@@ -2062,11 +2125,13 @@ mod tests {
         let format_info = FormatInfo::new(
             "demo".to_string(),
             "demo-uuid".to_string(),
-            "https://storage.example".to_string(),
-            "bucket-demo".to_string(),
-            "access-key".to_string(),
-            "secret-key".to_string(),
-            String::new(),
+            studiofs_meta::FormatInfoDataStore {
+                endpoint: "https://storage.example".to_string(),
+                bucket: "bucket-demo".to_string(),
+                access_key: "access-key".to_string(),
+                secret_key: "secret-key".to_string(),
+                region: String::new(),
+            },
             16,
         );
         let snapshot = MetadataSnapshot {
@@ -2128,6 +2193,24 @@ mod tests {
         "Z:".to_string()
     }
 
+    fn startup_request(
+        name: &str,
+        meta_dir: &Path,
+        settings_config: settings::StudioFsConfig,
+        overrides: MountStartupOverrides,
+        launch: MountLaunchOptions,
+        endpoint: Option<&str>,
+    ) -> MountStartupRequest {
+        MountStartupRequest {
+            name: name.to_string(),
+            meta_dir: meta_dir.to_path_buf(),
+            settings_config,
+            overrides,
+            launch,
+            endpoint: endpoint.map(str::to_string),
+        }
+    }
+
     #[test]
     fn resolve_mount_startup_context_defaults_to_meta_cache_and_foreground_launch() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2135,18 +2218,22 @@ mod tests {
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
         let cli_mount_point = startup_mount_point(&temp);
 
-        let startup = resolve_mount_startup(
+        let startup = resolve_mount_startup(startup_request(
             "projectfs",
             &meta_dir,
             startup_settings_config(cli_mount_point.clone(), None, Some("64GB")),
-            Some(cli_mount_point.as_str()),
-            None,
-            None,
-            Some("alice"),
-            false,
-            false,
+            MountStartupOverrides {
+                mount_point: Some(cli_mount_point),
+                cache_dir: None,
+                cache_size: None,
+                principal: Some("alice".to_string()),
+            },
+            MountLaunchOptions {
+                foreground: false,
+                detach: false,
+            },
             Some("127.0.0.1:9000"),
-        )
+        ))
         .expect("startup context resolved");
 
         assert_eq!(startup.base_cache_path, meta_dir.join("cache"));
@@ -2178,7 +2265,7 @@ mod tests {
         let cli_mount_point = startup_mount_point(&temp);
         let configured_cache_dir = temp.path().join("configured-cache");
 
-        let startup = resolve_mount_startup(
+        let startup = resolve_mount_startup(startup_request(
             "projectfs",
             &meta_dir,
             startup_settings_config(
@@ -2186,14 +2273,18 @@ mod tests {
                 Some(configured_cache_dir.clone()),
                 Some("32GB"),
             ),
-            Some(cli_mount_point.as_str()),
+            MountStartupOverrides {
+                mount_point: Some(cli_mount_point),
+                cache_dir: None,
+                cache_size: None,
+                principal: None,
+            },
+            MountLaunchOptions {
+                foreground: false,
+                detach: true,
+            },
             None,
-            None,
-            None,
-            false,
-            true,
-            None,
-        )
+        ))
         .expect("startup context resolved");
 
         assert_eq!(startup.base_cache_path, configured_cache_dir);
@@ -2218,7 +2309,7 @@ mod tests {
         #[cfg(windows)]
         let cli_mount_point = "Y:".to_string();
 
-        let startup = resolve_mount_startup(
+        let startup = resolve_mount_startup(startup_request(
             "projectfs",
             &meta_dir,
             startup_settings_config(
@@ -2226,14 +2317,18 @@ mod tests {
                 Some(configured_cache_dir),
                 Some("32GB"),
             ),
-            Some(cli_mount_point.as_str()),
-            Some(cli_cache_dir.as_path()),
-            Some("96GB"),
+            MountStartupOverrides {
+                mount_point: Some(cli_mount_point),
+                cache_dir: Some(cli_cache_dir.clone()),
+                cache_size: Some("96GB".to_string()),
+                principal: None,
+            },
+            MountLaunchOptions {
+                foreground: true,
+                detach: false,
+            },
             None,
-            true,
-            false,
-            None,
-        )
+        ))
         .expect("startup context resolved");
 
         assert_eq!(startup.base_cache_path, cli_cache_dir);
@@ -2261,18 +2356,22 @@ mod tests {
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
         let cli_mount_point = startup_mount_point(&temp);
 
-        let err = resolve_mount_startup(
+        let err = resolve_mount_startup(startup_request(
             "projectfs",
             &meta_dir,
             startup_settings_config(cli_mount_point.clone(), None, Some("64GB")),
-            Some(cli_mount_point.as_str()),
-            None,
-            None,
-            None,
-            false,
-            false,
+            MountStartupOverrides {
+                mount_point: Some(cli_mount_point),
+                cache_dir: None,
+                cache_size: None,
+                principal: None,
+            },
+            MountLaunchOptions {
+                foreground: false,
+                detach: false,
+            },
             Some("ftp://127.0.0.1:9000"),
-        )
+        ))
         .expect_err("invalid endpoint should be rejected");
 
         assert!(err.to_string().contains("invalid S3 endpoint"));
@@ -2291,11 +2390,13 @@ mod tests {
         let format_info = FormatInfo::new(
             "demo".to_string(),
             "demo-uuid".to_string(),
-            "https://storage.example".to_string(),
-            "bucket-demo".to_string(),
-            "access-key".to_string(),
-            "secret-key".to_string(),
-            String::new(),
+            studiofs_meta::FormatInfoDataStore {
+                endpoint: "https://storage.example".to_string(),
+                bucket: "bucket-demo".to_string(),
+                access_key: "access-key".to_string(),
+                secret_key: "secret-key".to_string(),
+                region: String::new(),
+            },
             16,
         );
 
