@@ -121,13 +121,13 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::OpenLocalBlockBackendError;
 use studiofs_cache::PreparedCacheV3Runtime;
-use studiofs_cache::block_cache::{BlockCache, BlockCacheConfig, CancelUploadMode};
+use studiofs_cache::local::LocalBlockBackend;
 use studiofs_cache::metrics::{LatencyHistogram, LatencyHistogramSnapshot, MaterializeBatchStats};
 use studiofs_cache::open_local_block_backend_with_budget_and_sync_mode;
 use studiofs_cache::open_prepared_local_block_backend_with_budget_and_sync_mode;
 use studiofs_cache::upload_queue::PendingUpload;
-use studiofs_cache::v2::LocalBlockBackend;
 use studiofs_cache::v3::CacheV3PayloadSyncMode;
+use studiofs_cache::{CancelUploadMode, UploadCoordinator, UploadCoordinatorConfig};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, format_object_fragment_keys,
     parse_object_id_from_key,
@@ -1088,7 +1088,7 @@ struct CacheRuntimeTuning {
 fn derive_cache_runtime_tuning(
     cache_size: u64,
     block_size: u32,
-    block_cache_l1_limit: u64,
+    memory_cache_budget_bytes: u64,
 ) -> CacheRuntimeTuning {
     let cache_size = cache_size.max(1);
     let block_size = u64::from(block_size.max(1));
@@ -1162,10 +1162,10 @@ fn derive_cache_runtime_tuning(
     // Transit memory keeps enough headroom for read/upload concurrency while
     // still bounded independently of raw cache-size growth.
     let from_cache_budget = cache_size / 96;
-    let from_l1_budget = if block_cache_l1_limit == 0 {
+    let from_l1_budget = if memory_cache_budget_bytes == 0 {
         0
     } else {
-        ((block_cache_l1_limit as u128)
+        ((memory_cache_budget_bytes as u128)
             .saturating_mul(DEFAULT_TRANSIT_MEMORY_BUDGET_RATIO_PERCENT as u128)
             / 100)
             .min(u64::MAX as u128) as u64
@@ -2108,7 +2108,7 @@ pub struct StudioVfs {
     /// Shared local block backend used by the foreground read path.
     local_block_backend: Arc<dyn LocalBlockBackend>,
     /// Upload queue and pending-upload pinning for the write path.
-    block_cache: Arc<BlockCache>,
+    upload_coordinator: Arc<UploadCoordinator>,
     /// Block size in bytes.
     block_size: u32,
     /// Volume data prefix for S3 object keys.
@@ -2596,7 +2596,9 @@ impl<'a> StartupReplayCoordinator<'a> {
         self.merge_pending_live_extents();
 
         if !self.replay_ops.is_empty() {
-            self.vfs.block_cache.submit_uploads_batch(&self.replay_ops);
+            self.vfs
+                .upload_coordinator
+                .submit_uploads_batch(&self.replay_ops);
             info!(
                 replayed_dirty_blocks = self.replay_ops.len(),
                 restored_live_extents = self.restored_live_extents,
@@ -2702,7 +2704,7 @@ impl StudioVfs {
             upload_rx,
         }: StartupChannels,
     ) -> VfsResult<()> {
-        self.block_cache.spawn_background_tasks();
+        self.upload_coordinator.spawn_background_tasks();
         self.spawn_prefetch_worker(prefetch_rx);
         self.spawn_uploader_worker(upload_rx);
         self.spawn_epoch_finalizer_worker();
@@ -2953,7 +2955,7 @@ impl StudioVfs {
     }
 
     fn inode_has_pending_uploads(&self, ino: Ino) -> bool {
-        self.block_cache.has_pending_uploads_for_ino(ino)
+        self.upload_coordinator.has_pending_uploads_for_ino(ino)
     }
 
     fn derive_committed_incarnation_from_attr(
@@ -3268,7 +3270,7 @@ impl StudioVfs {
         }
 
         let pending_uploads: Vec<_> = self
-            .block_cache
+            .upload_coordinator
             .snapshot_pending_uploads()
             .into_iter()
             .filter(|op| inos.contains(&op.ino))
@@ -3278,7 +3280,7 @@ impl StudioVfs {
         }
 
         for op in &pending_uploads {
-            self.block_cache
+            self.upload_coordinator
                 .cancel_upload(op, CancelUploadMode::KeepBlock);
         }
 
@@ -3433,7 +3435,7 @@ impl StudioVfs {
 
     pub fn pending_uploads_for_inode(&self, ino: Ino) -> Vec<(u64, u64, u64)> {
         let mut out: Vec<_> = self
-            .block_cache
+            .upload_coordinator
             .snapshot_pending_uploads()
             .into_iter()
             .filter(|op| op.ino == ino)
@@ -3673,7 +3675,7 @@ impl StudioVfs {
 
     pub fn upload_stats(&self) -> VfsUploadStats {
         VfsUploadStats {
-            pending_uploads: self.block_cache.pending_upload_count(),
+            pending_uploads: self.upload_coordinator.pending_upload_count(),
             upload_requeues: self.state.upload.upload_requeues.load(Ordering::Relaxed),
             canceled_deleted: self
                 .state
@@ -3958,9 +3960,9 @@ impl StudioVfs {
             .load(Ordering::Relaxed)
     }
 
-    /// Shared reference to the block cache.
-    pub fn block_cache(&self) -> &Arc<BlockCache> {
-        &self.block_cache
+    /// Shared reference to the upload coordinator.
+    pub fn upload_coordinator(&self) -> &Arc<UploadCoordinator> {
+        &self.upload_coordinator
     }
 
     /// Shared reference to the local block backend contract.
@@ -3984,7 +3986,7 @@ impl StudioVfs {
     /// Useful in tests to ensure block data is available on S3 before
     /// cross-client reads.
     pub async fn wait_for_uploads_idle(&self, timeout: Duration) -> bool {
-        self.block_cache.wait_for_uploads_idle(timeout).await
+        self.upload_coordinator.wait_for_uploads_idle(timeout).await
     }
 
     /// Snapshot accepted local-ingress state for diagnostics and backpressure

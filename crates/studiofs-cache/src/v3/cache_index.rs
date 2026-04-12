@@ -15,7 +15,7 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use redb::{Database, Error as RedbError, ReadableDatabase, ReadableTable, TableDefinition};
 
-use crate::v2::LocalBlockLifecycleState;
+use crate::local::LocalBlockLifecycleState;
 
 const INDEX_FORMAT_VERSION: u64 = 1;
 const ENTRY_ENCODING_VERSION: u8 = 1;

@@ -1,4 +1,4 @@
-//! Local block backend contract used by the redesigned data path.
+//! Active local block backend contract used by the Cache 3.0 data path.
 //!
 //! The goal is to keep VFS/data-path code independent of backend internals
 //! while still exposing the block lifecycle states required for upload replay
@@ -6,6 +6,7 @@
 
 use bytes::Bytes;
 use std::any::Any;
+use uuid::Uuid;
 
 /// Lifecycle state of a single locally persisted block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +64,16 @@ pub trait LocalBlockBackend: Send + Sync {
     fn dirty_object_ids(&self) -> Vec<u64>;
     fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState;
     fn is_evictable(&self, object_id: u64) -> bool;
+}
+
+/// Derive a stable 16-byte local backend volume UUID from a format UUID string.
+///
+/// Accepts plain UUID strings and falls back to deterministic UUIDv5 over the
+/// provided bytes so legacy/non-UUID values still map consistently.
+pub fn derive_backend_volume_uuid(volume_uuid: &str) -> [u8; 16] {
+    Uuid::parse_str(volume_uuid)
+        .unwrap_or_else(|_| Uuid::new_v5(&Uuid::NAMESPACE_URL, volume_uuid.as_bytes()))
+        .into_bytes()
 }
 
 #[cfg(test)]
@@ -131,8 +142,6 @@ pub(crate) mod contract_tests {
             backend.lifecycle_state(object_id),
             LocalBlockLifecycleState::Uploaded
         );
-        // Evictability is backend-specific; the contract does not require
-        // `is_evictable(...)` to be true for all implementations after upload.
         assert!(
             backend.dirty_object_ids().is_empty(),
             "uploaded block must no longer be dirty"
@@ -146,9 +155,9 @@ pub(crate) mod contract_tests {
     {
         let (backend, _guard) = factory();
 
-        backend.put(1, b"a", false).unwrap(); // dirty
-        backend.put(2, b"b", true).unwrap(); // uploaded/evictable
-        backend.put(3, b"c", false).unwrap(); // dirty
+        backend.put(1, b"a", false).unwrap();
+        backend.put(2, b"b", true).unwrap();
+        backend.put(3, b"c", false).unwrap();
         backend.sync_data().unwrap();
 
         assert_eq!(

@@ -239,7 +239,7 @@ fn remove_file_if_present(path: &Path) -> Result<bool, io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::LocalBlockLifecycleState;
+    use crate::local::LocalBlockLifecycleState;
     use crate::v3::FilePayloadStore;
 
     fn create_v3_marker(layout: &CacheV3Layout) {

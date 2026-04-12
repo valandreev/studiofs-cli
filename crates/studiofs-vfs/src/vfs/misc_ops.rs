@@ -117,14 +117,13 @@ impl StudioVfs {
         self.remove_live_extent(ino, block_index);
 
         // Committed cache + L1/L2 upload cache (defer if pinned for pending upload).
-        if self.block_cache.is_pinned(object_id) {
+        if self.upload_coordinator.is_pinned(object_id) {
             self.state.upload.pending_evictions.lock().insert(object_id);
             debug!(
                 "evict_block: deferred pinned object_id={} ino={} block={}",
                 object_id, ino, block_index
             );
         } else {
-            self.block_cache.remove_sync(object_id);
             self.local_block_backend.remove(object_id);
         }
     }

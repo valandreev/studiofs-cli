@@ -1,6 +1,6 @@
 //! Upload Queue — in-memory scheduler for pending S3 uploads.
 //!
-//! Cache v2 persists upload intent in local backend lifecycle flags (`DIRTY` /
+//! The local backend persists upload intent in lifecycle flags (`DIRTY` /
 //! transient `UPLOADING`). The queue itself is intentionally in-memory:
 //! startup replay is reconstructed from the local backend + metadata mapping.
 

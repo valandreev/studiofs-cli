@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
-use studiofs_cache::block_cache::DEFAULT_L1_SIZE;
+use studiofs_cache::DEFAULT_MEMORY_CACHE_SIZE;
 #[cfg(test)]
 use studiofs_cache::v3::CacheV3Layout;
 use studiofs_data::DataStoreConfig;
@@ -339,7 +339,7 @@ fn persist_mount_path_snapshot(vfs: &StudioVfs, output_path: &Path) -> std::io::
 /// Initial local-cache budget used to size the mount-time cache directory.
 /// Capped at 25 % of total RAM so low-memory machines don't overshoot.
 fn initial_cache_bytes() -> u64 {
-    const DEFAULT_INITIAL_CACHE_CAP_BYTES: u64 = DEFAULT_L1_SIZE * 2;
+    const DEFAULT_INITIAL_CACHE_CAP_BYTES: u64 = DEFAULT_MEMORY_CACHE_SIZE * 2;
     let mut sys = System::new();
     sys.refresh_memory();
     let total_ram = sys.total_memory();
@@ -1258,7 +1258,7 @@ fn prepare_mount_runtime(request: MountRuntimeRequest) -> anyhow::Result<Prepare
     )?;
 
     let data_config = DataStoreConfig::from(&format_info);
-    let block_cache_l1_limit = initial_cache_bytes();
+    let memory_cache_budget_bytes = initial_cache_bytes();
     let runtime_plan =
         crate::cli::mount_runtime::prepare_mount_runtime_plan(startup, &format_info.uuid)?;
     let PreparedMountRuntimePlan {
@@ -1293,7 +1293,7 @@ fn prepare_mount_runtime(request: MountRuntimeRequest) -> anyhow::Result<Prepare
         &data_config,
         &cache_path_str,
         cache_size_bytes,
-        block_cache_l1_limit,
+        memory_cache_budget_bytes,
         vfs_config,
         cache_runtime,
     )

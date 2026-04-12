@@ -242,7 +242,8 @@ test: add destroy tests fixes
 
 - Cache-v2 storage code has been removed from the workspace.
 - Cache 3.0 (`v3`) is the only local backend implementation.
-- `BlockCache` remains the upload queue + lightweight hot payload staging layer.
+- `UploadCoordinator` owns upload queue + pending-upload pinning for production.
+- `BenchmarkCache` owns the lightweight in-memory benchmark cache surface.
 
 ### Environment Variables
 

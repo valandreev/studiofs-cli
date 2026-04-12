@@ -802,7 +802,7 @@ impl StudioVfs {
             self.refresh_inode_incarnation_state_from_attr(ino, &attr);
         }
 
-        self.block_cache.submit_uploads_batch(&upload_ops);
+        self.upload_coordinator.submit_uploads_batch(&upload_ops);
         for (upload_ino, _, _, _) in &upload_ops {
             self.state.file_session.note_background_transition(
                 *upload_ino,
@@ -811,7 +811,7 @@ impl StudioVfs {
             );
         }
         if !upload_ops.is_empty() {
-            self.block_cache.flush_upload_journal().await;
+            self.upload_coordinator.flush_upload_journal().await;
         }
         Ok(persisted_blocks)
     }

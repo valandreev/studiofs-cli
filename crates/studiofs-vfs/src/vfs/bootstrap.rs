@@ -3,7 +3,7 @@ use super::*;
 #[derive(Debug, Clone)]
 pub(super) struct VfsBootstrapPlan {
     format_info: FormatInfo,
-    block_cache_l1_limit: u64,
+    memory_cache_budget_bytes: u64,
     pub(super) data_prefix: String,
     cache_runtime_tuning: CacheRuntimeTuning,
     pub(super) minimum_local_backend_budget_bytes: u64,
@@ -58,13 +58,13 @@ impl VfsBootstrapPlan {
     pub(super) fn build(
         format_info: FormatInfo,
         cache_size: u64,
-        block_cache_l1_limit: u64,
+        memory_cache_budget_bytes: u64,
         config: &VfsConfigValidated,
     ) -> VfsResult<Self> {
         let data_prefix = normalize_data_prefix(&format_info);
         let block_size = format_info.block_size;
         let cache_runtime_tuning = resolve_cache_runtime_tuning_overrides(
-            derive_cache_runtime_tuning(cache_size, block_size, block_cache_l1_limit),
+            derive_cache_runtime_tuning(cache_size, block_size, memory_cache_budget_bytes),
             config,
             config.cache_runtime_overrides(),
         );
@@ -121,7 +121,7 @@ impl VfsBootstrapPlan {
 
         Ok(Self {
             format_info,
-            block_cache_l1_limit,
+            memory_cache_budget_bytes,
             data_prefix,
             cache_runtime_tuning,
             minimum_local_backend_budget_bytes,
@@ -193,6 +193,7 @@ impl VfsBootstrapPlan {
         debug!(
             writeback = true,
             cache_size_bytes = cache_size,
+            memory_cache_budget_bytes = self.memory_cache_budget_bytes,
             minimum_local_backend_budget_bytes = self.minimum_local_backend_budget_bytes,
             local_backend_budget_bytes = self.local_backend_budget_bytes,
             upload_delay_ms = self.upload_delay.as_millis() as u64,
@@ -235,7 +236,7 @@ impl VfsBootstrapPlan {
             attr_read_cache_bytes = config.attr_read_cache_bytes,
             readdir_attr_batch_chunk = self.readdir_attr_batch_chunk,
             readdir_attr_batch_max_inodes = self.readdir_attr_batch_max_inodes,
-            "upload pipeline v2 enabled"
+            "upload pipeline enabled"
         );
     }
 }
@@ -244,7 +245,7 @@ struct VfsBootstrapResources {
     ingress_wal: IngressWal,
     initial_checkpoint_meta: Option<(u64, u64, u64)>,
     local_block_backend: Arc<dyn LocalBlockBackend>,
-    block_cache: Arc<BlockCache>,
+    upload_coordinator: Arc<UploadCoordinator>,
     readahead: Arc<ReadAheadTracker>,
     dir_prefetch: Arc<DirAccessTracker>,
     prefetch_tx: tokio::sync::mpsc::UnboundedSender<PrefetchWorkItem>,
@@ -299,8 +300,8 @@ impl VfsBootstrapResources {
         }
         let local_block_backend = opened_local_backend.backend;
 
-        let (block_cache, upload_rx) =
-            BlockCache::open(BlockCacheConfig::new(cache_dir, plan.block_cache_l1_limit))
+        let (upload_coordinator, upload_rx) =
+            UploadCoordinator::open(UploadCoordinatorConfig::new(cache_dir))
                 .map_err(VfsError::Io)?;
 
         let readahead = Arc::new(ReadAheadTracker::new_with_bounds(
@@ -345,7 +346,7 @@ impl VfsBootstrapResources {
             ingress_wal,
             initial_checkpoint_meta,
             local_block_backend,
-            block_cache,
+            upload_coordinator,
             readahead,
             dir_prefetch,
             prefetch_tx,
@@ -375,7 +376,7 @@ impl VfsBootstrap {
         data_config: &DataStoreConfig,
         cache_dir: &str,
         cache_size: u64,
-        block_cache_l1_limit: u64,
+        memory_cache_budget_bytes: u64,
         config: VfsConfigValidated,
         cache_runtime: Option<PreparedCacheV3Runtime>,
     ) -> VfsResult<Self>
@@ -386,7 +387,7 @@ impl VfsBootstrap {
         let plan = VfsBootstrapPlan::build(
             meta.get_format_info()?,
             cache_size,
-            block_cache_l1_limit,
+            memory_cache_budget_bytes,
             &config,
         )?;
         plan.log_summary(cache_size, &config);
@@ -414,7 +415,7 @@ impl VfsBootstrap {
             meta: MetaExecutor::new(meta),
             data_write: resources.data_write,
             local_block_backend: resources.local_block_backend,
-            block_cache: resources.block_cache,
+            upload_coordinator: resources.upload_coordinator,
             block_size,
             data_prefix: plan.data_prefix,
             acl_principal: plan.acl_principal,
@@ -494,7 +495,7 @@ impl VfsBootstrap {
 
 impl StudioVfs {
     fn finalize_constructor_bootstrap(&self) -> VfsResult<()> {
-        let pending_uploads = self.block_cache.snapshot_pending_uploads();
+        let pending_uploads = self.upload_coordinator.snapshot_pending_uploads();
         let attrs = self.sync_meta().list_inode_attrs()?;
         self.replay_dirty_uploads_from_local_backend(pending_uploads.as_slice(), attrs.as_slice());
         Ok(())
@@ -506,7 +507,7 @@ impl StudioVfs {
         data_config: &DataStoreConfig,
         cache_dir: &str,
         cache_size: u64,
-        block_cache_l1_limit: u64,
+        memory_cache_budget_bytes: u64,
         config: VfsConfigValidated,
     ) -> VfsResult<Arc<Self>>
     where
@@ -517,7 +518,7 @@ impl StudioVfs {
             data_config,
             cache_dir,
             cache_size,
-            block_cache_l1_limit,
+            memory_cache_budget_bytes,
             config,
             None,
         )
@@ -529,7 +530,7 @@ impl StudioVfs {
         data_config: &DataStoreConfig,
         cache_dir: &str,
         cache_size: u64,
-        block_cache_l1_limit: u64,
+        memory_cache_budget_bytes: u64,
         config: VfsConfigValidated,
         cache_runtime: PreparedCacheV3Runtime,
     ) -> VfsResult<Arc<Self>>
@@ -541,7 +542,7 @@ impl StudioVfs {
             data_config,
             cache_dir,
             cache_size,
-            block_cache_l1_limit,
+            memory_cache_budget_bytes,
             config,
             Some(cache_runtime),
         )
@@ -552,7 +553,7 @@ impl StudioVfs {
         data_config: &DataStoreConfig,
         cache_dir: &str,
         cache_size: u64,
-        block_cache_l1_limit: u64,
+        memory_cache_budget_bytes: u64,
         config: VfsConfigValidated,
         cache_runtime: Option<PreparedCacheV3Runtime>,
     ) -> VfsResult<Arc<Self>>
@@ -564,7 +565,7 @@ impl StudioVfs {
             data_config,
             cache_dir,
             cache_size,
-            block_cache_l1_limit,
+            memory_cache_budget_bytes,
             config,
             cache_runtime,
         )?
