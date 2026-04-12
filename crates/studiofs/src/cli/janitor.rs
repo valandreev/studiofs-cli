@@ -47,6 +47,23 @@ struct JanitorRunRequest {
     options: JanitorOptions,
 }
 
+impl JanitorRunRequest {
+    fn from_args(args: JanitorArgs) -> anyhow::Result<Self> {
+        let meta_dir = super::utils::get_default_meta_dir(&args.name)?;
+        Ok(Self {
+            name: args.name,
+            meta_dir,
+            options: JanitorOptions {
+                dry_run: args.dry_run,
+                loop_mode: args.r#loop,
+                interval_minutes: args.interval_minutes,
+                skip_newer_minutes: args.skip_newer_minutes,
+                max_deletes: args.max_deletes,
+            },
+        })
+    }
+}
+
 #[derive(Debug, Args)]
 #[command(about = "Scan data objects and remove orphaned ones (Phase 6 prototype)")]
 #[command(after_help = "\
@@ -82,18 +99,7 @@ pub(crate) struct JanitorArgs {
 
 impl JanitorArgs {
     pub(crate) fn dispatch(self) -> anyhow::Result<()> {
-        let meta_dir = super::utils::get_default_meta_dir(&self.name)?;
-        run(JanitorRunRequest {
-            name: self.name,
-            meta_dir,
-            options: JanitorOptions {
-                dry_run: self.dry_run,
-                loop_mode: self.r#loop,
-                interval_minutes: self.interval_minutes,
-                skip_newer_minutes: self.skip_newer_minutes,
-                max_deletes: self.max_deletes,
-            },
-        })
+        run(JanitorRunRequest::from_args(self)?)
     }
 }
 

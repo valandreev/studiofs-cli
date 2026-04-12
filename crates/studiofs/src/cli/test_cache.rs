@@ -59,6 +59,27 @@ struct TestCacheRunRequest {
     json_output: Option<PathBuf>,
 }
 
+impl From<TestCacheArgs> for TestCacheRunRequest {
+    fn from(args: TestCacheArgs) -> Self {
+        Self {
+            target: args.path,
+            block_size: args.block_size,
+            read_size: args.read_size,
+            small_max: args.small_max,
+            medium_max: args.medium_max,
+            concurrency: args.concurrency,
+            sequential_streams: args.sequential_streams,
+            io_depth: args.io_depth,
+            warmup_runs: args.warmup_runs,
+            sizes: args.sizes,
+            access_pattern: args.access_pattern,
+            l1_limit: args.l1_limit,
+            profile: args.profile,
+            json_output: args.json_output,
+        }
+    }
+}
+
 fn test_cache_runtime() -> Result<&'static tokio::runtime::Runtime> {
     TEST_CACHE_RUNTIME
         .get_or_init(tokio::runtime::Runtime::new)
@@ -135,22 +156,7 @@ pub(crate) struct TestCacheArgs {
 
 impl TestCacheArgs {
     pub(crate) fn dispatch(self) -> anyhow::Result<()> {
-        run(TestCacheRunRequest {
-            target: self.path,
-            block_size: self.block_size,
-            read_size: self.read_size,
-            small_max: self.small_max,
-            medium_max: self.medium_max,
-            concurrency: self.concurrency,
-            sequential_streams: self.sequential_streams,
-            io_depth: self.io_depth,
-            warmup_runs: self.warmup_runs,
-            sizes: self.sizes,
-            access_pattern: self.access_pattern,
-            l1_limit: self.l1_limit,
-            profile: self.profile,
-            json_output: self.json_output,
-        })
+        run(self.into())
     }
 }
 

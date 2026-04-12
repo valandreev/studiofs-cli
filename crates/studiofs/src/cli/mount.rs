@@ -58,6 +58,31 @@ struct MountRunRequest {
     session: MountSessionOptions,
 }
 
+impl MountRunRequest {
+    fn from_args(args: MountArgs) -> anyhow::Result<Self> {
+        let meta_dir = super::utils::get_default_meta_dir(&args.name)?;
+        Ok(Self {
+            name: args.name,
+            meta_dir,
+            startup_overrides: MountStartupOverrides {
+                mount_point: args.mount_point,
+                cache_dir: args.cache_dir,
+                cache_size: args.cache_size,
+                principal: args.principal,
+            },
+            launch: MountLaunchOptions {
+                foreground: args.foreground,
+                detach: args.detach,
+            },
+            session: MountSessionOptions {
+                profile: args.profile,
+                snapshot_id: args.snapshot_id,
+                endpoint: args.endpoint,
+            },
+        })
+    }
+}
+
 struct MountStartupRequest {
     name: String,
     meta_dir: PathBuf,
@@ -173,26 +198,7 @@ impl MountArgs {
         #[cfg(windows)]
         super::winfsp_bootstrap::ensure_mountmgr_bootstrap()?;
 
-        let meta_dir = super::utils::get_default_meta_dir(&self.name)?;
-        run(MountRunRequest {
-            name: self.name,
-            meta_dir,
-            startup_overrides: MountStartupOverrides {
-                mount_point: self.mount_point,
-                cache_dir: self.cache_dir,
-                cache_size: self.cache_size,
-                principal: self.principal,
-            },
-            launch: MountLaunchOptions {
-                foreground: self.foreground,
-                detach: self.detach,
-            },
-            session: MountSessionOptions {
-                profile: self.profile,
-                snapshot_id: self.snapshot_id,
-                endpoint: self.endpoint,
-            },
-        })
+        run(MountRunRequest::from_args(self)?)
     }
 }
 

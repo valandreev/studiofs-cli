@@ -55,6 +55,38 @@ struct InitRunRequest {
     meta_dir: PathBuf,
 }
 
+impl InitRunRequest {
+    fn from_args(args: InitArgs) -> anyhow::Result<Self> {
+        let meta_dir = super::utils::get_default_meta_dir(&args.name)?;
+        let region = if args.region.is_empty() {
+            "us-east-1".to_string()
+        } else {
+            args.region
+        };
+
+        Ok(Self {
+            name: args.name,
+            object_store: DataStoreConfig {
+                endpoint: args.endpoint,
+                bucket: args.bucket,
+                access_key: args.access_key,
+                secret_key: args.secret_key,
+                region,
+                volume_name: String::new(),
+            },
+            postgres_dsn: args.meta,
+            deprecated_metadata: DeprecatedMetadataArgs {
+                endpoint: args.metadata_endpoint,
+                bucket: args.metadata_bucket,
+                access_key: args.metadata_access_key,
+                secret_key: args.metadata_secret_key,
+                region: args.metadata_region,
+            },
+            meta_dir,
+        })
+    }
+}
+
 #[derive(Debug, Args)]
 #[command(about = "Initialize a new filesystem volume")]
 #[command(long_about = "\
@@ -142,32 +174,7 @@ pub(crate) struct InitArgs {
 
 impl InitArgs {
     pub(crate) fn dispatch(self) -> anyhow::Result<()> {
-        let meta_dir = super::utils::get_default_meta_dir(&self.name)?;
-        let region = if self.region.is_empty() {
-            "us-east-1".to_string()
-        } else {
-            self.region
-        };
-        run(InitRunRequest {
-            name: self.name,
-            object_store: DataStoreConfig {
-                endpoint: self.endpoint,
-                bucket: self.bucket,
-                access_key: self.access_key,
-                secret_key: self.secret_key,
-                region,
-                volume_name: String::new(),
-            },
-            postgres_dsn: self.meta,
-            deprecated_metadata: DeprecatedMetadataArgs {
-                endpoint: self.metadata_endpoint,
-                bucket: self.metadata_bucket,
-                access_key: self.metadata_access_key,
-                secret_key: self.metadata_secret_key,
-                region: self.metadata_region,
-            },
-            meta_dir,
-        })
+        run(InitRunRequest::from_args(self)?)
     }
 }
 
