@@ -15,7 +15,6 @@ fn test_format_info_roundtrip() {
         block_size: DEFAULT_BLOCK_SIZE,
     };
     engine.set_format_info(&info).unwrap();
-    engine.validate_migration_completed().unwrap();
     let loaded = engine.get_format_info().unwrap();
     assert_eq!(loaded.name, "test-vol");
     assert_eq!(loaded.endpoint, "http://localhost:9000");

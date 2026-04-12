@@ -434,33 +434,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
     }
 
     pub(super) fn remove_file_blocks_for_inode(&self, ino: Ino) -> MetaResult<()> {
-        let mut blocks_table = self
-            .txn
-            .open_table(FILE_BLOCKS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let block_prefix = file_block_prefix(ino);
-
-        let keys_to_remove: Vec<Vec<u8>> = {
-            let iter = blocks_table
-                .range(block_prefix.as_slice()..)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut keys = Vec::new();
-            for entry in iter {
-                let (key, _) = entry.map_err(|e| MetaError::Storage(e.to_string()))?;
-                let key_bytes = key.value().to_vec();
-                if !key_bytes.starts_with(block_prefix.as_slice()) {
-                    break;
-                }
-                keys.push(key_bytes);
-            }
-            keys
-        };
-        for key in keys_to_remove {
-            let _ = blocks_table
-                .remove(key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        Ok(())
+        RedbMetaEngine::clear_regular_file_graph_in_txn(self.txn, ino)
     }
 
     pub(super) fn record_deferred_delete(
