@@ -66,7 +66,7 @@ fn test_snapshot_pins_objects_and_is_listed() {
 }
 
 #[test]
-fn test_snapshot_payload_codec_roundtrips_and_reads_legacy_json() {
+fn test_snapshot_payload_codec_roundtrips_and_reads_json() {
     let engine = temp_engine();
     let state = engine.export_snapshot().unwrap();
 
@@ -75,8 +75,8 @@ fn test_snapshot_payload_codec_roundtrips_and_reads_legacy_json() {
     assert_eq!(decoded_binary.inodes, state.inodes);
     assert_eq!(decoded_binary.dentries, state.dentries);
 
-    let legacy_json = serde_json::to_vec(&state).unwrap();
-    let decoded_json = RedbMetaEngine::decode_snapshot_payload(&legacy_json).unwrap();
+    let json = serde_json::to_vec(&state).unwrap();
+    let decoded_json = RedbMetaEngine::decode_snapshot_payload(&json).unwrap();
     assert_eq!(decoded_json.inodes, state.inodes);
     assert_eq!(decoded_json.dentries, state.dentries);
 }
@@ -167,20 +167,12 @@ fn test_regular_file_graph_tables_roundtrip_and_project_remote_overlay() {
     let mut base_state = RegularFileBaseState::default();
     base_state.chunks.insert(ChunkId(11), base_chunk.clone());
 
-    let legacy_block = BlockRef::new_partial(901, 1024);
-    let legacy_bytes = encode(&legacy_block).expect("encode legacy block");
-    let legacy_key = encode_file_block_key(ino, 0);
     let overlay_bytes = encode(&overlay_chunk).expect("encode overlay chunk");
     let base_bytes = encode(&base_chunk).expect("encode base chunk");
     let chunk_key = encode_regular_file_chunk_key(ino, ChunkId(11));
 
     let txn = engine.db.begin_write().unwrap();
     {
-        let mut committed_table = txn.open_table(COMMITTED_FILE_BLOCKS_TABLE).unwrap();
-        committed_table
-            .insert(legacy_key.as_slice(), legacy_bytes.as_slice())
-            .unwrap();
-
         let mut overlay_table = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
         overlay_table
             .insert(chunk_key.as_slice(), overlay_bytes.as_slice())
@@ -244,7 +236,7 @@ fn test_regular_file_graph_tables_roundtrip_and_project_remote_overlay() {
         .find(|(name, _)| name.as_str() == counters::USED_SPACE)
         .map(|(_, value)| *value)
         .expect("used space counter");
-    assert_eq!(used_space, 1024 + 4096);
+    assert_eq!(used_space, 4096);
 }
 
 #[test]
@@ -340,7 +332,7 @@ fn test_redb_snapshot_defaults_missing_regular_file_fields() {
         "event_log": [],
         "snapshots": []
     }"#;
-    let snapshot: RedbSnapshot = serde_json::from_str(snapshot_json).unwrap();
+    let snapshot = RedbMetaEngine::decode_snapshot_payload(snapshot_json.as_bytes()).unwrap();
     assert!(snapshot.regular_file_overlay.is_empty());
     assert!(snapshot.regular_file_base.is_empty());
 }

@@ -30,15 +30,6 @@ pub(super) const BASE_DENTRIES_TABLE: TableDefinition<&[u8], &[u8]> =
 pub(super) const DENTRY_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> =
     TableDefinition::new("dentry_tombstones");
 
-/// File Blocks: (ino, block_index) -> BlockRef (postcard)
-/// Key encoding: ino (8 bytes LE) + block_index (4 bytes LE)
-pub(super) const FILE_BLOCKS_TABLE: TableDefinition<&[u8], &[u8]> =
-    TableDefinition::new("file_blocks");
-
-/// Remote-visible committed file blocks: (ino, block_index) -> BlockRef.
-pub(super) const COMMITTED_FILE_BLOCKS_TABLE: TableDefinition<&[u8], &[u8]> =
-    TableDefinition::new("committed_file_blocks");
-
 /// Local overlay regular-file chunk rows: (ino, chunk_id) -> RegularFileChunkState.
 pub(super) const REGULAR_FILE_OVERLAY_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("regular_file_overlay");
@@ -103,20 +94,11 @@ pub(super) const BASE_ACL_RULES_TABLE: TableDefinition<&[u8], u8> =
 pub(super) const ACL_RULE_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> =
     TableDefinition::new("acl_rule_tombstones");
 
-pub(super) const REGULAR_FILE_MIGRATION_NAME: &str = "regular_files_v2_to_v3";
-pub(super) const MIGRATION_STATUS_STARTED: u8 = 1;
-pub(super) const MIGRATION_STATUS_COMPLETED: u8 = 2;
-
 /// Event Log: sequence_id (u64) -> MetaEvent (postcard)
 pub(super) const EVENT_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("event_log");
 
 /// Snapshot definitions: snapshot_id (uuid text) -> MetadataSnapshot (postcard)
 pub(super) const SNAPSHOTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots");
-
-/// Migration status: migration_name -> status (u8)
-/// Used to track migration progress and detect interrupted migrations
-pub(super) const MIGRATION_STATUS_TABLE: TableDefinition<&str, u8> =
-    TableDefinition::new("migration_status");
 
 /// Serializable full snapshot of redb metadata state.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -125,8 +107,6 @@ pub struct RedbSnapshot {
     pub counters: Vec<(String, u64)>,
     pub inodes: Vec<(u64, Vec<u8>)>,
     pub dentries: Vec<(Vec<u8>, Vec<u8>)>,
-    pub file_blocks: Vec<(Vec<u8>, Vec<u8>)>,
-    pub committed_file_blocks: Vec<(Vec<u8>, Vec<u8>)>,
     #[serde(default)]
     pub regular_file_overlay: Vec<(u64, Vec<u8>)>,
     #[serde(default)]
@@ -156,26 +136,6 @@ pub(super) fn decode_dentry_key(key: &[u8]) -> (Ino, &[u8]) {
 /// The prefix for scanning all dentries of a parent inode.
 pub(super) fn dentry_prefix(parent: Ino) -> [u8; 8] {
     parent.to_le_bytes()
-}
-
-/// Encode a file block key: ino (8 bytes LE) + block_index (4 bytes LE).
-pub(super) fn encode_file_block_key(ino: Ino, block_index: u32) -> [u8; 12] {
-    let mut buf = [0u8; 12];
-    buf[..8].copy_from_slice(&ino.to_le_bytes());
-    buf[8..12].copy_from_slice(&block_index.to_le_bytes());
-    buf
-}
-
-/// Decode a file block key back to (ino, block_index).
-pub(super) fn decode_file_block_key(key: &[u8]) -> (Ino, u32) {
-    let ino = u64::from_le_bytes(key[..8].try_into().unwrap());
-    let block_index = u32::from_le_bytes(key[8..12].try_into().unwrap());
-    (ino, block_index)
-}
-
-/// The prefix for scanning all blocks of an inode.
-pub(super) fn file_block_prefix(ino: Ino) -> [u8; 8] {
-    ino.to_le_bytes()
 }
 
 /// Encode a regular-file chunk key: ino (8 bytes LE) + chunk_id (8 bytes LE).
