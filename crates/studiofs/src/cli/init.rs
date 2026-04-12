@@ -571,7 +571,47 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use clap::error::ErrorKind;
+
+    #[test]
+    fn init_parses_required_runtime_args() {
+        let cli = crate::cli::parse_for_test(&[
+            "init",
+            "vol",
+            "--endpoint",
+            "http://127.0.0.1:9000",
+            "--bucket",
+            "bucket",
+            "--access-key",
+            "ak",
+            "--secret-key",
+            "sk",
+            "--meta",
+            "postgres://u:p@127.0.0.1:5432",
+        ])
+        .unwrap();
+
+        match cli.command {
+            crate::cli::Commands::Init(InitArgs {
+                name,
+                endpoint,
+                bucket,
+                access_key,
+                secret_key,
+                meta,
+                ..
+            }) => {
+                assert_eq!(name, "vol");
+                assert_eq!(endpoint, "http://127.0.0.1:9000");
+                assert_eq!(bucket, "bucket");
+                assert_eq!(access_key, "ak");
+                assert_eq!(secret_key, "sk");
+                assert_eq!(meta.as_deref(), Some("postgres://u:p@127.0.0.1:5432"));
+            }
+            other => panic!("expected Init, got {other:?}"),
+        }
+    }
 
     #[test]
     fn init_rejects_block_size_flag() {

@@ -311,3 +311,44 @@ pub fn run(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn janitor_parses_flags_and_defaults() {
+        let cli = crate::cli::parse_for_test(&[
+            "janitor",
+            "vol",
+            "--dry-run",
+            "--loop",
+            "--interval-minutes",
+            "45",
+            "--skip-newer-minutes",
+            "20",
+            "--max-deletes",
+            "600",
+        ])
+        .unwrap();
+
+        match cli.command {
+            crate::cli::Commands::Janitor(JanitorArgs {
+                name,
+                dry_run,
+                r#loop,
+                interval_minutes,
+                skip_newer_minutes,
+                max_deletes,
+            }) => {
+                assert_eq!(name, "vol");
+                assert!(dry_run);
+                assert!(r#loop);
+                assert_eq!(interval_minutes, 45);
+                assert_eq!(skip_newer_minutes, 20);
+                assert_eq!(max_deletes, 600);
+            }
+            other => panic!("expected Janitor, got {other:?}"),
+        }
+    }
+}

@@ -385,4 +385,16 @@ mod tests {
             "local cleanup removes the entire metadata directory (`meta_dir`); Cache 3.0 layout state could not be inspected"
         );
     }
+
+    #[test]
+    fn destroy_parses_local_flag() {
+        let cli = crate::cli::parse_for_test(&["destroy", "vol", "--local"]).unwrap();
+        match cli.command {
+            crate::cli::Commands::Destroy(DestroyArgs { name, local }) => {
+                assert_eq!(name, "vol");
+                assert!(local);
+            }
+            other => panic!("expected Destroy, got {other:?}"),
+        }
+    }
 }

@@ -216,3 +216,27 @@ pub fn run(name: &str, meta_dsn: &str, meta_dir: &Path) -> DiscoveryResult<()> {
     println!("Run `studiofs mount {} <mount-point>` to mount.", name);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discover_parses_name_and_meta_dsn() {
+        let cli = crate::cli::parse_for_test(&[
+            "discover",
+            "vol",
+            "--meta",
+            "postgres://studiofs:studiofs@127.0.0.1:5432",
+        ])
+        .unwrap();
+
+        match cli.command {
+            crate::cli::Commands::Discover(DiscoverArgs { name, meta }) => {
+                assert_eq!(name, "vol");
+                assert_eq!(meta, "postgres://studiofs:studiofs@127.0.0.1:5432");
+            }
+            other => panic!("expected Discover, got {other:?}"),
+        }
+    }
+}
