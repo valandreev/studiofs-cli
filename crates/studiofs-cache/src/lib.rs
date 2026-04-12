@@ -83,10 +83,7 @@ pub fn prepare_cache_v3_runtime(
     cache_root: impl AsRef<Path>,
 ) -> Result<PreparedCacheV3Runtime, PrepareCacheV3RuntimeError> {
     let cache_root = cache_root.as_ref();
-    let cache_root_display = v3::CacheV3Layout::from_cache_root(cache_root)
-        .cache_root
-        .display()
-        .to_string();
+    let cache_root_display = cache_root.display().to_string();
 
     let mut detection = v3::detect_cache_backends(cache_root).map_err(|source| {
         PrepareCacheV3RuntimeError::DetectCacheBackend {
@@ -112,6 +109,30 @@ pub fn prepare_cache_v3_runtime(
     Ok(PreparedCacheV3Runtime {
         layout: detection.layout.clone(),
         detection,
+    })
+}
+
+fn open_detected_local_block_backend_budgeted(
+    detection: v3::CacheBackendDetection,
+    volume_uuid: &str,
+    cache_budget_bytes: Option<u64>,
+    payload_sync_mode: v3::CacheV3PayloadSyncMode,
+) -> Result<OpenedLocalBlockBackend, OpenLocalBlockBackendError> {
+    let cache_root = detection.layout.cache_root.as_path();
+    let cache_root_display = cache_root.display().to_string();
+    let backend_kind = v3::CacheBackendKind::CacheV3;
+    let backend = open_cache_v3_backend_budgeted(
+        cache_root,
+        &cache_root_display,
+        volume_uuid,
+        cache_budget_bytes,
+        payload_sync_mode,
+    )?;
+
+    Ok(OpenedLocalBlockBackend {
+        detection,
+        backend_kind,
+        backend,
     })
 }
 
@@ -217,6 +238,21 @@ pub fn open_local_block_backend_with_budget_and_sync_mode(
     )
 }
 
+/// Open the selected local backend using an already prepared Cache 3.0 runtime.
+pub fn open_prepared_local_block_backend_with_budget_and_sync_mode(
+    prepared: PreparedCacheV3Runtime,
+    volume_uuid: &str,
+    cache_budget_bytes: u64,
+    payload_sync_mode: v3::CacheV3PayloadSyncMode,
+) -> Result<OpenedLocalBlockBackend, OpenLocalBlockBackendError> {
+    open_detected_local_block_backend_budgeted(
+        prepared.detection,
+        volume_uuid,
+        Some(cache_budget_bytes),
+        payload_sync_mode,
+    )
+}
+
 fn open_local_block_backend_budgeted(
     cache_root: &Path,
     volume_uuid: &str,
@@ -235,23 +271,22 @@ fn open_local_block_backend_budgeted(
             }
         })?
         .detection;
-    let backend_kind = v3::CacheBackendKind::CacheV3;
-    let backend = match cache_budget_bytes {
-        Some(cache_budget_bytes) => open_cache_v3_backend_budgeted(
-            cache_root,
-            &cache_root_display,
+    match cache_budget_bytes {
+        Some(cache_budget_bytes) => open_detected_local_block_backend_budgeted(
+            detection,
             volume_uuid,
             Some(cache_budget_bytes),
             payload_sync_mode,
-        )?,
-        None => open_cache_v3_backend(cache_root, &cache_root_display, volume_uuid)?,
-    };
-
-    Ok(OpenedLocalBlockBackend {
-        detection,
-        backend_kind,
-        backend,
-    })
+        ),
+        None => {
+            let backend = open_cache_v3_backend(cache_root, &cache_root_display, volume_uuid)?;
+            Ok(OpenedLocalBlockBackend {
+                detection,
+                backend_kind: v3::CacheBackendKind::CacheV3,
+                backend,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -298,6 +333,23 @@ mod tests {
 
         assert_eq!(opened.backend_kind, CacheBackendKind::CacheV3);
         assert!(opened.detection.has_cache_v3_contract());
+    }
+
+    #[test]
+    fn prepared_cache_v3_runtime_reuses_detection_to_open_budgeted_backend() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let prepared = prepare_cache_v3_runtime(temp.path()).expect("prepare cache-v3 runtime");
+
+        let opened = open_prepared_local_block_backend_with_budget_and_sync_mode(
+            prepared.clone(),
+            "00000000-0000-0000-0000-000000000001",
+            64 * 1024 * 1024,
+            v3::CacheV3PayloadSyncMode::Durable,
+        )
+        .expect("open prepared cache-v3 backend");
+
+        assert_eq!(opened.backend_kind, CacheBackendKind::CacheV3);
+        assert_eq!(opened.detection, prepared.detection);
     }
 
     #[test]
