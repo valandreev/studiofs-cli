@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use studiofs_cache::block_cache::DEFAULT_L1_SIZE;
+#[cfg(test)]
 use studiofs_cache::v3::CacheV3Layout;
 use studiofs_data::DataStoreConfig;
 #[cfg(test)]
@@ -20,31 +21,12 @@ use studiofs_vfs::{StudioVfs, VfsConfigRaw, VfsMeta, into_vfs_meta, parse_size_b
 use sysinfo::System;
 use tracing::{debug, info, warn};
 
+use crate::cli::mount_runtime::{
+    MountLaunchMode, PreparedMountRuntimePlan, ResolvedMountConfig, ResolvedMountStartup,
+};
+
 const WRITE_PATH_OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(1);
 type MountProfileFinish = Box<dyn FnMut()>;
-
-struct ResolvedMountConfig {
-    vfs_config: studiofs_vfs::VfsConfigValidated,
-    cache_mode: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MountLaunchMode {
-    Foreground,
-    Daemon,
-}
-
-#[derive(Debug)]
-struct MountStartupContext {
-    actual_mount_path: String,
-    base_cache_path: PathBuf,
-    cache_size: String,
-    cache_mode: String,
-    vfs_config: studiofs_vfs::VfsConfigValidated,
-    principal_to_export: Option<String>,
-    run_in_foreground: bool,
-    launch_mode: MountLaunchMode,
-}
 
 trait MountOpenMeta: Send + Sync + MetaFormat + MetaReplication {}
 impl<T> MountOpenMeta for T where T: ?Sized + Send + Sync + MetaFormat + MetaReplication {}
@@ -195,44 +177,55 @@ fn normalize_windows_mount_path(path: &str) -> String {
     super::utils::normalize_mount_point(path)
 }
 
-fn parse_env_usize(key: &str) -> Option<usize> {
-    std::env::var(key)
+fn parse_env_usize_with<F>(read_var: &F, key: &str) -> Option<usize>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    read_var(key)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
 }
 
-fn parse_env_u64(key: &str) -> Option<u64> {
-    std::env::var(key)
+fn parse_env_u64_with<F>(read_var: &F, key: &str) -> Option<u64>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    read_var(key)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|v| *v > 0)
 }
 
-fn parse_env_u64_any(key: &str) -> Option<u64> {
-    std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok())
+fn parse_env_u64_any_with<F>(read_var: &F, key: &str) -> Option<u64>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    read_var(key).ok().and_then(|v| v.parse::<u64>().ok())
 }
 
-fn parse_env_f64(key: &str) -> Option<f64> {
-    std::env::var(key)
+fn parse_env_f64_with<F>(read_var: &F, key: &str) -> Option<f64>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    read_var(key)
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| *v > 0.0)
 }
 
-fn ensure_cache3_layout(cache_root: &Path) -> anyhow::Result<()> {
-    let layout = CacheV3Layout::from_cache_root(cache_root);
-    std::fs::create_dir_all(&layout.tmp_dir)?;
-    std::fs::create_dir_all(&layout.payload_blocks_dir)?;
-    std::fs::create_dir_all(&layout.index_dir)?;
-    if !layout.layout_marker.exists() {
-        std::fs::write(&layout.layout_marker, b"v1")?;
+fn parse_env_cache_safety_mode_with<F>(
+    read_var: &F,
+    key: &str,
+) -> Option<studiofs_vfs::CacheSafetyMode>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    match read_var(key).ok()?.trim().to_ascii_lowercase().as_str() {
+        "fast" => Some(studiofs_vfs::CacheSafetyMode::Fast),
+        "durable" => Some(studiofs_vfs::CacheSafetyMode::Durable),
+        _ => None,
     }
-    Ok(())
-}
-
-fn prepare_cache3_runtime(cache_root: &Path) -> anyhow::Result<()> {
-    ensure_cache3_layout(cache_root)
 }
 
 fn validate_endpoint_override(endpoint: Option<&str>) -> anyhow::Result<()> {
@@ -313,7 +306,7 @@ fn resolve_mount_startup(
     foreground: bool,
     detach: bool,
     endpoint: Option<&str>,
-) -> anyhow::Result<MountStartupContext> {
+) -> anyhow::Result<ResolvedMountStartup> {
     let resolved_settings = super::settings::resolve_mount_runtime_settings(
         &settings_config,
         cli_mount_point,
@@ -329,7 +322,7 @@ fn resolve_mount_startup(
     let mount_point = resolve_runtime_mount_point(resolved_settings.mount_point);
     let actual_mount_path = prepare_mount_path(name, &mount_point)?;
 
-    Ok(MountStartupContext {
+    Ok(ResolvedMountStartup {
         actual_mount_path,
         base_cache_path: resolved_settings
             .cache_dir
@@ -457,17 +450,6 @@ fn prepare_mount_path(name: &str, mount_point: &str) -> anyhow::Result<String> {
     Ok(actual_mount_path)
 }
 
-fn prepare_cache_path(cache_dir: &Path, volume_uuid: &str) -> anyhow::Result<(PathBuf, String)> {
-    std::fs::create_dir_all(cache_dir)?;
-    let cache_path = cache_dir.join(volume_uuid);
-    prepare_cache3_runtime(&cache_path)?;
-    let cache_path_str = cache_path
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("invalid cache path"))?
-        .to_string();
-    Ok((cache_path, cache_path_str))
-}
-
 fn build_mount_profile_finish(
     profile: Option<super::mount_profile_types::MountProfileMode>,
     name: &str,
@@ -506,31 +488,38 @@ fn build_mount_profile_finish(
     })
 }
 
-fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
+fn overlay_vfs_env(config: VfsConfigRaw) -> VfsConfigRaw {
+    overlay_vfs_env_with(config, |key| std::env::var(key))
+}
+
+fn overlay_vfs_env_with<F>(mut config: VfsConfigRaw, read_var: F) -> VfsConfigRaw
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
     macro_rules! set_usize {
         ($key:literal, $field:ident) => {
-            if let Some(value) = parse_env_usize($key) {
+            if let Some(value) = parse_env_usize_with(&read_var, $key) {
                 config.$field = Some(value);
             }
         };
     }
     macro_rules! set_u64 {
         ($key:literal, $field:ident) => {
-            if let Some(value) = parse_env_u64($key) {
+            if let Some(value) = parse_env_u64_with(&read_var, $key) {
                 config.$field = Some(value);
             }
         };
     }
     macro_rules! set_f64 {
         ($key:literal, $field:ident) => {
-            if let Some(value) = parse_env_f64($key) {
+            if let Some(value) = parse_env_f64_with(&read_var, $key) {
                 config.$field = Some(value);
             }
         };
     }
     macro_rules! set_size {
         ($key:literal, $field:ident) => {
-            if let Ok(v) = std::env::var($key)
+            if let Ok(v) = read_var($key)
                 && let Ok(bytes) = parse_positive_size_arg(&v)
                 && let Ok(bytes) = usize::try_from(bytes)
             {
@@ -545,16 +534,16 @@ fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
     );
     set_u64!("STUDIOFS_READ_BUFFER_MB", read_buffer_mb);
     set_usize!("STUDIOFS_PREFETCH_CONCURRENCY", prefetch_concurrency);
-    if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_WIDTH") {
+    if let Some(value) = parse_env_usize_with(&read_var, "STUDIOFS_READAHEAD_WIDTH") {
         config.readahead_width = Some(value as u32);
     }
-    if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_MIN_PREFETCH") {
+    if let Some(value) = parse_env_usize_with(&read_var, "STUDIOFS_READAHEAD_MIN_PREFETCH") {
         config.readahead_min_prefetch = Some(value as u32);
     }
-    if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_SEQ_STEP") {
+    if let Some(value) = parse_env_usize_with(&read_var, "STUDIOFS_READAHEAD_SEQ_STEP") {
         config.readahead_seq_step = Some(value as u8);
     }
-    if let Some(value) = parse_env_usize("STUDIOFS_READAHEAD_RANDOM_PENALTY") {
+    if let Some(value) = parse_env_usize_with(&read_var, "STUDIOFS_READAHEAD_RANDOM_PENALTY") {
         config.readahead_random_penalty = Some(value as u8);
     }
     set_usize!("STUDIOFS_DIR_PREFETCH_MAX_BATCH", dir_prefetch_max_batch);
@@ -596,7 +585,7 @@ fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
     );
     set_size!("STUDIOFS_ATTR_READ_CACHE_BYTES", attr_read_cache_bytes);
     set_u64!("STUDIOFS_JANITOR_INTERVAL_SECS", janitor_interval_secs);
-    if let Some(value) = parse_env_u64_any("STUDIOFS_JANITOR_SKIP_NEWER_SECS") {
+    if let Some(value) = parse_env_u64_any_with(&read_var, "STUDIOFS_JANITOR_SKIP_NEWER_SECS") {
         config.janitor_skip_newer_secs = Some(value);
     }
     set_u64!("STUDIOFS_JANITOR_MAX_DELETES", janitor_max_deletes);
@@ -605,7 +594,7 @@ fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
         "STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS",
         upload_user_idle_grace_ms
     );
-    if let Some(value) = parse_env_u64_any("STUDIOFS_UPLOAD_DELAY_MS") {
+    if let Some(value) = parse_env_u64_any_with(&read_var, "STUDIOFS_UPLOAD_DELAY_MS") {
         config.upload_delay_ms = Some(value);
     }
     set_u64!("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", upload_requeue_base_ms);
@@ -626,7 +615,7 @@ fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
         "STUDIOFS_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS",
         upload_fg_read_latency_sticky_windows
     );
-    if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_MAX_ATTEMPTS") {
+    if let Some(value) = parse_env_usize_with(&read_var, "STUDIOFS_UPLOAD_MAX_ATTEMPTS") {
         config.upload_max_attempts = Some(value as u32);
     }
     set_u64!(
@@ -652,10 +641,10 @@ fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
         "STUDIOFS_FETCH_DECREASE_COOLDOWN_SECS",
         fetch_decrease_cooldown_secs
     );
-    if let Some(value) = parse_env_usize("STUDIOFS_FETCH_MAX_ATTEMPTS") {
+    if let Some(value) = parse_env_usize_with(&read_var, "STUDIOFS_FETCH_MAX_ATTEMPTS") {
         config.fetch_max_attempts = Some(value as u32);
     }
-    if let Some(value) = parse_env_usize("STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS") {
+    if let Some(value) = parse_env_usize_with(&read_var, "STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS") {
         config.prefetch_fetch_max_attempts = Some(value as u32);
     }
     set_u64!(
@@ -683,15 +672,19 @@ fn overlay_vfs_env(mut config: VfsConfigRaw) -> VfsConfigRaw {
     set_usize!("STUDIOFS_QOS_UPLOAD_SLOTS", qos_upload_slots);
     set_usize!("STUDIOFS_QOS_COMMIT_SLOTS", qos_commit_slots);
     set_usize!("STUDIOFS_QOS_FETCH_SLOTS", qos_fetch_slots);
-    if let Ok(principal) = std::env::var("STUDIOFS_PRINCIPAL") {
+    if let Some(mode) = parse_env_cache_safety_mode_with(&read_var, "STUDIOFS_CACHE_SAFETY_MODE") {
+        config.cache_safety_mode = Some(mode);
+    }
+    if let Ok(principal) = read_var("STUDIOFS_PRINCIPAL") {
         let principal = principal.trim();
         if !principal.is_empty() {
             config.principal = Some(principal.to_string());
         }
     }
-    if let Some(worker_count) = parse_env_usize("STUDIOFS_UPLOAD_WORKER_COUNT") {
+    if let Some(worker_count) = parse_env_usize_with(&read_var, "STUDIOFS_UPLOAD_WORKER_COUNT") {
         config.upload_worker_count = Some(worker_count);
-    } else if let Some(max_spawned) = parse_env_usize("STUDIOFS_UPLOAD_MAX_SPAWNED") {
+    } else if let Some(max_spawned) = parse_env_usize_with(&read_var, "STUDIOFS_UPLOAD_MAX_SPAWNED")
+    {
         config.upload_worker_count = Some(max_spawned);
     }
 
@@ -1041,15 +1034,10 @@ fn resolve_mount_meta_session(
 fn prepare_mount_runtime(
     name: &str,
     meta_dir: &Path,
-    cache_dir: &Path,
-    cache_size: &str,
+    startup: ResolvedMountStartup,
     profile: Option<super::mount_profile_types::MountProfileMode>,
     snapshot_id: Option<&str>,
     endpoint: Option<&str>,
-    cache_mode: &str,
-    vfs_config: studiofs_vfs::VfsConfigValidated,
-    actual_mount_path: &str,
-    run_in_foreground: bool,
 ) -> anyhow::Result<PreparedMountRuntime> {
     let MountMetaSession {
         meta,
@@ -1059,10 +1047,23 @@ fn prepare_mount_runtime(
 
     let data_config = DataStoreConfig::from(&format_info);
     let block_cache_l1_limit = initial_cache_bytes();
-    let cache_size_bytes = parse_positive_size_arg(cache_size)?;
-    let (cache_path, cache_path_str) = prepare_cache_path(cache_dir, &format_info.uuid)?;
+    let runtime_plan =
+        crate::cli::mount_runtime::prepare_mount_runtime_plan(startup, &format_info.uuid)?;
+    let PreparedMountRuntimePlan {
+        actual_mount_path,
+        cache_path,
+        cache_path_str,
+        cache_size: _cache_size,
+        cache_size_bytes,
+        cache_mode,
+        cache_runtime: _cache_runtime,
+        vfs_config,
+        principal_to_export: _principal_to_export,
+        run_in_foreground,
+        launch_mode: _launch_mode,
+    } = runtime_plan;
     let profiling =
-        build_mount_profile_finish(profile, name, cache_mode, &cache_path, run_in_foreground);
+        build_mount_profile_finish(profile, name, &cache_mode, &cache_path, run_in_foreground);
 
     let rt = Arc::new(
         tokio::runtime::Runtime::new()
@@ -1087,7 +1088,7 @@ fn prepare_mount_runtime(
     );
 
     Ok(PreparedMountRuntime {
-        actual_mount_path: actual_mount_path.to_string(),
+        actual_mount_path,
         cache_path,
         cache_path_str,
         format_info,
@@ -1127,7 +1128,7 @@ pub fn run(
         endpoint,
     )?;
 
-    let MountStartupContext {
+    let ResolvedMountStartup {
         actual_mount_path,
         base_cache_path,
         cache_size,
@@ -1154,15 +1155,19 @@ pub fn run(
     let runtime = prepare_mount_runtime(
         name,
         meta_dir,
-        &base_cache_path,
-        &cache_size,
+        ResolvedMountStartup {
+            actual_mount_path,
+            base_cache_path,
+            cache_size: cache_size.clone(),
+            cache_mode,
+            vfs_config,
+            principal_to_export,
+            run_in_foreground,
+            launch_mode,
+        },
         profile,
         snapshot_id,
         endpoint,
-        &cache_mode,
-        vfs_config,
-        &actual_mount_path,
-        run_in_foreground,
     )?;
 
     runtime.launch(name, &cache_size, snapshot_id)
@@ -1338,14 +1343,22 @@ mod tests {
     }
 
     #[test]
-    fn prepare_cache3_runtime_creates_contract_paths() {
+    fn prepare_volume_cache_runtime_scopes_layout_by_volume_uuid_and_provisions_contract_paths() {
         let temp = tempfile::tempdir().expect("tempdir");
-        prepare_cache3_runtime(temp.path()).expect("create cache3 layout");
-        let layout = CacheV3Layout::from_cache_root(temp.path());
-        assert!(layout.layout_marker.exists());
-        assert!(layout.tmp_dir.exists());
-        assert!(layout.payload_blocks_dir.exists());
-        assert!(layout.index_dir.exists());
+        let prepared =
+            crate::cli::mount_runtime::prepare_volume_cache_runtime(temp.path(), "volume-uuid")
+                .expect("cache path prepared");
+
+        assert_eq!(prepared.cache_path, temp.path().join("volume-uuid"));
+        assert_eq!(
+            prepared.cache_path_str,
+            prepared.cache_path.to_string_lossy()
+        );
+        assert!(prepared.cache_runtime.detection.has_cache_v3_contract());
+        assert!(prepared.cache_runtime.layout.layout_marker.exists());
+        assert!(prepared.cache_runtime.layout.tmp_dir.exists());
+        assert!(prepared.cache_runtime.layout.payload_blocks_dir.exists());
+        assert!(prepared.cache_runtime.layout.index_dir.exists());
     }
 
     #[test]
@@ -1435,16 +1448,65 @@ mod tests {
     #[test]
     fn prepare_runtime_cache_path_scopes_layout_by_volume_uuid() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let (cache_path, cache_path_str) =
-            prepare_cache_path(temp.path(), "volume-uuid").expect("cache path prepared");
+        let prepared =
+            crate::cli::mount_runtime::prepare_volume_cache_runtime(temp.path(), "volume-uuid")
+                .expect("cache path prepared");
 
-        assert_eq!(cache_path, temp.path().join("volume-uuid"));
-        assert_eq!(cache_path_str, cache_path.to_string_lossy());
-        let layout = CacheV3Layout::from_cache_root(&cache_path);
-        assert!(layout.layout_marker.exists());
-        assert!(layout.tmp_dir.exists());
-        assert!(layout.payload_blocks_dir.exists());
-        assert!(layout.index_dir.exists());
+        assert_eq!(prepared.cache_path, temp.path().join("volume-uuid"));
+        assert_eq!(
+            prepared.cache_path_str,
+            prepared.cache_path.to_string_lossy()
+        );
+        assert_eq!(
+            prepared.cache_runtime.layout,
+            CacheV3Layout::from_cache_root(&prepared.cache_path)
+        );
+    }
+
+    #[test]
+    fn resolve_mount_startup_context_applies_env_overlay_before_validation() {
+        let raw = VfsConfigRaw {
+            cache_safety_mode: Some(studiofs_vfs::CacheSafetyMode::Fast),
+            ..VfsConfigRaw::default()
+        };
+
+        let resolved = build_mount_config_with(raw, None, |cfg| {
+            overlay_vfs_env_with(cfg, |key| match key {
+                "STUDIOFS_CACHE_SAFETY_MODE" => Ok("durable".to_string()),
+                _ => Err(std::env::VarError::NotPresent),
+            })
+        })
+        .expect("config should validate");
+
+        assert_eq!(resolved.cache_mode, "durable");
+        assert_eq!(
+            format!("{:?}", resolved.vfs_config.cache_safety_mode).to_ascii_lowercase(),
+            "durable"
+        );
+    }
+
+    #[test]
+    fn resolve_mount_startup_context_uses_fast_cache_mode_without_env_override() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let meta_dir = temp.path().join("meta");
+        std::fs::create_dir_all(&meta_dir).expect("create meta dir");
+        let cli_mount_point = startup_mount_point(&temp);
+
+        let startup = resolve_mount_startup(
+            "projectfs",
+            &meta_dir,
+            startup_settings_config(cli_mount_point.clone(), None, Some("64GB")),
+            Some(cli_mount_point.as_str()),
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+        )
+        .expect("startup context resolved");
+
+        assert_eq!(startup.cache_mode, "fast");
     }
 
     #[cfg(not(windows))]

@@ -82,6 +82,13 @@ impl CacheBackendDetection {
         self.v3_layout_marker_exists
     }
 
+    pub fn needs_runtime_provisioning(&self) -> Result<bool, io::Error> {
+        Ok(!self.v3_layout_marker_exists
+            || !self.v3_payload_blocks_dir_exists
+            || !self.layout.tmp_dir.try_exists()?
+            || !self.layout.index_dir.try_exists()?)
+    }
+
     pub fn runtime_backend(&self) -> Option<CacheBackendKind> {
         if !self.has_cache_v3_contract() {
             None

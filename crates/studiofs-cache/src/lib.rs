@@ -31,6 +31,30 @@ pub struct OpenedLocalBlockBackend {
     pub backend: Arc<dyn v2::LocalBlockBackend>,
 }
 
+/// Prepared cache-v3 runtime state for a per-volume cache root.
+#[derive(Debug, Clone)]
+pub struct PreparedCacheV3Runtime {
+    pub layout: v3::CacheV3Layout,
+    pub detection: v3::CacheBackendDetection,
+}
+
+/// Errors surfaced while provisioning cache-v3 runtime state.
+#[derive(Debug, thiserror::Error)]
+pub enum PrepareCacheV3RuntimeError {
+    #[error("failed to inspect cache backend contract at '{cache_root}': {source}")]
+    DetectCacheBackend {
+        cache_root: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to provision cache-v3 layout under '{cache_root}': {source}")]
+    ProvisionCacheV3Layout {
+        cache_root: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 /// Errors surfaced while selecting and opening the local backend.
 #[derive(Debug, thiserror::Error)]
 pub enum OpenLocalBlockBackendError {
@@ -52,6 +76,45 @@ pub enum OpenLocalBlockBackendError {
         #[source]
         source: Box<v3::CacheV3LocalBlockBackendError>,
     },
+}
+
+/// Ensure the cache-v3 runtime contract exists for a per-volume cache root.
+pub fn prepare_cache_v3_runtime(
+    cache_root: impl AsRef<Path>,
+) -> Result<PreparedCacheV3Runtime, PrepareCacheV3RuntimeError> {
+    let cache_root = cache_root.as_ref();
+    let cache_root_display = cache_root.display().to_string();
+
+    let mut detection = v3::detect_cache_backends(cache_root).map_err(|source| {
+        PrepareCacheV3RuntimeError::DetectCacheBackend {
+            cache_root: cache_root_display.clone(),
+            source,
+        }
+    })?;
+    if detection.needs_runtime_provisioning().map_err(|source| {
+        PrepareCacheV3RuntimeError::DetectCacheBackend {
+            cache_root: cache_root_display.clone(),
+            source,
+        }
+    })? {
+        detection.layout.provision().map_err(|source| {
+            PrepareCacheV3RuntimeError::ProvisionCacheV3Layout {
+                cache_root: detection.layout.v3_root.display().to_string(),
+                source,
+            }
+        })?;
+        detection = v3::detect_cache_backends(cache_root).map_err(|source| {
+            PrepareCacheV3RuntimeError::DetectCacheBackend {
+                cache_root: cache_root_display.clone(),
+                source,
+            }
+        })?;
+    }
+
+    Ok(PreparedCacheV3Runtime {
+        layout: detection.layout.clone(),
+        detection,
+    })
 }
 
 fn open_cache_v3_backend(
@@ -113,25 +176,6 @@ fn open_cache_v3_backend_budgeted(
     })
 }
 
-fn provision_cache_v3_layout(layout: &v3::CacheV3Layout) -> std::io::Result<()> {
-    std::fs::create_dir_all(&layout.tmp_dir)?;
-    std::fs::create_dir_all(&layout.payload_blocks_dir)?;
-    std::fs::create_dir_all(&layout.index_dir)?;
-    if !layout.layout_marker.exists() {
-        std::fs::write(&layout.layout_marker, b"v1")?;
-    }
-    Ok(())
-}
-
-fn needs_v3_layout_provisioning(
-    detection: &v3::CacheBackendDetection,
-) -> Result<bool, std::io::Error> {
-    Ok(!detection.v3_layout_marker_exists
-        || !detection.v3_payload_blocks_dir_exists
-        || !detection.layout.tmp_dir.try_exists()?
-        || !detection.layout.index_dir.try_exists()?)
-}
-
 /// Open the Cache 3.0 local backend for a cache root.
 pub fn open_local_block_backend(
     cache_root: impl AsRef<Path>,
@@ -183,31 +227,16 @@ fn open_local_block_backend_budgeted(
 ) -> Result<OpenedLocalBlockBackend, OpenLocalBlockBackendError> {
     let cache_root_display = cache_root.display().to_string();
 
-    let mut detection = v3::detect_cache_backends(cache_root).map_err(|source| {
-        OpenLocalBlockBackendError::DetectCacheBackend {
-            cache_root: cache_root_display.clone(),
-            source,
-        }
-    })?;
-    if needs_v3_layout_provisioning(&detection).map_err(|source| {
-        OpenLocalBlockBackendError::DetectCacheBackend {
-            cache_root: cache_root_display.clone(),
-            source,
-        }
-    })? {
-        provision_cache_v3_layout(&detection.layout).map_err(|source| {
-            OpenLocalBlockBackendError::ProvisionCacheV3Layout {
-                cache_root: detection.layout.v3_root.display().to_string(),
-                source,
+    let detection = prepare_cache_v3_runtime(cache_root)
+        .map_err(|source| match source {
+            PrepareCacheV3RuntimeError::DetectCacheBackend { cache_root, source } => {
+                OpenLocalBlockBackendError::DetectCacheBackend { cache_root, source }
             }
-        })?;
-        detection = v3::detect_cache_backends(cache_root).map_err(|source| {
-            OpenLocalBlockBackendError::DetectCacheBackend {
-                cache_root: cache_root_display.clone(),
-                source,
+            PrepareCacheV3RuntimeError::ProvisionCacheV3Layout { cache_root, source } => {
+                OpenLocalBlockBackendError::ProvisionCacheV3Layout { cache_root, source }
             }
-        })?;
-    }
+        })?
+        .detection;
     let backend_kind = v3::CacheBackendKind::CacheV3;
     let backend = match cache_budget_bytes {
         Some(cache_budget_bytes) => open_cache_v3_backend_budgeted(
@@ -231,6 +260,47 @@ fn open_local_block_backend_budgeted(
 mod tests {
     use super::*;
     use crate::v3::{CacheBackendKind, CacheV3Layout};
+
+    #[test]
+    fn prepare_cache_v3_runtime_creates_contract_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let prepared = prepare_cache_v3_runtime(temp.path()).expect("prepare cache-v3 runtime");
+
+        assert_eq!(prepared.layout, CacheV3Layout::from_cache_root(temp.path()));
+        assert!(prepared.detection.has_cache_v3_contract());
+        assert!(prepared.layout.layout_marker.exists());
+        assert!(prepared.layout.tmp_dir.exists());
+        assert!(prepared.layout.payload_blocks_dir.exists());
+        assert!(prepared.layout.index_dir.exists());
+    }
+
+    #[test]
+    fn prepare_cache_v3_runtime_is_idempotent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let first = prepare_cache_v3_runtime(temp.path()).expect("first prepare");
+        let second = prepare_cache_v3_runtime(temp.path()).expect("second prepare");
+
+        assert_eq!(first.layout, second.layout);
+        assert_eq!(first.detection, second.detection);
+        assert!(second.detection.has_cache_v3_contract());
+    }
+
+    #[test]
+    fn prepared_cache_v3_runtime_opens_cache_v3_backend() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let prepared = prepare_cache_v3_runtime(temp.path()).expect("prepare cache-v3 runtime");
+
+        let opened = open_local_block_backend(
+            &prepared.layout.cache_root,
+            "00000000-0000-0000-0000-000000000001",
+        )
+        .expect("open cache-v3 backend");
+
+        assert_eq!(opened.backend_kind, CacheBackendKind::CacheV3);
+        assert!(opened.detection.has_cache_v3_contract());
+    }
 
     #[test]
     fn cache_v3_root_opens_cache_v3_backend() {

@@ -14,6 +14,7 @@ pub mod mount;
 pub mod mount_profile;
 #[cfg(not(unix))]
 pub mod mount_profile_stub;
+pub mod mount_runtime;
 #[cfg(not(unix))]
 pub use self::mount_profile_stub as mount_profile;
 pub mod mount_profile_types;

@@ -1139,8 +1139,8 @@ fn test_compute_committed_size_prefers_regular_file_base_rows() {
         base_table
             .insert(chunk_key.as_slice(), chunk_bytes.as_slice())
             .unwrap();
-        let committed_size =
-            RedbMetaEngine::compute_committed_size_in_txn(&txn, ino).expect("compute committed size");
+        let committed_size = RedbMetaEngine::compute_committed_size_in_txn(&txn, &base_table, ino)
+            .expect("compute committed size");
         assert_eq!(
             committed_size,
             chunk_start_offset(ChunkId(1), DEFAULT_CHUNK_SIZE) + 4096
