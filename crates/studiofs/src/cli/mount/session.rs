@@ -54,7 +54,6 @@ struct ResolvedMountStartup {
     cache_size: String,
     cache_mode: String,
     vfs_config: VfsConfigValidated,
-    principal_to_export: Option<String>,
     run_in_foreground: bool,
     launch_mode: MountLaunchMode,
 }
@@ -74,6 +73,7 @@ pub(crate) struct MountSession {
     launch_mode: MountLaunchMode,
     format_info: Option<FormatInfo>,
     read_only_mount: bool,
+    snapshot_mount_db_path: Option<PathBuf>,
     prepared_foreground: Option<PreparedForegroundSession>,
 }
 
@@ -106,6 +106,7 @@ struct MountMetaSession<M: ?Sized + MountRuntimeMeta> {
     meta: Arc<M>,
     format_info: FormatInfo,
     read_only_mount: bool,
+    snapshot_db_path: Option<PathBuf>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -475,7 +476,6 @@ fn resolve_mount_startup(
         cache_size: resolved_settings.cache_size,
         cache_mode,
         vfs_config,
-        principal_to_export: command.principal.clone(),
         run_in_foreground: resolve_run_in_foreground(command.foreground, command.detach),
         launch_mode: resolve_mount_launch_mode(command.detach),
     })
@@ -483,25 +483,6 @@ fn resolve_mount_startup(
 
 fn resolve_run_in_foreground(foreground: bool, detach: bool) -> bool {
     foreground || !detach
-}
-
-fn export_mount_principal(principal: Option<&str>) {
-    export_mount_principal_with(principal, |key, value| {
-        // SAFETY: this happens before Tokio runtime creation, so no runtime
-        // worker threads are alive to race on process environment access.
-        unsafe {
-            std::env::set_var(key, value);
-        }
-    });
-}
-
-fn export_mount_principal_with<F>(principal: Option<&str>, set_var: F)
-where
-    F: FnOnce(&str, &str),
-{
-    if let Some(principal) = principal {
-        set_var("STUDIOFS_PRINCIPAL", principal);
-    }
 }
 
 fn resolve_runtime_mount_point(mount_point: String) -> String {
@@ -557,8 +538,10 @@ fn prepare_mount_path(name: &str, mount_point: &str) -> anyhow::Result<String> {
 
     if !is_drive_root && let Err(err) = std::fs::create_dir_all(&actual_mount_path) {
         #[cfg(target_os = "macos")]
-        if err.kind() == std::io::ErrorKind::PermissionDenied
-            && actual_mount_path.contains("/Volumes")
+        if matches!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::AlreadyExists
+        ) && actual_mount_path.contains("/Volumes")
         {
             anyhow::bail!(
                 "Failed to create mount point '{}'. You can grant mount access with:\n  sudo mkdir -p '{}'\n  sudo chown $(id -un):$(id -gn) '{}'",
@@ -892,7 +875,6 @@ impl MountSession {
             cache_size,
             cache_mode,
             vfs_config,
-            principal_to_export,
             run_in_foreground,
             launch_mode,
         } = startup;
@@ -906,17 +888,18 @@ impl MountSession {
                 launch_mode,
                 format_info: None,
                 read_only_mount: false,
+                snapshot_mount_db_path: None,
                 prepared_foreground: None,
             });
         }
 
-        export_mount_principal(principal_to_export.as_deref());
         guard_mount_pid_file(&actual_mount_path)?;
 
         let MountMetaSession {
             meta,
             format_info,
             read_only_mount,
+            snapshot_db_path,
         } = resolve_mount_meta_session(
             &command.name,
             &command.meta_dir,
@@ -939,35 +922,29 @@ impl MountSession {
             run_in_foreground,
         );
 
-        let runtime = Runtime::new()
-            .map_err(|error| anyhow::anyhow!("failed to create tokio runtime: {error}"))?;
-        let _guard = runtime.enter();
-        let vfs = StudioVfs::new_with_prepared_cache_runtime(
-            meta,
-            &data_config,
-            &cache_path_str,
-            cache_size_bytes,
-            memory_cache_budget_bytes,
-            vfs_config,
-            cache_runtime,
-        )
-        .map_err(|error| anyhow::anyhow!("failed to init vfs: {error}"))?;
-        vfs.start()
-            .map_err(|error| anyhow::anyhow!("failed to start vfs background workers: {error}"))?;
-        let write_path_observability_publisher = WritePathObservabilityPublisher::new(
-            vfs.clone(),
-            cache_path.join(WRITE_PATH_OBSERVABILITY_FILE),
-        );
+        let prepared_foreground = (|| -> anyhow::Result<PreparedForegroundSession> {
+            let runtime = Runtime::new()
+                .map_err(|error| anyhow::anyhow!("failed to create tokio runtime: {error}"))?;
+            let _guard = runtime.enter();
+            let vfs = StudioVfs::new_with_prepared_cache_runtime(
+                meta,
+                &data_config,
+                &cache_path_str,
+                cache_size_bytes,
+                memory_cache_budget_bytes,
+                vfs_config,
+                cache_runtime,
+            )
+            .map_err(|error| anyhow::anyhow!("failed to init vfs: {error}"))?;
+            vfs.start().map_err(|error| {
+                anyhow::anyhow!("failed to start vfs background workers: {error}")
+            })?;
+            let write_path_observability_publisher = WritePathObservabilityPublisher::new(
+                vfs.clone(),
+                cache_path.join(WRITE_PATH_OBSERVABILITY_FILE),
+            );
 
-        Ok(Self {
-            command,
-            actual_mount_path,
-            cache_size,
-            run_in_foreground,
-            launch_mode,
-            format_info: Some(format_info),
-            read_only_mount,
-            prepared_foreground: Some(PreparedForegroundSession {
+            Ok(PreparedForegroundSession {
                 cache_path,
                 cache_path_str,
                 backend: backend_factory(),
@@ -975,8 +952,26 @@ impl MountSession {
                 runtime,
                 profiling,
                 write_path_observability_publisher,
+            })
+        })();
+
+        match prepared_foreground {
+            Ok(prepared_foreground) => Ok(Self {
+                command,
+                actual_mount_path,
+                cache_size,
+                run_in_foreground,
+                launch_mode,
+                format_info: Some(format_info),
+                read_only_mount,
+                snapshot_mount_db_path: snapshot_db_path,
+                prepared_foreground: Some(prepared_foreground),
             }),
-        })
+            Err(error) => {
+                cleanup_snapshot_mount_db(snapshot_db_path.as_deref());
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn launch(self) -> anyhow::Result<()> {
@@ -1034,38 +1029,61 @@ impl MountSession {
             .format_info
             .as_ref()
             .expect("foreground mount sessions must resolve format info");
-        let mut prepared = self
+        let prepared = self
             .prepared_foreground
             .take()
             .expect("foreground mount sessions must prepare runtime");
-        let backend_name = prepared.backend.name();
+        let PreparedForegroundSession {
+            cache_path: _,
+            cache_path_str: _,
+            backend,
+            vfs,
+            runtime,
+            mut profiling,
+            mut write_path_observability_publisher,
+        } = prepared;
+        let backend_name = backend.name();
         info!(
             backend = backend_name,
             mount_point = %self.actual_mount_path,
             "starting mount backend"
         );
-        let serve_result = prepared.backend.serve(BackendLaunch {
-            vfs: prepared.vfs.clone(),
-            runtime_handle: prepared.runtime.handle().clone(),
+        let serve_result = backend.serve(BackendLaunch {
+            vfs: vfs.clone(),
+            runtime_handle: runtime.handle().clone(),
             mount_point: self.actual_mount_path.clone(),
             volume_name: format_info.name.clone(),
             read_only: self.read_only_mount,
             run_in_foreground: self.run_in_foreground,
         });
-        prepared.write_path_observability_publisher.stop_and_join();
-        prepared
-            .runtime
-            .block_on(prepared.vfs.shutdown(shutdown_upload_drain_timeout()));
-        if let Some(mut profiling) = prepared.profiling.take() {
-            profiling();
+        write_path_observability_publisher.stop_and_join();
+        runtime.block_on(vfs.shutdown(shutdown_upload_drain_timeout()));
+        if let Some(mut finish_profiling) = profiling.take() {
+            finish_profiling();
         }
-        if serve_result.is_ok() {
-            let _ = utils::remove_pid_file(&self.actual_mount_path);
-        }
-        prepared.runtime.shutdown_background();
+        drop(vfs);
+        let _ = utils::remove_pid_file(&self.actual_mount_path);
+        cleanup_snapshot_mount_db(self.snapshot_mount_db_path.take().as_deref());
+        runtime.shutdown_background();
 
         serve_result.map_err(|error| anyhow::anyhow!("{backend_name} error: {error}"))?;
         Ok(())
+    }
+}
+
+fn cleanup_snapshot_mount_db(snapshot_db_path: Option<&Path>) {
+    let Some(snapshot_db_path) = snapshot_db_path else {
+        return;
+    };
+
+    match std::fs::remove_file(snapshot_db_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => warn!(
+            path = %snapshot_db_path.display(),
+            error = %error,
+            "failed to remove snapshot mount database"
+        ),
     }
 }
 
@@ -1092,7 +1110,10 @@ where
     IsRunning: Fn(u32) -> bool,
 {
     if let Ok((pid, _, _)) = read_pid_file(actual_mount_path) {
-        if pid != current_pid && is_process_running(pid) {
+        if pid == current_pid {
+            return Ok(());
+        }
+        if is_process_running(pid) {
             anyhow::bail!(
                 "Already mounted at '{}' (PID {}). Run `studiofs umount \"{}\"` first.",
                 actual_mount_path,
@@ -1100,7 +1121,7 @@ where
                 actual_mount_path
             );
         }
-        // Stale PID file (or the pre-written entry from the parent) — clean up.
+        // Stale PID file — clean up before the session writes its own entry.
         let _ = remove_pid_file(actual_mount_path);
     }
     Ok(())
@@ -1200,9 +1221,7 @@ fn materialize_snapshot_mount_meta<M: ?Sized + SnapshotSourceMeta>(
     let snapshot_dir = meta_dir.join("snapshots");
     std::fs::create_dir_all(&snapshot_dir)?;
     let snapshot_db_path = snapshot_dir.join(format!("{name}.{snapshot_id}.db"));
-    if snapshot_db_path.exists() {
-        let _ = std::fs::remove_file(&snapshot_db_path);
-    }
+    cleanup_snapshot_mount_db(Some(snapshot_db_path.as_path()));
     let snapshot_engine = Arc::new(RedbMetaEngine::open(&snapshot_db_path)?);
     format_info.metadata.backend = MetadataBackend::RedbLocal;
     format_info.metadata.postgres = None;
@@ -1213,6 +1232,7 @@ fn materialize_snapshot_mount_meta<M: ?Sized + SnapshotSourceMeta>(
         meta: into_vfs_meta(snapshot_engine),
         format_info,
         read_only_mount: true,
+        snapshot_db_path: Some(snapshot_db_path),
     })
 }
 
@@ -1249,6 +1269,7 @@ fn resolve_mount_meta_session(
             meta: runtime_meta,
             format_info,
             read_only_mount: false,
+            snapshot_db_path: None,
         }
     };
 
@@ -1559,7 +1580,6 @@ mod tests {
         assert_eq!(startup.base_cache_path, meta_dir.join("cache"));
         assert_eq!(startup.cache_size, "64GB");
         assert_eq!(startup.cache_mode, "fast");
-        assert_eq!(startup.principal_to_export.as_deref(), Some("alice"));
         assert_eq!(startup.launch_mode, MountLaunchMode::Foreground);
         assert!(startup.run_in_foreground);
         assert_eq!(startup.vfs_config.principal, "alice");
@@ -1651,11 +1671,13 @@ mod tests {
             MetadataBackend::RedbLocal
         );
         assert!(session.format_info.metadata.postgres.is_none());
-        assert!(
-            meta_dir
-                .join("snapshots")
-                .join(format!("demo.{}.db", snapshot.id))
-                .exists()
+        let expected_snapshot_db_path = meta_dir
+            .join("snapshots")
+            .join(format!("demo.{}.db", snapshot.id));
+        assert!(expected_snapshot_db_path.exists());
+        assert_eq!(
+            session.snapshot_db_path.as_deref(),
+            Some(expected_snapshot_db_path.as_path())
         );
     }
 
@@ -1728,6 +1750,7 @@ mod tests {
                 .name(),
             "FakeBackend"
         );
+        assert!(session.snapshot_mount_db_path.is_some());
     }
 
     #[test]
@@ -1800,7 +1823,7 @@ mod tests {
     }
 
     #[test]
-    fn mount_session_launch_failure_keeps_pid_file() {
+    fn mount_session_launch_failure_removes_pid_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
         drop(engine);
@@ -1830,9 +1853,78 @@ mod tests {
         assert!(err.to_string().contains("FakeBackend error: boom"));
         assert_eq!(events.lock().expect("lock events").len(), 1);
         assert!(
-            utils::read_pid_file(&actual_mount_path).is_ok(),
-            "backend failure should preserve pid file"
+            utils::read_pid_file(&actual_mount_path).is_err(),
+            "backend failure should remove pid file"
         );
-        let _ = utils::remove_pid_file(&actual_mount_path);
+    }
+
+    #[test]
+    fn guard_mount_pid_file_with_keeps_current_process_pid_file() {
+        let removed = Arc::new(Mutex::new(Vec::new()));
+        guard_mount_pid_file_with(
+            "/tmp/demo",
+            4242,
+            |_| Ok((4242, "demo".to_string(), String::new())),
+            {
+                let removed = removed.clone();
+                move |path| {
+                    removed.lock().expect("lock removed").push(path.to_string());
+                    Ok(())
+                }
+            },
+            |_| true,
+        )
+        .expect("current pid should be accepted");
+
+        assert!(
+            removed.lock().expect("lock removed").is_empty(),
+            "current pid entry should not be removed"
+        );
+    }
+
+    #[test]
+    fn mount_session_launch_cleans_up_snapshot_mount_db_on_backend_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
+        let snapshot = engine.create_snapshot(ROOT_INO).expect("create snapshot");
+        drop(engine);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mount_point = startup_mount_point(&temp);
+        let mut command = mount_command(
+            "demo",
+            &meta_dir,
+            Some(mount_point.clone()),
+            Some(temp.path().join("cache")),
+            Some("64GB"),
+        );
+        command.snapshot_id = Some(snapshot.id.clone());
+
+        let session = MountSession::prepare_with_backend_factory(
+            command,
+            startup_settings_config(mount_point, None, Some("64GB")),
+            || {
+                Box::new(FakeBackend {
+                    events: events.clone(),
+                    fail: true,
+                })
+            },
+        )
+        .expect("prepare session");
+        let snapshot_db_path = session
+            .snapshot_mount_db_path
+            .clone()
+            .expect("snapshot db path");
+        assert!(
+            snapshot_db_path.exists(),
+            "prepare should materialize snapshot db"
+        );
+
+        let err = session.launch().expect_err("backend error should surface");
+
+        assert!(err.to_string().contains("FakeBackend error: boom"));
+        assert!(
+            !snapshot_db_path.exists(),
+            "launch should remove snapshot db after backend return"
+        );
     }
 }
