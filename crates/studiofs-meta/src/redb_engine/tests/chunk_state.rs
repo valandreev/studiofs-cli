@@ -98,10 +98,10 @@ fn test_clear_regular_file_graph_clears_pending_compaction_rows() {
 }
 
 #[test]
-fn test_block_replace_clears_pending_compaction_rows() {
+fn test_legacy_block_replace_clears_pending_compaction_rows() {
     let engine = temp_engine();
     let ino = engine
-        .create_file(ROOT_INO, b"block-replace.bin", 1000, 1000, 0o644)
+        .create_file(ROOT_INO, b"legacy-replace.bin", 1000, 1000, 0o644)
         .unwrap()
         .ino;
 
@@ -130,15 +130,6 @@ fn test_block_replace_clears_pending_compaction_rows() {
             .unwrap()
             .is_none()
     );
-}
-
-#[test]
-fn test_convert_blocks_to_chunk_state_rejects_slice_overflow() {
-    let block = BlockRef::new_partial(9_999, u32::MAX);
-    let err = RedbMetaEngine::convert_blocks_to_chunk_state(&[(1, block)], u32::MAX)
-        .expect_err("overflowing slice range must fail");
-
-    assert!(matches!(err, MetaError::Storage(message) if message.contains("slice range overflow")));
 }
 
 #[test]
@@ -1133,14 +1124,26 @@ fn test_compute_committed_size_prefers_regular_file_base_rows() {
 
     let chunk_key = encode_regular_file_chunk_key(ino, ChunkId(1));
     let chunk_bytes = encode(&chunk).expect("encode committed chunk");
+    let legacy_key = encode_file_block_key(ino, 0);
+    let legacy_block = BlockRef::new_partial(701, 1024);
+    let legacy_bytes = encode(&legacy_block).expect("encode legacy block");
+
     let txn = engine.db.begin_write().unwrap();
     {
-        let mut base_table = txn.open_table(REGULAR_FILE_BASE_TABLE).unwrap();
-        base_table
-            .insert(chunk_key.as_slice(), chunk_bytes.as_slice())
+        {
+            let mut base_table = txn.open_table(REGULAR_FILE_BASE_TABLE).unwrap();
+            base_table
+                .insert(chunk_key.as_slice(), chunk_bytes.as_slice())
+                .unwrap();
+        }
+
+        let mut committed_table = txn.open_table(COMMITTED_FILE_BLOCKS_TABLE).unwrap();
+        committed_table
+            .insert(legacy_key.as_slice(), legacy_bytes.as_slice())
             .unwrap();
         let committed_size =
-            RedbMetaEngine::compute_committed_size_in_txn(&txn, ino).expect("compute committed size");
+            RedbMetaEngine::compute_committed_size_in_txn(&txn, &committed_table, ino)
+                .expect("compute committed size");
         assert_eq!(
             committed_size,
             chunk_start_offset(ChunkId(1), DEFAULT_CHUNK_SIZE) + 4096

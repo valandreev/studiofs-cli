@@ -272,7 +272,7 @@ through `committed_size`, not through the local foreground `size`.
 
 ```
 local metadata view ──┬─ dirty `WriteBuffer`
-                      └─ committed local extents / `regular_file_base`
+                      └─ committed local extents / `committed_file_blocks`
          │
          ▼
   resolve block data ─── ┌─ `WriteBuffer`

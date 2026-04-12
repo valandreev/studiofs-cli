@@ -378,6 +378,54 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    pub(super) fn remove_all_committed_blocks_in_txn(
+        committed: &mut redb::Table<'_, &[u8], &[u8]>,
+        ino: Ino,
+    ) -> MetaResult<Vec<u64>> {
+        let prefix = file_block_prefix(ino);
+        let mut range_end = prefix.to_vec();
+        *range_end.last_mut().unwrap() += 1;
+        let rows: Vec<(Vec<u8>, u64)> = {
+            let iter = committed
+                .range(prefix.as_slice()..range_end.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            iter.filter_map(|r| r.ok())
+                .filter_map(|(k, v)| {
+                    let block: BlockRef = decode(v.value()).ok()?;
+                    Some((k.value().to_vec(), block.object_id))
+                })
+                .collect()
+        };
+        for (key, _) in &rows {
+            let _ = committed.remove(key.as_slice());
+        }
+        Ok(rows.into_iter().map(|(_, object_id)| object_id).collect())
+    }
+
+    pub(super) fn remove_all_file_blocks_in_txn(
+        blocks: &mut redb::Table<'_, &[u8], &[u8]>,
+        ino: Ino,
+    ) -> MetaResult<Vec<u64>> {
+        let prefix = file_block_prefix(ino);
+        let mut range_end = prefix.to_vec();
+        *range_end.last_mut().unwrap() += 1;
+        let rows: Vec<(Vec<u8>, u64)> = {
+            let iter = blocks
+                .range(prefix.as_slice()..range_end.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            iter.filter_map(|r| r.ok())
+                .filter_map(|(k, v)| {
+                    let block: BlockRef = decode(v.value()).ok()?;
+                    Some((k.value().to_vec(), block.object_id))
+                })
+                .collect()
+        };
+        for (key, _) in &rows {
+            let _ = blocks.remove(key.as_slice());
+        }
+        Ok(rows.into_iter().map(|(_, object_id)| object_id).collect())
+    }
+
     pub(super) fn lookup_merged_in_write_txn(
         txn: &redb::WriteTransaction,
         parent: Ino,

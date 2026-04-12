@@ -107,36 +107,6 @@ fn test_flush_blocks_batch_updates_regular_file_overlay() {
 }
 
 #[test]
-fn test_block_runtime_paths_use_graph_tables_only() {
-    let engine = temp_engine();
-
-    let file = engine
-        .create_file(ROOT_INO, b"graph-runtime-write.bin", 1000, 1000, 0o644)
-        .unwrap();
-    let mut attr = engine.get_attr(file.ino).unwrap();
-    attr.size = DEFAULT_BLOCK_SIZE as u64;
-    attr.content_epoch = 1;
-    engine.set_attr(&attr).unwrap();
-
-    let block = BlockRef::new_full(7_001, DEFAULT_BLOCK_SIZE);
-    engine.set_file_block(file.ino, 0, &block).unwrap();
-    assert!(engine.commit_uploaded_block(file.ino, 0, 1, &block).unwrap());
-
-    let txn = engine.db.begin_read().unwrap();
-    let overlay = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
-    let base = txn.open_table(REGULAR_FILE_BASE_TABLE).unwrap();
-    let chunk_key = encode_regular_file_chunk_key(file.ino, ChunkId(0));
-    assert!(
-        overlay.get(chunk_key.as_slice()).unwrap().is_some(),
-        "current local manifest should still be materialized in overlay rows"
-    );
-    assert!(
-        base.get(chunk_key.as_slice()).unwrap().is_some(),
-        "runtime writes should be materialized in regular_file_base rows"
-    );
-}
-
-#[test]
 fn test_file_block_overwrite_returns_old() {
     let engine = temp_engine();
 
@@ -165,7 +135,7 @@ fn test_file_block_overwrite_returns_old() {
 }
 
 #[test]
-fn test_get_file_block_reads_base_graph_rows() {
+fn test_get_file_block_falls_back_to_committed() {
     let engine = temp_engine();
 
     let attr = engine
@@ -197,14 +167,6 @@ fn test_get_file_block_reads_base_graph_rows() {
     assert_eq!(all_blocks.len(), 1);
     assert_eq!(all_blocks[0].0, 0);
     assert_eq!(all_blocks[0].1.object_id, 7);
-
-    let txn = engine.db.begin_read().unwrap();
-    let base = txn.open_table(REGULAR_FILE_BASE_TABLE).unwrap();
-    let chunk_key = encode_regular_file_chunk_key(ino, ChunkId(0));
-    assert!(
-        base.get(chunk_key.as_slice()).unwrap().is_some(),
-        "commit replay must materialize graph rows for runtime reads"
-    );
 }
 
 #[test]
@@ -413,6 +375,66 @@ fn test_commit_uploaded_block_rejects_replaced_block() {
 
     assert!(!engine.commit_uploaded_block(file.ino, 0, 0, &old).unwrap());
     assert!(engine.commit_uploaded_block(file.ino, 0, 0, &new).unwrap());
+}
+
+#[test]
+fn current_or_legacy_manifest_falls_back_to_legacy_rows_when_graph_is_empty() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"legacy-manifest-fallback.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let current_block = BlockRef::new_partial(901, 4096);
+    let committed_block = BlockRef::new_partial(902, 2048);
+
+    let txn = engine.db.begin_write().unwrap();
+    {
+        let mut file_blocks = txn.open_table(FILE_BLOCKS_TABLE).unwrap();
+        let key = encode_file_block_key(file.ino, 1);
+        let value = encode(&current_block).unwrap();
+        file_blocks
+            .insert(key.as_slice(), value.as_slice())
+            .unwrap();
+    }
+    {
+        let mut committed = txn.open_table(COMMITTED_FILE_BLOCKS_TABLE).unwrap();
+        let key = encode_file_block_key(file.ino, 3);
+        let value = encode(&committed_block).unwrap();
+        committed.insert(key.as_slice(), value.as_slice()).unwrap();
+    }
+
+    let manifest = RedbMetaEngine::current_or_legacy_manifest_in_txn(&txn, file.ino).unwrap();
+    assert_eq!(manifest, vec![(1, current_block), (3, committed_block)]);
+}
+
+#[test]
+fn current_or_legacy_manifest_prefers_current_graph_over_legacy_rows() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(
+            ROOT_INO,
+            b"current-manifest-preferred.bin",
+            1000,
+            1000,
+            0o644,
+        )
+        .unwrap();
+    let current_block = BlockRef::new_partial(911, 4096);
+    let stale_legacy_block = BlockRef::new_partial(999, 4096);
+
+    engine.set_file_block(file.ino, 0, &current_block).unwrap();
+
+    let txn = engine.db.begin_write().unwrap();
+    {
+        let mut file_blocks = txn.open_table(FILE_BLOCKS_TABLE).unwrap();
+        let key = encode_file_block_key(file.ino, 0);
+        let value = encode(&stale_legacy_block).unwrap();
+        file_blocks
+            .insert(key.as_slice(), value.as_slice())
+            .unwrap();
+    }
+
+    let manifest = RedbMetaEngine::current_or_legacy_manifest_in_txn(&txn, file.ino).unwrap();
+    assert_eq!(manifest, vec![(0, current_block)]);
 }
 
 #[test]

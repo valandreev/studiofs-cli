@@ -6,6 +6,7 @@ use crate::events::MetaEvent;
 
 include!("tests/format.rs");
 include!("tests/recovery.rs");
+include!("tests/migration.rs");
 include!("tests/replication.rs");
 include!("tests/symlink.rs");
 include!("tests/xattr.rs");

@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, info};
 
 mod layout;
 pub use self::layout::RedbSnapshot;
@@ -47,6 +47,8 @@ impl RedbMetaEngine {
             let _ = txn.open_table(DENTRIES_TABLE);
             let _ = txn.open_table(BASE_DENTRIES_TABLE);
             let _ = txn.open_table(DENTRY_TOMBSTONES_TABLE);
+            let _ = txn.open_table(FILE_BLOCKS_TABLE);
+            let _ = txn.open_table(COMMITTED_FILE_BLOCKS_TABLE);
             let _ = txn.open_table(REGULAR_FILE_OVERLAY_TABLE);
             let _ = txn.open_table(REGULAR_FILE_BASE_TABLE);
             let _ = txn.open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE);
@@ -65,6 +67,7 @@ impl RedbMetaEngine {
             let _ = txn.open_table(ACL_RULE_TOMBSTONES_TABLE);
             let _ = txn.open_table(EVENT_LOG_TABLE);
             let _ = txn.open_table(SNAPSHOTS_TABLE);
+            let _ = txn.open_table(MIGRATION_STATUS_TABLE);
             txn.commit()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
@@ -74,7 +77,18 @@ impl RedbMetaEngine {
         let _ = engine.recover_undo_logs()?;
 
         match engine.get_format_info() {
-            Ok(format_info) if format_info.format_version >= CURRENT_FORMAT_VERSION => {
+            Ok(format_info) if format_info.format_version == 2 => {
+                info!("migrating metadata from format version 2 to 3");
+                engine.migrate_regular_files_to_chunk_slice_model()?;
+
+                let mut updated_format_info = format_info;
+                updated_format_info.format_version = 3;
+                engine.set_format_info(&updated_format_info)?;
+                engine.validate_migration_completed()?;
+                info!("metadata migration completed successfully");
+            }
+            Ok(format_info) if format_info.format_version >= 3 => {
+                engine.validate_migration_completed()?;
                 debug!(
                     "format version {} is up to date",
                     format_info.format_version
@@ -120,6 +134,7 @@ mod chunk_state;
 mod format;
 mod gc;
 mod inodes;
+mod migration;
 mod namespace;
 mod recovery;
 mod replication;

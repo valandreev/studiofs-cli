@@ -8,8 +8,9 @@ impl RedbMetaEngine {
     pub fn decode_snapshot_payload(payload: &[u8]) -> MetaResult<RedbSnapshot> {
         match decode(payload) {
             Ok(snapshot) => Ok(snapshot),
-            Err(MetaError::Serialization(_)) => serde_json::from_slice::<RedbSnapshot>(payload)
-                .map_err(|e| MetaError::Serialization(e.to_string())),
+            Err(MetaError::Serialization(_)) => {
+                serde_json::from_slice(payload).map_err(|e| MetaError::Serialization(e.to_string()))
+            }
             Err(err) => Err(err),
         }
     }
@@ -70,6 +71,34 @@ impl RedbMetaEngine {
                 let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 snapshot
                     .dentries
+                    .push((k.value().to_vec(), v.value().to_vec()));
+            }
+        }
+        {
+            let table = txn
+                .open_table(FILE_BLOCKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for row in table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                snapshot
+                    .file_blocks
+                    .push((k.value().to_vec(), v.value().to_vec()));
+            }
+        }
+        {
+            let table = txn
+                .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for row in table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (k, v) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                snapshot
+                    .committed_file_blocks
                     .push((k.value().to_vec(), v.value().to_vec()));
             }
         }
@@ -319,10 +348,36 @@ impl RedbMetaEngine {
             }
         }
         {
+            let mut table = txn
+                .open_table(FILE_BLOCKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .retain(|_, _| false)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for (k, v) in &snapshot.file_blocks {
+                table
+                    .insert(k.as_slice(), v.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+        {
+            let mut table = txn
+                .open_table(COMMITTED_FILE_BLOCKS_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            table
+                .retain(|_, _| false)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            for (k, v) in &snapshot.committed_file_blocks {
+                table
+                    .insert(k.as_slice(), v.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+        }
+        {
             Self::replace_regular_file_chunk_rows_from_snapshot_rows(
                 &txn,
                 REGULAR_FILE_OVERLAY_TABLE,
-                snapshot.regular_file_overlay.as_slice(),
+                &snapshot.regular_file_overlay,
                 |bytes| {
                     let state: RegularFileOverlayState = decode(bytes)?;
                     Ok(state.chunks)
@@ -334,7 +389,7 @@ impl RedbMetaEngine {
             Self::replace_regular_file_chunk_rows_from_snapshot_rows(
                 &txn,
                 REGULAR_FILE_BASE_TABLE,
-                snapshot.regular_file_base.as_slice(),
+                &snapshot.regular_file_base,
                 |bytes| {
                     let state: RegularFileBaseState = decode(bytes)?;
                     Ok(state.chunks)

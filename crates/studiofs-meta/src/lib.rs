@@ -46,6 +46,10 @@ fn ensure_supported_format_version(info: &FormatInfo) -> MetaResult<()> {
     if info.format_version == CURRENT_FORMAT_VERSION {
         return Ok(());
     }
+    // Allow migration from version 2 to 3
+    if info.format_version == 2 && CURRENT_FORMAT_VERSION == 3 {
+        return Ok(());
+    }
     Err(MetaError::UnsupportedFormatVersion {
         found: info.format_version,
         expected: CURRENT_FORMAT_VERSION,

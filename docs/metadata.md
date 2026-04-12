@@ -64,7 +64,7 @@ Dependency rule:
 Local embedded serving store.
 - ACID local transactions
 - foreground source of truth for the mounted client
-- stores local overlay attrs/dentries/symlinks/xattrs, remote-visible base attrs/dentries/symlinks/xattrs, chunk-local regular-file overlay/base graphs, counters, and the local event log
+- stores local overlay attrs/dentries/symlinks/xattrs, remote-visible base attrs/dentries/symlinks/xattrs, staged blocks, committed blocks, chunk-local regular-file graphs, counters, local event log
 - regular-file graphs are stored as chunk-local rows in `regular_file_overlay` and `regular_file_base`, keyed by `(ino, chunk_id)`
 
 ### `PgMetaEngine`
@@ -131,9 +131,11 @@ After cleaning up locally, you can use `studiofs discover` to connect to the new
 For regular files StudioFS keeps two views:
 - local view:
   - `size`
+  - staged `file_blocks`
   - local-visible regular-file overlay graph in `regular_file_overlay`
 - remote-visible view:
   - `committed_size`
+  - `committed_file_blocks`
   - remote-visible regular-file base graph in `regular_file_base`
 
 This is required so a client can finish local writes immediately while remote
@@ -142,7 +144,7 @@ clients only see blocks that have actually finished uploading.
 Regular-file graph rules:
 - slices are chunk-relative and stay within a single chunk
 - overlay and base graphs resolve as `overlay over base`
-- `committed_size` follows the remote-visible committed state derived from `regular_file_base`
+- `committed_size` follows the remote-visible committed state, which is now derived from the committed manifest or the regular-file base graph during the transition period
 
 For namespace, attrs, symlink targets, and xattrs StudioFS also keeps two views:
 - base view:
@@ -302,6 +304,12 @@ Regular files now use two size/generation concepts:
 
 ## Important Block Tables
 
+Legacy block tables:
+- `file_blocks`
+  - staged/local-serving block refs
+- `committed_file_blocks`
+  - remote-visible block refs
+
 Regular-file graph tables:
 - `regular_file_overlay`
   - local-visible chunk/slice/block graph rows, keyed by `(ino, chunk_id)`
@@ -309,6 +317,14 @@ Regular-file graph tables:
   - remote-visible chunk/slice/block graph rows, keyed by `(ino, chunk_id)`
 - `SliceRange`
   - validated as chunk-relative half-open ranges and rejected if they cross the current chunk size
+
+Upgrade marker:
+- `migration_status["regular_files_v2_to_v3"] = 2` means the v2 -> v3 regular-file migration completed successfully.
+- That migration is additive: it backfills the chunk/slice tables and preserves the legacy flat block tables during the transition.
+
+Legacy block serving merges them as:
+- local staged block wins
+- otherwise fall back to committed block
 
 ## PostgreSQL Shared Schema
 
@@ -379,12 +395,12 @@ Where:
 
 ## Tables
 
-Regular-file runtime state is split into chunk-local overlay/base graphs:
+Regular file block split already exists:
 
-- `regular_file_overlay`
-  - local-serving chunk/slice/block rows
-- `regular_file_base`
-  - remote-visible chunk/slice/block rows
+- `file_blocks`
+  - local-serving block refs
+- `committed_file_blocks`
+  - remote-visible block refs
 
 Namespace/attrs gain the same split:
 
@@ -478,7 +494,9 @@ This is enough for:
 For regular files:
 
 - overlay `size` may be ahead of base `committed_size`
-- block reads resolve `regular_file_overlay over regular_file_base`
+- block reads still use current rule:
+  - local block in `file_blocks` wins
+  - otherwise fall back to `committed_file_blocks`
 
 ### `lookup(parent, name)`
 
@@ -556,7 +574,7 @@ Destination side:
 ### `truncate` / `setattr(size)`
 
 - update attr only in `inodes`
-- modify local-serving `regular_file_overlay`
+- modify local-serving `file_blocks`
 - leave `base_inodes.committed_size` and committed blocks untouched until upload
   completion and PG flush publish remote-visible state
 
@@ -624,7 +642,7 @@ view:
 1. Start from `base_*`
 2. Apply only overlay mutations that are already remote-visible
 3. Project regular-file attrs to committed size
-4. Export `regular_file_base` only
+4. Export committed blocks only
 
 Local-only staged state must never leak into checkpoint.
 
