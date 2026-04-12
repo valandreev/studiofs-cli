@@ -68,11 +68,11 @@ Little-endian encoding is used for all multi-byte fields.
 +------------------+
 ```
 
-On write, object upload paths use `opendal::Buffer` (`header` + payload chunks) to avoid copying full block payload buffers when prepending the fixed header.
+On write, object upload paths use `create_object_buffer` / `create_object_buffer_with_flags`
+and an `opendal::Buffer` (`header` + payload chunks) to avoid copying full block payload
+buffers when prepending the fixed header.
 
 On read, object decode accepts `opendal::Buffer` directly, parses the fixed header from a small stack buffer, and validates checksum incrementally across buffer chunks. Payload is returned as zero-copy `Bytes` when the payload is a single contiguous chunk, with contiguous materialization only as a fallback for fragmented payloads.
-
-Legacy helpers `create_object` / `create_object_with_flags` remain for compatibility and are marked deprecated in favor of `create_object_buffer` / `create_object_buffer_with_flags`.
 
 ### Flags
 

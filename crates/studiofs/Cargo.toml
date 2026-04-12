@@ -53,6 +53,7 @@ winreg = "0.55"
 winfsp.workspace = true
 
 [package.metadata.cargo-machete]
+# cargo-machete does not model the Windows-only build.rs usage here.
 ignored = ["winfsp"]
 
 [dev-dependencies]

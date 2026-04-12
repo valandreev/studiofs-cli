@@ -3531,8 +3531,6 @@ dependencies = [
  "bytes",
  "dotenvy",
  "opendal",
- "postcard",
- "serde",
  "studiofs-meta",
  "thiserror",
  "tokio",
