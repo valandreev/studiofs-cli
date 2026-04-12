@@ -426,7 +426,7 @@ impl RedbMetaEngine {
             if visible.len() <= 1 {
                 visible
             } else {
-                merge_covered_ranges(&visible)
+                merge_covered_ranges(visible)
             }
         }
 
@@ -437,8 +437,7 @@ impl RedbMetaEngine {
                 .collect()
         }
 
-        fn merge_covered_ranges(ranges: &[SliceRange]) -> Vec<SliceRange> {
-            let mut merged = ranges.to_vec();
+        fn merge_covered_ranges(mut merged: Vec<SliceRange>) -> Vec<SliceRange> {
             merged.sort_unstable_by_key(|range| (range.start, range.end));
 
             let mut out: Vec<SliceRange> = Vec::new();
@@ -469,6 +468,16 @@ impl RedbMetaEngine {
         } else {
             None
         };
+        let use_overlay_base_precedence = redb::TableHandle::name(&table_def)
+            == redb::TableHandle::name(&REGULAR_FILE_OVERLAY_TABLE);
+        let base_table = if use_overlay_base_precedence {
+            Some(
+                txn.open_table(REGULAR_FILE_BASE_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?,
+            )
+        } else {
+            None
+        };
 
         for (chunk_id, new_slices) in chunk_slices {
             let key = encode_regular_file_chunk_key(ino, *chunk_id);
@@ -480,11 +489,17 @@ impl RedbMetaEngine {
             } else {
                 RegularFileChunkState::default()
             };
-            let lower_precedence = if redb::TableHandle::name(&table_def)
-                == redb::TableHandle::name(&REGULAR_FILE_OVERLAY_TABLE)
-            {
-                txn.open_table(REGULAR_FILE_BASE_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?
+            let tombstone_queries = merge_covered_ranges(
+                new_slices
+                    .iter()
+                    .filter(|slice| slice.block.is_none())
+                    .map(|slice| slice.range)
+                    .collect::<Vec<_>>(),
+            );
+            let lower_precedence = if tombstone_queries.is_empty() {
+                None
+            } else if let Some(base_table) = base_table.as_ref() {
+                base_table
                     .get(key.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?
                     .map(|value| decode::<RegularFileChunkState>(value.value()))
@@ -492,13 +507,6 @@ impl RedbMetaEngine {
             } else {
                 None
             };
-            let tombstone_queries = merge_covered_ranges(
-                &new_slices
-                    .iter()
-                    .filter(|slice| slice.block.is_none())
-                    .map(|slice| slice.range)
-                    .collect::<Vec<_>>(),
-            );
             let visible_ranges = visible_data_ranges(
                 *chunk_id,
                 &state,
@@ -519,7 +527,7 @@ impl RedbMetaEngine {
             }
 
             let covered_ranges = merge_covered_ranges(
-                &effective_new_slices
+                effective_new_slices
                     .iter()
                     .map(|slice| slice.range)
                     .collect::<Vec<_>>(),

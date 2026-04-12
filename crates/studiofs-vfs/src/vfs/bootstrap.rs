@@ -262,6 +262,7 @@ impl VfsBootstrapResources {
         cache_dir: &str,
         plan: &VfsBootstrapPlan,
         config: &VfsConfigValidated,
+        cache_runtime: Option<PreparedCacheV3Runtime>,
     ) -> VfsResult<Self> {
         let ingress_wal = IngressWal::new(
             PathBuf::from(cache_dir).join("ingress_spill"),
@@ -273,12 +274,20 @@ impl VfsBootstrapResources {
         let initial_checkpoint_meta =
             init_ingress_recovery_state(plan.cache_safety_mode, &ingress_wal)?;
 
-        let opened_local_backend = open_local_block_backend_with_budget_and_sync_mode(
-            Path::new(cache_dir),
-            &plan.format_info.uuid,
-            plan.local_backend_budget_bytes,
-            plan.payload_sync_mode,
-        )
+        let opened_local_backend = match cache_runtime {
+            Some(cache_runtime) => open_prepared_local_block_backend_with_budget_and_sync_mode(
+                cache_runtime,
+                &plan.format_info.uuid,
+                plan.local_backend_budget_bytes,
+                plan.payload_sync_mode,
+            ),
+            None => open_local_block_backend_with_budget_and_sync_mode(
+                Path::new(cache_dir),
+                &plan.format_info.uuid,
+                plan.local_backend_budget_bytes,
+                plan.payload_sync_mode,
+            ),
+        }
         .map_err(|source| map_open_local_block_backend_error(cache_dir, source))?;
         if opened_local_backend.detection.has_cache_v3_contract() {
             info!(
@@ -368,6 +377,7 @@ impl VfsBootstrap {
         cache_size: u64,
         block_cache_l1_limit: u64,
         config: VfsConfigValidated,
+        cache_runtime: Option<PreparedCacheV3Runtime>,
     ) -> VfsResult<Self>
     where
         M: ?Sized + VfsMeta + 'static,
@@ -380,7 +390,8 @@ impl VfsBootstrap {
             &config,
         )?;
         plan.log_summary(cache_size, &config);
-        let resources = VfsBootstrapResources::open(data_config, cache_dir, &plan, &config)?;
+        let resources =
+            VfsBootstrapResources::open(data_config, cache_dir, &plan, &config, cache_runtime)?;
         Ok(Self {
             meta,
             config,
@@ -508,6 +519,31 @@ impl StudioVfs {
             cache_size,
             block_cache_l1_limit,
             config,
+            None,
+        )
+    }
+
+    /// Create a new VFS instance reusing a prepared Cache 3.0 runtime.
+    pub fn new_with_prepared_cache_runtime<M>(
+        meta: Arc<M>,
+        data_config: &DataStoreConfig,
+        cache_dir: &str,
+        cache_size: u64,
+        block_cache_l1_limit: u64,
+        config: VfsConfigValidated,
+        cache_runtime: PreparedCacheV3Runtime,
+    ) -> VfsResult<Arc<Self>>
+    where
+        M: ?Sized + VfsMeta + 'static,
+    {
+        Self::new_impl(
+            meta,
+            data_config,
+            cache_dir,
+            cache_size,
+            block_cache_l1_limit,
+            config,
+            Some(cache_runtime),
         )
     }
 
@@ -518,6 +554,7 @@ impl StudioVfs {
         cache_size: u64,
         block_cache_l1_limit: u64,
         config: VfsConfigValidated,
+        cache_runtime: Option<PreparedCacheV3Runtime>,
     ) -> VfsResult<Arc<Self>>
     where
         M: ?Sized + VfsMeta + 'static,
@@ -529,6 +566,7 @@ impl StudioVfs {
             cache_size,
             block_cache_l1_limit,
             config,
+            cache_runtime,
         )?
         .finish()
     }

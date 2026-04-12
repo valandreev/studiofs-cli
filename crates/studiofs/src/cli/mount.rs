@@ -187,6 +187,20 @@ where
         .filter(|v| *v > 0)
 }
 
+fn parse_env_u32_with<F>(read_var: &F, key: &str) -> Option<u32>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    parse_env_usize_with(read_var, key).and_then(|value| u32::try_from(value).ok())
+}
+
+fn parse_env_u8_with<F>(read_var: &F, key: &str) -> Option<u8>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
+    parse_env_usize_with(read_var, key).and_then(|value| u8::try_from(value).ok())
+}
+
 fn parse_env_u64_with<F>(read_var: &F, key: &str) -> Option<u64>
 where
     F: Fn(&str) -> Result<String, std::env::VarError>,
@@ -534,17 +548,17 @@ where
     );
     set_u64!("STUDIOFS_READ_BUFFER_MB", read_buffer_mb);
     set_usize!("STUDIOFS_PREFETCH_CONCURRENCY", prefetch_concurrency);
-    if let Some(value) = parse_env_usize_with(&read_var, "STUDIOFS_READAHEAD_WIDTH") {
-        config.readahead_width = Some(value as u32);
+    if let Some(value) = parse_env_u32_with(&read_var, "STUDIOFS_READAHEAD_WIDTH") {
+        config.readahead_width = Some(value);
     }
-    if let Some(value) = parse_env_usize_with(&read_var, "STUDIOFS_READAHEAD_MIN_PREFETCH") {
-        config.readahead_min_prefetch = Some(value as u32);
+    if let Some(value) = parse_env_u32_with(&read_var, "STUDIOFS_READAHEAD_MIN_PREFETCH") {
+        config.readahead_min_prefetch = Some(value);
     }
-    if let Some(value) = parse_env_usize_with(&read_var, "STUDIOFS_READAHEAD_SEQ_STEP") {
-        config.readahead_seq_step = Some(value as u8);
+    if let Some(value) = parse_env_u8_with(&read_var, "STUDIOFS_READAHEAD_SEQ_STEP") {
+        config.readahead_seq_step = Some(value);
     }
-    if let Some(value) = parse_env_usize_with(&read_var, "STUDIOFS_READAHEAD_RANDOM_PENALTY") {
-        config.readahead_random_penalty = Some(value as u8);
+    if let Some(value) = parse_env_u8_with(&read_var, "STUDIOFS_READAHEAD_RANDOM_PENALTY") {
+        config.readahead_random_penalty = Some(value);
     }
     set_usize!("STUDIOFS_DIR_PREFETCH_MAX_BATCH", dir_prefetch_max_batch);
     set_usize!(
@@ -615,8 +629,8 @@ where
         "STUDIOFS_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS",
         upload_fg_read_latency_sticky_windows
     );
-    if let Some(value) = parse_env_usize_with(&read_var, "STUDIOFS_UPLOAD_MAX_ATTEMPTS") {
-        config.upload_max_attempts = Some(value as u32);
+    if let Some(value) = parse_env_u32_with(&read_var, "STUDIOFS_UPLOAD_MAX_ATTEMPTS") {
+        config.upload_max_attempts = Some(value);
     }
     set_u64!(
         "STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS",
@@ -641,11 +655,11 @@ where
         "STUDIOFS_FETCH_DECREASE_COOLDOWN_SECS",
         fetch_decrease_cooldown_secs
     );
-    if let Some(value) = parse_env_usize_with(&read_var, "STUDIOFS_FETCH_MAX_ATTEMPTS") {
-        config.fetch_max_attempts = Some(value as u32);
+    if let Some(value) = parse_env_u32_with(&read_var, "STUDIOFS_FETCH_MAX_ATTEMPTS") {
+        config.fetch_max_attempts = Some(value);
     }
-    if let Some(value) = parse_env_usize_with(&read_var, "STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS") {
-        config.prefetch_fetch_max_attempts = Some(value as u32);
+    if let Some(value) = parse_env_u32_with(&read_var, "STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS") {
+        config.prefetch_fetch_max_attempts = Some(value);
     }
     set_u64!(
         "STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS",
@@ -1056,7 +1070,7 @@ fn prepare_mount_runtime(
         cache_size: _cache_size,
         cache_size_bytes,
         cache_mode,
-        cache_runtime: _cache_runtime,
+        cache_runtime,
         vfs_config,
         principal_to_export: _principal_to_export,
         run_in_foreground,
@@ -1071,13 +1085,14 @@ fn prepare_mount_runtime(
     );
     let _guard = rt.enter();
 
-    let vfs = StudioVfs::new(
+    let vfs = StudioVfs::new_with_prepared_cache_runtime(
         meta,
         &data_config,
         &cache_path_str,
         cache_size_bytes,
         block_cache_l1_limit,
         vfs_config,
+        cache_runtime,
     )
     .map_err(|e| anyhow::anyhow!("failed to init vfs: {e}"))?;
     vfs.start()
@@ -1483,6 +1498,43 @@ mod tests {
             format!("{:?}", resolved.vfs_config.cache_safety_mode).to_ascii_lowercase(),
             "durable"
         );
+    }
+
+    #[test]
+    fn resolve_mount_startup_context_ignores_env_values_that_overflow_target_fields() {
+        let raw = VfsConfigRaw {
+            readahead_width: Some(8),
+            readahead_min_prefetch: Some(4),
+            readahead_seq_step: Some(2),
+            readahead_random_penalty: Some(3),
+            upload_max_attempts: Some(7),
+            fetch_max_attempts: Some(9),
+            prefetch_fetch_max_attempts: Some(11),
+            ..VfsConfigRaw::default()
+        };
+
+        let resolved = build_mount_config_with(raw, None, |cfg| {
+            overlay_vfs_env_with(cfg, |key| match key {
+                "STUDIOFS_READAHEAD_WIDTH"
+                | "STUDIOFS_READAHEAD_MIN_PREFETCH"
+                | "STUDIOFS_UPLOAD_MAX_ATTEMPTS"
+                | "STUDIOFS_FETCH_MAX_ATTEMPTS"
+                | "STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS" => Ok("5000000000".to_string()),
+                "STUDIOFS_READAHEAD_SEQ_STEP" | "STUDIOFS_READAHEAD_RANDOM_PENALTY" => {
+                    Ok("500".to_string())
+                }
+                _ => Err(std::env::VarError::NotPresent),
+            })
+        })
+        .expect("config should validate");
+
+        assert_eq!(resolved.vfs_config.readahead_width, 8);
+        assert_eq!(resolved.vfs_config.readahead_min_prefetch, 4);
+        assert_eq!(resolved.vfs_config.readahead_seq_step, 2);
+        assert_eq!(resolved.vfs_config.readahead_random_penalty, 3);
+        assert_eq!(resolved.vfs_config.upload_max_attempts, 7);
+        assert_eq!(resolved.vfs_config.fetch_max_attempts, 9);
+        assert_eq!(resolved.vfs_config.prefetch_fetch_max_attempts, 11);
     }
 
     #[test]
