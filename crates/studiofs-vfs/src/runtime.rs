@@ -642,11 +642,13 @@ mod tests {
         let info = FormatInfo::new(
             "runtime-meta".to_string(),
             "runtime-meta-uuid".to_string(),
-            "http://127.0.0.1:9000".to_string(),
-            "runtime-meta-bucket".to_string(),
-            "runtime-access-key".to_string(),
-            "runtime-secret-key".to_string(),
-            String::new(),
+            studiofs_meta::FormatInfoDataStore {
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                bucket: "runtime-meta-bucket".to_string(),
+                access_key: "runtime-access-key".to_string(),
+                secret_key: "runtime-secret-key".to_string(),
+                region: String::new(),
+            },
             16,
         );
         engine.set_format_info(&info).expect("set format info");
@@ -668,11 +670,13 @@ mod tests {
         let info = FormatInfo::new(
             "runtime-meta".to_string(),
             "runtime-meta-uuid".to_string(),
-            "http://127.0.0.1:9000".to_string(),
-            "runtime-meta-bucket".to_string(),
-            "runtime-access-key".to_string(),
-            "runtime-secret-key".to_string(),
-            String::new(),
+            studiofs_meta::FormatInfoDataStore {
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                bucket: "runtime-meta-bucket".to_string(),
+                access_key: "runtime-access-key".to_string(),
+                secret_key: "runtime-secret-key".to_string(),
+                region: String::new(),
+            },
             16,
         );
         engine.set_format_info(&info).expect("set format info");

@@ -27,18 +27,25 @@ fn fmt_datetime_now() -> (String, String) {
     (datetime, date)
 }
 
-#[allow(clippy::too_many_arguments)]
+struct SignedRequest<'a> {
+    method: &'a str,
+    endpoint_url: &'a str,
+    path: &'a str,
+    query: &'a str,
+    body: &'a [u8],
+}
+
+struct SigningCredentials<'a> {
+    access_key: &'a str,
+    secret_key: &'a str,
+    region: &'a str,
+}
+
 fn build_signed_headers(
-    method: &str,
-    endpoint_url: &str,
-    path: &str,
-    query: &str,
-    body: &[u8],
-    access_key: &str,
-    secret_key: &str,
-    region: &str,
+    request: SignedRequest<'_>,
+    credentials: SigningCredentials<'_>,
 ) -> anyhow::Result<Vec<(String, String)>> {
-    let url = reqwest::Url::parse(endpoint_url).context("invalid endpoint URL")?;
+    let url = reqwest::Url::parse(request.endpoint_url).context("invalid endpoint URL")?;
     let host = url
         .host_str()
         .ok_or_else(|| anyhow!("endpoint URL has no host"))?;
@@ -48,10 +55,10 @@ fn build_signed_headers(
     };
 
     let (datetime, date) = fmt_datetime_now();
-    let payload_hash = sha256_hex_str(body);
-    let content_len = body.len().to_string();
+    let payload_hash = sha256_hex_str(request.body);
+    let content_len = request.body.len().to_string();
 
-    let content_type = if body.is_empty() {
+    let content_type = if request.body.is_empty() {
         "".to_string()
     } else {
         "application/xml".to_string()
@@ -78,21 +85,26 @@ fn build_signed_headers(
         .join(";");
 
     let canonical_request = format!(
-        "{method}\n{path}\n{query}\n{canonical_headers_str}\n{signed_headers_str}\n{payload_hash}"
+        "{}\n{}\n{}\n{canonical_headers_str}\n{signed_headers_str}\n{payload_hash}",
+        request.method, request.path, request.query
     );
     let cr_hash = sha256_hex_str(canonical_request.as_bytes());
 
-    let scope = format!("{date}/{region}/s3/aws4_request");
+    let scope = format!("{date}/{}/s3/aws4_request", credentials.region);
     let string_to_sign = format!("AWS4-HMAC-SHA256\n{datetime}\n{scope}\n{cr_hash}");
 
-    let k_date = hmac_sha256_raw(format!("AWS4{secret_key}").as_bytes(), date.as_bytes())?;
-    let k_region = hmac_sha256_raw(&k_date, region.as_bytes())?;
+    let k_date = hmac_sha256_raw(
+        format!("AWS4{}", credentials.secret_key).as_bytes(),
+        date.as_bytes(),
+    )?;
+    let k_region = hmac_sha256_raw(&k_date, credentials.region.as_bytes())?;
     let k_service = hmac_sha256_raw(&k_region, b"s3")?;
     let k_signing = hmac_sha256_raw(&k_service, b"aws4_request")?;
     let signature = hex::encode(hmac_sha256_raw(&k_signing, string_to_sign.as_bytes())?);
 
     let auth = format!(
-        "AWS4-HMAC-SHA256 Credential={access_key}/{scope},SignedHeaders={signed_headers_str},Signature={signature}"
+        "AWS4-HMAC-SHA256 Credential={}/{scope},SignedHeaders={signed_headers_str},Signature={signature}",
+        credentials.access_key
     );
 
     let mut out = vec![
@@ -128,7 +140,18 @@ pub(crate) async fn bucket_create(
     };
 
     let headers = build_signed_headers(
-        "PUT", endpoint, &path, "", &body, access_key, secret_key, region,
+        SignedRequest {
+            method: "PUT",
+            endpoint_url: endpoint,
+            path: &path,
+            query: "",
+            body: &body,
+        },
+        SigningCredentials {
+            access_key,
+            secret_key,
+            region,
+        },
     )?;
 
     let url = format!("{endpoint}{path}");

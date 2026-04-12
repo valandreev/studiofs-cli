@@ -29,7 +29,6 @@ pub(super) struct StartupState {
 }
 
 impl StartupState {
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         prefetch_rx: tokio::sync::mpsc::UnboundedReceiver<PrefetchWorkItem>,
         upload_rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>,

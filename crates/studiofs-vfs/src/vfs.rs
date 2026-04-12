@@ -890,26 +890,37 @@ impl AttrReadCache {
 }
 
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn ingress_checkpoint_due_with_policy(
+#[derive(Clone, Copy)]
+struct IngressCheckpointState {
     pending_bytes: u64,
     pending_mutations: u64,
+    active_segment_lag: u64,
+    live_segment_count: u64,
+    timer_fired: bool,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct IngressCheckpointPolicy {
     min_append_bytes: u64,
     min_mutations: u64,
-    active_segment_lag: u64,
     max_segment_lag: u64,
-    live_segment_count: u64,
     max_live_segments: u64,
-    timer_fired: bool,
+}
+
+#[cfg(test)]
+fn ingress_checkpoint_due_with_policy(
+    state: IngressCheckpointState,
+    policy: IngressCheckpointPolicy,
 ) -> bool {
-    if pending_bytes == 0 && pending_mutations == 0 {
+    if state.pending_bytes == 0 && state.pending_mutations == 0 {
         return false;
     }
-    timer_fired
-        || pending_bytes >= min_append_bytes
-        || pending_mutations >= min_mutations
-        || active_segment_lag >= max_segment_lag
-        || live_segment_count >= max_live_segments
+    state.timer_fired
+        || state.pending_bytes >= policy.min_append_bytes
+        || state.pending_mutations >= policy.min_mutations
+        || state.active_segment_lag >= policy.max_segment_lag
+        || state.live_segment_count >= policy.max_live_segments
 }
 
 fn run_sync_with_timeout<T: Send + 'static>(

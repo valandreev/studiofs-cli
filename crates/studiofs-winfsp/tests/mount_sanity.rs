@@ -384,16 +384,15 @@ where
     let event_for_thread = event_name.clone();
     let mp_for_thread = mount_point.clone();
     let handle = std::thread::spawn(move || {
-        mount_and_serve(
+        mount_and_serve(studiofs_winfsp::WinfspMountRequest {
             vfs,
             rt,
-            &mp_for_thread,
-            "StudioFS-Test",
-            true,
-            false,
-            Some(&event_for_thread),
-            None,
-        )
+            mount_point: mp_for_thread,
+            volume_label: "StudioFS-Test".to_string(),
+            read_only: false,
+            shutdown_event_name: Some(event_for_thread),
+            profiling: None,
+        })
         .map_err(|e| e.to_string())
     });
 

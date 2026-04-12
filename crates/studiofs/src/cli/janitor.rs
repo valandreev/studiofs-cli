@@ -2,7 +2,7 @@
 
 use clap::Args;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use opendal::services::S3;
@@ -31,6 +31,37 @@ struct JanitorCycleContext<'a> {
     dry_run: bool,
     skip_newer_than_secs: u64,
     max_deletes: u64,
+}
+
+struct JanitorOptions {
+    dry_run: bool,
+    loop_mode: bool,
+    interval_minutes: u64,
+    skip_newer_minutes: u64,
+    max_deletes: u64,
+}
+
+struct JanitorRunRequest {
+    name: String,
+    meta_dir: PathBuf,
+    options: JanitorOptions,
+}
+
+impl JanitorRunRequest {
+    fn from_args(args: JanitorArgs) -> anyhow::Result<Self> {
+        let meta_dir = super::utils::get_default_meta_dir(&args.name)?;
+        Ok(Self {
+            name: args.name,
+            meta_dir,
+            options: JanitorOptions {
+                dry_run: args.dry_run,
+                loop_mode: args.r#loop,
+                interval_minutes: args.interval_minutes,
+                skip_newer_minutes: args.skip_newer_minutes,
+                max_deletes: args.max_deletes,
+            },
+        })
+    }
 }
 
 #[derive(Debug, Args)]
@@ -68,16 +99,7 @@ pub(crate) struct JanitorArgs {
 
 impl JanitorArgs {
     pub(crate) fn dispatch(self) -> anyhow::Result<()> {
-        let meta_dir = super::utils::get_default_meta_dir(&self.name)?;
-        run(
-            &self.name,
-            &meta_dir,
-            self.dry_run,
-            self.r#loop,
-            self.interval_minutes,
-            self.skip_newer_minutes,
-            self.max_deletes,
-        )
+        run(JanitorRunRequest::from_args(self)?)
     }
 }
 
@@ -199,16 +221,19 @@ async fn run_one_cycle(ctx: JanitorCycleContext<'_>) -> anyhow::Result<JanitorSt
     Ok(stats)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    name: &str,
-    meta_dir: &Path,
-    dry_run: bool,
-    loop_mode: bool,
-    interval_minutes: u64,
-    skip_newer_minutes: u64,
-    max_deletes: u64,
-) -> anyhow::Result<()> {
+fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
+    let JanitorRunRequest {
+        name,
+        meta_dir,
+        options,
+    } = request;
+    let JanitorOptions {
+        dry_run,
+        loop_mode,
+        interval_minutes,
+        skip_newer_minutes,
+        max_deletes,
+    } = options;
     let db_path = meta_dir.join(format!("{name}.db"));
     if !db_path.exists() {
         return Err(anyhow::anyhow!(

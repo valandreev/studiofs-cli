@@ -39,7 +39,7 @@ pub async fn execute_sync_meta<M: ?Sized + Send + Sync + 'static, T: Send + 'sta
 #[cfg(test)]
 mod tests {
     use super::{SyncMetaEngineAdapter, execute_sync_meta};
-    use crate::{FormatInfo, MetaError, MetaFormat, RedbMetaEngine};
+    use crate::{FormatInfo, FormatInfoDataStore, MetaError, MetaFormat, RedbMetaEngine};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -50,11 +50,13 @@ mod tests {
         let info = FormatInfo::new(
             "async-meta".to_string(),
             "async-meta-uuid".to_string(),
-            "http://127.0.0.1:9000".to_string(),
-            "async-meta-bucket".to_string(),
-            "async-meta-access".to_string(),
-            "async-meta-secret".to_string(),
-            String::new(),
+            FormatInfoDataStore {
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                bucket: "async-meta-bucket".to_string(),
+                access_key: "async-meta-access".to_string(),
+                secret_key: "async-meta-secret".to_string(),
+                region: String::new(),
+            },
             16,
         );
         engine.set_format_info(&info).expect("set format info");

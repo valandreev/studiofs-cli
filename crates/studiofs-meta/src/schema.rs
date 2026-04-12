@@ -983,6 +983,27 @@ pub struct FormatInfo {
     pub block_size: u32,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct FormatInfoDataStore {
+    pub endpoint: String,
+    pub bucket: String,
+    pub access_key: String,
+    pub secret_key: String,
+    pub region: String,
+}
+
+impl std::fmt::Debug for FormatInfoDataStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FormatInfoDataStore")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("access_key", &"***")
+            .field("secret_key", &"***")
+            .field("region", &self.region)
+            .finish()
+    }
+}
+
 /// Metadata backend selection.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -1034,26 +1055,21 @@ fn default_metadata_prefix() -> String {
 
 impl FormatInfo {
     /// Create a new format info with the specified parameters.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,
         uuid: String,
-        endpoint: String,
-        bucket: String,
-        access_key: String,
-        secret_key: String,
-        region: String,
+        data_store: FormatInfoDataStore,
         block_size_mb: u32,
     ) -> Self {
         Self {
             format_version: CURRENT_FORMAT_VERSION,
             name,
             uuid,
-            endpoint,
-            bucket,
-            access_key,
-            secret_key,
-            region,
+            endpoint: data_store.endpoint,
+            bucket: data_store.bucket,
+            access_key: data_store.access_key,
+            secret_key: data_store.secret_key,
+            region: data_store.region,
             data_prefix: String::new(),
             metadata: MetadataConfig::default(),
             block_size: block_size_mb * 1024 * 1024, // Convert MB to bytes

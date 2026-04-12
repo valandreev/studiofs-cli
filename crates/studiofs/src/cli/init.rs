@@ -7,7 +7,7 @@
 
 use clap::Args;
 use std::io::Write;
-use std::path::Path;
+use std::path::PathBuf;
 use studiofs_data::{DataStore, DataStoreConfig};
 use studiofs_meta::{
     CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, FormatInfo, MetaFormat, MetadataBackend,
@@ -27,6 +27,64 @@ fn get_current_ids() -> (u32, u32) {
 #[cfg(windows)]
 fn get_current_ids() -> (u32, u32) {
     (0, 0)
+}
+
+struct DeprecatedMetadataArgs {
+    endpoint: Option<String>,
+    bucket: Option<String>,
+    access_key: Option<String>,
+    secret_key: Option<String>,
+    region: Option<String>,
+}
+
+impl DeprecatedMetadataArgs {
+    fn is_present(&self) -> bool {
+        self.endpoint.is_some()
+            || self.bucket.is_some()
+            || self.access_key.is_some()
+            || self.secret_key.is_some()
+            || self.region.is_some()
+    }
+}
+
+struct InitRunRequest {
+    name: String,
+    object_store: DataStoreConfig,
+    postgres_dsn: String,
+    deprecated_metadata: DeprecatedMetadataArgs,
+    meta_dir: PathBuf,
+}
+
+impl InitRunRequest {
+    fn from_args(args: InitArgs) -> anyhow::Result<Self> {
+        let meta_dir = super::utils::get_default_meta_dir(&args.name)?;
+        let region = if args.region.is_empty() {
+            "us-east-1".to_string()
+        } else {
+            args.region
+        };
+
+        Ok(Self {
+            name: args.name,
+            object_store: DataStoreConfig {
+                endpoint: args.endpoint,
+                bucket: args.bucket,
+                access_key: args.access_key,
+                secret_key: args.secret_key,
+                region,
+                volume_name: String::new(),
+            },
+            postgres_dsn: args.meta,
+            deprecated_metadata: DeprecatedMetadataArgs {
+                endpoint: args.metadata_endpoint,
+                bucket: args.metadata_bucket,
+                access_key: args.metadata_access_key,
+                secret_key: args.metadata_secret_key,
+                region: args.metadata_region,
+            },
+            meta_dir,
+        })
+    }
 }
 
 #[derive(Debug, Args)]
@@ -116,22 +174,7 @@ pub(crate) struct InitArgs {
 
 impl InitArgs {
     pub(crate) fn dispatch(self) -> anyhow::Result<()> {
-        let meta_dir = super::utils::get_default_meta_dir(&self.name)?;
-        run(
-            &self.name,
-            &self.endpoint,
-            &self.bucket,
-            &self.access_key,
-            &self.secret_key,
-            &self.region,
-            &self.meta,
-            self.metadata_endpoint.as_deref(),
-            self.metadata_bucket.as_deref(),
-            self.metadata_access_key.as_deref(),
-            self.metadata_secret_key.as_deref(),
-            self.metadata_region.as_deref(),
-            &meta_dir,
-        )
+        run(InitRunRequest::from_args(self)?)
     }
 }
 
@@ -142,27 +185,14 @@ impl InitArgs {
 fn ensure_bucket_accessible(
     rt: &tokio::runtime::Runtime,
     label: &str,
-    endpoint: &str,
-    bucket: &str,
-    access_key: &str,
-    secret_key: &str,
-    region: &str,
+    cfg: &DataStoreConfig,
 ) -> anyhow::Result<bool> {
     use super::test::bucket_create;
 
-    let cfg = DataStoreConfig {
-        endpoint: endpoint.to_string(),
-        bucket: bucket.to_string(),
-        access_key: access_key.to_string(),
-        secret_key: secret_key.to_string(),
-        region: region.to_string(),
-        volume_name: String::new(),
-    };
-
-    print!("  Checking {label} bucket '{bucket}'... ");
+    print!("  Checking {label} bucket '{}'... ", cfg.bucket);
     std::io::stdout().flush().ok();
 
-    let ds = DataStore::new(&cfg)
+    let ds = DataStore::new(cfg)
         .map_err(|e| anyhow::anyhow!("cannot build {label} store client: {e}"))?;
 
     match rt.block_on(ds.check()) {
@@ -175,15 +205,20 @@ fn ensure_bucket_accessible(
         }
     }
 
-    print!("  Creating {label} bucket '{bucket}'... ");
+    print!("  Creating {label} bucket '{}'... ", cfg.bucket);
     std::io::stdout().flush().ok();
     rt.block_on(bucket_create(
-        endpoint, bucket, access_key, secret_key, region,
+        &cfg.endpoint,
+        &cfg.bucket,
+        &cfg.access_key,
+        &cfg.secret_key,
+        &cfg.region,
     ))
     .map_err(|e| {
         anyhow::anyhow!(
-            "bucket '{bucket}' not accessible and could not be created: {e}\n\
-                 Tip: check credentials and ensure s3:CreateBucket permission is granted."
+            "bucket '{}' not accessible and could not be created: {e}\n\
+                 Tip: check credentials and ensure s3:CreateBucket permission is granted.",
+            cfg.bucket
         )
     })?;
     println!("OK (created)");
@@ -414,39 +449,21 @@ fn seed_pg_metadata_state(
 
 // ── Main run function ─────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
-pub fn run(
-    name: &str,
-    data_endpoint: &str,
-    data_bucket: &str,
-    data_access_key: &str,
-    data_secret_key: &str,
-    data_region: &str,
-    postgres_dsn: &str,
-    metadata_endpoint: Option<&str>,
-    metadata_bucket: Option<&str>,
-    metadata_access_key: Option<&str>,
-    metadata_secret_key: Option<&str>,
-    metadata_region: Option<&str>,
-    meta_dir: &Path,
-) -> anyhow::Result<()> {
+fn run(request: InitRunRequest) -> anyhow::Result<()> {
+    let InitRunRequest {
+        name,
+        object_store,
+        postgres_dsn,
+        deprecated_metadata,
+        meta_dir,
+    } = request;
     let rt = tokio::runtime::Runtime::new()?;
     let postgres_dsn = rt
-        .block_on(async { ensure_studiofs_database(postgres_dsn).await })
+        .block_on(async { ensure_studiofs_database(&postgres_dsn).await })
         .map_err(|e| anyhow::anyhow!(e.to_string()))?
         .metadata_dsn;
-    let eff_data_region = if data_region.is_empty() {
-        "us-east-1"
-    } else {
-        data_region
-    };
 
-    if metadata_endpoint.is_some()
-        || metadata_bucket.is_some()
-        || metadata_access_key.is_some()
-        || metadata_secret_key.is_some()
-        || metadata_region.is_some()
-    {
+    if deprecated_metadata.is_present() {
         return Err(anyhow::anyhow!(
             "--metadata-* options are removed. StudioFS now uses PostgreSQL metadata backend only."
         ));
@@ -455,15 +472,7 @@ pub fn run(
     // ── 1. Ensure buckets are accessible (create if missing) ─────────────────
     println!("Checking storage backends...");
     println!();
-    ensure_bucket_accessible(
-        &rt,
-        "data",
-        data_endpoint,
-        data_bucket,
-        data_access_key,
-        data_secret_key,
-        eff_data_region,
-    )?;
+    ensure_bucket_accessible(&rt, "data", &object_store)?;
     println!();
 
     println!("Checking PostgreSQL backend...");
@@ -471,7 +480,7 @@ pub fn run(
     println!("✓ PostgreSQL connectivity check passed.");
     println!();
 
-    if volume_name_exists(&rt, &postgres_dsn, name)? {
+    if volume_name_exists(&rt, &postgres_dsn, &name)? {
         return Err(anyhow::anyhow!(
             "Volume '{name}' already exists in PostgreSQL metadata. Run `studiofs destroy {name}` first, then retry `studiofs init {name}`."
         ));
@@ -489,14 +498,14 @@ pub fn run(
 
         if input == "y" || input == "yes" {
             info!("clearing existing metadata directory {:?}", meta_dir);
-            std::fs::remove_dir_all(meta_dir)?;
+            std::fs::remove_dir_all(&meta_dir)?;
         } else {
             return Err(anyhow::anyhow!("Initialization cancelled."));
         }
     }
 
     // ── 3. Create metadata directory and initialize local DB ─────────────────
-    std::fs::create_dir_all(meta_dir)?;
+    std::fs::create_dir_all(&meta_dir)?;
 
     let db_path = meta_dir.join(format!("{name}.db"));
     info!("initializing volume {name:?} at {db_path:?}");
@@ -508,18 +517,18 @@ pub fn run(
 
     let data_prefix = format!("{name}/objects/");
     let postgres_volume_id =
-        init_pg_schema_and_volume(&rt, &postgres_dsn, name, &volume_uuid, actual_block_size)?;
+        init_pg_schema_and_volume(&rt, &postgres_dsn, &name, &volume_uuid, actual_block_size)?;
 
     // ── 6. Persist format info ────────────────────────────────────────────────
     let format_info = FormatInfo {
         format_version: CURRENT_FORMAT_VERSION,
-        name: name.to_string(),
+        name: name.clone(),
         uuid: volume_uuid,
-        endpoint: data_endpoint.to_string(),
-        bucket: data_bucket.to_string(),
-        access_key: data_access_key.to_string(),
-        secret_key: data_secret_key.to_string(),
-        region: data_region.to_string(),
+        endpoint: object_store.endpoint.clone(),
+        bucket: object_store.bucket.clone(),
+        access_key: object_store.access_key.clone(),
+        secret_key: object_store.secret_key.clone(),
+        region: object_store.region.clone(),
         data_prefix,
         metadata: MetadataConfig {
             backend: MetadataBackend::Postgres,
@@ -550,8 +559,8 @@ pub fn run(
         actual_block_size,
         actual_block_size / (1024 * 1024)
     );
-    println!("  Data endpoint: {}", data_endpoint);
-    println!("  Data bucket:   {}", data_bucket);
+    println!("  Data endpoint: {}", object_store.endpoint);
+    println!("  Data bucket:   {}", object_store.bucket);
     if let Some(pg) = &format_info.metadata.postgres {
         println!("  Metadata backend: Postgres");
         println!("  Postgres: {}", pg.url);

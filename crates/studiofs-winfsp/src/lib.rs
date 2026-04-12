@@ -49,6 +49,16 @@ enum MountOptionError {
     InvalidDriveMountPoint(String),
 }
 
+pub struct WinfspMountRequest {
+    pub vfs: std::sync::Arc<studiofs_vfs::StudioVfs>,
+    pub rt: std::sync::Arc<tokio::runtime::Runtime>,
+    pub mount_point: String,
+    pub volume_label: String,
+    pub read_only: bool,
+    pub shutdown_event_name: Option<String>,
+    pub profiling: Option<Box<dyn FnMut()>>,
+}
+
 fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOptionError> {
     let trimmed = volume_label.trim();
     if trimmed.is_empty() {
@@ -324,21 +334,21 @@ fn shutdown_upload_drain_timeout() -> std::time::Duration {
 ///
 /// `shutdown_event_name` — if `Some`, a Win32 named event is created so that an
 /// external process (`studiofs umount`) can signal a graceful shutdown.
-#[allow(clippy::too_many_arguments)]
-pub fn mount_and_serve(
-    vfs: std::sync::Arc<studiofs_vfs::StudioVfs>,
-    rt: std::sync::Arc<tokio::runtime::Runtime>,
-    mount_point: &str,
-    volume_label: &str,
-    _foreground: bool,
-    read_only: bool,
-    shutdown_event_name: Option<&str>,
-    profiling: Option<Box<dyn FnMut()>>,
-) -> std::io::Result<()> {
+pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
     use studiofs_meta::Ino;
     use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 
-    let options = parse_mount_options(volume_label).map_err(invalid_input_io_error)?;
+    let WinfspMountRequest {
+        vfs,
+        rt,
+        mount_point,
+        volume_label,
+        read_only,
+        shutdown_event_name,
+        profiling,
+    } = request;
+
+    let options = parse_mount_options(&volume_label).map_err(invalid_input_io_error)?;
     let mut volume_params = VolumeParams::new();
     volume_params.case_sensitive_search(true);
     volume_params.case_preserved_names(true);
@@ -354,7 +364,7 @@ pub fn mount_and_serve(
     // WinFSP layer tuning:
     // - per-timeout environment overrides are supported for runtime tuning.
     // - local-drive geometry is explicit for tooling that queries sector info.
-    apply_volume_params(&mut volume_params, &options, mount_point)
+    apply_volume_params(&mut volume_params, &options, &mount_point)
         .map_err(invalid_input_io_error)?;
 
     // Keep a reference for shutdown() (vfs is moved into context).
@@ -377,7 +387,7 @@ pub fn mount_and_serve(
     )
     .map_err(|err| std::io::Error::other(format!("failed to initialize WinFSP host: {err}")))?;
     let mount_manager_path =
-        mount_manager_mount_point(mount_point).map_err(invalid_input_io_error)?;
+        mount_manager_mount_point(&mount_point).map_err(invalid_input_io_error)?;
     host.mount(&mount_manager_path).map_err(|err| {
         std::io::Error::other(format!(
             "failed to mount '{mount_point}' via WinFSP Mount Manager path '{mount_manager_path}': {err}. \
