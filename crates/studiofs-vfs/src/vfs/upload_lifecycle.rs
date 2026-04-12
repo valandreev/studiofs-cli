@@ -14,10 +14,10 @@ use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
 };
-use studiofs_meta::MetaEngine;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::VfsMeta;
 use crate::runtime::{TimeoutOrCancel, run_meta, run_with_timeout_or_cancel};
 use crate::utils::now_unix_millis;
 
@@ -407,8 +407,8 @@ impl StudioVfs {
         // Also check metadata: after a remount, `deleted_inodes` is empty but
         // the inode may have been deleted in a prior session.  If the inode no
         // longer exists in the metadata store, the upload is stale.
-        let meta = self.meta_async.clone();
-        let attr = run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
+        let meta = self.meta.clone();
+        let attr = run_meta(meta.clone(), move |engine: Arc<dyn VfsMeta>| {
             engine.get_attr(op.ino)
         })
         .await
@@ -468,7 +468,7 @@ impl StudioVfs {
             );
             return Ok(());
         }
-        if let Ok(Some(current)) = run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
+        if let Ok(Some(current)) = run_meta(meta.clone(), move |engine: Arc<dyn VfsMeta>| {
             engine.get_file_block(op.ino, block_index)
         })
         .await
@@ -843,7 +843,7 @@ impl StudioVfs {
             );
         }
 
-        let current = run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
+        let current = run_meta(meta.clone(), move |engine: Arc<dyn VfsMeta>| {
             engine.get_file_block(op.ino, block_index)
         })
         .await?;
@@ -855,7 +855,7 @@ impl StudioVfs {
         match current {
             Some(ref block_ref)
                 if block_ref.object_id == op.object_id
-                    && run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
+                    && run_meta(meta.clone(), move |engine: Arc<dyn VfsMeta>| {
                         engine
                             .get_attr(op.ino)
                             .map(|attr| attr.content_epoch == op.content_epoch)
@@ -872,7 +872,7 @@ impl StudioVfs {
                 );
             }
             _ => {
-                run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
+                run_meta(meta.clone(), move |engine: Arc<dyn VfsMeta>| {
                     engine.add_pending_deletion(op.object_id, timestamp)
                 })
                 .await?;
@@ -892,7 +892,7 @@ impl StudioVfs {
             }
         }
 
-        if let Ok(attr) = run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
+        if let Ok(attr) = run_meta(meta.clone(), move |engine: Arc<dyn VfsMeta>| {
             engine.get_attr(op.ino)
         })
         .await
@@ -920,11 +920,10 @@ impl StudioVfs {
                 object_id = op.object_id,
                 "post-upload eviction: block removed (inode deleted)"
             );
-        } else if let Ok(Some(current)) =
-            run_meta(meta.clone(), move |engine: Arc<dyn MetaEngine>| {
-                engine.get_file_block(op.ino, block_index)
-            })
-            .await
+        } else if let Ok(Some(current)) = run_meta(meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            engine.get_file_block(op.ino, block_index)
+        })
+        .await
             && current.object_id != op.object_id
         {
             self.block_cache

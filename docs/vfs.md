@@ -18,7 +18,7 @@ Holds all runtime state:
 
 | Field | Type | Purpose |
 |-------|------|---------|
-| `meta_async` | `Arc<dyn AsyncMetaEngine>` | Async metadata boundary used by `run_meta(...)` |
+| `meta` | `MetaExecutor<dyn VfsMeta>` | Typed metadata executor used by `run_meta(...)` |
 | `data_write` | `Arc<DataStore>` | S3 write/delete path (write-optimized profile) |
 | `block_store` | `Arc<dyn LocalBlockBackend>` | Cache 3.0 local data store for committed extents and upload rereads |
 | `local_block_backend()` | `&dyn LocalBlockBackend` | Backend boundary used by new data-path code; hides backend-specific internals |
@@ -38,8 +38,10 @@ Callers must invoke `start()` exactly once after successful construction and bef
 Repeated `start()` calls are safe and treated as idempotent once the instance is already running.
 
 Notes:
-- Sync metadata access still exists via `sync_meta()` for explicitly blocking-safe contexts.
-- Async call paths should use `run_meta(self.meta_async.clone(), ...)` so blocking work stays behind one boundary.
+- Sync metadata access still exists via `sync_meta()` for explicitly blocking-safe contexts and now returns the narrowed `Arc<dyn VfsMeta>` runtime surface.
+- Async call paths should use `run_meta(self.meta.clone(), ...)` so blocking work stays behind one typed executor boundary.
+- Hot-path helper functions can still express narrower needs (`AclMeta`, `ReadPathMeta`, `UploadMeta`, `JanitorMeta`) while sharing the same executor-owned runtime principal.
+- `StudioVfs::new(...)` remains compatible with `Arc<dyn MetaEngine>`, but the constructor narrows that aggregate to the VFS runtime bundle immediately after bootstrap.
 
 ### ACL Enforcement
 

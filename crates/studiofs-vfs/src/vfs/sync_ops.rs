@@ -4,9 +4,9 @@ use super::{
     OpenFile, OpenFlags, ReleaseFhOutcome, StickyErrorPolicy, StudioVfs, VfsResult,
 };
 use std::sync::Arc;
-use studiofs_meta::MetaEngine;
 use tracing::debug;
 
+use crate::VfsMeta;
 use crate::runtime::run_meta;
 
 impl StudioVfs {
@@ -182,11 +182,8 @@ impl StudioVfs {
             }
         };
         let persisted_dirty_attrs = if let Some(attr) = dirty_attr {
-            let meta = self.meta_async.clone();
-            run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-                engine.set_attr(&attr)
-            })
-            .await?;
+            let meta = self.meta.clone();
+            run_meta(meta, move |engine: Arc<dyn VfsMeta>| engine.set_attr(&attr)).await?;
             self.state.namespace.attr_read_cache.lock().remove(ino);
             true
         } else {

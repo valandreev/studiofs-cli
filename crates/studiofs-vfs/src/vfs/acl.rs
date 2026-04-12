@@ -1,7 +1,8 @@
 use super::{
-    AccessLevel, AtomicU64, Ino, MetaEngine, MetaError, MetaResult, Mutex, Ordering, ROOT_INO,
-    StudioVfs, VfsError, VfsResult, run_meta,
+    AccessLevel, AtomicU64, Ino, MetaError, MetaResult, Mutex, Ordering, ROOT_INO, StudioVfs,
+    VfsError, VfsResult, run_meta,
 };
+use crate::AclMeta;
 use std::collections::HashMap;
 
 pub(super) struct AclState {
@@ -59,8 +60,8 @@ impl StudioVfs {
         Ok(None)
     }
 
-    fn acl_rule_for_inode_meta(
-        meta: &dyn MetaEngine,
+    fn acl_rule_for_inode_meta<M: ?Sized + AclMeta>(
+        meta: &M,
         principal: &str,
         ino: Ino,
     ) -> MetaResult<Option<AccessLevel>> {
@@ -140,8 +141,8 @@ impl StudioVfs {
         Ok(access_level)
     }
 
-    fn effective_access_level_meta(
-        meta: &dyn MetaEngine,
+    fn effective_access_level_meta<M: ?Sized + AclMeta>(
+        meta: &M,
         principal: &str,
         ino: Ino,
     ) -> MetaResult<AccessLevel> {
@@ -199,7 +200,7 @@ impl StudioVfs {
             }));
         }
 
-        let meta = self.meta_async.clone();
+        let meta = self.meta.clone();
         let principal = self.acl_principal.clone();
         let actual = run_meta(meta, move |engine| {
             Self::effective_access_level_meta(engine.as_ref(), &principal, ino)

@@ -2,17 +2,18 @@ use super::{
     ATTR_CACHE_TTL, AccessLevel, ForegroundReadScope, PrefetchBatch, PrefetchReadContext,
     ReadRequestContext, StudioVfs, VfsError, VfsResult,
 };
+use crate::VfsMeta;
 use crate::runtime::run_meta;
 use bytes::Bytes;
 use futures::future::join_all;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
+use studiofs_meta::MetaError;
 use studiofs_meta::schema::{
     DEFAULT_CHUNK_SIZE, ResolvedSliceSource, ResolvedSliceSpan, chunk_start_offset,
 };
 use studiofs_meta::types::{BlockRef, Ino, InodeAttr, block_index_from_offset};
-use studiofs_meta::{MetaEngine, MetaError};
 use tracing::{debug, error, warn};
 
 #[derive(Debug, Clone, Copy)]
@@ -224,8 +225,8 @@ impl<'a> ReadPipeline<'a> {
                     |block| ReadPlanSource::Base { block },
                 );
             } else {
-                let meta = vfs.meta_async.clone();
-                let resolved = run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+                let meta = vfs.meta.clone();
+                let resolved = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
                     engine.lookup_regular_file_slices(ino, offset, length)
                 })
                 .await?;
@@ -660,8 +661,8 @@ impl<'a> ReadMetadataResolver<'a> {
             return Ok(Vec::new());
         }
         let ino = self.ino;
-        let meta = self.vfs.meta_async.clone();
-        match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+        let meta = self.vfs.meta.clone();
+        match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
             engine.lookup_regular_file_slices(ino, offset, read_len)
         })
         .await
@@ -674,11 +675,8 @@ impl<'a> ReadMetadataResolver<'a> {
 
     async fn load_attr_from_meta(&self) -> VfsResult<InodeAttr> {
         let ino = self.ino;
-        let meta = self.vfs.meta_async.clone();
-        let attr = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
-            engine.get_attr(ino)
-        })
-        .await
+        let meta = self.vfs.meta.clone();
+        let attr = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| engine.get_attr(ino)).await
         {
             Ok(attr) => attr,
             Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
@@ -706,8 +704,8 @@ impl<'a> ReadMetadataResolver<'a> {
         buffer_len: u64,
     ) -> VfsResult<ReadMetadata> {
         let ino = self.ino;
-        let meta = self.vfs.meta_async.clone();
-        let (attr, resolved_slices) = match run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+        let meta = self.vfs.meta.clone();
+        let (attr, resolved_slices) = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
             let attr = engine.get_attr(ino)?;
             let read_len = attr.size.saturating_sub(offset).min(buffer_len);
             let resolved_slices = if read_len == 0 {

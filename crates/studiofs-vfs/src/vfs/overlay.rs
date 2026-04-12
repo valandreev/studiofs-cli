@@ -3,9 +3,9 @@ use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use studiofs_cache::upload_queue::PendingUpload;
-use studiofs_meta::MetaEngine;
 use studiofs_meta::types::Ino;
 
+use crate::VfsMeta;
 use crate::runtime::run_meta;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -90,8 +90,8 @@ impl StudioVfs {
         if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino) {
             return Ok(attr.content_epoch);
         }
-        let meta = self.meta_async.clone();
-        run_meta(meta, move |engine: Arc<dyn MetaEngine>| {
+        let meta = self.meta.clone();
+        run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
             Ok(engine.get_attr(ino)?.content_epoch)
         })
         .await
