@@ -56,15 +56,6 @@ impl MetaFormat for RedbMetaEngine {
             table
                 .insert("format", json.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            drop(table);
-            if info.format_version == CURRENT_FORMAT_VERSION {
-                let mut migration_status = txn
-                    .open_table(MIGRATION_STATUS_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                migration_status
-                    .insert(REGULAR_FILE_MIGRATION_NAME, MIGRATION_STATUS_COMPLETED)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-            }
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;

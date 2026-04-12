@@ -15,12 +15,6 @@ impl RedbMetaEngine {
         snapshot.inodes = projected_inodes;
 
         let mut referenced_objects = BTreeMap::new();
-        for (_, bytes) in &snapshot.committed_file_blocks {
-            let block: BlockRef = decode(bytes)?;
-            referenced_objects
-                .entry(block.object_id)
-                .or_insert(block.length as u64);
-        }
         for (_, bytes) in &snapshot.regular_file_base {
             let regular: RegularFileBaseState = decode(bytes)?;
             for chunk in regular.chunks.values() {
@@ -37,7 +31,6 @@ impl RedbMetaEngine {
             .values()
             .fold(0_u64, |acc, len| acc.saturating_add(*len));
 
-        snapshot.file_blocks = snapshot.committed_file_blocks.clone();
         snapshot.regular_file_overlay = snapshot.regular_file_base.clone();
         snapshot.event_log.clear();
         snapshot
@@ -336,16 +329,6 @@ impl RedbMetaEngine {
                         let _ = xattrs.remove(key.as_slice());
                     }
 
-                    let mut blocks = txn
-                        .open_table(FILE_BLOCKS_TABLE)
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    let _ = Self::remove_all_file_blocks_in_txn(&mut blocks, *ino)?;
-                    drop(blocks);
-                    let mut committed = txn
-                        .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    let _ = Self::remove_all_committed_blocks_in_txn(&mut committed, *ino)?;
-                    drop(committed);
                     Self::clear_regular_file_graph_in_txn(&txn, *ino)?;
                 }
                 crate::events::MetaEvent::AddEntry { .. } => {}
@@ -366,13 +349,9 @@ impl RedbMetaEngine {
                 }
 
                 crate::events::MetaEvent::RemoveFileBlock { ino, block_index } => {
-                    let key = encode_file_block_key(*ino, *block_index);
-                    let mut committed = txn
-                        .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    let _ = committed.remove(key.as_slice());
-                    let committed_manifest = Self::committed_manifest_in_txn(&committed, *ino)?;
-                    drop(committed);
+                    let mut committed_manifest =
+                        Self::base_manifest_from_graph_rows_in_txn(&txn, *ino)?;
+                    committed_manifest.retain(|(current_index, _)| current_index != block_index);
                     let block_size = Self::regular_file_graph_block_size_from_write_txn(&txn)?;
                     Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
                         &txn,
@@ -385,16 +364,6 @@ impl RedbMetaEngine {
                     )?;
                 }
                 crate::events::MetaEvent::RemoveFileBlocks { ino } => {
-                    let mut blocks = txn
-                        .open_table(FILE_BLOCKS_TABLE)
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    let _ = Self::remove_all_file_blocks_in_txn(&mut blocks, *ino)?;
-                    drop(blocks);
-                    let mut committed = txn
-                        .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    let _ = Self::remove_all_committed_blocks_in_txn(&mut committed, *ino)?;
-                    drop(committed);
                     Self::clear_regular_file_graph_in_txn(&txn, *ino)?;
                 }
                 crate::events::MetaEvent::SetFileBlocksBatch { .. } => {}
@@ -403,17 +372,17 @@ impl RedbMetaEngine {
                     block_index,
                     block,
                 } => {
-                    let key = encode_file_block_key(*ino, *block_index);
-                    let data = encode(block)?;
-
-                    let mut committed = txn
-                        .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    committed
-                        .insert(key.as_slice(), data.as_slice())
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    let committed_manifest = Self::committed_manifest_in_txn(&committed, *ino)?;
-                    drop(committed);
+                    let mut committed_manifest =
+                        Self::base_manifest_from_graph_rows_in_txn(&txn, *ino)?;
+                    if let Some((_, existing_block)) = committed_manifest
+                        .iter_mut()
+                        .find(|(current_index, _)| current_index == block_index)
+                    {
+                        *existing_block = block.clone();
+                    } else {
+                        committed_manifest.push((*block_index, block.clone()));
+                        committed_manifest.sort_by_key(|(current_index, _)| *current_index);
+                    }
                     let block_size = Self::regular_file_graph_block_size_from_write_txn(&txn)?;
                     Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
                         &txn,
@@ -426,18 +395,6 @@ impl RedbMetaEngine {
                     )?;
                 }
                 crate::events::MetaEvent::PublishFileManifest { ino, blocks } => {
-                    let mut committed = txn
-                        .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    let _ = Self::remove_all_committed_blocks_in_txn(&mut committed, *ino)?;
-                    for (block_index, block) in blocks {
-                        let key = encode_file_block_key(*ino, *block_index);
-                        let data = encode(block)?;
-                        committed
-                            .insert(key.as_slice(), data.as_slice())
-                            .map_err(|e| MetaError::Storage(e.to_string()))?;
-                    }
-                    drop(committed);
                     let block_size = Self::regular_file_graph_block_size_from_write_txn(&txn)?;
                     Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
                         &txn,

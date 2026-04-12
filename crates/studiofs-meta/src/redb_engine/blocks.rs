@@ -1,52 +1,12 @@
-use super::chunk_state::LegacyChunkSyncFlags;
 use super::*;
 
 impl MetaBlocks for RedbMetaEngine {
     fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
-        let block_size = self.regular_file_graph_block_size()?;
-        let block_start = (block_index as u64).saturating_mul(block_size as u64);
-        let spans = self.lookup_regular_file_slices(ino, block_start, block_size as u64)?;
-        if !spans.is_empty() {
-            return Self::synthesize_block_ref_from_resolved_spans(
-                ino,
-                spans.as_slice(),
-                block_index,
-                block_size,
-            );
-        }
-
-        let key = encode_file_block_key(ino, block_index);
-        let txn = self
-            .db
-            .begin_read()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(FILE_BLOCKS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        match table
-            .get(key.as_slice())
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            Some(entry) => {
-                let block: BlockRef = decode(entry.value())?;
-                Ok(Some(block))
-            }
-            None => {
-                let committed = txn
-                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                match committed
-                    .get(key.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?
-                {
-                    Some(entry) => {
-                        let block: BlockRef = decode(entry.value())?;
-                        Ok(Some(block))
-                    }
-                    None => Ok(None),
-                }
-            }
-        }
+        Ok(self
+            .get_file_blocks(ino)?
+            .into_iter()
+            .find(|(current_index, _)| *current_index == block_index)
+            .map(|(_, block)| block))
     }
 
     fn set_file_block(
@@ -55,37 +15,29 @@ impl MetaBlocks for RedbMetaEngine {
         block_index: u32,
         block: &BlockRef,
     ) -> MetaResult<Option<BlockRef>> {
-        let key = encode_file_block_key(ino, block_index);
-        let data = encode(block)?;
         let block_size = self.regular_file_graph_block_size()?;
-        let chunk_id = chunk_id_from_offset(
-            (block_index as u64).saturating_mul(block_size as u64),
-            DEFAULT_CHUNK_SIZE,
-        );
         let txn = self
             .db
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let old_block;
         {
-            let mut table = txn
-                .open_table(FILE_BLOCKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut manifest = std::collections::BTreeMap::new();
+            for (current_index, current_block) in Self::current_manifest_in_txn(&txn, ino)? {
+                manifest.insert(current_index, current_block);
+            }
+            old_block = manifest.insert(block_index, block.clone());
+            let updated_manifest: Vec<_> = manifest.into_iter().collect();
 
-            // Get old block if exists (for GC)
-            old_block = if let Some(entry) = table
-                .get(key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                let old: BlockRef = decode(entry.value())?;
-                Some(old)
-            } else {
-                None
-            };
-
-            table
-                .insert(key.as_slice(), data.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+                &txn,
+                REGULAR_FILE_OVERLAY_TABLE,
+                ino,
+                updated_manifest.as_slice(),
+                block_size,
+                false,
+                true,
+            )?;
 
             let mut inodes = txn
                 .open_table(INODES_TABLE)
@@ -96,11 +48,8 @@ impl MetaBlocks for RedbMetaEngine {
                 .map(|g| g.value().to_vec());
             if let Some(attr_bytes) = attr_bytes {
                 let mut attr: InodeAttr = decode(&attr_bytes)?;
-                let committed = txn
-                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
                 let has_committed_manifest =
-                    !Self::committed_manifest_in_txn(&committed, ino)?.is_empty();
+                    !Self::base_manifest_from_graph_rows_in_txn(&txn, ino)?.is_empty();
                 Self::transition_upload_state_for_local_mutation(&mut attr, has_committed_manifest);
                 let encoded = encode(&attr)?;
                 inodes
@@ -108,19 +57,6 @@ impl MetaBlocks for RedbMetaEngine {
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
         }
-
-        Self::sync_regular_file_chunk_from_legacy_table_in_txn(
-            &txn,
-            FILE_BLOCKS_TABLE,
-            REGULAR_FILE_OVERLAY_TABLE,
-            ino,
-            chunk_id,
-            block_size,
-            LegacyChunkSyncFlags {
-                published: false,
-                track_pending_compaction: true,
-            },
-        )?;
 
         Self::append_event_in_txn(
             &txn,
@@ -136,84 +72,28 @@ impl MetaBlocks for RedbMetaEngine {
     }
 
     fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
-        let block_size = self.regular_file_graph_block_size()?;
-        let file_size = match self.get_attr(ino) {
-            Ok(attr) => Some(attr.size),
-            Err(MetaError::InodeNotFound(_)) => None,
-            Err(err) => return Err(err),
-        };
-
-        if let Some(file_size) = file_size
-            && file_size > 0
-        {
-            let spans = self.lookup_regular_file_slices(ino, 0, file_size)?;
-            if !spans.is_empty() {
-                let block_count =
-                    ((file_size.saturating_sub(1)) / block_size as u64).saturating_add(1);
-                let mut synthesized = Vec::new();
-                for idx in 0..block_count {
-                    let block_index = idx as u32;
-                    if let Some(block) = Self::synthesize_block_ref_from_resolved_spans(
-                        ino,
-                        spans.as_slice(),
-                        block_index,
-                        block_size,
-                    )? {
-                        synthesized.push((block_index, block));
-                    }
-                }
-                return Ok(synthesized);
-            }
-        }
-
-        let prefix = file_block_prefix(ino);
         let txn = self
             .db
             .begin_read()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(FILE_BLOCKS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let committed = txn
-            .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        let mut blocks = std::collections::BTreeMap::new();
-
-        let iter = table
-            .range(prefix.as_slice()..)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-        for result in iter {
-            let (key, value) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let key_bytes = key.value();
-            if !key_bytes.starts_with(prefix.as_slice()) {
-                break;
-            }
-            let (decoded_ino, block_index) = decode_file_block_key(key_bytes);
-            if decoded_ino != ino {
-                break;
-            }
-            let block: BlockRef = decode(value.value())?;
-            blocks.insert(block_index, block);
-        }
-
-        let iter = committed
-            .range(prefix.as_slice()..)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        for result in iter {
-            let (key, value) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let key_bytes = key.value();
-            if !key_bytes.starts_with(prefix.as_slice()) {
-                break;
-            }
-            let (decoded_ino, block_index) = decode_file_block_key(key_bytes);
-            if decoded_ino != ino {
-                break;
-            }
-            blocks.entry(block_index).or_insert(decode(value.value())?);
-        }
-        Ok(blocks.into_iter().collect())
+        let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_read_txn(
+            &txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            ino,
+        )?;
+        let base_chunks = Self::regular_file_chunk_states_for_inode_in_read_txn(
+            &txn,
+            REGULAR_FILE_BASE_TABLE,
+            ino,
+        )?;
+        let block_size = self.regular_file_graph_block_size()?;
+        let graph_manifest = Self::manifest_from_chunk_states(
+            ino,
+            Some(&overlay_chunks),
+            Some(&base_chunks),
+            block_size,
+        )?;
+        Ok(graph_manifest)
     }
 
     fn lookup_regular_file_chunk_slices(
@@ -308,54 +188,31 @@ impl MetaBlocks for RedbMetaEngine {
     }
 
     fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>> {
-        let prefix = file_block_prefix(ino);
         let txn = self
             .db
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let removed_ids;
         {
-            let current_manifest = Self::current_or_legacy_manifest_in_txn(&txn, ino)?;
-            let mut table = txn
-                .open_table(FILE_BLOCKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut committed = txn
-                .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            // Collect keys to remove
-            let blocks_to_remove: Vec<(Vec<u8>, u64)> = {
-                let iter = table
-                    .range(prefix.as_slice()..)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                let mut rows = Vec::new();
-                for row in iter {
-                    let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-                    if !key.value().starts_with(prefix.as_slice()) {
-                        break;
-                    }
-                    let block: BlockRef = decode(value.value())?;
-                    rows.push((key.value().to_vec(), block.object_id));
-                }
-                rows
-            };
-
             let mut removed_object_ids = std::collections::BTreeSet::new();
-            for (_, block) in &current_manifest {
-                removed_object_ids.insert(block.object_id);
-            }
-            for (_, object_id) in &blocks_to_remove {
-                removed_object_ids.insert(*object_id);
+            let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
+                &txn,
+                REGULAR_FILE_OVERLAY_TABLE,
+                ino,
+            )?;
+            let base_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
+                &txn,
+                REGULAR_FILE_BASE_TABLE,
+                ino,
+            )?;
+            for chunk_state in overlay_chunks.values().chain(base_chunks.values()) {
+                for slice in chunk_state.slices.values() {
+                    if let Some(block) = &slice.block {
+                        removed_object_ids.insert(block.object_id);
+                    }
+                }
             }
             removed_ids = removed_object_ids.into_iter().collect();
-
-            // Remove all entries
-            for (key, _) in &blocks_to_remove {
-                table
-                    .remove(key.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-            }
-            let _ = Self::remove_all_committed_blocks_in_txn(&mut committed, ino)?;
 
             Self::clear_regular_file_graph_in_txn(&txn, ino)?;
 
@@ -367,12 +224,7 @@ impl MetaBlocks for RedbMetaEngine {
     }
 
     fn remove_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<u64>> {
-        let key = encode_file_block_key(ino, block_index);
         let block_size = self.regular_file_graph_block_size()?;
-        let chunk_id = chunk_id_from_offset(
-            (block_index as u64).saturating_mul(block_size as u64),
-            DEFAULT_CHUNK_SIZE,
-        );
         let txn = self
             .db
             .begin_write()
@@ -380,38 +232,46 @@ impl MetaBlocks for RedbMetaEngine {
         let removed_id;
         let mut updated_attr: Option<InodeAttr> = None;
         {
-            let mut table = txn
-                .open_table(FILE_BLOCKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut committed = txn
-                .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let current_entry = table
-                .get(key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .map(|value| decode::<BlockRef>(value.value()))
-                .transpose()?;
-            let committed_entry = committed
-                .get(key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .map(|value| decode::<BlockRef>(value.value()))
-                .transpose()?;
-            removed_id = current_entry
-                .as_ref()
-                .or(committed_entry.as_ref())
-                .map(|block| block.object_id);
+            let mut current_manifest = std::collections::BTreeMap::new();
+            for (current_index, current_block) in Self::current_manifest_in_txn(&txn, ino)? {
+                current_manifest.insert(current_index, current_block);
+            }
+            let mut base_manifest = std::collections::BTreeMap::new();
+            for (current_index, current_block) in
+                Self::base_manifest_from_graph_rows_in_txn(&txn, ino)?
+            {
+                base_manifest.insert(current_index, current_block);
+            }
 
-            let _ = table
-                .remove(key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let _ = committed
-                .remove(key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            removed_id = current_manifest
+                .remove(&block_index)
+                .map(|block| block.object_id);
+            base_manifest.remove(&block_index);
+
+            let updated_current: Vec<_> = current_manifest.into_iter().collect();
+            Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+                &txn,
+                REGULAR_FILE_OVERLAY_TABLE,
+                ino,
+                updated_current.as_slice(),
+                block_size,
+                false,
+                true,
+            )?;
+            let updated_base: Vec<_> = base_manifest.into_iter().collect();
+            Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+                &txn,
+                REGULAR_FILE_BASE_TABLE,
+                ino,
+                updated_base.as_slice(),
+                block_size,
+                true,
+                false,
+            )?;
 
             if removed_id.is_some() {
-                let current_committed = Self::committed_manifest_in_txn(&committed, ino)?;
                 let new_committed_size =
-                    Self::legacy_committed_size_from_blocks(current_committed.as_slice());
+                    Self::legacy_committed_size_from_blocks(updated_base.as_slice());
                 let mut inodes = txn
                     .open_table(INODES_TABLE)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -422,7 +282,7 @@ impl MetaBlocks for RedbMetaEngine {
                 if let Some(attr_bytes) = attr_bytes {
                     let mut attr: InodeAttr = decode(&attr_bytes)?;
                     attr.committed_size = new_committed_size;
-                    let has_committed_manifest = new_committed_size > 0;
+                    let has_committed_manifest = !updated_base.is_empty();
                     Self::transition_upload_state_for_local_mutation(
                         &mut attr,
                         has_committed_manifest,
@@ -445,33 +305,6 @@ impl MetaBlocks for RedbMetaEngine {
                     )?;
                 }
             }
-        }
-
-        if removed_id.is_some() {
-            Self::sync_regular_file_chunk_from_legacy_table_in_txn(
-                &txn,
-                FILE_BLOCKS_TABLE,
-                REGULAR_FILE_OVERLAY_TABLE,
-                ino,
-                chunk_id,
-                block_size,
-                LegacyChunkSyncFlags {
-                    published: false,
-                    track_pending_compaction: true,
-                },
-            )?;
-            Self::sync_regular_file_chunk_from_legacy_table_in_txn(
-                &txn,
-                COMMITTED_FILE_BLOCKS_TABLE,
-                REGULAR_FILE_BASE_TABLE,
-                ino,
-                chunk_id,
-                block_size,
-                LegacyChunkSyncFlags {
-                    published: true,
-                    track_pending_compaction: false,
-                },
-            )?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -591,13 +424,7 @@ impl MetaBlocks for RedbMetaEngine {
         expected_epoch: u64,
         block: &BlockRef,
     ) -> MetaResult<bool> {
-        let key = encode_file_block_key(ino, block_index);
-        let data = encode(block)?;
         let block_size = self.regular_file_graph_block_size()?;
-        let chunk_id = chunk_id_from_offset(
-            (block_index as u64).saturating_mul(block_size as u64),
-            DEFAULT_CHUNK_SIZE,
-        );
         let txn = self
             .db
             .begin_write()
@@ -619,15 +446,10 @@ impl MetaBlocks for RedbMetaEngine {
             }
             drop(inodes);
 
-            let blocks = txn
-                .open_table(FILE_BLOCKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let current = blocks
-                .get(key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .map(|g| decode::<BlockRef>(g.value()))
-                .transpose()?;
-            drop(blocks);
+            let current = Self::current_manifest_in_txn(&txn, ino)?
+                .into_iter()
+                .find(|(current_index, _)| *current_index == block_index)
+                .map(|(_, current_block)| current_block);
             let Some(current) = current else {
                 return Ok(false);
             };
@@ -635,23 +457,25 @@ impl MetaBlocks for RedbMetaEngine {
                 return Ok(false);
             }
 
-            let mut committed = txn
-                .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let old_committed = committed
-                .get(key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .map(|g| decode::<BlockRef>(g.value()))
-                .transpose()?;
-
-            committed
-                .insert(key.as_slice(), data.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            let committed_manifest = Self::committed_manifest_in_txn(&committed, ino)?;
+            let mut committed_manifest = std::collections::BTreeMap::new();
+            for (current_index, current_block) in
+                Self::base_manifest_from_graph_rows_in_txn(&txn, ino)?
+            {
+                committed_manifest.insert(current_index, current_block);
+            }
+            let old_committed = committed_manifest.insert(block_index, block.clone());
+            let committed_manifest: Vec<_> = committed_manifest.into_iter().collect();
+            Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+                &txn,
+                REGULAR_FILE_BASE_TABLE,
+                ino,
+                committed_manifest.as_slice(),
+                block_size,
+                true,
+                false,
+            )?;
             let new_committed_size =
                 Self::legacy_committed_size_from_blocks(committed_manifest.as_slice());
-            drop(committed);
 
             let previous_committed_size = attr.committed_size;
             let previous_committed_epoch = attr.committed_content_epoch;
@@ -715,19 +539,6 @@ impl MetaBlocks for RedbMetaEngine {
             }
         }
 
-        Self::sync_regular_file_chunk_from_legacy_table_in_txn(
-            &txn,
-            COMMITTED_FILE_BLOCKS_TABLE,
-            REGULAR_FILE_BASE_TABLE,
-            ino,
-            chunk_id,
-            block_size,
-            LegacyChunkSyncFlags {
-                published: true,
-                track_pending_compaction: false,
-            },
-        )?;
-
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(true)
@@ -739,6 +550,7 @@ impl MetaBlocks for RedbMetaEngine {
         expected_epoch: u64,
         expected_manifest: &[(u32, BlockRef)],
     ) -> MetaResult<bool> {
+        let block_size = self.regular_file_graph_block_size()?;
         let txn = self
             .db
             .begin_write()
@@ -767,40 +579,47 @@ impl MetaBlocks for RedbMetaEngine {
                 return Ok(false);
             }
 
+            let previous_base_manifest = Self::base_manifest_from_graph_rows_in_txn(&txn, ino)?;
             let publish_regular_graph = Self::has_regular_file_chunk_rows_in_write_txn(
                 &txn,
                 REGULAR_FILE_OVERLAY_TABLE,
                 ino,
             )?;
-            let regular_graph_committed_size = if publish_regular_graph {
-                Some(Self::publish_regular_file_overlay_to_base_in_txn(&txn, ino)?.0)
+            let (regular_graph_committed_size, removed_object_ids) = if publish_regular_graph {
+                let (committed_size, removed_object_ids) =
+                    Self::publish_regular_file_overlay_to_base_in_txn(&txn, ino)?;
+                (Some(committed_size), removed_object_ids)
             } else {
-                None
+                Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+                    &txn,
+                    REGULAR_FILE_BASE_TABLE,
+                    ino,
+                    published_blocks.as_slice(),
+                    block_size,
+                    true,
+                    false,
+                )?;
+                let previous_ids: std::collections::HashSet<_> = previous_base_manifest
+                    .iter()
+                    .map(|(_, block)| block.object_id)
+                    .collect();
+                let next_ids: std::collections::HashSet<_> = published_blocks
+                    .iter()
+                    .map(|(_, block)| block.object_id)
+                    .collect();
+                (
+                    Some(Self::legacy_committed_size_from_blocks(
+                        published_blocks.as_slice(),
+                    )),
+                    previous_ids.difference(&next_ids).copied().collect(),
+                )
             };
-
-            let mut committed = txn
-                .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let old_committed = Self::remove_all_committed_blocks_in_txn(&mut committed, ino)?;
-            let mut surviving = std::collections::HashSet::new();
-            for (block_index, block) in &published_blocks {
-                let key = encode_file_block_key(ino, *block_index);
-                let data = encode(block)?;
-                committed
-                    .insert(key.as_slice(), data.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                surviving.insert(block.object_id);
-            }
-            drop(committed);
 
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            for object_id in old_committed {
-                if surviving.contains(&object_id) {
-                    continue;
-                }
+            for object_id in removed_object_ids {
                 let mut pending_del_table = txn
                     .open_table(PENDING_DELETIONS_TABLE)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1061,13 +880,10 @@ impl RedbMetaEngine {
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let normalized_attr = if let Some(attr) = attr {
-            let committed = txn
-                .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
             let mut normalized = attr.clone();
             if normalized.kind == FileType::RegularFile {
                 let has_committed_manifest =
-                    !Self::committed_manifest_in_txn(&committed, normalized.ino)?.is_empty();
+                    !Self::base_manifest_from_graph_rows_in_txn(&txn, normalized.ino)?.is_empty();
                 Self::transition_upload_state_for_local_mutation(
                     &mut normalized,
                     has_committed_manifest,
@@ -1221,13 +1037,10 @@ impl RedbMetaEngine {
         let mut used_space_delta: i64 = 0;
 
         let normalized_attr = if let Some(attr) = attr {
-            let committed = txn
-                .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
             let mut normalized = attr.clone();
             if normalized.kind == FileType::RegularFile {
                 let has_committed_manifest =
-                    !Self::committed_manifest_in_txn(&committed, normalized.ino)?.is_empty();
+                    !Self::base_manifest_from_graph_rows_in_txn(&txn, normalized.ino)?.is_empty();
                 Self::transition_upload_state_for_local_mutation(
                     &mut normalized,
                     has_committed_manifest,
@@ -1241,33 +1054,25 @@ impl RedbMetaEngine {
         {
             let mut touched_inodes = std::collections::BTreeSet::new();
             if !entries.is_empty() {
-                let mut blocks_table = txn
-                    .open_table(FILE_BLOCKS_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let mut manifests = std::collections::BTreeMap::<
+                    Ino,
+                    std::collections::BTreeMap<u32, BlockRef>,
+                >::new();
 
                 for e in entries {
-                    let key = encode_file_block_key(e.ino, e.block_index);
                     let block_ref = BlockRef {
                         object_id: e.object_id,
                         offset: 0,
                         length: e.length,
                         flags: e.flags,
                     };
-                    let data = encode(&block_ref)?;
-
-                    let old_block = if let Some(entry) = blocks_table
-                        .get(key.as_slice())
-                        .map_err(|e| MetaError::Storage(e.to_string()))?
-                    {
-                        let old: BlockRef = decode(entry.value())?;
-                        Some(old)
-                    } else {
-                        None
-                    };
-
-                    blocks_table
-                        .insert(key.as_slice(), data.as_slice())
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let manifest = manifests.entry(e.ino).or_insert_with(|| {
+                        Self::current_manifest_in_txn(&txn, e.ino)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect()
+                    });
+                    let old_block = manifest.insert(e.block_index, block_ref.clone());
 
                     if let Some(ref old) = old_block {
                         used_space_delta -= old.length as i64;
@@ -1277,12 +1082,25 @@ impl RedbMetaEngine {
                     results.push(BatchFlushResult { old_block });
                     touched_inodes.insert(e.ino);
                 }
+
+                for (&ino, manifest) in &manifests {
+                    let updated_manifest: Vec<_> = manifest
+                        .iter()
+                        .map(|(block_index, block_ref)| (*block_index, block_ref.clone()))
+                        .collect();
+                    Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+                        &txn,
+                        REGULAR_FILE_OVERLAY_TABLE,
+                        ino,
+                        updated_manifest.as_slice(),
+                        block_size,
+                        false,
+                        true,
+                    )?;
+                }
             }
 
             if !touched_inodes.is_empty() {
-                let committed = txn
-                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
                 let mut inodes = txn
                     .open_table(INODES_TABLE)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -1297,7 +1115,7 @@ impl RedbMetaEngine {
                     if let Some(attr_bytes) = attr_bytes {
                         let mut current_attr: InodeAttr = decode(&attr_bytes)?;
                         let has_committed_manifest =
-                            !Self::committed_manifest_in_txn(&committed, ino)?.is_empty();
+                            !Self::base_manifest_from_graph_rows_in_txn(&txn, ino)?.is_empty();
                         Self::transition_upload_state_for_local_mutation(
                             &mut current_attr,
                             has_committed_manifest,
@@ -1352,19 +1170,6 @@ impl RedbMetaEngine {
                     })
                     .collect();
 
-                for &ino in &touched_inodes {
-                    let current_blocks =
-                        Self::get_file_blocks_from_txn_internal(&txn, FILE_BLOCKS_TABLE, ino)?;
-                    Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
-                        &txn,
-                        REGULAR_FILE_OVERLAY_TABLE,
-                        ino,
-                        current_blocks.as_slice(),
-                        block_size,
-                        false,
-                        true,
-                    )?;
-                }
                 Self::append_event_in_txn(
                     &txn,
                     &crate::events::MetaEvent::SetFileBlocksBatch {
