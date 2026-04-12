@@ -74,34 +74,10 @@ impl MetaGc for RedbMetaEngine {
             .db
             .begin_read()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let table = txn
-            .open_table(FILE_BLOCKS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let committed = txn
-            .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
         let snapshots = txn
             .open_table(SNAPSHOTS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let mut refs = HashSet::new();
-        // Stream each table directly into the shared accumulator so we never
-        // build a second temporary set or materialize the chunk graph.
-        for item in table
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (_k, v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let block: BlockRef = decode(v.value())?;
-            refs.insert(block.object_id);
-        }
-        for item in committed
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (_k, v) = item.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let block: BlockRef = decode(v.value())?;
-            refs.insert(block.object_id);
-        }
         Self::regular_file_graph_object_ids_from_table(
             &txn,
             REGULAR_FILE_OVERLAY_TABLE,

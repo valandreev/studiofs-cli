@@ -6,29 +6,6 @@ impl RedbMetaEngine {
     ) -> MetaResult<HashSet<Ino>> {
         let mut overlay = HashSet::new();
 
-        let file_blocks = txn
-            .open_table(FILE_BLOCKS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let committed = txn
-            .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        for row in file_blocks
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let (ino, _block_index) = decode_file_block_key(key.value());
-            let committed_value = committed
-                .get(key.value())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            match committed_value {
-                Some(committed_value) if committed_value.value() == value.value() => {}
-                _ => {
-                    overlay.insert(ino);
-                }
-            }
-        }
-
         let regular_overlay =
             Self::regular_file_chunk_states_from_txn(txn, REGULAR_FILE_OVERLAY_TABLE)?;
         let regular_base = Self::regular_file_chunk_states_from_txn(txn, REGULAR_FILE_BASE_TABLE)?;
@@ -234,11 +211,8 @@ impl MetaInodes for RedbMetaEngine {
         {
             let mut normalized = attr.clone();
             if normalized.kind == FileType::RegularFile {
-                let committed = txn
-                    .open_table(COMMITTED_FILE_BLOCKS_TABLE)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
                 let has_committed_manifest =
-                    !Self::committed_manifest_in_txn(&committed, normalized.ino)?.is_empty();
+                    !Self::base_manifest_from_graph_rows_in_txn(&txn, normalized.ino)?.is_empty();
                 Self::transition_upload_state_for_local_mutation(
                     &mut normalized,
                     has_committed_manifest,
