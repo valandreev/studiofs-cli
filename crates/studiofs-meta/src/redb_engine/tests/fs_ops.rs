@@ -431,4 +431,27 @@ fn test_link_unlink_nlink_tracking() {
     assert!(engine.get_attr(ino).is_err());
 }
 
+#[test]
+fn test_unlink_last_link_cleans_blocks_for_inode_with_0xff_suffix() {
+    let engine = temp_engine();
+    engine.set_counter(counters::NEXT_INODE, 255).unwrap();
+
+    let attr = engine
+        .create_file(ROOT_INO, b"ff-suffix.bin", 0, 0, 0o644)
+        .unwrap();
+    assert_eq!(attr.ino, 255);
+
+    let mut persisted = engine.get_attr(attr.ino).unwrap();
+    persisted.size = 4096;
+    engine.set_attr(&persisted).unwrap();
+    engine
+        .set_file_block(attr.ino, 0, &BlockRef::new_partial(4_255, 4096))
+        .unwrap();
+
+    let removed = engine.unlink(ROOT_INO, b"ff-suffix.bin").unwrap();
+    assert_eq!(removed.nlink, 0);
+    assert!(engine.get_attr(attr.ino).is_err());
+    assert!(engine.get_file_blocks(attr.ino).unwrap().is_empty());
+}
+
 // === xattr Tests ===

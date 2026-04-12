@@ -319,9 +319,7 @@ impl MetaRecovery for RedbMetaEngine {
     }
 
     fn remove_pending_create(&self, ino: Ino) -> MetaResult<()> {
-        self.remove_pending_create_intent(ino)?;
-        self.cleanup_stale_undo_logs()?;
-        Ok(())
+        self.remove_pending_create_intent(ino)
     }
 
     fn list_pending_creates(&self) -> MetaResult<Vec<PendingCreateRecord>> {

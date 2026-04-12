@@ -1,6 +1,14 @@
 use super::*;
 
 impl RedbMetaEngine {
+    fn names_equal_case_insensitive(left: &[u8], right: &[u8], right_lower: &str) -> bool {
+        if left.eq_ignore_ascii_case(right) {
+            return true;
+        }
+
+        String::from_utf8_lossy(left).to_lowercase() == right_lower
+    }
+
     pub(super) fn lookup_in_opened_dentry_table<T>(
         table: &T,
         parent: Ino,
@@ -31,8 +39,7 @@ impl RedbMetaEngine {
             if decoded_parent != parent {
                 break;
             }
-            let stored_name_lower = String::from_utf8_lossy(stored_name).to_lowercase();
-            if stored_name_lower == name_lower {
+            if Self::names_equal_case_insensitive(stored_name, name, &name_lower) {
                 return decode(v.value()).map(Some);
             }
         }
@@ -486,6 +493,59 @@ impl RedbMetaEngine {
             parent,
             &overlay_dentries,
         )
+    }
+
+    pub(super) fn has_entries_merged_in_write_txn(
+        txn: &redb::WriteTransaction,
+        parent: Ino,
+    ) -> MetaResult<bool> {
+        let current = txn
+            .open_table(DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base = txn
+            .open_table(BASE_DENTRIES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let tombstones = txn
+            .open_table(DENTRY_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let prefix = dentry_prefix(parent);
+
+        for row in current
+            .range(prefix.as_ref()..)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            if !key.value().starts_with(prefix.as_ref()) {
+                break;
+            }
+            if tombstones
+                .get(key.value())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .is_none()
+            {
+                return Ok(true);
+            }
+        }
+
+        for row in base
+            .range(prefix.as_ref()..)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            if !key.value().starts_with(prefix.as_ref()) {
+                break;
+            }
+            if tombstones
+                .get(key.value())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .is_some()
+            {
+                continue;
+            }
+            return Ok(true);
+        }
+
+        Ok(false)
     }
 
     pub(super) fn get_bytes_from_table_u64(

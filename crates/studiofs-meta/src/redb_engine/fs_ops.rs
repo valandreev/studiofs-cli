@@ -224,7 +224,9 @@ impl<'a> NamespaceCreateTxn<'a> {
             .txn
             .open_table(INODE_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let _ = inode_tombstones.remove(ino);
+        let _ = inode_tombstones
+            .remove(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -245,7 +247,9 @@ impl<'a> NamespaceCreateTxn<'a> {
             .txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let _ = dentry_tombstones.remove(dentry_key);
+        let _ = dentry_tombstones
+            .remove(dentry_key)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -409,7 +413,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         if entry.kind != FileType::Directory {
             return Err(MetaError::NotADirectory(entry.ino));
         }
-        if !RedbMetaEngine::readdir_merged_in_write_txn(self.txn, entry.ino)?.is_empty() {
+        if RedbMetaEngine::has_entries_merged_in_write_txn(self.txn, entry.ino)? {
             return Err(MetaError::DirNotEmpty(entry.ino));
         }
 
@@ -435,18 +439,26 @@ impl<'a> NamespaceDeleteTxn<'a> {
             .open_table(FILE_BLOCKS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let block_prefix = file_block_prefix(ino);
-        let mut range_end = block_prefix.to_vec();
-        *range_end.last_mut().unwrap() += 1;
 
         let keys_to_remove: Vec<Vec<u8>> = {
             let iter = blocks_table
-                .range(block_prefix.as_slice()..range_end.as_slice())
+                .range(block_prefix.as_slice()..)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            iter.filter_map(|r| r.ok().map(|(k, _)| k.value().to_vec()))
-                .collect()
+            let mut keys = Vec::new();
+            for entry in iter {
+                let (key, _) = entry.map_err(|e| MetaError::Storage(e.to_string()))?;
+                let key_bytes = key.value().to_vec();
+                if !key_bytes.starts_with(block_prefix.as_slice()) {
+                    break;
+                }
+                keys.push(key_bytes);
+            }
+            keys
         };
         for key in keys_to_remove {
-            let _ = blocks_table.remove(key.as_slice());
+            let _ = blocks_table
+                .remove(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
         Ok(())
     }

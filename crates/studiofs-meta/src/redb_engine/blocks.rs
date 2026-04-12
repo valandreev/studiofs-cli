@@ -1,3 +1,4 @@
+use super::chunk_state::LegacyChunkSyncFlags;
 use super::*;
 
 impl MetaBlocks for RedbMetaEngine {
@@ -57,6 +58,10 @@ impl MetaBlocks for RedbMetaEngine {
         let key = encode_file_block_key(ino, block_index);
         let data = encode(block)?;
         let block_size = self.regular_file_graph_block_size()?;
+        let chunk_id = chunk_id_from_offset(
+            (block_index as u64).saturating_mul(block_size as u64),
+            DEFAULT_CHUNK_SIZE,
+        );
         let txn = self
             .db
             .begin_write()
@@ -104,15 +109,17 @@ impl MetaBlocks for RedbMetaEngine {
             }
         }
 
-        let current_blocks = Self::get_file_blocks_from_txn_internal(&txn, FILE_BLOCKS_TABLE, ino)?;
-        Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+        Self::sync_regular_file_chunk_from_legacy_table_in_txn(
             &txn,
+            FILE_BLOCKS_TABLE,
             REGULAR_FILE_OVERLAY_TABLE,
             ino,
-            current_blocks.as_slice(),
+            chunk_id,
             block_size,
-            false,
-            true,
+            LegacyChunkSyncFlags {
+                published: false,
+                track_pending_compaction: true,
+            },
         )?;
 
         Self::append_event_in_txn(
@@ -173,18 +180,16 @@ impl MetaBlocks for RedbMetaEngine {
 
         let mut blocks = std::collections::BTreeMap::new();
 
-        // Scan all keys starting with the inode prefix
-        let mut range_end = prefix.to_vec();
-        // Increment last byte to get exclusive upper bound
-        *range_end.last_mut().unwrap() += 1;
-
         let iter = table
-            .range(prefix.as_slice()..range_end.as_slice())
+            .range(prefix.as_slice()..)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
 
         for result in iter {
             let (key, value) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
             let key_bytes = key.value();
+            if !key_bytes.starts_with(prefix.as_slice()) {
+                break;
+            }
             let (decoded_ino, block_index) = decode_file_block_key(key_bytes);
             if decoded_ino != ino {
                 break;
@@ -194,11 +199,14 @@ impl MetaBlocks for RedbMetaEngine {
         }
 
         let iter = committed
-            .range(prefix.as_slice()..range_end.as_slice())
+            .range(prefix.as_slice()..)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         for result in iter {
             let (key, value) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
             let key_bytes = key.value();
+            if !key_bytes.starts_with(prefix.as_slice()) {
+                break;
+            }
             let (decoded_ino, block_index) = decode_file_block_key(key_bytes);
             if decoded_ino != ino {
                 break;
@@ -316,19 +324,20 @@ impl MetaBlocks for RedbMetaEngine {
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
 
             // Collect keys to remove
-            let mut range_end = prefix.to_vec();
-            *range_end.last_mut().unwrap() += 1;
-
             let blocks_to_remove: Vec<(Vec<u8>, u64)> = {
                 let iter = table
-                    .range(prefix.as_slice()..range_end.as_slice())
+                    .range(prefix.as_slice()..)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
-                iter.filter_map(|r| r.ok())
-                    .filter_map(|(k, v)| {
-                        let block: BlockRef = decode(v.value()).ok()?;
-                        Some((k.value().to_vec(), block.object_id))
-                    })
-                    .collect()
+                let mut rows = Vec::new();
+                for row in iter {
+                    let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                    if !key.value().starts_with(prefix.as_slice()) {
+                        break;
+                    }
+                    let block: BlockRef = decode(value.value())?;
+                    rows.push((key.value().to_vec(), block.object_id));
+                }
+                rows
             };
 
             let mut removed_object_ids = std::collections::BTreeSet::new();
@@ -360,46 +369,49 @@ impl MetaBlocks for RedbMetaEngine {
     fn remove_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<u64>> {
         let key = encode_file_block_key(ino, block_index);
         let block_size = self.regular_file_graph_block_size()?;
+        let chunk_id = chunk_id_from_offset(
+            (block_index as u64).saturating_mul(block_size as u64),
+            DEFAULT_CHUNK_SIZE,
+        );
         let txn = self
             .db
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let removed_id;
         let mut updated_attr: Option<InodeAttr> = None;
-        let mut committed_manifest: Option<Vec<(u32, BlockRef)>> = None;
-        let mut updated_manifest: Option<Vec<(u32, BlockRef)>> = None;
         {
-            let mut current_manifest = Self::current_or_legacy_manifest_in_txn(&txn, ino)?;
             let mut table = txn
                 .open_table(FILE_BLOCKS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             let mut committed = txn
                 .open_table(COMMITTED_FILE_BLOCKS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            removed_id = current_manifest
-                .iter()
-                .find(|(idx, _)| *idx == block_index)
-                .map(|(_, block)| block.object_id);
+            let current_entry = table
+                .get(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .map(|value| decode::<BlockRef>(value.value()))
+                .transpose()?;
+            let committed_entry = committed
+                .get(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .map(|value| decode::<BlockRef>(value.value()))
+                .transpose()?;
+            removed_id = current_entry
+                .as_ref()
+                .or(committed_entry.as_ref())
+                .map(|block| block.object_id);
 
-            let _ = table.remove(key.as_slice());
-            let _ = committed.remove(key.as_slice());
+            let _ = table
+                .remove(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let _ = committed
+                .remove(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
 
             if removed_id.is_some() {
-                current_manifest.retain(|(idx, _)| *idx != block_index);
-                let _ = Self::remove_all_file_blocks_in_txn(&mut table, ino)?;
-                for (idx, block) in &current_manifest {
-                    let row_key = encode_file_block_key(ino, *idx);
-                    let data = encode(block)?;
-                    table
-                        .insert(row_key.as_slice(), data.as_slice())
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
-                }
-                updated_manifest = Some(current_manifest.clone());
-
                 let current_committed = Self::committed_manifest_in_txn(&committed, ino)?;
                 let new_committed_size =
                     Self::legacy_committed_size_from_blocks(current_committed.as_slice());
-                committed_manifest = Some(current_committed);
                 let mut inodes = txn
                     .open_table(INODES_TABLE)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -436,27 +448,30 @@ impl MetaBlocks for RedbMetaEngine {
         }
 
         if removed_id.is_some() {
-            Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+            Self::sync_regular_file_chunk_from_legacy_table_in_txn(
                 &txn,
+                FILE_BLOCKS_TABLE,
                 REGULAR_FILE_OVERLAY_TABLE,
                 ino,
-                updated_manifest.as_deref().unwrap_or(&[]),
+                chunk_id,
                 block_size,
-                false,
-                true,
+                LegacyChunkSyncFlags {
+                    published: false,
+                    track_pending_compaction: true,
+                },
             )?;
-
-            if let Some(committed_manifest) = committed_manifest.as_ref() {
-                Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
-                    &txn,
-                    REGULAR_FILE_BASE_TABLE,
-                    ino,
-                    committed_manifest.as_slice(),
-                    block_size,
-                    true,
-                    false,
-                )?;
-            }
+            Self::sync_regular_file_chunk_from_legacy_table_in_txn(
+                &txn,
+                COMMITTED_FILE_BLOCKS_TABLE,
+                REGULAR_FILE_BASE_TABLE,
+                ino,
+                chunk_id,
+                block_size,
+                LegacyChunkSyncFlags {
+                    published: true,
+                    track_pending_compaction: false,
+                },
+            )?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -579,11 +594,15 @@ impl MetaBlocks for RedbMetaEngine {
         let key = encode_file_block_key(ino, block_index);
         let data = encode(block)?;
         let block_size = self.regular_file_graph_block_size()?;
+        let chunk_id = chunk_id_from_offset(
+            (block_index as u64).saturating_mul(block_size as u64),
+            DEFAULT_CHUNK_SIZE,
+        );
         let txn = self
             .db
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let committed_manifest = {
+        {
             let inodes = txn
                 .open_table(INODES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -694,17 +713,19 @@ impl MetaBlocks for RedbMetaEngine {
                     },
                 )?;
             }
-            committed_manifest
-        };
+        }
 
-        Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+        Self::sync_regular_file_chunk_from_legacy_table_in_txn(
             &txn,
+            COMMITTED_FILE_BLOCKS_TABLE,
             REGULAR_FILE_BASE_TABLE,
             ino,
-            committed_manifest.as_slice(),
+            chunk_id,
             block_size,
-            true,
-            false,
+            LegacyChunkSyncFlags {
+                published: true,
+                track_pending_compaction: false,
+            },
         )?;
 
         txn.commit()
@@ -899,6 +920,7 @@ impl MetaBlocks for RedbMetaEngine {
         if max_chunks == 0 {
             return Ok(0);
         }
+        const COMPACTION_TXN_BATCH_SIZE: usize = 64;
 
         let mut compacted = 0usize;
         let txn = self
@@ -924,11 +946,7 @@ impl MetaBlocks for RedbMetaEngine {
         drop(pending_table);
         drop(txn);
 
-        for (ino, chunk_id) in candidates {
-            if compacted >= max_chunks {
-                break;
-            }
-
+        for batch in candidates.chunks(COMPACTION_TXN_BATCH_SIZE) {
             let txn = self
                 .db
                 .begin_write()
@@ -939,98 +957,92 @@ impl MetaBlocks for RedbMetaEngine {
             let mut pending_table = txn
                 .open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let key = encode_regular_file_chunk_key(ino, chunk_id);
-            let current = overlay_table
-                .get(key.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-                .map(|value| decode::<RegularFileChunkState>(value.value()))
-                .transpose()?;
+            for &(ino, chunk_id) in batch {
+                if compacted >= max_chunks {
+                    break;
+                }
 
-            let Some(current) = current else {
-                let _ = pending_table
-                    .remove(key.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                drop(pending_table);
-                drop(overlay_table);
-                txn.commit()
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                continue;
-            };
-            if !current.fragmentation_metrics().should_compact() {
-                let _ = pending_table
-                    .remove(key.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                drop(pending_table);
-                drop(overlay_table);
-                txn.commit()
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                continue;
-            }
+                let key = encode_regular_file_chunk_key(ino, chunk_id);
+                let current = overlay_table
+                    .get(key.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                    .map(|value| decode::<RegularFileChunkState>(value.value()))
+                    .transpose()?;
 
-            let Some(compacted_chunk) = Self::compact_regular_file_chunk_state(chunk_id, &current)?
-            else {
-                let _ = overlay_table
-                    .remove(key.as_slice())
+                let Some(current) = current else {
+                    let _ = pending_table
+                        .remove(key.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    continue;
+                };
+                if !current.fragmentation_metrics().should_compact() {
+                    let _ = pending_table
+                        .remove(key.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    continue;
+                }
+
+                let Some(compacted_chunk) =
+                    Self::compact_regular_file_chunk_state(chunk_id, &current)?
+                else {
+                    let _ = overlay_table
+                        .remove(key.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    let _ = pending_table
+                        .remove(key.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    Self::append_event_in_txn(
+                        &txn,
+                        &crate::events::MetaEvent::SetRegularFileOverlaySlices {
+                            ino,
+                            chunk_slices: vec![(chunk_id, Vec::new())],
+                        },
+                    )?;
+                    compacted = compacted.saturating_add(1);
+                    continue;
+                };
+
+                if compacted_chunk == current {
+                    let _ = pending_table
+                        .remove(key.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    continue;
+                }
+
+                let encoded = encode(&compacted_chunk)?;
+                overlay_table
+                    .insert(key.as_slice(), encoded.as_slice())
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
-                let _ = pending_table
-                    .remove(key.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+                let compacted_slices: Vec<crate::schema::SliceRecord> =
+                    compacted_chunk.slices.values().cloned().collect();
                 Self::append_event_in_txn(
                     &txn,
                     &crate::events::MetaEvent::SetRegularFileOverlaySlices {
                         ino,
-                        chunk_slices: vec![(chunk_id, Vec::new())],
+                        chunk_slices: vec![(chunk_id, compacted_slices)],
                     },
                 )?;
-                drop(pending_table);
-                drop(overlay_table);
-                txn.commit()
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+                if compacted_chunk.fragmentation.should_compact() {
+                    let _ = pending_table
+                        .insert(key.as_slice(), 1)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                } else {
+                    let _ = pending_table
+                        .remove(key.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
                 compacted = compacted.saturating_add(1);
-                continue;
-            };
-
-            if compacted_chunk == current {
-                let _ = pending_table
-                    .remove(key.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                drop(pending_table);
-                drop(overlay_table);
-                txn.commit()
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-                continue;
-            }
-
-            let encoded = encode(&compacted_chunk)?;
-            overlay_table
-                .insert(key.as_slice(), encoded.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-
-            let compacted_slices: Vec<crate::schema::SliceRecord> =
-                compacted_chunk.slices.values().cloned().collect();
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::SetRegularFileOverlaySlices {
-                    ino,
-                    chunk_slices: vec![(chunk_id, compacted_slices)],
-                },
-            )?;
-
-            if compacted_chunk.fragmentation.should_compact() {
-                let _ = pending_table
-                    .insert(key.as_slice(), 1)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
-            } else {
-                let _ = pending_table
-                    .remove(key.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
 
             drop(pending_table);
             drop(overlay_table);
             txn.commit()
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            compacted = compacted.saturating_add(1);
+            if compacted >= max_chunks {
+                break;
+            }
         }
 
         Ok(compacted)

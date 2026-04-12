@@ -120,8 +120,11 @@ impl RedbMetaEngine {
 
                 self.migrate_inode_batch(pending_inodes.as_slice(), block_size)?;
 
-                last_processed_key =
-                    encode_file_block_key(*pending_inodes.last().unwrap(), u32::MAX).to_vec();
+                let last_ino = *pending_inodes.last().unwrap();
+                let Some(next_ino) = last_ino.checked_add(1) else {
+                    break;
+                };
+                last_processed_key = encode_file_block_key(next_ino, 0).to_vec();
             }
         }
 
@@ -248,7 +251,12 @@ impl RedbMetaEngine {
             let chunk_id = ChunkId(block_start_offset / (DEFAULT_CHUNK_SIZE as u64));
             let chunk_start_offset = chunk_id.0 * (DEFAULT_CHUNK_SIZE as u64);
             let slice_start = (block_start_offset - chunk_start_offset) as u32;
-            let slice_end = slice_start + block_ref.length;
+            let slice_end = slice_start.checked_add(block_ref.length).ok_or_else(|| {
+                MetaError::Storage(format!(
+                    "slice range overflow for block index {}: start={}, len={}",
+                    block_index, slice_start, block_ref.length
+                ))
+            })?;
 
             let slice_range = SliceRange::new(slice_start, slice_end).ok_or_else(|| {
                 MetaError::Storage(format!(

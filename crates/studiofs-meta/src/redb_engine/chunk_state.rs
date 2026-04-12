@@ -1,5 +1,10 @@
 use super::*;
 
+pub(super) struct LegacyChunkSyncFlags {
+    pub(super) published: bool,
+    pub(super) track_pending_compaction: bool,
+}
+
 impl RedbMetaEngine {
     pub(super) fn get_file_blocks_from_txn_internal(
         txn: &redb::WriteTransaction,
@@ -13,16 +18,16 @@ impl RedbMetaEngine {
 
         let mut blocks = std::collections::BTreeMap::new();
 
-        let mut range_end = prefix.to_vec();
-        *range_end.last_mut().unwrap() += 1;
-
         let iter = table
-            .range(prefix.as_slice()..range_end.as_slice())
+            .range(prefix.as_slice()..)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
 
         for result in iter {
             let (key, value) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
             let key_bytes = key.value();
+            if !key_bytes.starts_with(prefix.as_slice()) {
+                break;
+            }
             let (decoded_ino, block_index) = decode_file_block_key(key_bytes);
             if decoded_ino != ino {
                 break;
@@ -405,6 +410,96 @@ impl RedbMetaEngine {
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
         }
+        Ok(())
+    }
+
+    fn legacy_block_index_range_for_chunk(
+        chunk_id: ChunkId,
+        block_size: u32,
+    ) -> MetaResult<(u64, u64)> {
+        if block_size == 0 {
+            return Err(MetaError::Storage(
+                "block size must be non-zero".to_string(),
+            ));
+        }
+
+        let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
+        let chunk_end = chunk_start
+            .checked_add(DEFAULT_CHUNK_SIZE as u64)
+            .ok_or_else(|| MetaError::Storage("chunk range overflow".to_string()))?;
+        let block_size_u64 = u64::from(block_size);
+        let start_index = chunk_start / block_size_u64;
+        let end_index = chunk_end.div_ceil(block_size_u64);
+        Ok((start_index, end_index))
+    }
+
+    fn legacy_blocks_for_chunk_in_table(
+        table: &redb::Table<'_, &[u8], &[u8]>,
+        ino: Ino,
+        chunk_id: ChunkId,
+        block_size: u32,
+    ) -> MetaResult<Vec<(u32, BlockRef)>> {
+        let (start_index, end_index) =
+            Self::legacy_block_index_range_for_chunk(chunk_id, block_size)?;
+        let mut blocks = Vec::new();
+
+        for block_index in start_index..end_index {
+            let block_index = u32::try_from(block_index)
+                .map_err(|_| MetaError::Storage("block index overflow".to_string()))?;
+            let key = encode_file_block_key(ino, block_index);
+            if let Some(value) = table
+                .get(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                blocks.push((block_index, decode(value.value())?));
+            }
+        }
+
+        Ok(blocks)
+    }
+
+    pub(super) fn sync_regular_file_chunk_from_legacy_table_in_txn(
+        txn: &redb::WriteTransaction,
+        source_table_def: TableDefinition<&[u8], &[u8]>,
+        target_table_def: TableDefinition<&[u8], &[u8]>,
+        ino: Ino,
+        chunk_id: ChunkId,
+        block_size: u32,
+        flags: LegacyChunkSyncFlags,
+    ) -> MetaResult<()> {
+        let source_table = txn
+            .open_table(source_table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let blocks =
+            Self::legacy_blocks_for_chunk_in_table(&source_table, ino, chunk_id, block_size)?;
+        drop(source_table);
+
+        let chunk_slices = if blocks.is_empty() {
+            Vec::new()
+        } else {
+            let mut graph = Self::convert_blocks_to_chunk_state(blocks.as_slice(), block_size)?;
+            let chunk = graph.chunks.remove(&chunk_id).ok_or_else(|| {
+                MetaError::Storage(format!(
+                    "missing reconstructed chunk state for ino {} chunk {}",
+                    ino, chunk_id.0
+                ))
+            })?;
+            let chunk = if flags.published {
+                Self::chunk_for_published_base(&chunk)
+            } else {
+                chunk
+            };
+            chunk.slices.into_values().collect()
+        };
+
+        let _ = Self::set_regular_file_chunk_state_in_txn(
+            txn,
+            target_table_def,
+            flags.track_pending_compaction,
+            ino,
+            chunk_id,
+            chunk_slices.as_slice(),
+        )?;
         Ok(())
     }
 
@@ -864,14 +959,15 @@ impl RedbMetaEngine {
         ino: Ino,
     ) -> MetaResult<Vec<(u32, BlockRef)>> {
         let prefix = file_block_prefix(ino);
-        let mut range_end = prefix.to_vec();
-        *range_end.last_mut().unwrap() += 1;
         let mut out = Vec::new();
         for row in committed
-            .range(prefix.as_slice()..range_end.as_slice())
+            .range(prefix.as_slice()..)
             .map_err(|e| MetaError::Storage(e.to_string()))?
         {
             let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            if !key.value().starts_with(prefix.as_slice()) {
+                break;
+            }
             let (decoded_ino, block_index) = decode_file_block_key(key.value());
             if decoded_ino != ino {
                 break;
@@ -922,14 +1018,15 @@ impl RedbMetaEngine {
             .open_table(COMMITTED_FILE_BLOCKS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let prefix = file_block_prefix(ino);
-        let mut range_end = prefix.to_vec();
-        *range_end.last_mut().unwrap() += 1;
         let mut merged = std::collections::BTreeMap::new();
         for row in blocks
-            .range(prefix.as_slice()..range_end.as_slice())
+            .range(prefix.as_slice()..)
             .map_err(|e| MetaError::Storage(e.to_string()))?
         {
             let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            if !key.value().starts_with(prefix.as_slice()) {
+                break;
+            }
             let (decoded_ino, block_index) = decode_file_block_key(key.value());
             if decoded_ino != ino {
                 break;
@@ -937,10 +1034,13 @@ impl RedbMetaEngine {
             merged.insert(block_index, decode(value.value())?);
         }
         for row in committed
-            .range(prefix.as_slice()..range_end.as_slice())
+            .range(prefix.as_slice()..)
             .map_err(|e| MetaError::Storage(e.to_string()))?
         {
             let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            if !key.value().starts_with(prefix.as_slice()) {
+                break;
+            }
             let (decoded_ino, block_index) = decode_file_block_key(key.value());
             if decoded_ino != ino {
                 break;

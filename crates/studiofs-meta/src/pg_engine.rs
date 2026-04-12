@@ -5792,8 +5792,8 @@ mod tests {
         mount_engine
             .set_format_info(&mount_info)
             .expect("set mount format");
-        let snap_state: RedbSnapshot =
-            serde_json::from_slice(&peer_snapshot.snapshot_payload).expect("decode payload");
+        let snap_state = RedbMetaEngine::decode_snapshot_payload(&peer_snapshot.snapshot_payload)
+            .expect("decode payload");
         mount_engine
             .import_snapshot(&snap_state)
             .expect("import payload");

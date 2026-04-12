@@ -1,6 +1,20 @@
 use super::*;
 
 impl RedbMetaEngine {
+    pub fn encode_snapshot_payload(snapshot: &RedbSnapshot) -> MetaResult<Vec<u8>> {
+        encode(snapshot)
+    }
+
+    pub fn decode_snapshot_payload(payload: &[u8]) -> MetaResult<RedbSnapshot> {
+        match decode(payload) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(MetaError::Serialization(_)) => {
+                serde_json::from_slice(payload).map_err(|e| MetaError::Serialization(e.to_string()))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn export_snapshot(&self) -> MetaResult<RedbSnapshot> {
         let txn = self
             .db
@@ -530,8 +544,7 @@ impl MetaSnapshots for RedbMetaEngine {
         }
 
         let pinned_object_ids = self.collect_snapshot_pinned_object_ids(root_ino)?;
-        let snapshot_payload = serde_json::to_vec(&self.export_snapshot()?)
-            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        let snapshot_payload = Self::encode_snapshot_payload(&self.export_snapshot()?)?;
 
         let snapshot = MetadataSnapshot {
             id: uuid::Uuid::new_v4().to_string(),

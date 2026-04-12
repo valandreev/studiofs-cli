@@ -66,6 +66,22 @@ fn test_snapshot_pins_objects_and_is_listed() {
 }
 
 #[test]
+fn test_snapshot_payload_codec_roundtrips_and_reads_legacy_json() {
+    let engine = temp_engine();
+    let state = engine.export_snapshot().unwrap();
+
+    let binary = RedbMetaEngine::encode_snapshot_payload(&state).unwrap();
+    let decoded_binary = RedbMetaEngine::decode_snapshot_payload(&binary).unwrap();
+    assert_eq!(decoded_binary.inodes, state.inodes);
+    assert_eq!(decoded_binary.dentries, state.dentries);
+
+    let legacy_json = serde_json::to_vec(&state).unwrap();
+    let decoded_json = RedbMetaEngine::decode_snapshot_payload(&legacy_json).unwrap();
+    assert_eq!(decoded_json.inodes, state.inodes);
+    assert_eq!(decoded_json.dentries, state.dentries);
+}
+
+#[test]
 fn test_referenced_object_ids_include_committed_blocks() {
     let engine = temp_engine();
 

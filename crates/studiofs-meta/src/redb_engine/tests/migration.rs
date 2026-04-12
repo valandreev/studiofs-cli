@@ -281,3 +281,12 @@ fn test_migration_resume_after_interruption() {
     let slice = file2_chunk.slices.iter().next().unwrap().1;
     assert_eq!(slice.block.as_ref().unwrap().object_id, 4002);
 }
+
+#[test]
+fn test_convert_blocks_to_chunk_state_rejects_slice_overflow() {
+    let block = BlockRef::new_partial(9_999, u32::MAX);
+    let err = RedbMetaEngine::convert_blocks_to_chunk_state(&[(1, block)], u32::MAX)
+        .expect_err("overflowing slice range must fail");
+
+    assert!(matches!(err, MetaError::Storage(message) if message.contains("slice range overflow")));
+}
