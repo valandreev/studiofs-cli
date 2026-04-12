@@ -98,7 +98,7 @@ use crate::access::{
 use crate::incarnation::{
     CommittedIncarnation, InodeIncarnationState, PendingIncarnation, VfsUploadState,
 };
-use crate::qos::{FairInodeScheduler, QosController, TransitMemoryBudget};
+use crate::qos::{QosController, TransitMemoryBudget};
 use crate::readahead::{DirAccessTracker, ReadAheadTracker, ReadStreamKey};
 
 use crate::runtime::{
