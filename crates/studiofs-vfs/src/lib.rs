@@ -5,6 +5,7 @@
 
 pub mod access;
 pub mod aimd;
+pub mod bridge;
 pub mod fetch;
 pub mod incarnation;
 pub(crate) mod ingress_wal;
@@ -17,6 +18,7 @@ pub mod utils;
 pub mod vfs;
 
 pub use aimd::{AimdConfig, AimdController};
+pub use bridge::{BridgeAttrTimes, BridgeVfsErrorKind, classify_vfs_error, normalize_attr_times};
 pub use fetch::FetchScheduler;
 pub use incarnation::{
     CommittedIncarnation, InodeIncarnationState, PendingIncarnation, VfsUploadState,

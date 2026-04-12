@@ -8,7 +8,10 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_meta::{FileType, Ino, InodeAttr};
-use studiofs_vfs::{KernelInvalidator, NamespacePathStyle, OpenFlags, StudioVfs};
+use studiofs_vfs::{
+    BridgeVfsErrorKind, KernelInvalidator, NamespacePathStyle, OpenFlags, StudioVfs,
+    classify_vfs_error, normalize_attr_times,
+};
 use tokio::runtime::Runtime;
 use tracing::{debug, error, trace, warn};
 use windows::Win32::Foundation::NTSTATUS;
@@ -240,6 +243,7 @@ fn compute_file_attributes(attr: &InodeAttr) -> u32 {
 
 /// Convert InodeAttr to WinFSP FileInfo.
 fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
+    let times = normalize_attr_times(attr);
     let file_attributes = compute_file_attributes(attr);
 
     let mut info = FileInfo {
@@ -260,10 +264,10 @@ fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
     // Convert timestamps (nanoseconds since epoch → Windows FILETIME)
     // FILETIME is 100ns intervals since 1601-01-01
     // Use effective_crtime() for creation_time: actual birth time, falling back to ctime
-    info.creation_time = unix_nanos_to_filetime(attr.effective_crtime());
-    info.last_access_time = unix_nanos_to_filetime(attr.atime);
-    info.last_write_time = unix_nanos_to_filetime(attr.mtime);
-    info.change_time = unix_nanos_to_filetime(attr.mtime);
+    info.creation_time = unix_nanos_to_filetime(times.creation_time_unix_nanos);
+    info.last_access_time = unix_nanos_to_filetime(times.atime_unix_nanos);
+    info.last_write_time = unix_nanos_to_filetime(times.mtime_unix_nanos);
+    info.change_time = unix_nanos_to_filetime(times.ctime_unix_nanos);
 
     // Use inode as index
     info.index_number = attr.ino;
@@ -274,13 +278,13 @@ fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
 }
 
 /// Convert Unix timestamp (nanoseconds since epoch) to Windows FILETIME (100ns since 1601-01-01).
-fn unix_nanos_to_filetime(unix_nanos: i64) -> u64 {
+fn unix_nanos_to_filetime(unix_nanos: u64) -> u64 {
     const EPOCH_DIFF: u64 = 116_444_736_000_000_000; // Difference between 1601-01-01 and 1970-01-01 in 100ns intervals
-    const NANOS_PER_100NS: i64 = 100;
+    const NANOS_PER_100NS: u64 = 100;
 
     // Convert nanoseconds to 100ns intervals
     let intervals = unix_nanos / NANOS_PER_100NS;
-    (intervals as u64).saturating_add(EPOCH_DIFF)
+    intervals.saturating_add(EPOCH_DIFF)
 }
 
 /// Resolve a WinFSP path to an inode by walking the directory tree.
@@ -424,105 +428,67 @@ fn create_default_security_descriptor() -> Vec<u8> {
     }
 }
 
+fn note_critical_vfs_error(error: &studiofs_vfs::VfsError) {
+    if matches!(
+        classify_vfs_error(error),
+        BridgeVfsErrorKind::CriticalRuntimeFailure
+    ) && let studiofs_vfs::VfsError::Join(join_err) = error
+    {
+        error!(
+            error = %join_err,
+            "critical runtime failure (JoinError), requesting emergency unmount"
+        );
+        crate::request_shutdown();
+    }
+}
+
 /// Map VfsError to WinFSP NTSTATUS error.
 fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
-    match &e {
-        studiofs_vfs::VfsError::Join(join_err) => {
-            error!(
-                error = %join_err,
-                "critical runtime failure (JoinError), requesting emergency unmount"
-            );
-            crate::request_shutdown();
+    note_critical_vfs_error(&e);
+    match classify_vfs_error(&e) {
+        BridgeVfsErrorKind::NotFound => winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND),
+        BridgeVfsErrorKind::AlreadyExists => winfsp::FspError::from(STATUS_OBJECT_NAME_COLLISION),
+        BridgeVfsErrorKind::DirectoryNotEmpty => winfsp::FspError::from(STATUS_DIRECTORY_NOT_EMPTY),
+        BridgeVfsErrorKind::NotDirectory => winfsp::FspError::from(STATUS_NOT_A_DIRECTORY),
+        BridgeVfsErrorKind::IsDirectory => winfsp::FspError::from(STATUS_FILE_IS_A_DIRECTORY),
+        BridgeVfsErrorKind::UnrecognizedVolume => {
+            winfsp::FspError::from(STATUS_UNRECOGNIZED_VOLUME)
+        }
+        BridgeVfsErrorKind::XattrValueTooLarge => winfsp::FspError::from(STATUS_EA_TOO_LARGE),
+        BridgeVfsErrorKind::InvalidInput => winfsp::FspError::from(STATUS_INVALID_PARAMETER),
+        BridgeVfsErrorKind::PermissionDenied => winfsp::FspError::from(STATUS_ACCESS_DENIED),
+        BridgeVfsErrorKind::TimedOut => winfsp::FspError::from(STATUS_IO_TIMEOUT),
+        BridgeVfsErrorKind::InsufficientResources => {
+            winfsp::FspError::from(STATUS_INSUFFICIENT_RESOURCES)
+        }
+        BridgeVfsErrorKind::DataCorruption => winfsp::FspError::from(STATUS_DATA_ERROR),
+        BridgeVfsErrorKind::Retryable => {
+            match &e {
+                studiofs_vfs::VfsError::WouldBlock => debug!("vfs lock conflict: {e}"),
+                studiofs_vfs::VfsError::RemoteContentPending => {
+                    debug!("vfs remote content pending: {e}")
+                }
+                _ => debug!("retryable vfs error: {e}"),
+            }
             winfsp::FspError::from(STATUS_UNSUCCESSFUL)
         }
-        studiofs_vfs::VfsError::Meta(me) => match me {
-            studiofs_meta::MetaError::InodeNotFound(_) => {
-                winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND)
-            }
-            studiofs_meta::MetaError::EntryNotFound { .. } => {
-                winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND)
-            }
-            studiofs_meta::MetaError::EntryExists { .. } => {
-                winfsp::FspError::from(STATUS_OBJECT_NAME_COLLISION)
-            }
-            studiofs_meta::MetaError::DirNotEmpty(_) => {
-                winfsp::FspError::from(STATUS_DIRECTORY_NOT_EMPTY)
-            }
-            studiofs_meta::MetaError::NotADirectory(_) => {
-                winfsp::FspError::from(STATUS_NOT_A_DIRECTORY)
-            }
-            studiofs_meta::MetaError::IsADirectory(_) => {
-                winfsp::FspError::from(STATUS_FILE_IS_A_DIRECTORY)
-            }
-            studiofs_meta::MetaError::NotFormatted => {
-                winfsp::FspError::from(STATUS_UNRECOGNIZED_VOLUME)
-            }
-            studiofs_meta::MetaError::FragmentedBlock { .. } => {
-                winfsp::FspError::from(STATUS_DATA_ERROR)
-            }
-            studiofs_meta::MetaError::XattrValueTooLarge { .. } => {
-                winfsp::FspError::from(STATUS_EA_TOO_LARGE)
-            }
-            _ => {
+        BridgeVfsErrorKind::CriticalRuntimeFailure => winfsp::FspError::from(STATUS_UNSUCCESSFUL),
+        BridgeVfsErrorKind::GenericFailure => {
+            if matches!(e, studiofs_vfs::VfsError::Meta(_)) {
                 error!("metadata error: {e}");
-                winfsp::FspError::from(STATUS_UNSUCCESSFUL)
+            } else {
+                error!("vfs error: {e}");
             }
-        },
-        studiofs_vfs::VfsError::InvalidName(_) => winfsp::FspError::from(STATUS_INVALID_PARAMETER),
-        studiofs_vfs::VfsError::Io(ioe) => match ioe.kind() {
-            std::io::ErrorKind::NotFound => winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND),
-            std::io::ErrorKind::PermissionDenied => winfsp::FspError::from(STATUS_ACCESS_DENIED),
-            std::io::ErrorKind::AlreadyExists => {
-                winfsp::FspError::from(STATUS_OBJECT_NAME_COLLISION)
-            }
-            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => {
-                winfsp::FspError::from(STATUS_INVALID_PARAMETER)
-            }
-            _ => winfsp::FspError::from(STATUS_UNSUCCESSFUL),
-        },
-        studiofs_vfs::VfsError::WouldBlock => {
-            debug!("vfs lock conflict: {e}");
-            winfsp::FspError::from(STATUS_UNSUCCESSFUL)
-        }
-        studiofs_vfs::VfsError::RemoteContentPending => {
-            debug!("vfs remote content pending: {e}");
-            winfsp::FspError::from(STATUS_UNSUCCESSFUL)
-        }
-        studiofs_vfs::VfsError::Fetch(fetch_err) => match fetch_err {
-            studiofs_vfs::fetch::FetchError::NotFound { .. } => {
-                winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND)
-            }
-            studiofs_vfs::fetch::FetchError::Exhausted { .. } => {
-                winfsp::FspError::from(STATUS_IO_TIMEOUT)
-            }
-            studiofs_vfs::fetch::FetchError::PrefetchSkipped => {
-                winfsp::FspError::from(STATUS_UNSUCCESSFUL)
-            }
-            studiofs_vfs::fetch::FetchError::TransitBudgetTooSmall { .. } => {
-                winfsp::FspError::from(STATUS_INSUFFICIENT_RESOURCES)
-            }
-            studiofs_vfs::fetch::FetchError::Decode(_)
-            | studiofs_vfs::fetch::FetchError::CacheAccess(_)
-            | studiofs_vfs::fetch::FetchError::CorruptFragment { .. } => {
-                winfsp::FspError::from(STATUS_DATA_ERROR)
-            }
-        },
-        _ => {
-            error!("vfs error: {e}");
             winfsp::FspError::from(STATUS_UNSUCCESSFUL)
         }
     }
 }
 
 fn is_benign_cleanup_delete_error(e: &studiofs_vfs::VfsError, deleting_dir: bool) -> bool {
-    match e {
-        studiofs_vfs::VfsError::Meta(me) => match me {
-            studiofs_meta::MetaError::InodeNotFound(_)
-            | studiofs_meta::MetaError::EntryNotFound { .. } => true,
-            studiofs_meta::MetaError::NotADirectory(_) => deleting_dir,
-            studiofs_meta::MetaError::IsADirectory(_) => !deleting_dir,
-            _ => false,
-        },
+    match classify_vfs_error(e) {
+        BridgeVfsErrorKind::NotFound => true,
+        BridgeVfsErrorKind::NotDirectory => deleting_dir,
+        BridgeVfsErrorKind::IsDirectory => !deleting_dir,
         _ => false,
     }
 }
@@ -1764,9 +1730,10 @@ mod tests {
         FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FileSizeCallbackAction,
         STATUS_ACCESS_DENIED, STATUS_DATA_ERROR, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
         STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND, StudioFsContext, WinfspKernelInvalidator,
-        build_basic_info_setattr_args, build_notify_info, encode_symlink_reparse,
-        ino_to_windows_path, notify_filter_for_kind, open_flags_from_create_options,
-        resolve_create_callback_kind, resolve_file_size_callback_action, vfs_to_winfsp_err,
+        attr_to_file_info, build_basic_info_setattr_args, build_notify_info,
+        encode_symlink_reparse, ino_to_windows_path, notify_filter_for_kind,
+        open_flags_from_create_options, resolve_create_callback_kind,
+        resolve_file_size_callback_action, unix_nanos_to_filetime, vfs_to_winfsp_err,
     };
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -1774,8 +1741,8 @@ mod tests {
     use studiofs_data::store::DataStoreConfig;
     use studiofs_meta::MetaError;
     use studiofs_meta::{
-        CURRENT_FORMAT_VERSION, FormatInfo, MetaFormat, MetadataConfig, ROOT_INO, RedbMetaEngine,
-        SetattrArgs, TimeSpec,
+        CURRENT_FORMAT_VERSION, FormatInfo, InodeAttr, MetaFormat, MetadataConfig, ROOT_INO,
+        RedbMetaEngine, SetattrArgs, TimeSpec,
     };
     use studiofs_vfs::VfsError;
     use studiofs_vfs::{KernelInvalidator, OpenFlags, StudioVfs, VfsConfig};
@@ -1956,6 +1923,15 @@ mod tests {
         let status = vfs_to_winfsp_err(xattr_too_big).to_ntstatus();
         assert_eq!(status, STATUS_EA_TOO_LARGE.0);
 
+        let denied = VfsError::Meta(MetaError::AccessDenied {
+            ino: 7,
+            principal: "user".into(),
+            required: studiofs_meta::AccessLevel::ReadWrite,
+            actual: studiofs_meta::AccessLevel::ReadOnly,
+        });
+        let status = vfs_to_winfsp_err(denied).to_ntstatus();
+        assert_eq!(status, STATUS_ACCESS_DENIED.0);
+
         let fragmented = VfsError::Meta(MetaError::FragmentedBlock {
             ino: 7,
             block_index: 3,
@@ -1976,6 +1952,31 @@ mod tests {
         let err = VfsError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         let status = vfs_to_winfsp_err(err).to_ntstatus();
         assert_eq!(status, STATUS_ACCESS_DENIED.0);
+    }
+
+    #[test]
+    fn attr_to_file_info_keeps_winfsp_specific_allocation_and_reparse_behavior() {
+        let mut file = InodeAttr::new_file(21, ROOT_INO, 1000, 1000, 0o644);
+        file.size = 4097;
+        file.nlink = 0;
+        file.mtime = 123;
+        file.ctime = 456;
+        let file_info = attr_to_file_info(&file);
+        assert_eq!(file_info.allocation_size, 8192);
+        assert_eq!(file_info.hard_links, 1);
+        assert_eq!(file_info.index_number, 21);
+        assert_eq!(file_info.last_write_time, unix_nanos_to_filetime(123));
+        assert_eq!(file_info.change_time, unix_nanos_to_filetime(456));
+
+        let mut dir = InodeAttr::new_dir(22, ROOT_INO, 1000, 1000, 0o755);
+        dir.size = 0;
+        let dir_info = attr_to_file_info(&dir);
+        assert_eq!(dir_info.allocation_size, 4096);
+
+        let symlink = InodeAttr::new_symlink(23, ROOT_INO, 1000, 1000, 33);
+        let symlink_info = attr_to_file_info(&symlink);
+        assert_eq!(symlink_info.reparse_tag, super::IO_REPARSE_TAG_SYMLINK);
+        assert_eq!(symlink_info.allocation_size, 4096);
     }
 
     #[test]

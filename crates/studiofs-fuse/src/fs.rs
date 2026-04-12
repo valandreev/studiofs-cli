@@ -18,7 +18,10 @@ use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
 #[cfg(target_os = "macos")]
 use studiofs_meta::schema::DirEntry;
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
-use studiofs_vfs::{KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsError};
+use studiofs_vfs::{
+    BridgeVfsErrorKind, KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsError,
+    classify_vfs_error, normalize_attr_times,
+};
 use tokio::runtime::Runtime;
 use tracing::{debug, error, warn};
 #[cfg(target_os = "macos")]
@@ -94,7 +97,11 @@ fn missing_xattr_errno() -> i32 {
 }
 
 fn note_critical_vfs_error(e: &VfsError) {
-    if let VfsError::Join(join_err) = e {
+    if matches!(
+        classify_vfs_error(e),
+        BridgeVfsErrorKind::CriticalRuntimeFailure
+    ) && let VfsError::Join(join_err) = e
+    {
         error!(
             error = %join_err,
             "critical runtime failure (JoinError), requesting emergency unmount"
@@ -233,43 +240,23 @@ fn posix_flags_to_open_flags(flags: i32) -> (OpenFlags, bool) {
 
 /// Map VfsError to the correct libc errno for FUSE replies.
 fn vfs_err_to_errno(e: &VfsError) -> i32 {
-    use studiofs_meta::MetaError;
     note_critical_vfs_error(e);
-    match e {
-        VfsError::Meta(me) => match me {
-            MetaError::InodeNotFound(_) => libc::ENOENT,
-            MetaError::EntryNotFound { .. } => libc::ENOENT,
-            MetaError::EntryExists { .. } => libc::EEXIST,
-            MetaError::NotADirectory(_) => libc::ENOTDIR,
-            MetaError::IsADirectory(_) => libc::EISDIR,
-            MetaError::DirNotEmpty(_) => libc::ENOTEMPTY,
-            MetaError::NotFormatted => libc::ENODEV,
-            MetaError::FragmentedBlock { .. } => libc::EIO,
-            MetaError::XattrValueTooLarge { .. } => libc::E2BIG,
-            _ => libc::EIO,
-        },
-        VfsError::BlockNotFound(_, _) => libc::EIO,
-        VfsError::Join(_) => libc::EIO,
-        VfsError::WouldBlock | VfsError::RemoteContentPending => libc::EAGAIN,
-        VfsError::InvalidName(_) => libc::EINVAL,
-        VfsError::Fetch(fetch_err) => match fetch_err {
-            studiofs_vfs::fetch::FetchError::NotFound { .. } => libc::ENOENT,
-            studiofs_vfs::fetch::FetchError::Exhausted { .. } => libc::ETIMEDOUT,
-            studiofs_vfs::fetch::FetchError::PrefetchSkipped => libc::EAGAIN,
-            studiofs_vfs::fetch::FetchError::TransitBudgetTooSmall { .. } => libc::ENOMEM,
-            studiofs_vfs::fetch::FetchError::Decode(_)
-            | studiofs_vfs::fetch::FetchError::CacheAccess(_)
-            | studiofs_vfs::fetch::FetchError::CorruptFragment { .. } => libc::EIO,
-        },
-        VfsError::Io(ioe) => match ioe.kind() {
-            std::io::ErrorKind::NotFound => libc::ENOENT,
-            std::io::ErrorKind::PermissionDenied => libc::EACCES,
-            std::io::ErrorKind::AlreadyExists => libc::EEXIST,
-            std::io::ErrorKind::WouldBlock => libc::EAGAIN,
-            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => libc::EINVAL,
-            _ => libc::EIO,
-        },
-        _ => libc::EIO,
+    match classify_vfs_error(e) {
+        BridgeVfsErrorKind::NotFound => libc::ENOENT,
+        BridgeVfsErrorKind::AlreadyExists => libc::EEXIST,
+        BridgeVfsErrorKind::NotDirectory => libc::ENOTDIR,
+        BridgeVfsErrorKind::IsDirectory => libc::EISDIR,
+        BridgeVfsErrorKind::DirectoryNotEmpty => libc::ENOTEMPTY,
+        BridgeVfsErrorKind::UnrecognizedVolume => libc::ENODEV,
+        BridgeVfsErrorKind::XattrValueTooLarge => libc::E2BIG,
+        BridgeVfsErrorKind::InvalidInput => libc::EINVAL,
+        BridgeVfsErrorKind::PermissionDenied => libc::EACCES,
+        BridgeVfsErrorKind::Retryable => libc::EAGAIN,
+        BridgeVfsErrorKind::TimedOut => libc::ETIMEDOUT,
+        BridgeVfsErrorKind::InsufficientResources => libc::ENOMEM,
+        BridgeVfsErrorKind::DataCorruption
+        | BridgeVfsErrorKind::CriticalRuntimeFailure
+        | BridgeVfsErrorKind::GenericFailure => libc::EIO,
     }
 }
 
@@ -279,20 +266,17 @@ fn vfs_err_to_errno(e: &VfsError) -> i32 {
 /// `mount_uid`/`mount_gid` are used to remap inodes that were created with
 /// uid=0/gid=0 (the old default) so that the mounting user owns them.
 fn to_fuse_attr(attr: &studiofs_meta::InodeAttr, mount_uid: u32, mount_gid: u32) -> FileAttr {
+    let times = normalize_attr_times(attr);
     let uid = if attr.uid == 0 { mount_uid } else { attr.uid };
     let gid = if attr.gid == 0 { mount_gid } else { attr.gid };
-    let atime = u64::try_from(attr.atime.max(0)).unwrap_or(0);
-    let mtime = u64::try_from(attr.mtime.max(0)).unwrap_or(0);
-    let ctime = u64::try_from(attr.ctime.max(0)).unwrap_or(0);
-    let crtime = u64::try_from(attr.effective_crtime().max(0)).unwrap_or(0);
     FileAttr {
         ino: attr.ino,
         size: attr.size,
         blocks: attr.size.div_ceil(512),
-        atime: UNIX_EPOCH + Duration::from_nanos(atime),
-        mtime: UNIX_EPOCH + Duration::from_nanos(mtime),
-        ctime: UNIX_EPOCH + Duration::from_nanos(ctime),
-        crtime: UNIX_EPOCH + Duration::from_nanos(crtime),
+        atime: UNIX_EPOCH + Duration::from_nanos(times.atime_unix_nanos),
+        mtime: UNIX_EPOCH + Duration::from_nanos(times.mtime_unix_nanos),
+        ctime: UNIX_EPOCH + Duration::from_nanos(times.ctime_unix_nanos),
+        crtime: UNIX_EPOCH + Duration::from_nanos(times.creation_time_unix_nanos),
         kind: match attr.kind {
             FileType::RegularFile => FuseFileType::RegularFile,
             FileType::Directory => FuseFileType::Directory,
@@ -1175,12 +1159,9 @@ impl Filesystem for StudioFuseFs {
     fn getxtimes(&mut self, _req: &Request<'_>, ino: u64, reply: fuser::ReplyXTimes) {
         match self.vfs.getattr(ino) {
             Ok(attr) => {
-                let crtime = UNIX_EPOCH
-                    + Duration::from_nanos(
-                        u64::try_from(attr.effective_crtime().max(0)).unwrap_or(0),
-                    );
-                let bkuptime = UNIX_EPOCH
-                    + Duration::from_nanos(u64::try_from(attr.mtime.max(0)).unwrap_or(0));
+                let times = normalize_attr_times(&attr);
+                let crtime = UNIX_EPOCH + Duration::from_nanos(times.creation_time_unix_nanos);
+                let bkuptime = UNIX_EPOCH + Duration::from_nanos(times.mtime_unix_nanos);
                 reply.xtimes(bkuptime, crtime);
             }
             Err(e) => {
@@ -1561,7 +1542,7 @@ mod tests {
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, is_missing_xattr_error, missing_xattr_errno,
         normalize_unix_mode, posix_flags_to_open_flags, should_log_invalidation_error,
-        vfs_err_to_errno,
+        to_fuse_attr, vfs_err_to_errno,
     };
     #[cfg(target_os = "macos")]
     use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
@@ -1572,6 +1553,7 @@ mod tests {
         recover_macos_normalized_name, recover_macos_truncated_rename_source,
         resolve_macos_namespace_name,
     };
+    use studiofs_meta::InodeAttr;
     use studiofs_meta::MetaError;
     #[cfg(target_os = "macos")]
     use studiofs_meta::schema::DirEntry;
@@ -1648,6 +1630,19 @@ mod tests {
     fn io_permission_denied_maps_to_eacces() {
         let err = VfsError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         assert_eq!(vfs_err_to_errno(&err), libc::EACCES);
+    }
+
+    #[test]
+    fn to_fuse_attr_remaps_legacy_root_owner_and_rounds_blocks() {
+        let mut attr = InodeAttr::new_file(9, 1, 0, 0, 0o640);
+        attr.size = 513;
+
+        let file_attr = to_fuse_attr(&attr, 501, 20);
+
+        assert_eq!(file_attr.uid, 501);
+        assert_eq!(file_attr.gid, 20);
+        assert_eq!(file_attr.blocks, 2);
+        assert_eq!(file_attr.perm, 0o640);
     }
 
     #[test]
