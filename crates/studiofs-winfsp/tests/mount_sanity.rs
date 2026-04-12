@@ -381,17 +381,18 @@ fn with_winfsp_mount<R, F>(
 where
     F: FnOnce(&str) -> R,
 {
+    let vfs_for_shutdown = vfs.clone();
+    let rt_for_shutdown = rt.clone();
     let event_for_thread = event_name.clone();
     let mp_for_thread = mount_point.clone();
     let handle = std::thread::spawn(move || {
         mount_and_serve(studiofs_winfsp::WinfspMountRequest {
             vfs,
-            rt,
+            runtime_handle: rt.handle().clone(),
             mount_point: mp_for_thread,
             volume_label: "StudioFS-Test".to_string(),
             read_only: false,
             shutdown_event_name: Some(event_for_thread),
-            profiling: None,
         })
         .map_err(|e| e.to_string())
     });
@@ -404,6 +405,7 @@ where
 
     signal_named_event(&event_name);
     let join_result = handle.join();
+    rt_for_shutdown.block_on(vfs_for_shutdown.shutdown(Duration::from_secs(1)));
 
     match result {
         Ok(value) => {

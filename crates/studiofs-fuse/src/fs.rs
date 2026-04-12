@@ -22,7 +22,7 @@ use studiofs_vfs::{
     BridgeVfsErrorKind, KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsError,
     classify_vfs_error, normalize_attr_times,
 };
-use tokio::runtime::Runtime;
+use tokio::runtime::Handle;
 use tracing::{debug, error, warn};
 #[cfg(target_os = "macos")]
 use unicode_normalization::UnicodeNormalization;
@@ -312,7 +312,7 @@ fn fuse_file_type(kind: FileType) -> FuseFileType {
 
 pub struct StudioFuseFs {
     vfs: Arc<StudioVfs>,
-    rt: Arc<Runtime>,
+    rt: Handle,
     /// UID of the user that mounted the filesystem. Inodes owned by uid=0 in
     /// the DB are remapped to this so macOS permission checks don't block writes.
     mount_uid: u32,
@@ -321,7 +321,7 @@ pub struct StudioFuseFs {
 }
 
 impl StudioFuseFs {
-    pub fn new(vfs: Arc<StudioVfs>, rt: Arc<Runtime>) -> Self {
+    pub fn new(vfs: Arc<StudioVfs>, rt: Handle) -> Self {
         // SAFETY: getuid/getgid read process-wide credential values from libc and are
         // side-effect-free.
         let mount_uid = unsafe { libc::getuid() };

@@ -137,7 +137,7 @@ fn fuse_session_mount_and_drop_smoke() {
     let mount_dir = tempfile::tempdir().expect("mount tempdir");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let vfs = make_test_vfs(&tmp, "mount_sanity", &rt);
-    let fs = StudioFuseFs::new(vfs, rt);
+    let fs = StudioFuseFs::new(vfs, rt.handle().clone());
     let mut options = vec![fuser::MountOption::FSName("studiofs-test".into())];
     // On Linux, AutoUnmount in fuser v0.16 can implicitly add 'allow_other',
     // which fails on CI. Since we just drop the session here (and move to next test
@@ -209,7 +209,7 @@ fn fuse_mount_write_read_unmount_smoke() {
     let mount_dir = tempfile::tempdir().expect("mount tempdir");
     let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
     let vfs = make_test_vfs(&tmp, "write_read_smoke", &rt);
-    let fs = StudioFuseFs::new(vfs, rt);
+    let fs = StudioFuseFs::new(vfs, rt.handle().clone());
 
     let mut options = vec![fuser::MountOption::FSName("studiofs-smoke".into())];
     // Manually unmounting at the end of the test, so AutoUnmount is optional.

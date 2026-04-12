@@ -51,12 +51,11 @@ enum MountOptionError {
 
 pub struct WinfspMountRequest {
     pub vfs: std::sync::Arc<studiofs_vfs::StudioVfs>,
-    pub rt: std::sync::Arc<tokio::runtime::Runtime>,
+    pub runtime_handle: tokio::runtime::Handle,
     pub mount_point: String,
     pub volume_label: String,
     pub read_only: bool,
     pub shutdown_event_name: Option<String>,
-    pub profiling: Option<Box<dyn FnMut()>>,
 }
 
 fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOptionError> {
@@ -322,14 +321,6 @@ fn invalid_input_io_error(err: MountOptionError) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, err)
 }
 
-fn shutdown_upload_drain_timeout() -> std::time::Duration {
-    let secs = std::env::var("STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    std::time::Duration::from_secs(secs)
-}
-
 /// Start the WinFSP filesystem, mount, and block until unmounted.
 ///
 /// `shutdown_event_name` — if `Some`, a Win32 named event is created so that an
@@ -340,12 +331,11 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
 
     let WinfspMountRequest {
         vfs,
-        rt,
+        runtime_handle,
         mount_point,
         volume_label,
         read_only,
         shutdown_event_name,
-        profiling,
     } = request;
 
     let options = parse_mount_options(&volume_label).map_err(invalid_input_io_error)?;
@@ -367,14 +357,15 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
     apply_volume_params(&mut volume_params, &options, &mount_point)
         .map_err(invalid_input_io_error)?;
 
-    // Keep a reference for shutdown() (vfs is moved into context).
-    let vfs_ref = vfs.clone();
-
     // Shared invalidation queue: the `WinfspKernelInvalidator` pushes inode
     // IDs from metadata refresh events; the WinFSP timer drains and sends OS notifications.
     let invalidation_queue = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<Ino>::new()));
 
-    let context = StudioFsContext::new(vfs.clone(), rt.clone(), invalidation_queue.clone());
+    let context = StudioFsContext::new(
+        vfs.clone(),
+        runtime_handle.clone(),
+        invalidation_queue.clone(),
+    );
 
     // Use `new_with_timer` so the WinFSP threadpool timer periodically calls
     // our `NotifyingFileSystemContext` impl, which sends `FspFileSystemNotify`
@@ -474,12 +465,6 @@ this usually means Administrator privileges are required, or WinFSP must be conf
     // Stop WinFSP first so no new callbacks race with the shutdown drain.
     host.stop();
     host.unmount();
-    // By default do not block process exit on remote uploads; remaining dirty
-    // blocks are replayed into the upload queue on next mount.
-    rt.block_on(vfs_ref.shutdown(shutdown_upload_drain_timeout()));
-    if let Some(mut profiling) = profiling {
-        profiling();
-    }
 
     Ok(())
 }
