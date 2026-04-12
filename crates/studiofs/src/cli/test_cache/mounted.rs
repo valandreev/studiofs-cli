@@ -186,11 +186,13 @@ async fn run_filesystem_writes(
     let stats = Arc::new(Mutex::new(PhaseTelemetry::default()));
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
+    let files: Arc<[WorkFile]> = Arc::from(files.to_vec());
+    let order: Arc<[usize]> = Arc::from(order.to_vec());
     let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
 
     for _ in 0..worker_count {
-        let files = files.to_vec();
-        let order = order.to_vec();
+        let files = Arc::clone(&files);
+        let order = Arc::clone(&order);
         let stats = Arc::clone(&stats);
         let counter = Arc::clone(&counter);
         let sem = Arc::clone(&sem);
@@ -203,15 +205,15 @@ async fn run_filesystem_writes(
                 }
                 let work_index = order[op_index];
                 let item = &files[work_index];
-                let data = deterministic_bytes(
-                    usize::try_from(item.size).context("file write size overflow")?,
-                    item.index as u64 + 123,
-                );
                 let permit = sem
                     .acquire()
                     .await
                     .map_err(|e| anyhow!("filesystem write semaphore closed: {e}"))?;
                 let _permit = permit;
+                let data = deterministic_bytes(
+                    usize::try_from(item.size).context("file write size overflow")?,
+                    item.index as u64 + 123,
+                );
 
                 let start = Instant::now();
                 let mut out = fs::File::create(&item.path)
@@ -262,11 +264,13 @@ async fn run_filesystem_reads(
     let stats = Arc::new(Mutex::new(PhaseTelemetry::default()));
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
+    let files: Arc<[WorkFile]> = Arc::from(files.to_vec());
+    let order: Arc<[usize]> = Arc::from(order.to_vec());
     let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
 
     for _ in 0..worker_count {
-        let files = files.to_vec();
-        let order = order.to_vec();
+        let files = Arc::clone(&files);
+        let order = Arc::clone(&order);
         let stats = Arc::clone(&stats);
         let counter = Arc::clone(&counter);
         let sem = Arc::clone(&sem);
@@ -332,25 +336,26 @@ async fn run_filesystem_writes_sequential_streams(
 ) -> Result<Vec<PhaseTelemetry>> {
     let segments = split_stream_segments(order, stream_count);
     let sem = Arc::new(Semaphore::new(io_depth.max(1)));
+    let files: Arc<[WorkFile]> = Arc::from(files.to_vec());
     let mut handles: Vec<tokio::task::JoinHandle<Result<(usize, PhaseTelemetry)>>> =
         Vec::with_capacity(segments.len());
 
     for (stream_id, segment) in segments.into_iter().enumerate() {
         let sem = Arc::clone(&sem);
-        let files = files.to_vec();
+        let files = Arc::clone(&files);
         handles.push(tokio::spawn(async move {
             let mut telemetry = PhaseTelemetry::default();
             for work_index in segment {
                 let item = &files[work_index];
-                let data = deterministic_bytes(
-                    usize::try_from(item.size).context("sequential file write size overflow")?,
-                    item.index as u64 + 123 + stream_id as u64,
-                );
                 let permit = sem
                     .acquire()
                     .await
                     .map_err(|e| anyhow!("filesystem sequential write semaphore closed: {e}"))?;
                 let _permit = permit;
+                let data = deterministic_bytes(
+                    usize::try_from(item.size).context("sequential file write size overflow")?,
+                    item.index as u64 + 123 + stream_id as u64,
+                );
                 let start = Instant::now();
                 let mut out = fs::File::create(&item.path)
                     .await
@@ -392,12 +397,13 @@ async fn run_filesystem_reads_sequential_streams(
 ) -> Result<Vec<PhaseTelemetry>> {
     let segments = split_stream_segments(order, stream_count);
     let sem = Arc::new(Semaphore::new(io_depth.max(1)));
+    let files: Arc<[WorkFile]> = Arc::from(files.to_vec());
     let mut handles: Vec<tokio::task::JoinHandle<Result<(usize, PhaseTelemetry)>>> =
         Vec::with_capacity(segments.len());
 
     for (stream_id, segment) in segments.into_iter().enumerate() {
         let sem = Arc::clone(&sem);
-        let files = files.to_vec();
+        let files = Arc::clone(&files);
         handles.push(tokio::spawn(async move {
             let mut telemetry = PhaseTelemetry::default();
             for work_index in segment {
@@ -439,11 +445,15 @@ async fn run_filesystem_reads_sequential_streams(
     Ok(by_stream)
 }
 
-fn clear_mount_artifacts(path: &Path) -> Result<()> {
-    if path.exists() {
-        std::fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display()))?;
+async fn clear_mount_artifacts(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).with_context(|| format!("remove {}", path.display())),
     }
-    std::fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))
+    fs::create_dir_all(path)
+        .await
+        .with_context(|| format!("create {}", path.display()))
 }
 
 pub(super) async fn run_mounted_end_to_end(
@@ -454,7 +464,9 @@ pub(super) async fn run_mounted_end_to_end(
     cache_path: Option<&Path>,
 ) -> Result<BenchmarkReport> {
     let benchmark_result = async {
-        clear_mount_artifacts(work_root).context("prepare mount benchmark directory")?;
+        clear_mount_artifacts(work_root)
+            .await
+            .context("prepare mount benchmark directory")?;
 
         let size_class_bounds = SizeClassBounds {
             small_max: params.size_class_small_max,

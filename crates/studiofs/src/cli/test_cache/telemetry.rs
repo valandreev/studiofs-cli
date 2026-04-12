@@ -48,12 +48,10 @@ impl LatencySamples {
         }
     }
 
-    fn percentile_ns(&self, p: f64) -> u64 {
-        if self.samples_ns.is_empty() {
+    fn percentile_from_sorted_ns(samples: &[u64], p: f64) -> u64 {
+        if samples.is_empty() {
             return 0;
         }
-        let mut samples = self.samples_ns.clone();
-        samples.sort_unstable();
         let idx = ((samples.len() as f64 - 1.0) * p).round() as usize;
         samples[idx.min(samples.len().saturating_sub(1))]
     }
@@ -61,9 +59,11 @@ impl LatencySamples {
     pub(super) fn to_report(&self, wall_elapsed_ms: f64) -> OpReport {
         let total_ms = self.total_duration_ms();
         let avg_ms = self.avg_ns() / 1_000_000.0;
-        let p50_ms = self.percentile_ns(0.50) as f64 / 1_000_000.0;
-        let p95_ms = self.percentile_ns(0.95) as f64 / 1_000_000.0;
-        let p99_ms = self.percentile_ns(0.99) as f64 / 1_000_000.0;
+        let mut sorted_samples = self.samples_ns.clone();
+        sorted_samples.sort_unstable();
+        let p50_ms = Self::percentile_from_sorted_ns(&sorted_samples, 0.50) as f64 / 1_000_000.0;
+        let p95_ms = Self::percentile_from_sorted_ns(&sorted_samples, 0.95) as f64 / 1_000_000.0;
+        let p99_ms = Self::percentile_from_sorted_ns(&sorted_samples, 0.99) as f64 / 1_000_000.0;
 
         let throughput_bytes_per_sec = if wall_elapsed_ms <= 0.0 {
             0.0

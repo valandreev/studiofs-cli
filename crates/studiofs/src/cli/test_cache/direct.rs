@@ -35,12 +35,14 @@ async fn run_shim_writes(
     let stats = Arc::new(Mutex::new(PhaseTelemetry::default()));
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
+    let order: Arc<[usize]> = Arc::from(order.to_vec());
+    let sizes: Arc<[u64]> = Arc::from(sizes.to_vec());
     let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
 
     for worker_id in 0..worker_count {
         let cache = Arc::clone(&cache);
-        let order = order.to_vec();
-        let sizes = sizes.to_vec();
+        let order = Arc::clone(&order);
+        let sizes = Arc::clone(&sizes);
         let stats = Arc::clone(&stats);
         let counter = Arc::clone(&counter);
         let sem = Arc::clone(&sem);
@@ -115,12 +117,14 @@ async fn run_shim_reads(
     let stats = Arc::new(Mutex::new(DirectReadTelemetry::default()));
     let counter = Arc::new(AtomicUsize::new(0));
     let sem = Arc::new(Semaphore::new(queue_depth));
+    let order: Arc<[usize]> = Arc::from(order.to_vec());
+    let sizes: Arc<[u64]> = Arc::from(sizes.to_vec());
     let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
 
     for _ in 0..worker_count {
         let cache = Arc::clone(&cache);
-        let order = order.to_vec();
-        let sizes = sizes.to_vec();
+        let order = Arc::clone(&order);
+        let sizes = Arc::clone(&sizes);
         let stats = Arc::clone(&stats);
         let counter = Arc::clone(&counter);
         let sem = Arc::clone(&sem);
@@ -205,13 +209,14 @@ async fn run_shim_writes_sequential_streams(
 ) -> Result<Vec<PhaseTelemetry>> {
     let segments = split_stream_segments(order, stream_count);
     let sem = Arc::new(Semaphore::new(io_depth.max(1)));
+    let sizes: Arc<[u64]> = Arc::from(sizes.to_vec());
     let mut handles: Vec<tokio::task::JoinHandle<Result<(usize, PhaseTelemetry)>>> =
         Vec::with_capacity(segments.len());
 
     for (stream_id, segment) in segments.into_iter().enumerate() {
         let cache = Arc::clone(&cache);
         let sem = Arc::clone(&sem);
-        let sizes = sizes.to_vec();
+        let sizes = Arc::clone(&sizes);
         handles.push(tokio::spawn(async move {
             let mut telemetry = PhaseTelemetry::default();
             for work_index in segment {
@@ -268,13 +273,14 @@ async fn run_shim_reads_sequential_streams(
 ) -> Result<Vec<DirectReadTelemetry>> {
     let segments = split_stream_segments(order, stream_count);
     let sem = Arc::new(Semaphore::new(io_depth.max(1)));
+    let sizes: Arc<[u64]> = Arc::from(sizes.to_vec());
     let mut handles: Vec<tokio::task::JoinHandle<Result<(usize, DirectReadTelemetry)>>> =
         Vec::with_capacity(segments.len());
 
     for (stream_id, segment) in segments.into_iter().enumerate() {
         let cache = Arc::clone(&cache);
         let sem = Arc::clone(&sem);
-        let sizes = sizes.to_vec();
+        let sizes = Arc::clone(&sizes);
         handles.push(tokio::spawn(async move {
             let mut telemetry = DirectReadTelemetry::default();
             for work_index in segment {

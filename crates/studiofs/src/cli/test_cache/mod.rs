@@ -63,6 +63,13 @@ fn test_cache_runtime() -> Result<&'static tokio::runtime::Runtime> {
         .map_err(|error| anyhow!("create tokio runtime: {error}"))
 }
 
+fn resolve_report_dir(json_output: Option<&Path>, current_dir: &Path) -> PathBuf {
+    match json_output.and_then(Path::parent) {
+        Some(parent) if parent.components().next().is_some() => parent.to_path_buf(),
+        _ => current_dir.to_path_buf(),
+    }
+}
+
 fn run(request: TestCacheRunRequest) -> Result<()> {
     let TestCacheRunRequest {
         target,
@@ -176,10 +183,8 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
             .map(|path| path.join(WRITE_PATH_OBSERVABILITY_FILE)),
         ResolvedRunMode::DirectShim { .. } => None,
     };
-    let report_dir = json_output
-        .as_ref()
-        .and_then(|path| path.parent().map(Path::to_path_buf))
-        .unwrap_or(std::env::current_dir().context("resolve current directory")?);
+    let current_dir = std::env::current_dir().context("resolve current directory")?;
+    let report_dir = resolve_report_dir(json_output.as_deref(), &current_dir);
     let profile_session = TestCacheProfileSession::start(
         profile,
         &run_id,
@@ -240,4 +245,28 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
         "test-cache run completed"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_report_dir;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn resolve_report_dir_uses_current_dir_for_bare_relative_filename() {
+        let current_dir = PathBuf::from(r"C:\work");
+        assert_eq!(
+            resolve_report_dir(Some(Path::new("cache-run.json")), &current_dir),
+            current_dir
+        );
+    }
+
+    #[test]
+    fn resolve_report_dir_preserves_parent_for_nested_relative_filename() {
+        let current_dir = PathBuf::from(r"C:\work");
+        assert_eq!(
+            resolve_report_dir(Some(Path::new("reports/cache-run.json")), &current_dir),
+            PathBuf::from("reports")
+        );
+    }
 }
