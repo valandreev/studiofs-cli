@@ -24,7 +24,9 @@ pub use incarnation::{
 pub use lock_order::{LockOrderGuard, LockTier, debug_lock_stack, is_validation_enabled};
 pub use qos::QosController;
 pub use readahead::{DirAccessTracker, ReadAheadTracker};
-pub use runtime::{AclMeta, JanitorMeta, ReadPathMeta, UploadMeta, VfsMeta, into_vfs_meta};
+pub use runtime::{
+    AclMeta, JanitorMeta, ReadPathMeta, UploadMeta, VfsCommitMeta, VfsMeta, into_vfs_meta,
+};
 pub use studiofs_meta::types::{SetattrArgs, TimeSpec};
 pub use upload::UploadScheduler;
 pub use utils::parse_size_bytes;

@@ -8,19 +8,62 @@ use studiofs_meta::engine::{
 };
 use studiofs_meta::{
     AccessLevel, BatchFlushEntry, BatchFlushResult, BlockRef, ChunkId, DirEntry, DirEntryValue,
-    FormatInfo, Ino, InodeAttr, MetaAcl, MetaBlocks, MetaEngineCore, MetaFormat, MetaFsOps, MetaGc,
-    MetaInodes, MetaNamespace, MetaRecovery, MetaReplication, MetaResult, MetaSymlink, MetaXattr,
-    RenameAtomicResult, ResolvedSliceSpan, SliceRange, SliceRecord, SyncMetaEngineAdapter,
-    execute_sync_meta,
+    FormatInfo, Ino, InodeAttr, MetaAcl, MetaBlocks, MetaEngine, MetaEngineCore, MetaFormat,
+    MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaRecovery, MetaReplication, MetaResult,
+    MetaSymlink, MetaXattr, RenameAtomicResult, ResolvedSliceSpan, SliceRange, SliceRecord,
+    SyncMetaEngineAdapter, execute_sync_meta,
 };
 use tokio::task;
 use tokio_util::sync::CancellationToken;
 
 use super::{VfsError, VfsResult};
 
+pub trait VfsCommitMeta: Send + Sync {
+    fn flush_blocks_batch_with_attr(
+        &self,
+        entries: &[BatchFlushEntry],
+        attr: Option<&InodeAttr>,
+    ) -> MetaResult<Vec<BatchFlushResult>>;
+
+    fn flush_regular_file_overlay_slices_with_attr(
+        &self,
+        ino: Ino,
+        chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
+        attr: Option<&InodeAttr>,
+    ) -> MetaResult<Option<InodeAttr>>;
+}
+
+impl<T> VfsCommitMeta for T
+where
+    T: ?Sized + MetaEngine,
+{
+    fn flush_blocks_batch_with_attr(
+        &self,
+        entries: &[BatchFlushEntry],
+        attr: Option<&InodeAttr>,
+    ) -> MetaResult<Vec<BatchFlushResult>> {
+        <T as MetaEngine>::flush_blocks_batch_with_attr(self, entries, attr)
+    }
+
+    fn flush_regular_file_overlay_slices_with_attr(
+        &self,
+        ino: Ino,
+        chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
+        attr: Option<&InodeAttr>,
+    ) -> MetaResult<Option<InodeAttr>> {
+        <T as MetaEngine>::flush_regular_file_overlay_slices_with_attr(
+            self,
+            ino,
+            chunk_slices,
+            attr,
+        )
+    }
+}
+
 pub trait VfsMeta:
     Send
     + Sync
+    + VfsCommitMeta
     + MetaEngineCore
     + MetaFormat
     + MetaInodes
@@ -34,37 +77,13 @@ pub trait VfsMeta:
     + MetaAcl
     + MetaReplication
 {
-    fn flush_blocks_batch_with_attr(
-        &self,
-        entries: &[BatchFlushEntry],
-        attr: Option<&InodeAttr>,
-    ) -> MetaResult<Vec<BatchFlushResult>> {
-        let results = self.flush_blocks_batch(entries)?;
-        if let Some(attr) = attr {
-            self.set_attr(attr)?;
-        }
-        Ok(results)
-    }
-
-    fn flush_regular_file_overlay_slices_with_attr(
-        &self,
-        ino: Ino,
-        chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
-        attr: Option<&InodeAttr>,
-    ) -> MetaResult<Option<InodeAttr>> {
-        self.flush_regular_file_overlay_slices(ino, chunk_slices)?;
-        if let Some(attr) = attr {
-            self.set_attr(attr)?;
-            return Ok(Some(self.get_attr(ino)?));
-        }
-        Ok(None)
-    }
 }
 
 impl<T> VfsMeta for T where
     T: ?Sized
         + Send
         + Sync
+        + VfsCommitMeta
         + MetaEngineCore
         + MetaFormat
         + MetaInodes
@@ -138,6 +157,24 @@ impl<M: ?Sized> RuntimeMetaHandle<M> {
     }
 }
 
+impl<M: ?Sized + VfsCommitMeta> VfsCommitMeta for RuntimeMetaHandle<M> {
+    forward_method!(
+        fn flush_blocks_batch_with_attr(
+            &self,
+            entries: &[BatchFlushEntry],
+            attr: Option<&InodeAttr>,
+        ) -> MetaResult<Vec<BatchFlushResult>>
+    );
+    forward_method!(
+        fn flush_regular_file_overlay_slices_with_attr(
+            &self,
+            ino: Ino,
+            chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
+            attr: Option<&InodeAttr>,
+        ) -> MetaResult<Option<InodeAttr>>
+    );
+}
+
 impl<M: ?Sized + MetaEngineCore> MetaEngineCore for RuntimeMetaHandle<M> {
     forward_method!(fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool>);
     forward_method!(fn release_global_janitor_lock(&self) -> MetaResult<()>);
@@ -156,8 +193,10 @@ impl<M: ?Sized + MetaInodes> MetaInodes for RuntimeMetaHandle<M> {
     forward_method!(fn set_counter(&self, name: &str, value: u64) -> MetaResult<()>);
     forward_method!(fn next_inode(&self) -> MetaResult<Ino>);
     forward_method!(fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr>);
+    forward_method!(fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>>);
     forward_method!(fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()>);
     forward_method!(fn remove_attr(&self, ino: Ino) -> MetaResult<()>);
+    forward_method!(fn list_inode_attrs(&self) -> MetaResult<Vec<InodeAttr>>);
 }
 
 impl<M: ?Sized + MetaNamespace> MetaNamespace for RuntimeMetaHandle<M> {
@@ -263,12 +302,23 @@ impl<M: ?Sized + MetaBlocks> MetaBlocks for RuntimeMetaHandle<M> {
         fn remove_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<u64>>
     );
     forward_method!(fn next_block_id(&self) -> MetaResult<u64>);
+    forward_method!(fn next_block_ids(&self, count: u32) -> MetaResult<Vec<u64>>);
+    forward_method!(
+        fn flush_blocks_batch(
+            &self,
+            entries: &[BatchFlushEntry],
+        ) -> MetaResult<Vec<BatchFlushResult>>
+    );
     forward_method!(
         fn flush_regular_file_overlay_slices(
             &self,
             ino: Ino,
             chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
         ) -> MetaResult<()>
+    );
+    forward_method!(fn has_local_regular_file_overlay(&self, ino: Ino) -> MetaResult<bool>);
+    forward_method!(
+        fn get_regular_file_overlay_object_ids(&self, ino: Ino) -> MetaResult<Vec<u64>>
     );
     forward_method!(
         fn commit_uploaded_block(
@@ -293,6 +343,9 @@ impl<M: ?Sized + MetaBlocks> MetaBlocks for RuntimeMetaHandle<M> {
             ino: Ino,
             expected_epoch: u64,
         ) -> MetaResult<bool>
+    );
+    forward_method!(
+        fn compact_fragmented_regular_file_chunks(&self, max_chunks: usize) -> MetaResult<usize>
     );
 }
 
@@ -367,6 +420,7 @@ impl<M: ?Sized + MetaReplication> MetaReplication for RuntimeMetaHandle<M> {
     forward_method!(fn invalidation_sender_id(&self) -> Option<String>);
     forward_method!(fn request_eager_flush(&self));
     forward_method!(fn metadata_version_token(&self) -> Option<String>);
+    forward_method!(fn namespace_version_token(&self) -> Option<String>);
     forward_method!(fn replication_backlog(&self) -> MetadataReplicationBacklog);
     forward_method!(fn remote_metadata_size(&self) -> MetaResult<Option<u64>>);
     forward_method!(fn prepare_for_close(&self));
