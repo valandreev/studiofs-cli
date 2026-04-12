@@ -321,6 +321,8 @@ mod tests {
             v3_layout_marker_exists: marker,
             v3_index_exists: false,
             v3_payload_blocks_dir_exists: false,
+            v3_tmp_dir_exists: false,
+            v3_index_dir_exists: false,
         }
     }
 

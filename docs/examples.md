@@ -54,6 +54,9 @@ Mount with explicit cache safety mode override:
 STUDIOFS_CACHE_SAFETY_MODE=durable studiofs mount myvolume Z:
 ```
 
+This overrides any persisted `settings.vfs.cache_safety_mode` value for that
+mount only.
+
 Mount with a local S3 endpoint (for low-latency access in hybrid networks):
 
 ```bash

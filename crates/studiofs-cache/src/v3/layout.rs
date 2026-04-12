@@ -4,6 +4,7 @@
 //! implementation starts so mount/status code can reason about cache shape
 //! without mutating legacy state.
 
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// Layout contract version for Cache 3.0.
@@ -102,6 +103,17 @@ impl CacheV3Layout {
             return None;
         }
         u64::from_str_radix(hex, 16).ok()
+    }
+
+    /// Create the required cache-v3 directories and layout marker.
+    pub fn provision(&self) -> io::Result<()> {
+        std::fs::create_dir_all(&self.tmp_dir)?;
+        std::fs::create_dir_all(&self.payload_blocks_dir)?;
+        std::fs::create_dir_all(&self.index_dir)?;
+        if !self.layout_marker.exists() {
+            std::fs::write(&self.layout_marker, b"v1")?;
+        }
+        Ok(())
     }
 }
 

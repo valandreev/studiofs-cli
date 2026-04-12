@@ -406,6 +406,37 @@ impl RedbMetaEngine {
         chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
         track_pending_compaction: bool,
     ) -> MetaResult<()> {
+        fn visible_data_ranges(
+            chunk_id: ChunkId,
+            current: &RegularFileChunkState,
+            lower_precedence: Option<&RegularFileChunkState>,
+            queries: &[SliceRange],
+        ) -> Vec<SliceRange> {
+            if queries.is_empty() {
+                return Vec::new();
+            }
+            let mut visible = Vec::new();
+            for query in queries {
+                visible.extend(
+                    resolve_chunk_slice_spans(chunk_id, *query, Some(current), lower_precedence)
+                        .into_iter()
+                        .filter_map(|span| span.block.map(|_| span.range)),
+                );
+            }
+            if visible.len() <= 1 {
+                visible
+            } else {
+                merge_covered_ranges(&visible)
+            }
+        }
+
+        fn intersect_ranges(query: SliceRange, visible: &[SliceRange]) -> Vec<SliceRange> {
+            visible
+                .iter()
+                .filter_map(|range| query.intersection(*range))
+                .collect()
+        }
+
         fn merge_covered_ranges(ranges: &[SliceRange]) -> Vec<SliceRange> {
             let mut merged = ranges.to_vec();
             merged.sort_unstable_by_key(|range| (range.start, range.end));
@@ -449,9 +480,46 @@ impl RedbMetaEngine {
             } else {
                 RegularFileChunkState::default()
             };
+            let lower_precedence = if redb::TableHandle::name(&table_def)
+                == redb::TableHandle::name(&REGULAR_FILE_OVERLAY_TABLE)
+            {
+                txn.open_table(REGULAR_FILE_BASE_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                    .get(key.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                    .map(|value| decode::<RegularFileChunkState>(value.value()))
+                    .transpose()?
+            } else {
+                None
+            };
+            let tombstone_queries = merge_covered_ranges(
+                &new_slices
+                    .iter()
+                    .filter(|slice| slice.block.is_none())
+                    .map(|slice| slice.range)
+                    .collect::<Vec<_>>(),
+            );
+            let visible_ranges = visible_data_ranges(
+                *chunk_id,
+                &state,
+                lower_precedence.as_ref(),
+                tombstone_queries.as_slice(),
+            );
+            let mut effective_new_slices = Vec::new();
+            for new_slice in new_slices.iter().cloned() {
+                if new_slice.block.is_some() {
+                    effective_new_slices.push(new_slice);
+                    continue;
+                }
+                for intersection in intersect_ranges(new_slice.range, &visible_ranges) {
+                    let mut pruned = new_slice.clone();
+                    pruned.range = intersection;
+                    effective_new_slices.push(pruned);
+                }
+            }
 
             let covered_ranges = merge_covered_ranges(
-                &new_slices
+                &effective_new_slices
                     .iter()
                     .map(|slice| slice.range)
                     .collect::<Vec<_>>(),
@@ -469,7 +537,7 @@ impl RedbMetaEngine {
                 state.slices.remove(&id);
             }
 
-            for mut new_slice in new_slices.iter().cloned() {
+            for mut new_slice in effective_new_slices {
                 let slice_id = state
                     .try_alloc_slice_id()
                     .ok_or_else(|| MetaError::Storage("slice id overflow".to_string()))?;
@@ -989,21 +1057,10 @@ impl RedbMetaEngine {
         Ok(chosen.filter(|block| block.length > 0))
     }
 
-    #[cfg(test)]
-    pub(super) fn compute_committed_size_in_txn(
-        txn: &redb::WriteTransaction,
-        ino: Ino,
-    ) -> MetaResult<u64> {
-        Ok(Self::regular_file_committed_size_in_txn(txn, ino)?.unwrap_or(0))
-    }
-
-    pub(super) fn regular_file_committed_size_in_txn(
-        txn: &redb::WriteTransaction,
+    fn regular_file_committed_size_from_base_table(
+        table: &redb::Table<'_, &[u8], &[u8]>,
         ino: Ino,
     ) -> MetaResult<Option<u64>> {
-        let table = txn
-            .open_table(REGULAR_FILE_BASE_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
         let prefix = regular_file_chunk_prefix(ino);
         let mut size = 0u64;
         let mut saw_row = false;
@@ -1028,6 +1085,26 @@ impl RedbMetaEngine {
             }
         }
         Ok(saw_row.then_some(size))
+    }
+
+    #[cfg(test)]
+    pub(super) fn compute_committed_size_in_txn(
+        txn: &redb::WriteTransaction,
+        committed: &redb::Table<'_, &[u8], &[u8]>,
+        ino: Ino,
+    ) -> MetaResult<u64> {
+        let _ = txn;
+        Ok(Self::regular_file_committed_size_from_base_table(committed, ino)?.unwrap_or(0))
+    }
+
+    pub(super) fn regular_file_committed_size_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<Option<u64>> {
+        let table = txn
+            .open_table(REGULAR_FILE_BASE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Self::regular_file_committed_size_from_base_table(&table, ino)
     }
 
     pub(super) fn current_manifest_in_txn(

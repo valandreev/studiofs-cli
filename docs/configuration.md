@@ -80,6 +80,8 @@ studiofs mount <name> [<mount-point>] \
 Notes:
 - You can persist defaults with `studiofs settings`.
 - If `<mount-point>` is omitted, `studiofs mount` uses the configured default from `settings` on non-Windows platforms.
+- Precedence for mount path knobs is: CLI args -> persisted `studiofs settings` values -> built-in defaults.
+- VFS/runtime tuning starts from persisted `settings.vfs`, then applies supported `STUDIOFS_*` environment overrides for the current process, then validates the final typed config before mount startup continues.
 - Cross-client metadata convergence is handled through PostgreSQL sync.
 - Client-side PG batching/sync policy is controlled at mount/runtime via environment variables, not stored in the volume.
 - If `<mount-point>` does not already end with `<name>`, StudioFS mounts at `<mount-point>/<name>` and creates the directory automatically.
@@ -92,6 +94,7 @@ Notes:
 - `--detach` runs the mount as a background daemon.
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
 - `--cache-size` uses the shared size parser and accepts fractional values (for example `1.5GB`); the value must be greater than `0`.
+- Cache 3.0 provisioning is automatic for the per-volume root under `<cache-dir>/<volume-uuid>` and is owned by `studiofs-cache`; the CLI only resolves cache location and budget inputs.
 - Cache 3.0 runtime thresholds (dirty headroom, ingress checkpoint pacing, upload local-I/O slots, transit headroom) are derived automatically from cache budget.
 - On Windows and macOS, StudioFS uses the buffered-first runtime path for every mount. Foreground `flush()` / `close()` confirm local acceptance and surface sticky upload errors deterministically, while upload and manifest publication continue asynchronously.
 - Buffered-first reads are now classified per handle in core VFS, so sequential media readers keep prefetch/L1 promotion behavior even when another handle on the same inode is doing random seeks.
@@ -155,6 +158,7 @@ Notes:
 - `studiofs settings --mount-point` creates the mount directory if needed on non-Windows systems.
 - `studiofs settings --cache-dir` creates the cache directory if needed.
 - `studiofs settings` with no options prints current defaults and leaves the file unchanged.
+- `settings.vfs` values act as persisted runtime defaults for `studiofs mount`; supported `STUDIOFS_*` environment variables still override them for a single mount process before final validation.
 - Internal cache thresholds are derived from cache budget and are not configurable through `studiofs settings`.
 
 ### `umount`
