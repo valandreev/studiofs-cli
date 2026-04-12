@@ -314,7 +314,6 @@ where
     }
 
     fn additional_object_id_count_needed(
-        &self,
         pending: &std::collections::HashMap<(Ino, u32), PendingBlock>,
         ino: Ino,
         blocks: &[DirtyWriteSnapshot],
@@ -338,7 +337,7 @@ where
         blocks: &[DirtyWriteSnapshot],
         fresh_object_ids: &mut std::collections::VecDeque<u64>,
     ) -> Result<Vec<PersistedWriteBlock>, usize> {
-        let fresh_needed = self.additional_object_id_count_needed(pending, ino, blocks);
+        let fresh_needed = Self::additional_object_id_count_needed(pending, ino, blocks);
         let additional_needed = fresh_needed.saturating_sub(fresh_object_ids.len());
         if additional_needed > 0 {
             return Err(additional_needed);
@@ -746,10 +745,16 @@ impl<'a> OrderedWriteSession<'a> {
             match prepare_result {
                 Ok(persisted_blocks) => break persisted_blocks,
                 Err(additional_needed) => {
-                    let additional_ids = self
-                        .drain
-                        .allocate_block_ids(additional_needed as u32)
-                        .await?;
+                    let additional_needed = u32::try_from(additional_needed).map_err(|_| {
+                        VfsError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!(
+                                "requested additional block-id count {} exceeds u32::MAX",
+                                additional_needed
+                            ),
+                        ))
+                    })?;
+                    let additional_ids = self.drain.allocate_block_ids(additional_needed).await?;
                     fresh_object_ids.extend(additional_ids);
                 }
             }
