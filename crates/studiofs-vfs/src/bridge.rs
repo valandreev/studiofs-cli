@@ -36,6 +36,7 @@ pub fn classify_vfs_error(error: &VfsError) -> BridgeVfsErrorKind {
         VfsError::Meta(meta_error) => classify_meta_error(meta_error),
         VfsError::Io(io_error) => classify_io_error(io_error.kind()),
         VfsError::Join(_) => BridgeVfsErrorKind::CriticalRuntimeFailure,
+        VfsError::Object(_) | VfsError::BlockNotFound(_, _) => BridgeVfsErrorKind::DataCorruption,
         VfsError::WouldBlock | VfsError::RemoteContentPending => BridgeVfsErrorKind::Retryable,
         VfsError::InvalidName(_) => BridgeVfsErrorKind::InvalidInput,
         VfsError::Fetch(fetch_error) => classify_fetch_error(fetch_error),
@@ -64,6 +65,7 @@ fn classify_meta_error(error: &MetaError) -> BridgeVfsErrorKind {
         MetaError::NotFormatted => BridgeVfsErrorKind::UnrecognizedVolume,
         MetaError::FragmentedBlock { .. } => BridgeVfsErrorKind::DataCorruption,
         MetaError::XattrValueTooLarge { .. } => BridgeVfsErrorKind::XattrValueTooLarge,
+        MetaError::AccessDenied { .. } => BridgeVfsErrorKind::PermissionDenied,
         _ => BridgeVfsErrorKind::GenericFailure,
     }
 }
@@ -101,7 +103,7 @@ mod tests {
     use super::{BridgeAttrTimes, BridgeVfsErrorKind, classify_vfs_error, normalize_attr_times};
     use studiofs_data::object::ObjectError;
     use studiofs_data::store::DataError;
-    use studiofs_meta::{InodeAttr, MetaError};
+    use studiofs_meta::{AccessLevel, InodeAttr, MetaError};
 
     #[test]
     fn classify_vfs_error_maps_meta_variants_to_bridge_categories() {
@@ -133,6 +135,17 @@ mod tests {
         assert_eq!(
             classify_vfs_error(&dir_not_empty),
             BridgeVfsErrorKind::DirectoryNotEmpty
+        );
+
+        let denied = crate::VfsError::Meta(MetaError::AccessDenied {
+            ino: 7,
+            principal: "user".into(),
+            required: AccessLevel::ReadWrite,
+            actual: AccessLevel::ReadOnly,
+        });
+        assert_eq!(
+            classify_vfs_error(&denied),
+            BridgeVfsErrorKind::PermissionDenied
         );
     }
 
@@ -169,6 +182,18 @@ mod tests {
             crate::VfsError::Fetch(crate::fetch::FetchError::Decode(ObjectError::InvalidMagic));
         assert_eq!(
             classify_vfs_error(&decode),
+            BridgeVfsErrorKind::DataCorruption
+        );
+
+        let object = crate::VfsError::Object(ObjectError::InvalidMagic);
+        assert_eq!(
+            classify_vfs_error(&object),
+            BridgeVfsErrorKind::DataCorruption
+        );
+
+        let missing_block = crate::VfsError::BlockNotFound(42, 3);
+        assert_eq!(
+            classify_vfs_error(&missing_block),
             BridgeVfsErrorKind::DataCorruption
         );
     }

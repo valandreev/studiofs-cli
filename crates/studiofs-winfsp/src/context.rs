@@ -472,7 +472,8 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
             }
             winfsp::FspError::from(STATUS_UNSUCCESSFUL)
         }
-        BridgeVfsErrorKind::CriticalRuntimeFailure | BridgeVfsErrorKind::GenericFailure => {
+        BridgeVfsErrorKind::CriticalRuntimeFailure => winfsp::FspError::from(STATUS_UNSUCCESSFUL),
+        BridgeVfsErrorKind::GenericFailure => {
             if matches!(e, studiofs_vfs::VfsError::Meta(_)) {
                 error!("metadata error: {e}");
             } else {
@@ -1921,6 +1922,15 @@ mod tests {
         });
         let status = vfs_to_winfsp_err(xattr_too_big).to_ntstatus();
         assert_eq!(status, STATUS_EA_TOO_LARGE.0);
+
+        let denied = VfsError::Meta(MetaError::AccessDenied {
+            ino: 7,
+            principal: "user".into(),
+            required: studiofs_meta::AccessLevel::ReadWrite,
+            actual: studiofs_meta::AccessLevel::ReadOnly,
+        });
+        let status = vfs_to_winfsp_err(denied).to_ntstatus();
+        assert_eq!(status, STATUS_ACCESS_DENIED.0);
 
         let fragmented = VfsError::Meta(MetaError::FragmentedBlock {
             ino: 7,
