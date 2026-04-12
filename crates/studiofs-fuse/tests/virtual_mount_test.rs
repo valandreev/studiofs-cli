@@ -125,7 +125,7 @@ fn test_macos_logic_smoke_virtual() {
         vfs.start().expect("start vfs background workers");
     }
 
-    let _fs = StudioFuseFs::new(vfs.clone(), rt.clone());
+    let _fs = StudioFuseFs::new(vfs.clone(), rt.handle().clone());
 
     // 2. Simulate logic check directly on VFS
     // (Since we can't easily mock Request in fuser v0.16)

@@ -12,7 +12,7 @@ use studiofs_vfs::{
     BridgeVfsErrorKind, KernelInvalidator, NamespacePathStyle, OpenFlags, StudioVfs,
     classify_vfs_error, normalize_attr_times,
 };
-use tokio::runtime::Runtime;
+use tokio::runtime::Handle;
 use tracing::{debug, error, trace, warn};
 use windows::Win32::Foundation::NTSTATUS;
 use windows::Win32::Security::{
@@ -536,7 +536,7 @@ fn encode_entry_name_utf16_lossy(entry_name: &[u8], out: &mut Vec<u16>) -> bool 
 /// The WinFSP filesystem context — holds VFS and tokio runtime.
 pub struct StudioFsContext {
     vfs: Arc<StudioVfs>,
-    rt: Arc<Runtime>,
+    rt: Handle,
     /// Cached binary security descriptor (Everyone = Full Access).
     default_sd: Vec<u8>,
     /// Pending kernel cache invalidation queue (shared with
@@ -847,11 +847,7 @@ impl<'a> HandleCallbackLifecycle<'a> {
 }
 
 impl StudioFsContext {
-    pub fn new(
-        vfs: Arc<StudioVfs>,
-        rt: Arc<Runtime>,
-        invalidation_queue: Arc<Mutex<Vec<Ino>>>,
-    ) -> Self {
+    pub fn new(vfs: Arc<StudioVfs>, rt: Handle, invalidation_queue: Arc<Mutex<Vec<Ino>>>) -> Self {
         let default_sd = create_default_security_descriptor();
         Self {
             vfs,
@@ -1804,7 +1800,7 @@ mod tests {
         let queue = Arc::new(Mutex::new(Vec::new()));
         let rt = Arc::new(Runtime::new().expect("runtime"));
         let vfs = make_test_vfs(&tmp, volume_suffix, &rt);
-        let ctx = StudioFsContext::new(vfs.clone(), rt, queue.clone());
+        let ctx = StudioFsContext::new(vfs.clone(), rt.handle().clone(), queue.clone());
         (tmp, vfs, ctx, queue)
     }
 

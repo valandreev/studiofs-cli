@@ -11,14 +11,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub use fs::{FuseKernelInvalidator, StudioFuseFs};
 use thiserror::Error;
 
-fn shutdown_upload_drain_timeout() -> std::time::Duration {
-    let secs = std::env::var("STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    std::time::Duration::from_secs(secs)
-}
-
 #[derive(Debug, Error, PartialEq, Eq)]
 enum MountOptionError {
     #[error("volume name cannot be empty")]
@@ -128,17 +120,13 @@ fn spawn_signal_watcher(
 /// Mount and serve the FUSE filesystem (blocks until unmounted).
 pub fn mount_and_serve(
     vfs: std::sync::Arc<studiofs_vfs::StudioVfs>,
-    rt: std::sync::Arc<tokio::runtime::Runtime>,
+    runtime_handle: tokio::runtime::Handle,
     mount_point: &str,
     volume_name: &str,
     foreground: bool,
     read_only: bool,
-    profiling: Option<Box<dyn FnMut()>>,
 ) -> std::io::Result<()> {
-    // Keep a reference for shutdown() after the FUSE session ends
-    // (vfs is moved into StudioFuseFs below).
-    let vfs_ref = vfs.clone();
-    let fs = StudioFuseFs::new(vfs.clone(), rt.clone());
+    let fs = StudioFuseFs::new(vfs.clone(), runtime_handle);
     // Do NOT add DefaultPermissions here: it would make the kernel enforce
     // POSIX mode/uid/gid from getattr() in-kernel.  Old volumes have the
     // root inode stored with uid=0/gid=0 (historic default), so the kernel
@@ -171,10 +159,8 @@ pub fn mount_and_serve(
     session.run()?;
 
     // Session::run returns when the filesystem is unmounted.
-    // Drain uploads and persist cache checkpoint before process exit.
-    vfs_ref.clear_kernel_invalidator();
+    vfs.clear_kernel_invalidator();
     tracing::info!("unmounted, draining uploads …");
-    rt.block_on(vfs_ref.shutdown(shutdown_upload_drain_timeout()));
     // If we arrived here without SIGINT/SIGTERM, the mount point was most
     // likely detached by Finder/umount. In that case skip dropping the session
     // object to avoid a second unmount attempt during Drop (EINVAL on macOS).
@@ -187,14 +173,8 @@ pub fn mount_and_serve(
     } else {
         std::mem::forget(session);
     }
-    if let Some(mut profiling) = profiling {
-        profiling();
-    }
-    // Use process::exit to avoid blocking on tokio Runtime drop, which would
-    // wait for all background tasks (janitor, GC etc.) to complete — causing
-    // an indefinite hang after unmount on Linux/WSL.
-    tracing::info!("shutdown complete, exiting");
-    std::process::exit(0);
+    tracing::info!("shutdown complete");
+    Ok(())
 }
 
 #[cfg(test)]
