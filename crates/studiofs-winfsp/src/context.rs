@@ -267,7 +267,7 @@ fn attr_to_file_info(attr: &InodeAttr) -> FileInfo {
     info.creation_time = unix_nanos_to_filetime(times.creation_time_unix_nanos);
     info.last_access_time = unix_nanos_to_filetime(times.atime_unix_nanos);
     info.last_write_time = unix_nanos_to_filetime(times.mtime_unix_nanos);
-    info.change_time = unix_nanos_to_filetime(times.mtime_unix_nanos);
+    info.change_time = unix_nanos_to_filetime(times.ctime_unix_nanos);
 
     // Use inode as index
     info.index_number = attr.ino;
@@ -1733,6 +1733,7 @@ mod tests {
         encode_symlink_reparse, ino_to_windows_path, notify_filter_for_kind,
         open_flags_from_create_options, resolve_create_callback_kind,
         resolve_file_size_callback_action, vfs_to_winfsp_err,
+        unix_nanos_to_filetime,
     };
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -1949,10 +1950,14 @@ mod tests {
         let mut file = InodeAttr::new_file(21, ROOT_INO, 1000, 1000, 0o644);
         file.size = 4097;
         file.nlink = 0;
+        file.mtime = 123;
+        file.ctime = 456;
         let file_info = attr_to_file_info(&file);
         assert_eq!(file_info.allocation_size, 8192);
         assert_eq!(file_info.hard_links, 1);
         assert_eq!(file_info.index_number, 21);
+        assert_eq!(file_info.last_write_time, unix_nanos_to_filetime(123));
+        assert_eq!(file_info.change_time, unix_nanos_to_filetime(456));
 
         let mut dir = InodeAttr::new_dir(22, ROOT_INO, 1000, 1000, 0o755);
         dir.size = 0;

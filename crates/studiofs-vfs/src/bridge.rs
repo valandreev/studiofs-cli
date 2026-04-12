@@ -86,13 +86,14 @@ fn classify_io_error(kind: ErrorKind) -> BridgeVfsErrorKind {
         ErrorKind::PermissionDenied => BridgeVfsErrorKind::PermissionDenied,
         ErrorKind::AlreadyExists => BridgeVfsErrorKind::AlreadyExists,
         ErrorKind::WouldBlock => BridgeVfsErrorKind::Retryable,
+        ErrorKind::TimedOut => BridgeVfsErrorKind::TimedOut,
         ErrorKind::InvalidInput | ErrorKind::InvalidData => BridgeVfsErrorKind::InvalidInput,
         _ => BridgeVfsErrorKind::GenericFailure,
     }
 }
 
 fn clamp_unix_nanos(nanos: i64) -> u64 {
-    u64::try_from(nanos.max(0)).unwrap_or(0)
+    nanos.max(0) as u64
 }
 
 #[cfg(test)]
@@ -179,6 +180,12 @@ mod tests {
         assert_eq!(
             classify_vfs_error(&permission_denied),
             BridgeVfsErrorKind::PermissionDenied
+        );
+
+        let timed_out = crate::VfsError::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        assert_eq!(
+            classify_vfs_error(&timed_out),
+            BridgeVfsErrorKind::TimedOut
         );
 
         let invalid = crate::VfsError::InvalidName("bad".into());
