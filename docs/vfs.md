@@ -21,10 +21,11 @@ Holds all runtime state:
 | `meta` | `MetaExecutor<dyn VfsMeta>` | Typed metadata executor used by `run_meta(...)` |
 | `data_write` | `Arc<DataStore>` | S3 write/delete path (write-optimized profile) |
 | `local_block_backend` | `Arc<dyn LocalBlockBackend>` | Cache 3.0 local data store for committed extents and upload rereads |
-| `upload_coordinator` | `Arc<UploadCoordinator>` | Upload queue, pending-upload pinning, and upload-journal coordination |
+| `upload_coordinator` | `Arc<UploadCoordinator>` | Pending-upload pinning and in-memory upload queue orchestration, with upload intent persisted via local-backend lifecycle flags |
 | `fetch_scheduler` | `Arc<FetchScheduler>` | Adaptive S3 fetcher (read path) |
 | `readahead` | `Arc<ReadAheadTracker>` | Sequential prefetch |
-| `state` | `VfsState` | Write buffers, inode overlays, file sessions, and backpressure |
+| `dir_prefetch` | `Arc<DirAccessTracker>` | Directory-level prefetch |
+| `state` | `Arc<VfsState>` | Write buffers, inode overlays, file sessions, and backpressure |
 
 `local_block_backend()` remains the accessor used by helper modules that need
 the backend boundary without reaching through backend-specific internals.
