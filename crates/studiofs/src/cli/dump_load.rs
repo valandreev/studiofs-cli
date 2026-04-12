@@ -1,6 +1,7 @@
 //! `studiofs dump` / `studiofs load` — PostgreSQL metadata manifest backup/restore.
 
-use std::path::Path;
+use clap::Args;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use studiofs_meta::{MetaError, ensure_studiofs_database, open_meta_engine};
@@ -66,6 +67,44 @@ pub enum DumpLoadError {
 }
 
 type DumpLoadResult<T> = std::result::Result<T, DumpLoadError>;
+
+#[derive(Debug, Args)]
+#[command(about = "Dump metadata manifest from PostgreSQL (source of truth)")]
+pub(crate) struct DumpArgs {
+    /// Disk/volume name
+    name: String,
+
+    /// Output dump path (JSON)
+    #[arg(long = "path-to-dump")]
+    path_to_dump: PathBuf,
+}
+
+impl DumpArgs {
+    pub(crate) fn dispatch(self) -> anyhow::Result<()> {
+        let meta_dir = super::utils::get_default_meta_dir(&self.name)?;
+        dump(&self.name, &meta_dir, &self.path_to_dump)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Args)]
+#[command(about = "Load metadata manifest into PostgreSQL")]
+pub(crate) struct LoadArgs {
+    /// Input dump path (JSON)
+    #[arg(long = "path-to-dump")]
+    path_to_dump: PathBuf,
+
+    /// PostgreSQL address/DSN
+    #[arg(long = "postgresql-address", alias = "postgresql-adress")]
+    postgresql_address: String,
+}
+
+impl LoadArgs {
+    pub(crate) fn dispatch(self) -> anyhow::Result<()> {
+        load(&self.path_to_dump, &self.postgresql_address)?;
+        Ok(())
+    }
+}
 
 async fn ensure_pg_schema(client: &tokio_postgres::Client) -> DumpLoadResult<()> {
     client
@@ -463,4 +502,61 @@ pub fn load(input: &Path, postgres_address: &str) -> DumpLoadResult<()> {
     println!("  Volume: {}", volume_name);
     println!("  Source: {}", input.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dump_parses_name_and_output_path() {
+        let cli =
+            crate::cli::parse_for_test(&["dump", "vol", "--path-to-dump", "reports/metadata.json"])
+                .unwrap();
+
+        match cli.command {
+            crate::cli::Commands::Dump(DumpArgs { name, path_to_dump }) => {
+                assert_eq!(name, "vol");
+                assert_eq!(path_to_dump, PathBuf::from("reports/metadata.json"));
+            }
+            other => panic!("expected Dump, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_parses_legacy_and_canonical_postgres_flags() {
+        let legacy = crate::cli::parse_for_test(&[
+            "load",
+            "--path-to-dump",
+            "reports/metadata.json",
+            "--postgresql-address",
+            "postgres://user:pass@127.0.0.1:5432",
+        ])
+        .unwrap();
+        match legacy.command {
+            crate::cli::Commands::Load(LoadArgs {
+                path_to_dump,
+                postgresql_address,
+            }) => {
+                assert_eq!(path_to_dump, PathBuf::from("reports/metadata.json"));
+                assert_eq!(postgresql_address, "postgres://user:pass@127.0.0.1:5432");
+            }
+            other => panic!("expected Load, got {other:?}"),
+        }
+
+        let canonical = crate::cli::parse_for_test(&[
+            "load",
+            "--path-to-dump",
+            "reports/metadata.json",
+            "--postgresql-adress",
+            "postgres://user:pass@127.0.0.1:5432",
+        ])
+        .unwrap();
+        match canonical.command {
+            crate::cli::Commands::Load(LoadArgs {
+                postgresql_address, ..
+            }) => assert_eq!(postgresql_address, "postgres://user:pass@127.0.0.1:5432"),
+            other => panic!("expected Load, got {other:?}"),
+        }
+    }
 }
