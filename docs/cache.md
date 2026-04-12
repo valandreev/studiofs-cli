@@ -10,8 +10,9 @@ Current runtime components:
 | Component | Modules | Role |
 |---|---|---|
 | Cache 3.0 local backend | `v3::layout`, `v3::cache_index`, `v3::file_payload_store`, `v3::reconcile` | Persistent local payloads + lifecycle/index state |
-| Local-backend contract | `v2::local_block_backend` | Backend-agnostic trait used by VFS/read/write/upload paths |
-| Upload orchestration layer | `block_cache`, `upload_queue` | Pending-upload orchestration and local pipeline telemetry |
+| Local-backend contract | `local` | Backend-agnostic trait used by VFS read/write/upload paths |
+| Upload orchestration layer | `upload_coordinator`, `upload_queue` | Pending-upload orchestration, in-memory queue bookkeeping (reconstructed on startup), and pending-upload pinning |
+| Benchmark-only cache surface | `benchmark_cache` | Lightweight in-memory cache used by `studiofs test-cache` |
 
 Cache-v2 storage implementation code has been removed.
 
@@ -19,15 +20,15 @@ Cache-v2 storage implementation code has been removed.
 
 ```
                 ┌────────────────────────────┐
-                │       BlockCache           │
+                │    UploadCoordinator       │
                 │ (upload orchestration)     │
                 └───────────┬────────────────┘
                             │
           ┌─────────────────┴──────────────────┐
           │                                    │
    ┌──────▼────────┐                  ┌────────▼─────────┐
-   │ L1 Staging    │                  │ Upload Queue     │
-   │ (bounded RAM) │                  │ (in-memory+journal) │
+   │ Pending-upload│                  │ Upload Queue     │
+   │ pin tracking  │                  │ (in-memory)      │
    └───────────────┘                  └──────────────────┘
                             │
                             ▼
@@ -62,11 +63,14 @@ Reconciliation is scoped to `v3/**` and does not mutate unrelated files under
 
 ## Upload Orchestration Responsibilities
 
-`BlockCache` remains intentionally small and focused on:
+`UploadCoordinator` remains intentionally small and focused on:
 
-- buffering/pinning payloads near upload boundaries
+- pending-upload pinning near upload boundaries
 - pending-upload queue bookkeeping
-- runtime metrics used by `status` and benchmark tooling
+- runtime metrics used by `status`
+
+`BenchmarkCache` is separate and only backs `studiofs test-cache`; it is not
+part of the production mount runtime.
 
 It is not the source of truth for durable local payload state.
 
@@ -74,6 +78,8 @@ It is not the source of truth for durable local payload state.
 
 - Runtime local payload durability and lifecycle state are provided by Cache 3.0
   backend persistence + index state.
+- Upload intent is persisted through local-backend lifecycle flags; the
+  in-memory queue is rebuilt on startup from local backend + metadata mapping.
 - Upload workers reread committed payloads from the local backend
   (`get_for_upload()`), not from transient staging buffers.
 - `studiofs status` reports Cache 3.0 contract/index/payload health and does not
