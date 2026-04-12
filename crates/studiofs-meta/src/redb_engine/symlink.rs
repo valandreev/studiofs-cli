@@ -1,3 +1,5 @@
+use super::*;
+
 impl MetaSymlink for RedbMetaEngine {
     fn set_symlink_target(&self, ino: Ino, target: &[u8]) -> MetaResult<()> {
         let txn = self

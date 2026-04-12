@@ -1,5 +1,9 @@
+use super::*;
+
 impl RedbMetaEngine {
-    fn local_overlay_inodes_from_txn(txn: &redb::ReadTransaction) -> MetaResult<HashSet<Ino>> {
+    pub(super) fn local_overlay_inodes_from_txn(
+        txn: &redb::ReadTransaction,
+    ) -> MetaResult<HashSet<Ino>> {
         let mut overlay = HashSet::new();
 
         let file_blocks = txn
@@ -45,8 +49,9 @@ impl RedbMetaEngine {
         Ok(overlay)
     }
 
-
-    fn local_overlay_attr_inodes_from_txn(txn: &redb::ReadTransaction) -> MetaResult<HashSet<Ino>> {
+    pub(super) fn local_overlay_attr_inodes_from_txn(
+        txn: &redb::ReadTransaction,
+    ) -> MetaResult<HashSet<Ino>> {
         let current = txn
             .open_table(INODES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -57,67 +62,30 @@ impl RedbMetaEngine {
             .open_table(INODE_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-        let mut overlay = HashSet::new();
-        for row in current
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (ino, current_bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let ino = ino.value();
-            match base
-                .get(ino)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(base_bytes) if base_bytes.value() == current_bytes.value() => {}
-                _ => {
-                    overlay.insert(ino);
-                }
-            }
-        }
-
-        for row in tombstones
-            .iter()
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            let (ino, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            overlay.insert(ino.value());
-        }
-
-        Ok(overlay)
+        Self::collect_overlay_inode_attrs_from_tables(&current, &base, &tombstones)
     }
 
-    fn resolve_attr_in_read_snapshot(
+    pub(super) fn resolve_attr_in_read_snapshot(
         txn: &redb::ReadTransaction,
         ino: Ino,
         overlay_block_inodes: &HashSet<Ino>,
         overlay_attr_inodes: &HashSet<Ino>,
     ) -> MetaResult<InodeAttr> {
-        if Self::has_u64_marker(txn, INODE_TOMBSTONES_TABLE, ino)? {
-            return Err(MetaError::InodeNotFound(ino));
-        }
+        let current = txn
+            .open_table(INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base = txn
+            .open_table(BASE_INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let tombstones = txn
+            .open_table(INODE_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
 
-        if overlay_attr_inodes.contains(&ino) {
-            return Self::get_attr_from_table(txn, INODES_TABLE, ino)?
-                .ok_or(MetaError::InodeNotFound(ino));
-        }
+        let prefer_current =
+            overlay_attr_inodes.contains(&ino) || overlay_block_inodes.contains(&ino);
 
-        if overlay_block_inodes.contains(&ino) {
-            if let Some(attr) = Self::get_attr_from_table(txn, INODES_TABLE, ino)? {
-                return Ok(attr);
-            }
-            if let Some(attr) = Self::get_attr_from_table(txn, BASE_INODES_TABLE, ino)? {
-                return Ok(attr);
-            }
-            return Err(MetaError::InodeNotFound(ino));
-        }
-
-        if let Some(attr) = Self::get_attr_from_table(txn, BASE_INODES_TABLE, ino)? {
-            return Ok(attr);
-        }
-
-        Self::get_attr_from_table(txn, INODES_TABLE, ino)?.ok_or(MetaError::InodeNotFound(ino))
+        Self::resolve_attr_from_opened_tables(&base, &current, &tombstones, ino, prefer_current)
     }
-
 
     pub fn local_overlay_inodes(&self) -> MetaResult<HashSet<Ino>> {
         let txn = self
@@ -135,7 +103,6 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Self::local_overlay_attr_inodes_from_txn(&txn)
     }
-
 }
 
 impl MetaInodes for RedbMetaEngine {

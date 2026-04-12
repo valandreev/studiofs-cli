@@ -1,3 +1,5 @@
+use super::*;
+
 impl RedbMetaEngine {
     pub fn export_snapshot(&self) -> MetaResult<RedbSnapshot> {
         let txn = self
@@ -485,7 +487,6 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-
     fn collect_snapshot_pinned_object_ids(&self, root_ino: Ino) -> MetaResult<Vec<u64>> {
         let mut pinned = HashSet::new();
         let mut stack = vec![root_ino];
@@ -519,7 +520,6 @@ impl RedbMetaEngine {
         out.sort_unstable();
         Ok(out)
     }
-
 }
 
 impl MetaSnapshots for RedbMetaEngine {

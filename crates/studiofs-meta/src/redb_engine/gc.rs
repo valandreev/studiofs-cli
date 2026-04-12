@@ -1,3 +1,5 @@
+use super::*;
+
 impl MetaGc for RedbMetaEngine {
     fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> MetaResult<()> {
         let txn = self

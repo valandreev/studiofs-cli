@@ -1,3 +1,5 @@
+use super::*;
+
 impl RedbMetaEngine {
     pub fn local_overlay_dentries(&self) -> MetaResult<HashSet<Vec<u8>>> {
         let txn = self

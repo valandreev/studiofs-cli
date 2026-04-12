@@ -1,3 +1,5 @@
+use super::fs_ops::*;
+use super::layout::*;
 use super::test_support::*;
 use super::*;
 use crate::events::MetaEvent;

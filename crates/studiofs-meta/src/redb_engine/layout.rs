@@ -1,110 +1,122 @@
+use super::*;
+
 // ─── Table Definitions ──────────────────────────────────────────────────────
 
 /// Format info: "format" -> JSON bytes
-const SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("settings");
+pub(super) const SETTINGS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("settings");
 
 /// Counters: counter_name -> u64 (as bytes)
-const COUNTERS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("counters");
+pub(super) const COUNTERS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("counters");
 
 /// Inodes: ino (u64) -> InodeAttr (postcard)
-const INODES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("inodes");
+pub(super) const INODES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("inodes");
 
 /// Remote-visible base attrs imported from checkpoint + foreign PG apply.
-const BASE_INODES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("base_inodes");
+pub(super) const BASE_INODES_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("base_inodes");
 
 /// Local tombstones hiding remote-visible base attrs.
-const INODE_TOMBSTONES_TABLE: TableDefinition<u64, u8> = TableDefinition::new("inode_tombstones");
+pub(super) const INODE_TOMBSTONES_TABLE: TableDefinition<u64, u8> =
+    TableDefinition::new("inode_tombstones");
 
 /// Directory entries: (parent_ino, name) as bytes -> DirEntryValue (postcard)
-const DENTRIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("dentries");
+pub(super) const DENTRIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("dentries");
 
 /// Remote-visible base dentries imported from checkpoint + foreign PG apply.
-const BASE_DENTRIES_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("base_dentries");
+pub(super) const BASE_DENTRIES_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("base_dentries");
 
 /// Local tombstones hiding remote-visible base dentries.
-const DENTRY_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> =
+pub(super) const DENTRY_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> =
     TableDefinition::new("dentry_tombstones");
 
 /// File Blocks: (ino, block_index) -> BlockRef (postcard)
 /// Key encoding: ino (8 bytes LE) + block_index (4 bytes LE)
-const FILE_BLOCKS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("file_blocks");
+pub(super) const FILE_BLOCKS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("file_blocks");
 
 /// Remote-visible committed file blocks: (ino, block_index) -> BlockRef.
-const COMMITTED_FILE_BLOCKS_TABLE: TableDefinition<&[u8], &[u8]> =
+pub(super) const COMMITTED_FILE_BLOCKS_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("committed_file_blocks");
 
 /// Local overlay regular-file chunk rows: (ino, chunk_id) -> RegularFileChunkState.
-const REGULAR_FILE_OVERLAY_TABLE: TableDefinition<&[u8], &[u8]> =
+pub(super) const REGULAR_FILE_OVERLAY_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("regular_file_overlay");
 
 /// Remote-visible base regular-file chunk rows: (ino, chunk_id) -> RegularFileChunkState.
-const REGULAR_FILE_BASE_TABLE: TableDefinition<&[u8], &[u8]> =
+pub(super) const REGULAR_FILE_BASE_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("regular_file_base");
 
 /// Pending overlay chunk compaction work: (ino, chunk_id) -> marker.
-const PENDING_REGULAR_FILE_COMPACTION_TABLE: TableDefinition<&[u8], u8> =
+pub(super) const PENDING_REGULAR_FILE_COMPACTION_TABLE: TableDefinition<&[u8], u8> =
     TableDefinition::new("pending_regular_file_compaction");
 
-type RegularFileChunkSignature = Vec<(SliceRange, Option<BlockRef>)>;
-type RegularFileGraphSignature = BTreeMap<ChunkId, RegularFileChunkSignature>;
+pub(super) type RegularFileChunkSignature = Vec<(SliceRange, Option<BlockRef>)>;
+pub(super) type RegularFileGraphSignature = BTreeMap<ChunkId, RegularFileChunkSignature>;
 
 /// Pending Deletions (GC): object_id (u64) -> deletion_timestamp (i64)
-const PENDING_DELETIONS_TABLE: TableDefinition<u64, i64> =
+pub(super) const PENDING_DELETIONS_TABLE: TableDefinition<u64, i64> =
     TableDefinition::new("pending_deletions");
 
 /// Pending create intents: ino -> CreateIntent (postcard)
-const PENDING_CREATES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("pending_creates");
+pub(super) const PENDING_CREATES_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("pending_creates");
 
 /// Deferred deletes (open-unlink orphans): ino -> DeferredDeleteRecord (postcard)
-const DEFERRED_DELETES_TABLE: TableDefinition<u64, &[u8]> =
+pub(super) const DEFERRED_DELETES_TABLE: TableDefinition<u64, &[u8]> =
     TableDefinition::new("deferred_deletes");
 
 /// Generic undo-log records: op_id -> UndoLogRecord (postcard)
-const UNDO_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("undo_log");
-const NEXT_UNDO_OP_ID_COUNTER: &str = "next_undo_op_id";
+pub(super) const UNDO_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("undo_log");
+pub(super) const NEXT_UNDO_OP_ID_COUNTER: &str = "next_undo_op_id";
 
 /// Symlink targets: ino (u64) -> target path (&[u8])
-const SYMLINKS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("symlinks");
+pub(super) const SYMLINKS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("symlinks");
 
 /// Remote-visible base symlink targets imported from checkpoint + foreign apply.
-const BASE_SYMLINKS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("base_symlinks");
+pub(super) const BASE_SYMLINKS_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("base_symlinks");
 
 /// Local tombstones hiding remote-visible base symlink targets.
-const SYMLINK_TOMBSTONES_TABLE: TableDefinition<u64, u8> =
+pub(super) const SYMLINK_TOMBSTONES_TABLE: TableDefinition<u64, u8> =
     TableDefinition::new("symlink_tombstones");
 
 /// Extended attributes: (ino(8) + name_bytes) -> value_bytes
-const XATTRS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("xattrs");
+pub(super) const XATTRS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("xattrs");
 
 /// Remote-visible base xattrs imported from checkpoint + foreign apply.
-const BASE_XATTRS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("base_xattrs");
+pub(super) const BASE_XATTRS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("base_xattrs");
 
 /// Local tombstones hiding remote-visible base xattrs.
-const XATTR_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> = TableDefinition::new("xattr_tombstones");
+pub(super) const XATTR_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> =
+    TableDefinition::new("xattr_tombstones");
 
 /// ACL rules: (ino(8) + principal_bytes) -> access level (u8).
-const ACL_RULES_TABLE: TableDefinition<&[u8], u8> = TableDefinition::new("acl_rules");
+pub(super) const ACL_RULES_TABLE: TableDefinition<&[u8], u8> = TableDefinition::new("acl_rules");
 
 /// Remote-visible base ACL rules imported from checkpoint + foreign apply.
-const BASE_ACL_RULES_TABLE: TableDefinition<&[u8], u8> = TableDefinition::new("base_acl_rules");
+pub(super) const BASE_ACL_RULES_TABLE: TableDefinition<&[u8], u8> =
+    TableDefinition::new("base_acl_rules");
 
 /// Local tombstones hiding remote-visible base ACL rules.
-const ACL_RULE_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> =
+pub(super) const ACL_RULE_TOMBSTONES_TABLE: TableDefinition<&[u8], u8> =
     TableDefinition::new("acl_rule_tombstones");
 
-const REGULAR_FILE_MIGRATION_NAME: &str = "regular_files_v2_to_v3";
-const MIGRATION_STATUS_STARTED: u8 = 1;
-const MIGRATION_STATUS_COMPLETED: u8 = 2;
+pub(super) const REGULAR_FILE_MIGRATION_NAME: &str = "regular_files_v2_to_v3";
+pub(super) const MIGRATION_STATUS_STARTED: u8 = 1;
+pub(super) const MIGRATION_STATUS_COMPLETED: u8 = 2;
 
 /// Event Log: sequence_id (u64) -> MetaEvent (postcard)
-const EVENT_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("event_log");
+pub(super) const EVENT_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("event_log");
 
 /// Snapshot definitions: snapshot_id (uuid text) -> MetadataSnapshot (postcard)
-const SNAPSHOTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots");
+pub(super) const SNAPSHOTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots");
 
 /// Migration status: migration_name -> status (u8)
 /// Used to track migration progress and detect interrupted migrations
-const MIGRATION_STATUS_TABLE: TableDefinition<&str, u8> = TableDefinition::new("migration_status");
+pub(super) const MIGRATION_STATUS_TABLE: TableDefinition<&str, u8> =
+    TableDefinition::new("migration_status");
 
 /// Serializable full snapshot of redb metadata state.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -127,7 +139,7 @@ pub struct RedbSnapshot {
     pub snapshots: Vec<(String, Vec<u8>)>,
 }
 
-fn encode_dentry_key(parent: Ino, name: &[u8]) -> Vec<u8> {
+pub(super) fn encode_dentry_key(parent: Ino, name: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(8 + name.len());
     key.extend_from_slice(&parent.to_le_bytes());
     key.extend_from_slice(name);
@@ -135,19 +147,19 @@ fn encode_dentry_key(parent: Ino, name: &[u8]) -> Vec<u8> {
 }
 
 /// Decode a dentry key back to (parent_ino, name).
-fn decode_dentry_key(key: &[u8]) -> (Ino, &[u8]) {
+pub(super) fn decode_dentry_key(key: &[u8]) -> (Ino, &[u8]) {
     let parent = u64::from_le_bytes(key[..8].try_into().unwrap());
     let name = &key[8..];
     (parent, name)
 }
 
 /// The prefix for scanning all dentries of a parent inode.
-fn dentry_prefix(parent: Ino) -> [u8; 8] {
+pub(super) fn dentry_prefix(parent: Ino) -> [u8; 8] {
     parent.to_le_bytes()
 }
 
 /// Encode a file block key: ino (8 bytes LE) + block_index (4 bytes LE).
-fn encode_file_block_key(ino: Ino, block_index: u32) -> [u8; 12] {
+pub(super) fn encode_file_block_key(ino: Ino, block_index: u32) -> [u8; 12] {
     let mut buf = [0u8; 12];
     buf[..8].copy_from_slice(&ino.to_le_bytes());
     buf[8..12].copy_from_slice(&block_index.to_le_bytes());
@@ -155,19 +167,19 @@ fn encode_file_block_key(ino: Ino, block_index: u32) -> [u8; 12] {
 }
 
 /// Decode a file block key back to (ino, block_index).
-fn decode_file_block_key(key: &[u8]) -> (Ino, u32) {
+pub(super) fn decode_file_block_key(key: &[u8]) -> (Ino, u32) {
     let ino = u64::from_le_bytes(key[..8].try_into().unwrap());
     let block_index = u32::from_le_bytes(key[8..12].try_into().unwrap());
     (ino, block_index)
 }
 
 /// The prefix for scanning all blocks of an inode.
-fn file_block_prefix(ino: Ino) -> [u8; 8] {
+pub(super) fn file_block_prefix(ino: Ino) -> [u8; 8] {
     ino.to_le_bytes()
 }
 
 /// Encode a regular-file chunk key: ino (8 bytes LE) + chunk_id (8 bytes LE).
-fn encode_regular_file_chunk_key(ino: Ino, chunk_id: ChunkId) -> [u8; 16] {
+pub(super) fn encode_regular_file_chunk_key(ino: Ino, chunk_id: ChunkId) -> [u8; 16] {
     let mut buf = [0u8; 16];
     buf[..8].copy_from_slice(&ino.to_le_bytes());
     buf[8..16].copy_from_slice(&chunk_id.0.to_le_bytes());
@@ -175,19 +187,19 @@ fn encode_regular_file_chunk_key(ino: Ino, chunk_id: ChunkId) -> [u8; 16] {
 }
 
 /// Decode a regular-file chunk key back to (ino, chunk_id).
-fn decode_regular_file_chunk_key(key: &[u8]) -> (Ino, ChunkId) {
+pub(super) fn decode_regular_file_chunk_key(key: &[u8]) -> (Ino, ChunkId) {
     let ino = u64::from_le_bytes(key[..8].try_into().unwrap());
     let chunk_id = u64::from_le_bytes(key[8..16].try_into().unwrap());
     (ino, ChunkId(chunk_id))
 }
 
 /// The prefix for scanning all chunk rows of an inode.
-fn regular_file_chunk_prefix(ino: Ino) -> [u8; 8] {
+pub(super) fn regular_file_chunk_prefix(ino: Ino) -> [u8; 8] {
     ino.to_le_bytes()
 }
 
 /// Encode an xattr key: ino (8 bytes LE) + name bytes.
-fn encode_xattr_key(ino: Ino, name: &[u8]) -> Vec<u8> {
+pub(super) fn encode_xattr_key(ino: Ino, name: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(8 + name.len());
     key.extend_from_slice(&ino.to_le_bytes());
     key.extend_from_slice(name);
@@ -195,21 +207,21 @@ fn encode_xattr_key(ino: Ino, name: &[u8]) -> Vec<u8> {
 }
 
 /// The prefix for scanning all xattrs of an inode.
-fn xattr_prefix(ino: Ino) -> [u8; 8] {
+pub(super) fn xattr_prefix(ino: Ino) -> [u8; 8] {
     ino.to_le_bytes()
 }
 
-fn xattr_name_from_key(key: &[u8]) -> &[u8] {
+pub(super) fn xattr_name_from_key(key: &[u8]) -> &[u8] {
     &key[8..]
 }
 
-const RESOURCE_FORK_XATTR_NAME: &[u8] = b"com.apple.ResourceFork";
-const RESOURCE_FORK_ENCODING_MAGIC: &[u8; 4] = b"SFRF";
-const RESOURCE_FORK_ENCODING_VERSION: u8 = 1;
-const RESOURCE_FORK_ENCODING_SCHEME_RLE: u8 = 1;
-const RESOURCE_FORK_REPEAT_RUN_THRESHOLD: usize = 4;
+pub(super) const RESOURCE_FORK_XATTR_NAME: &[u8] = b"com.apple.ResourceFork";
+pub(super) const RESOURCE_FORK_ENCODING_MAGIC: &[u8; 4] = b"SFRF";
+pub(super) const RESOURCE_FORK_ENCODING_VERSION: u8 = 1;
+pub(super) const RESOURCE_FORK_ENCODING_SCHEME_RLE: u8 = 1;
+pub(super) const RESOURCE_FORK_REPEAT_RUN_THRESHOLD: usize = 4;
 
-fn resource_fork_checksum(bytes: &[u8]) -> u32 {
+pub(super) fn resource_fork_checksum(bytes: &[u8]) -> u32 {
     // FNV-1a checksum for light framing validation.
     let mut hash = 0x811c_9dc5u32;
     for byte in bytes {
@@ -219,7 +231,7 @@ fn resource_fork_checksum(bytes: &[u8]) -> u32 {
     hash
 }
 
-fn rle_compress(input: &[u8]) -> Vec<u8> {
+pub(super) fn rle_compress(input: &[u8]) -> Vec<u8> {
     if input.is_empty() {
         return Vec::new();
     }
@@ -266,7 +278,7 @@ fn rle_compress(input: &[u8]) -> Vec<u8> {
     out
 }
 
-fn rle_decompress(input: &[u8], expected_len: usize) -> Option<Vec<u8>> {
+pub(super) fn rle_decompress(input: &[u8], expected_len: usize) -> Option<Vec<u8>> {
     let initial_capacity = expected_len.min(64 * 1024);
     let mut out = Vec::with_capacity(initial_capacity);
     let mut i = 0usize;
@@ -295,7 +307,7 @@ fn rle_decompress(input: &[u8], expected_len: usize) -> Option<Vec<u8>> {
     }
 }
 
-fn encode_resource_fork_value_for_storage(value: &[u8]) -> Vec<u8> {
+pub(super) fn encode_resource_fork_value_for_storage(value: &[u8]) -> Vec<u8> {
     let Ok(len_u32) = u32::try_from(value.len()) else {
         return value.to_vec();
     };
@@ -315,7 +327,7 @@ fn encode_resource_fork_value_for_storage(value: &[u8]) -> Vec<u8> {
     framed
 }
 
-fn decode_resource_fork_value_from_storage(stored: &[u8]) -> Vec<u8> {
+pub(super) fn decode_resource_fork_value_from_storage(stored: &[u8]) -> Vec<u8> {
     let header_len = 4 + 1 + 1 + 4 + 4;
     if stored.len() < header_len {
         return stored.to_vec();
@@ -336,7 +348,7 @@ fn decode_resource_fork_value_from_storage(stored: &[u8]) -> Vec<u8> {
     }
 }
 
-fn encode_xattr_value_for_storage<'a>(name: &[u8], value: &'a [u8]) -> Cow<'a, [u8]> {
+pub(super) fn encode_xattr_value_for_storage<'a>(name: &[u8], value: &'a [u8]) -> Cow<'a, [u8]> {
     if name == RESOURCE_FORK_XATTR_NAME {
         Cow::Owned(encode_resource_fork_value_for_storage(value))
     } else {
@@ -344,7 +356,7 @@ fn encode_xattr_value_for_storage<'a>(name: &[u8], value: &'a [u8]) -> Cow<'a, [
     }
 }
 
-fn decode_xattr_value_from_storage(name: &[u8], stored: &[u8]) -> Vec<u8> {
+pub(super) fn decode_xattr_value_from_storage(name: &[u8], stored: &[u8]) -> Vec<u8> {
     if name == RESOURCE_FORK_XATTR_NAME {
         decode_resource_fork_value_from_storage(stored)
     } else {
@@ -352,7 +364,7 @@ fn decode_xattr_value_from_storage(name: &[u8], stored: &[u8]) -> Vec<u8> {
     }
 }
 
-fn decode_xattr_value_from_storage_owned(name: &[u8], stored: Vec<u8>) -> Vec<u8> {
+pub(super) fn decode_xattr_value_from_storage_owned(name: &[u8], stored: Vec<u8>) -> Vec<u8> {
     if name == RESOURCE_FORK_XATTR_NAME {
         decode_resource_fork_value_from_storage(stored.as_slice())
     } else {
@@ -360,7 +372,7 @@ fn decode_xattr_value_from_storage_owned(name: &[u8], stored: Vec<u8>) -> Vec<u8
     }
 }
 
-fn encode_acl_rule_key(ino: Ino, principal: &str) -> Vec<u8> {
+pub(super) fn encode_acl_rule_key(ino: Ino, principal: &str) -> Vec<u8> {
     let principal_bytes = principal.as_bytes();
     let mut key = Vec::with_capacity(8 + principal_bytes.len());
     key.extend_from_slice(&ino.to_le_bytes());
@@ -368,16 +380,16 @@ fn encode_acl_rule_key(ino: Ino, principal: &str) -> Vec<u8> {
     key
 }
 
-fn acl_rule_prefix(ino: Ino) -> [u8; 8] {
+pub(super) fn acl_rule_prefix(ino: Ino) -> [u8; 8] {
     ino.to_le_bytes()
 }
 
 // ─── Postcard helpers ────────────────────────────────────────────────────────
 
-fn encode<T: serde::Serialize>(val: &T) -> MetaResult<Vec<u8>> {
+pub(super) fn encode<T: serde::Serialize>(val: &T) -> MetaResult<Vec<u8>> {
     postcard::to_stdvec(val).map_err(|e| MetaError::Serialization(e.to_string()))
 }
 
-fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> MetaResult<T> {
+pub(super) fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> MetaResult<T> {
     postcard::from_bytes(bytes).map_err(|e| MetaError::Serialization(e.to_string()))
 }

@@ -1,3 +1,5 @@
+use super::*;
+
 impl RedbMetaEngine {
     pub fn export_remote_snapshot(&self) -> MetaResult<RedbSnapshot> {
         let mut snapshot = self.export_snapshot()?;
@@ -1009,7 +1011,6 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
-
 }
 
 impl MetaReplication for RedbMetaEngine {

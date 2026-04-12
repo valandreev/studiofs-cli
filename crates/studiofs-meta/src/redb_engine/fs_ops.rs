@@ -1,17 +1,19 @@
-fn current_unix_seconds() -> i64 {
+use super::*;
+
+pub(super) fn current_unix_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
 
-enum NamespaceCreateKind<'a> {
+pub(super) enum NamespaceCreateKind<'a> {
     File { mode: u16 },
     Directory { mode: u16 },
     Symlink { target: &'a [u8] },
 }
 
-struct NamespaceCreateSpec<'a> {
+pub(super) struct NamespaceCreateSpec<'a> {
     ino: Ino,
     parent: Ino,
     name: &'a [u8],
@@ -22,7 +24,14 @@ struct NamespaceCreateSpec<'a> {
 }
 
 impl<'a> NamespaceCreateSpec<'a> {
-    fn new_file(ino: Ino, parent: Ino, name: &'a [u8], uid: u32, gid: u32, mode: u16) -> Self {
+    pub(super) fn new_file(
+        ino: Ino,
+        parent: Ino,
+        name: &'a [u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> Self {
         Self {
             ino,
             parent,
@@ -34,7 +43,14 @@ impl<'a> NamespaceCreateSpec<'a> {
         }
     }
 
-    fn new_dir(ino: Ino, parent: Ino, name: &'a [u8], uid: u32, gid: u32, mode: u16) -> Self {
+    pub(super) fn new_dir(
+        ino: Ino,
+        parent: Ino,
+        name: &'a [u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> Self {
         Self {
             ino,
             parent,
@@ -46,7 +62,7 @@ impl<'a> NamespaceCreateSpec<'a> {
         }
     }
 
-    fn new_symlink(
+    pub(super) fn new_symlink(
         ino: Ino,
         parent: Ino,
         name: &'a [u8],
@@ -65,7 +81,7 @@ impl<'a> NamespaceCreateSpec<'a> {
         }
     }
 
-    fn kind(&self) -> FileType {
+    pub(super) fn kind(&self) -> FileType {
         match self.kind {
             NamespaceCreateKind::File { .. } => FileType::RegularFile,
             NamespaceCreateKind::Directory { .. } => FileType::Directory,
@@ -73,25 +89,25 @@ impl<'a> NamespaceCreateSpec<'a> {
         }
     }
 
-    fn updates_parent_attr(&self) -> bool {
+    pub(super) fn updates_parent_attr(&self) -> bool {
         matches!(self.kind, NamespaceCreateKind::Directory { .. })
     }
 
-    fn symlink_target(&self) -> Option<&'a [u8]> {
+    pub(super) fn symlink_target(&self) -> Option<&'a [u8]> {
         match self.kind {
             NamespaceCreateKind::Symlink { target } => Some(target),
             NamespaceCreateKind::File { .. } | NamespaceCreateKind::Directory { .. } => None,
         }
     }
 
-    fn dir_entry_value(&self) -> DirEntryValue {
+    pub(super) fn dir_entry_value(&self) -> DirEntryValue {
         DirEntryValue {
             ino: self.ino,
             kind: self.kind(),
         }
     }
 
-    fn initial_attr(&self) -> InodeAttr {
+    pub(super) fn initial_attr(&self) -> InodeAttr {
         match self.kind {
             NamespaceCreateKind::File { mode } => {
                 InodeAttr::new_file(self.ino, self.parent, self.uid, self.gid, mode)
@@ -105,7 +121,7 @@ impl<'a> NamespaceCreateSpec<'a> {
         }
     }
 
-    fn pending_create_record(&self) -> PendingCreateRecord {
+    pub(super) fn pending_create_record(&self) -> PendingCreateRecord {
         PendingCreateRecord {
             ino: self.ino,
             parent: self.parent,
@@ -115,7 +131,7 @@ impl<'a> NamespaceCreateSpec<'a> {
         }
     }
 
-    fn extra_event(&self) -> Option<crate::events::MetaEvent> {
+    pub(super) fn extra_event(&self) -> Option<crate::events::MetaEvent> {
         self.symlink_target()
             .map(|target| crate::events::MetaEvent::SetSymlinkTarget {
                 ino: self.ino,
@@ -124,16 +140,16 @@ impl<'a> NamespaceCreateSpec<'a> {
     }
 }
 
-struct NamespaceCreateTxn<'a> {
+pub(super) struct NamespaceCreateTxn<'a> {
     txn: &'a redb::WriteTransaction,
 }
 
 impl<'a> NamespaceCreateTxn<'a> {
-    fn new(txn: &'a redb::WriteTransaction) -> Self {
+    pub(super) fn new(txn: &'a redb::WriteTransaction) -> Self {
         Self { txn }
     }
 
-    fn execute(&self, spec: &NamespaceCreateSpec<'_>) -> MetaResult<InodeAttr> {
+    pub(super) fn execute(&self, spec: &NamespaceCreateSpec<'_>) -> MetaResult<InodeAttr> {
         let mut parent_attr = RedbMetaEngine::get_attr_merged_in_write_txn(self.txn, spec.parent)?;
         if parent_attr.kind != FileType::Directory {
             return Err(MetaError::NotADirectory(spec.parent));
@@ -173,7 +189,7 @@ impl<'a> NamespaceCreateTxn<'a> {
         Ok(attr)
     }
 
-    fn increment_total_inodes(&self) -> MetaResult<()> {
+    pub(super) fn increment_total_inodes(&self) -> MetaResult<()> {
         let mut counters = self
             .txn
             .open_table(COUNTERS_TABLE)
@@ -191,7 +207,7 @@ impl<'a> NamespaceCreateTxn<'a> {
         Ok(())
     }
 
-    fn insert_attr(&self, attr: &InodeAttr) -> MetaResult<()> {
+    pub(super) fn insert_attr(&self, attr: &InodeAttr) -> MetaResult<()> {
         let mut inodes = self
             .txn
             .open_table(INODES_TABLE)
@@ -203,7 +219,7 @@ impl<'a> NamespaceCreateTxn<'a> {
         Ok(())
     }
 
-    fn clear_inode_tombstone(&self, ino: Ino) -> MetaResult<()> {
+    pub(super) fn clear_inode_tombstone(&self, ino: Ino) -> MetaResult<()> {
         let mut inode_tombstones = self
             .txn
             .open_table(INODE_TOMBSTONES_TABLE)
@@ -212,7 +228,7 @@ impl<'a> NamespaceCreateTxn<'a> {
         Ok(())
     }
 
-    fn insert_dentry(&self, dentry_key: &[u8], entry: &DirEntryValue) -> MetaResult<()> {
+    pub(super) fn insert_dentry(&self, dentry_key: &[u8], entry: &DirEntryValue) -> MetaResult<()> {
         let mut dentries = self
             .txn
             .open_table(DENTRIES_TABLE)
@@ -224,7 +240,7 @@ impl<'a> NamespaceCreateTxn<'a> {
         Ok(())
     }
 
-    fn clear_dentry_tombstone(&self, dentry_key: &[u8]) -> MetaResult<()> {
+    pub(super) fn clear_dentry_tombstone(&self, dentry_key: &[u8]) -> MetaResult<()> {
         let mut dentry_tombstones = self
             .txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
@@ -233,7 +249,7 @@ impl<'a> NamespaceCreateTxn<'a> {
         Ok(())
     }
 
-    fn append_create_events(
+    pub(super) fn append_create_events(
         &self,
         spec: &NamespaceCreateSpec<'_>,
         attr: &InodeAttr,
@@ -264,13 +280,13 @@ impl<'a> NamespaceCreateTxn<'a> {
     }
 }
 
-enum NamespaceDeleteKind {
+pub(super) enum NamespaceDeleteKind {
     Unlink,
     UnlinkOpenHandle,
     RemoveDir,
 }
 
-struct NamespaceDeleteSpec<'a> {
+pub(super) struct NamespaceDeleteSpec<'a> {
     parent: Ino,
     name: &'a [u8],
     kind: NamespaceDeleteKind,
@@ -278,7 +294,7 @@ struct NamespaceDeleteSpec<'a> {
 }
 
 impl<'a> NamespaceDeleteSpec<'a> {
-    fn new_unlink(parent: Ino, name: &'a [u8]) -> Self {
+    pub(super) fn new_unlink(parent: Ino, name: &'a [u8]) -> Self {
         Self {
             parent,
             name,
@@ -287,7 +303,7 @@ impl<'a> NamespaceDeleteSpec<'a> {
         }
     }
 
-    fn new_unlink_open_handle(parent: Ino, name: &'a [u8]) -> Self {
+    pub(super) fn new_unlink_open_handle(parent: Ino, name: &'a [u8]) -> Self {
         Self {
             parent,
             name,
@@ -296,7 +312,7 @@ impl<'a> NamespaceDeleteSpec<'a> {
         }
     }
 
-    fn new_rmdir(parent: Ino, name: &'a [u8]) -> Self {
+    pub(super) fn new_rmdir(parent: Ino, name: &'a [u8]) -> Self {
         Self {
             parent,
             name,
@@ -305,34 +321,37 @@ impl<'a> NamespaceDeleteSpec<'a> {
         }
     }
 
-    fn records_deferred_delete(&self) -> bool {
+    pub(super) fn records_deferred_delete(&self) -> bool {
         matches!(self.kind, NamespaceDeleteKind::UnlinkOpenHandle)
     }
 
-    fn updates_parent_nlink(&self) -> bool {
+    pub(super) fn updates_parent_nlink(&self) -> bool {
         matches!(self.kind, NamespaceDeleteKind::RemoveDir)
     }
 
-    fn allows_directory_target(&self) -> bool {
+    pub(super) fn allows_directory_target(&self) -> bool {
         matches!(self.kind, NamespaceDeleteKind::RemoveDir)
     }
 }
 
-enum NamespaceDeleteResult {
+pub(super) enum NamespaceDeleteResult {
     File(InodeAttr),
     Directory,
 }
 
-struct NamespaceDeleteTxn<'a> {
+pub(super) struct NamespaceDeleteTxn<'a> {
     txn: &'a redb::WriteTransaction,
 }
 
 impl<'a> NamespaceDeleteTxn<'a> {
-    fn new(txn: &'a redb::WriteTransaction) -> Self {
+    pub(super) fn new(txn: &'a redb::WriteTransaction) -> Self {
         Self { txn }
     }
 
-    fn execute(&self, spec: &NamespaceDeleteSpec<'_>) -> MetaResult<NamespaceDeleteResult> {
+    pub(super) fn execute(
+        &self,
+        spec: &NamespaceDeleteSpec<'_>,
+    ) -> MetaResult<NamespaceDeleteResult> {
         let entry = RedbMetaEngine::lookup_merged_in_write_txn(self.txn, spec.parent, spec.name)?
             .ok_or(MetaError::EntryNotFound {
             parent: spec.parent,
@@ -346,7 +365,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         }
     }
 
-    fn execute_unlink(
+    pub(super) fn execute_unlink(
         &self,
         spec: &NamespaceDeleteSpec<'_>,
         entry: DirEntryValue,
@@ -382,7 +401,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         Ok(NamespaceDeleteResult::File(attr))
     }
 
-    fn execute_rmdir(
+    pub(super) fn execute_rmdir(
         &self,
         spec: &NamespaceDeleteSpec<'_>,
         entry: DirEntryValue,
@@ -410,7 +429,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         Ok(NamespaceDeleteResult::Directory)
     }
 
-    fn remove_file_blocks_for_inode(&self, ino: Ino) -> MetaResult<()> {
+    pub(super) fn remove_file_blocks_for_inode(&self, ino: Ino) -> MetaResult<()> {
         let mut blocks_table = self
             .txn
             .open_table(FILE_BLOCKS_TABLE)
@@ -432,7 +451,11 @@ impl<'a> NamespaceDeleteTxn<'a> {
         Ok(())
     }
 
-    fn record_deferred_delete(&self, spec: &NamespaceDeleteSpec<'_>, ino: Ino) -> MetaResult<()> {
+    pub(super) fn record_deferred_delete(
+        &self,
+        spec: &NamespaceDeleteSpec<'_>,
+        ino: Ino,
+    ) -> MetaResult<()> {
         let record = DeferredDeleteRecord {
             ino,
             parent: spec.parent,
@@ -460,7 +483,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         RedbMetaEngine::append_undo_log_in_txn(self.txn, &undo)
     }
 
-    fn append_unlink_events(
+    pub(super) fn append_unlink_events(
         &self,
         spec: &NamespaceDeleteSpec<'_>,
         attr: &InodeAttr,
@@ -496,7 +519,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         )
     }
 
-    fn append_rmdir_events(
+    pub(super) fn append_rmdir_events(
         &self,
         spec: &NamespaceDeleteSpec<'_>,
         ino: Ino,
@@ -522,9 +545,11 @@ impl<'a> NamespaceDeleteTxn<'a> {
     }
 }
 
-
 impl RedbMetaEngine {
-    fn execute_namespace_create(&self, spec: NamespaceCreateSpec<'_>) -> MetaResult<InodeAttr> {
+    pub(super) fn execute_namespace_create(
+        &self,
+        spec: NamespaceCreateSpec<'_>,
+    ) -> MetaResult<InodeAttr> {
         let intent = spec.pending_create_record();
         self.add_pending_create(&intent)?;
 
@@ -551,7 +576,7 @@ impl RedbMetaEngine {
         }
     }
 
-    fn execute_namespace_delete(
+    pub(super) fn execute_namespace_delete(
         &self,
         spec: NamespaceDeleteSpec<'_>,
     ) -> MetaResult<NamespaceDeleteResult> {
@@ -843,4 +868,3 @@ impl MetaFsOps for RedbMetaEngine {
         }
     }
 }
-

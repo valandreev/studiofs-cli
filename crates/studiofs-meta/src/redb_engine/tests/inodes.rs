@@ -146,6 +146,39 @@ fn test_getattr_falls_back_to_base_when_no_local_overlay() {
 }
 
 #[test]
+fn test_get_attr_merged_in_write_txn_matches_read_get_attr() {
+    let source = temp_engine();
+    let base_file = source
+        .create_file(ROOT_INO, b"base.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let local_file = source
+        .create_file(ROOT_INO, b"local.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let snapshot = source.export_snapshot().unwrap();
+
+    let engine = temp_engine();
+    engine.import_snapshot(&snapshot).unwrap();
+
+    let mut local_attr = engine.get_attr(local_file.ino).unwrap();
+    local_attr.mode = 0o600;
+    engine.set_attr(&local_attr).unwrap();
+
+    let txn = engine.db.begin_write().unwrap();
+    let base_from_write = RedbMetaEngine::get_attr_merged_in_write_txn(&txn, base_file.ino).unwrap();
+    let local_from_write =
+        RedbMetaEngine::get_attr_merged_in_write_txn(&txn, local_file.ino).unwrap();
+    txn.abort().unwrap();
+
+    let base_from_read = engine.get_attr(base_file.ino).unwrap();
+    let local_from_read = engine.get_attr(local_file.ino).unwrap();
+
+    assert_eq!(base_from_write.ino, base_from_read.ino);
+    assert_eq!(base_from_write.mode, base_from_read.mode);
+    assert_eq!(local_from_write.ino, local_from_read.ino);
+    assert_eq!(local_from_write.mode, local_from_read.mode);
+}
+
+#[test]
 fn test_decr_counter() {
     let engine = temp_engine();
     engine.set_counter("test_space", 1000).unwrap();

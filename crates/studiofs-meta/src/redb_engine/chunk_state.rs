@@ -1,5 +1,7 @@
+use super::*;
+
 impl RedbMetaEngine {
-    fn get_file_blocks_from_txn_internal(
+    pub(super) fn get_file_blocks_from_txn_internal(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
         ino: Ino,
@@ -32,7 +34,7 @@ impl RedbMetaEngine {
         Ok(blocks.into_iter().collect())
     }
 
-    fn regular_file_chunk_states_from_txn(
+    pub(super) fn regular_file_chunk_states_from_txn(
         txn: &redb::ReadTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
     ) -> MetaResult<BTreeMap<Ino, BTreeMap<ChunkId, RegularFileChunkState>>> {
@@ -52,7 +54,7 @@ impl RedbMetaEngine {
         Ok(states)
     }
 
-    fn regular_file_chunk_states_for_inode_in_write_txn(
+    pub(super) fn regular_file_chunk_states_for_inode_in_write_txn(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
         ino: Ino,
@@ -78,7 +80,7 @@ impl RedbMetaEngine {
         Ok(chunks)
     }
 
-    fn has_regular_file_chunk_rows_in_write_txn(
+    pub(super) fn has_regular_file_chunk_rows_in_write_txn(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
         ino: Ino,
@@ -99,7 +101,7 @@ impl RedbMetaEngine {
         }
     }
 
-    fn has_regular_file_chunk_rows_in_read_txn(
+    pub(super) fn has_regular_file_chunk_rows_in_read_txn(
         txn: &redb::ReadTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
         ino: Ino,
@@ -125,7 +127,7 @@ impl RedbMetaEngine {
     /// Internal counters and slice lifecycle fields are intentionally ignored so
     /// callers can detect real overlay data divergence without flagging pure
     /// bookkeeping changes.
-    fn regular_file_graph_signature(
+    pub(super) fn regular_file_graph_signature(
         chunks: &BTreeMap<ChunkId, RegularFileChunkState>,
     ) -> RegularFileGraphSignature {
         let mut signature = BTreeMap::new();
@@ -142,7 +144,7 @@ impl RedbMetaEngine {
         signature
     }
 
-    fn regular_file_chunk_state_from_slices(
+    pub(super) fn regular_file_chunk_state_from_slices(
         chunk_slices: &[crate::schema::SliceRecord],
     ) -> MetaResult<RegularFileChunkState> {
         let mut state = RegularFileChunkState::default();
@@ -183,7 +185,7 @@ impl RedbMetaEngine {
         Ok(state)
     }
 
-    fn set_regular_file_chunk_state_in_txn(
+    pub(super) fn set_regular_file_chunk_state_in_txn(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
         track_pending_compaction: bool,
@@ -239,7 +241,7 @@ impl RedbMetaEngine {
     ///
     /// This streams the table row-by-row so reachability checks never need to
     /// materialize the whole chunk graph in memory.
-    fn regular_file_graph_object_ids_from_table(
+    pub(super) fn regular_file_graph_object_ids_from_table(
         txn: &redb::ReadTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
         refs: &mut HashSet<u64>,
@@ -262,7 +264,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn clear_table_in_txn<K, V>(
+    pub(super) fn clear_table_in_txn<K, V>(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<K, V>,
     ) -> MetaResult<()>
@@ -279,7 +281,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn regular_file_snapshot_rows_from_txn<TState, F>(
+    pub(super) fn regular_file_snapshot_rows_from_txn<TState, F>(
         txn: &redb::ReadTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
         wrap_state: F,
@@ -297,7 +299,7 @@ impl RedbMetaEngine {
         Ok(snapshot_rows)
     }
 
-    fn clear_regular_file_chunk_rows_in_txn(
+    pub(super) fn clear_regular_file_chunk_rows_in_txn(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
         ino: Ino,
@@ -325,7 +327,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn clear_regular_file_pending_compaction_rows_in_txn(
+    pub(super) fn clear_regular_file_pending_compaction_rows_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
     ) -> MetaResult<()> {
@@ -352,14 +354,17 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn clear_regular_file_graph_in_txn(txn: &redb::WriteTransaction, ino: Ino) -> MetaResult<()> {
+    pub(super) fn clear_regular_file_graph_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<()> {
         Self::clear_regular_file_pending_compaction_rows_in_txn(txn, ino)?;
         Self::clear_regular_file_chunk_rows_in_txn(txn, REGULAR_FILE_OVERLAY_TABLE, ino)?;
         Self::clear_regular_file_chunk_rows_in_txn(txn, REGULAR_FILE_BASE_TABLE, ino)?;
         Ok(())
     }
 
-    fn replace_regular_file_chunk_rows_from_blocks_in_txn(
+    pub(super) fn replace_regular_file_chunk_rows_from_blocks_in_txn(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
         ino: Ino,
@@ -403,7 +408,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn replace_regular_file_chunk_rows_from_snapshot_rows<F>(
+    pub(super) fn replace_regular_file_chunk_rows_from_snapshot_rows<F>(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
         snapshot_rows: &[(u64, Vec<u8>)],
@@ -440,7 +445,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn regular_file_committed_size_from_chunks(
+    pub(super) fn regular_file_committed_size_from_chunks(
         chunks: &BTreeMap<ChunkId, RegularFileChunkState>,
     ) -> u64 {
         let mut size = 0u64;
@@ -456,7 +461,7 @@ impl RedbMetaEngine {
         size
     }
 
-    fn legacy_committed_size_from_blocks(blocks: &[(u32, BlockRef)]) -> u64 {
+    pub(super) fn legacy_committed_size_from_blocks(blocks: &[(u32, BlockRef)]) -> u64 {
         let mut size = 0u64;
         let mut expected = 0u32;
         for (block_index, block) in blocks {
@@ -472,7 +477,7 @@ impl RedbMetaEngine {
         size
     }
 
-    fn chunk_for_published_base(chunk: &RegularFileChunkState) -> RegularFileChunkState {
+    pub(super) fn chunk_for_published_base(chunk: &RegularFileChunkState) -> RegularFileChunkState {
         let mut published = chunk.clone();
         for slice in published.slices.values_mut() {
             slice.block_state = BlockRefState::Published;
@@ -480,7 +485,7 @@ impl RedbMetaEngine {
         published
     }
 
-    fn compact_regular_file_chunk_state(
+    pub(super) fn compact_regular_file_chunk_state(
         chunk_id: ChunkId,
         chunk: &RegularFileChunkState,
     ) -> MetaResult<Option<RegularFileChunkState>> {
@@ -562,7 +567,7 @@ impl RedbMetaEngine {
         Ok(Some(compacted))
     }
 
-    fn publish_regular_file_overlay_to_base_in_txn(
+    pub(super) fn publish_regular_file_overlay_to_base_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
     ) -> MetaResult<(u64, Vec<u64>)> {
@@ -641,7 +646,7 @@ impl RedbMetaEngine {
         ))
     }
 
-    fn regular_file_graph_block_size(&self) -> MetaResult<u32> {
+    pub(super) fn regular_file_graph_block_size(&self) -> MetaResult<u32> {
         match self.get_format_info() {
             Ok(info) => Ok(info.block_size),
             Err(MetaError::NotFormatted) => Ok(DEFAULT_BLOCK_SIZE),
@@ -649,7 +654,7 @@ impl RedbMetaEngine {
         }
     }
 
-    fn synthesize_block_ref_from_resolved_spans(
+    pub(super) fn synthesize_block_ref_from_resolved_spans(
         ino: Ino,
         spans: &[ResolvedSliceSpan],
         block_index: u32,
@@ -762,7 +767,7 @@ impl RedbMetaEngine {
         Ok(chosen.filter(|block| block.length > 0))
     }
 
-    fn lookup_regular_file_slices_in_write_txn(
+    pub(super) fn lookup_regular_file_slices_in_write_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
         offset: u64,
@@ -804,9 +809,8 @@ impl RedbMetaEngine {
         Ok(merge_adjacent_spans(spans))
     }
 
-
     #[cfg(test)]
-    fn compute_committed_size_in_txn(
+    pub(super) fn compute_committed_size_in_txn(
         txn: &redb::WriteTransaction,
         committed: &redb::Table<'_, &[u8], &[u8]>,
         ino: Ino,
@@ -822,7 +826,7 @@ impl RedbMetaEngine {
     }
 
     #[cfg(test)]
-    fn regular_file_committed_size_in_txn(
+    pub(super) fn regular_file_committed_size_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
     ) -> MetaResult<Option<u64>> {
@@ -855,7 +859,7 @@ impl RedbMetaEngine {
         Ok(saw_row.then_some(size))
     }
 
-    fn committed_manifest_in_txn(
+    pub(super) fn committed_manifest_in_txn(
         committed: &redb::Table<'_, &[u8], &[u8]>,
         ino: Ino,
     ) -> MetaResult<Vec<(u32, BlockRef)>> {
@@ -877,7 +881,7 @@ impl RedbMetaEngine {
         Ok(out)
     }
 
-    fn current_manifest_in_txn(
+    pub(super) fn current_manifest_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
     ) -> MetaResult<Vec<(u32, BlockRef)>> {
@@ -946,7 +950,7 @@ impl RedbMetaEngine {
         Ok(merged.into_iter().collect())
     }
 
-    fn current_manifest_from_graph_rows_in_txn(
+    pub(super) fn current_manifest_from_graph_rows_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
     ) -> MetaResult<Vec<(u32, BlockRef)>> {
@@ -1009,7 +1013,7 @@ impl RedbMetaEngine {
         Ok(synthesized)
     }
 
-    fn current_or_legacy_manifest_in_txn(
+    pub(super) fn current_or_legacy_manifest_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
     ) -> MetaResult<Vec<(u32, BlockRef)>> {
@@ -1038,7 +1042,7 @@ impl RedbMetaEngine {
         }
     }
 
-    fn regular_file_graph_block_size_from_write_txn(
+    pub(super) fn regular_file_graph_block_size_from_write_txn(
         txn: &redb::WriteTransaction,
     ) -> MetaResult<u32> {
         match Self::format_info_from_write_txn(txn) {
@@ -1048,7 +1052,7 @@ impl RedbMetaEngine {
         }
     }
 
-    fn transition_upload_state_for_local_mutation(
+    pub(super) fn transition_upload_state_for_local_mutation(
         attr: &mut InodeAttr,
         has_committed_manifest: bool,
     ) {
@@ -1068,7 +1072,7 @@ impl RedbMetaEngine {
         }
     }
 
-    fn manifest_matches_committed_in_txn(
+    pub(super) fn manifest_matches_committed_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
     ) -> MetaResult<bool> {

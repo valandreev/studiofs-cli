@@ -1,3 +1,5 @@
+use super::*;
+
 impl RedbMetaEngine {
     pub fn read_format_info_readonly(path: impl AsRef<Path>) -> MetaResult<FormatInfo> {
         let db = match ReadOnlyDatabase::open(path.as_ref()) {
@@ -26,7 +28,9 @@ impl RedbMetaEngine {
         serde_json::from_slice(entry.value()).map_err(|e| MetaError::Serialization(e.to_string()))
     }
 
-    fn format_info_from_write_txn(txn: &redb::WriteTransaction) -> MetaResult<FormatInfo> {
+    pub(super) fn format_info_from_write_txn(
+        txn: &redb::WriteTransaction,
+    ) -> MetaResult<FormatInfo> {
         let table = txn
             .open_table(SETTINGS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -36,7 +40,6 @@ impl RedbMetaEngine {
             .ok_or(MetaError::NotFormatted)?;
         serde_json::from_slice(entry.value()).map_err(|e| MetaError::Serialization(e.to_string()))
     }
-
 }
 
 impl MetaFormat for RedbMetaEngine {

@@ -1,3 +1,5 @@
+use super::*;
+
 impl RedbMetaEngine {
     fn add_pending_create_intent(&self, intent: &PendingCreateRecord) -> MetaResult<()> {
         let txn = self
@@ -67,7 +69,7 @@ impl RedbMetaEngine {
         Ok(out)
     }
 
-    fn recover_pending_create_intents(&self) -> MetaResult<Vec<Ino>> {
+    pub(super) fn recover_pending_create_intents(&self) -> MetaResult<Vec<Ino>> {
         let intents = self.list_pending_create_intents()?;
         if intents.is_empty() {
             return Ok(Vec::new());
@@ -115,7 +117,7 @@ impl RedbMetaEngine {
         Ok(touched_parents.into_iter().collect())
     }
 
-    fn cleanup_stale_undo_logs(&self) -> MetaResult<()> {
+    pub(super) fn cleanup_stale_undo_logs(&self) -> MetaResult<()> {
         let txn = self
             .db
             .begin_write()

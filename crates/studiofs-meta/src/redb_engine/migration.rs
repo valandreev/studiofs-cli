@@ -1,3 +1,5 @@
+use super::*;
+
 impl RedbMetaEngine {
     /// Migrate regular files from the old FILE_BLOCKS flat model to the new chunk/slice/block model.
     ///
@@ -14,7 +16,7 @@ impl RedbMetaEngine {
     ///
     /// Rollback is not supported in-place; interrupted upgrades are detected by
     /// startup validation and can be resumed by rerunning the migration.
-    fn migrate_regular_files_to_chunk_slice_model(&self) -> MetaResult<()> {
+    pub(super) fn migrate_regular_files_to_chunk_slice_model(&self) -> MetaResult<()> {
         const BATCH_SIZE: usize = 100;
 
         {
@@ -233,7 +235,7 @@ impl RedbMetaEngine {
     }
 
     /// Convert flat block list to chunk/slice state using the provided block size.
-    fn convert_blocks_to_chunk_state(
+    pub(super) fn convert_blocks_to_chunk_state(
         blocks: &[(u32, BlockRef)],
         block_size: u32,
     ) -> MetaResult<RegularFileOverlayState> {
@@ -273,7 +275,7 @@ impl RedbMetaEngine {
     /// Validate that migration from v2 to v3 completed successfully.
     /// Useful for manual recovery scenarios and debugging.
     #[allow(dead_code)]
-    fn validate_migration_completed(&self) -> MetaResult<()> {
+    pub(super) fn validate_migration_completed(&self) -> MetaResult<()> {
         let txn = self
             .db
             .begin_read()

@@ -1,3 +1,5 @@
+use super::*;
+
 impl MetaXattr for RedbMetaEngine {
     fn get_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>> {
         let txn = self

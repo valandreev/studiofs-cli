@@ -12,12 +12,11 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, info};
 
-// SFS-206 keeps the implementation split on internal files without widening the
-// refactor into a full `mod`-based visibility redesign. A dedicated follow-up
-// can convert these includes into true submodules once the private helper
-// surface is smaller and more deliberate.
-include!("redb_engine/layout.rs");
-include!("redb_engine/fs_ops.rs");
+mod layout;
+pub use self::layout::RedbSnapshot;
+use self::layout::*;
+
+mod fs_ops;
 
 /// Metadata engine backed by redb.
 pub struct RedbMetaEngine {
@@ -129,20 +128,20 @@ impl RedbMetaEngine {
     }
 }
 
-include!("redb_engine/txn.rs");
-include!("redb_engine/format.rs");
-include!("redb_engine/migration.rs");
-include!("redb_engine/inodes.rs");
-include!("redb_engine/namespace.rs");
-include!("redb_engine/chunk_state.rs");
-include!("redb_engine/blocks.rs");
-include!("redb_engine/gc.rs");
-include!("redb_engine/recovery.rs");
-include!("redb_engine/symlink.rs");
-include!("redb_engine/xattr.rs");
-include!("redb_engine/acl.rs");
-include!("redb_engine/snapshots.rs");
-include!("redb_engine/replication.rs");
+mod acl;
+mod blocks;
+mod chunk_state;
+mod format;
+mod gc;
+mod inodes;
+mod migration;
+mod namespace;
+mod recovery;
+mod replication;
+mod snapshots;
+mod symlink;
+mod txn;
+mod xattr;
 
 impl MetaEngineCore for RedbMetaEngine {
     fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool> {

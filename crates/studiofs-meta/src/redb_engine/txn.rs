@@ -1,5 +1,7 @@
+use super::*;
+
 impl RedbMetaEngine {
-    fn lookup_in_opened_dentry_table<T>(
+    pub(super) fn lookup_in_opened_dentry_table<T>(
         table: &T,
         parent: Ino,
         name: &[u8],
@@ -38,7 +40,10 @@ impl RedbMetaEngine {
         Ok(None)
     }
 
-    fn readdir_from_opened_dentry_table<T>(table: &T, parent: Ino) -> MetaResult<Vec<DirEntry>>
+    pub(super) fn readdir_from_opened_dentry_table<T>(
+        table: &T,
+        parent: Ino,
+    ) -> MetaResult<Vec<DirEntry>>
     where
         T: ReadableTable<&'static [u8], &'static [u8]>,
     {
@@ -70,7 +75,7 @@ impl RedbMetaEngine {
         Ok(entries)
     }
 
-    fn collect_overlay_dentries_from_tables<TCurrent, TBase, TTombstones>(
+    pub(super) fn collect_overlay_dentries_from_tables<TCurrent, TBase, TTombstones>(
         current: &TCurrent,
         base: &TBase,
         tombstones: &TTombstones,
@@ -82,7 +87,10 @@ impl RedbMetaEngine {
     {
         let mut overlay = HashSet::new();
 
-        for row in current.iter().map_err(|e| MetaError::Storage(e.to_string()))? {
+        for row in current
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
             let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
             let key_bytes = key.value().to_vec();
             match base
@@ -107,7 +115,7 @@ impl RedbMetaEngine {
         Ok(overlay)
     }
 
-    fn lookup_merged_from_opened_tables<TBase, TCurrent, TTombstones>(
+    pub(super) fn lookup_merged_from_opened_tables<TBase, TCurrent, TTombstones>(
         base: &TBase,
         current: &TCurrent,
         tombstones: &TTombstones,
@@ -140,7 +148,7 @@ impl RedbMetaEngine {
         Self::lookup_in_opened_dentry_table(current, parent, name)
     }
 
-    fn readdir_merged_from_opened_tables<TBase, TCurrent, TTombstones>(
+    pub(super) fn readdir_merged_from_opened_tables<TBase, TCurrent, TTombstones>(
         base: &TBase,
         current: &TCurrent,
         tombstones: &TTombstones,
@@ -212,7 +220,10 @@ impl RedbMetaEngine {
         Ok(merged.into_values().collect())
     }
 
-    fn get_attr_from_opened_table<T>(table: &T, ino: Ino) -> MetaResult<Option<InodeAttr>>
+    pub(super) fn get_attr_from_opened_table<T>(
+        table: &T,
+        ino: Ino,
+    ) -> MetaResult<Option<InodeAttr>>
     where
         T: ReadableTable<u64, &'static [u8]>,
     {
@@ -223,7 +234,89 @@ impl RedbMetaEngine {
             .transpose()
     }
 
-    fn lookup_in_write_table(
+    pub(super) fn collect_overlay_inode_attrs_from_tables<TCurrent, TBase, TTombstones>(
+        current: &TCurrent,
+        base: &TBase,
+        tombstones: &TTombstones,
+    ) -> MetaResult<HashSet<Ino>>
+    where
+        TCurrent: ReadableTable<u64, &'static [u8]>,
+        TBase: ReadableTable<u64, &'static [u8]>,
+        TTombstones: ReadableTable<u64, u8>,
+    {
+        let mut overlay = HashSet::new();
+
+        for row in current
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (ino, current_bytes) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let ino = ino.value();
+            match base
+                .get(ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(base_bytes) if base_bytes.value() == current_bytes.value() => {}
+                _ => {
+                    overlay.insert(ino);
+                }
+            }
+        }
+
+        for row in tombstones
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (ino, _) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            overlay.insert(ino.value());
+        }
+
+        Ok(overlay)
+    }
+
+    pub(super) fn resolve_attr_from_opened_tables<TBase, TCurrent, TTombstones>(
+        base: &TBase,
+        current: &TCurrent,
+        tombstones: &TTombstones,
+        ino: Ino,
+        prefer_current: bool,
+    ) -> MetaResult<InodeAttr>
+    where
+        TBase: ReadableTable<u64, &'static [u8]>,
+        TCurrent: ReadableTable<u64, &'static [u8]>,
+        TTombstones: ReadableTable<u64, u8>,
+    {
+        if tombstones
+            .get(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .is_some()
+        {
+            return Err(MetaError::InodeNotFound(ino));
+        }
+
+        let load_current = || Self::get_attr_from_opened_table(current, ino);
+        let load_base = || Self::get_attr_from_opened_table(base, ino);
+
+        if prefer_current {
+            if let Some(attr) = load_current()? {
+                return Ok(attr);
+            }
+            if let Some(attr) = load_base()? {
+                return Ok(attr);
+            }
+        } else {
+            if let Some(attr) = load_base()? {
+                return Ok(attr);
+            }
+            if let Some(attr) = load_current()? {
+                return Ok(attr);
+            }
+        }
+
+        Err(MetaError::InodeNotFound(ino))
+    }
+
+    pub(super) fn lookup_in_write_table(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
         parent: Ino,
@@ -235,18 +328,7 @@ impl RedbMetaEngine {
         Self::lookup_in_opened_dentry_table(&table, parent, name)
     }
 
-    fn get_attr_from_table(
-        txn: &redb::ReadTransaction,
-        table_def: TableDefinition<u64, &[u8]>,
-        ino: Ino,
-    ) -> MetaResult<Option<InodeAttr>> {
-        let table = txn
-            .open_table(table_def)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Self::get_attr_from_opened_table(&table, ino)
-    }
-
-    fn get_attr_from_write_table(
+    pub(super) fn get_attr_from_write_table(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<u64, &[u8]>,
         ino: Ino,
@@ -257,7 +339,7 @@ impl RedbMetaEngine {
         Self::get_attr_from_opened_table(&table, ino)
     }
 
-    fn append_event_in_txn(
+    pub(super) fn append_event_in_txn(
         txn: &redb::WriteTransaction,
         event: &crate::events::MetaEvent,
     ) -> MetaResult<()> {
@@ -289,7 +371,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn remove_all_committed_blocks_in_txn(
+    pub(super) fn remove_all_committed_blocks_in_txn(
         committed: &mut redb::Table<'_, &[u8], &[u8]>,
         ino: Ino,
     ) -> MetaResult<Vec<u64>> {
@@ -313,7 +395,7 @@ impl RedbMetaEngine {
         Ok(rows.into_iter().map(|(_, object_id)| object_id).collect())
     }
 
-    fn remove_all_file_blocks_in_txn(
+    pub(super) fn remove_all_file_blocks_in_txn(
         blocks: &mut redb::Table<'_, &[u8], &[u8]>,
         ino: Ino,
     ) -> MetaResult<Vec<u64>> {
@@ -337,22 +419,7 @@ impl RedbMetaEngine {
         Ok(rows.into_iter().map(|(_, object_id)| object_id).collect())
     }
 
-
-    fn has_u64_marker_in_write(
-        txn: &redb::WriteTransaction,
-        table_def: TableDefinition<u64, u8>,
-        key: u64,
-    ) -> MetaResult<bool> {
-        let table = txn
-            .open_table(table_def)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(table
-            .get(key)
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-            .is_some())
-    }
-
-    fn lookup_merged_in_write_txn(
+    pub(super) fn lookup_merged_in_write_txn(
         txn: &redb::WriteTransaction,
         parent: Ino,
         name: &[u8],
@@ -366,7 +433,8 @@ impl RedbMetaEngine {
         let tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let overlay_dentries = Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
+        let overlay_dentries =
+            Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
 
         Self::lookup_merged_from_opened_tables(
             &base,
@@ -378,23 +446,24 @@ impl RedbMetaEngine {
         )
     }
 
-    fn get_attr_merged_in_write_txn(
+    pub(super) fn get_attr_merged_in_write_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
     ) -> MetaResult<InodeAttr> {
-        if Self::has_u64_marker_in_write(txn, INODE_TOMBSTONES_TABLE, ino)? {
-            return Err(MetaError::InodeNotFound(ino));
-        }
-        if let Some(attr) = Self::get_attr_from_write_table(txn, INODES_TABLE, ino)? {
-            return Ok(attr);
-        }
-        if let Some(attr) = Self::get_attr_from_write_table(txn, BASE_INODES_TABLE, ino)? {
-            return Ok(attr);
-        }
-        Err(MetaError::InodeNotFound(ino))
+        let current = txn
+            .open_table(INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base = txn
+            .open_table(BASE_INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let tombstones = txn
+            .open_table(INODE_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+
+        Self::resolve_attr_from_opened_tables(&base, &current, &tombstones, ino, true)
     }
 
-    fn readdir_merged_in_write_txn(
+    pub(super) fn readdir_merged_in_write_txn(
         txn: &redb::WriteTransaction,
         parent: Ino,
     ) -> MetaResult<Vec<DirEntry>> {
@@ -407,7 +476,8 @@ impl RedbMetaEngine {
         let tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let overlay_dentries = Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
+        let overlay_dentries =
+            Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
 
         Self::readdir_merged_from_opened_tables(
             &base,
@@ -418,7 +488,7 @@ impl RedbMetaEngine {
         )
     }
 
-    fn get_bytes_from_table_u64(
+    pub(super) fn get_bytes_from_table_u64(
         txn: &redb::ReadTransaction,
         table_def: TableDefinition<u64, &[u8]>,
         key: u64,
@@ -432,7 +502,7 @@ impl RedbMetaEngine {
             .map(|entry| entry.value().to_vec()))
     }
 
-    fn get_bytes_from_table_slice(
+    pub(super) fn get_bytes_from_table_slice(
         txn: &redb::ReadTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
         key: &[u8],
@@ -446,7 +516,7 @@ impl RedbMetaEngine {
             .map(|entry| entry.value().to_vec()))
     }
 
-    fn has_u64_marker(
+    pub(super) fn has_u64_marker(
         txn: &redb::ReadTransaction,
         table_def: TableDefinition<u64, u8>,
         key: u64,
@@ -460,7 +530,7 @@ impl RedbMetaEngine {
             .is_some())
     }
 
-    fn has_slice_marker(
+    pub(super) fn has_slice_marker(
         txn: &redb::ReadTransaction,
         table_def: TableDefinition<&[u8], u8>,
         key: &[u8],
@@ -474,7 +544,7 @@ impl RedbMetaEngine {
             .is_some())
     }
 
-    fn keys_for_inode_in_table(
+    pub(super) fn keys_for_inode_in_table(
         txn: &redb::ReadTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
         ino: Ino,
@@ -498,7 +568,7 @@ impl RedbMetaEngine {
         Ok(keys)
     }
 
-    fn keys_for_inode_in_write_table(
+    pub(super) fn keys_for_inode_in_write_table(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
         ino: Ino,
@@ -522,7 +592,7 @@ impl RedbMetaEngine {
         Ok(keys)
     }
 
-    fn merged_symlink_target(
+    pub(super) fn merged_symlink_target(
         &self,
         txn: &redb::ReadTransaction,
         ino: Ino,
@@ -536,7 +606,7 @@ impl RedbMetaEngine {
         Self::get_bytes_from_table_u64(txn, BASE_SYMLINKS_TABLE, ino)
     }
 
-    fn merged_xattr_value(
+    pub(super) fn merged_xattr_value(
         &self,
         txn: &redb::ReadTransaction,
         ino: Ino,
@@ -555,7 +625,7 @@ impl RedbMetaEngine {
         )
     }
 
-    fn set_xattr_value_in_table_in_txn(
+    pub(super) fn set_xattr_value_in_table_in_txn(
         txn: &redb::WriteTransaction,
         table: TableDefinition<&[u8], &[u8]>,
         ino: Ino,
@@ -573,7 +643,10 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn set_inode_overlay_in_txn(txn: &redb::WriteTransaction, attr: &InodeAttr) -> MetaResult<()> {
+    pub(super) fn set_inode_overlay_in_txn(
+        txn: &redb::WriteTransaction,
+        attr: &InodeAttr,
+    ) -> MetaResult<()> {
         let mut tombstones = txn
             .open_table(INODE_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -590,7 +663,10 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn remove_inode_overlay_in_txn(txn: &redb::WriteTransaction, ino: Ino) -> MetaResult<()> {
+    pub(super) fn remove_inode_overlay_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<()> {
         let mut inodes = txn
             .open_table(INODES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -617,7 +693,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn set_dentry_overlay_in_txn(
+    pub(super) fn set_dentry_overlay_in_txn(
         txn: &redb::WriteTransaction,
         parent: Ino,
         name: &[u8],
@@ -640,7 +716,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn remove_dentry_overlay_in_txn(
+    pub(super) fn remove_dentry_overlay_in_txn(
         txn: &redb::WriteTransaction,
         parent: Ino,
         name: &[u8],
@@ -672,7 +748,10 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn set_inode_mirror_in_txn(txn: &redb::WriteTransaction, attr: &InodeAttr) -> MetaResult<()> {
+    pub(super) fn set_inode_mirror_in_txn(
+        txn: &redb::WriteTransaction,
+        attr: &InodeAttr,
+    ) -> MetaResult<()> {
         let mut tombstones = txn
             .open_table(INODE_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -689,7 +768,10 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn remove_inode_mirror_in_txn(txn: &redb::WriteTransaction, ino: Ino) -> MetaResult<()> {
+    pub(super) fn remove_inode_mirror_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<()> {
         let mut inodes = txn
             .open_table(INODES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -703,7 +785,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn set_dentry_mirror_in_txn(
+    pub(super) fn set_dentry_mirror_in_txn(
         txn: &redb::WriteTransaction,
         parent: Ino,
         name: &[u8],
@@ -726,7 +808,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn remove_dentry_mirror_in_txn(
+    pub(super) fn remove_dentry_mirror_in_txn(
         txn: &redb::WriteTransaction,
         parent: Ino,
         name: &[u8],
@@ -745,7 +827,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn set_symlink_mirror_in_txn(
+    pub(super) fn set_symlink_mirror_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
         target: &[u8],
@@ -765,7 +847,10 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn remove_symlink_mirror_in_txn(txn: &redb::WriteTransaction, ino: Ino) -> MetaResult<()> {
+    pub(super) fn remove_symlink_mirror_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<()> {
         let mut symlinks = txn
             .open_table(SYMLINKS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -779,7 +864,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn set_xattr_mirror_in_txn(
+    pub(super) fn set_xattr_mirror_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
         name: &[u8],
@@ -796,7 +881,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn remove_xattr_mirror_in_txn(
+    pub(super) fn remove_xattr_mirror_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
         name: &[u8],
@@ -815,7 +900,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn set_symlink_overlay_in_txn(
+    pub(super) fn set_symlink_overlay_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
         target: &[u8],
@@ -835,7 +920,10 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn remove_symlink_overlay_in_txn(txn: &redb::WriteTransaction, ino: Ino) -> MetaResult<()> {
+    pub(super) fn remove_symlink_overlay_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<()> {
         let mut symlinks = txn
             .open_table(SYMLINKS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -862,7 +950,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn set_xattr_overlay_in_txn(
+    pub(super) fn set_xattr_overlay_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
         name: &[u8],
@@ -879,7 +967,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn remove_xattr_overlay_in_txn(
+    pub(super) fn remove_xattr_overlay_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
         name: &[u8],
@@ -911,8 +999,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-
-    fn next_undo_op_id_in_txn(txn: &redb::WriteTransaction) -> MetaResult<u64> {
+    pub(super) fn next_undo_op_id_in_txn(txn: &redb::WriteTransaction) -> MetaResult<u64> {
         let mut counters = txn
             .open_table(COUNTERS_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -930,7 +1017,7 @@ impl RedbMetaEngine {
         Ok(current)
     }
 
-    fn append_undo_log_in_txn(
+    pub(super) fn append_undo_log_in_txn(
         txn: &redb::WriteTransaction,
         record: &UndoLogRecord,
     ) -> MetaResult<()> {
@@ -944,7 +1031,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn remove_undo_logs_for_in_txn(
+    pub(super) fn remove_undo_logs_for_in_txn(
         txn: &redb::WriteTransaction,
         kind: UndoLogKind,
         ino: Ino,
@@ -953,7 +1040,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn set_undo_log_phase_for(
+    pub(super) fn set_undo_log_phase_for(
         &self,
         kind: UndoLogKind,
         ino: Ino,
@@ -971,7 +1058,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn set_undo_log_phase_for_in_txn(
+    pub(super) fn set_undo_log_phase_for_in_txn(
         txn: &redb::WriteTransaction,
         kind: UndoLogKind,
         ino: Ino,
@@ -1001,7 +1088,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn update_counter_in_txn<F>(
+    pub(super) fn update_counter_in_txn<F>(
         txn: &redb::WriteTransaction,
         name: &str,
         update: F,
@@ -1026,7 +1113,7 @@ impl RedbMetaEngine {
         Ok(new_val)
     }
 
-    fn clear_inode_overlay_aux_in_txn_with_options(
+    pub(super) fn clear_inode_overlay_aux_in_txn_with_options(
         txn: &redb::WriteTransaction,
         ino: Ino,
         clear_regular_file_graph: bool,
@@ -1151,7 +1238,10 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    fn clear_inode_overlay_aux_in_txn(txn: &redb::WriteTransaction, ino: Ino) -> MetaResult<()> {
+    pub(super) fn clear_inode_overlay_aux_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<()> {
         Self::clear_inode_overlay_aux_in_txn_with_options(txn, ino, true)
     }
 }

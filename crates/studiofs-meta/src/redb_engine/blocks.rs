@@ -1,3 +1,5 @@
+use super::*;
+
 impl MetaBlocks for RedbMetaEngine {
     fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
         let block_size = self.regular_file_graph_block_size()?;
@@ -1034,7 +1036,6 @@ impl MetaBlocks for RedbMetaEngine {
         Ok(compacted)
     }
 }
-
 
 impl RedbMetaEngine {
     fn flush_regular_file_overlay_slices_with_attr_txn(
