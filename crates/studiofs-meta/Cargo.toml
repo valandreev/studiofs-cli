@@ -11,22 +11,13 @@ postcard.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
-parking_lot.workspace = true
-opendal.workspace = true
 tokio.workspace = true
 tokio-postgres.workspace = true
-deadpool-postgres.workspace = true
-postgres-types.workspace = true
-futures.workspace = true
 url.workspace = true
 uuid.workspace = true
 bitflags = { version = "2.4", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = "3"
-anyhow.workspace = true
-aws-config = "1"
-aws-sdk-s3 = "1"
-aws-smithy-http-client = "1"
 dotenvy.workspace = true
 uuid.workspace = true

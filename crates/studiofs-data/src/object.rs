@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 //! StudioFS S3 Object Format
 //!
 //! Defines the binary format for objects stored in S3.
@@ -271,6 +270,7 @@ impl ObjectHeader {
     since = "0.1.1",
     note = "Use create_object_buffer to avoid full payload copying on hot paths"
 )]
+#[allow(deprecated)]
 pub fn create_object(data: &[u8]) -> Result<Vec<u8>, ObjectError> {
     create_object_with(data, ObjectFlags::empty())
 }
@@ -345,6 +345,7 @@ pub fn create_object_buffer_with(data: Bytes, flags: ObjectFlags) -> Result<Buff
 }
 
 pub use create_object_buffer_with as create_object_buffer_with_flags;
+#[allow(deprecated)]
 pub use create_object_with as create_object_with_flags;
 
 /// Read and validate an object.
@@ -588,6 +589,7 @@ pub struct Objectlink {
 /// Legacy: Payload structure for metadata objects.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[deprecated(since = "0.2.0", note = "New architecture uses simple block storage")]
+#[allow(deprecated)]
 pub struct ObjectPayload {
     /// Kind of object.
     pub kind: ObjectKind,
@@ -655,6 +657,7 @@ impl ObjectPayload {
 // =============================================================================
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 

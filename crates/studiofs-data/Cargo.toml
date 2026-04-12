@@ -11,7 +11,6 @@ tokio.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-futures.workspace = true
 xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
 serde = { workspace = true, features = ["derive"] }
 postcard = { workspace = true }
@@ -21,6 +20,5 @@ url.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 dotenvy.workspace = true
-aws-config = "1"
 aws-sdk-s3 = "1"
 aws-smithy-http-client = "1"
