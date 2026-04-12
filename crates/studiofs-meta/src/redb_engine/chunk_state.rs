@@ -406,18 +406,30 @@ impl RedbMetaEngine {
         chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
         track_pending_compaction: bool,
     ) -> MetaResult<()> {
-        fn relevant_tombstone_ranges(
+        fn visible_data_ranges(
             chunk_id: ChunkId,
-            tombstone: SliceRange,
             current: &RegularFileChunkState,
             lower_precedence: Option<&RegularFileChunkState>,
         ) -> Vec<SliceRange> {
-            merge_covered_ranges(
-                &resolve_chunk_slice_spans(chunk_id, tombstone, Some(current), lower_precedence)
+            let full_chunk =
+                SliceRange::new(0, DEFAULT_CHUNK_SIZE).expect("full chunk range should be valid");
+            let visible =
+                resolve_chunk_slice_spans(chunk_id, full_chunk, Some(current), lower_precedence)
                     .into_iter()
                     .filter_map(|span| span.block.map(|_| span.range))
-                    .collect::<Vec<_>>(),
-            )
+                    .collect::<Vec<_>>();
+            if visible.len() <= 1 {
+                visible
+            } else {
+                merge_covered_ranges(&visible)
+            }
+        }
+
+        fn intersect_ranges(query: SliceRange, visible: &[SliceRange]) -> Vec<SliceRange> {
+            visible
+                .iter()
+                .filter_map(|range| query.intersection(*range))
+                .collect()
         }
 
         fn merge_covered_ranges(ranges: &[SliceRange]) -> Vec<SliceRange> {
@@ -475,23 +487,17 @@ impl RedbMetaEngine {
             } else {
                 None
             };
+            let visible_ranges = visible_data_ranges(*chunk_id, &state, lower_precedence.as_ref());
             let mut effective_new_slices = Vec::new();
             for new_slice in new_slices.iter().cloned() {
                 if new_slice.block.is_some() {
                     effective_new_slices.push(new_slice);
                     continue;
                 }
-                for range in relevant_tombstone_ranges(
-                    *chunk_id,
-                    new_slice.range,
-                    &state,
-                    lower_precedence.as_ref(),
-                ) {
-                    if let Some(intersection) = new_slice.range.intersection(range) {
-                        let mut pruned = new_slice.clone();
-                        pruned.range = intersection;
-                        effective_new_slices.push(pruned);
-                    }
+                for intersection in intersect_ranges(new_slice.range, &visible_ranges) {
+                    let mut pruned = new_slice.clone();
+                    pruned.range = intersection;
+                    effective_new_slices.push(pruned);
                 }
             }
 

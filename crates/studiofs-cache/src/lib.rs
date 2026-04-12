@@ -83,7 +83,10 @@ pub fn prepare_cache_v3_runtime(
     cache_root: impl AsRef<Path>,
 ) -> Result<PreparedCacheV3Runtime, PrepareCacheV3RuntimeError> {
     let cache_root = cache_root.as_ref();
-    let cache_root_display = cache_root.display().to_string();
+    let cache_root_display = v3::CacheV3Layout::from_cache_root(cache_root)
+        .cache_root
+        .display()
+        .to_string();
 
     let mut detection = v3::detect_cache_backends(cache_root).map_err(|source| {
         PrepareCacheV3RuntimeError::DetectCacheBackend {
@@ -91,15 +94,10 @@ pub fn prepare_cache_v3_runtime(
             source,
         }
     })?;
-    if detection.needs_runtime_provisioning().map_err(|source| {
-        PrepareCacheV3RuntimeError::DetectCacheBackend {
-            cache_root: cache_root_display.clone(),
-            source,
-        }
-    })? {
+    if detection.needs_runtime_provisioning() {
         detection.layout.provision().map_err(|source| {
             PrepareCacheV3RuntimeError::ProvisionCacheV3Layout {
-                cache_root: detection.layout.v3_root.display().to_string(),
+                cache_root: cache_root_display.clone(),
                 source,
             }
         })?;

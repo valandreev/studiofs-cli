@@ -75,6 +75,8 @@ pub struct CacheBackendDetection {
     pub v3_layout_marker_exists: bool,
     pub v3_index_exists: bool,
     pub v3_payload_blocks_dir_exists: bool,
+    pub v3_tmp_dir_exists: bool,
+    pub v3_index_dir_exists: bool,
 }
 
 impl CacheBackendDetection {
@@ -82,11 +84,11 @@ impl CacheBackendDetection {
         self.v3_layout_marker_exists
     }
 
-    pub fn needs_runtime_provisioning(&self) -> Result<bool, io::Error> {
-        Ok(!self.v3_layout_marker_exists
+    pub const fn needs_runtime_provisioning(&self) -> bool {
+        !self.v3_layout_marker_exists
             || !self.v3_payload_blocks_dir_exists
-            || !self.layout.tmp_dir.try_exists()?
-            || !self.layout.index_dir.try_exists()?)
+            || !self.v3_tmp_dir_exists
+            || !self.v3_index_dir_exists
     }
 
     pub fn runtime_backend(&self) -> Option<CacheBackendKind> {
@@ -104,11 +106,15 @@ pub fn detect_cache_backends(cache_root: &Path) -> io::Result<CacheBackendDetect
     let v3_layout_marker_exists = layout.layout_marker.try_exists()?;
     let v3_index_exists = layout.redb_index_path.try_exists()?;
     let v3_payload_blocks_dir_exists = layout.payload_blocks_dir.try_exists()?;
+    let v3_tmp_dir_exists = layout.tmp_dir.try_exists()?;
+    let v3_index_dir_exists = layout.index_dir.try_exists()?;
     Ok(CacheBackendDetection {
         layout,
         v3_layout_marker_exists,
         v3_index_exists,
         v3_payload_blocks_dir_exists,
+        v3_tmp_dir_exists,
+        v3_index_dir_exists,
     })
 }
 
@@ -935,6 +941,9 @@ mod tests {
         assert!(!detection.has_cache_v3_contract());
         assert!(!detection.v3_index_exists);
         assert!(!detection.v3_payload_blocks_dir_exists);
+        assert!(!detection.v3_tmp_dir_exists);
+        assert!(!detection.v3_index_dir_exists);
+        assert!(detection.needs_runtime_provisioning());
         assert_eq!(detection.runtime_backend(), None);
     }
 
@@ -948,6 +957,9 @@ mod tests {
         assert!(detection.has_cache_v3_contract());
         assert!(!detection.v3_index_exists);
         assert!(!detection.v3_payload_blocks_dir_exists);
+        assert!(!detection.v3_tmp_dir_exists);
+        assert!(!detection.v3_index_dir_exists);
+        assert!(detection.needs_runtime_provisioning());
         assert_eq!(detection.runtime_backend(), Some(CacheBackendKind::CacheV3));
     }
 

@@ -58,7 +58,6 @@ pub(crate) fn prepare_volume_cache_runtime(
     cache_dir: &Path,
     volume_uuid: &str,
 ) -> anyhow::Result<PreparedVolumeCacheRuntime> {
-    std::fs::create_dir_all(cache_dir)?;
     let cache_path = cache_dir.join(volume_uuid);
     let cache_runtime = prepare_cache_v3_runtime(&cache_path).map_err(|source| {
         anyhow::anyhow!(
