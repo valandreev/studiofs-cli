@@ -95,7 +95,7 @@ pub(crate) struct LoadArgs {
     path_to_dump: PathBuf,
 
     /// PostgreSQL address/DSN
-    #[arg(long = "postgresql-adress", alias = "postgresql-address")]
+    #[arg(long = "postgresql-address", alias = "postgresql-adress")]
     postgresql_address: String,
 }
 
@@ -529,7 +529,7 @@ mod tests {
             "load",
             "--path-to-dump",
             "reports/metadata.json",
-            "--postgresql-adress",
+            "--postgresql-address",
             "postgres://user:pass@127.0.0.1:5432",
         ])
         .unwrap();
@@ -548,7 +548,7 @@ mod tests {
             "load",
             "--path-to-dump",
             "reports/metadata.json",
-            "--postgresql-address",
+            "--postgresql-adress",
             "postgres://user:pass@127.0.0.1:5432",
         ])
         .unwrap();

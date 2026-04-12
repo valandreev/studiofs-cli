@@ -48,13 +48,13 @@ provided credentials allow it.")]
 #[command(after_help = "\
 EXAMPLES:
   AWS S3 + PostgreSQL:
-    studiofs init prod --endpoint https://s3.amazonaws.com \
-      --bucket my-bucket --access-key AKIA... --secret-key wJal... \
+    studiofs init prod --endpoint https://s3.amazonaws.com \\
+      --bucket my-bucket --access-key AKIA... --secret-key wJal... \\
       --region us-east-1 --meta postgres://user:pass@db:5432
 
   RustFS (local) + PostgreSQL:
-    studiofs init dev --endpoint http://127.0.0.1:9000 \
-      --bucket test-bucket --access-key studiofs --secret-key studiofs123 \
+    studiofs init dev --endpoint http://127.0.0.1:9000 \\
+      --bucket test-bucket --access-key studiofs --secret-key studiofs123 \\
       --meta postgres://studiofs:studiofs@127.0.0.1:5432
 
 RUNTIME POLICY:
@@ -95,7 +95,7 @@ pub(crate) struct InitArgs {
 
     /// PostgreSQL server DSN; StudioFS uses database `studiofs`
     #[arg(long = "meta", required = true)]
-    meta: Option<String>,
+    meta: String,
 
     /// Deprecated option. Metadata is PostgreSQL-only now.
     #[arg(long, hide = true)]
@@ -124,7 +124,7 @@ impl InitArgs {
             &self.access_key,
             &self.secret_key,
             &self.region,
-            self.meta.as_deref(),
+            &self.meta,
             self.metadata_endpoint.as_deref(),
             self.metadata_bucket.as_deref(),
             self.metadata_access_key.as_deref(),
@@ -422,7 +422,7 @@ pub fn run(
     data_access_key: &str,
     data_secret_key: &str,
     data_region: &str,
-    postgres_dsn: Option<&str>,
+    postgres_dsn: &str,
     metadata_endpoint: Option<&str>,
     metadata_bucket: Option<&str>,
     metadata_access_key: Option<&str>,
@@ -431,13 +431,8 @@ pub fn run(
     meta_dir: &Path,
 ) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    let meta_dsn = postgres_dsn.ok_or_else(|| {
-        anyhow::anyhow!(
-            "PostgreSQL metadata backend is required. Pass --meta postgres://user:pass@host:5432"
-        )
-    })?;
     let postgres_dsn = rt
-        .block_on(async { ensure_studiofs_database(meta_dsn).await })
+        .block_on(async { ensure_studiofs_database(postgres_dsn).await })
         .map_err(|e| anyhow::anyhow!(e.to_string()))?
         .metadata_dsn;
     let eff_data_region = if data_region.is_empty() {
@@ -607,7 +602,7 @@ mod tests {
                 assert_eq!(bucket, "bucket");
                 assert_eq!(access_key, "ak");
                 assert_eq!(secret_key, "sk");
-                assert_eq!(meta.as_deref(), Some("postgres://u:p@127.0.0.1:5432"));
+                assert_eq!(meta, "postgres://u:p@127.0.0.1:5432");
             }
             other => panic!("expected Init, got {other:?}"),
         }

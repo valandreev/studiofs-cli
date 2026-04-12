@@ -43,7 +43,7 @@ PostgreSQL delta batches.")]
 #[command(after_help = "\
 EXAMPLES:
   Discover a volume from PostgreSQL:
-    studiofs discover myvolume \
+    studiofs discover myvolume \\
       --meta postgres://studiofs:studiofs@127.0.0.1:5432
 ")]
 pub(crate) struct DiscoverArgs {

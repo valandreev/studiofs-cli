@@ -59,12 +59,12 @@ Supported S3 backends:
 #[command(after_help = "\
 EXAMPLES:
   Initialize a new volume with RustFS + PostgreSQL:
-    studiofs init myvolume --endpoint http://127.0.0.1:9000 \
-      --bucket mybucket --access-key studiofs --secret-key studiofs123 \
+    studiofs init myvolume --endpoint http://127.0.0.1:9000 \\
+      --bucket mybucket --access-key studiofs --secret-key studiofs123 \\
       --meta postgres://studiofs:studiofs@127.0.0.1:5432
 
   Discover the same volume on another machine/client:
-    studiofs discover myvolume \
+    studiofs discover myvolume \\
       --meta postgres://studiofs:studiofs@127.0.0.1:5432
 
   Mount on Windows (drive letter):
