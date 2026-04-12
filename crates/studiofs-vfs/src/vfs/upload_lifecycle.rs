@@ -9,7 +9,6 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use studiofs_cache::CancelUploadMode;
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
@@ -100,12 +99,7 @@ impl StudioVfs {
         op: &PendingUpload,
     ) -> VfsResult<()> {
         let has_open_handles = self.handle_table.open_count(op.ino) > 0;
-        let mode = if has_open_handles {
-            CancelUploadMode::KeepBlock
-        } else {
-            CancelUploadMode::RemoveBlock
-        };
-        self.upload_coordinator.cancel_upload(op, mode);
+        self.upload_coordinator.cancel_upload(op);
         if has_open_handles {
             self.record_deferred_deleted_local_block(op.ino, op.object_id);
         } else {
@@ -450,8 +444,7 @@ impl StudioVfs {
                 current_epoch = attr.content_epoch,
                 "upload cancelled: stale content epoch"
             );
-            self.upload_coordinator
-                .cancel_upload(&op, CancelUploadMode::KeepBlock);
+            self.upload_coordinator.cancel_upload(&op);
             self.block_store_remove_async(op.object_id).await?;
             self.state
                 .upload
@@ -485,8 +478,7 @@ impl StudioVfs {
                 block_index,
                 "upload cancelled: stale block superseded by newer object"
             );
-            self.upload_coordinator
-                .cancel_upload(&op, CancelUploadMode::KeepBlock);
+            self.upload_coordinator.cancel_upload(&op);
             self.block_store_remove_async(op.object_id).await?;
             self.state
                 .upload
@@ -701,8 +693,7 @@ impl StudioVfs {
                         // (race), cancel cleanly. Otherwise this remains a
                         // genuine error and will be retried.
                         if self.state.upload.deleted_inodes.lock().contains(&op.ino) {
-                            self.upload_coordinator
-                                .cancel_upload(&op, CancelUploadMode::KeepBlock);
+                            self.upload_coordinator.cancel_upload(&op);
                             self.block_store_remove_async(op.object_id).await?;
                             self.state
                                 .upload
@@ -720,8 +711,7 @@ impl StudioVfs {
                     // First attempt without a local persisted block is
                     // unexpected; retry through normal error path.
                     if self.state.upload.deleted_inodes.lock().contains(&op.ino) {
-                        self.upload_coordinator
-                            .cancel_upload(&op, CancelUploadMode::KeepBlock);
+                        self.upload_coordinator.cancel_upload(&op);
                         self.block_store_remove_async(op.object_id).await?;
                         self.state
                             .upload

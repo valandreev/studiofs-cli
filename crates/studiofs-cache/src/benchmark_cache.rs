@@ -130,7 +130,6 @@ pub struct BenchmarkCache {
 
 impl BenchmarkCache {
     pub fn open(config: BenchmarkCacheConfig) -> io::Result<Arc<Self>> {
-        std::fs::create_dir_all(&config.cache_dir)?;
         Ok(Arc::new(Self {
             l1: Mutex::new(L1State::default()),
             l1_max_bytes: AtomicU64::new(config.memory_cache_size.max(1)),

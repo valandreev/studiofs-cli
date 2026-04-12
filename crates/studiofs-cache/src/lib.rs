@@ -23,7 +23,7 @@ pub use benchmark_cache::{
     BenchmarkCache, BenchmarkCacheConfig, BenchmarkCacheStats, CacheReadLevel, CacheReadTrace,
     DEFAULT_MEMORY_CACHE_SIZE,
 };
-pub use upload_coordinator::{CancelUploadMode, UploadCoordinator, UploadCoordinatorConfig};
+pub use upload_coordinator::{UploadCoordinator, UploadCoordinatorConfig};
 pub use upload_queue::PendingUpload;
 
 const CACHE_V3_OPEN_LOCK_RETRY_ATTEMPTS: usize = 40;

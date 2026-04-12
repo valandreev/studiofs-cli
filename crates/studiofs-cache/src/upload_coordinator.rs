@@ -8,9 +8,8 @@ use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 
 use crate::metrics::{CachePipelineMetrics, CachePipelineMetricsSnapshot};
 use crate::upload_queue::{PendingUpload, UploadQueue};
@@ -28,12 +27,6 @@ impl UploadCoordinatorConfig {
             cache_dir: cache_dir.into(),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum CancelUploadMode {
-    KeepBlock,
-    RemoveBlock,
 }
 
 #[derive(Debug, Default)]
@@ -60,8 +53,6 @@ pub struct UploadCoordinator {
     pinned: Mutex<PinnedState>,
     upload_queue: Arc<UploadQueue>,
     metrics: CachePipelineMetrics,
-    background_tasks_started: AtomicBool,
-    shutdown_notify: Notify,
 }
 
 impl UploadCoordinator {
@@ -74,20 +65,9 @@ impl UploadCoordinator {
             pinned: Mutex::new(PinnedState::default()),
             upload_queue,
             metrics: CachePipelineMetrics::default(),
-            background_tasks_started: AtomicBool::new(false),
-            shutdown_notify: Notify::new(),
             config,
         });
         Ok((coordinator, upload_rx))
-    }
-
-    pub fn spawn_background_tasks(self: &Arc<Self>) {
-        let _ = self.background_tasks_started.compare_exchange(
-            false,
-            true,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
     }
 
     pub fn pin(&self, object_id: ObjectId) {
@@ -131,7 +111,7 @@ impl UploadCoordinator {
         queued
     }
 
-    pub fn cancel_upload(&self, op: &PendingUpload, _mode: CancelUploadMode) {
+    pub fn cancel_upload(&self, op: &PendingUpload) {
         self.upload_queue.cancel(op);
         self.unpin(op.object_id);
         self.metrics.upload_queue.record_cancel();
@@ -168,7 +148,6 @@ impl UploadCoordinator {
     pub async fn shutdown(&self) {
         self.upload_queue.shutdown();
         self.flush_upload_journal().await;
-        self.shutdown_notify.notify_waiters();
     }
 }
 
@@ -202,7 +181,7 @@ mod tests {
 
         coordinator.submit_upload(7, 4096, 202, 3);
         let op = rx.recv().await.expect("queued upload");
-        coordinator.cancel_upload(&op, CancelUploadMode::RemoveBlock);
+        coordinator.cancel_upload(&op);
 
         assert!(!coordinator.is_pinned(202));
         assert_eq!(coordinator.pending_upload_count(), 0);

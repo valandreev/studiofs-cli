@@ -127,7 +127,7 @@ use studiofs_cache::open_local_block_backend_with_budget_and_sync_mode;
 use studiofs_cache::open_prepared_local_block_backend_with_budget_and_sync_mode;
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_cache::v3::CacheV3PayloadSyncMode;
-use studiofs_cache::{CancelUploadMode, UploadCoordinator, UploadCoordinatorConfig};
+use studiofs_cache::{UploadCoordinator, UploadCoordinatorConfig};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, format_object_fragment_keys,
     parse_object_id_from_key,
@@ -1162,7 +1162,7 @@ fn derive_cache_runtime_tuning(
     // Transit memory keeps enough headroom for read/upload concurrency while
     // still bounded independently of raw cache-size growth.
     let from_cache_budget = cache_size / 96;
-    let from_l1_budget = if memory_cache_budget_bytes == 0 {
+    let from_memory_cache_budget = if memory_cache_budget_bytes == 0 {
         0
     } else {
         ((memory_cache_budget_bytes as u128)
@@ -1171,7 +1171,9 @@ fn derive_cache_runtime_tuning(
             .min(u64::MAX as u128) as u64
     };
     let transit_memory_budget_bytes = clamp_usize(
-        from_cache_budget.max(from_l1_budget).max(block_size),
+        from_cache_budget
+            .max(from_memory_cache_budget)
+            .max(block_size),
         CACHE_RUNTIME_MIN_TRANSIT_BUDGET_BYTES.max(block_size as usize),
         CACHE_RUNTIME_MAX_TRANSIT_BUDGET_BYTES,
     );
@@ -2704,7 +2706,6 @@ impl StudioVfs {
             upload_rx,
         }: StartupChannels,
     ) -> VfsResult<()> {
-        self.upload_coordinator.spawn_background_tasks();
         self.spawn_prefetch_worker(prefetch_rx);
         self.spawn_uploader_worker(upload_rx);
         self.spawn_epoch_finalizer_worker();
@@ -3280,8 +3281,7 @@ impl StudioVfs {
         }
 
         for op in &pending_uploads {
-            self.upload_coordinator
-                .cancel_upload(op, CancelUploadMode::KeepBlock);
+            self.upload_coordinator.cancel_upload(op);
         }
 
         let mut pending_evictions = self.state.upload.pending_evictions.lock();
