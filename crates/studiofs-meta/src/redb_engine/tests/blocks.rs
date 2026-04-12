@@ -165,6 +165,38 @@ fn test_file_block_overwrite_returns_old() {
 }
 
 #[test]
+fn test_partial_block_overwrite_hides_old_tail() {
+    let engine = temp_engine();
+
+    let attr = engine
+        .create_file(ROOT_INO, b"partial-overwrite.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let ino = attr.ino;
+
+    let full = BlockRef::new_full(101, DEFAULT_BLOCK_SIZE);
+    engine.set_file_block(ino, 0, &full).unwrap();
+
+    let partial = BlockRef::new_partial(102, 4096);
+    engine.set_file_block(ino, 0, &partial).unwrap();
+
+    let current = engine.get_file_block(ino, 0).unwrap().unwrap();
+    assert_eq!(current.object_id, 102);
+    assert_eq!(current.length, 4096);
+    assert!(current.is_partial());
+
+    let txn = engine.db.begin_write().unwrap();
+    let overlay_chunks = RedbMetaEngine::regular_file_chunk_states_for_inode_in_write_txn(
+        &txn,
+        REGULAR_FILE_OVERLAY_TABLE,
+        ino,
+    )
+    .unwrap();
+    txn.abort().unwrap();
+
+    assert_eq!(overlay_chunks.get(&ChunkId(0)).unwrap().slices.len(), 2);
+}
+
+#[test]
 fn test_get_file_block_reads_base_graph_rows() {
     let engine = temp_engine();
 
@@ -363,8 +395,16 @@ fn test_remove_file_block_updates_regular_file_graph() {
     txn.abort().unwrap();
 
     assert_eq!(overlay_chunks.len(), 1);
-    assert_eq!(overlay_chunks.get(&ChunkId(0)).unwrap().slices.len(), 1);
-    assert!(base_chunks.is_empty());
+    assert_eq!(overlay_chunks.get(&ChunkId(0)).unwrap().slices.len(), 2);
+    assert_eq!(base_chunks.get(&ChunkId(0)).unwrap().slices.len(), 1);
+    let txn = engine.db.begin_write().unwrap();
+    assert_eq!(
+        RedbMetaEngine::base_manifest_from_graph_rows_in_txn(&txn, ino)
+            .unwrap()
+            .len(),
+        0
+    );
+    txn.abort().unwrap();
     assert_eq!(engine.get_file_blocks(ino).unwrap().len(), 1);
     assert_eq!(
         engine.get_file_block(ino, 1).unwrap().unwrap().object_id,

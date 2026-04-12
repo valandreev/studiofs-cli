@@ -399,6 +399,117 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    pub(super) fn apply_regular_file_chunk_slices_in_txn(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<&[u8], &[u8]>,
+        ino: Ino,
+        chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
+        track_pending_compaction: bool,
+    ) -> MetaResult<()> {
+        fn merge_covered_ranges(ranges: &[SliceRange]) -> Vec<SliceRange> {
+            let mut merged = ranges.to_vec();
+            merged.sort_unstable_by_key(|range| (range.start, range.end));
+
+            let mut out: Vec<SliceRange> = Vec::new();
+            for range in merged {
+                if let Some(last) = out.last_mut()
+                    && range.start <= last.end
+                {
+                    last.end = last.end.max(range.end);
+                    continue;
+                }
+                out.push(range);
+            }
+            out
+        }
+
+        if chunk_slices.is_empty() {
+            return Ok(());
+        }
+
+        let mut table = txn
+            .open_table(table_def)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut pending = if track_pending_compaction {
+            Some(
+                txn.open_table(PENDING_REGULAR_FILE_COMPACTION_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+
+        for (chunk_id, new_slices) in chunk_slices {
+            let key = encode_regular_file_chunk_key(ino, *chunk_id);
+            let mut state = if let Some(entry) = table
+                .get(key.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                decode::<RegularFileChunkState>(entry.value())?
+            } else {
+                RegularFileChunkState::default()
+            };
+
+            let covered_ranges = merge_covered_ranges(
+                &new_slices
+                    .iter()
+                    .map(|slice| slice.range)
+                    .collect::<Vec<_>>(),
+            );
+            let mut fully_covered = Vec::new();
+            for (id, existing) in &state.slices {
+                if covered_ranges.iter().any(|range| {
+                    range.start <= existing.range.start && range.end >= existing.range.end
+                }) {
+                    fully_covered.push(*id);
+                }
+            }
+
+            for id in fully_covered {
+                state.slices.remove(&id);
+            }
+
+            for mut new_slice in new_slices.iter().cloned() {
+                let slice_id = state
+                    .try_alloc_slice_id()
+                    .ok_or_else(|| MetaError::Storage("slice id overflow".to_string()))?;
+                let slice_order = state
+                    .try_alloc_slice_order()
+                    .ok_or_else(|| MetaError::Storage("slice order overflow".to_string()))?;
+                new_slice.slice_id = slice_id;
+                new_slice.order = slice_order;
+                state.slices.insert(slice_id, new_slice);
+            }
+
+            state.refresh_fragmentation_metrics();
+
+            if state.is_empty() {
+                let _ = table
+                    .remove(key.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            } else {
+                let encoded = encode(&state)?;
+                table
+                    .insert(key.as_slice(), encoded.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+            }
+
+            if let Some(pending) = pending.as_mut() {
+                if state.fragmentation.should_compact() {
+                    pending
+                        .insert(key.as_slice(), 1)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                } else {
+                    let _ = pending
+                        .remove(key.as_slice())
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Convert flat block list to chunk/slice state using the provided block size.
     pub(super) fn convert_blocks_to_chunk_state(
         blocks: &[(u32, BlockRef)],
@@ -551,6 +662,11 @@ impl RedbMetaEngine {
             cursor = query_end;
         }
         let spans = merge_adjacent_spans(spans);
+        if block_size == 0 {
+            return Err(MetaError::Storage(
+                "invalid zero block size in manifest synthesis".to_string(),
+            ));
+        }
         let block_count = ((size.saturating_sub(1)) / block_size as u64).saturating_add(1);
         let mut synthesized = Vec::new();
         for idx in 0..block_count {
@@ -881,7 +997,6 @@ impl RedbMetaEngine {
         Ok(Self::regular_file_committed_size_in_txn(txn, ino)?.unwrap_or(0))
     }
 
-    #[cfg(test)]
     pub(super) fn regular_file_committed_size_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
@@ -919,13 +1034,16 @@ impl RedbMetaEngine {
         txn: &redb::WriteTransaction,
         ino: Ino,
     ) -> MetaResult<Vec<(u32, BlockRef)>> {
-        let _ = Self::get_attr_from_write_table(txn, INODES_TABLE, ino)?
+        let attr = Self::get_attr_from_write_table(txn, INODES_TABLE, ino)?
             .or_else(|| {
                 Self::get_attr_from_write_table(txn, BASE_INODES_TABLE, ino)
                     .ok()
                     .flatten()
             })
             .ok_or(MetaError::InodeNotFound(ino))?;
+        if attr.size == 0 {
+            return Ok(Vec::new());
+        }
         let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
             txn,
             REGULAR_FILE_OVERLAY_TABLE,
@@ -938,6 +1056,216 @@ impl RedbMetaEngine {
         )?;
         let block_size = Self::regular_file_graph_block_size_from_write_txn(txn)?;
         Self::manifest_from_chunk_states(ino, Some(&overlay_chunks), Some(&base_chunks), block_size)
+    }
+
+    pub(super) fn lookup_regular_file_slices_in_write_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+        offset: u64,
+        length: u64,
+        include_overlay: bool,
+        include_base: bool,
+    ) -> MetaResult<Vec<ResolvedSliceSpan>> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| MetaError::Storage("regular-file lookup range overflow".to_string()))?;
+        let overlay_table = if include_overlay {
+            Some(
+                txn.open_table(REGULAR_FILE_OVERLAY_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let base_table = if include_base {
+            Some(
+                txn.open_table(REGULAR_FILE_BASE_TABLE)
+                    .map_err(|e| MetaError::Storage(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let mut spans = Vec::new();
+        let mut cursor = offset;
+        while cursor < end {
+            let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);
+            let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
+            let chunk_end = chunk_start.saturating_add(DEFAULT_CHUNK_SIZE as u64);
+            let query_end = end.min(chunk_end);
+            let query = SliceRange::new(
+                (cursor - chunk_start) as u32,
+                (query_end - chunk_start) as u32,
+            )
+            .ok_or_else(|| MetaError::Storage("invalid chunk-local lookup range".to_string()))?;
+            let key = encode_regular_file_chunk_key(ino, chunk_id);
+            let overlay: Option<RegularFileChunkState> = if let Some(table) = overlay_table.as_ref()
+            {
+                table
+                    .get(key.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                    .map(|value| decode(value.value()))
+                    .transpose()?
+            } else {
+                None
+            };
+            let base: Option<RegularFileChunkState> = if let Some(table) = base_table.as_ref() {
+                table
+                    .get(key.as_slice())
+                    .map_err(|e| MetaError::Storage(e.to_string()))?
+                    .map(|value| decode(value.value()))
+                    .transpose()?
+            } else {
+                None
+            };
+            spans.extend(resolve_chunk_slice_spans(
+                chunk_id,
+                query,
+                overlay.as_ref(),
+                base.as_ref(),
+            ));
+            cursor = query_end;
+        }
+        Ok(merge_adjacent_spans(spans))
+    }
+
+    pub(super) fn current_block_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+        block_index: u32,
+        block_size: u32,
+    ) -> MetaResult<Option<BlockRef>> {
+        let block_start = u64::from(block_index).saturating_mul(u64::from(block_size));
+        let spans = Self::lookup_regular_file_slices_in_write_txn(
+            txn,
+            ino,
+            block_start,
+            u64::from(block_size),
+            true,
+            true,
+        )?;
+        Self::synthesize_block_ref_from_resolved_spans(
+            ino,
+            spans.as_slice(),
+            block_index,
+            block_size,
+        )
+    }
+
+    pub(super) fn base_block_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+        block_index: u32,
+        block_size: u32,
+    ) -> MetaResult<Option<BlockRef>> {
+        let block_start = u64::from(block_index).saturating_mul(u64::from(block_size));
+        let spans = Self::lookup_regular_file_slices_in_write_txn(
+            txn,
+            ino,
+            block_start,
+            u64::from(block_size),
+            false,
+            true,
+        )?;
+        Self::synthesize_block_ref_from_resolved_spans(
+            ino,
+            spans.as_slice(),
+            block_index,
+            block_size,
+        )
+    }
+
+    pub(super) fn chunk_slices_for_block(
+        block_index: u32,
+        block_size: u32,
+        block: Option<&BlockRef>,
+        block_state: BlockRefState,
+    ) -> MetaResult<Vec<(ChunkId, Vec<SliceRecord>)>> {
+        if block_size == 0 {
+            return Err(MetaError::Storage(
+                "invalid zero block size for block mutation".to_string(),
+            ));
+        }
+        if let Some(block) = block
+            && block.length > block_size
+        {
+            return Err(MetaError::Storage(format!(
+                "block length {} exceeds block size {}",
+                block.length, block_size
+            )));
+        }
+
+        let block_start = u64::from(block_index)
+            .checked_mul(u64::from(block_size))
+            .ok_or_else(|| MetaError::Storage("block offset overflow".to_string()))?;
+        let data_end = block_start
+            .checked_add(u64::from(block.map_or(0, |entry| entry.length)))
+            .ok_or_else(|| MetaError::Storage("block data range overflow".to_string()))?;
+        let block_end = block_start
+            .checked_add(u64::from(block_size))
+            .ok_or_else(|| MetaError::Storage("block slot range overflow".to_string()))?;
+
+        let mut chunks = BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
+        let mut push_segment = |segment_start: u64,
+                                segment_end: u64,
+                                data_block: Option<&BlockRef>|
+         -> MetaResult<()> {
+            if segment_start >= segment_end {
+                return Ok(());
+            }
+            let mut cursor = segment_start;
+            while cursor < segment_end {
+                let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);
+                let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
+                let chunk_end = chunk_start.saturating_add(DEFAULT_CHUNK_SIZE as u64);
+                let piece_end = segment_end.min(chunk_end);
+                let range = SliceRange::new(
+                    (cursor - chunk_start) as u32,
+                    (piece_end - chunk_start) as u32,
+                )
+                .ok_or_else(|| MetaError::Storage("invalid block mutation range".to_string()))?;
+                let slice = if let Some(block) = data_block {
+                    let delta = cursor.saturating_sub(block_start);
+                    let delta = u32::try_from(delta).map_err(|_| {
+                        MetaError::Storage("block offset delta overflow".to_string())
+                    })?;
+                    let length = u32::try_from(piece_end.saturating_sub(cursor)).map_err(|_| {
+                        MetaError::Storage("block slice length overflow".to_string())
+                    })?;
+                    let offset = block.offset.checked_add(delta).ok_or_else(|| {
+                        MetaError::Storage("block slice offset overflow".to_string())
+                    })?;
+                    let mut slice = SliceRecord::new(
+                        SliceId(0),
+                        SliceOrder(0),
+                        range,
+                        BlockRef {
+                            object_id: block.object_id,
+                            offset,
+                            length,
+                            flags: block.flags,
+                        },
+                    );
+                    slice.block_state = block_state;
+                    slice
+                } else {
+                    let mut slice = SliceRecord::tombstone(SliceId(0), SliceOrder(0), range);
+                    slice.block_state = block_state;
+                    slice
+                };
+                chunks.entry(chunk_id).or_default().push(slice);
+                cursor = piece_end;
+            }
+            Ok(())
+        };
+
+        push_segment(block_start, data_end, block)?;
+        if data_end < block_end {
+            push_segment(data_end, block_end, None)?;
+        }
+        Ok(chunks.into_iter().collect())
     }
 
     pub(super) fn base_manifest_from_graph_rows_in_txn(

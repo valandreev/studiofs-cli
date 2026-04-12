@@ -2,11 +2,15 @@ use super::*;
 
 impl MetaBlocks for RedbMetaEngine {
     fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
-        Ok(self
-            .get_file_blocks(ino)?
-            .into_iter()
-            .find(|(current_index, _)| *current_index == block_index)
-            .map(|(_, block)| block))
+        let block_size = self.regular_file_graph_block_size()?;
+        let block_start = u64::from(block_index).saturating_mul(u64::from(block_size));
+        let spans = self.lookup_regular_file_slices(ino, block_start, u64::from(block_size))?;
+        Self::synthesize_block_ref_from_resolved_spans(
+            ino,
+            spans.as_slice(),
+            block_index,
+            block_size,
+        )
     }
 
     fn set_file_block(
@@ -22,20 +26,18 @@ impl MetaBlocks for RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let old_block;
         {
-            let mut manifest = std::collections::BTreeMap::new();
-            for (current_index, current_block) in Self::current_manifest_in_txn(&txn, ino)? {
-                manifest.insert(current_index, current_block);
-            }
-            old_block = manifest.insert(block_index, block.clone());
-            let updated_manifest: Vec<_> = manifest.into_iter().collect();
-
-            Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+            old_block = Self::current_block_in_txn(&txn, ino, block_index, block_size)?;
+            let chunk_slices = Self::chunk_slices_for_block(
+                block_index,
+                block_size,
+                Some(block),
+                BlockRefState::LocalOnly,
+            )?;
+            Self::apply_regular_file_chunk_slices_in_txn(
                 &txn,
                 REGULAR_FILE_OVERLAY_TABLE,
                 ino,
-                updated_manifest.as_slice(),
-                block_size,
-                false,
+                chunk_slices.as_slice(),
                 true,
             )?;
 
@@ -49,7 +51,7 @@ impl MetaBlocks for RedbMetaEngine {
             if let Some(attr_bytes) = attr_bytes {
                 let mut attr: InodeAttr = decode(&attr_bytes)?;
                 let has_committed_manifest =
-                    !Self::base_manifest_from_graph_rows_in_txn(&txn, ino)?.is_empty();
+                    Self::regular_file_committed_size_in_txn(&txn, ino)?.unwrap_or(0) > 0;
                 Self::transition_upload_state_for_local_mutation(&mut attr, has_committed_manifest);
                 let encoded = encode(&attr)?;
                 inodes
@@ -232,46 +234,47 @@ impl MetaBlocks for RedbMetaEngine {
         let removed_id;
         let mut updated_attr: Option<InodeAttr> = None;
         {
-            let mut current_manifest = std::collections::BTreeMap::new();
-            for (current_index, current_block) in Self::current_manifest_in_txn(&txn, ino)? {
-                current_manifest.insert(current_index, current_block);
-            }
-            let mut base_manifest = std::collections::BTreeMap::new();
-            for (current_index, current_block) in
-                Self::base_manifest_from_graph_rows_in_txn(&txn, ino)?
-            {
-                base_manifest.insert(current_index, current_block);
-            }
+            let current_block = Self::current_block_in_txn(&txn, ino, block_index, block_size)?;
+            let base_block = Self::base_block_in_txn(&txn, ino, block_index, block_size)?;
+            removed_id = current_block
+                .as_ref()
+                .map(|block| block.object_id)
+                .or(base_block.as_ref().map(|block| block.object_id));
 
-            removed_id = current_manifest
-                .remove(&block_index)
-                .map(|block| block.object_id);
-            base_manifest.remove(&block_index);
-
-            let updated_current: Vec<_> = current_manifest.into_iter().collect();
-            Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
-                &txn,
-                REGULAR_FILE_OVERLAY_TABLE,
-                ino,
-                updated_current.as_slice(),
-                block_size,
-                false,
-                true,
-            )?;
-            let updated_base: Vec<_> = base_manifest.into_iter().collect();
-            Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
-                &txn,
-                REGULAR_FILE_BASE_TABLE,
-                ino,
-                updated_base.as_slice(),
-                block_size,
-                true,
-                false,
-            )?;
+            if current_block.is_some() || base_block.is_some() {
+                let overlay_tombstones = Self::chunk_slices_for_block(
+                    block_index,
+                    block_size,
+                    None,
+                    BlockRefState::LocalOnly,
+                )?;
+                Self::apply_regular_file_chunk_slices_in_txn(
+                    &txn,
+                    REGULAR_FILE_OVERLAY_TABLE,
+                    ino,
+                    overlay_tombstones.as_slice(),
+                    true,
+                )?;
+            }
+            if base_block.is_some() {
+                let base_tombstones = Self::chunk_slices_for_block(
+                    block_index,
+                    block_size,
+                    None,
+                    BlockRefState::Published,
+                )?;
+                Self::apply_regular_file_chunk_slices_in_txn(
+                    &txn,
+                    REGULAR_FILE_BASE_TABLE,
+                    ino,
+                    base_tombstones.as_slice(),
+                    false,
+                )?;
+            }
 
             if removed_id.is_some() {
                 let new_committed_size =
-                    Self::legacy_committed_size_from_blocks(updated_base.as_slice());
+                    Self::regular_file_committed_size_in_txn(&txn, ino)?.unwrap_or(0);
                 let mut inodes = txn
                     .open_table(INODES_TABLE)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -282,7 +285,7 @@ impl MetaBlocks for RedbMetaEngine {
                 if let Some(attr_bytes) = attr_bytes {
                     let mut attr: InodeAttr = decode(&attr_bytes)?;
                     attr.committed_size = new_committed_size;
-                    let has_committed_manifest = !updated_base.is_empty();
+                    let has_committed_manifest = new_committed_size > 0;
                     Self::transition_upload_state_for_local_mutation(
                         &mut attr,
                         has_committed_manifest,
@@ -446,10 +449,7 @@ impl MetaBlocks for RedbMetaEngine {
             }
             drop(inodes);
 
-            let current = Self::current_manifest_in_txn(&txn, ino)?
-                .into_iter()
-                .find(|(current_index, _)| *current_index == block_index)
-                .map(|(_, current_block)| current_block);
+            let current = Self::current_block_in_txn(&txn, ino, block_index, block_size)?;
             let Some(current) = current else {
                 return Ok(false);
             };
@@ -457,25 +457,22 @@ impl MetaBlocks for RedbMetaEngine {
                 return Ok(false);
             }
 
-            let mut committed_manifest = std::collections::BTreeMap::new();
-            for (current_index, current_block) in
-                Self::base_manifest_from_graph_rows_in_txn(&txn, ino)?
-            {
-                committed_manifest.insert(current_index, current_block);
-            }
-            let old_committed = committed_manifest.insert(block_index, block.clone());
-            let committed_manifest: Vec<_> = committed_manifest.into_iter().collect();
-            Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+            let old_committed = Self::base_block_in_txn(&txn, ino, block_index, block_size)?;
+            let committed_slices = Self::chunk_slices_for_block(
+                block_index,
+                block_size,
+                Some(block),
+                BlockRefState::Published,
+            )?;
+            Self::apply_regular_file_chunk_slices_in_txn(
                 &txn,
                 REGULAR_FILE_BASE_TABLE,
                 ino,
-                committed_manifest.as_slice(),
-                block_size,
-                true,
+                committed_slices.as_slice(),
                 false,
             )?;
             let new_committed_size =
-                Self::legacy_committed_size_from_blocks(committed_manifest.as_slice());
+                Self::regular_file_committed_size_in_txn(&txn, ino)?.unwrap_or(0);
 
             let previous_committed_size = attr.committed_size;
             let previous_committed_epoch = attr.committed_content_epoch;
