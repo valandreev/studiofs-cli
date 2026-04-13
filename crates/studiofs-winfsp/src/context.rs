@@ -11,12 +11,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use parking_lot::Mutex;
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_meta::{FileType, Ino, InodeAttr, MetaError, ROOT_INO};
+use studiofs_vfs::vfs::{ExplicitFlushOutcome, ReleaseFhOutcome};
 use studiofs_vfs::{
     BarrierObservabilityPort, BridgeVfsErrorKind, DeferredCleanupHintPort, DeleteCleanupPort,
     FlushGatePort, HandleDrainBarrier, HandleDrainDeleteRequest, HandleDrainRequest,
     HandleReleasePort, KernelInvalidator, LocalSyncBarrierPort, NamespacePathStyle, OpenFlags,
-    StudioVfs, classify_vfs_error, is_hidden_non_macos_root_metadata_name,
-    normalize_attr_times,
+    StudioVfs, classify_vfs_error, is_hidden_non_macos_root_metadata_name, normalize_attr_times,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, error, trace, warn};
@@ -699,6 +699,8 @@ pub struct StudioFsContext {
     /// and the WinFSP timer can drain them).
     invalidation_queue: Arc<Mutex<Vec<Ino>>>,
     callback_barrier_state: CallbackBarrierState,
+    #[cfg(test)]
+    _test_runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
 
 struct CallbackBarrierState {
@@ -747,11 +749,6 @@ impl CallbackBarrierState {
         self.deferred_cleanup_hints.take(ino)
     }
 
-    fn has_deferred_cleanup_hint(&self, ino: Ino) -> bool {
-        self.deferred_cleanup_hints.contains(ino)
-    }
-
-    #[cfg(test)]
     fn has_deferred_cleanup_hint(&self, ino: Ino) -> bool {
         self.deferred_cleanup_hints.contains(ino)
     }
@@ -888,7 +885,7 @@ impl LocalSyncBarrierPort for WinfspLocalSyncBarrierPort<'_> {
     fn explicit_flush(
         &self,
         request: HandleDrainRequest,
-    ) -> studiofs_vfs::VfsResult<studiofs_vfs::ExplicitFlushOutcome> {
+    ) -> studiofs_vfs::VfsResult<ExplicitFlushOutcome> {
         let vfs = self.context.vfs.clone();
         self.context.spawn_wait(async move {
             if request.fh != 0 {
@@ -904,7 +901,7 @@ impl HandleReleasePort for WinfspHandleReleasePort<'_> {
     fn release_handle(
         &self,
         request: HandleDrainRequest,
-    ) -> studiofs_vfs::VfsResult<studiofs_vfs::ReleaseFhOutcome> {
+    ) -> studiofs_vfs::VfsResult<ReleaseFhOutcome> {
         let vfs = self.context.vfs.clone();
         self.context
             .spawn_wait(async move { vfs.release_fh_with_outcome(request.fh).await })
@@ -942,6 +939,10 @@ impl FlushGatePort for WinfspFlushGatePort<'_> {
     where
         F: FnOnce() -> studiofs_vfs::VfsResult<T>,
     {
+        if !self.context.vfs.inode_has_local_dirty_state(ino) {
+            return op();
+        }
+
         // Tokio recommends a blocking mutex for plain data when the guard is
         // not held across `.await`. This gate lives entirely on the synchronous
         // WinFSP callback thread and only serializes per-inode barrier entry
@@ -951,8 +952,10 @@ impl FlushGatePort for WinfspFlushGatePort<'_> {
             .context
             .callback_barrier_state
             .flush_gate_for_inode(ino);
+        let gate_for_release = gate.clone();
         let _flush_guard = gate.lock();
-        let _gate_release = FlushGateRelease::new(&self.context.callback_barrier_state, ino, gate);
+        let _gate_release =
+            FlushGateRelease::new(&self.context.callback_barrier_state, ino, gate_for_release);
         op()
     }
 }
@@ -1024,7 +1027,7 @@ impl BarrierObservabilityPort for WinfspBarrierObservabilityPort<'_> {
         &self,
         request: HandleDrainRequest,
         hint_was_taken: bool,
-        outcome: studiofs_vfs::ReleaseFhOutcome,
+        outcome: ReleaseFhOutcome,
     ) {
         self.context
             .vfs
@@ -1070,6 +1073,26 @@ impl StudioFsContext {
             default_sd,
             invalidation_queue,
             callback_barrier_state: CallbackBarrierState::new(),
+            #[cfg(test)]
+            _test_runtime: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_for_tests(
+        vfs: Arc<StudioVfs>,
+        rt: Arc<tokio::runtime::Runtime>,
+        invalidation_queue: Arc<Mutex<Vec<Ino>>>,
+    ) -> Self {
+        ensure_winfsp_runtime_loaded_or_panic();
+        let default_sd = create_default_security_descriptor();
+        Self {
+            vfs,
+            rt: rt.handle().clone(),
+            default_sd,
+            invalidation_queue,
+            callback_barrier_state: CallbackBarrierState::new(),
+            _test_runtime: Some(rt),
         }
     }
 
@@ -2230,7 +2253,7 @@ mod tests {
         let queue = Arc::new(Mutex::new(Vec::new()));
         let rt = Arc::new(Runtime::new().expect("runtime"));
         let vfs = make_test_vfs(&tmp, volume_suffix, &rt);
-        let ctx = StudioFsContext::new(vfs.clone(), rt.handle().clone(), queue.clone());
+        let ctx = StudioFsContext::new_for_tests(vfs.clone(), rt, queue.clone());
         (tmp, vfs, ctx, queue)
     }
 
