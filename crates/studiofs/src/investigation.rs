@@ -4,6 +4,7 @@ use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
@@ -178,8 +179,8 @@ impl InvestigationStore {
 
     pub(crate) fn create_case(&self, input: NewInvestigationCase) -> Result<InvestigationCase> {
         let _guard = self.io_lock.lock();
-        self.ensure_layout()?;
         let _store_lock = self.lock_store()?;
+        self.ensure_layout()?;
 
         let now = now_unix_millis();
         let case = InvestigationCase {
@@ -198,8 +199,8 @@ impl InvestigationStore {
 
     pub(crate) fn create_run(&self, input: NewInvestigationRun) -> Result<InvestigationRun> {
         let _guard = self.io_lock.lock();
-        self.ensure_layout()?;
         let _store_lock = self.lock_store()?;
+        self.ensure_layout()?;
 
         let mut case = self.load_json::<InvestigationCase>(&self.case_path(&input.case_id))?;
         let now = now_unix_millis();
@@ -225,16 +226,17 @@ impl InvestigationStore {
         input: NewTimelineEntry,
     ) -> Result<TimelineEntry> {
         let _guard = self.io_lock.lock();
-        self.ensure_layout()?;
         let _store_lock = self.lock_store()?;
+        self.ensure_layout()?;
 
         let mut run = self.load_json::<InvestigationRun>(&self.run_path(run_id))?;
+        let log_path = self.timeline_log_path(run_id);
+        let last_sequence = load_last_timeline_entry(&log_path)?
+            .map(|entry| entry.sequence)
+            .or_else(|| run.timeline.last().map(|entry| entry.sequence))
+            .unwrap_or(0);
         let entry = TimelineEntry {
-            sequence: run
-                .timeline
-                .last()
-                .map(|entry| entry.sequence + 1)
-                .unwrap_or(1),
+            sequence: last_sequence + 1,
             occurred_unix_ms: now_unix_millis(),
             source: input.source,
             kind: input.kind,
@@ -243,8 +245,15 @@ impl InvestigationStore {
             actor: input.actor,
             reason: input.reason,
         };
-        run.timeline.push(entry.clone());
-        self.save_json(&self.run_path(run_id), &run)?;
+        let needs_header_compaction = !run.timeline.is_empty() || !log_path.exists();
+        if !run.timeline.is_empty() && !log_path.exists() {
+            append_timeline_entries(&log_path, &run.timeline)?;
+        }
+        append_timeline_entries(&log_path, std::slice::from_ref(&entry))?;
+        if needs_header_compaction {
+            run.timeline.clear();
+            self.save_json(&self.run_path(run_id), &run)?;
+        }
         Ok(entry)
     }
 
@@ -257,7 +266,12 @@ impl InvestigationStore {
     pub(crate) fn load_run(&self, run_id: &str) -> Result<InvestigationRun> {
         let _guard = self.io_lock.lock();
         let _store_lock = self.lock_store()?;
-        self.load_json(&self.run_path(run_id))
+        let mut run = self.load_json::<InvestigationRun>(&self.run_path(run_id))?;
+        let log_path = self.timeline_log_path(run_id);
+        if log_path.exists() {
+            run.timeline = load_timeline_entries(&log_path)?;
+        }
+        Ok(run)
     }
 
     fn ensure_layout(&self) -> Result<()> {
@@ -298,6 +312,10 @@ impl InvestigationStore {
 
     fn run_path(&self, run_id: &str) -> PathBuf {
         self.runs_dir().join(format!("{run_id}.json"))
+    }
+
+    fn timeline_log_path(&self, run_id: &str) -> PathBuf {
+        self.runs_dir().join(format!("{run_id}.timeline.ndjson"))
     }
 
     fn load_json<T>(&self, path: &Path) -> Result<T>
@@ -350,6 +368,12 @@ impl InvestigationStore {
     }
 
     fn lock_store(&self) -> Result<StoreLockGuard> {
+        fs::create_dir_all(&self.base_dir).with_context(|| {
+            format!(
+                "create investigation base directory '{}'",
+                self.base_dir.display()
+            )
+        })?;
         let lock_path = self.base_dir.join(".store.lock");
         let lock_file = OpenOptions::new()
             .read(true)
@@ -363,6 +387,123 @@ impl InvestigationStore {
             .with_context(|| format!("lock investigation store '{}'", lock_path.display()))?;
         Ok(StoreLockGuard { lock_file })
     }
+}
+
+fn append_timeline_entries(path: &Path, entries: &[TimelineEntry]) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("timeline log '{}' has no parent", path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create timeline log directory '{}'", parent.display()))?;
+
+    let created = !path.exists();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open timeline log '{}'", path.display()))?;
+
+    for entry in entries {
+        serde_json::to_writer(&mut file, entry)
+            .with_context(|| format!("serialize timeline log entry '{}'", path.display()))?;
+        use std::io::Write;
+        file.write_all(b"\n")
+            .with_context(|| format!("write timeline log separator '{}'", path.display()))?;
+    }
+    file.sync_all()
+        .with_context(|| format!("sync timeline log '{}'", path.display()))?;
+    if created {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+fn load_timeline_entries(path: &Path) -> Result<Vec<TimelineEntry>> {
+    let file =
+        File::open(path).with_context(|| format!("open timeline log '{}'", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    for line in reader.lines() {
+        let line =
+            line.with_context(|| format!("read timeline log line from '{}'", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        entries.push(
+            serde_json::from_str(&line)
+                .with_context(|| format!("parse timeline log line from '{}'", path.display()))?,
+        );
+    }
+    Ok(entries)
+}
+
+fn load_last_timeline_entry(path: &Path) -> Result<Option<TimelineEntry>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let mut file =
+        File::open(path).with_context(|| format!("open timeline log '{}'", path.display()))?;
+    let mut position = file
+        .metadata()
+        .with_context(|| format!("stat timeline log '{}'", path.display()))?
+        .len();
+    if position == 0 {
+        return Ok(None);
+    }
+
+    let mut tail = Vec::new();
+    let mut trim_trailing_newlines = true;
+
+    while position > 0 {
+        let chunk_start = position.saturating_sub(4096);
+        let chunk_len = usize::try_from(position - chunk_start).unwrap_or(4096);
+        file.seek(SeekFrom::Start(chunk_start))
+            .with_context(|| format!("seek timeline log '{}'", path.display()))?;
+        let mut chunk = vec![0_u8; chunk_len];
+        file.read_exact(&mut chunk)
+            .with_context(|| format!("read timeline log '{}'", path.display()))?;
+
+        let mut search_end = chunk.len();
+        if trim_trailing_newlines {
+            while search_end > 0 && matches!(chunk[search_end - 1], b'\n' | b'\r') {
+                search_end -= 1;
+            }
+            trim_trailing_newlines = false;
+        }
+        if search_end == 0 {
+            position = chunk_start;
+            continue;
+        }
+
+        if let Some(newline_index) = chunk[..search_end].iter().rposition(|byte| *byte == b'\n') {
+            let mut line = Vec::with_capacity(search_end - newline_index - 1 + tail.len());
+            line.extend_from_slice(&chunk[newline_index + 1..search_end]);
+            line.extend_from_slice(&tail);
+            return parse_timeline_line(path, &line).map(Some);
+        }
+
+        let mut combined = Vec::with_capacity(search_end + tail.len());
+        combined.extend_from_slice(&chunk[..search_end]);
+        combined.extend_from_slice(&tail);
+        tail = combined;
+        position = chunk_start;
+    }
+
+    if tail.is_empty() {
+        Ok(None)
+    } else {
+        parse_timeline_line(path, &tail).map(Some)
+    }
+}
+
+fn parse_timeline_line(path: &Path, bytes: &[u8]) -> Result<TimelineEntry> {
+    serde_json::from_slice(bytes)
+        .with_context(|| format!("parse timeline log line from '{}'", path.display()))
 }
 
 fn now_unix_millis() -> u64 {
@@ -382,10 +523,16 @@ impl Drop for StoreLockGuard {
     }
 }
 
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<()> {
     if let Ok(dir) = File::open(path) {
         let _ = dir.sync_all();
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -563,5 +710,125 @@ mod tests {
         assert_eq!(persisted_run.timeline[1].source, TimelineEntrySource::Mcp);
         assert_eq!(persisted_run.timeline[0].sequence, 1);
         assert_eq!(persisted_run.timeline[1].sequence, 2);
+    }
+
+    #[test]
+    fn store_persists_timeline_in_append_only_log() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let case = store
+            .create_case(NewInvestigationCase {
+                title: "AJA ingest".to_string(),
+                problem_statement: None,
+                workload_identity: None,
+                target_environment: None,
+            })
+            .expect("create case");
+        let run = store
+            .create_run(NewInvestigationRun {
+                case_id: case.id,
+                session_id: "session-1".to_string(),
+                fingerprint: sample_fingerprint(),
+            })
+            .expect("create run");
+
+        store
+            .append_timeline_entry(
+                &run.id,
+                NewTimelineEntry {
+                    source: TimelineEntrySource::Cli,
+                    kind: TimelineEntryKind::Marker,
+                    title: "first".to_string(),
+                    body: None,
+                    actor: None,
+                    reason: None,
+                },
+            )
+            .expect("append first entry");
+        store
+            .append_timeline_entry(
+                &run.id,
+                NewTimelineEntry {
+                    source: TimelineEntrySource::Mcp,
+                    kind: TimelineEntryKind::Note,
+                    title: "second".to_string(),
+                    body: None,
+                    actor: None,
+                    reason: None,
+                },
+            )
+            .expect("append second entry");
+
+        let stored_run: InvestigationRun = store
+            .load_json(&store.run_path(&run.id))
+            .expect("load stored header");
+        let timeline_log =
+            fs::read_to_string(store.timeline_log_path(&run.id)).expect("read timeline log");
+        let persisted_run = store.load_run(&run.id).expect("load run");
+
+        assert!(stored_run.timeline.is_empty());
+        assert_eq!(timeline_log.lines().count(), 2);
+        assert_eq!(persisted_run.timeline.len(), 2);
+        assert_eq!(persisted_run.timeline[0].sequence, 1);
+        assert_eq!(persisted_run.timeline[1].sequence, 2);
+    }
+
+    #[test]
+    fn store_migrates_legacy_embedded_timeline_to_log_on_append() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let case = store
+            .create_case(NewInvestigationCase {
+                title: "AJA ingest".to_string(),
+                problem_statement: None,
+                workload_identity: None,
+                target_environment: None,
+            })
+            .expect("create case");
+        let run = InvestigationRun {
+            id: Uuid::new_v4().to_string(),
+            case_id: case.id,
+            session_id: "session-legacy".to_string(),
+            created_unix_ms: 1,
+            fingerprint: sample_fingerprint(),
+            timeline: vec![TimelineEntry {
+                sequence: 1,
+                occurred_unix_ms: 1,
+                source: TimelineEntrySource::Cli,
+                kind: TimelineEntryKind::Marker,
+                title: "legacy".to_string(),
+                body: None,
+                actor: None,
+                reason: None,
+            }],
+        };
+        store.ensure_layout().expect("ensure layout");
+        store
+            .save_json(&store.run_path(&run.id), &run)
+            .expect("save legacy run");
+
+        let appended = store
+            .append_timeline_entry(
+                &run.id,
+                NewTimelineEntry {
+                    source: TimelineEntrySource::Mcp,
+                    kind: TimelineEntryKind::Note,
+                    title: "new".to_string(),
+                    body: None,
+                    actor: None,
+                    reason: None,
+                },
+            )
+            .expect("append migrated entry");
+        let stored_run: InvestigationRun = store
+            .load_json(&store.run_path(&run.id))
+            .expect("load stored header");
+        let persisted_run = store.load_run(&run.id).expect("load run");
+
+        assert_eq!(appended.sequence, 2);
+        assert!(stored_run.timeline.is_empty());
+        assert_eq!(persisted_run.timeline.len(), 2);
+        assert_eq!(persisted_run.timeline[0].title, "legacy");
+        assert_eq!(persisted_run.timeline[1].title, "new");
     }
 }

@@ -56,7 +56,8 @@ const DEFAULT_LEASE_TTL_MS: u64 = 5_000;
 const MAX_LEASE_TTL_MS: u64 = 60_000;
 const CONNECT_RETRY_ATTEMPTS: usize = 40;
 const CONNECT_RETRY_DELAY_MS: u64 = 25;
-const MAX_DIAGNOSTICS_FRAME_BYTES: usize = 64 * 1024;
+const MAX_DIAGNOSTICS_REQUEST_FRAME_BYTES: usize = 64 * 1024;
+const MAX_DIAGNOSTICS_RESPONSE_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DIAGNOSTICS_CONNECTIONS: usize = 16;
 #[cfg(unix)]
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
@@ -1028,7 +1029,7 @@ where
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     loop {
-        let line = match read_frame_line(&mut reader).await {
+        let line = match read_frame_line(&mut reader, MAX_DIAGNOSTICS_REQUEST_FRAME_BYTES).await {
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(FrameReadError::TooLarge) => {
@@ -1036,7 +1037,7 @@ where
                     code: "request_too_large".to_string(),
                     message: format!(
                         "diagnostics request exceeded {} bytes",
-                        MAX_DIAGNOSTICS_FRAME_BYTES
+                        MAX_DIAGNOSTICS_REQUEST_FRAME_BYTES
                     ),
                 };
                 writer
@@ -1084,7 +1085,10 @@ impl From<std::string::FromUtf8Error> for FrameReadError {
     }
 }
 
-async fn read_frame_line<R>(reader: &mut R) -> std::result::Result<Option<String>, FrameReadError>
+async fn read_frame_line<R>(
+    reader: &mut R,
+    max_frame_bytes: usize,
+) -> std::result::Result<Option<String>, FrameReadError>
 where
     R: AsyncBufRead + Unpin,
 {
@@ -1097,7 +1101,7 @@ where
                 (0, false, true)
             } else if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
                 let take = newline + 1;
-                if buffer.len() + take > MAX_DIAGNOSTICS_FRAME_BYTES {
+                if buffer.len() + take > max_frame_bytes {
                     (take, true, false)
                 } else {
                     buffer.extend_from_slice(&available[..take]);
@@ -1105,7 +1109,7 @@ where
                 }
             } else {
                 let take = available.len();
-                if buffer.len() + take > MAX_DIAGNOSTICS_FRAME_BYTES {
+                if buffer.len() + take > max_frame_bytes {
                     (take, true, false)
                 } else {
                     buffer.extend_from_slice(available);
@@ -1334,13 +1338,13 @@ where
         .await?;
     writer.write_all(b"\n").await?;
     writer.flush().await?;
-    let line = match read_frame_line(&mut reader).await {
+    let line = match read_frame_line(&mut reader, MAX_DIAGNOSTICS_RESPONSE_FRAME_BYTES).await {
         Ok(Some(line)) => line,
         Ok(None) => return Err(anyhow!("diagnostics peer closed without responding")),
         Err(FrameReadError::TooLarge) => {
             return Err(anyhow!(
                 "diagnostics response exceeded {} bytes",
-                MAX_DIAGNOSTICS_FRAME_BYTES
+                MAX_DIAGNOSTICS_RESPONSE_FRAME_BYTES
             ));
         }
         Err(FrameReadError::Io(error)) => return Err(error.into()),
@@ -1769,5 +1773,46 @@ mod tests {
         assert_eq!(persisted_run.timeline.len(), 2);
         assert_eq!(persisted_run.timeline[0].source, TimelineEntrySource::Cli);
         assert_eq!(persisted_run.timeline[1].source, TimelineEntrySource::Mcp);
+    }
+
+    #[test]
+    fn client_accepts_large_response_frames() {
+        let mut source = static_source();
+        source.session.cache_path = "C:/".to_string() + &"a".repeat(96 * 1024);
+
+        crate::runtime_bridge::block_on(async move {
+            let (client, server) = tokio::io::duplex(256 * 1024);
+            let permit = Arc::new(Semaphore::new(1))
+                .acquire_owned()
+                .await
+                .map_err(anyhow::Error::from)?;
+            let server_task = tokio::spawn(handle_client(
+                server,
+                "secret".to_string(),
+                Arc::new(source),
+                Arc::new(ControllerLeaseManager::default()),
+                None,
+                permit,
+            ));
+
+            let response = send_request(
+                client,
+                DiagnosticsRequest::SessionInfo {
+                    auth_token: "secret".to_string(),
+                },
+            )
+            .await?;
+
+            match response {
+                DiagnosticsResponse::SessionInfo { session } => {
+                    assert!(session.cache_path.len() > MAX_DIAGNOSTICS_REQUEST_FRAME_BYTES);
+                }
+                other => panic!("unexpected response: {other:?}"),
+            }
+
+            server_task.await.map_err(anyhow::Error::from)??;
+            Ok::<(), anyhow::Error>(())
+        })
+        .expect("large response exchange succeeds");
     }
 }
