@@ -200,6 +200,21 @@ pub(crate) struct InvestigationReportEvidenceSummary {
     pub hotspot_count: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct InvestigationReportSectionSummary {
+    pub included_count: usize,
+    pub total_count: usize,
+    pub truncated_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct InvestigationReportTruncationSummary {
+    pub anomalies: InvestigationReportSectionSummary,
+    pub candidate_bottlenecks: InvestigationReportSectionSummary,
+    pub selected_evidence: InvestigationReportSectionSummary,
+    pub recommended_next_actions: InvestigationReportSectionSummary,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct InvestigationReportFinding {
     pub title: String,
@@ -243,6 +258,8 @@ pub(crate) struct InvestigationReport {
     #[serde(default)]
     pub marker_timeline: Vec<TimelineEntry>,
     pub evidence_summary: InvestigationReportEvidenceSummary,
+    #[serde(default)]
+    pub truncation: InvestigationReportTruncationSummary,
     #[serde(default)]
     pub anomalies: Vec<InvestigationReportFinding>,
     #[serde(default)]
@@ -299,6 +316,7 @@ pub(crate) struct NewInvestigationReport {
     pub environment: EnvironmentFingerprint,
     pub marker_timeline: Vec<TimelineEntry>,
     pub evidence_summary: InvestigationReportEvidenceSummary,
+    pub truncation: InvestigationReportTruncationSummary,
     pub anomalies: Vec<InvestigationReportFinding>,
     pub candidate_bottlenecks: Vec<InvestigationReportFinding>,
     pub selected_evidence: Vec<InvestigationReportSelectedEvidence>,
@@ -470,6 +488,7 @@ impl InvestigationStore {
             environment: input.environment,
             marker_timeline: input.marker_timeline,
             evidence_summary: input.evidence_summary,
+            truncation: input.truncation,
             anomalies: input.anomalies,
             candidate_bottlenecks: input.candidate_bottlenecks,
             selected_evidence: input.selected_evidence,
@@ -1457,6 +1476,7 @@ mod tests {
                         blocking_interval_count: 1,
                         hotspot_count: 1,
                     },
+                    truncation: InvestigationReportTruncationSummary::default(),
                     anomalies: vec![InvestigationReportFinding {
                         title: "Upload queue growth".to_string(),
                         summary: "Pending uploads grew across the workload span.".to_string(),
