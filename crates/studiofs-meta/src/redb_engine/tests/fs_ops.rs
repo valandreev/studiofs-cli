@@ -146,6 +146,63 @@ fn test_rmdir_notempty() {
 }
 
 #[test]
+fn test_rmdir_uses_inode_kind_for_legacy_directory_entry() {
+    let engine = temp_engine();
+    let dir = engine
+        .create_dir(ROOT_INO, b"ajadisktest.dat", 1000, 1000, 0o755)
+        .unwrap();
+
+    let removed = engine.remove_entry(ROOT_INO, b"ajadisktest.dat").unwrap();
+    assert_eq!(removed.ino, dir.ino);
+    assert_eq!(removed.kind, FileType::Directory);
+    engine
+        .add_entry(
+            ROOT_INO,
+            b"ajadisktest.dat",
+            &DirEntryValue {
+                ino: dir.ino,
+                kind: FileType::RegularFile,
+            },
+        )
+        .unwrap();
+
+    let lookup = engine.lookup(ROOT_INO, b"ajadisktest.dat").unwrap();
+    assert_eq!(lookup.kind, FileType::RegularFile);
+    assert_eq!(engine.get_attr(dir.ino).unwrap().kind, FileType::Directory);
+
+    engine.rmdir(ROOT_INO, b"ajadisktest.dat").unwrap();
+
+    assert!(engine.lookup(ROOT_INO, b"ajadisktest.dat").is_err());
+    assert!(engine.get_attr(dir.ino).is_err());
+    assert_eq!(engine.get_attr(ROOT_INO).unwrap().nlink, 2);
+}
+
+#[test]
+fn test_unlink_rejects_legacy_directory_entry_with_stale_file_dentry_kind() {
+    let engine = temp_engine();
+    let dir = engine
+        .create_dir(ROOT_INO, b"ajadisktest.dat", 1000, 1000, 0o755)
+        .unwrap();
+
+    engine.remove_entry(ROOT_INO, b"ajadisktest.dat").unwrap();
+    engine
+        .add_entry(
+            ROOT_INO,
+            b"ajadisktest.dat",
+            &DirEntryValue {
+                ino: dir.ino,
+                kind: FileType::RegularFile,
+            },
+        )
+        .unwrap();
+
+    let result = engine.unlink(ROOT_INO, b"ajadisktest.dat");
+    assert!(matches!(result, Err(MetaError::IsADirectory(ino)) if ino == dir.ino));
+    assert_eq!(engine.lookup(ROOT_INO, b"ajadisktest.dat").unwrap().ino, dir.ino);
+    assert_eq!(engine.get_attr(ROOT_INO).unwrap().nlink, 3);
+}
+
+#[test]
 fn test_rename() {
     let engine = temp_engine();
     let src = engine

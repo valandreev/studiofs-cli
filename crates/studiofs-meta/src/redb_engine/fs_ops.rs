@@ -374,11 +374,16 @@ impl<'a> NamespaceDeleteTxn<'a> {
         spec: &NamespaceDeleteSpec<'_>,
         entry: DirEntryValue,
     ) -> MetaResult<NamespaceDeleteResult> {
-        if entry.kind == FileType::Directory {
+        let mut attr = match RedbMetaEngine::get_attr_merged_in_write_txn(self.txn, entry.ino) {
+            Ok(attr) => attr,
+            Err(MetaError::InodeNotFound(_)) if entry.kind == FileType::Directory => {
+                return Err(MetaError::IsADirectory(entry.ino));
+            }
+            Err(err) => return Err(err),
+        };
+        if attr.kind == FileType::Directory {
             return Err(MetaError::IsADirectory(entry.ino));
         }
-
-        let mut attr = RedbMetaEngine::get_attr_merged_in_write_txn(self.txn, entry.ino)?;
         let mut parent_attr = RedbMetaEngine::get_attr_merged_in_write_txn(self.txn, spec.parent)?;
 
         RedbMetaEngine::remove_dentry_overlay_in_txn(self.txn, spec.parent, spec.name)?;
@@ -410,7 +415,12 @@ impl<'a> NamespaceDeleteTxn<'a> {
         spec: &NamespaceDeleteSpec<'_>,
         entry: DirEntryValue,
     ) -> MetaResult<NamespaceDeleteResult> {
-        if entry.kind != FileType::Directory {
+        let target_kind = match RedbMetaEngine::get_attr_merged_in_write_txn(self.txn, entry.ino) {
+            Ok(attr) => attr.kind,
+            Err(MetaError::InodeNotFound(_)) => entry.kind,
+            Err(err) => return Err(err),
+        };
+        if target_kind != FileType::Directory {
             return Err(MetaError::NotADirectory(entry.ino));
         }
         if RedbMetaEngine::has_entries_merged_in_write_txn(self.txn, entry.ino)? {

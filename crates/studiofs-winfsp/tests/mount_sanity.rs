@@ -548,6 +548,84 @@ fn winfsp_mount_write_read_unmount_smoke() {
 }
 
 #[test]
+#[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn winfsp_mount_regular_file_attributes_do_not_materialize_directories() {
+    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let mount_point = match std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => {
+            eprintln!(
+                "Skipping WinFSP file-attribute smoke test: \
+                 set STUDIOFS_WINFSP_TEST_MOUNT_POINT to a free drive letter (for example `Z:`)."
+            );
+            return;
+        }
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+    let vfs = make_test_vfs(&tmp, "file_attribute_smoke", &rt);
+    let event_name = format!("Local\\StudioFsFileAttributeSmoke-{}", std::process::id());
+
+    with_winfsp_mount(vfs, rt, mount_point, event_name, |drive_root| {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_ATTRIBUTE_READONLY: u32 = 0x0000_0001;
+        const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0000_0020;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+        const FILE_ATTRIBUTE_TEMPORARY: u32 = 0x0000_0100;
+
+        for (name, attributes) in [
+            ("attrs-normal.bin", FILE_ATTRIBUTE_NORMAL),
+            ("attrs-archive.bin", FILE_ATTRIBUTE_ARCHIVE),
+            ("attrs-readonly.bin", FILE_ATTRIBUTE_READONLY),
+            ("attrs-temporary.bin", FILE_ATTRIBUTE_TEMPORARY),
+        ] {
+            let target = std::path::PathBuf::from(drive_root).join(name);
+            let mut file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(true)
+                .attributes(attributes)
+                .open(&target)
+                .unwrap_or_else(|err| panic!("open {name} with attrs {attributes:#x}: {err}"));
+            file.write_all(b"payload")
+                .unwrap_or_else(|err| panic!("write payload to {name}: {err}"));
+            file.flush()
+                .unwrap_or_else(|err| panic!("flush payload for {name}: {err}"));
+            drop(file);
+
+            let metadata = std::fs::metadata(&target)
+                .unwrap_or_else(|err| panic!("stat {name} after create: {err}"));
+            assert!(
+                metadata.is_file(),
+                "{name} with attrs {attributes:#x} should remain a regular file, got dir={} readonly={}",
+                metadata.is_dir(),
+                metadata.permissions().readonly()
+            );
+            assert!(
+                !metadata.is_dir(),
+                "{name} with attrs {attributes:#x} unexpectedly materialized as a directory"
+            );
+
+            let mut permissions = metadata.permissions();
+            if permissions.readonly() {
+                permissions.set_readonly(false);
+                std::fs::set_permissions(&target, permissions)
+                    .unwrap_or_else(|err| panic!("clear readonly attr for {name}: {err}"));
+            }
+            std::fs::remove_file(&target)
+                .unwrap_or_else(|err| panic!("delete {name} after attribute smoke test: {err}"));
+        }
+    });
+}
+
+#[test]
 fn validate_aja_sequential_workload_accepts_defaults() {
     let workload = validate_aja_sequential_workload(
         DEFAULT_AJA_SEQUENTIAL_CHUNK_BYTES,
