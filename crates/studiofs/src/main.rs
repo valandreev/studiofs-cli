@@ -17,6 +17,17 @@ type DiagnosticsLogFilterHandle =
     tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
 static DIAGNOSTICS_LOG_FILTER_HANDLE: OnceLock<DiagnosticsLogFilterHandle> = OnceLock::new();
 
+#[cfg(test)]
+struct TestDiagnosticsLogFilterLayer {
+    _layer: tracing_subscriber::reload::Layer<
+        tracing_subscriber::EnvFilter,
+        tracing_subscriber::Registry,
+    >,
+}
+
+#[cfg(test)]
+static TEST_DIAGNOSTICS_LOG_FILTER_LAYER: OnceLock<TestDiagnosticsLogFilterLayer> = OnceLock::new();
+
 fn prune_old_daemon_logs(logs_dir: &Path, stem: &str, today: NaiveDate) -> std::io::Result<()> {
     let cutoff = today - Duration::days(DAEMON_LOG_RETENTION_DAYS);
     for entry in fs::read_dir(logs_dir)? {
@@ -102,17 +113,13 @@ pub(crate) fn set_diagnostics_log_verbosity(
 
 #[cfg(test)]
 pub(crate) fn ensure_test_diagnostics_log_filter() {
-    static TEST_TRACING_INIT: OnceLock<()> = OnceLock::new();
-    TEST_TRACING_INIT.get_or_init(|| {
+    TEST_DIAGNOSTICS_LOG_FILTER_LAYER.get_or_init(|| {
         let (filter_layer, handle) =
             tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
         let _ = DIAGNOSTICS_LOG_FILTER_HANDLE.set(handle);
-        let subscriber = tracing_subscriber::registry().with(filter_layer).with(
-            tracing_subscriber::fmt::layer()
-                .with_test_writer()
-                .with_ansi(false),
-        );
-        let _ = tracing::subscriber::set_global_default(subscriber);
+        TestDiagnosticsLogFilterLayer {
+            _layer: filter_layer,
+        }
     });
 }
 
