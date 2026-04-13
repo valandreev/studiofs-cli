@@ -1003,7 +1003,7 @@ mod tests {
     use std::sync::Arc;
     use studiofs_meta::engine::MetaFsOps;
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
-    use studiofs_meta::{MetaFormat, RedbMetaEngine};
+    use studiofs_meta::{MetaFormat, MetaInodes, MetaNamespace, RedbMetaEngine};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
@@ -1741,5 +1741,37 @@ mod tests {
 
         assert_eq!(resolved.parent, dir.ino);
         assert_eq!(resolved.name, b"child.txt".to_vec());
+    }
+
+    #[test]
+    fn hidden_non_macos_root_metadata_name_matches_trashes_only() {
+        assert!(is_hidden_non_macos_root_metadata_name(b".Trashes"));
+        assert!(!is_hidden_non_macos_root_metadata_name(b".Trash"));
+        assert!(!is_hidden_non_macos_root_metadata_name(b".Spotlight-V100"));
+        assert!(!is_hidden_non_macos_root_metadata_name(b"visible"));
+    }
+
+    #[test]
+    fn heal_dangling_entry_if_inode_missing_prunes_stale_root_trashes_dentry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, meta) = make_test_vfs(&tmp, "heal-hidden-root-trashes");
+
+        let trashes = meta
+            .create_dir(ROOT_INO, b".Trashes", 1000, 1000, 0o755)
+            .expect("seed .Trashes");
+        meta.remove_attr(trashes.ino)
+            .expect("remove .Trashes attr to simulate stale hidden dentry");
+
+        assert!(
+            meta.lookup(ROOT_INO, b".Trashes").is_ok(),
+            "test setup requires a dentry that still points to the removed inode"
+        );
+
+        assert!(
+            vfs.heal_dangling_entry_if_inode_missing(ROOT_INO, b".Trashes")
+                .expect("heal stale .Trashes"),
+            "stale hidden root entry should be healed"
+        );
+        assert!(meta.lookup(ROOT_INO, b".Trashes").is_err());
     }
 }

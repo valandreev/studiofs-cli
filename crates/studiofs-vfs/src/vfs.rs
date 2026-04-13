@@ -266,6 +266,10 @@ fn is_probable_trash_component(name: &[u8]) -> bool {
     matches!(name, b".Trash" | b".Trashes") || name.starts_with(b".Trash-")
 }
 
+pub fn is_hidden_non_macos_root_metadata_name(name: &[u8]) -> bool {
+    name == b".Trashes"
+}
+
 fn is_ignored_macos_metadata(name: &[u8]) -> bool {
     name == b".DS_Store" || (name.len() > 2 && name.starts_with(b"._"))
 }

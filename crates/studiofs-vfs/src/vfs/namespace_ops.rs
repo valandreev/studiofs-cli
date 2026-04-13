@@ -231,6 +231,27 @@ impl StudioVfs {
         self.dentry_cache_insert_negative(parent, name);
     }
 
+    pub fn heal_dangling_entry_if_inode_missing(
+        &self,
+        parent: Ino,
+        name: &[u8],
+    ) -> VfsResult<bool> {
+        let entry = match self.sync_meta().lookup(parent, name) {
+            Ok(entry) => entry,
+            Err(MetaError::EntryNotFound { .. }) => return Ok(false),
+            Err(err) => return Err(VfsError::Meta(err)),
+        };
+
+        match self.sync_meta().get_attr(entry.ino) {
+            Ok(_) => Ok(false),
+            Err(MetaError::InodeNotFound(_)) => {
+                self.heal_orphaned_dentry(parent, name, Some(entry.ino));
+                Ok(true)
+            }
+            Err(err) => Err(VfsError::Meta(err)),
+        }
+    }
+
     pub(super) fn lookup_component_impl(&self, parent: Ino, name: &[u8]) -> VfsResult<InodeAttr> {
         self.enforce_access(parent, AccessLevel::ReadOnly)?;
         if let Some(ignored) = self.ignored_entry_lookup(parent, name) {

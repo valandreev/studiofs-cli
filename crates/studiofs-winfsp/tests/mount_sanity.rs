@@ -615,6 +615,7 @@ fn winfsp_mount_regular_file_attributes_do_not_materialize_directories() {
 
             let mut permissions = metadata.permissions();
             if permissions.readonly() {
+                #[allow(clippy::permissions_set_readonly_false)]
                 permissions.set_readonly(false);
                 std::fs::set_permissions(&target, permissions)
                     .unwrap_or_else(|err| panic!("clear readonly attr for {name}: {err}"));

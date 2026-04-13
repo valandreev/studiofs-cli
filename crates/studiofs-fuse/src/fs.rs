@@ -13,12 +13,16 @@ use fuser::{
     Request,
 };
 use studiofs_meta::FileType;
+#[cfg(not(target_os = "macos"))]
+use studiofs_meta::ROOT_INO;
 #[cfg(target_os = "macos")]
 use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
 #[cfg(target_os = "macos")]
 use studiofs_meta::schema::DirEntry;
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_vfs::vfs::{ExplicitFlushOutcome, ReleaseFhOutcome};
+#[cfg(not(target_os = "macos"))]
+use studiofs_vfs::is_hidden_non_macos_root_metadata_name;
 use studiofs_vfs::{
     BarrierObservabilityPort, BridgeVfsErrorKind, DeferredCleanupHintPort, DeleteCleanupPort,
     FlushGatePort, HandleDrainBarrier, HandleDrainDeleteRequest, HandleDrainRequest,
@@ -74,6 +78,30 @@ fn os_str_bytes(name: &OsStr) -> &[u8] {
 
 fn debug_name(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn should_hide_non_macos_root_metadata_entry(parent: u64, name: &[u8]) -> bool {
+    parent == ROOT_INO && is_hidden_non_macos_root_metadata_name(name)
+}
+
+#[cfg(target_os = "macos")]
+fn should_hide_non_macos_root_metadata_entry(_parent: u64, _name: &[u8]) -> bool {
+    false
+}
+
+fn heal_hidden_non_macos_root_metadata_entry(vfs: &StudioVfs, parent: u64, name: &[u8]) {
+    if !should_hide_non_macos_root_metadata_entry(parent, name) {
+        return;
+    }
+
+    if let Err(error) = vfs.heal_dangling_entry_if_inode_missing(parent, name) {
+        debug!(
+            parent,
+            name = %debug_name(name),
+            "failed to heal hidden non-macOS root metadata entry: {error}"
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -517,6 +545,11 @@ impl Filesystem for StudioFuseFs {
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_bytes = os_str_bytes(name).to_vec();
+        if should_hide_non_macos_root_metadata_entry(parent, &name_bytes) {
+            heal_hidden_non_macos_root_metadata_entry(&self.vfs, parent, &name_bytes);
+            reply.error(libc::ENOENT);
+            return;
+        }
         #[cfg(target_os = "macos")]
         let attr_result = self.vfs.lookup(parent, &name_bytes).or_else(|err| {
             if !matches!(
@@ -570,6 +603,11 @@ impl Filesystem for StudioFuseFs {
         reply: ReplyEntry,
     ) {
         let name_bytes = os_str_bytes(name).to_vec();
+        if should_hide_non_macos_root_metadata_entry(parent, &name_bytes) {
+            heal_hidden_non_macos_root_metadata_entry(&self.vfs, parent, &name_bytes);
+            reply.error(libc::ENOENT);
+            return;
+        }
         match self.vfs.mkdir(
             parent,
             &name_bytes,
@@ -609,6 +647,11 @@ impl Filesystem for StudioFuseFs {
         reply: ReplyEntry,
     ) {
         let name_bytes = os_str_bytes(name).to_vec();
+        if should_hide_non_macos_root_metadata_entry(parent, &name_bytes) {
+            heal_hidden_non_macos_root_metadata_entry(&self.vfs, parent, &name_bytes);
+            reply.error(libc::ENOENT);
+            return;
+        }
         match self.vfs.create(
             parent,
             &name_bytes,
@@ -639,6 +682,11 @@ impl Filesystem for StudioFuseFs {
         reply: ReplyCreate,
     ) {
         let name_bytes = os_str_bytes(name).to_vec();
+        if should_hide_non_macos_root_metadata_entry(parent, &name_bytes) {
+            heal_hidden_non_macos_root_metadata_entry(&self.vfs, parent, &name_bytes);
+            reply.error(libc::ENOENT);
+            return;
+        }
         match self.vfs.create(
             parent,
             &name_bytes,
@@ -684,6 +732,11 @@ impl Filesystem for StudioFuseFs {
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name_bytes = os_str_bytes(name).to_vec();
+        if should_hide_non_macos_root_metadata_entry(parent, &name_bytes) {
+            heal_hidden_non_macos_root_metadata_entry(&self.vfs, parent, &name_bytes);
+            reply.error(libc::ENOENT);
+            return;
+        }
         match self.vfs.unlink(parent, &name_bytes) {
             Ok(()) => reply.ok(),
             Err(e) => {
@@ -700,6 +753,11 @@ impl Filesystem for StudioFuseFs {
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let name_bytes = os_str_bytes(name).to_vec();
+        if should_hide_non_macos_root_metadata_entry(parent, &name_bytes) {
+            heal_hidden_non_macos_root_metadata_entry(&self.vfs, parent, &name_bytes);
+            reply.error(libc::ENOENT);
+            return;
+        }
         match self.vfs.rmdir(parent, &name_bytes) {
             Ok(()) => reply.ok(),
             Err(e) => {
@@ -723,6 +781,11 @@ impl Filesystem for StudioFuseFs {
         reply: ReplyEntry,
     ) {
         let name = os_str_bytes(link_name).to_vec();
+        if should_hide_non_macos_root_metadata_entry(parent, &name) {
+            heal_hidden_non_macos_root_metadata_entry(&self.vfs, parent, &name);
+            reply.error(libc::ENOENT);
+            return;
+        }
         let tgt = target.as_os_str().as_bytes().to_vec();
         match self.vfs.symlink(parent, &name, &tgt, req.uid(), req.gid()) {
             Ok(attr) => reply.entry(
@@ -756,6 +819,11 @@ impl Filesystem for StudioFuseFs {
         reply: ReplyEntry,
     ) {
         let name = os_str_bytes(newname).to_vec();
+        if should_hide_non_macos_root_metadata_entry(newparent, &name) {
+            heal_hidden_non_macos_root_metadata_entry(&self.vfs, newparent, &name);
+            reply.error(libc::ENOENT);
+            return;
+        }
         match self.vfs.link(ino, newparent, &name) {
             Ok(attr) => {
                 let fattr = to_fuse_attr(&attr, self.mount_uid, self.mount_gid);
@@ -780,6 +848,16 @@ impl Filesystem for StudioFuseFs {
     ) {
         let requested_old_name = os_str_bytes(name).to_vec();
         let requested_new_name = os_str_bytes(newname).to_vec();
+        if should_hide_non_macos_root_metadata_entry(parent, &requested_old_name) {
+            heal_hidden_non_macos_root_metadata_entry(&self.vfs, parent, &requested_old_name);
+            reply.error(libc::ENOENT);
+            return;
+        }
+        if should_hide_non_macos_root_metadata_entry(newparent, &requested_new_name) {
+            heal_hidden_non_macos_root_metadata_entry(&self.vfs, newparent, &requested_new_name);
+            reply.error(libc::ENOENT);
+            return;
+        }
         #[cfg(target_os = "macos")]
         let old_name = if self.vfs.lookup(parent, &requested_old_name).is_ok()
             || requested_old_name.is_ascii()
@@ -1100,6 +1178,10 @@ impl Filesystem for StudioFuseFs {
         }
 
         for (i, entry) in entries.iter().enumerate() {
+            if should_hide_non_macos_root_metadata_entry(ino, &entry.name) {
+                heal_hidden_non_macos_root_metadata_entry(&self.vfs, ino, &entry.name);
+                continue;
+            }
             let entry_idx = i + 2;
             if entry_idx < idx {
                 continue;
@@ -1183,6 +1265,10 @@ impl Filesystem for StudioFuseFs {
 
         // Regular entries with full attributes
         for (i, entry) in entries.iter().enumerate() {
+            if should_hide_non_macos_root_metadata_entry(ino, &entry.name) {
+                heal_hidden_non_macos_root_metadata_entry(&self.vfs, ino, &entry.name);
+                continue;
+            }
             let entry_idx = i + 2;
             if entry_idx < idx {
                 continue;
@@ -1907,6 +1993,25 @@ mod tests {
         assert_eq!(missing_xattr_errno(), libc::ENOATTR);
         #[cfg(not(target_os = "macos"))]
         assert_eq!(missing_xattr_errno(), libc::ENODATA);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn hidden_non_macos_root_metadata_entry_matches_trashes_only() {
+        assert!(should_hide_non_macos_root_metadata_entry(
+            ROOT_INO,
+            b".Trashes"
+        ));
+        assert!(!should_hide_non_macos_root_metadata_entry(
+            ROOT_INO, b".Trash"
+        ));
+        assert!(!should_hide_non_macos_root_metadata_entry(
+            ROOT_INO + 1,
+            b".Trashes"
+        ));
+        assert!(!should_hide_non_macos_root_metadata_entry(
+            ROOT_INO, b"visible"
+        ));
     }
 
     #[cfg(target_os = "macos")]
