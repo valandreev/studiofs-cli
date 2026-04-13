@@ -1,4 +1,10 @@
 use crate::cli::utils;
+use crate::investigation::{
+    BuildIdentity, DiagnosticsSettingsFingerprint, EnvironmentFingerprint, InvestigationCase,
+    InvestigationRun, InvestigationStore, MachineFingerprint, NewInvestigationCase,
+    NewInvestigationRun, NewTimelineEntry, PlatformFingerprint, RuntimeConfigurationFingerprint,
+    TimelineEntry, TimelineEntryKind, TimelineEntrySource, WorkloadIdentityFingerprint,
+};
 use anyhow::{Context, Result, anyhow};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -75,6 +81,8 @@ pub(crate) struct LocalDiagnosticsDiscovery {
     pub session_id: String,
     pub volume: String,
     pub volume_uuid: String,
+    #[serde(default)]
+    pub bridge: String,
     pub mount_point: String,
     pub pid: u32,
     pub cache_path: String,
@@ -98,6 +106,8 @@ pub(crate) struct DiagnosticsSessionInfo {
     pub session_id: String,
     pub volume: String,
     pub volume_uuid: String,
+    #[serde(default)]
+    pub bridge: String,
     pub mount_point: String,
     pub pid: u32,
     pub cache_path: String,
@@ -119,10 +129,25 @@ pub(crate) struct DiagnosticsHealthSnapshot {
 pub(crate) trait DiagnosticsDataSource: Send + Sync + 'static {
     fn session_info(&self) -> DiagnosticsSessionInfo;
     fn health_snapshot(&self) -> DiagnosticsHealthSnapshot;
+    fn environment_fingerprint(
+        &self,
+        case_workload_identity: Option<&str>,
+        run_workload_identity: Option<&str>,
+    ) -> EnvironmentFingerprint;
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LiveMountRuntimeFingerprint {
+    pub bridge: String,
+    pub cache_size: Option<String>,
+    pub endpoint_override: Option<String>,
+    pub snapshot_id: Option<String>,
+    pub vfs_config: serde_json::Value,
 }
 
 pub(crate) struct LiveMountDiagnosticsSource {
     identity: DiagnosticsSessionInfo,
+    runtime_fingerprint: LiveMountRuntimeFingerprint,
     vfs: Arc<StudioVfs>,
 }
 
@@ -133,6 +158,7 @@ impl LiveMountDiagnosticsSource {
         cache_path: &Path,
         pid: u32,
         read_only: bool,
+        runtime_fingerprint: LiveMountRuntimeFingerprint,
         vfs: Arc<StudioVfs>,
     ) -> Self {
         let session_id = Uuid::new_v5(
@@ -146,6 +172,7 @@ impl LiveMountDiagnosticsSource {
                 session_id,
                 volume: format_info.name.clone(),
                 volume_uuid: format_info.uuid.clone(),
+                bridge: runtime_fingerprint.bridge.clone(),
                 mount_point: mount_point.to_string(),
                 pid,
                 cache_path: cache_path.to_string_lossy().into_owned(),
@@ -153,6 +180,7 @@ impl LiveMountDiagnosticsSource {
                 started_unix_ms: now_unix_millis(),
                 controller: None,
             },
+            runtime_fingerprint,
             vfs,
         }
     }
@@ -171,6 +199,61 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
             file_sessions: self.vfs.file_session_stats(),
             foreground_reads: self.vfs.foreground_read_protection_stats(),
             write_path: self.vfs.write_path_observability_snapshot(),
+        }
+    }
+
+    fn environment_fingerprint(
+        &self,
+        case_workload_identity: Option<&str>,
+        run_workload_identity: Option<&str>,
+    ) -> EnvironmentFingerprint {
+        let mut system = sysinfo::System::new_all();
+        system.refresh_all();
+
+        EnvironmentFingerprint {
+            platform: PlatformFingerprint {
+                os: std::env::consts::OS.to_string(),
+                family: std::env::consts::FAMILY.to_string(),
+                arch: std::env::consts::ARCH.to_string(),
+            },
+            bridge: self.identity.bridge.clone(),
+            build: BuildIdentity {
+                package_name: env!("CARGO_PKG_NAME").to_string(),
+                package_version: env!("CARGO_PKG_VERSION").to_string(),
+                executable_path: std::env::current_exe()
+                    .ok()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                debug_build: cfg!(debug_assertions),
+            },
+            runtime_configuration: RuntimeConfigurationFingerprint {
+                volume: self.identity.volume.clone(),
+                volume_uuid: self.identity.volume_uuid.clone(),
+                mount_point: self.identity.mount_point.clone(),
+                cache_path: self.identity.cache_path.clone(),
+                read_only: self.identity.read_only,
+                cache_size: self.runtime_fingerprint.cache_size.clone(),
+                endpoint_override: self.runtime_fingerprint.endpoint_override.clone(),
+                snapshot_id: self.runtime_fingerprint.snapshot_id.clone(),
+                vfs_config: self.runtime_fingerprint.vfs_config.clone(),
+            },
+            workload_identity: WorkloadIdentityFingerprint {
+                case_workload: case_workload_identity.map(str::to_string),
+                run_workload: run_workload_identity.map(str::to_string),
+            },
+            machine: MachineFingerprint {
+                host_name: sysinfo::System::host_name(),
+                system_name: sysinfo::System::name(),
+                kernel_version: sysinfo::System::kernel_version(),
+                os_version: sysinfo::System::os_version(),
+                total_memory_bytes: system.total_memory(),
+                cpu_count: system.cpus().len(),
+            },
+            diagnostics: DiagnosticsSettingsFingerprint {
+                protocol_version: DIAGNOSTICS_PROTOCOL_VERSION,
+                default_lease_ttl_ms: DEFAULT_LEASE_TTL_MS,
+                max_lease_ttl_ms: MAX_LEASE_TTL_MS,
+                max_connections: MAX_DIAGNOSTICS_CONNECTIONS,
+            },
         }
     }
 }
@@ -194,6 +277,31 @@ enum DiagnosticsRequest {
         lease_id: String,
         ttl_ms: Option<u64>,
     },
+    CreateCase {
+        auth_token: String,
+        lease_id: String,
+        title: String,
+        problem_statement: Option<String>,
+        workload_identity: Option<String>,
+        target_environment: Option<String>,
+    },
+    CreateRun {
+        auth_token: String,
+        lease_id: String,
+        case_id: String,
+        run_workload_identity: Option<String>,
+    },
+    AppendTimelineEntry {
+        auth_token: String,
+        lease_id: String,
+        run_id: String,
+        source: TimelineEntrySource,
+        kind: TimelineEntryKind,
+        title: String,
+        body: Option<String>,
+        actor: Option<String>,
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -207,6 +315,15 @@ enum DiagnosticsResponse {
     },
     ControllerLease {
         lease: ControllerLease,
+    },
+    InvestigationCase {
+        case: Box<InvestigationCase>,
+    },
+    InvestigationRun {
+        run: Box<InvestigationRun>,
+    },
+    TimelineEntry {
+        entry: TimelineEntry,
     },
     Error {
         code: String,
@@ -278,6 +395,19 @@ impl ControllerLeaseManager {
         Ok(active.lease.clone())
     }
 
+    fn require_current(&self, lease_id: &str) -> Result<ControllerLease> {
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        Self::expire_if_needed(&mut state, now);
+        let active = state
+            .as_ref()
+            .ok_or_else(|| anyhow!("controller lease is not currently held"))?;
+        if active.lease.lease_id != lease_id {
+            return Err(anyhow!("controller lease '{lease_id}' is not current"));
+        }
+        Ok(active.lease.clone())
+    }
+
     fn expire_if_needed(state: &mut Option<ActiveControllerLease>, now: Instant) {
         if state.as_ref().is_some_and(|lease| lease.expires_at <= now) {
             *state = None;
@@ -316,12 +446,24 @@ impl LocalDiagnosticsHost {
         publish_discovery(mount_point, &discovery)?;
 
         let lease_manager = Arc::new(ControllerLeaseManager::default());
+        let investigation_store = match InvestigationStore::default_store() {
+            Ok(store) => Some(Arc::new(store)),
+            Err(error) => {
+                warn!(
+                    mount_point,
+                    error = %error,
+                    "investigation store unavailable; run metadata will not persist"
+                );
+                None
+            }
+        };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let task = runtime.spawn(run_server(
             endpoint,
             discovery.auth_token.clone(),
             source,
             lease_manager,
+            investigation_store,
             shutdown_rx,
         ));
 
@@ -433,6 +575,83 @@ impl LocalDiagnosticsClient {
         }
     }
 
+    pub(crate) async fn create_case(
+        &self,
+        lease_id: &str,
+        title: &str,
+        problem_statement: Option<String>,
+        workload_identity: Option<String>,
+        target_environment: Option<String>,
+    ) -> Result<InvestigationCase> {
+        match self
+            .send(DiagnosticsRequest::CreateCase {
+                auth_token: self.discovery.auth_token.clone(),
+                lease_id: lease_id.to_string(),
+                title: title.to_string(),
+                problem_statement,
+                workload_identity,
+                target_environment,
+            })
+            .await?
+        {
+            DiagnosticsResponse::InvestigationCase { case } => Ok(*case),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
+    pub(crate) async fn create_run(
+        &self,
+        lease_id: &str,
+        case_id: &str,
+        run_workload_identity: Option<String>,
+    ) -> Result<InvestigationRun> {
+        match self
+            .send(DiagnosticsRequest::CreateRun {
+                auth_token: self.discovery.auth_token.clone(),
+                lease_id: lease_id.to_string(),
+                case_id: case_id.to_string(),
+                run_workload_identity,
+            })
+            .await?
+        {
+            DiagnosticsResponse::InvestigationRun { run } => Ok(*run),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
+    pub(crate) async fn append_timeline_entry(
+        &self,
+        lease_id: &str,
+        run_id: &str,
+        source: TimelineEntrySource,
+        kind: TimelineEntryKind,
+        title: &str,
+        body: Option<String>,
+        actor: Option<String>,
+        reason: Option<String>,
+    ) -> Result<TimelineEntry> {
+        match self
+            .send(DiagnosticsRequest::AppendTimelineEntry {
+                auth_token: self.discovery.auth_token.clone(),
+                lease_id: lease_id.to_string(),
+                run_id: run_id.to_string(),
+                source,
+                kind,
+                title: title.to_string(),
+                body,
+                actor,
+                reason,
+            })
+            .await?
+        {
+            DiagnosticsResponse::TimelineEntry { entry } => Ok(entry),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
     async fn send(&self, request: DiagnosticsRequest) -> Result<DiagnosticsResponse> {
         #[cfg(unix)]
         {
@@ -531,6 +750,7 @@ fn discovery_from_source(
         session_id: session.session_id,
         volume: session.volume,
         volume_uuid: session.volume_uuid,
+        bridge: session.bridge,
         mount_point: session.mount_point,
         pid: session.pid,
         cache_path: session.cache_path,
@@ -604,6 +824,7 @@ async fn run_server(
     auth_token: String,
     source: Arc<dyn DiagnosticsDataSource>,
     lease_manager: Arc<ControllerLeaseManager>,
+    investigation_store: Option<Arc<InvestigationStore>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let connection_limit = Arc::new(Semaphore::new(MAX_DIAGNOSTICS_CONNECTIONS));
@@ -641,8 +862,9 @@ async fn run_server(
                             let auth_token = auth_token.clone();
                             let source = source.clone();
                             let lease_manager = lease_manager.clone();
+                            let investigation_store = investigation_store.clone();
                             tokio::spawn(async move {
-                                if let Err(error) = handle_client(stream, auth_token, source, lease_manager, permit).await {
+                                if let Err(error) = handle_client(stream, auth_token, source, lease_manager, investigation_store, permit).await {
                                     warn!(error = %error, "diagnostics request failed");
                                 }
                             });
@@ -701,8 +923,9 @@ async fn run_server(
                             let auth_token = auth_token.clone();
                             let source = source.clone();
                             let lease_manager = lease_manager.clone();
+                            let investigation_store = investigation_store.clone();
                             tokio::spawn(async move {
-                                if let Err(error) = handle_client(connected_server, auth_token, source, lease_manager, permit).await {
+                                if let Err(error) = handle_client(connected_server, auth_token, source, lease_manager, investigation_store, permit).await {
                                     warn!(error = %error, "diagnostics request failed");
                                 }
                             });
@@ -782,6 +1005,7 @@ async fn handle_client<S>(
     auth_token: String,
     source: Arc<dyn DiagnosticsDataSource>,
     lease_manager: Arc<ControllerLeaseManager>,
+    investigation_store: Option<Arc<InvestigationStore>>,
     _permit: OwnedSemaphorePermit,
 ) -> Result<()>
 where
@@ -812,7 +1036,13 @@ where
             Err(FrameReadError::Utf8(error)) => return Err(error.into()),
         };
         let request: DiagnosticsRequest = serde_json::from_str(line.trim_end())?;
-        let response = execute_request(request, &auth_token, source.as_ref(), &lease_manager);
+        let response = execute_request(
+            request,
+            &auth_token,
+            source.as_ref(),
+            &lease_manager,
+            investigation_store.as_deref(),
+        );
         writer
             .write_all(serde_json::to_string(&response)?.as_bytes())
             .await?;
@@ -897,11 +1127,33 @@ fn execute_request(
     auth_token: &str,
     source: &dyn DiagnosticsDataSource,
     lease_manager: &ControllerLeaseManager,
+    investigation_store: Option<&InvestigationStore>,
 ) -> DiagnosticsResponse {
     fn unauthorized() -> DiagnosticsResponse {
         DiagnosticsResponse::Error {
             code: "unauthorized".to_string(),
             message: "diagnostics auth token did not match".to_string(),
+        }
+    }
+
+    fn investigation_unavailable() -> DiagnosticsResponse {
+        DiagnosticsResponse::Error {
+            code: "investigation_unavailable".to_string(),
+            message: "investigation persistence is unavailable for this session".to_string(),
+        }
+    }
+
+    fn store_error(error: anyhow::Error) -> DiagnosticsResponse {
+        DiagnosticsResponse::Error {
+            code: "investigation_store_error".to_string(),
+            message: error.to_string(),
+        }
+    }
+
+    fn lease_error(error: anyhow::Error) -> DiagnosticsResponse {
+        DiagnosticsResponse::Error {
+            code: "lease_invalid".to_string(),
+            message: error.to_string(),
         }
     }
 
@@ -956,6 +1208,102 @@ fn execute_request(
                     code: "lease_invalid".to_string(),
                     message: error.to_string(),
                 },
+            }
+        }
+        DiagnosticsRequest::CreateCase {
+            auth_token: provided,
+            lease_id,
+            title,
+            problem_statement,
+            workload_identity,
+            target_environment,
+        } => {
+            if provided != auth_token {
+                return unauthorized();
+            }
+            if let Err(error) = lease_manager.require_current(&lease_id) {
+                return lease_error(error);
+            }
+            let Some(store) = investigation_store else {
+                return investigation_unavailable();
+            };
+            match store.create_case(NewInvestigationCase {
+                title,
+                problem_statement,
+                workload_identity,
+                target_environment,
+            }) {
+                Ok(case) => DiagnosticsResponse::InvestigationCase {
+                    case: Box::new(case),
+                },
+                Err(error) => store_error(error),
+            }
+        }
+        DiagnosticsRequest::CreateRun {
+            auth_token: provided,
+            lease_id,
+            case_id,
+            run_workload_identity,
+        } => {
+            if provided != auth_token {
+                return unauthorized();
+            }
+            if let Err(error) = lease_manager.require_current(&lease_id) {
+                return lease_error(error);
+            }
+            let Some(store) = investigation_store else {
+                return investigation_unavailable();
+            };
+            let case = match store.load_case(&case_id) {
+                Ok(case) => case,
+                Err(error) => return store_error(error),
+            };
+            let fingerprint = source.environment_fingerprint(
+                case.workload_identity.as_deref(),
+                run_workload_identity.as_deref(),
+            );
+            match store.create_run(NewInvestigationRun {
+                case_id,
+                session_id: source.session_info().session_id,
+                fingerprint,
+            }) {
+                Ok(run) => DiagnosticsResponse::InvestigationRun { run: Box::new(run) },
+                Err(error) => store_error(error),
+            }
+        }
+        DiagnosticsRequest::AppendTimelineEntry {
+            auth_token: provided,
+            lease_id,
+            run_id,
+            source,
+            kind,
+            title,
+            body,
+            actor,
+            reason,
+        } => {
+            if provided != auth_token {
+                return unauthorized();
+            }
+            if let Err(error) = lease_manager.require_current(&lease_id) {
+                return lease_error(error);
+            }
+            let Some(store) = investigation_store else {
+                return investigation_unavailable();
+            };
+            match store.append_timeline_entry(
+                &run_id,
+                NewTimelineEntry {
+                    source,
+                    kind,
+                    title,
+                    body,
+                    actor,
+                    reason,
+                },
+            ) {
+                Ok(entry) => DiagnosticsResponse::TimelineEntry { entry },
+                Err(error) => store_error(error),
             }
         }
     }
@@ -1093,6 +1441,97 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[derive(Clone)]
+    struct StaticDiagnosticsSource {
+        session: DiagnosticsSessionInfo,
+        health: DiagnosticsHealthSnapshot,
+        fingerprint: EnvironmentFingerprint,
+    }
+
+    impl DiagnosticsDataSource for StaticDiagnosticsSource {
+        fn session_info(&self) -> DiagnosticsSessionInfo {
+            self.session.clone()
+        }
+
+        fn health_snapshot(&self) -> DiagnosticsHealthSnapshot {
+            self.health.clone()
+        }
+
+        fn environment_fingerprint(
+            &self,
+            case_workload_identity: Option<&str>,
+            run_workload_identity: Option<&str>,
+        ) -> EnvironmentFingerprint {
+            let mut fingerprint = self.fingerprint.clone();
+            fingerprint.workload_identity.case_workload =
+                case_workload_identity.map(str::to_string);
+            fingerprint.workload_identity.run_workload = run_workload_identity.map(str::to_string);
+            fingerprint
+        }
+    }
+
+    fn static_source() -> StaticDiagnosticsSource {
+        StaticDiagnosticsSource {
+            session: DiagnosticsSessionInfo {
+                protocol_version: DIAGNOSTICS_PROTOCOL_VERSION,
+                session_id: "session-123".to_string(),
+                volume: "demo".to_string(),
+                volume_uuid: "uuid".to_string(),
+                bridge: "WinFSP".to_string(),
+                mount_point: "Q:".to_string(),
+                pid: 42,
+                cache_path: "C:/cache".to_string(),
+                read_only: false,
+                started_unix_ms: 123,
+                controller: None,
+            },
+            health: DiagnosticsHealthSnapshot::default(),
+            fingerprint: EnvironmentFingerprint {
+                platform: PlatformFingerprint {
+                    os: "windows".to_string(),
+                    family: "windows".to_string(),
+                    arch: "x86_64".to_string(),
+                },
+                bridge: "WinFSP".to_string(),
+                build: BuildIdentity {
+                    package_name: "studiofs".to_string(),
+                    package_version: "0.1.1".to_string(),
+                    executable_path: Some("C:/studiofs.exe".to_string()),
+                    debug_build: true,
+                },
+                runtime_configuration: RuntimeConfigurationFingerprint {
+                    volume: "demo".to_string(),
+                    volume_uuid: "uuid".to_string(),
+                    mount_point: "Q:".to_string(),
+                    cache_path: "C:/cache".to_string(),
+                    read_only: false,
+                    cache_size: Some("64GB".to_string()),
+                    endpoint_override: Some("http://127.0.0.1:9000".to_string()),
+                    snapshot_id: None,
+                    vfs_config: serde_json::json!({"principal":"*","cache_safety_mode":"fast"}),
+                },
+                workload_identity: WorkloadIdentityFingerprint {
+                    case_workload: None,
+                    run_workload: None,
+                },
+                machine: MachineFingerprint {
+                    host_name: Some("workstation".to_string()),
+                    system_name: Some("Windows".to_string()),
+                    kernel_version: Some("10.0".to_string()),
+                    os_version: Some("11".to_string()),
+                    total_memory_bytes: 64 * 1024 * 1024 * 1024,
+                    cpu_count: 24,
+                },
+                diagnostics: DiagnosticsSettingsFingerprint {
+                    protocol_version: DIAGNOSTICS_PROTOCOL_VERSION,
+                    default_lease_ttl_ms: DEFAULT_LEASE_TTL_MS,
+                    max_lease_ttl_ms: MAX_LEASE_TTL_MS,
+                    max_connections: MAX_DIAGNOSTICS_CONNECTIONS,
+                },
+            },
+        }
+    }
+
     fn mounts_dir_temp() -> TempDir {
         tempfile::tempdir().expect("tempdir")
     }
@@ -1126,6 +1565,7 @@ mod tests {
             session_id: "s1".to_string(),
             volume: "demo".to_string(),
             volume_uuid: "uuid".to_string(),
+            bridge: "WinFSP".to_string(),
             mount_point: "X:".to_string(),
             pid: 123,
             cache_path: "cache".to_string(),
@@ -1170,5 +1610,150 @@ mod tests {
                     .len()
         );
         assert!(Path::new(&path).as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES);
+    }
+
+    #[test]
+    fn mutating_requests_require_current_controller_lease() {
+        let source = static_source();
+        let lease_manager = ControllerLeaseManager::default();
+        let temp = mounts_dir_temp();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+
+        let response = execute_request(
+            DiagnosticsRequest::CreateCase {
+                auth_token: "secret".to_string(),
+                lease_id: "lease-1".to_string(),
+                title: "AJA slowdown".to_string(),
+                problem_statement: None,
+                workload_identity: Some("aja".to_string()),
+                target_environment: None,
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+        );
+
+        assert!(matches!(
+            response,
+            DiagnosticsResponse::Error { code, .. } if code == "lease_invalid"
+        ));
+    }
+
+    #[test]
+    fn mutating_requests_persist_run_fingerprint_and_timeline() {
+        let source = static_source();
+        let lease_manager = ControllerLeaseManager::default();
+        let temp = mounts_dir_temp();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+
+        let lease = match execute_request(
+            DiagnosticsRequest::AcquireController {
+                auth_token: "secret".to_string(),
+                client_name: "tester".to_string(),
+                ttl_ms: Some(250),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+        ) {
+            DiagnosticsResponse::ControllerLease { lease } => lease,
+            other => panic!("unexpected lease response: {other:?}"),
+        };
+
+        let case = match execute_request(
+            DiagnosticsRequest::CreateCase {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                title: "AJA slowdown".to_string(),
+                problem_statement: Some("Copy stalls after warmup".to_string()),
+                workload_identity: Some("aja".to_string()),
+                target_environment: Some("artist workstation".to_string()),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+        ) {
+            DiagnosticsResponse::InvestigationCase { case } => *case,
+            other => panic!("unexpected case response: {other:?}"),
+        };
+
+        let run = match execute_request(
+            DiagnosticsRequest::CreateRun {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                case_id: case.id.clone(),
+                run_workload_identity: Some("copy-pass-1".to_string()),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+        ) {
+            DiagnosticsResponse::InvestigationRun { run } => *run,
+            other => panic!("unexpected run response: {other:?}"),
+        };
+
+        let _ = execute_request(
+            DiagnosticsRequest::AppendTimelineEntry {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                run_id: run.id.clone(),
+                source: TimelineEntrySource::Cli,
+                kind: TimelineEntryKind::Marker,
+                title: "start copy".to_string(),
+                body: Some("Started the manual copy workload".to_string()),
+                actor: Some("developer".to_string()),
+                reason: Some("begin workload".to_string()),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+        );
+        let _ = execute_request(
+            DiagnosticsRequest::AppendTimelineEntry {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id,
+                run_id: run.id.clone(),
+                source: TimelineEntrySource::Mcp,
+                kind: TimelineEntryKind::Note,
+                title: "cache miss burst".to_string(),
+                body: Some("MCP adapter observed a foreground read spike".to_string()),
+                actor: Some("studiofs-dev-mcp".to_string()),
+                reason: Some("annotate anomaly".to_string()),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+        );
+
+        let persisted_run = store.load_run(&run.id).expect("load run");
+
+        assert_eq!(persisted_run.case_id, case.id);
+        assert_eq!(persisted_run.session_id, "session-123");
+        assert_eq!(persisted_run.fingerprint.bridge, "WinFSP");
+        assert_eq!(
+            persisted_run
+                .fingerprint
+                .workload_identity
+                .case_workload
+                .as_deref(),
+            Some("aja")
+        );
+        assert_eq!(
+            persisted_run
+                .fingerprint
+                .workload_identity
+                .run_workload
+                .as_deref(),
+            Some("copy-pass-1")
+        );
+        assert_eq!(persisted_run.timeline.len(), 2);
+        assert_eq!(persisted_run.timeline[0].source, TimelineEntrySource::Cli);
+        assert_eq!(persisted_run.timeline[1].source, TimelineEntrySource::Mcp);
     }
 }

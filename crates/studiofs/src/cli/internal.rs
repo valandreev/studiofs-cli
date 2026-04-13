@@ -1,6 +1,7 @@
 //! Hidden internal CLI subcommands.
 
 use crate::diagnostics;
+use crate::investigation::{InvestigationStore, TimelineEntryKind, TimelineEntrySource};
 use clap::{Args, Subcommand};
 use serde_json::json;
 use std::time::Duration;
@@ -33,6 +34,11 @@ impl InternalArgs {
                 Ok(())
             }
             InternalAction::DiagnosticsAttach(args) => run_diagnostics_attach(args),
+            InternalAction::DiagnosticsCreateCase(args) => run_diagnostics_create_case(args),
+            InternalAction::DiagnosticsCreateRun(args) => run_diagnostics_create_run(args),
+            InternalAction::DiagnosticsAddTimeline(args) => run_diagnostics_add_timeline(args),
+            InternalAction::DiagnosticsReadCase(args) => run_diagnostics_read_case(args),
+            InternalAction::DiagnosticsReadRun(args) => run_diagnostics_read_run(args),
         }
     }
 }
@@ -45,6 +51,16 @@ enum InternalAction {
     DiagnosticsDiscover,
     #[command(name = "diagnostics-attach", hide = true)]
     DiagnosticsAttach(DiagnosticsAttachArgs),
+    #[command(name = "diagnostics-create-case", hide = true)]
+    DiagnosticsCreateCase(DiagnosticsCreateCaseArgs),
+    #[command(name = "diagnostics-create-run", hide = true)]
+    DiagnosticsCreateRun(DiagnosticsCreateRunArgs),
+    #[command(name = "diagnostics-add-timeline", hide = true)]
+    DiagnosticsAddTimeline(DiagnosticsAddTimelineArgs),
+    #[command(name = "diagnostics-read-case", hide = true)]
+    DiagnosticsReadCase(DiagnosticsReadCaseArgs),
+    #[command(name = "diagnostics-read-run", hide = true)]
+    DiagnosticsReadRun(DiagnosticsReadRunArgs),
 }
 
 #[derive(Debug, Args)]
@@ -61,18 +77,113 @@ struct DiagnosticsAttachArgs {
     ttl_ms: u64,
 }
 
-fn run_diagnostics_attach(args: DiagnosticsAttachArgs) -> anyhow::Result<()> {
-    let discovery = diagnostics::discover_local_sessions()?
-        .into_iter()
-        .find(|session| session.mount_point == args.mount_point)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no live diagnostics session found for '{}'",
-                args.mount_point
-            )
-        })?;
+#[derive(Debug, Args)]
+struct DiagnosticsCreateCaseArgs {
+    mount_point: String,
 
-    let client = diagnostics::LocalDiagnosticsClient::new(discovery);
+    #[arg(long)]
+    lease_id: String,
+
+    #[arg(long)]
+    title: String,
+
+    #[arg(long)]
+    problem_statement: Option<String>,
+
+    #[arg(long)]
+    workload_identity: Option<String>,
+
+    #[arg(long)]
+    target_environment: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct DiagnosticsCreateRunArgs {
+    mount_point: String,
+
+    #[arg(long)]
+    lease_id: String,
+
+    #[arg(long)]
+    case_id: String,
+
+    #[arg(long)]
+    workload_identity: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum TimelineSourceArg {
+    Cli,
+    Mcp,
+}
+
+impl From<TimelineSourceArg> for TimelineEntrySource {
+    fn from(value: TimelineSourceArg) -> Self {
+        match value {
+            TimelineSourceArg::Cli => TimelineEntrySource::Cli,
+            TimelineSourceArg::Mcp => TimelineEntrySource::Mcp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum TimelineKindArg {
+    Marker,
+    Note,
+}
+
+impl From<TimelineKindArg> for TimelineEntryKind {
+    fn from(value: TimelineKindArg) -> Self {
+        match value {
+            TimelineKindArg::Marker => TimelineEntryKind::Marker,
+            TimelineKindArg::Note => TimelineEntryKind::Note,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct DiagnosticsAddTimelineArgs {
+    mount_point: String,
+
+    #[arg(long)]
+    lease_id: String,
+
+    #[arg(long)]
+    run_id: String,
+
+    #[arg(long, value_enum)]
+    source: TimelineSourceArg,
+
+    #[arg(long, value_enum)]
+    kind: TimelineKindArg,
+
+    #[arg(long)]
+    title: String,
+
+    #[arg(long)]
+    body: Option<String>,
+
+    #[arg(long)]
+    actor: Option<String>,
+
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct DiagnosticsReadCaseArgs {
+    #[arg(long)]
+    case_id: String,
+}
+
+#[derive(Debug, Args)]
+struct DiagnosticsReadRunArgs {
+    #[arg(long)]
+    run_id: String,
+}
+
+fn run_diagnostics_attach(args: DiagnosticsAttachArgs) -> anyhow::Result<()> {
+    let client = live_client_for_mount(&args.mount_point)?;
     let ttl = Duration::from_millis(args.ttl_ms.max(1));
     let payload = crate::runtime_bridge::block_on(async move {
         let session = client.session_info().await?;
@@ -94,6 +205,76 @@ fn run_diagnostics_attach(args: DiagnosticsAttachArgs) -> anyhow::Result<()> {
 
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())
+}
+
+fn run_diagnostics_create_case(args: DiagnosticsCreateCaseArgs) -> anyhow::Result<()> {
+    let client = live_client_for_mount(&args.mount_point)?;
+    let payload = crate::runtime_bridge::block_on(async move {
+        client
+            .create_case(
+                &args.lease_id,
+                &args.title,
+                args.problem_statement,
+                args.workload_identity,
+                args.target_environment,
+            )
+            .await
+    })?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+fn run_diagnostics_create_run(args: DiagnosticsCreateRunArgs) -> anyhow::Result<()> {
+    let client = live_client_for_mount(&args.mount_point)?;
+    let payload = crate::runtime_bridge::block_on(async move {
+        client
+            .create_run(&args.lease_id, &args.case_id, args.workload_identity)
+            .await
+    })?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+fn run_diagnostics_add_timeline(args: DiagnosticsAddTimelineArgs) -> anyhow::Result<()> {
+    let client = live_client_for_mount(&args.mount_point)?;
+    let payload = crate::runtime_bridge::block_on(async move {
+        client
+            .append_timeline_entry(
+                &args.lease_id,
+                &args.run_id,
+                args.source.into(),
+                args.kind.into(),
+                &args.title,
+                args.body,
+                args.actor,
+                args.reason,
+            )
+            .await
+    })?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+fn run_diagnostics_read_case(args: DiagnosticsReadCaseArgs) -> anyhow::Result<()> {
+    let payload = InvestigationStore::default_store()?.load_case(&args.case_id)?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+fn run_diagnostics_read_run(args: DiagnosticsReadRunArgs) -> anyhow::Result<()> {
+    let payload = InvestigationStore::default_store()?.load_run(&args.run_id)?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+fn live_client_for_mount(mount_point: &str) -> anyhow::Result<diagnostics::LocalDiagnosticsClient> {
+    let discovery = diagnostics::discover_local_sessions()?
+        .into_iter()
+        .find(|session| session.mount_point == mount_point)
+        .ok_or_else(|| {
+            anyhow::anyhow!("no live diagnostics session found for '{}'", mount_point)
+        })?;
+    Ok(diagnostics::LocalDiagnosticsClient::new(discovery))
 }
 
 #[cfg(test)]
@@ -135,6 +316,91 @@ mod tests {
             attach.command,
             crate::cli::Commands::Internal(InternalArgs {
                 action: InternalAction::DiagnosticsAttach(_)
+            })
+        ));
+
+        let create_case = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-create-case",
+            "Z:",
+            "--lease-id",
+            "lease-1",
+            "--title",
+            "AJA copy slowdown",
+            "--workload-identity",
+            "aja",
+        ])
+        .unwrap();
+        assert!(matches!(
+            create_case.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsCreateCase(_)
+            })
+        ));
+
+        let create_run = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-create-run",
+            "Z:",
+            "--lease-id",
+            "lease-1",
+            "--case-id",
+            "case-1",
+            "--workload-identity",
+            "copy-pass-1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            create_run.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsCreateRun(_)
+            })
+        ));
+
+        let add_timeline = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-add-timeline",
+            "Z:",
+            "--lease-id",
+            "lease-1",
+            "--run-id",
+            "run-1",
+            "--source",
+            "cli",
+            "--kind",
+            "marker",
+            "--title",
+            "start copy",
+        ])
+        .unwrap();
+        assert!(matches!(
+            add_timeline.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsAddTimeline(_)
+            })
+        ));
+
+        let read_case = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-read-case",
+            "--case-id",
+            "case-1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            read_case.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsReadCase(_)
+            })
+        ));
+
+        let read_run =
+            crate::cli::parse_for_test(&["internal", "diagnostics-read-run", "--run-id", "run-1"])
+                .unwrap();
+        assert!(matches!(
+            read_run.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsReadRun(_)
             })
         ));
     }
