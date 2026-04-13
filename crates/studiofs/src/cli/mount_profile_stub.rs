@@ -28,15 +28,19 @@ struct UnsupportedRuntimeProfilingBackend;
 
 impl RuntimeProfilingBackend for UnsupportedRuntimeProfilingBackend {
     fn supported_capture_modes(&self) -> Vec<ProfilingCaptureMode> {
-        vec![
-            ProfilingCaptureMode::WallBlocking,
-            ProfilingCaptureMode::Cpu,
-        ]
+        vec![ProfilingCaptureMode::Cpu]
     }
 
-    fn start_window(&self, _request: &StartProfilingWindowRequest) -> ProfilingBackendStartResult {
+    fn start_window(&self, request: &StartProfilingWindowRequest) -> ProfilingBackendStartResult {
         ProfilingBackendStartResult::Unsupported {
-            error: "profiling backend unavailable on this platform".to_string(),
+            error: match request.capture_mode {
+                ProfilingCaptureMode::Cpu => {
+                    "profiling backend unavailable on this platform".to_string()
+                }
+                ProfilingCaptureMode::WallBlocking => {
+                    "cpu profiling backend does not support wall/blocking captures".to_string()
+                }
+            },
         }
     }
 }

@@ -17,9 +17,7 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
-#[cfg(unix)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -71,6 +69,7 @@ const DEFAULT_PROFILE_SAMPLE_RATE_HZ: u32 = 100;
 const MIN_PROFILE_SAMPLE_RATE_HZ: u32 = 1;
 const MAX_PROFILE_SAMPLE_RATE_HZ: u32 = 1_000;
 pub(crate) const MAX_PROFILE_WINDOW_DURATION_MS: u64 = 30_000;
+const DIAGNOSTICS_PROFILE_ARTIFACT_DIR_NAME: &str = "profiles";
 #[cfg(unix)]
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
 
@@ -269,7 +268,7 @@ pub(crate) trait RuntimeProfilingBackend: Send + Sync + 'static {
 
 pub(crate) struct DiagnosticsProfilingCoordinator {
     backend: Arc<dyn RuntimeProfilingBackend>,
-    active_window: Mutex<Option<ActiveProfilingWindow>>,
+    active_window: Mutex<ProfilingWindowState>,
 }
 
 struct ActiveProfilingWindow {
@@ -285,11 +284,197 @@ struct ActiveProfilingWindow {
     stopper: Box<dyn RuntimeProfilingStopper>,
 }
 
+enum ProfilingWindowState {
+    Idle,
+    Starting,
+    Active(ActiveProfilingWindow),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProfilingBudgetValidationError {
+    ZeroDuration,
+    DurationTooLong {
+        max_duration_ms: u64,
+    },
+    InvalidSampleRate {
+        requested_hz: u32,
+        min_hz: u32,
+        max_hz: u32,
+    },
+}
+
+impl std::fmt::Display for ProfilingBudgetValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroDuration => write!(f, "profiling duration must be greater than zero"),
+            Self::DurationTooLong { max_duration_ms } => {
+                write!(f, "profiling budget exceeds limit of {max_duration_ms} ms")
+            }
+            Self::InvalidSampleRate {
+                requested_hz,
+                min_hz,
+                max_hz,
+            } => write!(
+                f,
+                "profiling sample rate {requested_hz} Hz must be between {min_hz} and {max_hz} Hz"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProfilingBudgetValidationError {}
+
+#[derive(Debug)]
+enum ProfilingWindowStartError {
+    Budget(ProfilingBudgetValidationError),
+    Busy,
+    Store(anyhow::Error),
+}
+
+impl std::fmt::Display for ProfilingWindowStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Budget(error) => write!(f, "{error}"),
+            Self::Busy => write!(f, "profiling window already active"),
+            Self::Store(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for ProfilingWindowStartError {}
+
+struct CompositeRuntimeProfilingBackend {
+    wall_blocking_backend: Arc<dyn RuntimeProfilingBackend>,
+    cpu_backend: Arc<dyn RuntimeProfilingBackend>,
+}
+
+impl CompositeRuntimeProfilingBackend {
+    fn new(
+        source: Arc<dyn DiagnosticsDataSource>,
+        cpu_backend: Arc<dyn RuntimeProfilingBackend>,
+    ) -> Self {
+        Self {
+            wall_blocking_backend: Arc::new(WallBlockingRuntimeProfilingBackend::new(source)),
+            cpu_backend,
+        }
+    }
+}
+
+impl RuntimeProfilingBackend for CompositeRuntimeProfilingBackend {
+    fn supported_capture_modes(&self) -> Vec<ProfilingCaptureMode> {
+        let mut modes = self.wall_blocking_backend.supported_capture_modes();
+        for mode in self.cpu_backend.supported_capture_modes() {
+            if !modes.contains(&mode) {
+                modes.push(mode);
+            }
+        }
+        modes
+    }
+
+    fn start_window(&self, request: &StartProfilingWindowRequest) -> ProfilingBackendStartResult {
+        match request.capture_mode {
+            ProfilingCaptureMode::WallBlocking => self.wall_blocking_backend.start_window(request),
+            ProfilingCaptureMode::Cpu => self.cpu_backend.start_window(request),
+        }
+    }
+}
+
+struct WallBlockingRuntimeProfilingBackend {
+    source: Arc<dyn DiagnosticsDataSource>,
+}
+
+impl WallBlockingRuntimeProfilingBackend {
+    fn new(source: Arc<dyn DiagnosticsDataSource>) -> Self {
+        Self { source }
+    }
+}
+
+struct WallBlockingProfileStopper {
+    source: Arc<dyn DiagnosticsDataSource>,
+    cache_path: PathBuf,
+    started_unix_ms: u64,
+    started_at: Instant,
+    budget: ProfilingBudget,
+    start_snapshot: DiagnosticsRuntimeSnapshot,
+    start_events: Vec<DiagnosticsRecentEvent>,
+}
+
+impl RuntimeProfilingBackend for WallBlockingRuntimeProfilingBackend {
+    fn supported_capture_modes(&self) -> Vec<ProfilingCaptureMode> {
+        vec![ProfilingCaptureMode::WallBlocking]
+    }
+
+    fn start_window(&self, request: &StartProfilingWindowRequest) -> ProfilingBackendStartResult {
+        ProfilingBackendStartResult::Active(ActiveRuntimeProfilingWindow {
+            sample_rate_hz: request.budget.sample_rate_hz,
+            stopper: Box::new(WallBlockingProfileStopper {
+                cache_path: PathBuf::from(self.source.session_info().cache_path),
+                source: self.source.clone(),
+                started_unix_ms: now_unix_millis(),
+                started_at: Instant::now(),
+                budget: request.budget.clone(),
+                start_snapshot: self.source.runtime_snapshot(),
+                start_events: self
+                    .source
+                    .recent_events(DEFAULT_RECENT_EVENTS_LIMIT.max(8)),
+            }),
+        })
+    }
+}
+
+impl RuntimeProfilingStopper for WallBlockingProfileStopper {
+    fn stop(self: Box<Self>) -> Result<ProfilingBackendStopResult> {
+        let finished_unix_ms = now_unix_millis();
+        let end_snapshot = self.source.runtime_snapshot();
+        let end_events = self
+            .source
+            .recent_events(DEFAULT_RECENT_EVENTS_LIMIT.max(8));
+        let actual_duration_ms = self.started_at.elapsed().as_millis().try_into().ok();
+
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "capture_mode": "wall_blocking",
+            "started_unix_ms": self.started_unix_ms,
+            "finished_unix_ms": finished_unix_ms,
+            "requested_duration_ms": self.budget.duration_ms,
+            "actual_duration_ms": actual_duration_ms,
+            "sampling_hint_hz": self.budget.sample_rate_hz,
+            "start_snapshot": self.start_snapshot,
+            "end_snapshot": end_snapshot,
+            "start_events": self.start_events,
+            "end_events": end_events,
+        });
+
+        let mut artifact = None;
+        let mut error = None;
+        match write_wall_blocking_artifact(&self.cache_path, &payload) {
+            Ok(path) => {
+                let bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+                artifact = Some(ProfileArtifactRecord {
+                    kind: "wall_blocking_summary".to_string(),
+                    path: path.to_string_lossy().into_owned(),
+                    bytes,
+                });
+            }
+            Err(write_error) => {
+                error = Some(write_error.to_string());
+            }
+        }
+
+        Ok(ProfilingBackendStopResult {
+            actual_duration_ms,
+            status: ProfilingWindowStatus::Completed,
+            artifact,
+            error,
+        })
+    }
+}
+
 impl DiagnosticsProfilingCoordinator {
     fn new(backend: Arc<dyn RuntimeProfilingBackend>) -> Self {
         Self {
             backend,
-            active_window: Mutex::new(None),
+            active_window: Mutex::new(ProfilingWindowState::Idle),
         }
     }
 
@@ -298,8 +483,8 @@ impl DiagnosticsProfilingCoordinator {
         run_id: &str,
         request: StartProfilingWindowRequest,
         investigation_store: Option<&InvestigationStore>,
-    ) -> Result<ProfilingWindowRecord> {
-        validate_profiling_request(&request)?;
+    ) -> std::result::Result<ProfilingWindowRecord, ProfilingWindowStartError> {
+        validate_profiling_request(&request).map_err(ProfilingWindowStartError::Budget)?;
 
         let estimated_cost = estimate_profiling_cost(&request);
         let occurred_unix_ms = now_unix_millis();
@@ -311,14 +496,23 @@ impl DiagnosticsProfilingCoordinator {
         );
         let window_id = Uuid::new_v4().to_string();
 
-        let mut active_window = self.active_window.lock();
-        if active_window.is_some() {
-            return Err(anyhow!("profiling window already active"));
+        {
+            let mut active_window = self.active_window.lock();
+            match &*active_window {
+                ProfilingWindowState::Idle => {
+                    *active_window = ProfilingWindowState::Starting;
+                }
+                ProfilingWindowState::Starting | ProfilingWindowState::Active(_) => {
+                    return Err(ProfilingWindowStartError::Busy);
+                }
+            }
         }
 
         match self.backend.start_window(&request) {
             ProfilingBackendStartResult::Active(active) => {
-                *active_window = Some(ActiveProfilingWindow {
+                let resolved_sample_rate_hz = active.sample_rate_hz.or(effective_sample_rate_hz);
+                let mut active_window = self.active_window.lock();
+                *active_window = ProfilingWindowState::Active(ActiveProfilingWindow {
                     window_id: window_id.clone(),
                     run_id: run_id.to_string(),
                     occurred_unix_ms,
@@ -326,7 +520,7 @@ impl DiagnosticsProfilingCoordinator {
                     capture_mode: request.capture_mode,
                     preset: request.preset,
                     requested_duration_ms: request.budget.duration_ms,
-                    sample_rate_hz: active.sample_rate_hz.or(effective_sample_rate_hz),
+                    sample_rate_hz: resolved_sample_rate_hz,
                     estimated_cost: estimated_cost.clone(),
                     stopper: active.stopper,
                 });
@@ -338,7 +532,7 @@ impl DiagnosticsProfilingCoordinator {
                     preset: request.preset,
                     requested_duration_ms: request.budget.duration_ms,
                     actual_duration_ms: None,
-                    sample_rate_hz: effective_sample_rate_hz,
+                    sample_rate_hz: resolved_sample_rate_hz,
                     estimated_cost,
                     status: ProfilingWindowStatus::Running,
                     artifact: None,
@@ -346,6 +540,8 @@ impl DiagnosticsProfilingCoordinator {
                 })
             }
             ProfilingBackendStartResult::Unsupported { error } => {
+                let mut active_window = self.active_window.lock();
+                *active_window = ProfilingWindowState::Idle;
                 let record = ProfilingWindowRecord {
                     window_id: window_id.clone(),
                     sequence: 0,
@@ -361,21 +557,24 @@ impl DiagnosticsProfilingCoordinator {
                     error: Some(error.clone()),
                 };
                 if let Some(store) = investigation_store {
-                    return store.append_profiling_window(
-                        run_id,
-                        NewProfilingWindow {
-                            window_id,
-                            capture_mode: request.capture_mode,
-                            preset: request.preset,
-                            requested_duration_ms: request.budget.duration_ms,
-                            actual_duration_ms: None,
-                            sample_rate_hz: effective_sample_rate_hz,
-                            estimated_cost,
-                            status: ProfilingWindowStatus::Unsupported,
-                            artifact: None,
-                            error: Some(error),
-                        },
-                    );
+                    return store
+                        .append_profiling_window(
+                            run_id,
+                            NewProfilingWindow {
+                                window_id,
+                                occurred_unix_ms,
+                                capture_mode: request.capture_mode,
+                                preset: request.preset,
+                                requested_duration_ms: request.budget.duration_ms,
+                                actual_duration_ms: None,
+                                sample_rate_hz: effective_sample_rate_hz,
+                                estimated_cost,
+                                status: ProfilingWindowStatus::Unsupported,
+                                artifact: None,
+                                error: Some(error),
+                            },
+                        )
+                        .map_err(ProfilingWindowStartError::Store);
                 }
                 Ok(record)
             }
@@ -389,14 +588,20 @@ impl DiagnosticsProfilingCoordinator {
     ) -> Result<ProfilingWindowRecord> {
         let active = {
             let mut active_window = self.active_window.lock();
-            let Some(active) = active_window.take() else {
-                return Err(anyhow!("profiling window is not currently active"));
-            };
-            if active.window_id != window_id {
-                *active_window = Some(active);
-                return Err(anyhow!("profiling window '{window_id}' is not current"));
+            match std::mem::replace(&mut *active_window, ProfilingWindowState::Idle) {
+                ProfilingWindowState::Idle => {
+                    return Err(anyhow!("profiling window is not currently active"));
+                }
+                ProfilingWindowState::Starting => {
+                    *active_window = ProfilingWindowState::Starting;
+                    return Err(anyhow!("profiling window is still starting"));
+                }
+                ProfilingWindowState::Active(active) if active.window_id != window_id => {
+                    *active_window = ProfilingWindowState::Active(active);
+                    return Err(anyhow!("profiling window '{window_id}' is not current"));
+                }
+                ProfilingWindowState::Active(active) => active,
             }
-            active
         };
 
         let result = match active.stopper.stop() {
@@ -416,16 +621,9 @@ impl DiagnosticsProfilingCoordinator {
             capture_mode: active.capture_mode,
             preset: active.preset,
             requested_duration_ms: active.requested_duration_ms,
-            actual_duration_ms: result.actual_duration_ms.or_else(|| {
-                Some(
-                    active
-                        .started_at
-                        .elapsed()
-                        .as_millis()
-                        .try_into()
-                        .unwrap_or(u64::MAX),
-                )
-            }),
+            actual_duration_ms: result
+                .actual_duration_ms
+                .or_else(|| u64::try_from(active.started_at.elapsed().as_millis()).ok()),
             sample_rate_hz: active.sample_rate_hz,
             estimated_cost: active.estimated_cost.clone(),
             status: result.status,
@@ -438,6 +636,7 @@ impl DiagnosticsProfilingCoordinator {
                 &active.run_id,
                 NewProfilingWindow {
                     window_id: active.window_id,
+                    occurred_unix_ms: active.occurred_unix_ms,
                     capture_mode: active.capture_mode,
                     preset: active.preset,
                     requested_duration_ms: active.requested_duration_ms,
@@ -467,39 +666,46 @@ impl DiagnosticsProfilingCoordinator {
             max_duration_ms: MAX_PROFILE_WINDOW_DURATION_MS,
             default_sample_rate_hz: DEFAULT_PROFILE_SAMPLE_RATE_HZ,
             max_sample_rate_hz: MAX_PROFILE_SAMPLE_RATE_HZ,
-            active_window: active_window.as_ref().map(|active| ProfilingWindowRecord {
-                window_id: active.window_id.clone(),
-                sequence: 0,
-                occurred_unix_ms: active.occurred_unix_ms,
-                capture_mode: active.capture_mode,
-                preset: active.preset,
-                requested_duration_ms: active.requested_duration_ms,
-                actual_duration_ms: None,
-                sample_rate_hz: active.sample_rate_hz,
-                estimated_cost: active.estimated_cost.clone(),
-                status: ProfilingWindowStatus::Running,
-                artifact: None,
-                error: None,
-            }),
+            active_window: match &*active_window {
+                ProfilingWindowState::Active(active) => Some(ProfilingWindowRecord {
+                    window_id: active.window_id.clone(),
+                    sequence: 0,
+                    occurred_unix_ms: active.occurred_unix_ms,
+                    capture_mode: active.capture_mode,
+                    preset: active.preset,
+                    requested_duration_ms: active.requested_duration_ms,
+                    actual_duration_ms: None,
+                    sample_rate_hz: active.sample_rate_hz,
+                    estimated_cost: active.estimated_cost.clone(),
+                    status: ProfilingWindowStatus::Running,
+                    artifact: None,
+                    error: None,
+                }),
+                ProfilingWindowState::Idle | ProfilingWindowState::Starting => None,
+            },
         }
     }
 }
 
-fn validate_profiling_request(request: &StartProfilingWindowRequest) -> Result<()> {
+fn validate_profiling_request(
+    request: &StartProfilingWindowRequest,
+) -> std::result::Result<(), ProfilingBudgetValidationError> {
     if request.budget.duration_ms == 0 {
-        return Err(anyhow!("profiling duration must be greater than zero"));
+        return Err(ProfilingBudgetValidationError::ZeroDuration);
     }
     if request.budget.duration_ms > MAX_PROFILE_WINDOW_DURATION_MS {
-        return Err(anyhow!("profiling budget exceeds limit"));
+        return Err(ProfilingBudgetValidationError::DurationTooLong {
+            max_duration_ms: MAX_PROFILE_WINDOW_DURATION_MS,
+        });
     }
     if let Some(sample_rate_hz) = request.budget.sample_rate_hz
         && !(MIN_PROFILE_SAMPLE_RATE_HZ..=MAX_PROFILE_SAMPLE_RATE_HZ).contains(&sample_rate_hz)
     {
-        return Err(anyhow!(
-            "profiling sample rate must be between {} and {} Hz",
-            MIN_PROFILE_SAMPLE_RATE_HZ,
-            MAX_PROFILE_SAMPLE_RATE_HZ
-        ));
+        return Err(ProfilingBudgetValidationError::InvalidSampleRate {
+            requested_hz: sample_rate_hz,
+            min_hz: MIN_PROFILE_SAMPLE_RATE_HZ,
+            max_hz: MAX_PROFILE_SAMPLE_RATE_HZ,
+        });
     }
     Ok(())
 }
@@ -530,6 +736,29 @@ fn estimate_profiling_cost(request: &StartProfilingWindowRequest) -> ProfilingCo
         score,
         label: label.to_string(),
     }
+}
+
+fn write_wall_blocking_artifact(cache_path: &Path, payload: &serde_json::Value) -> Result<PathBuf> {
+    let output_dir = cache_path.join(DIAGNOSTICS_PROFILE_ARTIFACT_DIR_NAME);
+    fs::create_dir_all(&output_dir).with_context(|| {
+        format!(
+            "create profiling artifact directory '{}'",
+            output_dir.display()
+        )
+    })?;
+    let filename = format!(
+        "wall-blocking-window-{}-{}.json",
+        now_unix_millis(),
+        Uuid::new_v4()
+    );
+    let path = output_dir.join(filename);
+    fs::write(&path, serde_json::to_vec_pretty(payload)?).with_context(|| {
+        format!(
+            "write wall-blocking profiling artifact '{}'",
+            path.display()
+        )
+    })?;
+    Ok(path)
 }
 
 #[derive(Debug, Clone)]
@@ -934,7 +1163,9 @@ impl LocalDiagnosticsHost {
             }
         };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let profiling = Arc::new(DiagnosticsProfilingCoordinator::new(profiling_backend));
+        let profiling = Arc::new(DiagnosticsProfilingCoordinator::new(Arc::new(
+            CompositeRuntimeProfilingBackend::new(source.clone(), profiling_backend),
+        )));
         let task = runtime.spawn(run_server(
             endpoint,
             discovery.auth_token.clone(),
@@ -1733,10 +1964,17 @@ fn execute_request(
         }
     }
 
-    fn profiling_budget_error(error: anyhow::Error) -> DiagnosticsResponse {
-        DiagnosticsResponse::Error {
-            code: "profiling_budget_invalid".to_string(),
-            message: error.to_string(),
+    fn profiling_start_error(error: ProfilingWindowStartError) -> DiagnosticsResponse {
+        match error {
+            ProfilingWindowStartError::Budget(error) => DiagnosticsResponse::Error {
+                code: "profiling_budget_invalid".to_string(),
+                message: error.to_string(),
+            },
+            ProfilingWindowStartError::Busy => DiagnosticsResponse::Error {
+                code: "profiling_start_failed".to_string(),
+                message: error.to_string(),
+            },
+            ProfilingWindowStartError::Store(error) => store_error(error),
         }
     }
 
@@ -1956,16 +2194,7 @@ fn execute_request(
                 Ok(window) => DiagnosticsResponse::ProfilingWindow {
                     window: Box::new(window),
                 },
-                Err(error) if error.to_string().contains("profiling budget") => {
-                    profiling_budget_error(error)
-                }
-                Err(error) if error.to_string().contains("sample rate") => {
-                    profiling_budget_error(error)
-                }
-                Err(error) => DiagnosticsResponse::Error {
-                    code: "profiling_start_failed".to_string(),
-                    message: error.to_string(),
-                },
+                Err(error) => profiling_start_error(error),
             }
         }
         DiagnosticsRequest::StopProfilingWindow {
@@ -2277,6 +2506,55 @@ mod tests {
             ProfilingBackendStartResult::Unsupported {
                 error: self.0.clone(),
             }
+        }
+    }
+
+    struct AdjustingProfilingBackend;
+
+    impl RuntimeProfilingBackend for AdjustingProfilingBackend {
+        fn supported_capture_modes(&self) -> Vec<ProfilingCaptureMode> {
+            vec![ProfilingCaptureMode::Cpu]
+        }
+
+        fn start_window(
+            &self,
+            _request: &StartProfilingWindowRequest,
+        ) -> ProfilingBackendStartResult {
+            ProfilingBackendStartResult::Active(ActiveRuntimeProfilingWindow {
+                sample_rate_hz: Some(77),
+                stopper: Box::new(SuccessfulProfilingStopper),
+            })
+        }
+    }
+
+    struct BlockingProfilingBackend {
+        entered_tx: std::sync::mpsc::Sender<()>,
+        release_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl RuntimeProfilingBackend for BlockingProfilingBackend {
+        fn supported_capture_modes(&self) -> Vec<ProfilingCaptureMode> {
+            vec![ProfilingCaptureMode::Cpu]
+        }
+
+        fn start_window(
+            &self,
+            _request: &StartProfilingWindowRequest,
+        ) -> ProfilingBackendStartResult {
+            self.entered_tx
+                .send(())
+                .expect("notify backend start entered");
+            self.release_rx
+                .lock()
+                .expect("lock release receiver")
+                .take()
+                .expect("single release receiver")
+                .recv()
+                .expect("release backend start");
+            ProfilingBackendStartResult::Active(ActiveRuntimeProfilingWindow {
+                sample_rate_hz: Some(100),
+                stopper: Box::new(SuccessfulProfilingStopper),
+            })
         }
     }
 
@@ -2840,6 +3118,116 @@ mod tests {
         assert_eq!(
             window.error.as_deref(),
             Some("profiling backend unavailable")
+        );
+    }
+
+    #[test]
+    fn profiling_start_reports_backend_resolved_sample_rate() {
+        let profiling = DiagnosticsProfilingCoordinator::new(Arc::new(AdjustingProfilingBackend));
+
+        let started = profiling
+            .start_window(
+                "run-1",
+                StartProfilingWindowRequest {
+                    capture_mode: ProfilingCaptureMode::Cpu,
+                    preset: DiagnosticsPreset::Balanced,
+                    budget: ProfilingBudget {
+                        duration_ms: 500,
+                        sample_rate_hz: Some(99),
+                    },
+                },
+                None,
+            )
+            .expect("start profiling window");
+
+        assert_eq!(started.sample_rate_hz, Some(77));
+    }
+
+    #[test]
+    fn profiling_status_does_not_block_while_backend_is_starting() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let profiling = Arc::new(DiagnosticsProfilingCoordinator::new(Arc::new(
+            BlockingProfilingBackend {
+                entered_tx,
+                release_rx: std::sync::Mutex::new(Some(release_rx)),
+            },
+        )));
+
+        let worker = {
+            let profiling = profiling.clone();
+            std::thread::spawn(move || {
+                profiling
+                    .start_window(
+                        "run-1",
+                        StartProfilingWindowRequest {
+                            capture_mode: ProfilingCaptureMode::Cpu,
+                            preset: DiagnosticsPreset::Balanced,
+                            budget: ProfilingBudget {
+                                duration_ms: 500,
+                                sample_rate_hz: Some(100),
+                            },
+                        },
+                        None,
+                    )
+                    .expect("start profiling window");
+            })
+        };
+
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("backend entered start");
+
+        let status_worker = {
+            let profiling = profiling.clone();
+            std::thread::spawn(move || profiling.status())
+        };
+
+        let status = status_worker
+            .join()
+            .expect("status thread should not block indefinitely");
+        assert!(status.active_window.is_none());
+
+        release_tx.send(()).expect("release backend start");
+        worker.join().expect("worker thread");
+    }
+
+    #[test]
+    fn wall_blocking_profiling_writes_summary_artifact() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut source = static_source();
+        source.session.cache_path = temp.path().to_string_lossy().into_owned();
+        let profiling =
+            DiagnosticsProfilingCoordinator::new(Arc::new(CompositeRuntimeProfilingBackend::new(
+                Arc::new(source),
+                Arc::new(UnsupportedProfilingBackend("cpu unavailable".to_string())),
+            )));
+
+        let started = profiling
+            .start_window(
+                "run-1",
+                StartProfilingWindowRequest {
+                    capture_mode: ProfilingCaptureMode::WallBlocking,
+                    preset: DiagnosticsPreset::Balanced,
+                    budget: ProfilingBudget {
+                        duration_ms: 500,
+                        sample_rate_hz: Some(25),
+                    },
+                },
+                None,
+            )
+            .expect("start wall blocking profiling");
+        let stopped = profiling
+            .stop_window(&started.window_id, None)
+            .expect("stop wall blocking profiling");
+
+        assert_eq!(stopped.status, ProfilingWindowStatus::Completed);
+        assert_eq!(
+            stopped
+                .artifact
+                .as_ref()
+                .map(|artifact| artifact.kind.as_str()),
+            Some("wall_blocking_summary")
         );
     }
 

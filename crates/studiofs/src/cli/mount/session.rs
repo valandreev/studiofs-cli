@@ -2209,12 +2209,14 @@ mod tests {
             } else {
                 profiling_window
             };
-            assert!(matches!(
-                final_window.status,
-                ProfilingWindowStatus::Completed
-                    | ProfilingWindowStatus::Failed
-                    | ProfilingWindowStatus::Unsupported
-            ));
+            assert_eq!(final_window.status, ProfilingWindowStatus::Completed);
+            assert_eq!(
+                final_window
+                    .artifact
+                    .as_ref()
+                    .map(|artifact| artifact.kind.as_str()),
+                Some("wall_blocking_summary")
+            );
             launch
                 .runtime_handle
                 .block_on(competing_client.append_timeline_entry(
@@ -2291,12 +2293,17 @@ mod tests {
         assert_eq!(persisted_run.timeline[0].source, TimelineEntrySource::Cli);
         assert_eq!(persisted_run.timeline[1].source, TimelineEntrySource::Mcp);
         assert_eq!(persisted_run.profiling_windows.len(), 1);
-        assert!(matches!(
+        assert_eq!(
             persisted_run.profiling_windows[0].status,
             ProfilingWindowStatus::Completed
-                | ProfilingWindowStatus::Failed
-                | ProfilingWindowStatus::Unsupported
-        ));
+        );
+        assert_eq!(
+            persisted_run.profiling_windows[0]
+                .artifact
+                .as_ref()
+                .map(|artifact| artifact.kind.as_str()),
+            Some("wall_blocking_summary")
+        );
     }
 
     #[test]

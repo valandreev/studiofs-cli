@@ -207,13 +207,15 @@ struct MountRuntimeProfileStopper {
 
 impl RuntimeProfilingBackend for MountRuntimeProfilingBackend {
     fn supported_capture_modes(&self) -> Vec<ProfilingCaptureMode> {
-        vec![
-            ProfilingCaptureMode::WallBlocking,
-            ProfilingCaptureMode::Cpu,
-        ]
+        vec![ProfilingCaptureMode::Cpu]
     }
 
     fn start_window(&self, request: &StartProfilingWindowRequest) -> ProfilingBackendStartResult {
+        if request.capture_mode != ProfilingCaptureMode::Cpu {
+            return ProfilingBackendStartResult::Unsupported {
+                error: "cpu profiling backend does not support wall/blocking captures".to_string(),
+            };
+        }
         let sample_rate = request.budget.sample_rate_hz.unwrap_or(DEFAULT_SAMPLE_RATE);
         let tags = merge_tags(
             vec![
@@ -322,13 +324,7 @@ impl RuntimeProfilingStopper for MountRuntimeProfileStopper {
         }
 
         Ok(ProfilingBackendStopResult {
-            actual_duration_ms: Some(
-                (finished_at - self.started_at)
-                    .num_milliseconds()
-                    .max(0)
-                    .try_into()
-                    .unwrap_or(u64::MAX),
-            ),
+            actual_duration_ms: duration_millis(self.started_at, finished_at),
             status: ProfilingWindowStatus::Completed,
             artifact,
             error: (!warnings.is_empty()).then(|| warnings.join("; ")),
@@ -354,6 +350,20 @@ pub(crate) fn runtime_profiling_backend(
         app_name: read_app_name(),
         endpoint: read_endpoint(),
     })
+}
+
+fn duration_millis(started_at: DateTime<Utc>, finished_at: DateTime<Utc>) -> Option<u64> {
+    let millis = (finished_at - started_at).num_milliseconds();
+    if millis < 0 {
+        warn!(
+            started_at = %started_at,
+            finished_at = %finished_at,
+            "profiling window finished before it started; omitting duration"
+        );
+        None
+    } else {
+        Some(millis as u64)
+    }
 }
 
 fn read_env_profile_mode() -> Option<MountProfileMode> {
