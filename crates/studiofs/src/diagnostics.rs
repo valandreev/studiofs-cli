@@ -79,6 +79,14 @@ static TEST_START_FAILURE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 #[cfg(test)]
 static TEST_SAFE_ACTION_AUDIT_FAILURE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
+#[cfg(test)]
+fn test_safe_action_audit_failure_message() -> Option<String> {
+    TEST_SAFE_ACTION_AUDIT_FAILURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .clone()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "transport", rename_all = "snake_case")]
 pub(crate) enum LocalDiagnosticsEndpoint {
@@ -856,11 +864,7 @@ fn append_safe_action_audit(
     outcome: &SafeDebugActionOutcome,
 ) -> Result<()> {
     #[cfg(test)]
-    if let Some(message) = TEST_SAFE_ACTION_AUDIT_FAILURE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .clone()
-    {
+    if let Some(message) = test_safe_action_audit_failure_message() {
         return Err(anyhow!(message));
     }
 
