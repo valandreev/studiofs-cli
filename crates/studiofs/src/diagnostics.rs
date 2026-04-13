@@ -1,11 +1,15 @@
 use crate::cli::utils;
 use crate::investigation::{
     BuildIdentity, DiagnosticsPreset, DiagnosticsSettingsFingerprint, EnvironmentFingerprint,
-    InvestigationCase, InvestigationRun, InvestigationStore, MachineFingerprint,
-    NewInvestigationCase, NewInvestigationRun, NewProfilingWindow, NewTimelineEntry,
-    PlatformFingerprint, ProfileArtifactRecord, ProfilingCaptureMode, ProfilingCostEstimate,
-    ProfilingWindowRecord, ProfilingWindowStatus, RuntimeConfigurationFingerprint, TimelineEntry,
-    TimelineEntryKind, TimelineEntrySource, WorkloadIdentityFingerprint,
+    InvestigationCase, InvestigationRecommendedNextAction, InvestigationReport,
+    InvestigationReportEvidenceSummary, InvestigationReportFinding, InvestigationReportReferences,
+    InvestigationReportSectionSummary, InvestigationReportSelectedEvidence,
+    InvestigationReportTruncationSummary, InvestigationRun, InvestigationStore, MachineFingerprint,
+    NewInvestigationCase, NewInvestigationReport, NewInvestigationRun, NewProfilingWindow,
+    NewTimelineEntry, PlatformFingerprint, ProfileArtifactRecord, ProfilingCaptureMode,
+    ProfilingCostEstimate, ProfilingWindowRecord, ProfilingWindowStatus,
+    RuntimeConfigurationFingerprint, TimelineEntry, TimelineEntryKind, TimelineEntrySource,
+    WorkloadIdentityFingerprint,
 };
 use anyhow::{Context, Result, anyhow};
 use parking_lot::Mutex;
@@ -78,6 +82,10 @@ const DEFAULT_EVIDENCE_PROFILING_WINDOWS_LIMIT: usize = 4;
 const MAX_EVIDENCE_PROFILING_WINDOWS_LIMIT: usize = 16;
 const DEFAULT_EVIDENCE_DERIVED_ITEMS_PER_KIND: usize = 4;
 const MAX_EVIDENCE_DERIVED_ITEMS_PER_KIND: usize = 16;
+const MAX_REPORT_ANOMALIES: usize = 6;
+const MAX_REPORT_CANDIDATE_BOTTLENECKS: usize = 6;
+const MAX_REPORT_SELECTED_EVIDENCE: usize = 4;
+const MAX_REPORT_RECOMMENDED_NEXT_ACTIONS: usize = 3;
 const SUBSYSTEM_UPLOAD_PIPELINE: &str = "upload_pipeline";
 const SUBSYSTEM_WRITE_PATH: &str = "write_path";
 const SUBSYSTEM_SYNCHRONIZATION: &str = "synchronization";
@@ -1787,6 +1795,16 @@ fn build_evidence_view(
     source: &dyn DiagnosticsDataSource,
     store: &InvestigationStore,
 ) -> Result<DiagnosticsEvidenceView> {
+    build_evidence_view_with_snapshot(run_id, request, source.runtime_snapshot(), source, store)
+}
+
+fn build_evidence_view_with_snapshot(
+    run_id: &str,
+    request: DiagnosticsEvidenceRequest,
+    snapshot: DiagnosticsRuntimeSnapshot,
+    source: &dyn DiagnosticsDataSource,
+    store: &InvestigationStore,
+) -> Result<DiagnosticsEvidenceView> {
     let run = store.load_run(run_id)?;
     let applied_budget = clamp_evidence_budget(&request.budget);
     let resolved_marker_span = request
@@ -1869,7 +1887,6 @@ fn build_evidence_view(
         });
     }
 
-    let snapshot = source.runtime_snapshot();
     let snapshot_in_view = resolved_marker_span.is_none();
     let snapshot_sections =
         snapshot_sections_for_scope(&snapshot, &request.scope, resolved_marker_span.as_ref());
@@ -1924,6 +1941,320 @@ fn build_evidence_view(
             hotspots,
         },
     })
+}
+
+fn truncate_report_items<T>(
+    items: Vec<T>,
+    limit: usize,
+) -> (Vec<T>, InvestigationReportSectionSummary) {
+    let total_count = items.len();
+    let included_count = total_count.min(limit);
+    let truncated_count = total_count.saturating_sub(included_count);
+    (
+        items.into_iter().take(limit).collect(),
+        InvestigationReportSectionSummary {
+            included_count,
+            total_count,
+            truncated_count,
+        },
+    )
+}
+
+fn timeline_entry_reference(entry: &TimelineEntry) -> DiagnosticsEvidenceReference {
+    DiagnosticsEvidenceReference {
+        source: DiagnosticsEvidenceReferenceSource::TimelineEntry,
+        id: entry.sequence.to_string(),
+        field: None,
+    }
+}
+
+fn is_legacy_anomaly_reason(reason: Option<&str>) -> bool {
+    matches!(reason, Some("annotate anomaly" | "annotate_anomaly"))
+}
+
+fn is_anomaly_timeline_entry(entry: &TimelineEntry) -> bool {
+    entry.kind == TimelineEntryKind::Anomaly
+        || (entry.kind == TimelineEntryKind::Note
+            && is_legacy_anomaly_reason(entry.reason.as_deref()))
+}
+
+fn build_report_anomaly_candidates(
+    run: &InvestigationRun,
+    derived_view: &DiagnosticsEvidenceView,
+) -> Vec<InvestigationReportFinding> {
+    let mut anomalies = derived_view
+        .derived
+        .queue_growth
+        .iter()
+        .map(|episode| InvestigationReportFinding {
+            title: format!(
+                "{} {}",
+                episode.subsystem.replace('_', " "),
+                episode.operation_type.replace('_', " ")
+            ),
+            summary: format!(
+                "Pending uploads moved from {} to {} across events {}-{}.",
+                episode.start_pending_uploads,
+                episode.end_pending_uploads,
+                episode.start_event_sequence,
+                episode.end_event_sequence
+            ),
+            supporting_evidence: episode.supporting_evidence.clone(),
+        })
+        .collect::<Vec<_>>();
+    anomalies.extend(
+        run.timeline
+            .iter()
+            .filter(|entry| is_anomaly_timeline_entry(entry))
+            .map(|entry| InvestigationReportFinding {
+                title: entry.title.clone(),
+                summary: entry
+                    .body
+                    .clone()
+                    .unwrap_or_else(|| "Operator annotated a runtime anomaly.".to_string()),
+                supporting_evidence: vec![timeline_entry_reference(entry)],
+            }),
+    );
+    anomalies.extend(
+        derived_view
+            .raw
+            .profiling_windows
+            .iter()
+            .filter_map(|window| {
+                window
+                    .load_error
+                    .as_ref()
+                    .map(|error| InvestigationReportFinding {
+                        title: format!("profiling window {}", window.window.window_id),
+                        summary: format!("Profiling artifact could not be reloaded: {error}"),
+                        supporting_evidence: vec![DiagnosticsEvidenceReference {
+                            source: DiagnosticsEvidenceReferenceSource::ProfilingWindow,
+                            id: window.window.window_id.clone(),
+                            field: None,
+                        }],
+                    })
+            }),
+    );
+    anomalies
+}
+
+fn build_report_bottleneck_candidates(
+    derived_view: &DiagnosticsEvidenceView,
+) -> Vec<InvestigationReportFinding> {
+    let mut candidate_bottlenecks = derived_view
+        .derived
+        .blocking_intervals
+        .iter()
+        .map(|interval| InvestigationReportFinding {
+            title: format!(
+                "{} {}",
+                interval.subsystem.replace('_', " "),
+                interval.operation_type.replace('_', " ")
+            ),
+            summary: format!(
+                "Observed {:.1} ms blocked with a {:.1} ms max interval.",
+                interval.total_blocked_ms, interval.max_blocked_ms
+            ),
+            supporting_evidence: interval.supporting_evidence.clone(),
+        })
+        .collect::<Vec<_>>();
+    candidate_bottlenecks.extend(derived_view.derived.hotspots.iter().map(|hotspot| {
+        InvestigationReportFinding {
+            title: format!(
+                "{} {}",
+                hotspot.subsystem.replace('_', " "),
+                hotspot.operation_type.replace('_', " ")
+            ),
+            summary: format!(
+                "Hotspot metric '{}' scored {:.1}.",
+                hotspot.metric, hotspot.score
+            ),
+            supporting_evidence: hotspot.supporting_evidence.clone(),
+        }
+    }));
+    candidate_bottlenecks
+}
+
+fn build_report_selected_evidence_candidates(
+    run: &InvestigationRun,
+    derived_view: &DiagnosticsEvidenceView,
+) -> Vec<InvestigationReportSelectedEvidence> {
+    let mut selected_evidence = Vec::new();
+    if !derived_view.raw.snapshot_sections.is_empty() {
+        let sections = derived_view
+            .raw
+            .snapshot_sections
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        selected_evidence.push(InvestigationReportSelectedEvidence {
+            label: "runtime snapshot".to_string(),
+            summary: format!("Captured snapshot sections: {sections}."),
+            supporting_evidence: vec![DiagnosticsEvidenceReference {
+                source: DiagnosticsEvidenceReferenceSource::RuntimeSnapshot,
+                id: "runtime_snapshot".to_string(),
+                field: None,
+            }],
+        });
+    }
+    if let Some(event) = derived_view.raw.recent_events.last() {
+        selected_evidence.push(InvestigationReportSelectedEvidence {
+            label: format!("recent event {}", event.sequence),
+            summary: format!("{} / {}: {}", event.subsystem, event.kind, event.title),
+            supporting_evidence: vec![DiagnosticsEvidenceReference {
+                source: DiagnosticsEvidenceReferenceSource::RecentEvent,
+                id: event.sequence.to_string(),
+                field: None,
+            }],
+        });
+    }
+    selected_evidence.extend(run.profiling_windows.iter().map(|window| {
+        InvestigationReportSelectedEvidence {
+            label: format!("profiling window {}", window.window_id),
+            summary: format!(
+                "{:?} {:?} status {:?}",
+                window.capture_mode, window.preset, window.status
+            ),
+            supporting_evidence: vec![DiagnosticsEvidenceReference {
+                source: DiagnosticsEvidenceReferenceSource::ProfilingWindow,
+                id: window.window_id.clone(),
+                field: None,
+            }],
+        }
+    }));
+    selected_evidence
+}
+
+fn build_report_next_action_candidates(
+    run: &InvestigationRun,
+    marker_timeline: &[TimelineEntry],
+    derived_view: &DiagnosticsEvidenceView,
+) -> Vec<InvestigationRecommendedNextAction> {
+    let mut recommended_next_actions = Vec::new();
+    if run.profiling_windows.is_empty() {
+        recommended_next_actions.push(InvestigationRecommendedNextAction {
+            title: "capture a balanced wall-blocking profile".to_string(),
+            rationale:
+                "The run has no profiling captures yet, so a follow-up capture would strengthen the report."
+                    .to_string(),
+            supporting_evidence: Vec::new(),
+        });
+    }
+    if let Some(interval) = derived_view
+        .derived
+        .blocking_intervals
+        .iter()
+        .max_by(|left, right| left.total_blocked_ms.total_cmp(&right.total_blocked_ms))
+    {
+        recommended_next_actions.push(InvestigationRecommendedNextAction {
+            title: format!(
+                "drill into {} {}",
+                interval.subsystem.replace('_', " "),
+                interval.operation_type.replace('_', " ")
+            ),
+            rationale: format!(
+                "This interval accumulated {:.1} ms of blocked time and is the strongest current bottleneck candidate.",
+                interval.total_blocked_ms
+            ),
+            supporting_evidence: interval.supporting_evidence.clone(),
+        });
+    }
+    if marker_timeline.is_empty() {
+        recommended_next_actions.push(InvestigationRecommendedNextAction {
+            title: "add workload markers on the next run".to_string(),
+            rationale:
+                "Marker spans will make the next report easier to compare and easier to scope for focused evidence views."
+                    .to_string(),
+            supporting_evidence: Vec::new(),
+        });
+    }
+    if recommended_next_actions.is_empty() {
+        recommended_next_actions.push(InvestigationRecommendedNextAction {
+            title: "review the selected evidence with engineering".to_string(),
+            rationale:
+                "The report already contains enough concrete evidence to drive a focused follow-up discussion."
+                    .to_string(),
+            supporting_evidence: Vec::new(),
+        });
+    }
+    recommended_next_actions
+}
+
+/// Build the first durable single-run report from persisted run data and the
+/// current diagnostics-derived evidence view, keeping the artifact concise while
+/// recording when any section had to be truncated for readability.
+fn materialize_report(
+    run_id: &str,
+    source: &dyn DiagnosticsDataSource,
+    store: &InvestigationStore,
+) -> Result<InvestigationReport> {
+    let run = store.load_run(run_id)?;
+    let runtime_snapshot = source.runtime_snapshot();
+    let derived_view = build_evidence_view_with_snapshot(
+        run_id,
+        DiagnosticsEvidenceRequest {
+            scope: DiagnosticsEvidenceScope::default(),
+            budget: DiagnosticsEvidenceBudget::default(),
+        },
+        runtime_snapshot.clone(),
+        source,
+        store,
+    )?;
+    let marker_timeline = run
+        .timeline
+        .iter()
+        .filter(|entry| entry.kind == TimelineEntryKind::Marker)
+        .cloned()
+        .collect::<Vec<_>>();
+    let evidence_summary = InvestigationReportEvidenceSummary {
+        recent_event_count: derived_view.raw.recent_events.len(),
+        timeline_entry_count: derived_view.raw.timeline_entries.len(),
+        profiling_window_count: derived_view.raw.profiling_windows.len(),
+        queue_growth_count: derived_view.derived.queue_growth.len(),
+        blocking_interval_count: derived_view.derived.blocking_intervals.len(),
+        hotspot_count: derived_view.derived.hotspots.len(),
+    };
+    let (anomalies, anomaly_summary) = truncate_report_items(
+        build_report_anomaly_candidates(&run, &derived_view),
+        MAX_REPORT_ANOMALIES,
+    );
+    let (candidate_bottlenecks, candidate_bottleneck_summary) = truncate_report_items(
+        build_report_bottleneck_candidates(&derived_view),
+        MAX_REPORT_CANDIDATE_BOTTLENECKS,
+    );
+    let (selected_evidence, selected_evidence_summary) = truncate_report_items(
+        build_report_selected_evidence_candidates(&run, &derived_view),
+        MAX_REPORT_SELECTED_EVIDENCE,
+    );
+    let (recommended_next_actions, next_action_summary) = truncate_report_items(
+        build_report_next_action_candidates(&run, &marker_timeline, &derived_view),
+        MAX_REPORT_RECOMMENDED_NEXT_ACTIONS,
+    );
+
+    store.append_report(
+        run_id,
+        NewInvestigationReport {
+            environment: run.fingerprint.clone(),
+            marker_timeline,
+            evidence_summary,
+            truncation: InvestigationReportTruncationSummary {
+                anomalies: anomaly_summary,
+                candidate_bottlenecks: candidate_bottleneck_summary,
+                selected_evidence: selected_evidence_summary,
+                recommended_next_actions: next_action_summary,
+            },
+            anomalies,
+            candidate_bottlenecks,
+            selected_evidence,
+            recommended_next_actions,
+            references: InvestigationReportReferences {
+                runtime_snapshot,
+                derived_view,
+                profiling_windows: run.profiling_windows.clone(),
+            },
+        },
+    )
 }
 
 fn append_safe_action_audit(
@@ -2218,6 +2549,11 @@ enum DiagnosticsRequest {
         run_id: String,
         request: DiagnosticsEvidenceRequest,
     },
+    MaterializeReport {
+        auth_token: String,
+        lease_id: String,
+        run_id: String,
+    },
     AcquireController {
         auth_token: String,
         client_name: String,
@@ -2292,6 +2628,9 @@ enum DiagnosticsResponse {
     },
     EvidenceView {
         view: Box<DiagnosticsEvidenceView>,
+    },
+    InvestigationReport {
+        report: Box<InvestigationReport>,
     },
     ControllerLease {
         lease: ControllerLease,
@@ -2617,6 +2956,25 @@ impl LocalDiagnosticsClient {
             .await?
         {
             DiagnosticsResponse::ControllerLease { lease } => Ok(lease),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
+    pub(crate) async fn materialize_report(
+        &self,
+        lease_id: &str,
+        run_id: &str,
+    ) -> Result<InvestigationReport> {
+        match self
+            .send(DiagnosticsRequest::MaterializeReport {
+                auth_token: self.discovery.auth_token.clone(),
+                lease_id: lease_id.to_string(),
+                run_id: run_id.to_string(),
+            })
+            .await?
+        {
+            DiagnosticsResponse::InvestigationReport { report } => Ok(*report),
             DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
             other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
         }
@@ -3342,6 +3700,30 @@ fn execute_request(
         investigation_store.ok_or(MutatingRequestPrereqError::InvestigationUnavailable)
     }
 
+    fn require_mutating_store<'a>(
+        provided_token: &str,
+        auth_token: &str,
+        lease_id: &str,
+        lease_manager: &ControllerLeaseManager,
+        investigation_store: Option<&'a InvestigationStore>,
+    ) -> std::result::Result<&'a InvestigationStore, MutatingRequestPrereqError> {
+        mutating_request_store(
+            provided_token,
+            auth_token,
+            lease_id,
+            lease_manager,
+            investigation_store,
+        )
+    }
+
+    fn mutating_request_error_response(error: MutatingRequestPrereqError) -> DiagnosticsResponse {
+        match error {
+            MutatingRequestPrereqError::Unauthorized => unauthorized(),
+            MutatingRequestPrereqError::InvalidLease(error) => lease_error(error),
+            MutatingRequestPrereqError::InvestigationUnavailable => investigation_unavailable(),
+        }
+    }
+
     match request {
         DiagnosticsRequest::SessionInfo {
             auth_token: provided,
@@ -3393,7 +3775,7 @@ fn execute_request(
             run_id,
             request,
         } => {
-            let store = match mutating_request_store(
+            let store = match require_mutating_store(
                 &provided,
                 auth_token,
                 &lease_id,
@@ -3401,17 +3783,33 @@ fn execute_request(
                 investigation_store,
             ) {
                 Ok(store) => store,
-                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
-                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
-                    return lease_error(error);
-                }
-                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
-                    return investigation_unavailable();
-                }
+                Err(error) => return mutating_request_error_response(error),
             };
             match build_evidence_view(&run_id, request, source, store) {
                 Ok(view) => DiagnosticsResponse::EvidenceView {
                     view: Box::new(view),
+                },
+                Err(error) => store_error(error),
+            }
+        }
+        DiagnosticsRequest::MaterializeReport {
+            auth_token: provided,
+            lease_id,
+            run_id,
+        } => {
+            let store = match require_mutating_store(
+                &provided,
+                auth_token,
+                &lease_id,
+                lease_manager,
+                investigation_store,
+            ) {
+                Ok(store) => store,
+                Err(error) => return mutating_request_error_response(error),
+            };
+            match materialize_report(&run_id, source, store) {
+                Ok(report) => DiagnosticsResponse::InvestigationReport {
+                    report: Box::new(report),
                 },
                 Err(error) => store_error(error),
             }
@@ -3435,7 +3833,7 @@ fn execute_request(
             run_id,
             action,
         } => {
-            let store = match mutating_request_store(
+            let store = match require_mutating_store(
                 &provided,
                 auth_token,
                 &lease_id,
@@ -3443,13 +3841,7 @@ fn execute_request(
                 investigation_store,
             ) {
                 Ok(store) => store,
-                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
-                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
-                    return lease_error(error);
-                }
-                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
-                    return investigation_unavailable();
-                }
+                Err(error) => return mutating_request_error_response(error),
             };
             if let Err(error) = store.load_run(&run_id) {
                 return store_error(error);
@@ -3624,7 +4016,7 @@ fn execute_request(
             workload_identity,
             target_environment,
         } => {
-            let store = match mutating_request_store(
+            let store = match require_mutating_store(
                 &provided,
                 auth_token,
                 &lease_id,
@@ -3632,13 +4024,7 @@ fn execute_request(
                 investigation_store,
             ) {
                 Ok(store) => store,
-                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
-                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
-                    return lease_error(error);
-                }
-                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
-                    return investigation_unavailable();
-                }
+                Err(error) => return mutating_request_error_response(error),
             };
             match store.create_case(NewInvestigationCase {
                 title,
@@ -3658,7 +4044,7 @@ fn execute_request(
             case_id,
             run_workload_identity,
         } => {
-            let store = match mutating_request_store(
+            let store = match require_mutating_store(
                 &provided,
                 auth_token,
                 &lease_id,
@@ -3666,13 +4052,7 @@ fn execute_request(
                 investigation_store,
             ) {
                 Ok(store) => store,
-                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
-                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
-                    return lease_error(error);
-                }
-                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
-                    return investigation_unavailable();
-                }
+                Err(error) => return mutating_request_error_response(error),
             };
             let case = match store.load_case(&case_id) {
                 Ok(case) => case,
@@ -3697,7 +4077,7 @@ fn execute_request(
             run_id,
             request,
         } => {
-            let store = match mutating_request_store(
+            let store = match require_mutating_store(
                 &provided,
                 auth_token,
                 &lease_id,
@@ -3705,13 +4085,7 @@ fn execute_request(
                 investigation_store,
             ) {
                 Ok(store) => store,
-                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
-                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
-                    return lease_error(error);
-                }
-                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
-                    return investigation_unavailable();
-                }
+                Err(error) => return mutating_request_error_response(error),
             };
             let Some(profiling) = profiling else {
                 return profiling_unavailable();
@@ -3728,7 +4102,7 @@ fn execute_request(
             lease_id,
             window_id,
         } => {
-            let store = match mutating_request_store(
+            let store = match require_mutating_store(
                 &provided,
                 auth_token,
                 &lease_id,
@@ -3736,13 +4110,7 @@ fn execute_request(
                 investigation_store,
             ) {
                 Ok(store) => store,
-                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
-                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
-                    return lease_error(error);
-                }
-                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
-                    return investigation_unavailable();
-                }
+                Err(error) => return mutating_request_error_response(error),
             };
             let Some(profiling) = profiling else {
                 return profiling_unavailable();
@@ -3768,7 +4136,7 @@ fn execute_request(
             actor,
             reason,
         } => {
-            let store = match mutating_request_store(
+            let store = match require_mutating_store(
                 &provided,
                 auth_token,
                 &lease_id,
@@ -3776,13 +4144,7 @@ fn execute_request(
                 investigation_store,
             ) {
                 Ok(store) => store,
-                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
-                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
-                    return lease_error(error);
-                }
-                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
-                    return investigation_unavailable();
-                }
+                Err(error) => return mutating_request_error_response(error),
             };
             match store.append_timeline_entry(
                 &run_id,
@@ -4895,6 +5257,388 @@ mod tests {
     }
 
     #[test]
+    fn materialize_report_persists_reloadable_run_artifact_with_findings() {
+        let temp = mounts_dir_temp();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let (_case, run) = test_case_and_run(&store);
+        store
+            .append_timeline_entry(
+                &run.id,
+                NewTimelineEntry {
+                    source: TimelineEntrySource::Cli,
+                    kind: TimelineEntryKind::Marker,
+                    title: "start copy".to_string(),
+                    body: Some("Begin workload".to_string()),
+                    actor: Some("developer".to_string()),
+                    reason: Some("baseline".to_string()),
+                },
+            )
+            .expect("append marker");
+        store
+            .append_timeline_entry(
+                &run.id,
+                NewTimelineEntry {
+                    source: TimelineEntrySource::Mcp,
+                    kind: TimelineEntryKind::Anomaly,
+                    title: "queue growth".to_string(),
+                    body: Some("Pending uploads spiked during the copy.".to_string()),
+                    actor: Some("studiofs-dev-mcp".to_string()),
+                    reason: Some("operator observation".to_string()),
+                },
+            )
+            .expect("append note");
+
+        let mut health = DiagnosticsHealthSnapshot::default();
+        health.upload.pending_uploads = 9;
+        health.write_path.block_store_sync_data.queue_wait_total_ms = 75.0;
+        health.write_path.block_store_sync_data.queue_wait_max_ms = 30.0;
+        let source = StaticDiagnosticsSource {
+            health,
+            recent_events: vec![
+                sample_scoped_recent_event(
+                    1,
+                    2_000,
+                    SUBSYSTEM_UPLOAD_PIPELINE,
+                    "sample",
+                    serde_json::json!({"pending_uploads": 2, "path": "Q:/clips/reel.mov"}),
+                ),
+                sample_scoped_recent_event(
+                    2,
+                    2_500,
+                    SUBSYSTEM_UPLOAD_PIPELINE,
+                    "sample",
+                    serde_json::json!({"pending_uploads": 9, "path": "Q:/clips/reel.mov"}),
+                ),
+            ],
+            ..static_source()
+        };
+        let artifact = write_wall_blocking_artifact_fixture(
+            &temp,
+            "report-window.json",
+            DiagnosticsRuntimeSnapshot::default(),
+            source.runtime_snapshot(),
+            vec![],
+            vec![],
+        );
+        store
+            .append_profiling_window(
+                &run.id,
+                NewProfilingWindow {
+                    window_id: "window-1".to_string(),
+                    occurred_unix_ms: 2_400,
+                    capture_mode: ProfilingCaptureMode::WallBlocking,
+                    preset: DiagnosticsPreset::Balanced,
+                    requested_duration_ms: 1_000,
+                    actual_duration_ms: Some(950),
+                    sample_rate_hz: Some(99),
+                    estimated_cost: ProfilingCostEstimate {
+                        score: 2,
+                        label: "balanced".to_string(),
+                    },
+                    status: ProfilingWindowStatus::Completed,
+                    artifact: Some(artifact),
+                    error: None,
+                },
+            )
+            .expect("append profiling window");
+
+        let lease_manager = ControllerLeaseManager::default();
+        let lease = lease_manager
+            .acquire("tester".to_string(), Some(500))
+            .expect("acquire lease");
+
+        let response = execute_request(
+            DiagnosticsRequest::MaterializeReport {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id,
+                run_id: run.id.clone(),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        );
+
+        let DiagnosticsResponse::InvestigationReport { report } = response else {
+            panic!("expected investigation report response");
+        };
+
+        assert_eq!(report.run_id, run.id);
+        assert_eq!(report.marker_timeline.len(), 1);
+        assert!(!report.anomalies.is_empty());
+        assert!(!report.candidate_bottlenecks.is_empty());
+        assert!(!report.recommended_next_actions.is_empty());
+        assert_eq!(report.references.derived_view.run_id, run.id);
+        assert_eq!(report.references.profiling_windows.len(), 1);
+
+        let persisted = store
+            .load_report(&report.id)
+            .expect("load persisted report");
+        assert_eq!(persisted.id, report.id);
+        assert_eq!(persisted.references.profiling_windows.len(), 1);
+        assert_eq!(persisted.truncation.anomalies.truncated_count, 0);
+        assert_eq!(
+            persisted.truncation.candidate_bottlenecks.truncated_count,
+            0
+        );
+    }
+
+    #[test]
+    fn materialize_report_records_truncation_metadata_for_condensed_sections() {
+        let temp = mounts_dir_temp();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let (_case, run) = test_case_and_run(&store);
+
+        for index in 0..10 {
+            store
+                .append_timeline_entry(
+                    &run.id,
+                    NewTimelineEntry {
+                        source: TimelineEntrySource::Mcp,
+                        kind: TimelineEntryKind::Anomaly,
+                        title: format!("anomaly {index}"),
+                        body: Some(format!("Anomaly body {index}")),
+                        actor: Some("studiofs-dev-mcp".to_string()),
+                        reason: Some("operator observation".to_string()),
+                    },
+                )
+                .expect("append anomaly note");
+        }
+
+        let mut health = DiagnosticsHealthSnapshot::default();
+        health.upload.pending_uploads = 12;
+        health.write_path.block_store_sync_data.queue_wait_total_ms = 100.0;
+        health.write_path.block_store_sync_data.queue_wait_max_ms = 50.0;
+        health.write_path.write_backpressure.wait_total_ms = 80;
+
+        let source = StaticDiagnosticsSource {
+            health,
+            recent_events: (1..=8)
+                .map(|sequence| {
+                    sample_scoped_recent_event(
+                        sequence,
+                        3_000 + sequence,
+                        SUBSYSTEM_UPLOAD_PIPELINE,
+                        "sample",
+                        serde_json::json!({
+                            "pending_uploads": sequence + 1,
+                            "path": format!("Q:/clips/reel-{sequence}.mov")
+                        }),
+                    )
+                })
+                .collect(),
+            ..static_source()
+        };
+
+        for index in 0..6 {
+            let artifact = write_wall_blocking_artifact_fixture(
+                &temp,
+                &format!("report-window-{index}.json"),
+                DiagnosticsRuntimeSnapshot::default(),
+                source.runtime_snapshot(),
+                vec![],
+                vec![],
+            );
+            store
+                .append_profiling_window(
+                    &run.id,
+                    NewProfilingWindow {
+                        window_id: format!("window-{index}"),
+                        occurred_unix_ms: 4_000 + index,
+                        capture_mode: ProfilingCaptureMode::WallBlocking,
+                        preset: DiagnosticsPreset::Balanced,
+                        requested_duration_ms: 1_000,
+                        actual_duration_ms: Some(950),
+                        sample_rate_hz: Some(99),
+                        estimated_cost: ProfilingCostEstimate {
+                            score: 2,
+                            label: "balanced".to_string(),
+                        },
+                        status: ProfilingWindowStatus::Completed,
+                        artifact: Some(artifact),
+                        error: None,
+                    },
+                )
+                .expect("append profiling window");
+        }
+
+        let lease_manager = ControllerLeaseManager::default();
+        let lease = lease_manager
+            .acquire("tester".to_string(), Some(500))
+            .expect("acquire lease");
+
+        let response = execute_request(
+            DiagnosticsRequest::MaterializeReport {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id,
+                run_id: run.id.clone(),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        );
+
+        let DiagnosticsResponse::InvestigationReport { report } = response else {
+            panic!("expected investigation report response");
+        };
+
+        assert_eq!(
+            report.truncation.anomalies.included_count,
+            report.anomalies.len()
+        );
+        assert!(report.truncation.anomalies.truncated_count > 0);
+        assert!(report.truncation.candidate_bottlenecks.truncated_count > 0);
+        assert!(report.truncation.selected_evidence.truncated_count > 0);
+    }
+
+    #[test]
+    fn build_report_next_action_candidates_uses_largest_blocking_interval() {
+        let run = InvestigationRun {
+            id: "run-1".to_string(),
+            case_id: "case-1".to_string(),
+            session_id: "session-1".to_string(),
+            created_unix_ms: 1,
+            fingerprint: static_source().fingerprint,
+            profiling_windows: Vec::new(),
+            report_ids: Vec::new(),
+            timeline: Vec::new(),
+        };
+        let derived_view = DiagnosticsEvidenceView {
+            generated_unix_ms: 1,
+            run_id: run.id.clone(),
+            scope: DiagnosticsEvidenceScopeResolution::default(),
+            budget: DiagnosticsEvidenceBudgetReport {
+                requested: DiagnosticsEvidenceBudget::default(),
+                applied: DiagnosticsEvidenceBudget::default(),
+                truncation: DiagnosticsEvidenceTruncation::default(),
+            },
+            raw: DiagnosticsEvidenceRawView::default(),
+            derived: DiagnosticsDerivedEvidenceView {
+                queue_growth: Vec::new(),
+                blocking_intervals: vec![
+                    DiagnosticsBlockingInterval {
+                        subsystem: SUBSYSTEM_WRITE_PATH.to_string(),
+                        operation_type: OPERATION_SYNC_DATA_QUEUE_WAIT.to_string(),
+                        total_blocked_ms: 20.0,
+                        max_blocked_ms: 10.0,
+                        supporting_evidence: Vec::new(),
+                    },
+                    DiagnosticsBlockingInterval {
+                        subsystem: SUBSYSTEM_UPLOAD_PIPELINE.to_string(),
+                        operation_type: OPERATION_UPLOAD_FALLBACK_WAIT.to_string(),
+                        total_blocked_ms: 50.0,
+                        max_blocked_ms: 25.0,
+                        supporting_evidence: Vec::new(),
+                    },
+                ],
+                hotspots: Vec::new(),
+            },
+        };
+
+        let actions = build_report_next_action_candidates(&run, &[], &derived_view);
+        let drill_down = actions
+            .iter()
+            .find(|action| action.title.contains("drill into"))
+            .expect("drill-down action");
+
+        assert!(drill_down.title.contains("upload pipeline"));
+        assert!(drill_down.rationale.contains("50.0 ms"));
+    }
+
+    #[test]
+    fn materialize_report_reuses_single_runtime_snapshot_for_report_and_view() {
+        #[derive(Clone)]
+        struct CountingSnapshotSource {
+            session: DiagnosticsSessionInfo,
+            fingerprint: EnvironmentFingerprint,
+            counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        }
+
+        impl DiagnosticsDataSource for CountingSnapshotSource {
+            fn session_info(&self) -> DiagnosticsSessionInfo {
+                self.session.clone()
+            }
+
+            fn health_snapshot(&self) -> DiagnosticsHealthSnapshot {
+                DiagnosticsHealthSnapshot::default()
+            }
+
+            fn runtime_snapshot(&self) -> DiagnosticsRuntimeSnapshot {
+                let sequence = self
+                    .counter
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                DiagnosticsRuntimeSnapshot {
+                    generated_unix_ms: 10_000 + sequence,
+                    upload: VfsUploadStats {
+                        pending_uploads: sequence as usize,
+                        ..VfsUploadStats::default()
+                    },
+                    ..DiagnosticsRuntimeSnapshot::default()
+                }
+            }
+
+            fn recent_events(&self, _limit: usize) -> Vec<DiagnosticsRecentEvent> {
+                Vec::new()
+            }
+
+            fn environment_fingerprint(
+                &self,
+                case_workload_identity: Option<&str>,
+                run_workload_identity: Option<&str>,
+            ) -> EnvironmentFingerprint {
+                let mut fingerprint = self.fingerprint.clone();
+                fingerprint.workload_identity.case_workload =
+                    case_workload_identity.map(str::to_string);
+                fingerprint.workload_identity.run_workload =
+                    run_workload_identity.map(str::to_string);
+                fingerprint
+            }
+        }
+
+        let temp = mounts_dir_temp();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let (_case, run) = test_case_and_run(&store);
+        let static_source = static_source();
+        let source = CountingSnapshotSource {
+            session: static_source.session,
+            fingerprint: static_source.fingerprint,
+            counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let lease_manager = ControllerLeaseManager::default();
+        let lease = lease_manager
+            .acquire("tester".to_string(), Some(500))
+            .expect("acquire lease");
+
+        let response = execute_request(
+            DiagnosticsRequest::MaterializeReport {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id,
+                run_id: run.id,
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        );
+
+        let DiagnosticsResponse::InvestigationReport { report } = response else {
+            panic!("expected investigation report response");
+        };
+
+        let upload_pending_in_view = report.references.derived_view.raw.snapshot_sections["upload"]
+            ["pending_uploads"]
+            .as_u64()
+            .expect("pending uploads in derived view snapshot");
+        assert_eq!(report.references.runtime_snapshot.upload.pending_uploads, 1);
+        assert_eq!(upload_pending_in_view, 1);
+    }
+
+    #[test]
     fn silent_log_verbosity_action_returns_updated_level_without_timeline_entry() {
         let _guard = lock_diagnostics_test_mutex();
         crate::ensure_test_diagnostics_log_filter();
@@ -5521,11 +6265,11 @@ mod tests {
                 lease_id: lease.lease_id,
                 run_id: run.id.clone(),
                 source: TimelineEntrySource::Mcp,
-                kind: TimelineEntryKind::Note,
+                kind: TimelineEntryKind::Anomaly,
                 title: "cache miss burst".to_string(),
                 body: Some("MCP adapter observed a foreground read spike".to_string()),
                 actor: Some("studiofs-dev-mcp".to_string()),
-                reason: Some("annotate anomaly".to_string()),
+                reason: Some("operator observation".to_string()),
             },
             "secret",
             &source,

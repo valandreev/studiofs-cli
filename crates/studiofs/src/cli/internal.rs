@@ -41,6 +41,10 @@ impl InternalArgs {
             InternalAction::DiagnosticsAddTimeline(args) => run_diagnostics_add_timeline(args),
             InternalAction::DiagnosticsReadCase(args) => run_diagnostics_read_case(args),
             InternalAction::DiagnosticsReadRun(args) => run_diagnostics_read_run(args),
+            InternalAction::DiagnosticsMaterializeReport(args) => {
+                run_diagnostics_materialize_report(args)
+            }
+            InternalAction::DiagnosticsReadReport(args) => run_diagnostics_read_report(args),
         }
     }
 }
@@ -63,6 +67,10 @@ enum InternalAction {
     DiagnosticsReadCase(DiagnosticsReadCaseArgs),
     #[command(name = "diagnostics-read-run", hide = true)]
     DiagnosticsReadRun(DiagnosticsReadRunArgs),
+    #[command(name = "diagnostics-materialize-report", hide = true)]
+    DiagnosticsMaterializeReport(DiagnosticsMaterializeReportArgs),
+    #[command(name = "diagnostics-read-report", hide = true)]
+    DiagnosticsReadReport(DiagnosticsReadReportArgs),
 }
 
 #[derive(Debug, Args)]
@@ -135,6 +143,7 @@ impl From<TimelineSourceArg> for TimelineEntrySource {
 enum TimelineKindArg {
     Marker,
     Note,
+    Anomaly,
 }
 
 impl From<TimelineKindArg> for TimelineEntryKind {
@@ -142,6 +151,7 @@ impl From<TimelineKindArg> for TimelineEntryKind {
         match value {
             TimelineKindArg::Marker => TimelineEntryKind::Marker,
             TimelineKindArg::Note => TimelineEntryKind::Note,
+            TimelineKindArg::Anomaly => TimelineEntryKind::Anomaly,
         }
     }
 }
@@ -185,6 +195,23 @@ struct DiagnosticsReadCaseArgs {
 struct DiagnosticsReadRunArgs {
     #[arg(long)]
     run_id: String,
+}
+
+#[derive(Debug, Args)]
+struct DiagnosticsMaterializeReportArgs {
+    mount_point: String,
+
+    #[arg(long)]
+    lease_id: String,
+
+    #[arg(long)]
+    run_id: String,
+}
+
+#[derive(Debug, Args)]
+struct DiagnosticsReadReportArgs {
+    #[arg(long)]
+    report_id: String,
 }
 
 fn run_diagnostics_attach(args: DiagnosticsAttachArgs) -> anyhow::Result<()> {
@@ -288,6 +315,25 @@ fn run_diagnostics_read_case(args: DiagnosticsReadCaseArgs) -> anyhow::Result<()
 
 fn run_diagnostics_read_run(args: DiagnosticsReadRunArgs) -> anyhow::Result<()> {
     let payload = InvestigationStore::default_store()?.load_run(&args.run_id)?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+fn run_diagnostics_materialize_report(
+    args: DiagnosticsMaterializeReportArgs,
+) -> anyhow::Result<()> {
+    let client = live_client_for_mount(&args.mount_point)?;
+    let payload = crate::runtime_bridge::block_on(async move {
+        client
+            .materialize_report(&args.lease_id, &args.run_id)
+            .await
+    })?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+fn run_diagnostics_read_report(args: DiagnosticsReadReportArgs) -> anyhow::Result<()> {
+    let payload = InvestigationStore::default_store()?.load_report(&args.report_id)?;
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())
 }
@@ -417,6 +463,29 @@ mod tests {
             })
         ));
 
+        let add_anomaly = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-add-timeline",
+            "Z:",
+            "--lease-id",
+            "lease-1",
+            "--run-id",
+            "run-1",
+            "--source",
+            "mcp",
+            "--kind",
+            "anomaly",
+            "--title",
+            "cache miss burst",
+        ])
+        .unwrap();
+        assert!(matches!(
+            add_anomaly.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsAddTimeline(_)
+            })
+        ));
+
         let read_case = crate::cli::parse_for_test(&[
             "internal",
             "diagnostics-read-case",
@@ -438,6 +507,37 @@ mod tests {
             read_run.command,
             crate::cli::Commands::Internal(InternalArgs {
                 action: InternalAction::DiagnosticsReadRun(_)
+            })
+        ));
+
+        let materialize_report = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-materialize-report",
+            "Z:",
+            "--lease-id",
+            "lease-1",
+            "--run-id",
+            "run-1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            materialize_report.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsMaterializeReport(_)
+            })
+        ));
+
+        let read_report = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-read-report",
+            "--report-id",
+            "report-1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            read_report.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsReadReport(_)
             })
         ));
     }

@@ -16,9 +16,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::OnceLock;
 
 pub(crate) const INVESTIGATION_STORE_VERSION: u32 = 1;
+pub(crate) const INVESTIGATION_REPORT_SCHEMA_VERSION: u32 = 1;
 
 #[cfg(test)]
 static TEST_BASE_DIR: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+static TEST_SAVE_JSON_FAILURE_PATTERN: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InvestigationCase {
@@ -41,6 +44,8 @@ pub(crate) struct InvestigationRun {
     pub fingerprint: EnvironmentFingerprint,
     #[serde(default)]
     pub profiling_windows: Vec<ProfilingWindowRecord>,
+    #[serde(default)]
+    pub report_ids: Vec<String>,
     pub timeline: Vec<TimelineEntry>,
 }
 
@@ -172,6 +177,7 @@ pub(crate) enum TimelineEntrySource {
 pub(crate) enum TimelineEntryKind {
     Marker,
     Note,
+    Anomaly,
     Action,
 }
 
@@ -185,6 +191,87 @@ pub(crate) struct TimelineEntry {
     pub body: Option<String>,
     pub actor: Option<String>,
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct InvestigationReportEvidenceSummary {
+    pub recent_event_count: usize,
+    pub timeline_entry_count: usize,
+    pub profiling_window_count: usize,
+    pub queue_growth_count: usize,
+    pub blocking_interval_count: usize,
+    pub hotspot_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct InvestigationReportSectionSummary {
+    pub included_count: usize,
+    pub total_count: usize,
+    pub truncated_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct InvestigationReportTruncationSummary {
+    pub anomalies: InvestigationReportSectionSummary,
+    pub candidate_bottlenecks: InvestigationReportSectionSummary,
+    pub selected_evidence: InvestigationReportSectionSummary,
+    pub recommended_next_actions: InvestigationReportSectionSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct InvestigationReportFinding {
+    pub title: String,
+    pub summary: String,
+    #[serde(default)]
+    pub supporting_evidence: Vec<crate::diagnostics::DiagnosticsEvidenceReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct InvestigationReportSelectedEvidence {
+    pub label: String,
+    pub summary: String,
+    #[serde(default)]
+    pub supporting_evidence: Vec<crate::diagnostics::DiagnosticsEvidenceReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct InvestigationRecommendedNextAction {
+    pub title: String,
+    pub rationale: String,
+    #[serde(default)]
+    pub supporting_evidence: Vec<crate::diagnostics::DiagnosticsEvidenceReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct InvestigationReportReferences {
+    pub runtime_snapshot: crate::diagnostics::DiagnosticsRuntimeSnapshot,
+    pub derived_view: crate::diagnostics::DiagnosticsEvidenceView,
+    #[serde(default)]
+    pub profiling_windows: Vec<ProfilingWindowRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct InvestigationReport {
+    pub schema_version: u32,
+    pub id: String,
+    pub run_id: String,
+    pub case_id: String,
+    pub created_unix_ms: u64,
+    pub environment: EnvironmentFingerprint,
+    #[serde(default)]
+    pub marker_timeline: Vec<TimelineEntry>,
+    pub evidence_summary: InvestigationReportEvidenceSummary,
+    #[serde(default)]
+    pub truncation: InvestigationReportTruncationSummary,
+    #[serde(default)]
+    pub anomalies: Vec<InvestigationReportFinding>,
+    #[serde(default)]
+    pub candidate_bottlenecks: Vec<InvestigationReportFinding>,
+    #[serde(default)]
+    pub selected_evidence: Vec<InvestigationReportSelectedEvidence>,
+    #[serde(default)]
+    pub recommended_next_actions: Vec<InvestigationRecommendedNextAction>,
+    pub references: InvestigationReportReferences,
 }
 
 #[derive(Debug, Clone)]
@@ -225,6 +312,19 @@ pub(crate) struct NewProfilingWindow {
     pub status: ProfilingWindowStatus,
     pub artifact: Option<ProfileArtifactRecord>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NewInvestigationReport {
+    pub environment: EnvironmentFingerprint,
+    pub marker_timeline: Vec<TimelineEntry>,
+    pub evidence_summary: InvestigationReportEvidenceSummary,
+    pub truncation: InvestigationReportTruncationSummary,
+    pub anomalies: Vec<InvestigationReportFinding>,
+    pub candidate_bottlenecks: Vec<InvestigationReportFinding>,
+    pub selected_evidence: Vec<InvestigationReportSelectedEvidence>,
+    pub recommended_next_actions: Vec<InvestigationRecommendedNextAction>,
+    pub references: InvestigationReportReferences,
 }
 
 #[derive(Debug)]
@@ -284,6 +384,7 @@ impl InvestigationStore {
             created_unix_ms: now,
             fingerprint: input.fingerprint,
             profiling_windows: Vec::new(),
+            report_ids: Vec::new(),
             timeline: Vec::new(),
         };
 
@@ -371,6 +472,56 @@ impl InvestigationStore {
         Ok(window)
     }
 
+    pub(crate) fn append_report(
+        &self,
+        run_id: &str,
+        input: NewInvestigationReport,
+    ) -> Result<InvestigationReport> {
+        let _guard = self.io_lock.lock();
+        let _store_lock = self.lock_store()?;
+        self.ensure_layout()?;
+
+        let mut run = self.load_json::<InvestigationRun>(&self.run_path(run_id))?;
+        let report = InvestigationReport {
+            schema_version: INVESTIGATION_REPORT_SCHEMA_VERSION,
+            id: Uuid::new_v4().to_string(),
+            run_id: run_id.to_string(),
+            case_id: run.case_id.clone(),
+            created_unix_ms: now_unix_millis(),
+            environment: input.environment,
+            marker_timeline: input.marker_timeline,
+            evidence_summary: input.evidence_summary,
+            truncation: input.truncation,
+            anomalies: input.anomalies,
+            candidate_bottlenecks: input.candidate_bottlenecks,
+            selected_evidence: input.selected_evidence,
+            recommended_next_actions: input.recommended_next_actions,
+            references: input.references,
+        };
+        let report_path = self.report_path(&report.id)?;
+        self.save_json(&report_path, &report)?;
+        run.report_ids.push(report.id.clone());
+        if let Err(run_save_error) = self.save_json(&self.run_path(run_id), &run) {
+            match fs::remove_file(&report_path) {
+                Ok(()) => {}
+                Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(cleanup_error) => {
+                    return Err(anyhow!(
+                        "failed to save run after writing report '{}'; additionally failed to remove orphaned report file '{}': {}",
+                        report.id,
+                        report_path.display(),
+                        cleanup_error
+                    ))
+                    .context(run_save_error);
+                }
+            }
+            return Err(run_save_error).context(
+                "failed to save run after writing report; cleaned up orphaned report file",
+            );
+        }
+        Ok(report)
+    }
+
     pub(crate) fn load_case(&self, case_id: &str) -> Result<InvestigationCase> {
         let _guard = self.io_lock.lock();
         let _store_lock = self.lock_store()?;
@@ -388,10 +539,17 @@ impl InvestigationStore {
         Ok(run)
     }
 
+    pub(crate) fn load_report(&self, report_id: &str) -> Result<InvestigationReport> {
+        let _guard = self.io_lock.lock();
+        let _store_lock = self.lock_store()?;
+        self.load_json(&self.report_path(report_id)?)
+    }
+
     fn ensure_layout(&self) -> Result<()> {
         ensure_private_directory(&self.base_dir)?;
         ensure_private_directory(&self.cases_dir())?;
         ensure_private_directory(&self.runs_dir())?;
+        ensure_private_directory(&self.reports_dir())?;
 
         let version_path = self.base_dir.join("store.json");
         if !version_path.exists() {
@@ -411,12 +569,22 @@ impl InvestigationStore {
         self.base_dir.join("runs")
     }
 
+    fn reports_dir(&self) -> PathBuf {
+        self.base_dir.join("reports")
+    }
+
     fn case_path(&self, case_id: &str) -> PathBuf {
         self.cases_dir().join(format!("{case_id}.json"))
     }
 
     fn run_path(&self, run_id: &str) -> PathBuf {
         self.runs_dir().join(format!("{run_id}.json"))
+    }
+
+    fn report_path(&self, report_id: &str) -> Result<PathBuf> {
+        Ok(self
+            .reports_dir()
+            .join(format!("{}.json", canonical_report_id(report_id)?)))
     }
 
     fn timeline_log_path(&self, run_id: &str) -> PathBuf {
@@ -437,6 +605,18 @@ impl InvestigationStore {
     where
         T: Serialize + ?Sized,
     {
+        #[cfg(test)]
+        if let Some(pattern) = test_save_json_failure_pattern()
+            && path
+                .file_name()
+                .and_then(|file_name| file_name.to_str())
+                .is_some_and(|file_name| file_name.contains(&pattern))
+        {
+            return Err(anyhow!(
+                "synthetic save_json failure for '{}'",
+                path.display()
+            ));
+        }
         if let Some(parent) = path.parent() {
             ensure_private_directory(parent)?;
         }
@@ -639,6 +819,12 @@ fn default_store_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+fn canonical_report_id(report_id: &str) -> Result<String> {
+    Uuid::parse_str(report_id)
+        .map(|uuid| uuid.to_string())
+        .map_err(|error| anyhow!("invalid report id '{}': {error}", report_id))
+}
+
 fn ensure_private_directory(path: &Path) -> Result<()> {
     fs::create_dir_all(path)
         .with_context(|| format!("create investigation directory '{}'", path.display()))?;
@@ -678,6 +864,21 @@ fn set_private_file_permissions(_path: &Path) -> Result<()> {
 #[cfg(test)]
 pub(crate) fn set_test_store_base_dir(path: Option<&Path>) {
     *TEST_BASE_DIR.get_or_init(|| Mutex::new(None)).lock() = path.map(Path::to_path_buf);
+}
+
+#[cfg(test)]
+fn test_save_json_failure_pattern() -> Option<String> {
+    TEST_SAVE_JSON_FAILURE_PATTERN
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .clone()
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_save_json_failure_pattern(pattern: Option<&str>) {
+    *TEST_SAVE_JSON_FAILURE_PATTERN
+        .get_or_init(|| Mutex::new(None))
+        .lock() = pattern.map(str::to_string);
 }
 
 #[cfg(test)]
@@ -962,6 +1163,7 @@ mod tests {
             created_unix_ms: 1,
             fingerprint: sample_fingerprint(),
             profiling_windows: Vec::new(),
+            report_ids: Vec::new(),
             timeline: vec![TimelineEntry {
                 sequence: 1,
                 occurred_unix_ms: 1,
@@ -1022,6 +1224,7 @@ mod tests {
             created_unix_ms: 1,
             fingerprint: sample_fingerprint(),
             profiling_windows: Vec::new(),
+            report_ids: Vec::new(),
             timeline: vec![TimelineEntry {
                 sequence: 1,
                 occurred_unix_ms: 1,
@@ -1285,6 +1488,233 @@ mod tests {
         assert_eq!(window.occurred_unix_ms, 123_456);
         let reloaded = store.load_run(&run.id).expect("reload run");
         assert_eq!(reloaded.profiling_windows[0].occurred_unix_ms, 123_456);
+    }
+
+    #[test]
+    fn store_persists_report_artifact_and_links_it_from_run() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let case = store
+            .create_case(NewInvestigationCase {
+                title: "single-run report".to_string(),
+                problem_statement: Some("Need a durable artifact".to_string()),
+                workload_identity: Some("aja".to_string()),
+                target_environment: Some("artist workstation".to_string()),
+            })
+            .expect("create case");
+        let run = store
+            .create_run(NewInvestigationRun {
+                case_id: case.id.clone(),
+                session_id: "session-1".to_string(),
+                fingerprint: sample_fingerprint(),
+            })
+            .expect("create run");
+        let report = store
+            .append_report(
+                &run.id,
+                NewInvestigationReport {
+                    environment: sample_fingerprint(),
+                    marker_timeline: vec![TimelineEntry {
+                        sequence: 1,
+                        occurred_unix_ms: 1_000,
+                        source: TimelineEntrySource::Cli,
+                        kind: TimelineEntryKind::Marker,
+                        title: "start copy".to_string(),
+                        body: Some("Begin workload".to_string()),
+                        actor: Some("developer".to_string()),
+                        reason: Some("baseline".to_string()),
+                    }],
+                    evidence_summary: InvestigationReportEvidenceSummary {
+                        recent_event_count: 2,
+                        timeline_entry_count: 3,
+                        profiling_window_count: 1,
+                        queue_growth_count: 1,
+                        blocking_interval_count: 1,
+                        hotspot_count: 1,
+                    },
+                    truncation: InvestigationReportTruncationSummary::default(),
+                    anomalies: vec![InvestigationReportFinding {
+                        title: "Upload queue growth".to_string(),
+                        summary: "Pending uploads grew across the workload span.".to_string(),
+                        supporting_evidence: vec![crate::diagnostics::DiagnosticsEvidenceReference {
+                            source: crate::diagnostics::DiagnosticsEvidenceReferenceSource::RecentEvent,
+                            id: "2".to_string(),
+                            field: Some("pending_uploads".to_string()),
+                        }],
+                    }],
+                    candidate_bottlenecks: vec![InvestigationReportFinding {
+                        title: "sync_data queue wait".to_string(),
+                        summary: "Write-path queue wait dominated the captured profile.".to_string(),
+                        supporting_evidence: vec![crate::diagnostics::DiagnosticsEvidenceReference {
+                            source: crate::diagnostics::DiagnosticsEvidenceReferenceSource::ProfilingArtifact,
+                            id: "profiles/window-1.json".to_string(),
+                            field: Some(
+                                "end_snapshot.write_path.block_store_sync_data.queue_wait_total_ms"
+                                    .to_string(),
+                            ),
+                        }],
+                    }],
+                    selected_evidence: vec![InvestigationReportSelectedEvidence {
+                        label: "Runtime snapshot".to_string(),
+                        summary: "Captured upload, write-path, cache, and synchronization sections."
+                            .to_string(),
+                        supporting_evidence: vec![crate::diagnostics::DiagnosticsEvidenceReference {
+                            source: crate::diagnostics::DiagnosticsEvidenceReferenceSource::RuntimeSnapshot,
+                            id: "runtime_snapshot".to_string(),
+                            field: Some("write_path".to_string()),
+                        }],
+                    }],
+                    recommended_next_actions: vec![InvestigationRecommendedNextAction {
+                        title: "Inspect sync_data ownership".to_string(),
+                        rationale:
+                            "Follow the write-path queue wait evidence before proposing a code change."
+                                .to_string(),
+                        supporting_evidence: vec![crate::diagnostics::DiagnosticsEvidenceReference {
+                            source: crate::diagnostics::DiagnosticsEvidenceReferenceSource::ProfilingWindow,
+                            id: "window-1".to_string(),
+                            field: None,
+                        }],
+                    }],
+                    references: InvestigationReportReferences {
+                        runtime_snapshot: crate::diagnostics::DiagnosticsRuntimeSnapshot::default(),
+                        derived_view: crate::diagnostics::DiagnosticsEvidenceView {
+                            generated_unix_ms: 2_000,
+                            run_id: run.id.clone(),
+                            scope: crate::diagnostics::DiagnosticsEvidenceScopeResolution::default(),
+                            budget: crate::diagnostics::DiagnosticsEvidenceBudgetReport {
+                                requested: crate::diagnostics::DiagnosticsEvidenceBudget::default(),
+                                applied: crate::diagnostics::DiagnosticsEvidenceBudget::default(),
+                                truncation:
+                                    crate::diagnostics::DiagnosticsEvidenceTruncation::default(),
+                            },
+                            raw: crate::diagnostics::DiagnosticsEvidenceRawView::default(),
+                            derived: crate::diagnostics::DiagnosticsDerivedEvidenceView::default(),
+                        },
+                        profiling_windows: vec![ProfilingWindowRecord {
+                            window_id: "window-1".to_string(),
+                            sequence: 1,
+                            occurred_unix_ms: 1_500,
+                            capture_mode: ProfilingCaptureMode::WallBlocking,
+                            preset: DiagnosticsPreset::Balanced,
+                            requested_duration_ms: 1_000,
+                            actual_duration_ms: Some(950),
+                            sample_rate_hz: Some(99),
+                            estimated_cost: ProfilingCostEstimate {
+                                score: 2,
+                                label: "balanced".to_string(),
+                            },
+                            status: ProfilingWindowStatus::Completed,
+                            artifact: Some(ProfileArtifactRecord {
+                                kind: "wall_blocking_summary".to_string(),
+                                path: "profiles/window-1.json".to_string(),
+                                bytes: 512,
+                            }),
+                            error: None,
+                        }],
+                    },
+                },
+            )
+            .expect("append report");
+
+        let reopened = InvestigationStore::new(store.base_dir().to_path_buf());
+        let reloaded_report = reopened.load_report(&report.id).expect("load report");
+        let reloaded_run = reopened.load_run(&run.id).expect("load run");
+
+        assert_eq!(reloaded_run.report_ids, vec![report.id.clone()]);
+        assert_eq!(reloaded_report.run_id, run.id);
+        assert_eq!(reloaded_report.case_id, case.id);
+        assert_eq!(reloaded_report.marker_timeline.len(), 1);
+        assert_eq!(reloaded_report.evidence_summary.hotspot_count, 1);
+        assert_eq!(reloaded_report.candidate_bottlenecks.len(), 1);
+        assert_eq!(reloaded_report.references.profiling_windows.len(), 1);
+    }
+
+    #[test]
+    fn load_report_rejects_non_uuid_ids() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+
+        let error = store
+            .load_report("../outside-store")
+            .expect_err("invalid report id should be rejected");
+
+        assert!(error.to_string().contains("invalid report id"));
+    }
+
+    #[test]
+    fn append_report_cleans_up_orphaned_report_when_run_save_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let case = store
+            .create_case(NewInvestigationCase {
+                title: "cleanup".to_string(),
+                problem_statement: None,
+                workload_identity: None,
+                target_environment: None,
+            })
+            .expect("create case");
+        let run = store
+            .create_run(NewInvestigationRun {
+                case_id: case.id,
+                session_id: "session-1".to_string(),
+                fingerprint: sample_fingerprint(),
+            })
+            .expect("create run");
+
+        set_test_save_json_failure_pattern(Some(&format!("{}.json", run.id)));
+        let result = store.append_report(
+            &run.id,
+            NewInvestigationReport {
+                environment: sample_fingerprint(),
+                marker_timeline: Vec::new(),
+                evidence_summary: InvestigationReportEvidenceSummary {
+                    recent_event_count: 0,
+                    timeline_entry_count: 0,
+                    profiling_window_count: 0,
+                    queue_growth_count: 0,
+                    blocking_interval_count: 0,
+                    hotspot_count: 0,
+                },
+                truncation: InvestigationReportTruncationSummary::default(),
+                anomalies: Vec::new(),
+                candidate_bottlenecks: Vec::new(),
+                selected_evidence: Vec::new(),
+                recommended_next_actions: Vec::new(),
+                references: InvestigationReportReferences {
+                    runtime_snapshot: crate::diagnostics::DiagnosticsRuntimeSnapshot::default(),
+                    derived_view: crate::diagnostics::DiagnosticsEvidenceView {
+                        generated_unix_ms: 0,
+                        run_id: run.id.clone(),
+                        scope: crate::diagnostics::DiagnosticsEvidenceScopeResolution::default(),
+                        budget: crate::diagnostics::DiagnosticsEvidenceBudgetReport {
+                            requested: crate::diagnostics::DiagnosticsEvidenceBudget::default(),
+                            applied: crate::diagnostics::DiagnosticsEvidenceBudget::default(),
+                            truncation: crate::diagnostics::DiagnosticsEvidenceTruncation::default(
+                            ),
+                        },
+                        raw: crate::diagnostics::DiagnosticsEvidenceRawView::default(),
+                        derived: crate::diagnostics::DiagnosticsDerivedEvidenceView::default(),
+                    },
+                    profiling_windows: Vec::new(),
+                },
+            },
+        );
+        set_test_save_json_failure_pattern(None);
+
+        let error = result.expect_err("run save failure should abort report append");
+        assert!(
+            error
+                .to_string()
+                .contains("cleaned up orphaned report file")
+        );
+        let report_files = fs::read_dir(store.reports_dir())
+            .expect("read reports dir")
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        assert!(
+            report_files.is_empty(),
+            "orphaned report file should be removed"
+        );
     }
 
     #[cfg(unix)]
