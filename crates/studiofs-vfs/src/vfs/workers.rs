@@ -319,7 +319,7 @@ impl StudioVfs {
             let dentry_cache = self.dentry_cache_metrics();
             let path_shortcut_cache = self.path_shortcut_cache_metrics();
             let attr_read_cache = self.attr_read_cache_metrics();
-            let local_backend_dirty_count = self.local_block_backend.dirty_object_ids().len();
+            let local_backend_dirty_count = self.local_block_backend.dirty_object_count();
             let transit_memory = self.transit_memory_budget.snapshot();
             let file_sessions = self.file_session_stats();
 
@@ -327,6 +327,28 @@ impl StudioVfs {
                 ticks_since_last_log = 0;
                 let pending_uploads =
                     Self::format_upload_pipeline_pending_uploads(pending_upload_bytes);
+                let became_idle = !is_active && upload_pipeline_summary_was_active;
+                if let Some((event_kind, event_title)) =
+                    Self::upload_pipeline_runtime_event(activity_started, became_idle, is_active)
+                {
+                    self.record_runtime_event(
+                        "upload_pipeline",
+                        event_kind,
+                        event_title,
+                        serde_json::json!({
+                            "pending_uploads": pending,
+                            "pending_upload_bytes": pending_upload_bytes,
+                            "pending_uploads_human": pending_uploads,
+                            "pending_metadata_ops": pending_metadata_ops,
+                            "inflight_metadata_ops": metadata_backlog.inflight_ops,
+                            "dirty_mem_blocks": ingress.dirty_mem_blocks,
+                            "dirty_mem_bytes": ingress.dirty_mem_bytes,
+                            "write_backpressure_events": ingress.write_backpressure_events,
+                            "write_backpressure_wait_ms": ingress.write_backpressure_wait_ms,
+                            "foreground_read_p90_latency_ns": foreground_read_protection.p90_latency_ns,
+                        }),
+                    );
+                }
                 info!(
                     pending_uploads = %pending_uploads,
                     pending_metadata_ops,

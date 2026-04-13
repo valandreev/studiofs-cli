@@ -1,3 +1,4 @@
+use super::file_session::VfsFileSessionStats;
 use serde::{Deserialize, Serialize};
 
 /// Filesystem statistics returned by `statfs()`.
@@ -286,4 +287,74 @@ pub struct VfsForegroundReadProtectionStats {
     pub upload_fallback_read_max_ns: u64,
     pub upload_cache_io_foreground_cost: u32,
     pub upload_scheduler_penalty_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VfsNamespaceCacheSnapshot {
+    pub hits: u64,
+    pub protected_hits: u64,
+    pub misses: u64,
+    pub negative_hits: u64,
+    pub evictions: u64,
+    pub negative_hit_ratio: f64,
+    pub hot_hit_ratio: f64,
+    pub occupancy_entries: usize,
+    pub occupancy_bytes: usize,
+    pub protected_occupancy_entries: usize,
+    pub protected_occupancy_bytes: usize,
+    pub entry_budget: usize,
+    pub byte_budget: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VfsAttrReadCacheSnapshot {
+    pub hits: u64,
+    pub protected_hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub hot_hit_ratio: f64,
+    pub occupancy_entries: usize,
+    pub occupancy_bytes: usize,
+    pub protected_occupancy_entries: usize,
+    pub protected_occupancy_bytes: usize,
+    pub entry_budget: usize,
+    pub byte_budget: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VfsTransitMemorySnapshot {
+    pub budget_bytes: usize,
+    pub used_bytes: usize,
+    pub available_bytes: usize,
+    pub waiting_foreground: usize,
+    pub waiting_background: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VfsCacheStateSnapshot {
+    pub dentry_cache: VfsNamespaceCacheSnapshot,
+    pub path_shortcut_cache: VfsNamespaceCacheSnapshot,
+    pub attr_read_cache: VfsAttrReadCacheSnapshot,
+    pub local_backend_dirty_objects: usize,
+    pub prefetch_queue_depth: u64,
+    pub transit_memory: VfsTransitMemorySnapshot,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VfsSynchronizationStateSnapshot {
+    pub file_sessions: VfsFileSessionStats,
+    pub foreground_reads: VfsForegroundReadProtectionStats,
+    pub pending_metadata_ops: u32,
+    pub inflight_metadata_ops: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VfsRuntimeEvent {
+    pub sequence: u64,
+    pub generated_unix_ms: u64,
+    pub subsystem: String,
+    pub kind: String,
+    pub title: String,
+    #[serde(default)]
+    pub fields: serde_json::Value,
 }

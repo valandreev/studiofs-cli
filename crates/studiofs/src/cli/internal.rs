@@ -77,6 +77,9 @@ struct DiagnosticsAttachArgs {
 
     #[arg(long, default_value_t = 5_000)]
     ttl_ms: u64,
+
+    #[arg(long, default_value_t = 16)]
+    recent_events_limit: usize,
 }
 
 #[derive(Debug, Args)]
@@ -187,9 +190,21 @@ struct DiagnosticsReadRunArgs {
 fn run_diagnostics_attach(args: DiagnosticsAttachArgs) -> anyhow::Result<()> {
     let client = live_client_for_mount(&args.mount_point)?;
     let ttl = Duration::from_millis(args.ttl_ms.max(1));
+    let recent_events_limit = args
+        .recent_events_limit
+        .clamp(1, diagnostics::MAX_RECENT_EVENTS_LIMIT);
     let payload = crate::runtime_bridge::block_on(async move {
         let session = client.session_info().await?;
         let health = client.health().await?;
+        let (runtime_snapshot, recent_events) =
+            if diagnostics_runtime_surface_supported(session.protocol_version) {
+                (
+                    Some(client.runtime_snapshot().await?),
+                    Some(client.recent_events(Some(recent_events_limit)).await?),
+                )
+            } else {
+                (None, None)
+            };
         let controller_lease = match (
             args.controller_client.as_deref(),
             args.renew_lease_id.as_deref(),
@@ -201,12 +216,18 @@ fn run_diagnostics_attach(args: DiagnosticsAttachArgs) -> anyhow::Result<()> {
         Ok::<_, anyhow::Error>(json!({
             "session": session,
             "health": health,
+            "runtime_snapshot": runtime_snapshot,
+            "recent_events": recent_events,
             "controller_lease": controller_lease,
         }))
     })?;
 
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())
+}
+
+fn diagnostics_runtime_surface_supported(protocol_version: u32) -> bool {
+    protocol_version >= diagnostics::DIAGNOSTICS_RUNTIME_SURFACE_PROTOCOL_VERSION
 }
 
 fn run_diagnostics_create_case(args: DiagnosticsCreateCaseArgs) -> anyhow::Result<()> {
@@ -286,6 +307,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn diagnostics_runtime_surface_is_gated_by_protocol_version() {
+        assert!(!diagnostics_runtime_surface_supported(1));
+        assert!(diagnostics_runtime_surface_supported(
+            diagnostics::DIAGNOSTICS_RUNTIME_SURFACE_PROTOCOL_VERSION
+        ));
+    }
+
+    #[test]
     fn hidden_internal_bootstrap_subcommand_parses() {
         let cli = crate::cli::parse_for_test(&["internal", "winfsp-bootstrap-mountmgr"]).unwrap();
         assert!(matches!(
@@ -314,14 +343,18 @@ mod tests {
             "tester",
             "--ttl-ms",
             "250",
+            "--recent-events-limit",
+            "64",
         ])
         .unwrap();
-        assert!(matches!(
-            attach.command,
+        match attach.command {
             crate::cli::Commands::Internal(InternalArgs {
-                action: InternalAction::DiagnosticsAttach(_)
-            })
-        ));
+                action: InternalAction::DiagnosticsAttach(args),
+            }) => {
+                assert_eq!(args.recent_events_limit, 64);
+            }
+            other => panic!("expected diagnostics attach args, got {other:?}"),
+        }
 
         let create_case = crate::cli::parse_for_test(&[
             "internal",

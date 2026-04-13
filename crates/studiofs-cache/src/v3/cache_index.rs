@@ -13,7 +13,10 @@ use std::time::{Duration, Instant};
 
 use lru::LruCache;
 use parking_lot::Mutex;
-use redb::{Database, Error as RedbError, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, Error as RedbError, ReadableDatabase, ReadableTable, ReadableTableMetadata,
+    TableDefinition,
+};
 
 use crate::local::LocalBlockLifecycleState;
 
@@ -155,6 +158,14 @@ impl CacheIndex {
             current_bytes: required_counter(&counters, COUNTER_CURRENT_BYTES)?,
             dirty_bytes: required_counter(&counters, COUNTER_DIRTY_BYTES)?,
             evictable_bytes: required_counter(&counters, COUNTER_EVICTABLE_BYTES)?,
+        })
+    }
+
+    pub fn dirty_object_count(&self) -> Result<usize, CacheIndexError> {
+        let txn = self.db.begin_read().map_err(storage_error)?;
+        let dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
+        usize::try_from(dirty_order.len().map_err(storage_error)?).map_err(|_| {
+            CacheIndexError::Corruption("dirty order length overflowed usize".to_string())
         })
     }
 
@@ -1242,24 +1253,28 @@ mod tests {
         assert_eq!(stats.current_bytes, 125);
         assert_eq!(stats.dirty_bytes, 100);
         assert_eq!(stats.evictable_bytes, 25);
+        assert_eq!(index.dirty_object_count().unwrap(), 1);
 
         index.mark_uploading(11).unwrap();
         let stats = index.stats().unwrap();
         assert_eq!(stats.current_bytes, 125);
         assert_eq!(stats.dirty_bytes, 100);
         assert_eq!(stats.evictable_bytes, 25);
+        assert_eq!(index.dirty_object_count().unwrap(), 1);
 
         index.mark_uploaded(11).unwrap();
         let stats = index.stats().unwrap();
         assert_eq!(stats.current_bytes, 125);
         assert_eq!(stats.dirty_bytes, 0);
         assert_eq!(stats.evictable_bytes, 125);
+        assert_eq!(index.dirty_object_count().unwrap(), 0);
 
         index.remove(12).unwrap();
         let stats = index.stats().unwrap();
         assert_eq!(stats.current_bytes, 100);
         assert_eq!(stats.dirty_bytes, 0);
         assert_eq!(stats.evictable_bytes, 100);
+        assert_eq!(index.dirty_object_count().unwrap(), 0);
     }
 
     #[test]

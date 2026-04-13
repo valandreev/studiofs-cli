@@ -62,6 +62,9 @@ pub trait LocalBlockBackend: Send + Sync {
     fn remove_batch(&self, object_ids: &[u64]);
 
     fn dirty_object_ids(&self) -> Vec<u64>;
+    fn dirty_object_count(&self) -> usize {
+        self.dirty_object_ids().len()
+    }
     fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState;
     fn is_evictable(&self, object_id: u64) -> bool;
 }

@@ -102,6 +102,26 @@ fn startup_replay_does_not_override_current_epoch_live_extent_with_stale_pending
 }
 
 #[test]
+fn upload_pipeline_runtime_events_only_emit_active_samples_and_transitions() {
+    assert_eq!(
+        StudioVfs::upload_pipeline_runtime_event(true, false, true),
+        Some(("became_active", "upload pipeline active"))
+    );
+    assert_eq!(
+        StudioVfs::upload_pipeline_runtime_event(false, true, false),
+        Some(("became_idle", "upload pipeline idle"))
+    );
+    assert_eq!(
+        StudioVfs::upload_pipeline_runtime_event(false, false, true),
+        Some(("sample", "upload pipeline sample"))
+    );
+    assert_eq!(
+        StudioVfs::upload_pipeline_runtime_event(false, false, false),
+        None
+    );
+}
+
+#[test]
 fn startup_replay_keeps_metadata_live_extent_when_pending_upload_has_same_epoch() {
     let tmp = TempDir::new().expect("tempdir");
     let (_rt, vfs, meta) = make_test_vfs(&tmp, "startup-replay-same-epoch");
