@@ -625,24 +625,19 @@ impl LocalDiagnosticsClient {
         &self,
         lease_id: &str,
         run_id: &str,
-        source: TimelineEntrySource,
-        kind: TimelineEntryKind,
-        title: &str,
-        body: Option<String>,
-        actor: Option<String>,
-        reason: Option<String>,
+        entry: NewTimelineEntry,
     ) -> Result<TimelineEntry> {
         match self
             .send(DiagnosticsRequest::AppendTimelineEntry {
                 auth_token: self.discovery.auth_token.clone(),
                 lease_id: lease_id.to_string(),
                 run_id: run_id.to_string(),
-                source,
-                kind,
-                title: title.to_string(),
-                body,
-                actor,
-                reason,
+                source: entry.source,
+                kind: entry.kind,
+                title: entry.title,
+                body: entry.body,
+                actor: entry.actor,
+                reason: entry.reason,
             })
             .await?
         {

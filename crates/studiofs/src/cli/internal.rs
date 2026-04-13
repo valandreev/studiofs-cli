@@ -1,7 +1,9 @@
 //! Hidden internal CLI subcommands.
 
 use crate::diagnostics;
-use crate::investigation::{InvestigationStore, TimelineEntryKind, TimelineEntrySource};
+use crate::investigation::{
+    InvestigationStore, NewTimelineEntry, TimelineEntryKind, TimelineEntrySource,
+};
 use clap::{Args, Subcommand};
 use serde_json::json;
 use std::time::Duration;
@@ -242,12 +244,14 @@ fn run_diagnostics_add_timeline(args: DiagnosticsAddTimelineArgs) -> anyhow::Res
             .append_timeline_entry(
                 &args.lease_id,
                 &args.run_id,
-                args.source.into(),
-                args.kind.into(),
-                &args.title,
-                args.body,
-                args.actor,
-                args.reason,
+                NewTimelineEntry {
+                    source: args.source.into(),
+                    kind: args.kind.into(),
+                    title: args.title,
+                    body: args.body,
+                    actor: args.actor,
+                    reason: args.reason,
+                },
             )
             .await
     })?;

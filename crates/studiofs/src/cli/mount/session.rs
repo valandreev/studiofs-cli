@@ -1481,7 +1481,8 @@ mod tests {
     use super::*;
     use crate::diagnostics;
     use crate::investigation::{
-        InvestigationStore, TimelineEntryKind, TimelineEntrySource, set_test_store_base_dir,
+        InvestigationStore, NewTimelineEntry, TimelineEntryKind, TimelineEntrySource,
+        set_test_store_base_dir,
     };
     use std::io;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -2112,12 +2113,14 @@ mod tests {
                 .block_on(competing_client.append_timeline_entry(
                     &renewed.lease_id,
                     &run.id,
-                    TimelineEntrySource::Cli,
-                    TimelineEntryKind::Marker,
-                    "start copy",
-                    Some("Started manual copy flow".to_string()),
-                    Some("developer".to_string()),
-                    Some("begin workload".to_string()),
+                    NewTimelineEntry {
+                        source: TimelineEntrySource::Cli,
+                        kind: TimelineEntryKind::Marker,
+                        title: "start copy".to_string(),
+                        body: Some("Started manual copy flow".to_string()),
+                        actor: Some("developer".to_string()),
+                        reason: Some("begin workload".to_string()),
+                    },
                 ))
                 .expect("append cli marker");
             launch
@@ -2125,12 +2128,14 @@ mod tests {
                 .block_on(competing_client.append_timeline_entry(
                     &renewed.lease_id,
                     &run.id,
-                    TimelineEntrySource::Mcp,
-                    TimelineEntryKind::Note,
-                    "cache miss burst",
-                    Some("Observed a foreground-read spike".to_string()),
-                    Some("studiofs-dev-mcp".to_string()),
-                    Some("annotate anomaly".to_string()),
+                    NewTimelineEntry {
+                        source: TimelineEntrySource::Mcp,
+                        kind: TimelineEntryKind::Note,
+                        title: "cache miss burst".to_string(),
+                        body: Some("Observed a foreground-read spike".to_string()),
+                        actor: Some("studiofs-dev-mcp".to_string()),
+                        reason: Some("annotate anomaly".to_string()),
+                    },
                 ))
                 .expect("append mcp note");
             *persisted_run_id_for_inspect
