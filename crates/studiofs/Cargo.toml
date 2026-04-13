@@ -41,6 +41,8 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 sysinfo.workspace = true
 url.workspace = true
 parking_lot.workspace = true
+tempfile.workspace = true
+fs2 = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 studiofs-fuse.workspace = true
@@ -59,5 +61,4 @@ winfsp.workspace = true
 ignored = ["winfsp"]
 
 [dev-dependencies]
-tempfile.workspace = true
 dotenvy.workspace = true

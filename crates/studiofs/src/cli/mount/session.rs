@@ -4,7 +4,10 @@ use super::MountCommand;
 use super::backend::{BackendLaunch, MountBackend, default_mount_backend};
 use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
 use crate::cli::{mount_profile, mount_profile_types, settings, utils};
-use crate::diagnostics::{DiagnosticsDataSource, LiveMountDiagnosticsSource, LocalDiagnosticsHost};
+use crate::diagnostics::{
+    DiagnosticsDataSource, LiveMountDiagnosticsSource, LiveMountRuntimeFingerprint,
+    LocalDiagnosticsHost,
+};
 use chrono::Utc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -937,6 +940,15 @@ impl MountSession {
             let runtime = Runtime::new()
                 .map_err(|error| anyhow::anyhow!("failed to create tokio runtime: {error}"))?;
             let _guard = runtime.enter();
+            let backend = backend_factory();
+            let diagnostics_runtime_fingerprint = LiveMountRuntimeFingerprint {
+                bridge: backend.name().to_string(),
+                cache_size: command.cache_size.clone(),
+                endpoint_override: command.endpoint.clone(),
+                snapshot_id: command.snapshot_id.clone(),
+                vfs_config: serde_json::to_value(vfs_config.as_ref())
+                    .map_err(|error| anyhow::anyhow!("failed to serialize vfs config: {error}"))?,
+            };
             let vfs = StudioVfs::new_with_prepared_cache_runtime(
                 meta,
                 &data_config,
@@ -961,13 +973,14 @@ impl MountSession {
                     &cache_path,
                     std::process::id(),
                     read_only_mount,
+                    diagnostics_runtime_fingerprint,
                     vfs.clone(),
                 ));
 
             Ok(PreparedForegroundSession {
                 cache_path,
                 cache_path_str,
-                backend: backend_factory(),
+                backend,
                 vfs,
                 runtime,
                 diagnostics_source,
@@ -1467,6 +1480,10 @@ fn sanitize_log_component(raw: &str) -> String {
 mod tests {
     use super::*;
     use crate::diagnostics;
+    use crate::investigation::{
+        InvestigationStore, NewTimelineEntry, TimelineEntryKind, TimelineEntrySource,
+        set_test_store_base_dir,
+    };
     use std::io;
     use std::sync::{Arc, Mutex, OnceLock};
     use tempfile::TempDir;
@@ -1887,7 +1904,7 @@ mod tests {
                 Some(temp.path().join("cache")),
                 Some("64GB"),
             ),
-            startup_settings_config(mount_point, None, Some("64GB")),
+            startup_settings_config(mount_point.clone(), None, Some("64GB")),
             || {
                 Box::new(FakeBackend {
                     events: events.clone(),
@@ -1952,7 +1969,7 @@ mod tests {
 
         let session = MountSession::prepare_with_backend_factory(
             command,
-            startup_settings_config(mount_point, None, Some("64GB")),
+            startup_settings_config(mount_point.clone(), None, Some("64GB")),
             || {
                 Box::new(FakeBackend {
                     events: events.clone(),
@@ -1987,9 +2004,19 @@ mod tests {
             .lock()
             .expect("lock diagnostics test mutex");
         let temp = tempfile::tempdir().expect("tempdir");
+        let store_dir = temp.path().join("investigations-store");
+        set_test_store_base_dir(Some(&store_dir));
+        struct ResetInvestigationStoreDir;
+        impl Drop for ResetInvestigationStoreDir {
+            fn drop(&mut self) {
+                set_test_store_base_dir(None);
+            }
+        }
+        let _reset_store_dir = ResetInvestigationStoreDir;
         let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
         drop(engine);
         let events = Arc::new(Mutex::new(Vec::new()));
+        let persisted_run_id = Arc::new(Mutex::new(None::<String>));
         #[cfg(windows)]
         let mount_point = "Q:".to_string();
         #[cfg(not(windows))]
@@ -1998,6 +2025,7 @@ mod tests {
             .join("diag-mount")
             .to_string_lossy()
             .into_owned();
+        let persisted_run_id_for_inspect = persisted_run_id.clone();
         let inspect: BackendInspect = Arc::new(move |launch| {
             let discovery = diagnostics::discover_local_sessions()
                 .expect("discover local sessions")
@@ -2010,6 +2038,7 @@ mod tests {
                 .block_on(client.session_info())
                 .expect("read session identity");
             assert_eq!(session.volume, "demo");
+            assert_eq!(session.bridge, "FakeBackend");
             assert_eq!(session.mount_point, launch.mount_point);
             assert_eq!(session.pid, std::process::id());
             assert!(!session.read_only);
@@ -2052,8 +2081,7 @@ mod tests {
             let renewed = launch
                 .runtime_handle
                 .block_on(
-                    competing_client
-                        .renew_controller(&takeover.lease_id, Duration::from_millis(250)),
+                    competing_client.renew_controller(&takeover.lease_id, Duration::from_secs(2)),
                 )
                 .expect("renew controller lease");
             assert_eq!(renewed.lease_id, takeover.lease_id);
@@ -2061,6 +2089,58 @@ mod tests {
                 renewed.expires_unix_ms >= takeover.expires_unix_ms,
                 "renewal should extend or preserve expiry"
             );
+
+            let case = launch
+                .runtime_handle
+                .block_on(competing_client.create_case(
+                    &renewed.lease_id,
+                    "AJA copy slowdown",
+                    Some("Copy stalls after warmup".to_string()),
+                    Some("aja".to_string()),
+                    Some("artist workstation".to_string()),
+                ))
+                .expect("create investigation case");
+            let run = launch
+                .runtime_handle
+                .block_on(competing_client.create_run(
+                    &renewed.lease_id,
+                    &case.id,
+                    Some("copy-pass-1".to_string()),
+                ))
+                .expect("create investigation run");
+            launch
+                .runtime_handle
+                .block_on(competing_client.append_timeline_entry(
+                    &renewed.lease_id,
+                    &run.id,
+                    NewTimelineEntry {
+                        source: TimelineEntrySource::Cli,
+                        kind: TimelineEntryKind::Marker,
+                        title: "start copy".to_string(),
+                        body: Some("Started manual copy flow".to_string()),
+                        actor: Some("developer".to_string()),
+                        reason: Some("begin workload".to_string()),
+                    },
+                ))
+                .expect("append cli marker");
+            launch
+                .runtime_handle
+                .block_on(competing_client.append_timeline_entry(
+                    &renewed.lease_id,
+                    &run.id,
+                    NewTimelineEntry {
+                        source: TimelineEntrySource::Mcp,
+                        kind: TimelineEntryKind::Note,
+                        title: "cache miss burst".to_string(),
+                        body: Some("Observed a foreground-read spike".to_string()),
+                        actor: Some("studiofs-dev-mcp".to_string()),
+                        reason: Some("annotate anomaly".to_string()),
+                    },
+                ))
+                .expect("append mcp note");
+            *persisted_run_id_for_inspect
+                .lock()
+                .expect("lock persisted run id") = Some(run.id);
             Ok(())
         });
 
@@ -2072,7 +2152,7 @@ mod tests {
                 Some(temp.path().join("cache")),
                 Some("64GB"),
             ),
-            startup_settings_config(mount_point, None, Some("64GB")),
+            startup_settings_config(mount_point.clone(), None, Some("64GB")),
             || {
                 Box::new(FakeBackend {
                     events: events.clone(),
@@ -2085,6 +2165,24 @@ mod tests {
 
         session.launch().expect("launch session");
         assert_eq!(events.lock().expect("lock events").len(), 1);
+
+        let run_id = persisted_run_id
+            .lock()
+            .expect("lock persisted run id")
+            .clone()
+            .expect("persisted run id");
+        let persisted_run = InvestigationStore::new(store_dir)
+            .load_run(&run_id)
+            .expect("load run after shutdown");
+        assert!(!persisted_run.session_id.is_empty());
+        assert_eq!(persisted_run.fingerprint.bridge, "FakeBackend");
+        assert_eq!(
+            persisted_run.fingerprint.runtime_configuration.mount_point,
+            mount_point
+        );
+        assert_eq!(persisted_run.timeline.len(), 2);
+        assert_eq!(persisted_run.timeline[0].source, TimelineEntrySource::Cli);
+        assert_eq!(persisted_run.timeline[1].source, TimelineEntrySource::Mcp);
     }
 
     #[test]
@@ -2122,7 +2220,7 @@ mod tests {
                 Some(temp.path().join("cache")),
                 Some("64GB"),
             ),
-            startup_settings_config(mount_point, None, Some("64GB")),
+            startup_settings_config(mount_point.clone(), None, Some("64GB")),
             || {
                 Box::new(FakeBackend {
                     events: events.clone(),
