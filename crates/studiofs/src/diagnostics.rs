@@ -51,7 +51,7 @@ use windows::{
     core::w,
 };
 
-const DIAGNOSTICS_PROTOCOL_VERSION: u32 = 1;
+pub(crate) const DIAGNOSTICS_PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_LEASE_TTL_MS: u64 = 5_000;
 const MAX_LEASE_TTL_MS: u64 = 60_000;
 const CONNECT_RETRY_ATTEMPTS: usize = 40;
@@ -1175,6 +1175,28 @@ fn execute_request(
         }
     }
 
+    enum MutatingRequestPrereqError {
+        Unauthorized,
+        InvalidLease(anyhow::Error),
+        InvestigationUnavailable,
+    }
+
+    fn mutating_request_store<'a>(
+        provided_token: &str,
+        auth_token: &str,
+        lease_id: &str,
+        lease_manager: &ControllerLeaseManager,
+        investigation_store: Option<&'a InvestigationStore>,
+    ) -> std::result::Result<&'a InvestigationStore, MutatingRequestPrereqError> {
+        if provided_token != auth_token {
+            return Err(MutatingRequestPrereqError::Unauthorized);
+        }
+        if let Err(error) = lease_manager.require_current(lease_id) {
+            return Err(MutatingRequestPrereqError::InvalidLease(error));
+        }
+        investigation_store.ok_or(MutatingRequestPrereqError::InvestigationUnavailable)
+    }
+
     match request {
         DiagnosticsRequest::SessionInfo {
             auth_token: provided,
@@ -1236,14 +1258,21 @@ fn execute_request(
             workload_identity,
             target_environment,
         } => {
-            if provided != auth_token {
-                return unauthorized();
-            }
-            if let Err(error) = lease_manager.require_current(&lease_id) {
-                return lease_error(error);
-            }
-            let Some(store) = investigation_store else {
-                return investigation_unavailable();
+            let store = match mutating_request_store(
+                &provided,
+                auth_token,
+                &lease_id,
+                lease_manager,
+                investigation_store,
+            ) {
+                Ok(store) => store,
+                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
+                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
+                    return lease_error(error);
+                }
+                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
+                    return investigation_unavailable();
+                }
             };
             match store.create_case(NewInvestigationCase {
                 title,
@@ -1263,14 +1292,21 @@ fn execute_request(
             case_id,
             run_workload_identity,
         } => {
-            if provided != auth_token {
-                return unauthorized();
-            }
-            if let Err(error) = lease_manager.require_current(&lease_id) {
-                return lease_error(error);
-            }
-            let Some(store) = investigation_store else {
-                return investigation_unavailable();
+            let store = match mutating_request_store(
+                &provided,
+                auth_token,
+                &lease_id,
+                lease_manager,
+                investigation_store,
+            ) {
+                Ok(store) => store,
+                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
+                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
+                    return lease_error(error);
+                }
+                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
+                    return investigation_unavailable();
+                }
             };
             let case = match store.load_case(&case_id) {
                 Ok(case) => case,
@@ -1300,14 +1336,21 @@ fn execute_request(
             actor,
             reason,
         } => {
-            if provided != auth_token {
-                return unauthorized();
-            }
-            if let Err(error) = lease_manager.require_current(&lease_id) {
-                return lease_error(error);
-            }
-            let Some(store) = investigation_store else {
-                return investigation_unavailable();
+            let store = match mutating_request_store(
+                &provided,
+                auth_token,
+                &lease_id,
+                lease_manager,
+                investigation_store,
+            ) {
+                Ok(store) => store,
+                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
+                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
+                    return lease_error(error);
+                }
+                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
+                    return investigation_unavailable();
+                }
             };
             match store.append_timeline_entry(
                 &run_id,
