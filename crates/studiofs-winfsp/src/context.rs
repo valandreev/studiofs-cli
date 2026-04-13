@@ -9,8 +9,10 @@ use parking_lot::Mutex;
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_meta::{FileType, Ino, InodeAttr};
 use studiofs_vfs::{
-    BridgeVfsErrorKind, KernelInvalidator, NamespacePathStyle, OpenFlags, StudioVfs,
-    classify_vfs_error, normalize_attr_times,
+    BarrierObservabilityPort, BridgeVfsErrorKind, DeferredCleanupHintPort, DeleteCleanupPort,
+    FlushGatePort, HandleDrainBarrier, HandleDrainDeleteRequest, HandleDrainRequest,
+    HandleReleasePort, KernelInvalidator, LocalSyncBarrierPort, NamespacePathStyle, OpenFlags,
+    StudioVfs, classify_vfs_error, normalize_attr_times,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, error, trace, warn};
@@ -554,7 +556,7 @@ struct CallbackBarrierState {
 struct FlushGateRegistry {
     /// Per-inode gates used to collapse concurrent callback-driven flush
     /// barriers into one effective in-flight flush.
-    gates: Mutex<HashMap<Ino, Arc<tokio::sync::Mutex<()>>>>,
+    gates: Mutex<HashMap<Ino, Arc<Mutex<()>>>>,
 }
 
 struct DeferredCleanupHints {
@@ -572,16 +574,16 @@ impl CallbackBarrierState {
         }
     }
 
-    fn flush_gate_for_inode(&self, ino: Ino) -> Arc<tokio::sync::Mutex<()>> {
+    fn flush_gate_for_inode(&self, ino: Ino) -> Arc<Mutex<()>> {
         self.flush_gates.gate_for_inode(ino)
     }
 
-    fn maybe_release_flush_gate(&self, ino: Ino, gate: &Arc<tokio::sync::Mutex<()>>) {
+    fn maybe_release_flush_gate(&self, ino: Ino, gate: &Arc<Mutex<()>>) {
         self.flush_gates.maybe_release(ino, gate);
     }
 
-    fn note_cleanup_non_delete_deferred(&self, vfs: &StudioVfs, ino: Ino, fh: u64) {
-        self.deferred_cleanup_hints.note_for_cleanup(vfs, ino, fh);
+    fn set_deferred_cleanup_hint(&self, ino: Ino) {
+        self.deferred_cleanup_hints.set(ino);
     }
 
     fn clear_deferred_cleanup_hint(&self, ino: Ino) {
@@ -592,38 +594,8 @@ impl CallbackBarrierState {
         self.deferred_cleanup_hints.take(ino)
     }
 
-    fn had_deferred_cleanup_hint(&self, ino: Ino) -> bool {
+    fn has_deferred_cleanup_hint(&self, ino: Ino) -> bool {
         self.deferred_cleanup_hints.contains(ino)
-    }
-
-    fn note_close_release_success(
-        &self,
-        vfs: &StudioVfs,
-        ino: Ino,
-        fh: u64,
-        outcome: &studiofs_vfs::vfs::ReleaseFhOutcome,
-    ) {
-        if !outcome.closed_last_handle {
-            return;
-        }
-
-        let hint_was_taken = self.take_deferred_cleanup_hint(ino);
-        vfs.note_winfsp_close_barrier_outcome(outcome.flushed_local_dirty_state);
-        if hint_was_taken && outcome.flushed_local_dirty_state {
-            debug!(
-                ino,
-                fh, "close owned deferred cleanup barrier on the last handle"
-            );
-        } else if hint_was_taken {
-            trace!(
-                ino,
-                fh, "close observed deferred cleanup hint but no last-handle barrier was needed"
-            );
-        }
-    }
-
-    fn take_close_error_hint(&self, ino: Ino, had_cleanup_deferred_hint: bool) -> bool {
-        self.take_deferred_cleanup_hint(ino) || had_cleanup_deferred_hint
     }
 
     #[cfg(test)]
@@ -644,15 +616,15 @@ impl FlushGateRegistry {
         }
     }
 
-    fn gate_for_inode(&self, ino: Ino) -> Arc<tokio::sync::Mutex<()>> {
+    fn gate_for_inode(&self, ino: Ino) -> Arc<Mutex<()>> {
         self.gates
             .lock()
             .entry(ino)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
 
-    fn maybe_release(&self, ino: Ino, gate: &Arc<tokio::sync::Mutex<()>>) {
+    fn maybe_release(&self, ino: Ino, gate: &Arc<Mutex<()>>) {
         let mut gates = self.gates.lock();
         let should_remove = gates
             .get(&ino)
@@ -675,19 +647,8 @@ impl DeferredCleanupHints {
         }
     }
 
-    fn note_for_cleanup(&self, vfs: &StudioVfs, ino: Ino, fh: u64) {
-        let dirty = vfs.inode_has_local_dirty_state(ino);
-        let deferred_to_close = fh != 0 && dirty;
-        if deferred_to_close {
-            self.inodes.lock().insert(ino);
-        }
-        trace!(
-            ino,
-            fh,
-            deferred_dirty = deferred_to_close,
-            dirty,
-            "cleanup non-delete deferred to close/release_fh"
-        );
+    fn set(&self, ino: Ino) {
+        self.inodes.lock().insert(ino);
     }
 
     fn clear(&self, ino: Ino) {
@@ -706,11 +667,11 @@ impl DeferredCleanupHints {
 struct FlushGateRelease<'a> {
     state: &'a CallbackBarrierState,
     ino: Ino,
-    gate: Arc<tokio::sync::Mutex<()>>,
+    gate: Arc<Mutex<()>>,
 }
 
 impl<'a> FlushGateRelease<'a> {
-    fn new(state: &'a CallbackBarrierState, ino: Ino, gate: Arc<tokio::sync::Mutex<()>>) -> Self {
+    fn new(state: &'a CallbackBarrierState, ino: Ino, gate: Arc<Mutex<()>>) -> Self {
         Self { state, ino, gate }
     }
 }
@@ -721,128 +682,207 @@ impl Drop for FlushGateRelease<'_> {
     }
 }
 
-struct HandleCallbackLifecycle<'a> {
-    context: &'a StudioFsContext,
-}
-
-struct CleanupDeleteTarget<'a> {
-    context: &'a StudioFileHandle,
-    file_name: &'a U16CStr,
-}
-
-enum CleanupCallbackAction<'a> {
-    Delete(CleanupDeleteTarget<'a>),
+enum CleanupCallbackAction {
+    Delete(HandleDrainDeleteRequest),
     SkipDeletePath { ino: Ino, is_dir: bool },
     NonDelete { ino: Ino, fh: u64 },
 }
 
-enum CloseCallbackAction {
-    ClearDeferredHintOnly,
-    ReleaseHandle { had_cleanup_deferred_hint: bool },
+type WinfspHandleDrainBarrier<'a> = HandleDrainBarrier<
+    WinfspLocalSyncBarrierPort<'a>,
+    WinfspHandleReleasePort<'a>,
+    WinfspDeferredCleanupHintPort<'a>,
+    WinfspFlushGatePort<'a>,
+    WinfspDeleteCleanupPort<'a>,
+    WinfspBarrierObservabilityPort<'a>,
+>;
+
+#[derive(Clone, Copy)]
+struct WinfspLocalSyncBarrierPort<'a> {
+    context: &'a StudioFsContext,
 }
 
-impl<'a> HandleCallbackLifecycle<'a> {
-    fn new(context: &'a StudioFsContext) -> Self {
-        Self { context }
+#[derive(Clone, Copy)]
+struct WinfspHandleReleasePort<'a> {
+    context: &'a StudioFsContext,
+}
+
+#[derive(Clone, Copy)]
+struct WinfspDeferredCleanupHintPort<'a> {
+    context: &'a StudioFsContext,
+}
+
+#[derive(Clone, Copy)]
+struct WinfspFlushGatePort<'a> {
+    context: &'a StudioFsContext,
+}
+
+#[derive(Clone, Copy)]
+struct WinfspDeleteCleanupPort<'a> {
+    context: &'a StudioFsContext,
+}
+
+#[derive(Clone, Copy)]
+struct WinfspBarrierObservabilityPort<'a> {
+    context: &'a StudioFsContext,
+}
+
+impl LocalSyncBarrierPort for WinfspLocalSyncBarrierPort<'_> {
+    fn inode_has_local_dirty_state(&self, ino: Ino) -> bool {
+        self.context.vfs.inode_has_local_dirty_state(ino)
     }
 
-    fn flush_callback_path_if_dirty(
+    fn explicit_flush(
         &self,
-        ino: Ino,
-        fh: Option<u64>,
-    ) -> studiofs_vfs::VfsResult<bool> {
-        if !self.context.vfs.inode_has_local_dirty_state(ino) {
-            return Ok(false);
-        }
+        request: HandleDrainRequest,
+    ) -> studiofs_vfs::VfsResult<studiofs_vfs::ExplicitFlushOutcome> {
+        let vfs = self.context.vfs.clone();
+        self.context.spawn_wait(async move {
+            if request.fh != 0 {
+                vfs.flush_fh_with_outcome(request.fh).await
+            } else {
+                vfs.flush_with_outcome(request.ino).await
+            }
+        })
+    }
+}
+
+impl HandleReleasePort for WinfspHandleReleasePort<'_> {
+    fn release_handle(
+        &self,
+        request: HandleDrainRequest,
+    ) -> studiofs_vfs::VfsResult<studiofs_vfs::ReleaseFhOutcome> {
+        let vfs = self.context.vfs.clone();
+        self.context
+            .spawn_wait(async move { vfs.release_fh_with_outcome(request.fh).await })
+    }
+}
+
+impl DeferredCleanupHintPort for WinfspDeferredCleanupHintPort<'_> {
+    fn set_deferred_cleanup_hint(&self, ino: Ino) {
+        self.context
+            .callback_barrier_state
+            .set_deferred_cleanup_hint(ino);
+    }
+
+    fn clear_deferred_cleanup_hint(&self, ino: Ino) {
+        self.context
+            .callback_barrier_state
+            .clear_deferred_cleanup_hint(ino);
+    }
+
+    fn take_deferred_cleanup_hint(&self, ino: Ino) -> bool {
+        self.context
+            .callback_barrier_state
+            .take_deferred_cleanup_hint(ino)
+    }
+
+    fn has_deferred_cleanup_hint(&self, ino: Ino) -> bool {
+        self.context
+            .callback_barrier_state
+            .has_deferred_cleanup_hint(ino)
+    }
+}
+
+impl FlushGatePort for WinfspFlushGatePort<'_> {
+    fn with_flush_gate<T, F>(&self, ino: Ino, op: F) -> studiofs_vfs::VfsResult<T>
+    where
+        F: FnOnce() -> studiofs_vfs::VfsResult<T>,
+    {
         let gate = self
             .context
             .callback_barrier_state
             .flush_gate_for_inode(ino);
         let _gate_release =
             FlushGateRelease::new(&self.context.callback_barrier_state, ino, gate.clone());
-        let gate_task = gate.clone();
-        let vfs = self.context.vfs.clone();
-        self.context.spawn_wait(async move {
-            let _flush_guard = gate_task.lock().await;
-            if !vfs.inode_has_local_dirty_state(ino) {
-                return Ok(false);
-            }
-            let outcome = if let Some(handle) = fh.filter(|candidate| *candidate != 0) {
-                vfs.flush_fh_with_outcome(handle).await?
-            } else {
-                vfs.flush_with_outcome(ino).await?
-            };
-            Ok(outcome.flushed_local_dirty_state)
-        })
+        let _flush_guard = gate.lock();
+        op()
     }
+}
 
-    fn run_cleanup_non_delete_callback(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
+impl DeleteCleanupPort for WinfspDeleteCleanupPort<'_> {
+    fn cleanup_delete(&self, request: HandleDrainDeleteRequest) {
+        let result = if request.is_dir {
+            self.context.vfs.rmdir(request.parent_ino, &request.name)
+        } else {
+            self.context.vfs.unlink(request.parent_ino, &request.name)
+        };
+
+        match result {
+            Ok(()) => {
+                debug!(ino = request.ino, "cleanup delete");
+            }
+            Err(error) if is_benign_cleanup_delete_error(&error, request.is_dir) => {
+                debug!(
+                    ino = request.ino,
+                    is_dir = request.is_dir,
+                    error = ?error,
+                    "cleanup delete skipped stale race"
+                );
+            }
+            Err(error) => {
+                error!("cleanup delete failed: {:?}", error);
+            }
+        }
+    }
+}
+
+impl BarrierObservabilityPort for WinfspBarrierObservabilityPort<'_> {
+    fn note_cleanup_callback(&self) {
         self.context.vfs.note_winfsp_cleanup_callback();
-        self.context
-            .callback_barrier_state
-            .note_cleanup_non_delete_deferred(&self.context.vfs, ino, fh);
-        Ok(())
     }
 
-    fn run_flush_callback(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
+    fn note_flush_callback(&self) {
         self.context.vfs.note_winfsp_flush_callback();
-        let flushed = self.flush_callback_path_if_dirty(ino, Some(fh))?;
-        self.context.vfs.note_winfsp_flush_barrier_outcome(flushed);
-        self.context.clear_deferred_cleanup_hint(ino);
-        Ok(())
     }
 
-    fn resolve_close_callback_action(&self, ino: Ino, fh: u64) -> CloseCallbackAction {
-        if fh == 0 {
-            return CloseCallbackAction::ClearDeferredHintOnly;
-        }
-
-        CloseCallbackAction::ReleaseHandle {
-            had_cleanup_deferred_hint: self
-                .context
-                .callback_barrier_state
-                .had_deferred_cleanup_hint(ino),
-        }
+    fn note_flush_barrier_outcome(&self, flushed_local_dirty_state: bool) {
+        self.context
+            .vfs
+            .note_winfsp_flush_barrier_outcome(flushed_local_dirty_state);
     }
 
-    fn execute_close_callback_action(&self, ino: Ino, fh: u64, action: CloseCallbackAction) {
-        match action {
-            CloseCallbackAction::ClearDeferredHintOnly => {
-                self.context.clear_deferred_cleanup_hint(ino);
-            }
-            CloseCallbackAction::ReleaseHandle {
-                had_cleanup_deferred_hint,
-            } => {
-                let vfs = self.context.vfs.clone();
-                let release_result = self
-                    .context
-                    .spawn_wait(async move { vfs.release_fh_with_outcome(fh).await });
-                if let Ok(outcome) = &release_result {
-                    self.context
-                        .callback_barrier_state
-                        .note_close_release_success(&self.context.vfs, ino, fh, outcome);
-                }
-                if let Err(e) = release_result {
-                    let hint_was_present_for_log = self
-                        .context
-                        .callback_barrier_state
-                        .take_close_error_hint(ino, had_cleanup_deferred_hint);
-                    error!(
-                        ino,
-                        fh,
-                        cleanup_deferred = hint_was_present_for_log,
-                        "release_fh failed after WinFSP close: {:?}",
-                        e
-                    );
-                }
-            }
-        }
-    }
-
-    fn run_close_callback(&self, ino: Ino, fh: u64) {
+    fn note_close_callback(&self) {
         self.context.vfs.note_winfsp_close_callback();
-        let action = self.resolve_close_callback_action(ino, fh);
-        self.execute_close_callback_action(ino, fh, action);
+    }
+
+    fn note_release_success(
+        &self,
+        request: HandleDrainRequest,
+        hint_was_taken: bool,
+        outcome: studiofs_vfs::ReleaseFhOutcome,
+    ) {
+        self.context
+            .vfs
+            .note_winfsp_close_barrier_outcome(outcome.flushed_local_dirty_state);
+        if hint_was_taken && outcome.flushed_local_dirty_state {
+            debug!(
+                ino = request.ino,
+                fh = request.fh,
+                "close owned deferred cleanup barrier on the last handle"
+            );
+        } else if hint_was_taken {
+            trace!(
+                ino = request.ino,
+                fh = request.fh,
+                "close observed deferred cleanup hint but no last-handle barrier was needed"
+            );
+        }
+    }
+
+    fn note_release_error(
+        &self,
+        request: HandleDrainRequest,
+        cleanup_deferred_hint: bool,
+        error: &studiofs_vfs::VfsError,
+    ) {
+        error!(
+            ino = request.ino,
+            fh = request.fh,
+            cleanup_deferred = cleanup_deferred_hint,
+            "release_fh failed after WinFSP close: {:?}",
+            error
+        );
     }
 }
 
@@ -858,10 +898,6 @@ impl StudioFsContext {
         }
     }
 
-    fn clear_deferred_cleanup_hint(&self, ino: Ino) {
-        self.callback_barrier_state.clear_deferred_cleanup_hint(ino);
-    }
-
     #[cfg(test)]
     fn has_deferred_cleanup_hint(&self, ino: Ino) -> bool {
         self.callback_barrier_state.has_deferred_cleanup_hint(ino)
@@ -872,8 +908,15 @@ impl StudioFsContext {
         self.callback_barrier_state.flush_gate_count()
     }
 
-    fn handle_callback_lifecycle(&self) -> HandleCallbackLifecycle<'_> {
-        HandleCallbackLifecycle::new(self)
+    fn handle_drain_barrier(&self) -> WinfspHandleDrainBarrier<'_> {
+        HandleDrainBarrier::new(
+            WinfspLocalSyncBarrierPort { context: self },
+            WinfspHandleReleasePort { context: self },
+            WinfspDeferredCleanupHintPort { context: self },
+            WinfspFlushGatePort { context: self },
+            WinfspDeleteCleanupPort { context: self },
+            WinfspBarrierObservabilityPort { context: self },
+        )
     }
 
     #[cfg(test)]
@@ -882,24 +925,47 @@ impl StudioFsContext {
         ino: Ino,
         fh: Option<u64>,
     ) -> studiofs_vfs::VfsResult<bool> {
-        self.handle_callback_lifecycle()
-            .flush_callback_path_if_dirty(ino, fh)
+        let local_sync = WinfspLocalSyncBarrierPort { context: self };
+        WinfspFlushGatePort { context: self }.with_flush_gate(ino, || {
+            if !local_sync.inode_has_local_dirty_state(ino) {
+                return Ok(false);
+            }
+            let outcome = local_sync.explicit_flush(HandleDrainRequest {
+                ino,
+                fh: fh.unwrap_or(0),
+            })?;
+            Ok(outcome.flushed_local_dirty_state)
+        })
     }
 
     fn run_cleanup_non_delete_callback(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
-        self.handle_callback_lifecycle()
-            .run_cleanup_non_delete_callback(ino, fh)
+        self.handle_drain_barrier()
+            .on_cleanup_non_delete(HandleDrainRequest { ino, fh });
+        Ok(())
     }
 
-    fn resolve_cleanup_callback_action<'a>(
+    fn resolve_cleanup_callback_action(
         &self,
-        context: &'a StudioFileHandle,
-        file_name: Option<&'a U16CStr>,
+        context: &StudioFileHandle,
+        file_name: Option<&U16CStr>,
         flags: u32,
-    ) -> CleanupCallbackAction<'a> {
+    ) -> CleanupCallbackAction {
         if flags & 0x01 != 0 {
             if let Some(file_name) = file_name {
-                return CleanupCallbackAction::Delete(CleanupDeleteTarget { context, file_name });
+                return match resolve_parent(&self.vfs, file_name) {
+                    Ok((parent_ino, name)) => {
+                        CleanupCallbackAction::Delete(HandleDrainDeleteRequest {
+                            ino: context.ino,
+                            parent_ino,
+                            name,
+                            is_dir: context.is_dir,
+                        })
+                    }
+                    Err(_) => CleanupCallbackAction::SkipDeletePath {
+                        ino: context.ino,
+                        is_dir: context.is_dir,
+                    },
+                };
             }
             return CleanupCallbackAction::SkipDeletePath {
                 ino: context.ino,
@@ -913,47 +979,10 @@ impl StudioFsContext {
         }
     }
 
-    fn execute_cleanup_delete_target(&self, target: CleanupDeleteTarget<'_>) {
-        match resolve_parent(&self.vfs, target.file_name) {
-            Ok((parent_ino, name)) => {
-                let res = if target.context.is_dir {
-                    self.vfs.rmdir(parent_ino, &name)
-                } else {
-                    self.vfs.unlink(parent_ino, &name)
-                };
-
-                match res {
-                    Ok(()) => {
-                        debug!(ino = target.context.ino, "cleanup delete");
-                    }
-                    Err(e) if is_benign_cleanup_delete_error(&e, target.context.is_dir) => {
-                        debug!(
-                            ino = target.context.ino,
-                            is_dir = target.context.is_dir,
-                            error = ?e,
-                            "cleanup delete skipped stale race"
-                        );
-                    }
-                    Err(e) => {
-                        error!("cleanup delete failed: {:?}", e);
-                    }
-                }
-            }
-            Err(_) => {
-                debug!(
-                    ino = target.context.ino,
-                    is_dir = target.context.is_dir,
-                    "cleanup delete skipped: path already gone"
-                );
-            }
-        }
-    }
-
-    fn execute_cleanup_callback_action(&self, action: CleanupCallbackAction<'_>) {
+    fn execute_cleanup_callback_action(&self, action: CleanupCallbackAction) {
         match action {
-            CleanupCallbackAction::Delete(target) => {
-                self.vfs.note_winfsp_cleanup_callback();
-                self.run_cleanup_delete_callback(target.context, Some(target.file_name));
+            CleanupCallbackAction::Delete(request) => {
+                self.handle_drain_barrier().on_cleanup_delete(request);
             }
             CleanupCallbackAction::SkipDeletePath { ino, is_dir } => {
                 self.vfs.note_winfsp_cleanup_callback();
@@ -965,18 +994,14 @@ impl StudioFsContext {
         }
     }
 
-    fn run_cleanup_delete_callback(&self, context: &StudioFileHandle, file_name: Option<&U16CStr>) {
-        if let Some(file_name) = file_name {
-            self.execute_cleanup_delete_target(CleanupDeleteTarget { context, file_name });
-        }
-    }
-
     fn run_flush_callback(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
-        self.handle_callback_lifecycle().run_flush_callback(ino, fh)
+        self.handle_drain_barrier()
+            .on_flush(HandleDrainRequest { ino, fh })
     }
 
     fn run_close_callback(&self, ino: Ino, fh: u64) {
-        self.handle_callback_lifecycle().run_close_callback(ino, fh);
+        self.handle_drain_barrier()
+            .on_close(HandleDrainRequest { ino, fh });
     }
 
     fn open_file_handle_for_attr(

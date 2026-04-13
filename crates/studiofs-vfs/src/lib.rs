@@ -33,9 +33,11 @@ pub use studiofs_meta::types::{SetattrArgs, TimeSpec};
 pub use upload::UploadScheduler;
 pub use utils::parse_size_bytes;
 pub use vfs::{
-    CacheSafetyMode, KernelInvalidator, LockKind, NamespaceParent, NamespacePathStyle,
-    NamespaceResolver, OpenFile, OpenFlags, StatFs, StudioVfs, VfsConfig, VfsConfigRaw,
-    VfsConfigValidated, VfsError, VfsForegroundReadProtectionStats, VfsIngressLane,
+    BarrierObservabilityPort, CacheSafetyMode, DeferredCleanupHintPort, DeleteCleanupPort,
+    FlushGatePort, HandleDrainBarrier, HandleDrainDeleteRequest, HandleDrainRequest,
+    HandleReleasePort, KernelInvalidator, LocalSyncBarrierPort, LockKind, NamespaceParent,
+    NamespacePathStyle, NamespaceResolver, OpenFile, OpenFlags, StatFs, StudioVfs, VfsConfig,
+    VfsConfigRaw, VfsConfigValidated, VfsError, VfsForegroundReadProtectionStats, VfsIngressLane,
     VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot, VfsResult, VfsUploadStats,
     VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathEagerFlushStats,
     VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,

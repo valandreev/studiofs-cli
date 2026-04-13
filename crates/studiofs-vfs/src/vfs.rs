@@ -29,6 +29,7 @@ mod commit;
 mod config;
 mod deletion_cleanup;
 mod file_session;
+mod handle_drain_barrier;
 mod handle_table;
 mod ignored_entries;
 mod io_ops;
@@ -53,6 +54,11 @@ pub use config::{
     VfsConfigValidated,
 };
 pub use file_session::{OpenFile, OpenFlags, VfsFileSessionStats};
+pub use handle_drain_barrier::{
+    BarrierObservabilityPort, DeferredCleanupHintPort, DeleteCleanupPort, FlushGatePort,
+    HandleDrainBarrier, HandleDrainDeleteRequest, HandleDrainRequest, HandleReleasePort,
+    LocalSyncBarrierPort,
+};
 pub use locking::LockKind;
 pub use metrics::{
     StatFs, VfsForegroundReadProtectionStats, VfsIngressLane, VfsIngressPressure, VfsIngressStats,
