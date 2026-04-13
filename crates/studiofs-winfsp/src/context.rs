@@ -31,6 +31,8 @@ use winfsp::filesystem::*;
 use winfsp::notify::{Notifier, NotifyInfo, NotifyingFileSystemContext};
 use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 
+use crate::ensure_winfsp_runtime_loaded_or_panic;
+
 // Windows reparse point constants
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
@@ -78,6 +80,7 @@ pub struct StudioFileHandle {
 
 impl StudioFileHandle {
     fn new(ino: Ino, is_dir: bool, fh: u64, open_flags: OpenFlags) -> Self {
+        ensure_winfsp_runtime_loaded_or_panic();
         Self {
             ino,
             is_dir,
@@ -1059,6 +1062,7 @@ impl BarrierObservabilityPort for WinfspBarrierObservabilityPort<'_> {
 
 impl StudioFsContext {
     pub fn new(vfs: Arc<StudioVfs>, rt: Handle, invalidation_queue: Arc<Mutex<Vec<Ino>>>) -> Self {
+        ensure_winfsp_runtime_loaded_or_panic();
         let default_sd = create_default_security_descriptor();
         Self {
             vfs,
@@ -2065,6 +2069,7 @@ fn notify_filter_for_kind(kind: FileType) -> u32 {
 }
 
 fn build_notify_info(path: &str, kind: FileType) -> Option<NotifyInfo<512>> {
+    ensure_winfsp_runtime_loaded_or_panic();
     let mut info = NotifyInfo::<512>::new();
     info.filter = notify_filter_for_kind(kind);
     info.action = FILE_ACTION_MODIFIED;

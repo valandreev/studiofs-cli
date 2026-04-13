@@ -6,8 +6,13 @@
 
 mod context;
 
+use std::os::windows::ffi::OsStrExt;
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
 pub use context::{StudioFsContext, WinfspKernelInvalidator};
 use thiserror::Error;
+use windows::Win32::System::LibraryLoader::LoadLibraryW;
 
 const DEFAULT_FILE_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_DIR_INFO_TIMEOUT_MS: u32 = 1000;
@@ -18,6 +23,7 @@ const DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE: bool = true;
 const DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP: bool = false;
 const DEFAULT_SECTORS_PER_ALLOCATION_UNIT: u16 =
     (DEFAULT_ALLOCATION_UNIT_SIZE / DEFAULT_SECTOR_SIZE as u32) as u16;
+static WINFSP_RUNTIME_DLL_LOAD: OnceLock<Result<(), String>> = OnceLock::new();
 const _: () = {
     assert!(DEFAULT_SECTOR_SIZE > 0);
     assert!(DEFAULT_ALLOCATION_UNIT_SIZE > 0);
@@ -56,6 +62,109 @@ pub struct WinfspMountRequest {
     pub volume_label: String,
     pub read_only: bool,
     pub shutdown_event_name: Option<String>,
+}
+
+fn winfsp_dll_stem_for_arch(target_arch: &str) -> Option<&'static str> {
+    match target_arch {
+        "x86_64" => Some("winfsp-x64"),
+        "x86" => Some("winfsp-x86"),
+        "aarch64" => Some("winfsp-a64"),
+        _ => None,
+    }
+}
+
+fn winfsp_dll_name() -> &'static str {
+    winfsp_dll_stem_for_arch(std::env::consts::ARCH)
+        .expect("unsupported Windows architecture for WinFSP runtime")
+}
+
+fn push_candidate_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !paths.iter().any(|path| path == &candidate) {
+        paths.push(candidate);
+    }
+}
+
+fn winfsp_dll_candidate_paths() -> Vec<PathBuf> {
+    let dll_name = format!("{}.dll", winfsp_dll_name());
+    let mut candidates = Vec::new();
+
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(parent) = current_exe.parent()
+    {
+        push_candidate_path(&mut candidates, parent.join(&dll_name));
+    }
+
+    if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)") {
+        push_candidate_path(
+            &mut candidates,
+            PathBuf::from(program_files_x86)
+                .join("WinFsp")
+                .join("bin")
+                .join(&dll_name),
+        );
+    }
+
+    if let Some(program_files) = std::env::var_os("ProgramFiles") {
+        push_candidate_path(
+            &mut candidates,
+            PathBuf::from(program_files)
+                .join("WinFsp")
+                .join("bin")
+                .join(&dll_name),
+        );
+    }
+
+    candidates
+}
+
+fn load_winfsp_runtime_dll() -> Result<(), String> {
+    let dll_name = format!("{}.dll", winfsp_dll_name());
+    let candidates = winfsp_dll_candidate_paths();
+    let mut last_error = None;
+
+    for candidate in &candidates {
+        if !candidate.is_file() {
+            continue;
+        }
+
+        let wide_path: Vec<u16> = candidate
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let load_result = unsafe { LoadLibraryW(windows::core::PCWSTR(wide_path.as_ptr())) };
+
+        match load_result {
+            Ok(_) => return Ok(()),
+            Err(err) => last_error = Some(format!("{}: {err}", candidate.display())),
+        }
+    }
+
+    let searched_paths = candidates
+        .iter()
+        .map(|candidate| candidate.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let suffix = last_error
+        .map(|err| format!(" Last LoadLibraryW error: {err}."))
+        .unwrap_or_default();
+    Err(format!(
+        "failed to preload WinFSP runtime DLL '{dll_name}'. Searched: [{searched_paths}]. Install WinFSP or add its bin directory to PATH.{suffix}"
+    ))
+}
+
+pub(crate) fn ensure_winfsp_runtime_loaded() -> std::io::Result<()> {
+    WINFSP_RUNTIME_DLL_LOAD
+        .get_or_init(load_winfsp_runtime_dll)
+        .as_ref()
+        .map(|_| ())
+        .map_err(|message| std::io::Error::other(message.clone()))
+}
+
+pub(crate) fn ensure_winfsp_runtime_loaded_or_panic() {
+    if let Err(err) = ensure_winfsp_runtime_loaded() {
+        panic!("WinFSP runtime preload failed before using WinFSP FFI types: {err}");
+    }
 }
 
 fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOptionError> {
@@ -329,6 +438,8 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
     use studiofs_meta::Ino;
     use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
 
+    ensure_winfsp_runtime_loaded()?;
+
     let WinfspMountRequest {
         vfs,
         runtime_handle,
@@ -509,7 +620,7 @@ mod tests {
         DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP, DEFAULT_SECTOR_SIZE,
         DEFAULT_SECTORS_PER_ALLOCATION_UNIT, DEFAULT_VOLUME_INFO_TIMEOUT_MS, MountOptionError,
         canonical_drive_mount_point, is_drive_root_mount_point, mount_manager_mount_point,
-        parse_mount_options,
+        parse_mount_options, winfsp_dll_stem_for_arch,
     };
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -723,5 +834,13 @@ mod tests {
             u32::from(DEFAULT_SECTORS_PER_ALLOCATION_UNIT) * u32::from(DEFAULT_SECTOR_SIZE),
             DEFAULT_ALLOCATION_UNIT_SIZE
         );
+    }
+
+    #[test]
+    fn winfsp_dll_stem_matches_supported_architectures() {
+        assert_eq!(winfsp_dll_stem_for_arch("x86_64"), Some("winfsp-x64"));
+        assert_eq!(winfsp_dll_stem_for_arch("x86"), Some("winfsp-x86"));
+        assert_eq!(winfsp_dll_stem_for_arch("aarch64"), Some("winfsp-a64"));
+        assert_eq!(winfsp_dll_stem_for_arch("arm"), None);
     }
 }
