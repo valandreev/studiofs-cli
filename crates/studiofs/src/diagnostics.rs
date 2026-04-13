@@ -2771,6 +2771,24 @@ const WORKFLOW_TOOL_DIAGNOSTICS_START_BALANCED_WALL_BLOCKING: &str =
 const WORKFLOW_TOOL_DIAGNOSTICS_STOP_ACTIVE_PROFILING: &str = "diagnostics.stop_active_profiling";
 const WORKFLOW_TOOL_DIAGNOSTICS_MATERIALIZE_REPORT: &str = "diagnostics.materialize_report";
 
+#[derive(Debug, Clone, Deserialize)]
+struct WorkflowAttachSnapshotToolArgs {
+    #[serde(default)]
+    recent_events_limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WorkflowProfilingToolArgs {
+    #[serde(default)]
+    capture_mode: Option<ProfilingCaptureMode>,
+    #[serde(default)]
+    preset: Option<DiagnosticsPreset>,
+    #[serde(default)]
+    duration_ms: Option<u64>,
+    #[serde(default)]
+    sample_rate_hz: Option<u32>,
+}
+
 fn built_in_workflow_presets() -> Vec<InvestigationWorkflowPreset> {
     vec![InvestigationWorkflowPreset {
         workflow_id: "aja_hybrid_v1".to_string(),
@@ -2813,6 +2831,9 @@ fn built_in_workflow_presets() -> Vec<InvestigationWorkflowPreset> {
                     family: InvestigationWorkflowToolFamily::InternalCli,
                     tool_id: WORKFLOW_TOOL_INTERNAL_ATTACH_SNAPSHOT.to_string(),
                 }),
+                tool_arguments: Some(serde_json::json!({
+                    "recent_events_limit": 24,
+                })),
             },
             InvestigationWorkflowPresetStep {
                 step_id: "start_balanced_profiling".to_string(),
@@ -2830,6 +2851,12 @@ fn built_in_workflow_presets() -> Vec<InvestigationWorkflowPreset> {
                     family: InvestigationWorkflowToolFamily::DiagnosticsTool,
                     tool_id: WORKFLOW_TOOL_DIAGNOSTICS_START_BALANCED_WALL_BLOCKING.to_string(),
                 }),
+                tool_arguments: Some(serde_json::json!({
+                    "capture_mode": "wall_blocking",
+                    "preset": "balanced",
+                    "duration_ms": 4000,
+                    "sample_rate_hz": 80,
+                })),
             },
             InvestigationWorkflowPresetStep {
                 step_id: "run_manual_aja_phase".to_string(),
@@ -2844,6 +2871,7 @@ fn built_in_workflow_presets() -> Vec<InvestigationWorkflowPreset> {
                 on_exit_marker: Some("AJA workload done".to_string()),
                 operator_ack_text: Some("AJA phase complete".to_string()),
                 tool: None,
+                tool_arguments: None,
             },
             InvestigationWorkflowPresetStep {
                 step_id: "stop_active_profiling".to_string(),
@@ -2861,6 +2889,7 @@ fn built_in_workflow_presets() -> Vec<InvestigationWorkflowPreset> {
                     family: InvestigationWorkflowToolFamily::DiagnosticsTool,
                     tool_id: WORKFLOW_TOOL_DIAGNOSTICS_STOP_ACTIVE_PROFILING.to_string(),
                 }),
+                tool_arguments: None,
             },
             InvestigationWorkflowPresetStep {
                 step_id: "materialize_report".to_string(),
@@ -2878,6 +2907,7 @@ fn built_in_workflow_presets() -> Vec<InvestigationWorkflowPreset> {
                     family: InvestigationWorkflowToolFamily::DiagnosticsTool,
                     tool_id: WORKFLOW_TOOL_DIAGNOSTICS_MATERIALIZE_REPORT.to_string(),
                 }),
+                tool_arguments: None,
             },
         ],
     }]
@@ -3056,8 +3086,11 @@ fn run_command_with_timeout(
             let output = child
                 .wait_with_output()
                 .context("collect workflow command output")?;
+            let exit_code = status
+                .code()
+                .ok_or_else(|| anyhow!("workflow command terminated without an exit code"))?;
             return Ok((
-                status.code().unwrap_or_default(),
+                exit_code,
                 String::from_utf8_lossy(&output.stdout).into_owned(),
                 String::from_utf8_lossy(&output.stderr).into_owned(),
             ));
@@ -3077,6 +3110,7 @@ fn run_command_with_timeout(
 fn run_attach_snapshot_tool(
     source: &dyn DiagnosticsDataSource,
     workflow_run: &InvestigationWorkflowRun,
+    step: &crate::investigation::InvestigationWorkflowStepState,
     tool: InvestigationWorkflowToolRef,
 ) -> Result<(
     serde_json::Value,
@@ -3084,9 +3118,22 @@ fn run_attach_snapshot_tool(
     InvestigationWorkflowToolInvocationRecord,
 )> {
     let session = source.session_info();
+    let tool_args = step
+        .tool_arguments
+        .clone()
+        .map(serde_json::from_value::<WorkflowAttachSnapshotToolArgs>)
+        .transpose()
+        .context("decode attach snapshot workflow tool arguments")?
+        .unwrap_or(WorkflowAttachSnapshotToolArgs {
+            recent_events_limit: None,
+        });
+    let recent_events_limit = tool_args
+        .recent_events_limit
+        .unwrap_or(DEFAULT_RECENT_EVENTS_LIMIT)
+        .clamp(1, MAX_RECENT_EVENTS_LIMIT);
     let arguments = serde_json::json!({
         "mount_point": session.mount_point,
-        "recent_events_limit": DEFAULT_RECENT_EVENTS_LIMIT,
+        "recent_events_limit": recent_events_limit,
     });
     let started_unix_ms = now_unix_millis();
 
@@ -3126,7 +3173,7 @@ fn run_attach_snapshot_tool(
         "diagnostics-attach",
         &session.mount_point,
         "--recent-events-limit",
-        &DEFAULT_RECENT_EVENTS_LIMIT.to_string(),
+        &recent_events_limit.to_string(),
     ]);
     let (exit_status, stdout, stderr) = run_command_with_timeout(command, Duration::from_secs(15))?;
     if exit_status != 0 {
@@ -3196,7 +3243,7 @@ fn execute_workflow_tool_like_step(
             WORKFLOW_TOOL_INTERNAL_ATTACH_SNAPSHOT,
         ) => {
             let (summary, artifacts, invocation) =
-                run_attach_snapshot_tool(source, workflow, tool)?;
+                run_attach_snapshot_tool(source, workflow, step, tool)?;
             Ok((summary, artifacts, Some(invocation)))
         }
         (
@@ -3207,14 +3254,32 @@ fn execute_workflow_tool_like_step(
             let Some(profiling) = profiling else {
                 return Err(anyhow!("profiling control is unavailable for this session"));
             };
+            let tool_args = step
+                .tool_arguments
+                .clone()
+                .map(serde_json::from_value::<WorkflowProfilingToolArgs>)
+                .transpose()
+                .context("decode profiling workflow tool arguments")?
+                .unwrap_or(WorkflowProfilingToolArgs {
+                    capture_mode: None,
+                    preset: None,
+                    duration_ms: None,
+                    sample_rate_hz: None,
+                });
             let window = profiling.start_window(
                 &workflow.run_id,
                 StartProfilingWindowRequest {
-                    capture_mode: ProfilingCaptureMode::WallBlocking,
-                    preset: DiagnosticsPreset::Balanced,
+                    capture_mode: tool_args
+                        .capture_mode
+                        .unwrap_or(ProfilingCaptureMode::WallBlocking),
+                    preset: tool_args.preset.unwrap_or(DiagnosticsPreset::Balanced),
                     budget: ProfilingBudget {
-                        duration_ms: 5_000,
-                        sample_rate_hz: Some(DEFAULT_PROFILE_SAMPLE_RATE_HZ),
+                        duration_ms: tool_args.duration_ms.unwrap_or(5_000),
+                        sample_rate_hz: Some(
+                            tool_args
+                                .sample_rate_hz
+                                .unwrap_or(DEFAULT_PROFILE_SAMPLE_RATE_HZ),
+                        ),
                     },
                 },
                 Some(store),
@@ -4764,14 +4829,23 @@ where
             Err(FrameReadError::Utf8(error)) => return Err(error.into()),
         };
         let request: DiagnosticsRequest = serde_json::from_str(line.trim_end())?;
-        let response = execute_request(
-            request,
-            &auth_token,
-            source.as_ref(),
-            &lease_manager,
-            investigation_store.as_deref(),
-            profiling.as_deref(),
-        );
+        let auth_token_for_request = auth_token.clone();
+        let source_for_request = source.clone();
+        let lease_manager_for_request = lease_manager.clone();
+        let investigation_store_for_request = investigation_store.clone();
+        let profiling_for_request = profiling.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            execute_request(
+                request,
+                &auth_token_for_request,
+                source_for_request.as_ref(),
+                &lease_manager_for_request,
+                investigation_store_for_request.as_deref(),
+                profiling_for_request.as_deref(),
+            )
+        })
+        .await
+        .map_err(|error| anyhow!("diagnostics request task failed: {error}"))?;
         writer
             .write_all(serde_json::to_string(&response)?.as_bytes())
             .await?;
@@ -5512,6 +5586,9 @@ fn execute_request(
                 .started_unix_ms
                 .get_or_insert_with(now_unix_millis);
             workflow.updated_unix_ms = now_unix_millis();
+            if let Err(error) = store.save_workflow_run(&workflow) {
+                return store_error(error);
+            }
 
             let result = match step_kind {
                 InvestigationWorkflowStepKind::Marker => append_workflow_marker(
@@ -8278,6 +8355,14 @@ mod tests {
         );
         assert_eq!(workflow.steps[0].artifacts.len(), 1);
         assert_eq!(
+            workflow.steps[0]
+                .tool_invocation
+                .as_ref()
+                .and_then(|invocation| invocation.arguments.get("recent_events_limit"))
+                .and_then(serde_json::Value::as_u64),
+            Some(24)
+        );
+        assert_eq!(
             workflow.current_step_id.as_deref(),
             Some("start_balanced_profiling")
         );
@@ -8410,6 +8495,12 @@ mod tests {
             .expect("load workflow run");
         assert_eq!(persisted_run.workflow_run_ids, vec![workflow.id.clone()]);
         assert_eq!(persisted_run.report_ids.len(), 1);
+        assert_eq!(persisted_run.profiling_windows.len(), 1);
+        assert_eq!(
+            persisted_run.profiling_windows[0].requested_duration_ms,
+            4_000
+        );
+        assert_eq!(persisted_run.profiling_windows[0].sample_rate_hz, Some(80));
         assert_eq!(persisted_workflow.steps[0].artifacts.len(), 1);
         assert_eq!(
             persisted_workflow.steps[2]

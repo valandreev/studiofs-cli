@@ -134,6 +134,7 @@ pub(crate) struct InvestigationWorkflowPresetStep {
     pub on_exit_marker: Option<String>,
     pub operator_ack_text: Option<String>,
     pub tool: Option<InvestigationWorkflowToolRef>,
+    pub tool_arguments: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -182,6 +183,7 @@ pub(crate) struct InvestigationWorkflowStepState {
     pub on_exit_marker: Option<String>,
     pub operator_ack_text: Option<String>,
     pub tool: Option<InvestigationWorkflowToolRef>,
+    pub tool_arguments: Option<serde_json::Value>,
     pub status: InvestigationWorkflowStepStatus,
     pub started_unix_ms: Option<u64>,
     pub completed_unix_ms: Option<u64>,
@@ -757,6 +759,7 @@ impl InvestigationStore {
                     on_exit_marker: step.on_exit_marker,
                     operator_ack_text: step.operator_ack_text,
                     tool: step.tool,
+                    tool_arguments: step.tool_arguments,
                     status: InvestigationWorkflowStepStatus::Pending,
                     started_unix_ms: None,
                     completed_unix_ms: None,
@@ -2552,6 +2555,7 @@ mod tests {
                         family: InvestigationWorkflowToolFamily::InternalCli,
                         tool_id: "internal.attach_snapshot".to_string(),
                     }),
+                    tool_arguments: Some(serde_json::json!({ "recent_events_limit": 16 })),
                 },
                 InvestigationWorkflowPresetStep {
                     step_id: "manual_workload".to_string(),
@@ -2568,6 +2572,7 @@ mod tests {
                     on_exit_marker: Some("AJA workload done".to_string()),
                     operator_ack_text: Some("AJA step complete".to_string()),
                     tool: None,
+                    tool_arguments: None,
                 },
             ],
         }
