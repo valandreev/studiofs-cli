@@ -683,9 +683,7 @@ async fn connect_named_pipe_with_retry(
 
 #[cfg(test)]
 pub(crate) fn set_test_start_failure(message: Option<&str>) {
-    *TEST_START_FAILURE
-        .get_or_init(|| Mutex::new(None))
-        .lock() = message.map(str::to_string);
+    *TEST_START_FAILURE.get_or_init(|| Mutex::new(None)).lock() = message.map(str::to_string);
 }
 
 async fn handle_client<S>(
