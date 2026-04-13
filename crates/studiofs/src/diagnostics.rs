@@ -1983,21 +1983,25 @@ fn build_report_anomaly_candidates(
             supporting_evidence: episode.supporting_evidence.clone(),
         })
         .collect::<Vec<_>>();
-    anomalies.extend(run.timeline.iter().filter_map(|entry| {
-        (entry.kind == TimelineEntryKind::Note
-            && entry
-                .reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("anomaly")))
-        .then(|| InvestigationReportFinding {
-            title: entry.title.clone(),
-            summary: entry
-                .body
-                .clone()
-                .unwrap_or_else(|| "Operator annotated a runtime anomaly.".to_string()),
-            supporting_evidence: vec![timeline_entry_reference(entry)],
-        })
-    }));
+    anomalies.extend(
+        run.timeline
+            .iter()
+            .filter(|entry| {
+                entry.kind == TimelineEntryKind::Note
+                    && entry
+                        .reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("anomaly"))
+            })
+            .map(|entry| InvestigationReportFinding {
+                title: entry.title.clone(),
+                summary: entry
+                    .body
+                    .clone()
+                    .unwrap_or_else(|| "Operator annotated a runtime anomaly.".to_string()),
+                supporting_evidence: vec![timeline_entry_reference(entry)],
+            }),
+    );
     anomalies.extend(
         derived_view
             .raw
