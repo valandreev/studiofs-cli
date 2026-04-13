@@ -798,9 +798,8 @@ impl FlushGatePort for WinfspFlushGatePort<'_> {
             .context
             .callback_barrier_state
             .flush_gate_for_inode(ino);
-        let _gate_release =
-            FlushGateRelease::new(&self.context.callback_barrier_state, ino, gate.clone());
         let _flush_guard = gate.lock();
+        let _gate_release = FlushGateRelease::new(&self.context.callback_barrier_state, ino, gate);
         op()
     }
 }
