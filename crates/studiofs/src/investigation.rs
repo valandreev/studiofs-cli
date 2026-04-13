@@ -19,6 +19,7 @@ pub(crate) const INVESTIGATION_STORE_VERSION: u32 = 1;
 pub(crate) const INVESTIGATION_REPORT_SCHEMA_VERSION: u32 = 1;
 pub(crate) const INVESTIGATION_COMPARISON_SCHEMA_VERSION: u32 = 1;
 pub(crate) const INVESTIGATION_HYPOTHESIS_SCHEMA_VERSION: u32 = 1;
+pub(crate) const INVESTIGATION_WORKFLOW_RUN_SCHEMA_VERSION: u32 = 1;
 
 #[cfg(test)]
 static TEST_BASE_DIR: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
@@ -53,8 +54,164 @@ pub(crate) struct InvestigationRun {
     #[serde(default)]
     pub report_ids: Vec<String>,
     #[serde(default)]
+    pub workflow_run_ids: Vec<String>,
+    #[serde(default)]
     pub marker_snapshots: Vec<InvestigationMarkerSnapshot>,
     pub timeline: Vec<TimelineEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InvestigationWorkflowStatus {
+    Pending,
+    InProgress,
+    WaitingForOperator,
+    Completed,
+    Failed,
+    Aborted,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InvestigationWorkflowStepKind {
+    Marker,
+    Note,
+    ProfilingWindow,
+    SafeAction,
+    ToolStep,
+    ManualStep,
+    ReportStep,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InvestigationWorkflowStepStatus {
+    Pending,
+    InProgress,
+    WaitingForOperator,
+    Completed,
+    Skipped,
+    Failed,
+    Aborted,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InvestigationWorkflowFailurePolicy {
+    FailOpen,
+    Retryable,
+    AbortWorkflow,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InvestigationWorkflowToolFamily {
+    DiagnosticsTool,
+    InternalCli,
+    ScriptHook,
+    ArtifactReader,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct InvestigationWorkflowToolRef {
+    pub family: InvestigationWorkflowToolFamily,
+    pub tool_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct InvestigationWorkflowPresetStep {
+    pub step_id: String,
+    pub title: String,
+    pub instructions: String,
+    pub kind: InvestigationWorkflowStepKind,
+    pub requires_controller: bool,
+    #[serde(default)]
+    pub allowed_after: Vec<String>,
+    #[serde(default)]
+    pub expected_artifacts: Vec<String>,
+    pub failure_policy: InvestigationWorkflowFailurePolicy,
+    pub on_enter_marker: Option<String>,
+    pub on_exit_marker: Option<String>,
+    pub operator_ack_text: Option<String>,
+    pub tool: Option<InvestigationWorkflowToolRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct InvestigationWorkflowPreset {
+    pub workflow_id: String,
+    pub version: u32,
+    pub title: String,
+    pub supported_workload: String,
+    pub description: String,
+    #[serde(default)]
+    pub tools: Vec<InvestigationWorkflowToolRef>,
+    pub steps: Vec<InvestigationWorkflowPresetStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct InvestigationWorkflowArtifactRecord {
+    pub kind: String,
+    pub path: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct InvestigationWorkflowToolInvocationRecord {
+    pub tool: InvestigationWorkflowToolRef,
+    pub arguments: serde_json::Value,
+    pub started_unix_ms: u64,
+    pub completed_unix_ms: Option<u64>,
+    pub exit_status: Option<i32>,
+    pub stdout_preview: Option<String>,
+    pub stderr_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct InvestigationWorkflowStepState {
+    pub step_id: String,
+    pub title: String,
+    pub instructions: String,
+    pub kind: InvestigationWorkflowStepKind,
+    pub requires_controller: bool,
+    #[serde(default)]
+    pub allowed_after: Vec<String>,
+    #[serde(default)]
+    pub expected_artifacts: Vec<String>,
+    pub failure_policy: InvestigationWorkflowFailurePolicy,
+    pub on_enter_marker: Option<String>,
+    pub on_exit_marker: Option<String>,
+    pub operator_ack_text: Option<String>,
+    pub tool: Option<InvestigationWorkflowToolRef>,
+    pub status: InvestigationWorkflowStepStatus,
+    pub started_unix_ms: Option<u64>,
+    pub completed_unix_ms: Option<u64>,
+    pub last_error: Option<String>,
+    pub output_summary: Option<serde_json::Value>,
+    #[serde(default)]
+    pub artifacts: Vec<InvestigationWorkflowArtifactRecord>,
+    pub operator_acknowledged_by: Option<String>,
+    pub operator_acknowledgement_note: Option<String>,
+    pub tool_invocation: Option<InvestigationWorkflowToolInvocationRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct InvestigationWorkflowRun {
+    pub schema_version: u32,
+    pub id: String,
+    pub case_id: String,
+    pub run_id: String,
+    pub created_unix_ms: u64,
+    pub updated_unix_ms: u64,
+    pub workflow_id: String,
+    pub workflow_version: u32,
+    pub workflow_title: String,
+    pub supported_workload: String,
+    pub description: String,
+    pub status: InvestigationWorkflowStatus,
+    pub current_step_id: Option<String>,
+    #[serde(default)]
+    pub tools: Vec<InvestigationWorkflowToolRef>,
+    pub steps: Vec<InvestigationWorkflowStepState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -476,6 +633,11 @@ pub(crate) struct UpdateInvestigationHypothesisStatus {
     pub supporting_evidence: Vec<crate::diagnostics::DiagnosticsEvidenceReference>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct NewInvestigationWorkflowRun {
+    pub workflow: InvestigationWorkflowPreset,
+}
+
 #[derive(Debug)]
 pub(crate) struct InvestigationStore {
     base_dir: PathBuf,
@@ -536,6 +698,7 @@ impl InvestigationStore {
             fingerprint: input.fingerprint,
             profiling_windows: Vec::new(),
             report_ids: Vec::new(),
+            workflow_run_ids: Vec::new(),
             marker_snapshots: Vec::new(),
             timeline: Vec::new(),
         };
@@ -545,6 +708,87 @@ impl InvestigationStore {
         self.save_json(&self.case_path(&case.id), &case)?;
         self.save_json(&self.run_path(&run.id), &run)?;
         Ok(run)
+    }
+
+    pub(crate) fn create_workflow_run(
+        &self,
+        run_id: &str,
+        input: NewInvestigationWorkflowRun,
+    ) -> Result<InvestigationWorkflowRun> {
+        let _guard = self.io_lock.lock();
+        let _store_lock = self.lock_store()?;
+        self.ensure_layout()?;
+
+        let mut run = self.load_json::<InvestigationRun>(&self.run_path(run_id))?;
+        let now = now_unix_millis();
+        let workflow_run = InvestigationWorkflowRun {
+            schema_version: INVESTIGATION_WORKFLOW_RUN_SCHEMA_VERSION,
+            id: Uuid::new_v4().to_string(),
+            case_id: run.case_id.clone(),
+            run_id: run_id.to_string(),
+            created_unix_ms: now,
+            updated_unix_ms: now,
+            workflow_id: input.workflow.workflow_id,
+            workflow_version: input.workflow.version,
+            workflow_title: input.workflow.title,
+            supported_workload: input.workflow.supported_workload,
+            description: input.workflow.description,
+            status: InvestigationWorkflowStatus::Pending,
+            current_step_id: input
+                .workflow
+                .steps
+                .first()
+                .map(|step| step.step_id.clone()),
+            tools: input.workflow.tools,
+            steps: input
+                .workflow
+                .steps
+                .into_iter()
+                .map(|step| InvestigationWorkflowStepState {
+                    step_id: step.step_id,
+                    title: step.title,
+                    instructions: step.instructions,
+                    kind: step.kind,
+                    requires_controller: step.requires_controller,
+                    allowed_after: step.allowed_after,
+                    expected_artifacts: step.expected_artifacts,
+                    failure_policy: step.failure_policy,
+                    on_enter_marker: step.on_enter_marker,
+                    on_exit_marker: step.on_exit_marker,
+                    operator_ack_text: step.operator_ack_text,
+                    tool: step.tool,
+                    status: InvestigationWorkflowStepStatus::Pending,
+                    started_unix_ms: None,
+                    completed_unix_ms: None,
+                    last_error: None,
+                    output_summary: None,
+                    artifacts: Vec::new(),
+                    operator_acknowledged_by: None,
+                    operator_acknowledgement_note: None,
+                    tool_invocation: None,
+                })
+                .collect(),
+        };
+        let workflow_path = self.workflow_run_path(&workflow_run.id)?;
+        self.save_json(&workflow_path, &workflow_run)?;
+        run.workflow_run_ids.push(workflow_run.id.clone());
+        if let Err(run_save_error) = self.save_json(&self.run_path(run_id), &run) {
+            return cleanup_orphaned_store_file(
+                &workflow_path,
+                "run",
+                "workflow run",
+                &workflow_run.id,
+                run_save_error,
+            );
+        }
+        Ok(workflow_run)
+    }
+
+    pub(crate) fn save_workflow_run(&self, workflow_run: &InvestigationWorkflowRun) -> Result<()> {
+        let _guard = self.io_lock.lock();
+        let _store_lock = self.lock_store()?;
+        self.ensure_layout()?;
+        self.save_json(&self.workflow_run_path(&workflow_run.id)?, workflow_run)
     }
 
     pub(crate) fn append_timeline_entry(
@@ -863,6 +1107,15 @@ impl InvestigationStore {
         self.load_json(&self.hypothesis_path(hypothesis_id)?)
     }
 
+    pub(crate) fn load_workflow_run(
+        &self,
+        workflow_run_id: &str,
+    ) -> Result<InvestigationWorkflowRun> {
+        let _guard = self.io_lock.lock();
+        let _store_lock = self.lock_store()?;
+        self.load_json(&self.workflow_run_path(workflow_run_id)?)
+    }
+
     fn ensure_layout(&self) -> Result<()> {
         ensure_private_directory(&self.base_dir)?;
         ensure_private_directory(&self.cases_dir())?;
@@ -870,6 +1123,7 @@ impl InvestigationStore {
         ensure_private_directory(&self.reports_dir())?;
         ensure_private_directory(&self.comparisons_dir())?;
         ensure_private_directory(&self.hypotheses_dir())?;
+        ensure_private_directory(&self.workflow_runs_dir())?;
 
         let version_path = self.base_dir.join("store.json");
         if !version_path.exists() {
@@ -901,6 +1155,10 @@ impl InvestigationStore {
         self.base_dir.join("hypotheses")
     }
 
+    fn workflow_runs_dir(&self) -> PathBuf {
+        self.base_dir.join("workflow-runs")
+    }
+
     fn case_path(&self, case_id: &str) -> PathBuf {
         self.cases_dir().join(format!("{case_id}.json"))
     }
@@ -925,6 +1183,13 @@ impl InvestigationStore {
         Ok(self
             .hypotheses_dir()
             .join(format!("{}.json", canonical_hypothesis_id(hypothesis_id)?)))
+    }
+
+    fn workflow_run_path(&self, workflow_run_id: &str) -> Result<PathBuf> {
+        Ok(self.workflow_runs_dir().join(format!(
+            "{}.json",
+            canonical_workflow_run_id(workflow_run_id)?
+        )))
     }
 
     fn timeline_log_path(&self, run_id: &str) -> PathBuf {
@@ -1174,6 +1439,12 @@ fn canonical_comparison_id(comparison_id: &str) -> Result<String> {
 fn canonical_hypothesis_id(hypothesis_id: &str) -> Result<String> {
     Ok(Uuid::parse_str(hypothesis_id)
         .with_context(|| format!("invalid hypothesis id '{}'", hypothesis_id))?
+        .to_string())
+}
+
+fn canonical_workflow_run_id(workflow_run_id: &str) -> Result<String> {
+    Ok(Uuid::parse_str(workflow_run_id)
+        .with_context(|| format!("invalid workflow run id '{}'", workflow_run_id))?
         .to_string())
 }
 
@@ -1541,6 +1812,7 @@ mod tests {
             fingerprint: sample_fingerprint(),
             profiling_windows: Vec::new(),
             report_ids: Vec::new(),
+            workflow_run_ids: Vec::new(),
             marker_snapshots: Vec::new(),
             timeline: vec![TimelineEntry {
                 sequence: 1,
@@ -1603,6 +1875,7 @@ mod tests {
             fingerprint: sample_fingerprint(),
             profiling_windows: Vec::new(),
             report_ids: Vec::new(),
+            workflow_run_ids: Vec::new(),
             marker_snapshots: Vec::new(),
             timeline: vec![TimelineEntry {
                 sequence: 1,
@@ -2249,6 +2522,134 @@ mod tests {
         let reloaded_case = store.load_case(&case.id).expect("reload case");
         assert_eq!(reloaded_case.comparison_ids, vec![comparison.id.clone()]);
         assert_eq!(reloaded_case.hypothesis_ids, vec![hypothesis.id.clone()]);
+    }
+
+    fn sample_workflow_preset() -> InvestigationWorkflowPreset {
+        InvestigationWorkflowPreset {
+            workflow_id: "aja_hybrid_v1".to_string(),
+            version: 1,
+            title: "AJA hybrid workflow".to_string(),
+            supported_workload: "aja".to_string(),
+            description: "Hybrid workflow for partially scriptable AJA runs.".to_string(),
+            tools: vec![InvestigationWorkflowToolRef {
+                family: InvestigationWorkflowToolFamily::InternalCli,
+                tool_id: "internal.attach_snapshot".to_string(),
+            }],
+            steps: vec![
+                InvestigationWorkflowPresetStep {
+                    step_id: "capture_attach".to_string(),
+                    title: "Capture attach snapshot".to_string(),
+                    instructions: "Capture the current diagnostics attach snapshot.".to_string(),
+                    kind: InvestigationWorkflowStepKind::ToolStep,
+                    requires_controller: true,
+                    allowed_after: Vec::new(),
+                    expected_artifacts: vec!["attach_snapshot.json".to_string()],
+                    failure_policy: InvestigationWorkflowFailurePolicy::FailOpen,
+                    on_enter_marker: None,
+                    on_exit_marker: None,
+                    operator_ack_text: None,
+                    tool: Some(InvestigationWorkflowToolRef {
+                        family: InvestigationWorkflowToolFamily::InternalCli,
+                        tool_id: "internal.attach_snapshot".to_string(),
+                    }),
+                },
+                InvestigationWorkflowPresetStep {
+                    step_id: "manual_workload".to_string(),
+                    title: "Run AJA workload".to_string(),
+                    instructions:
+                        "Run the operator-driven AJA phase and acknowledge when complete."
+                            .to_string(),
+                    kind: InvestigationWorkflowStepKind::ManualStep,
+                    requires_controller: true,
+                    allowed_after: vec!["capture_attach".to_string()],
+                    expected_artifacts: Vec::new(),
+                    failure_policy: InvestigationWorkflowFailurePolicy::Retryable,
+                    on_enter_marker: Some("AJA workload start".to_string()),
+                    on_exit_marker: Some("AJA workload done".to_string()),
+                    operator_ack_text: Some("AJA step complete".to_string()),
+                    tool: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn workflow_run_persists_step_status_artifacts_and_operator_acknowledgement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        set_test_store_base_dir(Some(temp.path()));
+        let store = InvestigationStore::default_store().expect("store");
+        let case = store
+            .create_case(NewInvestigationCase {
+                title: "AJA workflow".to_string(),
+                problem_statement: None,
+                workload_identity: Some("aja".to_string()),
+                target_environment: None,
+            })
+            .expect("create case");
+        let run = store
+            .create_run(NewInvestigationRun {
+                case_id: case.id.clone(),
+                session_id: "session-123".to_string(),
+                fingerprint: sample_fingerprint(),
+            })
+            .expect("create run");
+
+        let mut workflow_run = store
+            .create_workflow_run(
+                &run.id,
+                NewInvestigationWorkflowRun {
+                    workflow: sample_workflow_preset(),
+                },
+            )
+            .expect("create workflow run");
+        workflow_run.status = InvestigationWorkflowStatus::WaitingForOperator;
+        workflow_run.current_step_id = Some("manual_workload".to_string());
+        workflow_run.updated_unix_ms = 456_789;
+        workflow_run.steps[0].status = InvestigationWorkflowStepStatus::Completed;
+        workflow_run.steps[0].started_unix_ms = Some(123_456);
+        workflow_run.steps[0].completed_unix_ms = Some(123_556);
+        workflow_run.steps[0].output_summary =
+            Some(serde_json::json!({ "artifact": "attach_snapshot.json" }));
+        workflow_run.steps[0]
+            .artifacts
+            .push(InvestigationWorkflowArtifactRecord {
+                kind: "json".to_string(),
+                path: "artifacts/attach_snapshot.json".to_string(),
+                bytes: 321,
+            });
+        workflow_run.steps[1].status = InvestigationWorkflowStepStatus::WaitingForOperator;
+        workflow_run.steps[1].started_unix_ms = Some(123_600);
+        workflow_run.steps[1].operator_acknowledged_by = Some("operator".to_string());
+        workflow_run.steps[1].operator_acknowledgement_note =
+            Some("AJA finished successfully".to_string());
+        store
+            .save_workflow_run(&workflow_run)
+            .expect("save workflow run");
+
+        let reloaded = store
+            .load_workflow_run(&workflow_run.id)
+            .expect("load workflow run");
+        let reloaded_run = store.load_run(&run.id).expect("load run");
+
+        assert_eq!(reloaded_run.workflow_run_ids, vec![workflow_run.id.clone()]);
+        assert_eq!(
+            reloaded.status,
+            InvestigationWorkflowStatus::WaitingForOperator
+        );
+        assert_eq!(reloaded.current_step_id.as_deref(), Some("manual_workload"));
+        assert_eq!(
+            reloaded.steps[0].status,
+            InvestigationWorkflowStepStatus::Completed
+        );
+        assert_eq!(reloaded.steps[0].artifacts.len(), 1);
+        assert_eq!(
+            reloaded.steps[1].operator_acknowledged_by.as_deref(),
+            Some("operator")
+        );
+        assert_eq!(
+            reloaded.steps[1].operator_acknowledgement_note.as_deref(),
+            Some("AJA finished successfully")
+        );
     }
 
     #[cfg(unix)]

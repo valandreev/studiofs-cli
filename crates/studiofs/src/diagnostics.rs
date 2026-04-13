@@ -7,9 +7,14 @@ use crate::investigation::{
     InvestigationReportEvidenceSummary, InvestigationReportFinding, InvestigationReportReferences,
     InvestigationReportSectionSummary, InvestigationReportSelectedEvidence,
     InvestigationReportTruncationSummary, InvestigationRun, InvestigationSpanComparison,
-    InvestigationSpanComparisonSummary, InvestigationStore, MachineFingerprint,
-    NewInvestigationCase, NewInvestigationHypothesis, NewInvestigationMarkerSnapshot,
-    NewInvestigationReport, NewInvestigationRun, NewInvestigationSpanComparison,
+    InvestigationSpanComparisonSummary, InvestigationStore, InvestigationWorkflowArtifactRecord,
+    InvestigationWorkflowFailurePolicy, InvestigationWorkflowPreset,
+    InvestigationWorkflowPresetStep, InvestigationWorkflowRun, InvestigationWorkflowStatus,
+    InvestigationWorkflowStepKind, InvestigationWorkflowStepStatus,
+    InvestigationWorkflowToolFamily, InvestigationWorkflowToolInvocationRecord,
+    InvestigationWorkflowToolRef, MachineFingerprint, NewInvestigationCase,
+    NewInvestigationHypothesis, NewInvestigationMarkerSnapshot, NewInvestigationReport,
+    NewInvestigationRun, NewInvestigationSpanComparison, NewInvestigationWorkflowRun,
     NewProfilingWindow, NewTimelineEntry, PlatformFingerprint, ProfileArtifactRecord,
     ProfilingCaptureMode, ProfilingCostEstimate, ProfilingWindowRecord, ProfilingWindowStatus,
     RuntimeConfigurationFingerprint, TimelineEntry, TimelineEntryKind, TimelineEntrySource,
@@ -62,7 +67,8 @@ use windows::{
 
 pub(crate) const DIAGNOSTICS_RUNTIME_SURFACE_PROTOCOL_VERSION: u32 = 3;
 pub(crate) const DIAGNOSTICS_SAFE_ACTIONS_PROTOCOL_VERSION: u32 = 4;
-pub(crate) const DIAGNOSTICS_PROTOCOL_VERSION: u32 = DIAGNOSTICS_SAFE_ACTIONS_PROTOCOL_VERSION;
+pub(crate) const DIAGNOSTICS_WORKFLOW_PROTOCOL_VERSION: u32 = 5;
+pub(crate) const DIAGNOSTICS_PROTOCOL_VERSION: u32 = DIAGNOSTICS_WORKFLOW_PROTOCOL_VERSION;
 const DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_LEASE_TTL_MS: u64 = 5_000;
 const MAX_LEASE_TTL_MS: u64 = 60_000;
@@ -101,6 +107,7 @@ const OPERATION_UPLOAD_FALLBACK_WAIT: &str = "upload_fallback_wait";
 const OPERATION_PREFETCH_QUEUE: &str = "prefetch_queue";
 const OPERATION_METADATA_BACKLOG: &str = "metadata_backlog";
 const DIAGNOSTICS_PROFILE_ARTIFACT_DIR_NAME: &str = "profiles";
+const DIAGNOSTICS_WORKFLOW_ARTIFACT_DIR_NAME: &str = "workflow-artifacts";
 #[cfg(unix)]
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
 
@@ -108,10 +115,20 @@ const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
 static TEST_START_FAILURE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 #[cfg(test)]
 static TEST_SAFE_ACTION_AUDIT_FAILURE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+#[cfg(test)]
+static TEST_WORKFLOW_ATTACH_SNAPSHOT_OUTPUT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 #[cfg(test)]
 fn test_safe_action_audit_failure_message() -> Option<String> {
     TEST_SAFE_ACTION_AUDIT_FAILURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .clone()
+}
+
+#[cfg(test)]
+fn test_workflow_attach_snapshot_output() -> Option<String> {
+    TEST_WORKFLOW_ATTACH_SNAPSHOT_OUTPUT
         .get_or_init(|| Mutex::new(None))
         .lock()
         .clone()
@@ -2748,6 +2765,522 @@ fn capture_bundle_artifact(
     })
 }
 
+const WORKFLOW_TOOL_INTERNAL_ATTACH_SNAPSHOT: &str = "internal.attach_snapshot";
+const WORKFLOW_TOOL_DIAGNOSTICS_START_BALANCED_WALL_BLOCKING: &str =
+    "diagnostics.start_balanced_wall_blocking";
+const WORKFLOW_TOOL_DIAGNOSTICS_STOP_ACTIVE_PROFILING: &str = "diagnostics.stop_active_profiling";
+const WORKFLOW_TOOL_DIAGNOSTICS_MATERIALIZE_REPORT: &str = "diagnostics.materialize_report";
+
+fn built_in_workflow_presets() -> Vec<InvestigationWorkflowPreset> {
+    vec![InvestigationWorkflowPreset {
+        workflow_id: "aja_hybrid_v1".to_string(),
+        version: 1,
+        title: "AJA Hybrid Investigation".to_string(),
+        supported_workload: "aja".to_string(),
+        description: "Guide an AJA-style operator workflow with bounded automation, manual acknowledgement, profiling, and report generation.".to_string(),
+        tools: vec![
+            InvestigationWorkflowToolRef {
+                family: InvestigationWorkflowToolFamily::InternalCli,
+                tool_id: WORKFLOW_TOOL_INTERNAL_ATTACH_SNAPSHOT.to_string(),
+            },
+            InvestigationWorkflowToolRef {
+                family: InvestigationWorkflowToolFamily::DiagnosticsTool,
+                tool_id: WORKFLOW_TOOL_DIAGNOSTICS_START_BALANCED_WALL_BLOCKING.to_string(),
+            },
+            InvestigationWorkflowToolRef {
+                family: InvestigationWorkflowToolFamily::DiagnosticsTool,
+                tool_id: WORKFLOW_TOOL_DIAGNOSTICS_STOP_ACTIVE_PROFILING.to_string(),
+            },
+            InvestigationWorkflowToolRef {
+                family: InvestigationWorkflowToolFamily::DiagnosticsTool,
+                tool_id: WORKFLOW_TOOL_DIAGNOSTICS_MATERIALIZE_REPORT.to_string(),
+            },
+        ],
+        steps: vec![
+            InvestigationWorkflowPresetStep {
+                step_id: "capture_attach_snapshot".to_string(),
+                title: "Capture attach snapshot".to_string(),
+                instructions: "Run the bounded attach helper and save the resulting diagnostics snapshot artifact.".to_string(),
+                kind: InvestigationWorkflowStepKind::ToolStep,
+                requires_controller: true,
+                allowed_after: Vec::new(),
+                expected_artifacts: vec!["attach_snapshot.json".to_string()],
+                failure_policy: InvestigationWorkflowFailurePolicy::FailOpen,
+                on_enter_marker: None,
+                on_exit_marker: None,
+                operator_ack_text: None,
+                tool: Some(InvestigationWorkflowToolRef {
+                    family: InvestigationWorkflowToolFamily::InternalCli,
+                    tool_id: WORKFLOW_TOOL_INTERNAL_ATTACH_SNAPSHOT.to_string(),
+                }),
+            },
+            InvestigationWorkflowPresetStep {
+                step_id: "start_balanced_profiling".to_string(),
+                title: "Start balanced wall-blocking profile".to_string(),
+                instructions: "Start a bounded wall-blocking profile before the operator workload phase.".to_string(),
+                kind: InvestigationWorkflowStepKind::ProfilingWindow,
+                requires_controller: true,
+                allowed_after: vec!["capture_attach_snapshot".to_string()],
+                expected_artifacts: Vec::new(),
+                failure_policy: InvestigationWorkflowFailurePolicy::FailOpen,
+                on_enter_marker: None,
+                on_exit_marker: None,
+                operator_ack_text: None,
+                tool: Some(InvestigationWorkflowToolRef {
+                    family: InvestigationWorkflowToolFamily::DiagnosticsTool,
+                    tool_id: WORKFLOW_TOOL_DIAGNOSTICS_START_BALANCED_WALL_BLOCKING.to_string(),
+                }),
+            },
+            InvestigationWorkflowPresetStep {
+                step_id: "run_manual_aja_phase".to_string(),
+                title: "Run operator AJA phase".to_string(),
+                instructions: "Run the AJA-controlled workload now, then acknowledge this step when the manual phase completes.".to_string(),
+                kind: InvestigationWorkflowStepKind::ManualStep,
+                requires_controller: true,
+                allowed_after: vec!["start_balanced_profiling".to_string()],
+                expected_artifacts: Vec::new(),
+                failure_policy: InvestigationWorkflowFailurePolicy::Retryable,
+                on_enter_marker: Some("AJA workload start".to_string()),
+                on_exit_marker: Some("AJA workload done".to_string()),
+                operator_ack_text: Some("AJA phase complete".to_string()),
+                tool: None,
+            },
+            InvestigationWorkflowPresetStep {
+                step_id: "stop_active_profiling".to_string(),
+                title: "Stop active profiling window".to_string(),
+                instructions: "Stop the active profiling window started before the manual phase.".to_string(),
+                kind: InvestigationWorkflowStepKind::ProfilingWindow,
+                requires_controller: true,
+                allowed_after: vec!["run_manual_aja_phase".to_string()],
+                expected_artifacts: vec!["profile_summary".to_string()],
+                failure_policy: InvestigationWorkflowFailurePolicy::FailOpen,
+                on_enter_marker: None,
+                on_exit_marker: None,
+                operator_ack_text: None,
+                tool: Some(InvestigationWorkflowToolRef {
+                    family: InvestigationWorkflowToolFamily::DiagnosticsTool,
+                    tool_id: WORKFLOW_TOOL_DIAGNOSTICS_STOP_ACTIVE_PROFILING.to_string(),
+                }),
+            },
+            InvestigationWorkflowPresetStep {
+                step_id: "materialize_report".to_string(),
+                title: "Materialize investigation report".to_string(),
+                instructions: "Generate a single-run report from the captured workflow evidence.".to_string(),
+                kind: InvestigationWorkflowStepKind::ReportStep,
+                requires_controller: true,
+                allowed_after: vec!["stop_active_profiling".to_string()],
+                expected_artifacts: vec!["investigation_report".to_string()],
+                failure_policy: InvestigationWorkflowFailurePolicy::Retryable,
+                on_enter_marker: None,
+                on_exit_marker: None,
+                operator_ack_text: None,
+                tool: Some(InvestigationWorkflowToolRef {
+                    family: InvestigationWorkflowToolFamily::DiagnosticsTool,
+                    tool_id: WORKFLOW_TOOL_DIAGNOSTICS_MATERIALIZE_REPORT.to_string(),
+                }),
+            },
+        ],
+    }]
+}
+
+fn built_in_workflow_by_id(workflow_id: &str) -> Option<InvestigationWorkflowPreset> {
+    built_in_workflow_presets()
+        .into_iter()
+        .find(|workflow| workflow.workflow_id == workflow_id)
+}
+
+fn append_workflow_timeline_event(
+    store: &InvestigationStore,
+    run_id: &str,
+    title: &str,
+    body: serde_json::Value,
+) -> Result<()> {
+    store.append_timeline_entry(
+        run_id,
+        NewTimelineEntry {
+            source: TimelineEntrySource::Mcp,
+            kind: TimelineEntryKind::Action,
+            title: title.to_string(),
+            body: Some(serde_json::to_string(&body)?),
+            actor: Some("workflow".to_string()),
+            reason: None,
+        },
+    )?;
+    Ok(())
+}
+
+fn append_workflow_marker(
+    store: &InvestigationStore,
+    run_id: &str,
+    title: &str,
+    source: &dyn DiagnosticsDataSource,
+) -> Result<()> {
+    let marker = store.append_timeline_entry(
+        run_id,
+        NewTimelineEntry {
+            source: TimelineEntrySource::Mcp,
+            kind: TimelineEntryKind::Marker,
+            title: title.to_string(),
+            body: None,
+            actor: Some("workflow".to_string()),
+            reason: None,
+        },
+    )?;
+    store.append_marker_snapshot(
+        run_id,
+        NewInvestigationMarkerSnapshot {
+            marker_sequence: marker.sequence,
+            marker_title: marker.title,
+            runtime_snapshot: source.runtime_snapshot(),
+        },
+    )?;
+    Ok(())
+}
+
+fn workflow_step_index(workflow: &InvestigationWorkflowRun, step_id: &str) -> Result<usize> {
+    workflow
+        .steps
+        .iter()
+        .position(|step| step.step_id == step_id)
+        .ok_or_else(|| anyhow!("workflow step '{}' not found", step_id))
+}
+
+fn workflow_step_is_terminal(status: InvestigationWorkflowStepStatus) -> bool {
+    matches!(
+        status,
+        InvestigationWorkflowStepStatus::Completed
+            | InvestigationWorkflowStepStatus::Skipped
+            | InvestigationWorkflowStepStatus::Failed
+            | InvestigationWorkflowStepStatus::Aborted
+    )
+}
+
+fn workflow_dependencies_satisfied(
+    workflow: &InvestigationWorkflowRun,
+    step: &crate::investigation::InvestigationWorkflowStepState,
+) -> bool {
+    step.allowed_after.iter().all(|dependency| {
+        workflow
+            .steps
+            .iter()
+            .find(|candidate| candidate.step_id == *dependency)
+            .is_some_and(|candidate| workflow_step_is_terminal(candidate.status))
+    })
+}
+
+fn next_available_workflow_step_id(workflow: &InvestigationWorkflowRun) -> Option<String> {
+    workflow
+        .steps
+        .iter()
+        .find(|step| {
+            step.status == InvestigationWorkflowStepStatus::Pending
+                && workflow_dependencies_satisfied(workflow, step)
+        })
+        .map(|step| step.step_id.clone())
+}
+
+fn complete_workflow_progress(workflow: &mut InvestigationWorkflowRun) {
+    workflow.updated_unix_ms = now_unix_millis();
+    if let Some(waiting) = workflow
+        .steps
+        .iter()
+        .find(|step| step.status == InvestigationWorkflowStepStatus::WaitingForOperator)
+    {
+        workflow.status = InvestigationWorkflowStatus::WaitingForOperator;
+        workflow.current_step_id = Some(waiting.step_id.clone());
+        return;
+    }
+    if let Some(next_step_id) = next_available_workflow_step_id(workflow) {
+        workflow.status = InvestigationWorkflowStatus::InProgress;
+        workflow.current_step_id = Some(next_step_id);
+    } else {
+        workflow.status = InvestigationWorkflowStatus::Completed;
+        workflow.current_step_id = None;
+    }
+}
+
+fn workflow_artifact_dir(cache_path: &str, workflow_run_id: &str) -> Result<PathBuf> {
+    let dir = PathBuf::from(cache_path)
+        .join(DIAGNOSTICS_WORKFLOW_ARTIFACT_DIR_NAME)
+        .join(workflow_run_id);
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("create workflow artifact dir '{}'", dir.display()))?;
+    Ok(dir)
+}
+
+fn write_workflow_artifact(
+    cache_path: &str,
+    workflow_run_id: &str,
+    step_id: &str,
+    kind: &str,
+    extension: &str,
+    bytes: &[u8],
+) -> Result<InvestigationWorkflowArtifactRecord> {
+    let dir = workflow_artifact_dir(cache_path, workflow_run_id)?;
+    let path = dir.join(format!(
+        "{}-{}-{}.{}",
+        step_id,
+        now_unix_millis(),
+        Uuid::new_v4(),
+        extension
+    ));
+    fs::write(&path, bytes)
+        .with_context(|| format!("write workflow artifact '{}'", path.display()))?;
+    Ok(InvestigationWorkflowArtifactRecord {
+        kind: kind.to_string(),
+        path: path.to_string_lossy().into_owned(),
+        bytes: bytes.len() as u64,
+    })
+}
+
+fn preview_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.chars().take(512).collect())
+    }
+}
+
+fn run_command_with_timeout(
+    mut command: std::process::Command,
+    timeout: Duration,
+) -> Result<(i32, String, String)> {
+    use std::process::Stdio;
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().context("spawn workflow command")?;
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().context("poll workflow command")? {
+            let output = child
+                .wait_with_output()
+                .context("collect workflow command output")?;
+            return Ok((
+                status.code().unwrap_or_default(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
+        }
+        if started.elapsed() >= timeout {
+            child.kill().ok();
+            let _ = child.wait();
+            return Err(anyhow!(
+                "workflow command exceeded timeout of {} ms",
+                timeout.as_millis()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn run_attach_snapshot_tool(
+    source: &dyn DiagnosticsDataSource,
+    workflow_run: &InvestigationWorkflowRun,
+    tool: InvestigationWorkflowToolRef,
+) -> Result<(
+    serde_json::Value,
+    Vec<InvestigationWorkflowArtifactRecord>,
+    InvestigationWorkflowToolInvocationRecord,
+)> {
+    let session = source.session_info();
+    let arguments = serde_json::json!({
+        "mount_point": session.mount_point,
+        "recent_events_limit": DEFAULT_RECENT_EVENTS_LIMIT,
+    });
+    let started_unix_ms = now_unix_millis();
+
+    #[cfg(test)]
+    if let Some(output) = test_workflow_attach_snapshot_output() {
+        let artifact = write_workflow_artifact(
+            &session.cache_path,
+            &workflow_run.id,
+            "capture_attach_snapshot",
+            "attach_snapshot",
+            "json",
+            output.as_bytes(),
+        )?;
+        return Ok((
+            serde_json::json!({
+                "tool_id": tool.tool_id,
+                "artifact": artifact.path,
+            }),
+            vec![artifact],
+            InvestigationWorkflowToolInvocationRecord {
+                tool,
+                arguments,
+                started_unix_ms,
+                completed_unix_ms: Some(now_unix_millis()),
+                exit_status: Some(0),
+                stdout_preview: preview_text(&output),
+                stderr_preview: None,
+            },
+        ));
+    }
+
+    let current_exe = std::env::current_exe().context("resolve current executable")?;
+    let mut command = std::process::Command::new(&current_exe);
+    command.current_dir(&session.cache_path);
+    command.args([
+        "internal",
+        "diagnostics-attach",
+        &session.mount_point,
+        "--recent-events-limit",
+        &DEFAULT_RECENT_EVENTS_LIMIT.to_string(),
+    ]);
+    let (exit_status, stdout, stderr) = run_command_with_timeout(command, Duration::from_secs(15))?;
+    if exit_status != 0 {
+        return Err(anyhow!(
+            "workflow tool '{}' exited with status {}: {}",
+            WORKFLOW_TOOL_INTERNAL_ATTACH_SNAPSHOT,
+            exit_status,
+            stderr.trim()
+        ));
+    }
+    let artifact = write_workflow_artifact(
+        &session.cache_path,
+        &workflow_run.id,
+        "capture_attach_snapshot",
+        "attach_snapshot",
+        "json",
+        stdout.as_bytes(),
+    )?;
+    Ok((
+        serde_json::json!({
+            "tool_id": WORKFLOW_TOOL_INTERNAL_ATTACH_SNAPSHOT,
+            "artifact": artifact.path,
+        }),
+        vec![artifact],
+        InvestigationWorkflowToolInvocationRecord {
+            tool,
+            arguments,
+            started_unix_ms,
+            completed_unix_ms: Some(now_unix_millis()),
+            exit_status: Some(exit_status),
+            stdout_preview: preview_text(&stdout),
+            stderr_preview: preview_text(&stderr),
+        },
+    ))
+}
+
+fn find_last_started_workflow_window_id(workflow: &InvestigationWorkflowRun) -> Option<String> {
+    workflow.steps.iter().rev().find_map(|step| {
+        step.output_summary
+            .as_ref()
+            .and_then(|summary| summary.get("window_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    })
+}
+
+fn execute_workflow_tool_like_step(
+    workflow: &InvestigationWorkflowRun,
+    step_index: usize,
+    source: &dyn DiagnosticsDataSource,
+    store: &InvestigationStore,
+    profiling: Option<&DiagnosticsProfilingCoordinator>,
+) -> Result<(
+    serde_json::Value,
+    Vec<InvestigationWorkflowArtifactRecord>,
+    Option<InvestigationWorkflowToolInvocationRecord>,
+)> {
+    let step = &workflow.steps[step_index];
+    let tool = step
+        .tool
+        .clone()
+        .ok_or_else(|| anyhow!("workflow step '{}' is missing a tool", step.step_id))?;
+    match (step.kind, tool.family, tool.tool_id.as_str()) {
+        (
+            InvestigationWorkflowStepKind::ToolStep,
+            InvestigationWorkflowToolFamily::InternalCli,
+            WORKFLOW_TOOL_INTERNAL_ATTACH_SNAPSHOT,
+        ) => {
+            let (summary, artifacts, invocation) =
+                run_attach_snapshot_tool(source, workflow, tool)?;
+            Ok((summary, artifacts, Some(invocation)))
+        }
+        (
+            InvestigationWorkflowStepKind::ProfilingWindow,
+            InvestigationWorkflowToolFamily::DiagnosticsTool,
+            WORKFLOW_TOOL_DIAGNOSTICS_START_BALANCED_WALL_BLOCKING,
+        ) => {
+            let Some(profiling) = profiling else {
+                return Err(anyhow!("profiling control is unavailable for this session"));
+            };
+            let window = profiling.start_window(
+                &workflow.run_id,
+                StartProfilingWindowRequest {
+                    capture_mode: ProfilingCaptureMode::WallBlocking,
+                    preset: DiagnosticsPreset::Balanced,
+                    budget: ProfilingBudget {
+                        duration_ms: 5_000,
+                        sample_rate_hz: Some(DEFAULT_PROFILE_SAMPLE_RATE_HZ),
+                    },
+                },
+                Some(store),
+            )?;
+            Ok((
+                serde_json::json!({
+                    "window_id": window.window_id,
+                    "status": window.status,
+                }),
+                Vec::new(),
+                None,
+            ))
+        }
+        (
+            InvestigationWorkflowStepKind::ProfilingWindow,
+            InvestigationWorkflowToolFamily::DiagnosticsTool,
+            WORKFLOW_TOOL_DIAGNOSTICS_STOP_ACTIVE_PROFILING,
+        ) => {
+            let Some(profiling) = profiling else {
+                return Err(anyhow!("profiling control is unavailable for this session"));
+            };
+            let Some(window_id) = find_last_started_workflow_window_id(workflow) else {
+                return Err(anyhow!("no active workflow profiling window to stop"));
+            };
+            let window = profiling.stop_window(&window_id, Some(store))?;
+            let artifacts = window
+                .artifact
+                .as_ref()
+                .map(|artifact| {
+                    vec![InvestigationWorkflowArtifactRecord {
+                        kind: artifact.kind.clone(),
+                        path: artifact.path.clone(),
+                        bytes: artifact.bytes,
+                    }]
+                })
+                .unwrap_or_default();
+            Ok((
+                serde_json::json!({
+                    "window_id": window.window_id,
+                    "status": window.status,
+                }),
+                artifacts,
+                None,
+            ))
+        }
+        (
+            InvestigationWorkflowStepKind::ReportStep,
+            InvestigationWorkflowToolFamily::DiagnosticsTool,
+            WORKFLOW_TOOL_DIAGNOSTICS_MATERIALIZE_REPORT,
+        ) => {
+            let report = materialize_report(&workflow.run_id, source, store)?;
+            Ok((
+                serde_json::json!({
+                    "report_id": report.id,
+                }),
+                Vec::new(),
+                None,
+            ))
+        }
+        _ => Err(anyhow!(
+            "workflow tool '{}' is not allowed for this step",
+            tool.tool_id
+        )),
+    }
+}
+
 fn write_wall_blocking_artifact(cache_path: &Path, payload: &serde_json::Value) -> Result<PathBuf> {
     let output_dir = cache_path.join(DIAGNOSTICS_PROFILE_ARTIFACT_DIR_NAME);
     fs::create_dir_all(&output_dir).with_context(|| {
@@ -2950,6 +3483,9 @@ enum DiagnosticsRequest {
     SessionInfo {
         auth_token: String,
     },
+    ListWorkflows {
+        auth_token: String,
+    },
     Health {
         auth_token: String,
     },
@@ -2999,6 +3535,42 @@ enum DiagnosticsRequest {
         lease_id: String,
         case_id: String,
         run_workload_identity: Option<String>,
+    },
+    StartWorkflow {
+        auth_token: String,
+        lease_id: String,
+        run_id: String,
+        workflow_id: String,
+    },
+    GetWorkflowRun {
+        auth_token: String,
+        lease_id: String,
+        workflow_run_id: String,
+    },
+    AdvanceWorkflowStep {
+        auth_token: String,
+        lease_id: String,
+        workflow_run_id: String,
+        step_id: String,
+    },
+    AcknowledgeManualStep {
+        auth_token: String,
+        lease_id: String,
+        workflow_run_id: String,
+        step_id: String,
+        actor: Option<String>,
+        note: Option<String>,
+    },
+    AbortWorkflow {
+        auth_token: String,
+        lease_id: String,
+        workflow_run_id: String,
+        reason: Option<String>,
+    },
+    CompleteWorkflow {
+        auth_token: String,
+        lease_id: String,
+        workflow_run_id: String,
     },
     CreateHypothesis {
         auth_token: String,
@@ -3056,6 +3628,9 @@ enum DiagnosticsResponse {
     SessionInfo {
         session: DiagnosticsSessionInfo,
     },
+    WorkflowPresets {
+        workflows: Vec<InvestigationWorkflowPreset>,
+    },
     Health {
         health: Box<DiagnosticsHealthSnapshot>,
     },
@@ -3082,6 +3657,9 @@ enum DiagnosticsResponse {
     },
     InvestigationRun {
         run: Box<InvestigationRun>,
+    },
+    WorkflowRun {
+        workflow: Box<InvestigationWorkflowRun>,
     },
     InvestigationHypothesis {
         hypothesis: Box<InvestigationHypothesis>,
@@ -3303,6 +3881,19 @@ impl LocalDiagnosticsClient {
         }
     }
 
+    pub(crate) async fn list_workflows(&self) -> Result<Vec<InvestigationWorkflowPreset>> {
+        match self
+            .send(DiagnosticsRequest::ListWorkflows {
+                auth_token: self.discovery.auth_token.clone(),
+            })
+            .await?
+        {
+            DiagnosticsResponse::WorkflowPresets { workflows } => Ok(workflows),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
     pub(crate) async fn health(&self) -> Result<DiagnosticsHealthSnapshot> {
         match self
             .send(DiagnosticsRequest::Health {
@@ -3485,6 +4076,132 @@ impl LocalDiagnosticsClient {
             .await?
         {
             DiagnosticsResponse::InvestigationRun { run } => Ok(*run),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
+    pub(crate) async fn start_workflow(
+        &self,
+        lease_id: &str,
+        run_id: &str,
+        workflow_id: &str,
+    ) -> Result<InvestigationWorkflowRun> {
+        match self
+            .send(DiagnosticsRequest::StartWorkflow {
+                auth_token: self.discovery.auth_token.clone(),
+                lease_id: lease_id.to_string(),
+                run_id: run_id.to_string(),
+                workflow_id: workflow_id.to_string(),
+            })
+            .await?
+        {
+            DiagnosticsResponse::WorkflowRun { workflow } => Ok(*workflow),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
+    pub(crate) async fn workflow_run(
+        &self,
+        lease_id: &str,
+        workflow_run_id: &str,
+    ) -> Result<InvestigationWorkflowRun> {
+        match self
+            .send(DiagnosticsRequest::GetWorkflowRun {
+                auth_token: self.discovery.auth_token.clone(),
+                lease_id: lease_id.to_string(),
+                workflow_run_id: workflow_run_id.to_string(),
+            })
+            .await?
+        {
+            DiagnosticsResponse::WorkflowRun { workflow } => Ok(*workflow),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
+    pub(crate) async fn advance_workflow_step(
+        &self,
+        lease_id: &str,
+        workflow_run_id: &str,
+        step_id: &str,
+    ) -> Result<InvestigationWorkflowRun> {
+        match self
+            .send(DiagnosticsRequest::AdvanceWorkflowStep {
+                auth_token: self.discovery.auth_token.clone(),
+                lease_id: lease_id.to_string(),
+                workflow_run_id: workflow_run_id.to_string(),
+                step_id: step_id.to_string(),
+            })
+            .await?
+        {
+            DiagnosticsResponse::WorkflowRun { workflow } => Ok(*workflow),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
+    pub(crate) async fn acknowledge_manual_step(
+        &self,
+        lease_id: &str,
+        workflow_run_id: &str,
+        step_id: &str,
+        actor: Option<String>,
+        note: Option<String>,
+    ) -> Result<InvestigationWorkflowRun> {
+        match self
+            .send(DiagnosticsRequest::AcknowledgeManualStep {
+                auth_token: self.discovery.auth_token.clone(),
+                lease_id: lease_id.to_string(),
+                workflow_run_id: workflow_run_id.to_string(),
+                step_id: step_id.to_string(),
+                actor,
+                note,
+            })
+            .await?
+        {
+            DiagnosticsResponse::WorkflowRun { workflow } => Ok(*workflow),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
+    pub(crate) async fn abort_workflow(
+        &self,
+        lease_id: &str,
+        workflow_run_id: &str,
+        reason: Option<String>,
+    ) -> Result<InvestigationWorkflowRun> {
+        match self
+            .send(DiagnosticsRequest::AbortWorkflow {
+                auth_token: self.discovery.auth_token.clone(),
+                lease_id: lease_id.to_string(),
+                workflow_run_id: workflow_run_id.to_string(),
+                reason,
+            })
+            .await?
+        {
+            DiagnosticsResponse::WorkflowRun { workflow } => Ok(*workflow),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
+    pub(crate) async fn complete_workflow(
+        &self,
+        lease_id: &str,
+        workflow_run_id: &str,
+    ) -> Result<InvestigationWorkflowRun> {
+        match self
+            .send(DiagnosticsRequest::CompleteWorkflow {
+                auth_token: self.discovery.auth_token.clone(),
+                lease_id: lease_id.to_string(),
+                workflow_run_id: workflow_run_id.to_string(),
+            })
+            .await?
+        {
+            DiagnosticsResponse::WorkflowRun { workflow } => Ok(*workflow),
             DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
             other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
         }
@@ -4180,6 +4897,13 @@ fn execute_request(
         }
     }
 
+    fn workflow_error(code: &str, message: impl Into<String>) -> DiagnosticsResponse {
+        DiagnosticsResponse::Error {
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+
     fn profiling_start_error(error: ProfilingWindowStartError) -> DiagnosticsResponse {
         match error {
             ProfilingWindowStartError::Budget(error) => DiagnosticsResponse::Error {
@@ -4250,6 +4974,16 @@ fn execute_request(
             let mut session = source.session_info();
             session.controller = lease_manager.snapshot();
             DiagnosticsResponse::SessionInfo { session }
+        }
+        DiagnosticsRequest::ListWorkflows {
+            auth_token: provided,
+        } => {
+            if provided != auth_token {
+                return unauthorized();
+            }
+            DiagnosticsResponse::WorkflowPresets {
+                workflows: built_in_workflow_presets(),
+            }
         }
         DiagnosticsRequest::Health {
             auth_token: provided,
@@ -4607,6 +5341,481 @@ fn execute_request(
             }) {
                 Ok(run) => DiagnosticsResponse::InvestigationRun { run: Box::new(run) },
                 Err(error) => store_error(error),
+            }
+        }
+        DiagnosticsRequest::StartWorkflow {
+            auth_token: provided,
+            lease_id,
+            run_id,
+            workflow_id,
+        } => {
+            let store = match require_mutating_store(
+                &provided,
+                auth_token,
+                &lease_id,
+                lease_manager,
+                investigation_store,
+            ) {
+                Ok(store) => store,
+                Err(error) => return mutating_request_error_response(error),
+            };
+            if let Err(error) = store.load_run(&run_id) {
+                return store_error(error);
+            }
+            let Some(workflow) = built_in_workflow_by_id(&workflow_id) else {
+                return workflow_error(
+                    "workflow_unknown",
+                    format!("workflow preset '{}' is not registered", workflow_id),
+                );
+            };
+            match store.create_workflow_run(&run_id, NewInvestigationWorkflowRun { workflow }) {
+                Ok(mut workflow_run) => {
+                    if workflow_run.current_step_id.is_some() {
+                        workflow_run.status = InvestigationWorkflowStatus::InProgress;
+                        workflow_run.updated_unix_ms = now_unix_millis();
+                        if let Err(error) = store.save_workflow_run(&workflow_run) {
+                            return store_error(error);
+                        }
+                    }
+                    if let Err(error) = append_workflow_timeline_event(
+                        store,
+                        &run_id,
+                        "workflow_started",
+                        serde_json::json!({
+                            "workflow_run_id": workflow_run.id,
+                            "workflow_id": workflow_run.workflow_id,
+                        }),
+                    ) {
+                        warn!(
+                            run_id = %run_id,
+                            workflow_id = %workflow_run.workflow_id,
+                            error = %error,
+                            "failed to append workflow start timeline event"
+                        );
+                    }
+                    DiagnosticsResponse::WorkflowRun {
+                        workflow: Box::new(workflow_run),
+                    }
+                }
+                Err(error) => store_error(error),
+            }
+        }
+        DiagnosticsRequest::GetWorkflowRun {
+            auth_token: provided,
+            lease_id,
+            workflow_run_id,
+        } => {
+            let store = match require_mutating_store(
+                &provided,
+                auth_token,
+                &lease_id,
+                lease_manager,
+                investigation_store,
+            ) {
+                Ok(store) => store,
+                Err(error) => return mutating_request_error_response(error),
+            };
+            match store.load_workflow_run(&workflow_run_id) {
+                Ok(workflow) => DiagnosticsResponse::WorkflowRun {
+                    workflow: Box::new(workflow),
+                },
+                Err(error) => store_error(error),
+            }
+        }
+        DiagnosticsRequest::AdvanceWorkflowStep {
+            auth_token: provided,
+            lease_id,
+            workflow_run_id,
+            step_id,
+        } => {
+            let store = match require_mutating_store(
+                &provided,
+                auth_token,
+                &lease_id,
+                lease_manager,
+                investigation_store,
+            ) {
+                Ok(store) => store,
+                Err(error) => return mutating_request_error_response(error),
+            };
+            let mut workflow = match store.load_workflow_run(&workflow_run_id) {
+                Ok(workflow) => workflow,
+                Err(error) => return store_error(error),
+            };
+            if matches!(
+                workflow.status,
+                InvestigationWorkflowStatus::Completed
+                    | InvestigationWorkflowStatus::Failed
+                    | InvestigationWorkflowStatus::Aborted
+            ) {
+                return workflow_error(
+                    "workflow_invalid",
+                    format!(
+                        "workflow run '{}' is already in terminal state {:?}",
+                        workflow.id, workflow.status
+                    ),
+                );
+            }
+            if workflow.current_step_id.as_deref() != Some(step_id.as_str()) {
+                return workflow_error(
+                    "workflow_invalid_step",
+                    format!(
+                        "workflow step '{}' is not current for workflow run '{}'",
+                        step_id, workflow.id
+                    ),
+                );
+            }
+            let step_index = match workflow_step_index(&workflow, &step_id) {
+                Ok(index) => index,
+                Err(error) => return workflow_error("workflow_invalid_step", error.to_string()),
+            };
+            if !workflow_dependencies_satisfied(&workflow, &workflow.steps[step_index]) {
+                return workflow_error(
+                    "workflow_dependencies_unmet",
+                    format!("workflow step '{}' dependencies are not satisfied", step_id),
+                );
+            }
+
+            let step_kind = workflow.steps[step_index].kind;
+            let step_failure_policy = workflow.steps[step_index].failure_policy;
+            if step_kind == InvestigationWorkflowStepKind::ManualStep {
+                if workflow.steps[step_index].status != InvestigationWorkflowStepStatus::Pending {
+                    return workflow_error(
+                        "workflow_invalid_step",
+                        format!(
+                            "manual workflow step '{}' is not pending",
+                            workflow.steps[step_index].step_id
+                        ),
+                    );
+                }
+                workflow.steps[step_index].status =
+                    InvestigationWorkflowStepStatus::WaitingForOperator;
+                workflow.steps[step_index].started_unix_ms = Some(now_unix_millis());
+                workflow.updated_unix_ms = now_unix_millis();
+                workflow.status = InvestigationWorkflowStatus::WaitingForOperator;
+                if let Some(marker_title) = workflow.steps[step_index].on_enter_marker.clone()
+                    && let Err(error) =
+                        append_workflow_marker(store, &workflow.run_id, &marker_title, source)
+                {
+                    return store_error(error);
+                }
+                if let Err(error) = store.save_workflow_run(&workflow) {
+                    return store_error(error);
+                }
+                return DiagnosticsResponse::WorkflowRun {
+                    workflow: Box::new(workflow),
+                };
+            }
+
+            workflow.steps[step_index].status = InvestigationWorkflowStepStatus::InProgress;
+            workflow.steps[step_index]
+                .started_unix_ms
+                .get_or_insert_with(now_unix_millis);
+            workflow.updated_unix_ms = now_unix_millis();
+
+            let result = match step_kind {
+                InvestigationWorkflowStepKind::Marker => append_workflow_marker(
+                    store,
+                    &workflow.run_id,
+                    &workflow.steps[step_index].title,
+                    source,
+                )
+                .map(|_| {
+                    (
+                        serde_json::json!({ "marker": workflow.steps[step_index].title }),
+                        Vec::new(),
+                        None,
+                    )
+                }),
+                InvestigationWorkflowStepKind::Note => store
+                    .append_timeline_entry(
+                        &workflow.run_id,
+                        NewTimelineEntry {
+                            source: TimelineEntrySource::Mcp,
+                            kind: TimelineEntryKind::Note,
+                            title: workflow.steps[step_index].title.clone(),
+                            body: Some(workflow.steps[step_index].instructions.clone()),
+                            actor: Some("workflow".to_string()),
+                            reason: None,
+                        },
+                    )
+                    .map(|_| {
+                        (
+                            serde_json::json!({ "note": workflow.steps[step_index].title }),
+                            Vec::new(),
+                            None,
+                        )
+                    }),
+                InvestigationWorkflowStepKind::ToolStep
+                | InvestigationWorkflowStepKind::ProfilingWindow
+                | InvestigationWorkflowStepKind::SafeAction
+                | InvestigationWorkflowStepKind::ReportStep => {
+                    execute_workflow_tool_like_step(&workflow, step_index, source, store, profiling)
+                }
+                InvestigationWorkflowStepKind::ManualStep => unreachable!(),
+            };
+
+            match result {
+                Ok((summary, artifacts, invocation)) => {
+                    workflow.steps[step_index].status = InvestigationWorkflowStepStatus::Completed;
+                    workflow.steps[step_index].completed_unix_ms = Some(now_unix_millis());
+                    workflow.steps[step_index].last_error = None;
+                    workflow.steps[step_index].output_summary = Some(summary);
+                    workflow.steps[step_index].artifacts = artifacts;
+                    workflow.steps[step_index].tool_invocation = invocation;
+                    complete_workflow_progress(&mut workflow);
+                    if let Err(error) = store.save_workflow_run(&workflow) {
+                        return store_error(error);
+                    }
+                    if let Err(error) = append_workflow_timeline_event(
+                        store,
+                        &workflow.run_id,
+                        "workflow_step_completed",
+                        serde_json::json!({
+                            "workflow_run_id": workflow.id,
+                            "step_id": workflow.steps[step_index].step_id,
+                            "status": workflow.steps[step_index].status,
+                        }),
+                    ) {
+                        warn!(
+                            workflow_run_id = %workflow.id,
+                            step_id = %workflow.steps[step_index].step_id,
+                            error = %error,
+                            "failed to append workflow completion timeline event"
+                        );
+                    }
+                    DiagnosticsResponse::WorkflowRun {
+                        workflow: Box::new(workflow),
+                    }
+                }
+                Err(error) => {
+                    workflow.steps[step_index].last_error = Some(error.to_string());
+                    match step_failure_policy {
+                        InvestigationWorkflowFailurePolicy::FailOpen => {
+                            workflow.steps[step_index].status =
+                                InvestigationWorkflowStepStatus::Failed;
+                            workflow.steps[step_index].completed_unix_ms = Some(now_unix_millis());
+                            complete_workflow_progress(&mut workflow);
+                            if let Err(save_error) = store.save_workflow_run(&workflow) {
+                                return store_error(save_error);
+                            }
+                            DiagnosticsResponse::WorkflowRun {
+                                workflow: Box::new(workflow),
+                            }
+                        }
+                        InvestigationWorkflowFailurePolicy::Retryable => {
+                            workflow.steps[step_index].status =
+                                InvestigationWorkflowStepStatus::Pending;
+                            workflow.status = InvestigationWorkflowStatus::InProgress;
+                            workflow.current_step_id =
+                                Some(workflow.steps[step_index].step_id.clone());
+                            if let Err(save_error) = store.save_workflow_run(&workflow) {
+                                return store_error(save_error);
+                            }
+                            workflow_error("workflow_step_failed", error.to_string())
+                        }
+                        InvestigationWorkflowFailurePolicy::AbortWorkflow => {
+                            workflow.steps[step_index].status =
+                                InvestigationWorkflowStepStatus::Failed;
+                            workflow.steps[step_index].completed_unix_ms = Some(now_unix_millis());
+                            workflow.status = InvestigationWorkflowStatus::Failed;
+                            workflow.current_step_id =
+                                Some(workflow.steps[step_index].step_id.clone());
+                            if let Err(save_error) = store.save_workflow_run(&workflow) {
+                                return store_error(save_error);
+                            }
+                            workflow_error("workflow_failed", error.to_string())
+                        }
+                    }
+                }
+            }
+        }
+        DiagnosticsRequest::AcknowledgeManualStep {
+            auth_token: provided,
+            lease_id,
+            workflow_run_id,
+            step_id,
+            actor,
+            note,
+        } => {
+            let store = match require_mutating_store(
+                &provided,
+                auth_token,
+                &lease_id,
+                lease_manager,
+                investigation_store,
+            ) {
+                Ok(store) => store,
+                Err(error) => return mutating_request_error_response(error),
+            };
+            let mut workflow = match store.load_workflow_run(&workflow_run_id) {
+                Ok(workflow) => workflow,
+                Err(error) => return store_error(error),
+            };
+            if workflow.current_step_id.as_deref() != Some(step_id.as_str()) {
+                return workflow_error(
+                    "workflow_invalid_step",
+                    format!(
+                        "workflow step '{}' is not current for workflow run '{}'",
+                        step_id, workflow.id
+                    ),
+                );
+            }
+            let step_index = match workflow_step_index(&workflow, &step_id) {
+                Ok(index) => index,
+                Err(error) => return workflow_error("workflow_invalid_step", error.to_string()),
+            };
+            if workflow.steps[step_index].status
+                != InvestigationWorkflowStepStatus::WaitingForOperator
+            {
+                return workflow_error(
+                    "workflow_invalid_step",
+                    format!("workflow step '{}' is not waiting for operator", step_id),
+                );
+            }
+            if let Some(marker_title) = workflow.steps[step_index].on_exit_marker.clone()
+                && let Err(error) =
+                    append_workflow_marker(store, &workflow.run_id, &marker_title, source)
+            {
+                return store_error(error);
+            }
+            workflow.steps[step_index].status = InvestigationWorkflowStepStatus::Completed;
+            workflow.steps[step_index].completed_unix_ms = Some(now_unix_millis());
+            workflow.steps[step_index].operator_acknowledged_by = actor.clone();
+            workflow.steps[step_index].operator_acknowledgement_note = note.clone();
+            workflow.steps[step_index].output_summary = Some(serde_json::json!({
+                "acknowledged_by": actor,
+                "note": note,
+            }));
+            complete_workflow_progress(&mut workflow);
+            if let Err(error) = store.save_workflow_run(&workflow) {
+                return store_error(error);
+            }
+            if let Err(error) = append_workflow_timeline_event(
+                store,
+                &workflow.run_id,
+                "workflow_manual_acknowledged",
+                serde_json::json!({
+                    "workflow_run_id": workflow.id,
+                    "step_id": step_id,
+                }),
+            ) {
+                warn!(
+                    workflow_run_id = %workflow.id,
+                    step_id = %step_id,
+                    error = %error,
+                    "failed to append manual acknowledgement timeline event"
+                );
+            }
+            DiagnosticsResponse::WorkflowRun {
+                workflow: Box::new(workflow),
+            }
+        }
+        DiagnosticsRequest::AbortWorkflow {
+            auth_token: provided,
+            lease_id,
+            workflow_run_id,
+            reason,
+        } => {
+            let store = match require_mutating_store(
+                &provided,
+                auth_token,
+                &lease_id,
+                lease_manager,
+                investigation_store,
+            ) {
+                Ok(store) => store,
+                Err(error) => return mutating_request_error_response(error),
+            };
+            let mut workflow = match store.load_workflow_run(&workflow_run_id) {
+                Ok(workflow) => workflow,
+                Err(error) => return store_error(error),
+            };
+            if let Some(current_step_id) = workflow.current_step_id.clone()
+                && let Ok(step_index) = workflow_step_index(&workflow, &current_step_id)
+                && !workflow_step_is_terminal(workflow.steps[step_index].status)
+            {
+                workflow.steps[step_index].status = InvestigationWorkflowStepStatus::Aborted;
+                workflow.steps[step_index].completed_unix_ms = Some(now_unix_millis());
+                workflow.steps[step_index].last_error = reason.clone();
+            }
+            workflow.status = InvestigationWorkflowStatus::Aborted;
+            workflow.current_step_id = None;
+            workflow.updated_unix_ms = now_unix_millis();
+            if let Err(error) = store.save_workflow_run(&workflow) {
+                return store_error(error);
+            }
+            if let Err(error) = append_workflow_timeline_event(
+                store,
+                &workflow.run_id,
+                "workflow_aborted",
+                serde_json::json!({
+                    "workflow_run_id": workflow.id,
+                    "reason": reason,
+                }),
+            ) {
+                warn!(
+                    workflow_run_id = %workflow.id,
+                    error = %error,
+                    "failed to append workflow abort timeline event"
+                );
+            }
+            DiagnosticsResponse::WorkflowRun {
+                workflow: Box::new(workflow),
+            }
+        }
+        DiagnosticsRequest::CompleteWorkflow {
+            auth_token: provided,
+            lease_id,
+            workflow_run_id,
+        } => {
+            let store = match require_mutating_store(
+                &provided,
+                auth_token,
+                &lease_id,
+                lease_manager,
+                investigation_store,
+            ) {
+                Ok(store) => store,
+                Err(error) => return mutating_request_error_response(error),
+            };
+            let mut workflow = match store.load_workflow_run(&workflow_run_id) {
+                Ok(workflow) => workflow,
+                Err(error) => return store_error(error),
+            };
+            if workflow
+                .steps
+                .iter()
+                .any(|step| !workflow_step_is_terminal(step.status))
+            {
+                return workflow_error(
+                    "workflow_incomplete",
+                    format!("workflow run '{}' still has unfinished steps", workflow.id),
+                );
+            }
+            workflow.status = InvestigationWorkflowStatus::Completed;
+            workflow.current_step_id = None;
+            workflow.updated_unix_ms = now_unix_millis();
+            if let Err(error) = store.save_workflow_run(&workflow) {
+                return store_error(error);
+            }
+            if let Err(error) = append_workflow_timeline_event(
+                store,
+                &workflow.run_id,
+                "workflow_completed",
+                serde_json::json!({
+                    "workflow_run_id": workflow.id,
+                    "workflow_id": workflow.workflow_id,
+                }),
+            ) {
+                warn!(
+                    workflow_run_id = %workflow.id,
+                    error = %error,
+                    "failed to append workflow completion timeline event"
+                );
+            }
+            DiagnosticsResponse::WorkflowRun {
+                workflow: Box::new(workflow),
             }
         }
         DiagnosticsRequest::CreateHypothesis {
@@ -5146,6 +6355,12 @@ mod tests {
             },
             reset_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    fn set_test_workflow_attach_snapshot_output(value: Option<&str>) {
+        *TEST_WORKFLOW_ATTACH_SNAPSHOT_OUTPUT
+            .get_or_init(|| Mutex::new(None))
+            .lock() = value.map(str::to_string);
     }
 
     fn sample_scoped_recent_event(
@@ -6129,6 +7344,7 @@ mod tests {
             fingerprint: static_source().fingerprint,
             profiling_windows: Vec::new(),
             report_ids: Vec::new(),
+            workflow_run_ids: Vec::new(),
             marker_snapshots: Vec::new(),
             timeline: Vec::new(),
         };
@@ -6809,6 +8025,29 @@ mod tests {
     }
 
     #[test]
+    fn list_workflows_includes_aja_hybrid_preset() {
+        let source = static_source();
+        let lease_manager = ControllerLeaseManager::default();
+        let response = execute_request(
+            DiagnosticsRequest::ListWorkflows {
+                auth_token: "secret".to_string(),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            None,
+            None,
+        );
+
+        let DiagnosticsResponse::WorkflowPresets { workflows } = response else {
+            panic!("expected workflow preset response");
+        };
+        assert_eq!(workflows.len(), 1);
+        assert_eq!(workflows[0].workflow_id, "aja_hybrid_v1");
+        assert_eq!(workflows[0].steps[0].step_id, "capture_attach_snapshot");
+    }
+
+    #[test]
     fn mutating_requests_persist_run_fingerprint_and_timeline() {
         let source = static_source();
         let lease_manager = ControllerLeaseManager::default();
@@ -6928,6 +8167,270 @@ mod tests {
         assert_eq!(persisted_run.timeline.len(), 2);
         assert_eq!(persisted_run.timeline[0].source, TimelineEntrySource::Cli);
         assert_eq!(persisted_run.timeline[1].source, TimelineEntrySource::Mcp);
+    }
+
+    #[test]
+    fn workflow_requests_execute_hybrid_preset_and_persist_progress() {
+        let _guard = lock_diagnostics_test_mutex();
+        set_test_workflow_attach_snapshot_output(Some(
+            "{\"session\":{\"mount_point\":\"Q:\"},\"health\":{},\"runtime_snapshot\":null}",
+        ));
+
+        let mut source = static_source();
+        let temp = mounts_dir_temp();
+        source.session.cache_path = temp.path().to_string_lossy().into_owned();
+        source.fingerprint.runtime_configuration.cache_path = source.session.cache_path.clone();
+
+        let lease_manager = ControllerLeaseManager::default();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let profiling = DiagnosticsProfilingCoordinator::new(Arc::new(SuccessfulProfilingBackend));
+
+        let lease = match execute_request(
+            DiagnosticsRequest::AcquireController {
+                auth_token: "secret".to_string(),
+                client_name: "tester".to_string(),
+                ttl_ms: Some(250),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            Some(&profiling),
+        ) {
+            DiagnosticsResponse::ControllerLease { lease } => lease,
+            other => panic!("unexpected lease response: {other:?}"),
+        };
+        let case = match execute_request(
+            DiagnosticsRequest::CreateCase {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                title: "AJA workflow".to_string(),
+                problem_statement: None,
+                workload_identity: Some("aja".to_string()),
+                target_environment: None,
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            Some(&profiling),
+        ) {
+            DiagnosticsResponse::InvestigationCase { case } => *case,
+            other => panic!("unexpected case response: {other:?}"),
+        };
+        let run = match execute_request(
+            DiagnosticsRequest::CreateRun {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                case_id: case.id,
+                run_workload_identity: Some("aja-pass-1".to_string()),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            Some(&profiling),
+        ) {
+            DiagnosticsResponse::InvestigationRun { run } => *run,
+            other => panic!("unexpected run response: {other:?}"),
+        };
+
+        let mut workflow = match execute_request(
+            DiagnosticsRequest::StartWorkflow {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                run_id: run.id.clone(),
+                workflow_id: "aja_hybrid_v1".to_string(),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            Some(&profiling),
+        ) {
+            DiagnosticsResponse::WorkflowRun { workflow } => *workflow,
+            other => panic!("unexpected workflow response: {other:?}"),
+        };
+        assert_eq!(
+            workflow.current_step_id.as_deref(),
+            Some("capture_attach_snapshot")
+        );
+
+        workflow = match execute_request(
+            DiagnosticsRequest::AdvanceWorkflowStep {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                workflow_run_id: workflow.id.clone(),
+                step_id: "capture_attach_snapshot".to_string(),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            Some(&profiling),
+        ) {
+            DiagnosticsResponse::WorkflowRun { workflow } => *workflow,
+            other => panic!("unexpected workflow step response: {other:?}"),
+        };
+        assert_eq!(
+            workflow.steps[0].status,
+            InvestigationWorkflowStepStatus::Completed
+        );
+        assert_eq!(workflow.steps[0].artifacts.len(), 1);
+        assert_eq!(
+            workflow.current_step_id.as_deref(),
+            Some("start_balanced_profiling")
+        );
+
+        workflow = match execute_request(
+            DiagnosticsRequest::AdvanceWorkflowStep {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                workflow_run_id: workflow.id.clone(),
+                step_id: "start_balanced_profiling".to_string(),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            Some(&profiling),
+        ) {
+            DiagnosticsResponse::WorkflowRun { workflow } => *workflow,
+            other => panic!("unexpected workflow profiling response: {other:?}"),
+        };
+        assert_eq!(
+            workflow.steps[1].status,
+            InvestigationWorkflowStepStatus::Completed
+        );
+        assert_eq!(
+            workflow.current_step_id.as_deref(),
+            Some("run_manual_aja_phase")
+        );
+
+        workflow = match execute_request(
+            DiagnosticsRequest::AdvanceWorkflowStep {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                workflow_run_id: workflow.id.clone(),
+                step_id: "run_manual_aja_phase".to_string(),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            Some(&profiling),
+        ) {
+            DiagnosticsResponse::WorkflowRun { workflow } => *workflow,
+            other => panic!("unexpected manual workflow response: {other:?}"),
+        };
+        assert_eq!(
+            workflow.status,
+            InvestigationWorkflowStatus::WaitingForOperator
+        );
+        assert_eq!(
+            workflow.steps[2].status,
+            InvestigationWorkflowStepStatus::WaitingForOperator
+        );
+
+        workflow = match execute_request(
+            DiagnosticsRequest::AcknowledgeManualStep {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                workflow_run_id: workflow.id.clone(),
+                step_id: "run_manual_aja_phase".to_string(),
+                actor: Some("operator".to_string()),
+                note: Some("AJA phase complete".to_string()),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            Some(&profiling),
+        ) {
+            DiagnosticsResponse::WorkflowRun { workflow } => *workflow,
+            other => panic!("unexpected manual ack response: {other:?}"),
+        };
+        assert_eq!(
+            workflow.steps[2].status,
+            InvestigationWorkflowStepStatus::Completed
+        );
+        assert_eq!(
+            workflow.current_step_id.as_deref(),
+            Some("stop_active_profiling")
+        );
+
+        workflow = match execute_request(
+            DiagnosticsRequest::AdvanceWorkflowStep {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                workflow_run_id: workflow.id.clone(),
+                step_id: "stop_active_profiling".to_string(),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            Some(&profiling),
+        ) {
+            DiagnosticsResponse::WorkflowRun { workflow } => *workflow,
+            other => panic!("unexpected profiling stop response: {other:?}"),
+        };
+        assert_eq!(
+            workflow.steps[3].status,
+            InvestigationWorkflowStepStatus::Completed
+        );
+        assert_eq!(workflow.steps[3].artifacts.len(), 1);
+        assert_eq!(
+            workflow.current_step_id.as_deref(),
+            Some("materialize_report")
+        );
+
+        workflow = match execute_request(
+            DiagnosticsRequest::AdvanceWorkflowStep {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id,
+                workflow_run_id: workflow.id.clone(),
+                step_id: "materialize_report".to_string(),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            Some(&profiling),
+        ) {
+            DiagnosticsResponse::WorkflowRun { workflow } => *workflow,
+            other => panic!("unexpected report step response: {other:?}"),
+        };
+        assert_eq!(workflow.status, InvestigationWorkflowStatus::Completed);
+        assert!(workflow.current_step_id.is_none());
+
+        let persisted_run = store.load_run(&run.id).expect("load run");
+        let persisted_workflow = store
+            .load_workflow_run(&workflow.id)
+            .expect("load workflow run");
+        assert_eq!(persisted_run.workflow_run_ids, vec![workflow.id.clone()]);
+        assert_eq!(persisted_run.report_ids.len(), 1);
+        assert_eq!(persisted_workflow.steps[0].artifacts.len(), 1);
+        assert_eq!(
+            persisted_workflow.steps[2]
+                .operator_acknowledged_by
+                .as_deref(),
+            Some("operator")
+        );
+        assert!(
+            persisted_run
+                .timeline
+                .iter()
+                .any(|entry| entry.title == "AJA workload start")
+        );
+        assert!(
+            persisted_run
+                .timeline
+                .iter()
+                .any(|entry| entry.title == "AJA workload done")
+        );
+
+        set_test_workflow_attach_snapshot_output(None);
     }
 
     #[test]
