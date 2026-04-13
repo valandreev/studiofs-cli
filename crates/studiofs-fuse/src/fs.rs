@@ -20,9 +20,9 @@ use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
 #[cfg(target_os = "macos")]
 use studiofs_meta::schema::DirEntry;
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
-use studiofs_vfs::vfs::{ExplicitFlushOutcome, ReleaseFhOutcome};
 #[cfg(not(target_os = "macos"))]
 use studiofs_vfs::is_hidden_non_macos_root_metadata_name;
+use studiofs_vfs::vfs::{ExplicitFlushOutcome, ReleaseFhOutcome};
 use studiofs_vfs::{
     BarrierObservabilityPort, BridgeVfsErrorKind, DeferredCleanupHintPort, DeleteCleanupPort,
     FlushGatePort, HandleDrainBarrier, HandleDrainDeleteRequest, HandleDrainRequest,

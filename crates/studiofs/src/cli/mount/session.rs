@@ -69,6 +69,7 @@ pub(crate) struct MountSession {
     command: MountCommand,
     actual_mount_path: String,
     cache_size: String,
+    #[cfg(unix)]
     run_in_foreground: bool,
     launch_mode: MountLaunchMode,
     format_info: Option<FormatInfo>,
@@ -221,7 +222,7 @@ fn parse_positive_size_arg(raw: &str) -> anyhow::Result<u64> {
 fn resolve_mount_path(name: &str, mount_point: &str) -> PathBuf {
     let mount_path = Path::new(mount_point);
     #[cfg(windows)]
-    if super::utils::is_drive_root(mount_point) {
+    if utils::is_drive_root(mount_point) {
         return mount_path.to_path_buf();
     }
 
@@ -234,7 +235,7 @@ fn resolve_mount_path(name: &str, mount_point: &str) -> PathBuf {
 
 #[cfg(windows)]
 fn normalize_windows_mount_path(path: &str) -> String {
-    super::utils::normalize_mount_point(path)
+    utils::normalize_mount_point(path)
 }
 
 fn parse_env_usize_with<F>(read_var: &F, key: &str) -> Option<usize>
@@ -387,7 +388,7 @@ fn configured_mount_point_for_mount(config: &settings::StudioFsConfig) -> Option
 
 fn validate_mount_point_for_mount(mount_point: &str) -> anyhow::Result<()> {
     #[cfg(windows)]
-    if !super::utils::is_drive_root(mount_point) {
+    if !utils::is_drive_root(mount_point) {
         anyhow::bail!(
             "Invalid mount point '{}': Windows requires a drive letter mount (for example `Z:`).",
             mount_point
@@ -511,7 +512,7 @@ where
 fn validate_mount_point(mount_point: &str) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
-        if !super::utils::is_drive_root(mount_point) {
+        if !utils::is_drive_root(mount_point) {
             anyhow::bail!(
                 "Invalid mount point '{}': Windows mount is supported only on drive letters (for example `Z:`). Directory mount points are not supported.",
                 mount_point
@@ -531,7 +532,7 @@ fn prepare_mount_path(name: &str, mount_point: &str) -> anyhow::Result<String> {
         .to_string_lossy()
         .into_owned();
     #[cfg(windows)]
-    let is_drive_root = super::utils::is_drive_root(&actual_mount_path);
+    let is_drive_root = utils::is_drive_root(&actual_mount_path);
 
     #[cfg(not(windows))]
     let is_drive_root = false;
@@ -892,6 +893,7 @@ impl MountSession {
                 command,
                 actual_mount_path,
                 cache_size,
+                #[cfg(unix)]
                 run_in_foreground,
                 launch_mode,
                 format_info: None,
@@ -967,6 +969,7 @@ impl MountSession {
                 command,
                 actual_mount_path,
                 cache_size,
+                #[cfg(unix)]
                 run_in_foreground,
                 launch_mode,
                 format_info: Some(format_info),
@@ -1061,6 +1064,7 @@ impl MountSession {
             mount_point: self.actual_mount_path.clone(),
             volume_name: format_info.name.clone(),
             read_only: self.read_only_mount,
+            #[cfg(unix)]
             run_in_foreground: self.run_in_foreground,
         });
         write_path_observability_publisher.stop_and_join();

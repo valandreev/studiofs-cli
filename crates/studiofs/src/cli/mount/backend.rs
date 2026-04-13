@@ -10,6 +10,7 @@ pub(crate) struct BackendLaunch {
     pub(crate) mount_point: String,
     pub(crate) volume_name: String,
     pub(crate) read_only: bool,
+    #[cfg(unix)]
     pub(crate) run_in_foreground: bool,
 }
 

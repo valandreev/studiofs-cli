@@ -15,7 +15,7 @@ impl InternalArgs {
             InternalAction::WinfspBootstrapMountmgr => {
                 #[cfg(windows)]
                 {
-                    super::winfsp_bootstrap::run_internal_bootstrap_mountmgr()
+                    Ok(super::winfsp_bootstrap::run_internal_bootstrap_mountmgr()?)
                 }
                 #[cfg(not(windows))]
                 {
