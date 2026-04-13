@@ -2,27 +2,47 @@ use crate::cli::utils;
 use anyhow::{Context, Result, anyhow};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use sha2::{Digest, Sha256};
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use studiofs_meta::FormatInfo;
 use studiofs_vfs::vfs::VfsFileSessionStats;
 use studiofs_vfs::{
     StudioVfs, VfsForegroundReadProtectionStats, VfsIngressStats, VfsUploadStats,
     VfsWritePathObservabilitySnapshot,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::runtime::Handle;
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tracing::warn;
 use uuid::Uuid;
+
+#[cfg(windows)]
+use std::{ffi::c_void, mem::size_of};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+#[cfg(windows)]
+use windows::{
+    Win32::{
+        Foundation::{HLOCAL, LocalFree},
+        Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        },
+        Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES},
+    },
+    core::w,
+};
 
 #[cfg(test)]
 use std::sync::OnceLock;
@@ -32,6 +52,10 @@ const DEFAULT_LEASE_TTL_MS: u64 = 5_000;
 const MAX_LEASE_TTL_MS: u64 = 60_000;
 const CONNECT_RETRY_ATTEMPTS: usize = 40;
 const CONNECT_RETRY_DELAY_MS: u64 = 25;
+const MAX_DIAGNOSTICS_FRAME_BYTES: usize = 64 * 1024;
+const MAX_DIAGNOSTICS_CONNECTIONS: usize = 16;
+#[cfg(unix)]
+const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
 
 #[cfg(test)]
 static TEST_START_FAILURE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
@@ -192,36 +216,32 @@ enum DiagnosticsResponse {
 
 #[derive(Debug, Default)]
 struct ControllerLeaseManager {
-    state: Mutex<Option<ControllerLease>>,
+    state: Mutex<Option<ActiveControllerLease>>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveControllerLease {
+    lease: ControllerLease,
+    expires_at: Instant,
 }
 
 impl ControllerLeaseManager {
     fn snapshot(&self) -> Option<ControllerLease> {
-        let now = now_unix_millis();
+        let now = Instant::now();
         let mut state = self.state.lock();
-        if state
-            .as_ref()
-            .is_some_and(|lease| lease.expires_unix_ms <= now)
-        {
-            *state = None;
-        }
-        state.clone()
+        Self::expire_if_needed(&mut state, now);
+        state.as_ref().map(|lease| lease.lease.clone())
     }
 
     fn acquire(&self, client_name: String, ttl_ms: Option<u64>) -> Result<ControllerLease> {
-        let now = now_unix_millis();
+        let now = Instant::now();
         let mut state = self.state.lock();
-        if state
-            .as_ref()
-            .is_some_and(|lease| lease.expires_unix_ms <= now)
-        {
-            *state = None;
-        }
+        Self::expire_if_needed(&mut state, now);
         if let Some(active) = state.as_ref() {
             return Err(anyhow!(
                 "controller lease already held by '{}' until {}",
-                active.client_name,
-                active.expires_unix_ms
+                active.lease.client_name,
+                active.lease.expires_unix_ms
             ));
         }
         let ttl_ms = ttl_ms
@@ -231,30 +251,37 @@ impl ControllerLeaseManager {
             lease_id: Uuid::new_v4().to_string(),
             client_name,
             ttl_ms,
-            expires_unix_ms: now.saturating_add(ttl_ms),
+            expires_unix_ms: now_unix_millis().saturating_add(ttl_ms),
         };
-        *state = Some(lease.clone());
+        *state = Some(ActiveControllerLease {
+            lease: lease.clone(),
+            expires_at: now + Duration::from_millis(ttl_ms),
+        });
         Ok(lease)
     }
 
     fn renew(&self, lease_id: &str, ttl_ms: Option<u64>) -> Result<ControllerLease> {
-        let now = now_unix_millis();
+        let now = Instant::now();
         let mut state = self.state.lock();
-        if state
-            .as_ref()
-            .is_some_and(|lease| lease.expires_unix_ms <= now)
-        {
-            *state = None;
-        }
-        let lease = state
+        Self::expire_if_needed(&mut state, now);
+        let active = state
             .as_mut()
             .ok_or_else(|| anyhow!("controller lease is not currently held"))?;
-        if lease.lease_id != lease_id {
+        if active.lease.lease_id != lease_id {
             return Err(anyhow!("controller lease '{lease_id}' is not current"));
         }
-        lease.ttl_ms = ttl_ms.unwrap_or(lease.ttl_ms).clamp(1, MAX_LEASE_TTL_MS);
-        lease.expires_unix_ms = now.saturating_add(lease.ttl_ms);
-        Ok(lease.clone())
+        active.lease.ttl_ms = ttl_ms
+            .unwrap_or(active.lease.ttl_ms)
+            .clamp(1, MAX_LEASE_TTL_MS);
+        active.expires_at = now + Duration::from_millis(active.lease.ttl_ms);
+        active.lease.expires_unix_ms = now_unix_millis().saturating_add(active.lease.ttl_ms);
+        Ok(active.lease.clone())
+    }
+
+    fn expire_if_needed(state: &mut Option<ActiveControllerLease>, now: Instant) {
+        if state.as_ref().is_some_and(|lease| lease.expires_at <= now) {
+            *state = None;
+        }
     }
 }
 
@@ -433,15 +460,29 @@ fn discover_sessions_in(
 ) -> Result<Vec<LocalDiagnosticsDiscovery>> {
     let mut sessions = Vec::new();
     for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if !file_type.is_file() {
             continue;
         }
         if entry.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
-        let bytes = fs::read(entry.path())?;
-        let Some(discovery) = serde_json::from_slice::<MountRecord>(&bytes)?.diagnostics else {
+        let bytes = match fs::read(entry.path()) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        let record = match serde_json::from_slice::<MountRecord>(&bytes) {
+            Ok(record) => record,
+            Err(_) => continue,
+        };
+        let Some(discovery) = record.diagnostics else {
             continue;
         };
         if is_process_running(discovery.pid) {
@@ -465,6 +506,9 @@ struct MountRecord {
 
 fn publish_discovery(mount_point: &str, discovery: &LocalDiagnosticsDiscovery) -> Result<()> {
     let record_path = utils::pid_file_path(mount_point)?;
+    if let Some(parent) = record_path.parent() {
+        ensure_owner_only_directory(parent)?;
+    }
     let bytes = fs::read(&record_path).with_context(|| {
         format!(
             "read mount record '{}' before publishing diagnostics",
@@ -474,6 +518,7 @@ fn publish_discovery(mount_point: &str, discovery: &LocalDiagnosticsDiscovery) -
     let mut record: MountRecord = serde_json::from_slice(&bytes)?;
     record.diagnostics = Some(discovery.clone());
     fs::write(&record_path, serde_json::to_vec_pretty(&record)?)?;
+    ensure_owner_only_file(&record_path)?;
     Ok(())
 }
 
@@ -499,11 +544,9 @@ fn discovery_from_source(
 fn endpoint_for(_mounts_dir: &Path, base_name: &str, pid: u32) -> LocalDiagnosticsEndpoint {
     #[cfg(unix)]
     {
+        let socket_path = unix_socket_path(_mounts_dir, base_name, pid);
         LocalDiagnosticsEndpoint::UnixSocket {
-            path: _mounts_dir
-                .join(format!("{base_name}.{pid}.sock"))
-                .to_string_lossy()
-                .into_owned(),
+            path: socket_path.to_string_lossy().into_owned(),
         }
     }
 
@@ -513,6 +556,17 @@ fn endpoint_for(_mounts_dir: &Path, base_name: &str, pid: u32) -> LocalDiagnosti
             name: format!(r"\\.\pipe\studiofs-{base_name}-{pid}-diagnostics"),
         }
     }
+}
+
+#[cfg(unix)]
+fn unix_socket_path(mounts_dir: &Path, base_name: &str, pid: u32) -> PathBuf {
+    let preferred = mounts_dir.join(format!("{base_name}.{pid}.sock"));
+    if preferred.as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES {
+        return preferred;
+    }
+
+    let digest = Sha256::digest(base_name.as_bytes());
+    mounts_dir.join(format!("sfsdiag-{pid}-{}.sock", hex::encode(&digest[..8])))
 }
 
 fn now_unix_millis() -> u64 {
@@ -528,12 +582,19 @@ fn now_unix_millis() -> u64 {
 fn bind_unix_listener_path(endpoint: &LocalDiagnosticsEndpoint) -> Result<PathBuf> {
     let LocalDiagnosticsEndpoint::UnixSocket { path } = endpoint;
     let path = PathBuf::from(path);
+    if path.as_os_str().as_bytes().len() > MAX_UNIX_SOCKET_PATH_BYTES {
+        return Err(anyhow!(
+            "diagnostics socket path '{}' exceeds unix socket limit",
+            path.display()
+        ));
+    }
     if path.exists() {
         fs::remove_file(&path)
             .with_context(|| format!("remove stale diagnostics socket '{}'", path.display()))?;
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+        ensure_owner_only_directory(parent)?;
     }
     Ok(path)
 }
@@ -545,6 +606,8 @@ async fn run_server(
     lease_manager: Arc<ControllerLeaseManager>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    let connection_limit = Arc::new(Semaphore::new(MAX_DIAGNOSTICS_CONNECTIONS));
+
     #[cfg(unix)]
     {
         let LocalDiagnosticsEndpoint::UnixSocket { path } = &endpoint;
@@ -555,7 +618,11 @@ async fn run_server(
                 return;
             }
         };
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        if let Err(error) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+            warn!(path, error = %error, "failed to restrict diagnostics socket permissions");
+            let _ = fs::remove_file(path);
+            return;
+        }
         loop {
             tokio::select! {
                 changed = shutdown_rx.changed() => {
@@ -566,11 +633,16 @@ async fn run_server(
                 accept = listener.accept() => {
                     match accept {
                         Ok((stream, _)) => {
+                            let Ok(permit) = connection_limit.clone().try_acquire_owned() else {
+                                warn!(path, limit = MAX_DIAGNOSTICS_CONNECTIONS, "diagnostics connection limit reached");
+                                drop(stream);
+                                continue;
+                            };
                             let auth_token = auth_token.clone();
                             let source = source.clone();
                             let lease_manager = lease_manager.clone();
                             tokio::spawn(async move {
-                                if let Err(error) = handle_client(stream, auth_token, source, lease_manager).await {
+                                if let Err(error) = handle_client(stream, auth_token, source, lease_manager, permit).await {
                                     warn!(error = %error, "diagnostics request failed");
                                 }
                             });
@@ -587,17 +659,22 @@ async fn run_server(
 
     #[cfg(windows)]
     {
-        use tokio::net::windows::named_pipe::ServerOptions;
-
         let LocalDiagnosticsEndpoint::WindowsNamedPipe { name } = &endpoint;
+        let pipe_factory = match WindowsPipeFactory::new(name) {
+            Ok(factory) => factory,
+            Err(error) => {
+                warn!(name, error = %error, "failed to configure diagnostics pipe security");
+                return;
+            }
+        };
+        let mut server = match pipe_factory.create_server(true) {
+            Ok(server) => server,
+            Err(error) => {
+                warn!(name, error = %error, "failed to create diagnostics pipe");
+                return;
+            }
+        };
         loop {
-            let server = match ServerOptions::new().create(name) {
-                Ok(server) => server,
-                Err(error) => {
-                    warn!(name, error = %error, "failed to create diagnostics pipe");
-                    return;
-                }
-            };
             tokio::select! {
                 changed = shutdown_rx.changed() => {
                     if changed.is_ok() && *shutdown_rx.borrow() {
@@ -607,11 +684,25 @@ async fn run_server(
                 connect = server.connect() => {
                     match connect {
                         Ok(()) => {
+                            let next_server = match pipe_factory.create_server(false) {
+                                Ok(server) => server,
+                                Err(error) => {
+                                    warn!(name, error = %error, "failed to create diagnostics pipe");
+                                    break;
+                                }
+                            };
+                            let connected_server = server;
+                            server = next_server;
+                            let Ok(permit) = connection_limit.clone().try_acquire_owned() else {
+                                warn!(name, limit = MAX_DIAGNOSTICS_CONNECTIONS, "diagnostics connection limit reached");
+                                drop(connected_server);
+                                continue;
+                            };
                             let auth_token = auth_token.clone();
                             let source = source.clone();
                             let lease_manager = lease_manager.clone();
                             tokio::spawn(async move {
-                                if let Err(error) = handle_client(server, auth_token, source, lease_manager).await {
+                                if let Err(error) = handle_client(connected_server, auth_token, source, lease_manager, permit).await {
                                     warn!(error = %error, "diagnostics request failed");
                                 }
                             });
@@ -691,6 +782,7 @@ async fn handle_client<S>(
     auth_token: String,
     source: Arc<dyn DiagnosticsDataSource>,
     lease_manager: Arc<ControllerLeaseManager>,
+    _permit: OwnedSemaphorePermit,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -698,11 +790,27 @@ where
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     loop {
-        let mut line = String::new();
-        let read = reader.read_line(&mut line).await?;
-        if read == 0 {
-            break;
-        }
+        let line = match read_frame_line(&mut reader).await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(FrameReadError::TooLarge) => {
+                let response = DiagnosticsResponse::Error {
+                    code: "request_too_large".to_string(),
+                    message: format!(
+                        "diagnostics request exceeded {} bytes",
+                        MAX_DIAGNOSTICS_FRAME_BYTES
+                    ),
+                };
+                writer
+                    .write_all(serde_json::to_string(&response)?.as_bytes())
+                    .await?;
+                writer.write_all(b"\n").await?;
+                writer.flush().await?;
+                break;
+            }
+            Err(FrameReadError::Io(error)) => return Err(error.into()),
+            Err(FrameReadError::Utf8(error)) => return Err(error.into()),
+        };
         let request: DiagnosticsRequest = serde_json::from_str(line.trim_end())?;
         let response = execute_request(request, &auth_token, source.as_ref(), &lease_manager);
         writer
@@ -712,6 +820,76 @@ where
         writer.flush().await?;
     }
     Ok(())
+}
+
+enum FrameReadError {
+    Io(std::io::Error),
+    TooLarge,
+    Utf8(std::string::FromUtf8Error),
+}
+
+impl From<std::io::Error> for FrameReadError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<std::string::FromUtf8Error> for FrameReadError {
+    fn from(error: std::string::FromUtf8Error) -> Self {
+        Self::Utf8(error)
+    }
+}
+
+async fn read_frame_line<R>(reader: &mut R) -> std::result::Result<Option<String>, FrameReadError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut buffer = Vec::new();
+
+    loop {
+        let (consumed, too_large, eof) = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                (0, false, true)
+            } else if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+                let take = newline + 1;
+                if buffer.len() + take > MAX_DIAGNOSTICS_FRAME_BYTES {
+                    (take, true, false)
+                } else {
+                    buffer.extend_from_slice(&available[..take]);
+                    (take, false, false)
+                }
+            } else {
+                let take = available.len();
+                if buffer.len() + take > MAX_DIAGNOSTICS_FRAME_BYTES {
+                    (take, true, false)
+                } else {
+                    buffer.extend_from_slice(available);
+                    (take, false, false)
+                }
+            }
+        };
+        if eof {
+            if buffer.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+
+        reader.consume(consumed);
+        if too_large {
+            return Err(FrameReadError::TooLarge);
+        }
+        if buffer.last() == Some(&b'\n') {
+            break;
+        }
+    }
+
+    while matches!(buffer.last(), Some(b'\n' | b'\r')) {
+        buffer.pop();
+    }
+
+    Ok(Some(String::from_utf8(buffer)?))
 }
 
 fn execute_request(
@@ -794,10 +972,121 @@ where
         .await?;
     writer.write_all(b"\n").await?;
     writer.flush().await?;
-    let mut line = String::new();
-    reader.read_line(&mut line).await?;
+    let line = match read_frame_line(&mut reader).await {
+        Ok(Some(line)) => line,
+        Ok(None) => return Err(anyhow!("diagnostics peer closed without responding")),
+        Err(FrameReadError::TooLarge) => {
+            return Err(anyhow!(
+                "diagnostics response exceeded {} bytes",
+                MAX_DIAGNOSTICS_FRAME_BYTES
+            ));
+        }
+        Err(FrameReadError::Io(error)) => return Err(error.into()),
+        Err(FrameReadError::Utf8(error)) => return Err(error.into()),
+    };
     Ok(serde_json::from_str(line.trim_end())?)
 }
+
+#[cfg(unix)]
+fn ensure_owner_only_directory(path: &Path) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("restrict directory permissions for '{}'", path.display()))
+}
+
+#[cfg(not(unix))]
+fn ensure_owner_only_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_owner_only_file(path: &Path) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restrict file permissions for '{}'", path.display()))
+}
+
+#[cfg(not(unix))]
+fn ensure_owner_only_file(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsPipeFactory {
+    name: String,
+    security_descriptor: WindowsSecurityDescriptor,
+}
+
+#[cfg(windows)]
+impl WindowsPipeFactory {
+    fn new(name: &str) -> Result<Self> {
+        Ok(Self {
+            name: name.to_string(),
+            security_descriptor: WindowsSecurityDescriptor::same_user_only()?,
+        })
+    }
+
+    fn create_server(&self, first_pipe_instance: bool) -> Result<NamedPipeServer> {
+        let mut options = ServerOptions::new();
+        options
+            .first_pipe_instance(first_pipe_instance)
+            .reject_remote_clients(true);
+
+        let mut attrs = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: self.security_descriptor.as_ptr().0,
+            bInheritHandle: false.into(),
+        };
+
+        unsafe {
+            options.create_with_security_attributes_raw(
+                &self.name,
+                &mut attrs as *mut _ as *mut c_void,
+            )
+        }
+        .with_context(|| format!("create diagnostics pipe '{}'", self.name))
+    }
+}
+
+#[cfg(windows)]
+struct WindowsSecurityDescriptor {
+    descriptor: PSECURITY_DESCRIPTOR,
+}
+
+#[cfg(windows)]
+impl WindowsSecurityDescriptor {
+    fn same_user_only() -> Result<Self> {
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                w!("D:P(A;;GA;;;OW)"),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                None,
+            )
+        }
+        .context("build same-user security descriptor for diagnostics pipe")?;
+
+        Ok(Self { descriptor })
+    }
+
+    fn as_ptr(&self) -> PSECURITY_DESCRIPTOR {
+        self.descriptor
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsSecurityDescriptor {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(self.descriptor.0)));
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe impl Send for WindowsSecurityDescriptor {}
+
+#[cfg(windows)]
+unsafe impl Sync for WindowsSecurityDescriptor {}
 
 #[cfg(test)]
 mod tests {
@@ -851,5 +1140,35 @@ mod tests {
         let sessions = discover_sessions_in(dir.path(), |pid| pid == 123).expect("discover");
 
         assert_eq!(sessions, vec![discovery]);
+    }
+
+    #[test]
+    fn discover_sessions_skips_malformed_records() {
+        let dir = mounts_dir_temp();
+        fs::write(dir.path().join("broken.json"), b"{not-json").expect("write malformed record");
+        write_mount_record(dir.path(), "X:", None, 123);
+
+        let sessions = discover_sessions_in(dir.path(), |_| true).expect("discover");
+
+        assert!(sessions.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_for_shortens_long_unix_socket_paths() {
+        let dir = mounts_dir_temp();
+        let base_name = "a".repeat(256);
+        let LocalDiagnosticsEndpoint::UnixSocket { path } =
+            endpoint_for(dir.path(), &base_name, 42);
+
+        assert!(
+            path.len()
+                < dir
+                    .path()
+                    .join(format!("{base_name}.42.sock"))
+                    .to_string_lossy()
+                    .len()
+        );
+        assert!(Path::new(&path).as_os_str().as_bytes().len() <= MAX_UNIX_SOCKET_PATH_BYTES);
     }
 }

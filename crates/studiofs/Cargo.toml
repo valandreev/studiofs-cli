@@ -49,6 +49,7 @@ pyroscope = { version = "2", default-features = false, features = ["backend-jema
 [target.'cfg(windows)'.dependencies]
 studiofs-winfsp.workspace = true
 winreg = "0.55"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winfsp.workspace = true
