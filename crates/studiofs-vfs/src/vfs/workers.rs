@@ -327,6 +327,37 @@ impl StudioVfs {
                 ticks_since_last_log = 0;
                 let pending_uploads =
                     Self::format_upload_pipeline_pending_uploads(pending_upload_bytes);
+                let event_kind = if activity_started {
+                    "became_active"
+                } else if !is_active && upload_pipeline_summary_was_active {
+                    "became_idle"
+                } else {
+                    "sample"
+                };
+                let event_title = if activity_started {
+                    "upload pipeline active"
+                } else if !is_active && upload_pipeline_summary_was_active {
+                    "upload pipeline idle"
+                } else {
+                    "upload pipeline sample"
+                };
+                self.record_runtime_event(
+                    "upload_pipeline",
+                    event_kind,
+                    event_title,
+                    serde_json::json!({
+                        "pending_uploads": pending,
+                        "pending_upload_bytes": pending_upload_bytes,
+                        "pending_uploads_human": pending_uploads,
+                        "pending_metadata_ops": pending_metadata_ops,
+                        "inflight_metadata_ops": metadata_backlog.inflight_ops,
+                        "dirty_mem_blocks": ingress.dirty_mem_blocks,
+                        "dirty_mem_bytes": ingress.dirty_mem_bytes,
+                        "write_backpressure_events": ingress.write_backpressure_events,
+                        "write_backpressure_wait_ms": ingress.write_backpressure_wait_ms,
+                        "foreground_read_p90_latency_ns": foreground_read_protection.p90_latency_ns,
+                    }),
+                );
                 info!(
                     pending_uploads = %pending_uploads,
                     pending_metadata_ops,

@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 use studiofs_meta::FormatInfo;
 use studiofs_vfs::vfs::VfsFileSessionStats;
 use studiofs_vfs::{
-    StudioVfs, VfsForegroundReadProtectionStats, VfsIngressStats, VfsUploadStats,
+    StudioVfs, VfsCacheStateSnapshot, VfsForegroundReadProtectionStats, VfsIngressStats,
+    VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsUploadStats,
     VfsWritePathObservabilitySnapshot,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -52,8 +53,11 @@ use windows::{
 };
 
 pub(crate) const DIAGNOSTICS_PROTOCOL_VERSION: u32 = 1;
+const DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_LEASE_TTL_MS: u64 = 5_000;
 const MAX_LEASE_TTL_MS: u64 = 60_000;
+const DEFAULT_RECENT_EVENTS_LIMIT: usize = 32;
+const MAX_RECENT_EVENTS_LIMIT: usize = 256;
 const CONNECT_RETRY_ATTEMPTS: usize = 40;
 const CONNECT_RETRY_DELAY_MS: u64 = 25;
 const MAX_DIAGNOSTICS_REQUEST_FRAME_BYTES: usize = 64 * 1024;
@@ -125,9 +129,78 @@ pub(crate) struct DiagnosticsHealthSnapshot {
     pub write_path: VfsWritePathObservabilitySnapshot,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct DiagnosticsCacheSnapshot {
+    pub state: VfsCacheStateSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct DiagnosticsSynchronizationSnapshot {
+    pub state: VfsSynchronizationStateSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct DiagnosticsRuntimeSnapshot {
+    pub schema_version: u32,
+    pub generated_unix_ms: u64,
+    pub ingress: VfsIngressStats,
+    pub write_path: VfsWritePathObservabilitySnapshot,
+    pub upload: VfsUploadStats,
+    pub cache: DiagnosticsCacheSnapshot,
+    pub synchronization: DiagnosticsSynchronizationSnapshot,
+}
+
+impl DiagnosticsRuntimeSnapshot {
+    #[cfg(test)]
+    fn from_health(health: DiagnosticsHealthSnapshot) -> Self {
+        Self {
+            schema_version: DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
+            generated_unix_ms: health.generated_unix_ms,
+            ingress: health.ingress,
+            write_path: health.write_path,
+            cache: DiagnosticsCacheSnapshot::default(),
+            synchronization: DiagnosticsSynchronizationSnapshot {
+                state: VfsSynchronizationStateSnapshot {
+                    file_sessions: health.file_sessions,
+                    foreground_reads: health.foreground_reads,
+                    pending_metadata_ops: 0,
+                    inflight_metadata_ops: 0,
+                },
+            },
+            upload: health.upload,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct DiagnosticsRecentEvent {
+    pub sequence: u64,
+    pub generated_unix_ms: u64,
+    pub subsystem: String,
+    pub kind: String,
+    pub title: String,
+    #[serde(default)]
+    pub fields: serde_json::Value,
+}
+
+impl From<VfsRuntimeEvent> for DiagnosticsRecentEvent {
+    fn from(value: VfsRuntimeEvent) -> Self {
+        Self {
+            sequence: value.sequence,
+            generated_unix_ms: value.generated_unix_ms,
+            subsystem: value.subsystem,
+            kind: value.kind,
+            title: value.title,
+            fields: value.fields,
+        }
+    }
+}
+
 pub(crate) trait DiagnosticsDataSource: Send + Sync + 'static {
     fn session_info(&self) -> DiagnosticsSessionInfo;
     fn health_snapshot(&self) -> DiagnosticsHealthSnapshot;
+    fn runtime_snapshot(&self) -> DiagnosticsRuntimeSnapshot;
+    fn recent_events(&self, limit: usize) -> Vec<DiagnosticsRecentEvent>;
     fn environment_fingerprint(
         &self,
         case_workload_identity: Option<&str>,
@@ -201,6 +274,31 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
             foreground_reads: self.vfs.foreground_read_protection_stats(),
             write_path: self.vfs.write_path_observability_snapshot(),
         }
+    }
+
+    fn runtime_snapshot(&self) -> DiagnosticsRuntimeSnapshot {
+        let health = self.health_snapshot();
+        DiagnosticsRuntimeSnapshot {
+            schema_version: DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION,
+            generated_unix_ms: health.generated_unix_ms,
+            ingress: health.ingress,
+            write_path: health.write_path,
+            upload: health.upload,
+            cache: DiagnosticsCacheSnapshot {
+                state: self.vfs.cache_state_snapshot(),
+            },
+            synchronization: DiagnosticsSynchronizationSnapshot {
+                state: self.vfs.synchronization_state_snapshot(),
+            },
+        }
+    }
+
+    fn recent_events(&self, limit: usize) -> Vec<DiagnosticsRecentEvent> {
+        self.vfs
+            .recent_runtime_events(limit)
+            .into_iter()
+            .map(DiagnosticsRecentEvent::from)
+            .collect()
     }
 
     fn environment_fingerprint(
@@ -287,6 +385,13 @@ enum DiagnosticsRequest {
     Health {
         auth_token: String,
     },
+    RuntimeSnapshot {
+        auth_token: String,
+    },
+    RecentEvents {
+        auth_token: String,
+        limit: Option<usize>,
+    },
     AcquireController {
         auth_token: String,
         client_name: String,
@@ -332,6 +437,12 @@ enum DiagnosticsResponse {
     },
     Health {
         health: Box<DiagnosticsHealthSnapshot>,
+    },
+    RuntimeSnapshot {
+        snapshot: Box<DiagnosticsRuntimeSnapshot>,
+    },
+    RecentEvents {
+        events: Vec<DiagnosticsRecentEvent>,
     },
     ControllerLease {
         lease: ControllerLease,
@@ -552,6 +663,36 @@ impl LocalDiagnosticsClient {
             .await?
         {
             DiagnosticsResponse::Health { health } => Ok(*health),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
+    pub(crate) async fn runtime_snapshot(&self) -> Result<DiagnosticsRuntimeSnapshot> {
+        match self
+            .send(DiagnosticsRequest::RuntimeSnapshot {
+                auth_token: self.discovery.auth_token.clone(),
+            })
+            .await?
+        {
+            DiagnosticsResponse::RuntimeSnapshot { snapshot } => Ok(*snapshot),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
+    pub(crate) async fn recent_events(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<DiagnosticsRecentEvent>> {
+        match self
+            .send(DiagnosticsRequest::RecentEvents {
+                auth_token: self.discovery.auth_token.clone(),
+                limit,
+            })
+            .await?
+        {
+            DiagnosticsResponse::RecentEvents { events } => Ok(events),
             DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
             other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
         }
@@ -1218,6 +1359,30 @@ fn execute_request(
                 health: Box::new(source.health_snapshot()),
             }
         }
+        DiagnosticsRequest::RuntimeSnapshot {
+            auth_token: provided,
+        } => {
+            if provided != auth_token {
+                return unauthorized();
+            }
+            DiagnosticsResponse::RuntimeSnapshot {
+                snapshot: Box::new(source.runtime_snapshot()),
+            }
+        }
+        DiagnosticsRequest::RecentEvents {
+            auth_token: provided,
+            limit,
+        } => {
+            if provided != auth_token {
+                return unauthorized();
+            }
+            let limit = limit
+                .unwrap_or(DEFAULT_RECENT_EVENTS_LIMIT)
+                .clamp(1, MAX_RECENT_EVENTS_LIMIT);
+            DiagnosticsResponse::RecentEvents {
+                events: source.recent_events(limit),
+            }
+        }
         DiagnosticsRequest::AcquireController {
             auth_token: provided,
             client_name,
@@ -1506,6 +1671,7 @@ mod tests {
     struct StaticDiagnosticsSource {
         session: DiagnosticsSessionInfo,
         health: DiagnosticsHealthSnapshot,
+        recent_events: Vec<DiagnosticsRecentEvent>,
         fingerprint: EnvironmentFingerprint,
     }
 
@@ -1516,6 +1682,15 @@ mod tests {
 
         fn health_snapshot(&self) -> DiagnosticsHealthSnapshot {
             self.health.clone()
+        }
+
+        fn runtime_snapshot(&self) -> DiagnosticsRuntimeSnapshot {
+            DiagnosticsRuntimeSnapshot::from_health(self.health.clone())
+        }
+
+        fn recent_events(&self, limit: usize) -> Vec<DiagnosticsRecentEvent> {
+            let keep = limit.min(self.recent_events.len());
+            self.recent_events[self.recent_events.len().saturating_sub(keep)..].to_vec()
         }
 
         fn environment_fingerprint(
@@ -1547,6 +1722,7 @@ mod tests {
                 controller: None,
             },
             health: DiagnosticsHealthSnapshot::default(),
+            recent_events: Vec::new(),
             fingerprint: EnvironmentFingerprint {
                 platform: PlatformFingerprint {
                     os: "windows".to_string(),
@@ -1595,6 +1771,17 @@ mod tests {
 
     fn mounts_dir_temp() -> TempDir {
         tempfile::tempdir().expect("tempdir")
+    }
+
+    fn sample_recent_event(title: &str, sequence: u64) -> DiagnosticsRecentEvent {
+        DiagnosticsRecentEvent {
+            sequence,
+            generated_unix_ms: 1_000 + sequence,
+            subsystem: "upload_pipeline".to_string(),
+            kind: "sample".to_string(),
+            title: title.to_string(),
+            fields: serde_json::json!({ "pending_uploads": sequence }),
+        }
     }
 
     fn write_mount_record(
@@ -1699,6 +1886,66 @@ mod tests {
             response,
             DiagnosticsResponse::Error { code, .. } if code == "lease_invalid"
         ));
+    }
+
+    #[test]
+    fn runtime_snapshot_request_returns_structured_sections() {
+        let source = static_source();
+
+        let response = execute_request(
+            DiagnosticsRequest::RuntimeSnapshot {
+                auth_token: "secret".to_string(),
+            },
+            "secret",
+            &source,
+            &ControllerLeaseManager::default(),
+            None,
+        );
+
+        let DiagnosticsResponse::RuntimeSnapshot { snapshot } = response else {
+            panic!("expected runtime snapshot response");
+        };
+
+        assert_eq!(snapshot.schema_version, 1);
+        assert_eq!(
+            snapshot.upload.pending_uploads,
+            source.health.upload.pending_uploads
+        );
+        assert_eq!(
+            snapshot.synchronization.state.file_sessions.open_handles,
+            source.health.file_sessions.open_handles
+        );
+    }
+
+    #[test]
+    fn recent_events_request_is_bounded_and_keeps_newest_entries() {
+        let source = StaticDiagnosticsSource {
+            recent_events: vec![
+                sample_recent_event("older", 1),
+                sample_recent_event("middle", 2),
+                sample_recent_event("newest", 3),
+            ],
+            ..static_source()
+        };
+
+        let response = execute_request(
+            DiagnosticsRequest::RecentEvents {
+                auth_token: "secret".to_string(),
+                limit: Some(2),
+            },
+            "secret",
+            &source,
+            &ControllerLeaseManager::default(),
+            None,
+        );
+
+        let DiagnosticsResponse::RecentEvents { events } = response else {
+            panic!("expected recent events response");
+        };
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].title, "middle");
+        assert_eq!(events[1].title, "newest");
     }
 
     #[test]

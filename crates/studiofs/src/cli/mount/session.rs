@@ -2050,6 +2050,29 @@ mod tests {
             assert!(health.generated_unix_ms > 0);
             assert!(health.write_path.generated_unix_ms > 0);
 
+            let runtime_snapshot = launch
+                .runtime_handle
+                .block_on(client.runtime_snapshot())
+                .expect("read runtime snapshot");
+            assert_eq!(runtime_snapshot.schema_version, 1);
+            assert_eq!(
+                runtime_snapshot.upload.pending_uploads,
+                health.upload.pending_uploads
+            );
+            assert!(
+                runtime_snapshot.cache.state.transit_memory.budget_bytes > 0,
+                "runtime snapshot should include cache-state transit budget"
+            );
+
+            let recent_events = launch
+                .runtime_handle
+                .block_on(client.recent_events(Some(8)))
+                .expect("read recent runtime events");
+            assert!(
+                recent_events.len() <= 8,
+                "recent events must respect the requested bound"
+            );
+
             let first_lease = launch
                 .runtime_handle
                 .block_on(client.acquire_controller("test-client-a", Duration::from_millis(100)))

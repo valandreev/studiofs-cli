@@ -61,8 +61,10 @@ pub use handle_drain_barrier::{
 };
 pub use locking::LockKind;
 pub use metrics::{
-    StatFs, VfsForegroundReadProtectionStats, VfsIngressLane, VfsIngressPressure, VfsIngressStats,
-    VfsLatencyHistogramSnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
+    StatFs, VfsAttrReadCacheSnapshot, VfsCacheStateSnapshot, VfsForegroundReadProtectionStats,
+    VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot,
+    VfsNamespaceCacheSnapshot, VfsRuntimeEvent, VfsSynchronizationStateSnapshot,
+    VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
     VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathEagerFlushStats,
     VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
     VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
@@ -154,6 +156,8 @@ use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+const RUNTIME_EVENT_CAPACITY: usize = 128;
 
 use crate::ingress_wal::{
     IngressWal, latest_ingress_checkpoint_path, load_latest_ingress_checkpoint_meta,
@@ -1805,6 +1809,8 @@ struct MetricsState {
     winfsp_cleanup_barrier_skipped_clean: AtomicU64,
     winfsp_flush_barrier_skipped_clean: AtomicU64,
     winfsp_close_barrier_skipped_clean: AtomicU64,
+    runtime_event_sequence: AtomicU64,
+    runtime_events: Mutex<VecDeque<VfsRuntimeEvent>>,
 }
 
 impl MetricsState {
@@ -1874,6 +1880,8 @@ impl MetricsState {
             winfsp_cleanup_barrier_skipped_clean: AtomicU64::new(0),
             winfsp_flush_barrier_skipped_clean: AtomicU64::new(0),
             winfsp_close_barrier_skipped_clean: AtomicU64::new(0),
+            runtime_event_sequence: AtomicU64::new(0),
+            runtime_events: Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -2673,8 +2681,96 @@ fn map_open_local_block_backend_error(
 }
 
 impl StudioVfs {
+    fn attr_read_cache_snapshot(metrics: AttrReadCacheMetrics) -> VfsAttrReadCacheSnapshot {
+        VfsAttrReadCacheSnapshot {
+            hits: metrics.hits,
+            protected_hits: metrics.protected_hits,
+            misses: metrics.misses,
+            evictions: metrics.evictions,
+            hot_hit_ratio: metrics.hot_hit_ratio(),
+            occupancy_entries: metrics.occupancy_entries,
+            occupancy_bytes: metrics.occupancy_bytes,
+            protected_occupancy_entries: metrics.protected_occupancy_entries,
+            protected_occupancy_bytes: metrics.protected_occupancy_bytes,
+            entry_budget: metrics.entry_budget,
+            byte_budget: metrics.byte_budget,
+        }
+    }
+
     fn attr_read_cache_metrics(&self) -> AttrReadCacheMetrics {
         self.state.namespace.attr_read_cache.lock().metrics()
+    }
+
+    pub fn cache_state_snapshot(&self) -> VfsCacheStateSnapshot {
+        let dentry = self.dentry_cache_metrics();
+        let path_shortcut = self.path_shortcut_cache_metrics();
+        let transit = self.transit_memory_budget.snapshot();
+
+        VfsCacheStateSnapshot {
+            dentry_cache: dentry.into(),
+            path_shortcut_cache: path_shortcut.into(),
+            attr_read_cache: Self::attr_read_cache_snapshot(self.attr_read_cache_metrics()),
+            local_backend_dirty_objects: self.local_block_backend.dirty_object_ids().len(),
+            prefetch_queue_depth: self
+                .state
+                .metrics
+                .prefetch_queue_depth
+                .load(Ordering::Relaxed),
+            transit_memory: VfsTransitMemorySnapshot {
+                budget_bytes: transit.budget_bytes,
+                used_bytes: transit.used_bytes,
+                available_bytes: transit.available_bytes,
+                waiting_foreground: transit.waiting_foreground,
+                waiting_background: transit.waiting_background,
+            },
+        }
+    }
+
+    pub fn synchronization_state_snapshot(&self) -> VfsSynchronizationStateSnapshot {
+        let metadata_backlog = self.sync_meta().replication_backlog();
+        VfsSynchronizationStateSnapshot {
+            file_sessions: self.file_session_stats(),
+            foreground_reads: self.foreground_read_protection_stats(),
+            pending_metadata_ops: metadata_backlog.pending_ops,
+            inflight_metadata_ops: metadata_backlog.inflight_ops,
+        }
+    }
+
+    pub fn recent_runtime_events(&self, limit: usize) -> Vec<VfsRuntimeEvent> {
+        let events = self.state.metrics.runtime_events.lock();
+        let keep = limit.min(events.len());
+        events
+            .iter()
+            .skip(events.len().saturating_sub(keep))
+            .cloned()
+            .collect()
+    }
+
+    pub fn record_runtime_event(
+        &self,
+        subsystem: &str,
+        kind: &str,
+        title: &str,
+        fields: serde_json::Value,
+    ) {
+        let sequence = self
+            .state
+            .metrics
+            .runtime_event_sequence
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let mut events = self.state.metrics.runtime_events.lock();
+        if events.len() >= RUNTIME_EVENT_CAPACITY {
+            events.pop_front();
+        }
+        events.push_back(VfsRuntimeEvent {
+            sequence,
+            generated_unix_ms: now_unix_millis(),
+            subsystem: subsystem.to_string(),
+            kind: kind.to_string(),
+            title: title.to_string(),
+            fields,
+        });
     }
 
     fn replay_dirty_uploads_from_local_backend(

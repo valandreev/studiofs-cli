@@ -190,6 +190,8 @@ fn run_diagnostics_attach(args: DiagnosticsAttachArgs) -> anyhow::Result<()> {
     let payload = crate::runtime_bridge::block_on(async move {
         let session = client.session_info().await?;
         let health = client.health().await?;
+        let runtime_snapshot = client.runtime_snapshot().await?;
+        let recent_events = client.recent_events(Some(16)).await?;
         let controller_lease = match (
             args.controller_client.as_deref(),
             args.renew_lease_id.as_deref(),
@@ -201,6 +203,8 @@ fn run_diagnostics_attach(args: DiagnosticsAttachArgs) -> anyhow::Result<()> {
         Ok::<_, anyhow::Error>(json!({
             "session": session,
             "health": health,
+            "runtime_snapshot": runtime_snapshot,
+            "recent_events": recent_events,
             "controller_lease": controller_lease,
         }))
     })?;

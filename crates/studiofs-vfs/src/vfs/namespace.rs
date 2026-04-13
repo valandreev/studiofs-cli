@@ -76,6 +76,26 @@ impl DentryCacheMetrics {
     }
 }
 
+impl From<DentryCacheMetrics> for VfsNamespaceCacheSnapshot {
+    fn from(value: DentryCacheMetrics) -> Self {
+        Self {
+            hits: value.hits,
+            protected_hits: value.protected_hits,
+            misses: value.misses,
+            negative_hits: value.negative_hits,
+            evictions: value.evictions,
+            negative_hit_ratio: value.negative_hit_ratio(),
+            hot_hit_ratio: value.hot_hit_ratio(),
+            occupancy_entries: value.occupancy_entries,
+            occupancy_bytes: value.occupancy_bytes,
+            protected_occupancy_entries: value.protected_occupancy_entries,
+            protected_occupancy_bytes: value.protected_occupancy_bytes,
+            entry_budget: value.entry_budget,
+            byte_budget: value.byte_budget,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct DentryCachePolicy {
     parent_index: HashMap<Ino, HashSet<DentryCacheKey>>,
@@ -340,6 +360,26 @@ impl PathShortcutCacheMetrics {
             return 0.0;
         }
         self.protected_hits as f64 / self.hits as f64
+    }
+}
+
+impl From<PathShortcutCacheMetrics> for VfsNamespaceCacheSnapshot {
+    fn from(value: PathShortcutCacheMetrics) -> Self {
+        Self {
+            hits: value.hits,
+            protected_hits: value.protected_hits,
+            misses: value.misses,
+            negative_hits: value.negative_hits,
+            evictions: value.evictions,
+            negative_hit_ratio: value.negative_hit_ratio(),
+            hot_hit_ratio: value.hot_hit_ratio(),
+            occupancy_entries: value.occupancy_entries,
+            occupancy_bytes: value.occupancy_bytes,
+            protected_occupancy_entries: value.protected_occupancy_entries,
+            protected_occupancy_bytes: value.protected_occupancy_bytes,
+            entry_budget: value.entry_budget,
+            byte_budget: value.byte_budget,
+        }
     }
 }
 
