@@ -17,6 +17,8 @@ use std::sync::OnceLock;
 
 pub(crate) const INVESTIGATION_STORE_VERSION: u32 = 1;
 pub(crate) const INVESTIGATION_REPORT_SCHEMA_VERSION: u32 = 1;
+pub(crate) const INVESTIGATION_COMPARISON_SCHEMA_VERSION: u32 = 1;
+pub(crate) const INVESTIGATION_HYPOTHESIS_SCHEMA_VERSION: u32 = 1;
 
 #[cfg(test)]
 static TEST_BASE_DIR: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
@@ -33,9 +35,13 @@ pub(crate) struct InvestigationCase {
     pub workload_identity: Option<String>,
     pub target_environment: Option<String>,
     pub run_ids: Vec<String>,
+    #[serde(default)]
+    pub comparison_ids: Vec<String>,
+    #[serde(default)]
+    pub hypothesis_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct InvestigationRun {
     pub id: String,
     pub case_id: String,
@@ -46,7 +52,17 @@ pub(crate) struct InvestigationRun {
     pub profiling_windows: Vec<ProfilingWindowRecord>,
     #[serde(default)]
     pub report_ids: Vec<String>,
+    #[serde(default)]
+    pub marker_snapshots: Vec<InvestigationMarkerSnapshot>,
     pub timeline: Vec<TimelineEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct InvestigationMarkerSnapshot {
+    pub marker_sequence: u64,
+    pub marker_title: String,
+    pub captured_unix_ms: u64,
+    pub runtime_snapshot: crate::diagnostics::DiagnosticsRuntimeSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -274,6 +290,108 @@ pub(crate) struct InvestigationReport {
     pub references: InvestigationReportReferences,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct InvestigationMatchedMarkerSpan {
+    pub start_marker_title: String,
+    pub end_marker_title: String,
+    pub baseline_start_sequence: u64,
+    pub baseline_end_sequence: u64,
+    pub candidate_start_sequence: u64,
+    pub candidate_end_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct InvestigationComparisonMetricDelta {
+    pub metric: String,
+    pub baseline_value: f64,
+    pub candidate_value: f64,
+    pub delta: f64,
+    #[serde(default)]
+    pub supporting_evidence: Vec<crate::diagnostics::DiagnosticsEvidenceReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct InvestigationComparisonAnomalyDelta {
+    pub title: String,
+    pub baseline_count: usize,
+    pub candidate_count: usize,
+    pub delta: i64,
+    #[serde(default)]
+    pub supporting_evidence: Vec<crate::diagnostics::DiagnosticsEvidenceReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct InvestigationComparisonHotspotDelta {
+    pub subsystem: String,
+    pub operation_type: String,
+    pub metric: String,
+    pub baseline_score: f64,
+    pub candidate_score: f64,
+    pub delta: f64,
+    #[serde(default)]
+    pub supporting_evidence: Vec<crate::diagnostics::DiagnosticsEvidenceReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct InvestigationSpanComparisonSummary {
+    #[serde(default)]
+    pub metric_deltas: Vec<InvestigationComparisonMetricDelta>,
+    #[serde(default)]
+    pub anomaly_deltas: Vec<InvestigationComparisonAnomalyDelta>,
+    #[serde(default)]
+    pub hotspot_deltas: Vec<InvestigationComparisonHotspotDelta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct InvestigationSpanComparison {
+    pub schema_version: u32,
+    pub id: String,
+    pub case_id: String,
+    pub created_unix_ms: u64,
+    pub baseline_run_id: String,
+    pub candidate_run_id: String,
+    pub span: InvestigationMatchedMarkerSpan,
+    pub summary: InvestigationSpanComparisonSummary,
+    #[serde(default)]
+    pub supporting_evidence: Vec<crate::diagnostics::DiagnosticsEvidenceReference>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InvestigationHypothesisStatus {
+    Open,
+    Supported,
+    Rejected,
+    Inconclusive,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct InvestigationHypothesisStatusTransition {
+    pub occurred_unix_ms: u64,
+    pub from_status: Option<InvestigationHypothesisStatus>,
+    pub to_status: InvestigationHypothesisStatus,
+    pub actor: Option<String>,
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub supporting_evidence: Vec<crate::diagnostics::DiagnosticsEvidenceReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct InvestigationHypothesis {
+    pub schema_version: u32,
+    pub id: String,
+    pub case_id: String,
+    pub created_unix_ms: u64,
+    pub updated_unix_ms: u64,
+    pub statement: String,
+    pub expected_signal: String,
+    pub status: InvestigationHypothesisStatus,
+    #[serde(default)]
+    pub supporting_evidence: Vec<crate::diagnostics::DiagnosticsEvidenceReference>,
+    #[serde(default)]
+    pub status_history: Vec<InvestigationHypothesisStatusTransition>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct NewInvestigationCase {
     pub title: String,
@@ -287,6 +405,13 @@ pub(crate) struct NewInvestigationRun {
     pub case_id: String,
     pub session_id: String,
     pub fingerprint: EnvironmentFingerprint,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NewInvestigationMarkerSnapshot {
+    pub marker_sequence: u64,
+    pub marker_title: String,
+    pub runtime_snapshot: crate::diagnostics::DiagnosticsRuntimeSnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +452,30 @@ pub(crate) struct NewInvestigationReport {
     pub references: InvestigationReportReferences,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct NewInvestigationSpanComparison {
+    pub baseline_run_id: String,
+    pub candidate_run_id: String,
+    pub span: InvestigationMatchedMarkerSpan,
+    pub summary: InvestigationSpanComparisonSummary,
+    pub supporting_evidence: Vec<crate::diagnostics::DiagnosticsEvidenceReference>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NewInvestigationHypothesis {
+    pub statement: String,
+    pub expected_signal: String,
+    pub supporting_evidence: Vec<crate::diagnostics::DiagnosticsEvidenceReference>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UpdateInvestigationHypothesisStatus {
+    pub status: InvestigationHypothesisStatus,
+    pub actor: Option<String>,
+    pub reason: Option<String>,
+    pub supporting_evidence: Vec<crate::diagnostics::DiagnosticsEvidenceReference>,
+}
+
 #[derive(Debug)]
 pub(crate) struct InvestigationStore {
     base_dir: PathBuf,
@@ -365,6 +514,8 @@ impl InvestigationStore {
             workload_identity: input.workload_identity,
             target_environment: input.target_environment,
             run_ids: Vec::new(),
+            comparison_ids: Vec::new(),
+            hypothesis_ids: Vec::new(),
         };
         self.save_json(&self.case_path(&case.id), &case)?;
         Ok(case)
@@ -385,6 +536,7 @@ impl InvestigationStore {
             fingerprint: input.fingerprint,
             profiling_windows: Vec::new(),
             report_ids: Vec::new(),
+            marker_snapshots: Vec::new(),
             timeline: Vec::new(),
         };
 
@@ -472,6 +624,37 @@ impl InvestigationStore {
         Ok(window)
     }
 
+    pub(crate) fn append_marker_snapshot(
+        &self,
+        run_id: &str,
+        input: NewInvestigationMarkerSnapshot,
+    ) -> Result<InvestigationMarkerSnapshot> {
+        let _guard = self.io_lock.lock();
+        let _store_lock = self.lock_store()?;
+        self.ensure_layout()?;
+
+        let mut run = self.load_json::<InvestigationRun>(&self.run_path(run_id))?;
+        let snapshot = InvestigationMarkerSnapshot {
+            marker_sequence: input.marker_sequence,
+            marker_title: input.marker_title,
+            captured_unix_ms: now_unix_millis(),
+            runtime_snapshot: input.runtime_snapshot,
+        };
+        if let Some(existing) = run
+            .marker_snapshots
+            .iter_mut()
+            .find(|existing| existing.marker_sequence == snapshot.marker_sequence)
+        {
+            *existing = snapshot.clone();
+        } else {
+            run.marker_snapshots.push(snapshot.clone());
+            run.marker_snapshots
+                .sort_by_key(|item| item.marker_sequence);
+        }
+        self.save_json(&self.run_path(run_id), &run)?;
+        Ok(snapshot)
+    }
+
     pub(crate) fn append_report(
         &self,
         run_id: &str,
@@ -522,6 +705,126 @@ impl InvestigationStore {
         Ok(report)
     }
 
+    pub(crate) fn append_span_comparison(
+        &self,
+        case_id: &str,
+        input: NewInvestigationSpanComparison,
+    ) -> Result<InvestigationSpanComparison> {
+        let _guard = self.io_lock.lock();
+        let _store_lock = self.lock_store()?;
+        self.ensure_layout()?;
+
+        let mut case = self.load_json::<InvestigationCase>(&self.case_path(case_id))?;
+        let comparison = InvestigationSpanComparison {
+            schema_version: INVESTIGATION_COMPARISON_SCHEMA_VERSION,
+            id: Uuid::new_v4().to_string(),
+            case_id: case_id.to_string(),
+            created_unix_ms: now_unix_millis(),
+            baseline_run_id: input.baseline_run_id,
+            candidate_run_id: input.candidate_run_id,
+            span: input.span,
+            summary: input.summary,
+            supporting_evidence: input.supporting_evidence,
+        };
+        let comparison_path = self.comparison_path(&comparison.id)?;
+        self.save_json(&comparison_path, &comparison)?;
+        case.updated_unix_ms = now_unix_millis();
+        case.comparison_ids.push(comparison.id.clone());
+        if let Err(case_save_error) = self.save_json(&self.case_path(case_id), &case) {
+            return cleanup_orphaned_store_file(
+                &comparison_path,
+                "case",
+                "comparison",
+                &comparison.id,
+                case_save_error,
+            );
+        }
+        Ok(comparison)
+    }
+
+    pub(crate) fn create_hypothesis(
+        &self,
+        case_id: &str,
+        input: NewInvestigationHypothesis,
+    ) -> Result<InvestigationHypothesis> {
+        let _guard = self.io_lock.lock();
+        let _store_lock = self.lock_store()?;
+        self.ensure_layout()?;
+
+        let mut case = self.load_json::<InvestigationCase>(&self.case_path(case_id))?;
+        let now = now_unix_millis();
+        let hypothesis = InvestigationHypothesis {
+            schema_version: INVESTIGATION_HYPOTHESIS_SCHEMA_VERSION,
+            id: Uuid::new_v4().to_string(),
+            case_id: case_id.to_string(),
+            created_unix_ms: now,
+            updated_unix_ms: now,
+            statement: input.statement,
+            expected_signal: input.expected_signal,
+            status: InvestigationHypothesisStatus::Open,
+            supporting_evidence: input.supporting_evidence.clone(),
+            status_history: vec![InvestigationHypothesisStatusTransition {
+                occurred_unix_ms: now,
+                from_status: None,
+                to_status: InvestigationHypothesisStatus::Open,
+                actor: None,
+                reason: Some("hypothesis created".to_string()),
+                supporting_evidence: input.supporting_evidence,
+            }],
+        };
+        let hypothesis_path = self.hypothesis_path(&hypothesis.id)?;
+        self.save_json(&hypothesis_path, &hypothesis)?;
+        case.updated_unix_ms = now;
+        case.hypothesis_ids.push(hypothesis.id.clone());
+        if let Err(case_save_error) = self.save_json(&self.case_path(case_id), &case) {
+            return cleanup_orphaned_store_file(
+                &hypothesis_path,
+                "case",
+                "hypothesis",
+                &hypothesis.id,
+                case_save_error,
+            );
+        }
+        Ok(hypothesis)
+    }
+
+    pub(crate) fn update_hypothesis_status(
+        &self,
+        hypothesis_id: &str,
+        input: UpdateInvestigationHypothesisStatus,
+    ) -> Result<InvestigationHypothesis> {
+        let _guard = self.io_lock.lock();
+        let _store_lock = self.lock_store()?;
+        self.ensure_layout()?;
+
+        let mut hypothesis =
+            self.load_json::<InvestigationHypothesis>(&self.hypothesis_path(hypothesis_id)?)?;
+        let previous_status = hypothesis.status;
+        hypothesis.status = input.status;
+        hypothesis.updated_unix_ms = now_unix_millis();
+        for evidence in &input.supporting_evidence {
+            if !hypothesis.supporting_evidence.iter().any(|existing| {
+                existing.source == evidence.source
+                    && existing.id == evidence.id
+                    && existing.field == evidence.field
+            }) {
+                hypothesis.supporting_evidence.push(evidence.clone());
+            }
+        }
+        hypothesis
+            .status_history
+            .push(InvestigationHypothesisStatusTransition {
+                occurred_unix_ms: hypothesis.updated_unix_ms,
+                from_status: Some(previous_status),
+                to_status: input.status,
+                actor: input.actor,
+                reason: input.reason,
+                supporting_evidence: input.supporting_evidence,
+            });
+        self.save_json(&self.hypothesis_path(hypothesis_id)?, &hypothesis)?;
+        Ok(hypothesis)
+    }
+
     pub(crate) fn load_case(&self, case_id: &str) -> Result<InvestigationCase> {
         let _guard = self.io_lock.lock();
         let _store_lock = self.lock_store()?;
@@ -545,11 +848,28 @@ impl InvestigationStore {
         self.load_json(&self.report_path(report_id)?)
     }
 
+    pub(crate) fn load_comparison(
+        &self,
+        comparison_id: &str,
+    ) -> Result<InvestigationSpanComparison> {
+        let _guard = self.io_lock.lock();
+        let _store_lock = self.lock_store()?;
+        self.load_json(&self.comparison_path(comparison_id)?)
+    }
+
+    pub(crate) fn load_hypothesis(&self, hypothesis_id: &str) -> Result<InvestigationHypothesis> {
+        let _guard = self.io_lock.lock();
+        let _store_lock = self.lock_store()?;
+        self.load_json(&self.hypothesis_path(hypothesis_id)?)
+    }
+
     fn ensure_layout(&self) -> Result<()> {
         ensure_private_directory(&self.base_dir)?;
         ensure_private_directory(&self.cases_dir())?;
         ensure_private_directory(&self.runs_dir())?;
         ensure_private_directory(&self.reports_dir())?;
+        ensure_private_directory(&self.comparisons_dir())?;
+        ensure_private_directory(&self.hypotheses_dir())?;
 
         let version_path = self.base_dir.join("store.json");
         if !version_path.exists() {
@@ -573,6 +893,14 @@ impl InvestigationStore {
         self.base_dir.join("reports")
     }
 
+    fn comparisons_dir(&self) -> PathBuf {
+        self.base_dir.join("comparisons")
+    }
+
+    fn hypotheses_dir(&self) -> PathBuf {
+        self.base_dir.join("hypotheses")
+    }
+
     fn case_path(&self, case_id: &str) -> PathBuf {
         self.cases_dir().join(format!("{case_id}.json"))
     }
@@ -585,6 +913,18 @@ impl InvestigationStore {
         Ok(self
             .reports_dir()
             .join(format!("{}.json", canonical_report_id(report_id)?)))
+    }
+
+    fn comparison_path(&self, comparison_id: &str) -> Result<PathBuf> {
+        Ok(self
+            .comparisons_dir()
+            .join(format!("{}.json", canonical_comparison_id(comparison_id)?)))
+    }
+
+    fn hypothesis_path(&self, hypothesis_id: &str) -> Result<PathBuf> {
+        Ok(self
+            .hypotheses_dir()
+            .join(format!("{}.json", canonical_hypothesis_id(hypothesis_id)?)))
     }
 
     fn timeline_log_path(&self, run_id: &str) -> PathBuf {
@@ -823,6 +1163,43 @@ fn canonical_report_id(report_id: &str) -> Result<String> {
     Uuid::parse_str(report_id)
         .map(|uuid| uuid.to_string())
         .map_err(|error| anyhow!("invalid report id '{}': {error}", report_id))
+}
+
+fn canonical_comparison_id(comparison_id: &str) -> Result<String> {
+    Ok(Uuid::parse_str(comparison_id)
+        .with_context(|| format!("invalid comparison id '{}'", comparison_id))?
+        .to_string())
+}
+
+fn canonical_hypothesis_id(hypothesis_id: &str) -> Result<String> {
+    Ok(Uuid::parse_str(hypothesis_id)
+        .with_context(|| format!("invalid hypothesis id '{}'", hypothesis_id))?
+        .to_string())
+}
+
+fn cleanup_orphaned_store_file<T>(
+    path: &Path,
+    owner_kind: &str,
+    artifact_kind: &str,
+    artifact_id: &str,
+    save_error: anyhow::Error,
+) -> Result<T> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(cleanup_error) => {
+            return Err(anyhow!(
+                "failed to save {owner_kind} after writing {artifact_kind} '{}'; additionally failed to remove orphaned {artifact_kind} file '{}': {}",
+                artifact_id,
+                path.display(),
+                cleanup_error
+            ))
+            .context(save_error);
+        }
+    }
+    Err(save_error).context(format!(
+        "failed to save {owner_kind} after writing {artifact_kind}; cleaned up orphaned {artifact_kind} file"
+    ))
 }
 
 fn ensure_private_directory(path: &Path) -> Result<()> {
@@ -1164,6 +1541,7 @@ mod tests {
             fingerprint: sample_fingerprint(),
             profiling_windows: Vec::new(),
             report_ids: Vec::new(),
+            marker_snapshots: Vec::new(),
             timeline: vec![TimelineEntry {
                 sequence: 1,
                 occurred_unix_ms: 1,
@@ -1225,6 +1603,7 @@ mod tests {
             fingerprint: sample_fingerprint(),
             profiling_windows: Vec::new(),
             report_ids: Vec::new(),
+            marker_snapshots: Vec::new(),
             timeline: vec![TimelineEntry {
                 sequence: 1,
                 occurred_unix_ms: 1,
@@ -1715,6 +2094,161 @@ mod tests {
             report_files.is_empty(),
             "orphaned report file should be removed"
         );
+    }
+
+    #[test]
+    fn append_marker_snapshot_persists_runtime_boundary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let case = store
+            .create_case(NewInvestigationCase {
+                title: "marker boundaries".to_string(),
+                problem_statement: None,
+                workload_identity: None,
+                target_environment: None,
+            })
+            .expect("create case");
+        let run = store
+            .create_run(NewInvestigationRun {
+                case_id: case.id,
+                session_id: "session-1".to_string(),
+                fingerprint: sample_fingerprint(),
+            })
+            .expect("create run");
+
+        let marker = store
+            .append_timeline_entry(
+                &run.id,
+                NewTimelineEntry {
+                    source: TimelineEntrySource::Cli,
+                    kind: TimelineEntryKind::Marker,
+                    title: "warm copy".to_string(),
+                    body: None,
+                    actor: None,
+                    reason: None,
+                },
+            )
+            .expect("append marker");
+
+        let mut snapshot = crate::diagnostics::DiagnosticsRuntimeSnapshot::default();
+        snapshot.upload.pending_uploads = 7;
+        let boundary = store
+            .append_marker_snapshot(
+                &run.id,
+                NewInvestigationMarkerSnapshot {
+                    marker_sequence: marker.sequence,
+                    marker_title: marker.title.clone(),
+                    runtime_snapshot: snapshot,
+                },
+            )
+            .expect("append marker snapshot");
+
+        assert_eq!(boundary.marker_sequence, marker.sequence);
+        let reloaded = store.load_run(&run.id).expect("reload run");
+        assert_eq!(reloaded.marker_snapshots.len(), 1);
+        assert_eq!(
+            reloaded.marker_snapshots[0].marker_sequence,
+            marker.sequence
+        );
+        assert_eq!(
+            reloaded.marker_snapshots[0]
+                .runtime_snapshot
+                .upload
+                .pending_uploads,
+            7
+        );
+    }
+
+    #[test]
+    fn store_persists_span_comparison_and_hypothesis_status_history() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let case = store
+            .create_case(NewInvestigationCase {
+                title: "comparison".to_string(),
+                problem_statement: None,
+                workload_identity: None,
+                target_environment: None,
+            })
+            .expect("create case");
+
+        let comparison = store
+            .append_span_comparison(
+                &case.id,
+                NewInvestigationSpanComparison {
+                    baseline_run_id: "run-a".to_string(),
+                    candidate_run_id: "run-b".to_string(),
+                    span: InvestigationMatchedMarkerSpan {
+                        start_marker_title: "warm copy".to_string(),
+                        end_marker_title: "warm copy done".to_string(),
+                        baseline_start_sequence: 1,
+                        baseline_end_sequence: 2,
+                        candidate_start_sequence: 3,
+                        candidate_end_sequence: 4,
+                    },
+                    summary: InvestigationSpanComparisonSummary {
+                        metric_deltas: vec![InvestigationComparisonMetricDelta {
+                            metric: "upload.pending_uploads_delta".to_string(),
+                            baseline_value: 9.0,
+                            candidate_value: 4.0,
+                            delta: -5.0,
+                            supporting_evidence: vec![crate::diagnostics::DiagnosticsEvidenceReference {
+                                source: crate::diagnostics::DiagnosticsEvidenceReferenceSource::MarkerSnapshot,
+                                id: "1".to_string(),
+                                field: Some("upload.pending_uploads".to_string()),
+                            }],
+                        }],
+                        anomaly_deltas: Vec::new(),
+                        hotspot_deltas: Vec::new(),
+                    },
+                    supporting_evidence: vec![crate::diagnostics::DiagnosticsEvidenceReference {
+                        source: crate::diagnostics::DiagnosticsEvidenceReferenceSource::MarkerSnapshot,
+                        id: "2".to_string(),
+                        field: Some("write_path.block_store_sync_data.queue_wait_total_ms".to_string()),
+                    }],
+                },
+            )
+            .expect("append comparison");
+
+        let hypothesis = store
+            .create_hypothesis(
+                &case.id,
+                NewInvestigationHypothesis {
+                    statement: "sync_data queue wait dropped after the fix".to_string(),
+                    expected_signal: "candidate span should have lower queue wait totals".to_string(),
+                    supporting_evidence: vec![crate::diagnostics::DiagnosticsEvidenceReference {
+                        source: crate::diagnostics::DiagnosticsEvidenceReferenceSource::InvestigationSpanComparison,
+                        id: comparison.id.clone(),
+                        field: None,
+                    }],
+                },
+            )
+            .expect("create hypothesis");
+        let updated = store
+            .update_hypothesis_status(
+                &hypothesis.id,
+                UpdateInvestigationHypothesisStatus {
+                    status: InvestigationHypothesisStatus::Supported,
+                    actor: Some("studiofs-dev-mcp".to_string()),
+                    reason: Some("comparison shows lower queue wait".to_string()),
+                    supporting_evidence: vec![crate::diagnostics::DiagnosticsEvidenceReference {
+                        source: crate::diagnostics::DiagnosticsEvidenceReferenceSource::InvestigationSpanComparison,
+                        id: comparison.id.clone(),
+                        field: None,
+                    }],
+                },
+            )
+            .expect("update hypothesis status");
+
+        assert_eq!(updated.status, InvestigationHypothesisStatus::Supported);
+        assert_eq!(updated.status_history.len(), 2);
+        assert_eq!(
+            updated.status_history[1].to_status,
+            InvestigationHypothesisStatus::Supported
+        );
+        let reloaded_case = store.load_case(&case.id).expect("reload case");
+        assert_eq!(reloaded_case.comparison_ids, vec![comparison.id.clone()]);
+        assert_eq!(reloaded_case.hypothesis_ids, vec![hypothesis.id.clone()]);
     }
 
     #[cfg(unix)]

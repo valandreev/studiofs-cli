@@ -1,15 +1,19 @@
 use crate::cli::utils;
 use crate::investigation::{
     BuildIdentity, DiagnosticsPreset, DiagnosticsSettingsFingerprint, EnvironmentFingerprint,
-    InvestigationCase, InvestigationRecommendedNextAction, InvestigationReport,
+    InvestigationCase, InvestigationComparisonAnomalyDelta, InvestigationComparisonHotspotDelta,
+    InvestigationComparisonMetricDelta, InvestigationHypothesis, InvestigationHypothesisStatus,
+    InvestigationMatchedMarkerSpan, InvestigationRecommendedNextAction, InvestigationReport,
     InvestigationReportEvidenceSummary, InvestigationReportFinding, InvestigationReportReferences,
     InvestigationReportSectionSummary, InvestigationReportSelectedEvidence,
-    InvestigationReportTruncationSummary, InvestigationRun, InvestigationStore, MachineFingerprint,
-    NewInvestigationCase, NewInvestigationReport, NewInvestigationRun, NewProfilingWindow,
-    NewTimelineEntry, PlatformFingerprint, ProfileArtifactRecord, ProfilingCaptureMode,
-    ProfilingCostEstimate, ProfilingWindowRecord, ProfilingWindowStatus,
+    InvestigationReportTruncationSummary, InvestigationRun, InvestigationSpanComparison,
+    InvestigationSpanComparisonSummary, InvestigationStore, MachineFingerprint,
+    NewInvestigationCase, NewInvestigationHypothesis, NewInvestigationMarkerSnapshot,
+    NewInvestigationReport, NewInvestigationRun, NewInvestigationSpanComparison,
+    NewProfilingWindow, NewTimelineEntry, PlatformFingerprint, ProfileArtifactRecord,
+    ProfilingCaptureMode, ProfilingCostEstimate, ProfilingWindowRecord, ProfilingWindowStatus,
     RuntimeConfigurationFingerprint, TimelineEntry, TimelineEntryKind, TimelineEntrySource,
-    WorkloadIdentityFingerprint,
+    UpdateInvestigationHypothesisStatus, WorkloadIdentityFingerprint,
 };
 use anyhow::{Context, Result, anyhow};
 use parking_lot::Mutex;
@@ -367,6 +371,8 @@ pub(crate) enum DiagnosticsEvidenceReferenceSource {
     TimelineEntry,
     ProfilingWindow,
     ProfilingArtifact,
+    MarkerSnapshot,
+    InvestigationSpanComparison,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -446,6 +452,14 @@ pub(crate) struct DiagnosticsEvidenceView {
     pub budget: DiagnosticsEvidenceBudgetReport,
     pub raw: DiagnosticsEvidenceRawView,
     pub derived: DiagnosticsDerivedEvidenceView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DiagnosticsCompareRunSpanRequest {
+    pub baseline_run_id: String,
+    pub candidate_run_id: String,
+    pub start_marker_title: String,
+    pub end_marker_title: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1421,6 +1435,37 @@ fn runtime_snapshot_reference(field: &str) -> DiagnosticsEvidenceReference {
     }
 }
 
+fn marker_snapshot_reference(sequence: u64, field: &str) -> DiagnosticsEvidenceReference {
+    DiagnosticsEvidenceReference {
+        source: DiagnosticsEvidenceReferenceSource::MarkerSnapshot,
+        id: sequence.to_string(),
+        field: Some(field.to_string()),
+    }
+}
+
+fn qualify_comparison_evidence(
+    run_id: &str,
+    reference: DiagnosticsEvidenceReference,
+) -> DiagnosticsEvidenceReference {
+    let needs_run_scope = matches!(
+        reference.source,
+        DiagnosticsEvidenceReferenceSource::RuntimeSnapshot
+            | DiagnosticsEvidenceReferenceSource::RecentEvent
+            | DiagnosticsEvidenceReferenceSource::TimelineEntry
+            | DiagnosticsEvidenceReferenceSource::ProfilingWindow
+            | DiagnosticsEvidenceReferenceSource::ProfilingArtifact
+            | DiagnosticsEvidenceReferenceSource::MarkerSnapshot
+    );
+    if !needs_run_scope {
+        return reference;
+    }
+
+    DiagnosticsEvidenceReference {
+        id: format!("{run_id}:{}", reference.id),
+        ..reference
+    }
+}
+
 fn push_blocking_interval(
     output: &mut Vec<DiagnosticsBlockingInterval>,
     scope: &DiagnosticsEvidenceScope,
@@ -2257,6 +2302,378 @@ fn materialize_report(
     )
 }
 
+fn marker_snapshot_by_title<'a>(
+    run: &'a InvestigationRun,
+    title: &str,
+) -> Result<&'a crate::investigation::InvestigationMarkerSnapshot> {
+    let mut matches = run
+        .marker_snapshots
+        .iter()
+        .filter(|snapshot| snapshot.marker_title == title);
+    let Some(snapshot) = matches.next() else {
+        return Err(anyhow!(
+            "marker snapshot '{}' not found for run {}",
+            title,
+            run.id
+        ));
+    };
+    if matches.next().is_some() {
+        return Err(anyhow!(
+            "marker snapshot '{}' is ambiguous for run {}",
+            title,
+            run.id
+        ));
+    }
+    Ok(snapshot)
+}
+
+fn count_anomalies_in_span(
+    run: &InvestigationRun,
+    start_sequence: u64,
+    end_sequence: u64,
+) -> Vec<(String, DiagnosticsEvidenceReference)> {
+    run.timeline
+        .iter()
+        .filter(|entry| {
+            is_anomaly_timeline_entry(entry)
+                && entry.sequence >= start_sequence
+                && entry.sequence <= end_sequence
+        })
+        .map(|entry| {
+            (
+                entry.title.clone(),
+                qualify_comparison_evidence(&run.id, timeline_entry_reference(entry)),
+            )
+        })
+        .collect()
+}
+
+fn profiling_windows_in_span(
+    run: &InvestigationRun,
+    start_sequence: u64,
+    end_sequence: u64,
+) -> Vec<&ProfilingWindowRecord> {
+    let Some(start) = run
+        .timeline
+        .iter()
+        .find(|entry| entry.sequence == start_sequence)
+    else {
+        return Vec::new();
+    };
+    let Some(end) = run
+        .timeline
+        .iter()
+        .find(|entry| entry.sequence == end_sequence)
+    else {
+        return Vec::new();
+    };
+    run.profiling_windows
+        .iter()
+        .filter(|window| {
+            window.occurred_unix_ms >= start.occurred_unix_ms
+                && window.occurred_unix_ms <= end.occurred_unix_ms
+        })
+        .collect()
+}
+
+fn collect_hotspots_for_windows(
+    windows: &[&ProfilingWindowRecord],
+) -> Result<Vec<DiagnosticsHotspotSummary>> {
+    let mut loaded = Vec::new();
+    for window in windows {
+        match load_wall_blocking_profile_artifact(window) {
+            Ok(Some((_summary, artifact))) => loaded.push(((*window).clone(), Some(artifact))),
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    window_id = %window.window_id,
+                    error = %error,
+                    "failed to load wall-blocking profile artifact while collecting comparison hotspots"
+                );
+                return Err(error);
+            }
+        }
+    }
+    Ok(derive_hotspots(
+        &DiagnosticsEvidenceScope::default(),
+        None,
+        &loaded,
+        MAX_EVIDENCE_DERIVED_ITEMS_PER_KIND,
+    )
+    .0)
+}
+
+fn materialize_run_span_comparison(
+    request: DiagnosticsCompareRunSpanRequest,
+    store: &InvestigationStore,
+) -> Result<InvestigationSpanComparison> {
+    let baseline = store.load_run(&request.baseline_run_id)?;
+    let candidate = store.load_run(&request.candidate_run_id)?;
+    if baseline.case_id != candidate.case_id {
+        return Err(anyhow!(
+            "runs {} and {} belong to different investigation cases",
+            baseline.id,
+            candidate.id
+        ));
+    }
+    let baseline_start = marker_snapshot_by_title(&baseline, &request.start_marker_title)?;
+    let candidate_start = marker_snapshot_by_title(&candidate, &request.start_marker_title)?;
+    let baseline_end = marker_snapshot_by_title(&baseline, &request.end_marker_title)?;
+    let candidate_end = marker_snapshot_by_title(&candidate, &request.end_marker_title)?;
+    if baseline_end.marker_sequence < baseline_start.marker_sequence {
+        return Err(anyhow!("baseline marker span ordering is invalid"));
+    }
+    if candidate_end.marker_sequence < candidate_start.marker_sequence {
+        return Err(anyhow!("candidate marker span ordering is invalid"));
+    }
+
+    let metric_deltas = [
+        (
+            "upload.pending_uploads_delta",
+            baseline_end.runtime_snapshot.upload.pending_uploads as f64
+                - baseline_start.runtime_snapshot.upload.pending_uploads as f64,
+            candidate_end.runtime_snapshot.upload.pending_uploads as f64
+                - candidate_start.runtime_snapshot.upload.pending_uploads as f64,
+            "upload.pending_uploads",
+        ),
+        (
+            "write_path.block_store_sync_data.queue_wait_total_ms_delta",
+            baseline_end
+                .runtime_snapshot
+                .write_path
+                .block_store_sync_data
+                .queue_wait_total_ms
+                - baseline_start
+                    .runtime_snapshot
+                    .write_path
+                    .block_store_sync_data
+                    .queue_wait_total_ms,
+            candidate_end
+                .runtime_snapshot
+                .write_path
+                .block_store_sync_data
+                .queue_wait_total_ms
+                - candidate_start
+                    .runtime_snapshot
+                    .write_path
+                    .block_store_sync_data
+                    .queue_wait_total_ms,
+            "write_path.block_store_sync_data.queue_wait_total_ms",
+        ),
+        (
+            "write_path.write_backpressure.wait_total_ms_delta",
+            baseline_end
+                .runtime_snapshot
+                .write_path
+                .write_backpressure
+                .wait_total_ms as f64
+                - baseline_start
+                    .runtime_snapshot
+                    .write_path
+                    .write_backpressure
+                    .wait_total_ms as f64,
+            candidate_end
+                .runtime_snapshot
+                .write_path
+                .write_backpressure
+                .wait_total_ms as f64
+                - candidate_start
+                    .runtime_snapshot
+                    .write_path
+                    .write_backpressure
+                    .wait_total_ms as f64,
+            "write_path.write_backpressure.wait_total_ms",
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(metric, baseline_value, candidate_value, field)| InvestigationComparisonMetricDelta {
+            metric: metric.to_string(),
+            baseline_value,
+            candidate_value,
+            delta: candidate_value - baseline_value,
+            supporting_evidence: vec![
+                qualify_comparison_evidence(
+                    &baseline.id,
+                    marker_snapshot_reference(baseline_start.marker_sequence, field),
+                ),
+                qualify_comparison_evidence(
+                    &baseline.id,
+                    marker_snapshot_reference(baseline_end.marker_sequence, field),
+                ),
+                qualify_comparison_evidence(
+                    &candidate.id,
+                    marker_snapshot_reference(candidate_start.marker_sequence, field),
+                ),
+                qualify_comparison_evidence(
+                    &candidate.id,
+                    marker_snapshot_reference(candidate_end.marker_sequence, field),
+                ),
+            ],
+        },
+    )
+    .collect::<Vec<_>>();
+
+    let baseline_anomalies = count_anomalies_in_span(
+        &baseline,
+        baseline_start.marker_sequence,
+        baseline_end.marker_sequence,
+    );
+    let candidate_anomalies = count_anomalies_in_span(
+        &candidate,
+        candidate_start.marker_sequence,
+        candidate_end.marker_sequence,
+    );
+    let mut anomaly_titles = baseline_anomalies
+        .iter()
+        .map(|(title, _)| title.clone())
+        .collect::<Vec<_>>();
+    anomaly_titles.extend(candidate_anomalies.iter().map(|(title, _)| title.clone()));
+    anomaly_titles.sort();
+    anomaly_titles.dedup();
+    let anomaly_deltas = anomaly_titles
+        .into_iter()
+        .filter_map(|title| {
+            let baseline_refs = baseline_anomalies
+                .iter()
+                .filter(|(candidate_title, _)| *candidate_title == title)
+                .map(|(_, evidence)| evidence.clone())
+                .collect::<Vec<_>>();
+            let candidate_refs = candidate_anomalies
+                .iter()
+                .filter(|(candidate_title, _)| *candidate_title == title)
+                .map(|(_, evidence)| evidence.clone())
+                .collect::<Vec<_>>();
+            let baseline_count = baseline_refs.len();
+            let candidate_count = candidate_refs.len();
+            let delta = candidate_count as i64 - baseline_count as i64;
+            (baseline_count > 0 || candidate_count > 0).then_some(
+                InvestigationComparisonAnomalyDelta {
+                    title,
+                    baseline_count,
+                    candidate_count,
+                    delta,
+                    supporting_evidence: baseline_refs.into_iter().chain(candidate_refs).collect(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let baseline_hotspots = collect_hotspots_for_windows(&profiling_windows_in_span(
+        &baseline,
+        baseline_start.marker_sequence,
+        baseline_end.marker_sequence,
+    ))?;
+    let candidate_hotspots = collect_hotspots_for_windows(&profiling_windows_in_span(
+        &candidate,
+        candidate_start.marker_sequence,
+        candidate_end.marker_sequence,
+    ))?;
+    let mut hotspot_keys = baseline_hotspots
+        .iter()
+        .map(|hotspot| {
+            (
+                hotspot.subsystem.clone(),
+                hotspot.operation_type.clone(),
+                hotspot.metric.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    hotspot_keys.extend(candidate_hotspots.iter().map(|hotspot| {
+        (
+            hotspot.subsystem.clone(),
+            hotspot.operation_type.clone(),
+            hotspot.metric.clone(),
+        )
+    }));
+    hotspot_keys.sort();
+    hotspot_keys.dedup();
+    let hotspot_deltas = hotspot_keys
+        .into_iter()
+        .map(|(subsystem, operation_type, metric)| {
+            let baseline_match = baseline_hotspots.iter().find(|hotspot| {
+                hotspot.subsystem == subsystem
+                    && hotspot.operation_type == operation_type
+                    && hotspot.metric == metric
+            });
+            let candidate_match = candidate_hotspots.iter().find(|hotspot| {
+                hotspot.subsystem == subsystem
+                    && hotspot.operation_type == operation_type
+                    && hotspot.metric == metric
+            });
+            let baseline_score = baseline_match.map(|hotspot| hotspot.score).unwrap_or(0.0);
+            let candidate_score = candidate_match.map(|hotspot| hotspot.score).unwrap_or(0.0);
+            InvestigationComparisonHotspotDelta {
+                subsystem,
+                operation_type,
+                metric,
+                baseline_score,
+                candidate_score,
+                delta: candidate_score - baseline_score,
+                supporting_evidence: baseline_match
+                    .into_iter()
+                    .flat_map(|hotspot| {
+                        hotspot
+                            .supporting_evidence
+                            .clone()
+                            .into_iter()
+                            .map(|reference| qualify_comparison_evidence(&baseline.id, reference))
+                    })
+                    .chain(candidate_match.into_iter().flat_map(|hotspot| {
+                        hotspot
+                            .supporting_evidence
+                            .clone()
+                            .into_iter()
+                            .map(|reference| qualify_comparison_evidence(&candidate.id, reference))
+                    }))
+                    .collect(),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let summary = InvestigationSpanComparisonSummary {
+        metric_deltas,
+        anomaly_deltas,
+        hotspot_deltas,
+    };
+    let span = InvestigationMatchedMarkerSpan {
+        start_marker_title: request.start_marker_title,
+        end_marker_title: request.end_marker_title,
+        baseline_start_sequence: baseline_start.marker_sequence,
+        baseline_end_sequence: baseline_end.marker_sequence,
+        candidate_start_sequence: candidate_start.marker_sequence,
+        candidate_end_sequence: candidate_end.marker_sequence,
+    };
+    let supporting_evidence = summary
+        .metric_deltas
+        .iter()
+        .flat_map(|item| item.supporting_evidence.clone())
+        .chain(
+            summary
+                .anomaly_deltas
+                .iter()
+                .flat_map(|item| item.supporting_evidence.clone()),
+        )
+        .chain(
+            summary
+                .hotspot_deltas
+                .iter()
+                .flat_map(|item| item.supporting_evidence.clone()),
+        )
+        .collect::<Vec<_>>();
+
+    store.append_span_comparison(
+        &baseline.case_id,
+        NewInvestigationSpanComparison {
+            baseline_run_id: baseline.id,
+            candidate_run_id: candidate.id,
+            span,
+            summary,
+            supporting_evidence,
+        },
+    )
+}
+
 fn append_safe_action_audit(
     store: &InvestigationStore,
     run_id: &str,
@@ -2554,6 +2971,11 @@ enum DiagnosticsRequest {
         lease_id: String,
         run_id: String,
     },
+    CompareRunSpan {
+        auth_token: String,
+        lease_id: String,
+        request: DiagnosticsCompareRunSpanRequest,
+    },
     AcquireController {
         auth_token: String,
         client_name: String,
@@ -2577,6 +2999,23 @@ enum DiagnosticsRequest {
         lease_id: String,
         case_id: String,
         run_workload_identity: Option<String>,
+    },
+    CreateHypothesis {
+        auth_token: String,
+        lease_id: String,
+        case_id: String,
+        statement: String,
+        expected_signal: String,
+        supporting_evidence: Vec<DiagnosticsEvidenceReference>,
+    },
+    UpdateHypothesisStatus {
+        auth_token: String,
+        lease_id: String,
+        hypothesis_id: String,
+        status: InvestigationHypothesisStatus,
+        actor: Option<String>,
+        reason: Option<String>,
+        supporting_evidence: Vec<DiagnosticsEvidenceReference>,
     },
     StartProfilingWindow {
         auth_token: String,
@@ -2632,6 +3071,9 @@ enum DiagnosticsResponse {
     InvestigationReport {
         report: Box<InvestigationReport>,
     },
+    InvestigationSpanComparison {
+        comparison: Box<InvestigationSpanComparison>,
+    },
     ControllerLease {
         lease: ControllerLease,
     },
@@ -2640,6 +3082,9 @@ enum DiagnosticsResponse {
     },
     InvestigationRun {
         run: Box<InvestigationRun>,
+    },
+    InvestigationHypothesis {
+        hypothesis: Box<InvestigationHypothesis>,
     },
     ProfilingWindow {
         window: Box<ProfilingWindowRecord>,
@@ -2980,6 +3425,25 @@ impl LocalDiagnosticsClient {
         }
     }
 
+    pub(crate) async fn compare_run_span(
+        &self,
+        lease_id: &str,
+        request: DiagnosticsCompareRunSpanRequest,
+    ) -> Result<InvestigationSpanComparison> {
+        match self
+            .send(DiagnosticsRequest::CompareRunSpan {
+                auth_token: self.discovery.auth_token.clone(),
+                lease_id: lease_id.to_string(),
+                request,
+            })
+            .await?
+        {
+            DiagnosticsResponse::InvestigationSpanComparison { comparison } => Ok(*comparison),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
     pub(crate) async fn create_case(
         &self,
         lease_id: &str,
@@ -3021,6 +3485,58 @@ impl LocalDiagnosticsClient {
             .await?
         {
             DiagnosticsResponse::InvestigationRun { run } => Ok(*run),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
+    pub(crate) async fn create_hypothesis(
+        &self,
+        lease_id: &str,
+        case_id: &str,
+        statement: String,
+        expected_signal: String,
+        supporting_evidence: Vec<DiagnosticsEvidenceReference>,
+    ) -> Result<InvestigationHypothesis> {
+        match self
+            .send(DiagnosticsRequest::CreateHypothesis {
+                auth_token: self.discovery.auth_token.clone(),
+                lease_id: lease_id.to_string(),
+                case_id: case_id.to_string(),
+                statement,
+                expected_signal,
+                supporting_evidence,
+            })
+            .await?
+        {
+            DiagnosticsResponse::InvestigationHypothesis { hypothesis } => Ok(*hypothesis),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
+    pub(crate) async fn update_hypothesis_status(
+        &self,
+        lease_id: &str,
+        hypothesis_id: &str,
+        status: InvestigationHypothesisStatus,
+        actor: Option<String>,
+        reason: Option<String>,
+        supporting_evidence: Vec<DiagnosticsEvidenceReference>,
+    ) -> Result<InvestigationHypothesis> {
+        match self
+            .send(DiagnosticsRequest::UpdateHypothesisStatus {
+                auth_token: self.discovery.auth_token.clone(),
+                lease_id: lease_id.to_string(),
+                hypothesis_id: hypothesis_id.to_string(),
+                status,
+                actor,
+                reason,
+                supporting_evidence,
+            })
+            .await?
+        {
+            DiagnosticsResponse::InvestigationHypothesis { hypothesis } => Ok(*hypothesis),
             DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
             other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
         }
@@ -3814,6 +4330,28 @@ fn execute_request(
                 Err(error) => store_error(error),
             }
         }
+        DiagnosticsRequest::CompareRunSpan {
+            auth_token: provided,
+            lease_id,
+            request,
+        } => {
+            let store = match require_mutating_store(
+                &provided,
+                auth_token,
+                &lease_id,
+                lease_manager,
+                investigation_store,
+            ) {
+                Ok(store) => store,
+                Err(error) => return mutating_request_error_response(error),
+            };
+            match materialize_run_span_comparison(request, store) {
+                Ok(comparison) => DiagnosticsResponse::InvestigationSpanComparison {
+                    comparison: Box::new(comparison),
+                },
+                Err(error) => store_error(error),
+            }
+        }
         DiagnosticsRequest::ProfilingStatus {
             auth_token: provided,
         } => {
@@ -4071,6 +4609,72 @@ fn execute_request(
                 Err(error) => store_error(error),
             }
         }
+        DiagnosticsRequest::CreateHypothesis {
+            auth_token: provided,
+            lease_id,
+            case_id,
+            statement,
+            expected_signal,
+            supporting_evidence,
+        } => {
+            let store = match require_mutating_store(
+                &provided,
+                auth_token,
+                &lease_id,
+                lease_manager,
+                investigation_store,
+            ) {
+                Ok(store) => store,
+                Err(error) => return mutating_request_error_response(error),
+            };
+            match store.create_hypothesis(
+                &case_id,
+                NewInvestigationHypothesis {
+                    statement,
+                    expected_signal,
+                    supporting_evidence,
+                },
+            ) {
+                Ok(hypothesis) => DiagnosticsResponse::InvestigationHypothesis {
+                    hypothesis: Box::new(hypothesis),
+                },
+                Err(error) => store_error(error),
+            }
+        }
+        DiagnosticsRequest::UpdateHypothesisStatus {
+            auth_token: provided,
+            lease_id,
+            hypothesis_id,
+            status,
+            actor,
+            reason,
+            supporting_evidence,
+        } => {
+            let store = match require_mutating_store(
+                &provided,
+                auth_token,
+                &lease_id,
+                lease_manager,
+                investigation_store,
+            ) {
+                Ok(store) => store,
+                Err(error) => return mutating_request_error_response(error),
+            };
+            match store.update_hypothesis_status(
+                &hypothesis_id,
+                UpdateInvestigationHypothesisStatus {
+                    status,
+                    actor,
+                    reason,
+                    supporting_evidence,
+                },
+            ) {
+                Ok(hypothesis) => DiagnosticsResponse::InvestigationHypothesis {
+                    hypothesis: Box::new(hypothesis),
+                },
+                Err(error) => store_error(error),
+            }
+        }
         DiagnosticsRequest::StartProfilingWindow {
             auth_token: provided,
             lease_id,
@@ -4129,7 +4733,7 @@ fn execute_request(
             auth_token: provided,
             lease_id,
             run_id,
-            source,
+            source: entry_source,
             kind,
             title,
             body,
@@ -4149,7 +4753,7 @@ fn execute_request(
             match store.append_timeline_entry(
                 &run_id,
                 NewTimelineEntry {
-                    source,
+                    source: entry_source,
                     kind,
                     title,
                     body,
@@ -4157,7 +4761,28 @@ fn execute_request(
                     reason,
                 },
             ) {
-                Ok(entry) => DiagnosticsResponse::TimelineEntry { entry },
+                Ok(entry) => {
+                    let marker_runtime_snapshot = (entry.kind == TimelineEntryKind::Marker)
+                        .then(|| source.runtime_snapshot());
+                    if let Some(runtime_snapshot) = marker_runtime_snapshot
+                        && let Err(error) = store.append_marker_snapshot(
+                            &run_id,
+                            NewInvestigationMarkerSnapshot {
+                                marker_sequence: entry.sequence,
+                                marker_title: entry.title.clone(),
+                                runtime_snapshot,
+                            },
+                        )
+                    {
+                        warn!(
+                            run_id = %run_id,
+                            marker_sequence = entry.sequence,
+                            error = %error,
+                            "failed to persist marker snapshot after timeline marker append"
+                        );
+                    }
+                    DiagnosticsResponse::TimelineEntry { entry }
+                }
                 Err(error) => store_error(error),
             }
         }
@@ -5504,6 +6129,7 @@ mod tests {
             fingerprint: static_source().fingerprint,
             profiling_windows: Vec::new(),
             report_ids: Vec::new(),
+            marker_snapshots: Vec::new(),
             timeline: Vec::new(),
         };
         let derived_view = DiagnosticsEvidenceView {
@@ -6607,6 +7233,460 @@ mod tests {
                 .as_ref()
                 .map(|artifact| artifact.kind.as_str()),
             Some("wall_blocking_summary")
+        );
+    }
+
+    #[test]
+    fn compare_run_span_matches_markers_and_persists_delta_summary() {
+        let temp = mounts_dir_temp();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let case = store
+            .create_case(NewInvestigationCase {
+                title: "compare".to_string(),
+                problem_statement: None,
+                workload_identity: None,
+                target_environment: None,
+            })
+            .expect("create case");
+        let baseline = store
+            .create_run(NewInvestigationRun {
+                case_id: case.id.clone(),
+                session_id: "session-a".to_string(),
+                fingerprint: static_source().fingerprint.clone(),
+            })
+            .expect("create baseline run");
+        let candidate = store
+            .create_run(NewInvestigationRun {
+                case_id: case.id.clone(),
+                session_id: "session-b".to_string(),
+                fingerprint: static_source().fingerprint.clone(),
+            })
+            .expect("create candidate run");
+
+        let baseline_start = store
+            .append_timeline_entry(
+                &baseline.id,
+                NewTimelineEntry {
+                    source: TimelineEntrySource::Cli,
+                    kind: TimelineEntryKind::Marker,
+                    title: "warm copy".to_string(),
+                    body: None,
+                    actor: None,
+                    reason: None,
+                },
+            )
+            .expect("baseline start marker");
+        store
+            .append_timeline_entry(
+                &baseline.id,
+                NewTimelineEntry {
+                    source: TimelineEntrySource::Mcp,
+                    kind: TimelineEntryKind::Anomaly,
+                    title: "queue growth".to_string(),
+                    body: Some("Pending uploads climbed during warm copy.".to_string()),
+                    actor: Some("studiofs-dev-mcp".to_string()),
+                    reason: Some("annotate anomaly".to_string()),
+                },
+            )
+            .expect("baseline anomaly");
+        let baseline_end = store
+            .append_timeline_entry(
+                &baseline.id,
+                NewTimelineEntry {
+                    source: TimelineEntrySource::Cli,
+                    kind: TimelineEntryKind::Marker,
+                    title: "warm copy done".to_string(),
+                    body: None,
+                    actor: None,
+                    reason: None,
+                },
+            )
+            .expect("baseline end marker");
+        let candidate_start = store
+            .append_timeline_entry(
+                &candidate.id,
+                NewTimelineEntry {
+                    source: TimelineEntrySource::Cli,
+                    kind: TimelineEntryKind::Marker,
+                    title: "warm copy".to_string(),
+                    body: None,
+                    actor: None,
+                    reason: None,
+                },
+            )
+            .expect("candidate start marker");
+        store
+            .append_timeline_entry(
+                &candidate.id,
+                NewTimelineEntry {
+                    source: TimelineEntrySource::Mcp,
+                    kind: TimelineEntryKind::Anomaly,
+                    title: "queue growth".to_string(),
+                    body: Some("Pending uploads still climbed, but less sharply.".to_string()),
+                    actor: Some("studiofs-dev-mcp".to_string()),
+                    reason: Some("annotate anomaly".to_string()),
+                },
+            )
+            .expect("candidate anomaly");
+        let candidate_end = store
+            .append_timeline_entry(
+                &candidate.id,
+                NewTimelineEntry {
+                    source: TimelineEntrySource::Cli,
+                    kind: TimelineEntryKind::Marker,
+                    title: "warm copy done".to_string(),
+                    body: None,
+                    actor: None,
+                    reason: None,
+                },
+            )
+            .expect("candidate end marker");
+
+        let mut baseline_start_snapshot = DiagnosticsRuntimeSnapshot::default();
+        baseline_start_snapshot.upload.pending_uploads = 2;
+        let mut baseline_end_snapshot = DiagnosticsRuntimeSnapshot::default();
+        baseline_end_snapshot.upload.pending_uploads = 9;
+        baseline_end_snapshot
+            .write_path
+            .block_store_sync_data
+            .queue_wait_total_ms = 40.0;
+        let mut candidate_start_snapshot = DiagnosticsRuntimeSnapshot::default();
+        candidate_start_snapshot.upload.pending_uploads = 1;
+        let mut candidate_end_snapshot = DiagnosticsRuntimeSnapshot::default();
+        candidate_end_snapshot.upload.pending_uploads = 4;
+        candidate_end_snapshot
+            .write_path
+            .block_store_sync_data
+            .queue_wait_total_ms = 10.0;
+
+        store
+            .append_marker_snapshot(
+                &baseline.id,
+                NewInvestigationMarkerSnapshot {
+                    marker_sequence: baseline_start.sequence,
+                    marker_title: baseline_start.title.clone(),
+                    runtime_snapshot: baseline_start_snapshot.clone(),
+                },
+            )
+            .expect("baseline start snapshot");
+        store
+            .append_marker_snapshot(
+                &baseline.id,
+                NewInvestigationMarkerSnapshot {
+                    marker_sequence: baseline_end.sequence,
+                    marker_title: baseline_end.title.clone(),
+                    runtime_snapshot: baseline_end_snapshot.clone(),
+                },
+            )
+            .expect("baseline end snapshot");
+        store
+            .append_marker_snapshot(
+                &candidate.id,
+                NewInvestigationMarkerSnapshot {
+                    marker_sequence: candidate_start.sequence,
+                    marker_title: candidate_start.title.clone(),
+                    runtime_snapshot: candidate_start_snapshot.clone(),
+                },
+            )
+            .expect("candidate start snapshot");
+        store
+            .append_marker_snapshot(
+                &candidate.id,
+                NewInvestigationMarkerSnapshot {
+                    marker_sequence: candidate_end.sequence,
+                    marker_title: candidate_end.title.clone(),
+                    runtime_snapshot: candidate_end_snapshot.clone(),
+                },
+            )
+            .expect("candidate end snapshot");
+
+        let baseline_artifact = write_wall_blocking_artifact_fixture(
+            &temp,
+            "baseline-compare-window.json",
+            baseline_start_snapshot,
+            baseline_end_snapshot,
+            Vec::new(),
+            Vec::new(),
+        );
+        store
+            .append_profiling_window(
+                &baseline.id,
+                NewProfilingWindow {
+                    window_id: "baseline-window".to_string(),
+                    occurred_unix_ms: baseline_end.occurred_unix_ms,
+                    capture_mode: ProfilingCaptureMode::WallBlocking,
+                    preset: DiagnosticsPreset::Balanced,
+                    requested_duration_ms: 1_000,
+                    actual_duration_ms: Some(950),
+                    sample_rate_hz: Some(99),
+                    estimated_cost: ProfilingCostEstimate {
+                        score: 2,
+                        label: "balanced".to_string(),
+                    },
+                    status: ProfilingWindowStatus::Completed,
+                    artifact: Some(baseline_artifact),
+                    error: None,
+                },
+            )
+            .expect("baseline profiling window");
+        let candidate_artifact = write_wall_blocking_artifact_fixture(
+            &temp,
+            "candidate-compare-window.json",
+            candidate_start_snapshot,
+            candidate_end_snapshot,
+            Vec::new(),
+            Vec::new(),
+        );
+        store
+            .append_profiling_window(
+                &candidate.id,
+                NewProfilingWindow {
+                    window_id: "candidate-window".to_string(),
+                    occurred_unix_ms: candidate_end.occurred_unix_ms,
+                    capture_mode: ProfilingCaptureMode::WallBlocking,
+                    preset: DiagnosticsPreset::Balanced,
+                    requested_duration_ms: 1_000,
+                    actual_duration_ms: Some(950),
+                    sample_rate_hz: Some(99),
+                    estimated_cost: ProfilingCostEstimate {
+                        score: 2,
+                        label: "balanced".to_string(),
+                    },
+                    status: ProfilingWindowStatus::Completed,
+                    artifact: Some(candidate_artifact),
+                    error: None,
+                },
+            )
+            .expect("candidate profiling window");
+
+        let lease_manager = ControllerLeaseManager::default();
+        let lease = lease_manager
+            .acquire("tester".to_string(), Some(500))
+            .expect("acquire lease");
+
+        let response = execute_request(
+            DiagnosticsRequest::CompareRunSpan {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                request: DiagnosticsCompareRunSpanRequest {
+                    baseline_run_id: baseline.id.clone(),
+                    candidate_run_id: candidate.id.clone(),
+                    start_marker_title: "warm copy".to_string(),
+                    end_marker_title: "warm copy done".to_string(),
+                },
+            },
+            "secret",
+            &static_source(),
+            &lease_manager,
+            Some(&store),
+            None,
+        );
+
+        let DiagnosticsResponse::InvestigationSpanComparison { comparison } = response else {
+            panic!("expected comparison response");
+        };
+        assert_eq!(comparison.baseline_run_id, baseline.id);
+        assert_eq!(comparison.candidate_run_id, candidate.id);
+        assert!(comparison.summary.metric_deltas.iter().any(|metric| {
+            metric.metric == "upload.pending_uploads_delta" && metric.delta < 0.0
+        }));
+        assert!(comparison.summary.anomaly_deltas.iter().any(|anomaly| {
+            anomaly.title == "queue growth"
+                && anomaly.baseline_count == 1
+                && anomaly.candidate_count == 1
+        }));
+        assert!(comparison.summary.hotspot_deltas.iter().any(|hotspot| {
+            hotspot.metric == "block_store_sync_data.queue_wait_total_ms_delta"
+                && hotspot.delta < 0.0
+        }));
+        assert!(
+            comparison
+                .supporting_evidence
+                .iter()
+                .any(|reference| reference.id.starts_with(&format!("{}:", baseline.id)))
+        );
+        assert!(
+            comparison
+                .supporting_evidence
+                .iter()
+                .any(|reference| reference.id.starts_with(&format!("{}:", candidate.id)))
+        );
+    }
+
+    #[test]
+    fn compare_run_span_rejects_ambiguous_marker_titles() {
+        let temp = mounts_dir_temp();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let case = store
+            .create_case(NewInvestigationCase {
+                title: "ambiguous markers".to_string(),
+                problem_statement: None,
+                workload_identity: None,
+                target_environment: None,
+            })
+            .expect("create case");
+        let baseline = store
+            .create_run(NewInvestigationRun {
+                case_id: case.id.clone(),
+                session_id: "session-a".to_string(),
+                fingerprint: static_source().fingerprint.clone(),
+            })
+            .expect("create baseline run");
+        let candidate = store
+            .create_run(NewInvestigationRun {
+                case_id: case.id.clone(),
+                session_id: "session-b".to_string(),
+                fingerprint: static_source().fingerprint.clone(),
+            })
+            .expect("create candidate run");
+
+        for run_id in [&baseline.id, &candidate.id] {
+            let first = store
+                .append_timeline_entry(
+                    run_id,
+                    NewTimelineEntry {
+                        source: TimelineEntrySource::Cli,
+                        kind: TimelineEntryKind::Marker,
+                        title: "warm copy".to_string(),
+                        body: None,
+                        actor: None,
+                        reason: None,
+                    },
+                )
+                .expect("first marker");
+            let second = store
+                .append_timeline_entry(
+                    run_id,
+                    NewTimelineEntry {
+                        source: TimelineEntrySource::Cli,
+                        kind: TimelineEntryKind::Marker,
+                        title: "warm copy".to_string(),
+                        body: None,
+                        actor: None,
+                        reason: None,
+                    },
+                )
+                .expect("second marker");
+            store
+                .append_marker_snapshot(
+                    run_id,
+                    NewInvestigationMarkerSnapshot {
+                        marker_sequence: first.sequence,
+                        marker_title: "warm copy".to_string(),
+                        runtime_snapshot: DiagnosticsRuntimeSnapshot::default(),
+                    },
+                )
+                .expect("first marker snapshot");
+            store
+                .append_marker_snapshot(
+                    run_id,
+                    NewInvestigationMarkerSnapshot {
+                        marker_sequence: second.sequence,
+                        marker_title: "warm copy".to_string(),
+                        runtime_snapshot: DiagnosticsRuntimeSnapshot::default(),
+                    },
+                )
+                .expect("second marker snapshot");
+        }
+
+        let lease_manager = ControllerLeaseManager::default();
+        let lease = lease_manager
+            .acquire("tester".to_string(), Some(500))
+            .expect("acquire lease");
+
+        let response = execute_request(
+            DiagnosticsRequest::CompareRunSpan {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id,
+                request: DiagnosticsCompareRunSpanRequest {
+                    baseline_run_id: baseline.id,
+                    candidate_run_id: candidate.id,
+                    start_marker_title: "warm copy".to_string(),
+                    end_marker_title: "warm copy".to_string(),
+                },
+            },
+            "secret",
+            &static_source(),
+            &lease_manager,
+            Some(&store),
+            None,
+        );
+
+        assert!(matches!(
+            response,
+            DiagnosticsResponse::Error { code, message }
+                if code == "investigation_store_error" && message.contains("ambiguous")
+        ));
+    }
+
+    #[test]
+    fn hypothesis_status_updates_remain_traceable_to_comparison_evidence() {
+        let temp = mounts_dir_temp();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let case = store
+            .create_case(NewInvestigationCase {
+                title: "hypothesis".to_string(),
+                problem_statement: None,
+                workload_identity: None,
+                target_environment: None,
+            })
+            .expect("create case");
+
+        let lease_manager = ControllerLeaseManager::default();
+        let lease = lease_manager
+            .acquire("tester".to_string(), Some(500))
+            .expect("acquire lease");
+
+        let create_response = execute_request(
+            DiagnosticsRequest::CreateHypothesis {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                case_id: case.id.clone(),
+                statement: "queue wait should fall".to_string(),
+                expected_signal: "candidate comparison should show a negative queue wait delta"
+                    .to_string(),
+                supporting_evidence: Vec::new(),
+            },
+            "secret",
+            &static_source(),
+            &lease_manager,
+            Some(&store),
+            None,
+        );
+
+        let DiagnosticsResponse::InvestigationHypothesis { hypothesis } = create_response else {
+            panic!("expected hypothesis response");
+        };
+
+        let update_response = execute_request(
+            DiagnosticsRequest::UpdateHypothesisStatus {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id,
+                hypothesis_id: hypothesis.id.clone(),
+                status: InvestigationHypothesisStatus::Supported,
+                actor: Some("studiofs-dev-mcp".to_string()),
+                reason: Some("matched comparison improved the hotspot".to_string()),
+                supporting_evidence: vec![DiagnosticsEvidenceReference {
+                    source: DiagnosticsEvidenceReferenceSource::InvestigationSpanComparison,
+                    id: "comparison-1".to_string(),
+                    field: None,
+                }],
+            },
+            "secret",
+            &static_source(),
+            &lease_manager,
+            Some(&store),
+            None,
+        );
+
+        let DiagnosticsResponse::InvestigationHypothesis { hypothesis } = update_response else {
+            panic!("expected updated hypothesis response");
+        };
+        assert_eq!(hypothesis.status, InvestigationHypothesisStatus::Supported);
+        assert_eq!(hypothesis.status_history.len(), 2);
+        assert_eq!(
+            hypothesis.status_history[1].supporting_evidence[0].source,
+            DiagnosticsEvidenceReferenceSource::InvestigationSpanComparison
         );
     }
 
