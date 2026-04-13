@@ -4,6 +4,7 @@ use super::MountCommand;
 use super::backend::{BackendLaunch, MountBackend, default_mount_backend};
 use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
 use crate::cli::{mount_profile, mount_profile_types, settings, utils};
+use crate::diagnostics::{DiagnosticsDataSource, LiveMountDiagnosticsSource, LocalDiagnosticsHost};
 use chrono::Utc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -84,6 +85,7 @@ struct PreparedForegroundSession {
     backend: Box<dyn MountBackend>,
     vfs: Arc<StudioVfs>,
     runtime: Runtime,
+    diagnostics_source: Arc<dyn DiagnosticsDataSource>,
     profiling: Option<MountProfileFinish>,
     write_path_observability_publisher: WritePathObservabilityPublisher,
 }
@@ -952,6 +954,15 @@ impl MountSession {
                 vfs.clone(),
                 cache_path.join(WRITE_PATH_OBSERVABILITY_FILE),
             );
+            let diagnostics_source: Arc<dyn DiagnosticsDataSource> =
+                Arc::new(LiveMountDiagnosticsSource::new(
+                    &format_info,
+                    &actual_mount_path,
+                    &cache_path,
+                    std::process::id(),
+                    read_only_mount,
+                    vfs.clone(),
+                ));
 
             Ok(PreparedForegroundSession {
                 cache_path,
@@ -959,6 +970,7 @@ impl MountSession {
                 backend: backend_factory(),
                 vfs,
                 runtime,
+                diagnostics_source,
                 profiling,
                 write_path_observability_publisher,
             })
@@ -1049,6 +1061,7 @@ impl MountSession {
             backend,
             vfs,
             runtime,
+            diagnostics_source,
             mut profiling,
             mut write_path_observability_publisher,
         } = prepared;
@@ -1057,6 +1070,11 @@ impl MountSession {
             backend = backend_name,
             mount_point = %self.actual_mount_path,
             "starting mount backend"
+        );
+        let diagnostics_host = LocalDiagnosticsHost::start_best_effort(
+            runtime.handle(),
+            &self.actual_mount_path,
+            diagnostics_source,
         );
         let serve_result = backend.serve(BackendLaunch {
             vfs: vfs.clone(),
@@ -1067,6 +1085,9 @@ impl MountSession {
             #[cfg(unix)]
             run_in_foreground: self.run_in_foreground,
         });
+        if let Some(diagnostics_host) = diagnostics_host {
+            diagnostics_host.stop();
+        }
         write_path_observability_publisher.stop_and_join();
         runtime.block_on(vfs.shutdown(shutdown_upload_drain_timeout()));
         if let Some(mut finish_profiling) = profiling.take() {
@@ -1445,16 +1466,22 @@ fn sanitize_log_component(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostics;
     use std::io;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
     use tempfile::TempDir;
 
     use studiofs_meta::{ROOT_INO, RedbMetaEngine};
+
+    static DIAGNOSTICS_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    type BackendInspect = Arc<dyn Fn(&BackendLaunch) -> io::Result<()> + Send + Sync>;
 
     #[derive(Clone)]
     struct FakeBackend {
         events: Arc<Mutex<Vec<String>>>,
         fail: bool,
+        inspect: Option<BackendInspect>,
     }
 
     impl MountBackend for FakeBackend {
@@ -1467,6 +1494,9 @@ mod tests {
                 "{}:{}:{}",
                 launch.mount_point, launch.volume_name, launch.read_only
             ));
+            if let Some(inspect) = &self.inspect {
+                inspect(&launch)?;
+            }
             if self.fail {
                 Err(io::Error::other("boom"))
             } else {
@@ -1743,6 +1773,7 @@ mod tests {
                 Box::new(FakeBackend {
                     events: events.clone(),
                     fail: false,
+                    inspect: None,
                 })
             },
         )
@@ -1791,6 +1822,7 @@ mod tests {
                 Box::new(FakeBackend {
                     events: Arc::new(Mutex::new(Vec::new())),
                     fail: false,
+                    inspect: None,
                 })
             },
         )
@@ -1822,6 +1854,7 @@ mod tests {
                 Box::new(FakeBackend {
                     events: events.clone(),
                     fail: false,
+                    inspect: None,
                 })
             },
         )
@@ -1859,6 +1892,7 @@ mod tests {
                 Box::new(FakeBackend {
                     events: events.clone(),
                     fail: true,
+                    inspect: None,
                 })
             },
         )
@@ -1923,6 +1957,7 @@ mod tests {
                 Box::new(FakeBackend {
                     events: events.clone(),
                     fail: true,
+                    inspect: None,
                 })
             },
         )
@@ -1943,5 +1978,164 @@ mod tests {
             !snapshot_db_path.exists(),
             "launch should remove snapshot db after backend return"
         );
+    }
+
+    #[test]
+    fn mount_session_launch_publishes_live_diagnostics_and_supports_attach() {
+        let _guard = DIAGNOSTICS_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock diagnostics test mutex");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
+        drop(engine);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        #[cfg(windows)]
+        let mount_point = "Q:".to_string();
+        #[cfg(not(windows))]
+        let mount_point = temp
+            .path()
+            .join("diag-mount")
+            .to_string_lossy()
+            .into_owned();
+        let inspect: BackendInspect = Arc::new(move |launch| {
+            let discovery = diagnostics::discover_local_sessions()
+                .expect("discover local sessions")
+                .into_iter()
+                .find(|session| session.mount_point == launch.mount_point)
+                .expect("live diagnostics session for mounted volume");
+            let client = diagnostics::LocalDiagnosticsClient::new(discovery.clone());
+            let session = launch
+                .runtime_handle
+                .block_on(client.session_info())
+                .expect("read session identity");
+            assert_eq!(session.volume, "demo");
+            assert_eq!(session.mount_point, launch.mount_point);
+            assert_eq!(session.pid, std::process::id());
+            assert!(!session.read_only);
+
+            let health = launch
+                .runtime_handle
+                .block_on(client.health())
+                .expect("read session health");
+            assert!(health.generated_unix_ms > 0);
+            assert!(health.write_path.generated_unix_ms > 0);
+
+            let first_lease = launch
+                .runtime_handle
+                .block_on(client.acquire_controller("test-client-a", Duration::from_millis(100)))
+                .expect("acquire first controller lease");
+            assert_eq!(first_lease.client_name, "test-client-a");
+
+            let competing_client = diagnostics::LocalDiagnosticsClient::new(discovery);
+            let conflict = launch
+                .runtime_handle
+                .block_on(
+                    competing_client
+                        .acquire_controller("test-client-b", Duration::from_millis(100)),
+                )
+                .expect_err("second controller should be rejected before expiry");
+            assert!(
+                conflict.to_string().contains("already held"),
+                "unexpected controller conflict: {conflict:#}"
+            );
+
+            std::thread::sleep(Duration::from_millis(125));
+
+            let takeover = launch
+                .runtime_handle
+                .block_on(
+                    competing_client
+                        .acquire_controller("test-client-b", Duration::from_millis(100)),
+                )
+                .expect("controller should be available after expiry");
+            let renewed = launch
+                .runtime_handle
+                .block_on(
+                    competing_client
+                        .renew_controller(&takeover.lease_id, Duration::from_millis(250)),
+                )
+                .expect("renew controller lease");
+            assert_eq!(renewed.lease_id, takeover.lease_id);
+            assert!(
+                renewed.expires_unix_ms >= takeover.expires_unix_ms,
+                "renewal should extend or preserve expiry"
+            );
+            Ok(())
+        });
+
+        let session = MountSession::prepare_with_backend_factory(
+            mount_command(
+                "demo",
+                &meta_dir,
+                Some(mount_point.clone()),
+                Some(temp.path().join("cache")),
+                Some("64GB"),
+            ),
+            startup_settings_config(mount_point, None, Some("64GB")),
+            || {
+                Box::new(FakeBackend {
+                    events: events.clone(),
+                    fail: false,
+                    inspect: Some(inspect.clone()),
+                })
+            },
+        )
+        .expect("prepare session");
+
+        session.launch().expect("launch session");
+        assert_eq!(events.lock().expect("lock events").len(), 1);
+    }
+
+    #[test]
+    fn mount_session_launch_fails_open_when_diagnostics_start_fails() {
+        let _guard = DIAGNOSTICS_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock diagnostics test mutex");
+        diagnostics::set_test_start_failure(Some("synthetic diagnostics startup failure"));
+        struct ResetDiagnosticsFailure;
+        impl Drop for ResetDiagnosticsFailure {
+            fn drop(&mut self) {
+                diagnostics::set_test_start_failure(None);
+            }
+        }
+        let _reset = ResetDiagnosticsFailure;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
+        drop(engine);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        #[cfg(windows)]
+        let mount_point = "R:".to_string();
+        #[cfg(not(windows))]
+        let mount_point = temp
+            .path()
+            .join("diag-fail-open")
+            .to_string_lossy()
+            .into_owned();
+        let session = MountSession::prepare_with_backend_factory(
+            mount_command(
+                "demo",
+                &meta_dir,
+                Some(mount_point.clone()),
+                Some(temp.path().join("cache")),
+                Some("64GB"),
+            ),
+            startup_settings_config(mount_point, None, Some("64GB")),
+            || {
+                Box::new(FakeBackend {
+                    events: events.clone(),
+                    fail: false,
+                    inspect: None,
+                })
+            },
+        )
+        .expect("prepare session");
+
+        session
+            .launch()
+            .expect("mount launch should survive diagnostics startup failure");
+        assert_eq!(events.lock().expect("lock events").len(), 1);
     }
 }

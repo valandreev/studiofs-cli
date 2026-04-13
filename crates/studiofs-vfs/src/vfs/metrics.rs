@@ -13,7 +13,7 @@ pub struct StatFs {
     pub frsize: u32,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VfsIngressStats {
     pub dirty_mem_bytes: usize,
     pub dirty_mem_blocks: usize,
@@ -250,7 +250,7 @@ pub struct VfsIngressPressure {
     pub lane: VfsIngressLane,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VfsUploadStats {
     pub pending_uploads: usize,
     pub upload_requeues: u64,
@@ -258,7 +258,7 @@ pub struct VfsUploadStats {
     pub canceled_stale: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VfsForegroundReadProtectionStats {
     pub p90_latency_ns: Option<u64>,
     pub throughput_bytes_per_sec: f64,

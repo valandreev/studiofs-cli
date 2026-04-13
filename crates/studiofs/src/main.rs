@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use tracing_appender::non_blocking::WorkerGuard;
 
 mod cli;
+mod diagnostics;
 mod runtime_bridge;
 
 const DAEMON_LOG_RETENTION_DAYS: i64 = 30;
