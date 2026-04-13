@@ -77,6 +77,9 @@ struct DiagnosticsAttachArgs {
 
     #[arg(long, default_value_t = 5_000)]
     ttl_ms: u64,
+
+    #[arg(long, default_value_t = 16)]
+    recent_events_limit: usize,
 }
 
 #[derive(Debug, Args)]
@@ -187,11 +190,12 @@ struct DiagnosticsReadRunArgs {
 fn run_diagnostics_attach(args: DiagnosticsAttachArgs) -> anyhow::Result<()> {
     let client = live_client_for_mount(&args.mount_point)?;
     let ttl = Duration::from_millis(args.ttl_ms.max(1));
+    let recent_events_limit = args.recent_events_limit.clamp(1, 128);
     let payload = crate::runtime_bridge::block_on(async move {
         let session = client.session_info().await?;
         let health = client.health().await?;
         let runtime_snapshot = client.runtime_snapshot().await?;
-        let recent_events = client.recent_events(Some(16)).await?;
+        let recent_events = client.recent_events(Some(recent_events_limit)).await?;
         let controller_lease = match (
             args.controller_client.as_deref(),
             args.renew_lease_id.as_deref(),
@@ -318,14 +322,18 @@ mod tests {
             "tester",
             "--ttl-ms",
             "250",
+            "--recent-events-limit",
+            "64",
         ])
         .unwrap();
-        assert!(matches!(
-            attach.command,
+        match attach.command {
             crate::cli::Commands::Internal(InternalArgs {
-                action: InternalAction::DiagnosticsAttach(_)
-            })
-        ));
+                action: InternalAction::DiagnosticsAttach(args),
+            }) => {
+                assert_eq!(args.recent_events_limit, 64);
+            }
+            other => panic!("expected diagnostics attach args, got {other:?}"),
+        }
 
         let create_case = crate::cli::parse_for_test(&[
             "internal",
