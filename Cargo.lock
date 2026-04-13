@@ -3478,6 +3478,7 @@ dependencies = [
  "home",
  "libc",
  "opendal",
+ "parking_lot",
  "prost",
  "pyroscope",
  "reqwest 0.12.28",
@@ -3501,6 +3502,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "windows 0.62.2",
  "winfsp",
  "winreg",
 ]

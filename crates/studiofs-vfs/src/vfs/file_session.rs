@@ -1,5 +1,6 @@
 use crate::access::{AccessClass, AccessClassifierConfig, AccessDecision, HandleAccessState};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -13,7 +14,7 @@ use crate::utils::now_unix_millis;
 // Open File Handle Tracking
 // =============================================================================
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VfsFileSessionStats {
     pub active_sessions: usize,
     pub open_handles: u64,
