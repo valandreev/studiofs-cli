@@ -53,7 +53,8 @@ use windows::{
 };
 
 pub(crate) const DIAGNOSTICS_RUNTIME_SURFACE_PROTOCOL_VERSION: u32 = 3;
-pub(crate) const DIAGNOSTICS_PROTOCOL_VERSION: u32 = DIAGNOSTICS_RUNTIME_SURFACE_PROTOCOL_VERSION;
+pub(crate) const DIAGNOSTICS_SAFE_ACTIONS_PROTOCOL_VERSION: u32 = 4;
+pub(crate) const DIAGNOSTICS_PROTOCOL_VERSION: u32 = DIAGNOSTICS_SAFE_ACTIONS_PROTOCOL_VERSION;
 const DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_LEASE_TTL_MS: u64 = 5_000;
 const MAX_LEASE_TTL_MS: u64 = 60_000;
@@ -75,6 +76,16 @@ const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
 
 #[cfg(test)]
 static TEST_START_FAILURE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+#[cfg(test)]
+static TEST_SAFE_ACTION_AUDIT_FAILURE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+#[cfg(test)]
+fn test_safe_action_audit_failure_message() -> Option<String> {
+    TEST_SAFE_ACTION_AUDIT_FAILURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .clone()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "transport", rename_all = "snake_case")]
@@ -214,10 +225,8 @@ pub(crate) trait DiagnosticsDataSource: Send + Sync + 'static {
         run_workload_identity: Option<&str>,
     ) -> EnvironmentFingerprint;
 
-    fn reset_observability_counters(&self) -> Result<()> {
-        Err(anyhow!(
-            "observability counter reset is unavailable for this session"
-        ))
+    fn reset_observability_counters(&self) -> std::result::Result<(), DiagnosticsActionError> {
+        Err(DiagnosticsActionError::ResetUnavailable)
     }
 }
 
@@ -329,6 +338,22 @@ pub(crate) struct SafeDebugActionOutcome {
     pub summary: serde_json::Value,
     pub artifact: Option<ProfileArtifactRecord>,
     pub error: Option<String>,
+    pub audit_error: Option<String>,
+}
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum DiagnosticsActionError {
+    #[error("observability counter reset is unavailable for this session")]
+    ResetUnavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct SafeActionAuditBody {
+    status: SafeDebugActionStatus,
+    summary: serde_json::Value,
+    artifact: Option<ProfileArtifactRecord>,
+    error: Option<String>,
+    audit_error: Option<String>,
 }
 
 pub(crate) trait RuntimeProfilingStopper: Send + 'static {
@@ -838,12 +863,18 @@ fn append_safe_action_audit(
     reason: Option<&str>,
     outcome: &SafeDebugActionOutcome,
 ) -> Result<()> {
-    let body = serde_json::json!({
-        "status": outcome.status,
-        "summary": outcome.summary,
-        "error": outcome.error,
-        "artifact": outcome.artifact,
-    });
+    #[cfg(test)]
+    if let Some(message) = test_safe_action_audit_failure_message() {
+        return Err(anyhow!(message));
+    }
+
+    let body = SafeActionAuditBody {
+        status: outcome.status,
+        summary: outcome.summary.clone(),
+        artifact: outcome.artifact.clone(),
+        error: outcome.error.clone(),
+        audit_error: outcome.audit_error.clone(),
+    };
     store.append_timeline_entry(
         run_id,
         NewTimelineEntry {
@@ -857,7 +888,7 @@ fn append_safe_action_audit(
                 }
                 SafeDebugActionKind::LightweightSelfCheck => "lightweight_self_check".to_string(),
             },
-            body: Some(body.to_string()),
+            body: Some(serde_json::to_string(&body)?),
             actor: actor.map(str::to_string),
             reason: reason.map(str::to_string),
         },
@@ -1027,7 +1058,7 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
         fingerprint
     }
 
-    fn reset_observability_counters(&self) -> Result<()> {
+    fn reset_observability_counters(&self) -> std::result::Result<(), DiagnosticsActionError> {
         self.vfs.reset_diagnostics_observability();
         Ok(())
     }
@@ -1598,6 +1629,12 @@ impl LocalDiagnosticsClient {
         run_id: &str,
         action: SafeDebugActionRequest,
     ) -> Result<SafeDebugActionOutcome> {
+        if self.discovery.protocol_version < DIAGNOSTICS_SAFE_ACTIONS_PROTOCOL_VERSION {
+            return Err(anyhow!(
+                "safe debug actions require diagnostics protocol version {} or newer",
+                DIAGNOSTICS_SAFE_ACTIONS_PROTOCOL_VERSION
+            ));
+        }
         match self
             .send(DiagnosticsRequest::InvokeSafeAction {
                 auth_token: self.discovery.auth_token.clone(),
@@ -1990,6 +2027,13 @@ pub(crate) fn set_test_start_failure(message: Option<&str>) {
     *TEST_START_FAILURE.get_or_init(|| Mutex::new(None)).lock() = message.map(str::to_string);
 }
 
+#[cfg(test)]
+pub(crate) fn set_test_safe_action_audit_failure(message: Option<&str>) {
+    *TEST_SAFE_ACTION_AUDIT_FAILURE
+        .get_or_init(|| Mutex::new(None))
+        .lock() = message.map(str::to_string);
+}
+
 async fn handle_client<S>(
     stream: S,
     auth_token: String,
@@ -2281,7 +2325,7 @@ fn execute_request(
             }
             let actor = action.actor().map(str::to_string);
             let reason = action.reason().map(str::to_string);
-            let outcome = match action {
+            let mut outcome = match action {
                 SafeDebugActionRequest::SetLogVerbosity { level } => {
                     match crate::set_diagnostics_log_verbosity(level) {
                         Ok(()) => SafeDebugActionOutcome {
@@ -2293,6 +2337,7 @@ fn execute_request(
                             }),
                             artifact: None,
                             error: None,
+                            audit_error: None,
                         },
                         Err(error) => SafeDebugActionOutcome {
                             action: SafeDebugActionKind::SetLogVerbosity,
@@ -2303,6 +2348,7 @@ fn execute_request(
                             }),
                             artifact: None,
                             error: Some(error.to_string()),
+                            audit_error: None,
                         },
                     }
                 }
@@ -2328,6 +2374,7 @@ fn execute_request(
                             }),
                             artifact: Some(artifact),
                             error: None,
+                            audit_error: None,
                         },
                         Err(error) => SafeDebugActionOutcome {
                             action: SafeDebugActionKind::CaptureBundle,
@@ -2338,6 +2385,7 @@ fn execute_request(
                             }),
                             artifact: None,
                             error: Some(error.to_string()),
+                            audit_error: None,
                         },
                     }
                 }
@@ -2352,6 +2400,7 @@ fn execute_request(
                             }),
                             artifact: None,
                             error: None,
+                            audit_error: None,
                         },
                         Err(error) => SafeDebugActionOutcome {
                             action: SafeDebugActionKind::ResetObservabilityCounters,
@@ -2360,6 +2409,7 @@ fn execute_request(
                             summary: serde_json::json!({}),
                             artifact: None,
                             error: Some(error.to_string()),
+                            audit_error: None,
                         },
                     }
                 }
@@ -2377,6 +2427,7 @@ fn execute_request(
                         }),
                         artifact: None,
                         error: None,
+                        audit_error: None,
                     }
                 }
             };
@@ -2390,7 +2441,13 @@ fn execute_request(
                     &outcome,
                 )
             {
-                return store_error(error);
+                warn!(
+                    run_id,
+                    action = ?outcome.action,
+                    error = %error,
+                    "failed to persist safe action audit entry"
+                );
+                outcome.audit_error = Some(error.to_string());
             }
             DiagnosticsResponse::SafeDebugAction {
                 outcome: Box::new(outcome),
@@ -2785,7 +2842,7 @@ mod tests {
             fingerprint
         }
 
-        fn reset_observability_counters(&self) -> Result<()> {
+        fn reset_observability_counters(&self) -> std::result::Result<(), DiagnosticsActionError> {
             self.reset_calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(())
@@ -2969,6 +3026,36 @@ mod tests {
 
     fn mounts_dir_temp() -> TempDir {
         tempfile::tempdir().expect("tempdir")
+    }
+
+    fn sample_discovery(protocol_version: u32) -> LocalDiagnosticsDiscovery {
+        LocalDiagnosticsDiscovery {
+            protocol_version,
+            session_id: "session-123".to_string(),
+            volume: "demo".to_string(),
+            volume_uuid: "uuid".to_string(),
+            bridge: "WinFSP".to_string(),
+            mount_point: "Q:".to_string(),
+            pid: 42,
+            cache_path: "C:/cache".to_string(),
+            read_only: false,
+            started_unix_ms: 123,
+            endpoint: {
+                #[cfg(unix)]
+                {
+                    LocalDiagnosticsEndpoint::UnixSocket {
+                        path: "/tmp/studiofs-test.sock".to_string(),
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    LocalDiagnosticsEndpoint::WindowsNamedPipe {
+                        name: r"\\.\pipe\studiofs-test".to_string(),
+                    }
+                }
+            },
+            auth_token: "secret".to_string(),
+        }
     }
 
     fn sample_recent_event(title: &str, sequence: u64) -> DiagnosticsRecentEvent {
@@ -3520,6 +3607,138 @@ mod tests {
             "reset action should invoke the data source exactly once"
         );
         assert_eq!(store.load_run(&run.id).expect("load run").timeline.len(), 1);
+    }
+
+    #[test]
+    fn loud_safe_action_audit_failures_are_reported_in_outcome() {
+        struct ResetAuditFailure;
+        impl Drop for ResetAuditFailure {
+            fn drop(&mut self) {
+                set_test_safe_action_audit_failure(None);
+            }
+        }
+
+        let _reset = ResetAuditFailure;
+        set_test_safe_action_audit_failure(Some("synthetic audit append failure"));
+
+        let source = static_source();
+        let lease_manager = ControllerLeaseManager::default();
+        let temp = mounts_dir_temp();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+
+        let lease = match execute_request(
+            DiagnosticsRequest::AcquireController {
+                auth_token: "secret".to_string(),
+                client_name: "tester".to_string(),
+                ttl_ms: Some(250),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        ) {
+            DiagnosticsResponse::ControllerLease { lease } => lease,
+            other => panic!("unexpected lease response: {other:?}"),
+        };
+
+        let case = match execute_request(
+            DiagnosticsRequest::CreateCase {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                title: "AJA slowdown".to_string(),
+                problem_statement: Some("Copy stalls after warmup".to_string()),
+                workload_identity: Some("aja".to_string()),
+                target_environment: Some("artist workstation".to_string()),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        ) {
+            DiagnosticsResponse::InvestigationCase { case } => *case,
+            other => panic!("unexpected case response: {other:?}"),
+        };
+
+        let run = match execute_request(
+            DiagnosticsRequest::CreateRun {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                case_id: case.id,
+                run_workload_identity: Some("copy-pass-1".to_string()),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        ) {
+            DiagnosticsResponse::InvestigationRun { run } => *run,
+            other => panic!("unexpected run response: {other:?}"),
+        };
+
+        let response = execute_request(
+            DiagnosticsRequest::InvokeSafeAction {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id,
+                run_id: run.id.clone(),
+                action: SafeDebugActionRequest::LightweightSelfCheck {
+                    actor: Some("studiofs-dev-mcp".to_string()),
+                    reason: Some("audit failure coverage".to_string()),
+                },
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        );
+
+        let DiagnosticsResponse::SafeDebugAction { outcome } = response else {
+            panic!("expected safe debug action response");
+        };
+        assert_eq!(outcome.status, SafeDebugActionStatus::Succeeded);
+        assert_eq!(
+            outcome.audit_error.as_deref(),
+            Some("synthetic audit append failure")
+        );
+        assert!(
+            store
+                .load_run(&run.id)
+                .expect("load run")
+                .timeline
+                .is_empty(),
+            "failed audit append should not persist timeline entries"
+        );
+    }
+
+    #[test]
+    fn invoke_safe_action_rejects_older_protocol_versions_before_connect() {
+        let client = LocalDiagnosticsClient::new(sample_discovery(
+            DIAGNOSTICS_SAFE_ACTIONS_PROTOCOL_VERSION - 1,
+        ));
+
+        let error = crate::runtime_bridge::block_on(async move {
+            client
+                .invoke_safe_action(
+                    "lease-1",
+                    "run-1",
+                    SafeDebugActionRequest::LightweightSelfCheck {
+                        actor: Some("studiofs-dev-mcp".to_string()),
+                        reason: Some("gate coverage".to_string()),
+                    },
+                )
+                .await
+        })
+        .expect_err("older protocol versions should be gated");
+
+        assert!(
+            error
+                .to_string()
+                .contains("safe debug actions require diagnostics protocol version"),
+            "unexpected protocol gate error: {error:#}"
+        );
     }
 
     #[test]

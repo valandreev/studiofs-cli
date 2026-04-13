@@ -1,6 +1,8 @@
 //! StudioFS CLI — FUSE mount tool for S3-backed virtual filesystems.
 
 use chrono::{Duration, NaiveDate, Utc};
+#[cfg(test)]
+use parking_lot::Mutex;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -16,6 +18,9 @@ const DAEMON_LOG_RETENTION_DAYS: i64 = 30;
 type DiagnosticsLogFilterHandle =
     tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
 static DIAGNOSTICS_LOG_FILTER_HANDLE: OnceLock<DiagnosticsLogFilterHandle> = OnceLock::new();
+
+#[cfg(test)]
+static TEST_DIAGNOSTICS_LOG_LEVEL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 fn prune_old_daemon_logs(logs_dir: &Path, stem: &str, today: NaiveDate) -> std::io::Result<()> {
     let cutoff = today - Duration::days(DAEMON_LOG_RETENTION_DAYS);
@@ -93,6 +98,12 @@ fn init_tracing(log_level: &str) -> anyhow::Result<Option<WorkerGuard>> {
 pub(crate) fn set_diagnostics_log_verbosity(
     level: crate::diagnostics::SafeLogVerbosity,
 ) -> anyhow::Result<()> {
+    #[cfg(test)]
+    if let Some(test_level) = TEST_DIAGNOSTICS_LOG_LEVEL.get() {
+        *test_level.lock() = Some(level.as_directive().to_string());
+        return Ok(());
+    }
+
     let handle = DIAGNOSTICS_LOG_FILTER_HANDLE
         .get()
         .ok_or_else(|| anyhow::anyhow!("diagnostics log filter reload handle is unavailable"))?;
@@ -102,18 +113,7 @@ pub(crate) fn set_diagnostics_log_verbosity(
 
 #[cfg(test)]
 pub(crate) fn ensure_test_diagnostics_log_filter() {
-    static TEST_TRACING_INIT: OnceLock<()> = OnceLock::new();
-    TEST_TRACING_INIT.get_or_init(|| {
-        let (filter_layer, handle) =
-            tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
-        let _ = DIAGNOSTICS_LOG_FILTER_HANDLE.set(handle);
-        let subscriber = tracing_subscriber::registry().with(filter_layer).with(
-            tracing_subscriber::fmt::layer()
-                .with_test_writer()
-                .with_ansi(false),
-        );
-        let _ = tracing::subscriber::set_global_default(subscriber);
-    });
+    let _ = TEST_DIAGNOSTICS_LOG_LEVEL.get_or_init(|| Mutex::new(Some("info".to_string())));
 }
 
 /// On Windows, locate WinFSP via the registry and pre-load `winfsp-x64.dll`
