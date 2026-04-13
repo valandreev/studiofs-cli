@@ -794,6 +794,16 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
         }
     }
 
+    fn dirty_object_count(&self) -> usize {
+        match self.index.dirty_object_count() {
+            Ok(count) => count,
+            Err(error) => {
+                warn!(error = ?error, "cache-v3 index dirty count lookup failed");
+                0
+            }
+        }
+    }
+
     fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState {
         match self.index.get_entry(object_id) {
             Ok(Some(entry)) => {

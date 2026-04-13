@@ -157,7 +157,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-const RUNTIME_EVENT_CAPACITY: usize = 128;
+pub const VFS_RUNTIME_EVENT_CAPACITY: usize = 128;
 
 use crate::ingress_wal::{
     IngressWal, latest_ingress_checkpoint_path, load_latest_ingress_checkpoint_meta,
@@ -2701,6 +2701,22 @@ impl StudioVfs {
         self.state.namespace.attr_read_cache.lock().metrics()
     }
 
+    pub(crate) fn upload_pipeline_runtime_event(
+        activity_started: bool,
+        became_idle: bool,
+        is_active: bool,
+    ) -> Option<(&'static str, &'static str)> {
+        if activity_started {
+            Some(("became_active", "upload pipeline active"))
+        } else if became_idle {
+            Some(("became_idle", "upload pipeline idle"))
+        } else if is_active {
+            Some(("sample", "upload pipeline sample"))
+        } else {
+            None
+        }
+    }
+
     pub fn cache_state_snapshot(&self) -> VfsCacheStateSnapshot {
         let dentry = self.dentry_cache_metrics();
         let path_shortcut = self.path_shortcut_cache_metrics();
@@ -2710,7 +2726,7 @@ impl StudioVfs {
             dentry_cache: dentry.into(),
             path_shortcut_cache: path_shortcut.into(),
             attr_read_cache: Self::attr_read_cache_snapshot(self.attr_read_cache_metrics()),
-            local_backend_dirty_objects: self.local_block_backend.dirty_object_ids().len(),
+            local_backend_dirty_objects: self.local_block_backend.dirty_object_count(),
             prefetch_queue_depth: self
                 .state
                 .metrics
@@ -2760,7 +2776,7 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
         let mut events = self.state.metrics.runtime_events.lock();
-        if events.len() >= RUNTIME_EVENT_CAPACITY {
+        if events.len() >= VFS_RUNTIME_EVENT_CAPACITY {
             events.pop_front();
         }
         events.push_back(VfsRuntimeEvent {

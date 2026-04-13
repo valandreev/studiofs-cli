@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 use studiofs_meta::FormatInfo;
 use studiofs_vfs::vfs::VfsFileSessionStats;
 use studiofs_vfs::{
-    StudioVfs, VfsCacheStateSnapshot, VfsForegroundReadProtectionStats, VfsIngressStats,
-    VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsUploadStats,
+    StudioVfs, VFS_RUNTIME_EVENT_CAPACITY, VfsCacheStateSnapshot, VfsForegroundReadProtectionStats,
+    VfsIngressStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsUploadStats,
     VfsWritePathObservabilitySnapshot,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -52,12 +52,13 @@ use windows::{
     core::w,
 };
 
-pub(crate) const DIAGNOSTICS_PROTOCOL_VERSION: u32 = 1;
+pub(crate) const DIAGNOSTICS_RUNTIME_SURFACE_PROTOCOL_VERSION: u32 = 2;
+pub(crate) const DIAGNOSTICS_PROTOCOL_VERSION: u32 = DIAGNOSTICS_RUNTIME_SURFACE_PROTOCOL_VERSION;
 const DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_LEASE_TTL_MS: u64 = 5_000;
 const MAX_LEASE_TTL_MS: u64 = 60_000;
 const DEFAULT_RECENT_EVENTS_LIMIT: usize = 32;
-const MAX_RECENT_EVENTS_LIMIT: usize = 256;
+pub(crate) const MAX_RECENT_EVENTS_LIMIT: usize = VFS_RUNTIME_EVENT_CAPACITY;
 const CONNECT_RETRY_ATTEMPTS: usize = 40;
 const CONNECT_RETRY_DELAY_MS: u64 = 25;
 const MAX_DIAGNOSTICS_REQUEST_FRAME_BYTES: usize = 64 * 1024;

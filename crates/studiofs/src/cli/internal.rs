@@ -190,12 +190,21 @@ struct DiagnosticsReadRunArgs {
 fn run_diagnostics_attach(args: DiagnosticsAttachArgs) -> anyhow::Result<()> {
     let client = live_client_for_mount(&args.mount_point)?;
     let ttl = Duration::from_millis(args.ttl_ms.max(1));
-    let recent_events_limit = args.recent_events_limit.clamp(1, 128);
+    let recent_events_limit = args
+        .recent_events_limit
+        .clamp(1, diagnostics::MAX_RECENT_EVENTS_LIMIT);
     let payload = crate::runtime_bridge::block_on(async move {
         let session = client.session_info().await?;
         let health = client.health().await?;
-        let runtime_snapshot = client.runtime_snapshot().await?;
-        let recent_events = client.recent_events(Some(recent_events_limit)).await?;
+        let (runtime_snapshot, recent_events) =
+            if diagnostics_runtime_surface_supported(session.protocol_version) {
+                (
+                    Some(client.runtime_snapshot().await?),
+                    Some(client.recent_events(Some(recent_events_limit)).await?),
+                )
+            } else {
+                (None, None)
+            };
         let controller_lease = match (
             args.controller_client.as_deref(),
             args.renew_lease_id.as_deref(),
@@ -215,6 +224,10 @@ fn run_diagnostics_attach(args: DiagnosticsAttachArgs) -> anyhow::Result<()> {
 
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())
+}
+
+fn diagnostics_runtime_surface_supported(protocol_version: u32) -> bool {
+    protocol_version >= diagnostics::DIAGNOSTICS_RUNTIME_SURFACE_PROTOCOL_VERSION
 }
 
 fn run_diagnostics_create_case(args: DiagnosticsCreateCaseArgs) -> anyhow::Result<()> {
@@ -292,6 +305,14 @@ fn live_client_for_mount(mount_point: &str) -> anyhow::Result<diagnostics::Local
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_runtime_surface_is_gated_by_protocol_version() {
+        assert!(!diagnostics_runtime_surface_supported(1));
+        assert!(diagnostics_runtime_surface_supported(
+            diagnostics::DIAGNOSTICS_RUNTIME_SURFACE_PROTOCOL_VERSION
+        ));
+    }
 
     #[test]
     fn hidden_internal_bootstrap_subcommand_parses() {
