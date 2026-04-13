@@ -459,7 +459,7 @@ pub(crate) struct DiagnosticsCompareRunSpanRequest {
     pub baseline_run_id: String,
     pub candidate_run_id: String,
     pub start_marker_title: String,
-    pub end_marker_title: Option<String>,
+    pub end_marker_title: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1443,6 +1443,29 @@ fn marker_snapshot_reference(sequence: u64, field: &str) -> DiagnosticsEvidenceR
     }
 }
 
+fn qualify_comparison_evidence(
+    run_id: &str,
+    reference: DiagnosticsEvidenceReference,
+) -> DiagnosticsEvidenceReference {
+    let needs_run_scope = matches!(
+        reference.source,
+        DiagnosticsEvidenceReferenceSource::RuntimeSnapshot
+            | DiagnosticsEvidenceReferenceSource::RecentEvent
+            | DiagnosticsEvidenceReferenceSource::TimelineEntry
+            | DiagnosticsEvidenceReferenceSource::ProfilingWindow
+            | DiagnosticsEvidenceReferenceSource::ProfilingArtifact
+            | DiagnosticsEvidenceReferenceSource::MarkerSnapshot
+    );
+    if !needs_run_scope {
+        return reference;
+    }
+
+    DiagnosticsEvidenceReference {
+        id: format!("{run_id}:{}", reference.id),
+        ..reference
+    }
+}
+
 fn push_blocking_interval(
     output: &mut Vec<DiagnosticsBlockingInterval>,
     scope: &DiagnosticsEvidenceScope,
@@ -2283,10 +2306,25 @@ fn marker_snapshot_by_title<'a>(
     run: &'a InvestigationRun,
     title: &str,
 ) -> Result<&'a crate::investigation::InvestigationMarkerSnapshot> {
-    run.marker_snapshots
+    let mut matches = run
+        .marker_snapshots
         .iter()
-        .find(|snapshot| snapshot.marker_title == title)
-        .ok_or_else(|| anyhow!("marker snapshot '{}' not found for run {}", title, run.id))
+        .filter(|snapshot| snapshot.marker_title == title);
+    let Some(snapshot) = matches.next() else {
+        return Err(anyhow!(
+            "marker snapshot '{}' not found for run {}",
+            title,
+            run.id
+        ));
+    };
+    if matches.next().is_some() {
+        return Err(anyhow!(
+            "marker snapshot '{}' is ambiguous for run {}",
+            title,
+            run.id
+        ));
+    }
+    Ok(snapshot)
 }
 
 fn count_anomalies_in_span(
@@ -2301,7 +2339,12 @@ fn count_anomalies_in_span(
                 && entry.sequence >= start_sequence
                 && entry.sequence <= end_sequence
         })
-        .map(|entry| (entry.title.clone(), timeline_entry_reference(entry)))
+        .map(|entry| {
+            (
+                entry.title.clone(),
+                qualify_comparison_evidence(&run.id, timeline_entry_reference(entry)),
+            )
+        })
         .collect()
 }
 
@@ -2335,22 +2378,29 @@ fn profiling_windows_in_span(
 
 fn collect_hotspots_for_windows(
     windows: &[&ProfilingWindowRecord],
-) -> Vec<DiagnosticsHotspotSummary> {
-    let loaded = windows
-        .iter()
-        .filter_map(|window| match load_wall_blocking_profile_artifact(window) {
-            Ok(Some((_summary, artifact))) => Some(((*window).clone(), Some(artifact))),
-            Ok(None) => None,
-            Err(_) => None,
-        })
-        .collect::<Vec<_>>();
-    derive_hotspots(
+) -> Result<Vec<DiagnosticsHotspotSummary>> {
+    let mut loaded = Vec::new();
+    for window in windows {
+        match load_wall_blocking_profile_artifact(window) {
+            Ok(Some((_summary, artifact))) => loaded.push(((*window).clone(), Some(artifact))),
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    window_id = %window.window_id,
+                    error = %error,
+                    "failed to load wall-blocking profile artifact while collecting comparison hotspots"
+                );
+                return Err(error);
+            }
+        }
+    }
+    Ok(derive_hotspots(
         &DiagnosticsEvidenceScope::default(),
         None,
         &loaded,
         MAX_EVIDENCE_DERIVED_ITEMS_PER_KIND,
     )
-    .0
+    .0)
 }
 
 fn materialize_run_span_comparison(
@@ -2366,16 +2416,10 @@ fn materialize_run_span_comparison(
             candidate.id
         ));
     }
-    let Some(end_title) = request.end_marker_title.clone() else {
-        return Err(anyhow!(
-            "end_marker_title is required for run span comparison"
-        ));
-    };
-
     let baseline_start = marker_snapshot_by_title(&baseline, &request.start_marker_title)?;
     let candidate_start = marker_snapshot_by_title(&candidate, &request.start_marker_title)?;
-    let baseline_end = marker_snapshot_by_title(&baseline, &end_title)?;
-    let candidate_end = marker_snapshot_by_title(&candidate, &end_title)?;
+    let baseline_end = marker_snapshot_by_title(&baseline, &request.end_marker_title)?;
+    let candidate_end = marker_snapshot_by_title(&candidate, &request.end_marker_title)?;
     if baseline_end.marker_sequence < baseline_start.marker_sequence {
         return Err(anyhow!("baseline marker span ordering is invalid"));
     }
@@ -2449,10 +2493,22 @@ fn materialize_run_span_comparison(
             candidate_value,
             delta: candidate_value - baseline_value,
             supporting_evidence: vec![
-                marker_snapshot_reference(baseline_start.marker_sequence, field),
-                marker_snapshot_reference(baseline_end.marker_sequence, field),
-                marker_snapshot_reference(candidate_start.marker_sequence, field),
-                marker_snapshot_reference(candidate_end.marker_sequence, field),
+                qualify_comparison_evidence(
+                    &baseline.id,
+                    marker_snapshot_reference(baseline_start.marker_sequence, field),
+                ),
+                qualify_comparison_evidence(
+                    &baseline.id,
+                    marker_snapshot_reference(baseline_end.marker_sequence, field),
+                ),
+                qualify_comparison_evidence(
+                    &candidate.id,
+                    marker_snapshot_reference(candidate_start.marker_sequence, field),
+                ),
+                qualify_comparison_evidence(
+                    &candidate.id,
+                    marker_snapshot_reference(candidate_end.marker_sequence, field),
+                ),
             ],
         },
     )
@@ -2507,12 +2563,12 @@ fn materialize_run_span_comparison(
         &baseline,
         baseline_start.marker_sequence,
         baseline_end.marker_sequence,
-    ));
+    ))?;
     let candidate_hotspots = collect_hotspots_for_windows(&profiling_windows_in_span(
         &candidate,
         candidate_start.marker_sequence,
         candidate_end.marker_sequence,
-    ));
+    ))?;
     let mut hotspot_keys = baseline_hotspots
         .iter()
         .map(|hotspot| {
@@ -2556,12 +2612,20 @@ fn materialize_run_span_comparison(
                 delta: candidate_score - baseline_score,
                 supporting_evidence: baseline_match
                     .into_iter()
-                    .flat_map(|hotspot| hotspot.supporting_evidence.clone())
-                    .chain(
-                        candidate_match
+                    .flat_map(|hotspot| {
+                        hotspot
+                            .supporting_evidence
+                            .clone()
                             .into_iter()
-                            .flat_map(|hotspot| hotspot.supporting_evidence.clone()),
-                    )
+                            .map(|reference| qualify_comparison_evidence(&baseline.id, reference))
+                    })
+                    .chain(candidate_match.into_iter().flat_map(|hotspot| {
+                        hotspot
+                            .supporting_evidence
+                            .clone()
+                            .into_iter()
+                            .map(|reference| qualify_comparison_evidence(&candidate.id, reference))
+                    }))
                     .collect(),
             }
         })
@@ -4698,17 +4762,24 @@ fn execute_request(
                 },
             ) {
                 Ok(entry) => {
-                    if entry.kind == TimelineEntryKind::Marker
+                    let marker_runtime_snapshot = (entry.kind == TimelineEntryKind::Marker)
+                        .then(|| source.runtime_snapshot());
+                    if let Some(runtime_snapshot) = marker_runtime_snapshot
                         && let Err(error) = store.append_marker_snapshot(
                             &run_id,
                             NewInvestigationMarkerSnapshot {
                                 marker_sequence: entry.sequence,
                                 marker_title: entry.title.clone(),
-                                runtime_snapshot: source.runtime_snapshot(),
+                                runtime_snapshot,
                             },
                         )
                     {
-                        return store_error(error);
+                        warn!(
+                            run_id = %run_id,
+                            marker_sequence = entry.sequence,
+                            error = %error,
+                            "failed to persist marker snapshot after timeline marker append"
+                        );
                     }
                     DiagnosticsResponse::TimelineEntry { entry }
                 }
@@ -7401,7 +7472,7 @@ mod tests {
                     baseline_run_id: baseline.id.clone(),
                     candidate_run_id: candidate.id.clone(),
                     start_marker_title: "warm copy".to_string(),
-                    end_marker_title: Some("warm copy done".to_string()),
+                    end_marker_title: "warm copy done".to_string(),
                 },
             },
             "secret",
@@ -7428,6 +7499,124 @@ mod tests {
             hotspot.metric == "block_store_sync_data.queue_wait_total_ms_delta"
                 && hotspot.delta < 0.0
         }));
+        assert!(
+            comparison
+                .supporting_evidence
+                .iter()
+                .any(|reference| reference.id.starts_with(&format!("{}:", baseline.id)))
+        );
+        assert!(
+            comparison
+                .supporting_evidence
+                .iter()
+                .any(|reference| reference.id.starts_with(&format!("{}:", candidate.id)))
+        );
+    }
+
+    #[test]
+    fn compare_run_span_rejects_ambiguous_marker_titles() {
+        let temp = mounts_dir_temp();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let case = store
+            .create_case(NewInvestigationCase {
+                title: "ambiguous markers".to_string(),
+                problem_statement: None,
+                workload_identity: None,
+                target_environment: None,
+            })
+            .expect("create case");
+        let baseline = store
+            .create_run(NewInvestigationRun {
+                case_id: case.id.clone(),
+                session_id: "session-a".to_string(),
+                fingerprint: static_source().fingerprint.clone(),
+            })
+            .expect("create baseline run");
+        let candidate = store
+            .create_run(NewInvestigationRun {
+                case_id: case.id.clone(),
+                session_id: "session-b".to_string(),
+                fingerprint: static_source().fingerprint.clone(),
+            })
+            .expect("create candidate run");
+
+        for run_id in [&baseline.id, &candidate.id] {
+            let first = store
+                .append_timeline_entry(
+                    run_id,
+                    NewTimelineEntry {
+                        source: TimelineEntrySource::Cli,
+                        kind: TimelineEntryKind::Marker,
+                        title: "warm copy".to_string(),
+                        body: None,
+                        actor: None,
+                        reason: None,
+                    },
+                )
+                .expect("first marker");
+            let second = store
+                .append_timeline_entry(
+                    run_id,
+                    NewTimelineEntry {
+                        source: TimelineEntrySource::Cli,
+                        kind: TimelineEntryKind::Marker,
+                        title: "warm copy".to_string(),
+                        body: None,
+                        actor: None,
+                        reason: None,
+                    },
+                )
+                .expect("second marker");
+            store
+                .append_marker_snapshot(
+                    run_id,
+                    NewInvestigationMarkerSnapshot {
+                        marker_sequence: first.sequence,
+                        marker_title: "warm copy".to_string(),
+                        runtime_snapshot: DiagnosticsRuntimeSnapshot::default(),
+                    },
+                )
+                .expect("first marker snapshot");
+            store
+                .append_marker_snapshot(
+                    run_id,
+                    NewInvestigationMarkerSnapshot {
+                        marker_sequence: second.sequence,
+                        marker_title: "warm copy".to_string(),
+                        runtime_snapshot: DiagnosticsRuntimeSnapshot::default(),
+                    },
+                )
+                .expect("second marker snapshot");
+        }
+
+        let lease_manager = ControllerLeaseManager::default();
+        let lease = lease_manager
+            .acquire("tester".to_string(), Some(500))
+            .expect("acquire lease");
+
+        let response = execute_request(
+            DiagnosticsRequest::CompareRunSpan {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id,
+                request: DiagnosticsCompareRunSpanRequest {
+                    baseline_run_id: baseline.id,
+                    candidate_run_id: candidate.id,
+                    start_marker_title: "warm copy".to_string(),
+                    end_marker_title: "warm copy".to_string(),
+                },
+            },
+            "secret",
+            &static_source(),
+            &lease_manager,
+            Some(&store),
+            None,
+        );
+
+        assert!(matches!(
+            response,
+            DiagnosticsResponse::Error { code, message }
+                if code == "investigation_store_error" && message.contains("ambiguous")
+        ));
     }
 
     #[test]

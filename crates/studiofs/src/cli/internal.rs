@@ -228,7 +228,7 @@ struct DiagnosticsCompareRunSpanArgs {
     start_marker_title: String,
 
     #[arg(long)]
-    end_marker_title: Option<String>,
+    end_marker_title: String,
 }
 
 #[derive(Debug, Args)]
@@ -748,6 +748,53 @@ mod tests {
             create_hypothesis.command,
             crate::cli::Commands::Internal(InternalArgs {
                 action: InternalAction::DiagnosticsCreateHypothesis(_)
+            })
+        ));
+
+        let update_hypothesis = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-update-hypothesis",
+            "Z:",
+            "--lease-id",
+            "lease-1",
+            "--hypothesis-id",
+            "hyp-1",
+            "--status",
+            "supported",
+        ])
+        .unwrap();
+        assert!(matches!(
+            update_hypothesis.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsUpdateHypothesis(_)
+            })
+        ));
+
+        let read_comparison = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-read-comparison",
+            "--comparison-id",
+            "comparison-1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            read_comparison.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsReadComparison(_)
+            })
+        ));
+
+        let read_hypothesis = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-read-hypothesis",
+            "--hypothesis-id",
+            "hypothesis-1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            read_hypothesis.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsReadHypothesis(_)
             })
         ));
 

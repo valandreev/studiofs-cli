@@ -293,7 +293,7 @@ pub(crate) struct InvestigationReport {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InvestigationMatchedMarkerSpan {
     pub start_marker_title: String,
-    pub end_marker_title: Option<String>,
+    pub end_marker_title: String,
     pub baseline_start_sequence: u64,
     pub baseline_end_sequence: u64,
     pub candidate_start_sequence: u64,
@@ -731,21 +731,12 @@ impl InvestigationStore {
         case.updated_unix_ms = now_unix_millis();
         case.comparison_ids.push(comparison.id.clone());
         if let Err(case_save_error) = self.save_json(&self.case_path(case_id), &case) {
-            match fs::remove_file(&comparison_path) {
-                Ok(()) => {}
-                Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(cleanup_error) => {
-                    return Err(anyhow!(
-                        "failed to save case after writing comparison '{}'; additionally failed to remove orphaned comparison file '{}': {}",
-                        comparison.id,
-                        comparison_path.display(),
-                        cleanup_error
-                    ))
-                    .context(case_save_error);
-                }
-            }
-            return Err(case_save_error).context(
-                "failed to save case after writing comparison; cleaned up orphaned comparison file",
+            return cleanup_orphaned_store_file(
+                &comparison_path,
+                "case",
+                "comparison",
+                &comparison.id,
+                case_save_error,
             );
         }
         Ok(comparison)
@@ -786,21 +777,12 @@ impl InvestigationStore {
         case.updated_unix_ms = now;
         case.hypothesis_ids.push(hypothesis.id.clone());
         if let Err(case_save_error) = self.save_json(&self.case_path(case_id), &case) {
-            match fs::remove_file(&hypothesis_path) {
-                Ok(()) => {}
-                Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(cleanup_error) => {
-                    return Err(anyhow!(
-                        "failed to save case after writing hypothesis '{}'; additionally failed to remove orphaned hypothesis file '{}': {}",
-                        hypothesis.id,
-                        hypothesis_path.display(),
-                        cleanup_error
-                    ))
-                    .context(case_save_error);
-                }
-            }
-            return Err(case_save_error).context(
-                "failed to save case after writing hypothesis; cleaned up orphaned hypothesis file",
+            return cleanup_orphaned_store_file(
+                &hypothesis_path,
+                "case",
+                "hypothesis",
+                &hypothesis.id,
+                case_save_error,
             );
         }
         Ok(hypothesis)
@@ -1193,6 +1175,31 @@ fn canonical_hypothesis_id(hypothesis_id: &str) -> Result<String> {
     Ok(Uuid::parse_str(hypothesis_id)
         .with_context(|| format!("invalid hypothesis id '{}'", hypothesis_id))?
         .to_string())
+}
+
+fn cleanup_orphaned_store_file<T>(
+    path: &Path,
+    owner_kind: &str,
+    artifact_kind: &str,
+    artifact_id: &str,
+    save_error: anyhow::Error,
+) -> Result<T> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(cleanup_error) => {
+            return Err(anyhow!(
+                "failed to save {owner_kind} after writing {artifact_kind} '{}'; additionally failed to remove orphaned {artifact_kind} file '{}': {}",
+                artifact_id,
+                path.display(),
+                cleanup_error
+            ))
+            .context(save_error);
+        }
+    }
+    Err(save_error).context(format!(
+        "failed to save {owner_kind} after writing {artifact_kind}; cleaned up orphaned {artifact_kind} file"
+    ))
 }
 
 fn ensure_private_directory(path: &Path) -> Result<()> {
@@ -2173,7 +2180,7 @@ mod tests {
                     candidate_run_id: "run-b".to_string(),
                     span: InvestigationMatchedMarkerSpan {
                         start_marker_title: "warm copy".to_string(),
-                        end_marker_title: Some("warm copy done".to_string()),
+                        end_marker_title: "warm copy done".to_string(),
                         baseline_start_sequence: 1,
                         baseline_end_sequence: 2,
                         candidate_start_sequence: 3,
