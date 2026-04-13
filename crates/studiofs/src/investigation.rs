@@ -20,6 +20,8 @@ pub(crate) const INVESTIGATION_REPORT_SCHEMA_VERSION: u32 = 1;
 
 #[cfg(test)]
 static TEST_BASE_DIR: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+static TEST_SAVE_JSON_FAILURE_PATTERN: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InvestigationCase {
@@ -175,6 +177,7 @@ pub(crate) enum TimelineEntrySource {
 pub(crate) enum TimelineEntryKind {
     Marker,
     Note,
+    Anomaly,
     Action,
 }
 
@@ -495,9 +498,27 @@ impl InvestigationStore {
             recommended_next_actions: input.recommended_next_actions,
             references: input.references,
         };
-        self.save_json(&self.report_path(&report.id), &report)?;
+        let report_path = self.report_path(&report.id)?;
+        self.save_json(&report_path, &report)?;
         run.report_ids.push(report.id.clone());
-        self.save_json(&self.run_path(run_id), &run)?;
+        if let Err(run_save_error) = self.save_json(&self.run_path(run_id), &run) {
+            match fs::remove_file(&report_path) {
+                Ok(()) => {}
+                Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(cleanup_error) => {
+                    return Err(anyhow!(
+                        "failed to save run after writing report '{}'; additionally failed to remove orphaned report file '{}': {}",
+                        report.id,
+                        report_path.display(),
+                        cleanup_error
+                    ))
+                    .context(run_save_error);
+                }
+            }
+            return Err(run_save_error).context(
+                "failed to save run after writing report; cleaned up orphaned report file",
+            );
+        }
         Ok(report)
     }
 
@@ -521,7 +542,7 @@ impl InvestigationStore {
     pub(crate) fn load_report(&self, report_id: &str) -> Result<InvestigationReport> {
         let _guard = self.io_lock.lock();
         let _store_lock = self.lock_store()?;
-        self.load_json(&self.report_path(report_id))
+        self.load_json(&self.report_path(report_id)?)
     }
 
     fn ensure_layout(&self) -> Result<()> {
@@ -560,8 +581,10 @@ impl InvestigationStore {
         self.runs_dir().join(format!("{run_id}.json"))
     }
 
-    fn report_path(&self, report_id: &str) -> PathBuf {
-        self.reports_dir().join(format!("{report_id}.json"))
+    fn report_path(&self, report_id: &str) -> Result<PathBuf> {
+        Ok(self
+            .reports_dir()
+            .join(format!("{}.json", canonical_report_id(report_id)?)))
     }
 
     fn timeline_log_path(&self, run_id: &str) -> PathBuf {
@@ -582,6 +605,18 @@ impl InvestigationStore {
     where
         T: Serialize + ?Sized,
     {
+        #[cfg(test)]
+        if let Some(pattern) = test_save_json_failure_pattern()
+            && path
+                .file_name()
+                .and_then(|file_name| file_name.to_str())
+                .is_some_and(|file_name| file_name.contains(&pattern))
+        {
+            return Err(anyhow!(
+                "synthetic save_json failure for '{}'",
+                path.display()
+            ));
+        }
         if let Some(parent) = path.parent() {
             ensure_private_directory(parent)?;
         }
@@ -784,6 +819,12 @@ fn default_store_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+fn canonical_report_id(report_id: &str) -> Result<String> {
+    Uuid::parse_str(report_id)
+        .map(|uuid| uuid.to_string())
+        .map_err(|error| anyhow!("invalid report id '{}': {error}", report_id))
+}
+
 fn ensure_private_directory(path: &Path) -> Result<()> {
     fs::create_dir_all(path)
         .with_context(|| format!("create investigation directory '{}'", path.display()))?;
@@ -823,6 +864,21 @@ fn set_private_file_permissions(_path: &Path) -> Result<()> {
 #[cfg(test)]
 pub(crate) fn set_test_store_base_dir(path: Option<&Path>) {
     *TEST_BASE_DIR.get_or_init(|| Mutex::new(None)).lock() = path.map(Path::to_path_buf);
+}
+
+#[cfg(test)]
+fn test_save_json_failure_pattern() -> Option<String> {
+    TEST_SAVE_JSON_FAILURE_PATTERN
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .clone()
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_save_json_failure_pattern(pattern: Option<&str>) {
+    *TEST_SAVE_JSON_FAILURE_PATTERN
+        .get_or_init(|| Mutex::new(None))
+        .lock() = pattern.map(str::to_string);
 }
 
 #[cfg(test)]
@@ -1571,6 +1627,94 @@ mod tests {
         assert_eq!(reloaded_report.evidence_summary.hotspot_count, 1);
         assert_eq!(reloaded_report.candidate_bottlenecks.len(), 1);
         assert_eq!(reloaded_report.references.profiling_windows.len(), 1);
+    }
+
+    #[test]
+    fn load_report_rejects_non_uuid_ids() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+
+        let error = store
+            .load_report("../outside-store")
+            .expect_err("invalid report id should be rejected");
+
+        assert!(error.to_string().contains("invalid report id"));
+    }
+
+    #[test]
+    fn append_report_cleans_up_orphaned_report_when_run_save_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let case = store
+            .create_case(NewInvestigationCase {
+                title: "cleanup".to_string(),
+                problem_statement: None,
+                workload_identity: None,
+                target_environment: None,
+            })
+            .expect("create case");
+        let run = store
+            .create_run(NewInvestigationRun {
+                case_id: case.id,
+                session_id: "session-1".to_string(),
+                fingerprint: sample_fingerprint(),
+            })
+            .expect("create run");
+
+        set_test_save_json_failure_pattern(Some(&format!("{}.json", run.id)));
+        let result = store.append_report(
+            &run.id,
+            NewInvestigationReport {
+                environment: sample_fingerprint(),
+                marker_timeline: Vec::new(),
+                evidence_summary: InvestigationReportEvidenceSummary {
+                    recent_event_count: 0,
+                    timeline_entry_count: 0,
+                    profiling_window_count: 0,
+                    queue_growth_count: 0,
+                    blocking_interval_count: 0,
+                    hotspot_count: 0,
+                },
+                truncation: InvestigationReportTruncationSummary::default(),
+                anomalies: Vec::new(),
+                candidate_bottlenecks: Vec::new(),
+                selected_evidence: Vec::new(),
+                recommended_next_actions: Vec::new(),
+                references: InvestigationReportReferences {
+                    runtime_snapshot: crate::diagnostics::DiagnosticsRuntimeSnapshot::default(),
+                    derived_view: crate::diagnostics::DiagnosticsEvidenceView {
+                        generated_unix_ms: 0,
+                        run_id: run.id.clone(),
+                        scope: crate::diagnostics::DiagnosticsEvidenceScopeResolution::default(),
+                        budget: crate::diagnostics::DiagnosticsEvidenceBudgetReport {
+                            requested: crate::diagnostics::DiagnosticsEvidenceBudget::default(),
+                            applied: crate::diagnostics::DiagnosticsEvidenceBudget::default(),
+                            truncation: crate::diagnostics::DiagnosticsEvidenceTruncation::default(
+                            ),
+                        },
+                        raw: crate::diagnostics::DiagnosticsEvidenceRawView::default(),
+                        derived: crate::diagnostics::DiagnosticsDerivedEvidenceView::default(),
+                    },
+                    profiling_windows: Vec::new(),
+                },
+            },
+        );
+        set_test_save_json_failure_pattern(None);
+
+        let error = result.expect_err("run save failure should abort report append");
+        assert!(
+            error
+                .to_string()
+                .contains("cleaned up orphaned report file")
+        );
+        let report_files = fs::read_dir(store.reports_dir())
+            .expect("read reports dir")
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        assert!(
+            report_files.is_empty(),
+            "orphaned report file should be removed"
+        );
     }
 
     #[cfg(unix)]

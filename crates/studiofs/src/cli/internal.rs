@@ -143,6 +143,7 @@ impl From<TimelineSourceArg> for TimelineEntrySource {
 enum TimelineKindArg {
     Marker,
     Note,
+    Anomaly,
 }
 
 impl From<TimelineKindArg> for TimelineEntryKind {
@@ -150,6 +151,7 @@ impl From<TimelineKindArg> for TimelineEntryKind {
         match value {
             TimelineKindArg::Marker => TimelineEntryKind::Marker,
             TimelineKindArg::Note => TimelineEntryKind::Note,
+            TimelineKindArg::Anomaly => TimelineEntryKind::Anomaly,
         }
     }
 }
@@ -456,6 +458,29 @@ mod tests {
         .unwrap();
         assert!(matches!(
             add_timeline.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsAddTimeline(_)
+            })
+        ));
+
+        let add_anomaly = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-add-timeline",
+            "Z:",
+            "--lease-id",
+            "lease-1",
+            "--run-id",
+            "run-1",
+            "--source",
+            "mcp",
+            "--kind",
+            "anomaly",
+            "--title",
+            "cache miss burst",
+        ])
+        .unwrap();
+        assert!(matches!(
+            add_anomaly.command,
             crate::cli::Commands::Internal(InternalArgs {
                 action: InternalAction::DiagnosticsAddTimeline(_)
             })

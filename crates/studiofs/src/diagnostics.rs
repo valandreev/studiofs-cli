@@ -1795,6 +1795,16 @@ fn build_evidence_view(
     source: &dyn DiagnosticsDataSource,
     store: &InvestigationStore,
 ) -> Result<DiagnosticsEvidenceView> {
+    build_evidence_view_with_snapshot(run_id, request, source.runtime_snapshot(), source, store)
+}
+
+fn build_evidence_view_with_snapshot(
+    run_id: &str,
+    request: DiagnosticsEvidenceRequest,
+    snapshot: DiagnosticsRuntimeSnapshot,
+    source: &dyn DiagnosticsDataSource,
+    store: &InvestigationStore,
+) -> Result<DiagnosticsEvidenceView> {
     let run = store.load_run(run_id)?;
     let applied_budget = clamp_evidence_budget(&request.budget);
     let resolved_marker_span = request
@@ -1877,7 +1887,6 @@ fn build_evidence_view(
         });
     }
 
-    let snapshot = source.runtime_snapshot();
     let snapshot_in_view = resolved_marker_span.is_none();
     let snapshot_sections =
         snapshot_sections_for_scope(&snapshot, &request.scope, resolved_marker_span.as_ref());
@@ -1959,6 +1968,16 @@ fn timeline_entry_reference(entry: &TimelineEntry) -> DiagnosticsEvidenceReferen
     }
 }
 
+fn is_legacy_anomaly_reason(reason: Option<&str>) -> bool {
+    matches!(reason, Some("annotate anomaly" | "annotate_anomaly"))
+}
+
+fn is_anomaly_timeline_entry(entry: &TimelineEntry) -> bool {
+    entry.kind == TimelineEntryKind::Anomaly
+        || (entry.kind == TimelineEntryKind::Note
+            && is_legacy_anomaly_reason(entry.reason.as_deref()))
+}
+
 fn build_report_anomaly_candidates(
     run: &InvestigationRun,
     derived_view: &DiagnosticsEvidenceView,
@@ -1986,13 +2005,7 @@ fn build_report_anomaly_candidates(
     anomalies.extend(
         run.timeline
             .iter()
-            .filter(|entry| {
-                entry.kind == TimelineEntryKind::Note
-                    && entry
-                        .reason
-                        .as_deref()
-                        .is_some_and(|reason| reason.contains("anomaly"))
-            })
+            .filter(|entry| is_anomaly_timeline_entry(entry))
             .map(|entry| InvestigationReportFinding {
                 title: entry.title.clone(),
                 summary: entry
@@ -2128,7 +2141,12 @@ fn build_report_next_action_candidates(
             supporting_evidence: Vec::new(),
         });
     }
-    if let Some(interval) = derived_view.derived.blocking_intervals.first() {
+    if let Some(interval) = derived_view
+        .derived
+        .blocking_intervals
+        .iter()
+        .max_by(|left, right| left.total_blocked_ms.total_cmp(&right.total_blocked_ms))
+    {
         recommended_next_actions.push(InvestigationRecommendedNextAction {
             title: format!(
                 "drill into {} {}",
@@ -2172,16 +2190,17 @@ fn materialize_report(
     store: &InvestigationStore,
 ) -> Result<InvestigationReport> {
     let run = store.load_run(run_id)?;
-    let derived_view = build_evidence_view(
+    let runtime_snapshot = source.runtime_snapshot();
+    let derived_view = build_evidence_view_with_snapshot(
         run_id,
         DiagnosticsEvidenceRequest {
             scope: DiagnosticsEvidenceScope::default(),
             budget: DiagnosticsEvidenceBudget::default(),
         },
+        runtime_snapshot.clone(),
         source,
         store,
     )?;
-    let runtime_snapshot = source.runtime_snapshot();
     let marker_timeline = run
         .timeline
         .iter()
@@ -3681,6 +3700,30 @@ fn execute_request(
         investigation_store.ok_or(MutatingRequestPrereqError::InvestigationUnavailable)
     }
 
+    fn require_mutating_store<'a>(
+        provided_token: &str,
+        auth_token: &str,
+        lease_id: &str,
+        lease_manager: &ControllerLeaseManager,
+        investigation_store: Option<&'a InvestigationStore>,
+    ) -> std::result::Result<&'a InvestigationStore, MutatingRequestPrereqError> {
+        mutating_request_store(
+            provided_token,
+            auth_token,
+            lease_id,
+            lease_manager,
+            investigation_store,
+        )
+    }
+
+    fn mutating_request_error_response(error: MutatingRequestPrereqError) -> DiagnosticsResponse {
+        match error {
+            MutatingRequestPrereqError::Unauthorized => unauthorized(),
+            MutatingRequestPrereqError::InvalidLease(error) => lease_error(error),
+            MutatingRequestPrereqError::InvestigationUnavailable => investigation_unavailable(),
+        }
+    }
+
     match request {
         DiagnosticsRequest::SessionInfo {
             auth_token: provided,
@@ -3732,7 +3775,7 @@ fn execute_request(
             run_id,
             request,
         } => {
-            let store = match mutating_request_store(
+            let store = match require_mutating_store(
                 &provided,
                 auth_token,
                 &lease_id,
@@ -3740,13 +3783,7 @@ fn execute_request(
                 investigation_store,
             ) {
                 Ok(store) => store,
-                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
-                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
-                    return lease_error(error);
-                }
-                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
-                    return investigation_unavailable();
-                }
+                Err(error) => return mutating_request_error_response(error),
             };
             match build_evidence_view(&run_id, request, source, store) {
                 Ok(view) => DiagnosticsResponse::EvidenceView {
@@ -3760,7 +3797,7 @@ fn execute_request(
             lease_id,
             run_id,
         } => {
-            let store = match mutating_request_store(
+            let store = match require_mutating_store(
                 &provided,
                 auth_token,
                 &lease_id,
@@ -3768,13 +3805,7 @@ fn execute_request(
                 investigation_store,
             ) {
                 Ok(store) => store,
-                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
-                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
-                    return lease_error(error);
-                }
-                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
-                    return investigation_unavailable();
-                }
+                Err(error) => return mutating_request_error_response(error),
             };
             match materialize_report(&run_id, source, store) {
                 Ok(report) => DiagnosticsResponse::InvestigationReport {
@@ -3802,7 +3833,7 @@ fn execute_request(
             run_id,
             action,
         } => {
-            let store = match mutating_request_store(
+            let store = match require_mutating_store(
                 &provided,
                 auth_token,
                 &lease_id,
@@ -3810,13 +3841,7 @@ fn execute_request(
                 investigation_store,
             ) {
                 Ok(store) => store,
-                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
-                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
-                    return lease_error(error);
-                }
-                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
-                    return investigation_unavailable();
-                }
+                Err(error) => return mutating_request_error_response(error),
             };
             if let Err(error) = store.load_run(&run_id) {
                 return store_error(error);
@@ -3991,7 +4016,7 @@ fn execute_request(
             workload_identity,
             target_environment,
         } => {
-            let store = match mutating_request_store(
+            let store = match require_mutating_store(
                 &provided,
                 auth_token,
                 &lease_id,
@@ -3999,13 +4024,7 @@ fn execute_request(
                 investigation_store,
             ) {
                 Ok(store) => store,
-                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
-                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
-                    return lease_error(error);
-                }
-                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
-                    return investigation_unavailable();
-                }
+                Err(error) => return mutating_request_error_response(error),
             };
             match store.create_case(NewInvestigationCase {
                 title,
@@ -4025,7 +4044,7 @@ fn execute_request(
             case_id,
             run_workload_identity,
         } => {
-            let store = match mutating_request_store(
+            let store = match require_mutating_store(
                 &provided,
                 auth_token,
                 &lease_id,
@@ -4033,13 +4052,7 @@ fn execute_request(
                 investigation_store,
             ) {
                 Ok(store) => store,
-                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
-                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
-                    return lease_error(error);
-                }
-                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
-                    return investigation_unavailable();
-                }
+                Err(error) => return mutating_request_error_response(error),
             };
             let case = match store.load_case(&case_id) {
                 Ok(case) => case,
@@ -4064,7 +4077,7 @@ fn execute_request(
             run_id,
             request,
         } => {
-            let store = match mutating_request_store(
+            let store = match require_mutating_store(
                 &provided,
                 auth_token,
                 &lease_id,
@@ -4072,13 +4085,7 @@ fn execute_request(
                 investigation_store,
             ) {
                 Ok(store) => store,
-                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
-                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
-                    return lease_error(error);
-                }
-                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
-                    return investigation_unavailable();
-                }
+                Err(error) => return mutating_request_error_response(error),
             };
             let Some(profiling) = profiling else {
                 return profiling_unavailable();
@@ -4095,7 +4102,7 @@ fn execute_request(
             lease_id,
             window_id,
         } => {
-            let store = match mutating_request_store(
+            let store = match require_mutating_store(
                 &provided,
                 auth_token,
                 &lease_id,
@@ -4103,13 +4110,7 @@ fn execute_request(
                 investigation_store,
             ) {
                 Ok(store) => store,
-                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
-                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
-                    return lease_error(error);
-                }
-                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
-                    return investigation_unavailable();
-                }
+                Err(error) => return mutating_request_error_response(error),
             };
             let Some(profiling) = profiling else {
                 return profiling_unavailable();
@@ -4135,7 +4136,7 @@ fn execute_request(
             actor,
             reason,
         } => {
-            let store = match mutating_request_store(
+            let store = match require_mutating_store(
                 &provided,
                 auth_token,
                 &lease_id,
@@ -4143,13 +4144,7 @@ fn execute_request(
                 investigation_store,
             ) {
                 Ok(store) => store,
-                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
-                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
-                    return lease_error(error);
-                }
-                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
-                    return investigation_unavailable();
-                }
+                Err(error) => return mutating_request_error_response(error),
             };
             match store.append_timeline_entry(
                 &run_id,
@@ -5284,11 +5279,11 @@ mod tests {
                 &run.id,
                 NewTimelineEntry {
                     source: TimelineEntrySource::Mcp,
-                    kind: TimelineEntryKind::Note,
+                    kind: TimelineEntryKind::Anomaly,
                     title: "queue growth".to_string(),
                     body: Some("Pending uploads spiked during the copy.".to_string()),
                     actor: Some("studiofs-dev-mcp".to_string()),
-                    reason: Some("annotate anomaly".to_string()),
+                    reason: Some("operator observation".to_string()),
                 },
             )
             .expect("append note");
@@ -5401,11 +5396,11 @@ mod tests {
                     &run.id,
                     NewTimelineEntry {
                         source: TimelineEntrySource::Mcp,
-                        kind: TimelineEntryKind::Note,
+                        kind: TimelineEntryKind::Anomaly,
                         title: format!("anomaly {index}"),
                         body: Some(format!("Anomaly body {index}")),
                         actor: Some("studiofs-dev-mcp".to_string()),
-                        reason: Some("annotate anomaly".to_string()),
+                        reason: Some("operator observation".to_string()),
                     },
                 )
                 .expect("append anomaly note");
@@ -5497,6 +5492,150 @@ mod tests {
         assert!(report.truncation.anomalies.truncated_count > 0);
         assert!(report.truncation.candidate_bottlenecks.truncated_count > 0);
         assert!(report.truncation.selected_evidence.truncated_count > 0);
+    }
+
+    #[test]
+    fn build_report_next_action_candidates_uses_largest_blocking_interval() {
+        let run = InvestigationRun {
+            id: "run-1".to_string(),
+            case_id: "case-1".to_string(),
+            session_id: "session-1".to_string(),
+            created_unix_ms: 1,
+            fingerprint: static_source().fingerprint,
+            profiling_windows: Vec::new(),
+            report_ids: Vec::new(),
+            timeline: Vec::new(),
+        };
+        let derived_view = DiagnosticsEvidenceView {
+            generated_unix_ms: 1,
+            run_id: run.id.clone(),
+            scope: DiagnosticsEvidenceScopeResolution::default(),
+            budget: DiagnosticsEvidenceBudgetReport {
+                requested: DiagnosticsEvidenceBudget::default(),
+                applied: DiagnosticsEvidenceBudget::default(),
+                truncation: DiagnosticsEvidenceTruncation::default(),
+            },
+            raw: DiagnosticsEvidenceRawView::default(),
+            derived: DiagnosticsDerivedEvidenceView {
+                queue_growth: Vec::new(),
+                blocking_intervals: vec![
+                    DiagnosticsBlockingInterval {
+                        subsystem: SUBSYSTEM_WRITE_PATH.to_string(),
+                        operation_type: OPERATION_SYNC_DATA_QUEUE_WAIT.to_string(),
+                        total_blocked_ms: 20.0,
+                        max_blocked_ms: 10.0,
+                        supporting_evidence: Vec::new(),
+                    },
+                    DiagnosticsBlockingInterval {
+                        subsystem: SUBSYSTEM_UPLOAD_PIPELINE.to_string(),
+                        operation_type: OPERATION_UPLOAD_FALLBACK_WAIT.to_string(),
+                        total_blocked_ms: 50.0,
+                        max_blocked_ms: 25.0,
+                        supporting_evidence: Vec::new(),
+                    },
+                ],
+                hotspots: Vec::new(),
+            },
+        };
+
+        let actions = build_report_next_action_candidates(&run, &[], &derived_view);
+        let drill_down = actions
+            .iter()
+            .find(|action| action.title.contains("drill into"))
+            .expect("drill-down action");
+
+        assert!(drill_down.title.contains("upload pipeline"));
+        assert!(drill_down.rationale.contains("50.0 ms"));
+    }
+
+    #[test]
+    fn materialize_report_reuses_single_runtime_snapshot_for_report_and_view() {
+        #[derive(Clone)]
+        struct CountingSnapshotSource {
+            session: DiagnosticsSessionInfo,
+            fingerprint: EnvironmentFingerprint,
+            counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        }
+
+        impl DiagnosticsDataSource for CountingSnapshotSource {
+            fn session_info(&self) -> DiagnosticsSessionInfo {
+                self.session.clone()
+            }
+
+            fn health_snapshot(&self) -> DiagnosticsHealthSnapshot {
+                DiagnosticsHealthSnapshot::default()
+            }
+
+            fn runtime_snapshot(&self) -> DiagnosticsRuntimeSnapshot {
+                let sequence = self
+                    .counter
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                DiagnosticsRuntimeSnapshot {
+                    generated_unix_ms: 10_000 + sequence,
+                    upload: VfsUploadStats {
+                        pending_uploads: sequence as usize,
+                        ..VfsUploadStats::default()
+                    },
+                    ..DiagnosticsRuntimeSnapshot::default()
+                }
+            }
+
+            fn recent_events(&self, _limit: usize) -> Vec<DiagnosticsRecentEvent> {
+                Vec::new()
+            }
+
+            fn environment_fingerprint(
+                &self,
+                case_workload_identity: Option<&str>,
+                run_workload_identity: Option<&str>,
+            ) -> EnvironmentFingerprint {
+                let mut fingerprint = self.fingerprint.clone();
+                fingerprint.workload_identity.case_workload =
+                    case_workload_identity.map(str::to_string);
+                fingerprint.workload_identity.run_workload =
+                    run_workload_identity.map(str::to_string);
+                fingerprint
+            }
+        }
+
+        let temp = mounts_dir_temp();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let (_case, run) = test_case_and_run(&store);
+        let static_source = static_source();
+        let source = CountingSnapshotSource {
+            session: static_source.session,
+            fingerprint: static_source.fingerprint,
+            counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let lease_manager = ControllerLeaseManager::default();
+        let lease = lease_manager
+            .acquire("tester".to_string(), Some(500))
+            .expect("acquire lease");
+
+        let response = execute_request(
+            DiagnosticsRequest::MaterializeReport {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id,
+                run_id: run.id,
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        );
+
+        let DiagnosticsResponse::InvestigationReport { report } = response else {
+            panic!("expected investigation report response");
+        };
+
+        let upload_pending_in_view = report.references.derived_view.raw.snapshot_sections["upload"]
+            ["pending_uploads"]
+            .as_u64()
+            .expect("pending uploads in derived view snapshot");
+        assert_eq!(report.references.runtime_snapshot.upload.pending_uploads, 1);
+        assert_eq!(upload_pending_in_view, 1);
     }
 
     #[test]
@@ -6126,11 +6265,11 @@ mod tests {
                 lease_id: lease.lease_id,
                 run_id: run.id.clone(),
                 source: TimelineEntrySource::Mcp,
-                kind: TimelineEntryKind::Note,
+                kind: TimelineEntryKind::Anomaly,
                 title: "cache miss burst".to_string(),
                 body: Some("MCP adapter observed a foreground read spike".to_string()),
                 actor: Some("studiofs-dev-mcp".to_string()),
-                reason: Some("annotate anomaly".to_string()),
+                reason: Some("operator observation".to_string()),
             },
             "secret",
             &source,

@@ -2255,11 +2255,11 @@ mod tests {
                     &run.id,
                     NewTimelineEntry {
                         source: TimelineEntrySource::Mcp,
-                        kind: TimelineEntryKind::Note,
+                        kind: TimelineEntryKind::Anomaly,
                         title: "cache miss burst".to_string(),
                         body: Some("Observed a foreground-read spike".to_string()),
                         actor: Some("studiofs-dev-mcp".to_string()),
-                        reason: Some("annotate anomaly".to_string()),
+                        reason: Some("operator observation".to_string()),
                     },
                 ))
                 .expect("append mcp note");
