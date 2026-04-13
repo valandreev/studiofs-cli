@@ -2,7 +2,8 @@
 
 use crate::diagnostics;
 use crate::investigation::{
-    InvestigationStore, NewTimelineEntry, TimelineEntryKind, TimelineEntrySource,
+    InvestigationHypothesisStatus, InvestigationStore, NewTimelineEntry, TimelineEntryKind,
+    TimelineEntrySource,
 };
 use clap::{Args, Subcommand};
 use serde_json::json;
@@ -39,8 +40,23 @@ impl InternalArgs {
             InternalAction::DiagnosticsCreateCase(args) => run_diagnostics_create_case(args),
             InternalAction::DiagnosticsCreateRun(args) => run_diagnostics_create_run(args),
             InternalAction::DiagnosticsAddTimeline(args) => run_diagnostics_add_timeline(args),
+            InternalAction::DiagnosticsCompareRunSpan(args) => {
+                run_diagnostics_compare_run_span(args)
+            }
+            InternalAction::DiagnosticsCreateHypothesis(args) => {
+                run_diagnostics_create_hypothesis(args)
+            }
+            InternalAction::DiagnosticsUpdateHypothesis(args) => {
+                run_diagnostics_update_hypothesis(args)
+            }
             InternalAction::DiagnosticsReadCase(args) => run_diagnostics_read_case(args),
             InternalAction::DiagnosticsReadRun(args) => run_diagnostics_read_run(args),
+            InternalAction::DiagnosticsReadComparison(args) => {
+                run_diagnostics_read_comparison(args)
+            }
+            InternalAction::DiagnosticsReadHypothesis(args) => {
+                run_diagnostics_read_hypothesis(args)
+            }
             InternalAction::DiagnosticsMaterializeReport(args) => {
                 run_diagnostics_materialize_report(args)
             }
@@ -63,10 +79,20 @@ enum InternalAction {
     DiagnosticsCreateRun(DiagnosticsCreateRunArgs),
     #[command(name = "diagnostics-add-timeline", hide = true)]
     DiagnosticsAddTimeline(DiagnosticsAddTimelineArgs),
+    #[command(name = "diagnostics-compare-run-span", hide = true)]
+    DiagnosticsCompareRunSpan(DiagnosticsCompareRunSpanArgs),
+    #[command(name = "diagnostics-create-hypothesis", hide = true)]
+    DiagnosticsCreateHypothesis(DiagnosticsCreateHypothesisArgs),
+    #[command(name = "diagnostics-update-hypothesis", hide = true)]
+    DiagnosticsUpdateHypothesis(DiagnosticsUpdateHypothesisArgs),
     #[command(name = "diagnostics-read-case", hide = true)]
     DiagnosticsReadCase(DiagnosticsReadCaseArgs),
     #[command(name = "diagnostics-read-run", hide = true)]
     DiagnosticsReadRun(DiagnosticsReadRunArgs),
+    #[command(name = "diagnostics-read-comparison", hide = true)]
+    DiagnosticsReadComparison(DiagnosticsReadComparisonArgs),
+    #[command(name = "diagnostics-read-hypothesis", hide = true)]
+    DiagnosticsReadHypothesis(DiagnosticsReadHypothesisArgs),
     #[command(name = "diagnostics-materialize-report", hide = true)]
     DiagnosticsMaterializeReport(DiagnosticsMaterializeReportArgs),
     #[command(name = "diagnostics-read-report", hide = true)]
@@ -186,6 +212,82 @@ struct DiagnosticsAddTimelineArgs {
 }
 
 #[derive(Debug, Args)]
+struct DiagnosticsCompareRunSpanArgs {
+    mount_point: String,
+
+    #[arg(long)]
+    lease_id: String,
+
+    #[arg(long)]
+    baseline_run_id: String,
+
+    #[arg(long)]
+    candidate_run_id: String,
+
+    #[arg(long)]
+    start_marker_title: String,
+
+    #[arg(long)]
+    end_marker_title: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct DiagnosticsCreateHypothesisArgs {
+    mount_point: String,
+
+    #[arg(long)]
+    lease_id: String,
+
+    #[arg(long)]
+    case_id: String,
+
+    #[arg(long)]
+    statement: String,
+
+    #[arg(long)]
+    expected_signal: String,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum HypothesisStatusArg {
+    Open,
+    Supported,
+    Rejected,
+    Inconclusive,
+}
+
+impl From<HypothesisStatusArg> for InvestigationHypothesisStatus {
+    fn from(value: HypothesisStatusArg) -> Self {
+        match value {
+            HypothesisStatusArg::Open => InvestigationHypothesisStatus::Open,
+            HypothesisStatusArg::Supported => InvestigationHypothesisStatus::Supported,
+            HypothesisStatusArg::Rejected => InvestigationHypothesisStatus::Rejected,
+            HypothesisStatusArg::Inconclusive => InvestigationHypothesisStatus::Inconclusive,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct DiagnosticsUpdateHypothesisArgs {
+    mount_point: String,
+
+    #[arg(long)]
+    lease_id: String,
+
+    #[arg(long)]
+    hypothesis_id: String,
+
+    #[arg(long, value_enum)]
+    status: HypothesisStatusArg,
+
+    #[arg(long)]
+    actor: Option<String>,
+
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
 struct DiagnosticsReadCaseArgs {
     #[arg(long)]
     case_id: String,
@@ -195,6 +297,18 @@ struct DiagnosticsReadCaseArgs {
 struct DiagnosticsReadRunArgs {
     #[arg(long)]
     run_id: String,
+}
+
+#[derive(Debug, Args)]
+struct DiagnosticsReadComparisonArgs {
+    #[arg(long)]
+    comparison_id: String,
+}
+
+#[derive(Debug, Args)]
+struct DiagnosticsReadHypothesisArgs {
+    #[arg(long)]
+    hypothesis_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -307,6 +421,60 @@ fn run_diagnostics_add_timeline(args: DiagnosticsAddTimelineArgs) -> anyhow::Res
     Ok(())
 }
 
+fn run_diagnostics_compare_run_span(args: DiagnosticsCompareRunSpanArgs) -> anyhow::Result<()> {
+    let client = live_client_for_mount(&args.mount_point)?;
+    let payload = crate::runtime_bridge::block_on(async move {
+        client
+            .compare_run_span(
+                &args.lease_id,
+                diagnostics::DiagnosticsCompareRunSpanRequest {
+                    baseline_run_id: args.baseline_run_id,
+                    candidate_run_id: args.candidate_run_id,
+                    start_marker_title: args.start_marker_title,
+                    end_marker_title: args.end_marker_title,
+                },
+            )
+            .await
+    })?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+fn run_diagnostics_create_hypothesis(args: DiagnosticsCreateHypothesisArgs) -> anyhow::Result<()> {
+    let client = live_client_for_mount(&args.mount_point)?;
+    let payload = crate::runtime_bridge::block_on(async move {
+        client
+            .create_hypothesis(
+                &args.lease_id,
+                &args.case_id,
+                args.statement,
+                args.expected_signal,
+                Vec::new(),
+            )
+            .await
+    })?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+fn run_diagnostics_update_hypothesis(args: DiagnosticsUpdateHypothesisArgs) -> anyhow::Result<()> {
+    let client = live_client_for_mount(&args.mount_point)?;
+    let payload = crate::runtime_bridge::block_on(async move {
+        client
+            .update_hypothesis_status(
+                &args.lease_id,
+                &args.hypothesis_id,
+                args.status.into(),
+                args.actor,
+                args.reason,
+                Vec::new(),
+            )
+            .await
+    })?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
 fn run_diagnostics_read_case(args: DiagnosticsReadCaseArgs) -> anyhow::Result<()> {
     let payload = InvestigationStore::default_store()?.load_case(&args.case_id)?;
     println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -315,6 +483,18 @@ fn run_diagnostics_read_case(args: DiagnosticsReadCaseArgs) -> anyhow::Result<()
 
 fn run_diagnostics_read_run(args: DiagnosticsReadRunArgs) -> anyhow::Result<()> {
     let payload = InvestigationStore::default_store()?.load_run(&args.run_id)?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+fn run_diagnostics_read_comparison(args: DiagnosticsReadComparisonArgs) -> anyhow::Result<()> {
+    let payload = InvestigationStore::default_store()?.load_comparison(&args.comparison_id)?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+fn run_diagnostics_read_hypothesis(args: DiagnosticsReadHypothesisArgs) -> anyhow::Result<()> {
+    let payload = InvestigationStore::default_store()?.load_hypothesis(&args.hypothesis_id)?;
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())
 }
@@ -524,6 +704,50 @@ mod tests {
             materialize_report.command,
             crate::cli::Commands::Internal(InternalArgs {
                 action: InternalAction::DiagnosticsMaterializeReport(_)
+            })
+        ));
+
+        let compare_run_span = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-compare-run-span",
+            "Z:",
+            "--lease-id",
+            "lease-1",
+            "--baseline-run-id",
+            "run-a",
+            "--candidate-run-id",
+            "run-b",
+            "--start-marker-title",
+            "warm copy",
+            "--end-marker-title",
+            "warm copy done",
+        ])
+        .unwrap();
+        assert!(matches!(
+            compare_run_span.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsCompareRunSpan(_)
+            })
+        ));
+
+        let create_hypothesis = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-create-hypothesis",
+            "Z:",
+            "--lease-id",
+            "lease-1",
+            "--case-id",
+            "case-1",
+            "--statement",
+            "queue wait dropped",
+            "--expected-signal",
+            "comparison delta becomes negative",
+        ])
+        .unwrap();
+        assert!(matches!(
+            create_hypothesis.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsCreateHypothesis(_)
             })
         ));
 
