@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use crate::vfs::VfsConfig;
 use studiofs_meta::Ino;
@@ -160,6 +161,19 @@ impl TransitMemoryBudget {
 
     pub async fn acquire_background(self: &Arc<Self>, bytes: usize) -> TransitMemoryGuard {
         self.acquire(TransitPriority::Background, bytes).await
+    }
+
+    pub async fn acquire_background_cancelable(
+        self: &Arc<Self>,
+        bytes: usize,
+        cancel_token: &CancellationToken,
+    ) -> Option<TransitMemoryGuard> {
+        let acquire = self.acquire(TransitPriority::Background, bytes);
+        tokio::pin!(acquire);
+        tokio::select! {
+            guard = &mut acquire => Some(guard),
+            _ = cancel_token.cancelled() => None,
+        }
     }
 
     async fn acquire(

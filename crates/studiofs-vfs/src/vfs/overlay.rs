@@ -266,6 +266,7 @@ mod tests {
                 object_id: 101,
                 content_epoch: 3,
                 created_unix_ms: 100,
+                not_before_unix_ms: 0,
                 retry_count: 0,
             },
             PendingUpload {
@@ -274,6 +275,7 @@ mod tests {
                 object_id: 202,
                 content_epoch: 5,
                 created_unix_ms: 200,
+                not_before_unix_ms: 0,
                 retry_count: 0,
             },
         ]);
