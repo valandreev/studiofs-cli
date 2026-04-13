@@ -39,6 +39,19 @@ impl InternalArgs {
             InternalAction::DiagnosticsAttach(args) => run_diagnostics_attach(args),
             InternalAction::DiagnosticsCreateCase(args) => run_diagnostics_create_case(args),
             InternalAction::DiagnosticsCreateRun(args) => run_diagnostics_create_run(args),
+            InternalAction::DiagnosticsListWorkflows(args) => run_diagnostics_list_workflows(args),
+            InternalAction::DiagnosticsStartWorkflow(args) => run_diagnostics_start_workflow(args),
+            InternalAction::DiagnosticsGetWorkflow(args) => run_diagnostics_get_workflow(args),
+            InternalAction::DiagnosticsAdvanceWorkflow(args) => {
+                run_diagnostics_advance_workflow(args)
+            }
+            InternalAction::DiagnosticsAckWorkflowStep(args) => {
+                run_diagnostics_ack_workflow_step(args)
+            }
+            InternalAction::DiagnosticsAbortWorkflow(args) => run_diagnostics_abort_workflow(args),
+            InternalAction::DiagnosticsCompleteWorkflow(args) => {
+                run_diagnostics_complete_workflow(args)
+            }
             InternalAction::DiagnosticsAddTimeline(args) => run_diagnostics_add_timeline(args),
             InternalAction::DiagnosticsCompareRunSpan(args) => {
                 run_diagnostics_compare_run_span(args)
@@ -77,6 +90,20 @@ enum InternalAction {
     DiagnosticsCreateCase(DiagnosticsCreateCaseArgs),
     #[command(name = "diagnostics-create-run", hide = true)]
     DiagnosticsCreateRun(DiagnosticsCreateRunArgs),
+    #[command(name = "diagnostics-list-workflows", hide = true)]
+    DiagnosticsListWorkflows(DiagnosticsListWorkflowsArgs),
+    #[command(name = "diagnostics-start-workflow", hide = true)]
+    DiagnosticsStartWorkflow(DiagnosticsStartWorkflowArgs),
+    #[command(name = "diagnostics-get-workflow", hide = true)]
+    DiagnosticsGetWorkflow(DiagnosticsGetWorkflowArgs),
+    #[command(name = "diagnostics-advance-workflow", hide = true)]
+    DiagnosticsAdvanceWorkflow(DiagnosticsAdvanceWorkflowArgs),
+    #[command(name = "diagnostics-ack-workflow-step", hide = true)]
+    DiagnosticsAckWorkflowStep(DiagnosticsAckWorkflowStepArgs),
+    #[command(name = "diagnostics-abort-workflow", hide = true)]
+    DiagnosticsAbortWorkflow(DiagnosticsAbortWorkflowArgs),
+    #[command(name = "diagnostics-complete-workflow", hide = true)]
+    DiagnosticsCompleteWorkflow(DiagnosticsCompleteWorkflowArgs),
     #[command(name = "diagnostics-add-timeline", hide = true)]
     DiagnosticsAddTimeline(DiagnosticsAddTimelineArgs),
     #[command(name = "diagnostics-compare-run-span", hide = true)]
@@ -148,6 +175,95 @@ struct DiagnosticsCreateRunArgs {
 
     #[arg(long)]
     workload_identity: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct DiagnosticsListWorkflowsArgs {
+    mount_point: String,
+}
+
+#[derive(Debug, Args)]
+struct DiagnosticsStartWorkflowArgs {
+    mount_point: String,
+
+    #[arg(long)]
+    lease_id: String,
+
+    #[arg(long)]
+    run_id: String,
+
+    #[arg(long)]
+    workflow_id: String,
+}
+
+#[derive(Debug, Args)]
+struct DiagnosticsGetWorkflowArgs {
+    mount_point: String,
+
+    #[arg(long)]
+    lease_id: String,
+
+    #[arg(long)]
+    workflow_run_id: String,
+}
+
+#[derive(Debug, Args)]
+struct DiagnosticsAdvanceWorkflowArgs {
+    mount_point: String,
+
+    #[arg(long)]
+    lease_id: String,
+
+    #[arg(long)]
+    workflow_run_id: String,
+
+    #[arg(long)]
+    step_id: String,
+}
+
+#[derive(Debug, Args)]
+struct DiagnosticsAckWorkflowStepArgs {
+    mount_point: String,
+
+    #[arg(long)]
+    lease_id: String,
+
+    #[arg(long)]
+    workflow_run_id: String,
+
+    #[arg(long)]
+    step_id: String,
+
+    #[arg(long)]
+    actor: Option<String>,
+
+    #[arg(long)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct DiagnosticsAbortWorkflowArgs {
+    mount_point: String,
+
+    #[arg(long)]
+    lease_id: String,
+
+    #[arg(long)]
+    workflow_run_id: String,
+
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct DiagnosticsCompleteWorkflowArgs {
+    mount_point: String,
+
+    #[arg(long)]
+    lease_id: String,
+
+    #[arg(long)]
+    workflow_run_id: String,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -399,6 +515,105 @@ fn run_diagnostics_create_run(args: DiagnosticsCreateRunArgs) -> anyhow::Result<
     Ok(())
 }
 
+fn run_live_diagnostics_command<F, Fut, P>(mount_point: &str, command: F) -> anyhow::Result<()>
+where
+    F: FnOnce(diagnostics::LocalDiagnosticsClient) -> Fut + Send,
+    Fut: std::future::Future<Output = anyhow::Result<P>> + Send,
+    P: serde::Serialize + Send,
+{
+    let client = live_client_for_mount(mount_point)?;
+    let payload = crate::runtime_bridge::block_on(async move { command(client).await })?;
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+fn run_diagnostics_list_workflows(args: DiagnosticsListWorkflowsArgs) -> anyhow::Result<()> {
+    let DiagnosticsListWorkflowsArgs { mount_point } = args;
+    run_live_diagnostics_command(&mount_point, |client| async move {
+        client.list_workflows().await
+    })
+}
+
+fn run_diagnostics_start_workflow(args: DiagnosticsStartWorkflowArgs) -> anyhow::Result<()> {
+    let DiagnosticsStartWorkflowArgs {
+        mount_point,
+        lease_id,
+        run_id,
+        workflow_id,
+    } = args;
+    run_live_diagnostics_command(&mount_point, |client| async move {
+        client
+            .start_workflow(&lease_id, &run_id, &workflow_id)
+            .await
+    })
+}
+
+fn run_diagnostics_get_workflow(args: DiagnosticsGetWorkflowArgs) -> anyhow::Result<()> {
+    let DiagnosticsGetWorkflowArgs {
+        mount_point,
+        lease_id,
+        workflow_run_id,
+    } = args;
+    run_live_diagnostics_command(&mount_point, |client| async move {
+        client.workflow_run(&lease_id, &workflow_run_id).await
+    })
+}
+
+fn run_diagnostics_advance_workflow(args: DiagnosticsAdvanceWorkflowArgs) -> anyhow::Result<()> {
+    let DiagnosticsAdvanceWorkflowArgs {
+        mount_point,
+        lease_id,
+        workflow_run_id,
+        step_id,
+    } = args;
+    run_live_diagnostics_command(&mount_point, |client| async move {
+        client
+            .advance_workflow_step(&lease_id, &workflow_run_id, &step_id)
+            .await
+    })
+}
+
+fn run_diagnostics_ack_workflow_step(args: DiagnosticsAckWorkflowStepArgs) -> anyhow::Result<()> {
+    let DiagnosticsAckWorkflowStepArgs {
+        mount_point,
+        lease_id,
+        workflow_run_id,
+        step_id,
+        actor,
+        note,
+    } = args;
+    run_live_diagnostics_command(&mount_point, |client| async move {
+        client
+            .acknowledge_manual_step(&lease_id, &workflow_run_id, &step_id, actor, note)
+            .await
+    })
+}
+
+fn run_diagnostics_abort_workflow(args: DiagnosticsAbortWorkflowArgs) -> anyhow::Result<()> {
+    let DiagnosticsAbortWorkflowArgs {
+        mount_point,
+        lease_id,
+        workflow_run_id,
+        reason,
+    } = args;
+    run_live_diagnostics_command(&mount_point, |client| async move {
+        client
+            .abort_workflow(&lease_id, &workflow_run_id, reason)
+            .await
+    })
+}
+
+fn run_diagnostics_complete_workflow(args: DiagnosticsCompleteWorkflowArgs) -> anyhow::Result<()> {
+    let DiagnosticsCompleteWorkflowArgs {
+        mount_point,
+        lease_id,
+        workflow_run_id,
+    } = args;
+    run_live_diagnostics_command(&mount_point, |client| async move {
+        client.complete_workflow(&lease_id, &workflow_run_id).await
+    })
+}
+
 fn run_diagnostics_add_timeline(args: DiagnosticsAddTimelineArgs) -> anyhow::Result<()> {
     let client = live_client_for_mount(&args.mount_point)?;
     let payload = crate::runtime_bridge::block_on(async move {
@@ -617,6 +832,125 @@ mod tests {
             create_run.command,
             crate::cli::Commands::Internal(InternalArgs {
                 action: InternalAction::DiagnosticsCreateRun(_)
+            })
+        ));
+
+        let list_workflows =
+            crate::cli::parse_for_test(&["internal", "diagnostics-list-workflows", "Z:"]).unwrap();
+        assert!(matches!(
+            list_workflows.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsListWorkflows(_)
+            })
+        ));
+
+        let start_workflow = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-start-workflow",
+            "Z:",
+            "--lease-id",
+            "lease-1",
+            "--run-id",
+            "run-1",
+            "--workflow-id",
+            "aja_hybrid_v1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            start_workflow.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsStartWorkflow(_)
+            })
+        ));
+
+        let get_workflow = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-get-workflow",
+            "Z:",
+            "--lease-id",
+            "lease-1",
+            "--workflow-run-id",
+            "workflow-1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            get_workflow.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsGetWorkflow(_)
+            })
+        ));
+
+        let advance_workflow = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-advance-workflow",
+            "Z:",
+            "--lease-id",
+            "lease-1",
+            "--workflow-run-id",
+            "workflow-1",
+            "--step-id",
+            "capture_attach_snapshot",
+        ])
+        .unwrap();
+        assert!(matches!(
+            advance_workflow.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsAdvanceWorkflow(_)
+            })
+        ));
+
+        let ack_workflow = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-ack-workflow-step",
+            "Z:",
+            "--lease-id",
+            "lease-1",
+            "--workflow-run-id",
+            "workflow-1",
+            "--step-id",
+            "run_manual_aja_phase",
+            "--actor",
+            "operator",
+        ])
+        .unwrap();
+        assert!(matches!(
+            ack_workflow.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsAckWorkflowStep(_)
+            })
+        ));
+
+        let abort_workflow = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-abort-workflow",
+            "Z:",
+            "--lease-id",
+            "lease-1",
+            "--workflow-run-id",
+            "workflow-1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            abort_workflow.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsAbortWorkflow(_)
+            })
+        ));
+
+        let complete_workflow = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-complete-workflow",
+            "Z:",
+            "--lease-id",
+            "lease-1",
+            "--workflow-run-id",
+            "workflow-1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            complete_workflow.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsCompleteWorkflow(_)
             })
         ));
 
