@@ -6,7 +6,7 @@ use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
 use crate::cli::{mount_profile, mount_profile_types, settings, utils};
 use crate::diagnostics::{
     DiagnosticsDataSource, LiveMountDiagnosticsSource, LiveMountRuntimeFingerprint,
-    LocalDiagnosticsHost,
+    LocalDiagnosticsHost, RuntimeProfilingBackend,
 };
 use chrono::Utc;
 use std::path::{Path, PathBuf};
@@ -89,6 +89,7 @@ struct PreparedForegroundSession {
     vfs: Arc<StudioVfs>,
     runtime: Runtime,
     diagnostics_source: Arc<dyn DiagnosticsDataSource>,
+    profiling_backend: Arc<dyn RuntimeProfilingBackend>,
     profiling: Option<MountProfileFinish>,
     write_path_observability_publisher: WritePathObservabilityPublisher,
 }
@@ -624,6 +625,35 @@ fn build_mount_profile_finish(
     })
 }
 
+fn build_runtime_profiling_backend(
+    name: &str,
+    cache_mode: &str,
+    cache_path: &Path,
+    run_in_foreground: bool,
+) -> Arc<dyn RuntimeProfilingBackend> {
+    let mount_mode = if run_in_foreground {
+        "foreground"
+    } else {
+        "daemon"
+    };
+
+    #[cfg(windows)]
+    let platform = "windows";
+    #[cfg(target_os = "macos")]
+    let platform = "macos";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let platform = "linux";
+
+    #[cfg(windows)]
+    let bridge = "winfsp";
+    #[cfg(unix)]
+    let bridge = "fuse";
+
+    mount_profile::runtime_profiling_backend(
+        name, platform, bridge, mount_mode, cache_mode, cache_path,
+    )
+}
+
 fn overlay_vfs_env(config: VfsConfigRaw) -> VfsConfigRaw {
     overlay_vfs_env_with(config, |key| std::env::var(key))
 }
@@ -937,6 +967,12 @@ impl MountSession {
                 &cache_path,
                 run_in_foreground,
             );
+            let profiling_backend = build_runtime_profiling_backend(
+                &command.name,
+                &cache_mode,
+                &cache_path,
+                run_in_foreground,
+            );
             let runtime = Runtime::new()
                 .map_err(|error| anyhow::anyhow!("failed to create tokio runtime: {error}"))?;
             let _guard = runtime.enter();
@@ -984,6 +1020,7 @@ impl MountSession {
                 vfs,
                 runtime,
                 diagnostics_source,
+                profiling_backend,
                 profiling,
                 write_path_observability_publisher,
             })
@@ -1075,6 +1112,7 @@ impl MountSession {
             vfs,
             runtime,
             diagnostics_source,
+            profiling_backend,
             mut profiling,
             mut write_path_observability_publisher,
         } = prepared;
@@ -1088,6 +1126,7 @@ impl MountSession {
             runtime.handle(),
             &self.actual_mount_path,
             diagnostics_source,
+            profiling_backend,
         );
         let serve_result = backend.serve(BackendLaunch {
             vfs: vfs.clone(),
@@ -1481,8 +1520,8 @@ mod tests {
     use super::*;
     use crate::diagnostics;
     use crate::investigation::{
-        InvestigationStore, NewTimelineEntry, TimelineEntryKind, TimelineEntrySource,
-        set_test_store_base_dir,
+        DiagnosticsPreset, InvestigationStore, NewTimelineEntry, ProfilingCaptureMode,
+        ProfilingWindowStatus, TimelineEntryKind, TimelineEntrySource, set_test_store_base_dir,
     };
     use std::io;
     use std::sync::{Arc, Mutex, OnceLock};
@@ -2131,6 +2170,51 @@ mod tests {
                     Some("copy-pass-1".to_string()),
                 ))
                 .expect("create investigation run");
+            let profiling_status = launch
+                .runtime_handle
+                .block_on(competing_client.profiling_status())
+                .expect("read profiling status");
+            assert_eq!(
+                profiling_status.max_duration_ms,
+                diagnostics::MAX_PROFILE_WINDOW_DURATION_MS
+            );
+            assert!(
+                profiling_status
+                    .supported_presets
+                    .contains(&DiagnosticsPreset::Balanced)
+            );
+            let profiling_window = launch
+                .runtime_handle
+                .block_on(competing_client.start_profiling_window(
+                    &renewed.lease_id,
+                    &run.id,
+                    diagnostics::StartProfilingWindowRequest {
+                        capture_mode: ProfilingCaptureMode::WallBlocking,
+                        preset: DiagnosticsPreset::Balanced,
+                        budget: diagnostics::ProfilingBudget {
+                            duration_ms: 500,
+                            sample_rate_hz: Some(99),
+                        },
+                    },
+                ))
+                .expect("start profiling window");
+            let final_window = if profiling_window.status == ProfilingWindowStatus::Running {
+                launch
+                    .runtime_handle
+                    .block_on(
+                        competing_client
+                            .stop_profiling_window(&renewed.lease_id, &profiling_window.window_id),
+                    )
+                    .expect("stop profiling window")
+            } else {
+                profiling_window
+            };
+            assert!(matches!(
+                final_window.status,
+                ProfilingWindowStatus::Completed
+                    | ProfilingWindowStatus::Failed
+                    | ProfilingWindowStatus::Unsupported
+            ));
             launch
                 .runtime_handle
                 .block_on(competing_client.append_timeline_entry(
@@ -2206,6 +2290,13 @@ mod tests {
         assert_eq!(persisted_run.timeline.len(), 2);
         assert_eq!(persisted_run.timeline[0].source, TimelineEntrySource::Cli);
         assert_eq!(persisted_run.timeline[1].source, TimelineEntrySource::Mcp);
+        assert_eq!(persisted_run.profiling_windows.len(), 1);
+        assert!(matches!(
+            persisted_run.profiling_windows[0].status,
+            ProfilingWindowStatus::Completed
+                | ProfilingWindowStatus::Failed
+                | ProfilingWindowStatus::Unsupported
+        ));
     }
 
     #[test]

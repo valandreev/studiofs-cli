@@ -1,9 +1,11 @@
 use crate::cli::utils;
 use crate::investigation::{
-    BuildIdentity, DiagnosticsSettingsFingerprint, EnvironmentFingerprint, InvestigationCase,
-    InvestigationRun, InvestigationStore, MachineFingerprint, NewInvestigationCase,
-    NewInvestigationRun, NewTimelineEntry, PlatformFingerprint, RuntimeConfigurationFingerprint,
-    TimelineEntry, TimelineEntryKind, TimelineEntrySource, WorkloadIdentityFingerprint,
+    BuildIdentity, DiagnosticsPreset, DiagnosticsSettingsFingerprint, EnvironmentFingerprint,
+    InvestigationCase, InvestigationRun, InvestigationStore, MachineFingerprint,
+    NewInvestigationCase, NewInvestigationRun, NewProfilingWindow, NewTimelineEntry,
+    PlatformFingerprint, ProfileArtifactRecord, ProfilingCaptureMode, ProfilingCostEstimate,
+    ProfilingWindowRecord, ProfilingWindowStatus, RuntimeConfigurationFingerprint, TimelineEntry,
+    TimelineEntryKind, TimelineEntrySource, WorkloadIdentityFingerprint,
 };
 use anyhow::{Context, Result, anyhow};
 use parking_lot::Mutex;
@@ -52,7 +54,7 @@ use windows::{
     core::w,
 };
 
-pub(crate) const DIAGNOSTICS_RUNTIME_SURFACE_PROTOCOL_VERSION: u32 = 2;
+pub(crate) const DIAGNOSTICS_RUNTIME_SURFACE_PROTOCOL_VERSION: u32 = 3;
 pub(crate) const DIAGNOSTICS_PROTOCOL_VERSION: u32 = DIAGNOSTICS_RUNTIME_SURFACE_PROTOCOL_VERSION;
 const DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_LEASE_TTL_MS: u64 = 5_000;
@@ -64,6 +66,11 @@ const CONNECT_RETRY_DELAY_MS: u64 = 25;
 const MAX_DIAGNOSTICS_REQUEST_FRAME_BYTES: usize = 64 * 1024;
 const MAX_DIAGNOSTICS_RESPONSE_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DIAGNOSTICS_CONNECTIONS: usize = 16;
+const DEFAULT_PROFILE_WINDOW_DURATION_MS: u64 = 5_000;
+const DEFAULT_PROFILE_SAMPLE_RATE_HZ: u32 = 100;
+const MIN_PROFILE_SAMPLE_RATE_HZ: u32 = 1;
+const MAX_PROFILE_SAMPLE_RATE_HZ: u32 = 1_000;
+pub(crate) const MAX_PROFILE_WINDOW_DURATION_MS: u64 = 30_000;
 #[cfg(unix)]
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
 
@@ -207,6 +214,322 @@ pub(crate) trait DiagnosticsDataSource: Send + Sync + 'static {
         case_workload_identity: Option<&str>,
         run_workload_identity: Option<&str>,
     ) -> EnvironmentFingerprint;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ProfilingBudget {
+    pub duration_ms: u64,
+    pub sample_rate_hz: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct StartProfilingWindowRequest {
+    pub capture_mode: ProfilingCaptureMode,
+    pub preset: DiagnosticsPreset,
+    pub budget: ProfilingBudget,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct DiagnosticsProfilingStatus {
+    pub supported_presets: Vec<DiagnosticsPreset>,
+    pub supported_capture_modes: Vec<ProfilingCaptureMode>,
+    pub default_duration_ms: u64,
+    pub max_duration_ms: u64,
+    pub default_sample_rate_hz: u32,
+    pub max_sample_rate_hz: u32,
+    pub active_window: Option<ProfilingWindowRecord>,
+}
+
+pub(crate) trait RuntimeProfilingStopper: Send + 'static {
+    fn stop(self: Box<Self>) -> Result<ProfilingBackendStopResult>;
+}
+
+pub(crate) struct ActiveRuntimeProfilingWindow {
+    pub sample_rate_hz: Option<u32>,
+    pub stopper: Box<dyn RuntimeProfilingStopper>,
+}
+
+pub(crate) struct ProfilingBackendStopResult {
+    pub actual_duration_ms: Option<u64>,
+    pub status: ProfilingWindowStatus,
+    pub artifact: Option<ProfileArtifactRecord>,
+    pub error: Option<String>,
+}
+
+#[allow(dead_code)]
+pub(crate) enum ProfilingBackendStartResult {
+    Active(ActiveRuntimeProfilingWindow),
+    Unsupported { error: String },
+}
+
+pub(crate) trait RuntimeProfilingBackend: Send + Sync + 'static {
+    fn supported_capture_modes(&self) -> Vec<ProfilingCaptureMode>;
+    fn start_window(&self, request: &StartProfilingWindowRequest) -> ProfilingBackendStartResult;
+}
+
+pub(crate) struct DiagnosticsProfilingCoordinator {
+    backend: Arc<dyn RuntimeProfilingBackend>,
+    active_window: Mutex<Option<ActiveProfilingWindow>>,
+}
+
+struct ActiveProfilingWindow {
+    window_id: String,
+    run_id: String,
+    occurred_unix_ms: u64,
+    started_at: Instant,
+    capture_mode: ProfilingCaptureMode,
+    preset: DiagnosticsPreset,
+    requested_duration_ms: u64,
+    sample_rate_hz: Option<u32>,
+    estimated_cost: ProfilingCostEstimate,
+    stopper: Box<dyn RuntimeProfilingStopper>,
+}
+
+impl DiagnosticsProfilingCoordinator {
+    fn new(backend: Arc<dyn RuntimeProfilingBackend>) -> Self {
+        Self {
+            backend,
+            active_window: Mutex::new(None),
+        }
+    }
+
+    fn start_window(
+        &self,
+        run_id: &str,
+        request: StartProfilingWindowRequest,
+        investigation_store: Option<&InvestigationStore>,
+    ) -> Result<ProfilingWindowRecord> {
+        validate_profiling_request(&request)?;
+
+        let estimated_cost = estimate_profiling_cost(&request);
+        let occurred_unix_ms = now_unix_millis();
+        let effective_sample_rate_hz = Some(
+            request
+                .budget
+                .sample_rate_hz
+                .unwrap_or(DEFAULT_PROFILE_SAMPLE_RATE_HZ),
+        );
+        let window_id = Uuid::new_v4().to_string();
+
+        let mut active_window = self.active_window.lock();
+        if active_window.is_some() {
+            return Err(anyhow!("profiling window already active"));
+        }
+
+        match self.backend.start_window(&request) {
+            ProfilingBackendStartResult::Active(active) => {
+                *active_window = Some(ActiveProfilingWindow {
+                    window_id: window_id.clone(),
+                    run_id: run_id.to_string(),
+                    occurred_unix_ms,
+                    started_at: Instant::now(),
+                    capture_mode: request.capture_mode,
+                    preset: request.preset,
+                    requested_duration_ms: request.budget.duration_ms,
+                    sample_rate_hz: active.sample_rate_hz.or(effective_sample_rate_hz),
+                    estimated_cost: estimated_cost.clone(),
+                    stopper: active.stopper,
+                });
+                Ok(ProfilingWindowRecord {
+                    window_id,
+                    sequence: 0,
+                    occurred_unix_ms,
+                    capture_mode: request.capture_mode,
+                    preset: request.preset,
+                    requested_duration_ms: request.budget.duration_ms,
+                    actual_duration_ms: None,
+                    sample_rate_hz: effective_sample_rate_hz,
+                    estimated_cost,
+                    status: ProfilingWindowStatus::Running,
+                    artifact: None,
+                    error: None,
+                })
+            }
+            ProfilingBackendStartResult::Unsupported { error } => {
+                let record = ProfilingWindowRecord {
+                    window_id: window_id.clone(),
+                    sequence: 0,
+                    occurred_unix_ms,
+                    capture_mode: request.capture_mode,
+                    preset: request.preset,
+                    requested_duration_ms: request.budget.duration_ms,
+                    actual_duration_ms: None,
+                    sample_rate_hz: effective_sample_rate_hz,
+                    estimated_cost: estimated_cost.clone(),
+                    status: ProfilingWindowStatus::Unsupported,
+                    artifact: None,
+                    error: Some(error.clone()),
+                };
+                if let Some(store) = investigation_store {
+                    return store.append_profiling_window(
+                        run_id,
+                        NewProfilingWindow {
+                            window_id,
+                            capture_mode: request.capture_mode,
+                            preset: request.preset,
+                            requested_duration_ms: request.budget.duration_ms,
+                            actual_duration_ms: None,
+                            sample_rate_hz: effective_sample_rate_hz,
+                            estimated_cost,
+                            status: ProfilingWindowStatus::Unsupported,
+                            artifact: None,
+                            error: Some(error),
+                        },
+                    );
+                }
+                Ok(record)
+            }
+        }
+    }
+
+    fn stop_window(
+        &self,
+        window_id: &str,
+        investigation_store: Option<&InvestigationStore>,
+    ) -> Result<ProfilingWindowRecord> {
+        let active = {
+            let mut active_window = self.active_window.lock();
+            let Some(active) = active_window.take() else {
+                return Err(anyhow!("profiling window is not currently active"));
+            };
+            if active.window_id != window_id {
+                *active_window = Some(active);
+                return Err(anyhow!("profiling window '{window_id}' is not current"));
+            }
+            active
+        };
+
+        let result = match active.stopper.stop() {
+            Ok(result) => result,
+            Err(error) => ProfilingBackendStopResult {
+                actual_duration_ms: None,
+                status: ProfilingWindowStatus::Failed,
+                artifact: None,
+                error: Some(error.to_string()),
+            },
+        };
+
+        let record = ProfilingWindowRecord {
+            window_id: active.window_id.clone(),
+            sequence: 0,
+            occurred_unix_ms: active.occurred_unix_ms,
+            capture_mode: active.capture_mode,
+            preset: active.preset,
+            requested_duration_ms: active.requested_duration_ms,
+            actual_duration_ms: result.actual_duration_ms.or_else(|| {
+                Some(
+                    active
+                        .started_at
+                        .elapsed()
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                )
+            }),
+            sample_rate_hz: active.sample_rate_hz,
+            estimated_cost: active.estimated_cost.clone(),
+            status: result.status,
+            artifact: result.artifact.clone(),
+            error: result.error.clone(),
+        };
+
+        if let Some(store) = investigation_store {
+            return store.append_profiling_window(
+                &active.run_id,
+                NewProfilingWindow {
+                    window_id: active.window_id,
+                    capture_mode: active.capture_mode,
+                    preset: active.preset,
+                    requested_duration_ms: active.requested_duration_ms,
+                    actual_duration_ms: record.actual_duration_ms,
+                    sample_rate_hz: active.sample_rate_hz,
+                    estimated_cost: active.estimated_cost,
+                    status: record.status,
+                    artifact: result.artifact,
+                    error: result.error,
+                },
+            );
+        }
+
+        Ok(record)
+    }
+
+    fn status(&self) -> DiagnosticsProfilingStatus {
+        let active_window = self.active_window.lock();
+        DiagnosticsProfilingStatus {
+            supported_presets: vec![
+                DiagnosticsPreset::Minimal,
+                DiagnosticsPreset::Balanced,
+                DiagnosticsPreset::Deep,
+            ],
+            supported_capture_modes: self.backend.supported_capture_modes(),
+            default_duration_ms: DEFAULT_PROFILE_WINDOW_DURATION_MS,
+            max_duration_ms: MAX_PROFILE_WINDOW_DURATION_MS,
+            default_sample_rate_hz: DEFAULT_PROFILE_SAMPLE_RATE_HZ,
+            max_sample_rate_hz: MAX_PROFILE_SAMPLE_RATE_HZ,
+            active_window: active_window.as_ref().map(|active| ProfilingWindowRecord {
+                window_id: active.window_id.clone(),
+                sequence: 0,
+                occurred_unix_ms: active.occurred_unix_ms,
+                capture_mode: active.capture_mode,
+                preset: active.preset,
+                requested_duration_ms: active.requested_duration_ms,
+                actual_duration_ms: None,
+                sample_rate_hz: active.sample_rate_hz,
+                estimated_cost: active.estimated_cost.clone(),
+                status: ProfilingWindowStatus::Running,
+                artifact: None,
+                error: None,
+            }),
+        }
+    }
+}
+
+fn validate_profiling_request(request: &StartProfilingWindowRequest) -> Result<()> {
+    if request.budget.duration_ms == 0 {
+        return Err(anyhow!("profiling duration must be greater than zero"));
+    }
+    if request.budget.duration_ms > MAX_PROFILE_WINDOW_DURATION_MS {
+        return Err(anyhow!("profiling budget exceeds limit"));
+    }
+    if let Some(sample_rate_hz) = request.budget.sample_rate_hz
+        && !(MIN_PROFILE_SAMPLE_RATE_HZ..=MAX_PROFILE_SAMPLE_RATE_HZ).contains(&sample_rate_hz)
+    {
+        return Err(anyhow!(
+            "profiling sample rate must be between {} and {} Hz",
+            MIN_PROFILE_SAMPLE_RATE_HZ,
+            MAX_PROFILE_SAMPLE_RATE_HZ
+        ));
+    }
+    Ok(())
+}
+
+fn estimate_profiling_cost(request: &StartProfilingWindowRequest) -> ProfilingCostEstimate {
+    let base_score: u8 = match request.preset {
+        DiagnosticsPreset::Minimal => 1,
+        DiagnosticsPreset::Balanced => 2,
+        DiagnosticsPreset::Deep => 3,
+    };
+    let longer_than_default = request.budget.duration_ms > DEFAULT_PROFILE_WINDOW_DURATION_MS;
+    let higher_than_default = request
+        .budget
+        .sample_rate_hz
+        .unwrap_or(DEFAULT_PROFILE_SAMPLE_RATE_HZ)
+        > DEFAULT_PROFILE_SAMPLE_RATE_HZ;
+    let score = if longer_than_default || higher_than_default {
+        base_score.saturating_add(1)
+    } else {
+        base_score
+    };
+    let label = match request.preset {
+        DiagnosticsPreset::Minimal => "minimal",
+        DiagnosticsPreset::Balanced => "balanced",
+        DiagnosticsPreset::Deep => "deep",
+    };
+    ProfilingCostEstimate {
+        score,
+        label: label.to_string(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -417,6 +740,20 @@ enum DiagnosticsRequest {
         case_id: String,
         run_workload_identity: Option<String>,
     },
+    StartProfilingWindow {
+        auth_token: String,
+        lease_id: String,
+        run_id: String,
+        request: StartProfilingWindowRequest,
+    },
+    StopProfilingWindow {
+        auth_token: String,
+        lease_id: String,
+        window_id: String,
+    },
+    ProfilingStatus {
+        auth_token: String,
+    },
     AppendTimelineEntry {
         auth_token: String,
         lease_id: String,
@@ -453,6 +790,12 @@ enum DiagnosticsResponse {
     },
     InvestigationRun {
         run: Box<InvestigationRun>,
+    },
+    ProfilingWindow {
+        window: Box<ProfilingWindowRecord>,
+    },
+    ProfilingStatus {
+        status: Box<DiagnosticsProfilingStatus>,
     },
     TimelineEntry {
         entry: TimelineEntry,
@@ -559,6 +902,7 @@ impl LocalDiagnosticsHost {
         runtime: &Handle,
         mount_point: &str,
         source: Arc<dyn DiagnosticsDataSource>,
+        profiling_backend: Arc<dyn RuntimeProfilingBackend>,
     ) -> Result<Self> {
         #[cfg(test)]
         if let Some(message) = TEST_START_FAILURE
@@ -590,12 +934,14 @@ impl LocalDiagnosticsHost {
             }
         };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let profiling = Arc::new(DiagnosticsProfilingCoordinator::new(profiling_backend));
         let task = runtime.spawn(run_server(
             endpoint,
             discovery.auth_token.clone(),
             source,
             lease_manager,
             investigation_store,
+            Some(profiling),
             shutdown_rx,
         ));
 
@@ -611,8 +957,9 @@ impl LocalDiagnosticsHost {
         runtime: &Handle,
         mount_point: &str,
         source: Arc<dyn DiagnosticsDataSource>,
+        profiling_backend: Arc<dyn RuntimeProfilingBackend>,
     ) -> Option<Self> {
-        match Self::start(runtime, mount_point, source) {
+        match Self::start(runtime, mount_point, source, profiling_backend) {
             Ok(host) => Some(host),
             Err(error) => {
                 warn!(
@@ -778,6 +1125,62 @@ impl LocalDiagnosticsClient {
             .await?
         {
             DiagnosticsResponse::InvestigationRun { run } => Ok(*run),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn profiling_status(&self) -> Result<DiagnosticsProfilingStatus> {
+        match self
+            .send(DiagnosticsRequest::ProfilingStatus {
+                auth_token: self.discovery.auth_token.clone(),
+            })
+            .await?
+        {
+            DiagnosticsResponse::ProfilingStatus { status } => Ok(*status),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn start_profiling_window(
+        &self,
+        lease_id: &str,
+        run_id: &str,
+        request: StartProfilingWindowRequest,
+    ) -> Result<ProfilingWindowRecord> {
+        match self
+            .send(DiagnosticsRequest::StartProfilingWindow {
+                auth_token: self.discovery.auth_token.clone(),
+                lease_id: lease_id.to_string(),
+                run_id: run_id.to_string(),
+                request,
+            })
+            .await?
+        {
+            DiagnosticsResponse::ProfilingWindow { window } => Ok(*window),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn stop_profiling_window(
+        &self,
+        lease_id: &str,
+        window_id: &str,
+    ) -> Result<ProfilingWindowRecord> {
+        match self
+            .send(DiagnosticsRequest::StopProfilingWindow {
+                auth_token: self.discovery.auth_token.clone(),
+                lease_id: lease_id.to_string(),
+                window_id: window_id.to_string(),
+            })
+            .await?
+        {
+            DiagnosticsResponse::ProfilingWindow { window } => Ok(*window),
             DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
             other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
         }
@@ -982,6 +1385,7 @@ async fn run_server(
     source: Arc<dyn DiagnosticsDataSource>,
     lease_manager: Arc<ControllerLeaseManager>,
     investigation_store: Option<Arc<InvestigationStore>>,
+    profiling: Option<Arc<DiagnosticsProfilingCoordinator>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let connection_limit = Arc::new(Semaphore::new(MAX_DIAGNOSTICS_CONNECTIONS));
@@ -1020,8 +1424,9 @@ async fn run_server(
                             let source = source.clone();
                             let lease_manager = lease_manager.clone();
                             let investigation_store = investigation_store.clone();
+                            let profiling = profiling.clone();
                             tokio::spawn(async move {
-                                if let Err(error) = handle_client(stream, auth_token, source, lease_manager, investigation_store, permit).await {
+                                if let Err(error) = handle_client(stream, auth_token, source, lease_manager, investigation_store, profiling, permit).await {
                                     warn!(error = %error, "diagnostics request failed");
                                 }
                             });
@@ -1081,8 +1486,9 @@ async fn run_server(
                             let source = source.clone();
                             let lease_manager = lease_manager.clone();
                             let investigation_store = investigation_store.clone();
+                            let profiling = profiling.clone();
                             tokio::spawn(async move {
-                                if let Err(error) = handle_client(connected_server, auth_token, source, lease_manager, investigation_store, permit).await {
+                                if let Err(error) = handle_client(connected_server, auth_token, source, lease_manager, investigation_store, profiling, permit).await {
                                     warn!(error = %error, "diagnostics request failed");
                                 }
                             });
@@ -1163,6 +1569,7 @@ async fn handle_client<S>(
     source: Arc<dyn DiagnosticsDataSource>,
     lease_manager: Arc<ControllerLeaseManager>,
     investigation_store: Option<Arc<InvestigationStore>>,
+    profiling: Option<Arc<DiagnosticsProfilingCoordinator>>,
     _permit: OwnedSemaphorePermit,
 ) -> Result<()>
 where
@@ -1199,6 +1606,7 @@ where
             source.as_ref(),
             &lease_manager,
             investigation_store.as_deref(),
+            profiling.as_deref(),
         );
         writer
             .write_all(serde_json::to_string(&response)?.as_bytes())
@@ -1288,6 +1696,7 @@ fn execute_request(
     source: &dyn DiagnosticsDataSource,
     lease_manager: &ControllerLeaseManager,
     investigation_store: Option<&InvestigationStore>,
+    profiling: Option<&DiagnosticsProfilingCoordinator>,
 ) -> DiagnosticsResponse {
     fn unauthorized() -> DiagnosticsResponse {
         DiagnosticsResponse::Error {
@@ -1313,6 +1722,20 @@ fn execute_request(
     fn lease_error(error: anyhow::Error) -> DiagnosticsResponse {
         DiagnosticsResponse::Error {
             code: "lease_invalid".to_string(),
+            message: error.to_string(),
+        }
+    }
+
+    fn profiling_unavailable() -> DiagnosticsResponse {
+        DiagnosticsResponse::Error {
+            code: "profiling_unavailable".to_string(),
+            message: "profiling control is unavailable for this session".to_string(),
+        }
+    }
+
+    fn profiling_budget_error(error: anyhow::Error) -> DiagnosticsResponse {
+        DiagnosticsResponse::Error {
+            code: "profiling_budget_invalid".to_string(),
             message: error.to_string(),
         }
     }
@@ -1382,6 +1805,19 @@ fn execute_request(
                 .clamp(1, MAX_RECENT_EVENTS_LIMIT);
             DiagnosticsResponse::RecentEvents {
                 events: source.recent_events(limit),
+            }
+        }
+        DiagnosticsRequest::ProfilingStatus {
+            auth_token: provided,
+        } => {
+            if provided != auth_token {
+                return unauthorized();
+            }
+            let Some(profiling) = profiling else {
+                return profiling_unavailable();
+            };
+            DiagnosticsResponse::ProfilingStatus {
+                status: Box::new(profiling.status()),
             }
         }
         DiagnosticsRequest::AcquireController {
@@ -1489,6 +1925,81 @@ fn execute_request(
             }) {
                 Ok(run) => DiagnosticsResponse::InvestigationRun { run: Box::new(run) },
                 Err(error) => store_error(error),
+            }
+        }
+        DiagnosticsRequest::StartProfilingWindow {
+            auth_token: provided,
+            lease_id,
+            run_id,
+            request,
+        } => {
+            let store = match mutating_request_store(
+                &provided,
+                auth_token,
+                &lease_id,
+                lease_manager,
+                investigation_store,
+            ) {
+                Ok(store) => store,
+                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
+                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
+                    return lease_error(error);
+                }
+                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
+                    return investigation_unavailable();
+                }
+            };
+            let Some(profiling) = profiling else {
+                return profiling_unavailable();
+            };
+            match profiling.start_window(&run_id, request, Some(store)) {
+                Ok(window) => DiagnosticsResponse::ProfilingWindow {
+                    window: Box::new(window),
+                },
+                Err(error) if error.to_string().contains("profiling budget") => {
+                    profiling_budget_error(error)
+                }
+                Err(error) if error.to_string().contains("sample rate") => {
+                    profiling_budget_error(error)
+                }
+                Err(error) => DiagnosticsResponse::Error {
+                    code: "profiling_start_failed".to_string(),
+                    message: error.to_string(),
+                },
+            }
+        }
+        DiagnosticsRequest::StopProfilingWindow {
+            auth_token: provided,
+            lease_id,
+            window_id,
+        } => {
+            let store = match mutating_request_store(
+                &provided,
+                auth_token,
+                &lease_id,
+                lease_manager,
+                investigation_store,
+            ) {
+                Ok(store) => store,
+                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
+                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
+                    return lease_error(error);
+                }
+                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
+                    return investigation_unavailable();
+                }
+            };
+            let Some(profiling) = profiling else {
+                return profiling_unavailable();
+            };
+            match profiling.stop_window(&window_id, Some(store)) {
+                Ok(window) => DiagnosticsResponse::ProfilingWindow {
+                    window: Box::new(window),
+                },
+                Err(error) => DiagnosticsResponse::Error {
+                    code: "profiling_stop_failed".to_string(),
+                    message: error.to_string(),
+                },
             }
         }
         DiagnosticsRequest::AppendTimelineEntry {
@@ -1707,6 +2218,68 @@ mod tests {
         }
     }
 
+    struct SuccessfulProfilingBackend;
+
+    impl RuntimeProfilingBackend for SuccessfulProfilingBackend {
+        fn supported_capture_modes(&self) -> Vec<ProfilingCaptureMode> {
+            vec![
+                ProfilingCaptureMode::WallBlocking,
+                ProfilingCaptureMode::Cpu,
+            ]
+        }
+
+        fn start_window(
+            &self,
+            request: &StartProfilingWindowRequest,
+        ) -> ProfilingBackendStartResult {
+            let sample_rate_hz = request
+                .budget
+                .sample_rate_hz
+                .or(Some(DEFAULT_PROFILE_SAMPLE_RATE_HZ));
+            ProfilingBackendStartResult::Active(ActiveRuntimeProfilingWindow {
+                sample_rate_hz,
+                stopper: Box::new(SuccessfulProfilingStopper),
+            })
+        }
+    }
+
+    struct SuccessfulProfilingStopper;
+
+    impl RuntimeProfilingStopper for SuccessfulProfilingStopper {
+        fn stop(self: Box<Self>) -> Result<ProfilingBackendStopResult> {
+            Ok(ProfilingBackendStopResult {
+                actual_duration_ms: Some(250),
+                status: ProfilingWindowStatus::Completed,
+                artifact: Some(ProfileArtifactRecord {
+                    kind: "pprof".to_string(),
+                    path: "profiles/window.pb.gz".to_string(),
+                    bytes: 2_048,
+                }),
+                error: None,
+            })
+        }
+    }
+
+    struct UnsupportedProfilingBackend(String);
+
+    impl RuntimeProfilingBackend for UnsupportedProfilingBackend {
+        fn supported_capture_modes(&self) -> Vec<ProfilingCaptureMode> {
+            vec![
+                ProfilingCaptureMode::WallBlocking,
+                ProfilingCaptureMode::Cpu,
+            ]
+        }
+
+        fn start_window(
+            &self,
+            _request: &StartProfilingWindowRequest,
+        ) -> ProfilingBackendStartResult {
+            ProfilingBackendStartResult::Unsupported {
+                error: self.0.clone(),
+            }
+        }
+    }
+
     fn static_source() -> StaticDiagnosticsSource {
         StaticDiagnosticsSource {
             session: DiagnosticsSessionInfo {
@@ -1881,6 +2454,7 @@ mod tests {
             &source,
             &lease_manager,
             Some(&store),
+            None,
         );
 
         assert!(matches!(
@@ -1900,6 +2474,7 @@ mod tests {
             "secret",
             &source,
             &ControllerLeaseManager::default(),
+            None,
             None,
         );
 
@@ -1938,6 +2513,7 @@ mod tests {
             &source,
             &ControllerLeaseManager::default(),
             None,
+            None,
         );
 
         let DiagnosticsResponse::RecentEvents { events } = response else {
@@ -1966,6 +2542,7 @@ mod tests {
             &source,
             &lease_manager,
             Some(&store),
+            None,
         ) {
             DiagnosticsResponse::ControllerLease { lease } => lease,
             other => panic!("unexpected lease response: {other:?}"),
@@ -1984,6 +2561,7 @@ mod tests {
             &source,
             &lease_manager,
             Some(&store),
+            None,
         ) {
             DiagnosticsResponse::InvestigationCase { case } => *case,
             other => panic!("unexpected case response: {other:?}"),
@@ -2000,6 +2578,7 @@ mod tests {
             &source,
             &lease_manager,
             Some(&store),
+            None,
         ) {
             DiagnosticsResponse::InvestigationRun { run } => *run,
             other => panic!("unexpected run response: {other:?}"),
@@ -2021,6 +2600,7 @@ mod tests {
             &source,
             &lease_manager,
             Some(&store),
+            None,
         );
         let _ = execute_request(
             DiagnosticsRequest::AppendTimelineEntry {
@@ -2038,6 +2618,7 @@ mod tests {
             &source,
             &lease_manager,
             Some(&store),
+            None,
         );
 
         let persisted_run = store.load_run(&run.id).expect("load run");
@@ -2067,6 +2648,202 @@ mod tests {
     }
 
     #[test]
+    fn profiling_requests_start_stop_and_persist_window() {
+        let source = static_source();
+        let lease_manager = ControllerLeaseManager::default();
+        let temp = mounts_dir_temp();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let profiling = DiagnosticsProfilingCoordinator::new(Arc::new(SuccessfulProfilingBackend));
+
+        let lease = match execute_request(
+            DiagnosticsRequest::AcquireController {
+                auth_token: "secret".to_string(),
+                client_name: "tester".to_string(),
+                ttl_ms: Some(250),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            Some(&profiling),
+        ) {
+            DiagnosticsResponse::ControllerLease { lease } => lease,
+            other => panic!("unexpected lease response: {other:?}"),
+        };
+
+        let case = match execute_request(
+            DiagnosticsRequest::CreateCase {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                title: "AJA slowdown".to_string(),
+                problem_statement: Some("Copy stalls after warmup".to_string()),
+                workload_identity: Some("aja".to_string()),
+                target_environment: Some("artist workstation".to_string()),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            Some(&profiling),
+        ) {
+            DiagnosticsResponse::InvestigationCase { case } => *case,
+            other => panic!("unexpected case response: {other:?}"),
+        };
+
+        let run = match execute_request(
+            DiagnosticsRequest::CreateRun {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                case_id: case.id.clone(),
+                run_workload_identity: Some("copy-pass-1".to_string()),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            Some(&profiling),
+        ) {
+            DiagnosticsResponse::InvestigationRun { run } => *run,
+            other => panic!("unexpected run response: {other:?}"),
+        };
+
+        let started = match execute_request(
+            DiagnosticsRequest::StartProfilingWindow {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                run_id: run.id.clone(),
+                request: StartProfilingWindowRequest {
+                    capture_mode: ProfilingCaptureMode::WallBlocking,
+                    preset: DiagnosticsPreset::Balanced,
+                    budget: ProfilingBudget {
+                        duration_ms: 500,
+                        sample_rate_hz: Some(99),
+                    },
+                },
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            Some(&profiling),
+        ) {
+            DiagnosticsResponse::ProfilingWindow { window } => *window,
+            other => panic!("unexpected profiling start response: {other:?}"),
+        };
+
+        assert_eq!(started.status, ProfilingWindowStatus::Running);
+
+        let stopped = match execute_request(
+            DiagnosticsRequest::StopProfilingWindow {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                window_id: started.window_id.clone(),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            Some(&profiling),
+        ) {
+            DiagnosticsResponse::ProfilingWindow { window } => *window,
+            other => panic!("unexpected profiling stop response: {other:?}"),
+        };
+
+        assert_eq!(stopped.status, ProfilingWindowStatus::Completed);
+        assert_eq!(stopped.sample_rate_hz, Some(99));
+        assert_eq!(stopped.preset, DiagnosticsPreset::Balanced);
+
+        let persisted_run = store.load_run(&run.id).expect("load run");
+        assert_eq!(persisted_run.profiling_windows.len(), 1);
+        assert_eq!(
+            persisted_run.profiling_windows[0]
+                .artifact
+                .as_ref()
+                .map(|artifact| artifact.kind.as_str()),
+            Some("pprof")
+        );
+    }
+
+    #[test]
+    fn profiling_requests_reject_budget_above_limit() {
+        let source = static_source();
+        let lease_manager = ControllerLeaseManager::default();
+        let temp = mounts_dir_temp();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let profiling = DiagnosticsProfilingCoordinator::new(Arc::new(SuccessfulProfilingBackend));
+
+        let lease = match execute_request(
+            DiagnosticsRequest::AcquireController {
+                auth_token: "secret".to_string(),
+                client_name: "tester".to_string(),
+                ttl_ms: Some(250),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            Some(&profiling),
+        ) {
+            DiagnosticsResponse::ControllerLease { lease } => lease,
+            other => panic!("unexpected lease response: {other:?}"),
+        };
+
+        let response = execute_request(
+            DiagnosticsRequest::StartProfilingWindow {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id,
+                run_id: "run-1".to_string(),
+                request: StartProfilingWindowRequest {
+                    capture_mode: ProfilingCaptureMode::Cpu,
+                    preset: DiagnosticsPreset::Minimal,
+                    budget: ProfilingBudget {
+                        duration_ms: MAX_PROFILE_WINDOW_DURATION_MS + 1,
+                        sample_rate_hz: Some(100),
+                    },
+                },
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            Some(&profiling),
+        );
+
+        assert!(matches!(
+            response,
+            DiagnosticsResponse::Error { code, .. } if code == "profiling_budget_invalid"
+        ));
+    }
+
+    #[test]
+    fn profiling_coordinator_returns_unsupported_window_without_crashing() {
+        let profiling = DiagnosticsProfilingCoordinator::new(Arc::new(
+            UnsupportedProfilingBackend("profiling backend unavailable".to_string()),
+        ));
+
+        let window = profiling
+            .start_window(
+                "run-1",
+                StartProfilingWindowRequest {
+                    capture_mode: ProfilingCaptureMode::Cpu,
+                    preset: DiagnosticsPreset::Minimal,
+                    budget: ProfilingBudget {
+                        duration_ms: 500,
+                        sample_rate_hz: Some(100),
+                    },
+                },
+                None,
+            )
+            .expect("unsupported backend should fail open");
+
+        assert_eq!(window.status, ProfilingWindowStatus::Unsupported);
+        assert_eq!(
+            window.error.as_deref(),
+            Some("profiling backend unavailable")
+        );
+    }
+
+    #[test]
     fn client_accepts_large_response_frames() {
         let mut source = static_source();
         source.session.cache_path = "C:/".to_string() + &"a".repeat(96 * 1024);
@@ -2082,6 +2859,7 @@ mod tests {
                 "secret".to_string(),
                 Arc::new(source),
                 Arc::new(ControllerLeaseManager::default()),
+                None,
                 None,
                 permit,
             ));
