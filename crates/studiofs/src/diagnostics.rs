@@ -4735,6 +4735,62 @@ mod tests {
     }
 
     #[test]
+    fn evidence_view_returns_empty_collections_for_empty_slices() {
+        let temp = mounts_dir_temp();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let (_case, run) = test_case_and_run(&store);
+        let lease_manager = ControllerLeaseManager::default();
+        let lease = lease_manager
+            .acquire("tester".to_string(), Some(500))
+            .expect("acquire lease");
+
+        let response = execute_request(
+            DiagnosticsRequest::EvidenceView {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id,
+                run_id: run.id,
+                request: DiagnosticsEvidenceRequest {
+                    scope: DiagnosticsEvidenceScope {
+                        subsystem: Some("upload_pipeline".to_string()),
+                        operation_type: Some("sample".to_string()),
+                        object_identity: Some(DiagnosticsObjectIdentity {
+                            path: Some("Q:/missing/file.mov".to_string()),
+                            ..DiagnosticsObjectIdentity::default()
+                        }),
+                        ..DiagnosticsEvidenceScope::default()
+                    },
+                    budget: DiagnosticsEvidenceBudget {
+                        max_recent_events: 8,
+                        max_timeline_entries: 8,
+                        max_profiling_windows: 4,
+                        max_derived_items_per_kind: 4,
+                    },
+                },
+            },
+            "secret",
+            &static_source(),
+            &lease_manager,
+            Some(&store),
+            None,
+        );
+
+        let DiagnosticsResponse::EvidenceView { view } = response else {
+            panic!("expected evidence view response");
+        };
+
+        assert!(view.raw.recent_events.is_empty());
+        assert!(view.raw.timeline_entries.is_empty());
+        assert!(view.raw.profiling_windows.is_empty());
+        assert!(view.derived.queue_growth.is_empty());
+        assert!(view.derived.blocking_intervals.is_empty());
+        assert!(view.derived.hotspots.is_empty());
+        assert!(
+            !view.raw.snapshot_sections.is_empty(),
+            "empty slices should still return the scoped snapshot surface"
+        );
+    }
+
+    #[test]
     fn silent_log_verbosity_action_returns_updated_level_without_timeline_entry() {
         crate::ensure_test_diagnostics_log_filter();
 
