@@ -1,5 +1,6 @@
 use crate::cli::utils;
 use anyhow::{Context, Result, anyhow};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::fs;
 #[cfg(unix)]
@@ -7,7 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use studiofs_meta::FormatInfo;
 use studiofs_vfs::vfs::VfsFileSessionStats;
@@ -197,7 +198,7 @@ struct ControllerLeaseManager {
 impl ControllerLeaseManager {
     fn snapshot(&self) -> Option<ControllerLease> {
         let now = now_unix_millis();
-        let mut state = self.state.lock().expect("controller lease mutex poisoned");
+        let mut state = self.state.lock();
         if state
             .as_ref()
             .is_some_and(|lease| lease.expires_unix_ms <= now)
@@ -209,7 +210,7 @@ impl ControllerLeaseManager {
 
     fn acquire(&self, client_name: String, ttl_ms: Option<u64>) -> Result<ControllerLease> {
         let now = now_unix_millis();
-        let mut state = self.state.lock().expect("controller lease mutex poisoned");
+        let mut state = self.state.lock();
         if state
             .as_ref()
             .is_some_and(|lease| lease.expires_unix_ms <= now)
@@ -238,7 +239,7 @@ impl ControllerLeaseManager {
 
     fn renew(&self, lease_id: &str, ttl_ms: Option<u64>) -> Result<ControllerLease> {
         let now = now_unix_millis();
-        let mut state = self.state.lock().expect("controller lease mutex poisoned");
+        let mut state = self.state.lock();
         if state
             .as_ref()
             .is_some_and(|lease| lease.expires_unix_ms <= now)
@@ -274,7 +275,6 @@ impl LocalDiagnosticsHost {
         if let Some(message) = TEST_START_FAILURE
             .get_or_init(|| Mutex::new(None))
             .lock()
-            .expect("test start failure mutex poisoned")
             .clone()
         {
             return Err(anyhow!(message));
@@ -685,8 +685,7 @@ async fn connect_named_pipe_with_retry(
 pub(crate) fn set_test_start_failure(message: Option<&str>) {
     *TEST_START_FAILURE
         .get_or_init(|| Mutex::new(None))
-        .lock()
-        .expect("test start failure mutex poisoned") = message.map(str::to_string);
+        .lock() = message.map(str::to_string);
 }
 
 async fn handle_client<S>(
@@ -700,18 +699,20 @@ where
 {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
-    let read = reader.read_line(&mut line).await?;
-    if read == 0 {
-        return Ok(());
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line).await?;
+        if read == 0 {
+            break;
+        }
+        let request: DiagnosticsRequest = serde_json::from_str(line.trim_end())?;
+        let response = execute_request(request, &auth_token, source.as_ref(), &lease_manager);
+        writer
+            .write_all(serde_json::to_string(&response)?.as_bytes())
+            .await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
     }
-    let request: DiagnosticsRequest = serde_json::from_str(line.trim_end())?;
-    let response = execute_request(request, &auth_token, source.as_ref(), &lease_manager);
-    writer
-        .write_all(serde_json::to_string(&response)?.as_bytes())
-        .await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
     Ok(())
 }
 

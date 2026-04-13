@@ -1085,11 +1085,11 @@ impl MountSession {
             #[cfg(unix)]
             run_in_foreground: self.run_in_foreground,
         });
+        write_path_observability_publisher.stop_and_join();
+        runtime.block_on(vfs.shutdown(shutdown_upload_drain_timeout()));
         if let Some(diagnostics_host) = diagnostics_host {
             diagnostics_host.stop();
         }
-        write_path_observability_publisher.stop_and_join();
-        runtime.block_on(vfs.shutdown(shutdown_upload_drain_timeout()));
         if let Some(mut finish_profiling) = profiling.take() {
             finish_profiling();
         }

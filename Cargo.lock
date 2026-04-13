@@ -3478,6 +3478,7 @@ dependencies = [
  "home",
  "libc",
  "opendal",
+ "parking_lot",
  "prost",
  "pyroscope",
  "reqwest 0.12.28",

@@ -40,6 +40,7 @@ prost = "0.14"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 sysinfo.workspace = true
 url.workspace = true
+parking_lot.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 studiofs-fuse.workspace = true
