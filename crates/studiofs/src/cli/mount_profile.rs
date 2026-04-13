@@ -1,4 +1,9 @@
 use crate::cli::mount_profile_types::MountProfileMode;
+use crate::diagnostics::{
+    ActiveRuntimeProfilingWindow, ProfilingBackendStartResult, ProfilingBackendStopResult,
+    RuntimeProfilingBackend, RuntimeProfilingStopper, StartProfilingWindowRequest,
+};
+use crate::investigation::{ProfilingCaptureMode, ProfilingWindowStatus};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use flate2::{Compression, write::GzEncoder};
@@ -15,6 +20,7 @@ use std::env;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -174,6 +180,189 @@ impl MountProfileSession {
         if let Err(err) = backend.shutdown() {
             warn!("Pyroscope CPU profiler shutdown failed: {err}");
         }
+    }
+}
+
+struct MountRuntimeProfilingBackend {
+    volume_name: String,
+    platform: String,
+    bridge: String,
+    mount_mode: String,
+    cache_mode: String,
+    output_dir: PathBuf,
+    app_name: String,
+    endpoint: Option<ProfileEndpoint>,
+}
+
+struct MountRuntimeProfileStopper {
+    backend: BackendImpl<BackendReady>,
+    started_at: DateTime<Utc>,
+    sample_rate: u32,
+    endpoint: Option<ProfileEndpoint>,
+    app_name: String,
+    tags: Vec<(String, String)>,
+    source: String,
+    output_dir: PathBuf,
+}
+
+impl RuntimeProfilingBackend for MountRuntimeProfilingBackend {
+    fn supported_capture_modes(&self) -> Vec<ProfilingCaptureMode> {
+        vec![ProfilingCaptureMode::Cpu]
+    }
+
+    fn start_window(&self, request: &StartProfilingWindowRequest) -> ProfilingBackendStartResult {
+        if request.capture_mode != ProfilingCaptureMode::Cpu {
+            return ProfilingBackendStartResult::Unsupported {
+                error: "cpu profiling backend does not support wall/blocking captures".to_string(),
+            };
+        }
+        let sample_rate = request.budget.sample_rate_hz.unwrap_or(DEFAULT_SAMPLE_RATE);
+        let tags = merge_tags(
+            vec![
+                ("platform".to_string(), self.platform.clone()),
+                ("volume".to_string(), self.volume_name.clone()),
+                ("mount_mode".to_string(), self.mount_mode.clone()),
+                ("cache_mode".to_string(), self.cache_mode.clone()),
+                ("bridge".to_string(), self.bridge.clone()),
+                ("runtime".to_string(), "attach".to_string()),
+                (
+                    "capture_mode".to_string(),
+                    match request.capture_mode {
+                        ProfilingCaptureMode::WallBlocking => "wall_blocking",
+                        ProfilingCaptureMode::Cpu => "cpu",
+                    }
+                    .to_string(),
+                ),
+                (
+                    "preset".to_string(),
+                    format!("{:?}", request.preset).to_ascii_lowercase(),
+                ),
+            ],
+            read_custom_tags(),
+        );
+
+        let backend = match pprof_backend(PprofConfig { sample_rate }, BackendConfig::default())
+            .initialize()
+        {
+            Ok(backend) => backend,
+            Err(error) => {
+                return ProfilingBackendStartResult::Unsupported {
+                    error: format!("Pyroscope CPU profiler unavailable: {error}"),
+                };
+            }
+        };
+
+        let source = match request.capture_mode {
+            ProfilingCaptureMode::WallBlocking => "wall-blocking-window",
+            ProfilingCaptureMode::Cpu => "cpu-window",
+        }
+        .to_string();
+
+        ProfilingBackendStartResult::Active(ActiveRuntimeProfilingWindow {
+            sample_rate_hz: Some(sample_rate),
+            stopper: Box::new(MountRuntimeProfileStopper {
+                backend,
+                started_at: Utc::now(),
+                sample_rate,
+                endpoint: self.endpoint.clone(),
+                app_name: self.app_name.clone(),
+                tags,
+                source,
+                output_dir: self.output_dir.clone(),
+            }),
+        })
+    }
+}
+
+impl RuntimeProfilingStopper for MountRuntimeProfileStopper {
+    fn stop(mut self: Box<Self>) -> Result<ProfilingBackendStopResult> {
+        let finished_at = Utc::now();
+        let mut artifact = None;
+        let mut warnings = Vec::new();
+
+        let report = self
+            .backend
+            .report()
+            .map_err(|error| anyhow!("Pyroscope CPU profile collection failed: {error}"))?;
+        let mut report = report;
+        let bytes = render_cpu_pprof(&mut report, self.sample_rate, self.started_at, finished_at)
+            .map_err(|error| anyhow!("Pyroscope CPU profile export failed: {error}"))?;
+
+        match write_artifact(
+            &self.output_dir,
+            &self.app_name,
+            &self.source,
+            &self.tags,
+            finished_at,
+            bytes.as_slice(),
+        ) {
+            Ok(path) => {
+                let bytes_written = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+                artifact = Some(ProfileArtifactRecord {
+                    kind: "pprof".to_string(),
+                    path: path.to_string_lossy().into_owned(),
+                    bytes: bytes_written,
+                });
+            }
+            Err(error) => warnings.push(error.to_string()),
+        }
+
+        if let Some(endpoint) = self.endpoint.as_ref()
+            && let Err(error) = send_profile(
+                endpoint,
+                &self.app_name,
+                report.profile_type.as_str(),
+                &self.tags,
+                bytes.as_slice(),
+            )
+        {
+            warnings.push(format!("mount Pyroscope profile upload failed: {error}"));
+        }
+
+        if let Err(error) = self.backend.shutdown() {
+            warnings.push(format!("Pyroscope CPU profiler shutdown failed: {error}"));
+        }
+
+        Ok(ProfilingBackendStopResult {
+            actual_duration_ms: duration_millis(self.started_at, finished_at),
+            status: ProfilingWindowStatus::Completed,
+            artifact,
+            error: (!warnings.is_empty()).then(|| warnings.join("; ")),
+        })
+    }
+}
+
+pub(crate) fn runtime_profiling_backend(
+    volume_name: &str,
+    platform: &str,
+    bridge: &str,
+    mount_mode: &str,
+    cache_mode: &str,
+    cache_path: &Path,
+) -> Arc<dyn RuntimeProfilingBackend> {
+    Arc::new(MountRuntimeProfilingBackend {
+        volume_name: volume_name.to_string(),
+        platform: platform.to_string(),
+        bridge: bridge.to_string(),
+        mount_mode: mount_mode.to_string(),
+        cache_mode: cache_mode.to_string(),
+        output_dir: cache_path.join(PROFILE_DIR_NAME),
+        app_name: read_app_name(),
+        endpoint: read_endpoint(),
+    })
+}
+
+fn duration_millis(started_at: DateTime<Utc>, finished_at: DateTime<Utc>) -> Option<u64> {
+    let millis = (finished_at - started_at).num_milliseconds();
+    if millis < 0 {
+        warn!(
+            started_at = %started_at,
+            finished_at = %finished_at,
+            "profiling window finished before it started; omitting duration"
+        );
+        None
+    } else {
+        Some(millis as u64)
     }
 }
 

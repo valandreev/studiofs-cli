@@ -39,6 +39,8 @@ pub(crate) struct InvestigationRun {
     pub session_id: String,
     pub created_unix_ms: u64,
     pub fingerprint: EnvironmentFingerprint,
+    #[serde(default)]
+    pub profiling_windows: Vec<ProfilingWindowRecord>,
     pub timeline: Vec<TimelineEntry>,
 }
 
@@ -107,6 +109,59 @@ pub(crate) struct DiagnosticsSettingsFingerprint {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub(crate) enum DiagnosticsPreset {
+    Minimal,
+    Balanced,
+    Deep,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProfilingCaptureMode {
+    WallBlocking,
+    Cpu,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProfilingWindowStatus {
+    Running,
+    Completed,
+    Failed,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ProfilingCostEstimate {
+    pub score: u8,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ProfileArtifactRecord {
+    pub kind: String,
+    pub path: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ProfilingWindowRecord {
+    pub window_id: String,
+    pub sequence: u64,
+    pub occurred_unix_ms: u64,
+    pub capture_mode: ProfilingCaptureMode,
+    pub preset: DiagnosticsPreset,
+    pub requested_duration_ms: u64,
+    pub actual_duration_ms: Option<u64>,
+    pub sample_rate_hz: Option<u32>,
+    pub estimated_cost: ProfilingCostEstimate,
+    pub status: ProfilingWindowStatus,
+    pub artifact: Option<ProfileArtifactRecord>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum TimelineEntrySource {
     Cli,
     Mcp,
@@ -154,6 +209,21 @@ pub(crate) struct NewTimelineEntry {
     pub body: Option<String>,
     pub actor: Option<String>,
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NewProfilingWindow {
+    pub window_id: String,
+    pub occurred_unix_ms: u64,
+    pub capture_mode: ProfilingCaptureMode,
+    pub preset: DiagnosticsPreset,
+    pub requested_duration_ms: u64,
+    pub actual_duration_ms: Option<u64>,
+    pub sample_rate_hz: Option<u32>,
+    pub estimated_cost: ProfilingCostEstimate,
+    pub status: ProfilingWindowStatus,
+    pub artifact: Option<ProfileArtifactRecord>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -212,6 +282,7 @@ impl InvestigationStore {
             session_id: input.session_id,
             created_unix_ms: now,
             fingerprint: input.fingerprint,
+            profiling_windows: Vec::new(),
             timeline: Vec::new(),
         };
 
@@ -263,6 +334,40 @@ impl InvestigationStore {
             self.save_json(&self.run_path(run_id), &run)?;
         }
         Ok(entry)
+    }
+
+    pub(crate) fn append_profiling_window(
+        &self,
+        run_id: &str,
+        input: NewProfilingWindow,
+    ) -> Result<ProfilingWindowRecord> {
+        let _guard = self.io_lock.lock();
+        let _store_lock = self.lock_store()?;
+        self.ensure_layout()?;
+
+        let mut run = self.load_json::<InvestigationRun>(&self.run_path(run_id))?;
+        let sequence = run
+            .profiling_windows
+            .last()
+            .map(|window| window.sequence + 1)
+            .unwrap_or(1);
+        let window = ProfilingWindowRecord {
+            window_id: input.window_id,
+            sequence,
+            occurred_unix_ms: input.occurred_unix_ms,
+            capture_mode: input.capture_mode,
+            preset: input.preset,
+            requested_duration_ms: input.requested_duration_ms,
+            actual_duration_ms: input.actual_duration_ms,
+            sample_rate_hz: input.sample_rate_hz,
+            estimated_cost: input.estimated_cost,
+            status: input.status,
+            artifact: input.artifact,
+            error: input.error,
+        };
+        run.profiling_windows.push(window.clone());
+        self.save_json(&self.run_path(run_id), &run)?;
+        Ok(window)
     }
 
     pub(crate) fn load_case(&self, case_id: &str) -> Result<InvestigationCase> {
@@ -814,6 +919,7 @@ mod tests {
             session_id: "session-legacy".to_string(),
             created_unix_ms: 1,
             fingerprint: sample_fingerprint(),
+            profiling_windows: Vec::new(),
             timeline: vec![TimelineEntry {
                 sequence: 1,
                 occurred_unix_ms: 1,
@@ -873,6 +979,7 @@ mod tests {
             session_id: "session-partial".to_string(),
             created_unix_ms: 1,
             fingerprint: sample_fingerprint(),
+            profiling_windows: Vec::new(),
             timeline: vec![TimelineEntry {
                 sequence: 1,
                 occurred_unix_ms: 1,
@@ -972,6 +1079,170 @@ mod tests {
         assert_eq!(persisted_run.timeline.len(), 1);
         assert_eq!(persisted_run.timeline[0].title, "first");
         assert_eq!(second.sequence, 2);
+    }
+
+    #[test]
+    fn append_profiling_window_persists_capture_metadata() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let case = store
+            .create_case(NewInvestigationCase {
+                title: "profiling".to_string(),
+                problem_statement: None,
+                workload_identity: None,
+                target_environment: None,
+            })
+            .expect("create case");
+        let run = store
+            .create_run(NewInvestigationRun {
+                case_id: case.id.clone(),
+                session_id: "session-1".to_string(),
+                fingerprint: sample_fingerprint(),
+            })
+            .expect("create run");
+
+        let window = store
+            .append_profiling_window(
+                &run.id,
+                NewProfilingWindow {
+                    window_id: "window-1".to_string(),
+                    occurred_unix_ms: 1_111,
+                    capture_mode: ProfilingCaptureMode::WallBlocking,
+                    preset: DiagnosticsPreset::Balanced,
+                    requested_duration_ms: 1_500,
+                    actual_duration_ms: Some(1_250),
+                    sample_rate_hz: Some(97),
+                    estimated_cost: ProfilingCostEstimate {
+                        score: 2,
+                        label: "balanced".to_string(),
+                    },
+                    status: ProfilingWindowStatus::Completed,
+                    artifact: Some(ProfileArtifactRecord {
+                        kind: "pprof".to_string(),
+                        path: "profiles/demo.pb.gz".to_string(),
+                        bytes: 1_024,
+                    }),
+                    error: None,
+                },
+            )
+            .expect("append profiling window");
+
+        assert_eq!(window.sequence, 1);
+        let reloaded = store.load_run(&run.id).expect("reload run");
+        assert_eq!(reloaded.profiling_windows.len(), 1);
+        assert_eq!(
+            reloaded.profiling_windows[0].capture_mode,
+            ProfilingCaptureMode::WallBlocking
+        );
+        assert_eq!(
+            reloaded.profiling_windows[0]
+                .artifact
+                .as_ref()
+                .map(|artifact| artifact.bytes),
+            Some(1_024)
+        );
+    }
+
+    #[test]
+    fn append_profiling_window_keeps_fail_open_failure_metadata() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let case = store
+            .create_case(NewInvestigationCase {
+                title: "profiling".to_string(),
+                problem_statement: None,
+                workload_identity: None,
+                target_environment: None,
+            })
+            .expect("create case");
+        let run = store
+            .create_run(NewInvestigationRun {
+                case_id: case.id.clone(),
+                session_id: "session-1".to_string(),
+                fingerprint: sample_fingerprint(),
+            })
+            .expect("create run");
+
+        let window = store
+            .append_profiling_window(
+                &run.id,
+                NewProfilingWindow {
+                    window_id: "window-2".to_string(),
+                    occurred_unix_ms: 2_222,
+                    capture_mode: ProfilingCaptureMode::Cpu,
+                    preset: DiagnosticsPreset::Minimal,
+                    requested_duration_ms: 5_000,
+                    actual_duration_ms: None,
+                    sample_rate_hz: Some(100),
+                    estimated_cost: ProfilingCostEstimate {
+                        score: 1,
+                        label: "minimal".to_string(),
+                    },
+                    status: ProfilingWindowStatus::Unsupported,
+                    artifact: None,
+                    error: Some("profiling backend unavailable".to_string()),
+                },
+            )
+            .expect("append profiling window");
+
+        assert_eq!(window.status, ProfilingWindowStatus::Unsupported);
+        assert_eq!(
+            window.error.as_deref(),
+            Some("profiling backend unavailable")
+        );
+        let reloaded = store.load_run(&run.id).expect("reload run");
+        assert_eq!(reloaded.profiling_windows.len(), 1);
+        assert_eq!(
+            reloaded.profiling_windows[0].error.as_deref(),
+            Some("profiling backend unavailable")
+        );
+    }
+
+    #[test]
+    fn append_profiling_window_preserves_provided_occurrence_timestamp() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let case = store
+            .create_case(NewInvestigationCase {
+                title: "profiling".to_string(),
+                problem_statement: None,
+                workload_identity: None,
+                target_environment: None,
+            })
+            .expect("create case");
+        let run = store
+            .create_run(NewInvestigationRun {
+                case_id: case.id.clone(),
+                session_id: "session-1".to_string(),
+                fingerprint: sample_fingerprint(),
+            })
+            .expect("create run");
+
+        let window = store
+            .append_profiling_window(
+                &run.id,
+                NewProfilingWindow {
+                    window_id: "window-3".to_string(),
+                    occurred_unix_ms: 123_456,
+                    capture_mode: ProfilingCaptureMode::WallBlocking,
+                    preset: DiagnosticsPreset::Balanced,
+                    requested_duration_ms: 1_000,
+                    actual_duration_ms: Some(950),
+                    sample_rate_hz: Some(50),
+                    estimated_cost: ProfilingCostEstimate {
+                        score: 2,
+                        label: "balanced".to_string(),
+                    },
+                    status: ProfilingWindowStatus::Completed,
+                    artifact: None,
+                    error: None,
+                },
+            )
+            .expect("append profiling window");
+
+        assert_eq!(window.occurred_unix_ms, 123_456);
+        let reloaded = store.load_run(&run.id).expect("reload run");
+        assert_eq!(reloaded.profiling_windows[0].occurred_unix_ms, 123_456);
     }
 
     #[cfg(unix)]
