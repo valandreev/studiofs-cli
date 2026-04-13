@@ -1892,6 +1892,8 @@ impl MetricsState {
             };
         }
 
+        // Keep this reset path aligned with new MetricsState fields so the
+        // diagnostics "reset counters" action remains a complete bounded reset.
         self.materialize_batch_stats.reset();
         self.prefetch_queue_depth.store(0, Ordering::Relaxed);
         reset_atomic!(
