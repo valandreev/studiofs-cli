@@ -3,7 +3,9 @@
 use chrono::{Duration, NaiveDate, Utc};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::prelude::*;
 
 mod cli;
 mod diagnostics;
@@ -11,6 +13,9 @@ mod investigation;
 mod runtime_bridge;
 
 const DAEMON_LOG_RETENTION_DAYS: i64 = 30;
+type DiagnosticsLogFilterHandle =
+    tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
+static DIAGNOSTICS_LOG_FILTER_HANDLE: OnceLock<DiagnosticsLogFilterHandle> = OnceLock::new();
 
 fn prune_old_daemon_logs(logs_dir: &Path, stem: &str, today: NaiveDate) -> std::io::Result<()> {
     let cutoff = today - Duration::days(DAEMON_LOG_RETENTION_DAYS);
@@ -42,6 +47,8 @@ fn parse_daemon_log_date(file_name: &str, stem: &str) -> Option<NaiveDate> {
 fn init_tracing(log_level: &str) -> anyhow::Result<Option<WorkerGuard>> {
     let filter = tracing_subscriber::EnvFilter::try_new(log_level)
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let (filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(filter);
+    let _ = DIAGNOSTICS_LOG_FILTER_HANDLE.set(reload_handle);
 
     if let (Ok(stem), Ok(logs_dir)) = (
         std::env::var("STUDIOFS_DAEMON_LOG_STEM"),
@@ -55,11 +62,14 @@ fn init_tracing(log_level: &str) -> anyhow::Result<Option<WorkerGuard>> {
         let file_appender = tracing_appender::rolling::daily(&logs_dir, format!("{stem}.log"));
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(false)
-            .with_ansi(false)
-            .with_writer(non_blocking)
+        tracing_subscriber::registry()
+            .with(filter_layer)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                    .with_ansi(false)
+                    .with_writer(non_blocking),
+            )
             .init();
 
         if let Some(err) = prune_error {
@@ -72,12 +82,38 @@ fn init_tracing(log_level: &str) -> anyhow::Result<Option<WorkerGuard>> {
 
         Ok(Some(guard))
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(false)
+        tracing_subscriber::registry()
+            .with(filter_layer)
+            .with(tracing_subscriber::fmt::layer().with_target(false))
             .init();
         Ok(None)
     }
+}
+
+pub(crate) fn set_diagnostics_log_verbosity(
+    level: crate::diagnostics::SafeLogVerbosity,
+) -> anyhow::Result<()> {
+    let handle = DIAGNOSTICS_LOG_FILTER_HANDLE
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("diagnostics log filter reload handle is unavailable"))?;
+    handle.reload(tracing_subscriber::EnvFilter::new(level.as_directive()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn ensure_test_diagnostics_log_filter() {
+    static TEST_TRACING_INIT: OnceLock<()> = OnceLock::new();
+    TEST_TRACING_INIT.get_or_init(|| {
+        let (filter_layer, handle) =
+            tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
+        let _ = DIAGNOSTICS_LOG_FILTER_HANDLE.set(handle);
+        let subscriber = tracing_subscriber::registry().with(filter_layer).with(
+            tracing_subscriber::fmt::layer()
+                .with_test_writer()
+                .with_ansi(false),
+        );
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
 }
 
 /// On Windows, locate WinFSP via the registry and pre-load `winfsp-x64.dll`

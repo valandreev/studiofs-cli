@@ -2170,6 +2170,22 @@ mod tests {
                     Some("copy-pass-1".to_string()),
                 ))
                 .expect("create investigation run");
+            let safe_action = launch
+                .runtime_handle
+                .block_on(competing_client.invoke_safe_action(
+                    &renewed.lease_id,
+                    &run.id,
+                    diagnostics::SafeDebugActionRequest::LightweightSelfCheck {
+                        actor: Some("studiofs-dev-mcp".to_string()),
+                        reason: Some("verify live action surface".to_string()),
+                    },
+                ))
+                .expect("invoke safe debug action");
+            assert!(safe_action.loud);
+            assert_eq!(
+                safe_action.action,
+                diagnostics::SafeDebugActionKind::LightweightSelfCheck
+            );
             let profiling_status = launch
                 .runtime_handle
                 .block_on(competing_client.profiling_status())
@@ -2289,9 +2305,11 @@ mod tests {
             persisted_run.fingerprint.runtime_configuration.mount_point,
             mount_point
         );
-        assert_eq!(persisted_run.timeline.len(), 2);
-        assert_eq!(persisted_run.timeline[0].source, TimelineEntrySource::Cli);
-        assert_eq!(persisted_run.timeline[1].source, TimelineEntrySource::Mcp);
+        assert_eq!(persisted_run.timeline.len(), 3);
+        assert_eq!(persisted_run.timeline[0].kind, TimelineEntryKind::Action);
+        assert_eq!(persisted_run.timeline[0].source, TimelineEntrySource::Mcp);
+        assert_eq!(persisted_run.timeline[1].source, TimelineEntrySource::Cli);
+        assert_eq!(persisted_run.timeline[2].source, TimelineEntrySource::Mcp);
         assert_eq!(persisted_run.profiling_windows.len(), 1);
         assert_eq!(
             persisted_run.profiling_windows[0].status,
