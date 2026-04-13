@@ -172,6 +172,7 @@ pub(crate) enum TimelineEntrySource {
 pub(crate) enum TimelineEntryKind {
     Marker,
     Note,
+    Action,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -838,6 +839,47 @@ mod tests {
         assert_eq!(persisted_run.timeline[1].source, TimelineEntrySource::Mcp);
         assert_eq!(persisted_run.timeline[0].sequence, 1);
         assert_eq!(persisted_run.timeline[1].sequence, 2);
+    }
+
+    #[test]
+    fn loud_safe_action_audit_entries_round_trip_with_action_kind() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let case = store
+            .create_case(NewInvestigationCase {
+                title: "safe action".to_string(),
+                problem_statement: None,
+                workload_identity: None,
+                target_environment: None,
+            })
+            .expect("create case");
+        let run = store
+            .create_run(NewInvestigationRun {
+                case_id: case.id,
+                session_id: "session-1".to_string(),
+                fingerprint: sample_fingerprint(),
+            })
+            .expect("create run");
+
+        let entry = store
+            .append_timeline_entry(
+                &run.id,
+                NewTimelineEntry {
+                    source: TimelineEntrySource::Mcp,
+                    kind: TimelineEntryKind::Action,
+                    title: "reset_counters".to_string(),
+                    body: Some("reset upload/cache counters".to_string()),
+                    actor: Some("studiofs-dev-mcp".to_string()),
+                    reason: Some("baseline before rerun".to_string()),
+                },
+            )
+            .expect("append action");
+
+        assert_eq!(entry.kind, TimelineEntryKind::Action);
+        assert_eq!(
+            store.load_run(&run.id).expect("load run").timeline[0],
+            entry
+        );
     }
 
     #[test]

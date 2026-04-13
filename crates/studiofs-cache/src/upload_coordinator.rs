@@ -145,6 +145,10 @@ impl UploadCoordinator {
         self.metrics.snapshot(self.upload_queue.pending_count())
     }
 
+    pub fn reset_diagnostics_metrics(&self) {
+        self.metrics.reset();
+    }
+
     pub async fn shutdown(&self) {
         self.upload_queue.shutdown();
         self.flush_upload_journal().await;

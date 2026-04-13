@@ -213,6 +213,12 @@ pub(crate) trait DiagnosticsDataSource: Send + Sync + 'static {
         case_workload_identity: Option<&str>,
         run_workload_identity: Option<&str>,
     ) -> EnvironmentFingerprint;
+
+    fn reset_observability_counters(&self) -> Result<()> {
+        Err(anyhow!(
+            "observability counter reset is unavailable for this session"
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -237,6 +243,92 @@ pub(crate) struct DiagnosticsProfilingStatus {
     pub default_sample_rate_hz: u32,
     pub max_sample_rate_hz: u32,
     pub active_window: Option<ProfilingWindowRecord>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SafeLogVerbosity {
+    Info,
+    Debug,
+    Trace,
+}
+
+impl SafeLogVerbosity {
+    pub(crate) fn as_directive(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SafeDebugActionKind {
+    SetLogVerbosity,
+    CaptureBundle,
+    ResetObservabilityCounters,
+    LightweightSelfCheck,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SafeDebugActionStatus {
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub(crate) enum SafeDebugActionRequest {
+    SetLogVerbosity {
+        level: SafeLogVerbosity,
+    },
+    CaptureBundle {
+        actor: Option<String>,
+        reason: Option<String>,
+        recent_events_limit: Option<usize>,
+    },
+    ResetObservabilityCounters {
+        actor: Option<String>,
+        reason: Option<String>,
+    },
+    LightweightSelfCheck {
+        actor: Option<String>,
+        reason: Option<String>,
+    },
+}
+
+impl SafeDebugActionRequest {
+    fn actor(&self) -> Option<&str> {
+        match self {
+            Self::SetLogVerbosity { .. } => None,
+            Self::CaptureBundle { actor, .. }
+            | Self::ResetObservabilityCounters { actor, .. }
+            | Self::LightweightSelfCheck { actor, .. } => actor.as_deref(),
+        }
+    }
+
+    fn reason(&self) -> Option<&str> {
+        match self {
+            Self::SetLogVerbosity { .. } => None,
+            Self::CaptureBundle { reason, .. }
+            | Self::ResetObservabilityCounters { reason, .. }
+            | Self::LightweightSelfCheck { reason, .. } => reason.as_deref(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SafeDebugActionOutcome {
+    pub action: SafeDebugActionKind,
+    pub loud: bool,
+    pub status: SafeDebugActionStatus,
+    #[serde(default)]
+    pub summary: serde_json::Value,
+    pub artifact: Option<ProfileArtifactRecord>,
+    pub error: Option<String>,
 }
 
 pub(crate) trait RuntimeProfilingStopper: Send + 'static {
@@ -738,6 +830,74 @@ fn estimate_profiling_cost(request: &StartProfilingWindowRequest) -> ProfilingCo
     }
 }
 
+fn append_safe_action_audit(
+    store: &InvestigationStore,
+    run_id: &str,
+    action: SafeDebugActionKind,
+    actor: Option<&str>,
+    reason: Option<&str>,
+    outcome: &SafeDebugActionOutcome,
+) -> Result<()> {
+    let body = serde_json::json!({
+        "status": outcome.status,
+        "summary": outcome.summary,
+        "error": outcome.error,
+        "artifact": outcome.artifact,
+    });
+    store.append_timeline_entry(
+        run_id,
+        NewTimelineEntry {
+            source: TimelineEntrySource::Mcp,
+            kind: TimelineEntryKind::Action,
+            title: match action {
+                SafeDebugActionKind::SetLogVerbosity => "set_log_verbosity".to_string(),
+                SafeDebugActionKind::CaptureBundle => "capture_bundle".to_string(),
+                SafeDebugActionKind::ResetObservabilityCounters => {
+                    "reset_observability_counters".to_string()
+                }
+                SafeDebugActionKind::LightweightSelfCheck => "lightweight_self_check".to_string(),
+            },
+            body: Some(body.to_string()),
+            actor: actor.map(str::to_string),
+            reason: reason.map(str::to_string),
+        },
+    )?;
+    Ok(())
+}
+
+fn capture_bundle_artifact(
+    session: &DiagnosticsSessionInfo,
+    snapshot: &DiagnosticsRuntimeSnapshot,
+    recent_events: &[DiagnosticsRecentEvent],
+) -> Result<ProfileArtifactRecord> {
+    let output_dir = PathBuf::from(&session.cache_path).join("diagnostics-bundles");
+    fs::create_dir_all(&output_dir).with_context(|| {
+        format!(
+            "create diagnostics bundle directory '{}'",
+            output_dir.display()
+        )
+    })?;
+    let path = output_dir.join(format!(
+        "bundle-{}-{}.json",
+        now_unix_millis(),
+        Uuid::new_v4()
+    ));
+    let payload = serde_json::json!({
+        "schema_version": 1,
+        "session": session,
+        "runtime_snapshot": snapshot,
+        "recent_events": recent_events,
+    });
+    fs::write(&path, serde_json::to_vec_pretty(&payload)?)
+        .with_context(|| format!("write diagnostics bundle '{}'", path.display()))?;
+    let bytes = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    Ok(ProfileArtifactRecord {
+        kind: "diagnostics_bundle".to_string(),
+        path: path.to_string_lossy().into_owned(),
+        bytes,
+    })
+}
+
 fn write_wall_blocking_artifact(cache_path: &Path, payload: &serde_json::Value) -> Result<PathBuf> {
     let output_dir = cache_path.join(DIAGNOSTICS_PROFILE_ARTIFACT_DIR_NAME);
     fs::create_dir_all(&output_dir).with_context(|| {
@@ -866,6 +1026,11 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
         };
         fingerprint
     }
+
+    fn reset_observability_counters(&self) -> Result<()> {
+        self.vfs.reset_diagnostics_observability();
+        Ok(())
+    }
 }
 
 fn base_environment_fingerprint(
@@ -983,6 +1148,12 @@ enum DiagnosticsRequest {
     ProfilingStatus {
         auth_token: String,
     },
+    InvokeSafeAction {
+        auth_token: String,
+        lease_id: String,
+        run_id: String,
+        action: SafeDebugActionRequest,
+    },
     AppendTimelineEntry {
         auth_token: String,
         lease_id: String,
@@ -1025,6 +1196,9 @@ enum DiagnosticsResponse {
     },
     ProfilingStatus {
         status: Box<DiagnosticsProfilingStatus>,
+    },
+    SafeDebugAction {
+        outcome: Box<SafeDebugActionOutcome>,
     },
     TimelineEntry {
         entry: TimelineEntry,
@@ -1412,6 +1586,28 @@ impl LocalDiagnosticsClient {
             .await?
         {
             DiagnosticsResponse::ProfilingWindow { window } => Ok(*window),
+            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn invoke_safe_action(
+        &self,
+        lease_id: &str,
+        run_id: &str,
+        action: SafeDebugActionRequest,
+    ) -> Result<SafeDebugActionOutcome> {
+        match self
+            .send(DiagnosticsRequest::InvokeSafeAction {
+                auth_token: self.discovery.auth_token.clone(),
+                lease_id: lease_id.to_string(),
+                run_id: run_id.to_string(),
+                action,
+            })
+            .await?
+        {
+            DiagnosticsResponse::SafeDebugAction { outcome } => Ok(*outcome),
             DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
             other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
         }
@@ -2058,6 +2254,148 @@ fn execute_request(
                 status: Box::new(profiling.status()),
             }
         }
+        DiagnosticsRequest::InvokeSafeAction {
+            auth_token: provided,
+            lease_id,
+            run_id,
+            action,
+        } => {
+            let store = match mutating_request_store(
+                &provided,
+                auth_token,
+                &lease_id,
+                lease_manager,
+                investigation_store,
+            ) {
+                Ok(store) => store,
+                Err(MutatingRequestPrereqError::Unauthorized) => return unauthorized(),
+                Err(MutatingRequestPrereqError::InvalidLease(error)) => {
+                    return lease_error(error);
+                }
+                Err(MutatingRequestPrereqError::InvestigationUnavailable) => {
+                    return investigation_unavailable();
+                }
+            };
+            if let Err(error) = store.load_run(&run_id) {
+                return store_error(error);
+            }
+            let actor = action.actor().map(str::to_string);
+            let reason = action.reason().map(str::to_string);
+            let outcome = match action {
+                SafeDebugActionRequest::SetLogVerbosity { level } => {
+                    match crate::set_diagnostics_log_verbosity(level) {
+                        Ok(()) => SafeDebugActionOutcome {
+                            action: SafeDebugActionKind::SetLogVerbosity,
+                            loud: false,
+                            status: SafeDebugActionStatus::Succeeded,
+                            summary: serde_json::json!({
+                                "level": level.as_directive(),
+                            }),
+                            artifact: None,
+                            error: None,
+                        },
+                        Err(error) => SafeDebugActionOutcome {
+                            action: SafeDebugActionKind::SetLogVerbosity,
+                            loud: false,
+                            status: SafeDebugActionStatus::Failed,
+                            summary: serde_json::json!({
+                                "level": level.as_directive(),
+                            }),
+                            artifact: None,
+                            error: Some(error.to_string()),
+                        },
+                    }
+                }
+                SafeDebugActionRequest::CaptureBundle {
+                    recent_events_limit,
+                    ..
+                } => {
+                    let session = source.session_info();
+                    let snapshot = source.runtime_snapshot();
+                    let events = source.recent_events(
+                        recent_events_limit
+                            .unwrap_or(DEFAULT_RECENT_EVENTS_LIMIT)
+                            .clamp(1, MAX_RECENT_EVENTS_LIMIT),
+                    );
+                    match capture_bundle_artifact(&session, &snapshot, &events) {
+                        Ok(artifact) => SafeDebugActionOutcome {
+                            action: SafeDebugActionKind::CaptureBundle,
+                            loud: true,
+                            status: SafeDebugActionStatus::Succeeded,
+                            summary: serde_json::json!({
+                                "recent_events": events.len(),
+                                "path": artifact.path.clone(),
+                            }),
+                            artifact: Some(artifact),
+                            error: None,
+                        },
+                        Err(error) => SafeDebugActionOutcome {
+                            action: SafeDebugActionKind::CaptureBundle,
+                            loud: true,
+                            status: SafeDebugActionStatus::Failed,
+                            summary: serde_json::json!({
+                                "recent_events": events.len(),
+                            }),
+                            artifact: None,
+                            error: Some(error.to_string()),
+                        },
+                    }
+                }
+                SafeDebugActionRequest::ResetObservabilityCounters { .. } => {
+                    match source.reset_observability_counters() {
+                        Ok(()) => SafeDebugActionOutcome {
+                            action: SafeDebugActionKind::ResetObservabilityCounters,
+                            loud: true,
+                            status: SafeDebugActionStatus::Succeeded,
+                            summary: serde_json::json!({
+                                "status": "reset",
+                            }),
+                            artifact: None,
+                            error: None,
+                        },
+                        Err(error) => SafeDebugActionOutcome {
+                            action: SafeDebugActionKind::ResetObservabilityCounters,
+                            loud: true,
+                            status: SafeDebugActionStatus::Failed,
+                            summary: serde_json::json!({}),
+                            artifact: None,
+                            error: Some(error.to_string()),
+                        },
+                    }
+                }
+                SafeDebugActionRequest::LightweightSelfCheck { .. } => {
+                    let snapshot = source.runtime_snapshot();
+                    let events = source.recent_events(DEFAULT_RECENT_EVENTS_LIMIT.min(8));
+                    SafeDebugActionOutcome {
+                        action: SafeDebugActionKind::LightweightSelfCheck,
+                        loud: true,
+                        status: SafeDebugActionStatus::Succeeded,
+                        summary: serde_json::json!({
+                            "status": "ok",
+                            "pending_uploads": snapshot.upload.pending_uploads,
+                            "recent_events": events.len(),
+                        }),
+                        artifact: None,
+                        error: None,
+                    }
+                }
+            };
+            if outcome.loud
+                && let Err(error) = append_safe_action_audit(
+                    store,
+                    &run_id,
+                    outcome.action,
+                    actor.as_deref(),
+                    reason.as_deref(),
+                    &outcome,
+                )
+            {
+                return store_error(error);
+            }
+            DiagnosticsResponse::SafeDebugAction {
+                outcome: Box::new(outcome),
+            }
+        }
         DiagnosticsRequest::AcquireController {
             auth_token: provided,
             client_name,
@@ -2414,6 +2752,7 @@ mod tests {
         health: DiagnosticsHealthSnapshot,
         recent_events: Vec<DiagnosticsRecentEvent>,
         fingerprint: EnvironmentFingerprint,
+        reset_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl DiagnosticsDataSource for StaticDiagnosticsSource {
@@ -2444,6 +2783,12 @@ mod tests {
                 case_workload_identity.map(str::to_string);
             fingerprint.workload_identity.run_workload = run_workload_identity.map(str::to_string);
             fingerprint
+        }
+
+        fn reset_observability_counters(&self) -> Result<()> {
+            self.reset_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
         }
     }
 
@@ -2618,6 +2963,7 @@ mod tests {
                     max_connections: MAX_DIAGNOSTICS_CONNECTIONS,
                 },
             },
+            reset_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -2742,6 +3088,36 @@ mod tests {
     }
 
     #[test]
+    fn mutating_safe_action_requests_require_current_controller_lease() {
+        let source = static_source();
+        let lease_manager = ControllerLeaseManager::default();
+        let temp = mounts_dir_temp();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+
+        let response = execute_request(
+            DiagnosticsRequest::InvokeSafeAction {
+                auth_token: "secret".to_string(),
+                lease_id: "lease-1".to_string(),
+                run_id: "run-1".to_string(),
+                action: SafeDebugActionRequest::ResetObservabilityCounters {
+                    actor: Some("studiofs-dev-mcp".to_string()),
+                    reason: Some("baseline".to_string()),
+                },
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        );
+
+        assert!(matches!(
+            response,
+            DiagnosticsResponse::Error { code, .. } if code == "lease_invalid"
+        ));
+    }
+
+    #[test]
     fn runtime_snapshot_request_returns_structured_sections() {
         let source = static_source();
 
@@ -2769,6 +3145,381 @@ mod tests {
             snapshot.synchronization.state.file_sessions.open_handles,
             source.health.file_sessions.open_handles
         );
+    }
+
+    #[test]
+    fn silent_log_verbosity_action_returns_updated_level_without_timeline_entry() {
+        crate::ensure_test_diagnostics_log_filter();
+
+        let source = static_source();
+        let lease_manager = ControllerLeaseManager::default();
+        let temp = mounts_dir_temp();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+
+        let lease = match execute_request(
+            DiagnosticsRequest::AcquireController {
+                auth_token: "secret".to_string(),
+                client_name: "tester".to_string(),
+                ttl_ms: Some(250),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        ) {
+            DiagnosticsResponse::ControllerLease { lease } => lease,
+            other => panic!("unexpected lease response: {other:?}"),
+        };
+
+        let case = match execute_request(
+            DiagnosticsRequest::CreateCase {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                title: "AJA slowdown".to_string(),
+                problem_statement: Some("Copy stalls after warmup".to_string()),
+                workload_identity: Some("aja".to_string()),
+                target_environment: Some("artist workstation".to_string()),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        ) {
+            DiagnosticsResponse::InvestigationCase { case } => *case,
+            other => panic!("unexpected case response: {other:?}"),
+        };
+
+        let run = match execute_request(
+            DiagnosticsRequest::CreateRun {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                case_id: case.id,
+                run_workload_identity: Some("copy-pass-1".to_string()),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        ) {
+            DiagnosticsResponse::InvestigationRun { run } => *run,
+            other => panic!("unexpected run response: {other:?}"),
+        };
+
+        let response = execute_request(
+            DiagnosticsRequest::InvokeSafeAction {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id,
+                run_id: run.id.clone(),
+                action: SafeDebugActionRequest::SetLogVerbosity {
+                    level: SafeLogVerbosity::Debug,
+                },
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        );
+
+        let DiagnosticsResponse::SafeDebugAction { outcome } = response else {
+            panic!("expected safe debug action response");
+        };
+        assert_eq!(outcome.action, SafeDebugActionKind::SetLogVerbosity);
+        assert_eq!(outcome.status, SafeDebugActionStatus::Succeeded);
+        assert_eq!(outcome.summary["level"], serde_json::json!("debug"));
+        assert!(
+            store
+                .load_run(&run.id)
+                .expect("load run")
+                .timeline
+                .is_empty(),
+            "silent safe actions should not append audit entries"
+        );
+    }
+
+    #[test]
+    fn loud_safe_action_appends_audited_timeline_entry() {
+        let source = static_source();
+        let lease_manager = ControllerLeaseManager::default();
+        let temp = mounts_dir_temp();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+
+        let lease = match execute_request(
+            DiagnosticsRequest::AcquireController {
+                auth_token: "secret".to_string(),
+                client_name: "tester".to_string(),
+                ttl_ms: Some(250),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        ) {
+            DiagnosticsResponse::ControllerLease { lease } => lease,
+            other => panic!("unexpected lease response: {other:?}"),
+        };
+
+        let case = match execute_request(
+            DiagnosticsRequest::CreateCase {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                title: "AJA slowdown".to_string(),
+                problem_statement: Some("Copy stalls after warmup".to_string()),
+                workload_identity: Some("aja".to_string()),
+                target_environment: Some("artist workstation".to_string()),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        ) {
+            DiagnosticsResponse::InvestigationCase { case } => *case,
+            other => panic!("unexpected case response: {other:?}"),
+        };
+
+        let run = match execute_request(
+            DiagnosticsRequest::CreateRun {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                case_id: case.id,
+                run_workload_identity: Some("copy-pass-1".to_string()),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        ) {
+            DiagnosticsResponse::InvestigationRun { run } => *run,
+            other => panic!("unexpected run response: {other:?}"),
+        };
+
+        let response = execute_request(
+            DiagnosticsRequest::InvokeSafeAction {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id,
+                run_id: run.id.clone(),
+                action: SafeDebugActionRequest::LightweightSelfCheck {
+                    actor: Some("studiofs-dev-mcp".to_string()),
+                    reason: Some("sanity check after attach".to_string()),
+                },
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        );
+
+        let DiagnosticsResponse::SafeDebugAction { outcome } = response else {
+            panic!("expected safe debug action response");
+        };
+        assert!(outcome.loud);
+        assert_eq!(outcome.status, SafeDebugActionStatus::Succeeded);
+        let persisted = store.load_run(&run.id).expect("load run");
+        assert_eq!(persisted.timeline.len(), 1);
+        assert_eq!(persisted.timeline[0].kind, TimelineEntryKind::Action);
+        assert_eq!(
+            persisted.timeline[0].actor.as_deref(),
+            Some("studiofs-dev-mcp")
+        );
+        assert_eq!(
+            persisted.timeline[0].reason.as_deref(),
+            Some("sanity check after attach")
+        );
+    }
+
+    #[test]
+    fn loud_safe_action_failures_remain_audited_and_fail_open() {
+        let temp = mounts_dir_temp();
+        let cache_file = temp.path().join("cache-file");
+        fs::write(&cache_file, b"not-a-directory").expect("write cache file");
+        let source = StaticDiagnosticsSource {
+            session: DiagnosticsSessionInfo {
+                cache_path: cache_file.to_string_lossy().into_owned(),
+                ..static_source().session
+            },
+            ..static_source()
+        };
+        let lease_manager = ControllerLeaseManager::default();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+
+        let lease = match execute_request(
+            DiagnosticsRequest::AcquireController {
+                auth_token: "secret".to_string(),
+                client_name: "tester".to_string(),
+                ttl_ms: Some(250),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        ) {
+            DiagnosticsResponse::ControllerLease { lease } => lease,
+            other => panic!("unexpected lease response: {other:?}"),
+        };
+
+        let case = match execute_request(
+            DiagnosticsRequest::CreateCase {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                title: "AJA slowdown".to_string(),
+                problem_statement: Some("Copy stalls after warmup".to_string()),
+                workload_identity: Some("aja".to_string()),
+                target_environment: Some("artist workstation".to_string()),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        ) {
+            DiagnosticsResponse::InvestigationCase { case } => *case,
+            other => panic!("unexpected case response: {other:?}"),
+        };
+
+        let run = match execute_request(
+            DiagnosticsRequest::CreateRun {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                case_id: case.id,
+                run_workload_identity: Some("copy-pass-1".to_string()),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        ) {
+            DiagnosticsResponse::InvestigationRun { run } => *run,
+            other => panic!("unexpected run response: {other:?}"),
+        };
+
+        let response = execute_request(
+            DiagnosticsRequest::InvokeSafeAction {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id,
+                run_id: run.id.clone(),
+                action: SafeDebugActionRequest::CaptureBundle {
+                    actor: Some("studiofs-dev-mcp".to_string()),
+                    reason: Some("capture evidence".to_string()),
+                    recent_events_limit: Some(8),
+                },
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        );
+
+        let DiagnosticsResponse::SafeDebugAction { outcome } = response else {
+            panic!("expected safe debug action response");
+        };
+        assert_eq!(outcome.status, SafeDebugActionStatus::Failed);
+        assert!(outcome.error.is_some());
+        let persisted = store.load_run(&run.id).expect("load run");
+        assert_eq!(persisted.timeline.len(), 1);
+        assert_eq!(persisted.timeline[0].kind, TimelineEntryKind::Action);
+        assert_eq!(
+            persisted.timeline[0].reason.as_deref(),
+            Some("capture evidence")
+        );
+    }
+
+    #[test]
+    fn reset_counters_action_calls_data_source_and_is_audited() {
+        let source = static_source();
+        let reset_calls = source.reset_calls.clone();
+        let lease_manager = ControllerLeaseManager::default();
+        let temp = mounts_dir_temp();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+
+        let lease = match execute_request(
+            DiagnosticsRequest::AcquireController {
+                auth_token: "secret".to_string(),
+                client_name: "tester".to_string(),
+                ttl_ms: Some(250),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        ) {
+            DiagnosticsResponse::ControllerLease { lease } => lease,
+            other => panic!("unexpected lease response: {other:?}"),
+        };
+
+        let case = match execute_request(
+            DiagnosticsRequest::CreateCase {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                title: "AJA slowdown".to_string(),
+                problem_statement: Some("Copy stalls after warmup".to_string()),
+                workload_identity: Some("aja".to_string()),
+                target_environment: Some("artist workstation".to_string()),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        ) {
+            DiagnosticsResponse::InvestigationCase { case } => *case,
+            other => panic!("unexpected case response: {other:?}"),
+        };
+
+        let run = match execute_request(
+            DiagnosticsRequest::CreateRun {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id.clone(),
+                case_id: case.id,
+                run_workload_identity: Some("copy-pass-1".to_string()),
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        ) {
+            DiagnosticsResponse::InvestigationRun { run } => *run,
+            other => panic!("unexpected run response: {other:?}"),
+        };
+
+        let response = execute_request(
+            DiagnosticsRequest::InvokeSafeAction {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id,
+                run_id: run.id.clone(),
+                action: SafeDebugActionRequest::ResetObservabilityCounters {
+                    actor: Some("studiofs-dev-mcp".to_string()),
+                    reason: Some("baseline before rerun".to_string()),
+                },
+            },
+            "secret",
+            &source,
+            &lease_manager,
+            Some(&store),
+            None,
+        );
+
+        let DiagnosticsResponse::SafeDebugAction { outcome } = response else {
+            panic!("expected safe debug action response");
+        };
+        assert_eq!(outcome.status, SafeDebugActionStatus::Succeeded);
+        assert_eq!(
+            reset_calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "reset action should invoke the data source exactly once"
+        );
+        assert_eq!(store.load_run(&run.id).expect("load run").timeline.len(), 1);
     }
 
     #[test]

@@ -1884,6 +1884,83 @@ impl MetricsState {
             runtime_events: Mutex::new(VecDeque::new()),
         }
     }
+
+    fn reset_diagnostics_observability(&self) {
+        macro_rules! reset_atomic {
+            ($($field:ident),+ $(,)?) => {
+                $(self.$field.store(0, Ordering::Relaxed);)+
+            };
+        }
+
+        // Keep this reset path aligned with new MetricsState fields so the
+        // diagnostics "reset counters" action remains a complete bounded reset.
+        self.materialize_batch_stats.reset();
+        self.prefetch_queue_depth.store(0, Ordering::Relaxed);
+        reset_atomic!(
+            flush_ordered_calls,
+            local_cache_io_calls,
+            local_cache_io_handoff_total_ns,
+            local_cache_io_handoff_max_ns,
+            local_cache_io_backend_total_ns,
+            local_cache_io_backend_max_ns,
+            block_store_sync_data_calls,
+            block_store_sync_data_deferred_calls,
+            block_store_sync_data_synced_bytes,
+            block_store_sync_data_total_ns,
+            block_store_sync_data_max_ns,
+            block_store_sync_data_queue_wait_calls,
+            block_store_sync_data_queue_wait_total_ns,
+            block_store_sync_data_queue_wait_max_ns,
+            block_store_sync_data_last_completed_ns,
+            block_store_sync_data_interval_total_ns,
+            block_store_sync_data_interval_max_ns,
+            payload_persist_calls,
+            payload_persist_total_ns,
+            payload_persist_max_ns,
+            payload_burst_count,
+            payload_burst_total_blocks,
+            payload_burst_total_bytes,
+            payload_burst_max_blocks,
+            payload_burst_max_bytes,
+            payload_burst_last_completed_ns,
+            payload_burst_interval_total_ns,
+            payload_burst_interval_max_ns,
+            metadata_commit_calls,
+            metadata_commit_total_ns,
+            metadata_commit_max_ns,
+            metadata_commit_completed_calls,
+            metadata_commit_last_completed_ns,
+            metadata_commit_interval_total_ns,
+            metadata_commit_interval_max_ns,
+            eager_flush_checks,
+            eager_flush_triggered,
+            eager_flush_skipped_empty,
+            eager_flush_skipped_below_threshold,
+            winfsp_write_callbacks,
+            winfsp_overwrite_callbacks,
+            winfsp_cleanup_callbacks,
+            winfsp_flush_callbacks,
+            winfsp_close_callbacks,
+            winfsp_cleanup_flush_fh_callbacks,
+            winfsp_cleanup_barrier_calls,
+            winfsp_flush_barrier_calls,
+            winfsp_close_barrier_calls,
+            winfsp_cleanup_barrier_skipped_clean,
+            winfsp_flush_barrier_skipped_clean,
+            winfsp_close_barrier_skipped_clean,
+            runtime_event_sequence
+        );
+        self.local_cache_io_handoff_histogram.reset();
+        self.local_cache_io_backend_histogram.reset();
+        self.block_store_sync_data_histogram.reset();
+        self.block_store_sync_data_queue_wait_histogram.reset();
+        self.block_store_sync_data_interval_histogram.reset();
+        self.payload_persist_histogram.reset();
+        self.payload_burst_interval_histogram.reset();
+        self.metadata_commit_histogram.reset();
+        self.metadata_commit_interval_histogram.reset();
+        self.runtime_events.lock().clear();
+    }
 }
 
 // =============================================================================
@@ -2760,6 +2837,11 @@ impl StudioVfs {
             .skip(events.len().saturating_sub(keep))
             .cloned()
             .collect()
+    }
+
+    pub fn reset_diagnostics_observability(&self) {
+        self.state.metrics.reset_diagnostics_observability();
+        self.upload_coordinator.reset_diagnostics_metrics();
     }
 
     pub fn record_runtime_event(

@@ -132,6 +132,15 @@ impl MaterializeBatchStats {
             duration_histogram: self.duration_histogram.snapshot(),
         }
     }
+
+    pub fn reset(&self) {
+        self.batches.store(0, Ordering::Relaxed);
+        self.blocks.store(0, Ordering::Relaxed);
+        self.bytes.store(0, Ordering::Relaxed);
+        self.inflight_batches.store(0, Ordering::Relaxed);
+        self.inflight_batches_peak.store(0, Ordering::Relaxed);
+        self.duration_histogram.reset();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +189,14 @@ impl UploadQueueStats {
             requeued: self.requeued.load(Ordering::Relaxed),
             canceled: self.canceled.load(Ordering::Relaxed),
         }
+    }
+
+    pub fn reset(&self) {
+        self.pending_depth_peak.store(0, Ordering::Relaxed);
+        self.submitted.store(0, Ordering::Relaxed);
+        self.completed.store(0, Ordering::Relaxed);
+        self.requeued.store(0, Ordering::Relaxed);
+        self.canceled.store(0, Ordering::Relaxed);
     }
 }
 
@@ -326,6 +343,11 @@ impl CachePipelineMetrics {
             upload_queue: self.upload_queue.snapshot(pending_uploads),
             blocking_tasks: empty_blocking_task_metrics(),
         }
+    }
+
+    pub fn reset(&self) {
+        self.materialize_batches.reset();
+        self.upload_queue.reset();
     }
 }
 
