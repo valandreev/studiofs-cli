@@ -2294,26 +2294,12 @@ fn count_anomalies_in_span(
     start_sequence: u64,
     end_sequence: u64,
 ) -> Vec<(String, DiagnosticsEvidenceReference)> {
-    let Some(start) = run
-        .timeline
-        .iter()
-        .find(|entry| entry.sequence == start_sequence)
-    else {
-        return Vec::new();
-    };
-    let Some(end) = run
-        .timeline
-        .iter()
-        .find(|entry| entry.sequence == end_sequence)
-    else {
-        return Vec::new();
-    };
     run.timeline
         .iter()
         .filter(|entry| {
             is_anomaly_timeline_entry(entry)
-                && entry.occurred_unix_ms >= start.occurred_unix_ms
-                && entry.occurred_unix_ms <= end.occurred_unix_ms
+                && entry.sequence >= start_sequence
+                && entry.sequence <= end_sequence
         })
         .map(|entry| (entry.title.clone(), timeline_entry_reference(entry)))
         .collect()
@@ -2380,13 +2366,14 @@ fn materialize_run_span_comparison(
             candidate.id
         ));
     }
+    let Some(end_title) = request.end_marker_title.clone() else {
+        return Err(anyhow!(
+            "end_marker_title is required for run span comparison"
+        ));
+    };
 
     let baseline_start = marker_snapshot_by_title(&baseline, &request.start_marker_title)?;
     let candidate_start = marker_snapshot_by_title(&candidate, &request.start_marker_title)?;
-    let end_title = request
-        .end_marker_title
-        .clone()
-        .unwrap_or_else(|| request.start_marker_title.clone());
     let baseline_end = marker_snapshot_by_title(&baseline, &end_title)?;
     let candidate_end = marker_snapshot_by_title(&candidate, &end_title)?;
     if baseline_end.marker_sequence < baseline_start.marker_sequence {

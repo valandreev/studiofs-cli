@@ -820,9 +820,15 @@ impl InvestigationStore {
         let previous_status = hypothesis.status;
         hypothesis.status = input.status;
         hypothesis.updated_unix_ms = now_unix_millis();
-        hypothesis
-            .supporting_evidence
-            .extend(input.supporting_evidence.iter().cloned());
+        for evidence in &input.supporting_evidence {
+            if !hypothesis.supporting_evidence.iter().any(|existing| {
+                existing.source == evidence.source
+                    && existing.id == evidence.id
+                    && existing.field == evidence.field
+            }) {
+                hypothesis.supporting_evidence.push(evidence.clone());
+            }
+        }
         hypothesis
             .status_history
             .push(InvestigationHypothesisStatusTransition {
@@ -1178,15 +1184,15 @@ fn canonical_report_id(report_id: &str) -> Result<String> {
 }
 
 fn canonical_comparison_id(comparison_id: &str) -> Result<String> {
-    Uuid::parse_str(comparison_id)
-        .map(|uuid| uuid.to_string())
-        .map_err(|error| anyhow!("invalid comparison id '{}': {error}", comparison_id))
+    Ok(Uuid::parse_str(comparison_id)
+        .with_context(|| format!("invalid comparison id '{}'", comparison_id))?
+        .to_string())
 }
 
 fn canonical_hypothesis_id(hypothesis_id: &str) -> Result<String> {
-    Uuid::parse_str(hypothesis_id)
-        .map(|uuid| uuid.to_string())
-        .map_err(|error| anyhow!("invalid hypothesis id '{}': {error}", hypothesis_id))
+    Ok(Uuid::parse_str(hypothesis_id)
+        .with_context(|| format!("invalid hypothesis id '{}'", hypothesis_id))?
+        .to_string())
 }
 
 fn ensure_private_directory(path: &Path) -> Result<()> {
