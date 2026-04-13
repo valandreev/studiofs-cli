@@ -789,6 +789,11 @@ impl FlushGatePort for WinfspFlushGatePort<'_> {
     where
         F: FnOnce() -> studiofs_vfs::VfsResult<T>,
     {
+        // Tokio recommends a blocking mutex for plain data when the guard is
+        // not held across `.await`. This gate lives entirely on the synchronous
+        // WinFSP callback thread and only serializes per-inode barrier entry
+        // into `spawn_wait`; the async flush work itself runs after the gate is
+        // acquired and never holds this guard across an `.await`.
         let gate = self
             .context
             .callback_barrier_state

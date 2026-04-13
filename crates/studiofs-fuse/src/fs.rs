@@ -403,6 +403,8 @@ impl HandleReleasePort for FuseHandleReleasePort<'_> {
 }
 
 impl DeferredCleanupHintPort for FuseDeferredCleanupHintPort {
+    // FUSE does not have the WinFSP-style non-delete cleanup callback split, so
+    // there is no deferred-hint state to preserve in this bridge.
     fn set_deferred_cleanup_hint(&self, _ino: studiofs_meta::types::Ino) {}
 
     fn clear_deferred_cleanup_hint(&self, _ino: studiofs_meta::types::Ino) {}
@@ -417,6 +419,8 @@ impl DeferredCleanupHintPort for FuseDeferredCleanupHintPort {
 }
 
 impl FlushGatePort for FuseFlushGatePort {
+    // FUSE calls into the barrier from a direct synchronous bridge path and
+    // does not need callback-side coalescing, so the flush gate is a no-op.
     fn with_flush_gate<T, F>(
         &self,
         _ino: studiofs_meta::types::Ino,
@@ -430,6 +434,7 @@ impl FlushGatePort for FuseFlushGatePort {
 }
 
 impl DeleteCleanupPort for FuseDeleteCleanupPort {
+    // FUSE delete handling is not routed through this barrier facade.
     fn cleanup_delete(&self, _request: HandleDrainDeleteRequest) {}
 }
 

@@ -12,6 +12,9 @@ pub struct HandleDrainDeleteRequest {
     pub ino: Ino,
     pub parent_ino: Ino,
     pub name: Vec<u8>,
+    /// The bridge passes the callback's delete intent explicitly so the delete
+    /// adapter can choose `unlink` vs `rmdir` without reloading inode state
+    /// after the callback has already classified the path.
     pub is_dir: bool,
 }
 
@@ -151,33 +154,11 @@ where
             return;
         }
 
-        let had_cleanup_deferred_hint = self
-            .deferred_cleanup_hints
-            .has_deferred_cleanup_hint(request.ino);
-        match self.handle_release.release_handle(request) {
-            Ok(outcome) => {
-                self.complete_release(request, outcome);
-            }
-            Err(error) => {
-                self.note_release_error(request, had_cleanup_deferred_hint, &error);
-            }
-        }
+        let _ = self.try_release(request);
     }
 
     pub fn on_release(&self, request: HandleDrainRequest) -> VfsResult<()> {
-        let had_cleanup_deferred_hint = self
-            .deferred_cleanup_hints
-            .has_deferred_cleanup_hint(request.ino);
-        match self.handle_release.release_handle(request) {
-            Ok(outcome) => {
-                self.complete_release(request, outcome);
-                Ok(())
-            }
-            Err(error) => {
-                self.note_release_error(request, had_cleanup_deferred_hint, &error);
-                Err(error)
-            }
-        }
+        self.try_release(request)
     }
 
     pub fn on_cleanup_delete(&self, request: HandleDrainDeleteRequest) {
@@ -196,12 +177,33 @@ where
             .note_release_success(request, hint_was_taken, outcome);
     }
 
+    fn try_release(&self, request: HandleDrainRequest) -> VfsResult<()> {
+        let had_cleanup_deferred_hint = self
+            .deferred_cleanup_hints
+            .has_deferred_cleanup_hint(request.ino);
+        match self.handle_release.release_handle(request) {
+            Ok(outcome) => {
+                self.complete_release(request, outcome);
+                Ok(())
+            }
+            Err(error) => {
+                self.note_release_error(request, had_cleanup_deferred_hint, &error);
+                Err(error)
+            }
+        }
+    }
+
     fn note_release_error(
         &self,
         request: HandleDrainRequest,
         had_cleanup_deferred_hint: bool,
         error: &VfsError,
     ) {
+        // `release_handle` only reaches this error path once the underlying
+        // implementation has engaged the last-handle release flow. Non-final
+        // handle closes return `Ok(default())`, so clearing the hint here avoids
+        // leaving stale deferred-cleanup state behind after a terminal release
+        // failure on the inode lifecycle boundary.
         let hint_was_present_for_log = self
             .deferred_cleanup_hints
             .take_deferred_cleanup_hint(request.ino)

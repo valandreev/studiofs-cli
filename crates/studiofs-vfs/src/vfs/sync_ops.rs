@@ -143,6 +143,9 @@ impl StudioVfs {
     /// last-handle path, plus whether it had to drain local dirty state there.
     pub async fn release_fh_with_outcome(&self, fh: u64) -> VfsResult<ReleaseFhOutcome> {
         let Some(context) = self.close_handle_for_release(fh) else {
+            // Non-final handle closes stop here and never enter the
+            // last-handle drain path, so any error returned by this method
+            // necessarily comes from the final release flow below.
             return Ok(ReleaseFhOutcome::default());
         };
         let ino = context.ino;
