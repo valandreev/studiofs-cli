@@ -1010,9 +1010,11 @@ impl UploadLifecycleWorker {
         let mut dispatched_since_yield = 0u32;
         let mut inbound_closed = false;
         loop {
+            Self::reap_ready_workers(&mut workers);
             Self::promote_ready_uploads(&mut fair, &mut delayed);
 
             while !fair.is_empty() {
+                Self::reap_ready_workers(&mut workers);
                 let Some(permit) = permits.clone().try_acquire_owned().ok() else {
                     break;
                 };
@@ -1037,6 +1039,7 @@ impl UploadLifecycleWorker {
                 if dispatched_since_yield >= UPLOAD_WORKER_YIELD_EVERY_OPS {
                     dispatched_since_yield = 0;
                     tokio::task::yield_now().await;
+                    Self::reap_ready_workers(&mut workers);
                     Self::promote_ready_uploads(&mut fair, &mut delayed);
                 }
             }
@@ -1123,6 +1126,16 @@ impl UploadLifecycleWorker {
         delayed.first_key_value().map(|(&not_before_unix_ms, _)| {
             Duration::from_millis(not_before_unix_ms.saturating_sub(now_unix_millis()))
         })
+    }
+
+    fn reap_ready_workers(workers: &mut JoinSet<()>) {
+        while let Some(join_result) = workers.try_join_next() {
+            match join_result {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => warn!(error = %error, "uploader worker join failed"),
+            }
+        }
     }
 
     async fn drain_workers(&self, workers: &mut JoinSet<()>) {
