@@ -117,6 +117,13 @@ static TEST_START_FAILURE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static TEST_SAFE_ACTION_AUDIT_FAILURE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 #[cfg(test)]
 static TEST_WORKFLOW_ATTACH_SNAPSHOT_OUTPUT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+#[cfg(test)]
+static DIAGNOSTICS_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn lock_diagnostics_test_mutex() -> parking_lot::MutexGuard<'static, ()> {
+    DIAGNOSTICS_TEST_LOCK.get_or_init(|| Mutex::new(())).lock()
+}
 
 #[cfg(test)]
 fn test_safe_action_audit_failure_message() -> Option<String> {
@@ -6206,12 +6213,6 @@ unsafe impl Sync for WindowsSecurityDescriptor {}
 mod tests {
     use super::*;
     use tempfile::TempDir;
-
-    static DIAGNOSTICS_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    fn lock_diagnostics_test_mutex() -> parking_lot::MutexGuard<'static, ()> {
-        DIAGNOSTICS_TEST_LOCK.get_or_init(|| Mutex::new(())).lock()
-    }
 
     #[derive(Clone)]
     struct StaticDiagnosticsSource {

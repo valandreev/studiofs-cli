@@ -1524,12 +1524,10 @@ mod tests {
         ProfilingWindowStatus, TimelineEntryKind, TimelineEntrySource, set_test_store_base_dir,
     };
     use std::io;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     use studiofs_meta::{ROOT_INO, RedbMetaEngine};
-
-    static DIAGNOSTICS_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     type BackendInspect = Arc<dyn Fn(&BackendLaunch) -> io::Result<()> + Send + Sync>;
 
@@ -2038,10 +2036,7 @@ mod tests {
 
     #[test]
     fn mount_session_launch_publishes_live_diagnostics_and_supports_attach() {
-        let _guard = DIAGNOSTICS_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("lock diagnostics test mutex");
+        let _guard = diagnostics::lock_diagnostics_test_mutex();
         let temp = tempfile::tempdir().expect("tempdir");
         let store_dir = temp.path().join("investigations-store");
         set_test_store_base_dir(Some(&store_dir));
@@ -2326,10 +2321,7 @@ mod tests {
 
     #[test]
     fn mount_session_launch_fails_open_when_diagnostics_start_fails() {
-        let _guard = DIAGNOSTICS_TEST_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("lock diagnostics test mutex");
+        let _guard = diagnostics::lock_diagnostics_test_mutex();
         diagnostics::set_test_start_failure(Some("synthetic diagnostics startup failure"));
         struct ResetDiagnosticsFailure;
         impl Drop for ResetDiagnosticsFailure {
