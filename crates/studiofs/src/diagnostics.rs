@@ -78,6 +78,16 @@ const DEFAULT_EVIDENCE_PROFILING_WINDOWS_LIMIT: usize = 4;
 const MAX_EVIDENCE_PROFILING_WINDOWS_LIMIT: usize = 16;
 const DEFAULT_EVIDENCE_DERIVED_ITEMS_PER_KIND: usize = 4;
 const MAX_EVIDENCE_DERIVED_ITEMS_PER_KIND: usize = 16;
+const SUBSYSTEM_UPLOAD_PIPELINE: &str = "upload_pipeline";
+const SUBSYSTEM_WRITE_PATH: &str = "write_path";
+const SUBSYSTEM_SYNCHRONIZATION: &str = "synchronization";
+const SUBSYSTEM_CACHE: &str = "cache";
+const OPERATION_QUEUE_GROWTH: &str = "queue_growth";
+const OPERATION_SYNC_DATA_QUEUE_WAIT: &str = "sync_data_queue_wait";
+const OPERATION_WRITE_BACKPRESSURE: &str = "write_backpressure";
+const OPERATION_UPLOAD_FALLBACK_WAIT: &str = "upload_fallback_wait";
+const OPERATION_PREFETCH_QUEUE: &str = "prefetch_queue";
+const OPERATION_METADATA_BACKLOG: &str = "metadata_backlog";
 const DIAGNOSTICS_PROFILE_ARTIFACT_DIR_NAME: &str = "profiles";
 #[cfg(unix)]
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
@@ -362,6 +372,7 @@ pub(crate) struct DiagnosticsEvidenceReference {
 pub(crate) struct DiagnosticsEvidenceProfilingWindow {
     pub window: ProfilingWindowRecord,
     pub summary: Option<serde_json::Value>,
+    pub load_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -376,7 +387,7 @@ pub(crate) struct DiagnosticsEvidenceRawView {
     pub profiling_windows: Vec<DiagnosticsEvidenceProfilingWindow>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DiagnosticsQueueGrowthEpisode {
     pub subsystem: String,
     pub operation_type: String,
@@ -389,7 +400,7 @@ pub(crate) struct DiagnosticsQueueGrowthEpisode {
     pub supporting_evidence: Vec<DiagnosticsEvidenceReference>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DiagnosticsBlockingInterval {
     pub subsystem: String,
     pub operation_type: String,
@@ -399,7 +410,7 @@ pub(crate) struct DiagnosticsBlockingInterval {
     pub supporting_evidence: Vec<DiagnosticsEvidenceReference>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DiagnosticsHotspotSummary {
     pub subsystem: String,
     pub operation_type: String,
@@ -409,7 +420,7 @@ pub(crate) struct DiagnosticsHotspotSummary {
     pub supporting_evidence: Vec<DiagnosticsEvidenceReference>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub(crate) struct DiagnosticsDerivedEvidenceView {
     #[serde(default)]
     pub queue_growth: Vec<DiagnosticsQueueGrowthEpisode>,
@@ -1276,10 +1287,46 @@ fn truncate_to_limit<T>(mut items: Vec<T>, limit: usize) -> (Vec<T>, bool) {
     (items, truncated)
 }
 
+fn queue_growth_episode(
+    start_event: &DiagnosticsRecentEvent,
+    start_pending_uploads: u64,
+    end_event: &DiagnosticsRecentEvent,
+    end_pending_uploads: u64,
+) -> DiagnosticsQueueGrowthEpisode {
+    DiagnosticsQueueGrowthEpisode {
+        subsystem: SUBSYSTEM_UPLOAD_PIPELINE.to_string(),
+        operation_type: OPERATION_QUEUE_GROWTH.to_string(),
+        start_event_sequence: start_event.sequence,
+        end_event_sequence: end_event.sequence,
+        start_pending_uploads,
+        end_pending_uploads,
+        delta_pending_uploads: end_pending_uploads as i64 - start_pending_uploads as i64,
+        supporting_evidence: vec![
+            DiagnosticsEvidenceReference {
+                source: DiagnosticsEvidenceReferenceSource::RecentEvent,
+                id: start_event.sequence.to_string(),
+                field: Some("fields.pending_uploads".to_string()),
+            },
+            DiagnosticsEvidenceReference {
+                source: DiagnosticsEvidenceReferenceSource::RecentEvent,
+                id: end_event.sequence.to_string(),
+                field: Some("fields.pending_uploads".to_string()),
+            },
+        ],
+    }
+}
+
 fn derive_queue_growth_episodes(
+    scope: &DiagnosticsEvidenceScope,
     events: &[DiagnosticsRecentEvent],
     limit: usize,
 ) -> (Vec<DiagnosticsQueueGrowthEpisode>, bool) {
+    if !subsystem_matches(scope.subsystem.as_deref(), SUBSYSTEM_UPLOAD_PIPELINE)
+        || !operation_matches(scope.operation_type.as_deref(), OPERATION_QUEUE_GROWTH)
+    {
+        return (Vec::new(), false);
+    }
+
     let mut episodes = Vec::new();
     let mut current: Option<(&DiagnosticsRecentEvent, u64, &DiagnosticsRecentEvent, u64)> = None;
 
@@ -1298,27 +1345,12 @@ fn derive_queue_growth_episodes(
             Some((start_event, start_pending, end_event, end_pending))
                 if end_pending > start_pending =>
             {
-                episodes.push(DiagnosticsQueueGrowthEpisode {
-                    subsystem: "upload_pipeline".to_string(),
-                    operation_type: "sample".to_string(),
-                    start_event_sequence: start_event.sequence,
-                    end_event_sequence: end_event.sequence,
-                    start_pending_uploads: start_pending,
-                    end_pending_uploads: end_pending,
-                    delta_pending_uploads: end_pending as i64 - start_pending as i64,
-                    supporting_evidence: vec![
-                        DiagnosticsEvidenceReference {
-                            source: DiagnosticsEvidenceReferenceSource::RecentEvent,
-                            id: start_event.sequence.to_string(),
-                            field: Some("fields.pending_uploads".to_string()),
-                        },
-                        DiagnosticsEvidenceReference {
-                            source: DiagnosticsEvidenceReferenceSource::RecentEvent,
-                            id: end_event.sequence.to_string(),
-                            field: Some("fields.pending_uploads".to_string()),
-                        },
-                    ],
-                });
+                episodes.push(queue_growth_episode(
+                    start_event,
+                    start_pending,
+                    end_event,
+                    end_pending,
+                ));
                 current = Some((event, pending_uploads, event, pending_uploads));
             }
             _ => {
@@ -1330,27 +1362,12 @@ fn derive_queue_growth_episodes(
     if let Some((start_event, start_pending, end_event, end_pending)) = current
         && end_pending > start_pending
     {
-        episodes.push(DiagnosticsQueueGrowthEpisode {
-            subsystem: "upload_pipeline".to_string(),
-            operation_type: "sample".to_string(),
-            start_event_sequence: start_event.sequence,
-            end_event_sequence: end_event.sequence,
-            start_pending_uploads: start_pending,
-            end_pending_uploads: end_pending,
-            delta_pending_uploads: end_pending as i64 - start_pending as i64,
-            supporting_evidence: vec![
-                DiagnosticsEvidenceReference {
-                    source: DiagnosticsEvidenceReferenceSource::RecentEvent,
-                    id: start_event.sequence.to_string(),
-                    field: Some("fields.pending_uploads".to_string()),
-                },
-                DiagnosticsEvidenceReference {
-                    source: DiagnosticsEvidenceReferenceSource::RecentEvent,
-                    id: end_event.sequence.to_string(),
-                    field: Some("fields.pending_uploads".to_string()),
-                },
-            ],
-        });
+        episodes.push(queue_growth_episode(
+            start_event,
+            start_pending,
+            end_event,
+            end_pending,
+        ));
     }
 
     truncate_to_limit(episodes, limit)
@@ -1405,7 +1422,9 @@ fn push_blocking_interval(
     max_blocked_ms: f64,
     supporting_evidence: Vec<DiagnosticsEvidenceReference>,
 ) {
-    if total_blocked_ms <= 0.0
+    if !total_blocked_ms.is_finite()
+        || !max_blocked_ms.is_finite()
+        || total_blocked_ms <= 0.0
         || !subsystem_matches(scope.subsystem.as_deref(), subsystem)
         || !operation_matches(scope.operation_type.as_deref(), operation_type)
     {
@@ -1430,7 +1449,8 @@ fn push_hotspot(
     score: f64,
     supporting_evidence: Vec<DiagnosticsEvidenceReference>,
 ) {
-    if score <= 0.0
+    if !score.is_finite()
+        || score <= 0.0
         || !subsystem_matches(scope.subsystem.as_deref(), subsystem)
         || !operation_matches(scope.operation_type.as_deref(), operation_type)
     {
@@ -1449,10 +1469,7 @@ fn push_hotspot(
 fn derive_blocking_intervals(
     scope: &DiagnosticsEvidenceScope,
     snapshot: Option<&DiagnosticsRuntimeSnapshot>,
-    profiling_windows: &[(
-        ProfilingWindowRecord,
-        Option<(serde_json::Value, WallBlockingProfileArtifact)>,
-    )],
+    profiling_windows: &[(ProfilingWindowRecord, Option<WallBlockingProfileArtifact>)],
     limit: usize,
 ) -> (Vec<DiagnosticsBlockingInterval>, bool) {
     let mut intervals = Vec::new();
@@ -1461,8 +1478,8 @@ fn derive_blocking_intervals(
             push_blocking_interval(
                 &mut intervals,
                 scope,
-                "write_path",
-                "sync_data_queue_wait",
+                SUBSYSTEM_WRITE_PATH,
+                OPERATION_SYNC_DATA_QUEUE_WAIT,
                 snapshot
                     .write_path
                     .block_store_sync_data
@@ -1475,8 +1492,8 @@ fn derive_blocking_intervals(
             push_blocking_interval(
                 &mut intervals,
                 scope,
-                "write_path",
-                "write_backpressure",
+                SUBSYSTEM_WRITE_PATH,
+                OPERATION_WRITE_BACKPRESSURE,
                 snapshot.write_path.write_backpressure.wait_total_ms as f64,
                 snapshot.write_path.write_backpressure.stall_max_ms as f64,
                 vec![runtime_snapshot_reference(
@@ -1486,8 +1503,8 @@ fn derive_blocking_intervals(
             push_blocking_interval(
                 &mut intervals,
                 scope,
-                "synchronization",
-                "upload_fallback_wait",
+                SUBSYSTEM_SYNCHRONIZATION,
+                OPERATION_UPLOAD_FALLBACK_WAIT,
                 snapshot
                     .synchronization
                     .state
@@ -1508,7 +1525,7 @@ fn derive_blocking_intervals(
     }
 
     for (window, artifact) in profiling_windows {
-        let Some((_, artifact)) = artifact else {
+        let Some(artifact) = artifact else {
             continue;
         };
         if !artifact_matches_scope(artifact, scope) {
@@ -1532,8 +1549,8 @@ fn derive_blocking_intervals(
         push_blocking_interval(
             &mut intervals,
             scope,
-            "write_path",
-            "sync_data_queue_wait",
+            SUBSYSTEM_WRITE_PATH,
+            OPERATION_SYNC_DATA_QUEUE_WAIT,
             queue_wait_delta,
             artifact
                 .end_snapshot
@@ -1561,8 +1578,8 @@ fn derive_blocking_intervals(
         push_blocking_interval(
             &mut intervals,
             scope,
-            "write_path",
-            "write_backpressure",
+            SUBSYSTEM_WRITE_PATH,
+            OPERATION_WRITE_BACKPRESSURE,
             backpressure_delta,
             artifact
                 .end_snapshot
@@ -1594,8 +1611,8 @@ fn derive_blocking_intervals(
         push_blocking_interval(
             &mut intervals,
             scope,
-            "synchronization",
-            "upload_fallback_wait",
+            SUBSYSTEM_SYNCHRONIZATION,
+            OPERATION_UPLOAD_FALLBACK_WAIT,
             fallback_delta,
             artifact
                 .end_snapshot
@@ -1620,10 +1637,7 @@ fn derive_blocking_intervals(
 fn derive_hotspots(
     scope: &DiagnosticsEvidenceScope,
     snapshot: Option<&DiagnosticsRuntimeSnapshot>,
-    profiling_windows: &[(
-        ProfilingWindowRecord,
-        Option<(serde_json::Value, WallBlockingProfileArtifact)>,
-    )],
+    profiling_windows: &[(ProfilingWindowRecord, Option<WallBlockingProfileArtifact>)],
     limit: usize,
 ) -> (Vec<DiagnosticsHotspotSummary>, bool) {
     let mut hotspots = Vec::new();
@@ -1632,8 +1646,8 @@ fn derive_hotspots(
             push_hotspot(
                 &mut hotspots,
                 scope,
-                "upload_pipeline",
-                "queue_growth",
+                SUBSYSTEM_UPLOAD_PIPELINE,
+                OPERATION_QUEUE_GROWTH,
                 "pending_uploads",
                 snapshot.upload.pending_uploads as f64,
                 vec![runtime_snapshot_reference("upload.pending_uploads")],
@@ -1641,8 +1655,8 @@ fn derive_hotspots(
             push_hotspot(
                 &mut hotspots,
                 scope,
-                "write_path",
-                "sync_data_queue_wait",
+                SUBSYSTEM_WRITE_PATH,
+                OPERATION_SYNC_DATA_QUEUE_WAIT,
                 "block_store_sync_data.queue_wait_total_ms",
                 snapshot
                     .write_path
@@ -1655,8 +1669,8 @@ fn derive_hotspots(
             push_hotspot(
                 &mut hotspots,
                 scope,
-                "write_path",
-                "write_backpressure",
+                SUBSYSTEM_WRITE_PATH,
+                OPERATION_WRITE_BACKPRESSURE,
                 "write_backpressure.wait_total_ms",
                 snapshot.write_path.write_backpressure.wait_total_ms as f64,
                 vec![runtime_snapshot_reference(
@@ -1666,8 +1680,8 @@ fn derive_hotspots(
             push_hotspot(
                 &mut hotspots,
                 scope,
-                "cache",
-                "prefetch_queue",
+                SUBSYSTEM_CACHE,
+                OPERATION_PREFETCH_QUEUE,
                 "prefetch_queue_depth",
                 snapshot.cache.state.prefetch_queue_depth as f64,
                 vec![runtime_snapshot_reference(
@@ -1677,8 +1691,8 @@ fn derive_hotspots(
             push_hotspot(
                 &mut hotspots,
                 scope,
-                "synchronization",
-                "metadata_backlog",
+                SUBSYSTEM_SYNCHRONIZATION,
+                OPERATION_METADATA_BACKLOG,
                 "pending_metadata_ops",
                 snapshot.synchronization.state.pending_metadata_ops as f64,
                 vec![runtime_snapshot_reference(
@@ -1689,7 +1703,7 @@ fn derive_hotspots(
     }
 
     for (window, artifact) in profiling_windows {
-        let Some((_, artifact)) = artifact else {
+        let Some(artifact) = artifact else {
             continue;
         };
         if !artifact_matches_scope(artifact, scope) {
@@ -1703,8 +1717,8 @@ fn derive_hotspots(
         push_hotspot(
             &mut hotspots,
             scope,
-            "write_path",
-            "sync_data_queue_wait",
+            SUBSYSTEM_WRITE_PATH,
+            OPERATION_SYNC_DATA_QUEUE_WAIT,
             "block_store_sync_data.queue_wait_total_ms_delta",
             artifact
                 .end_snapshot
@@ -1727,8 +1741,8 @@ fn derive_hotspots(
         push_hotspot(
             &mut hotspots,
             scope,
-            "write_path",
-            "write_backpressure",
+            SUBSYSTEM_WRITE_PATH,
+            OPERATION_WRITE_BACKPRESSURE,
             "write_backpressure.wait_total_ms_delta",
             artifact
                 .end_snapshot
@@ -1751,8 +1765,8 @@ fn derive_hotspots(
         push_hotspot(
             &mut hotspots,
             scope,
-            "upload_pipeline",
-            "queue_growth",
+            SUBSYSTEM_UPLOAD_PIPELINE,
+            OPERATION_QUEUE_GROWTH,
             "pending_uploads_delta",
             artifact.end_snapshot.upload.pending_uploads as f64
                 - artifact.start_snapshot.upload.pending_uploads as f64,
@@ -1763,12 +1777,7 @@ fn derive_hotspots(
         );
     }
 
-    hotspots.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    hotspots.sort_by(|left, right| right.score.total_cmp(&left.score));
     truncate_to_limit(hotspots, limit)
 }
 
@@ -1829,38 +1838,47 @@ fn build_evidence_view(
         .collect::<Vec<_>>();
     let profiling_windows_requested_too_large =
         request.budget.max_profiling_windows > applied_budget.max_profiling_windows;
+    let derived_items_requested_too_large =
+        request.budget.max_derived_items_per_kind > applied_budget.max_derived_items_per_kind;
     let (selected_windows, profiling_windows_truncated_by_count) = truncate_to_limit(
         filtered_profiling_windows,
         applied_budget.max_profiling_windows,
     );
-    let profiling_windows = selected_windows
-        .into_iter()
-        .map(|window| {
-            let summary = load_wall_blocking_profile_artifact(&window)
-                .map(|artifact| artifact.map(|(summary, _)| summary))
-                .ok()
-                .flatten();
-            DiagnosticsEvidenceProfilingWindow { window, summary }
-        })
-        .collect::<Vec<_>>();
-
-    let typed_profiling_windows = profiling_windows
-        .iter()
-        .map(|window| {
-            let typed = load_wall_blocking_profile_artifact(&window.window)
-                .ok()
-                .flatten();
-            (window.window.clone(), typed)
-        })
-        .collect::<Vec<_>>();
+    let mut profiling_windows = Vec::with_capacity(selected_windows.len());
+    let mut typed_profiling_windows = Vec::with_capacity(selected_windows.len());
+    for window in selected_windows {
+        let (artifact, load_error) = match load_wall_blocking_profile_artifact(&window) {
+            Ok(artifact) => (artifact, None),
+            Err(error) => {
+                warn!(
+                    window_id = %window.window_id,
+                    artifact_path = ?window.artifact.as_ref().map(|artifact| artifact.path.as_str()),
+                    error = %error,
+                    "failed to load wall-blocking profiling artifact for evidence view"
+                );
+                (None, Some(error.to_string()))
+            }
+        };
+        let summary = artifact.as_ref().map(|(summary, _)| summary.clone());
+        let typed = artifact.map(|(_, typed)| typed);
+        typed_profiling_windows.push((window.clone(), typed));
+        profiling_windows.push(DiagnosticsEvidenceProfilingWindow {
+            window,
+            summary,
+            load_error,
+        });
+    }
 
     let snapshot = source.runtime_snapshot();
     let snapshot_in_view = resolved_marker_span.is_none();
     let snapshot_sections =
         snapshot_sections_for_scope(&snapshot, &request.scope, resolved_marker_span.as_ref());
 
-    let (queue_growth, queue_growth_truncated) =
-        derive_queue_growth_episodes(&recent_events, applied_budget.max_derived_items_per_kind);
+    let (queue_growth, queue_growth_truncated) = derive_queue_growth_episodes(
+        &request.scope,
+        &recent_events,
+        applied_budget.max_derived_items_per_kind,
+    );
     let (blocking_intervals, blocking_intervals_truncated) = derive_blocking_intervals(
         &request.scope,
         snapshot_in_view.then_some(&snapshot),
@@ -1888,9 +1906,10 @@ fn build_evidence_view(
                     || request.budget.max_timeline_entries > applied_budget.max_timeline_entries,
                 profiling_windows: profiling_windows_truncated_by_count
                     || profiling_windows_requested_too_large,
-                queue_growth: queue_growth_truncated,
-                blocking_intervals: blocking_intervals_truncated,
-                hotspots: hotspots_truncated,
+                queue_growth: queue_growth_truncated || derived_items_requested_too_large,
+                blocking_intervals: blocking_intervals_truncated
+                    || derived_items_requested_too_large,
+                hotspots: hotspots_truncated || derived_items_requested_too_large,
             },
         },
         raw: DiagnosticsEvidenceRawView {
@@ -3915,6 +3934,12 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    static DIAGNOSTICS_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn lock_diagnostics_test_mutex() -> parking_lot::MutexGuard<'static, ()> {
+        DIAGNOSTICS_TEST_LOCK.get_or_init(|| Mutex::new(())).lock()
+    }
+
     #[derive(Clone)]
     struct StaticDiagnosticsSource {
         session: DiagnosticsSessionInfo,
@@ -4452,35 +4477,35 @@ mod tests {
                 sample_scoped_recent_event(
                     1,
                     start.occurred_unix_ms.saturating_sub(10),
-                    "upload_pipeline",
+                    SUBSYSTEM_UPLOAD_PIPELINE,
                     "sample",
                     serde_json::json!({"pending_uploads": 1, "path": "Q:/clips/reel.mov"}),
                 ),
                 sample_scoped_recent_event(
                     2,
                     start.occurred_unix_ms.saturating_add(1),
-                    "upload_pipeline",
+                    SUBSYSTEM_UPLOAD_PIPELINE,
                     "sample",
                     serde_json::json!({"pending_uploads": 2, "path": "Q:/clips/reel.mov"}),
                 ),
                 sample_scoped_recent_event(
                     3,
                     start.occurred_unix_ms.saturating_add(2),
-                    "cache",
+                    SUBSYSTEM_CACHE,
                     "sample",
                     serde_json::json!({"pending_uploads": 99, "path": "Q:/clips/reel.mov"}),
                 ),
                 sample_scoped_recent_event(
                     4,
                     end.occurred_unix_ms.saturating_sub(1),
-                    "upload_pipeline",
+                    SUBSYSTEM_UPLOAD_PIPELINE,
                     "sample",
                     serde_json::json!({"pending_uploads": 5, "path": "Q:/clips/reel.mov"}),
                 ),
                 sample_scoped_recent_event(
                     5,
                     end.occurred_unix_ms.saturating_add(1),
-                    "upload_pipeline",
+                    SUBSYSTEM_UPLOAD_PIPELINE,
                     "sample",
                     serde_json::json!({"pending_uploads": 7, "path": "Q:/clips/reel.mov"}),
                 ),
@@ -4499,8 +4524,8 @@ mod tests {
                 run_id: run.id.clone(),
                 request: DiagnosticsEvidenceRequest {
                     scope: DiagnosticsEvidenceScope {
-                        subsystem: Some("upload_pipeline".to_string()),
-                        operation_type: Some("sample".to_string()),
+                        subsystem: Some(SUBSYSTEM_UPLOAD_PIPELINE.to_string()),
+                        operation_type: None,
                         object_identity: Some(DiagnosticsObjectIdentity {
                             path: Some("Q:/clips/reel.mov".to_string()),
                             ..DiagnosticsObjectIdentity::default()
@@ -4541,6 +4566,10 @@ mod tests {
         assert_eq!(resolved_span.start_sequence, start.sequence);
         assert_eq!(resolved_span.end_sequence, end.sequence);
         assert_eq!(view.derived.queue_growth.len(), 1);
+        assert_eq!(
+            view.derived.queue_growth[0].operation_type,
+            OPERATION_QUEUE_GROWTH
+        );
         assert_eq!(view.derived.queue_growth[0].delta_pending_uploads, 3);
         assert_eq!(
             view.derived.queue_growth[0]
@@ -4563,7 +4592,7 @@ mod tests {
                     sample_scoped_recent_event(
                         sequence,
                         10_000 + sequence,
-                        "upload_pipeline",
+                        SUBSYSTEM_UPLOAD_PIPELINE,
                         "sample",
                         serde_json::json!({"pending_uploads": sequence}),
                     )
@@ -4607,6 +4636,9 @@ mod tests {
             MAX_EVIDENCE_RECENT_EVENTS_LIMIT
         );
         assert!(view.budget.truncation.recent_events);
+        assert!(view.budget.truncation.queue_growth);
+        assert!(view.budget.truncation.blocking_intervals);
+        assert!(view.budget.truncation.hotspots);
         assert_eq!(
             view.raw.recent_events.len(),
             MAX_EVIDENCE_RECENT_EVENTS_LIMIT
@@ -4647,14 +4679,14 @@ mod tests {
             vec![sample_scoped_recent_event(
                 1,
                 2_100,
-                "upload_pipeline",
+                SUBSYSTEM_UPLOAD_PIPELINE,
                 "sample",
                 serde_json::json!({"pending_uploads": 2}),
             )],
             vec![sample_scoped_recent_event(
                 2,
                 3_900,
-                "upload_pipeline",
+                SUBSYSTEM_UPLOAD_PIPELINE,
                 "sample",
                 serde_json::json!({"pending_uploads": 9}),
             )],
@@ -4717,12 +4749,14 @@ mod tests {
 
         assert_eq!(view.raw.profiling_windows.len(), 1);
         assert!(view.raw.profiling_windows[0].summary.is_some());
+        assert!(view.raw.profiling_windows[0].load_error.is_none());
         assert!(view.derived.blocking_intervals.iter().any(|interval| {
-            interval.operation_type == "sync_data_queue_wait" && interval.total_blocked_ms == 60.0
+            interval.operation_type == OPERATION_SYNC_DATA_QUEUE_WAIT
+                && interval.total_blocked_ms == 60.0
         }));
         assert!(view.derived.hotspots.iter().any(|hotspot| {
             hotspot.metric == "block_store_sync_data.queue_wait_total_ms_delta"
-                && hotspot.subsystem == "write_path"
+                && hotspot.subsystem == SUBSYSTEM_WRITE_PATH
         }));
         assert!(
             view.derived.blocking_intervals[0]
@@ -4751,8 +4785,7 @@ mod tests {
                 run_id: run.id,
                 request: DiagnosticsEvidenceRequest {
                     scope: DiagnosticsEvidenceScope {
-                        subsystem: Some("upload_pipeline".to_string()),
-                        operation_type: Some("sample".to_string()),
+                        subsystem: Some(SUBSYSTEM_UPLOAD_PIPELINE.to_string()),
                         object_identity: Some(DiagnosticsObjectIdentity {
                             path: Some("Q:/missing/file.mov".to_string()),
                             ..DiagnosticsObjectIdentity::default()
@@ -4791,7 +4824,79 @@ mod tests {
     }
 
     #[test]
+    fn evidence_view_surfaces_profile_artifact_load_errors() {
+        let temp = mounts_dir_temp();
+        let store = InvestigationStore::new(temp.path().join("investigations"));
+        let (_case, run) = test_case_and_run(&store);
+        store
+            .append_profiling_window(
+                &run.id,
+                NewProfilingWindow {
+                    window_id: "window-bad".to_string(),
+                    occurred_unix_ms: 2_000,
+                    capture_mode: ProfilingCaptureMode::WallBlocking,
+                    preset: DiagnosticsPreset::Balanced,
+                    requested_duration_ms: 2_000,
+                    actual_duration_ms: Some(1_750),
+                    sample_rate_hz: Some(50),
+                    estimated_cost: ProfilingCostEstimate {
+                        score: 2,
+                        label: "balanced".to_string(),
+                    },
+                    status: ProfilingWindowStatus::Completed,
+                    artifact: Some(ProfileArtifactRecord {
+                        kind: "wall_blocking_summary".to_string(),
+                        path: temp
+                            .path()
+                            .join("missing-wall-blocking.json")
+                            .to_string_lossy()
+                            .into_owned(),
+                        bytes: 0,
+                    }),
+                    error: None,
+                },
+            )
+            .expect("append profiling window");
+
+        let lease_manager = ControllerLeaseManager::default();
+        let lease = lease_manager
+            .acquire("tester".to_string(), Some(500))
+            .expect("acquire lease");
+
+        let response = execute_request(
+            DiagnosticsRequest::EvidenceView {
+                auth_token: "secret".to_string(),
+                lease_id: lease.lease_id,
+                run_id: run.id,
+                request: DiagnosticsEvidenceRequest {
+                    scope: DiagnosticsEvidenceScope::default(),
+                    budget: DiagnosticsEvidenceBudget {
+                        max_recent_events: 8,
+                        max_timeline_entries: 8,
+                        max_profiling_windows: 4,
+                        max_derived_items_per_kind: 4,
+                    },
+                },
+            },
+            "secret",
+            &static_source(),
+            &lease_manager,
+            Some(&store),
+            None,
+        );
+
+        let DiagnosticsResponse::EvidenceView { view } = response else {
+            panic!("expected evidence view response");
+        };
+
+        assert_eq!(view.raw.profiling_windows.len(), 1);
+        assert!(view.raw.profiling_windows[0].summary.is_none());
+        assert!(view.raw.profiling_windows[0].load_error.is_some());
+    }
+
+    #[test]
     fn silent_log_verbosity_action_returns_updated_level_without_timeline_entry() {
+        let _guard = lock_diagnostics_test_mutex();
         crate::ensure_test_diagnostics_log_filter();
 
         let source = static_source();
@@ -4885,6 +4990,7 @@ mod tests {
 
     #[test]
     fn loud_safe_action_appends_audited_timeline_entry() {
+        let _guard = lock_diagnostics_test_mutex();
         let source = static_source();
         let lease_manager = ControllerLeaseManager::default();
         let temp = mounts_dir_temp();
@@ -4979,6 +5085,7 @@ mod tests {
 
     #[test]
     fn loud_safe_action_failures_remain_audited_and_fail_open() {
+        let _guard = lock_diagnostics_test_mutex();
         let temp = mounts_dir_temp();
         let cache_file = temp.path().join("cache-file");
         fs::write(&cache_file, b"not-a-directory").expect("write cache file");
@@ -5078,6 +5185,7 @@ mod tests {
 
     #[test]
     fn reset_counters_action_calls_data_source_and_is_audited() {
+        let _guard = lock_diagnostics_test_mutex();
         let source = static_source();
         let reset_calls = source.reset_calls.clone();
         let lease_manager = ControllerLeaseManager::default();
@@ -5167,6 +5275,7 @@ mod tests {
 
     #[test]
     fn loud_safe_action_audit_failures_are_reported_in_outcome() {
+        let _guard = lock_diagnostics_test_mutex();
         struct ResetAuditFailure;
         impl Drop for ResetAuditFailure {
             fn drop(&mut self) {
