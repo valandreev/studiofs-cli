@@ -66,10 +66,13 @@ The generic step kinds for the first slice are:
 - `marker`
 - `note`
 - `profiling_window`
-- `safe_action`
 - `tool_step`
 - `manual_step`
 - `report_step`
+
+`safe_action` is intentionally out of scope for the first slice. Existing safe
+diagnostics actions can be exposed in a later phase once matching workflow tool
+catalog entries and executor handling are implemented.
 
 Each step carries:
 
@@ -205,9 +208,10 @@ arguments. The host resolves that request against the catalog, enforces safety
 rules, executes it, captures stdout/stderr metadata as artifacts, and returns a
 structured outcome.
 
-The hidden internal CLI should expose matching `diagnostics-workflow-*`
-commands so the first workflow can be exercised locally in tests and by human
-operators without an MCP adapter.
+The hidden internal CLI should expose matching `diagnostics-*-workflow`
+commands (for example, `diagnostics-start-workflow` and
+`diagnostics-get-workflow`) so the first workflow can be exercised locally in
+tests and by human operators without an MCP adapter.
 
 ## Safety Boundaries
 
@@ -277,7 +281,7 @@ the feature, while the manual path is validated through a documented human pass.
 
 ### `crates/studiofs/src/cli/internal.rs`
 
-- parsing for hidden `diagnostics-workflow-*` helper commands
+- parsing for hidden `diagnostics-*-workflow` helper commands
 
 ### Human Validation
 

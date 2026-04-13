@@ -515,83 +515,103 @@ fn run_diagnostics_create_run(args: DiagnosticsCreateRunArgs) -> anyhow::Result<
     Ok(())
 }
 
-fn run_diagnostics_list_workflows(args: DiagnosticsListWorkflowsArgs) -> anyhow::Result<()> {
-    let client = live_client_for_mount(&args.mount_point)?;
-    let payload = crate::runtime_bridge::block_on(async move { client.list_workflows().await })?;
+fn run_live_diagnostics_command<F, Fut, P>(mount_point: &str, command: F) -> anyhow::Result<()>
+where
+    F: FnOnce(diagnostics::LocalDiagnosticsClient) -> Fut + Send,
+    Fut: std::future::Future<Output = anyhow::Result<P>> + Send,
+    P: serde::Serialize + Send,
+{
+    let client = live_client_for_mount(mount_point)?;
+    let payload = crate::runtime_bridge::block_on(async move { command(client).await })?;
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())
+}
+
+fn run_diagnostics_list_workflows(args: DiagnosticsListWorkflowsArgs) -> anyhow::Result<()> {
+    let DiagnosticsListWorkflowsArgs { mount_point } = args;
+    run_live_diagnostics_command(&mount_point, |client| async move {
+        client.list_workflows().await
+    })
 }
 
 fn run_diagnostics_start_workflow(args: DiagnosticsStartWorkflowArgs) -> anyhow::Result<()> {
-    let client = live_client_for_mount(&args.mount_point)?;
-    let payload = crate::runtime_bridge::block_on(async move {
+    let DiagnosticsStartWorkflowArgs {
+        mount_point,
+        lease_id,
+        run_id,
+        workflow_id,
+    } = args;
+    run_live_diagnostics_command(&mount_point, |client| async move {
         client
-            .start_workflow(&args.lease_id, &args.run_id, &args.workflow_id)
+            .start_workflow(&lease_id, &run_id, &workflow_id)
             .await
-    })?;
-    println!("{}", serde_json::to_string_pretty(&payload)?);
-    Ok(())
+    })
 }
 
 fn run_diagnostics_get_workflow(args: DiagnosticsGetWorkflowArgs) -> anyhow::Result<()> {
-    let client = live_client_for_mount(&args.mount_point)?;
-    let payload = crate::runtime_bridge::block_on(async move {
-        client
-            .workflow_run(&args.lease_id, &args.workflow_run_id)
-            .await
-    })?;
-    println!("{}", serde_json::to_string_pretty(&payload)?);
-    Ok(())
+    let DiagnosticsGetWorkflowArgs {
+        mount_point,
+        lease_id,
+        workflow_run_id,
+    } = args;
+    run_live_diagnostics_command(&mount_point, |client| async move {
+        client.workflow_run(&lease_id, &workflow_run_id).await
+    })
 }
 
 fn run_diagnostics_advance_workflow(args: DiagnosticsAdvanceWorkflowArgs) -> anyhow::Result<()> {
-    let client = live_client_for_mount(&args.mount_point)?;
-    let payload = crate::runtime_bridge::block_on(async move {
+    let DiagnosticsAdvanceWorkflowArgs {
+        mount_point,
+        lease_id,
+        workflow_run_id,
+        step_id,
+    } = args;
+    run_live_diagnostics_command(&mount_point, |client| async move {
         client
-            .advance_workflow_step(&args.lease_id, &args.workflow_run_id, &args.step_id)
+            .advance_workflow_step(&lease_id, &workflow_run_id, &step_id)
             .await
-    })?;
-    println!("{}", serde_json::to_string_pretty(&payload)?);
-    Ok(())
+    })
 }
 
 fn run_diagnostics_ack_workflow_step(args: DiagnosticsAckWorkflowStepArgs) -> anyhow::Result<()> {
-    let client = live_client_for_mount(&args.mount_point)?;
-    let payload = crate::runtime_bridge::block_on(async move {
+    let DiagnosticsAckWorkflowStepArgs {
+        mount_point,
+        lease_id,
+        workflow_run_id,
+        step_id,
+        actor,
+        note,
+    } = args;
+    run_live_diagnostics_command(&mount_point, |client| async move {
         client
-            .acknowledge_manual_step(
-                &args.lease_id,
-                &args.workflow_run_id,
-                &args.step_id,
-                args.actor,
-                args.note,
-            )
+            .acknowledge_manual_step(&lease_id, &workflow_run_id, &step_id, actor, note)
             .await
-    })?;
-    println!("{}", serde_json::to_string_pretty(&payload)?);
-    Ok(())
+    })
 }
 
 fn run_diagnostics_abort_workflow(args: DiagnosticsAbortWorkflowArgs) -> anyhow::Result<()> {
-    let client = live_client_for_mount(&args.mount_point)?;
-    let payload = crate::runtime_bridge::block_on(async move {
+    let DiagnosticsAbortWorkflowArgs {
+        mount_point,
+        lease_id,
+        workflow_run_id,
+        reason,
+    } = args;
+    run_live_diagnostics_command(&mount_point, |client| async move {
         client
-            .abort_workflow(&args.lease_id, &args.workflow_run_id, args.reason)
+            .abort_workflow(&lease_id, &workflow_run_id, reason)
             .await
-    })?;
-    println!("{}", serde_json::to_string_pretty(&payload)?);
-    Ok(())
+    })
 }
 
 fn run_diagnostics_complete_workflow(args: DiagnosticsCompleteWorkflowArgs) -> anyhow::Result<()> {
-    let client = live_client_for_mount(&args.mount_point)?;
-    let payload = crate::runtime_bridge::block_on(async move {
-        client
-            .complete_workflow(&args.lease_id, &args.workflow_run_id)
-            .await
-    })?;
-    println!("{}", serde_json::to_string_pretty(&payload)?);
-    Ok(())
+    let DiagnosticsCompleteWorkflowArgs {
+        mount_point,
+        lease_id,
+        workflow_run_id,
+    } = args;
+    run_live_diagnostics_command(&mount_point, |client| async move {
+        client.complete_workflow(&lease_id, &workflow_run_id).await
+    })
 }
 
 fn run_diagnostics_add_timeline(args: DiagnosticsAddTimelineArgs) -> anyhow::Result<()> {
