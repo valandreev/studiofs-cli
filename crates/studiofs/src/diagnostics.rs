@@ -19,6 +19,7 @@ use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use studiofs_meta::FormatInfo;
 use studiofs_vfs::vfs::VfsFileSessionStats;
@@ -49,9 +50,6 @@ use windows::{
     },
     core::w,
 };
-
-#[cfg(test)]
-use std::sync::OnceLock;
 
 const DIAGNOSTICS_PROTOCOL_VERSION: u32 = 1;
 const DEFAULT_LEASE_TTL_MS: u64 = 5_000;
@@ -147,7 +145,7 @@ pub(crate) struct LiveMountRuntimeFingerprint {
 
 pub(crate) struct LiveMountDiagnosticsSource {
     identity: DiagnosticsSessionInfo,
-    runtime_fingerprint: LiveMountRuntimeFingerprint,
+    base_fingerprint: EnvironmentFingerprint,
     vfs: Arc<StudioVfs>,
 }
 
@@ -166,21 +164,23 @@ impl LiveMountDiagnosticsSource {
             format!("{}:{mount_point}:{pid}", format_info.uuid).as_bytes(),
         )
         .to_string();
+        let identity = DiagnosticsSessionInfo {
+            protocol_version: DIAGNOSTICS_PROTOCOL_VERSION,
+            session_id,
+            volume: format_info.name.clone(),
+            volume_uuid: format_info.uuid.clone(),
+            bridge: runtime_fingerprint.bridge.clone(),
+            mount_point: mount_point.to_string(),
+            pid,
+            cache_path: cache_path.to_string_lossy().into_owned(),
+            read_only,
+            started_unix_ms: now_unix_millis(),
+            controller: None,
+        };
+        let base_fingerprint = base_environment_fingerprint(&identity, &runtime_fingerprint);
         Self {
-            identity: DiagnosticsSessionInfo {
-                protocol_version: DIAGNOSTICS_PROTOCOL_VERSION,
-                session_id,
-                volume: format_info.name.clone(),
-                volume_uuid: format_info.uuid.clone(),
-                bridge: runtime_fingerprint.bridge.clone(),
-                mount_point: mount_point.to_string(),
-                pid,
-                cache_path: cache_path.to_string_lossy().into_owned(),
-                read_only,
-                started_unix_ms: now_unix_millis(),
-                controller: None,
-            },
-            runtime_fingerprint,
+            identity,
+            base_fingerprint,
             vfs,
         }
     }
@@ -207,55 +207,74 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
         case_workload_identity: Option<&str>,
         run_workload_identity: Option<&str>,
     ) -> EnvironmentFingerprint {
-        let mut system = sysinfo::System::new_all();
-        system.refresh_all();
+        let mut fingerprint = self.base_fingerprint.clone();
+        fingerprint.workload_identity = WorkloadIdentityFingerprint {
+            case_workload: case_workload_identity.map(str::to_string),
+            run_workload: run_workload_identity.map(str::to_string),
+        };
+        fingerprint
+    }
+}
 
-        EnvironmentFingerprint {
-            platform: PlatformFingerprint {
-                os: std::env::consts::OS.to_string(),
-                family: std::env::consts::FAMILY.to_string(),
-                arch: std::env::consts::ARCH.to_string(),
-            },
-            bridge: self.identity.bridge.clone(),
-            build: BuildIdentity {
-                package_name: env!("CARGO_PKG_NAME").to_string(),
-                package_version: env!("CARGO_PKG_VERSION").to_string(),
-                executable_path: std::env::current_exe()
-                    .ok()
-                    .map(|path| path.to_string_lossy().into_owned()),
-                debug_build: cfg!(debug_assertions),
-            },
-            runtime_configuration: RuntimeConfigurationFingerprint {
-                volume: self.identity.volume.clone(),
-                volume_uuid: self.identity.volume_uuid.clone(),
-                mount_point: self.identity.mount_point.clone(),
-                cache_path: self.identity.cache_path.clone(),
-                read_only: self.identity.read_only,
-                cache_size: self.runtime_fingerprint.cache_size.clone(),
-                endpoint_override: self.runtime_fingerprint.endpoint_override.clone(),
-                snapshot_id: self.runtime_fingerprint.snapshot_id.clone(),
-                vfs_config: self.runtime_fingerprint.vfs_config.clone(),
-            },
-            workload_identity: WorkloadIdentityFingerprint {
-                case_workload: case_workload_identity.map(str::to_string),
-                run_workload: run_workload_identity.map(str::to_string),
-            },
-            machine: MachineFingerprint {
+fn base_environment_fingerprint(
+    identity: &DiagnosticsSessionInfo,
+    runtime_fingerprint: &LiveMountRuntimeFingerprint,
+) -> EnvironmentFingerprint {
+    EnvironmentFingerprint {
+        platform: PlatformFingerprint {
+            os: std::env::consts::OS.to_string(),
+            family: std::env::consts::FAMILY.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+        },
+        bridge: identity.bridge.clone(),
+        build: BuildIdentity {
+            package_name: env!("CARGO_PKG_NAME").to_string(),
+            package_version: env!("CARGO_PKG_VERSION").to_string(),
+            executable_path: std::env::current_exe()
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned()),
+            debug_build: cfg!(debug_assertions),
+        },
+        runtime_configuration: RuntimeConfigurationFingerprint {
+            volume: identity.volume.clone(),
+            volume_uuid: identity.volume_uuid.clone(),
+            mount_point: identity.mount_point.clone(),
+            cache_path: identity.cache_path.clone(),
+            read_only: identity.read_only,
+            cache_size: runtime_fingerprint.cache_size.clone(),
+            endpoint_override: runtime_fingerprint.endpoint_override.clone(),
+            snapshot_id: runtime_fingerprint.snapshot_id.clone(),
+            vfs_config: runtime_fingerprint.vfs_config.clone(),
+        },
+        workload_identity: WorkloadIdentityFingerprint {
+            case_workload: None,
+            run_workload: None,
+        },
+        machine: static_machine_fingerprint(),
+        diagnostics: DiagnosticsSettingsFingerprint {
+            protocol_version: DIAGNOSTICS_PROTOCOL_VERSION,
+            default_lease_ttl_ms: DEFAULT_LEASE_TTL_MS,
+            max_lease_ttl_ms: MAX_LEASE_TTL_MS,
+            max_connections: MAX_DIAGNOSTICS_CONNECTIONS,
+        },
+    }
+}
+
+fn static_machine_fingerprint() -> MachineFingerprint {
+    static MACHINE_FINGERPRINT: OnceLock<MachineFingerprint> = OnceLock::new();
+    MACHINE_FINGERPRINT
+        .get_or_init(|| {
+            let system = sysinfo::System::new_all();
+            MachineFingerprint {
                 host_name: sysinfo::System::host_name(),
                 system_name: sysinfo::System::name(),
                 kernel_version: sysinfo::System::kernel_version(),
                 os_version: sysinfo::System::os_version(),
                 total_memory_bytes: system.total_memory(),
                 cpu_count: system.cpus().len(),
-            },
-            diagnostics: DiagnosticsSettingsFingerprint {
-                protocol_version: DIAGNOSTICS_PROTOCOL_VERSION,
-                default_lease_ttl_ms: DEFAULT_LEASE_TTL_MS,
-                max_lease_ttl_ms: MAX_LEASE_TTL_MS,
-                max_connections: MAX_DIAGNOSTICS_CONNECTIONS,
-            },
-        }
-    }
+            }
+        })
+        .clone()
 }
 
 #[derive(Debug, Serialize, Deserialize)]

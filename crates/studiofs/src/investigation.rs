@@ -1,10 +1,12 @@
 use anyhow::{Context, Result, anyhow};
+use fs2::FileExt;
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tempfile::NamedTempFile;
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -177,6 +179,7 @@ impl InvestigationStore {
     pub(crate) fn create_case(&self, input: NewInvestigationCase) -> Result<InvestigationCase> {
         let _guard = self.io_lock.lock();
         self.ensure_layout()?;
+        let _store_lock = self.lock_store()?;
 
         let now = now_unix_millis();
         let case = InvestigationCase {
@@ -196,6 +199,7 @@ impl InvestigationStore {
     pub(crate) fn create_run(&self, input: NewInvestigationRun) -> Result<InvestigationRun> {
         let _guard = self.io_lock.lock();
         self.ensure_layout()?;
+        let _store_lock = self.lock_store()?;
 
         let mut case = self.load_json::<InvestigationCase>(&self.case_path(&input.case_id))?;
         let now = now_unix_millis();
@@ -222,6 +226,7 @@ impl InvestigationStore {
     ) -> Result<TimelineEntry> {
         let _guard = self.io_lock.lock();
         self.ensure_layout()?;
+        let _store_lock = self.lock_store()?;
 
         let mut run = self.load_json::<InvestigationRun>(&self.run_path(run_id))?;
         let entry = TimelineEntry {
@@ -245,11 +250,13 @@ impl InvestigationStore {
 
     pub(crate) fn load_case(&self, case_id: &str) -> Result<InvestigationCase> {
         let _guard = self.io_lock.lock();
+        let _store_lock = self.lock_store()?;
         self.load_json(&self.case_path(case_id))
     }
 
     pub(crate) fn load_run(&self, run_id: &str) -> Result<InvestigationRun> {
         let _guard = self.io_lock.lock();
+        let _store_lock = self.lock_store()?;
         self.load_json(&self.run_path(run_id))
     }
 
@@ -315,8 +322,46 @@ impl InvestigationStore {
         let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
             anyhow!("serialize investigation file '{}': {error}", path.display())
         })?;
-        fs::write(path, bytes)
-            .with_context(|| format!("write investigation file '{}'", path.display()))
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("investigation file '{}' has no parent", path.display()))?;
+        let mut temp_file = NamedTempFile::new_in(parent).with_context(|| {
+            format!(
+                "create temporary investigation file in '{}'",
+                parent.display()
+            )
+        })?;
+        use std::io::Write;
+        temp_file.write_all(&bytes).with_context(|| {
+            format!(
+                "write temporary investigation file for '{}'",
+                path.display()
+            )
+        })?;
+        temp_file.as_file().sync_all().with_context(|| {
+            format!("sync temporary investigation file for '{}'", path.display())
+        })?;
+        temp_file
+            .persist(path)
+            .map_err(|error| error.error)
+            .with_context(|| format!("persist investigation file '{}'", path.display()))?;
+        sync_directory(parent)?;
+        Ok(())
+    }
+
+    fn lock_store(&self) -> Result<StoreLockGuard> {
+        let lock_path = self.base_dir.join(".store.lock");
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("open investigation lock '{}'", lock_path.display()))?;
+        lock_file
+            .lock_exclusive()
+            .with_context(|| format!("lock investigation store '{}'", lock_path.display()))?;
+        Ok(StoreLockGuard { lock_file })
     }
 }
 
@@ -324,7 +369,24 @@ fn now_unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
+        .unwrap_or_else(|_| 1)
+}
+
+struct StoreLockGuard {
+    lock_file: File,
+}
+
+impl Drop for StoreLockGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.lock_file);
+    }
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    if let Ok(dir) = File::open(path) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 fn default_store_dir() -> Result<PathBuf> {
