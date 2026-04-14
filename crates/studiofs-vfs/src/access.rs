@@ -4,6 +4,7 @@ use crate::vfs::OpenFlags;
 const ACCESS_SCORE_MAX: i16 = 12;
 const READ_SEQUENTIAL_PROMOTION_THRESHOLD: i16 = 4;
 const READ_RANDOM_PROMOTION_THRESHOLD: i16 = 3;
+const READ_IMMEDIATE_SEQUENTIAL_BONUS: i16 = 3;
 const WRITE_SEQUENTIAL_PROMOTION_THRESHOLD: i16 = 3;
 const DEFAULT_READAHEAD_BASE_WIDTH: u32 = 4;
 const DEFAULT_READAHEAD_MAX_WIDTH: u32 = 32;
@@ -102,24 +103,31 @@ impl AccessPolicy {
         let base_width = cfg.readahead_base_width.max(1);
         let max_width = cfg.readahead_max_width.max(base_width);
         let min_prefetch = cfg.readahead_min_prefetch.max(1).min(max_width);
+        let widened_base_width = base_width.saturating_mul(2).max(base_width);
+        let widened_max_width = max_width.saturating_mul(2).max(widened_base_width);
+        let random_readahead_floor = widened_base_width;
+        let random_readahead_ceiling = base_width.saturating_mul(4).max(random_readahead_floor);
+        let random_readahead_width = max_width
+            .min(random_readahead_ceiling)
+            .max(random_readahead_floor);
         match class {
             AccessClass::SequentialMediaRead => Self {
                 class,
                 prefetch_enabled: true,
                 cache_promotion_on_read: false,
-                readahead_base_width: base_width,
-                readahead_max_width: max_width,
-                readahead_min_prefetch: min_prefetch,
-                upload_pressure_boost: 2,
+                readahead_base_width: widened_base_width,
+                readahead_max_width: widened_max_width,
+                readahead_min_prefetch: min_prefetch.max(base_width),
+                upload_pressure_boost: 3,
             },
             AccessClass::RandomInteractiveRead => Self {
                 class,
-                prefetch_enabled: false,
+                prefetch_enabled: true,
                 cache_promotion_on_read: true,
                 readahead_base_width: base_width.max(1),
-                readahead_max_width: base_width.clamp(1, 4),
+                readahead_max_width: random_readahead_width,
                 readahead_min_prefetch: min_prefetch,
-                upload_pressure_boost: 1,
+                upload_pressure_boost: 2,
             },
             AccessClass::SequentialWriter => Self {
                 class,
@@ -208,10 +216,30 @@ impl HandleAccessState {
     ) -> AccessDecision {
         let previous_class = self.current_class;
         let (first_block, last_block, span_blocks) = block_span(offset, len, cfg.block_size_u64());
+        let previous_op = self.last_op;
+        let previous_first_block = self.last_first_block;
         self.prepare_for_operation(AccessOperation::Read);
 
-        let mut next_class = self.current_class;
+        let restarting_after_write = previous_op == Some(AccessOperation::Write)
+            && previous_first_block.is_some_and(|prev_first| first_block < prev_first);
+        if restarting_after_write {
+            // Only clear the block-position history when the first read jumps
+            // backwards relative to the preceding write stream. Forward or
+            // same-position read handoffs are intentional mixed-workload
+            // behavior and still benefit from preserved contiguous progress.
+            self.last_first_block = None;
+            self.last_last_block = None;
+        }
+
+        let mut next_class = match self.current_class {
+            AccessClass::SequentialWriter | AccessClass::RandomWriter => {
+                AccessClass::RandomInteractiveRead
+            }
+            other => other,
+        };
         let broad_scan = span_blocks >= LARGE_SEQUENTIAL_SPAN_BLOCKS;
+        let recovering_from_random =
+            next_class == AccessClass::RandomInteractiveRead && self.random_score > 0;
         let contiguous_forward = self
             .last_last_block
             .is_some_and(|prev_last| first_block <= prev_last.saturating_add(1))
@@ -232,13 +260,30 @@ impl HandleAccessState {
             .is_some_and(|prev_first| first_block < prev_first);
 
         if self.last_first_block.is_none() {
-            if broad_scan {
-                self.bump_sequential(3);
+            if broad_scan
+                || (restarting_after_write
+                    && first_block == 0
+                    && previous_class == AccessClass::SequentialWriter)
+            {
+                self.bump_sequential(READ_IMMEDIATE_SEQUENTIAL_BONUS);
                 next_class = AccessClass::SequentialMediaRead;
             }
-        } else if contiguous_forward || overlapping_window || broad_scan {
-            let gain = if broad_scan {
-                3
+        } else if broad_scan {
+            self.bump_sequential(READ_SEQUENTIAL_PROMOTION_THRESHOLD);
+            self.random_score = self
+                .random_score
+                .saturating_sub(READ_RANDOM_PROMOTION_THRESHOLD);
+            next_class = AccessClass::SequentialMediaRead;
+        } else if contiguous_forward || overlapping_window {
+            if recovering_from_random {
+                self.sequential_score = self.sequential_score.max(0);
+            }
+            let gain = if recovering_from_random {
+                if contiguous_forward {
+                    READ_SEQUENTIAL_PROMOTION_THRESHOLD
+                } else {
+                    2
+                }
             } else if contiguous_forward {
                 2
             } else {
@@ -398,8 +443,9 @@ mod tests {
         let _ = state.observe_read(4096, 4096, cfg);
         let random = state.observe_read(64 * 1024, 1024, cfg);
         assert_eq!(random.class, AccessClass::RandomInteractiveRead);
-        assert!(!random.policy.prefetch_enabled);
+        assert!(random.policy.prefetch_enabled);
         assert!(random.policy.cache_promotion_on_read);
+        assert!(random.policy.readahead_max_width > random.policy.readahead_base_width);
     }
 
     #[test]
@@ -430,8 +476,9 @@ mod tests {
         // With the soft reset, last_last_block=Some(2) is preserved, so the
         // classifier detects contiguous-forward from the very first read.
         let r1 = state.observe_read(3072, 1024, cfg);
-        // gain=2 → sequential_score=2, below threshold(4) → inherits RandomWriter.
-        assert_eq!(r1.class, AccessClass::RandomWriter);
+        // gain=2 → sequential_score=2, below threshold(4) → stays on the
+        // read-side random class instead of inheriting the old writer label.
+        assert_eq!(r1.class, AccessClass::RandomInteractiveRead);
 
         // Second contiguous read at block 4: gain=2 → seq=4 ≥ threshold(4).
         let r2 = state.observe_read(4096, 1024, cfg);
@@ -440,5 +487,99 @@ mod tests {
             AccessClass::SequentialMediaRead,
             "soft reset: promotion after 2 contiguous reads (vs 3 with full reset)"
         );
+    }
+
+    #[test]
+    fn read_classifier_recovers_quickly_after_random_seek() {
+        let mut state = HandleAccessState::new(11, OpenFlags::RDONLY);
+        let cfg = config();
+
+        let _ = state.observe_read(64 * 1024, 1024, cfg);
+        let r1 = state.observe_read(0, 1024, cfg);
+        let r2 = state.observe_read(1024, 1024, cfg);
+
+        assert_eq!(r1.class, AccessClass::RandomInteractiveRead);
+        assert_eq!(
+            r2.class,
+            AccessClass::SequentialMediaRead,
+            "two contiguous reads after a restart should recover out of random mode"
+        );
+        assert!(r2.policy.prefetch_enabled);
+    }
+
+    #[test]
+    fn write_then_read_from_start_avoids_sticking_in_random_read() {
+        let mut state = HandleAccessState::new(12, OpenFlags::RDWR | OpenFlags::APPEND);
+        let cfg = config();
+
+        let _ = state.observe_write(0, 1024, cfg);
+        let _ = state.observe_write(1024, 1024, cfg);
+        let _ = state.observe_write(2048, 1024, cfg);
+        assert_eq!(state.current_class(), AccessClass::SequentialWriter);
+
+        let r1 = state.observe_read(0, 1024, cfg);
+        let r2 = state.observe_read(1024, 1024, cfg);
+
+        assert_ne!(
+            r1.class,
+            AccessClass::RandomInteractiveRead,
+            "the first read after a sequential writer restarts from offset 0 should not be treated as a random seek"
+        );
+        assert_eq!(
+            r2.class,
+            AccessClass::SequentialMediaRead,
+            "a restarted sequential read should recover by the second contiguous read"
+        );
+    }
+
+    #[test]
+    fn tail_read_after_write_preserves_contiguous_progress() {
+        let mut state = HandleAccessState::new(13, OpenFlags::RDWR);
+        let cfg = config();
+
+        state.observe_write(0, 1024, cfg);
+        state.observe_write(1024, 1024, cfg);
+        state.observe_write(2048, 1024, cfg);
+
+        let r1 = state.observe_read(2048, 1024, cfg);
+        let r2 = state.observe_read(3072, 1024, cfg);
+
+        assert_eq!(r1.class, AccessClass::RandomInteractiveRead);
+        assert_eq!(
+            r2.class,
+            AccessClass::SequentialMediaRead,
+            "tail reads after a write stream should keep contiguous progress instead of hard-resetting"
+        );
+    }
+
+    #[test]
+    fn overlap_after_random_seek_does_not_instantly_promote_to_sequential() {
+        let mut state = HandleAccessState::new(14, OpenFlags::RDONLY);
+        let cfg = config();
+
+        let _ = state.observe_read(64 * 1024, 1024, cfg);
+        let _ = state.observe_read(2048, 1024, cfg);
+        let overlap = state.observe_read(1536, 1024, cfg);
+        let contiguous = state.observe_read(3072, 1024, cfg);
+
+        assert_eq!(
+            overlap.class,
+            AccessClass::RandomInteractiveRead,
+            "an overlapping retry alone should not recover all the way out of random mode"
+        );
+        assert_eq!(contiguous.class, AccessClass::SequentialMediaRead);
+    }
+
+    #[test]
+    fn read_policies_bias_toward_more_aggressive_prefetch() {
+        let cfg = config();
+        let sequential = AccessPolicy::from_class(AccessClass::SequentialMediaRead, cfg);
+        let random = AccessPolicy::from_class(AccessClass::RandomInteractiveRead, cfg);
+
+        assert!(sequential.prefetch_enabled);
+        assert!(random.prefetch_enabled);
+        assert!(sequential.readahead_base_width > cfg.readahead_base_width);
+        assert!(sequential.readahead_max_width > cfg.readahead_max_width);
+        assert!(random.readahead_max_width > random.readahead_base_width);
     }
 }

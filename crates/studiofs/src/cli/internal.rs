@@ -2,8 +2,8 @@
 
 use crate::diagnostics;
 use crate::investigation::{
-    InvestigationHypothesisStatus, InvestigationStore, NewTimelineEntry, TimelineEntryKind,
-    TimelineEntrySource,
+    DiagnosticsPreset, InvestigationHypothesisStatus, InvestigationStore, NewTimelineEntry,
+    ProfilingCaptureMode, TimelineEntryKind, TimelineEntrySource,
 };
 use clap::{Args, Subcommand};
 use serde_json::json;
@@ -52,6 +52,13 @@ impl InternalArgs {
             InternalAction::DiagnosticsCompleteWorkflow(args) => {
                 run_diagnostics_complete_workflow(args)
             }
+            InternalAction::DiagnosticsProfilingStatus(args) => {
+                run_diagnostics_profiling_status(args)
+            }
+            InternalAction::DiagnosticsStartProfiling(args) => {
+                run_diagnostics_start_profiling(args)
+            }
+            InternalAction::DiagnosticsStopProfiling(args) => run_diagnostics_stop_profiling(args),
             InternalAction::DiagnosticsAddTimeline(args) => run_diagnostics_add_timeline(args),
             InternalAction::DiagnosticsCompareRunSpan(args) => {
                 run_diagnostics_compare_run_span(args)
@@ -104,6 +111,12 @@ enum InternalAction {
     DiagnosticsAbortWorkflow(DiagnosticsAbortWorkflowArgs),
     #[command(name = "diagnostics-complete-workflow", hide = true)]
     DiagnosticsCompleteWorkflow(DiagnosticsCompleteWorkflowArgs),
+    #[command(name = "diagnostics-profiling-status", hide = true)]
+    DiagnosticsProfilingStatus(DiagnosticsProfilingStatusArgs),
+    #[command(name = "diagnostics-start-profiling", hide = true)]
+    DiagnosticsStartProfiling(DiagnosticsStartProfilingArgs),
+    #[command(name = "diagnostics-stop-profiling", hide = true)]
+    DiagnosticsStopProfiling(DiagnosticsStopProfilingArgs),
     #[command(name = "diagnostics-add-timeline", hide = true)]
     DiagnosticsAddTimeline(DiagnosticsAddTimelineArgs),
     #[command(name = "diagnostics-compare-run-span", hide = true)]
@@ -266,20 +279,89 @@ struct DiagnosticsCompleteWorkflowArgs {
     workflow_run_id: String,
 }
 
+#[derive(Debug, Args)]
+struct DiagnosticsProfilingStatusArgs {
+    mount_point: String,
+}
+
+macro_rules! impl_arg_enum_from {
+    ($source:ty => $target:ty { $($variant:ident),+ $(,)? }) => {
+        impl From<$source> for $target {
+            fn from(value: $source) -> Self {
+                match value {
+                    $(<$source>::$variant => <$target>::$variant,)+
+                }
+            }
+        }
+    };
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum ProfilingCaptureModeArg {
+    WallBlocking,
+    Cpu,
+}
+
+impl_arg_enum_from!(ProfilingCaptureModeArg => ProfilingCaptureMode { WallBlocking, Cpu });
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum DiagnosticsPresetArg {
+    Minimal,
+    Balanced,
+    Deep,
+}
+
+impl_arg_enum_from!(DiagnosticsPresetArg => DiagnosticsPreset { Minimal, Balanced, Deep });
+
+#[derive(Debug, Args)]
+struct DiagnosticsStartProfilingArgs {
+    mount_point: String,
+
+    #[arg(long, help = "Controller lease id returned by diagnostics-attach")]
+    lease_id: String,
+
+    #[arg(long, help = "Investigation run id returned by diagnostics-create-run")]
+    run_id: String,
+
+    #[arg(long, value_enum, default_value_t = ProfilingCaptureModeArg::WallBlocking)]
+    capture_mode: ProfilingCaptureModeArg,
+
+    #[arg(long, value_enum, default_value_t = DiagnosticsPresetArg::Balanced)]
+    preset: DiagnosticsPresetArg,
+
+    #[arg(
+        long,
+        default_value_t = diagnostics::MAX_PROFILE_WINDOW_DURATION_MS,
+        value_parser = clap::value_parser!(u64).range(1..=diagnostics::MAX_PROFILE_WINDOW_DURATION_MS),
+        help = "Requested profiling duration in milliseconds"
+    )]
+    duration_ms: u64,
+
+    #[arg(long)]
+    sample_rate_hz: Option<u32>,
+}
+
+#[derive(Debug, Args)]
+struct DiagnosticsStopProfilingArgs {
+    mount_point: String,
+
+    #[arg(long, help = "Controller lease id returned by diagnostics-attach")]
+    lease_id: String,
+
+    #[arg(
+        long,
+        help = "Profiling window id returned by diagnostics-start-profiling"
+    )]
+    window_id: String,
+}
+
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum TimelineSourceArg {
     Cli,
     Mcp,
 }
 
-impl From<TimelineSourceArg> for TimelineEntrySource {
-    fn from(value: TimelineSourceArg) -> Self {
-        match value {
-            TimelineSourceArg::Cli => TimelineEntrySource::Cli,
-            TimelineSourceArg::Mcp => TimelineEntrySource::Mcp,
-        }
-    }
-}
+impl_arg_enum_from!(TimelineSourceArg => TimelineEntrySource { Cli, Mcp });
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum TimelineKindArg {
@@ -288,15 +370,7 @@ enum TimelineKindArg {
     Anomaly,
 }
 
-impl From<TimelineKindArg> for TimelineEntryKind {
-    fn from(value: TimelineKindArg) -> Self {
-        match value {
-            TimelineKindArg::Marker => TimelineEntryKind::Marker,
-            TimelineKindArg::Note => TimelineEntryKind::Note,
-            TimelineKindArg::Anomaly => TimelineEntryKind::Anomaly,
-        }
-    }
-}
+impl_arg_enum_from!(TimelineKindArg => TimelineEntryKind { Marker, Note, Anomaly });
 
 #[derive(Debug, Args)]
 struct DiagnosticsAddTimelineArgs {
@@ -372,16 +446,12 @@ enum HypothesisStatusArg {
     Inconclusive,
 }
 
-impl From<HypothesisStatusArg> for InvestigationHypothesisStatus {
-    fn from(value: HypothesisStatusArg) -> Self {
-        match value {
-            HypothesisStatusArg::Open => InvestigationHypothesisStatus::Open,
-            HypothesisStatusArg::Supported => InvestigationHypothesisStatus::Supported,
-            HypothesisStatusArg::Rejected => InvestigationHypothesisStatus::Rejected,
-            HypothesisStatusArg::Inconclusive => InvestigationHypothesisStatus::Inconclusive,
-        }
-    }
-}
+impl_arg_enum_from!(HypothesisStatusArg => InvestigationHypothesisStatus {
+    Open,
+    Supported,
+    Rejected,
+    Inconclusive,
+});
 
 #[derive(Debug, Args)]
 struct DiagnosticsUpdateHypothesisArgs {
@@ -611,6 +681,52 @@ fn run_diagnostics_complete_workflow(args: DiagnosticsCompleteWorkflowArgs) -> a
     } = args;
     run_live_diagnostics_command(&mount_point, |client| async move {
         client.complete_workflow(&lease_id, &workflow_run_id).await
+    })
+}
+
+fn run_diagnostics_profiling_status(args: DiagnosticsProfilingStatusArgs) -> anyhow::Result<()> {
+    let DiagnosticsProfilingStatusArgs { mount_point } = args;
+    run_live_diagnostics_command(&mount_point, |client| async move {
+        client.profiling_status().await
+    })
+}
+
+fn run_diagnostics_start_profiling(args: DiagnosticsStartProfilingArgs) -> anyhow::Result<()> {
+    let DiagnosticsStartProfilingArgs {
+        mount_point,
+        lease_id,
+        run_id,
+        capture_mode,
+        preset,
+        duration_ms,
+        sample_rate_hz,
+    } = args;
+    run_live_diagnostics_command(&mount_point, |client| async move {
+        client
+            .start_profiling_window(
+                &lease_id,
+                &run_id,
+                diagnostics::StartProfilingWindowRequest {
+                    capture_mode: capture_mode.into(),
+                    preset: preset.into(),
+                    budget: diagnostics::ProfilingBudget {
+                        duration_ms,
+                        sample_rate_hz,
+                    },
+                },
+            )
+            .await
+    })
+}
+
+fn run_diagnostics_stop_profiling(args: DiagnosticsStopProfilingArgs) -> anyhow::Result<()> {
+    let DiagnosticsStopProfilingArgs {
+        mount_point,
+        lease_id,
+        window_id,
+    } = args;
+    run_live_diagnostics_command(&mount_point, |client| async move {
+        client.stop_profiling_window(&lease_id, &window_id).await
     })
 }
 
@@ -951,6 +1067,69 @@ mod tests {
             complete_workflow.command,
             crate::cli::Commands::Internal(InternalArgs {
                 action: InternalAction::DiagnosticsCompleteWorkflow(_)
+            })
+        ));
+
+        let profiling_status =
+            crate::cli::parse_for_test(&["internal", "diagnostics-profiling-status", "Z:"])
+                .unwrap();
+        assert!(matches!(
+            profiling_status.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsProfilingStatus(_)
+            })
+        ));
+
+        let start_profiling = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-start-profiling",
+            "Z:",
+            "--lease-id",
+            "lease-1",
+            "--run-id",
+            "run-1",
+            "--capture-mode",
+            "wall-blocking",
+            "--preset",
+            "balanced",
+            "--duration-ms",
+            "30000",
+            "--sample-rate-hz",
+            "80",
+        ])
+        .unwrap();
+        match start_profiling.command {
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsStartProfiling(args),
+            }) => {
+                assert_eq!(args.mount_point, "Z:");
+                assert_eq!(args.lease_id, "lease-1");
+                assert_eq!(args.run_id, "run-1");
+                assert_eq!(args.duration_ms, 30_000);
+                assert_eq!(args.sample_rate_hz, Some(80));
+                assert!(matches!(
+                    args.capture_mode,
+                    ProfilingCaptureModeArg::WallBlocking
+                ));
+                assert!(matches!(args.preset, DiagnosticsPresetArg::Balanced));
+            }
+            other => panic!("unexpected parse result: {other:?}"),
+        }
+
+        let stop_profiling = crate::cli::parse_for_test(&[
+            "internal",
+            "diagnostics-stop-profiling",
+            "Z:",
+            "--lease-id",
+            "lease-1",
+            "--window-id",
+            "window-1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            stop_profiling.command,
+            crate::cli::Commands::Internal(InternalArgs {
+                action: InternalAction::DiagnosticsStopProfiling(_)
             })
         ));
 
