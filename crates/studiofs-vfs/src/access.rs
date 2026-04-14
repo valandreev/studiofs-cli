@@ -582,4 +582,45 @@ mod tests {
         assert!(sequential.readahead_max_width > cfg.readahead_max_width);
         assert!(random.readahead_max_width > random.readahead_base_width);
     }
+
+    #[test]
+    fn read_classifier_promotes_on_sub_block_forward_progress() {
+        let mut state = HandleAccessState::new(15, OpenFlags::RDONLY);
+        let cfg = AccessClassifierConfig {
+            block_size: 4096,
+            readahead_base_width: 32,
+            readahead_max_width: 256,
+            readahead_min_prefetch: 8,
+        };
+
+        let first = state.observe_read(0, 1024, cfg);
+        let second = state.observe_read(1024, 1024, cfg);
+        let third = state.observe_read(2048, 1024, cfg);
+
+        assert_eq!(first.class, AccessClass::RandomInteractiveRead);
+        assert_eq!(second.class, AccessClass::RandomInteractiveRead);
+        assert_eq!(
+            third.class,
+            AccessClass::SequentialMediaRead,
+            "steady forward progress inside a single cache block should still promote to sequential media read"
+        );
+    }
+
+    #[test]
+    fn read_classifier_recovers_when_overlap_keeps_extending_frontier() {
+        let mut state = HandleAccessState::new(16, OpenFlags::RDONLY);
+        let cfg = config();
+
+        let first = state.observe_read(0, 3 * 1024, cfg);
+        let second = state.observe_read(1024, 3 * 1024, cfg);
+        let third = state.observe_read(0, 5 * 1024, cfg);
+
+        assert_eq!(first.class, AccessClass::RandomInteractiveRead);
+        assert_eq!(second.class, AccessClass::RandomInteractiveRead);
+        assert_eq!(
+            third.class,
+            AccessClass::SequentialMediaRead,
+            "overlapping retries that keep pushing the read frontier forward should still recover into sequential mode"
+        );
+    }
 }

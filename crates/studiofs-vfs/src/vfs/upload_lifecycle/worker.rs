@@ -119,6 +119,7 @@ trait UploadPolicyPort: Clone + Send + Sync + 'static {
     fn quarantine_invalid_regular_file_graph(&self, ino: Ino, size: u64, error: &VfsError);
     fn mark_upload_sticky_error(&self, ino: Ino, error: &VfsError);
     fn clear_upload_sticky_error(&self, ino: Ino);
+    fn debug_pending_inode_state(&self, ino: Ino, event: &'static str);
     async fn refresh_incarnation_state(&self, ino: Ino);
 }
 
@@ -228,6 +229,8 @@ where
                     not_before_unix_ms = retry_op.not_before_unix_ms,
                     "upload processing error, scheduled for delayed requeue: {error}"
                 );
+                self.policy
+                    .debug_pending_inode_state(retry_op.ino, "upload_requeued");
 
                 if !self.shutdown.uploader_shutdown_requested()
                     && !self.coordinator.requeue_upload(retry_op)
@@ -449,6 +452,8 @@ where
 
         self.policy.refresh_incarnation_state(op.ino).await;
         self.policy.clear_upload_sticky_error(op.ino);
+        self.policy
+            .debug_pending_inode_state(op.ino, "upload_completed");
 
         if self.local_blocks.clear_pending_eviction(op.object_id) {
             self.local_blocks.remove(op.object_id).await?;
@@ -951,6 +956,10 @@ impl UploadPolicyPort for VfsUploadPolicyPort {
 
     fn clear_upload_sticky_error(&self, ino: Ino) {
         self.vfs.clear_upload_sticky_error(ino);
+    }
+
+    fn debug_pending_inode_state(&self, ino: Ino, event: &'static str) {
+        self.vfs.debug_pending_inode_state(ino, event);
     }
 
     async fn refresh_incarnation_state(&self, ino: Ino) {
@@ -1483,6 +1492,8 @@ mod tests {
         }
 
         fn clear_upload_sticky_error(&self, _ino: Ino) {}
+
+        fn debug_pending_inode_state(&self, _ino: Ino, _event: &'static str) {}
 
         async fn refresh_incarnation_state(&self, ino: Ino) {
             self.refreshed.lock().push(ino);

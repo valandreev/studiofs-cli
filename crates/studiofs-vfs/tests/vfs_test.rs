@@ -9224,6 +9224,93 @@ fn write_eager_flush_advances_logical_size_when_tail_remains_buffered() {
 }
 
 #[test]
+fn read_from_start_flushes_large_dirty_full_block_tail_before_sequential_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let format_info = make_format_info_with_endpoint(
+        &format!("read-drains-dirty-tail-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    let block_size = format_info.block_size as usize;
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            VfsConfigRaw::default()
+                .validate()
+                .expect("default VFS config should validate"),
+        )
+        .unwrap();
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
+
+        let attr = vfs
+            .create(1, b"read-drains-dirty-tail.bin", 0, 0, 0o644)
+            .unwrap();
+        let burst_blocks = 27usize;
+        let payload = vec![0x5Au8; block_size * burst_blocks];
+
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+
+        let persisted_before = vfs.meta().get_file_blocks(attr.ino).unwrap().len();
+        let ingress_before = vfs.ingress_stats();
+        assert_eq!(
+            ingress_before.dirty_mem_blocks + persisted_before,
+            burst_blocks,
+            "a single large write burst should leave only the bounded eager-flush chunk persisted while the rest stays buffered"
+        );
+        assert_eq!(
+            ingress_before.dirty_mem_bytes,
+            block_size * ingress_before.dirty_mem_blocks,
+            "the buffered tail should be composed of full dirty blocks"
+        );
+        assert!(
+            ingress_before.dirty_mem_blocks > 0,
+            "the repro needs a buffered dirty tail before the read starts"
+        );
+        assert!(
+            persisted_before < burst_blocks,
+            "the repro needs eager flush to persist only part of the burst before the read starts"
+        );
+
+        let read = vfs.read(attr.ino, 0, block_size as u32).await.unwrap();
+        assert_eq!(read.as_ref(), &payload[..block_size]);
+
+        let ingress_after = vfs.ingress_stats();
+        assert_eq!(
+            ingress_after.dirty_mem_blocks,
+            0,
+            "the first read from offset 0 should drain the remaining full dirty tail"
+        );
+        assert_eq!(
+            ingress_after.dirty_mem_bytes,
+            0,
+            "the first read from offset 0 should clear buffered full-block dirty bytes"
+        );
+        assert_eq!(
+            vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
+            burst_blocks,
+            "draining on read should publish every full block into metadata before the sequential read continues"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
 fn write_backpressure_flushes_full_blocks_before_tail_blocks() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");

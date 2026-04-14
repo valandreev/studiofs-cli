@@ -26,6 +26,8 @@ impl StudioVfs {
             let len = end.saturating_sub(offset) as usize;
             return Ok(Bytes::from(vec![0; len]));
         }
+        self.flush_dirty_write_buffer_for_read_start(ino, offset)
+            .await?;
         let prepared = self
             .prepare_foreground_read(ino, offset, size as usize)
             .await?;
@@ -110,6 +112,8 @@ impl StudioVfs {
             }
             return Ok(len as u32);
         }
+        self.flush_dirty_write_buffer_for_read_start(ino, offset)
+            .await?;
         let prepared = self
             .prepare_foreground_read(ino, offset, buffer.len())
             .await?;

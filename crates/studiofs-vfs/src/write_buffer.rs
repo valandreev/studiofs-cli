@@ -1147,6 +1147,22 @@ impl StudioVfs {
             .is_some_and(|indexes| !indexes.is_empty())
     }
 
+    fn dirty_full_write_buffer_bytes_for_inode(&self, ino: Ino) -> usize {
+        let pending = self.state.write_buffer.pending_blocks.lock();
+        let indexes = self.state.write_buffer.pending_block_indexes.lock();
+        indexes
+            .get(&ino)
+            .into_iter()
+            .flat_map(|inode_indexes| inode_indexes.iter())
+            .map(|block_index| {
+                pending
+                    .get(&(ino, *block_index))
+                    .filter(|block| block.dirty && block.data.len() >= self.block_size as usize)
+                    .map_or(0, |block| block.data.len())
+            })
+            .sum()
+    }
+
     fn clear_matching_dirty_attr_if_committed(&self, ino: Ino, attr: &InodeAttr) {
         if self.has_pending_write_buffer_blocks_for_inode(ino) {
             return;
@@ -1750,6 +1766,24 @@ impl StudioVfs {
     ) -> VfsResult<()> {
         self.ordered_write_session(ino)
             .flush(local_sync_policy)
+            .await
+    }
+
+    pub(super) async fn flush_dirty_write_buffer_for_read_start(
+        &self,
+        ino: Ino,
+        offset: u64,
+    ) -> VfsResult<()> {
+        let dirty_full_bytes = self.dirty_full_write_buffer_bytes_for_inode(ino);
+        if offset != 0 || dirty_full_bytes < self.write_eager_flush_batch_bytes {
+            return Ok(());
+        }
+
+        // Large sequential writers can switch directly from write to read on
+        // the same handle. Drain any remaining full-block dirty tail before the
+        // first read from offset 0 so the reader does not stay stuck on the
+        // local-only eager-flush residue.
+        self.flush_ordered(ino, LocalSyncPolicy::Opportunistic)
             .await
     }
 

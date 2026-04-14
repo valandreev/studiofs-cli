@@ -40,6 +40,11 @@ const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0020;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x0080;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 const FILE_DIRECTORY_FILE_OPTION: u32 = 0x0000_0001;
+const FILE_READ_DATA_ACCESS: FILE_ACCESS_RIGHTS = 0x0001;
+const FILE_WRITE_DATA_ACCESS: FILE_ACCESS_RIGHTS = 0x0002;
+const FILE_APPEND_DATA_ACCESS: FILE_ACCESS_RIGHTS = 0x0004;
+const FILE_GENERIC_READ_ACCESS: FILE_ACCESS_RIGHTS = 0x0012_0089;
+const FILE_GENERIC_WRITE_ACCESS: FILE_ACCESS_RIGHTS = 0x0012_0116;
 const DEBUG_AGENT_SESSION_ID: &str = "78abc1";
 const DEBUG_AGENT_RUN_ID: &str = "winfsp-vfx-legacy-dir-delete-2026-04-13b";
 const DEBUG_AGENT_LOG_PATH: &str =
@@ -142,14 +147,25 @@ impl SendConstBuffer {
     }
 }
 
-/// Map WinFSP create options to the single supported Windows handle mode.
+/// Map WinFSP granted access to StudioFS open flags.
 ///
 /// As part of SFS-122, StudioFS removed the Windows direct-I/O product surface.
 /// `FILE_NO_INTERMEDIATE_BUFFERING` and `FILE_WRITE_THROUGH` therefore no longer
 /// select an alternate VFS path and are intentionally ignored here so all
-/// Windows handles use the buffered runtime model.
-fn open_flags_from_create_options(_create_options: u32) -> OpenFlags {
-    OpenFlags::RDWR
+/// Windows handles use the buffered runtime model. What still matters is the
+/// actual access mask: treating every Windows handle as RDWR confuses the VFS
+/// classifier, sticky-error reporting, and last-handle release policy.
+fn open_flags_from_access(granted_access: FILE_ACCESS_RIGHTS, _create_options: u32) -> OpenFlags {
+    let wants_read = (granted_access & (FILE_READ_DATA_ACCESS | FILE_GENERIC_READ_ACCESS)) != 0;
+    let wants_write = (granted_access
+        & (FILE_WRITE_DATA_ACCESS | FILE_APPEND_DATA_ACCESS | FILE_GENERIC_WRITE_ACCESS))
+        != 0;
+    match (wants_read, wants_write) {
+        (true, true) => OpenFlags::RDWR,
+        (true, false) => OpenFlags::RDONLY,
+        (false, true) => OpenFlags::WRONLY,
+        (false, false) => OpenFlags::RDONLY,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1277,6 +1293,7 @@ impl StudioFsContext {
         &self,
         file_name: &U16CStr,
         create_options: u32,
+        granted_access: FILE_ACCESS_RIGHTS,
         extra_buffer: Option<&[u8]>,
         extra_buffer_is_reparse_point: bool,
     ) -> winfsp::Result<CreateCallbackPlan> {
@@ -1284,7 +1301,7 @@ impl StudioFsContext {
         Ok(CreateCallbackPlan {
             parent_ino,
             name,
-            open_flags: open_flags_from_create_options(create_options),
+            open_flags: open_flags_from_access(granted_access, create_options),
             kind: resolve_create_callback_kind(
                 create_options,
                 extra_buffer,
@@ -1448,14 +1465,14 @@ impl FileSystemContext for StudioFsContext {
         &self,
         file_name: &U16CStr,
         create_options: u32,
-        _granted_access: FILE_ACCESS_RIGHTS,
+        granted_access: FILE_ACCESS_RIGHTS,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
         if maybe_hide_non_macos_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
         let attr = resolve_path(&self.vfs, file_name)?;
-        let open_flags = open_flags_from_create_options(create_options);
+        let open_flags = open_flags_from_access(granted_access, create_options);
         Self::write_open_file_info(file_info, &attr);
         let handle = self.open_file_handle_for_attr(&attr, open_flags)?;
         let display_path = file_name.to_string_lossy();
@@ -1499,7 +1516,7 @@ impl FileSystemContext for StudioFsContext {
         &self,
         file_name: &U16CStr,
         create_options: u32,
-        _granted_access: FILE_ACCESS_RIGHTS,
+        granted_access: FILE_ACCESS_RIGHTS,
         _file_attributes: FILE_FLAGS_AND_ATTRIBUTES,
         _security_descriptor: Option<&[c_void]>,
         _allocation_size: u64,
@@ -1514,6 +1531,7 @@ impl FileSystemContext for StudioFsContext {
         let plan = self.resolve_create_callback_plan(
             file_name,
             create_options,
+            granted_access,
             extra_buffer,
             extra_buffer_is_reparse_point,
         )?;
@@ -2171,16 +2189,18 @@ impl NotifyingFileSystemContext<Vec<Ino>> for StudioFsContext {
 mod tests {
     use super::is_benign_cleanup_delete_error;
     use super::{
-        CreateCallbackKind, FILE_ACTION_MODIFIED, FILE_DIRECTORY_FILE_OPTION,
+        CreateCallbackKind, FILE_ACTION_MODIFIED, FILE_APPEND_DATA_ACCESS,
+        FILE_DIRECTORY_FILE_OPTION, FILE_GENERIC_READ_ACCESS, FILE_GENERIC_WRITE_ACCESS,
         FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
-        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FileSizeCallbackAction,
-        STATUS_ACCESS_DENIED, STATUS_DATA_ERROR, STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER,
-        STATUS_IO_TIMEOUT, STATUS_OBJECT_NAME_NOT_FOUND, StudioFileHandle, StudioFsContext,
-        WinfspKernelInvalidator, attr_to_file_info, build_basic_info_setattr_args,
-        build_notify_info, encode_symlink_reparse, hidden_non_macos_root_path_component,
-        ino_to_windows_path, maybe_hide_non_macos_root_entry, notify_filter_for_kind,
-        open_flags_from_create_options, resolve_create_callback_kind,
-        resolve_file_size_callback_action, unix_nanos_to_filetime, vfs_to_winfsp_err,
+        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_READ_DATA_ACCESS,
+        FILE_WRITE_DATA_ACCESS, FileSizeCallbackAction, STATUS_ACCESS_DENIED, STATUS_DATA_ERROR,
+        STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER, STATUS_IO_TIMEOUT,
+        STATUS_OBJECT_NAME_NOT_FOUND, StudioFileHandle, StudioFsContext, WinfspKernelInvalidator,
+        attr_to_file_info, build_basic_info_setattr_args, build_notify_info,
+        encode_symlink_reparse, hidden_non_macos_root_path_component, ino_to_windows_path,
+        maybe_hide_non_macos_root_entry, notify_filter_for_kind, open_flags_from_access,
+        resolve_create_callback_kind, resolve_file_size_callback_action, unix_nanos_to_filetime,
+        vfs_to_winfsp_err,
     };
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -2283,17 +2303,28 @@ mod tests {
     }
 
     #[test]
-    fn create_options_ignore_unbuffered_bits() {
+    fn granted_access_maps_to_expected_open_flags() {
         const FILE_WRITE_THROUGH_OPTION: u32 = 0x0000_0002;
         const FILE_NO_INTERMEDIATE_BUFFERING_OPTION: u32 = 0x0000_0008;
 
-        let plain = open_flags_from_create_options(0);
-        assert_eq!(plain.bits(), OpenFlags::RDWR.bits());
+        let readonly = open_flags_from_access(FILE_READ_DATA_ACCESS, 0);
+        assert_eq!(readonly.bits(), OpenFlags::RDONLY.bits());
 
-        let unbuffered = open_flags_from_create_options(
+        let writeonly = open_flags_from_access(FILE_WRITE_DATA_ACCESS, 0);
+        assert_eq!(writeonly.bits(), OpenFlags::WRONLY.bits());
+
+        let append = open_flags_from_access(FILE_APPEND_DATA_ACCESS, 0);
+        assert_eq!(append.bits(), OpenFlags::WRONLY.bits());
+
+        let readwrite =
+            open_flags_from_access(FILE_GENERIC_READ_ACCESS | FILE_GENERIC_WRITE_ACCESS, 0);
+        assert_eq!(readwrite.bits(), OpenFlags::RDWR.bits());
+
+        let unbuffered = open_flags_from_access(
+            FILE_READ_DATA_ACCESS,
             FILE_NO_INTERMEDIATE_BUFFERING_OPTION | FILE_WRITE_THROUGH_OPTION,
         );
-        assert_eq!(unbuffered.bits(), OpenFlags::RDWR.bits());
+        assert_eq!(unbuffered.bits(), OpenFlags::RDONLY.bits());
     }
 
     #[test]

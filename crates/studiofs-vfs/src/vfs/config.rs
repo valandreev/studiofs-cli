@@ -919,6 +919,19 @@ mod tests {
             validated.upload_worker_count, 128,
             "validation should materialize upload worker default"
         );
+        assert_eq!(
+            validated.upload_requeue_base_ms,
+            defaults.upload_requeue_base_ms
+        );
+        assert_eq!(
+            validated.upload_requeue_max_ms,
+            defaults.upload_requeue_max_ms
+        );
+        assert_eq!(validated.upload_max_attempts, defaults.upload_max_attempts);
+        assert_eq!(
+            validated.upload_request_timeout_secs,
+            defaults.upload_request_timeout_secs
+        );
     }
 
     #[test]

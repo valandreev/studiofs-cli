@@ -40,9 +40,11 @@ impl StudioVfs {
         debug!("release_fh fh={} ino={} remaining={}", fh, ino, remaining);
         self.state.file_session.note_close_handle(ino, remaining);
         self.clear_access_tracking_for_stream(ino, stream_id);
+        self.debug_pending_inode_state(ino, "release_handle_closed");
         if remaining > 0 {
             return None;
         }
+        self.debug_pending_inode_state(ino, "release_last_handle");
         Some(HandleReleaseContext { open_file, ino })
     }
 

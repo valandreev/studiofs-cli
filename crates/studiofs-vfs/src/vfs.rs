@@ -309,8 +309,10 @@ const DEFAULT_DIR_PREFETCH_MAX_BATCH: usize = 0;
 const DEFAULT_READDIR_ATTR_BATCH_CHUNK: usize = 256;
 const DEFAULT_READDIR_ATTR_BATCH_MAX_INODES: usize = 4096;
 const DEFAULT_UPLOAD_DELAY_MS: u64 = 2000;
-const DEFAULT_UPLOAD_REQUEUE_BASE_MS: u64 = 5000;
-const DEFAULT_UPLOAD_REQUEUE_MAX_MS: u64 = 120_000;
+// Keep failed uploads circulating quickly so a single transient error does not
+// strand the whole inode in pending-overlay mode until remount.
+const DEFAULT_UPLOAD_REQUEUE_BASE_MS: u64 = 500;
+const DEFAULT_UPLOAD_REQUEUE_MAX_MS: u64 = 5_000;
 const DEFAULT_UPLOAD_STATS_INTERVAL_SECS: u64 = 1;
 const DEFAULT_UPLOAD_CACHE_IO_SLOTS: usize = 32;
 const DEFAULT_TRANSIT_MEMORY_BUDGET_BYTES: usize = 0;
@@ -337,8 +339,8 @@ const DEFAULT_UPLOAD_DECREASE_COOLDOWN_SECS: u64 = 3;
 const DEFAULT_SLAB_FLUSH_INTERVAL_MS: u64 = 10;
 const DEFAULT_UPLOAD_WORKER_COUNT: usize = 128;
 const MIN_UPLOAD_WORKER_COUNT: usize = 1;
-const DEFAULT_UPLOAD_MAX_ATTEMPTS: u32 = 10;
-const DEFAULT_UPLOAD_REQUEST_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_UPLOAD_MAX_ATTEMPTS: u32 = 4;
+const DEFAULT_UPLOAD_REQUEST_TIMEOUT_SECS: u64 = 15;
 const DEFAULT_UPLOAD_RETRY_BASE_MS: u64 = 200;
 const DEFAULT_UPLOAD_RETRY_MAX_MS: u64 = 5_000;
 const DEFAULT_FETCH_MAX_ATTEMPTS: u32 = 8;
@@ -391,6 +393,7 @@ const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
 const CACHE_RUNTIME_MIN_DIRTY_BYTES: usize = 256 * 1024 * 1024;
 const CACHE_RUNTIME_MAX_DIRTY_BYTES_BASE: usize = 2 * 1024 * 1024 * 1024;
+const DEBUG_PENDING_PATH_SUFFIX_ENV: &str = "STUDIOFS_DEBUG_PENDING_PATH_SUFFIX";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TwoTierSegment {
     Probationary,
@@ -3368,6 +3371,94 @@ impl StudioVfs {
             .evict_stream(ReadStreamKey { ino, stream_id });
     }
 
+    fn debug_pending_target_path(&self, ino: Ino) -> Option<String> {
+        let suffix = std::env::var(DEBUG_PENDING_PATH_SUFFIX_ENV).ok()?;
+        let suffix = suffix.trim();
+        if suffix.is_empty() {
+            return None;
+        }
+        let normalized_suffix = suffix.replace('/', "\\").to_ascii_lowercase();
+        let normalized_basename = normalized_suffix
+            .trim_end_matches('\\')
+            .rsplit('\\')
+            .next()
+            .unwrap_or(normalized_suffix.as_str());
+        let path = NamespaceResolver::new(self, NamespacePathStyle::Windows)
+            .path_for_inode(ino)
+            .or_else(|| {
+                NamespaceResolver::new(self, NamespacePathStyle::Posix).path_for_inode(ino)
+            })?;
+        let normalized_path = path.replace('/', "\\").to_ascii_lowercase();
+        let basename = Path::new(&normalized_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        (normalized_path.ends_with(&normalized_suffix) || basename == normalized_basename)
+            .then_some(path)
+    }
+
+    fn debug_pending_inode_state(&self, ino: Ino, event: &str) {
+        let Some(path) = self.debug_pending_target_path(ino) else {
+            return;
+        };
+        let pending_uploads = self.pending_uploads_for_inode(ino);
+        let pending_upload_sample: Vec<_> = pending_uploads
+            .iter()
+            .take(8)
+            .map(|(offset, object_id, content_epoch)| {
+                format!("{offset}:{object_id}@{content_epoch}")
+            })
+            .collect();
+        let pending_epochs: Vec<_> = self
+            .state
+            .upload
+            .pending_epoch_finalizations
+            .lock()
+            .iter()
+            .filter_map(|(candidate, content_epoch)| (*candidate == ino).then_some(*content_epoch))
+            .collect();
+        let sticky_error = self
+            .state
+            .upload
+            .upload_sticky_errors
+            .lock()
+            .get(&ino)
+            .cloned();
+        let attr = self.getattr(ino).ok();
+        let (size, committed_size, content_epoch, committed_content_epoch, upload_state) = attr
+            .as_ref()
+            .map(|attr| {
+                (
+                    attr.size,
+                    attr.committed_size,
+                    attr.content_epoch,
+                    attr.committed_content_epoch,
+                    Some(format!("{:?}", attr.upload_state)),
+                )
+            })
+            .unwrap_or((0, 0, 0, 0, None));
+        info!(
+            event,
+            ino,
+            path = %path,
+            open_handles = self.open_count(ino),
+            pending_upload_count = pending_uploads.len(),
+            pending_upload_sample = ?pending_upload_sample,
+            pending_epoch_count = pending_epochs.len(),
+            pending_epochs = ?pending_epochs,
+            sticky_error = ?sticky_error,
+            has_local_dirty_state = self.inode_has_local_dirty_state(ino),
+            has_pending_write_buffer_blocks = self.has_pending_write_buffer_blocks_for_inode(ino),
+            attr_present = attr.is_some(),
+            size,
+            committed_size,
+            content_epoch,
+            committed_content_epoch,
+            upload_state = ?upload_state,
+            "debug pending inode state"
+        );
+    }
+
     fn mark_upload_sticky_error(&self, ino: Ino, error: &VfsError) {
         let message = error.to_string();
         let mut sticky = self.state.upload.upload_sticky_errors.lock();
@@ -3388,6 +3479,7 @@ impl StudioVfs {
             FileSessionOperation::Upload,
             "failed",
         );
+        self.debug_pending_inode_state(ino, "sticky_error_recorded");
     }
 
     fn clear_upload_sticky_error(&self, ino: Ino) {
@@ -3406,6 +3498,7 @@ impl StudioVfs {
             FileSessionOperation::Upload,
             "recovered",
         );
+        self.debug_pending_inode_state(ino, "sticky_error_cleared");
     }
 
     fn ensure_no_upload_sticky_error(&self, ino: Ino) -> VfsResult<()> {
@@ -3452,15 +3545,19 @@ impl StudioVfs {
                 .upload
                 .pending_epoch_finalizations_notify
                 .notify_one();
+            self.debug_pending_inode_state(ino, "epoch_finalization_queued");
         }
     }
 
     fn remove_pending_epoch_finalizations_for_inode(&self, ino: Ino) {
-        self.state
-            .upload
-            .pending_epoch_finalizations
-            .lock()
-            .retain(|(candidate, _)| *candidate != ino);
+        let mut pending = self.state.upload.pending_epoch_finalizations.lock();
+        let before = pending.len();
+        pending.retain(|(candidate, _)| *candidate != ino);
+        let removed = before.saturating_sub(pending.len());
+        drop(pending);
+        if removed > 0 {
+            self.debug_pending_inode_state(ino, "epoch_finalization_cleared");
+        }
     }
 
     fn cancel_pending_uploads_for_inode(&self, ino: Ino) {
@@ -3491,6 +3588,7 @@ impl StudioVfs {
         let mut pending_evictions = self.state.upload.pending_evictions.lock();
         for op in pending_uploads {
             pending_evictions.remove(&op.object_id);
+            self.debug_pending_inode_state(op.ino, "pending_upload_canceled");
         }
     }
 
@@ -3507,6 +3605,7 @@ impl StudioVfs {
                 FileSessionOperation::Finalize,
                 "dequeued",
             );
+            self.debug_pending_inode_state(ino, "epoch_finalization_dequeued");
         }
         next
     }
@@ -5101,6 +5200,7 @@ impl StudioVfs {
         // Verify the inode exists
         let read_context = ReadRequestContext::from_attr(self, ino, self.getattr(ino)?);
         if read_context.placeholder_visible(self, ino) {
+            self.debug_pending_inode_state(ino, "open_blocked_remote_content_pending");
             return Err(VfsError::RemoteContentPending);
         }
 
@@ -5116,6 +5216,7 @@ impl StudioVfs {
             .read
             .increment_active_access_class(open_file.current_access_class());
         debug!("open_file ino={} fh={} flags={:#x}", ino, fh, flags.bits());
+        self.debug_pending_inode_state(ino, "open_file");
 
         // Eager prefetch: when opening a regular file for reading, schedule
         // background prefetch of the first block to hide initial S3 latency.
