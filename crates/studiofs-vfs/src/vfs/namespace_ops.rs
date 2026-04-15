@@ -1,9 +1,15 @@
 use super::{
-    ATTR_CACHE_TTL, AccessLevel, Arc, DirEntry, FileType, Ino, InodeAttr, InodeIncarnationState,
-    Instant, LocalSyncPolicy, MetaBlockFlags, MetaError, NamespacePathStyle, PendingIncarnation,
-    SetattrArgs, StudioVfs, UnlinkTarget, VfsError, VfsMeta, VfsResult, VfsState, VfsUploadState,
-    block_index_from_offset, debug, info, offset_within_block, validate_name, warn,
+    ATTR_CACHE_TTL, AccessLevel, Arc, BlockRef, DirEntry, FileSessionOperation, FileType, Ino,
+    InodeAttr, InodeIncarnationState, Instant, LocalSyncPolicy, MetaBlockFlags, MetaError,
+    NamespacePathStyle, PendingIncarnation, SetattrArgs, StudioVfs, UnlinkTarget, VfsError,
+    VfsMeta, VfsResult, VfsState, VfsUploadState, block_index_from_offset, debug, info,
+    offset_within_block, validate_name, warn,
 };
+
+struct TruncateMutation {
+    old_blocks: Vec<(u32, BlockRef)>,
+    removed_blocks: Vec<(u32, BlockRef)>,
+}
 
 impl StudioVfs {
     pub fn setattr(&self, ino: Ino, args: SetattrArgs) -> VfsResult<InodeAttr> {
@@ -40,23 +46,11 @@ impl StudioVfs {
         }
 
         let mut attr = self.getattr(ino)?;
-        let mut changed = false;
-        let mut size_changed = false;
-
-        if let Some(new_size) = args.size
-            && new_size != attr.size
-        {
-            self.begin_pending_incarnation(ino, &mut attr);
-            if new_size < attr.size {
-                self.truncate_blocks(ino, new_size, attr.size)?;
-                attr.committed_size = attr.committed_size.min(new_size);
-            }
-            attr.size = new_size;
-            self.update_pending_incarnation_size(ino, attr.size);
-            changed = true;
-            size_changed = true;
+        if args.size.is_some_and(|new_size| new_size != attr.size) {
+            return Self::run_sync_future(self.setattr_with_size_change(ino, args.clone()));
         }
 
+        let mut changed = false;
         if let Some(mode) = args.mode {
             attr.mode = mode & 0o7777;
             changed = true;
@@ -103,14 +97,162 @@ impl StudioVfs {
             self.sync_meta().set_attr(&attr)?;
             self.refresh_inode_incarnation_state_from_attr(ino, &attr);
         }
-        if size_changed {
-            Self::run_sync_future(self.flush_ordered(ino, LocalSyncPolicy::Strict))?;
-        }
 
         Ok(attr)
     }
 
-    fn truncate_blocks(&self, ino: Ino, new_size: u64, old_size: u64) -> VfsResult<()> {
+    async fn setattr_with_size_change(&self, ino: Ino, args: SetattrArgs) -> VfsResult<InodeAttr> {
+        let session = self
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Flush)
+            .await;
+        let result: VfsResult<InodeAttr> = async {
+            self.flush_ordered(ino, LocalSyncPolicy::Strict).await?;
+
+            let old_attr = self.getattr_async(ino).await?;
+            let mut attr = old_attr.clone();
+            let mut truncate_mutation = None;
+
+            if let Some(new_size) = args.size
+                && new_size != attr.size
+            {
+                self.begin_pending_incarnation(ino, &mut attr);
+                if new_size < attr.size {
+                    truncate_mutation = Some(self.truncate_blocks(ino, new_size, attr.size)?);
+                    attr.committed_size = attr.committed_size.min(new_size);
+                }
+                attr.size = new_size;
+                self.update_pending_incarnation_size(ino, attr.size);
+            }
+
+            if let Some(mode) = args.mode {
+                attr.mode = mode & 0o7777;
+            }
+
+            if let Some(uid) = args.uid {
+                attr.uid = uid;
+            }
+
+            if let Some(gid) = args.gid {
+                attr.gid = gid;
+            }
+
+            if let Some(ns) = args.atime.resolve() {
+                attr.atime = ns;
+            }
+
+            if let Some(ns) = args.mtime.resolve() {
+                attr.mtime = ns;
+            }
+
+            if let Some(ns) = args.crtime.resolve() {
+                attr.crtime = ns;
+            }
+
+            if let Some(wa) = args.win_attrs {
+                attr.win_attrs = wa;
+            }
+
+            attr.touch_ctime();
+            self.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .insert(ino, attr.clone());
+            self.state.namespace.attr_read_cache.lock().remove(ino);
+
+            let flush_result = match self.fail_size_change_setattr_before_flush_for_test() {
+                Ok(()) => self.flush_ordered(ino, LocalSyncPolicy::Strict).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = flush_result {
+                self.rollback_failed_size_change_setattr(
+                    ino,
+                    &old_attr,
+                    truncate_mutation.as_ref(),
+                )?;
+                return Err(error);
+            }
+
+            self.finalize_truncate_cleanup(ino, truncate_mutation.as_ref());
+            self.refresh_inode_incarnation_state_from_attr(ino, &attr);
+            Ok(attr)
+        }
+        .await;
+        drop(session);
+        self.state.file_session.gc_if_idle(ino);
+        result
+    }
+
+    fn rollback_failed_size_change_setattr(
+        &self,
+        ino: Ino,
+        old_attr: &InodeAttr,
+        truncate_mutation: Option<&TruncateMutation>,
+    ) -> VfsResult<()> {
+        self.clear_pending_blocks_for_inode(ino);
+        self.state.namespace.dirty_attrs.lock().remove(&ino);
+        self.state.namespace.attr_read_cache.lock().remove(ino);
+
+        if let Some(mutation) = truncate_mutation {
+            for (block_index, block_ref) in &mutation.old_blocks {
+                self.sync_meta()
+                    .set_file_block(ino, *block_index, block_ref)?;
+            }
+            let live_extents: Vec<_> = mutation
+                .old_blocks
+                .iter()
+                .map(|(block_index, block_ref)| {
+                    (
+                        ino,
+                        *block_index,
+                        block_ref.object_id,
+                        old_attr.content_epoch,
+                    )
+                })
+                .collect();
+            self.record_live_extents(&live_extents);
+        }
+
+        self.sync_meta().set_attr(old_attr)?;
+        self.refresh_inode_incarnation_state_from_attr(ino, old_attr);
+        Ok(())
+    }
+
+    fn finalize_truncate_cleanup(&self, ino: Ino, truncate_mutation: Option<&TruncateMutation>) {
+        let Some(mutation) = truncate_mutation else {
+            return;
+        };
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mut scheduled_for_gc = std::collections::HashSet::new();
+        for (block_index, block_ref) in &mutation.removed_blocks {
+            if scheduled_for_gc.insert(block_ref.object_id)
+                && let Err(error) = self
+                    .sync_meta()
+                    .add_pending_deletion(block_ref.object_id, timestamp)
+            {
+                warn!(
+                    ino,
+                    object_id = block_ref.object_id,
+                    error = %error,
+                    "failed to schedule truncated object for deferred deletion"
+                );
+            }
+            self.evict_block_from_caches(ino, *block_index, block_ref.object_id);
+        }
+    }
+
+    fn truncate_blocks(
+        &self,
+        ino: Ino,
+        new_size: u64,
+        old_size: u64,
+    ) -> VfsResult<TruncateMutation> {
         let old_last_block = if old_size == 0 {
             0
         } else {
@@ -122,51 +264,32 @@ impl StudioVfs {
         } else {
             block_index_from_offset(new_size - 1, self.block_size) + 1
         };
+        let old_blocks = self.sync_meta().get_file_blocks(ino)?;
+        let existing_blocks: std::collections::HashMap<u32, BlockRef> =
+            old_blocks.iter().cloned().collect();
+        let mut removed_blocks = Vec::new();
 
         if new_size == 0 && old_size > 0 {
-            let existing_blocks = self.sync_meta().get_file_blocks(ino)?;
-            let removed_ids: std::collections::HashSet<u64> = self
-                .sync_meta()
-                .remove_file_blocks(ino)?
-                .into_iter()
-                .collect();
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
+            removed_blocks.extend(old_blocks.iter().cloned());
+            self.sync_meta().remove_file_blocks(ino)?;
 
             for block_idx in first_block_to_remove..=old_last_block {
                 self.clear_pending_block(ino, block_idx);
                 self.remove_live_extent(ino, block_idx);
             }
-
-            for (block_idx, block_ref) in existing_blocks {
-                if removed_ids.contains(&block_ref.object_id) {
-                    self.sync_meta()
-                        .add_pending_deletion(block_ref.object_id, timestamp)?;
-                    debug!(
-                        "marking block {} for deletion (truncate)",
-                        block_ref.object_id
-                    );
-                    self.evict_block_from_caches(ino, block_idx, block_ref.object_id);
-                }
-            }
-            return Ok(());
+            return Ok(TruncateMutation {
+                old_blocks,
+                removed_blocks,
+            });
         }
 
         for block_idx in first_block_to_remove..=old_last_block {
             self.clear_pending_block(ino, block_idx);
             self.remove_live_extent(ino, block_idx);
-            if let Some(object_id) = self.sync_meta().remove_file_block(ino, block_idx)? {
-                let timestamp = std::time::SystemTime::now()
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                self.sync_meta()
-                    .add_pending_deletion(object_id, timestamp)?;
-                debug!("marking block {} for deletion (truncate)", object_id);
-                self.evict_block_from_caches(ino, block_idx, object_id);
+            if let Some(block_ref) = existing_blocks.get(&block_idx) {
+                removed_blocks.push((block_idx, block_ref.clone()));
             }
+            let _ = self.sync_meta().remove_file_block(ino, block_idx)?;
         }
 
         if new_size > 0 {
@@ -189,17 +312,47 @@ impl StudioVfs {
                 {
                     self.install_truncated_pending_block(ino, new_last_block, bytes, new_last_len);
                 }
-                block_ref.length = last_block_offset + 1;
-                if block_ref.length < self.block_size {
-                    block_ref.flags |= MetaBlockFlags::PARTIAL_BLOCK;
-                } else {
-                    block_ref.flags.remove(MetaBlockFlags::PARTIAL_BLOCK);
+                if block_ref.length as usize > new_last_len {
+                    block_ref.length = last_block_offset + 1;
+                    if block_ref.length < self.block_size {
+                        block_ref.flags |= MetaBlockFlags::PARTIAL_BLOCK;
+                    } else {
+                        block_ref.flags.remove(MetaBlockFlags::PARTIAL_BLOCK);
+                    }
+                    self.sync_meta()
+                        .set_file_block(ino, new_last_block, &block_ref)?;
                 }
-                self.sync_meta()
-                    .set_file_block(ino, new_last_block, &block_ref)?;
             }
         }
 
+        Ok(TruncateMutation {
+            old_blocks,
+            removed_blocks,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn arm_fail_next_size_change_setattr_before_flush_for_test(&self) {
+        self.fail_next_size_change_setattr_before_flush
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn fail_size_change_setattr_before_flush_for_test(&self) -> VfsResult<()> {
+        if self
+            .fail_next_size_change_setattr_before_flush
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            Err(VfsError::Other(
+                "simulated size-changing setattr local persist failure".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(not(test))]
+    fn fail_size_change_setattr_before_flush_for_test(&self) -> VfsResult<()> {
         Ok(())
     }
 

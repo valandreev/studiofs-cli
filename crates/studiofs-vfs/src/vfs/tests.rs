@@ -1417,6 +1417,101 @@ fn test_file_session_wait_reasons_and_transitions_are_observable() {
 }
 
 #[test]
+fn test_size_changing_setattr_waits_on_file_session_gate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-setattr-size-gate");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"session-setattr-size-gate.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let session_guard = vfs
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Write)
+            .await;
+        let vfs_clone = vfs.clone();
+        let setter = std::thread::spawn(move || vfs_clone.setattr(ino, SetattrArgs::size_only(1)));
+
+        let mid = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let stats = vfs.file_session_stats();
+                if stats.queued_ops >= 1 {
+                    break stats;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expected size-changing setattr to wait behind the file-session gate");
+        assert!(
+            mid.queued_ops >= 1,
+            "expected size-changing setattr to queue behind the file-session gate"
+        );
+
+        drop(session_guard);
+        let updated = setter.join().unwrap().unwrap();
+        assert_eq!(updated.size, 1);
+    });
+}
+
+#[test]
+fn test_size_changing_setattr_rollback_restores_old_local_state_on_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "setattr-size-rollback");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"setattr-size-rollback.txt", 0, 0, 0o644)
+            .unwrap();
+        let payload = b"setattr rollback payload";
+        vfs.write(attr.ino, 0, payload).await.unwrap();
+
+        vfs.arm_fail_next_size_change_setattr_before_flush_for_test();
+        let error = vfs
+            .setattr(attr.ino, SetattrArgs::size_only(8))
+            .expect_err("simulated local persist failure should fail setattr");
+        assert!(
+            error
+                .to_string()
+                .contains("simulated size-changing setattr local persist failure"),
+            "expected the injected size-changing setattr failure to surface"
+        );
+
+        let persisted_attr = meta.get_attr(attr.ino).unwrap();
+        assert_eq!(
+            persisted_attr.size,
+            payload.len() as u64,
+            "failed size-changing setattr must restore the previous durable size"
+        );
+        assert!(
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "failed size-changing setattr must not leave dirty local state behind"
+        );
+        let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(
+            read.as_ref(),
+            payload,
+            "failed size-changing setattr must preserve the last durable local contents"
+        );
+
+        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        assert_eq!(
+            blocks.len(),
+            1,
+            "failed rollback should restore the original block map"
+        );
+        assert_eq!(
+            blocks[0].1.length as usize,
+            payload.len(),
+            "failed size-changing setattr must restore the previous block length"
+        );
+    });
+}
+
+#[test]
 fn test_file_session_read_lock_allows_parallel_readers() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-read-parallel");
