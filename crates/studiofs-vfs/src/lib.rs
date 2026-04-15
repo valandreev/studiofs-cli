@@ -34,8 +34,8 @@ pub use utils::parse_size_bytes;
 pub use vfs::{
     BarrierObservabilityPort, CacheSafetyMode, DeferredCleanupHintPort, DeleteCleanupPort,
     FlushGatePort, HandleDrainBarrier, HandleDrainDeleteRequest, HandleDrainRequest,
-    HandleReleasePort, KernelInvalidator, LocalSyncBarrierPort, LockKind, NamespaceParent,
-    NamespacePathStyle, NamespaceResolver, OpenFile, OpenFlags, StatFs, StudioVfs,
+    HandleReleasePort, KernelInvalidator, LocalSyncBarrierPort, LocalSyncPolicy, LockKind,
+    NamespaceParent, NamespacePathStyle, NamespaceResolver, OpenFile, OpenFlags, StatFs, StudioVfs,
     VFS_RUNTIME_EVENT_CAPACITY, VfsAttrReadCacheSnapshot, VfsCacheStateSnapshot, VfsConfig,
     VfsConfigRaw, VfsConfigValidated, VfsError, VfsForegroundReadProtectionStats, VfsIngressLane,
     VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot, VfsNamespaceCacheSnapshot,

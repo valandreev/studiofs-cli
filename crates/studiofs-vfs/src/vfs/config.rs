@@ -68,7 +68,7 @@ pub enum CacheSafetyMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum LocalSyncPolicy {
+pub enum LocalSyncPolicy {
     Opportunistic,
     Strict,
 }
@@ -138,6 +138,13 @@ pub(super) enum LocalSyncTrigger {
     DurableMode,
     BytesThreshold,
     TimeWindow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EagerFlushOutcome {
+    Triggered,
+    SkippedEmpty,
+    SkippedBelowThreshold,
 }
 
 pub(super) fn write_path_sync_trigger(

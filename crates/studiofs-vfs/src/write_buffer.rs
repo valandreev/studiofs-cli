@@ -1,6 +1,10 @@
 use super::*;
 use futures::stream::{FuturesUnordered, StreamExt};
 
+fn blocks_can_accept_more(selected_bytes: usize, next_block_bytes: usize, limit: usize) -> bool {
+    selected_bytes == 0 || selected_bytes.saturating_add(next_block_bytes) <= limit
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct PendingBlock {
     pub(super) data: BytesMut,
@@ -818,7 +822,77 @@ impl<'a> OrderedWriteSession<'a> {
         Ok(())
     }
 
-    async fn write(&self, offset: u64, data: &[u8]) -> VfsResult<u32> {
+    async fn flush_dirty_full_blocks(
+        &self,
+        minimum_batch_bytes: usize,
+        track_eager_flush_outcomes: bool,
+        fallback_content_epoch: Option<u64>,
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<bool> {
+        let (full_blocks, _selected_bytes, total_full_block_bytes) =
+            self.vfs.snapshot_dirty_full_write_buffer_blocks(
+                self.ino,
+                Some(self.vfs.write_eager_flush_drain_chunk_bytes),
+            );
+        if full_blocks.is_empty() {
+            if track_eager_flush_outcomes {
+                self.vfs
+                    .note_eager_flush_outcome(EagerFlushOutcome::SkippedEmpty);
+            }
+            return Ok(false);
+        }
+        if total_full_block_bytes < minimum_batch_bytes {
+            if track_eager_flush_outcomes {
+                self.vfs
+                    .note_eager_flush_outcome(EagerFlushOutcome::SkippedBelowThreshold);
+            }
+            return Ok(false);
+        }
+
+        let dirty_attr = {
+            self.vfs
+                .state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .get(&self.ino)
+                .cloned()
+        };
+        let content_epoch = if let Some(attr) = dirty_attr.as_ref() {
+            attr.content_epoch
+        } else if let Some(content_epoch) = fallback_content_epoch {
+            content_epoch
+        } else {
+            self.vfs.current_content_epoch_async(self.ino).await?
+        };
+        let chunk_slices = self
+            .vfs
+            .snapshot_dirty_write_buffer_chunk_slices(self.ino, &full_blocks);
+        let persisted_blocks = self
+            .drain_snapshot(
+                full_blocks,
+                chunk_slices,
+                content_epoch,
+                dirty_attr,
+                PayloadPersistConfig {
+                    put_concurrency: self.drain.put_concurrency,
+                    local_sync_policy,
+                },
+            )
+            .await?;
+        if track_eager_flush_outcomes && !persisted_blocks.is_empty() {
+            self.vfs
+                .note_eager_flush_outcome(EagerFlushOutcome::Triggered);
+        }
+        Ok(!persisted_blocks.is_empty())
+    }
+
+    async fn write(
+        &self,
+        offset: u64,
+        data: &[u8],
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<u32> {
         self.vfs.enforce_access(self.ino, AccessLevel::ReadWrite)?;
         let _ = self.vfs.state.read.observe_write_access(
             None,
@@ -847,10 +921,12 @@ impl<'a> OrderedWriteSession<'a> {
         let current_size = initial_attr.size;
         self.vfs
             .refresh_inode_incarnation_state_from_attr(self.ino, &initial_attr);
+        let pending_before_write = self.vfs.total_pending_write_buffer_bytes();
         let mut written = 0u64;
         let mut remaining = data.len();
         let mut current_offset = offset;
         let mut data_offset = 0;
+        let mut has_full_blocks = false;
         let mut inserted_block_indexes = Vec::new();
         let mut pending_slices_batch: Vec<(
             studiofs_meta::schema::ChunkId,
@@ -925,6 +1001,10 @@ impl<'a> OrderedWriteSession<'a> {
                 pending_block.data[offset_in_block..end_pos]
                     .copy_from_slice(&data[data_offset..data_offset + to_write]);
                 pending_block.dirty = true;
+
+                if pending_block.data.len() >= self.vfs.block_size as usize {
+                    has_full_blocks = true;
+                }
             }
             let mut slice_cursor = write_start;
             while slice_cursor < write_end {
@@ -999,10 +1079,40 @@ impl<'a> OrderedWriteSession<'a> {
                 .update_pending_incarnation_size(self.ino, attr.size);
         }
 
-        // ZeroIO foreground success is the local durable unpublished boundary:
-        // payload and overlay/attr state must be persisted before write()
-        // reports success.
-        self.flush(LocalSyncPolicy::Strict).await?;
+        if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
+            // The strict write path preserves the SFS-231 local-durable
+            // contract for callers that explicitly opt into write-through
+            // behavior. Ordinary buffered bridge writes use the opportunistic
+            // path below and pay the local barrier on flush/close instead.
+            self.flush(LocalSyncPolicy::Strict).await?;
+            return Ok(written as u32);
+        }
+
+        if has_full_blocks
+            && !self
+                .flush_dirty_full_blocks(
+                    self.vfs.write_eager_flush_batch_bytes,
+                    true,
+                    Some(base_attr.content_epoch),
+                    LocalSyncPolicy::Opportunistic,
+                )
+                .await?
+        {
+            let pending_after_write = self.vfs.total_pending_write_buffer_bytes();
+            if pending_before_write > 0
+                && pending_after_write > self.vfs.max_dirty_bytes.load(Ordering::Acquire)
+            {
+                self.vfs.apply_write_buffer_backpressure(self.ino).await?;
+            }
+            return Ok(written as u32);
+        }
+
+        let pending_after_write = self.vfs.total_pending_write_buffer_bytes();
+        if pending_before_write > 0
+            && pending_after_write > self.vfs.max_dirty_bytes.load(Ordering::Acquire)
+        {
+            self.vfs.apply_write_buffer_backpressure(self.ino).await?;
+        }
 
         Ok(written as u32)
     }
@@ -1279,6 +1389,47 @@ impl StudioVfs {
         self.clear_pending_dirty_slices_for_inode(ino);
     }
 
+    async fn apply_write_buffer_backpressure(&self, ino: Ino) -> VfsResult<()> {
+        let started = Instant::now();
+        let _ = self
+            .flush_dirty_full_write_buffer_blocks(
+                ino,
+                1,
+                false,
+                None,
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await?;
+        if self.total_pending_write_buffer_bytes() > self.max_dirty_bytes.load(Ordering::Acquire) {
+            self.flush_ordered(ino, LocalSyncPolicy::Opportunistic)
+                .await?;
+        }
+        let waited_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        if waited_ms > 0 {
+            self.state
+                .write_buffer
+                .write_backpressure_events
+                .fetch_add(1, Ordering::Relaxed);
+            self.state
+                .write_buffer
+                .write_backpressure_wait_ms
+                .fetch_add(waited_ms, Ordering::Relaxed);
+            self.state
+                .write_buffer
+                .fast_backpressure_events
+                .fetch_add(1, Ordering::Relaxed);
+            self.state
+                .write_buffer
+                .fast_backpressure_wait_ms
+                .fetch_add(waited_ms, Ordering::Relaxed);
+            self.state
+                .write_buffer
+                .fast_backpressure_stall_max_ms
+                .fetch_max(waited_ms, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     pub(super) fn clear_pending_block(&self, ino: Ino, block_index: u32) {
         let mut pending = self.state.write_buffer.pending_blocks.lock();
         let mut indexes = self.state.write_buffer.pending_block_indexes.lock();
@@ -1316,6 +1467,41 @@ impl StudioVfs {
                     })
             })
             .collect()
+    }
+
+    fn snapshot_dirty_full_write_buffer_blocks(
+        &self,
+        ino: Ino,
+        max_drain_bytes: Option<usize>,
+    ) -> (Vec<DirtyWriteSnapshot>, usize, usize) {
+        let pending = self.state.write_buffer.pending_blocks.lock();
+        let indexes = self.state.write_buffer.pending_block_indexes.lock();
+        let mut total_available_bytes = 0usize;
+        let mut selected_bytes = 0usize;
+        let blocks: Vec<_> = indexes
+            .get(&ino)
+            .into_iter()
+            .flat_map(|inode_indexes| inode_indexes.iter())
+            .filter_map(|block_index| {
+                let pending = pending.get(&(ino, *block_index))?;
+                if !pending.dirty || pending.data.len() < self.block_size as usize {
+                    return None;
+                }
+                total_available_bytes = total_available_bytes.saturating_add(pending.data.len());
+                if let Some(limit) = max_drain_bytes
+                    && !blocks_can_accept_more(selected_bytes, pending.data.len(), limit)
+                {
+                    return None;
+                }
+                let data = pending.data.clone().freeze();
+                selected_bytes = selected_bytes.saturating_add(data.len());
+                Some(DirtyWriteSnapshot {
+                    block_index: *block_index,
+                    data,
+                })
+            })
+            .collect();
+        (blocks, selected_bytes, total_available_bytes)
     }
 
     fn snapshot_dirty_write_buffer_chunk_slices(
@@ -1455,6 +1641,24 @@ impl StudioVfs {
         self.clear_pending_dirty_slices_for_blocks(ino, &removed_block_indexes);
     }
 
+    async fn flush_dirty_full_write_buffer_blocks(
+        &self,
+        ino: Ino,
+        minimum_batch_bytes: usize,
+        track_eager_flush_outcomes: bool,
+        fallback_content_epoch: Option<u64>,
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<bool> {
+        self.ordered_write_session(ino)
+            .flush_dirty_full_blocks(
+                minimum_batch_bytes,
+                track_eager_flush_outcomes,
+                fallback_content_epoch,
+                local_sync_policy,
+            )
+            .await
+    }
+
     pub(super) fn trim_local_block_staging(
         &self,
         ino: Ino,
@@ -1563,8 +1767,16 @@ impl StudioVfs {
         Ok(Some(data))
     }
 
-    pub(super) async fn write_ordered(&self, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
-        self.ordered_write_session(ino).write(offset, data).await
+    pub(super) async fn write_ordered_with_local_sync_policy(
+        &self,
+        ino: Ino,
+        offset: u64,
+        data: &[u8],
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<u32> {
+        self.ordered_write_session(ino)
+            .write(offset, data, local_sync_policy)
+            .await
     }
 
     pub(super) async fn flush_ordered(
