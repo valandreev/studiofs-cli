@@ -718,6 +718,36 @@ fn zeroio_unpublished_lifecycle_survives_restart() {
 }
 
 #[test]
+fn zeroio_metadata_only_local_epoch_keeps_published_payload_warm() {
+    let engine = temp_engine();
+
+    let file = engine
+        .create_file(ROOT_INO, b"zeroio-metadata-only.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+    let published = BlockRef::new_partial(902, 4096);
+    engine.set_file_block(file.ino, 0, &published).unwrap();
+    assert!(engine.publish_file_manifest(file.ino, 1).unwrap());
+
+    let mut truncated = engine.get_attr(file.ino).unwrap();
+    truncated.size = 2048;
+    truncated.content_epoch = 2;
+    engine.set_attr(&truncated).unwrap();
+
+    let lifecycle = engine.get_inode_lifecycle(file.ino).unwrap().unwrap();
+    assert_eq!(lifecycle.state, InodeLifecycleState::LocalOnly);
+    assert_eq!(lifecycle.retention, PayloadRetentionClass::PublishedWarm);
+    assert!(lifecycle.has_published_base);
+    assert_eq!(lifecycle.local_visible_size, 2048);
+    assert_eq!(lifecycle.published_size, 4096);
+    assert_eq!(lifecycle.local_content_epoch, 2);
+    assert_eq!(lifecycle.published_content_epoch, 1);
+}
+
+#[test]
 fn test_next_block_id() {
     let engine = temp_engine();
 

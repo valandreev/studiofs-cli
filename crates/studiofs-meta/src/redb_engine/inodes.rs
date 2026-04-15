@@ -1,6 +1,44 @@
 use super::*;
 
+const INODE_LIFECYCLE_SCHEMA_VERSION_KEY: &str = "inode_lifecycle_schema_version";
+const CURRENT_INODE_LIFECYCLE_SCHEMA_VERSION: u64 = 1;
+
 impl RedbMetaEngine {
+    pub fn ensure_inode_lifecycle_table(&self) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let settings = txn
+            .open_table(SETTINGS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let current_version = settings
+            .get(INODE_LIFECYCLE_SCHEMA_VERSION_KEY)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|value| {
+                let raw = value.value();
+                if raw.len() != 8 {
+                    return Err(MetaError::Storage(
+                        "invalid inode lifecycle schema version payload".to_string(),
+                    ));
+                }
+                let bytes: [u8; 8] = raw.try_into().map_err(|_| {
+                    MetaError::Storage("invalid inode lifecycle schema version bytes".to_string())
+                })?;
+                Ok(u64::from_le_bytes(bytes))
+            })
+            .transpose()?;
+        drop(settings);
+        if current_version == Some(CURRENT_INODE_LIFECYCLE_SCHEMA_VERSION) {
+            txn.abort().map_err(|e| MetaError::Storage(e.to_string()))?;
+            return Ok(());
+        }
+        Self::rebuild_inode_lifecycle_table_in_txn(&txn)?;
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
     pub fn get_inode_lifecycle(&self, ino: Ino) -> MetaResult<Option<InodeLifecycleRecord>> {
         let txn = self
             .db
@@ -47,32 +85,50 @@ impl RedbMetaEngine {
             }
             rows
         };
-        let regular_attrs = {
-            let table = txn
-                .open_table(INODES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut attrs = Vec::new();
-            for row in table
-                .iter()
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                let (_ino, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-                let attr: InodeAttr = decode(value.value())?;
-                if attr.kind == FileType::RegularFile {
-                    attrs.push(attr);
-                }
-            }
-            attrs
-        };
-
-        Self::clear_table_in_txn(txn, INODE_LIFECYCLE_TABLE)?;
+        let mut lifecycle = txn
+            .open_table(INODE_LIFECYCLE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        lifecycle
+            .retain(|_, _| false)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         for record in preserved_deleted {
-            Self::put_inode_lifecycle_in_txn(txn, &record)?;
+            let bytes = encode(&record)?;
+            lifecycle
+                .insert(record.ino, bytes.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
-        for attr in regular_attrs {
+        let inodes = txn
+            .open_table(INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        for row in inodes
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_ino, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            let attr: InodeAttr = decode(value.value())?;
+            if attr.kind != FileType::RegularFile {
+                continue;
+            }
             let record = Self::compute_inode_lifecycle_record_in_txn(txn, &attr)?;
-            Self::put_inode_lifecycle_in_txn(txn, &record)?;
+            let bytes = encode(&record)?;
+            lifecycle
+                .insert(record.ino, bytes.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
+        drop(inodes);
+        drop(lifecycle);
+        Self::set_inode_lifecycle_schema_version_in_txn(txn)?;
+        Ok(())
+    }
+
+    fn set_inode_lifecycle_schema_version_in_txn(txn: &redb::WriteTransaction) -> MetaResult<()> {
+        let mut settings = txn
+            .open_table(SETTINGS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let bytes = CURRENT_INODE_LIFECYCLE_SCHEMA_VERSION.to_le_bytes();
+        settings
+            .insert(INODE_LIFECYCLE_SCHEMA_VERSION_KEY, bytes.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -161,6 +217,7 @@ impl RedbMetaEngine {
             && attr.content_epoch == attr.committed_content_epoch
             && Self::manifest_matches_committed_in_txn(txn, attr.ino)?;
 
+        let overlay_state = Self::overlay_lifecycle_state(overlay_chunks.values());
         let state = if local_matches_published {
             if has_published_base {
                 InodeLifecycleState::Published
@@ -168,7 +225,7 @@ impl RedbMetaEngine {
                 InodeLifecycleState::LocalOnly
             }
         } else {
-            match Self::overlay_lifecycle_state(overlay_chunks.values()) {
+            match overlay_state {
                 Some(InodeLifecycleState::Uploading) => InodeLifecycleState::Uploading,
                 Some(InodeLifecycleState::PublishReady) => InodeLifecycleState::PublishReady,
                 Some(InodeLifecycleState::LocalOnly) | None => InodeLifecycleState::LocalOnly,
@@ -176,7 +233,18 @@ impl RedbMetaEngine {
                 | Some(InodeLifecycleState::DeletedBeforePublish) => InodeLifecycleState::LocalOnly,
             }
         };
+        let has_unpublished_payload = matches!(
+            overlay_state,
+            Some(InodeLifecycleState::LocalOnly)
+                | Some(InodeLifecycleState::Uploading)
+                | Some(InodeLifecycleState::PublishReady)
+        );
         let retention = match state {
+            InodeLifecycleState::LocalOnly | InodeLifecycleState::Uploading
+                if !has_unpublished_payload && has_published_base =>
+            {
+                PayloadRetentionClass::PublishedWarm
+            }
             InodeLifecycleState::LocalOnly | InodeLifecycleState::Uploading => {
                 PayloadRetentionClass::PinnedUnpublished
             }

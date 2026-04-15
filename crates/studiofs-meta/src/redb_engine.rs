@@ -73,10 +73,10 @@ impl RedbMetaEngine {
         debug!("opened metadata database at {:?}", path.as_ref());
         let engine = Self { db: Arc::new(db) };
         let _ = engine.recover_undo_logs()?;
-        engine.rebuild_inode_lifecycle_table()?;
 
         match engine.get_format_info() {
             Ok(format_info) if format_info.format_version >= CURRENT_FORMAT_VERSION => {
+                engine.ensure_inode_lifecycle_table()?;
                 debug!(
                     "format version {} is up to date",
                     format_info.format_version
