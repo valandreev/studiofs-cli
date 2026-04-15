@@ -1,3 +1,4 @@
+use super::overlay::PendingOverlayBlockSource;
 use super::{
     ATTR_CACHE_TTL, AccessLevel, ForegroundReadScope, PrefetchBatch, PrefetchReadContext,
     ReadRequestContext, StudioVfs, VfsError, VfsResult,
@@ -14,7 +15,7 @@ use studiofs_meta::schema::{
     DEFAULT_CHUNK_SIZE, ResolvedSliceSource, ResolvedSliceSpan, chunk_start_offset,
 };
 use studiofs_meta::types::{BlockRef, Ino, InodeAttr, block_index_from_offset};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, Copy)]
 struct ReadRange {
@@ -34,6 +35,7 @@ impl ReadRange {
 enum ReadPlanSource {
     Dirty { data: Bytes, block_offset: u32 },
     PendingOverlay { data: Bytes, block_offset: u32 },
+    PendingExtent { object_id: u64, block_offset: u32 },
     Overlay { block: BlockRef },
     Base { block: BlockRef },
     Zero,
@@ -76,6 +78,7 @@ impl<'a> ReadPipeline<'a> {
     async fn execute_into(&self, buffer: &mut [u8]) -> VfsResult<usize> {
         let mut plan = self.build_plan().await?;
         plan.sort_by_key(|span| span.range.start);
+        Self::log_debug_target_plan(self.vfs, self.ino, self.offset, self.length, &plan);
         let missing_remote = Self::prefetch_remote_blocks(self.vfs, &plan, false).await?;
         let written =
             Self::assemble_into(self.vfs, self.offset, &plan, &missing_remote, buffer).await?;
@@ -88,6 +91,66 @@ impl<'a> ReadPipeline<'a> {
         plan.sort_by_key(|span| span.range.start);
         let _ = Self::prefetch_remote_blocks(self.vfs, &plan, prefetch).await?;
         Ok(())
+    }
+
+    fn log_debug_target_plan(
+        vfs: &StudioVfs,
+        ino: Ino,
+        offset: u64,
+        length: u64,
+        plan: &[ReadPlanSpan],
+    ) {
+        let Some(path) = vfs.debug_pending_target_path(ino) else {
+            return;
+        };
+        let mut dirty_spans = 0usize;
+        let mut pending_overlay_spans = 0usize;
+        let mut pending_extent_spans = 0usize;
+        let mut overlay_spans = 0usize;
+        let mut base_spans = 0usize;
+        let mut zero_spans = 0usize;
+        for span in plan {
+            match &span.source {
+                ReadPlanSource::Dirty { .. } => dirty_spans += 1,
+                ReadPlanSource::PendingOverlay { .. } => pending_overlay_spans += 1,
+                ReadPlanSource::PendingExtent { .. } => pending_extent_spans += 1,
+                ReadPlanSource::Overlay { .. } => overlay_spans += 1,
+                ReadPlanSource::Base { .. } => base_spans += 1,
+                ReadPlanSource::Zero => zero_spans += 1,
+            }
+        }
+        info!(
+            ino,
+            path = %path,
+            offset,
+            length,
+            spans = plan.len(),
+            dirty_spans,
+            pending_overlay_spans,
+            pending_extent_spans,
+            overlay_spans,
+            base_spans,
+            zero_spans,
+            "debug target read plan"
+        );
+    }
+
+    #[cfg(test)]
+    fn collect_data_block_refs(plan: &[ReadPlanSpan]) -> BTreeMap<u64, BlockRef> {
+        let mut block_refs = BTreeMap::new();
+        for span in plan {
+            let block = match &span.source {
+                ReadPlanSource::Overlay { block } | ReadPlanSource::Base { block } => block,
+                ReadPlanSource::Dirty { .. }
+                | ReadPlanSource::PendingOverlay { .. }
+                | ReadPlanSource::PendingExtent { .. }
+                | ReadPlanSource::Zero => continue,
+            };
+            block_refs
+                .entry(block.object_id)
+                .or_insert_with(|| block.clone());
+        }
+        block_refs
     }
 
     async fn build_plan(&self) -> VfsResult<Vec<ReadPlanSpan>> {
@@ -169,17 +232,18 @@ impl<'a> ReadPipeline<'a> {
                 if unresolved.is_empty() {
                     break;
                 }
-                let Some(data) = vfs
-                    .read_pending_overlay_block_async(
-                        ino,
-                        block_index,
-                        pending_content_epoch,
-                        Some(&pending_upload_index),
-                    )
-                    .await?
-                else {
+                let Some(source) = vfs.pending_overlay_block_source(
+                    ino,
+                    block_index,
+                    pending_content_epoch,
+                    Some(&pending_upload_index),
+                ) else {
                     continue;
                 };
+                if matches!(&source, PendingOverlayBlockSource::Extent(object_id) if !vfs.local_block_backend.contains(*object_id))
+                {
+                    continue;
+                }
                 let block_start = (block_index as u64).saturating_mul(vfs.block_size as u64);
                 let block_end = block_start.saturating_add(vfs.block_size as u64);
                 let (next_unresolved, claimed) = Self::claim_unresolved_ranges(
@@ -197,9 +261,19 @@ impl<'a> ReadPipeline<'a> {
                     };
                     plan.push(ReadPlanSpan {
                         range: overlap,
-                        source: ReadPlanSource::PendingOverlay {
-                            data: data.clone(),
-                            block_offset,
+                        source: match &source {
+                            PendingOverlayBlockSource::Pending(data) => {
+                                ReadPlanSource::PendingOverlay {
+                                    data: data.clone(),
+                                    block_offset,
+                                }
+                            }
+                            PendingOverlayBlockSource::Extent(object_id) => {
+                                ReadPlanSource::PendingExtent {
+                                    object_id: *object_id,
+                                    block_offset,
+                                }
+                            }
                         },
                     });
                 }
@@ -343,22 +417,6 @@ impl<'a> ReadPipeline<'a> {
         unresolved
     }
 
-    fn collect_data_block_refs(plan: &[ReadPlanSpan]) -> BTreeMap<u64, BlockRef> {
-        let mut block_refs = BTreeMap::new();
-        for span in plan {
-            let block = match &span.source {
-                ReadPlanSource::Overlay { block } | ReadPlanSource::Base { block } => block,
-                ReadPlanSource::Dirty { .. }
-                | ReadPlanSource::PendingOverlay { .. }
-                | ReadPlanSource::Zero => continue,
-            };
-            block_refs
-                .entry(block.object_id)
-                .or_insert_with(|| block.clone());
-        }
-        block_refs
-    }
-
     async fn prefetch_remote_blocks(
         vfs: &StudioVfs,
         plan: &[ReadPlanSpan],
@@ -366,14 +424,30 @@ impl<'a> ReadPipeline<'a> {
     ) -> VfsResult<HashSet<u64>> {
         let mut cached = BTreeSet::new();
         let mut missing = BTreeMap::new();
-        for (object_id, block) in Self::collect_data_block_refs(plan) {
-            if vfs.local_block_backend.contains(object_id) {
-                cached.insert(object_id);
-            } else {
-                missing.insert(object_id, block);
+        let mut local_pending = BTreeSet::new();
+        for span in plan {
+            match &span.source {
+                ReadPlanSource::Overlay { block } | ReadPlanSource::Base { block } => {
+                    if vfs.local_block_backend.contains(block.object_id) {
+                        cached.insert(block.object_id);
+                    } else {
+                        missing
+                            .entry(block.object_id)
+                            .or_insert_with(|| block.clone());
+                    }
+                }
+                ReadPlanSource::PendingExtent { object_id, .. } => {
+                    local_pending.insert(*object_id);
+                }
+                ReadPlanSource::Dirty { .. }
+                | ReadPlanSource::PendingOverlay { .. }
+                | ReadPlanSource::Zero => {}
             }
         }
         for object_id in cached {
+            vfs.local_block_backend.advise_will_need(object_id);
+        }
+        for object_id in local_pending {
             vfs.local_block_backend.advise_will_need(object_id);
         }
         if missing.is_empty() {
@@ -433,6 +507,44 @@ impl<'a> ReadPipeline<'a> {
                 }
                 ReadPlanSource::PendingOverlay { data, block_offset } => {
                     vfs.copy_block_payload_into_range(data.as_ref(), *block_offset, dst);
+                }
+                ReadPlanSource::PendingExtent {
+                    object_id,
+                    block_offset,
+                } => {
+                    let block_offset = usize::try_from(*block_offset).map_err(|_| {
+                        VfsError::Other(format!(
+                            "pending extent offset does not fit usize: object_id={}, offset={}",
+                            object_id, block_offset
+                        ))
+                    })?;
+                    let read = vfs
+                        .block_store_read_into_async(*object_id, block_offset, dst)
+                        .await?;
+                    match read {
+                        Some(read) if read == dst.len() => {}
+                        Some(read) => {
+                            debug!(
+                                object_id,
+                                file_offset = span.range.start,
+                                block_offset,
+                                requested = dst.len(),
+                                read,
+                                "assemble_read_plan: short local read for pending extent; padding tail with zeros"
+                            );
+                            dst[read..].fill(0);
+                        }
+                        None => {
+                            warn!(
+                                object_id,
+                                file_offset = span.range.start,
+                                block_offset,
+                                requested = dst.len(),
+                                "assemble_read_plan: pending extent missing from local backend, zeroing range"
+                            );
+                            dst.fill(0);
+                        }
+                    }
                 }
                 ReadPlanSource::Overlay { block } | ReadPlanSource::Base { block } => {
                     if remote_not_found.contains(&block.object_id) {
@@ -789,6 +901,27 @@ impl StudioVfs {
             buffer.len(),
             self.access_classifier,
         );
+        if let Some(path) = self.debug_pending_target_path(ino) {
+            info!(
+                ino,
+                path = %path,
+                fh = fh.unwrap_or_default(),
+                offset,
+                requested_len = buffer.len(),
+                read_len = prepared.read_len,
+                stream_id = access.stream_id,
+                previous_access_class = access.previous_class.as_str(),
+                access_class = access.class.as_str(),
+                prefetch_enabled = access.policy.prefetch_enabled,
+                readahead_base_width = access.policy.readahead_base_width,
+                readahead_max_width = access.policy.readahead_max_width,
+                readahead_min_prefetch = access.policy.readahead_min_prefetch,
+                first_block = blocks_needed.first().map(|entry| entry.0).unwrap_or(u32::MAX),
+                last_block = blocks_needed.last().map(|entry| entry.0).unwrap_or(u32::MAX),
+                block_count = blocks_needed.len(),
+                "debug target foreground read"
+            );
+        }
         let mut guard = ForegroundReadScope::new(
             &self.state.read,
             self.upload_fg_read_latency_window,
@@ -920,14 +1053,137 @@ mod tests {
     use super::super::*;
     use super::{ReadPipeline, ReadPlanSource, ReadPlanSpan, ReadRange};
     use bytes::{Bytes, BytesMut};
+    use std::any::Any;
     use std::collections::HashSet;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering as AtomicOrdering;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::time::Instant;
+    use studiofs_cache::local::{
+        LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState, LocalBlockObjectStats,
+        LocalBlockStorageStats,
+    };
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig, ROOT_INO};
     use studiofs_meta::{MetaBlocks, MetaFormat, MetaInodes, RedbMetaEngine};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
+
+    struct CountingLocalBlockBackend {
+        inner: Arc<dyn LocalBlockBackend>,
+        get_calls: AtomicU64,
+        read_into_calls: AtomicU64,
+    }
+
+    impl CountingLocalBlockBackend {
+        fn new(inner: Arc<dyn LocalBlockBackend>) -> Self {
+            Self {
+                inner,
+                get_calls: AtomicU64::new(0),
+                read_into_calls: AtomicU64::new(0),
+            }
+        }
+
+        fn reset_counters(&self) {
+            self.get_calls.store(0, AtomicOrdering::Relaxed);
+            self.read_into_calls.store(0, AtomicOrdering::Relaxed);
+        }
+
+        fn get_calls(&self) -> u64 {
+            self.get_calls.load(AtomicOrdering::Relaxed)
+        }
+
+        fn read_into_calls(&self) -> u64 {
+            self.read_into_calls.load(AtomicOrdering::Relaxed)
+        }
+    }
+
+    impl LocalBlockBackend for CountingLocalBlockBackend {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn get(&self, object_id: u64) -> Option<Bytes> {
+            self.get_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner.get(object_id)
+        }
+
+        fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize> {
+            self.read_into_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            self.inner.read_into(object_id, data_offset, out)
+        }
+
+        fn get_for_upload(&self, object_id: u64) -> Option<Bytes> {
+            self.inner.get_for_upload(object_id)
+        }
+
+        fn contains(&self, object_id: u64) -> bool {
+            self.inner.contains(object_id)
+        }
+
+        fn advise_will_need(&self, object_id: u64) {
+            self.inner.advise_will_need(object_id);
+        }
+
+        fn put(
+            &self,
+            object_id: u64,
+            data: &[u8],
+            evictable: bool,
+        ) -> Result<(), LocalBlockBackendError> {
+            self.inner.put(object_id, data, evictable)
+        }
+
+        fn sync_data(&self) -> Result<(), LocalBlockBackendError> {
+            self.inner.sync_data()
+        }
+
+        fn run_pressure_maintenance(&self) -> Result<(), LocalBlockBackendError> {
+            self.inner.run_pressure_maintenance()
+        }
+
+        fn mark_uploading(&self, object_id: u64) {
+            self.inner.mark_uploading(object_id);
+        }
+
+        fn mark_upload_failed(&self, object_id: u64) {
+            self.inner.mark_upload_failed(object_id);
+        }
+
+        fn mark_uploaded(&self, object_id: u64) {
+            self.inner.mark_uploaded(object_id);
+        }
+
+        fn remove(&self, object_id: u64) {
+            self.inner.remove(object_id);
+        }
+
+        fn remove_batch(&self, object_ids: &[u64]) {
+            self.inner.remove_batch(object_ids);
+        }
+
+        fn dirty_object_ids(&self) -> Vec<u64> {
+            self.inner.dirty_object_ids()
+        }
+
+        fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState {
+            self.inner.lifecycle_state(object_id)
+        }
+
+        fn is_evictable(&self, object_id: u64) -> bool {
+            self.inner.is_evictable(object_id)
+        }
+
+        fn storage_stats(&self) -> LocalBlockStorageStats {
+            self.inner.storage_stats()
+        }
+
+        fn object_stats(&self, object_id: u64) -> Option<LocalBlockObjectStats> {
+            self.inner.object_stats(object_id)
+        }
+
+        fn object_ids(&self) -> Vec<u64> {
+            self.inner.object_ids()
+        }
+    }
 
     fn test_format_info(volume_suffix: &str) -> FormatInfo {
         let volume_name = format!("read-path-{volume_suffix}-{}", std::process::id());
@@ -1306,6 +1562,7 @@ mod tests {
                     &span.source,
                     ReadPlanSource::Dirty { .. }
                         | ReadPlanSource::PendingOverlay { .. }
+                        | ReadPlanSource::PendingExtent { .. }
                         | ReadPlanSource::Overlay { .. }
                         if span.range.start < 4 && span.range.end > 2
                 )
@@ -1342,5 +1599,62 @@ mod tests {
             assert_eq!(written, 4);
             assert_eq!(buffer, [0_u8; 4]);
         });
+    }
+
+    #[test]
+    fn materialized_pending_local_read_uses_direct_backend_read_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-local-read-fast-path");
+        let inner = vfs.local_block_backend.clone();
+        let counting_backend = Arc::new(CountingLocalBlockBackend::new(inner));
+        Arc::get_mut(&mut vfs)
+            .expect("unstarted test VFS should be uniquely owned")
+            .local_block_backend = counting_backend.clone();
+
+        rt.block_on(async {
+            let created = vfs
+                .create(ROOT_INO, b"pending-local-read.bin", 1000, 1000, 0o644)
+                .expect("create file");
+            let payload = vec![0x5Au8; 512 * 1024];
+
+            vfs.write(created.ino, 0, &payload)
+                .await
+                .expect("write payload");
+
+            assert!(
+                !vfs.has_pending_write_buffer_blocks_for_inode(created.ino),
+                "foreground write should materialize local pending extents before read"
+            );
+            assert!(
+                !vfs.pending_uploads_for_inode(created.ino).is_empty(),
+                "file should remain unpublished so the read stays on the pending incarnation path"
+            );
+            assert!(
+                vfs.inode_incarnation_state(created.ino)
+                    .await
+                    .expect("load incarnation state")
+                    .pending_incarnation
+                    .is_some(),
+                "newly written file should still expose a pending incarnation locally"
+            );
+
+            counting_backend.reset_counters();
+
+            let read = vfs
+                .read(created.ino, 0, payload.len() as u32)
+                .await
+                .expect("read payload");
+            assert_eq!(read.as_ref(), payload.as_slice());
+        });
+
+        assert_eq!(
+            counting_backend.get_calls(),
+            0,
+            "materialized pending local reads should not fall back to whole-block get()"
+        );
+        assert!(
+            counting_backend.read_into_calls() > 0,
+            "materialized pending local reads should use direct partial read_into()"
+        );
     }
 }

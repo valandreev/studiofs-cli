@@ -15,7 +15,7 @@ pub(super) struct ExtentRecordId {
 }
 
 #[derive(Debug, Clone)]
-enum PendingOverlayBlockSource {
+pub(super) enum PendingOverlayBlockSource {
     Pending(Bytes),
     Extent(u64),
 }
@@ -151,7 +151,7 @@ impl StudioVfs {
         Some(recovered)
     }
 
-    fn pending_overlay_block_source(
+    pub(super) fn pending_overlay_block_source(
         &self,
         ino: Ino,
         block_index: u32,

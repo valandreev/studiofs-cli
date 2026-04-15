@@ -1348,13 +1348,13 @@ impl ReadState {
         ino: Ino,
         stream_id: u64,
         range: PrefetchHintRange,
-    ) -> bool {
+    ) -> PrefetchHintUpdate {
         let mut last_hints = self.prefetch_last_hint.lock();
         match range.update_against(last_hints.get(&(ino, stream_id)).copied()) {
-            PrefetchHintUpdate::Suppress => false,
+            PrefetchHintUpdate::Suppress => PrefetchHintUpdate::Suppress,
             PrefetchHintUpdate::Store(stored) => {
                 last_hints.insert((ino, stream_id), stored.as_stored());
-                true
+                PrefetchHintUpdate::Store(stored)
             }
         }
     }
