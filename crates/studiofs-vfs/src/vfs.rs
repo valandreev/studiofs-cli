@@ -136,7 +136,7 @@ use studiofs_cache::metrics::{LatencyHistogram, LatencyHistogramSnapshot, Materi
 use studiofs_cache::open_local_block_backend_with_budget_and_sync_mode;
 use studiofs_cache::open_prepared_local_block_backend_with_budget_and_sync_mode;
 use studiofs_cache::upload_queue::PendingUpload;
-use studiofs_cache::v3::{CacheV3PayloadSyncMode, platform::sync_directory};
+use studiofs_cache::v3::CacheV3PayloadSyncMode;
 use studiofs_cache::{UploadCoordinator, UploadCoordinatorConfig};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, format_object_fragment_keys,
@@ -2819,14 +2819,6 @@ impl StudioVfs {
                 path = %path.display(),
                 error = %error,
                 "failed to persist zeroio shutdown snapshot"
-            );
-            return;
-        }
-        if let Err(error) = sync_directory(parent) {
-            warn!(
-                path = %parent.display(),
-                error = %error,
-                "failed to sync zeroio shutdown snapshot directory"
             );
         }
     }
