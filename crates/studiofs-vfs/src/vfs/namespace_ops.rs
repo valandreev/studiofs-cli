@@ -7,8 +7,9 @@ use super::{
 };
 
 struct TruncateMutation {
-    old_blocks: Vec<(u32, BlockRef)>,
     removed_blocks: Vec<(u32, BlockRef)>,
+    modified_tail_block: Option<(u32, BlockRef)>,
+    installed_pending_tail_block: Option<u32>,
 }
 
 impl StudioVfs {
@@ -119,8 +120,12 @@ impl StudioVfs {
             {
                 self.begin_pending_incarnation(ino, &mut attr);
                 if new_size < attr.size {
-                    truncate_mutation = Some(self.truncate_blocks(ino, new_size, attr.size)?);
-                    attr.committed_size = attr.committed_size.min(new_size);
+                    truncate_mutation = Some(self.truncate_blocks(
+                        ino,
+                        new_size,
+                        attr.size,
+                        old_attr.content_epoch,
+                    )?);
                 }
                 attr.size = new_size;
                 self.update_pending_incarnation_size(ino, attr.size);
@@ -195,28 +200,54 @@ impl StudioVfs {
         self.state.namespace.dirty_attrs.lock().remove(&ino);
         self.state.namespace.attr_read_cache.lock().remove(ino);
 
-        if let Some(mutation) = truncate_mutation {
-            for (block_index, block_ref) in &mutation.old_blocks {
-                self.sync_meta()
-                    .set_file_block(ino, *block_index, block_ref)?;
-            }
-            let live_extents: Vec<_> = mutation
-                .old_blocks
-                .iter()
-                .map(|(block_index, block_ref)| {
-                    (
-                        ino,
-                        *block_index,
-                        block_ref.object_id,
-                        old_attr.content_epoch,
-                    )
-                })
-                .collect();
-            self.record_live_extents(&live_extents);
-        }
+        self.rollback_truncate_mutation(ino, old_attr.content_epoch, truncate_mutation)?;
 
         self.sync_meta().set_attr(old_attr)?;
         self.refresh_inode_incarnation_state_from_attr(ino, old_attr);
+        Ok(())
+    }
+
+    fn rollback_truncate_mutation(
+        &self,
+        ino: Ino,
+        restore_content_epoch: u64,
+        truncate_mutation: Option<&TruncateMutation>,
+    ) -> VfsResult<()> {
+        let Some(mutation) = truncate_mutation else {
+            return Ok(());
+        };
+
+        if let Some(block_index) = mutation.installed_pending_tail_block {
+            self.clear_pending_block(ino, block_index);
+        }
+
+        let mut live_extents = Vec::with_capacity(
+            mutation.removed_blocks.len() + usize::from(mutation.modified_tail_block.is_some()),
+        );
+        for (block_index, block_ref) in &mutation.removed_blocks {
+            self.sync_meta()
+                .set_file_block(ino, *block_index, block_ref)?;
+            live_extents.push((
+                ino,
+                *block_index,
+                block_ref.object_id,
+                restore_content_epoch,
+            ));
+        }
+        if let Some((block_index, block_ref)) = &mutation.modified_tail_block {
+            self.sync_meta()
+                .set_file_block(ino, *block_index, block_ref)?;
+            live_extents.push((
+                ino,
+                *block_index,
+                block_ref.object_id,
+                restore_content_epoch,
+            ));
+        }
+        if !live_extents.is_empty() {
+            self.record_live_extents(&live_extents);
+        }
+
         Ok(())
     }
 
@@ -252,83 +283,132 @@ impl StudioVfs {
         ino: Ino,
         new_size: u64,
         old_size: u64,
+        restore_content_epoch: u64,
     ) -> VfsResult<TruncateMutation> {
-        let old_last_block = if old_size == 0 {
-            0
-        } else {
-            block_index_from_offset(old_size - 1, self.block_size)
-        };
-
         let first_block_to_remove = if new_size == 0 {
             0
         } else {
             block_index_from_offset(new_size - 1, self.block_size) + 1
         };
-        let old_blocks = self.sync_meta().get_file_blocks(ino)?;
-        let existing_blocks: std::collections::HashMap<u32, BlockRef> =
-            old_blocks.iter().cloned().collect();
-        let mut removed_blocks = Vec::new();
+        let mut old_blocks = self.sync_meta().get_file_blocks(ino)?;
+        old_blocks.sort_unstable_by_key(|(block_index, _)| *block_index);
+        let mut mutation = TruncateMutation {
+            removed_blocks: Vec::new(),
+            modified_tail_block: None,
+            installed_pending_tail_block: None,
+        };
 
         if new_size == 0 && old_size > 0 {
-            removed_blocks.extend(old_blocks.iter().cloned());
+            mutation.removed_blocks = old_blocks;
             self.sync_meta().remove_file_blocks(ino)?;
 
-            for block_idx in first_block_to_remove..=old_last_block {
-                self.clear_pending_block(ino, block_idx);
-                self.remove_live_extent(ino, block_idx);
+            for (block_idx, _) in &mutation.removed_blocks {
+                self.clear_pending_block(ino, *block_idx);
+                self.remove_live_extent(ino, *block_idx);
             }
-            return Ok(TruncateMutation {
-                old_blocks,
-                removed_blocks,
-            });
+            return Ok(mutation);
         }
 
-        for block_idx in first_block_to_remove..=old_last_block {
-            self.clear_pending_block(ino, block_idx);
-            self.remove_live_extent(ino, block_idx);
-            if let Some(block_ref) = existing_blocks.get(&block_idx) {
-                removed_blocks.push((block_idx, block_ref.clone()));
+        for (block_idx, block_ref) in old_blocks
+            .iter()
+            .filter(|(block_idx, _)| *block_idx >= first_block_to_remove)
+        {
+            let removal_result = self.sync_meta().remove_file_block(ino, *block_idx);
+            if let Err(error) = removal_result {
+                self.rollback_truncate_mutation(ino, restore_content_epoch, Some(&mutation))?;
+                return Err(error.into());
             }
-            let _ = self.sync_meta().remove_file_block(ino, block_idx)?;
+            self.clear_pending_block(ino, *block_idx);
+            self.remove_live_extent(ino, *block_idx);
+            mutation
+                .removed_blocks
+                .push((*block_idx, block_ref.clone()));
+            if let Err(error) = self.fail_size_change_truncate_after_first_removed_block_for_test(
+                mutation.removed_blocks.len(),
+            ) {
+                self.rollback_truncate_mutation(ino, restore_content_epoch, Some(&mutation))?;
+                return Err(error);
+            }
         }
 
         if new_size > 0 {
             let new_last_block = block_index_from_offset(new_size - 1, self.block_size);
             let last_block_offset = offset_within_block(new_size - 1, self.block_size);
             let new_last_len = last_block_offset as usize + 1;
-            let trimmed_local = self.trim_local_block_staging(ino, new_last_block, new_last_len)?;
-            if let Some(mut block_ref) = self.sync_meta().get_file_block(ino, new_last_block)? {
-                if !trimmed_local
-                    && let Some(bytes) = {
-                        let pending_upload_index = self.snapshot_pending_upload_index();
-                        self.load_local_block_bytes_sync(
+            let trimmed_local =
+                match self.trim_local_block_staging(ino, new_last_block, new_last_len) {
+                    Ok(trimmed_local) => trimmed_local,
+                    Err(error) => {
+                        self.rollback_truncate_mutation(
                             ino,
-                            new_last_block,
-                            block_ref.object_id,
-                            Some(&pending_upload_index),
-                        )?
+                            restore_content_epoch,
+                            Some(&mutation),
+                        )?;
+                        return Err(error);
                     }
-                    && bytes.len() > new_last_len
-                {
-                    self.install_truncated_pending_block(ino, new_last_block, bytes, new_last_len);
+                };
+            if let Ok(pos) =
+                old_blocks.binary_search_by_key(&new_last_block, |(block_idx, _)| *block_idx)
+            {
+                let original_tail_block = old_blocks[pos].1.clone();
+                let mut truncated_pending_bytes = None;
+                if !trimmed_local {
+                    let pending_upload_index = self.snapshot_pending_upload_index();
+                    let bytes = match self.load_local_block_bytes_sync(
+                        ino,
+                        new_last_block,
+                        original_tail_block.object_id,
+                        Some(&pending_upload_index),
+                    ) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            self.rollback_truncate_mutation(
+                                ino,
+                                restore_content_epoch,
+                                Some(&mutation),
+                            )?;
+                            return Err(error);
+                        }
+                    };
+                    if let Some(bytes) = bytes
+                        && bytes.len() > new_last_len
+                    {
+                        truncated_pending_bytes = Some(bytes);
+                    }
                 }
-                if block_ref.length as usize > new_last_len {
-                    block_ref.length = last_block_offset + 1;
-                    if block_ref.length < self.block_size {
-                        block_ref.flags |= MetaBlockFlags::PARTIAL_BLOCK;
+
+                if original_tail_block.length as usize > new_last_len {
+                    let mut shortened_tail_block = original_tail_block.clone();
+                    shortened_tail_block.length = last_block_offset + 1;
+                    if shortened_tail_block.length < self.block_size {
+                        shortened_tail_block.flags |= MetaBlockFlags::PARTIAL_BLOCK;
                     } else {
-                        block_ref.flags.remove(MetaBlockFlags::PARTIAL_BLOCK);
+                        shortened_tail_block
+                            .flags
+                            .remove(MetaBlockFlags::PARTIAL_BLOCK);
                     }
-                    self.sync_meta()
-                        .set_file_block(ino, new_last_block, &block_ref)?;
+                    if let Err(error) =
+                        self.sync_meta()
+                            .set_file_block(ino, new_last_block, &shortened_tail_block)
+                    {
+                        self.rollback_truncate_mutation(
+                            ino,
+                            restore_content_epoch,
+                            Some(&mutation),
+                        )?;
+                        return Err(error.into());
+                    }
+                    mutation.modified_tail_block = Some((new_last_block, original_tail_block));
+                }
+
+                if let Some(bytes) = truncated_pending_bytes {
+                    self.install_truncated_pending_block(ino, new_last_block, bytes, new_last_len);
+                    mutation.installed_pending_tail_block = Some(new_last_block);
                 }
             }
         }
 
-        Ok(TruncateMutation {
-            old_blocks,
-            removed_blocks,
-        })
+        Ok(mutation)
     }
 
     #[cfg(test)]
@@ -353,6 +433,38 @@ impl StudioVfs {
 
     #[cfg(not(test))]
     fn fail_size_change_setattr_before_flush_for_test(&self) -> VfsResult<()> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn arm_fail_next_size_change_truncate_after_first_removed_block_for_test(&self) {
+        self.fail_next_size_change_truncate_after_first_removed_block
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn fail_size_change_truncate_after_first_removed_block_for_test(
+        &self,
+        removed_block_count: usize,
+    ) -> VfsResult<()> {
+        if removed_block_count == 1
+            && self
+                .fail_next_size_change_truncate_after_first_removed_block
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            Err(VfsError::Other(
+                "simulated truncate mutation failure after first removed block".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(not(test))]
+    fn fail_size_change_truncate_after_first_removed_block_for_test(
+        &self,
+        _removed_block_count: usize,
+    ) -> VfsResult<()> {
         Ok(())
     }
 

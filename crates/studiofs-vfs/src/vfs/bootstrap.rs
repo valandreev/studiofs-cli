@@ -485,6 +485,9 @@ impl VfsBootstrap {
             write_path_started_at: Instant::now(),
             #[cfg(test)]
             fail_next_size_change_setattr_before_flush: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_size_change_truncate_after_first_removed_block:
+                std::sync::atomic::AtomicBool::new(false),
         })
     }
 

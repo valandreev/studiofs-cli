@@ -7354,39 +7354,34 @@ fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
         vfs.write(first.ino, 0, &payload).await.unwrap();
         assert_eq!(
             vfs.ingress_pressure_for(payload.len()).lane,
-            VfsIngressLane::Backpressure,
-            "once the write buffer is full, the same payload should hit local backpressure"
+            VfsIngressLane::DirtyMem,
+            "once the first payload is durably committed locally, the next payload should start from a clean local budget"
         );
 
-        let blocked_vfs = vfs.clone();
-        let blocked_payload = payload.clone();
-        let blocked = tokio::spawn(async move {
-            let second = blocked_vfs.create(1, b"drained.bin", 0, 0, 0o644).unwrap();
-            blocked_vfs
-                .write(second.ino, 0, &blocked_payload)
-                .await
-                .unwrap();
-            match tokio::time::timeout(Duration::from_secs(30), blocked_vfs.flush(second.ino)).await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => panic!("flush failed: {e}"),
-                Err(_) => {
-                    let stats = blocked_vfs.ingress_stats();
-                    panic!(
-                        "flush timed out after 30s: dirty_mem={} spill={} wait_ms={}",
-                        stats.dirty_mem_bytes, stats.spill_bytes, stats.write_backpressure_wait_ms
-                    );
-                }
+        let second = vfs.create(1, b"drained.bin", 0, 0, 0o644).unwrap();
+        vfs.write(second.ino, 0, &payload).await.unwrap();
+        match tokio::time::timeout(Duration::from_secs(30), vfs.flush(second.ino)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("flush failed: {e}"),
+            Err(_) => {
+                let stats = vfs.ingress_stats();
+                panic!(
+                    "flush timed out after 30s: dirty_mem={} spill={} wait_ms={}",
+                    stats.dirty_mem_bytes, stats.spill_bytes, stats.write_backpressure_wait_ms
+                );
             }
-        });
-        blocked.await.unwrap();
+        }
 
         let stats = vfs.ingress_stats();
         assert!(
-            stats.dirty_mem_bytes <= payload.len(),
-            "backpressure should drain at least the newly written inode back out of the write buffer"
+            stats.dirty_mem_bytes == 0,
+            "foreground writes should leave no dirty-memory tail once each write crosses the local durable boundary"
         );
         assert_eq!(stats.spill_bytes, 0);
+        assert_eq!(
+            stats.write_backpressure_wait_ms, 0,
+            "sequential locally committed writes must not accumulate ingress backpressure wait time"
+        );
     });
     rt.shutdown_background();
 }
@@ -9072,6 +9067,96 @@ fn overwrite_of_published_file_is_locally_readable_without_flush() {
         assert_eq!(
             persisted_after.committed_size, published_size,
             "foreground overwrite must keep the last published size intact"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn truncate_of_published_file_keeps_committed_size_and_pending_incarnation() {
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let format_info = make_format_info_with_endpoint(
+        &format!("zeroio-published-truncate-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    let baseline_payload = b"committed baseline payload".to_vec();
+    let truncated_size = 8u64;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (meta, _data_config, vfs) = make_local_zeroio_test_vfs(
+            &db_path,
+            &cache_dir_str,
+            &format_info,
+            VfsConfigRaw::default()
+                .validate()
+                .expect("default VFS config should validate"),
+        );
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
+
+        let attr = vfs
+            .create(1, b"zeroio-published-truncate.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        vfs.write(ino, 0, &baseline_payload).await.unwrap();
+        vfs.flush(ino).await.unwrap();
+        wait_until_blocks(&vfs, ino, Duration::from_secs(15))
+            .expect("baseline file must commit before truncate test");
+
+        let published_before = meta.get_attr(ino).unwrap();
+        let published_epoch = published_before.committed_content_epoch;
+        let published_size = published_before.committed_size;
+
+        vfs.setattr(ino, SetattrArgs::size_only(truncated_size))
+            .unwrap();
+
+        let read = vfs.read(ino, 0, truncated_size as u32).await.unwrap();
+        assert_eq!(
+            read.as_ref(),
+            &baseline_payload[..truncated_size as usize],
+            "writing mount should immediately prefer the locally truncated unpublished view"
+        );
+
+        let state = vfs.inode_incarnation_state(ino).await.unwrap();
+        let committed = state
+            .committed_incarnation
+            .expect("published base must remain available during local truncate");
+        let pending = state
+            .pending_incarnation
+            .expect("local truncate of a published file must retain a pending incarnation");
+        assert_eq!(committed.content_epoch, published_epoch);
+        assert_eq!(committed.size, published_size);
+        assert!(pending.content_epoch > committed.content_epoch);
+        assert_eq!(pending.size, truncated_size);
+        assert_eq!(pending.base_size, committed.size);
+
+        let persisted_after = meta.get_attr(ino).unwrap();
+        assert_eq!(
+            persisted_after.size, truncated_size,
+            "foreground truncate must persist the new local unpublished size"
+        );
+        assert_eq!(
+            persisted_after.committed_content_epoch, published_epoch,
+            "foreground truncate must not advance globally published visibility"
+        );
+        assert_eq!(
+            persisted_after.committed_size, published_size,
+            "foreground truncate must keep the last published size intact"
         );
     });
     rt.shutdown_background();

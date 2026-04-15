@@ -1512,6 +1512,56 @@ fn test_size_changing_setattr_rollback_restores_old_local_state_on_failure() {
 }
 
 #[test]
+fn test_size_changing_setattr_rolls_back_partial_truncate_mutation_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "setattr-truncate-mutation-rollback");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"setattr-truncate-mutation-rollback.bin", 0, 0, 0o644)
+            .unwrap();
+        let block_size = vfs.block_size as usize;
+        let payload = vec![0x5Au8; block_size * 2];
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+
+        vfs.arm_fail_next_size_change_truncate_after_first_removed_block_for_test();
+        let error = vfs
+            .setattr(attr.ino, SetattrArgs::size_only((block_size / 2) as u64))
+            .expect_err("simulated truncate mutation failure should fail setattr");
+        assert!(
+            error
+                .to_string()
+                .contains("simulated truncate mutation failure after first removed block"),
+            "expected the injected truncate mutation failure to surface"
+        );
+
+        let persisted_attr = meta.get_attr(attr.ino).unwrap();
+        assert_eq!(
+            persisted_attr.size,
+            payload.len() as u64,
+            "failed truncate mutation must restore the previous durable size"
+        );
+        assert!(
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "failed truncate mutation must not leave dirty local state behind"
+        );
+
+        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        assert_eq!(
+            blocks.len(),
+            2,
+            "rollback should restore both originally committed blocks"
+        );
+        let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(
+            read.as_ref(),
+            payload.as_slice(),
+            "failed truncate mutation must preserve the last durable local contents"
+        );
+    });
+}
+
+#[test]
 fn test_file_session_read_lock_allows_parallel_readers() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-read-parallel");
