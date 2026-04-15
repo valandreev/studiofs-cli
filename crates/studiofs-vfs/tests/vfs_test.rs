@@ -5684,7 +5684,7 @@ fn published_file_remains_readable_after_cache_wipe_and_restart() {
 
 #[test]
 #[ignore = "requires live S3 backend; run with --ignored and valid .env"]
-fn background_epoch_finalizer_publishes_publish_ready_epoch_without_pending_uploads() {
+fn background_epoch_finalizer_publishes_legacy_epoch_without_publish_ready_marker() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_bucket = ScopedEnvVar::capture("STUDIOFS_S3_BUCKET");
     let _restore_access_key = ScopedEnvVar::capture("STUDIOFS_S3_ACCESS_KEY");
@@ -5748,16 +5748,6 @@ fn background_epoch_finalizer_publishes_publish_ready_epoch_without_pending_uplo
             let replacement_block =
                 BlockRef::new_partial(replacement_object_id, replacement_payload.len() as u32);
             meta.set_file_block(ino, 0, &replacement_block).unwrap();
-            assert!(
-                meta.mark_file_block_uploaded_if_matches(
-                    ino,
-                    0,
-                    staged_attr.content_epoch,
-                    &replacement_block
-                )
-                .unwrap(),
-                "staged restart epoch should become publish-ready before replay"
-            );
 
             let unpublished_attr = meta.get_attr(ino).unwrap();
             assert_eq!(unpublished_attr.upload_state, UploadState::Updating);
@@ -5770,7 +5760,7 @@ fn background_epoch_finalizer_publishes_publish_ready_epoch_without_pending_uplo
                 lifecycle.local_content_epoch,
                 unpublished_attr.content_epoch
             );
-            assert_eq!(lifecycle.state, InodeLifecycleState::PublishReady);
+            assert_eq!(lifecycle.state, InodeLifecycleState::LocalOnly);
         });
         rt.shutdown_background();
     }
@@ -5808,14 +5798,17 @@ fn background_epoch_finalizer_publishes_publish_ready_epoch_without_pending_uplo
                     .unwrap_or(false)
             })
             .await,
-            "background epoch finalizer should publish the durable publish-ready epoch without pending uploads"
+            "background epoch finalizer should preserve legacy metadata-only publish after restart"
         );
 
         let published_blocks = meta.get_file_blocks(ino).unwrap();
         assert_eq!(published_blocks.len(), 1);
         assert_eq!(published_blocks[0].1.object_id, replacement_object_id);
 
-        let data = vfs.read(ino, 0, replacement_payload.len() as u32).await.unwrap();
+        let data = vfs
+            .read(ino, 0, replacement_payload.len() as u32)
+            .await
+            .unwrap();
         assert_eq!(data.as_ref(), replacement_payload.as_slice());
     });
     rt.shutdown_background();

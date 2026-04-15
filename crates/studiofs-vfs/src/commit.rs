@@ -1,4 +1,5 @@
 use super::*;
+use studiofs_cache::local::LocalBlockLifecycleState;
 use studiofs_data::object::format_object_fragment_keys;
 use studiofs_meta::InodeLifecycleState;
 
@@ -45,6 +46,10 @@ impl CommitCoordinator {
             return Ok(EpochFinalizeStatus::Deferred);
         }
 
+        let has_persisted_overlay = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            engine.has_local_regular_file_overlay(ino)
+        })
+        .await?;
         let lifecycle = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
             engine.get_inode_lifecycle(ino)
         })
@@ -68,19 +73,31 @@ impl CommitCoordinator {
             return Ok(EpochFinalizeStatus::Skipped);
         }
         if lifecycle.state != InodeLifecycleState::PublishReady {
-            tracing::debug!(
+            let legacy_publishable = Self::legacy_epoch_can_publish_without_publish_ready(
+                vfs,
                 ino,
                 content_epoch,
-                lifecycle_state = ?lifecycle.state,
-                "deferring epoch publication until durable lifecycle reaches publish-ready"
-            );
-            return Ok(EpochFinalizeStatus::Deferred);
+                has_persisted_overlay,
+            )
+            .await?;
+            if legacy_publishable {
+                tracing::debug!(
+                    ino,
+                    content_epoch,
+                    lifecycle_state = ?lifecycle.state,
+                    "finalizing legacy epoch without durable publish-ready marker"
+                );
+            } else {
+                tracing::debug!(
+                    ino,
+                    content_epoch,
+                    lifecycle_state = ?lifecycle.state,
+                    "deferring epoch publication until durable lifecycle reaches publish-ready"
+                );
+                return Ok(EpochFinalizeStatus::Deferred);
+            }
         }
 
-        let has_persisted_overlay = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-            engine.has_local_regular_file_overlay(ino)
-        })
-        .await?;
         let published = if has_persisted_overlay {
             let overlay_object_ids = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
                 engine.get_regular_file_overlay_object_ids(ino)
@@ -267,6 +284,44 @@ impl CommitCoordinator {
 
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    async fn legacy_epoch_can_publish_without_publish_ready(
+        vfs: &StudioVfs,
+        ino: Ino,
+        content_epoch: u64,
+        has_persisted_overlay: bool,
+    ) -> VfsResult<bool> {
+        let pending_same_epoch = vfs
+            .upload_coordinator()
+            .snapshot_pending_uploads()
+            .into_iter()
+            .any(|pending| pending.ino == ino && pending.content_epoch == content_epoch);
+        if pending_same_epoch {
+            return Ok(false);
+        }
+
+        let required_object_ids = if has_persisted_overlay {
+            run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                engine.get_regular_file_overlay_object_ids(ino)
+            })
+            .await?
+        } else {
+            run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+                engine.get_file_blocks(ino)
+            })
+            .await?
+            .into_iter()
+            .map(|(_, block_ref)| block_ref.object_id)
+            .collect()
+        };
+
+        Ok(required_object_ids.into_iter().all(|object_id| {
+            !matches!(
+                vfs.local_block_backend().lifecycle_state(object_id),
+                LocalBlockLifecycleState::Dirty | LocalBlockLifecycleState::Uploading
+            )
+        }))
     }
 }
 
