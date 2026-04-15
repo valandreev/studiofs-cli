@@ -20,9 +20,11 @@ impl StudioVfs {
     /// pending, `release_fh` must push that state through the current local
     /// payload/metadata pipeline before the handle disappears so later opens,
     /// open-unlink cleanup, and sticky-error reporting all see a coherent
-    /// inode. This is not a strict `fsync` promise in Fast mode: `fsync`
-    /// remains the explicit crash-durability barrier, while `release_fh`
-    /// preserves the existing local-visibility semantics.
+    /// inode. When dirty unpublished state is still present, the final release
+    /// must drive that inode through the strict local durability barrier so a
+    /// clean reboot can replay the accepted epoch without involving publish.
+    /// Clean last-handle closes still short-circuit without inventing extra
+    /// work on the foreground path.
     pub async fn release_fh(&self, fh: u64) -> VfsResult<()> {
         self.release_fh_with_outcome(fh).await.map(|_| ())
     }
@@ -116,10 +118,15 @@ impl StudioVfs {
             LastHandleReleaseAction::LocalSync {
                 sticky_error_policy,
             } => {
+                let local_sync_policy = if self.inode_has_local_dirty_state(ino) {
+                    LocalSyncPolicy::Strict
+                } else {
+                    LocalSyncPolicy::Opportunistic
+                };
                 let outcome = self
                     .local_sync_barrier_with_outcome(
                         ino,
-                        LocalSyncPolicy::Opportunistic,
+                        local_sync_policy,
                         sticky_error_policy,
                         DirtyAttrPersistPolicy::Ignore,
                     )
@@ -217,10 +224,15 @@ impl StudioVfs {
             .enter_op(ino, FileSessionOperation::Flush)
             .await;
         let result: VfsResult<ExplicitFlushOutcome> = async {
+            let local_sync_policy = if self.inode_has_local_dirty_state(ino) {
+                LocalSyncPolicy::Strict
+            } else {
+                LocalSyncPolicy::Opportunistic
+            };
             let outcome = self
                 .local_sync_barrier_with_outcome(
                     ino,
-                    LocalSyncPolicy::Opportunistic,
+                    local_sync_policy,
                     sticky_error_policy,
                     DirtyAttrPersistPolicy::Ignore,
                 )
