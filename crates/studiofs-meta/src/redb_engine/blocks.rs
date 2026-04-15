@@ -41,7 +41,7 @@ impl MetaBlocks for RedbMetaEngine {
                 true,
             )?;
 
-            let mut inodes = txn
+            let inodes = txn
                 .open_table(INODES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             let attr_bytes = inodes
@@ -53,10 +53,9 @@ impl MetaBlocks for RedbMetaEngine {
                 let has_committed_manifest =
                     Self::regular_file_committed_size_in_txn(&txn, ino)?.unwrap_or(0) > 0;
                 Self::transition_upload_state_for_local_mutation(&mut attr, has_committed_manifest);
-                let encoded = encode(&attr)?;
-                inodes
-                    .insert(ino, encoded.as_slice())
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                drop(inodes);
+                Self::set_inode_overlay_in_txn(&txn, &attr)?;
+                Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
             }
         }
 
@@ -217,6 +216,7 @@ impl MetaBlocks for RedbMetaEngine {
             removed_ids = removed_object_ids.into_iter().collect();
 
             Self::clear_regular_file_graph_in_txn(&txn, ino)?;
+            Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
 
             Self::append_event_in_txn(&txn, &crate::events::MetaEvent::RemoveFileBlocks { ino })?;
         }
@@ -275,7 +275,7 @@ impl MetaBlocks for RedbMetaEngine {
             if removed_id.is_some() {
                 let new_committed_size =
                     Self::regular_file_committed_size_in_txn(&txn, ino)?.unwrap_or(0);
-                let mut inodes = txn
+                let inodes = txn
                     .open_table(INODES_TABLE)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
                 let attr_bytes = inodes
@@ -290,10 +290,9 @@ impl MetaBlocks for RedbMetaEngine {
                         &mut attr,
                         has_committed_manifest,
                     );
-                    let data = encode(&attr)?;
-                    inodes
-                        .insert(ino, data.as_slice())
-                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    drop(inodes);
+                    Self::set_inode_overlay_in_txn(&txn, &attr)?;
+                    Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
                     updated_attr = Some(attr);
                 }
 
@@ -488,14 +487,8 @@ impl MetaBlocks for RedbMetaEngine {
             let committed_changed = previous_committed_size != attr.committed_size
                 || previous_committed_epoch != attr.committed_content_epoch
                 || previous_upload_state != attr.upload_state;
-            let attr_data = encode(&attr)?;
-            let mut inodes = txn
-                .open_table(INODES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            inodes
-                .insert(ino, attr_data.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            drop(inodes);
+            Self::set_inode_overlay_in_txn(&txn, &attr)?;
+            Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
 
             Self::append_event_in_txn(
                 &txn,
@@ -638,13 +631,8 @@ impl MetaBlocks for RedbMetaEngine {
                 .unwrap_or(attr.size);
             attr.committed_content_epoch = attr.content_epoch;
             attr.upload_state = UploadState::Ready;
-            let attr_data = encode(&attr)?;
-            let mut inodes = txn
-                .open_table(INODES_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            inodes
-                .insert(ino, attr_data.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            Self::set_inode_overlay_in_txn(&txn, &attr)?;
+            Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
 
             Self::append_event_in_txn(
                 &txn,
@@ -675,7 +663,7 @@ impl MetaBlocks for RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
 
         {
-            let mut inodes = txn
+            let inodes = txn
                 .open_table(INODES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             let attr_bytes = match inodes
@@ -716,10 +704,9 @@ impl MetaBlocks for RedbMetaEngine {
             attr.committed_size = committed_size.min(attr.size);
             attr.committed_content_epoch = attr.content_epoch;
             attr.upload_state = UploadState::Ready;
-            let encoded = encode(&attr)?;
-            inodes
-                .insert(ino, encoded.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            drop(inodes);
+            Self::set_inode_overlay_in_txn(&txn, &attr)?;
+            Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
 
             Self::append_event_in_txn(
                 &txn,
@@ -995,6 +982,7 @@ impl RedbMetaEngine {
                 Self::set_inode_overlay_in_txn(&txn, attr)?;
             }
         }
+        Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
 
         Self::append_event_in_txn(
             &txn,
@@ -1098,9 +1086,10 @@ impl RedbMetaEngine {
             }
 
             if !touched_inodes.is_empty() {
-                let mut inodes = txn
+                let inodes = txn
                     .open_table(INODES_TABLE)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
+                let mut current_attrs = Vec::new();
                 for &ino in &touched_inodes {
                     if normalized_attr.as_ref().is_some_and(|attr| attr.ino == ino) {
                         continue;
@@ -1117,16 +1106,23 @@ impl RedbMetaEngine {
                             &mut current_attr,
                             has_committed_manifest,
                         );
-                        let encoded = encode(&current_attr)?;
-                        inodes
-                            .insert(ino, encoded.as_slice())
-                            .map_err(|e| MetaError::Storage(e.to_string()))?;
+                        current_attrs.push(current_attr);
                     }
+                }
+                drop(inodes);
+                for current_attr in current_attrs {
+                    Self::set_inode_overlay_in_txn(&txn, &current_attr)?;
                 }
             }
 
             if let Some(attr) = normalized_attr.as_ref() {
                 Self::set_inode_overlay_in_txn(&txn, attr)?;
+            }
+            if let Some(attr) = normalized_attr.as_ref() {
+                touched_inodes.insert(attr.ino);
+            }
+            for &ino in &touched_inodes {
+                Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
             }
 
             if !entries.is_empty() {
@@ -1205,5 +1201,27 @@ impl crate::engine::MetaEngine for RedbMetaEngine {
         attr: Option<&InodeAttr>,
     ) -> MetaResult<Option<InodeAttr>> {
         self.flush_regular_file_overlay_slices_with_attr_txn(ino, chunk_slices, attr)
+    }
+}
+
+impl RedbMetaEngine {
+    pub(super) fn overlay_object_ids_in_write_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<Vec<u64>> {
+        let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
+            txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            ino,
+        )?;
+        let mut object_ids = std::collections::BTreeSet::new();
+        for chunk_state in overlay_chunks.values() {
+            for slice in chunk_state.slices.values() {
+                if let Some(block) = slice.block.as_ref() {
+                    object_ids.insert(block.object_id);
+                }
+            }
+        }
+        Ok(object_ids.into_iter().collect())
     }
 }

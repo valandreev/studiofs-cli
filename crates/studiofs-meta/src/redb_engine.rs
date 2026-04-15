@@ -43,6 +43,7 @@ impl RedbMetaEngine {
             let _ = txn.open_table(COUNTERS_TABLE);
             let _ = txn.open_table(INODES_TABLE);
             let _ = txn.open_table(BASE_INODES_TABLE);
+            let _ = txn.open_table(INODE_LIFECYCLE_TABLE);
             let _ = txn.open_table(INODE_TOMBSTONES_TABLE);
             let _ = txn.open_table(DENTRIES_TABLE);
             let _ = txn.open_table(BASE_DENTRIES_TABLE);
@@ -75,6 +76,7 @@ impl RedbMetaEngine {
 
         match engine.get_format_info() {
             Ok(format_info) if format_info.format_version >= CURRENT_FORMAT_VERSION => {
+                engine.ensure_inode_lifecycle_table()?;
                 debug!(
                     "format version {} is up to date",
                     format_info.format_version

@@ -166,6 +166,9 @@ impl<'a> NamespaceCreateTxn<'a> {
         let attr = spec.initial_attr();
         self.insert_attr(&attr)?;
         self.clear_inode_tombstone(spec.ino)?;
+        if attr.kind == FileType::RegularFile {
+            RedbMetaEngine::sync_inode_lifecycle_in_txn(self.txn, attr.ino)?;
+        }
 
         let dentry_key = encode_dentry_key(spec.parent, spec.name);
         self.insert_dentry(dentry_key.as_slice(), &spec.dir_entry_value())?;
@@ -391,12 +394,29 @@ impl<'a> NamespaceDeleteTxn<'a> {
         attr.nlink = attr.nlink.saturating_sub(1);
         if spec.records_deferred_delete() {
             RedbMetaEngine::set_inode_overlay_in_txn(self.txn, &attr)?;
+            RedbMetaEngine::sync_inode_lifecycle_in_txn(self.txn, attr.ino)?;
         } else if attr.nlink == 0 {
+            let overlay_object_ids =
+                RedbMetaEngine::overlay_object_ids_in_write_txn(self.txn, entry.ino)?;
             RedbMetaEngine::remove_inode_overlay_in_txn(self.txn, entry.ino)?;
             RedbMetaEngine::clear_inode_overlay_aux_in_txn(self.txn, entry.ino)?;
             self.remove_file_blocks_for_inode(entry.ino)?;
+            if attr.kind == FileType::RegularFile
+                && (attr.content_epoch != attr.committed_content_epoch
+                    || attr.size != attr.committed_size
+                    || !overlay_object_ids.is_empty())
+            {
+                RedbMetaEngine::record_deleted_before_publish_in_txn(
+                    self.txn,
+                    &attr,
+                    overlay_object_ids,
+                )?;
+            } else {
+                RedbMetaEngine::remove_inode_lifecycle_in_txn(self.txn, entry.ino)?;
+            }
         } else {
             RedbMetaEngine::set_inode_overlay_in_txn(self.txn, &attr)?;
+            RedbMetaEngine::sync_inode_lifecycle_in_txn(self.txn, attr.ino)?;
         }
 
         parent_attr.touch_mtime();

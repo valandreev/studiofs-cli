@@ -576,6 +576,178 @@ fn redb_publish_file_manifest_if_matches_rejects_manifest_changes() {
 }
 
 #[test]
+fn zeroio_new_file_starts_local_only() {
+    let engine = temp_engine();
+
+    let file = engine
+        .create_file(ROOT_INO, b"zeroio-local-only.bin", 1000, 1000, 0o644)
+        .unwrap();
+
+    let lifecycle = engine.get_inode_lifecycle(file.ino).unwrap().unwrap();
+    assert_eq!(lifecycle.state, InodeLifecycleState::LocalOnly);
+    assert_eq!(lifecycle.retention, PayloadRetentionClass::PinnedUnpublished);
+    assert_eq!(lifecycle.local_visible_size, 0);
+    assert_eq!(lifecycle.published_size, 0);
+    assert_eq!(lifecycle.local_content_epoch, 0);
+    assert_eq!(lifecycle.published_content_epoch, 0);
+    assert!(!lifecycle.has_published_base);
+}
+
+#[test]
+fn zeroio_published_file_can_carry_new_unpublished_epoch() {
+    let engine = temp_engine();
+
+    let file = engine
+        .create_file(ROOT_INO, b"zeroio-overwrite.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+    let published = BlockRef::new_partial(601, 4096);
+    engine.set_file_block(file.ino, 0, &published).unwrap();
+    assert!(engine.publish_file_manifest(file.ino, 1).unwrap());
+
+    let mut overwrite = engine.get_attr(file.ino).unwrap();
+    overwrite.content_epoch = 2;
+    engine.set_attr(&overwrite).unwrap();
+    let local = BlockRef::new_partial(602, 4096);
+    engine.set_file_block(file.ino, 0, &local).unwrap();
+
+    let lifecycle = engine.get_inode_lifecycle(file.ino).unwrap().unwrap();
+    assert_eq!(lifecycle.state, InodeLifecycleState::LocalOnly);
+    assert_eq!(lifecycle.retention, PayloadRetentionClass::PinnedUnpublished);
+    assert_eq!(lifecycle.local_visible_size, 4096);
+    assert_eq!(lifecycle.published_size, 4096);
+    assert_eq!(lifecycle.local_content_epoch, 2);
+    assert_eq!(lifecycle.published_content_epoch, 1);
+    assert!(lifecycle.has_published_base);
+}
+
+#[test]
+fn zeroio_append_to_unpublished_file_reuses_same_lifecycle() {
+    let engine = temp_engine();
+
+    let file = engine
+        .create_file(ROOT_INO, b"zeroio-append.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+    engine
+        .set_file_block(file.ino, 0, &BlockRef::new_partial(701, 4096))
+        .unwrap();
+
+    let mut appended = engine.get_attr(file.ino).unwrap();
+    appended.size = 8192;
+    engine.set_attr(&appended).unwrap();
+    engine
+        .set_file_block(file.ino, 1, &BlockRef::new_partial(702, 4096))
+        .unwrap();
+
+    let lifecycle = engine.get_inode_lifecycle(file.ino).unwrap().unwrap();
+    assert_eq!(lifecycle.state, InodeLifecycleState::LocalOnly);
+    assert_eq!(lifecycle.local_visible_size, 8192);
+    assert_eq!(lifecycle.published_size, 0);
+    assert_eq!(lifecycle.local_content_epoch, 1);
+    assert_eq!(lifecycle.published_content_epoch, 0);
+}
+
+#[test]
+fn zeroio_truncate_unpublished_file_reuses_same_lifecycle() {
+    let engine = temp_engine();
+
+    let file = engine
+        .create_file(ROOT_INO, b"zeroio-truncate.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 8192;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+    engine
+        .set_file_block(file.ino, 0, &BlockRef::new_partial(801, 4096))
+        .unwrap();
+    engine
+        .set_file_block(file.ino, 1, &BlockRef::new_partial(802, 4096))
+        .unwrap();
+
+    let mut truncated = engine.get_attr(file.ino).unwrap();
+    truncated.size = 4096;
+    engine.set_attr(&truncated).unwrap();
+    engine.remove_file_block(file.ino, 1).unwrap();
+
+    let lifecycle = engine.get_inode_lifecycle(file.ino).unwrap().unwrap();
+    assert_eq!(lifecycle.state, InodeLifecycleState::LocalOnly);
+    assert_eq!(lifecycle.local_visible_size, 4096);
+    assert_eq!(lifecycle.published_size, 0);
+    assert_eq!(lifecycle.local_content_epoch, 1);
+    assert_eq!(lifecycle.published_content_epoch, 0);
+}
+
+#[test]
+fn zeroio_unpublished_lifecycle_survives_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("zeroio-restart.redb");
+
+    let file_ino = {
+        let engine = RedbMetaEngine::open(&db_path).unwrap();
+        engine.init_root(1000, 1000).unwrap();
+        engine
+            .set_format_info(&test_format_info("zeroio-restart"))
+            .unwrap();
+        let file = engine
+            .create_file(ROOT_INO, b"restart.bin", 1000, 1000, 0o644)
+            .unwrap();
+        let mut attr = engine.get_attr(file.ino).unwrap();
+        attr.size = 4096;
+        attr.content_epoch = 1;
+        engine.set_attr(&attr).unwrap();
+        engine
+            .set_file_block(file.ino, 0, &BlockRef::new_partial(901, 4096))
+            .unwrap();
+        file.ino
+    };
+
+    let reopened = RedbMetaEngine::open(&db_path).unwrap();
+    let lifecycle = reopened.get_inode_lifecycle(file_ino).unwrap().unwrap();
+    assert_eq!(lifecycle.state, InodeLifecycleState::LocalOnly);
+    assert_eq!(lifecycle.local_visible_size, 4096);
+    assert_eq!(lifecycle.local_content_epoch, 1);
+    assert_eq!(lifecycle.published_content_epoch, 0);
+}
+
+#[test]
+fn zeroio_metadata_only_local_epoch_keeps_published_payload_warm() {
+    let engine = temp_engine();
+
+    let file = engine
+        .create_file(ROOT_INO, b"zeroio-metadata-only.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+    let published = BlockRef::new_partial(902, 4096);
+    engine.set_file_block(file.ino, 0, &published).unwrap();
+    assert!(engine.publish_file_manifest(file.ino, 1).unwrap());
+
+    let mut truncated = engine.get_attr(file.ino).unwrap();
+    truncated.size = 2048;
+    truncated.content_epoch = 2;
+    engine.set_attr(&truncated).unwrap();
+
+    let lifecycle = engine.get_inode_lifecycle(file.ino).unwrap().unwrap();
+    assert_eq!(lifecycle.state, InodeLifecycleState::LocalOnly);
+    assert_eq!(lifecycle.retention, PayloadRetentionClass::PublishedWarm);
+    assert!(lifecycle.has_published_base);
+    assert_eq!(lifecycle.local_visible_size, 2048);
+    assert_eq!(lifecycle.published_size, 4096);
+    assert_eq!(lifecycle.local_content_epoch, 2);
+    assert_eq!(lifecycle.published_content_epoch, 1);
+}
+
+#[test]
 fn test_next_block_id() {
     let engine = temp_engine();
 

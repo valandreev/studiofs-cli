@@ -1521,7 +1521,8 @@ mod tests {
     use crate::diagnostics;
     use crate::investigation::{
         DiagnosticsPreset, InvestigationStore, NewTimelineEntry, ProfilingCaptureMode,
-        ProfilingWindowStatus, TimelineEntryKind, TimelineEntrySource, set_test_store_base_dir,
+        ProfilingWindowStatus, TimelineEntryKind, TimelineEntrySource,
+        lock_investigation_test_mutex, set_test_store_base_dir,
     };
     use std::io;
     use std::sync::{Arc, Mutex};
@@ -2037,6 +2038,7 @@ mod tests {
     #[test]
     fn mount_session_launch_publishes_live_diagnostics_and_supports_attach() {
         let _guard = diagnostics::lock_diagnostics_test_mutex();
+        let _investigation_guard = lock_investigation_test_mutex();
         let temp = tempfile::tempdir().expect("tempdir");
         let store_dir = temp.path().join("investigations-store");
         set_test_store_base_dir(Some(&store_dir));
@@ -2118,23 +2120,32 @@ mod tests {
                 .runtime_handle
                 .block_on(
                     competing_client
-                        .acquire_controller("test-client-b", Duration::from_millis(100)),
+                        .try_acquire_controller("test-client-b", Duration::from_millis(100)),
                 )
                 .expect_err("second controller should be rejected before expiry");
             assert!(
-                conflict.to_string().contains("already held"),
+                conflict.code == "controller_busy",
                 "unexpected controller conflict: {conflict:#}"
             );
 
-            std::thread::sleep(Duration::from_millis(125));
-
-            let takeover = launch
-                .runtime_handle
-                .block_on(
+            let takeover_deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let takeover = loop {
+                match launch.runtime_handle.block_on(
                     competing_client
-                        .acquire_controller("test-client-b", Duration::from_millis(100)),
-                )
-                .expect("controller should be available after expiry");
+                        .try_acquire_controller("test-client-b", Duration::from_millis(100)),
+                ) {
+                    Ok(lease) => break lease,
+                    Err(error)
+                        if error.code == "controller_busy"
+                            && std::time::Instant::now() < takeover_deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(error) => panic!(
+                        "controller should become available after expiry, last error: {error:#}"
+                    ),
+                }
+            };
             let renewed = launch
                 .runtime_handle
                 .block_on(

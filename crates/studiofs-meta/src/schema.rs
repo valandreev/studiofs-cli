@@ -68,6 +68,42 @@ pub enum UploadState {
     Ready = 3,
 }
 
+/// Explicit ZeroIO lifecycle for the locally durable view of a regular file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+pub enum InodeLifecycleState {
+    /// Locally durable and visible on this mount, but not yet uploaded.
+    #[default]
+    LocalOnly = 1,
+    /// Upload is in flight for the current unpublished epoch.
+    Uploading = 2,
+    /// The current unpublished epoch is fully uploaded and is waiting for
+    /// explicit publication.
+    PublishReady = 3,
+    /// Local and globally published views are aligned.
+    Published = 4,
+    /// The unpublished epoch was deleted locally and must never publish.
+    DeletedBeforePublish = 5,
+}
+
+/// Retention class for payload objects inside the single local cache tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+pub enum PayloadRetentionClass {
+    /// Correctness-critical unpublished payload; must remain pinned locally.
+    #[default]
+    PinnedUnpublished = 1,
+    /// Uploaded unpublished payload retained until explicit publication.
+    PublishReadyRetained = 2,
+    /// Published payload retained only as a warm local cache copy.
+    PublishedWarm = 3,
+    /// Payload that belonged to a deleted-before-publish epoch and awaits
+    /// deferred cleanup.
+    DeletedBeforePublish = 4,
+}
+
 /// Coarse ACL access level used for local-first authorization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[repr(u8)]
@@ -150,6 +186,38 @@ pub struct InodeAttr {
     /// Coarse remote upload lifecycle for the current inode view.
     #[serde(default)]
     pub upload_state: UploadState,
+}
+
+/// Durable lifecycle metadata for a regular file's locally visible epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InodeLifecycleRecord {
+    pub ino: Ino,
+    pub state: InodeLifecycleState,
+    /// Size visible on the local mount for the current epoch.
+    pub local_visible_size: u64,
+    /// Size visible to globally published readers.
+    pub published_size: u64,
+    /// Current locally visible content epoch.
+    pub local_content_epoch: u64,
+    /// Last globally published content epoch.
+    pub published_content_epoch: u64,
+    /// Whether the inode still has a published base that local mutations build
+    /// on top of.
+    #[serde(default)]
+    pub has_published_base: bool,
+    /// Retention policy for the current local epoch in the shared cache.
+    #[serde(default)]
+    pub retention: PayloadRetentionClass,
+    /// Object ids awaiting deferred cleanup for deleted-before-publish epochs.
+    #[serde(default)]
+    pub deferred_cleanup_object_ids: Vec<u64>,
+}
+
+impl InodeLifecycleRecord {
+    pub fn local_view_differs_from_published(&self) -> bool {
+        self.local_visible_size != self.published_size
+            || self.local_content_epoch != self.published_content_epoch
+    }
 }
 
 impl InodeAttr {
@@ -511,6 +579,25 @@ pub enum BlockRefState {
     Published,
     /// State is being reconstructed after a crash or replay.
     Recovering,
+}
+
+impl BlockRefState {
+    pub fn retention_class(self) -> PayloadRetentionClass {
+        match self {
+            Self::LocalOnly | Self::Uploading | Self::Recovering => {
+                PayloadRetentionClass::PinnedUnpublished
+            }
+            Self::Uploaded => PayloadRetentionClass::PublishReadyRetained,
+            Self::Published => PayloadRetentionClass::PublishedWarm,
+        }
+    }
+
+    pub fn is_pinned_unpublished(self) -> bool {
+        matches!(
+            self.retention_class(),
+            PayloadRetentionClass::PinnedUnpublished
+        )
+    }
 }
 
 /// Per-chunk fragmentation counters and compaction hooks.
