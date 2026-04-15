@@ -457,7 +457,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
             &attr,
             &parent_attr,
             deleted_before_publish.as_ref(),
-            published_manifest.as_deref(),
+            published_manifest,
         )?;
         Ok(NamespaceDeleteResult::File(attr))
     }
@@ -590,17 +590,19 @@ impl<'a> NamespaceDeleteTxn<'a> {
         attr: &InodeAttr,
         parent_attr: &InodeAttr,
         deleted_before_publish: Option<&InodeLifecycleRecord>,
-        published_manifest: Option<&[(u32, BlockRef)]>,
+        published_manifest: Option<Vec<(u32, BlockRef)>>,
     ) -> MetaResult<()> {
-        if deleted_before_publish
-            .map(|record| record.has_published_base)
-            .unwrap_or(false)
-        {
+        if deleted_before_publish.is_some_and(|record| record.has_published_base) {
+            let published_manifest = published_manifest.ok_or_else(|| {
+                MetaError::Storage(
+                    "missing published manifest for deleted-before-publish rollback".to_string(),
+                )
+            })?;
             RedbMetaEngine::append_event_in_txn(
                 self.txn,
                 &crate::events::MetaEvent::PublishFileManifest {
                     ino: attr.ino,
-                    blocks: published_manifest.unwrap_or_default().to_vec(),
+                    blocks: published_manifest,
                 },
             )?;
             let mut remote_attr = attr.clone();
