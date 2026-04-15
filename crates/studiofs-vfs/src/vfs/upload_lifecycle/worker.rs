@@ -79,6 +79,13 @@ trait UploadMetaPort: Clone + Send + Sync + 'static {
     async fn get_attr(&self, ino: Ino) -> VfsResult<Option<InodeAttr>>;
     async fn get_file_block(&self, ino: Ino, block_index: u32) -> VfsResult<Option<BlockRef>>;
     async fn attr_matches_content_epoch(&self, ino: Ino, content_epoch: u64) -> bool;
+    async fn mark_file_block_uploaded_if_matches(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        expected_epoch: u64,
+        block: &BlockRef,
+    ) -> VfsResult<bool>;
     async fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> VfsResult<()>;
 }
 
@@ -440,6 +447,20 @@ where
                         .attr_matches_content_epoch(op.ino, op.content_epoch)
                         .await =>
             {
+                let marked = self
+                    .meta
+                    .mark_file_block_uploaded_if_matches(
+                        op.ino,
+                        block_index,
+                        op.content_epoch,
+                        block_ref,
+                    )
+                    .await?;
+                if !marked {
+                    self.meta
+                        .add_pending_deletion(op.object_id, timestamp)
+                        .await?;
+                }
                 self.coordinator.complete_upload(op);
             }
             _ => {
@@ -683,6 +704,21 @@ impl UploadMetaPort for VfsUploadMetaPort {
         })
         .await
         .unwrap_or(false)
+    }
+
+    async fn mark_file_block_uploaded_if_matches(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        expected_epoch: u64,
+        block: &BlockRef,
+    ) -> VfsResult<bool> {
+        let meta = self.vfs.meta.clone();
+        let block = block.clone();
+        run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            engine.mark_file_block_uploaded_if_matches(ino, block_index, expected_epoch, &block)
+        })
+        .await
     }
 
     async fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> VfsResult<()> {
@@ -1300,11 +1336,14 @@ mod tests {
         }
     }
 
+    type UploadedBlockRecord = (Ino, u32, u64, u64);
+
     #[derive(Clone)]
     struct FakeMeta {
         attrs: Arc<Mutex<HashMap<Ino, Option<InodeAttr>>>>,
         blocks: Arc<Mutex<FakeBlockMap>>,
         pending_deletions: Arc<Mutex<Vec<u64>>>,
+        uploaded_blocks: Arc<Mutex<Vec<UploadedBlockRecord>>>,
     }
 
     impl Default for FakeMeta {
@@ -1313,6 +1352,7 @@ mod tests {
                 attrs: Arc::new(Mutex::new(HashMap::new())),
                 blocks: Arc::new(Mutex::new(HashMap::new())),
                 pending_deletions: Arc::new(Mutex::new(Vec::new())),
+                uploaded_blocks: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -1338,6 +1378,38 @@ mod tests {
                 .and_then(|attr| attr.as_ref())
                 .map(|attr| attr.content_epoch == content_epoch)
                 .unwrap_or(false)
+        }
+
+        async fn mark_file_block_uploaded_if_matches(
+            &self,
+            ino: Ino,
+            block_index: u32,
+            expected_epoch: u64,
+            block: &BlockRef,
+        ) -> VfsResult<bool> {
+            let matches = self
+                .attrs
+                .lock()
+                .get(&ino)
+                .and_then(|attr| attr.as_ref())
+                .map(|attr| attr.content_epoch == expected_epoch)
+                .unwrap_or(false)
+                && self
+                    .blocks
+                    .lock()
+                    .get(&(ino, block_index))
+                    .cloned()
+                    .flatten()
+                    .is_some_and(|current| current == *block);
+            if matches {
+                self.uploaded_blocks.lock().push((
+                    ino,
+                    block_index,
+                    expected_epoch,
+                    block.object_id,
+                ));
+            }
+            Ok(matches)
         }
 
         async fn add_pending_deletion(&self, object_id: u64, _timestamp: i64) -> VfsResult<()> {
@@ -1628,6 +1700,31 @@ mod tests {
         assert_eq!(local_blocks.removed.lock().as_slice(), &[77]);
         assert_eq!(shutdown.canceled_stale.load(Ordering::Relaxed), 1);
         assert_eq!(shutdown.released_tokens.lock().as_slice(), &[11]);
+    }
+
+    #[tokio::test]
+    async fn process_upload_records_durable_uploaded_progress_before_local_cleanup() {
+        let (processor, coordinator, local_blocks, meta, _remote, _shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.blocks
+            .lock()
+            .insert((op.ino, 0), Some(BlockRef::new_partial(op.object_id, 4096)));
+
+        let outcome = processor.process_upload(op).await;
+
+        assert_eq!(outcome, UploadOutcome::Completed);
+        assert_eq!(
+            meta.uploaded_blocks.lock().as_slice(),
+            &[(11, 0, 3, 77)],
+            "successful upload should durably mark epoch/block progress before publish"
+        );
+        assert_eq!(local_blocks.uploaded.lock().as_slice(), &[77]);
+        assert_eq!(policy.refreshed.lock().as_slice(), &[11]);
     }
 
     #[tokio::test]

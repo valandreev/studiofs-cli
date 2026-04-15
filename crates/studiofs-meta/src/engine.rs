@@ -213,6 +213,10 @@ pub trait MetaInodes: Send + Sync {
     /// Get inode attributes.
     fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr>;
 
+    /// Get the durable unpublished/published lifecycle state for a regular
+    /// file, when present.
+    fn get_inode_lifecycle(&self, ino: Ino) -> MetaResult<Option<InodeLifecycleRecord>>;
+
     /// Batch-fetch inode attributes.
     fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
         let mut attrs = Vec::with_capacity(inos.len());
@@ -460,6 +464,21 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
     /// Remote-backed engines can use this to publish block visibility and
     /// advance remote-visible file size independently from the local write view.
     fn commit_uploaded_block(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        expected_epoch: u64,
+        block: &BlockRef,
+    ) -> MetaResult<bool>;
+
+    /// Mark the current unpublished overlay block as fully uploaded without
+    /// publishing the inode's remote-visible manifest yet.
+    ///
+    /// Returns `Ok(true)` when the active overlay block for the current epoch
+    /// still matches `block` and its local lifecycle can advance to
+    /// `BlockRefState::Uploaded`. Returns `Ok(false)` when the inode/epoch/block
+    /// no longer matches the caller's view.
+    fn mark_file_block_uploaded_if_matches(
         &self,
         ino: Ino,
         block_index: u32,

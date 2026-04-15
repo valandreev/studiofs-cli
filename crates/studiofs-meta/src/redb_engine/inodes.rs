@@ -514,6 +514,10 @@ impl MetaInodes for RedbMetaEngine {
         Self::resolve_attr_in_read_snapshot(&txn, ino, &overlay_block_inodes, &overlay_attr_inodes)
     }
 
+    fn get_inode_lifecycle(&self, ino: Ino) -> MetaResult<Option<InodeLifecycleRecord>> {
+        RedbMetaEngine::get_inode_lifecycle(self, ino)
+    }
+
     fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
         if inos.is_empty() {
             return Ok(Vec::new());

@@ -1912,6 +1912,10 @@ impl MetaInodes for PgMetaEngine {
         self.local.get_attr(ino)
     }
 
+    fn get_inode_lifecycle(&self, ino: Ino) -> MetaResult<Option<InodeLifecycleRecord>> {
+        self.local.get_inode_lifecycle(ino)
+    }
+
     fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
         self.local.get_attrs_batch(inos)
     }
@@ -2099,6 +2103,18 @@ impl MetaBlocks for PgMetaEngine {
             self.request_pending_flush();
         }
         result
+    }
+
+    fn mark_file_block_uploaded_if_matches(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        expected_epoch: u64,
+        block: &BlockRef,
+    ) -> MetaResult<bool> {
+        self.mutate(|local| {
+            local.mark_file_block_uploaded_if_matches(ino, block_index, expected_epoch, block)
+        })
     }
 
     fn publish_file_manifest_if_matches(

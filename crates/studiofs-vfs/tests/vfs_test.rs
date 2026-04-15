@@ -34,6 +34,7 @@ use studiofs_meta::{
     CURRENT_FORMAT_VERSION, FormatInfo, MetaBlocks, MetaEngine, MetaError, MetaFormat, MetaInodes,
     MetadataBackend, MetadataConfig, PgMetaEngine, PostgresConfig, ROOT_INO, RedbMetaEngine,
     ensure_studiofs_database,
+    schema::InodeLifecycleState,
     schema::{ChunkId, SliceId, SliceOrder, SliceRange, SliceRecord},
     types::{AccessLevel, BlockFlags, BlockRef, UploadState},
 };
@@ -5683,7 +5684,7 @@ fn published_file_remains_readable_after_cache_wipe_and_restart() {
 
 #[test]
 #[ignore = "requires live S3 backend; run with --ignored and valid .env"]
-fn background_epoch_finalizer_publishes_unpublished_epoch_without_pending_uploads() {
+fn background_epoch_finalizer_publishes_publish_ready_epoch_without_pending_uploads() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_bucket = ScopedEnvVar::capture("STUDIOFS_S3_BUCKET");
     let _restore_access_key = ScopedEnvVar::capture("STUDIOFS_S3_ACCESS_KEY");
@@ -5747,6 +5748,16 @@ fn background_epoch_finalizer_publishes_unpublished_epoch_without_pending_upload
             let replacement_block =
                 BlockRef::new_partial(replacement_object_id, replacement_payload.len() as u32);
             meta.set_file_block(ino, 0, &replacement_block).unwrap();
+            assert!(
+                meta.mark_file_block_uploaded_if_matches(
+                    ino,
+                    0,
+                    staged_attr.content_epoch,
+                    &replacement_block
+                )
+                .unwrap(),
+                "staged restart epoch should become publish-ready before replay"
+            );
 
             let unpublished_attr = meta.get_attr(ino).unwrap();
             assert_eq!(unpublished_attr.upload_state, UploadState::Updating);
@@ -5754,6 +5765,12 @@ fn background_epoch_finalizer_publishes_unpublished_epoch_without_pending_upload
                 unpublished_attr.committed_content_epoch,
                 unpublished_attr.content_epoch
             );
+            let lifecycle = meta.get_inode_lifecycle(ino).unwrap().unwrap();
+            assert_eq!(
+                lifecycle.local_content_epoch,
+                unpublished_attr.content_epoch
+            );
+            assert_eq!(lifecycle.state, InodeLifecycleState::PublishReady);
         });
         rt.shutdown_background();
     }
@@ -5791,7 +5808,7 @@ fn background_epoch_finalizer_publishes_unpublished_epoch_without_pending_upload
                     .unwrap_or(false)
             })
             .await,
-            "background epoch finalizer should publish the unpublished epoch without pending uploads"
+            "background epoch finalizer should publish the durable publish-ready epoch without pending uploads"
         );
 
         let published_blocks = meta.get_file_blocks(ino).unwrap();

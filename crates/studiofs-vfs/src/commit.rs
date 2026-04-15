@@ -1,5 +1,6 @@
 use super::*;
 use studiofs_data::object::format_object_fragment_keys;
+use studiofs_meta::InodeLifecycleState;
 
 pub(super) struct CommitCoordinator;
 
@@ -44,12 +45,35 @@ impl CommitCoordinator {
             return Ok(EpochFinalizeStatus::Deferred);
         }
 
-        let pending_same_epoch = vfs
-            .upload_coordinator()
-            .snapshot_pending_uploads()
-            .into_iter()
-            .any(|pending| pending.ino == ino && pending.content_epoch == content_epoch);
-        if pending_same_epoch {
+        let lifecycle = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            engine.get_inode_lifecycle(ino)
+        })
+        .await?;
+        let Some(lifecycle) = lifecycle else {
+            tracing::debug!(
+                ino,
+                content_epoch,
+                "deferring epoch publication until durable lifecycle bookkeeping is available"
+            );
+            return Ok(EpochFinalizeStatus::Deferred);
+        };
+        if lifecycle.local_content_epoch != content_epoch {
+            tracing::debug!(
+                ino,
+                queued_content_epoch = content_epoch,
+                lifecycle_content_epoch = lifecycle.local_content_epoch,
+                lifecycle_state = ?lifecycle.state,
+                "skipping stale epoch publication attempt after lifecycle refresh"
+            );
+            return Ok(EpochFinalizeStatus::Skipped);
+        }
+        if lifecycle.state != InodeLifecycleState::PublishReady {
+            tracing::debug!(
+                ino,
+                content_epoch,
+                lifecycle_state = ?lifecycle.state,
+                "deferring epoch publication until durable lifecycle reaches publish-ready"
+            );
             return Ok(EpochFinalizeStatus::Deferred);
         }
 

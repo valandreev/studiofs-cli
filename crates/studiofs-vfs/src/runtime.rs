@@ -8,10 +8,10 @@ use studiofs_meta::engine::{
 };
 use studiofs_meta::{
     AccessLevel, BatchFlushEntry, BatchFlushResult, BlockRef, ChunkId, DirEntry, DirEntryValue,
-    FormatInfo, Ino, InodeAttr, MetaAcl, MetaBlocks, MetaEngine, MetaEngineCore, MetaFormat,
-    MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaRecovery, MetaReplication, MetaResult,
-    MetaSymlink, MetaXattr, RenameAtomicResult, ResolvedSliceSpan, SliceRange, SliceRecord,
-    SyncMetaEngineAdapter, execute_sync_meta,
+    FormatInfo, Ino, InodeAttr, InodeLifecycleRecord, MetaAcl, MetaBlocks, MetaEngine,
+    MetaEngineCore, MetaFormat, MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaRecovery,
+    MetaReplication, MetaResult, MetaSymlink, MetaXattr, RenameAtomicResult, ResolvedSliceSpan,
+    SliceRange, SliceRecord, SyncMetaEngineAdapter, execute_sync_meta,
 };
 use tokio::task;
 use tokio_util::sync::CancellationToken;
@@ -193,6 +193,7 @@ impl<M: ?Sized + MetaInodes> MetaInodes for RuntimeMetaHandle<M> {
     forward_method!(fn set_counter(&self, name: &str, value: u64) -> MetaResult<()>);
     forward_method!(fn next_inode(&self) -> MetaResult<Ino>);
     forward_method!(fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr>);
+    forward_method!(fn get_inode_lifecycle(&self, ino: Ino) -> MetaResult<Option<InodeLifecycleRecord>>);
     forward_method!(fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>>);
     forward_method!(fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()>);
     forward_method!(fn remove_attr(&self, ino: Ino) -> MetaResult<()>);
@@ -322,6 +323,15 @@ impl<M: ?Sized + MetaBlocks> MetaBlocks for RuntimeMetaHandle<M> {
     );
     forward_method!(
         fn commit_uploaded_block(
+            &self,
+            ino: Ino,
+            block_index: u32,
+            expected_epoch: u64,
+            block: &BlockRef,
+        ) -> MetaResult<bool>
+    );
+    forward_method!(
+        fn mark_file_block_uploaded_if_matches(
             &self,
             ino: Ino,
             block_index: u32,
