@@ -745,6 +745,7 @@ impl MetaBlocks for RedbMetaEngine {
 
             let (committed_size, removed_object_ids) =
                 Self::publish_regular_file_overlay_to_base_in_txn(&txn, ino)?;
+            let published_blocks = Self::base_manifest_from_graph_rows_in_txn(&txn, ino)?;
             if !removed_object_ids.is_empty() {
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -773,6 +774,13 @@ impl MetaBlocks for RedbMetaEngine {
             Self::set_inode_overlay_in_txn(&txn, &attr)?;
             Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
 
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::PublishFileManifest {
+                    ino,
+                    blocks: published_blocks,
+                },
+            )?;
             Self::append_event_in_txn(
                 &txn,
                 &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
@@ -1266,27 +1274,5 @@ impl crate::engine::MetaEngine for RedbMetaEngine {
         attr: Option<&InodeAttr>,
     ) -> MetaResult<Option<InodeAttr>> {
         self.flush_regular_file_overlay_slices_with_attr_txn(ino, chunk_slices, attr)
-    }
-}
-
-impl RedbMetaEngine {
-    pub(super) fn overlay_object_ids_in_write_txn(
-        txn: &redb::WriteTransaction,
-        ino: Ino,
-    ) -> MetaResult<Vec<u64>> {
-        let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
-            txn,
-            REGULAR_FILE_OVERLAY_TABLE,
-            ino,
-        )?;
-        let mut object_ids = std::collections::BTreeSet::new();
-        for chunk_state in overlay_chunks.values() {
-            for slice in chunk_state.slices.values() {
-                if let Some(block) = slice.block.as_ref() {
-                    object_ids.insert(block.object_id);
-                }
-            }
-        }
-        Ok(object_ids.into_iter().collect())
     }
 }

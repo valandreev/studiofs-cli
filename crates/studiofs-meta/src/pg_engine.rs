@@ -3191,6 +3191,153 @@ mod tests {
     }
 
     #[test]
+    fn unit_remote_projection_keeps_published_file_visible_when_unpublished_epoch_is_deleted() {
+        let (_writer_dir, writer) = temp_pg_engine_for_unit();
+        let (_remote_dir, remote) = temp_pg_engine_for_unit();
+
+        let seed_start = writer
+            .local
+            .get_counter("nextEventSeq")
+            .expect("seed start");
+        let dir = writer
+            .create_dir(ROOT_INO, b"shared", 0, 0, 0o755)
+            .expect("create dir");
+        let file = writer
+            .create_file(dir.ino, b"final.bin", 0, 0, 0o644)
+            .expect("create final");
+        set_file_state(&writer, file.ino, 4096, 1);
+        let published = BlockRef::new_partial(904, 4096);
+        writer
+            .set_file_block(file.ino, 0, &published)
+            .expect("set published block");
+        assert!(
+            writer
+                .publish_file_manifest(file.ino, 1)
+                .expect("publish seed manifest"),
+            "seed publish must succeed"
+        );
+        let seed_end = writer.local.get_counter("nextEventSeq").expect("seed end");
+
+        apply_projected_remote_range(&writer, &remote, seed_start, seed_end);
+
+        let remote_dir = remote.lookup(ROOT_INO, b"shared").expect("lookup dir");
+        let remote_file = remote
+            .lookup(remote_dir.ino, b"final.bin")
+            .expect("lookup published file");
+        assert_eq!(remote_file.ino, file.ino);
+
+        let upload_start = seed_end;
+        set_file_state(&writer, file.ino, 4096, 2);
+        let uploaded_overlay = BlockRef::new_partial(905, 4096);
+        writer
+            .set_file_block(file.ino, 0, &uploaded_overlay)
+            .expect("set unpublished overlay");
+        assert!(
+            writer
+                .mark_file_block_uploaded_if_matches(file.ino, 0, 2, &uploaded_overlay)
+                .expect("mark overlay uploaded"),
+            "overlay upload marker must succeed"
+        );
+        let upload_end = writer
+            .local
+            .get_counter("nextEventSeq")
+            .expect("upload end");
+
+        apply_projected_remote_range(&writer, &remote, upload_start, upload_end);
+
+        writer
+            .unlink(dir.ino, b"final.bin")
+            .expect("unlink unpublished replacement");
+        let delete_end = writer
+            .local
+            .get_counter("nextEventSeq")
+            .expect("delete end");
+
+        apply_projected_remote_range(&writer, &remote, upload_end, delete_end);
+
+        let remote_after = remote
+            .lookup(remote_dir.ino, b"final.bin")
+            .expect("remote must retain last published entry");
+        assert_eq!(remote_after.ino, file.ino);
+        let remote_attr = remote.get_attr(file.ino).expect("remote attr");
+        assert_eq!(remote_attr.size, 4096);
+        assert_eq!(remote_attr.committed_size, 4096);
+        assert_eq!(remote_attr.content_epoch, 1);
+        assert_eq!(remote_attr.committed_content_epoch, 1);
+        let remote_blocks = remote.get_file_blocks(file.ino).expect("remote blocks");
+        assert_eq!(remote_blocks, vec![(0, published)]);
+
+        assert!(
+            writer.get_attr(file.ino).is_err(),
+            "local unlink removes inode attr"
+        );
+        let lifecycle = writer
+            .get_inode_lifecycle(file.ino)
+            .expect("local lifecycle")
+            .expect("deleted-before-publish lifecycle");
+        assert_eq!(lifecycle.state, InodeLifecycleState::DeletedBeforePublish);
+        assert!(lifecycle.has_published_base);
+        assert_eq!(lifecycle.deferred_cleanup_object_ids, vec![905]);
+        let pending_deletions = writer.get_pending_deletions().expect("pending deletions");
+        assert!(
+            pending_deletions
+                .iter()
+                .any(|(object_id, _timestamp)| *object_id == 905),
+            "uploaded unpublished object should be queued for GC"
+        );
+        assert!(
+            pending_deletions
+                .iter()
+                .all(|(object_id, _timestamp)| *object_id != 904),
+            "last published object must remain referenced"
+        );
+    }
+
+    #[test]
+    fn unit_remote_projection_preserves_overlay_publish_path() {
+        let (_writer_dir, writer) = temp_pg_engine_for_unit();
+        let (_remote_dir, remote) = temp_pg_engine_for_unit();
+
+        let start = writer.local.get_counter("nextEventSeq").expect("start seq");
+        let file = writer
+            .create_file(ROOT_INO, b"overlay.bin", 0, 0, 0o644)
+            .expect("create overlay file");
+        set_file_state(&writer, file.ino, 4096, 1);
+        let block = BlockRef::new_partial(906, 4096);
+        writer
+            .set_file_block(file.ino, 0, &block)
+            .expect("set overlay block");
+        assert!(
+            writer
+                .mark_file_block_uploaded_if_matches(file.ino, 0, 1, &block)
+                .expect("mark overlay uploaded"),
+            "uploaded marker must succeed"
+        );
+        assert!(
+            writer
+                .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+                .expect("publish overlay to base"),
+            "overlay publish must succeed"
+        );
+        let end = writer.local.get_counter("nextEventSeq").expect("end seq");
+
+        apply_projected_remote_range(&writer, &remote, start, end);
+
+        let remote_file = remote
+            .lookup(ROOT_INO, b"overlay.bin")
+            .expect("lookup overlay file");
+        let remote_attr = remote.get_attr(remote_file.ino).expect("remote attr");
+        assert_eq!(remote_attr.size, 4096);
+        assert_eq!(remote_attr.committed_size, 4096);
+        assert_eq!(remote_attr.committed_content_epoch, 1);
+        assert_eq!(remote_attr.upload_state, UploadState::Ready);
+        let remote_blocks = remote
+            .get_file_blocks(remote_file.ino)
+            .expect("remote overlay blocks");
+        assert_eq!(remote_blocks, vec![(0, block)]);
+    }
+
+    #[test]
     fn claim_and_restore_pending_batch_updates_replication_backlog() {
         let (_dir, pg) = temp_pg_engine_for_unit();
         {
