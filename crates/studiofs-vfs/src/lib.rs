@@ -8,7 +8,6 @@ pub mod aimd;
 pub mod bridge;
 pub mod fetch;
 pub mod incarnation;
-pub(crate) mod ingress_wal;
 pub mod lock_order;
 pub mod qos;
 pub mod readahead;

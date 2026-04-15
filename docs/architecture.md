@@ -89,8 +89,8 @@ Reads prefer local state in this order:
 4. S3 fetch
 
 Historical ingress artifacts note:
-- `cache_safety_mode=durable` still preserves ingress checkpoint/state metadata
-  for startup recovery of legacy ingress artifacts.
+- `cache_safety_mode=durable` refuses to mount if legacy `ingress_spill` artifacts are still present,
+  so operators do not silently bypass old unpublished state during upgrade.
 - `cache_safety_mode=fast` discards those artifacts during startup self-heal.
 
 Metadata lookups are served from local `redb`, where local staged blocks

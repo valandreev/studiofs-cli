@@ -200,18 +200,6 @@ impl VfsBootstrapPlan {
             requeue_base_ms = self.upload_requeue_base.as_millis() as u64,
             requeue_max_ms = self.upload_requeue_max.as_millis() as u64,
             upload_stats_interval_secs = self.upload_stats_interval.as_secs(),
-            ingress_checkpoint_interval_secs =
-                self.cache_runtime_tuning.ingress_checkpoint_interval_secs,
-            ingress_checkpoint_min_append_bytes = self
-                .cache_runtime_tuning
-                .ingress_checkpoint_min_append_bytes,
-            ingress_checkpoint_min_mutations =
-                self.cache_runtime_tuning.ingress_checkpoint_min_mutations,
-            ingress_checkpoint_max_segment_lag =
-                self.cache_runtime_tuning.ingress_checkpoint_max_segment_lag,
-            ingress_checkpoint_max_live_segments = self
-                .cache_runtime_tuning
-                .ingress_checkpoint_max_live_segments,
             upload_cache_io_slots = self.cache_runtime_tuning.upload_cache_io_slots,
             upload_cache_io_foreground_cost_base = self.upload_cache_io_foreground_cost_base,
             upload_cache_io_foreground_cost_step = self.upload_cache_io_foreground_cost_step,
@@ -241,9 +229,88 @@ impl VfsBootstrapPlan {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct LegacyIngressArtifactScan {
+    segment_count: usize,
+    checkpoint_count: usize,
+    state_present: bool,
+    spill_file_count: usize,
+}
+
+impl LegacyIngressArtifactScan {
+    fn has_any(self) -> bool {
+        self.segment_count > 0
+            || self.checkpoint_count > 0
+            || self.state_present
+            || self.spill_file_count > 0
+    }
+}
+
+fn scan_legacy_ingress_artifacts(spill_dir: &Path) -> VfsResult<LegacyIngressArtifactScan> {
+    let count_files_with_extension = |dir: &Path, extension: &str| -> VfsResult<usize> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(VfsError::Io(error)),
+        };
+        Ok(entries
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let path = entry.path();
+                path.is_file() && path.extension().is_some_and(|ext| ext == extension)
+            })
+            .count())
+    };
+
+    Ok(LegacyIngressArtifactScan {
+        segment_count: count_files_with_extension(&spill_dir.join("segments"), "seg")?,
+        checkpoint_count: usize::from(spill_dir.join("checkpoints").join("latest.json").exists()),
+        state_present: spill_dir.join("state.json").exists(),
+        spill_file_count: count_files_with_extension(spill_dir, "spill")?,
+    })
+}
+
+fn reset_legacy_ingress_artifacts(spill_dir: &Path) -> VfsResult<()> {
+    let segment_dir = spill_dir.join("segments");
+    let checkpoint_dir = spill_dir.join("checkpoints");
+
+    std::fs::create_dir_all(spill_dir).map_err(VfsError::Io)?;
+    if let Err(error) = std::fs::remove_dir_all(&segment_dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(VfsError::Io(error));
+    }
+    if let Err(error) = std::fs::remove_dir_all(&checkpoint_dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(VfsError::Io(error));
+    }
+    std::fs::create_dir_all(&segment_dir).map_err(VfsError::Io)?;
+    std::fs::create_dir_all(&checkpoint_dir).map_err(VfsError::Io)?;
+
+    if let Err(error) = std::fs::remove_file(spill_dir.join("state.json"))
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(VfsError::Io(error));
+    }
+
+    let entries = match std::fs::read_dir(spill_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(VfsError::Io(error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(VfsError::Io)?;
+        let path = entry.path();
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "spill") {
+            std::fs::remove_file(path).map_err(VfsError::Io)?;
+        }
+    }
+    Ok(())
+}
+
 struct VfsBootstrapResources {
-    ingress_wal: IngressWal,
-    initial_checkpoint_meta: Option<(u64, u64, u64)>,
+    zeroio_runtime_state_dir: PathBuf,
     local_block_backend: Arc<dyn LocalBlockBackend>,
     upload_coordinator: Arc<UploadCoordinator>,
     readahead: Arc<ReadAheadTracker>,
@@ -265,15 +332,33 @@ impl VfsBootstrapResources {
         config: &VfsConfigValidated,
         cache_runtime: Option<PreparedCacheV3Runtime>,
     ) -> VfsResult<Self> {
-        let ingress_wal = IngressWal::new(
-            PathBuf::from(cache_dir).join("ingress_spill"),
-            plan.cache_runtime_tuning.max_ingress_segment_bytes,
-        );
-        std::fs::create_dir_all(ingress_wal.spill_dir()).map_err(VfsError::Io)?;
-        std::fs::create_dir_all(ingress_wal.segment_dir()).map_err(VfsError::Io)?;
-        std::fs::create_dir_all(ingress_wal.checkpoint_dir()).map_err(VfsError::Io)?;
-        let initial_checkpoint_meta =
-            init_ingress_recovery_state(plan.cache_safety_mode, &ingress_wal)?;
+        let legacy_spill_dir = PathBuf::from(cache_dir).join("ingress_spill");
+        let legacy_ingress = scan_legacy_ingress_artifacts(&legacy_spill_dir)?;
+        if legacy_ingress.has_any() {
+            match plan.cache_safety_mode {
+                CacheSafetyMode::Fast => {
+                    warn!(
+                        spill_dir = %legacy_spill_dir.display(),
+                        segments = legacy_ingress.segment_count,
+                        checkpoints = legacy_ingress.checkpoint_count,
+                        state_present = legacy_ingress.state_present,
+                        spill_files = legacy_ingress.spill_file_count,
+                        "startup detected legacy ingress artifacts; fast mode will discard them during self-heal"
+                    );
+                    reset_legacy_ingress_artifacts(&legacy_spill_dir)?;
+                }
+                CacheSafetyMode::Durable => {
+                    return Err(VfsError::Other(format!(
+                        "legacy ingress artifacts detected under '{}'; mount once with STUDIOFS_CACHE_SAFETY_MODE=fast to self-heal the old ingress_spill layout before using durable mode",
+                        legacy_spill_dir.display()
+                    )));
+                }
+            }
+        }
+
+        let zeroio_runtime_state_dir =
+            PathBuf::from(cache_dir).join(super::ZEROIO_RUNTIME_STATE_DIR);
+        std::fs::create_dir_all(&zeroio_runtime_state_dir).map_err(VfsError::Io)?;
 
         let opened_local_backend = match cache_runtime {
             Some(cache_runtime) => open_prepared_local_block_backend_with_budget_and_sync_mode(
@@ -343,8 +428,7 @@ impl VfsBootstrapResources {
         ));
 
         Ok(Self {
-            ingress_wal,
-            initial_checkpoint_meta,
+            zeroio_runtime_state_dir,
             local_block_backend,
             upload_coordinator,
             readahead,
@@ -421,7 +505,6 @@ impl VfsBootstrap {
             acl_principal: plan.acl_principal,
             effective_acl_cache_capacity: plan.effective_acl_cache_capacity,
             state: Arc::new(VfsState::new(
-                resources.initial_checkpoint_meta,
                 block_size,
                 &config,
                 plan.upload_cache_io_foreground_cost_base,
@@ -464,7 +547,7 @@ impl VfsBootstrap {
             local_sync_group_min_bytes: plan.local_sync_group_min_bytes,
             local_sync_group_max_delay: plan.local_sync_group_max_delay,
             max_xattr_bytes: plan.max_xattr_bytes,
-            ingress_wal: resources.ingress_wal,
+            zeroio_runtime_state_dir: resources.zeroio_runtime_state_dir,
             handle_table: HandleTable::new(),
             janitor_lease: None,
             janitor_interval: plan.janitor_interval,

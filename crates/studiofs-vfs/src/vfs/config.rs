@@ -10,9 +10,6 @@ use crate::vfs::{
     DEFAULT_FETCH_MAX_ATTEMPTS, DEFAULT_FETCH_MAX_WINDOW, DEFAULT_FETCH_MIN_WINDOW,
     DEFAULT_FETCH_PREFETCH_ACQUIRE_WAIT_MS, DEFAULT_FETCH_PREFETCH_RESERVE,
     DEFAULT_FETCH_REQUEST_TIMEOUT_SECS, DEFAULT_FETCH_RETRY_BASE_MS, DEFAULT_FETCH_RETRY_MAX_MS,
-    DEFAULT_INGRESS_CHECKPOINT_INTERVAL_SECS, DEFAULT_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS,
-    DEFAULT_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG, DEFAULT_INGRESS_CHECKPOINT_MIN_APPEND_BYTES,
-    DEFAULT_INGRESS_CHECKPOINT_MIN_MUTATIONS, DEFAULT_INGRESS_SEGMENT_MAX_BYTES,
     DEFAULT_JANITOR_INTERVAL, DEFAULT_JANITOR_LEASE_TTL, DEFAULT_JANITOR_MAX_DELETES_PER_RUN,
     DEFAULT_JANITOR_SKIP_NEWER_THAN, DEFAULT_LOCK_LEASE_TTL, DEFAULT_LOCK_RETRY_BASE_MS,
     DEFAULT_LOCK_RETRY_MAX_MS, DEFAULT_MAX_DIRTY_BYTES, DEFAULT_MAX_DRAIN_BATCH,
@@ -51,8 +48,6 @@ pub(super) const PAYLOAD_PUT_CONCURRENCY_MAX: usize = 32;
 pub(super) const FAST_MODE_SYNC_GROUP_MIN_BYTES_FLOOR: u64 = 32 * 1024 * 1024;
 pub(super) const FAST_MODE_SYNC_GROUP_MIN_BYTES_CEIL: u64 = 256 * 1024 * 1024;
 pub(super) const FAST_MODE_SYNC_GROUP_MAX_DELAY_MS: u64 = 25;
-pub(super) const CACHE_RUNTIME_MIN_INGRESS_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
-pub(super) const CACHE_RUNTIME_MAX_INGRESS_SEGMENT_BYTES: u64 = 512 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_MIN_TRANSIT_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_MAX_TRANSIT_BUDGET_BYTES: usize = 4 * 1024 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_SMALL_BUDGET_BYTES: u64 = 128 * 1024 * 1024 * 1024;
@@ -243,9 +238,6 @@ pub struct VfsConfig {
     pub attr_read_cache_bytes: usize,
     /// Effective ACL cache entry budget.
     pub effective_acl_cache_capacity: usize,
-    /// Maximum active ingress segment size.
-    /// Parsed from env via `parse_size_bytes` (for example `1GB`).
-    pub max_ingress_segment_bytes: u64,
     /// Local cache durability/safety policy.
     pub cache_safety_mode: CacheSafetyMode,
     /// Principal used for ACL evaluation.
@@ -284,16 +276,6 @@ pub struct VfsConfig {
     pub upload_stats_interval_secs: u64,
     /// Background slab flusher wake interval.
     pub slab_flush_interval_ms: u64,
-    /// Periodic ingress checkpoint interval.
-    pub ingress_checkpoint_interval_secs: u64,
-    /// Immediate checkpoint trigger on uncheckpointed ingress bytes.
-    pub ingress_checkpoint_min_append_bytes: u64,
-    /// Immediate checkpoint trigger on ingress record mutations.
-    pub ingress_checkpoint_min_mutations: u64,
-    /// Checkpoint trigger when active segment runs too far ahead.
-    pub ingress_checkpoint_max_segment_lag: u64,
-    /// Checkpoint trigger when live ingress index spans too many segments.
-    pub ingress_checkpoint_max_live_segments: u64,
     /// Upload local-cache I/O slots.
     pub upload_cache_io_slots: usize,
     /// Max active transit-memory bytes used by in-flight read/upload buffers.
@@ -390,7 +372,6 @@ pub struct VfsConfigRaw {
     pub attr_read_cache_capacity: Option<usize>,
     pub attr_read_cache_bytes: Option<usize>,
     pub effective_acl_cache_capacity: Option<usize>,
-    pub max_ingress_segment_bytes: Option<u64>,
     pub cache_safety_mode: Option<CacheSafetyMode>,
     pub principal: Option<String>,
     pub fetch_initial_window: Option<f64>,
@@ -410,11 +391,6 @@ pub struct VfsConfigRaw {
     pub upload_requeue_max_ms: Option<u64>,
     pub upload_stats_interval_secs: Option<u64>,
     pub slab_flush_interval_ms: Option<u64>,
-    pub ingress_checkpoint_interval_secs: Option<u64>,
-    pub ingress_checkpoint_min_append_bytes: Option<u64>,
-    pub ingress_checkpoint_min_mutations: Option<u64>,
-    pub ingress_checkpoint_max_segment_lag: Option<u64>,
-    pub ingress_checkpoint_max_live_segments: Option<u64>,
     pub upload_cache_io_slots: Option<usize>,
     pub transit_memory_budget_bytes: Option<usize>,
     pub upload_user_idle_grace_ms: Option<u64>,
@@ -454,12 +430,6 @@ pub struct VfsConfigValidated {
 pub(super) struct CacheRuntimeTuningOverrides {
     pub(super) max_dirty_bytes: bool,
     pub(super) write_eager_flush_batch_bytes: bool,
-    pub(super) max_ingress_segment_bytes: bool,
-    pub(super) ingress_checkpoint_interval_secs: bool,
-    pub(super) ingress_checkpoint_min_append_bytes: bool,
-    pub(super) ingress_checkpoint_min_mutations: bool,
-    pub(super) ingress_checkpoint_max_segment_lag: bool,
-    pub(super) ingress_checkpoint_max_live_segments: bool,
     pub(super) upload_cache_io_slots: bool,
     pub(super) transit_memory_budget_bytes: bool,
 }
@@ -497,12 +467,6 @@ impl TryFrom<VfsConfig> for VfsConfigValidated {
             CacheRuntimeTuningOverrides {
                 max_dirty_bytes: true,
                 write_eager_flush_batch_bytes: true,
-                max_ingress_segment_bytes: true,
-                ingress_checkpoint_interval_secs: true,
-                ingress_checkpoint_min_append_bytes: true,
-                ingress_checkpoint_min_mutations: true,
-                ingress_checkpoint_max_segment_lag: true,
-                ingress_checkpoint_max_live_segments: true,
                 upload_cache_io_slots: true,
                 transit_memory_budget_bytes: true,
             },
@@ -515,14 +479,6 @@ impl VfsConfigRaw {
         let overrides = CacheRuntimeTuningOverrides {
             max_dirty_bytes: self.max_dirty_bytes.is_some(),
             write_eager_flush_batch_bytes: self.write_eager_flush_batch_bytes.is_some(),
-            max_ingress_segment_bytes: self.max_ingress_segment_bytes.is_some(),
-            ingress_checkpoint_interval_secs: self.ingress_checkpoint_interval_secs.is_some(),
-            ingress_checkpoint_min_append_bytes: self.ingress_checkpoint_min_append_bytes.is_some(),
-            ingress_checkpoint_min_mutations: self.ingress_checkpoint_min_mutations.is_some(),
-            ingress_checkpoint_max_segment_lag: self.ingress_checkpoint_max_segment_lag.is_some(),
-            ingress_checkpoint_max_live_segments: self
-                .ingress_checkpoint_max_live_segments
-                .is_some(),
             upload_cache_io_slots: self.upload_cache_io_slots.is_some(),
             transit_memory_budget_bytes: self.transit_memory_budget_bytes.is_some(),
         };
@@ -563,7 +519,6 @@ impl VfsConfigRaw {
             attr_read_cache_capacity,
             attr_read_cache_bytes,
             effective_acl_cache_capacity,
-            max_ingress_segment_bytes,
             cache_safety_mode,
             principal,
             fetch_initial_window,
@@ -583,11 +538,6 @@ impl VfsConfigRaw {
             upload_requeue_max_ms,
             upload_stats_interval_secs,
             slab_flush_interval_ms,
-            ingress_checkpoint_interval_secs,
-            ingress_checkpoint_min_append_bytes,
-            ingress_checkpoint_min_mutations,
-            ingress_checkpoint_max_segment_lag,
-            ingress_checkpoint_max_live_segments,
             upload_cache_io_slots,
             transit_memory_budget_bytes,
             upload_user_idle_grace_ms,
@@ -660,7 +610,6 @@ fn normalize_vfs_config(
     cfg.attr_read_cache_capacity = cfg.attr_read_cache_capacity.max(1);
     cfg.attr_read_cache_bytes = cfg.attr_read_cache_bytes.max(1);
     cfg.effective_acl_cache_capacity = cfg.effective_acl_cache_capacity.max(1);
-    cfg.max_ingress_segment_bytes = cfg.max_ingress_segment_bytes.max(1);
     cfg.fetch_min_window = cfg.fetch_min_window.max(1.0);
     cfg.fetch_decrease_cooldown_secs = cfg.fetch_decrease_cooldown_secs.max(1);
     cfg.upload_min_window = cfg.upload_min_window.max(1.0);
@@ -672,7 +621,6 @@ fn normalize_vfs_config(
     cfg.upload_requeue_max_ms = cfg.upload_requeue_max_ms.max(cfg.upload_requeue_base_ms);
     cfg.upload_stats_interval_secs = cfg.upload_stats_interval_secs.max(1);
     cfg.slab_flush_interval_ms = cfg.slab_flush_interval_ms.max(1);
-    cfg.ingress_checkpoint_interval_secs = cfg.ingress_checkpoint_interval_secs.max(1);
     cfg.upload_cache_io_slots = cfg.upload_cache_io_slots.max(1);
     cfg.upload_fg_read_latency_target_ms = cfg.upload_fg_read_latency_target_ms.max(1);
     cfg.upload_fg_read_latency_window_ms = cfg.upload_fg_read_latency_window_ms.max(100);
@@ -741,7 +689,6 @@ impl From<VfsConfig> for VfsConfigRaw {
             attr_read_cache_capacity: Some(cfg.attr_read_cache_capacity),
             attr_read_cache_bytes: Some(cfg.attr_read_cache_bytes),
             effective_acl_cache_capacity: Some(cfg.effective_acl_cache_capacity),
-            max_ingress_segment_bytes: Some(cfg.max_ingress_segment_bytes),
             cache_safety_mode: Some(cfg.cache_safety_mode),
             principal: Some(cfg.principal),
             fetch_initial_window: Some(cfg.fetch_initial_window),
@@ -761,11 +708,6 @@ impl From<VfsConfig> for VfsConfigRaw {
             upload_requeue_max_ms: Some(cfg.upload_requeue_max_ms),
             upload_stats_interval_secs: Some(cfg.upload_stats_interval_secs),
             slab_flush_interval_ms: Some(cfg.slab_flush_interval_ms),
-            ingress_checkpoint_interval_secs: Some(cfg.ingress_checkpoint_interval_secs),
-            ingress_checkpoint_min_append_bytes: Some(cfg.ingress_checkpoint_min_append_bytes),
-            ingress_checkpoint_min_mutations: Some(cfg.ingress_checkpoint_min_mutations),
-            ingress_checkpoint_max_segment_lag: Some(cfg.ingress_checkpoint_max_segment_lag),
-            ingress_checkpoint_max_live_segments: Some(cfg.ingress_checkpoint_max_live_segments),
             upload_cache_io_slots: Some(cfg.upload_cache_io_slots),
             transit_memory_budget_bytes: Some(cfg.transit_memory_budget_bytes),
             upload_user_idle_grace_ms: Some(cfg.upload_user_idle_grace_ms),
@@ -831,7 +773,6 @@ impl Default for VfsConfig {
             attr_read_cache_capacity: DEFAULT_ATTR_READ_CACHE_CAPACITY,
             attr_read_cache_bytes: DEFAULT_ATTR_READ_CACHE_BYTES,
             effective_acl_cache_capacity: DEFAULT_EFFECTIVE_ACL_CACHE_CAPACITY,
-            max_ingress_segment_bytes: DEFAULT_INGRESS_SEGMENT_MAX_BYTES,
             cache_safety_mode: CacheSafetyMode::Fast,
             principal: "*".to_string(),
             fetch_initial_window: DEFAULT_FETCH_INITIAL_WINDOW,
@@ -851,11 +792,6 @@ impl Default for VfsConfig {
             upload_requeue_max_ms: DEFAULT_UPLOAD_REQUEUE_MAX_MS,
             upload_stats_interval_secs: DEFAULT_UPLOAD_STATS_INTERVAL_SECS,
             slab_flush_interval_ms: DEFAULT_SLAB_FLUSH_INTERVAL_MS,
-            ingress_checkpoint_interval_secs: DEFAULT_INGRESS_CHECKPOINT_INTERVAL_SECS,
-            ingress_checkpoint_min_append_bytes: DEFAULT_INGRESS_CHECKPOINT_MIN_APPEND_BYTES,
-            ingress_checkpoint_min_mutations: DEFAULT_INGRESS_CHECKPOINT_MIN_MUTATIONS,
-            ingress_checkpoint_max_segment_lag: DEFAULT_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG,
-            ingress_checkpoint_max_live_segments: DEFAULT_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS,
             upload_cache_io_slots: DEFAULT_UPLOAD_CACHE_IO_SLOTS,
             transit_memory_budget_bytes: DEFAULT_TRANSIT_MEMORY_BUDGET_BYTES,
             upload_user_idle_grace_ms: DEFAULT_UPLOAD_USER_IDLE_GRACE_MS,
@@ -985,10 +921,6 @@ mod tests {
         );
 
         assert!(large.max_dirty_bytes >= small.max_dirty_bytes);
-        assert!(large.max_ingress_segment_bytes >= small.max_ingress_segment_bytes);
-        assert!(
-            large.ingress_checkpoint_min_append_bytes >= small.ingress_checkpoint_min_append_bytes
-        );
         assert!(large.upload_cache_io_slots >= small.upload_cache_io_slots);
     }
 

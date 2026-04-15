@@ -79,8 +79,7 @@ use acl::AclState;
 use config::{
     CACHE_RUNTIME_HUGE_BUDGET_BYTES, CACHE_RUNTIME_LARGE_BUDGET_BYTES,
     CACHE_RUNTIME_MAX_DIRTY_BYTES_HUGE, CACHE_RUNTIME_MAX_DIRTY_BYTES_LARGE,
-    CACHE_RUNTIME_MAX_INGRESS_SEGMENT_BYTES, CACHE_RUNTIME_MAX_TRANSIT_BUDGET_BYTES,
-    CACHE_RUNTIME_MAX_WRITE_EAGER_BATCH_BYTES, CACHE_RUNTIME_MIN_INGRESS_SEGMENT_BYTES,
+    CACHE_RUNTIME_MAX_TRANSIT_BUDGET_BYTES, CACHE_RUNTIME_MAX_WRITE_EAGER_BATCH_BYTES,
     CACHE_RUNTIME_MIN_TRANSIT_BUDGET_BYTES, CACHE_RUNTIME_MIN_WRITE_EAGER_BATCH_BYTES,
     CACHE_RUNTIME_SMALL_BUDGET_BYTES, CacheRuntimeTuningOverrides, DeletedInodeCleanup,
     DirtyAttrPersistPolicy, FAST_MODE_SYNC_GROUP_MAX_DELAY_MS, FAST_MODE_SYNC_GROUP_MIN_BYTES_CEIL,
@@ -165,12 +164,8 @@ pub const VFS_RUNTIME_EVENT_CAPACITY: usize = 128;
 const ZEROIO_DIAGNOSTIC_DRILLDOWN_LIMIT: usize = 32;
 const ZEROIO_HEALTH_SIGNAL_LIMIT: usize = 16;
 const ZEROIO_REPLAY_EVENT_SAMPLE_LIMIT: usize = 16;
+pub(crate) const ZEROIO_RUNTIME_STATE_DIR: &str = "runtime";
 const ZEROIO_LAST_SHUTDOWN_SNAPSHOT_FILE: &str = "zeroio-last-shutdown.json";
-
-use crate::ingress_wal::{
-    IngressWal, latest_ingress_checkpoint_path, load_latest_ingress_checkpoint_meta,
-    reset_ingress_artifacts_for_fast_mode, scan_ingress_artifacts,
-};
 
 // =============================================================================
 // Error Types
@@ -387,12 +382,6 @@ const METADATA_CACHE_PROTECTED_PERCENT: usize = 80;
 const DENTRY_CACHE_ORDER_COMPACT_MULTIPLIER: usize = 2;
 const DENTRY_CACHE_ORDER_COMPACT_SLACK: usize = 64;
 const DENTRY_CACHE_INDEX_NODE_OVERHEAD: usize = 32;
-const DEFAULT_INGRESS_SEGMENT_MAX_BYTES: u64 = 256 * 1024 * 1024;
-const DEFAULT_INGRESS_CHECKPOINT_INTERVAL_SECS: u64 = 30;
-const DEFAULT_INGRESS_CHECKPOINT_MIN_APPEND_BYTES: u64 = 64 * 1024 * 1024;
-const DEFAULT_INGRESS_CHECKPOINT_MIN_MUTATIONS: u64 = 128;
-const DEFAULT_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG: u64 = 2;
-const DEFAULT_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS: u64 = 4;
 const DEFAULT_XATTR_MAX_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS: u64 = 500;
@@ -914,40 +903,6 @@ impl AttrReadCache {
     }
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy)]
-struct IngressCheckpointState {
-    pending_bytes: u64,
-    pending_mutations: u64,
-    active_segment_lag: u64,
-    live_segment_count: u64,
-    timer_fired: bool,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy)]
-struct IngressCheckpointPolicy {
-    min_append_bytes: u64,
-    min_mutations: u64,
-    max_segment_lag: u64,
-    max_live_segments: u64,
-}
-
-#[cfg(test)]
-fn ingress_checkpoint_due_with_policy(
-    state: IngressCheckpointState,
-    policy: IngressCheckpointPolicy,
-) -> bool {
-    if state.pending_bytes == 0 && state.pending_mutations == 0 {
-        return false;
-    }
-    state.timer_fired
-        || state.pending_bytes >= policy.min_append_bytes
-        || state.pending_mutations >= policy.min_mutations
-        || state.active_segment_lag >= policy.max_segment_lag
-        || state.live_segment_count >= policy.max_live_segments
-}
-
 fn run_sync_with_timeout<T: Send + 'static>(
     timeout: Duration,
     operation: impl FnOnce() -> VfsResult<T> + Send + 'static,
@@ -989,88 +944,9 @@ fn run_sync_with_timeout<T: Send + 'static>(
     }
 }
 
-type IngressRecoveryInit = Option<(u64, u64, u64)>;
-
-fn init_ingress_recovery_state(
-    cache_safety_mode: CacheSafetyMode,
-    ingress_wal: &IngressWal,
-) -> VfsResult<IngressRecoveryInit> {
-    if matches!(cache_safety_mode, CacheSafetyMode::Durable) {
-        let existing_checkpoint = load_latest_ingress_checkpoint_meta(
-            ingress_wal.checkpoint_dir(),
-            ingress_wal.segment_dir(),
-        )?;
-        let initial_checkpoint_meta = existing_checkpoint.map(|checkpoint| {
-            let checkpoint_path = latest_ingress_checkpoint_path(ingress_wal.checkpoint_dir());
-            let checkpoint_unix_ms = std::fs::metadata(checkpoint_path)
-                .ok()
-                .and_then(|meta| meta.modified().ok())
-                .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            (
-                checkpoint_unix_ms,
-                checkpoint.covered_segment_id,
-                checkpoint.covered_offset,
-            )
-        });
-        return Ok(initial_checkpoint_meta);
-    }
-
-    let (segment_count, checkpoint_count, state_present) =
-        scan_ingress_artifacts(ingress_wal.spill_dir())?;
-    if segment_count > 0 || checkpoint_count > 0 || state_present {
-        warn!(
-            mode = "fast",
-            segment_count,
-            checkpoint_count,
-            state_present,
-            "startup detected durable ingress artifacts; fast mode will discard them during self-heal"
-        );
-    }
-    reset_ingress_artifacts_for_fast_mode(ingress_wal.spill_dir())?;
-    Ok(None)
-}
-
 // =============================================================================
 // Internal State Subsystems
 // =============================================================================
-
-struct IngressState {
-    ingress_checkpoint_persists: AtomicU64,
-    ingress_checkpoint_failures: AtomicU64,
-    ingress_last_checkpoint_unix_ms: AtomicU64,
-    ingress_last_checkpoint_segment_id: AtomicU64,
-    ingress_last_checkpoint_offset: AtomicU64,
-    ingress_checkpoint_notify: tokio::sync::Notify,
-    ingress_checkpoint_stopped: std::sync::atomic::AtomicBool,
-}
-
-impl IngressState {
-    fn new(initial_checkpoint_meta: Option<(u64, u64, u64)>) -> Self {
-        Self {
-            ingress_checkpoint_persists: AtomicU64::new(0),
-            ingress_checkpoint_failures: AtomicU64::new(0),
-            ingress_last_checkpoint_unix_ms: AtomicU64::new(
-                initial_checkpoint_meta
-                    .map(|(unix_ms, _, _)| unix_ms)
-                    .unwrap_or(0),
-            ),
-            ingress_last_checkpoint_segment_id: AtomicU64::new(
-                initial_checkpoint_meta
-                    .map(|(_, segment_id, _)| segment_id)
-                    .unwrap_or(0),
-            ),
-            ingress_last_checkpoint_offset: AtomicU64::new(
-                initial_checkpoint_meta
-                    .map(|(_, _, offset)| offset)
-                    .unwrap_or(0),
-            ),
-            ingress_checkpoint_notify: tokio::sync::Notify::new(),
-            ingress_checkpoint_stopped: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-}
 
 struct UploadState {
     deleted_inodes: Mutex<std::collections::HashSet<Ino>>,
@@ -1101,12 +977,6 @@ struct UploadState {
 struct CacheRuntimeTuning {
     max_dirty_bytes: usize,
     write_eager_flush_batch_bytes: usize,
-    max_ingress_segment_bytes: u64,
-    ingress_checkpoint_interval_secs: u64,
-    ingress_checkpoint_min_append_bytes: u64,
-    ingress_checkpoint_min_mutations: u64,
-    ingress_checkpoint_max_segment_lag: u64,
-    ingress_checkpoint_max_live_segments: u64,
     upload_cache_io_slots: usize,
     transit_memory_budget_bytes: usize,
 }
@@ -1122,8 +992,6 @@ fn derive_cache_runtime_tuning(
     let clamp_usize = |value: u64, min: usize, max: usize| -> usize {
         value.clamp(min as u64, max as u64).min(usize::MAX as u64) as usize
     };
-    let clamp_u64 = |value: u64, min: u64, max: u64| -> u64 { value.clamp(min, max) };
-
     // Keep foreground write buffering bounded by cache budget while capping
     // absolute memory so the same defaults remain safe on USB-attached NVMe.
     let max_dirty_cap = if cache_size >= CACHE_RUNTIME_HUGE_BUDGET_BYTES {
@@ -1146,36 +1014,6 @@ fn derive_cache_runtime_tuning(
         CACHE_RUNTIME_MIN_WRITE_EAGER_BATCH_BYTES.max(block_size as usize),
         CACHE_RUNTIME_MAX_WRITE_EAGER_BATCH_BYTES,
     );
-
-    let max_ingress_segment_bytes = clamp_u64(
-        cache_size / 512,
-        CACHE_RUNTIME_MIN_INGRESS_SEGMENT_BYTES,
-        CACHE_RUNTIME_MAX_INGRESS_SEGMENT_BYTES,
-    );
-    let ingress_checkpoint_interval_secs = if cache_size <= CACHE_RUNTIME_SMALL_BUDGET_BYTES {
-        15
-    } else if cache_size <= CACHE_RUNTIME_LARGE_BUDGET_BYTES {
-        30
-    } else {
-        45
-    };
-    let ingress_checkpoint_min_append_bytes = clamp_u64(
-        max_ingress_segment_bytes / 4,
-        16 * 1024 * 1024,
-        128 * 1024 * 1024,
-    );
-    let ingress_checkpoint_min_mutations =
-        clamp_u64(ingress_checkpoint_min_append_bytes / block_size, 64, 4_096);
-    let ingress_checkpoint_max_segment_lag = if cache_size <= CACHE_RUNTIME_SMALL_BUDGET_BYTES {
-        2
-    } else {
-        3
-    };
-    let ingress_checkpoint_max_live_segments = if cache_size <= CACHE_RUNTIME_SMALL_BUDGET_BYTES {
-        4
-    } else {
-        6
-    };
 
     let upload_cache_io_slots = if cache_size <= CACHE_RUNTIME_SMALL_BUDGET_BYTES {
         16
@@ -1207,12 +1045,6 @@ fn derive_cache_runtime_tuning(
     CacheRuntimeTuning {
         max_dirty_bytes,
         write_eager_flush_batch_bytes,
-        max_ingress_segment_bytes,
-        ingress_checkpoint_interval_secs,
-        ingress_checkpoint_min_append_bytes,
-        ingress_checkpoint_min_mutations,
-        ingress_checkpoint_max_segment_lag,
-        ingress_checkpoint_max_live_segments,
         upload_cache_io_slots,
         transit_memory_budget_bytes,
     }
@@ -1253,36 +1085,6 @@ fn resolve_cache_runtime_tuning_overrides(
             config.write_eager_flush_batch_bytes
         } else {
             derived.write_eager_flush_batch_bytes
-        },
-        max_ingress_segment_bytes: if overrides.max_ingress_segment_bytes {
-            config.max_ingress_segment_bytes
-        } else {
-            derived.max_ingress_segment_bytes
-        },
-        ingress_checkpoint_interval_secs: if overrides.ingress_checkpoint_interval_secs {
-            config.ingress_checkpoint_interval_secs
-        } else {
-            derived.ingress_checkpoint_interval_secs
-        },
-        ingress_checkpoint_min_append_bytes: if overrides.ingress_checkpoint_min_append_bytes {
-            config.ingress_checkpoint_min_append_bytes
-        } else {
-            derived.ingress_checkpoint_min_append_bytes
-        },
-        ingress_checkpoint_min_mutations: if overrides.ingress_checkpoint_min_mutations {
-            config.ingress_checkpoint_min_mutations
-        } else {
-            derived.ingress_checkpoint_min_mutations
-        },
-        ingress_checkpoint_max_segment_lag: if overrides.ingress_checkpoint_max_segment_lag {
-            config.ingress_checkpoint_max_segment_lag
-        } else {
-            derived.ingress_checkpoint_max_segment_lag
-        },
-        ingress_checkpoint_max_live_segments: if overrides.ingress_checkpoint_max_live_segments {
-            config.ingress_checkpoint_max_live_segments
-        } else {
-            derived.ingress_checkpoint_max_live_segments
         },
         upload_cache_io_slots: if overrides.upload_cache_io_slots {
             config.upload_cache_io_slots
@@ -1987,14 +1789,8 @@ impl MetricsState {
 // =============================================================================
 
 impl VfsState {
-    fn new(
-        initial_checkpoint_meta: Option<(u64, u64, u64)>,
-        _block_size: u32,
-        cfg: &VfsConfig,
-        upload_cache_io_foreground_cost_base: u32,
-    ) -> Self {
+    fn new(_block_size: u32, cfg: &VfsConfig, upload_cache_io_foreground_cost_base: u32) -> Self {
         Self {
-            ingress: IngressState::new(initial_checkpoint_meta),
             upload: UploadState::new(upload_cache_io_foreground_cost_base),
             file_session: FileSessionState::new(),
             namespace: NamespaceState::new(
@@ -2017,7 +1813,6 @@ impl VfsState {
 }
 
 struct VfsState {
-    ingress: IngressState,
     upload: UploadState,
     file_session: FileSessionState,
     namespace: NamespaceState,
@@ -2293,7 +2088,7 @@ pub struct StudioVfs {
     local_sync_group_max_delay: Duration,
     /// Maximum bytes allowed for a single xattr value.
     max_xattr_bytes: usize,
-    ingress_wal: IngressWal,
+    zeroio_runtime_state_dir: PathBuf,
     /// Handle table: tracks all open file descriptors.
     handle_table: HandleTable,
     /// Optional distributed lease for janitor leader election.
@@ -2948,10 +2743,7 @@ impl StudioVfs {
     }
 
     fn zeroio_last_shutdown_snapshot_path(&self) -> PathBuf {
-        self.ingress_wal
-            .checkpoint_dir()
-            .parent()
-            .unwrap_or(self.ingress_wal.checkpoint_dir())
+        self.zeroio_runtime_state_dir
             .join(ZEROIO_LAST_SHUTDOWN_SNAPSHOT_FILE)
     }
 
@@ -5073,23 +4865,9 @@ impl StudioVfs {
         let dirty_mem_bytes = self.total_pending_write_buffer_bytes();
         drop(pending);
 
-        let last_checkpoint_unix_ms = self
-            .state
-            .ingress
-            .ingress_last_checkpoint_unix_ms
-            .load(Ordering::Relaxed);
-        let last_checkpoint_age_ms = if last_checkpoint_unix_ms == 0 {
-            0
-        } else {
-            now_unix_millis().saturating_sub(last_checkpoint_unix_ms)
-        };
-
         VfsIngressStats {
             dirty_mem_bytes,
             dirty_mem_blocks,
-            spill_bytes: 0,
-            spill_records: 0,
-            oldest_spill_age_ms: 0,
             write_backpressure_wait_ms: self
                 .state
                 .write_buffer
@@ -5115,41 +4893,11 @@ impl StudioVfs {
                 .write_buffer
                 .fast_backpressure_stall_max_ms
                 .load(Ordering::Relaxed),
-            forced_spill_blocks: 0,
-            drained_mem_blocks: 0,
-            drained_mem_bytes: 0,
-            drained_spill_blocks: 0,
-            drained_spill_bytes: 0,
             prefetch_queue_depth: self
                 .state
                 .metrics
                 .prefetch_queue_depth
                 .load(Ordering::Relaxed),
-            checkpoint_persists: self
-                .state
-                .ingress
-                .ingress_checkpoint_persists
-                .load(Ordering::Relaxed),
-            checkpoint_failures: self
-                .state
-                .ingress
-                .ingress_checkpoint_failures
-                .load(Ordering::Relaxed),
-            last_checkpoint_age_ms,
-            last_checkpoint_segment_id: self
-                .state
-                .ingress
-                .ingress_last_checkpoint_segment_id
-                .load(Ordering::Relaxed),
-            last_checkpoint_offset: self
-                .state
-                .ingress
-                .ingress_last_checkpoint_offset
-                .load(Ordering::Relaxed),
-            checkpoint_pending_bytes: 0,
-            checkpoint_pending_mutations: 0,
-            checkpoint_active_segment_lag: 0,
-            checkpoint_live_segments: 0,
         }
     }
 
@@ -5893,8 +5641,8 @@ impl StudioVfs {
         }
     }
 
-    /// Describe where a new locally materialized payload would be accepted
-    /// right now: RAM, spill, or local backpressure.
+    /// Describe whether a new locally materialized payload would still fit in
+    /// the in-memory dirty buffer or would hit local backpressure.
     pub fn ingress_pressure_for(&self, next_bytes: usize) -> VfsIngressPressure {
         let dirty_mem_bytes = self.total_pending_write_buffer_bytes();
         let dirty_mem_limit = self.max_dirty_bytes.load(Ordering::Acquire);
@@ -5910,8 +5658,6 @@ impl StudioVfs {
             next_bytes,
             dirty_mem_bytes,
             dirty_mem_limit,
-            spill_bytes: 0,
-            spill_limit: 0,
             lane,
         }
     }

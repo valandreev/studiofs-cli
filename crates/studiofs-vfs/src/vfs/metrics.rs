@@ -19,29 +19,12 @@ pub struct StatFs {
 pub struct VfsIngressStats {
     pub dirty_mem_bytes: usize,
     pub dirty_mem_blocks: usize,
-    pub spill_bytes: usize,
-    pub spill_records: usize,
-    pub oldest_spill_age_ms: u64,
     pub write_backpressure_wait_ms: u64,
     pub write_backpressure_events: u64,
     pub fast_backpressure_wait_ms: u64,
     pub fast_backpressure_events: u64,
     pub fast_backpressure_stall_max_ms: u64,
-    pub forced_spill_blocks: u64,
-    pub drained_mem_blocks: u64,
-    pub drained_mem_bytes: u64,
-    pub drained_spill_blocks: u64,
-    pub drained_spill_bytes: u64,
     pub prefetch_queue_depth: u64,
-    pub checkpoint_persists: u64,
-    pub checkpoint_failures: u64,
-    pub last_checkpoint_age_ms: u64,
-    pub last_checkpoint_segment_id: u64,
-    pub last_checkpoint_offset: u64,
-    pub checkpoint_pending_bytes: u64,
-    pub checkpoint_pending_mutations: u64,
-    pub checkpoint_active_segment_lag: u64,
-    pub checkpoint_live_segments: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -238,7 +221,6 @@ pub struct VfsWritePathObservabilitySnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsIngressLane {
     DirtyMem,
-    Spill,
     Backpressure,
 }
 
@@ -247,8 +229,6 @@ pub struct VfsIngressPressure {
     pub next_bytes: usize,
     pub dirty_mem_bytes: usize,
     pub dirty_mem_limit: usize,
-    pub spill_bytes: usize,
-    pub spill_limit: usize,
     pub lane: VfsIngressLane,
 }
 

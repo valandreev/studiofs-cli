@@ -135,7 +135,7 @@ fn sync_directory_impl(path: &Path) -> io::Result<()> {
                 tracing::warn!(
                     path = %path.display(),
                     error = ?error,
-                    "cache-v3 directory sync is unsupported on this Windows filesystem (warning will be logged once)"
+                    "directory sync is unsupported on this Windows filesystem (warning will be logged once)"
                 );
             }
             Ok(())
