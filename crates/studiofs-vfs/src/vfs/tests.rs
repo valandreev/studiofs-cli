@@ -66,6 +66,28 @@ fn make_test_vfs(
     (rt, vfs, meta)
 }
 
+fn reopen_existing_test_vfs(tmp: &TempDir) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
+    let db_path = tmp.path().join("meta.redb");
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("reopen RedbMetaEngine"));
+    let format_info = meta.get_format_info().expect("load format info");
+    let data_config = DataStoreConfig::from(&format_info);
+    let cache_dir = tmp.path().join("cache");
+    let rt = Arc::new(Runtime::new().expect("runtime"));
+    let _guard = rt.enter();
+    let vfs = StudioVfs::new(
+        meta.clone(),
+        &data_config,
+        cache_dir.to_str().expect("cache dir str"),
+        64 * 1024 * 1024,
+        32 * 1024 * 1024,
+        VfsConfig::default()
+            .try_into()
+            .expect("default VFS config should validate"),
+    )
+    .expect("reopen vfs");
+    (rt, vfs, meta)
+}
+
 fn mark_all_file_blocks_uploaded(
     vfs: &Arc<StudioVfs>,
     meta: &Arc<RedbMetaEngine>,
@@ -461,6 +483,83 @@ fn zeroio_snapshot_reports_repeated_restart_replay_as_health_signal() {
         .expect("replayed inode should appear in zeroio drilldown");
     assert!(entry.replayed_after_restart);
     assert!(entry.repeated_replay_count >= 2);
+}
+
+#[test]
+fn zeroio_snapshot_loads_last_graceful_shutdown_after_restart() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "zeroio-shutdown-persisted");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let created = vfs
+            .create(1, b"shutdown-persisted.bin", 0, 0, 0o644)
+            .expect("create shutdown test file");
+        vfs.write(created.ino, 0, b"shutdown-payload")
+            .await
+            .expect("write shutdown payload");
+        vfs.shutdown(std::time::Duration::ZERO).await;
+    });
+    drop(vfs);
+    drop(meta);
+    drop(rt);
+
+    let (_reopen_rt, reopened, _reopened_meta) = reopen_existing_test_vfs(&tmp);
+    assert!(
+        reopened
+            .recent_runtime_events(8)
+            .into_iter()
+            .all(|event| event.kind != "shutdown_local_state"),
+        "freshly reopened VFS should not have inherited runtime events in memory"
+    );
+
+    let snapshot = reopened.zeroio_runtime_snapshot();
+    let shutdown = snapshot
+        .last_graceful_shutdown
+        .expect("shutdown evidence should survive restart");
+    assert!(shutdown.generated_unix_ms > 0);
+    assert_eq!(shutdown.metadata_flush_outcome, "success");
+    assert!(shutdown.local_payload_sync_ok);
+    assert!(shutdown.recoverable_on_restart);
+}
+
+#[test]
+fn zeroio_snapshot_reports_replay_backlog_beyond_recent_event_sample_limit() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "zeroio-replay-sample-limit");
+    let _guard = rt.enter();
+
+    let mut replayed_epochs = Vec::new();
+    rt.block_on(async {
+        for idx in 0..17 {
+            let name = format!("replay-{idx}.bin");
+            let created = vfs.create(1, name.as_bytes(), 0, 0, 0o644).unwrap();
+            vfs.write(created.ino, 0, b"replay-payload").await.unwrap();
+            let attr = meta.get_attr(created.ino).expect("load replay attr");
+            replayed_epochs.push((created.ino, attr.content_epoch));
+        }
+    });
+
+    {
+        let mut replay_counts = vfs.state.upload.startup_replay_counts.lock();
+        for (ino, content_epoch) in &replayed_epochs {
+            replay_counts.insert((*ino, *content_epoch), 1);
+        }
+    }
+
+    let snapshot = vfs.zeroio_runtime_snapshot();
+    assert_eq!(
+        snapshot.replayed_after_restart_epochs,
+        replayed_epochs.len() as u64
+    );
+    assert_eq!(snapshot.replay_backlog_epochs, replayed_epochs.len());
+    let last_ino = replayed_epochs.last().map(|(ino, _)| *ino).unwrap();
+    let entry = snapshot
+        .drilldown
+        .iter()
+        .find(|entry| entry.ino == last_ino)
+        .expect("epochs beyond the sampled runtime-event limit must still be marked replayed");
+    assert!(entry.replayed_after_restart);
 }
 
 #[test]

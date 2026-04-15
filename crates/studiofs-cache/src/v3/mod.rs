@@ -869,7 +869,6 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
         match self.index.get_entry(object_id) {
             Ok(Some(entry)) => {
                 if self.payload_missing(object_id, "object_stats") {
-                    self.remove_orphaned_index_entry(object_id, "object_stats");
                     None
                 } else {
                     Some(LocalBlockObjectStats {
@@ -1329,6 +1328,34 @@ mod tests {
             LocalBlockLifecycleState::Missing
         );
         assert!(!backend.contains(10));
+    }
+
+    #[test]
+    fn cache_v3_backend_object_stats_do_not_prune_missing_payload_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x67; 16],
+        })
+        .unwrap();
+        backend.put(10, b"ten", false).unwrap();
+        backend.sync_data().unwrap();
+        std::fs::remove_file(layout.payload_block_path(10)).unwrap();
+
+        assert!(
+            backend.object_stats(10).is_none(),
+            "observational object_stats should hide missing payloads"
+        );
+        drop(backend);
+
+        let index = CacheIndex::open(&layout.redb_index_path).unwrap();
+        assert!(
+            index.get_entry(10).unwrap().is_some(),
+            "object_stats must not prune stale index state during diagnostics reads"
+        );
     }
 
     #[test]

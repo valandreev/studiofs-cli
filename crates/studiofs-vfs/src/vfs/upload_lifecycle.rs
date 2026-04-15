@@ -2,7 +2,7 @@ mod worker;
 
 pub(super) use worker::UploadLifecycleWorker;
 
-use super::{Ino, StudioVfs, VfsError, VfsIngressStats, info, warn};
+use super::{Ino, StudioVfs, VfsError, VfsIngressStats, VfsZeroIoShutdownSnapshot, info, warn};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
@@ -396,20 +396,31 @@ impl StudioVfs {
         let dirty_after = self.total_pending_write_buffer_bytes();
         let pending_uploads_after = self.upload_coordinator.pending_upload_count();
         let recoverable_on_restart = dirty_after == 0 && local_payload_sync_ok;
+        let shutdown_snapshot = VfsZeroIoShutdownSnapshot {
+            generated_unix_ms: now_unix_millis(),
+            accepted_write_buffer_bytes_before: dirty_before as u64,
+            accepted_write_buffer_bytes_after: dirty_after as u64,
+            pending_uploads_after,
+            uploader_drained_before_cancel: drained,
+            metadata_flush_outcome: metadata_flush_outcome.to_string(),
+            local_payload_sync_ok,
+            recoverable_on_restart,
+        };
         self.record_runtime_event(
             "zeroio",
             "shutdown_local_state",
             "zeroio graceful shutdown local durability",
             serde_json::json!({
-                "accepted_write_buffer_bytes_before": dirty_before,
-                "accepted_write_buffer_bytes_after": dirty_after,
-                "pending_uploads_after": pending_uploads_after,
-                "uploader_drained_before_cancel": drained,
-                "metadata_flush_outcome": metadata_flush_outcome,
-                "local_payload_sync_ok": local_payload_sync_ok,
-                "recoverable_on_restart": recoverable_on_restart,
+                "accepted_write_buffer_bytes_before": shutdown_snapshot.accepted_write_buffer_bytes_before,
+                "accepted_write_buffer_bytes_after": shutdown_snapshot.accepted_write_buffer_bytes_after,
+                "pending_uploads_after": shutdown_snapshot.pending_uploads_after,
+                "uploader_drained_before_cancel": shutdown_snapshot.uploader_drained_before_cancel,
+                "metadata_flush_outcome": shutdown_snapshot.metadata_flush_outcome,
+                "local_payload_sync_ok": shutdown_snapshot.local_payload_sync_ok,
+                "recoverable_on_restart": shutdown_snapshot.recoverable_on_restart,
             }),
         );
+        self.persist_zeroio_shutdown_snapshot(&shutdown_snapshot);
         self.state
             .shutdown
             .shutdown_completed

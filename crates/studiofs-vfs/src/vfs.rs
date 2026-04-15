@@ -146,7 +146,7 @@ use studiofs_data::store::{DataError, DataStore, DataStoreConfig, IoProfile};
 
 use studiofs_meta::schema::{
     DEFAULT_CHUNK_SIZE, DirEntry, FormatInfo, InodeLifecycleState, PayloadRetentionClass, ROOT_INO,
-    SetattrArgs, UploadState as MetaUploadState, chunk_start_offset, counters,
+    SetattrArgs, UploadState as MetaUploadState, chunk_start_offset,
 };
 use studiofs_meta::types::{
     AccessLevel, BlockFlags as MetaBlockFlags, BlockRef, FileType, Ino, InodeAttr,
@@ -163,6 +163,7 @@ pub const VFS_RUNTIME_EVENT_CAPACITY: usize = 128;
 const ZEROIO_DIAGNOSTIC_DRILLDOWN_LIMIT: usize = 32;
 const ZEROIO_HEALTH_SIGNAL_LIMIT: usize = 16;
 const ZEROIO_REPLAY_EVENT_SAMPLE_LIMIT: usize = 16;
+const ZEROIO_LAST_SHUTDOWN_SNAPSHOT_FILE: &str = "zeroio-last-shutdown.json";
 
 use crate::ingress_wal::{
     IngressWal, latest_ingress_checkpoint_path, load_latest_ingress_checkpoint_meta,
@@ -1078,6 +1079,7 @@ struct UploadState {
     pending_epoch_finalizations: Mutex<BTreeSet<(Ino, u64)>>,
     pending_epoch_finalizations_notify: tokio::sync::Notify,
     upload_sticky_errors: Mutex<std::collections::HashMap<Ino, String>>,
+    startup_replay_counts: Mutex<HashMap<(Ino, u64), u64>>,
     upload_requeues: AtomicU64,
     upload_canceled_deleted: AtomicU64,
     upload_canceled_stale: AtomicU64,
@@ -1351,6 +1353,7 @@ impl UploadState {
             pending_epoch_finalizations: Mutex::new(BTreeSet::new()),
             pending_epoch_finalizations_notify: tokio::sync::Notify::new(),
             upload_sticky_errors: Mutex::new(std::collections::HashMap::new()),
+            startup_replay_counts: Mutex::new(HashMap::new()),
             upload_requeues: AtomicU64::new(0),
             upload_canceled_deleted: AtomicU64::new(0),
             upload_canceled_stale: AtomicU64::new(0),
@@ -2765,6 +2768,12 @@ impl<'a> StartupReplayCoordinator<'a> {
                 "seeded epoch finalizer queue from metadata"
             );
         }
+        {
+            let mut replay_counts = self.vfs.state.upload.startup_replay_counts.lock();
+            for (ino, content_epoch) in replayed_epochs.iter().copied() {
+                *replay_counts.entry((ino, content_epoch)).or_insert(0) += 1;
+            }
+        }
 
         for (ino, content_epoch) in replayed_epochs
             .iter()
@@ -2930,6 +2939,63 @@ impl StudioVfs {
             .map(str::to_string)
     }
 
+    fn zeroio_last_shutdown_snapshot_path(&self) -> PathBuf {
+        self.ingress_wal
+            .checkpoint_dir()
+            .parent()
+            .unwrap_or(self.ingress_wal.checkpoint_dir())
+            .join(ZEROIO_LAST_SHUTDOWN_SNAPSHOT_FILE)
+    }
+
+    fn load_persisted_zeroio_shutdown_snapshot(&self) -> Option<VfsZeroIoShutdownSnapshot> {
+        let path = self.zeroio_last_shutdown_snapshot_path();
+        let bytes = std::fs::read(&path).ok()?;
+        match serde_json::from_slice(&bytes) {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => {
+                warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "failed to parse persisted zeroio shutdown snapshot"
+                );
+                None
+            }
+        }
+    }
+
+    fn persist_zeroio_shutdown_snapshot(&self, snapshot: &VfsZeroIoShutdownSnapshot) {
+        let path = self.zeroio_last_shutdown_snapshot_path();
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            warn!(
+                path = %parent.display(),
+                error = %error,
+                "failed to create zeroio shutdown snapshot directory"
+            );
+            return;
+        }
+        let bytes = match serde_json::to_vec(snapshot) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "failed to serialize zeroio shutdown snapshot"
+                );
+                return;
+            }
+        };
+        if let Err(error) = std::fs::write(&path, bytes) {
+            warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to persist zeroio shutdown snapshot"
+            );
+        }
+    }
+
     fn zeroio_retention_priority(retention: PayloadRetentionClass) -> u8 {
         match retention {
             PayloadRetentionClass::PublishedWarm => 0,
@@ -3045,8 +3111,8 @@ impl StudioVfs {
         let pending_epoch_finalizations =
             self.state.upload.pending_epoch_finalizations.lock().clone();
         let sticky_errors = self.state.upload.upload_sticky_errors.lock().clone();
+        let replay_counts = self.state.upload.startup_replay_counts.lock().clone();
 
-        let mut replay_counts: HashMap<(Ino, u64), u64> = HashMap::new();
         let mut startup_replay = None;
         let mut startup_replay_ts = 0;
         let mut last_graceful_shutdown = None;
@@ -3056,17 +3122,6 @@ impl StudioVfs {
                 continue;
             }
             match event.kind.as_str() {
-                "epoch_replayed_after_restart" => {
-                    let Some(ino) = Self::zeroio_event_u64(&event.fields, "ino") else {
-                        continue;
-                    };
-                    let Some(content_epoch) =
-                        Self::zeroio_event_u64(&event.fields, "content_epoch")
-                    else {
-                        continue;
-                    };
-                    *replay_counts.entry((ino, content_epoch)).or_insert(0) += 1;
-                }
                 "startup_replay_summary" if event.generated_unix_ms >= startup_replay_ts => {
                     startup_replay_ts = event.generated_unix_ms;
                     startup_replay = Some(VfsZeroIoStartupReplaySnapshot {
@@ -3150,6 +3205,15 @@ impl StudioVfs {
             .metrics
             .zeroio_publish_failures
             .load(Ordering::Relaxed);
+        let persisted_shutdown = self.load_persisted_zeroio_shutdown_snapshot();
+        if let Some(snapshot) = persisted_shutdown
+            && last_graceful_shutdown
+                .as_ref()
+                .map(|current| snapshot.generated_unix_ms > current.generated_unix_ms)
+                .unwrap_or(true)
+        {
+            last_graceful_shutdown = Some(snapshot);
+        }
 
         let mut snapshot = VfsZeroIoRuntimeSnapshot {
             generated_unix_ms,
@@ -3163,17 +3227,16 @@ impl StudioVfs {
             },
             startup_replay,
             last_graceful_shutdown,
-            replayed_after_restart_epochs: replay_counts.len() as u64,
             ..VfsZeroIoRuntimeSnapshot::default()
         };
 
         let meta = self.sync_meta();
-        let next_inode = match meta.get_counter(counters::NEXT_INODE) {
-            Ok(next_inode) => next_inode,
+        let lifecycles = match meta.list_inode_lifecycles() {
+            Ok(lifecycles) => lifecycles,
             Err(error) => {
                 warn!(
                     error = %error,
-                    "failed to load next inode counter for zeroio snapshot"
+                    "failed to enumerate inode lifecycle records for zeroio snapshot"
                 );
                 return snapshot;
             }
@@ -3183,20 +3246,8 @@ impl StudioVfs {
         let mut health_signals = Vec::new();
         let mut drilldown = Vec::new();
 
-        for ino in ROOT_INO..next_inode {
-            let lifecycle = match meta.get_inode_lifecycle(ino) {
-                Ok(Some(lifecycle)) => lifecycle,
-                Ok(None) => continue,
-                Err(error) => {
-                    warn!(
-                        ino,
-                        error = %error,
-                        "failed to load inode lifecycle for zeroio snapshot"
-                    );
-                    continue;
-                }
-            };
-
+        for lifecycle in lifecycles {
+            let ino = lifecycle.ino;
             let object_ids = self.zeroio_object_ids_for_lifecycle(ino, &lifecycle);
             let lifecycle_bytes = self.zeroio_object_bytes(&object_ids);
             for object_id in &object_ids {
@@ -3235,6 +3286,10 @@ impl StudioVfs {
                 .copied()
                 .unwrap_or(0);
             let replayed_after_restart = repeated_replay_count > 0;
+            if replayed_after_restart {
+                snapshot.replayed_after_restart_epochs =
+                    snapshot.replayed_after_restart_epochs.saturating_add(1);
+            }
             let deferred_cleanup_object_count = lifecycle.deferred_cleanup_object_ids.len();
             let deferred_cleanup_bytes =
                 self.zeroio_object_bytes(&lifecycle.deferred_cleanup_object_ids);
@@ -3479,6 +3534,7 @@ impl StudioVfs {
 
     pub fn reset_diagnostics_observability(&self) {
         self.state.metrics.reset_diagnostics_observability();
+        self.state.upload.startup_replay_counts.lock().clear();
         self.upload_coordinator.reset_diagnostics_metrics();
     }
 

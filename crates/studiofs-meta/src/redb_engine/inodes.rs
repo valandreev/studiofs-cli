@@ -56,6 +56,25 @@ impl RedbMetaEngine {
             .transpose()
     }
 
+    pub fn list_inode_lifecycles(&self) -> MetaResult<Vec<InodeLifecycleRecord>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(INODE_LIFECYCLE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut records = Vec::new();
+        for row in table
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (_ino, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            records.push(decode(value.value())?);
+        }
+        Ok(records)
+    }
+
     pub fn rebuild_inode_lifecycle_table(&self) -> MetaResult<()> {
         let txn = self
             .db
@@ -569,6 +588,10 @@ impl MetaInodes for RedbMetaEngine {
 
     fn get_inode_lifecycle(&self, ino: Ino) -> MetaResult<Option<InodeLifecycleRecord>> {
         RedbMetaEngine::get_inode_lifecycle(self, ino)
+    }
+
+    fn list_inode_lifecycles(&self) -> MetaResult<Vec<InodeLifecycleRecord>> {
+        RedbMetaEngine::list_inode_lifecycles(self)
     }
 
     fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
