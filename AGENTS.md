@@ -280,12 +280,12 @@ Tunable at runtime (see `crates/studiofs/src/cli/mount.rs` for full list):
 Keep `crates/studiofs-winfsp/src/context.rs` and `crates/studiofs-vfs/src/vfs.rs`
 aligned on these rules whenever WinFSP callback sequencing changes:
 
-- `flush` for a file handle is a mandatory correctness barrier when the inode still has local dirty state. Repeated clean callbacks may short-circuit, and concurrent duplicate callbacks may coalesce per inode.
+- `flush` for a file handle is a mandatory explicit local-durability barrier when the inode still has dirty unpublished state. Success means the accepted writes are durable in the local unpublished view; it must not wait for S3 upload or PostgreSQL publish. Repeated clean callbacks may short-circuit, and concurrent duplicate callbacks may coalesce per inode.
 - `cleanup` with `FspCleanupDelete` must finalize delete in cleanup. `set_delete`/`can_delete` only validate intent; they must not delete.
 - Non-delete `cleanup` is observational only. It must not own a foreground local-dirty-state barrier; explicit `flush` and the last-handle `close`/`release_fh` path retain that responsibility.
-- `close` is a release path, not an independent durability contract. It may observe and attribute the fallback release barrier when cleanup did not drain the inode first.
-- `overwrite` and `set_file_size` must publish the new EOF and attrs before returning; they are not backgroundable flush callbacks.
-- `release_fh` must push any remaining local dirty state through the existing local payload/metadata pipeline before the last handle disappears, including open-unlink/orphan lifecycles and sticky upload error reporting. Full crash-durability still belongs to `fsync` / strict local sync barriers.
+- `close` is a release path, not an independent publish or upload contract. It may observe and attribute the fallback local-durability barrier when cleanup did not drain the inode first.
+- `overwrite` and `set_file_size` must commit the new local EOF and attrs before returning; they are not backgroundable flush callbacks, and they must not force global publish of the new epoch.
+- `release_fh` must push any remaining local dirty state through the existing local payload/metadata pipeline before the last handle disappears, including open-unlink/orphan lifecycles and sticky upload error reporting. When dirty unpublished state is still present, the fallback release barrier must reach the strict local durable boundary; it must not drag S3 upload or PostgreSQL publish into the foreground path.
 - Mounted Windows validation aimed at AJA-style sequential writers should treat any non-zero non-delete `cleanup` foreground barriers, `cleanup_skipped_clean`, or `cleanup_flush_fh` callback counts (that is, any cleanup barrier attribution, including skipped-clean) as concrete follow-up evidence for `SFS-192`, because those indicate avoidable callback-side flush work is still present.
 
 Future defer/coalesce work may target non-delete `cleanup`, repeated clean callback
