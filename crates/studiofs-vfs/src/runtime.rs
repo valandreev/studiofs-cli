@@ -194,6 +194,7 @@ impl<M: ?Sized + MetaInodes> MetaInodes for RuntimeMetaHandle<M> {
     forward_method!(fn next_inode(&self) -> MetaResult<Ino>);
     forward_method!(fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr>);
     forward_method!(fn get_inode_lifecycle(&self, ino: Ino) -> MetaResult<Option<InodeLifecycleRecord>>);
+    forward_method!(fn list_inode_lifecycles(&self) -> MetaResult<Vec<InodeLifecycleRecord>>);
     forward_method!(fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>>);
     forward_method!(fn set_attr(&self, attr: &InodeAttr) -> MetaResult<()>);
     forward_method!(fn remove_attr(&self, ino: Ino) -> MetaResult<()>);

@@ -63,6 +63,22 @@ fn test_list_inode_attrs_ignores_sparse_next_inode_range() {
     assert_eq!(inos.len(), 2);
 }
 
+#[test]
+fn test_list_inode_lifecycles_ignores_sparse_next_inode_range() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"sparse-lifecycle.txt", 1000, 1000, 0o644)
+        .unwrap();
+    engine.set_counter(counters::NEXT_INODE, 1_000_000).unwrap();
+
+    let lifecycles = engine.list_inode_lifecycles().unwrap();
+    let inos: std::collections::BTreeSet<_> =
+        lifecycles.into_iter().map(|record| record.ino).collect();
+
+    assert!(inos.contains(&file.ino));
+    assert_eq!(inos.len(), 1);
+}
+
 // === Architecture Tests ===
 
 #[test]

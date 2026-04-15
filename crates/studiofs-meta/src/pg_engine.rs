@@ -1916,6 +1916,10 @@ impl MetaInodes for PgMetaEngine {
         self.local.get_inode_lifecycle(ino)
     }
 
+    fn list_inode_lifecycles(&self) -> MetaResult<Vec<InodeLifecycleRecord>> {
+        self.local.list_inode_lifecycles()
+    }
+
     fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
         self.local.get_attrs_batch(inos)
     }

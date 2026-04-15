@@ -217,6 +217,10 @@ pub trait MetaInodes: Send + Sync {
     /// file, when present.
     fn get_inode_lifecycle(&self, ino: Ino) -> MetaResult<Option<InodeLifecycleRecord>>;
 
+    /// Enumerate active lifecycle records for regular files plus any retained
+    /// deleted-before-publish tombstones.
+    fn list_inode_lifecycles(&self) -> MetaResult<Vec<InodeLifecycleRecord>>;
+
     /// Batch-fetch inode attributes.
     fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
         let mut attrs = Vec::with_capacity(inos.len());

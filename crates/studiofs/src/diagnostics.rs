@@ -39,7 +39,7 @@ use studiofs_vfs::vfs::VfsFileSessionStats;
 use studiofs_vfs::{
     StudioVfs, VFS_RUNTIME_EVENT_CAPACITY, VfsCacheStateSnapshot, VfsForegroundReadProtectionStats,
     VfsIngressStats, VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsUploadStats,
-    VfsWritePathObservabilitySnapshot,
+    VfsWritePathObservabilitySnapshot, VfsZeroIoRuntimeSnapshot,
 };
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(unix)]
@@ -69,7 +69,7 @@ pub(crate) const DIAGNOSTICS_RUNTIME_SURFACE_PROTOCOL_VERSION: u32 = 3;
 pub(crate) const DIAGNOSTICS_SAFE_ACTIONS_PROTOCOL_VERSION: u32 = 4;
 pub(crate) const DIAGNOSTICS_WORKFLOW_PROTOCOL_VERSION: u32 = 5;
 pub(crate) const DIAGNOSTICS_PROTOCOL_VERSION: u32 = DIAGNOSTICS_WORKFLOW_PROTOCOL_VERSION;
-const DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+const DIAGNOSTICS_RUNTIME_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_LEASE_TTL_MS: u64 = 5_000;
 const MAX_LEASE_TTL_MS: u64 = 60_000;
 const DEFAULT_RECENT_EVENTS_LIMIT: usize = 32;
@@ -199,6 +199,8 @@ pub(crate) struct DiagnosticsHealthSnapshot {
     pub file_sessions: VfsFileSessionStats,
     pub foreground_reads: VfsForegroundReadProtectionStats,
     pub write_path: VfsWritePathObservabilitySnapshot,
+    #[serde(default)]
+    pub zeroio: VfsZeroIoRuntimeSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -218,6 +220,8 @@ pub(crate) struct DiagnosticsRuntimeSnapshot {
     pub ingress: VfsIngressStats,
     pub write_path: VfsWritePathObservabilitySnapshot,
     pub upload: VfsUploadStats,
+    #[serde(default)]
+    pub zeroio: VfsZeroIoRuntimeSnapshot,
     pub cache: DiagnosticsCacheSnapshot,
     pub synchronization: DiagnosticsSynchronizationSnapshot,
 }
@@ -240,6 +244,7 @@ impl DiagnosticsRuntimeSnapshot {
                 },
             },
             upload: health.upload,
+            zeroio: health.zeroio,
         }
     }
 }
@@ -1260,6 +1265,9 @@ fn snapshot_sections_for_scope(
     }
     if subsystem_matches(filter, "upload_pipeline") {
         sections.insert("upload".to_string(), serde_json::json!(snapshot.upload));
+    }
+    if subsystem_matches(filter, "zeroio") {
+        sections.insert("zeroio".to_string(), serde_json::json!(snapshot.zeroio));
     }
     if subsystem_matches(filter, "cache") {
         sections.insert("cache".to_string(), serde_json::json!(snapshot.cache));
@@ -3508,6 +3516,7 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
             file_sessions: self.vfs.file_session_stats(),
             foreground_reads: self.vfs.foreground_read_protection_stats(),
             write_path: self.vfs.write_path_observability_snapshot(),
+            zeroio: self.vfs.zeroio_runtime_snapshot(),
         }
     }
 
@@ -3519,6 +3528,7 @@ impl DiagnosticsDataSource for LiveMountDiagnosticsSource {
             ingress: health.ingress,
             write_path: health.write_path,
             upload: health.upload,
+            zeroio: health.zeroio,
             cache: DiagnosticsCacheSnapshot {
                 state: self.vfs.cache_state_snapshot(),
             },
@@ -6822,7 +6832,7 @@ mod tests {
             panic!("expected runtime snapshot response");
         };
 
-        assert_eq!(snapshot.schema_version, 1);
+        assert_eq!(snapshot.schema_version, 2);
         assert_eq!(
             snapshot.upload.pending_uploads,
             source.health.upload.pending_uploads
@@ -6830,6 +6840,32 @@ mod tests {
         assert_eq!(
             snapshot.synchronization.state.file_sessions.open_handles,
             source.health.file_sessions.open_handles
+        );
+    }
+
+    #[test]
+    fn snapshot_sections_for_scope_includes_zeroio_section() {
+        let snapshot = DiagnosticsRuntimeSnapshot {
+            zeroio: VfsZeroIoRuntimeSnapshot {
+                unpublished_files: 3,
+                ..VfsZeroIoRuntimeSnapshot::default()
+            },
+            ..DiagnosticsRuntimeSnapshot::default()
+        };
+        let scope = DiagnosticsEvidenceScope {
+            subsystem: Some("zeroio".to_string()),
+            ..DiagnosticsEvidenceScope::default()
+        };
+
+        let sections = snapshot_sections_for_scope(&snapshot, &scope, None);
+
+        assert_eq!(sections.len(), 1);
+        assert_eq!(
+            sections
+                .get("zeroio")
+                .and_then(|value| value.get("unpublished_files"))
+                .and_then(|value| value.as_u64()),
+            Some(3)
         );
     }
 

@@ -46,5 +46,7 @@ pub use vfs::{
     VfsWritePathLatencyQuantilesSaturated, VfsWritePathObservabilitySnapshot,
     VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
     VfsWritePathWinfspCallbackStats, VfsWritePathWinfspForegroundFlushStats,
+    VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
+    VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
     is_hidden_non_macos_root_metadata_name,
 };

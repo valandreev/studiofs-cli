@@ -16,7 +16,10 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use tracing::{debug, warn};
 
-use crate::local::{LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState};
+use crate::local::{
+    LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState, LocalBlockObjectStats,
+    LocalBlockStorageStats,
+};
 
 pub mod cache_index;
 pub mod eviction;
@@ -847,6 +850,49 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
             }
         }
     }
+
+    fn storage_stats(&self) -> LocalBlockStorageStats {
+        match self.index.stats() {
+            Ok(stats) => LocalBlockStorageStats {
+                current_bytes: stats.current_bytes,
+                dirty_bytes: stats.dirty_bytes,
+                evictable_bytes: stats.evictable_bytes,
+            },
+            Err(error) => {
+                warn!(error = ?error, "cache-v3 index storage stats lookup failed");
+                LocalBlockStorageStats::default()
+            }
+        }
+    }
+
+    fn object_stats(&self, object_id: u64) -> Option<LocalBlockObjectStats> {
+        match self.index.get_entry(object_id) {
+            Ok(Some(entry)) => Some(LocalBlockObjectStats {
+                payload_len: entry.payload_len,
+                lifecycle: entry.lifecycle,
+                evictable: entry.evictable,
+            }),
+            Ok(None) => None,
+            Err(error) => {
+                warn!(
+                    object_id,
+                    error = ?error,
+                    "cache-v3 index object stats lookup failed"
+                );
+                None
+            }
+        }
+    }
+
+    fn object_ids(&self) -> Vec<u64> {
+        match self.index.access_order_object_ids() {
+            Ok(object_ids) => object_ids,
+            Err(error) => {
+                warn!(error = ?error, "cache-v3 index object id snapshot failed");
+                Vec::new()
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1286,6 +1332,34 @@ mod tests {
             LocalBlockLifecycleState::Missing
         );
         assert!(!backend.contains(10));
+    }
+
+    #[test]
+    fn cache_v3_backend_object_stats_do_not_prune_missing_payload_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x67; 16],
+        })
+        .unwrap();
+        backend.put(10, b"ten", false).unwrap();
+        backend.sync_data().unwrap();
+        std::fs::remove_file(layout.payload_block_path(10)).unwrap();
+
+        assert!(
+            backend.object_stats(10).is_some(),
+            "observational object_stats should use index state without probing payload files"
+        );
+        drop(backend);
+
+        let index = CacheIndex::open(&layout.redb_index_path).unwrap();
+        assert!(
+            index.get_entry(10).unwrap().is_some(),
+            "object_stats must not prune stale index state during diagnostics reads"
+        );
     }
 
     #[test]

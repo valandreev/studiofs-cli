@@ -2,7 +2,7 @@ mod worker;
 
 pub(super) use worker::UploadLifecycleWorker;
 
-use super::{Ino, StudioVfs, VfsError, VfsIngressStats, info, warn};
+use super::{Ino, StudioVfs, VfsError, VfsIngressStats, VfsZeroIoShutdownSnapshot, info, warn};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
@@ -245,14 +245,19 @@ impl StudioVfs {
     ///
     /// Called at shutdown so pending-upload state and local backend metadata
     /// stay consistent across remounts.
-    pub async fn persist_cache(&self) {
+    pub async fn persist_cache(&self) -> bool {
         self.upload_coordinator.shutdown().await;
         if let Err(error) = self.local_block_backend.sync_data() {
             warn!(error = %error, "local cache backend sync failed during shutdown");
+            tracing::info!(
+                "upload coordinator checkpoint persisted, but local cache backend sync failed"
+            );
+            false
         } else {
             tracing::info!("local cache backend sync persisted");
+            tracing::info!("upload coordinator checkpoint persisted");
+            true
         }
-        tracing::info!("upload coordinator checkpoint persisted");
     }
 
     /// Best-effort graceful shutdown: drain dirty buffers, persist final
@@ -368,25 +373,56 @@ impl StudioVfs {
         );
         let meta = self.sync_meta();
         let metadata_flush_timeout = self.shutdown_metadata_flush_timeout;
-        match super::run_sync_with_timeout(metadata_flush_timeout, move || {
-            meta.flush_metadata().map_err(VfsError::Meta)
-        }) {
-            Ok(Some(())) => {}
+        let metadata_flush_outcome = match super::run_sync_with_timeout(
+            metadata_flush_timeout,
+            move || meta.flush_metadata().map_err(VfsError::Meta),
+        ) {
+            Ok(Some(())) => "success",
             Ok(None) => {
                 warn!(
                     timeout_ms = metadata_flush_timeout.as_millis() as u64,
                     "VFS shutdown: metadata flush timed out, leaving remote sync for next session"
                 );
+                "timeout"
             }
             Err(e) => {
                 warn!("VFS shutdown: metadata flush failed: {}", e);
+                "failed"
             }
-        }
+        };
         // Stop any background metadata threads (e.g. PgMetaEngine poll) so
         // their Arc references are released before process exit, allowing
         // redb::Database::drop() to run cleanly.
         self.sync_meta().prepare_for_close();
-        self.persist_cache().await;
+        let local_payload_sync_ok = self.persist_cache().await;
+        let dirty_after = self.total_pending_write_buffer_bytes();
+        let pending_uploads_after = self.upload_coordinator.pending_upload_count();
+        let recoverable_on_restart = dirty_after == 0 && local_payload_sync_ok;
+        let shutdown_snapshot = VfsZeroIoShutdownSnapshot {
+            generated_unix_ms: now_unix_millis(),
+            accepted_write_buffer_bytes_before: dirty_before as u64,
+            accepted_write_buffer_bytes_after: dirty_after as u64,
+            pending_uploads_after,
+            uploader_drained_before_cancel: drained,
+            metadata_flush_outcome: metadata_flush_outcome.to_string(),
+            local_payload_sync_ok,
+            recoverable_on_restart,
+        };
+        self.record_runtime_event(
+            "zeroio",
+            "shutdown_local_state",
+            "zeroio graceful shutdown local durability",
+            serde_json::json!({
+                "accepted_write_buffer_bytes_before": shutdown_snapshot.accepted_write_buffer_bytes_before,
+                "accepted_write_buffer_bytes_after": shutdown_snapshot.accepted_write_buffer_bytes_after,
+                "pending_uploads_after": shutdown_snapshot.pending_uploads_after,
+                "uploader_drained_before_cancel": shutdown_snapshot.uploader_drained_before_cancel,
+                "metadata_flush_outcome": shutdown_snapshot.metadata_flush_outcome,
+                "local_payload_sync_ok": shutdown_snapshot.local_payload_sync_ok,
+                "recoverable_on_restart": shutdown_snapshot.recoverable_on_restart,
+            }),
+        );
+        self.persist_zeroio_shutdown_snapshot(&shutdown_snapshot);
         self.state
             .shutdown
             .shutdown_completed

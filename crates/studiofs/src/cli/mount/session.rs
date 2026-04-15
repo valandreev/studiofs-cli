@@ -2090,7 +2090,7 @@ mod tests {
                 .runtime_handle
                 .block_on(client.runtime_snapshot())
                 .expect("read runtime snapshot");
-            assert_eq!(runtime_snapshot.schema_version, 1);
+            assert_eq!(runtime_snapshot.schema_version, 2);
             assert_eq!(
                 runtime_snapshot.upload.pending_uploads,
                 health.upload.pending_uploads
