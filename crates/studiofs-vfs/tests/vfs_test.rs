@@ -518,6 +518,32 @@ fn apply_test_online_s3_env() {
     }
 }
 
+fn install_zeroio_replay_offline_env() {
+    let _env_lock = acquire_test_env_lock();
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_BUCKET", "studiofs-test");
+        std::env::set_var("STUDIOFS_S3_ACCESS_KEY", "studiofs");
+        std::env::set_var("STUDIOFS_S3_SECRET_KEY", "studiofs123");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+}
+
+fn install_zeroio_replay_online_env(upload_delay_ms: &str) {
+    let _env_lock = acquire_test_env_lock();
+    apply_test_online_s3_env();
+    unsafe {
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", upload_delay_ms);
+    }
+}
+
 fn make_format_info_with_endpoint(volume_suffix: &str, endpoint: &str) -> FormatInfo {
     let mut info = make_format_info(volume_suffix);
     info.endpoint = endpoint.to_string();
@@ -2641,6 +2667,381 @@ fn writer_recovers_local_file_after_restart_before_upload_complete() {
         });
         rt.shutdown_background();
     }
+}
+
+#[test]
+fn graceful_shutdown_remount_recovers_new_unpublished_file_before_publish() {
+    let _env = ScopedTestEnv::new();
+    install_zeroio_replay_offline_env();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("graceful-remount-new-file-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let data_config = DataStoreConfig::from(&format_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let payload = vec![0x7Bu8; 512 * 1024];
+    let ino = {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let ino = rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+                test_vfs_config_from_env(),
+            )
+            .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
+
+            let attr = vfs
+                .create(1, b"graceful-remount-new.bin", 0, 0, 0o644)
+                .unwrap();
+            vfs.write(attr.ino, 0, &payload).await.unwrap();
+            vfs.flush(attr.ino).await.unwrap();
+
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    !vfs.pending_uploads_for_inode(attr.ino).is_empty()
+                })
+                .await,
+                "offline setup should leave pending uploads before shutdown"
+            );
+
+            tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+                .await
+                .expect("shutdown should stay bounded");
+            attr.ino
+        });
+        rt.shutdown_background();
+        ino
+    };
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let reopened = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+            test_vfs_config_from_env(),
+        )
+        .unwrap();
+        reopened
+            .start()
+            .expect("failed to start reopened StudioVfs background workers");
+
+        let read = reopened.read(ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(
+            read.as_ref(),
+            payload.as_slice(),
+            "graceful remount must restore local visibility before publish completes"
+        );
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                !reopened.pending_uploads_for_inode(ino).is_empty()
+            })
+            .await,
+            "graceful remount must rebuild upload work from durable local state"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn graceful_shutdown_remount_preserves_newer_local_epoch_over_published_base() {
+    let _env = ScopedTestEnv::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let online_info = make_format_info("graceful-remount-overwrite-base");
+    let offline_info =
+        make_format_info_with_endpoint("graceful-remount-overwrite-base", "http://127.0.0.1:59999");
+    let data_config_offline = DataStoreConfig::from(&offline_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&online_info).unwrap();
+
+    install_zeroio_replay_offline_env();
+
+    let baseline_payload = vec![0x31u8; 256 * 1024];
+    let replacement_payload = vec![0x92u8; 256 * 1024];
+    let ino = {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let ino = rt.block_on(async {
+            let (seeded_ino, _) = seed_committed_file(
+                &meta,
+                &online_info,
+                b"graceful-remount-overwrite.bin",
+                &baseline_payload,
+            )
+            .await;
+            seeded_ino
+        });
+        rt.shutdown_background();
+        ino
+    };
+
+    meta.set_format_info(&offline_info).unwrap();
+    {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config_offline,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+                test_vfs_config_from_env(),
+            )
+            .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
+
+            vfs.write(ino, 0, &replacement_payload).await.unwrap();
+            vfs.flush(ino).await.unwrap();
+
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    vfs.pending_uploads_for_inode(ino).len() == 1
+                })
+                .await,
+                "offline overwrite should leave one pending upload before shutdown"
+            );
+
+            let read = vfs
+                .read(ino, 0, replacement_payload.len() as u32)
+                .await
+                .unwrap();
+            assert_eq!(read.as_ref(), replacement_payload.as_slice());
+
+            tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+                .await
+                .expect("shutdown should stay bounded");
+        });
+        rt.shutdown_background();
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let reopened = StudioVfs::new(
+            meta.clone(),
+            &data_config_offline,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+            test_vfs_config_from_env(),
+        )
+        .unwrap();
+        reopened
+            .start()
+            .expect("failed to start reopened StudioVfs background workers");
+
+        let read = reopened
+            .read(ino, 0, replacement_payload.len() as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            read.as_ref(),
+            replacement_payload.as_slice(),
+            "writer remount must see the newer unpublished epoch over the published base"
+        );
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                reopened.pending_uploads_for_inode(ino).len() == 1
+            })
+            .await,
+            "overwrite remount must rebuild exactly the latest unpublished upload work"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
+fn repeated_graceful_restarts_during_upload_replay_are_idempotent() {
+    let _env = ScopedTestEnv::new();
+
+    let boot_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    boot_rt.block_on(ensure_bucket());
+    boot_rt.shutdown_background();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let online_info = make_format_info("graceful-restart-idempotent");
+    let offline_info =
+        make_format_info_with_endpoint("graceful-restart-idempotent", "http://127.0.0.1:59999");
+    let data_config_offline = DataStoreConfig::from(&offline_info);
+    let data_config_online = DataStoreConfig::from(&online_info);
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&offline_info).unwrap();
+
+    install_zeroio_replay_offline_env();
+    unsafe {
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
+    }
+
+    let payload = vec![0xA5u8; 512 * 1024];
+    let ino = {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let ino = rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config_offline,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+                test_vfs_config_from_env(),
+            )
+            .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
+
+            let attr = vfs
+                .create(1, b"graceful-restart-idempotent.bin", 0, 0, 0o644)
+                .unwrap();
+            vfs.write(attr.ino, 0, &payload).await.unwrap();
+            vfs.flush(attr.ino).await.unwrap();
+
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    !vfs.pending_uploads_for_inode(attr.ino).is_empty()
+                })
+                .await,
+                "offline setup should create pending upload work before shutdown"
+            );
+
+            tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+                .await
+                .expect("shutdown should stay bounded");
+            attr.ino
+        });
+        rt.shutdown_background();
+        ino
+    };
+
+    let mut pending_snapshots = Vec::new();
+    for _ in 0..2 {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let snapshot = rt.block_on(async {
+            let vfs = StudioVfs::new(
+                meta.clone(),
+                &data_config_offline,
+                &cache_dir_str,
+                1024 * 1024 * 1024,
+                512 * 1024 * 1024,
+                test_vfs_config_from_env(),
+            )
+            .unwrap();
+            vfs.start()
+                .expect("failed to start StudioVfs background workers");
+
+            let read = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
+            assert_eq!(read.as_ref(), payload.as_slice());
+
+            assert!(
+                wait_until(Duration::from_secs(10), || {
+                    !vfs.pending_uploads_for_inode(ino).is_empty()
+                })
+                .await,
+                "each replay pass should rebuild upload work"
+            );
+            let snapshot = vfs.pending_uploads_for_inode(ino);
+
+            tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+                .await
+                .expect("shutdown should stay bounded");
+            snapshot
+        });
+        rt.shutdown_background();
+        pending_snapshots.push(snapshot);
+    }
+
+    assert_eq!(
+        pending_snapshots[0], pending_snapshots[1],
+        "repeated graceful restarts must replay the same latest unfinished epoch without duplicating upload accounting"
+    );
+
+    install_zeroio_replay_online_env("0");
+    meta.set_format_info(&online_info).unwrap();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let reopened = StudioVfs::new(
+            meta.clone(),
+            &data_config_online,
+            &cache_dir_str,
+            1024 * 1024 * 1024,
+            512 * 1024 * 1024,
+            test_vfs_config_from_env(),
+        )
+        .unwrap();
+        reopened
+            .start()
+            .expect("failed to start reopened StudioVfs background workers");
+
+        assert!(
+            wait_until(Duration::from_secs(20), || {
+                reopened.pending_uploads_for_inode(ino).is_empty()
+                    && meta
+                        .get_attr(ino)
+                        .map(|attr| {
+                            attr.upload_state == UploadState::Ready
+                                && attr.committed_content_epoch == attr.content_epoch
+                        })
+                        .unwrap_or(false)
+            })
+            .await,
+            "after repeated replay, publish should still complete exactly once for the latest epoch"
+        );
+    });
+    rt.shutdown_background();
 }
 
 #[test]
