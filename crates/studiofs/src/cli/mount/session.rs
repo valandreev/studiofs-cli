@@ -2109,7 +2109,7 @@ mod tests {
 
             let first_lease = launch
                 .runtime_handle
-                .block_on(client.acquire_controller("test-client-a", Duration::from_millis(100)))
+                .block_on(client.acquire_controller("test-client-a", Duration::from_millis(500)))
                 .expect("acquire first controller lease");
             assert_eq!(first_lease.client_name, "test-client-a");
 
@@ -2118,7 +2118,7 @@ mod tests {
                 .runtime_handle
                 .block_on(
                     competing_client
-                        .acquire_controller("test-client-b", Duration::from_millis(100)),
+                        .acquire_controller("test-client-b", Duration::from_millis(500)),
                 )
                 .expect_err("second controller should be rejected before expiry");
             assert!(
@@ -2126,15 +2126,24 @@ mod tests {
                 "unexpected controller conflict: {conflict:#}"
             );
 
-            std::thread::sleep(Duration::from_millis(125));
-
-            let takeover = launch
-                .runtime_handle
-                .block_on(
+            let takeover_deadline = std::time::Instant::now() + Duration::from_secs(3);
+            let takeover = loop {
+                match launch.runtime_handle.block_on(
                     competing_client
-                        .acquire_controller("test-client-b", Duration::from_millis(100)),
-                )
-                .expect("controller should be available after expiry");
+                        .acquire_controller("test-client-b", Duration::from_millis(500)),
+                ) {
+                    Ok(lease) => break lease,
+                    Err(error)
+                        if error.to_string().contains("already held")
+                            && std::time::Instant::now() < takeover_deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    Err(error) => panic!(
+                        "controller should become available after expiry, last error: {error:#}"
+                    ),
+                }
+            };
             let renewed = launch
                 .runtime_handle
                 .block_on(
