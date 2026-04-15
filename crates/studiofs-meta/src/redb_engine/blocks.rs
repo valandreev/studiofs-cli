@@ -745,6 +745,7 @@ impl MetaBlocks for RedbMetaEngine {
 
             let (committed_size, removed_object_ids) =
                 Self::publish_regular_file_overlay_to_base_in_txn(&txn, ino)?;
+            let published_blocks = Self::base_manifest_from_graph_rows_in_txn(&txn, ino)?;
             if !removed_object_ids.is_empty() {
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -773,6 +774,13 @@ impl MetaBlocks for RedbMetaEngine {
             Self::set_inode_overlay_in_txn(&txn, &attr)?;
             Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
 
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::PublishFileManifest {
+                    ino,
+                    blocks: published_blocks,
+                },
+            )?;
             Self::append_event_in_txn(
                 &txn,
                 &crate::events::MetaEvent::SetAttr { attr: attr.clone() },

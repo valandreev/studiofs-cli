@@ -820,7 +820,6 @@ impl PgMetaEngine {
                 | MetaEvent::RemoveFileBlock { .. }
                 | MetaEvent::RemoveFileBlocks { .. }
                 | MetaEvent::SetFileBlocksBatch { .. }
-                | MetaEvent::SetRegularFileOverlaySlices { .. }
                 | MetaEvent::CommitFileBlock { .. } => {}
                 MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => {}
                 MetaEvent::CreateSnapshot { snapshot } => {
@@ -3227,7 +3226,7 @@ mod tests {
             .expect("lookup published file");
         assert_eq!(remote_file.ino, file.ino);
 
-        let delete_start = seed_end;
+        let upload_start = seed_end;
         set_file_state(&writer, file.ino, 4096, 2);
         let uploaded_overlay = BlockRef::new_partial(905, 4096);
         writer
@@ -3239,6 +3238,13 @@ mod tests {
                 .expect("mark overlay uploaded"),
             "overlay upload marker must succeed"
         );
+        let upload_end = writer
+            .local
+            .get_counter("nextEventSeq")
+            .expect("upload end");
+
+        apply_projected_remote_range(&writer, &remote, upload_start, upload_end);
+
         writer
             .unlink(dir.ino, b"final.bin")
             .expect("unlink unpublished replacement");
@@ -3247,7 +3253,7 @@ mod tests {
             .get_counter("nextEventSeq")
             .expect("delete end");
 
-        apply_projected_remote_range(&writer, &remote, delete_start, delete_end);
+        apply_projected_remote_range(&writer, &remote, upload_end, delete_end);
 
         let remote_after = remote
             .lookup(remote_dir.ino, b"final.bin")
@@ -3285,6 +3291,50 @@ mod tests {
                 .all(|(object_id, _timestamp)| *object_id != 904),
             "last published object must remain referenced"
         );
+    }
+
+    #[test]
+    fn unit_remote_projection_preserves_overlay_publish_path() {
+        let (_writer_dir, writer) = temp_pg_engine_for_unit();
+        let (_remote_dir, remote) = temp_pg_engine_for_unit();
+
+        let start = writer.local.get_counter("nextEventSeq").expect("start seq");
+        let file = writer
+            .create_file(ROOT_INO, b"overlay.bin", 0, 0, 0o644)
+            .expect("create overlay file");
+        set_file_state(&writer, file.ino, 4096, 1);
+        let block = BlockRef::new_partial(906, 4096);
+        writer
+            .set_file_block(file.ino, 0, &block)
+            .expect("set overlay block");
+        assert!(
+            writer
+                .mark_file_block_uploaded_if_matches(file.ino, 0, 1, &block)
+                .expect("mark overlay uploaded"),
+            "uploaded marker must succeed"
+        );
+        assert!(
+            writer
+                .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+                .expect("publish overlay to base"),
+            "overlay publish must succeed"
+        );
+        let end = writer.local.get_counter("nextEventSeq").expect("end seq");
+
+        apply_projected_remote_range(&writer, &remote, start, end);
+
+        let remote_file = remote
+            .lookup(ROOT_INO, b"overlay.bin")
+            .expect("lookup overlay file");
+        let remote_attr = remote.get_attr(remote_file.ino).expect("remote attr");
+        assert_eq!(remote_attr.size, 4096);
+        assert_eq!(remote_attr.committed_size, 4096);
+        assert_eq!(remote_attr.committed_content_epoch, 1);
+        assert_eq!(remote_attr.upload_state, UploadState::Ready);
+        let remote_blocks = remote
+            .get_file_blocks(remote_file.ino)
+            .expect("remote overlay blocks");
+        assert_eq!(remote_blocks, vec![(0, block)]);
     }
 
     #[test]

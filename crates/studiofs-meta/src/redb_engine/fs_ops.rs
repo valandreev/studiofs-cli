@@ -417,6 +417,16 @@ impl<'a> NamespaceDeleteTxn<'a> {
         } else {
             None
         };
+        let published_manifest = if deleted_before_publish
+            .as_ref()
+            .is_some_and(|record| record.has_published_base)
+        {
+            Some(RedbMetaEngine::base_manifest_from_graph_rows_in_txn(
+                self.txn, entry.ino,
+            )?)
+        } else {
+            None
+        };
 
         if spec.records_deferred_delete() {
             RedbMetaEngine::set_inode_overlay_in_txn(self.txn, &attr)?;
@@ -442,7 +452,13 @@ impl<'a> NamespaceDeleteTxn<'a> {
             self.record_deferred_delete(spec, entry.ino)?;
         }
 
-        self.append_unlink_events(spec, &attr, &parent_attr, deleted_before_publish.as_ref())?;
+        self.append_unlink_events(
+            spec,
+            &attr,
+            &parent_attr,
+            deleted_before_publish.as_ref(),
+            published_manifest.as_deref(),
+        )?;
         Ok(NamespaceDeleteResult::File(attr))
     }
 
@@ -574,11 +590,19 @@ impl<'a> NamespaceDeleteTxn<'a> {
         attr: &InodeAttr,
         parent_attr: &InodeAttr,
         deleted_before_publish: Option<&InodeLifecycleRecord>,
+        published_manifest: Option<&[(u32, BlockRef)]>,
     ) -> MetaResult<()> {
         if deleted_before_publish
             .map(|record| record.has_published_base)
             .unwrap_or(false)
         {
+            RedbMetaEngine::append_event_in_txn(
+                self.txn,
+                &crate::events::MetaEvent::PublishFileManifest {
+                    ino: attr.ino,
+                    blocks: published_manifest.unwrap_or_default().to_vec(),
+                },
+            )?;
             let mut remote_attr = attr.clone();
             remote_attr.nlink = remote_attr.nlink.saturating_add(1);
             remote_attr.size = remote_attr.committed_size;
