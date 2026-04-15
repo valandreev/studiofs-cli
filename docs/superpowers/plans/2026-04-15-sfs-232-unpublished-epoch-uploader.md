@@ -13,8 +13,8 @@
 ### Task 1: Lock the failing behavior in tests
 
 **Files:**
-- Modify: `E:/dev/studiofs-cli/crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs`
-- Modify: `E:/dev/studiofs-cli/crates/studiofs-meta/src/redb_engine/tests/blocks.rs`
+- Modify: `crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs`
+- Modify: `crates/studiofs-meta/src/redb_engine/tests/blocks.rs`
 
 - [ ] Add a metadata test that proves uploaded overlay slices transition inode lifecycle to `PublishReady` without publishing the inode yet.
 - [ ] Run only the new metadata test and verify it fails for the expected reason.
@@ -24,10 +24,10 @@
 ### Task 2: Add durable per-block uploaded bookkeeping
 
 **Files:**
-- Modify: `E:/dev/studiofs-cli/crates/studiofs-meta/src/engine.rs`
-- Modify: `E:/dev/studiofs-cli/crates/studiofs-vfs/src/runtime.rs`
-- Modify: `E:/dev/studiofs-cli/crates/studiofs-meta/src/redb_engine/blocks.rs`
-- Modify: `E:/dev/studiofs-cli/crates/studiofs-meta/src/pg_engine.rs`
+- Modify: `crates/studiofs-meta/src/engine.rs`
+- Modify: `crates/studiofs-vfs/src/runtime.rs`
+- Modify: `crates/studiofs-meta/src/redb_engine/blocks.rs`
+- Modify: `crates/studiofs-meta/src/pg_engine.rs`
 
 - [ ] Add a metadata API that marks the current overlay block for `(ino, block_index, expected_epoch, expected_block)` as uploaded without publishing base visibility.
 - [ ] Implement the Redb mutation so it updates overlay slice state to `Uploaded`, preserves stale-epoch rejection, and rebuilds inode lifecycle.
@@ -37,7 +37,7 @@
 ### Task 3: Make upload success advance epoch state
 
 **Files:**
-- Modify: `E:/dev/studiofs-cli/crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs`
+- Modify: `crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs`
 
 - [ ] Update the upload worker success path to mark metadata block state as uploaded before local post-upload cleanup.
 - [ ] Keep retry, delete-cancel, and stale-epoch short-circuit behavior unchanged for local readability.
@@ -47,9 +47,9 @@
 ### Task 4: Replace queue-emptiness publication gating with explicit publish barrier
 
 **Files:**
-- Modify: `E:/dev/studiofs-cli/crates/studiofs-vfs/src/commit.rs`
-- Modify: `E:/dev/studiofs-cli/crates/studiofs-vfs/src/vfs/workers.rs`
-- Modify: `E:/dev/studiofs-cli/crates/studiofs-vfs/src/vfs.rs`
+- Modify: `crates/studiofs-vfs/src/commit.rs`
+- Modify: `crates/studiofs-vfs/src/vfs/workers.rs`
+- Modify: `crates/studiofs-vfs/src/vfs.rs`
 
 - [ ] Change finalization so the current epoch publishes only when metadata says the inode lifecycle is `PublishReady`.
 - [ ] Preserve stale-epoch suppression by re-reading current attr/lifecycle before publish and skipping superseded epochs.
@@ -59,7 +59,7 @@
 ### Task 5: Cover restart-safe and visibility semantics with focused tests
 
 **Files:**
-- Modify: `E:/dev/studiofs-cli/crates/studiofs-vfs/tests/vfs_test.rs`
+- Modify: `crates/studiofs-vfs/tests/vfs_test.rs`
 
 - [ ] Add or adapt focused tests for successful upload to publish-ready to publish, retry/requeue without local read regression, and stale-epoch suppression when a newer epoch supersedes an older one.
 - [ ] Keep test runs scoped to the changed tests only; do not run the full workspace suite.
@@ -68,8 +68,8 @@
 ### Task 6: Refresh docs to match the new uploader contract
 
 **Files:**
-- Modify: `E:/dev/studiofs-cli/docs/vfs.md`
-- Modify: `E:/dev/studiofs-cli/docs/metadata.md`
+- Modify: `docs/vfs.md`
+- Modify: `docs/metadata.md`
 
 - [ ] Update docs so the uploader is described as data-plane only, with durable epoch progress stored in metadata and `PublishReady` as the explicit publish barrier.
 - [ ] Mention that the same local payload objects stay in one cache and only lifecycle/retention metadata changes across upload and publish.

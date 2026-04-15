@@ -11,6 +11,16 @@ pub(super) enum EpochFinalizeStatus {
     Skipped,
 }
 
+enum FinalizeExtentPlan {
+    Overlay { object_ids: Vec<u64> },
+    Manifest { blocks: Vec<(u32, BlockRef)> },
+}
+
+struct FinalizeMetaSnapshot {
+    lifecycle: Option<studiofs_meta::InodeLifecycleRecord>,
+    extent_plan: FinalizeExtentPlan,
+}
+
 impl CommitCoordinator {
     pub(super) async fn finalize_inode_epoch(
         vfs: &StudioVfs,
@@ -46,14 +56,25 @@ impl CommitCoordinator {
             return Ok(EpochFinalizeStatus::Deferred);
         }
 
-        let has_persisted_overlay = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-            engine.has_local_regular_file_overlay(ino)
+        let meta = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            let has_persisted_overlay = engine.has_local_regular_file_overlay(ino)?;
+            let lifecycle = engine.get_inode_lifecycle(ino)?;
+            let extent_plan = if has_persisted_overlay {
+                FinalizeExtentPlan::Overlay {
+                    object_ids: engine.get_regular_file_overlay_object_ids(ino)?,
+                }
+            } else {
+                FinalizeExtentPlan::Manifest {
+                    blocks: engine.get_file_blocks(ino)?,
+                }
+            };
+            Ok(FinalizeMetaSnapshot {
+                lifecycle,
+                extent_plan,
+            })
         })
         .await?;
-        let lifecycle = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-            engine.get_inode_lifecycle(ino)
-        })
-        .await?;
+        let lifecycle = meta.lifecycle;
         let Some(lifecycle) = lifecycle else {
             tracing::debug!(
                 ino,
@@ -77,7 +98,7 @@ impl CommitCoordinator {
                 vfs,
                 ino,
                 content_epoch,
-                has_persisted_overlay,
+                &meta.extent_plan,
             )
             .await?;
             if legacy_publishable {
@@ -98,11 +119,10 @@ impl CommitCoordinator {
             }
         }
 
-        let published = if has_persisted_overlay {
-            let overlay_object_ids = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-                engine.get_regular_file_overlay_object_ids(ino)
-            })
-            .await?;
+        let published = if let FinalizeExtentPlan::Overlay {
+            object_ids: overlay_object_ids,
+        } = &meta.extent_plan
+        {
             if !overlay_object_ids.is_empty() {
                 let extents_to_verify: Vec<(u32, ExtentRecordId)> = overlay_object_ids
                     .iter()
@@ -124,10 +144,10 @@ impl CommitCoordinator {
             })
             .await?
         } else {
-            let required_blocks = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-                engine.get_file_blocks(ino)
-            })
-            .await?;
+            let required_blocks = match &meta.extent_plan {
+                FinalizeExtentPlan::Manifest { blocks } => blocks.clone(),
+                FinalizeExtentPlan::Overlay { .. } => unreachable!("overlay path handled above"),
+            };
             if !required_blocks.is_empty() {
                 let extents_to_verify: Vec<(u32, ExtentRecordId)> = required_blocks
                     .iter()
@@ -290,7 +310,7 @@ impl CommitCoordinator {
         vfs: &StudioVfs,
         ino: Ino,
         content_epoch: u64,
-        has_persisted_overlay: bool,
+        extent_plan: &FinalizeExtentPlan,
     ) -> VfsResult<bool> {
         let pending_same_epoch = vfs
             .upload_coordinator()
@@ -301,19 +321,12 @@ impl CommitCoordinator {
             return Ok(false);
         }
 
-        let required_object_ids = if has_persisted_overlay {
-            run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-                engine.get_regular_file_overlay_object_ids(ino)
-            })
-            .await?
-        } else {
-            run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-                engine.get_file_blocks(ino)
-            })
-            .await?
-            .into_iter()
-            .map(|(_, block_ref)| block_ref.object_id)
-            .collect()
+        let required_object_ids: Vec<u64> = match extent_plan {
+            FinalizeExtentPlan::Overlay { object_ids } => object_ids.clone(),
+            FinalizeExtentPlan::Manifest { blocks } => blocks
+                .iter()
+                .map(|(_, block_ref)| block_ref.object_id)
+                .collect(),
         };
 
         Ok(required_object_ids.into_iter().all(|object_id| {

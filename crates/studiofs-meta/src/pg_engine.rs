@@ -2112,9 +2112,13 @@ impl MetaBlocks for PgMetaEngine {
         expected_epoch: u64,
         block: &BlockRef,
     ) -> MetaResult<bool> {
-        self.mutate(|local| {
+        let result = self.mutate(|local| {
             local.mark_file_block_uploaded_if_matches(ino, block_index, expected_epoch, block)
-        })
+        });
+        if matches!(result, Ok(true)) {
+            self.request_pending_flush();
+        }
+        result
     }
 
     fn publish_file_manifest_if_matches(

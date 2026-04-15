@@ -584,7 +584,14 @@ impl MetaBlocks for RedbMetaEngine {
                 uploaded_slices.as_slice(),
                 true,
             )?;
-            Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetRegularFileOverlaySlices {
+                    ino,
+                    chunk_slices: uploaded_slices.clone(),
+                },
+            )?;
+            Self::sync_unpublished_upload_progress_lifecycle_in_txn(&txn, &attr)?;
         }
 
         txn.commit()
