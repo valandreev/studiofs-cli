@@ -518,6 +518,32 @@ fn apply_test_online_s3_env() {
     }
 }
 
+fn install_zeroio_replay_offline_env() {
+    let _env_lock = acquire_test_env_lock();
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_S3_BUCKET", "studiofs-test");
+        std::env::set_var("STUDIOFS_S3_ACCESS_KEY", "studiofs");
+        std::env::set_var("STUDIOFS_S3_SECRET_KEY", "studiofs123");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+}
+
+fn install_zeroio_replay_online_env(upload_delay_ms: &str) {
+    let _env_lock = acquire_test_env_lock();
+    apply_test_online_s3_env();
+    unsafe {
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", upload_delay_ms);
+    }
+}
+
 fn make_format_info_with_endpoint(volume_suffix: &str, endpoint: &str) -> FormatInfo {
     let mut info = make_format_info(volume_suffix);
     info.endpoint = endpoint.to_string();
@@ -2645,20 +2671,8 @@ fn writer_recovers_local_file_after_restart_before_upload_complete() {
 
 #[test]
 fn graceful_shutdown_remount_recovers_new_unpublished_file_before_publish() {
-    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
-    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
-    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
-    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
-    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-    }
+    let _env = ScopedTestEnv::new();
+    install_zeroio_replay_offline_env();
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
@@ -2752,12 +2766,7 @@ fn graceful_shutdown_remount_recovers_new_unpublished_file_before_publish() {
 
 #[test]
 fn graceful_shutdown_remount_preserves_newer_local_epoch_over_published_base() {
-    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
-    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
-    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
-    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
-    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    let _env = ScopedTestEnv::new();
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -2770,14 +2779,7 @@ fn graceful_shutdown_remount_preserves_newer_local_epoch_over_published_base() {
     meta.init_root(0, 0).unwrap();
     meta.set_format_info(&online_info).unwrap();
 
-    unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
-    }
+    install_zeroio_replay_offline_env();
 
     let baseline_payload = vec![0x31u8; 256 * 1024];
     let replacement_payload = vec![0x92u8; 256 * 1024];
@@ -2886,13 +2888,7 @@ fn graceful_shutdown_remount_preserves_newer_local_epoch_over_published_base() {
 #[test]
 #[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn repeated_graceful_restarts_during_upload_replay_are_idempotent() {
-    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
-    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
-    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
-    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
-    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    let _env = ScopedTestEnv::new();
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2914,13 +2910,8 @@ fn repeated_graceful_restarts_during_upload_replay_are_idempotent() {
     meta.init_root(0, 0).unwrap();
     meta.set_format_info(&offline_info).unwrap();
 
+    install_zeroio_replay_offline_env();
     unsafe {
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
-        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
-        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
         std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
     }
 
@@ -3013,13 +3004,7 @@ fn repeated_graceful_restarts_during_upload_replay_are_idempotent() {
         "repeated graceful restarts must replay the same latest unfinished epoch without duplicating upload accounting"
     );
 
-    unsafe {
-        apply_test_online_s3_env();
-        std::env::remove_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
-        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
-        std::env::remove_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
-        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "0");
-    }
+    install_zeroio_replay_online_env("0");
     meta.set_format_info(&online_info).unwrap();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
