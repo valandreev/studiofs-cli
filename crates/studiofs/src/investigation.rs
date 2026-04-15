@@ -25,6 +25,8 @@ pub(crate) const INVESTIGATION_WORKFLOW_RUN_SCHEMA_VERSION: u32 = 1;
 static TEST_BASE_DIR: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
 static TEST_SAVE_JSON_FAILURE_PATTERN: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+#[cfg(test)]
+static INVESTIGATION_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct InvestigationCase {
@@ -1518,6 +1520,13 @@ pub(crate) fn set_test_store_base_dir(path: Option<&Path>) {
 }
 
 #[cfg(test)]
+pub(crate) fn lock_investigation_test_mutex() -> parking_lot::MutexGuard<'static, ()> {
+    INVESTIGATION_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+}
+
+#[cfg(test)]
 fn test_save_json_failure_pattern() -> Option<String> {
     TEST_SAVE_JSON_FAILURE_PATTERN
         .get_or_init(|| Mutex::new(None))
@@ -2580,8 +2589,16 @@ mod tests {
 
     #[test]
     fn workflow_run_persists_step_status_artifacts_and_operator_acknowledgement() {
+        let _guard = lock_investigation_test_mutex();
         let temp = tempfile::tempdir().expect("tempdir");
         set_test_store_base_dir(Some(temp.path()));
+        struct ResetStoreDir;
+        impl Drop for ResetStoreDir {
+            fn drop(&mut self) {
+                set_test_store_base_dir(None);
+            }
+        }
+        let _reset_store_dir = ResetStoreDir;
         let store = InvestigationStore::default_store().expect("store");
         let case = store
             .create_case(NewInvestigationCase {

@@ -29,7 +29,9 @@ impl RedbMetaEngine {
             })
             .transpose()?;
         drop(settings);
-        if current_version == Some(CURRENT_INODE_LIFECYCLE_SCHEMA_VERSION) {
+        if current_version == Some(CURRENT_INODE_LIFECYCLE_SCHEMA_VERSION)
+            && Self::inode_lifecycle_table_is_current_in_txn(&txn)?
+        {
             txn.abort().map_err(|e| MetaError::Storage(e.to_string()))?;
             return Ok(());
         }
@@ -97,6 +99,53 @@ impl RedbMetaEngine {
                 .insert(record.ino, bytes.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
+        let regular_attrs = {
+            let inodes = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut attrs = Vec::new();
+            for row in inodes
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (_ino, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                let attr: InodeAttr = decode(value.value())?;
+                if attr.kind == FileType::RegularFile {
+                    attrs.push(attr);
+                }
+            }
+            attrs
+        };
+        for attr in regular_attrs {
+            let record = Self::compute_inode_lifecycle_record_in_txn(txn, &attr)?;
+            let bytes = encode(&record)?;
+            lifecycle
+                .insert(record.ino, bytes.as_slice())
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        drop(lifecycle);
+        Self::set_inode_lifecycle_schema_version_in_txn(txn)?;
+        Ok(())
+    }
+
+    fn inode_lifecycle_table_is_current_in_txn(txn: &redb::WriteTransaction) -> MetaResult<bool> {
+        let lifecycle = txn
+            .open_table(INODE_LIFECYCLE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let mut lifecycle_rows = lifecycle
+            .iter()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        if let Some(row) = lifecycle_rows.next() {
+            let _ = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            return Ok(true);
+        }
+        drop(lifecycle_rows);
+        drop(lifecycle);
+
+        Ok(!Self::has_regular_file_inodes_in_txn(txn)?)
+    }
+
+    fn has_regular_file_inodes_in_txn(txn: &redb::WriteTransaction) -> MetaResult<bool> {
         let inodes = txn
             .open_table(INODES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -106,19 +155,11 @@ impl RedbMetaEngine {
         {
             let (_ino, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
             let attr: InodeAttr = decode(value.value())?;
-            if attr.kind != FileType::RegularFile {
-                continue;
+            if attr.kind == FileType::RegularFile {
+                return Ok(true);
             }
-            let record = Self::compute_inode_lifecycle_record_in_txn(txn, &attr)?;
-            let bytes = encode(&record)?;
-            lifecycle
-                .insert(record.ino, bytes.as_slice())
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
-        drop(inodes);
-        drop(lifecycle);
-        Self::set_inode_lifecycle_schema_version_in_txn(txn)?;
-        Ok(())
+        Ok(false)
     }
 
     fn set_inode_lifecycle_schema_version_in_txn(txn: &redb::WriteTransaction) -> MetaResult<()> {
@@ -582,5 +623,76 @@ impl MetaInodes for RedbMetaEngine {
             }
         }
         Ok(attrs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn test_format_info(name: &str) -> FormatInfo {
+        FormatInfo::new(
+            name.to_string(),
+            format!("{name}-uuid"),
+            FormatInfoDataStore {
+                endpoint: "https://storage.example".to_string(),
+                bucket: "bucket-demo".to_string(),
+                access_key: "access-key".to_string(),
+                secret_key: "secret-key".to_string(),
+                region: String::new(),
+            },
+            u32::from(CURRENT_FORMAT_VERSION),
+        )
+    }
+
+    #[test]
+    fn ensure_inode_lifecycle_table_recovers_empty_table_with_current_version() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("inode-lifecycle-empty.redb");
+
+        let file_ino = {
+            let engine = RedbMetaEngine::open(&db_path).unwrap();
+            engine.init_root(1000, 1000).unwrap();
+            engine
+                .set_format_info(&test_format_info("inode-lifecycle-empty"))
+                .unwrap();
+            let file = engine
+                .create_file(ROOT_INO, b"rebuild-me.bin", 1000, 1000, 0o644)
+                .unwrap();
+            let mut attr = engine.get_attr(file.ino).unwrap();
+            attr.size = 4096;
+            attr.content_epoch = 1;
+            engine.set_attr(&attr).unwrap();
+            engine
+                .set_file_block(file.ino, 0, &BlockRef::new_partial(777, 4096))
+                .unwrap();
+            file.ino
+        };
+
+        {
+            let db = Database::create(&db_path).unwrap();
+            let txn = db.begin_write().unwrap();
+            let mut lifecycle = txn.open_table(INODE_LIFECYCLE_TABLE).unwrap();
+            lifecycle.retain(|_, _| false).unwrap();
+            drop(lifecycle);
+            let mut settings = txn.open_table(SETTINGS_TABLE).unwrap();
+            settings
+                .insert(
+                    INODE_LIFECYCLE_SCHEMA_VERSION_KEY,
+                    CURRENT_INODE_LIFECYCLE_SCHEMA_VERSION
+                        .to_le_bytes()
+                        .as_slice(),
+                )
+                .unwrap();
+            drop(settings);
+            txn.commit().unwrap();
+        }
+
+        let reopened = RedbMetaEngine::open(&db_path).unwrap();
+        let lifecycle = reopened.get_inode_lifecycle(file_ino).unwrap().unwrap();
+        assert_eq!(lifecycle.state, InodeLifecycleState::LocalOnly);
+        assert_eq!(lifecycle.local_visible_size, 4096);
+        assert_eq!(lifecycle.local_content_epoch, 1);
     }
 }

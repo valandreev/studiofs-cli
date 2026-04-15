@@ -1521,7 +1521,8 @@ mod tests {
     use crate::diagnostics;
     use crate::investigation::{
         DiagnosticsPreset, InvestigationStore, NewTimelineEntry, ProfilingCaptureMode,
-        ProfilingWindowStatus, TimelineEntryKind, TimelineEntrySource, set_test_store_base_dir,
+        ProfilingWindowStatus, TimelineEntryKind, TimelineEntrySource,
+        lock_investigation_test_mutex, set_test_store_base_dir,
     };
     use std::io;
     use std::sync::{Arc, Mutex};
@@ -2037,6 +2038,7 @@ mod tests {
     #[test]
     fn mount_session_launch_publishes_live_diagnostics_and_supports_attach() {
         let _guard = diagnostics::lock_diagnostics_test_mutex();
+        let _investigation_guard = lock_investigation_test_mutex();
         let temp = tempfile::tempdir().expect("tempdir");
         let store_dir = temp.path().join("investigations-store");
         set_test_store_base_dir(Some(&store_dir));
@@ -2109,7 +2111,7 @@ mod tests {
 
             let first_lease = launch
                 .runtime_handle
-                .block_on(client.acquire_controller("test-client-a", Duration::from_millis(500)))
+                .block_on(client.acquire_controller("test-client-a", Duration::from_millis(100)))
                 .expect("acquire first controller lease");
             assert_eq!(first_lease.client_name, "test-client-a");
 
@@ -2118,7 +2120,7 @@ mod tests {
                 .runtime_handle
                 .block_on(
                     competing_client
-                        .acquire_controller("test-client-b", Duration::from_millis(500)),
+                        .acquire_controller("test-client-b", Duration::from_millis(100)),
                 )
                 .expect_err("second controller should be rejected before expiry");
             assert!(
@@ -2130,7 +2132,7 @@ mod tests {
             let takeover = loop {
                 match launch.runtime_handle.block_on(
                     competing_client
-                        .acquire_controller("test-client-b", Duration::from_millis(500)),
+                        .acquire_controller("test-client-b", Duration::from_millis(100)),
                 ) {
                     Ok(lease) => break lease,
                     Err(error)
