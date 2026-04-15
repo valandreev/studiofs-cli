@@ -118,15 +118,10 @@ impl StudioVfs {
             LastHandleReleaseAction::LocalSync {
                 sticky_error_policy,
             } => {
-                let local_sync_policy = if self.inode_has_local_dirty_state(ino) {
-                    LocalSyncPolicy::Strict
-                } else {
-                    LocalSyncPolicy::Opportunistic
-                };
                 let outcome = self
                     .local_sync_barrier_with_outcome(
                         ino,
-                        local_sync_policy,
+                        self.local_sync_policy_for_barrier(ino),
                         sticky_error_policy,
                         DirtyAttrPersistPolicy::Ignore,
                     )
@@ -213,6 +208,14 @@ impl StudioVfs {
         })
     }
 
+    fn local_sync_policy_for_barrier(&self, ino: Ino) -> LocalSyncPolicy {
+        if self.inode_has_local_dirty_state(ino) {
+            LocalSyncPolicy::Strict
+        } else {
+            LocalSyncPolicy::Opportunistic
+        }
+    }
+
     pub(super) async fn flush_inode_barrier_with_outcome(
         &self,
         ino: Ino,
@@ -224,15 +227,10 @@ impl StudioVfs {
             .enter_op(ino, FileSessionOperation::Flush)
             .await;
         let result: VfsResult<ExplicitFlushOutcome> = async {
-            let local_sync_policy = if self.inode_has_local_dirty_state(ino) {
-                LocalSyncPolicy::Strict
-            } else {
-                LocalSyncPolicy::Opportunistic
-            };
             let outcome = self
                 .local_sync_barrier_with_outcome(
                     ino,
-                    local_sync_policy,
+                    self.local_sync_policy_for_barrier(ino),
                     sticky_error_policy,
                     DirtyAttrPersistPolicy::Ignore,
                 )
