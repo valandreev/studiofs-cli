@@ -928,7 +928,7 @@ fn test_release_fh_reports_sticky_error_after_persisting_current_changes() {
 }
 
 #[test]
-fn test_release_fh_with_outcome_distinguishes_nonfinal_and_final_close() {
+fn test_release_fh_with_outcome_keeps_write_committed_inode_clean_on_close() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-close-ownership");
     let _guard = rt.enter();
@@ -939,6 +939,10 @@ fn test_release_fh_with_outcome_distinguishes_nonfinal_and_final_close() {
         let fh2 = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
 
         vfs.write(ino, 0, b"payload").await.unwrap();
+        assert!(
+            !vfs.inode_has_local_dirty_state(ino),
+            "write should already cross the local durable barrier"
+        );
 
         let first = vfs.release_fh_with_outcome(fh1).await.unwrap();
         assert!(
@@ -957,8 +961,8 @@ fn test_release_fh_with_outcome_distinguishes_nonfinal_and_final_close() {
             "the final close should report last-handle ownership"
         );
         assert!(
-            second.flushed_local_dirty_state,
-            "the final close should report the fallback local dirty-state drain"
+            !second.flushed_local_dirty_state,
+            "the final close should stay clean once write already persisted local state"
         );
         assert_eq!(vfs.open_count(ino), 0, "all handles should be closed");
     });
@@ -1125,7 +1129,7 @@ fn test_release_fh_orphan_cleanup_waits_for_final_handle_before_clearing_live_ex
 }
 
 #[test]
-fn test_unlink_immediate_cleanup_clears_dirty_local_state() {
+fn test_unlink_immediate_cleanup_keeps_write_committed_inode_clean() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "unlink-immediate-cleanup");
     let _guard = rt.enter();
@@ -1137,8 +1141,8 @@ fn test_unlink_immediate_cleanup_clears_dirty_local_state() {
 
         vfs.write(ino, 0, b"payload").await.unwrap();
         assert!(
-            vfs.inode_has_local_dirty_state(ino),
-            "write should leave local dirty state before unlink"
+            !vfs.inode_has_local_dirty_state(ino),
+            "write should already leave the inode locally durable before unlink"
         );
 
         vfs.unlink(1, b"unlink-immediate-cleanup.txt").unwrap();
@@ -1155,7 +1159,7 @@ fn test_unlink_immediate_cleanup_clears_dirty_local_state() {
 }
 
 #[test]
-fn test_rename_over_existing_target_clears_displaced_inode_dirty_state() {
+fn test_rename_over_existing_target_discards_clean_persisted_local_state() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "rename-displaced-cleanup");
     let _guard = rt.enter();
@@ -1166,8 +1170,8 @@ fn test_rename_over_existing_target_clears_displaced_inode_dirty_state() {
         vfs.write(source.ino, 0, b"source").await.unwrap();
         vfs.write(displaced.ino, 0, b"target").await.unwrap();
         assert!(
-            vfs.inode_has_local_dirty_state(displaced.ino),
-            "target should have local dirty state before it is displaced"
+            !vfs.inode_has_local_dirty_state(displaced.ino),
+            "overwrite target should already be locally durable before it is displaced"
         );
 
         vfs.rename(1, b"rename-source.txt", 1, b"rename-target.txt")
@@ -1185,7 +1189,7 @@ fn test_rename_over_existing_target_clears_displaced_inode_dirty_state() {
 }
 
 #[test]
-fn test_flush_fh_with_outcome_distinguishes_clean_and_dirty_barriers() {
+fn test_flush_fh_with_outcome_treats_write_committed_inode_as_clean() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-handle-outcome");
     let _guard = rt.enter();
@@ -1204,18 +1208,22 @@ fn test_flush_fh_with_outcome_distinguishes_clean_and_dirty_barriers() {
 
         let payload = b"payload";
         vfs.write(ino, 0, payload).await.unwrap();
-
-        let dirty = vfs.flush_fh_with_outcome(fh).await.unwrap();
         assert!(
-            dirty.flushed_local_dirty_state,
-            "dirty handle flush should report that it drained local dirty state"
+            !vfs.inode_has_local_dirty_state(ino),
+            "write should already persist local dirty state before flush_fh"
+        );
+
+        let after_write = vfs.flush_fh_with_outcome(fh).await.unwrap();
+        assert!(
+            !after_write.flushed_local_dirty_state,
+            "flush_fh should report a clean skip once write already crossed the barrier"
         );
 
         let after = vfs.getattr(ino).unwrap();
         assert_eq!(
             after.size,
             payload.len() as u64,
-            "flush_fh_with_outcome should still persist current dirty attrs"
+            "flush_fh_with_outcome should preserve the write-committed file size"
         );
 
         vfs.release_fh(fh).await.unwrap();
@@ -1223,7 +1231,7 @@ fn test_flush_fh_with_outcome_distinguishes_clean_and_dirty_barriers() {
 }
 
 #[test]
-fn test_flush_with_outcome_distinguishes_clean_and_dirty_inode_barriers() {
+fn test_flush_with_outcome_treats_write_committed_inode_as_clean() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-inode-outcome");
     let _guard = rt.enter();
@@ -1241,24 +1249,28 @@ fn test_flush_with_outcome_distinguishes_clean_and_dirty_inode_barriers() {
 
         let payload = b"payload";
         vfs.write(ino, 0, payload).await.unwrap();
-
-        let dirty = vfs.flush_with_outcome(ino).await.unwrap();
         assert!(
-            dirty.flushed_local_dirty_state,
-            "dirty inode flush should report that it drained local dirty state"
+            !vfs.inode_has_local_dirty_state(ino),
+            "write should already persist local dirty state before inode flush"
+        );
+
+        let after_write = vfs.flush_with_outcome(ino).await.unwrap();
+        assert!(
+            !after_write.flushed_local_dirty_state,
+            "flush_with_outcome should report a clean skip once write already crossed the barrier"
         );
 
         let after = vfs.getattr(ino).unwrap();
         assert_eq!(
             after.size,
             payload.len() as u64,
-            "flush_with_outcome should still persist current dirty attrs"
+            "flush_with_outcome should preserve the write-committed file size"
         );
     });
 }
 
 #[test]
-fn test_fsync_with_outcome_distinguishes_clean_and_dirty_data_barriers() {
+fn test_fsync_with_outcome_treats_write_committed_inode_as_clean() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "fsync-outcome-clean-data");
     let _guard = rt.enter();
@@ -1280,11 +1292,19 @@ fn test_fsync_with_outcome_distinguishes_clean_and_dirty_data_barriers() {
 
         let payload = b"payload";
         vfs.write(ino, 0, payload).await.unwrap();
-
-        let dirty = vfs.fsync_with_outcome(ino, false).await.unwrap();
         assert!(
-            dirty.flushed_file_data,
-            "dirty fsync should report draining file data"
+            !vfs.inode_has_local_dirty_state(ino),
+            "write should already persist local dirty state before fsync"
+        );
+
+        let after_write = vfs.fsync_with_outcome(ino, false).await.unwrap();
+        assert!(
+            !after_write.flushed_file_data,
+            "fsync should report clean data once write already crossed the local barrier"
+        );
+        assert!(
+            !after_write.persisted_dirty_attrs,
+            "fsync should not invent metadata work after write already committed it"
         );
     });
 }

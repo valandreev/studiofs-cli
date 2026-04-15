@@ -1,7 +1,7 @@
 use super::{
     ATTR_CACHE_TTL, AccessLevel, Arc, DirEntry, FileType, Ino, InodeAttr, InodeIncarnationState,
-    Instant, MetaBlockFlags, MetaError, NamespacePathStyle, PendingIncarnation, SetattrArgs,
-    StudioVfs, UnlinkTarget, VfsError, VfsMeta, VfsResult, VfsState, VfsUploadState,
+    Instant, LocalSyncPolicy, MetaBlockFlags, MetaError, NamespacePathStyle, PendingIncarnation,
+    SetattrArgs, StudioVfs, UnlinkTarget, VfsError, VfsMeta, VfsResult, VfsState, VfsUploadState,
     block_index_from_offset, debug, info, offset_within_block, validate_name, warn,
 };
 
@@ -41,6 +41,7 @@ impl StudioVfs {
 
         let mut attr = self.getattr(ino)?;
         let mut changed = false;
+        let mut size_changed = false;
 
         if let Some(new_size) = args.size
             && new_size != attr.size
@@ -53,6 +54,7 @@ impl StudioVfs {
             attr.size = new_size;
             self.update_pending_incarnation_size(ino, attr.size);
             changed = true;
+            size_changed = true;
         }
 
         if let Some(mode) = args.mode {
@@ -100,6 +102,9 @@ impl StudioVfs {
             self.state.namespace.attr_read_cache.lock().remove(ino);
             self.sync_meta().set_attr(&attr)?;
             self.refresh_inode_incarnation_state_from_attr(ino, &attr);
+        }
+        if size_changed {
+            Self::run_sync_future(self.flush_ordered(ino, LocalSyncPolicy::Strict))?;
         }
 
         Ok(attr)

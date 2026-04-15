@@ -2769,7 +2769,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_non_delete_defers_dirty_inode_flush_to_last_handle_release() {
+    fn cleanup_non_delete_on_write_committed_inode_skips_deferred_release_hint() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_defer_dirty");
         let attr = vfs
             .create(ROOT_INO, b"dirty-callback.txt", 0, 0, 0o644)
@@ -2791,8 +2791,8 @@ mod tests {
         ctx.run_cleanup_non_delete_callback(attr.ino, fh)
             .expect("cleanup callback");
         assert!(
-            ctx.has_deferred_cleanup_hint(attr.ino),
-            "cleanup should leave a deferred-close hint for dirty inodes"
+            !ctx.has_deferred_cleanup_hint(attr.ino),
+            "cleanup should not leave a deferred-close hint once write already committed local state"
         );
         let callbacks_after_cleanup = winfsp_callbacks(&vfs);
         let barriers_after_cleanup = winfsp_foreground_flushes(&vfs);
@@ -2829,18 +2829,17 @@ mod tests {
             "close should still be counted after deferred cleanup"
         );
         assert_eq!(
-            barriers_after_close.close,
-            barriers_before.close + 1,
-            "last-handle close should own the deferred cleanup barrier"
+            barriers_after_close.close, barriers_before.close,
+            "last-handle close should not claim a barrier once write already committed local state"
         );
         assert_eq!(
-            barriers_after_close.close_skipped_clean, barriers_before.close_skipped_clean,
-            "dirty last-handle close should not look like a clean release"
+            barriers_after_close.close_skipped_clean,
+            barriers_before.close_skipped_clean + 1,
+            "last-handle close should be attributed as a clean skip"
         );
         assert_eq!(
-            flush_calls_after_close,
-            flush_calls_before + 1,
-            "release fallback should drain local dirty state exactly once"
+            flush_calls_after_close, flush_calls_before,
+            "close should not trigger another ordered flush after write already committed local state"
         );
     }
 
@@ -2939,7 +2938,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_flush_callback_records_barrier_then_clean_skip() {
+    fn repeated_flush_callback_records_clean_skips_after_write_commit() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("flush_callback_repeated");
         let attr = vfs
             .create(ROOT_INO, b"flush-callback-repeated.txt", 0, 0, 0o644)
@@ -2967,13 +2966,13 @@ mod tests {
             "first flush callback should be counted"
         );
         assert_eq!(
-            after_first_barriers.flush,
-            barriers_before.flush + 1,
-            "first flush callback should attribute one foreground barrier to the flush path"
+            after_first_barriers.flush, barriers_before.flush,
+            "first flush callback should not attribute a barrier once write already committed local state"
         );
         assert_eq!(
-            after_first_barriers.flush_skipped_clean, barriers_before.flush_skipped_clean,
-            "first dirty flush should not look like a clean skip"
+            after_first_barriers.flush_skipped_clean,
+            barriers_before.flush_skipped_clean + 1,
+            "first flush callback should be attributed as a clean skip"
         );
 
         ctx.run_flush_callback(attr.ino, fh)
@@ -2987,12 +2986,12 @@ mod tests {
         );
         assert_eq!(
             after_second_barriers.flush, after_first_barriers.flush,
-            "second flush callback should not add a barrier once the inode is already clean"
+            "second flush callback should not add a barrier once the inode is clean"
         );
         assert_eq!(
             after_second_barriers.flush_skipped_clean,
             after_first_barriers.flush_skipped_clean + 1,
-            "second flush callback should be attributed as a clean skip"
+            "second flush callback should also be attributed as a clean skip"
         );
 
         ctx.spawn_wait({
@@ -3003,7 +3002,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_flush_callbacks_coalesce_to_one_barrier_and_clean_skips() {
+    fn concurrent_flush_callbacks_all_record_clean_skips_after_write_commit() {
         const CONCURRENT_FLUSH_CALLBACKS: usize = 4;
         let (_tmp, vfs, ctx, _queue) = make_test_context("flush_callback_concurrent");
         let attr = vfs
@@ -3050,19 +3049,17 @@ mod tests {
             "all concurrent flush callbacks should still be observable"
         );
         assert_eq!(
-            barriers_after.flush,
-            barriers_before.flush + 1,
-            "the per-inode gate should collapse concurrent dirty flush callbacks into one barrier"
+            barriers_after.flush, barriers_before.flush,
+            "concurrent flush callbacks should not claim a barrier once write already committed local state"
         );
         assert_eq!(
             barriers_after.flush_skipped_clean,
-            barriers_before.flush_skipped_clean + (CONCURRENT_FLUSH_CALLBACKS - 1) as u64,
-            "duplicate concurrent flush callbacks should turn into clean skips once the gate owner drains the inode"
+            barriers_before.flush_skipped_clean + CONCURRENT_FLUSH_CALLBACKS as u64,
+            "all concurrent flush callbacks should be attributed as clean skips"
         );
         assert_eq!(
-            flush_calls_after,
-            flush_calls_before + 1,
-            "concurrent explicit flush callbacks should trigger one ordered flush"
+            flush_calls_after, flush_calls_before,
+            "concurrent explicit flush callbacks should not trigger ordered flushes after write already committed local state"
         );
 
         ctx.spawn_wait({
@@ -3073,7 +3070,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_flush_callback_clears_deferred_cleanup_hint() {
+    fn explicit_flush_callback_keeps_write_committed_inode_hint_free() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_hint_cleared_by_flush");
         let attr = vfs
             .create(ROOT_INO, b"cleanup-hint-cleared-by-flush.txt", 0, 0, 0o644)
@@ -3091,15 +3088,15 @@ mod tests {
         ctx.run_cleanup_non_delete_callback(attr.ino, fh)
             .expect("cleanup callback");
         assert!(
-            ctx.has_deferred_cleanup_hint(attr.ino),
-            "cleanup should leave a deferred-close hint before explicit flush"
+            !ctx.has_deferred_cleanup_hint(attr.ino),
+            "cleanup should not leave a deferred-close hint once write already committed local state"
         );
 
         ctx.run_flush_callback(attr.ino, fh)
             .expect("explicit flush callback");
         assert!(
             !ctx.has_deferred_cleanup_hint(attr.ino),
-            "explicit flush should clear the deferred cleanup hint"
+            "explicit flush should leave the inode hint-free"
         );
 
         ctx.spawn_wait({
@@ -3110,7 +3107,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_then_flush_then_close_turns_final_close_into_clean_skip() {
+    fn cleanup_then_flush_then_close_stays_clean_after_write_commit() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_flush_close_clean_skip");
         let attr = vfs
             .create(ROOT_INO, b"cleanup-flush-close-clean-skip.txt", 0, 0, 0o644)
@@ -3134,8 +3131,8 @@ mod tests {
         let callbacks_after_cleanup = winfsp_callbacks(&vfs);
         let barriers_after_cleanup = winfsp_foreground_flushes(&vfs);
         assert!(
-            ctx.has_deferred_cleanup_hint(attr.ino),
-            "cleanup should leave a deferred-close hint before the explicit flush"
+            !ctx.has_deferred_cleanup_hint(attr.ino),
+            "cleanup should not leave a deferred-close hint once write already committed local state"
         );
         assert_eq!(
             callbacks_after_cleanup.cleanup,
@@ -3162,14 +3159,17 @@ mod tests {
             "explicit flush should be counted as a WinFSP flush callback"
         );
         assert_eq!(
-            barriers_after_flush.flush,
-            barriers_before.flush + 1,
-            "explicit flush should own one foreground barrier"
+            barriers_after_flush.flush, barriers_before.flush,
+            "explicit flush should not own a barrier once write already committed local state"
         );
         assert_eq!(
-            flush_calls_after_flush,
-            flush_calls_before + 1,
-            "explicit flush should drain the dirty inode exactly once"
+            barriers_after_flush.flush_skipped_clean,
+            barriers_before.flush_skipped_clean + 1,
+            "explicit flush should be attributed as a clean skip"
+        );
+        assert_eq!(
+            flush_calls_after_flush, flush_calls_before,
+            "explicit flush should not drain the inode again after write already committed local state"
         );
 
         ctx.run_close_callback(attr.ino, fh);
@@ -3202,7 +3202,7 @@ mod tests {
     }
 
     #[test]
-    fn nonfinal_close_preserves_deferred_cleanup_hint_until_last_handle() {
+    fn nonfinal_close_on_write_committed_inode_keeps_no_deferred_hint() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_nonfinal_close_then_final");
         let attr = vfs
             .create(
@@ -3233,8 +3233,8 @@ mod tests {
         ctx.run_cleanup_non_delete_callback(attr.ino, fh1)
             .expect("cleanup callback");
         assert!(
-            ctx.has_deferred_cleanup_hint(attr.ino),
-            "cleanup should defer the barrier until the final handle closes"
+            !ctx.has_deferred_cleanup_hint(attr.ino),
+            "cleanup should not defer a barrier once write already committed local state"
         );
 
         ctx.run_close_callback(attr.ino, fh1);
@@ -3242,8 +3242,8 @@ mod tests {
         let barriers_after_first_close = winfsp_foreground_flushes(&vfs);
         let flush_calls_after_first_close = flush_ordered_calls(&vfs);
         assert!(
-            ctx.has_deferred_cleanup_hint(attr.ino),
-            "closing a non-final handle must preserve the deferred cleanup hint"
+            !ctx.has_deferred_cleanup_hint(attr.ino),
+            "closing a non-final handle should keep the inode hint-free"
         );
         assert_eq!(
             callbacks_after_first_close.close,
@@ -3274,7 +3274,7 @@ mod tests {
         let flush_calls_after_second_close = flush_ordered_calls(&vfs);
         assert!(
             !ctx.has_deferred_cleanup_hint(attr.ino),
-            "the final close should consume the deferred cleanup hint"
+            "the final close should also leave the inode hint-free"
         );
         assert_eq!(
             callbacks_after_second_close.close,
@@ -3282,18 +3282,17 @@ mod tests {
             "both close callbacks should be observable"
         );
         assert_eq!(
-            barriers_after_second_close.close,
-            barriers_before.close + 1,
-            "the final close should own the deferred cleanup barrier"
+            barriers_after_second_close.close, barriers_before.close,
+            "the final close should not own a deferred cleanup barrier once write already committed local state"
         );
         assert_eq!(
-            barriers_after_second_close.close_skipped_clean, barriers_before.close_skipped_clean,
-            "dirty final close should not be classified as a clean skip"
+            barriers_after_second_close.close_skipped_clean,
+            barriers_before.close_skipped_clean + 1,
+            "the final close should be classified as a clean skip"
         );
         assert_eq!(
-            flush_calls_after_second_close,
-            flush_calls_before + 1,
-            "the final close should drain dirty local state exactly once"
+            flush_calls_after_second_close, flush_calls_before,
+            "the final close should not drain local state again after write already committed it"
         );
         assert_eq!(
             vfs.open_count(attr.ino),
@@ -3333,7 +3332,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_cleanup_callback_records_callbacks_without_foreground_barriers() {
+    fn repeated_cleanup_callback_on_write_committed_inode_leaves_clean_close() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_callback_repeated");
         let attr = vfs
             .create(ROOT_INO, b"cleanup-callback-repeated.txt", 0, 0, 0o644)
@@ -3392,19 +3391,22 @@ mod tests {
         let after_close_barriers = winfsp_foreground_flushes(&vfs);
         let flush_calls_after_close = flush_ordered_calls(&vfs);
         assert_eq!(
-            after_close_barriers.close,
-            barriers_before.close + 1,
-            "close should own the fallback barrier after repeated cleanup callbacks"
+            after_close_barriers.close, barriers_before.close,
+            "close should not own a fallback barrier once write already committed local state"
         );
         assert_eq!(
-            flush_calls_after_close,
-            flush_calls_before_close + 1,
-            "close fallback should still drain the dirty inode once"
+            after_close_barriers.close_skipped_clean,
+            barriers_before.close_skipped_clean + 1,
+            "close should be attributed as a clean skip after repeated cleanup callbacks"
+        );
+        assert_eq!(
+            flush_calls_after_close, flush_calls_before_close,
+            "close should not drain the inode again after write already committed local state"
         );
     }
 
     #[test]
-    fn dirty_handle_lifecycle_defers_barrier_from_cleanup_to_close() {
+    fn dirty_handle_lifecycle_on_write_committed_inode_stays_clean() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("dirty_handle_cleanup_close");
         let attr = vfs
             .create(ROOT_INO, b"dirty-handle-close.txt", 0, 0, 0o644)
@@ -3445,13 +3447,13 @@ mod tests {
             "close should be counted after cleanup"
         );
         assert_eq!(
-            after_close_barriers.close,
-            barriers_before.close + 1,
-            "close should own the deferred dirty-handle barrier after cleanup returns"
+            after_close_barriers.close, barriers_before.close,
+            "close should not own a deferred barrier once write already committed local state"
         );
         assert_eq!(
-            after_close_barriers.close_skipped_clean, barriers_before.close_skipped_clean,
-            "dirty last-handle close should not be attributed as a clean release"
+            after_close_barriers.close_skipped_clean,
+            barriers_before.close_skipped_clean + 1,
+            "last-handle close should be attributed as a clean release"
         );
         assert_eq!(
             vfs.open_count(attr.ino),
@@ -3461,7 +3463,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_last_handle_close_falls_back_to_release_barrier_when_cleanup_did_not_run() {
+    fn last_handle_close_after_write_commit_is_clean_skip_without_cleanup() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("dirty_last_handle_close_fallback");
         let attr = vfs
             .create(ROOT_INO, b"dirty-close-fallback.txt", 0, 0, 0o644)
@@ -3491,18 +3493,17 @@ mod tests {
             "close should still be counted when it owns the last-handle fallback path"
         );
         assert_eq!(
-            barriers_after.close,
-            barriers_before.close + 1,
-            "close should attribute the fallback last-handle barrier when cleanup did not run"
+            barriers_after.close, barriers_before.close,
+            "close should not attribute a fallback barrier when write already committed local state"
         );
         assert_eq!(
-            barriers_after.close_skipped_clean, barriers_before.close_skipped_clean,
-            "dirty last-handle close should not look like a clean release"
+            barriers_after.close_skipped_clean,
+            barriers_before.close_skipped_clean + 1,
+            "last-handle close should look like a clean release"
         );
         assert_eq!(
-            flush_calls_after,
-            flush_calls_before + 1,
-            "release_fh should still drain dirty local state before the last handle disappears"
+            flush_calls_after, flush_calls_before,
+            "release_fh should not drain local state again after write already committed it"
         );
         assert_eq!(
             vfs.open_count(attr.ino),
@@ -3512,7 +3513,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_close_after_deferred_cleanup_is_a_clean_noop() {
+    fn duplicate_close_after_clean_cleanup_path_is_a_noop() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("cleanup_close_duplicate_close");
         let attr = vfs
             .create(ROOT_INO, b"cleanup-close-duplicate-close.txt", 0, 0, 0o644)
@@ -3530,8 +3531,8 @@ mod tests {
         ctx.run_cleanup_non_delete_callback(attr.ino, fh)
             .expect("cleanup callback");
         assert!(
-            ctx.has_deferred_cleanup_hint(attr.ino),
-            "cleanup should leave a deferred-close hint before the last-handle close"
+            !ctx.has_deferred_cleanup_hint(attr.ino),
+            "cleanup should not leave a deferred-close hint once write already committed local state"
         );
 
         let flush_calls_before = flush_ordered_calls(&vfs);
@@ -3551,14 +3552,17 @@ mod tests {
             "the first close should release the last handle"
         );
         assert_eq!(
-            flush_calls_after_first_close,
-            flush_calls_before + 1,
-            "the first close should still drain local dirty state exactly once"
+            flush_calls_after_first_close, flush_calls_before,
+            "the first close should not drain local state again after write already committed it"
         );
         assert_eq!(
-            close_barriers_after_first_close.close,
-            close_barriers_before.close + 1,
-            "the first close should own the deferred cleanup barrier"
+            close_barriers_after_first_close.close, close_barriers_before.close,
+            "the first close should not own a deferred cleanup barrier"
+        );
+        assert_eq!(
+            close_barriers_after_first_close.close_skipped_clean,
+            close_barriers_before.close_skipped_clean + 1,
+            "the first close should be attributed as a clean skip"
         );
 
         ctx.run_close_callback(attr.ino, fh);

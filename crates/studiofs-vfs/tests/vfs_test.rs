@@ -6454,7 +6454,7 @@ fn slow_s3_does_not_stall_local_reads_and_writes() {
 }
 
 #[test]
-fn backpressure_only_on_local_budget_exhaustion() {
+fn upload_backlog_does_not_create_local_backpressure_after_write_commit() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
@@ -6582,18 +6582,24 @@ fn backpressure_only_on_local_budget_exhaustion() {
 
             let attr = vfs.create(1, b"budget-full.bin", 0, 0, 0o644).unwrap();
             vfs.write(attr.ino, 0, &partial_payload).await.unwrap();
+            let stats = vfs.ingress_stats();
 
             assert_eq!(
                 vfs.ingress_pressure_for(partial_payload.len()).lane,
-                VfsIngressLane::Backpressure,
-                "foreground backpressure should appear only when pending write-buffer bytes exhaust the local limit"
+                VfsIngressLane::DirtyMem,
+                "durably persisted local state should not keep consuming foreground dirty-memory budget"
             );
+            assert_eq!(
+                stats.dirty_mem_bytes, 0,
+                "write() should leave no pending write-buffer bytes once the local durable barrier completes"
+            );
+            assert_eq!(stats.spill_bytes, 0);
 
             vfs.flush(attr.ino).await.unwrap();
             assert_eq!(
                 vfs.ingress_pressure_for(partial_payload.len()).lane,
                 VfsIngressLane::DirtyMem,
-                "flushing the pending write buffer should clear local backpressure"
+                "an explicit flush should remain clean after write already persisted local state"
             );
         });
         rt.shutdown_background();
@@ -7229,7 +7235,7 @@ fn test_write_fast_mode_no_spill_artifacts() {
 }
 
 #[test]
-fn test_ingress_pressure_reports_backpressure_when_spill_is_full() {
+fn test_ingress_pressure_stays_clean_after_partial_write_is_locally_committed() {
     type EnvRestore = ScopedEnvVar;
 
     let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
@@ -7285,14 +7291,14 @@ fn test_ingress_pressure_reports_backpressure_when_spill_is_full() {
 
         let stats = vfs.ingress_stats();
         assert!(
-            stats.dirty_mem_bytes >= payload.len(),
-            "the first partial payload should stay resident in the write buffer"
+            stats.dirty_mem_bytes == 0,
+            "the first partial payload should already be durably committed out of the write buffer"
         );
         assert_eq!(stats.spill_bytes, 0);
         assert_eq!(
             vfs.ingress_pressure_for(payload.len()).lane,
-            VfsIngressLane::Backpressure,
-            "once the write buffer is full, the next payload should report local backpressure"
+            VfsIngressLane::DirtyMem,
+            "once the first partial payload is locally committed, the next payload should start from a clean local budget"
         );
     });
     rt.shutdown_background();
@@ -8906,6 +8912,289 @@ fn flush_with_offline_s3_keeps_data_locally_committed_and_queued() {
     rt.shutdown_background();
 }
 
+fn make_local_zeroio_test_vfs(
+    db_path: &std::path::Path,
+    cache_dir_str: &str,
+    format_info: &FormatInfo,
+    vfs_config: VfsConfigValidated,
+) -> (Arc<RedbMetaEngine>, DataStoreConfig, Arc<StudioVfs>) {
+    let data_config = DataStoreConfig::from(format_info);
+    let meta = Arc::new(RedbMetaEngine::open(db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(format_info).unwrap();
+    let vfs = StudioVfs::new(
+        meta.clone(),
+        &data_config,
+        cache_dir_str,
+        16 * 1024 * 1024,
+        16 * 1024 * 1024,
+        vfs_config,
+    )
+    .unwrap();
+    (meta, data_config, vfs)
+}
+
+#[test]
+fn write_returns_after_small_new_file_is_locally_durable() {
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    unsafe {
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let mut format_info = make_format_info_with_endpoint(
+        &format!("zeroio-small-write-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    format_info.block_size = 512 * 1024;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (meta, _data_config, vfs) = make_local_zeroio_test_vfs(
+            &db_path,
+            &cache_dir_str,
+            &format_info,
+            VfsConfigRaw::default()
+                .validate()
+                .expect("default VFS config should validate"),
+        );
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
+
+        let attr = vfs
+            .create(1, b"zeroio-small-write.bin", 0, 0, 0o644)
+            .unwrap();
+        let payload = b"small local durable payload";
+
+        let written = vfs.write(attr.ino, 0, payload).await.unwrap();
+        assert_eq!(written as usize, payload.len());
+
+        let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(read.as_ref(), payload);
+
+        let persisted_attr = meta.get_attr(attr.ino).unwrap();
+        assert_eq!(persisted_attr.size, payload.len() as u64);
+        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        assert_eq!(
+            blocks.len(),
+            1,
+            "small write must durably materialize a partial block before write() returns"
+        );
+        let block = &blocks[0].1;
+        assert_eq!(block.length as usize, payload.len());
+        assert!(
+            block.flags.contains(BlockFlags::PARTIAL_BLOCK),
+            "small write should persist as a partial block"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn overwrite_of_published_file_is_locally_readable_without_flush() {
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let format_info = make_format_info_with_endpoint(
+        &format!("zeroio-overwrite-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    let baseline_payload = b"committed baseline payload".to_vec();
+    let patch = b"draft".to_vec();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (meta, _data_config, vfs) = make_local_zeroio_test_vfs(
+            &db_path,
+            &cache_dir_str,
+            &format_info,
+            VfsConfigRaw::default()
+                .validate()
+                .expect("default VFS config should validate"),
+        );
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
+
+        let attr = vfs.create(1, b"zeroio-overwrite.bin", 0, 0, 0o644).unwrap();
+        let ino = attr.ino;
+        vfs.write(ino, 0, &baseline_payload).await.unwrap();
+        vfs.flush(ino).await.unwrap();
+        wait_until_blocks(&vfs, ino, Duration::from_secs(15))
+            .expect("baseline file must commit before overwrite test");
+
+        let published_before = meta.get_attr(ino).unwrap();
+        let published_epoch = published_before.committed_content_epoch;
+        let published_size = published_before.committed_size;
+
+        vfs.write(ino, 0, &patch).await.unwrap();
+
+        let mut expected = baseline_payload.clone();
+        expected[..patch.len()].copy_from_slice(&patch);
+        let read = vfs.read(ino, 0, expected.len() as u32).await.unwrap();
+        assert_eq!(read.as_ref(), expected.as_slice());
+
+        let state = vfs.inode_incarnation_state(ino).await.unwrap();
+        let committed = state
+            .committed_incarnation
+            .expect("published base must remain available during local overwrite");
+        let pending = state
+            .pending_incarnation
+            .expect("local overwrite must create a pending unpublished epoch");
+        assert_eq!(committed.content_epoch, published_epoch);
+        assert_eq!(committed.size, published_size);
+        assert!(pending.content_epoch > committed.content_epoch);
+        assert_eq!(pending.base_size, committed.size);
+
+        let persisted_after = meta.get_attr(ino).unwrap();
+        assert_eq!(
+            persisted_after.committed_content_epoch, published_epoch,
+            "foreground overwrite must not advance globally published visibility"
+        );
+        assert_eq!(
+            persisted_after.committed_size, published_size,
+            "foreground overwrite must keep the last published size intact"
+        );
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn append_after_create_is_locally_durable_without_flush() {
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    unsafe {
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let mut format_info = make_format_info_with_endpoint(
+        &format!("zeroio-append-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    format_info.block_size = 512 * 1024;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (meta, _data_config, vfs) = make_local_zeroio_test_vfs(
+            &db_path,
+            &cache_dir_str,
+            &format_info,
+            VfsConfigRaw::default()
+                .validate()
+                .expect("default VFS config should validate"),
+        );
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
+
+        let attr = vfs.create(1, b"zeroio-append.bin", 0, 0, 0o644).unwrap();
+        let first = b"hello ";
+        let second = b"world";
+
+        vfs.write(attr.ino, 0, first).await.unwrap();
+        vfs.write(attr.ino, first.len() as u64, second).await.unwrap();
+
+        let expected = b"hello world";
+        let read = vfs.read(attr.ino, 0, expected.len() as u32).await.unwrap();
+        assert_eq!(read.as_ref(), expected);
+
+        let persisted_attr = meta.get_attr(attr.ino).unwrap();
+        assert_eq!(persisted_attr.size, expected.len() as u64);
+        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        assert_eq!(
+            blocks.len(),
+            1,
+            "append-after-create should durably persist the unpublished local block before write() returns"
+        );
+        assert_eq!(blocks[0].1.length as usize, expected.len());
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+fn truncate_after_create_is_locally_durable_without_flush() {
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    unsafe {
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let mut format_info = make_format_info_with_endpoint(
+        &format!("zeroio-truncate-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    format_info.block_size = 512 * 1024;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (meta, _data_config, vfs) = make_local_zeroio_test_vfs(
+            &db_path,
+            &cache_dir_str,
+            &format_info,
+            VfsConfigRaw::default()
+                .validate()
+                .expect("default VFS config should validate"),
+        );
+        vfs.start()
+            .expect("failed to start StudioVfs background workers");
+
+        let attr = vfs.create(1, b"zeroio-truncate.bin", 0, 0, 0o644).unwrap();
+        let payload = b"truncate-me-down";
+        vfs.write(attr.ino, 0, payload).await.unwrap();
+
+        vfs.setattr(attr.ino, SetattrArgs::size_only(8)).unwrap();
+
+        let read = vfs.read(attr.ino, 0, 8).await.unwrap();
+        assert_eq!(read.as_ref(), b"truncate");
+
+        let persisted_attr = meta.get_attr(attr.ino).unwrap();
+        assert_eq!(persisted_attr.size, 8);
+        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        assert_eq!(
+            blocks.len(),
+            1,
+            "truncate must leave a durably persisted partial block for the unpublished local state"
+        );
+        assert_eq!(blocks[0].1.length, 8);
+        assert!(
+            blocks[0].1.flags.contains(BlockFlags::PARTIAL_BLOCK),
+            "truncated block should remain marked partial"
+        );
+    });
+    rt.shutdown_background();
+}
+
 #[test]
 fn eager_full_block_write_with_offline_s3_keeps_data_locally_committed_and_queued() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
@@ -8986,7 +9275,7 @@ fn eager_full_block_write_with_offline_s3_keeps_data_locally_committed_and_queue
 }
 
 #[test]
-fn write_eager_flush_drains_a_bounded_chunk_after_threshold_crossed() {
+fn write_persists_successive_full_blocks_without_waiting_for_threshold() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -9036,12 +9325,12 @@ fn write_eager_flush_drains_a_bounded_chunk_after_threshold_crossed() {
 
         vfs.write(attr.ino, 0, &first).await.unwrap();
         assert!(
-            vfs.meta().get_file_blocks(attr.ino).unwrap().is_empty(),
-            "one full block should stay buffered until the eager-flush batch threshold is reached"
+            vfs.meta().get_file_blocks(attr.ino).unwrap().len() == 1,
+            "foreground write should durably persist the first full block immediately"
         );
         assert!(
-            vfs.pending_uploads_for_inode(attr.ino).is_empty(),
-            "no upload should be enqueued before the local batch persists"
+            vfs.pending_uploads_for_inode(attr.ino).len() == 1,
+            "foreground write should queue upload work after the local block is durable"
         );
         let first_read = vfs.read(attr.ino, 0, block_size as u32).await.unwrap();
         assert_eq!(
@@ -9062,8 +9351,8 @@ fn write_eager_flush_drains_a_bounded_chunk_after_threshold_crossed() {
         let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
-            2,
-            "crossing the eager-flush threshold should drain only the bounded eager chunk, not the whole accumulated batch"
+            4,
+            "each successful write should leave all written full blocks durably visible in local metadata"
         );
 
         let combined = vfs
@@ -9076,15 +9365,15 @@ fn write_eager_flush_drains_a_bounded_chunk_after_threshold_crossed() {
         assert_eq!(&combined[(block_size * 3)..], fourth.as_slice());
         assert_eq!(
             vfs.pending_uploads_for_inode(attr.ino).len(),
-            2,
-            "only the drained eager chunk should be enqueued for upload"
+            4,
+            "each durably persisted block should be queued for upload"
         );
     });
     rt.shutdown_background();
 }
 
 #[test]
-fn write_eager_flush_flushes_full_blocks_below_threshold() {
+fn write_persists_full_blocks_without_explicit_flush() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -9130,17 +9419,11 @@ fn write_eager_flush_flushes_full_blocks_below_threshold() {
         let payload = vec![0x33u8; block_size];
 
         vfs.write(attr.ino, 0, &payload).await.unwrap();
-        assert!(
-            vfs.meta().get_file_blocks(attr.ino).unwrap().is_empty(),
-            "full blocks below the threshold should remain buffered until flush()"
-        );
-
-        vfs.flush(attr.ino).await.unwrap();
         let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             1,
-            "flush() must persist remaining full blocks even when eager batching did not fire"
+            "write() must persist a full block before returning even below the old eager threshold"
         );
         let read = vfs.read(attr.ino, 0, block_size as u32).await.unwrap();
         assert_eq!(read.as_ref(), payload.as_slice());
@@ -9149,7 +9432,7 @@ fn write_eager_flush_flushes_full_blocks_below_threshold() {
 }
 
 #[test]
-fn write_eager_flush_advances_logical_size_when_tail_remains_buffered() {
+fn write_persists_partial_tail_before_returning() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -9202,20 +9485,21 @@ fn write_eager_flush_advances_logical_size_when_tail_remains_buffered() {
         assert_eq!(
             live_attr.size,
             payload.len() as u64,
-            "the live inode view should still expose the buffered tail bytes"
+            "the live inode view should expose the newly written tail bytes"
         );
 
         let persisted_attr = vfs.meta().get_attr(attr.ino).unwrap();
         assert_eq!(
             persisted_attr.size,
             payload.len() as u64,
-            "eager persistence should keep logical file size advancing even while a tail block remains buffered"
+            "the durable local metadata should advance the file size before write() returns"
         );
         assert_eq!(
             vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
-            1,
-            "only the contiguous full block should reach metadata before flush() persists the tail"
+            2,
+            "write() should durably persist both the full block and the partial tail block"
         );
+        assert_eq!(vfs.ingress_stats().dirty_mem_bytes, 0);
 
         let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
         assert_eq!(read.as_ref(), payload.as_slice());
@@ -9224,7 +9508,7 @@ fn write_eager_flush_advances_logical_size_when_tail_remains_buffered() {
 }
 
 #[test]
-fn read_from_start_flushes_large_dirty_full_block_tail_before_sequential_read() {
+fn read_from_start_does_not_depend_on_draining_dirty_tail() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -9269,22 +9553,14 @@ fn read_from_start_flushes_large_dirty_full_block_tail_before_sequential_read() 
         let persisted_before = vfs.meta().get_file_blocks(attr.ino).unwrap().len();
         let ingress_before = vfs.ingress_stats();
         assert_eq!(
-            ingress_before.dirty_mem_blocks + persisted_before,
+            persisted_before,
             burst_blocks,
-            "a single large write burst should leave only the bounded eager-flush chunk persisted while the rest stays buffered"
+            "a large write burst should already be durably materialized before the first read"
         );
         assert_eq!(
             ingress_before.dirty_mem_bytes,
-            block_size * ingress_before.dirty_mem_blocks,
-            "the buffered tail should be composed of full dirty blocks"
-        );
-        assert!(
-            ingress_before.dirty_mem_blocks > 0,
-            "the repro needs a buffered dirty tail before the read starts"
-        );
-        assert!(
-            persisted_before < burst_blocks,
-            "the repro needs eager flush to persist only part of the burst before the read starts"
+            0,
+            "the first read should not need to drain any buffered dirty tail"
         );
 
         let read = vfs.read(attr.ino, 0, block_size as u32).await.unwrap();
@@ -9294,24 +9570,24 @@ fn read_from_start_flushes_large_dirty_full_block_tail_before_sequential_read() 
         assert_eq!(
             ingress_after.dirty_mem_blocks,
             0,
-            "the first read from offset 0 should drain the remaining full dirty tail"
+            "the first read from offset 0 should not introduce dirty buffered state"
         );
         assert_eq!(
             ingress_after.dirty_mem_bytes,
             0,
-            "the first read from offset 0 should clear buffered full-block dirty bytes"
+            "the first read from offset 0 should not need to clear buffered full-block dirty bytes"
         );
         assert_eq!(
             vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
             burst_blocks,
-            "draining on read should publish every full block into metadata before the sequential read continues"
+            "all full blocks should already be present in local metadata before the sequential read starts"
         );
     });
     rt.shutdown_background();
 }
 
 #[test]
-fn write_backpressure_flushes_full_blocks_before_tail_blocks() {
+fn write_persists_full_blocks_and_tail_without_buffered_relief() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -9360,21 +9636,21 @@ fn write_backpressure_flushes_full_blocks_before_tail_blocks() {
 
         vfs.write(attr.ino, 0, &first).await.unwrap();
         assert!(
-            vfs.meta().get_file_blocks(attr.ino).unwrap().is_empty(),
-            "the initial full block should stay buffered while eager batching is disabled"
+            vfs.meta().get_file_blocks(attr.ino).unwrap().len() == 1,
+            "the initial full block should be durably visible immediately"
         );
 
         vfs.write(attr.ino, block_size as u64, &tail).await.unwrap();
 
         assert_eq!(
             vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
-            1,
-            "backpressure should flush the accumulated full block before forcing the tail block to disk"
+            2,
+            "the tail block should be durably persisted alongside the initial full block"
         );
         assert_eq!(
             vfs.ingress_stats().dirty_mem_bytes,
-            tail_len,
-            "after backpressure relief only the tail block should remain in the write buffer"
+            0,
+            "foreground success should not leave a buffered tail block behind"
         );
 
         let live_attr = vfs.getattr(attr.ino).unwrap();
@@ -9387,7 +9663,7 @@ fn write_backpressure_flushes_full_blocks_before_tail_blocks() {
         assert_eq!(
             persisted_attr.size,
             (block_size + tail_len) as u64,
-            "backpressure relief should preserve the latest logical size even when the tail block remains buffered"
+            "the durable local metadata should preserve the latest logical size"
         );
 
         let read = vfs
