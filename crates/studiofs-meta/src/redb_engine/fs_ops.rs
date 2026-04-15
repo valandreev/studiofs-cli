@@ -392,26 +392,42 @@ impl<'a> NamespaceDeleteTxn<'a> {
         RedbMetaEngine::remove_dentry_overlay_in_txn(self.txn, spec.parent, spec.name)?;
 
         attr.nlink = attr.nlink.saturating_sub(1);
+        let deleted_before_publish = if attr.nlink == 0
+            && attr.kind == FileType::RegularFile
+            && (attr.content_epoch != attr.committed_content_epoch
+                || attr.size != attr.committed_size
+                || RedbMetaEngine::has_regular_file_chunk_rows_in_write_txn(
+                    self.txn,
+                    REGULAR_FILE_OVERLAY_TABLE,
+                    entry.ino,
+                )?) {
+            let uploaded_overlay_object_ids =
+                self.uploaded_overlay_object_ids_in_write_txn(entry.ino)?;
+            if !uploaded_overlay_object_ids.is_empty() {
+                self.queue_pending_deletions_in_txn(
+                    uploaded_overlay_object_ids.as_slice(),
+                    spec.created_at,
+                )?;
+            }
+            Some(RedbMetaEngine::record_deleted_before_publish_in_txn(
+                self.txn,
+                &attr,
+                uploaded_overlay_object_ids,
+            )?)
+        } else {
+            None
+        };
+
         if spec.records_deferred_delete() {
             RedbMetaEngine::set_inode_overlay_in_txn(self.txn, &attr)?;
-            RedbMetaEngine::sync_inode_lifecycle_in_txn(self.txn, attr.ino)?;
+            if deleted_before_publish.is_none() {
+                RedbMetaEngine::sync_inode_lifecycle_in_txn(self.txn, attr.ino)?;
+            }
         } else if attr.nlink == 0 {
-            let overlay_object_ids =
-                RedbMetaEngine::overlay_object_ids_in_write_txn(self.txn, entry.ino)?;
             RedbMetaEngine::remove_inode_overlay_in_txn(self.txn, entry.ino)?;
             RedbMetaEngine::clear_inode_overlay_aux_in_txn(self.txn, entry.ino)?;
             self.remove_file_blocks_for_inode(entry.ino)?;
-            if attr.kind == FileType::RegularFile
-                && (attr.content_epoch != attr.committed_content_epoch
-                    || attr.size != attr.committed_size
-                    || !overlay_object_ids.is_empty())
-            {
-                RedbMetaEngine::record_deleted_before_publish_in_txn(
-                    self.txn,
-                    &attr,
-                    overlay_object_ids,
-                )?;
-            } else {
+            if deleted_before_publish.is_none() {
                 RedbMetaEngine::remove_inode_lifecycle_in_txn(self.txn, entry.ino)?;
             }
         } else {
@@ -426,7 +442,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
             self.record_deferred_delete(spec, entry.ino)?;
         }
 
-        self.append_unlink_events(spec, &attr, &parent_attr)?;
+        self.append_unlink_events(spec, &attr, &parent_attr, deleted_before_publish.as_ref())?;
         Ok(NamespaceDeleteResult::File(attr))
     }
 
@@ -499,12 +515,82 @@ impl<'a> NamespaceDeleteTxn<'a> {
         RedbMetaEngine::append_undo_log_in_txn(self.txn, &undo)
     }
 
+    pub(super) fn uploaded_overlay_object_ids_in_write_txn(
+        &self,
+        ino: Ino,
+    ) -> MetaResult<Vec<u64>> {
+        let overlay_chunks = RedbMetaEngine::regular_file_chunk_states_for_inode_in_write_txn(
+            self.txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            ino,
+        )?;
+        let mut object_ids = std::collections::BTreeSet::new();
+        for chunk_state in overlay_chunks.values() {
+            for slice in chunk_state.slices.values() {
+                if slice.block_state == BlockRefState::Uploaded
+                    && let Some(block) = slice.block.as_ref()
+                {
+                    object_ids.insert(block.object_id);
+                }
+            }
+        }
+        Ok(object_ids.into_iter().collect())
+    }
+
+    pub(super) fn queue_pending_deletions_in_txn(
+        &self,
+        object_ids: &[u64],
+        timestamp: i64,
+    ) -> MetaResult<()> {
+        if object_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut pending_deletions = self
+            .txn
+            .open_table(PENDING_DELETIONS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        for &object_id in object_ids {
+            pending_deletions
+                .insert(object_id, timestamp)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        }
+        drop(pending_deletions);
+        for &object_id in object_ids {
+            RedbMetaEngine::append_event_in_txn(
+                self.txn,
+                &crate::events::MetaEvent::AddPendingDeletion {
+                    object_id,
+                    timestamp,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     pub(super) fn append_unlink_events(
         &self,
         spec: &NamespaceDeleteSpec<'_>,
         attr: &InodeAttr,
         parent_attr: &InodeAttr,
+        deleted_before_publish: Option<&InodeLifecycleRecord>,
     ) -> MetaResult<()> {
+        if deleted_before_publish
+            .map(|record| record.has_published_base)
+            .unwrap_or(false)
+        {
+            let mut remote_attr = attr.clone();
+            remote_attr.nlink = remote_attr.nlink.saturating_add(1);
+            remote_attr.size = remote_attr.committed_size;
+            remote_attr.content_epoch = remote_attr.committed_content_epoch;
+            remote_attr.upload_state = UploadState::Ready;
+            RedbMetaEngine::append_event_in_txn(
+                self.txn,
+                &crate::events::MetaEvent::SetAttr { attr: remote_attr },
+            )?;
+            return Ok(());
+        }
+
         RedbMetaEngine::append_event_in_txn(
             self.txn,
             &crate::events::MetaEvent::RemoveEntry {

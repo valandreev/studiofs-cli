@@ -125,12 +125,19 @@ fn zeroio_delete_before_publish_persists_tombstone_lifecycle() {
         .create_file(ROOT_INO, b"delete-before-publish.bin", 1000, 1000, 0o644)
         .unwrap();
     let mut attr = engine.get_attr(file.ino).unwrap();
-    attr.size = 4096;
+    attr.size = 8192;
     attr.content_epoch = 1;
     engine.set_attr(&attr).unwrap();
     engine
         .set_file_block(file.ino, 0, &BlockRef::new_partial(950, 4096))
         .unwrap();
+    let uploaded = BlockRef::new_partial(951, 4096);
+    engine.set_file_block(file.ino, 1, &uploaded).unwrap();
+    assert!(
+        engine
+            .mark_file_block_uploaded_if_matches(file.ino, 1, 1, &uploaded)
+            .unwrap()
+    );
 
     engine.unlink(ROOT_INO, b"delete-before-publish.bin").unwrap();
 
@@ -141,11 +148,80 @@ fn zeroio_delete_before_publish_persists_tombstone_lifecycle() {
         lifecycle.retention,
         PayloadRetentionClass::DeletedBeforePublish
     );
-    assert_eq!(lifecycle.local_visible_size, 4096);
+    assert_eq!(lifecycle.local_visible_size, 8192);
     assert_eq!(lifecycle.published_size, 0);
     assert_eq!(lifecycle.local_content_epoch, 1);
     assert_eq!(lifecycle.published_content_epoch, 0);
-    assert_eq!(lifecycle.deferred_cleanup_object_ids, vec![950]);
+    assert_eq!(lifecycle.deferred_cleanup_object_ids, vec![951]);
+    let pending_deletions = engine.get_pending_deletions().unwrap();
+    assert!(
+        pending_deletions
+            .iter()
+            .any(|(object_id, _timestamp)| *object_id == 951),
+        "uploaded-but-unpublished object should be queued for GC"
+    );
+    assert!(
+        pending_deletions
+            .iter()
+            .all(|(object_id, _timestamp)| *object_id != 950),
+        "local-only overlay objects must not be treated as remote GC candidates"
+    );
+}
+
+#[test]
+fn zeroio_unlink_open_handle_marks_unpublished_epoch_deleted_before_publish() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"open-unlink-overwrite.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut published_attr = engine.get_attr(file.ino).unwrap();
+    published_attr.size = 4096;
+    published_attr.content_epoch = 1;
+    engine.set_attr(&published_attr).unwrap();
+    let published = BlockRef::new_partial(960, 4096);
+    engine.set_file_block(file.ino, 0, &published).unwrap();
+    assert!(engine.publish_file_manifest(file.ino, 1).unwrap());
+
+    let mut overwrite_attr = engine.get_attr(file.ino).unwrap();
+    overwrite_attr.content_epoch = 2;
+    engine.set_attr(&overwrite_attr).unwrap();
+    let uploaded_overlay = BlockRef::new_partial(961, 4096);
+    engine.set_file_block(file.ino, 0, &uploaded_overlay).unwrap();
+    assert!(
+        engine
+            .mark_file_block_uploaded_if_matches(file.ino, 0, 2, &uploaded_overlay)
+            .unwrap()
+    );
+
+    let unlinked = engine
+        .unlink_open_handle(ROOT_INO, b"open-unlink-overwrite.bin")
+        .unwrap();
+
+    assert_eq!(unlinked.nlink, 0);
+    assert!(engine.lookup(ROOT_INO, b"open-unlink-overwrite.bin").is_err());
+    let persisted = engine.get_attr(file.ino).unwrap();
+    assert_eq!(persisted.nlink, 0);
+    let lifecycle = engine.get_inode_lifecycle(file.ino).unwrap().unwrap();
+    assert_eq!(lifecycle.state, InodeLifecycleState::DeletedBeforePublish);
+    assert!(lifecycle.has_published_base);
+    assert_eq!(lifecycle.local_visible_size, 4096);
+    assert_eq!(lifecycle.published_size, 4096);
+    assert_eq!(lifecycle.local_content_epoch, 2);
+    assert_eq!(lifecycle.published_content_epoch, 1);
+    assert_eq!(lifecycle.deferred_cleanup_object_ids, vec![961]);
+    let pending_deletions = engine.get_pending_deletions().unwrap();
+    assert!(
+        pending_deletions
+            .iter()
+            .any(|(object_id, _timestamp)| *object_id == 961),
+        "uploaded overlay from deleted unpublished epoch should be reclaimable"
+    );
+    assert!(
+        pending_deletions
+            .iter()
+            .all(|(object_id, _timestamp)| *object_id != 960),
+        "published base objects must remain reachable after canceling the replacement epoch"
+    );
 }
 
 #[test]
