@@ -928,7 +928,7 @@ fn test_release_fh_reports_sticky_error_after_persisting_current_changes() {
 }
 
 #[test]
-fn test_release_fh_with_outcome_distinguishes_nonfinal_and_final_close() {
+fn test_release_fh_with_outcome_keeps_write_committed_inode_clean_on_close() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-close-ownership");
     let _guard = rt.enter();
@@ -939,6 +939,10 @@ fn test_release_fh_with_outcome_distinguishes_nonfinal_and_final_close() {
         let fh2 = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
 
         vfs.write(ino, 0, b"payload").await.unwrap();
+        assert!(
+            !vfs.inode_has_local_dirty_state(ino),
+            "write should already cross the local durable barrier"
+        );
 
         let first = vfs.release_fh_with_outcome(fh1).await.unwrap();
         assert!(
@@ -957,8 +961,8 @@ fn test_release_fh_with_outcome_distinguishes_nonfinal_and_final_close() {
             "the final close should report last-handle ownership"
         );
         assert!(
-            second.flushed_local_dirty_state,
-            "the final close should report the fallback local dirty-state drain"
+            !second.flushed_local_dirty_state,
+            "the final close should stay clean once write already persisted local state"
         );
         assert_eq!(vfs.open_count(ino), 0, "all handles should be closed");
     });
@@ -1125,7 +1129,7 @@ fn test_release_fh_orphan_cleanup_waits_for_final_handle_before_clearing_live_ex
 }
 
 #[test]
-fn test_unlink_immediate_cleanup_clears_dirty_local_state() {
+fn test_unlink_immediate_cleanup_keeps_write_committed_inode_clean() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "unlink-immediate-cleanup");
     let _guard = rt.enter();
@@ -1137,8 +1141,8 @@ fn test_unlink_immediate_cleanup_clears_dirty_local_state() {
 
         vfs.write(ino, 0, b"payload").await.unwrap();
         assert!(
-            vfs.inode_has_local_dirty_state(ino),
-            "write should leave local dirty state before unlink"
+            !vfs.inode_has_local_dirty_state(ino),
+            "write should already leave the inode locally durable before unlink"
         );
 
         vfs.unlink(1, b"unlink-immediate-cleanup.txt").unwrap();
@@ -1155,7 +1159,7 @@ fn test_unlink_immediate_cleanup_clears_dirty_local_state() {
 }
 
 #[test]
-fn test_rename_over_existing_target_clears_displaced_inode_dirty_state() {
+fn test_rename_over_existing_target_discards_clean_persisted_local_state() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "rename-displaced-cleanup");
     let _guard = rt.enter();
@@ -1166,8 +1170,8 @@ fn test_rename_over_existing_target_clears_displaced_inode_dirty_state() {
         vfs.write(source.ino, 0, b"source").await.unwrap();
         vfs.write(displaced.ino, 0, b"target").await.unwrap();
         assert!(
-            vfs.inode_has_local_dirty_state(displaced.ino),
-            "target should have local dirty state before it is displaced"
+            !vfs.inode_has_local_dirty_state(displaced.ino),
+            "overwrite target should already be locally durable before it is displaced"
         );
 
         vfs.rename(1, b"rename-source.txt", 1, b"rename-target.txt")
@@ -1185,7 +1189,7 @@ fn test_rename_over_existing_target_clears_displaced_inode_dirty_state() {
 }
 
 #[test]
-fn test_flush_fh_with_outcome_distinguishes_clean_and_dirty_barriers() {
+fn test_flush_fh_with_outcome_treats_write_committed_inode_as_clean() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-handle-outcome");
     let _guard = rt.enter();
@@ -1204,18 +1208,22 @@ fn test_flush_fh_with_outcome_distinguishes_clean_and_dirty_barriers() {
 
         let payload = b"payload";
         vfs.write(ino, 0, payload).await.unwrap();
-
-        let dirty = vfs.flush_fh_with_outcome(fh).await.unwrap();
         assert!(
-            dirty.flushed_local_dirty_state,
-            "dirty handle flush should report that it drained local dirty state"
+            !vfs.inode_has_local_dirty_state(ino),
+            "write should already persist local dirty state before flush_fh"
+        );
+
+        let after_write = vfs.flush_fh_with_outcome(fh).await.unwrap();
+        assert!(
+            !after_write.flushed_local_dirty_state,
+            "flush_fh should report a clean skip once write already crossed the barrier"
         );
 
         let after = vfs.getattr(ino).unwrap();
         assert_eq!(
             after.size,
             payload.len() as u64,
-            "flush_fh_with_outcome should still persist current dirty attrs"
+            "flush_fh_with_outcome should preserve the write-committed file size"
         );
 
         vfs.release_fh(fh).await.unwrap();
@@ -1223,7 +1231,7 @@ fn test_flush_fh_with_outcome_distinguishes_clean_and_dirty_barriers() {
 }
 
 #[test]
-fn test_flush_with_outcome_distinguishes_clean_and_dirty_inode_barriers() {
+fn test_flush_with_outcome_treats_write_committed_inode_as_clean() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-inode-outcome");
     let _guard = rt.enter();
@@ -1241,24 +1249,28 @@ fn test_flush_with_outcome_distinguishes_clean_and_dirty_inode_barriers() {
 
         let payload = b"payload";
         vfs.write(ino, 0, payload).await.unwrap();
-
-        let dirty = vfs.flush_with_outcome(ino).await.unwrap();
         assert!(
-            dirty.flushed_local_dirty_state,
-            "dirty inode flush should report that it drained local dirty state"
+            !vfs.inode_has_local_dirty_state(ino),
+            "write should already persist local dirty state before inode flush"
+        );
+
+        let after_write = vfs.flush_with_outcome(ino).await.unwrap();
+        assert!(
+            !after_write.flushed_local_dirty_state,
+            "flush_with_outcome should report a clean skip once write already crossed the barrier"
         );
 
         let after = vfs.getattr(ino).unwrap();
         assert_eq!(
             after.size,
             payload.len() as u64,
-            "flush_with_outcome should still persist current dirty attrs"
+            "flush_with_outcome should preserve the write-committed file size"
         );
     });
 }
 
 #[test]
-fn test_fsync_with_outcome_distinguishes_clean_and_dirty_data_barriers() {
+fn test_fsync_with_outcome_treats_write_committed_inode_as_clean() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "fsync-outcome-clean-data");
     let _guard = rt.enter();
@@ -1280,11 +1292,19 @@ fn test_fsync_with_outcome_distinguishes_clean_and_dirty_data_barriers() {
 
         let payload = b"payload";
         vfs.write(ino, 0, payload).await.unwrap();
-
-        let dirty = vfs.fsync_with_outcome(ino, false).await.unwrap();
         assert!(
-            dirty.flushed_file_data,
-            "dirty fsync should report draining file data"
+            !vfs.inode_has_local_dirty_state(ino),
+            "write should already persist local dirty state before fsync"
+        );
+
+        let after_write = vfs.fsync_with_outcome(ino, false).await.unwrap();
+        assert!(
+            !after_write.flushed_file_data,
+            "fsync should report clean data once write already crossed the local barrier"
+        );
+        assert!(
+            !after_write.persisted_dirty_attrs,
+            "fsync should not invent metadata work after write already committed it"
         );
     });
 }
@@ -1392,6 +1412,151 @@ fn test_file_session_wait_reasons_and_transitions_are_observable() {
                 .iter()
                 .any(|(reason, count)| reason == "read" && *count >= 1),
             "expected wait reason for read operation"
+        );
+    });
+}
+
+#[test]
+fn test_size_changing_setattr_waits_on_file_session_gate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "file-session-setattr-size-gate");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"session-setattr-size-gate.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+
+        let session_guard = vfs
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Write)
+            .await;
+        let vfs_clone = vfs.clone();
+        let setter = std::thread::spawn(move || vfs_clone.setattr(ino, SetattrArgs::size_only(1)));
+
+        let mid = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let stats = vfs.file_session_stats();
+                if stats.queued_ops >= 1 {
+                    break stats;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expected size-changing setattr to wait behind the file-session gate");
+        assert!(
+            mid.queued_ops >= 1,
+            "expected size-changing setattr to queue behind the file-session gate"
+        );
+
+        drop(session_guard);
+        let updated = setter.join().unwrap().unwrap();
+        assert_eq!(updated.size, 1);
+    });
+}
+
+#[test]
+fn test_size_changing_setattr_rollback_restores_old_local_state_on_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "setattr-size-rollback");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"setattr-size-rollback.txt", 0, 0, 0o644)
+            .unwrap();
+        let payload = b"setattr rollback payload";
+        vfs.write(attr.ino, 0, payload).await.unwrap();
+
+        vfs.arm_fail_next_size_change_setattr_before_flush_for_test();
+        let error = vfs
+            .setattr(attr.ino, SetattrArgs::size_only(8))
+            .expect_err("simulated local persist failure should fail setattr");
+        assert!(
+            error
+                .to_string()
+                .contains("simulated size-changing setattr local persist failure"),
+            "expected the injected size-changing setattr failure to surface"
+        );
+
+        let persisted_attr = meta.get_attr(attr.ino).unwrap();
+        assert_eq!(
+            persisted_attr.size,
+            payload.len() as u64,
+            "failed size-changing setattr must restore the previous durable size"
+        );
+        assert!(
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "failed size-changing setattr must not leave dirty local state behind"
+        );
+        let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(
+            read.as_ref(),
+            payload,
+            "failed size-changing setattr must preserve the last durable local contents"
+        );
+
+        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        assert_eq!(
+            blocks.len(),
+            1,
+            "failed rollback should restore the original block map"
+        );
+        assert_eq!(
+            blocks[0].1.length as usize,
+            payload.len(),
+            "failed size-changing setattr must restore the previous block length"
+        );
+    });
+}
+
+#[test]
+fn test_size_changing_setattr_rolls_back_partial_truncate_mutation_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "setattr-truncate-mutation-rollback");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"setattr-truncate-mutation-rollback.bin", 0, 0, 0o644)
+            .unwrap();
+        let block_size = vfs.block_size as usize;
+        let payload = vec![0x5Au8; block_size * 2];
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+
+        vfs.arm_fail_next_size_change_truncate_after_first_removed_block_for_test();
+        let error = vfs
+            .setattr(attr.ino, SetattrArgs::size_only((block_size / 2) as u64))
+            .expect_err("simulated truncate mutation failure should fail setattr");
+        assert!(
+            error
+                .to_string()
+                .contains("simulated truncate mutation failure after first removed block"),
+            "expected the injected truncate mutation failure to surface"
+        );
+
+        let persisted_attr = meta.get_attr(attr.ino).unwrap();
+        assert_eq!(
+            persisted_attr.size,
+            payload.len() as u64,
+            "failed truncate mutation must restore the previous durable size"
+        );
+        assert!(
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "failed truncate mutation must not leave dirty local state behind"
+        );
+
+        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        assert_eq!(
+            blocks.len(),
+            2,
+            "rollback should restore both originally committed blocks"
+        );
+        let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(
+            read.as_ref(),
+            payload.as_slice(),
+            "failed truncate mutation must preserve the last durable local contents"
         );
     });
 }

@@ -254,9 +254,9 @@ impl StudioVfs {
 
     /// Write data to a file at the given offset.
     ///
-    /// Completed full blocks are coalesced into a larger eager-persist batch so
-    /// `write()` avoids paying the local durability boundary for every single
-    /// block while `flush()` still handles any remaining tail blocks.
+    /// ZeroIO foreground success now means the unpublished local state is
+    /// durable: payload blocks and overlay/attr metadata are persisted locally
+    /// before `write()` returns.
     pub async fn write(&self, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
         let session = self
             .state

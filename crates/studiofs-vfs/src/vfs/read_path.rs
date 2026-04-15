@@ -1267,7 +1267,7 @@ mod tests {
     }
 
     #[test]
-    fn build_read_plan_prefers_dirty_span_over_committed_base_coverage() {
+    fn build_read_plan_prefers_local_unpublished_span_over_committed_base_coverage() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (rt, vfs, meta) = make_test_vfs(&tmp, "build-read-plan-dirty-over-base");
         rt.block_on(async {
@@ -1301,15 +1301,18 @@ mod tests {
                 .await
                 .expect("build read plan");
 
-            assert!(plan.iter().any(|span| matches!(
-                &span.source,
-                ReadPlanSource::Dirty { .. } if span.range.start == 2 && span.range.end == 4
-            )));
-            assert!(!plan.iter().any(|span| {
+            assert!(plan.iter().any(|span| {
                 matches!(
                     &span.source,
-                    ReadPlanSource::Overlay { .. } | ReadPlanSource::Base { .. }
-                ) && span.range.start < 4
+                    ReadPlanSource::Dirty { .. }
+                        | ReadPlanSource::PendingOverlay { .. }
+                        | ReadPlanSource::Overlay { .. }
+                        if span.range.start < 4 && span.range.end > 2
+                )
+            }));
+            assert!(!plan.iter().any(|span| {
+                matches!(&span.source, ReadPlanSource::Base { .. })
+                    && span.range.start < 4
                     && span.range.end > 2
             }));
         });

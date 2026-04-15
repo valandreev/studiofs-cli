@@ -81,11 +81,11 @@ use config::{
     CACHE_RUNTIME_MAX_WRITE_EAGER_BATCH_BYTES, CACHE_RUNTIME_MIN_INGRESS_SEGMENT_BYTES,
     CACHE_RUNTIME_MIN_TRANSIT_BUDGET_BYTES, CACHE_RUNTIME_MIN_WRITE_EAGER_BATCH_BYTES,
     CACHE_RUNTIME_SMALL_BUDGET_BYTES, CacheRuntimeTuningOverrides, DeletedInodeCleanup,
-    DirtyAttrPersistPolicy, EagerFlushOutcome, FAST_MODE_SYNC_GROUP_MAX_DELAY_MS,
-    FAST_MODE_SYNC_GROUP_MIN_BYTES_CEIL, FAST_MODE_SYNC_GROUP_MIN_BYTES_FLOOR, FsyncOutcome,
-    HandleReleaseContext, LastHandleReleaseAction, LocalSyncBarrierOutcome, LocalSyncPolicy,
-    PAYLOAD_PUT_CONCURRENCY_MAX, PAYLOAD_PUT_CONCURRENCY_TARGET_BYTES, StickyErrorPolicy,
-    UnlinkTarget, WRITE_EAGER_DRAIN_CHUNK_MAX_BYTES, write_path_sync_trigger,
+    DirtyAttrPersistPolicy, FAST_MODE_SYNC_GROUP_MAX_DELAY_MS, FAST_MODE_SYNC_GROUP_MIN_BYTES_CEIL,
+    FAST_MODE_SYNC_GROUP_MIN_BYTES_FLOOR, FsyncOutcome, HandleReleaseContext,
+    LastHandleReleaseAction, LocalSyncBarrierOutcome, LocalSyncPolicy, PAYLOAD_PUT_CONCURRENCY_MAX,
+    PAYLOAD_PUT_CONCURRENCY_TARGET_BYTES, StickyErrorPolicy, UnlinkTarget,
+    WRITE_EAGER_DRAIN_CHUNK_MAX_BYTES, write_path_sync_trigger,
 };
 use file_session::{FileSessionOperation, FileSessionState};
 use handle_table::HandleTable;
@@ -2302,6 +2302,10 @@ pub struct StudioVfs {
     kernel_invalidator: RwLock<Option<Arc<dyn KernelInvalidator>>>,
     write_path_backend_tag: String,
     write_path_started_at: Instant,
+    #[cfg(test)]
+    fail_next_size_change_setattr_before_flush: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_size_change_truncate_after_first_removed_block: std::sync::atomic::AtomicBool,
 }
 
 struct ForegroundReadScope<'a> {
@@ -4569,28 +4573,6 @@ impl StudioVfs {
             &metrics.block_store_sync_data_interval_max_ns,
             &metrics.block_store_sync_data_interval_histogram,
         );
-    }
-
-    pub(super) fn note_eager_flush_outcome(&self, outcome: EagerFlushOutcome) {
-        let metrics = &self.state.metrics;
-        metrics.eager_flush_checks.fetch_add(1, Ordering::Relaxed);
-        match outcome {
-            EagerFlushOutcome::Triggered => {
-                metrics
-                    .eager_flush_triggered
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            EagerFlushOutcome::SkippedEmpty => {
-                metrics
-                    .eager_flush_skipped_empty
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            EagerFlushOutcome::SkippedBelowThreshold => {
-                metrics
-                    .eager_flush_skipped_below_threshold
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
     }
 
     pub(super) fn record_payload_persist_observability(
