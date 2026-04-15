@@ -99,24 +99,27 @@ impl RedbMetaEngine {
                 .insert(record.ino, bytes.as_slice())
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
-        let regular_attrs = {
+        let regular_inos = {
             let inodes = txn
                 .open_table(INODES_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
-            let mut attrs = Vec::new();
+            let mut inos = Vec::new();
             for row in inodes
                 .iter()
                 .map_err(|e| MetaError::Storage(e.to_string()))?
             {
-                let (_ino, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                let (ino, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
                 let attr: InodeAttr = decode(value.value())?;
                 if attr.kind == FileType::RegularFile {
-                    attrs.push(attr);
+                    inos.push(ino.value());
                 }
             }
-            attrs
+            inos
         };
-        for attr in regular_attrs {
+        for ino in regular_inos {
+            let Some(attr) = Self::get_attr_from_write_table(txn, INODES_TABLE, ino)? else {
+                continue;
+            };
             let record = Self::compute_inode_lifecycle_record_in_txn(txn, &attr)?;
             let bytes = encode(&record)?;
             lifecycle
@@ -269,9 +272,7 @@ impl RedbMetaEngine {
             match overlay_state {
                 Some(InodeLifecycleState::Uploading) => InodeLifecycleState::Uploading,
                 Some(InodeLifecycleState::PublishReady) => InodeLifecycleState::PublishReady,
-                Some(InodeLifecycleState::LocalOnly) | None => InodeLifecycleState::LocalOnly,
-                Some(InodeLifecycleState::Published)
-                | Some(InodeLifecycleState::DeletedBeforePublish) => InodeLifecycleState::LocalOnly,
+                _ => InodeLifecycleState::LocalOnly,
             }
         };
         let has_unpublished_payload = matches!(

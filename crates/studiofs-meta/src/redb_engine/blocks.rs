@@ -1118,11 +1118,11 @@ impl RedbMetaEngine {
             if let Some(attr) = normalized_attr.as_ref() {
                 Self::set_inode_overlay_in_txn(&txn, attr)?;
             }
+            if let Some(attr) = normalized_attr.as_ref() {
+                touched_inodes.insert(attr.ino);
+            }
             for &ino in &touched_inodes {
                 Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
-            }
-            if let Some(attr) = normalized_attr.as_ref() {
-                Self::sync_inode_lifecycle_in_txn(&txn, attr.ino)?;
             }
 
             if !entries.is_empty() {

@@ -4002,6 +4002,20 @@ pub(crate) struct LocalDiagnosticsClient {
     discovery: LocalDiagnosticsDiscovery,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiagnosticsClientError {
+    pub code: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for DiagnosticsClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for DiagnosticsClientError {}
+
 impl LocalDiagnosticsClient {
     pub(crate) fn new(discovery: LocalDiagnosticsDiscovery) -> Self {
         Self { discovery }
@@ -4103,17 +4117,36 @@ impl LocalDiagnosticsClient {
         client_name: &str,
         ttl: Duration,
     ) -> Result<ControllerLease> {
+        self.try_acquire_controller(client_name, ttl)
+            .await
+            .map_err(anyhow::Error::from)
+    }
+
+    pub(crate) async fn try_acquire_controller(
+        &self,
+        client_name: &str,
+        ttl: Duration,
+    ) -> std::result::Result<ControllerLease, DiagnosticsClientError> {
         match self
             .send(DiagnosticsRequest::AcquireController {
                 auth_token: self.discovery.auth_token.clone(),
                 client_name: client_name.to_string(),
                 ttl_ms: Some(ttl.as_millis().try_into().unwrap_or(MAX_LEASE_TTL_MS)),
             })
-            .await?
+            .await
         {
-            DiagnosticsResponse::ControllerLease { lease } => Ok(lease),
-            DiagnosticsResponse::Error { message, .. } => Err(anyhow!(message)),
-            other => Err(anyhow!("unexpected diagnostics response: {other:?}")),
+            Ok(DiagnosticsResponse::ControllerLease { lease }) => Ok(lease),
+            Ok(DiagnosticsResponse::Error { code, message }) => {
+                Err(DiagnosticsClientError { code, message })
+            }
+            Ok(other) => Err(DiagnosticsClientError {
+                code: "unexpected_response".to_string(),
+                message: format!("unexpected diagnostics response: {other:?}"),
+            }),
+            Err(error) => Err(DiagnosticsClientError {
+                code: "transport".to_string(),
+                message: error.to_string(),
+            }),
         }
     }
 

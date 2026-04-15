@@ -441,10 +441,10 @@ impl RedbMetaEngine {
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
         }
+        Self::rebuild_inode_lifecycle_table_in_txn(&txn)?;
 
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        self.rebuild_inode_lifecycle_table()?;
         Ok(())
     }
 

@@ -2120,11 +2120,11 @@ mod tests {
                 .runtime_handle
                 .block_on(
                     competing_client
-                        .acquire_controller("test-client-b", Duration::from_millis(100)),
+                        .try_acquire_controller("test-client-b", Duration::from_millis(100)),
                 )
                 .expect_err("second controller should be rejected before expiry");
             assert!(
-                conflict.to_string().contains("already held"),
+                conflict.code == "controller_busy",
                 "unexpected controller conflict: {conflict:#}"
             );
 
@@ -2132,11 +2132,11 @@ mod tests {
             let takeover = loop {
                 match launch.runtime_handle.block_on(
                     competing_client
-                        .acquire_controller("test-client-b", Duration::from_millis(100)),
+                        .try_acquire_controller("test-client-b", Duration::from_millis(100)),
                 ) {
                     Ok(lease) => break lease,
                     Err(error)
-                        if error.to_string().contains("already held")
+                        if error.code == "controller_busy"
                             && std::time::Instant::now() < takeover_deadline =>
                     {
                         std::thread::sleep(Duration::from_millis(25));
