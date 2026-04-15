@@ -867,17 +867,11 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
 
     fn object_stats(&self, object_id: u64) -> Option<LocalBlockObjectStats> {
         match self.index.get_entry(object_id) {
-            Ok(Some(entry)) => {
-                if self.payload_missing(object_id, "object_stats") {
-                    None
-                } else {
-                    Some(LocalBlockObjectStats {
-                        payload_len: entry.payload_len,
-                        lifecycle: entry.lifecycle,
-                        evictable: entry.evictable,
-                    })
-                }
-            }
+            Ok(Some(entry)) => Some(LocalBlockObjectStats {
+                payload_len: entry.payload_len,
+                lifecycle: entry.lifecycle,
+                evictable: entry.evictable,
+            }),
             Ok(None) => None,
             Err(error) => {
                 warn!(
@@ -886,6 +880,16 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
                     "cache-v3 index object stats lookup failed"
                 );
                 None
+            }
+        }
+    }
+
+    fn object_ids(&self) -> Vec<u64> {
+        match self.index.access_order_object_ids() {
+            Ok(object_ids) => object_ids,
+            Err(error) => {
+                warn!(error = ?error, "cache-v3 index object id snapshot failed");
+                Vec::new()
             }
         }
     }
@@ -1346,8 +1350,8 @@ mod tests {
         std::fs::remove_file(layout.payload_block_path(10)).unwrap();
 
         assert!(
-            backend.object_stats(10).is_none(),
-            "observational object_stats should hide missing payloads"
+            backend.object_stats(10).is_some(),
+            "observational object_stats should use index state without probing payload files"
         );
         drop(backend);
 

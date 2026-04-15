@@ -125,18 +125,19 @@ use parking_lot::{Mutex, RwLock};
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::OpenLocalBlockBackendError;
 use studiofs_cache::PreparedCacheV3Runtime;
-use studiofs_cache::local::LocalBlockBackend;
+use studiofs_cache::local::{LocalBlockBackend, LocalBlockLifecycleState};
 use studiofs_cache::metrics::{LatencyHistogram, LatencyHistogramSnapshot, MaterializeBatchStats};
 use studiofs_cache::open_local_block_backend_with_budget_and_sync_mode;
 use studiofs_cache::open_prepared_local_block_backend_with_budget_and_sync_mode;
 use studiofs_cache::upload_queue::PendingUpload;
-use studiofs_cache::v3::CacheV3PayloadSyncMode;
+use studiofs_cache::v3::{CacheV3PayloadSyncMode, platform::sync_directory};
 use studiofs_cache::{UploadCoordinator, UploadCoordinatorConfig};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, format_object_fragment_keys,
@@ -153,6 +154,7 @@ use studiofs_meta::types::{
     block_index_from_offset, offset_within_block,
 };
 use studiofs_meta::{MetaError, MetaResult};
+use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
@@ -2403,6 +2405,12 @@ struct ZeroIoDrilldownStatusInput<'a> {
     sticky_error: Option<&'a str>,
 }
 
+#[derive(Default)]
+struct ZeroIoObjectView {
+    object_ids: Vec<u64>,
+    live_extent_count: usize,
+}
+
 impl<'a> StartupReplayCoordinator<'a> {
     fn new(vfs: &'a StudioVfs, pending_uploads: &[PendingUpload]) -> Self {
         Self {
@@ -2987,11 +2995,46 @@ impl StudioVfs {
                 return;
             }
         };
-        if let Err(error) = std::fs::write(&path, bytes) {
+        let mut temp_file = match NamedTempFile::new_in(parent) {
+            Ok(temp_file) => temp_file,
+            Err(error) => {
+                warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "failed to create temporary zeroio shutdown snapshot file"
+                );
+                return;
+            }
+        };
+        if let Err(error) = temp_file.write_all(&bytes) {
+            warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to write temporary zeroio shutdown snapshot file"
+            );
+            return;
+        }
+        if let Err(error) = temp_file.as_file().sync_all() {
+            warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to sync temporary zeroio shutdown snapshot file"
+            );
+            return;
+        }
+        if let Err(error) = temp_file.persist(&path).map_err(|error| error.error) {
             warn!(
                 path = %path.display(),
                 error = %error,
                 "failed to persist zeroio shutdown snapshot"
+            );
+            return;
+        }
+        if let Err(error) = sync_directory(parent) {
+            warn!(
+                path = %parent.display(),
+                error = %error,
+                "failed to sync zeroio shutdown snapshot directory"
             );
         }
     }
@@ -3018,36 +3061,49 @@ impl StudioVfs {
         }
     }
 
-    fn zeroio_object_ids_for_lifecycle(
+    fn zeroio_object_view_for_lifecycle(
         &self,
         ino: Ino,
         lifecycle: &studiofs_meta::schema::InodeLifecycleRecord,
-    ) -> Vec<u64> {
-        let meta = self.sync_meta();
+    ) -> ZeroIoObjectView {
         let mut object_ids = BTreeSet::new();
 
         if lifecycle.state == InodeLifecycleState::DeletedBeforePublish {
             object_ids.extend(lifecycle.deferred_cleanup_object_ids.iter().copied());
-            return object_ids.into_iter().collect();
+            return ZeroIoObjectView {
+                object_ids: object_ids.into_iter().collect(),
+                live_extent_count: 0,
+            };
         }
 
-        if lifecycle.state != InodeLifecycleState::Published {
-            for (_, object_id, content_epoch) in self.live_extent_records_for_inode(ino) {
-                if content_epoch == lifecycle.local_content_epoch {
-                    object_ids.insert(object_id);
-                }
+        if lifecycle.state == InodeLifecycleState::Published {
+            return ZeroIoObjectView::default();
+        }
+
+        let meta = self.sync_meta();
+        let mut live_extent_count = 0;
+        for (_, object_id, content_epoch) in self.live_extent_records_for_inode(ino) {
+            if content_epoch == lifecycle.local_content_epoch {
+                live_extent_count += 1;
+                object_ids.insert(object_id);
+            }
+        }
+        if !object_ids.is_empty() {
+            return ZeroIoObjectView {
+                object_ids: object_ids.into_iter().collect(),
+                live_extent_count,
+            };
+        }
+
+        if meta.has_local_regular_file_overlay(ino).unwrap_or(false) {
+            if let Ok(ids) = meta.get_regular_file_overlay_object_ids(ino) {
+                object_ids.extend(ids);
             }
             if !object_ids.is_empty() {
-                return object_ids.into_iter().collect();
-            }
-
-            if meta.has_local_regular_file_overlay(ino).unwrap_or(false) {
-                if let Ok(ids) = meta.get_regular_file_overlay_object_ids(ino) {
-                    object_ids.extend(ids);
-                }
-                if !object_ids.is_empty() {
-                    return object_ids.into_iter().collect();
-                }
+                return ZeroIoObjectView {
+                    object_ids: object_ids.into_iter().collect(),
+                    live_extent_count,
+                };
             }
         }
 
@@ -3055,7 +3111,10 @@ impl StudioVfs {
             object_ids.extend(blocks.into_iter().map(|(_, block)| block.object_id));
         }
 
-        object_ids.into_iter().collect()
+        ZeroIoObjectView {
+            object_ids: object_ids.into_iter().collect(),
+            live_extent_count,
+        }
     }
 
     fn zeroio_object_bytes(&self, object_ids: &[u64]) -> u64 {
@@ -3248,9 +3307,9 @@ impl StudioVfs {
 
         for lifecycle in lifecycles {
             let ino = lifecycle.ino;
-            let object_ids = self.zeroio_object_ids_for_lifecycle(ino, &lifecycle);
-            let lifecycle_bytes = self.zeroio_object_bytes(&object_ids);
-            for object_id in &object_ids {
+            let object_view = self.zeroio_object_view_for_lifecycle(ino, &lifecycle);
+            let lifecycle_bytes = self.zeroio_object_bytes(&object_view.object_ids);
+            for object_id in &object_view.object_ids {
                 let next = lifecycle.retention;
                 object_retentions
                     .entry(*object_id)
@@ -3264,20 +3323,24 @@ impl StudioVfs {
                     .or_insert(next);
             }
 
-            let pending_uploads = pending_uploads_by_inode
-                .get(&ino)
-                .cloned()
-                .unwrap_or_default();
-            let pending_upload_count = pending_uploads.len();
+            let pending_uploads = pending_uploads_by_inode.get(&ino);
+            let pending_upload_count = pending_uploads.map(|uploads| uploads.len()).unwrap_or(0);
             let pending_upload_bytes = pending_uploads
-                .iter()
-                .filter_map(|op| self.local_block_backend.object_stats(op.object_id))
-                .map(|stats| stats.payload_len)
-                .sum();
+                .map(|uploads| {
+                    uploads
+                        .iter()
+                        .filter_map(|op| self.local_block_backend.object_stats(op.object_id))
+                        .map(|stats| stats.payload_len)
+                        .sum()
+                })
+                .unwrap_or(0);
             let oldest_pending_upload_age_ms = pending_uploads
-                .iter()
-                .map(|op| generated_unix_ms.saturating_sub(op.created_unix_ms))
-                .max()
+                .and_then(|uploads| {
+                    uploads
+                        .iter()
+                        .map(|op| generated_unix_ms.saturating_sub(op.created_unix_ms))
+                        .max()
+                })
                 .unwrap_or(0);
             let publish_ready_queued =
                 pending_epoch_finalizations.contains(&(ino, lifecycle.local_content_epoch));
@@ -3304,12 +3367,7 @@ impl StudioVfs {
                 sticky_error: sticky_error.as_deref(),
             })
             .to_string();
-            let live_extent_count = self
-                .live_extent_records_for_inode(ino)
-                .into_iter()
-                .filter(|(_, _, content_epoch)| *content_epoch == lifecycle.local_content_epoch)
-                .count();
-            let path = self.best_effort_path_for_inode(ino);
+            let live_extent_count = object_view.live_extent_count;
 
             match lifecycle.state {
                 InodeLifecycleState::LocalOnly
@@ -3358,7 +3416,7 @@ impl StudioVfs {
                     summary: "sticky upload error is blocking unpublished progress".to_string(),
                     ino: Some(ino),
                     content_epoch: Some(lifecycle.local_content_epoch),
-                    path: path.clone(),
+                    path: None,
                 });
                 let _ = error;
             } else if repeated_replay_count > 1 {
@@ -3371,7 +3429,7 @@ impl StudioVfs {
                     ),
                     ino: Some(ino),
                     content_epoch: Some(lifecycle.local_content_epoch),
-                    path: path.clone(),
+                    path: None,
                 });
             } else if lifecycle.state == InodeLifecycleState::PublishReady && replayed_after_restart
             {
@@ -3382,7 +3440,7 @@ impl StudioVfs {
                         .to_string(),
                     ino: Some(ino),
                     content_epoch: Some(lifecycle.local_content_epoch),
-                    path: path.clone(),
+                    path: None,
                 });
             } else if lifecycle.state == InodeLifecycleState::Uploading && pending_upload_count == 0
             {
@@ -3393,7 +3451,7 @@ impl StudioVfs {
                         .to_string(),
                     ino: Some(ino),
                     content_epoch: Some(lifecycle.local_content_epoch),
-                    path: path.clone(),
+                    path: None,
                 });
             } else if lifecycle.state == InodeLifecycleState::DeletedBeforePublish
                 && deferred_cleanup_object_count > 0
@@ -3405,34 +3463,37 @@ impl StudioVfs {
                         .to_string(),
                     ino: Some(ino),
                     content_epoch: Some(lifecycle.local_content_epoch),
-                    path: path.clone(),
+                    path: None,
                 });
             }
 
-            drilldown.push(VfsZeroIoDrilldownEntry {
-                ino,
-                path,
-                lifecycle_state: lifecycle.state,
-                retention: lifecycle.retention,
-                local_content_epoch: lifecycle.local_content_epoch,
-                published_content_epoch: lifecycle.published_content_epoch,
-                local_visible_size: lifecycle.local_visible_size,
-                published_size: lifecycle.published_size,
-                live_extent_count,
-                pending_upload_count,
-                pending_upload_bytes,
-                oldest_pending_upload_age_ms,
-                publish_ready_queued,
-                replayed_after_restart,
-                repeated_replay_count,
-                deferred_cleanup_object_count,
-                deferred_cleanup_bytes,
-                sticky_error,
-                status,
-            });
+            if lifecycle.state != InodeLifecycleState::Published {
+                drilldown.push(VfsZeroIoDrilldownEntry {
+                    ino,
+                    path: None,
+                    lifecycle_state: lifecycle.state,
+                    retention: lifecycle.retention,
+                    local_content_epoch: lifecycle.local_content_epoch,
+                    published_content_epoch: lifecycle.published_content_epoch,
+                    local_visible_size: lifecycle.local_visible_size,
+                    published_size: lifecycle.published_size,
+                    live_extent_count,
+                    pending_upload_count,
+                    pending_upload_bytes,
+                    oldest_pending_upload_age_ms,
+                    publish_ready_queued,
+                    replayed_after_restart,
+                    repeated_replay_count,
+                    deferred_cleanup_object_count,
+                    deferred_cleanup_bytes,
+                    sticky_error,
+                    status,
+                });
+            }
         }
 
-        for (object_id, retention) in object_retentions {
+        let classified_object_ids: HashSet<u64> = object_retentions.keys().copied().collect();
+        for (&object_id, &retention) in &object_retentions {
             let Some(stats) = self.local_block_backend.object_stats(object_id) else {
                 continue;
             };
@@ -3449,18 +3510,27 @@ impl StudioVfs {
                         .publish_ready_retained_bytes
                         .saturating_add(stats.payload_len);
                 }
-                PayloadRetentionClass::PublishedWarm => {
-                    snapshot.cache_bytes.published_warm_bytes = snapshot
-                        .cache_bytes
-                        .published_warm_bytes
-                        .saturating_add(stats.payload_len);
-                }
+                PayloadRetentionClass::PublishedWarm => {}
                 PayloadRetentionClass::DeletedBeforePublish => {
                     snapshot.cache_bytes.deleted_before_publish_bytes = snapshot
                         .cache_bytes
                         .deleted_before_publish_bytes
                         .saturating_add(stats.payload_len);
                 }
+            }
+        }
+        for object_id in self.local_block_backend.object_ids() {
+            if classified_object_ids.contains(&object_id) {
+                continue;
+            }
+            let Some(stats) = self.local_block_backend.object_stats(object_id) else {
+                continue;
+            };
+            if stats.lifecycle == LocalBlockLifecycleState::Uploaded {
+                snapshot.cache_bytes.published_warm_bytes = snapshot
+                    .cache_bytes
+                    .published_warm_bytes
+                    .saturating_add(stats.payload_len);
             }
         }
 
@@ -3500,6 +3570,13 @@ impl StudioVfs {
                 .then_with(|| left.ino.cmp(&right.ino))
         });
         health_signals.truncate(ZEROIO_HEALTH_SIGNAL_LIMIT);
+        for signal in &mut health_signals {
+            if signal.path.is_none()
+                && let Some(ino) = signal.ino
+            {
+                signal.path = self.best_effort_path_for_inode(ino);
+            }
+        }
         snapshot.health_signals = health_signals;
 
         drilldown.sort_by(|left, right| {
@@ -3518,6 +3595,9 @@ impl StudioVfs {
             .len()
             .saturating_sub(ZEROIO_DIAGNOSTIC_DRILLDOWN_LIMIT);
         drilldown.truncate(ZEROIO_DIAGNOSTIC_DRILLDOWN_LIMIT);
+        for entry in &mut drilldown {
+            entry.path = self.best_effort_path_for_inode(entry.ino);
+        }
         snapshot.drilldown = drilldown;
         snapshot
     }

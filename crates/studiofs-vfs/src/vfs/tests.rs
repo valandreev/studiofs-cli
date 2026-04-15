@@ -342,14 +342,12 @@ fn zeroio_snapshot_distinguishes_single_store_payload_classes_and_publish_backlo
         assert!(publish_ready_entry.publish_ready_queued);
         assert_eq!(publish_ready_entry.status, "publish_ready_queued");
 
-        let published_entry = snapshot
-            .drilldown
-            .iter()
-            .find(|entry| entry.ino == published.ino)
-            .expect("published inode should remain visible for warm-cache accounting");
-        assert_eq!(
-            published_entry.retention,
-            PayloadRetentionClass::PublishedWarm
+        assert!(
+            !snapshot
+                .drilldown
+                .iter()
+                .any(|entry| entry.ino == published.ino),
+            "published warm-cache files should not force per-file drilldown work"
         );
 
         assert!(

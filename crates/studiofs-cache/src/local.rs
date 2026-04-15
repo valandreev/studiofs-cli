@@ -88,6 +88,9 @@ pub trait LocalBlockBackend: Send + Sync {
         let _ = object_id;
         None
     }
+    fn object_ids(&self) -> Vec<u64> {
+        Vec::new()
+    }
 }
 
 /// Derive a stable 16-byte local backend volume UUID from a format UUID string.

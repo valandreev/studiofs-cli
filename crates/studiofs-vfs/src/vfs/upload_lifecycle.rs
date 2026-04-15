@@ -249,7 +249,9 @@ impl StudioVfs {
         self.upload_coordinator.shutdown().await;
         if let Err(error) = self.local_block_backend.sync_data() {
             warn!(error = %error, "local cache backend sync failed during shutdown");
-            tracing::info!("upload coordinator checkpoint persisted");
+            tracing::info!(
+                "upload coordinator checkpoint persisted, but local cache backend sync failed"
+            );
             false
         } else {
             tracing::info!("local cache backend sync persisted");

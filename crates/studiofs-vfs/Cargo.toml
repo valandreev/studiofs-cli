@@ -21,10 +21,10 @@ serde.workspace = true
 serde_json.workspace = true
 postcard.workspace = true
 uuid.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tempfile.workspace = true
 bytes.workspace = true
 aws-sdk-s3 = "1"
 aws-smithy-http-client = "1"
