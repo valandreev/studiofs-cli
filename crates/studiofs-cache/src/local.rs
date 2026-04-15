@@ -25,6 +25,20 @@ pub enum LocalBlockLifecycleState {
     Uploaded,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocalBlockStorageStats {
+    pub current_bytes: u64,
+    pub dirty_bytes: u64,
+    pub evictable_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalBlockObjectStats {
+    pub payload_len: u64,
+    pub lifecycle: LocalBlockLifecycleState,
+    pub evictable: bool,
+}
+
 /// Backend-agnostic error surface for local block operations.
 #[derive(Debug, thiserror::Error)]
 pub enum LocalBlockBackendError {
@@ -67,6 +81,13 @@ pub trait LocalBlockBackend: Send + Sync {
     }
     fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState;
     fn is_evictable(&self, object_id: u64) -> bool;
+    fn storage_stats(&self) -> LocalBlockStorageStats {
+        LocalBlockStorageStats::default()
+    }
+    fn object_stats(&self, object_id: u64) -> Option<LocalBlockObjectStats> {
+        let _ = object_id;
+        None
+    }
 }
 
 /// Derive a stable 16-byte local backend volume UUID from a format UUID string.

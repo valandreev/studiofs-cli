@@ -2,8 +2,11 @@ use super::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use studiofs_meta::engine::{MetaBlocks, MetaInodes};
-use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
-use studiofs_meta::{MetaFormat, RedbMetaEngine};
+use studiofs_meta::schema::{
+    CURRENT_FORMAT_VERSION, FormatInfo, InodeLifecycleState, MetadataConfig, PayloadRetentionClass,
+    ROOT_INO,
+};
+use studiofs_meta::{MetaFormat, MetaFsOps, RedbMetaEngine};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
@@ -61,6 +64,37 @@ fn make_test_vfs(
     let _guard = rt.enter();
     vfs.start().expect("start vfs background workers");
     (rt, vfs, meta)
+}
+
+fn mark_all_file_blocks_uploaded(
+    vfs: &Arc<StudioVfs>,
+    meta: &Arc<RedbMetaEngine>,
+    ino: Ino,
+) -> (u64, Vec<(u32, BlockRef)>) {
+    let attr = meta.get_attr(ino).expect("load inode attrs");
+    let blocks = meta.get_file_blocks(ino).expect("load file blocks");
+    for (block_index, block) in &blocks {
+        vfs.local_block_backend().mark_uploaded(block.object_id);
+        assert!(
+            meta.mark_file_block_uploaded_if_matches(ino, *block_index, attr.content_epoch, block)
+                .expect("mark block uploaded"),
+            "expected metadata upload mark to apply for every block"
+        );
+    }
+    (attr.content_epoch, blocks)
+}
+
+fn publish_current_manifest(
+    meta: &Arc<RedbMetaEngine>,
+    ino: Ino,
+    content_epoch: u64,
+    blocks: &[(u32, BlockRef)],
+) {
+    assert!(
+        meta.publish_file_manifest_if_matches(ino, content_epoch, blocks)
+            .expect("publish current manifest"),
+        "expected manifest publish to apply"
+    );
 }
 
 #[test]
@@ -216,6 +250,217 @@ fn startup_replay_removes_orphan_dirty_blocks_and_clears_pending_evictions() {
         1,
         "startup replay should attribute removed orphan to stale-upload cleanup"
     );
+}
+
+#[test]
+fn zeroio_snapshot_distinguishes_single_store_payload_classes_and_publish_backlog() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "zeroio-snapshot-classes");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let pinned = vfs.create(1, b"pinned.bin", 0, 0, 0o644).unwrap();
+        vfs.write(pinned.ino, 0, b"pinned-unpublished-payload")
+            .await
+            .unwrap();
+
+        let publish_ready = vfs.create(1, b"publish-ready.bin", 0, 0, 0o644).unwrap();
+        vfs.write(publish_ready.ino, 0, b"publish-ready-payload")
+            .await
+            .unwrap();
+
+        let published = vfs.create(1, b"published.bin", 0, 0, 0o644).unwrap();
+        vfs.write(published.ino, 0, b"published-warm-payload")
+            .await
+            .unwrap();
+
+        let (publish_ready_epoch, publish_ready_blocks) =
+            mark_all_file_blocks_uploaded(&vfs, &meta, publish_ready.ino);
+        let (published_epoch, published_blocks) =
+            mark_all_file_blocks_uploaded(&vfs, &meta, published.ino);
+        publish_current_manifest(&meta, published.ino, published_epoch, &published_blocks);
+
+        let snapshot = vfs.zeroio_runtime_snapshot();
+
+        assert!(
+            snapshot.unpublished_files >= 2,
+            "expected pinned and publish-ready epochs to remain unpublished"
+        );
+        assert!(
+            snapshot.cache_bytes.pinned_unpublished_bytes > 0,
+            "single-store snapshot must report correctness-critical pinned unpublished bytes"
+        );
+        assert!(
+            snapshot.cache_bytes.publish_ready_retained_bytes > 0,
+            "single-store snapshot must report uploaded-but-unpublished retained bytes"
+        );
+        assert!(
+            snapshot.cache_bytes.published_warm_bytes > 0,
+            "single-store snapshot must report published evictable warm-cache bytes"
+        );
+        assert!(
+            snapshot.publish_ready_backlog_epochs >= 1,
+            "publish-ready backlog should include fully uploaded unpublished epochs"
+        );
+
+        let publish_ready_entry = snapshot
+            .drilldown
+            .iter()
+            .find(|entry| entry.ino == publish_ready.ino)
+            .expect("publish-ready inode should appear in zeroio drilldown");
+        assert_eq!(
+            publish_ready_entry.lifecycle_state,
+            InodeLifecycleState::PublishReady
+        );
+        assert_eq!(
+            publish_ready_entry.retention,
+            PayloadRetentionClass::PublishReadyRetained
+        );
+        assert_eq!(publish_ready_entry.local_content_epoch, publish_ready_epoch);
+        assert!(publish_ready_entry.publish_ready_queued);
+        assert_eq!(publish_ready_entry.status, "publish_ready_queued");
+
+        let published_entry = snapshot
+            .drilldown
+            .iter()
+            .find(|entry| entry.ino == published.ino)
+            .expect("published inode should remain visible for warm-cache accounting");
+        assert_eq!(
+            published_entry.retention,
+            PayloadRetentionClass::PublishedWarm
+        );
+
+        assert!(
+            !publish_ready_blocks.is_empty(),
+            "test setup should persist current unpublished blocks"
+        );
+    });
+}
+
+#[test]
+fn zeroio_snapshot_reports_delete_before_publish_cleanup_visibility() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "zeroio-delete-before-publish");
+    let _guard = rt.enter();
+
+    let attr = vfs
+        .create(1, b"delete-before-publish.bin", 0, 0, 0o644)
+        .unwrap();
+    let mut staged_attr = meta
+        .get_attr(attr.ino)
+        .expect("load delete-before-publish attr");
+    staged_attr.size = 8192;
+    staged_attr.content_epoch = 1;
+    meta.set_attr(&staged_attr).expect("persist staged attr");
+    vfs.local_block_backend()
+        .put(950, b"local-only", false)
+        .expect("persist local-only object");
+    vfs.local_block_backend()
+        .put(951, b"uploaded", true)
+        .expect("persist uploaded object");
+    vfs.local_block_backend().mark_uploaded(951);
+    meta.set_file_block(attr.ino, 0, &BlockRef::new_partial(950, 4096))
+        .expect("persist local-only block");
+    let uploaded = BlockRef::new_partial(951, 4096);
+    meta.set_file_block(attr.ino, 1, &uploaded)
+        .expect("persist uploaded block");
+    assert!(
+        meta.mark_file_block_uploaded_if_matches(attr.ino, 1, 1, &uploaded)
+            .expect("mark uploaded block"),
+        "expected uploaded block transition to apply"
+    );
+
+    meta.unlink(ROOT_INO, b"delete-before-publish.bin")
+        .expect("persist delete-before-publish lifecycle");
+
+    let lifecycle = meta
+        .get_inode_lifecycle(attr.ino)
+        .expect("load lifecycle tombstone")
+        .expect("deleted-before-publish lifecycle should persist");
+    assert_eq!(lifecycle.state, InodeLifecycleState::DeletedBeforePublish);
+    assert!(
+        !lifecycle.deferred_cleanup_object_ids.is_empty(),
+        "test setup should preserve uploaded object ids for deferred cleanup"
+    );
+
+    let snapshot = vfs.zeroio_runtime_snapshot();
+    assert_eq!(snapshot.deferred_delete_backlog_epochs, 1);
+    assert!(
+        snapshot.deferred_delete_backlog_objects > 0,
+        "deleted-before-publish epochs should retain uploaded objects for deferred cleanup"
+    );
+
+    let entry = snapshot
+        .drilldown
+        .iter()
+        .find(|entry| entry.ino == attr.ino)
+        .expect("deleted-before-publish inode should remain drill-down visible");
+    assert_eq!(
+        entry.lifecycle_state,
+        InodeLifecycleState::DeletedBeforePublish
+    );
+    assert_eq!(entry.status, "awaiting_deferred_cleanup");
+    assert!(entry.deferred_cleanup_object_count > 0);
+}
+
+#[test]
+fn zeroio_snapshot_reports_repeated_restart_replay_as_health_signal() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "zeroio-repeated-replay");
+    let _guard = rt.enter();
+
+    let created = vfs
+        .create(1, b"replay-health.bin", 0, 0, 0o644)
+        .expect("create replay test file");
+    let ino = created.ino;
+    rt.block_on(async {
+        vfs.write(ino, 0, b"replay-health-payload").await.unwrap();
+    });
+    let attr = meta.get_attr(ino).expect("load replay attr");
+    let block = meta
+        .get_file_blocks(ino)
+        .expect("load replay blocks")
+        .into_iter()
+        .next()
+        .expect("at least one persisted block")
+        .1;
+    let pending_uploads = vec![PendingUpload {
+        ino,
+        offset: 0,
+        object_id: block.object_id,
+        content_epoch: attr.content_epoch,
+        created_unix_ms: 100,
+        not_before_unix_ms: 0,
+        retry_count: 0,
+    }];
+
+    vfs.replay_dirty_uploads_from_local_backend(&pending_uploads, std::slice::from_ref(&attr));
+    vfs.replay_dirty_uploads_from_local_backend(&pending_uploads, &[attr]);
+
+    let snapshot = vfs.zeroio_runtime_snapshot();
+    assert!(
+        snapshot
+            .startup_replay
+            .as_ref()
+            .map(|summary| summary.replayed_blocks)
+            .unwrap_or(0)
+            >= 1,
+        "startup replay summary should be surfaced in zeroio diagnostics"
+    );
+    assert!(
+        snapshot
+            .health_signals
+            .iter()
+            .any(|signal| signal.code == "repeated_replay" && signal.ino == Some(ino)),
+        "repeated restart replay should surface as an explicit zeroio health signal"
+    );
+    let entry = snapshot
+        .drilldown
+        .iter()
+        .find(|entry| entry.ino == ino)
+        .expect("replayed inode should appear in zeroio drilldown");
+    assert!(entry.replayed_after_restart);
+    assert!(entry.repeated_replay_count >= 2);
 }
 
 #[test]

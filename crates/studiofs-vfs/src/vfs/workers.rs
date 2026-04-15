@@ -40,6 +40,21 @@ impl StudioVfs {
                     self.schedule_epoch_finalization_retry(ino, content_epoch, retry_delay);
                 }
                 Err(err) => {
+                    self.state
+                        .metrics
+                        .zeroio_publish_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.record_runtime_event(
+                        "zeroio",
+                        "publish_failed",
+                        "zeroio publish failed",
+                        serde_json::json!({
+                            "ino": ino,
+                            "content_epoch": content_epoch,
+                            "path": self.best_effort_path_for_inode(ino),
+                            "error": err.to_string(),
+                        }),
+                    );
                     if Self::is_invalid_regular_file_graph_error(&err) {
                         let attr_size =
                             run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {

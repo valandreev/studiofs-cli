@@ -1,5 +1,6 @@
 use super::file_session::VfsFileSessionStats;
 use serde::{Deserialize, Serialize};
+use studiofs_meta::schema::{InodeLifecycleState, PayloadRetentionClass};
 
 /// Filesystem statistics returned by `statfs()`.
 #[derive(Debug, Clone)]
@@ -257,6 +258,107 @@ pub struct VfsUploadStats {
     pub upload_requeues: u64,
     pub canceled_deleted: u64,
     pub canceled_stale: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VfsZeroIoCacheBytesSnapshot {
+    pub total_local_bytes: u64,
+    pub backend_evictable_bytes: u64,
+    pub backend_non_evictable_bytes: u64,
+    pub pinned_unpublished_bytes: u64,
+    pub publish_ready_retained_bytes: u64,
+    pub published_warm_bytes: u64,
+    pub deleted_before_publish_bytes: u64,
+    pub unclassified_non_evictable_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VfsZeroIoStartupReplaySnapshot {
+    pub generated_unix_ms: u64,
+    pub replayed_epochs: u64,
+    pub replayed_blocks: u64,
+    pub queued_publish_ready_epochs: u64,
+    pub quarantined_inodes: u64,
+    pub orphan_dirty_blocks_removed: u64,
+    pub replay_failures: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VfsZeroIoShutdownSnapshot {
+    pub generated_unix_ms: u64,
+    pub accepted_write_buffer_bytes_before: u64,
+    pub accepted_write_buffer_bytes_after: u64,
+    pub pending_uploads_after: usize,
+    pub uploader_drained_before_cancel: bool,
+    pub metadata_flush_outcome: String,
+    pub local_payload_sync_ok: bool,
+    pub recoverable_on_restart: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VfsZeroIoHealthSignal {
+    pub severity: String,
+    pub code: String,
+    pub summary: String,
+    #[serde(default)]
+    pub ino: Option<u64>,
+    #[serde(default)]
+    pub content_epoch: Option<u64>,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VfsZeroIoDrilldownEntry {
+    pub ino: u64,
+    #[serde(default)]
+    pub path: Option<String>,
+    pub lifecycle_state: InodeLifecycleState,
+    pub retention: PayloadRetentionClass,
+    pub local_content_epoch: u64,
+    pub published_content_epoch: u64,
+    pub local_visible_size: u64,
+    pub published_size: u64,
+    pub live_extent_count: usize,
+    pub pending_upload_count: usize,
+    pub pending_upload_bytes: u64,
+    pub oldest_pending_upload_age_ms: u64,
+    pub publish_ready_queued: bool,
+    pub replayed_after_restart: bool,
+    pub repeated_replay_count: u64,
+    pub deferred_cleanup_object_count: usize,
+    pub deferred_cleanup_bytes: u64,
+    #[serde(default)]
+    pub sticky_error: Option<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VfsZeroIoRuntimeSnapshot {
+    pub generated_unix_ms: u64,
+    pub unpublished_files: usize,
+    pub unpublished_epochs: usize,
+    pub unpublished_payload_bytes: u64,
+    pub uploading_epochs: usize,
+    pub replay_backlog_epochs: usize,
+    pub replay_backlog_bytes: u64,
+    pub publish_ready_backlog_epochs: usize,
+    pub replayed_after_restart_epochs: u64,
+    pub deferred_delete_backlog_epochs: usize,
+    pub deferred_delete_backlog_objects: usize,
+    pub deferred_delete_backlog_bytes: u64,
+    pub replay_failures: u64,
+    pub publish_failures: u64,
+    pub cache_bytes: VfsZeroIoCacheBytesSnapshot,
+    #[serde(default)]
+    pub startup_replay: Option<VfsZeroIoStartupReplaySnapshot>,
+    #[serde(default)]
+    pub last_graceful_shutdown: Option<VfsZeroIoShutdownSnapshot>,
+    #[serde(default)]
+    pub health_signals: Vec<VfsZeroIoHealthSignal>,
+    pub drilldown_truncated: usize,
+    #[serde(default)]
+    pub drilldown: Vec<VfsZeroIoDrilldownEntry>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

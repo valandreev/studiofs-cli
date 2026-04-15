@@ -70,6 +70,8 @@ pub use metrics::{
     VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
     VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
     VfsWritePathWinfspCallbackStats, VfsWritePathWinfspForegroundFlushStats,
+    VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
+    VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
 };
 pub use namespace::{KernelInvalidator, NamespaceParent, NamespacePathStyle, NamespaceResolver};
 
@@ -143,8 +145,8 @@ use studiofs_data::object::{
 use studiofs_data::store::{DataError, DataStore, DataStoreConfig, IoProfile};
 
 use studiofs_meta::schema::{
-    DEFAULT_CHUNK_SIZE, DirEntry, FormatInfo, ROOT_INO, SetattrArgs,
-    UploadState as MetaUploadState, chunk_start_offset,
+    DEFAULT_CHUNK_SIZE, DirEntry, FormatInfo, InodeLifecycleState, PayloadRetentionClass, ROOT_INO,
+    SetattrArgs, UploadState as MetaUploadState, chunk_start_offset, counters,
 };
 use studiofs_meta::types::{
     AccessLevel, BlockFlags as MetaBlockFlags, BlockRef, FileType, Ino, InodeAttr,
@@ -158,6 +160,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 pub const VFS_RUNTIME_EVENT_CAPACITY: usize = 128;
+const ZEROIO_DIAGNOSTIC_DRILLDOWN_LIMIT: usize = 32;
+const ZEROIO_HEALTH_SIGNAL_LIMIT: usize = 16;
+const ZEROIO_REPLAY_EVENT_SAMPLE_LIMIT: usize = 16;
 
 use crate::ingress_wal::{
     IngressWal, latest_ingress_checkpoint_path, load_latest_ingress_checkpoint_meta,
@@ -1812,6 +1817,8 @@ struct MetricsState {
     winfsp_cleanup_barrier_skipped_clean: AtomicU64,
     winfsp_flush_barrier_skipped_clean: AtomicU64,
     winfsp_close_barrier_skipped_clean: AtomicU64,
+    zeroio_replay_failures: AtomicU64,
+    zeroio_publish_failures: AtomicU64,
     runtime_event_sequence: AtomicU64,
     runtime_events: Mutex<VecDeque<VfsRuntimeEvent>>,
 }
@@ -1883,6 +1890,8 @@ impl MetricsState {
             winfsp_cleanup_barrier_skipped_clean: AtomicU64::new(0),
             winfsp_flush_barrier_skipped_clean: AtomicU64::new(0),
             winfsp_close_barrier_skipped_clean: AtomicU64::new(0),
+            zeroio_replay_failures: AtomicU64::new(0),
+            zeroio_publish_failures: AtomicU64::new(0),
             runtime_event_sequence: AtomicU64::new(0),
             runtime_events: Mutex::new(VecDeque::new()),
         }
@@ -1951,6 +1960,8 @@ impl MetricsState {
             winfsp_cleanup_barrier_skipped_clean,
             winfsp_flush_barrier_skipped_clean,
             winfsp_close_barrier_skipped_clean,
+            zeroio_replay_failures,
+            zeroio_publish_failures,
             runtime_event_sequence
         );
         self.local_cache_io_handoff_histogram.reset();
@@ -2375,6 +2386,18 @@ struct StartupReplayCoordinator<'a> {
     live_extents: HashMap<(Ino, u32), ExtentRecordId>,
     pending_epoch_finalizations: Vec<(Ino, u64)>,
     restored_live_extents: usize,
+    replay_failures: u64,
+    orphan_dirty_blocks_removed: u64,
+}
+
+struct ZeroIoDrilldownStatusInput<'a> {
+    lifecycle: &'a studiofs_meta::schema::InodeLifecycleRecord,
+    pending_upload_count: usize,
+    publish_ready_queued: bool,
+    replayed_after_restart: bool,
+    repeated_replay_count: u64,
+    deferred_cleanup_object_count: usize,
+    sticky_error: Option<&'a str>,
 }
 
 impl<'a> StartupReplayCoordinator<'a> {
@@ -2393,6 +2416,8 @@ impl<'a> StartupReplayCoordinator<'a> {
             live_extents: HashMap::new(),
             pending_epoch_finalizations: Vec::new(),
             restored_live_extents: 0,
+            replay_failures: 0,
+            orphan_dirty_blocks_removed: 0,
         }
     }
 
@@ -2417,6 +2442,7 @@ impl<'a> StartupReplayCoordinator<'a> {
                 if StudioVfs::is_invalid_regular_file_graph_error(&error) {
                     self.handle_quarantine(ino, attr.size, &error);
                 } else {
+                    self.replay_failures = self.replay_failures.saturating_add(1);
                     warn!(
                         ino,
                         error = %error,
@@ -2470,6 +2496,7 @@ impl<'a> StartupReplayCoordinator<'a> {
                         }
                     }
                     Err(error) => {
+                        self.replay_failures = self.replay_failures.saturating_add(1);
                         warn!(
                             ino,
                             error = %error,
@@ -2663,6 +2690,9 @@ impl<'a> StartupReplayCoordinator<'a> {
             return;
         }
         let orphan_count = self.dirty_set.len() as u64;
+        self.orphan_dirty_blocks_removed = self
+            .orphan_dirty_blocks_removed
+            .saturating_add(orphan_count);
         for object_id in &self.dirty_set {
             warn!(
                 object_id,
@@ -2698,6 +2728,17 @@ impl<'a> StartupReplayCoordinator<'a> {
     fn finish(mut self) {
         self.discard_quarantined_dirty_objects();
         self.merge_pending_live_extents();
+        let replayed_blocks = self.replay_ops.len() as u64;
+        let replayed_epochs: BTreeSet<_> = self
+            .replay_ops
+            .iter()
+            .map(|(ino, _, _, content_epoch)| (*ino, *content_epoch))
+            .collect();
+        self.vfs
+            .state
+            .metrics
+            .zeroio_replay_failures
+            .fetch_add(self.replay_failures, Ordering::Relaxed);
 
         if !self.replay_ops.is_empty() {
             self.vfs
@@ -2725,7 +2766,37 @@ impl<'a> StartupReplayCoordinator<'a> {
             );
         }
 
+        for (ino, content_epoch) in replayed_epochs
+            .iter()
+            .copied()
+            .take(ZEROIO_REPLAY_EVENT_SAMPLE_LIMIT)
+        {
+            self.vfs.record_runtime_event(
+                "zeroio",
+                "epoch_replayed_after_restart",
+                "zeroio epoch replayed after restart",
+                serde_json::json!({
+                    "ino": ino,
+                    "content_epoch": content_epoch,
+                    "path": self.vfs.best_effort_path_for_inode(ino),
+                }),
+            );
+        }
         self.cleanup_orphan_dirty_blocks();
+
+        self.vfs.record_runtime_event(
+            "zeroio",
+            "startup_replay_summary",
+            "zeroio startup replay summary",
+            serde_json::json!({
+                "replayed_epochs": replayed_epochs.len() as u64,
+                "replayed_blocks": replayed_blocks,
+                "queued_publish_ready_epochs": self.queued_epoch_count() as u64,
+                "quarantined_inodes": self.quarantined_inodes.len() as u64,
+                "orphan_dirty_blocks_removed": self.orphan_dirty_blocks_removed,
+                "replay_failures": self.replay_failures,
+            }),
+        );
 
         if !self.quarantined_inodes.is_empty() {
             self.vfs
@@ -2834,6 +2905,566 @@ impl StudioVfs {
             pending_metadata_ops: metadata_backlog.pending_ops,
             inflight_metadata_ops: metadata_backlog.inflight_ops,
         }
+    }
+
+    fn zeroio_event_u64(fields: &serde_json::Value, key: &str) -> Option<u64> {
+        fields
+            .get(key)
+            .and_then(|value| value.as_u64())
+            .or_else(|| {
+                fields
+                    .get(key)
+                    .and_then(|value| value.as_i64())
+                    .and_then(|value| u64::try_from(value).ok())
+            })
+    }
+
+    fn zeroio_event_bool(fields: &serde_json::Value, key: &str) -> Option<bool> {
+        fields.get(key).and_then(|value| value.as_bool())
+    }
+
+    fn zeroio_event_string(fields: &serde_json::Value, key: &str) -> Option<String> {
+        fields
+            .get(key)
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    }
+
+    fn zeroio_retention_priority(retention: PayloadRetentionClass) -> u8 {
+        match retention {
+            PayloadRetentionClass::PublishedWarm => 0,
+            PayloadRetentionClass::PinnedUnpublished => 1,
+            PayloadRetentionClass::PublishReadyRetained => 2,
+            PayloadRetentionClass::DeletedBeforePublish => 3,
+        }
+    }
+
+    fn zeroio_status_priority(status: &str) -> u8 {
+        match status {
+            "stuck_upload_error" => 7,
+            "repeated_replay_after_restart" => 6,
+            "publish_starved_after_replay" => 5,
+            "awaiting_deferred_cleanup" => 4,
+            "uploading_without_queue" => 3,
+            "publish_ready_queued" => 2,
+            "publish_ready_waiting" | "replayed_waiting_for_upload" | "uploading" => 1,
+            _ => 0,
+        }
+    }
+
+    fn zeroio_object_ids_for_lifecycle(
+        &self,
+        ino: Ino,
+        lifecycle: &studiofs_meta::schema::InodeLifecycleRecord,
+    ) -> Vec<u64> {
+        let meta = self.sync_meta();
+        let mut object_ids = BTreeSet::new();
+
+        if lifecycle.state == InodeLifecycleState::DeletedBeforePublish {
+            object_ids.extend(lifecycle.deferred_cleanup_object_ids.iter().copied());
+            return object_ids.into_iter().collect();
+        }
+
+        if lifecycle.state != InodeLifecycleState::Published {
+            for (_, object_id, content_epoch) in self.live_extent_records_for_inode(ino) {
+                if content_epoch == lifecycle.local_content_epoch {
+                    object_ids.insert(object_id);
+                }
+            }
+            if !object_ids.is_empty() {
+                return object_ids.into_iter().collect();
+            }
+
+            if meta.has_local_regular_file_overlay(ino).unwrap_or(false) {
+                if let Ok(ids) = meta.get_regular_file_overlay_object_ids(ino) {
+                    object_ids.extend(ids);
+                }
+                if !object_ids.is_empty() {
+                    return object_ids.into_iter().collect();
+                }
+            }
+        }
+
+        if let Ok(blocks) = meta.get_file_blocks(ino) {
+            object_ids.extend(blocks.into_iter().map(|(_, block)| block.object_id));
+        }
+
+        object_ids.into_iter().collect()
+    }
+
+    fn zeroio_object_bytes(&self, object_ids: &[u64]) -> u64 {
+        object_ids
+            .iter()
+            .filter_map(|object_id| self.local_block_backend.object_stats(*object_id))
+            .map(|stats| stats.payload_len)
+            .sum()
+    }
+
+    fn zeroio_drilldown_status(input: ZeroIoDrilldownStatusInput<'_>) -> &'static str {
+        if input.sticky_error.is_some() {
+            "stuck_upload_error"
+        } else if input.repeated_replay_count > 1 {
+            "repeated_replay_after_restart"
+        } else if input.lifecycle.state == InodeLifecycleState::PublishReady
+            && input.replayed_after_restart
+        {
+            "publish_starved_after_replay"
+        } else if input.deferred_cleanup_object_count > 0
+            || input.lifecycle.state == InodeLifecycleState::DeletedBeforePublish
+        {
+            "awaiting_deferred_cleanup"
+        } else if input.lifecycle.state == InodeLifecycleState::Uploading
+            && input.pending_upload_count == 0
+        {
+            "uploading_without_queue"
+        } else if input.publish_ready_queued {
+            "publish_ready_queued"
+        } else if input.lifecycle.state == InodeLifecycleState::PublishReady {
+            "publish_ready_waiting"
+        } else if input.replayed_after_restart {
+            "replayed_waiting_for_upload"
+        } else if input.lifecycle.state == InodeLifecycleState::Uploading {
+            "uploading"
+        } else {
+            "healthy"
+        }
+    }
+
+    pub fn zeroio_runtime_snapshot(&self) -> VfsZeroIoRuntimeSnapshot {
+        let generated_unix_ms = now_unix_millis();
+        let storage_stats = self.local_block_backend.storage_stats();
+        let backend_non_evictable_bytes = storage_stats
+            .current_bytes
+            .saturating_sub(storage_stats.evictable_bytes);
+        let pending_uploads = self.upload_coordinator.snapshot_pending_uploads();
+        let mut pending_uploads_by_inode: HashMap<Ino, Vec<PendingUpload>> = HashMap::new();
+        for op in pending_uploads {
+            pending_uploads_by_inode.entry(op.ino).or_default().push(op);
+        }
+
+        let pending_epoch_finalizations =
+            self.state.upload.pending_epoch_finalizations.lock().clone();
+        let sticky_errors = self.state.upload.upload_sticky_errors.lock().clone();
+
+        let mut replay_counts: HashMap<(Ino, u64), u64> = HashMap::new();
+        let mut startup_replay = None;
+        let mut startup_replay_ts = 0;
+        let mut last_graceful_shutdown = None;
+        let mut shutdown_ts = 0;
+        for event in self.recent_runtime_events(VFS_RUNTIME_EVENT_CAPACITY) {
+            if event.subsystem != "zeroio" {
+                continue;
+            }
+            match event.kind.as_str() {
+                "epoch_replayed_after_restart" => {
+                    let Some(ino) = Self::zeroio_event_u64(&event.fields, "ino") else {
+                        continue;
+                    };
+                    let Some(content_epoch) =
+                        Self::zeroio_event_u64(&event.fields, "content_epoch")
+                    else {
+                        continue;
+                    };
+                    *replay_counts.entry((ino, content_epoch)).or_insert(0) += 1;
+                }
+                "startup_replay_summary" if event.generated_unix_ms >= startup_replay_ts => {
+                    startup_replay_ts = event.generated_unix_ms;
+                    startup_replay = Some(VfsZeroIoStartupReplaySnapshot {
+                        generated_unix_ms: event.generated_unix_ms,
+                        replayed_epochs: Self::zeroio_event_u64(&event.fields, "replayed_epochs")
+                            .unwrap_or(0),
+                        replayed_blocks: Self::zeroio_event_u64(&event.fields, "replayed_blocks")
+                            .unwrap_or(0),
+                        queued_publish_ready_epochs: Self::zeroio_event_u64(
+                            &event.fields,
+                            "queued_publish_ready_epochs",
+                        )
+                        .unwrap_or(0),
+                        quarantined_inodes: Self::zeroio_event_u64(
+                            &event.fields,
+                            "quarantined_inodes",
+                        )
+                        .unwrap_or(0),
+                        orphan_dirty_blocks_removed: Self::zeroio_event_u64(
+                            &event.fields,
+                            "orphan_dirty_blocks_removed",
+                        )
+                        .unwrap_or(0),
+                        replay_failures: Self::zeroio_event_u64(&event.fields, "replay_failures")
+                            .unwrap_or(0),
+                    });
+                }
+                "shutdown_local_state" if event.generated_unix_ms >= shutdown_ts => {
+                    shutdown_ts = event.generated_unix_ms;
+                    last_graceful_shutdown = Some(VfsZeroIoShutdownSnapshot {
+                        generated_unix_ms: event.generated_unix_ms,
+                        accepted_write_buffer_bytes_before: Self::zeroio_event_u64(
+                            &event.fields,
+                            "accepted_write_buffer_bytes_before",
+                        )
+                        .unwrap_or(0),
+                        accepted_write_buffer_bytes_after: Self::zeroio_event_u64(
+                            &event.fields,
+                            "accepted_write_buffer_bytes_after",
+                        )
+                        .unwrap_or(0),
+                        pending_uploads_after: Self::zeroio_event_u64(
+                            &event.fields,
+                            "pending_uploads_after",
+                        )
+                        .and_then(|value| usize::try_from(value).ok())
+                        .unwrap_or(0),
+                        uploader_drained_before_cancel: Self::zeroio_event_bool(
+                            &event.fields,
+                            "uploader_drained_before_cancel",
+                        )
+                        .unwrap_or(false),
+                        metadata_flush_outcome: Self::zeroio_event_string(
+                            &event.fields,
+                            "metadata_flush_outcome",
+                        )
+                        .unwrap_or_else(|| "unknown".to_string()),
+                        local_payload_sync_ok: Self::zeroio_event_bool(
+                            &event.fields,
+                            "local_payload_sync_ok",
+                        )
+                        .unwrap_or(false),
+                        recoverable_on_restart: Self::zeroio_event_bool(
+                            &event.fields,
+                            "recoverable_on_restart",
+                        )
+                        .unwrap_or(false),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        let replay_failures = self
+            .state
+            .metrics
+            .zeroio_replay_failures
+            .load(Ordering::Relaxed);
+        let publish_failures = self
+            .state
+            .metrics
+            .zeroio_publish_failures
+            .load(Ordering::Relaxed);
+
+        let mut snapshot = VfsZeroIoRuntimeSnapshot {
+            generated_unix_ms,
+            replay_failures,
+            publish_failures,
+            cache_bytes: VfsZeroIoCacheBytesSnapshot {
+                total_local_bytes: storage_stats.current_bytes,
+                backend_evictable_bytes: storage_stats.evictable_bytes,
+                backend_non_evictable_bytes,
+                ..VfsZeroIoCacheBytesSnapshot::default()
+            },
+            startup_replay,
+            last_graceful_shutdown,
+            replayed_after_restart_epochs: replay_counts.len() as u64,
+            ..VfsZeroIoRuntimeSnapshot::default()
+        };
+
+        let meta = self.sync_meta();
+        let next_inode = match meta.get_counter(counters::NEXT_INODE) {
+            Ok(next_inode) => next_inode,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "failed to load next inode counter for zeroio snapshot"
+                );
+                return snapshot;
+            }
+        };
+
+        let mut object_retentions: HashMap<u64, PayloadRetentionClass> = HashMap::new();
+        let mut health_signals = Vec::new();
+        let mut drilldown = Vec::new();
+
+        for ino in ROOT_INO..next_inode {
+            let lifecycle = match meta.get_inode_lifecycle(ino) {
+                Ok(Some(lifecycle)) => lifecycle,
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(
+                        ino,
+                        error = %error,
+                        "failed to load inode lifecycle for zeroio snapshot"
+                    );
+                    continue;
+                }
+            };
+
+            let object_ids = self.zeroio_object_ids_for_lifecycle(ino, &lifecycle);
+            let lifecycle_bytes = self.zeroio_object_bytes(&object_ids);
+            for object_id in &object_ids {
+                let next = lifecycle.retention;
+                object_retentions
+                    .entry(*object_id)
+                    .and_modify(|current| {
+                        if Self::zeroio_retention_priority(next)
+                            > Self::zeroio_retention_priority(*current)
+                        {
+                            *current = next;
+                        }
+                    })
+                    .or_insert(next);
+            }
+
+            let pending_uploads = pending_uploads_by_inode
+                .get(&ino)
+                .cloned()
+                .unwrap_or_default();
+            let pending_upload_count = pending_uploads.len();
+            let pending_upload_bytes = pending_uploads
+                .iter()
+                .filter_map(|op| self.local_block_backend.object_stats(op.object_id))
+                .map(|stats| stats.payload_len)
+                .sum();
+            let oldest_pending_upload_age_ms = pending_uploads
+                .iter()
+                .map(|op| generated_unix_ms.saturating_sub(op.created_unix_ms))
+                .max()
+                .unwrap_or(0);
+            let publish_ready_queued =
+                pending_epoch_finalizations.contains(&(ino, lifecycle.local_content_epoch));
+            let repeated_replay_count = replay_counts
+                .get(&(ino, lifecycle.local_content_epoch))
+                .copied()
+                .unwrap_or(0);
+            let replayed_after_restart = repeated_replay_count > 0;
+            let deferred_cleanup_object_count = lifecycle.deferred_cleanup_object_ids.len();
+            let deferred_cleanup_bytes =
+                self.zeroio_object_bytes(&lifecycle.deferred_cleanup_object_ids);
+            let sticky_error = sticky_errors.get(&ino).cloned();
+            let status = Self::zeroio_drilldown_status(ZeroIoDrilldownStatusInput {
+                lifecycle: &lifecycle,
+                pending_upload_count,
+                publish_ready_queued,
+                replayed_after_restart,
+                repeated_replay_count,
+                deferred_cleanup_object_count,
+                sticky_error: sticky_error.as_deref(),
+            })
+            .to_string();
+            let live_extent_count = self
+                .live_extent_records_for_inode(ino)
+                .into_iter()
+                .filter(|(_, _, content_epoch)| *content_epoch == lifecycle.local_content_epoch)
+                .count();
+            let path = self.best_effort_path_for_inode(ino);
+
+            match lifecycle.state {
+                InodeLifecycleState::LocalOnly
+                | InodeLifecycleState::Uploading
+                | InodeLifecycleState::PublishReady => {
+                    snapshot.unpublished_files = snapshot.unpublished_files.saturating_add(1);
+                    snapshot.unpublished_epochs = snapshot.unpublished_epochs.saturating_add(1);
+                    snapshot.unpublished_payload_bytes = snapshot
+                        .unpublished_payload_bytes
+                        .saturating_add(lifecycle_bytes);
+                }
+                InodeLifecycleState::Published | InodeLifecycleState::DeletedBeforePublish => {}
+            }
+
+            if lifecycle.state == InodeLifecycleState::Uploading {
+                snapshot.uploading_epochs = snapshot.uploading_epochs.saturating_add(1);
+            }
+            if lifecycle.state == InodeLifecycleState::PublishReady {
+                snapshot.publish_ready_backlog_epochs =
+                    snapshot.publish_ready_backlog_epochs.saturating_add(1);
+            }
+            if lifecycle.state == InodeLifecycleState::DeletedBeforePublish {
+                snapshot.deferred_delete_backlog_epochs =
+                    snapshot.deferred_delete_backlog_epochs.saturating_add(1);
+                snapshot.deferred_delete_backlog_objects = snapshot
+                    .deferred_delete_backlog_objects
+                    .saturating_add(deferred_cleanup_object_count);
+                snapshot.deferred_delete_backlog_bytes = snapshot
+                    .deferred_delete_backlog_bytes
+                    .saturating_add(deferred_cleanup_bytes);
+            }
+            if replayed_after_restart
+                && lifecycle.state != InodeLifecycleState::Published
+                && lifecycle.state != InodeLifecycleState::DeletedBeforePublish
+            {
+                snapshot.replay_backlog_epochs = snapshot.replay_backlog_epochs.saturating_add(1);
+                snapshot.replay_backlog_bytes = snapshot
+                    .replay_backlog_bytes
+                    .saturating_add(lifecycle_bytes);
+            }
+
+            if let Some(error) = sticky_error.clone() {
+                health_signals.push(VfsZeroIoHealthSignal {
+                    severity: "error".to_string(),
+                    code: "upload_failure".to_string(),
+                    summary: "sticky upload error is blocking unpublished progress".to_string(),
+                    ino: Some(ino),
+                    content_epoch: Some(lifecycle.local_content_epoch),
+                    path: path.clone(),
+                });
+                let _ = error;
+            } else if repeated_replay_count > 1 {
+                health_signals.push(VfsZeroIoHealthSignal {
+                    severity: "warn".to_string(),
+                    code: "repeated_replay".to_string(),
+                    summary: format!(
+                        "epoch replayed after restart {} times without completing publish",
+                        repeated_replay_count
+                    ),
+                    ino: Some(ino),
+                    content_epoch: Some(lifecycle.local_content_epoch),
+                    path: path.clone(),
+                });
+            } else if lifecycle.state == InodeLifecycleState::PublishReady && replayed_after_restart
+            {
+                health_signals.push(VfsZeroIoHealthSignal {
+                    severity: "warn".to_string(),
+                    code: "publish_starvation".to_string(),
+                    summary: "epoch replayed after restart but is still waiting to publish"
+                        .to_string(),
+                    ino: Some(ino),
+                    content_epoch: Some(lifecycle.local_content_epoch),
+                    path: path.clone(),
+                });
+            } else if lifecycle.state == InodeLifecycleState::Uploading && pending_upload_count == 0
+            {
+                health_signals.push(VfsZeroIoHealthSignal {
+                    severity: "warn".to_string(),
+                    code: "upload_queue_missing".to_string(),
+                    summary: "inode is marked uploading but has no pending upload queue entries"
+                        .to_string(),
+                    ino: Some(ino),
+                    content_epoch: Some(lifecycle.local_content_epoch),
+                    path: path.clone(),
+                });
+            } else if lifecycle.state == InodeLifecycleState::DeletedBeforePublish
+                && deferred_cleanup_object_count > 0
+            {
+                health_signals.push(VfsZeroIoHealthSignal {
+                    severity: "info".to_string(),
+                    code: "deferred_delete_backlog".to_string(),
+                    summary: "deleted-before-publish payload is awaiting deferred cleanup"
+                        .to_string(),
+                    ino: Some(ino),
+                    content_epoch: Some(lifecycle.local_content_epoch),
+                    path: path.clone(),
+                });
+            }
+
+            drilldown.push(VfsZeroIoDrilldownEntry {
+                ino,
+                path,
+                lifecycle_state: lifecycle.state,
+                retention: lifecycle.retention,
+                local_content_epoch: lifecycle.local_content_epoch,
+                published_content_epoch: lifecycle.published_content_epoch,
+                local_visible_size: lifecycle.local_visible_size,
+                published_size: lifecycle.published_size,
+                live_extent_count,
+                pending_upload_count,
+                pending_upload_bytes,
+                oldest_pending_upload_age_ms,
+                publish_ready_queued,
+                replayed_after_restart,
+                repeated_replay_count,
+                deferred_cleanup_object_count,
+                deferred_cleanup_bytes,
+                sticky_error,
+                status,
+            });
+        }
+
+        for (object_id, retention) in object_retentions {
+            let Some(stats) = self.local_block_backend.object_stats(object_id) else {
+                continue;
+            };
+            match retention {
+                PayloadRetentionClass::PinnedUnpublished => {
+                    snapshot.cache_bytes.pinned_unpublished_bytes = snapshot
+                        .cache_bytes
+                        .pinned_unpublished_bytes
+                        .saturating_add(stats.payload_len);
+                }
+                PayloadRetentionClass::PublishReadyRetained => {
+                    snapshot.cache_bytes.publish_ready_retained_bytes = snapshot
+                        .cache_bytes
+                        .publish_ready_retained_bytes
+                        .saturating_add(stats.payload_len);
+                }
+                PayloadRetentionClass::PublishedWarm => {
+                    snapshot.cache_bytes.published_warm_bytes = snapshot
+                        .cache_bytes
+                        .published_warm_bytes
+                        .saturating_add(stats.payload_len);
+                }
+                PayloadRetentionClass::DeletedBeforePublish => {
+                    snapshot.cache_bytes.deleted_before_publish_bytes = snapshot
+                        .cache_bytes
+                        .deleted_before_publish_bytes
+                        .saturating_add(stats.payload_len);
+                }
+            }
+        }
+
+        let classified_non_evictable = snapshot
+            .cache_bytes
+            .pinned_unpublished_bytes
+            .saturating_add(snapshot.cache_bytes.publish_ready_retained_bytes)
+            .saturating_add(snapshot.cache_bytes.deleted_before_publish_bytes);
+        snapshot.cache_bytes.unclassified_non_evictable_bytes =
+            backend_non_evictable_bytes.saturating_sub(classified_non_evictable);
+
+        if let Some(shutdown) = &snapshot.last_graceful_shutdown {
+            if !shutdown.recoverable_on_restart {
+                health_signals.push(VfsZeroIoHealthSignal {
+                    severity: "error".to_string(),
+                    code: "shutdown_not_recoverable".to_string(),
+                    summary:
+                        "last graceful shutdown did not fully flush accepted writes into recoverable local durable state"
+                            .to_string(),
+                    ino: None,
+                    content_epoch: None,
+                    path: None,
+                });
+            }
+        }
+
+        health_signals.sort_by(|left, right| {
+            let severity_rank = |severity: &str| match severity {
+                "error" => 3,
+                "warn" => 2,
+                "info" => 1,
+                _ => 0,
+            };
+            severity_rank(&right.severity)
+                .cmp(&severity_rank(&left.severity))
+                .then_with(|| left.code.cmp(&right.code))
+                .then_with(|| left.ino.cmp(&right.ino))
+        });
+        health_signals.truncate(ZEROIO_HEALTH_SIGNAL_LIMIT);
+        snapshot.health_signals = health_signals;
+
+        drilldown.sort_by(|left, right| {
+            Self::zeroio_status_priority(&right.status)
+                .cmp(&Self::zeroio_status_priority(&left.status))
+                .then_with(|| right.repeated_replay_count.cmp(&left.repeated_replay_count))
+                .then_with(|| {
+                    right
+                        .oldest_pending_upload_age_ms
+                        .cmp(&left.oldest_pending_upload_age_ms)
+                })
+                .then_with(|| right.pending_upload_bytes.cmp(&left.pending_upload_bytes))
+                .then_with(|| left.ino.cmp(&right.ino))
+        });
+        snapshot.drilldown_truncated = drilldown
+            .len()
+            .saturating_sub(ZEROIO_DIAGNOSTIC_DRILLDOWN_LIMIT);
+        drilldown.truncate(ZEROIO_DIAGNOSTIC_DRILLDOWN_LIMIT);
+        snapshot.drilldown = drilldown;
+        snapshot
     }
 
     pub fn recent_runtime_events(&self, limit: usize) -> Vec<VfsRuntimeEvent> {
@@ -3375,6 +4006,12 @@ impl StudioVfs {
             .evict_stream(ReadStreamKey { ino, stream_id });
     }
 
+    fn best_effort_path_for_inode(&self, ino: Ino) -> Option<String> {
+        NamespaceResolver::new(self, NamespacePathStyle::Windows)
+            .path_for_inode(ino)
+            .or_else(|| NamespaceResolver::new(self, NamespacePathStyle::Posix).path_for_inode(ino))
+    }
+
     fn debug_pending_target_path(&self, ino: Ino) -> Option<String> {
         let suffix = std::env::var(DEBUG_PENDING_PATH_SUFFIX_ENV).ok()?;
         let suffix = suffix.trim();
@@ -3387,11 +4024,7 @@ impl StudioVfs {
             .rsplit('\\')
             .next()
             .unwrap_or(normalized_suffix.as_str());
-        let path = NamespaceResolver::new(self, NamespacePathStyle::Windows)
-            .path_for_inode(ino)
-            .or_else(|| {
-                NamespaceResolver::new(self, NamespacePathStyle::Posix).path_for_inode(ino)
-            })?;
+        let path = self.best_effort_path_for_inode(ino)?;
         let normalized_path = path.replace('/', "\\").to_ascii_lowercase();
         let basename = Path::new(&normalized_path)
             .file_name()

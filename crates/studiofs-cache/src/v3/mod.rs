@@ -16,7 +16,10 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use tracing::{debug, warn};
 
-use crate::local::{LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState};
+use crate::local::{
+    LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState, LocalBlockObjectStats,
+    LocalBlockStorageStats,
+};
 
 pub mod cache_index;
 pub mod eviction;
@@ -844,6 +847,46 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
                     "cache-v3 index evictable lookup failed"
                 );
                 false
+            }
+        }
+    }
+
+    fn storage_stats(&self) -> LocalBlockStorageStats {
+        match self.index.stats() {
+            Ok(stats) => LocalBlockStorageStats {
+                current_bytes: stats.current_bytes,
+                dirty_bytes: stats.dirty_bytes,
+                evictable_bytes: stats.evictable_bytes,
+            },
+            Err(error) => {
+                warn!(error = ?error, "cache-v3 index storage stats lookup failed");
+                LocalBlockStorageStats::default()
+            }
+        }
+    }
+
+    fn object_stats(&self, object_id: u64) -> Option<LocalBlockObjectStats> {
+        match self.index.get_entry(object_id) {
+            Ok(Some(entry)) => {
+                if self.payload_missing(object_id, "object_stats") {
+                    self.remove_orphaned_index_entry(object_id, "object_stats");
+                    None
+                } else {
+                    Some(LocalBlockObjectStats {
+                        payload_len: entry.payload_len,
+                        lifecycle: entry.lifecycle,
+                        evictable: entry.evictable,
+                    })
+                }
+            }
+            Ok(None) => None,
+            Err(error) => {
+                warn!(
+                    object_id,
+                    error = ?error,
+                    "cache-v3 index object stats lookup failed"
+                );
+                None
             }
         }
     }
