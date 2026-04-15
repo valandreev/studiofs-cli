@@ -119,6 +119,36 @@ fn test_unlink_open_handle_keeps_inode_and_decrements_nlink() {
 }
 
 #[test]
+fn zeroio_delete_before_publish_persists_tombstone_lifecycle() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"delete-before-publish.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+    engine
+        .set_file_block(file.ino, 0, &BlockRef::new_partial(950, 4096))
+        .unwrap();
+
+    engine.unlink(ROOT_INO, b"delete-before-publish.bin").unwrap();
+
+    assert!(engine.get_attr(file.ino).is_err());
+    let lifecycle = engine.get_inode_lifecycle(file.ino).unwrap().unwrap();
+    assert_eq!(lifecycle.state, InodeLifecycleState::DeletedBeforePublish);
+    assert_eq!(
+        lifecycle.retention,
+        PayloadRetentionClass::DeletedBeforePublish
+    );
+    assert_eq!(lifecycle.local_visible_size, 4096);
+    assert_eq!(lifecycle.published_size, 0);
+    assert_eq!(lifecycle.local_content_epoch, 1);
+    assert_eq!(lifecycle.published_content_epoch, 0);
+    assert_eq!(lifecycle.deferred_cleanup_object_ids, vec![950]);
+}
+
+#[test]
 fn test_rmdir() {
     let engine = temp_engine();
     engine

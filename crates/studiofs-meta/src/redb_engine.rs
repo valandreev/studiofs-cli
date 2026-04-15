@@ -43,6 +43,7 @@ impl RedbMetaEngine {
             let _ = txn.open_table(COUNTERS_TABLE);
             let _ = txn.open_table(INODES_TABLE);
             let _ = txn.open_table(BASE_INODES_TABLE);
+            let _ = txn.open_table(INODE_LIFECYCLE_TABLE);
             let _ = txn.open_table(INODE_TOMBSTONES_TABLE);
             let _ = txn.open_table(DENTRIES_TABLE);
             let _ = txn.open_table(BASE_DENTRIES_TABLE);
@@ -72,6 +73,7 @@ impl RedbMetaEngine {
         debug!("opened metadata database at {:?}", path.as_ref());
         let engine = Self { db: Arc::new(db) };
         let _ = engine.recover_undo_logs()?;
+        engine.rebuild_inode_lifecycle_table()?;
 
         match engine.get_format_info() {
             Ok(format_info) if format_info.format_version >= CURRENT_FORMAT_VERSION => {

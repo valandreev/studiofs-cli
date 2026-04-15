@@ -1,6 +1,233 @@
 use super::*;
 
 impl RedbMetaEngine {
+    pub fn get_inode_lifecycle(&self, ino: Ino) -> MetaResult<Option<InodeLifecycleRecord>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let table = txn
+            .open_table(INODE_LIFECYCLE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        table
+            .get(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|value| decode(value.value()))
+            .transpose()
+    }
+
+    pub fn rebuild_inode_lifecycle_table(&self) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Self::rebuild_inode_lifecycle_table_in_txn(&txn)?;
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    pub(super) fn rebuild_inode_lifecycle_table_in_txn(
+        txn: &redb::WriteTransaction,
+    ) -> MetaResult<()> {
+        let preserved_deleted = {
+            let table = txn
+                .open_table(INODE_LIFECYCLE_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut rows = Vec::new();
+            for row in table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (_ino, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                let record: InodeLifecycleRecord = decode(value.value())?;
+                if record.state == InodeLifecycleState::DeletedBeforePublish {
+                    rows.push(record);
+                }
+            }
+            rows
+        };
+        let regular_attrs = {
+            let table = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let mut attrs = Vec::new();
+            for row in table
+                .iter()
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                let (_ino, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+                let attr: InodeAttr = decode(value.value())?;
+                if attr.kind == FileType::RegularFile {
+                    attrs.push(attr);
+                }
+            }
+            attrs
+        };
+
+        Self::clear_table_in_txn(txn, INODE_LIFECYCLE_TABLE)?;
+        for record in preserved_deleted {
+            Self::put_inode_lifecycle_in_txn(txn, &record)?;
+        }
+        for attr in regular_attrs {
+            let record = Self::compute_inode_lifecycle_record_in_txn(txn, &attr)?;
+            Self::put_inode_lifecycle_in_txn(txn, &record)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn put_inode_lifecycle_in_txn(
+        txn: &redb::WriteTransaction,
+        record: &InodeLifecycleRecord,
+    ) -> MetaResult<()> {
+        let mut table = txn
+            .open_table(INODE_LIFECYCLE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let bytes = encode(record)?;
+        table
+            .insert(record.ino, bytes.as_slice())
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    pub(super) fn remove_inode_lifecycle_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<()> {
+        let mut table = txn
+            .open_table(INODE_LIFECYCLE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let _ = table
+            .remove(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    pub(super) fn record_deleted_before_publish_in_txn(
+        txn: &redb::WriteTransaction,
+        attr: &InodeAttr,
+        deferred_cleanup_object_ids: Vec<u64>,
+    ) -> MetaResult<InodeLifecycleRecord> {
+        let has_published_base = attr.committed_size > 0 || attr.committed_content_epoch > 0;
+        let record = InodeLifecycleRecord {
+            ino: attr.ino,
+            state: InodeLifecycleState::DeletedBeforePublish,
+            local_visible_size: attr.size,
+            published_size: attr.committed_size,
+            local_content_epoch: attr.content_epoch,
+            published_content_epoch: attr.committed_content_epoch,
+            has_published_base,
+            retention: PayloadRetentionClass::DeletedBeforePublish,
+            deferred_cleanup_object_ids,
+        };
+        Self::put_inode_lifecycle_in_txn(txn, &record)?;
+        Ok(record)
+    }
+
+    pub(super) fn sync_inode_lifecycle_in_txn(
+        txn: &redb::WriteTransaction,
+        ino: Ino,
+    ) -> MetaResult<Option<InodeLifecycleRecord>> {
+        let attr = match Self::get_attr_from_write_table(txn, INODES_TABLE, ino)? {
+            Some(attr) => attr,
+            None => {
+                Self::remove_inode_lifecycle_in_txn(txn, ino)?;
+                return Ok(None);
+            }
+        };
+        if attr.kind != FileType::RegularFile {
+            Self::remove_inode_lifecycle_in_txn(txn, ino)?;
+            return Ok(None);
+        }
+        let record = Self::compute_inode_lifecycle_record_in_txn(txn, &attr)?;
+        Self::put_inode_lifecycle_in_txn(txn, &record)?;
+        Ok(Some(record))
+    }
+
+    pub(super) fn compute_inode_lifecycle_record_in_txn(
+        txn: &redb::WriteTransaction,
+        attr: &InodeAttr,
+    ) -> MetaResult<InodeLifecycleRecord> {
+        let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
+            txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            attr.ino,
+        )?;
+        let has_published_base = !Self::base_manifest_from_graph_rows_in_txn(txn, attr.ino)?
+            .is_empty()
+            || attr.committed_size > 0
+            || attr.committed_content_epoch > 0;
+        let local_matches_published = attr.size == attr.committed_size
+            && attr.content_epoch == attr.committed_content_epoch
+            && Self::manifest_matches_committed_in_txn(txn, attr.ino)?;
+
+        let state = if local_matches_published {
+            if has_published_base {
+                InodeLifecycleState::Published
+            } else {
+                InodeLifecycleState::LocalOnly
+            }
+        } else {
+            match Self::overlay_lifecycle_state(overlay_chunks.values()) {
+                Some(InodeLifecycleState::Uploading) => InodeLifecycleState::Uploading,
+                Some(InodeLifecycleState::PublishReady) => InodeLifecycleState::PublishReady,
+                Some(InodeLifecycleState::LocalOnly) | None => InodeLifecycleState::LocalOnly,
+                Some(InodeLifecycleState::Published)
+                | Some(InodeLifecycleState::DeletedBeforePublish) => InodeLifecycleState::LocalOnly,
+            }
+        };
+        let retention = match state {
+            InodeLifecycleState::LocalOnly | InodeLifecycleState::Uploading => {
+                PayloadRetentionClass::PinnedUnpublished
+            }
+            InodeLifecycleState::PublishReady => PayloadRetentionClass::PublishReadyRetained,
+            InodeLifecycleState::Published => PayloadRetentionClass::PublishedWarm,
+            InodeLifecycleState::DeletedBeforePublish => {
+                PayloadRetentionClass::DeletedBeforePublish
+            }
+        };
+
+        Ok(InodeLifecycleRecord {
+            ino: attr.ino,
+            state,
+            local_visible_size: attr.size,
+            published_size: attr.committed_size,
+            local_content_epoch: attr.content_epoch,
+            published_content_epoch: attr.committed_content_epoch,
+            has_published_base,
+            retention,
+            deferred_cleanup_object_ids: Vec::new(),
+        })
+    }
+
+    fn overlay_lifecycle_state<'a>(
+        chunk_states: impl Iterator<Item = &'a RegularFileChunkState>,
+    ) -> Option<InodeLifecycleState> {
+        let mut saw_local_only = false;
+        let mut saw_uploaded = false;
+        for chunk_state in chunk_states {
+            for slice in chunk_state.slices.values() {
+                match slice.block_state {
+                    BlockRefState::Uploading => return Some(InodeLifecycleState::Uploading),
+                    BlockRefState::LocalOnly | BlockRefState::Recovering => {
+                        saw_local_only = true;
+                    }
+                    BlockRefState::Uploaded => {
+                        saw_uploaded = true;
+                    }
+                    BlockRefState::Published => {}
+                }
+            }
+        }
+        if saw_local_only {
+            Some(InodeLifecycleState::LocalOnly)
+        } else if saw_uploaded {
+            Some(InodeLifecycleState::PublishReady)
+        } else {
+            None
+        }
+    }
+
     pub(super) fn local_overlay_inodes_from_txn(
         txn: &redb::ReadTransaction,
     ) -> MetaResult<HashSet<Ino>> {
@@ -219,6 +446,7 @@ impl MetaInodes for RedbMetaEngine {
                 );
             }
             Self::set_inode_overlay_in_txn(&txn, &normalized)?;
+            Self::sync_inode_lifecycle_in_txn(&txn, normalized.ino)?;
 
             Self::append_event_in_txn(
                 &txn,
@@ -241,6 +469,7 @@ impl MetaInodes for RedbMetaEngine {
             Self::remove_inode_overlay_in_txn(&txn, ino)?;
 
             Self::clear_inode_overlay_aux_in_txn(&txn, ino)?;
+            Self::remove_inode_lifecycle_in_txn(&txn, ino)?;
 
             Self::append_event_in_txn(&txn, &crate::events::MetaEvent::RemoveAttr { ino })?;
         }

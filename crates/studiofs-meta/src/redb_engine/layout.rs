@@ -15,6 +15,10 @@ pub(super) const INODES_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::ne
 pub(super) const BASE_INODES_TABLE: TableDefinition<u64, &[u8]> =
     TableDefinition::new("base_inodes");
 
+/// Explicit inode lifecycle metadata for locally durable regular files.
+pub(super) const INODE_LIFECYCLE_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("inode_lifecycle");
+
 /// Local tombstones hiding remote-visible base attrs.
 pub(super) const INODE_TOMBSTONES_TABLE: TableDefinition<u64, u8> =
     TableDefinition::new("inode_tombstones");

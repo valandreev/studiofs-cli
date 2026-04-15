@@ -233,6 +233,7 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
 
         Self::clear_table_in_txn(&txn, PENDING_REGULAR_FILE_COMPACTION_TABLE)?;
+        Self::clear_table_in_txn(&txn, INODE_LIFECYCLE_TABLE)?;
 
         {
             let mut table = txn
@@ -443,6 +444,7 @@ impl RedbMetaEngine {
 
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        self.rebuild_inode_lifecycle_table()?;
         Ok(())
     }
 
