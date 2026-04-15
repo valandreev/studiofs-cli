@@ -456,6 +456,52 @@ fn test_commit_uploaded_block_rejects_replaced_block() {
 }
 
 #[test]
+fn zeroio_uploaded_overlay_blocks_make_epoch_publish_ready_only_after_full_epoch_upload() {
+    let engine = temp_engine();
+
+    let file = engine
+        .create_file(ROOT_INO, b"zeroio-publish-ready.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 8192;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+
+    let block0 = BlockRef::new_partial(1001, 4096);
+    let block1 = BlockRef::new_partial(1002, 4096);
+    engine.set_file_block(file.ino, 0, &block0).unwrap();
+    engine.set_file_block(file.ino, 1, &block1).unwrap();
+
+    assert!(
+        engine
+            .mark_file_block_uploaded_if_matches(file.ino, 0, 1, &block0)
+            .unwrap()
+    );
+    let partially_uploaded = engine.get_inode_lifecycle(file.ino).unwrap().unwrap();
+    assert_eq!(partially_uploaded.state, InodeLifecycleState::LocalOnly);
+    assert_eq!(
+        partially_uploaded.retention,
+        PayloadRetentionClass::PinnedUnpublished
+    );
+
+    assert!(
+        engine
+            .mark_file_block_uploaded_if_matches(file.ino, 1, 1, &block1)
+            .unwrap()
+    );
+    let publish_ready = engine.get_inode_lifecycle(file.ino).unwrap().unwrap();
+    assert_eq!(publish_ready.state, InodeLifecycleState::PublishReady);
+    assert_eq!(
+        publish_ready.retention,
+        PayloadRetentionClass::PublishReadyRetained
+    );
+    assert_eq!(publish_ready.local_visible_size, 8192);
+    assert_eq!(publish_ready.published_size, 0);
+    assert_eq!(publish_ready.local_content_epoch, 1);
+    assert_eq!(publish_ready.published_content_epoch, 0);
+}
+
+#[test]
 fn redb_upload_state_transitions_follow_inode_fields() {
     let engine = temp_engine();
 

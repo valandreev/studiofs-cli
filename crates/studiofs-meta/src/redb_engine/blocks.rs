@@ -534,6 +534,71 @@ impl MetaBlocks for RedbMetaEngine {
         Ok(true)
     }
 
+    fn mark_file_block_uploaded_if_matches(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        expected_epoch: u64,
+        block: &BlockRef,
+    ) -> MetaResult<bool> {
+        let block_size = self.regular_file_graph_block_size()?;
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        {
+            let inodes = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let attr_bytes = match inodes
+                .get(ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(g) => g.value().to_vec(),
+                None => return Ok(false),
+            };
+            let attr: InodeAttr = decode(&attr_bytes)?;
+            if attr.content_epoch != expected_epoch {
+                return Ok(false);
+            }
+            drop(inodes);
+
+            let current = Self::current_block_in_txn(&txn, ino, block_index, block_size)?;
+            let Some(current) = current else {
+                return Ok(false);
+            };
+            if current != *block {
+                return Ok(false);
+            }
+
+            let uploaded_slices = Self::chunk_slices_for_block(
+                block_index,
+                block_size,
+                Some(block),
+                BlockRefState::Uploaded,
+            )?;
+            Self::apply_regular_file_chunk_slices_in_txn(
+                &txn,
+                REGULAR_FILE_OVERLAY_TABLE,
+                ino,
+                uploaded_slices.as_slice(),
+                true,
+            )?;
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::SetRegularFileOverlaySlices {
+                    ino,
+                    chunk_slices: uploaded_slices.clone(),
+                },
+            )?;
+            Self::sync_unpublished_upload_progress_lifecycle_in_txn(&txn, &attr)?;
+        }
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(true)
+    }
+
     fn publish_file_manifest_if_matches(
         &self,
         ino: Ino,

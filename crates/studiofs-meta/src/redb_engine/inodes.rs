@@ -244,6 +244,59 @@ impl RedbMetaEngine {
         Ok(Some(record))
     }
 
+    pub(super) fn sync_unpublished_upload_progress_lifecycle_in_txn(
+        txn: &redb::WriteTransaction,
+        attr: &InodeAttr,
+    ) -> MetaResult<InodeLifecycleRecord> {
+        let existing: Option<InodeLifecycleRecord> = txn
+            .open_table(INODE_LIFECYCLE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .get(attr.ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .map(|value| decode(value.value()))
+            .transpose()?;
+        let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
+            txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            attr.ino,
+        )?;
+        let overlay_state = Self::overlay_lifecycle_state(overlay_chunks.values());
+        let has_published_base = existing
+            .as_ref()
+            .map(|record| record.has_published_base)
+            .unwrap_or(attr.committed_size > 0 || attr.committed_content_epoch > 0);
+        let state = match overlay_state {
+            Some(InodeLifecycleState::Uploading) => InodeLifecycleState::Uploading,
+            Some(InodeLifecycleState::PublishReady) => InodeLifecycleState::PublishReady,
+            _ => InodeLifecycleState::LocalOnly,
+        };
+        let retention = match state {
+            InodeLifecycleState::PublishReady => PayloadRetentionClass::PublishReadyRetained,
+            InodeLifecycleState::LocalOnly | InodeLifecycleState::Uploading => {
+                PayloadRetentionClass::PinnedUnpublished
+            }
+            InodeLifecycleState::Published => PayloadRetentionClass::PublishedWarm,
+            InodeLifecycleState::DeletedBeforePublish => {
+                PayloadRetentionClass::DeletedBeforePublish
+            }
+        };
+        let record = InodeLifecycleRecord {
+            ino: attr.ino,
+            state,
+            local_visible_size: attr.size,
+            published_size: attr.committed_size,
+            local_content_epoch: attr.content_epoch,
+            published_content_epoch: attr.committed_content_epoch,
+            has_published_base,
+            retention,
+            deferred_cleanup_object_ids: existing
+                .map(|record| record.deferred_cleanup_object_ids)
+                .unwrap_or_default(),
+        };
+        Self::put_inode_lifecycle_in_txn(txn, &record)?;
+        Ok(record)
+    }
+
     pub(super) fn compute_inode_lifecycle_record_in_txn(
         txn: &redb::WriteTransaction,
         attr: &InodeAttr,
@@ -512,6 +565,10 @@ impl MetaInodes for RedbMetaEngine {
         let overlay_block_inodes = Self::local_overlay_inodes_from_txn(&txn)?;
         let overlay_attr_inodes = Self::local_overlay_attr_inodes_from_txn(&txn)?;
         Self::resolve_attr_in_read_snapshot(&txn, ino, &overlay_block_inodes, &overlay_attr_inodes)
+    }
+
+    fn get_inode_lifecycle(&self, ino: Ino) -> MetaResult<Option<InodeLifecycleRecord>> {
+        RedbMetaEngine::get_inode_lifecycle(self, ino)
     }
 
     fn get_attrs_batch(&self, inos: &[Ino]) -> MetaResult<Vec<InodeAttr>> {
