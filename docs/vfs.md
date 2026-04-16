@@ -549,6 +549,10 @@ through VFS lookup/readdir/getattr behavior, so runtime rules (ignored entries,
 blocked root metadata names, and local-only ignored subtrees) are identical for
 both full-path and component-based resolution.
 
+These namespace caches are process-local accelerators layered over the local
+metadata database. They are not a separate operator-facing consistency surface
+and do not create a user-facing `dir-entry-cache` contract.
+
 `lookup_component` uses a bounded in-memory dentry cache keyed by
 `(parent_ino, name)`:
 - positive entries: `(parent_ino, name) -> child_ino`
@@ -586,6 +590,10 @@ This removes repeated metadata lookups for hot path components while preserving
 namespace correctness across local mutations and remote namespace apply events.
 Non-namespace metadata mutations (for example `setattr`) do not bump namespace
 tokens and therefore do not invalidate dentry/path namespace cache entries.
+
+`readdir`-triggered attr hydration is likewise an internal attr prewarm step for
+follow-up `getattr` calls, not an authoritative directory-listing cache with
+independent visibility rules.
 
 Path normalization is style-aware:
 - `NamespacePathStyle::Posix`: `/`, `.`, `..`

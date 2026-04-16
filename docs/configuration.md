@@ -16,10 +16,11 @@ StudioFS stores global defaults for mount in the OS-standard config path under:
 - Linux: `~/.config/studiofs/config.toml`
 - Windows: `%APPDATA%\studiofs\config.toml`
 
-Values in the config file are used by `studiofs mount` when the corresponding CLI flags are omitted.
-Cache 3.0 intentionally exposes only two cache knobs to operators:
-`cache_dir` and `cache_size`. Internal cache thresholds are derived
-automatically at mount time.
+Values in the config file are used by `studiofs mount` when the corresponding
+CLI flags are omitted.
+The operator-facing mount surface intentionally exposes only two local data
+cache knobs today: `cache_dir` and `cache_size`. Internal cache thresholds and
+metadata-cache defaults are derived or fixed automatically at mount time.
 
 Priority for each setting:
 
@@ -98,8 +99,8 @@ Notes:
 - `--detach` runs the mount as a background daemon.
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
 - `--cache-size` uses the shared size parser and accepts fractional values (for example `1.5GB`); the value must be greater than `0`.
-- Cache 3.0 provisioning is automatic for the per-volume root under `<cache-dir>/<volume-uuid>` and is owned by `studiofs-cache`; the CLI only resolves cache location and budget inputs.
-- Cache 3.0 runtime thresholds (dirty headroom, upload local-I/O slots, transit headroom) are derived automatically from cache budget.
+- Local data-cache backend provisioning is automatic for the per-volume root under `<cache-dir>/<volume-uuid>` and is owned by `studiofs-cache`; the CLI only resolves cache location and budget inputs.
+- Internal runtime thresholds (dirty headroom, upload local-I/O slots, transit headroom) are derived automatically from cache budget.
 - On Windows and macOS, StudioFS uses the buffered-first runtime path for every mount. Foreground `flush()` / `close()` confirm local acceptance and surface sticky upload errors deterministically, while upload and manifest publication continue asynchronously.
 - Buffered-first reads are now classified per handle in core VFS, so sequential media readers keep prefetch/L1 promotion behavior even when another handle on the same inode is doing random seeks.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
@@ -374,6 +375,14 @@ fractional inputs such as `1.5GB`; parsing rounds down fractional bytes.
 Supported suffixes are `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `EB` using binary
 multipliers (`1KB = 1024B`).
 
+Operator stance for the rewrite:
+
+- Normal mount UX should stay focused on local data-cache and I/O behavior.
+- Metadata-cache knobs below are internal runtime defaults for developers and
+  diagnostics, not the primary operator-facing surface.
+- There is intentionally no separate user-facing `dir-entry-cache` knob because
+  namespace resolution already runs against the local metadata database.
+
 | Variable | Default | Description |
 |---|---|---|
 | `STUDIOFS_JANITOR_INTERVAL_SECS` | `1800` | Background janitor interval |
@@ -385,7 +394,7 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_PG_FLUSH_OPS_THRESHOLD` | `500` | Client-side PG metadata flush op batch threshold |
 | `STUDIOFS_PG_FLUSH_IDLE_MS` | `5000` | Idle grace before PG flush of accumulated local metadata events |
 | `STUDIOFS_PRINCIPAL` | `*` | Principal identity used by VFS ACL checks (`no_access` / `ro` / `rw`) |
-| `--cache-size` (CLI/config) | `100GB` | Cache 3.0 budget input; internal dirty/ingress/upload/transit thresholds are derived automatically |
+| `--cache-size` (CLI/config) | `100GB` | Local data-cache budget input; internal dirty/upload/transit thresholds are derived automatically |
 | `STUDIOFS_XATTR_MAX_BYTES` | `4MB` | Maximum bytes per xattr value when writing metadata (enforced in VFS before metadata persistence) |
 | `STUDIOFS_DENTRY_CACHE_CAPACITY` | `65536` | Max number of `(parent_ino, name)` dentry cache entries (positive + negative) |
 | `STUDIOFS_DENTRY_CACHE_BYTES` | `64MB` | Max in-memory bytes for dentry cache entries (hard cap, SLRU eviction) |
@@ -443,6 +452,20 @@ multipliers (`1KB = 1024B`).
 | `STUDIOFS_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS` | `2` | Keep last P90 for this many windows when samples pause |
 | `STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS` | `5` | Max graceful upload-drain wait before forced uploader cancellation |
 | `STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS`| `10` | Metadata flush timeout upon shutdown|
+
+Internal metadata-cache defaults:
+
+- `STUDIOFS_DENTRY_CACHE_*`, `STUDIOFS_PATH_SHORTCUT_CACHE_*`,
+  `STUDIOFS_ATTR_READ_CACHE_*`, `STUDIOFS_READDIR_ATTR_BATCH_*`,
+  `STUDIOFS_EFFECTIVE_ACL_CACHE_CAPACITY`, and
+  `STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS` are internal defaults, not
+  part of the intended simple operator UX.
+- Current numeric defaults live in `crates/studiofs-vfs/src/vfs.rs` as
+  `DEFAULT_*` constants.
+- Typed config fields and validation live in
+  `crates/studiofs-vfs/src/vfs/config.rs` (`VfsConfig` and `VfsConfigRaw`).
+- If these values need to move, change them as a code change with supporting
+  reasoning rather than treating them as routine mount-time tuning.
 
 Metadata cache observability is emitted through the existing `upload pipeline` / `upload pipeline counters` log events and includes:
 

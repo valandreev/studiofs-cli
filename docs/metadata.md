@@ -1,5 +1,11 @@
 # Metadata Engine
 
+This page is a current implementation snapshot for `studiofs-meta`. It is not
+the canonical SFS-242 rewrite contract. The rewrite source of truth lives in
+[juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
+Historical terms such as `base` and `overlay` below describe current metadata
+internals, not the final operator-facing rewrite vocabulary.
+
 `studiofs-meta` exposes synchronous metadata operations through `MetaEngine`.
 `studiofs-vfs` consumes metadata through a typed async boundary:
 - `SyncMetaEngineAdapter<M>` (bridges any sync metadata principal via blocking execution)
@@ -343,7 +349,7 @@ Persisted in `FormatInfo`:
 
 Not persisted in the volume format:
 - PG flush cadence / op thresholds
-- metadata cache TTL
+- client-local metadata-cache defaults / invalidation cadence
 - legacy `chunk_size`
 - legacy per-volume format `version`
 

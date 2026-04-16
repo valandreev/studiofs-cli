@@ -49,7 +49,10 @@ Mount a previously initialized volume. On Windows, the mount point is a drive \
 letter (e.g. Z:). On Linux/macOS, it is an existing directory path.
 
 The local client uses its cached metadata database while synchronizing shared \
-state through PostgreSQL.
+state through PostgreSQL. Same-mount reads observe accepted writes \
+immediately through the Local-First view. Other mounts converge after \
+background upload and metadata publish; close does not imply a global \
+close-to-open barrier.
 
 The process blocks while the filesystem is mounted. Press Ctrl+C to unmount.")]
 #[command(after_help = "\
@@ -60,7 +63,7 @@ EXAMPLES:
   Basic mount (Linux/macOS):
     studiofs mount myvolume /mnt/studio
 
-  Cache 3.0 two-knob mount (location + size):
+  Local data cache two-knob mount (location + size):
     studiofs mount myvolume Z: --cache-dir D:\\cache\\studiofs --cache-size 500GB
 
   Debug logging:
@@ -77,6 +80,12 @@ PYROSCOPE PROFILING:
 
 SIZE FORMATS:
   --cache-size accepts: KB, MB, GB, TB (e.g. 512MB, 4GB, 1TB)
+
+CONSISTENCY MODEL:
+  Same-mount reads see accepted writes immediately.
+  Other mounts converge after background upload + publish.
+  `flush()` / `fsync()` and the last-handle close/release barrier confirm local
+  durability when dirty state remains, not remote close-to-open visibility.
 
 RUNTIME PG POLICY:
   PG batching / sync cadence is client-side and can be tuned per mount via:

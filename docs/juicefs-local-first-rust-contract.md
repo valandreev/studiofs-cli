@@ -90,10 +90,48 @@ Implications:
 | Writer path | `crates/studiofs-vfs/src/write_buffer.rs`, `crates/studiofs-vfs/src/vfs/upload_lifecycle.rs` | `pkg/vfs/writer.go` | Per-file writer ownership, chunk/slice decomposition, flush-driven slice materialization |
 | Reader path, readahead, prefetch | `crates/studiofs-vfs/src/vfs/read_path.rs`, `crates/studiofs-vfs/src/readahead.rs`, `crates/studiofs-vfs/src/vfs/prefetch.rs` | `pkg/vfs/reader.go`, `pkg/chunk/prefetch.go`, `docs/en/guide/cache.md` | `dataReader`-style resolution, adaptive readahead, whole-block prefetch |
 | Cache, staging, object-store handoff | `crates/studiofs-cache/src/cached_store.rs`, `crates/studiofs-cache/src/v3/*.rs`, `crates/studiofs-data/src/store.rs` | `pkg/chunk/cached_store.go`, `pkg/chunk/cache_eviction.go`, `docs/en/guide/cache.md` | Cached-store lifecycle, cache/download/writeback structure, eviction and background upload concepts |
-| Metadata-cache and operator surface | `crates/studiofs/src/cli/mount/*.rs`, `docs/configuration.md` | `cmd/flags.go`, `cmd/mount.go`, `cmd/mount_unix.go`, `cmd/mount_windows.go`, `docs/en/guide/cache.md` | Coherent mount/cache flags, metadata-cache knobs, operator-facing terminology |
+| Metadata-cache and operator surface | `crates/studiofs/src/cli/mount/*.rs`, `docs/configuration.md` | `cmd/flags.go`, `cmd/mount.go`, `cmd/mount_unix.go`, `cmd/mount_windows.go`, `docs/en/guide/cache.md` | Coherent mount/cache flags, strong internal metadata-cache defaults, operator-facing terminology |
 | Bridge and mount behavior | `crates/studiofs-fuse/src/lib.rs`, `crates/studiofs-winfsp/src/*.rs` | `pkg/vfs/vfs.go`, `pkg/vfs/vfs_unix.go`, `pkg/vfs/vfs_windows.go`, `cmd/mount*.go` | Performance-sensitive bridge/mount patterns and callback expectations |
 
-## 7. Current StudioFS Concepts: Delete, Retain, Rename, Simplify
+## 7. Metadata Cache Contract And Operator Stance
+
+StudioFS keeps metadata-cache behavior explicit, but it does not treat every
+metadata cache as a first-class operator knob.
+
+- Metadata caches are process-local accelerators layered over the local metadata
+  database plus metadata invalidation feed. They are not the primary user-facing
+  consistency mechanism.
+- The standard mount UX should focus on local data cache, read/write buffering,
+  readahead/prefetch, and upload/writeback behavior.
+- Dentry cache, path shortcut cache, attr read cache, and post-`readdir` attr
+  hydration stay internal by default with strong built-in defaults.
+- StudioFS does not need a user-facing `dir-entry-cache` concept as a core
+  tuning surface. Namespace operations already resolve against the local
+  metadata database; the internal dentry/shortcut caches only skip repeated
+  hot-path lookups.
+- Post-`readdir` attr hydration is attr prewarming after a directory listing. It
+  is not an authoritative directory-listing cache with separate visibility
+  semantics.
+- Numeric metadata-cache defaults may still be adjusted in code when evidence
+  supports it, but those changes should be evaluated against Local-First
+  semantics and bridge behavior instead of parity with every JuiceFS switch.
+
+## 8. Mutation Visibility And Invalidation Matrix
+
+| Mutation or transition | Visibility contract | Invalidation contract |
+|---|---|---|
+| `write` | The writing mount reads accepted bytes immediately from writer state. Other mounts see nothing yet. | Namespace caches stay unchanged. Attr reads on the writing mount must not let stale cached attrs outrank newer writer/local unpublished state. |
+| `flush` / `fsync` | Accepted bytes become durably visible in local unpublished state. Remote publication still remains pending. | Namespace caches stay unchanged. Attr resolution on the writing mount must prefer the newer local unpublished attrs over stale attr-cache entries. |
+| Last-handle `close` / `release` | If dirty unpublished state remains, the last-handle path acts as a fallback local-durability barrier only. Clean close is observational. | Close/release by itself must not force synchronous publish/upload and must not introduce an independent namespace-cache invalidation rule. |
+| `rename` | Source disappearance and destination appearance are immediate on the writing mount. Other mounts converge later through metadata replication/invalidation. | Source dentry becomes negative, destination dentry becomes positive, affected parent generations bump, and affected inode/parent attr caches invalidate. |
+| `unlink` / `rmdir` | Removal is immediate on the writing mount. Other mounts converge later through metadata replication/invalidation. | Removed entry becomes negative, affected parent generations bump, affected inode/parent attr caches invalidate, and deleted-file cleanup may cancel pending upload work. |
+| `truncate` / size-changing `setattr` | New EOF and attrs are visible immediately on the writing mount and remain local-first until later publish/replication makes them remotely visible. | Attr cache for the affected inode invalidates or refreshes. Namespace generations do not bump when name topology does not change. |
+| Non-size `setattr` | New mode/ownership/timestamps are visible immediately on the writing mount. Other mounts converge through metadata replication. | Attr cache for the affected inode invalidates. Dentry/path namespace caches remain valid because name topology did not change. |
+| Upload completion | Payload blocks may already exist remotely, but the new file version is still not remotely visible until publish finishes. | No namespace-cache change is implied. Local lifecycle state may advance, but published-state visibility does not switch yet. |
+| Publish finalization | Remote visibility flips atomically at the file-version boundary. Other mounts observe the new state after metadata invalidation polling/expiration rather than synchronous close-to-open. | The writing mount must invalidate stale inode attr state immediately. Other mounts converge through metadata invalidation/expiration instead of a per-close global barrier. |
+| Remote metadata invalidation apply | A mount keeps its newer local unpublished state ahead of foreign published updates while still converging unaffected inodes/directories to the newer published state. | Broad foreign namespace apply events bump namespace epoch, while affected attr caches invalidate or expire before serving the newer published state. |
+
+## 9. Current StudioFS Concepts: Delete, Retain, Rename, Simplify
 
 | Current concept | Decision in this rewrite |
 |---|---|
@@ -105,7 +143,7 @@ Implications:
 | File-version publication boundary (`incarnation`, manifest-like switch) | Retain the semantic requirement: remote visibility changes atomically at a file-version boundary. |
 | `STUDIOFS_*` tuning sprawl | Simplify into a JuiceFS-inspired CLI/config surface with only transitional env vars where necessary. |
 
-## 8. Rust-Native Implementation Rules
+## 10. Rust-Native Implementation Rules
 
 Rust-native implementation means:
 
@@ -124,7 +162,7 @@ Review guardrails:
 - Reject generic `anyhow`-style library errors where callers need domain decisions.
 - Reject designs that require remote readers to reason about writer-local unpublished RAM state.
 
-## 9. Historical Docs And Issues That Are No Longer Authoritative
+## 11. Historical Docs And Issues That Are No Longer Authoritative
 
 | Source | Status after this contract |
 |---|---|
@@ -138,7 +176,7 @@ Supporting implementation snapshots such as `docs/architecture.md`, `docs/vfs.md
 and `docs/configuration.md` still describe in-flight code, but they are not
 authoritative for the rewrite target when they conflict with this contract.
 
-## 10. Glossary For Downstream Issues
+## 12. Glossary For Downstream Issues
 
 | Term to use in new issues | Type | Meaning |
 |---|---|---|
