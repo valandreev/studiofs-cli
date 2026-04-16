@@ -139,7 +139,7 @@ use studiofs_cache::open_local_block_backend_with_budget_and_sync_mode;
 use studiofs_cache::open_prepared_local_block_backend_with_budget_and_sync_mode;
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_cache::v3::CacheV3PayloadSyncMode;
-use studiofs_cache::{UploadCoordinator, UploadCoordinatorConfig};
+use studiofs_cache::{CachedStore, CachedStoreConfig};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, format_object_fragment_keys,
     parse_object_id_from_key,
@@ -2022,8 +2022,8 @@ pub struct StudioVfs {
     data_write: Arc<DataStore>,
     /// Shared local block backend used by the foreground read path.
     local_block_backend: Arc<dyn LocalBlockBackend>,
-    /// Upload queue and pending-upload pinning for the write path.
-    upload_coordinator: Arc<UploadCoordinator>,
+    /// Shared cached-store runtime that owns local staging + pending uploads.
+    cached_store: Arc<CachedStore>,
     /// Block size in bytes.
     block_size: u32,
     /// Volume data prefix for S3 object keys.
@@ -2551,9 +2551,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             .fetch_add(self.replay_failures, Ordering::Relaxed);
 
         if !self.replay_ops.is_empty() {
-            self.vfs
-                .upload_coordinator
-                .submit_uploads_batch(&self.replay_ops);
+            self.vfs.cached_store.submit_uploads_batch(&self.replay_ops);
             info!(
                 replayed_dirty_blocks = self.replay_ops.len(),
                 restored_live_extents = self.restored_live_extents,
@@ -2949,7 +2947,7 @@ impl StudioVfs {
         let backend_non_evictable_bytes = storage_stats
             .current_bytes
             .saturating_sub(storage_stats.evictable_bytes);
-        let pending_uploads = self.upload_coordinator.snapshot_pending_uploads();
+        let pending_uploads = self.cached_store.snapshot_pending_uploads();
         let mut pending_uploads_by_inode: HashMap<Ino, Vec<PendingUpload>> = HashMap::new();
         for op in pending_uploads {
             pending_uploads_by_inode.entry(op.ino).or_default().push(op);
@@ -3403,7 +3401,7 @@ impl StudioVfs {
     pub fn reset_diagnostics_observability(&self) {
         self.state.metrics.reset_diagnostics_observability();
         self.state.upload.startup_replay_counts.lock().clear();
-        self.upload_coordinator.reset_diagnostics_metrics();
+        self.cached_store.reset_diagnostics_metrics();
     }
 
     pub fn record_runtime_event(
@@ -3722,7 +3720,7 @@ impl StudioVfs {
     }
 
     fn inode_has_pending_uploads(&self, ino: Ino) -> bool {
-        self.upload_coordinator.has_pending_uploads_for_ino(ino)
+        self.cached_store.has_pending_uploads_for_ino(ino)
     }
 
     fn derive_committed_incarnation_from_attr(
@@ -4133,7 +4131,7 @@ impl StudioVfs {
         }
 
         let pending_uploads: Vec<_> = self
-            .upload_coordinator
+            .cached_store
             .snapshot_pending_uploads()
             .into_iter()
             .filter(|op| inos.contains(&op.ino))
@@ -4143,7 +4141,7 @@ impl StudioVfs {
         }
 
         for op in &pending_uploads {
-            self.upload_coordinator.cancel_upload(op);
+            self.cached_store.cancel_upload(op);
         }
 
         let mut pending_evictions = self.state.upload.pending_evictions.lock();
@@ -4299,7 +4297,7 @@ impl StudioVfs {
 
     pub fn pending_uploads_for_inode(&self, ino: Ino) -> Vec<(u64, u64, u64)> {
         let mut out: Vec<_> = self
-            .upload_coordinator
+            .cached_store
             .snapshot_pending_uploads()
             .into_iter()
             .filter(|op| op.ino == ino)
@@ -4539,7 +4537,7 @@ impl StudioVfs {
 
     pub fn upload_stats(&self) -> VfsUploadStats {
         VfsUploadStats {
-            pending_uploads: self.upload_coordinator.pending_upload_count(),
+            pending_uploads: self.cached_store.pending_upload_count(),
             upload_requeues: self.state.upload.upload_requeues.load(Ordering::Relaxed),
             canceled_deleted: self
                 .state
@@ -4824,9 +4822,9 @@ impl StudioVfs {
             .load(Ordering::Relaxed)
     }
 
-    /// Shared reference to the upload coordinator.
-    pub fn upload_coordinator(&self) -> &Arc<UploadCoordinator> {
-        &self.upload_coordinator
+    /// Shared reference to the cached-store runtime.
+    pub fn cached_store(&self) -> &Arc<CachedStore> {
+        &self.cached_store
     }
 
     /// Shared reference to the local block backend contract.
@@ -4850,7 +4848,7 @@ impl StudioVfs {
     /// Useful in tests to ensure block data is available on S3 before
     /// cross-client reads.
     pub async fn wait_for_uploads_idle(&self, timeout: Duration) -> bool {
-        self.upload_coordinator.wait_for_uploads_idle(timeout).await
+        self.cached_store.wait_for_uploads_idle(timeout).await
     }
 
     /// Snapshot accepted local-ingress state for diagnostics and backpressure

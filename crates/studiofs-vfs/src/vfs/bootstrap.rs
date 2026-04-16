@@ -312,7 +312,7 @@ fn reset_legacy_ingress_artifacts(spill_dir: &Path) -> VfsResult<()> {
 struct VfsBootstrapResources {
     zeroio_runtime_state_dir: PathBuf,
     local_block_backend: Arc<dyn LocalBlockBackend>,
-    upload_coordinator: Arc<UploadCoordinator>,
+    cached_store: Arc<CachedStore>,
     readahead: Arc<ReadAheadTracker>,
     dir_prefetch: Arc<DirAccessTracker>,
     prefetch_tx: tokio::sync::mpsc::UnboundedSender<PrefetchWorkItem>,
@@ -385,9 +385,11 @@ impl VfsBootstrapResources {
         }
         let local_block_backend = opened_local_backend.backend;
 
-        let (upload_coordinator, upload_rx) =
-            UploadCoordinator::open(UploadCoordinatorConfig::new(cache_dir))
-                .map_err(VfsError::Io)?;
+        let (cached_store, upload_rx) = CachedStore::open(
+            CachedStoreConfig::new(cache_dir),
+            local_block_backend.clone(),
+        )
+        .map_err(VfsError::Io)?;
 
         let readahead = Arc::new(ReadAheadTracker::new_with_bounds(
             plan.readahead_base_width,
@@ -414,7 +416,7 @@ impl VfsBootstrapResources {
             TransitMemoryBudget::new(plan.cache_runtime_tuning.transit_memory_budget_bytes);
         let fetch_scheduler = Arc::new(crate::fetch::FetchScheduler::new(
             data_read,
-            local_block_backend.clone(),
+            cached_store.clone(),
             plan.fetch_aimd_config.clone(),
             plan.prefetch_foreground_reserve,
             qos.clone(),
@@ -430,7 +432,7 @@ impl VfsBootstrapResources {
         Ok(Self {
             zeroio_runtime_state_dir,
             local_block_backend,
-            upload_coordinator,
+            cached_store,
             readahead,
             dir_prefetch,
             prefetch_tx,
@@ -499,7 +501,7 @@ impl VfsBootstrap {
             meta: MetaExecutor::new(meta),
             data_write: resources.data_write,
             local_block_backend: resources.local_block_backend,
-            upload_coordinator: resources.upload_coordinator,
+            cached_store: resources.cached_store,
             block_size,
             data_prefix: plan.data_prefix,
             acl_principal: plan.acl_principal,
@@ -583,7 +585,7 @@ impl VfsBootstrap {
 
 impl StudioVfs {
     fn finalize_constructor_bootstrap(&self) -> VfsResult<()> {
-        let pending_uploads = self.upload_coordinator.snapshot_pending_uploads();
+        let pending_uploads = self.cached_store.snapshot_pending_uploads();
         let attrs = self.sync_meta().list_inode_attrs()?;
         self.replay_dirty_uploads_from_local_backend(pending_uploads.as_slice(), attrs.as_slice());
         Ok(())
