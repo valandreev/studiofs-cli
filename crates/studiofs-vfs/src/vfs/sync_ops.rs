@@ -378,6 +378,9 @@ impl StudioVfs {
         );
         let result = async {
             self.enforce_access(ino, AccessLevel::ReadWrite)?;
+            if data.is_empty() {
+                return Ok(0);
+            }
             if self.ignored_entry_attr(ino).is_some() {
                 let size = offset.saturating_add(data.len() as u64);
                 let _ = self.update_ignored_entry(ino, |attr| {

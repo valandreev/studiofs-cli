@@ -164,10 +164,19 @@ impl StudioVfs {
     pub(super) fn copy_block_payload_into_range(
         &self,
         data: &[u8],
-        block_offset: u32,
+        block_offset: u64,
         dst: &mut [u8],
     ) {
-        let src_start = block_offset as usize;
+        let Ok(src_start) = usize::try_from(block_offset) else {
+            warn!(
+                block_offset,
+                data_len = data.len(),
+                dst_len = dst.len(),
+                "copy_block_payload_into_range: block_offset does not fit usize, zeroing dst"
+            );
+            dst.fill(0);
+            return;
+        };
         if src_start >= data.len() {
             warn!(
                 block_offset,

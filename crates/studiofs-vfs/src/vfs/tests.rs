@@ -2871,6 +2871,89 @@ fn flush_fh_materializes_handle_writer_state_without_legacy_ordered_flush() {
 }
 
 #[test]
+fn write_fh_empty_payload_is_a_noop_for_handle_writer_state() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-empty-handle-write");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-245-empty-handle-write.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        let written = vfs
+            .write_fh_with_local_sync_policy(fh, ino, 0, &[], LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+
+        assert_eq!(written, 0);
+        assert!(
+            !vfs.state.handle_writers.has_dirty_writers(ino),
+            "empty handle writes should not create dirty writer state"
+        );
+        assert!(
+            !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+            "empty handle writes should not stage dirty attrs"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn handle_writer_dirty_attrs_keep_nanos_timestamps() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-handle-write-nanos");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-245-handle-write-nanos.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let before = vfs.getattr(ino).unwrap();
+
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            0,
+            b"timestamp-check",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        let dirty_attr = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .cloned()
+            .expect("dirty attr");
+        assert!(
+            dirty_attr.mtime >= before.mtime,
+            "handle-writer mtime should not go backwards"
+        );
+        assert!(
+            dirty_attr.ctime >= before.ctime,
+            "handle-writer ctime should not go backwards"
+        );
+        assert!(
+            dirty_attr.mtime > 1_000_000_000_000,
+            "handle-writer timestamps should remain in nanoseconds"
+        );
+        assert!(
+            dirty_attr.ctime > 1_000_000_000_000,
+            "handle-writer timestamps should remain in nanoseconds"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn release_fh_forces_strict_local_sync_when_last_handle_still_owns_dirty_state() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-fh-strict-local-sync");

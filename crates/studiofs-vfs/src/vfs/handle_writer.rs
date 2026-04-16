@@ -1,4 +1,4 @@
-use super::{Bytes, FileType, Ino, LocalSyncPolicy, StudioVfs, VfsResult, now_unix_secs};
+use super::{Bytes, FileType, Ino, LocalSyncPolicy, StudioVfs, VfsResult};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(super) struct HandleWriterReadSpan {
     pub(super) start: u64,
     pub(super) end: u64,
-    pub(super) block_offset: u32,
+    pub(super) block_offset: u64,
     pub(super) seq: u64,
     pub(super) data: Bytes,
 }
@@ -110,14 +110,10 @@ impl HandleSliceWriter {
             if start >= stop {
                 continue;
             }
-            let delta = start.saturating_sub(write.offset);
-            let Some(block_offset) = u32::try_from(delta).ok() else {
-                continue;
-            };
             spans.push(HandleWriterReadSpan {
                 start,
                 end: stop,
-                block_offset,
+                block_offset: start.saturating_sub(write.offset),
                 seq: write.seq,
                 data: write.data.clone(),
             });
@@ -129,8 +125,16 @@ impl HandleSliceWriter {
     }
 
     fn mark_materialized(&mut self, seq: u64) {
-        self.writes.retain(|_, write| write.seq > seq);
-        self.dirty_bytes = self.writes.values().map(|write| write.data.len()).sum();
+        let mut removed_bytes = 0usize;
+        self.writes.retain(|_, write| {
+            if write.seq <= seq {
+                removed_bytes = removed_bytes.saturating_add(write.data.len());
+                false
+            } else {
+                true
+            }
+        });
+        self.dirty_bytes = self.dirty_bytes.saturating_sub(removed_bytes);
     }
 }
 
@@ -188,9 +192,11 @@ impl HandleWriterRegistry {
         };
         let writers = self.writers.lock();
         let mut spans = Vec::new();
-        for fh in writers.writers_by_ino.get(&ino).into_iter().flatten() {
-            if let Some(writer) = writers.writers.get(fh) {
-                writer.snapshot_read_spans(offset, end, &mut spans);
+        if let Some(handles) = writers.writers_by_ino.get(&ino) {
+            for fh in handles {
+                if let Some(writer) = writers.writers.get(fh) {
+                    writer.snapshot_read_spans(offset, end, &mut spans);
+                }
             }
         }
         spans.sort_by_key(|span| std::cmp::Reverse(span.seq));
@@ -267,9 +273,11 @@ impl HandleWriterRegistry {
     pub(super) fn snapshot_materialization_writes(&self, ino: Ino) -> Vec<BufferedHandleWrite> {
         let writers = self.writers.lock();
         let mut writes = Vec::new();
-        for fh in writers.writers_by_ino.get(&ino).into_iter().flatten() {
-            if let Some(writer) = writers.writers.get(fh) {
-                writer.snapshot_materialization_writes(&mut writes);
+        if let Some(handles) = writers.writers_by_ino.get(&ino) {
+            for fh in handles {
+                if let Some(writer) = writers.writers.get(fh) {
+                    writer.snapshot_materialization_writes(&mut writes);
+                }
             }
         }
         writes.sort_by_key(|write| write.seq);
@@ -420,8 +428,7 @@ impl StudioVfs {
             if new_size > attr.size {
                 attr.size = new_size;
             }
-            attr.mtime = now_unix_secs();
-            attr.ctime = attr.mtime;
+            attr.touch_mtime();
             self.update_pending_incarnation_size(ino, attr.size);
         }
         Ok(written)
@@ -452,22 +459,26 @@ impl StudioVfs {
         }
 
         while self.state.handle_writers.total_dirty_bytes() > max_dirty {
-            let next_ino = self
-                .state
-                .handle_writers
-                .snapshot_dirty_inodes_by_bytes()
-                .into_iter()
-                .max_by_key(|(_, dirty_bytes)| *dirty_bytes)
-                .map(|(candidate_ino, _)| candidate_ino);
-            let Some(next_ino) = next_ino else {
+            let mut dirty_inodes = self.state.handle_writers.snapshot_dirty_inodes_by_bytes();
+            dirty_inodes.sort_by_key(|(_, dirty_bytes)| std::cmp::Reverse(*dirty_bytes));
+            if dirty_inodes.is_empty() {
                 break;
-            };
-            let total_before = self.state.handle_writers.total_dirty_bytes();
-            let materialized = self
-                .materialize_handle_writers_for_inode(next_ino, local_sync_policy)
-                .await?;
-            let total_after = self.state.handle_writers.total_dirty_bytes();
-            if !materialized || total_after >= total_before {
+            }
+            let mut made_progress = false;
+            for (next_ino, _) in dirty_inodes {
+                if self.state.handle_writers.total_dirty_bytes() <= max_dirty {
+                    break;
+                }
+                let total_before = self.state.handle_writers.total_dirty_bytes();
+                let materialized = self
+                    .materialize_handle_writers_for_inode(next_ino, local_sync_policy)
+                    .await?;
+                let total_after = self.state.handle_writers.total_dirty_bytes();
+                if materialized && total_after < total_before {
+                    made_progress = true;
+                }
+            }
+            if !made_progress {
                 break;
             }
         }

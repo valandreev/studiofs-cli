@@ -386,27 +386,18 @@ where
             std::collections::BTreeMap::new();
 
         if !dirty_chunk_slices.is_empty() {
-            // Dirty-chunk-slices path: validate per-write-slice invariants but
-            // emit ONE full-block SliceRecord per persisted block.
+            // Dirty-chunk-slices path: validate per-write-slice invariants, then
+            // emit chunk-aware SliceRecords per persisted block.
             //
-            // Previously this path emitted per-write-slice records with partial
-            // BlockRef.offset/length pointing into the new S3 object.  That left
-            // stale slices from *earlier* objects (with different object_ids) in
-            // the overlay because the "fully_covered" pruning in
-            // flush_regular_file_overlay_slices_with_attr_txn only removes a
-            // prior slice when the incoming slice completely covers its chunk
-            // range.  A partial write slice (e.g. 1MB..1.5MB) never fully covers
-            // an old full-block slice (0..1MB), so both survive in the overlay.
-            // synthesize_block_ref_from_resolved_spans then sees two spans with
-            // different object_ids for block_index=0 and returns
-            // FragmentedBlock, quarantining the inode and making all reads
-            // return zeros.
+            // Previously this path emitted per-write-slice records keyed to the
+            // dirty-write geometry, which could leave stale slices from older
+            // objects in the overlay. Emitting records that cover the committed
+            // block geometry fixes that. When a full block straddles a 64MiB
+            // chunk boundary, we still need to split it into chunk-local slice
+            // records whose BlockRef offsets remain contiguous within the new
+            // object, so redb can reconstruct the logical block without raising
+            // FragmentedBlock.
             //
-            // The fix: always write a single full-block SliceRecord whose
-            // BlockRef references the NEW object from offset=0 with the full
-            // persisted data length.  This guarantees the incoming slice fully
-            // covers any previous slice for the same block and the overlay
-            // stays consistent.
             let block_lengths_by_block_index: std::collections::HashMap<u32, usize> =
                 persisted_blocks
                     .iter()
@@ -438,38 +429,7 @@ where
         }
 
         for persisted in persisted_blocks {
-            let block_start = (persisted.block_index as u64) * (self.block_size as u64);
-            let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64;
-            let chunk_id = block_start / chunk_size;
-            let chunk_start = chunk_id * chunk_size;
-            let slice_start = (block_start - chunk_start) as u32;
-            let slice_end = slice_start + (persisted.data.len() as u32);
-            let slice_range = studiofs_meta::schema::SliceRange::new(slice_start, slice_end)
-                .ok_or_else(|| {
-                    crate::VfsError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("invalid slice range {}..{}", slice_start, slice_end),
-                    ))
-                })?;
-            let mut flags = studiofs_meta::schema::BlockFlags::empty();
-            if persisted.data.len() < self.block_size as usize {
-                flags |= studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK;
-            }
-            chunks
-                .entry(chunk_id)
-                .or_default()
-                .push(studiofs_meta::schema::SliceRecord {
-                    slice_id: studiofs_meta::schema::SliceId::default(),
-                    order: studiofs_meta::schema::SliceOrder::default(),
-                    range: slice_range,
-                    block: Some(studiofs_meta::schema::BlockRef {
-                        object_id: persisted.object_id,
-                        offset: 0,
-                        length: persisted.data.len() as u32,
-                        flags,
-                    }),
-                    block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
-                });
+            self.append_persisted_block_slice_records(&mut chunks, persisted)?;
         }
 
         for slices in chunks.values_mut() {
@@ -487,6 +447,118 @@ where
             .into_iter()
             .map(|(k, v)| (studiofs_meta::schema::ChunkId(k), v))
             .collect())
+    }
+
+    fn append_persisted_block_slice_records(
+        &self,
+        chunks: &mut std::collections::BTreeMap<u64, Vec<studiofs_meta::schema::SliceRecord>>,
+        persisted: &PersistedWriteBlock,
+    ) -> VfsResult<()> {
+        let block_start = (persisted.block_index as u64).saturating_mul(self.block_size as u64);
+        let block_len = u64::try_from(persisted.data.len()).map_err(|_| {
+            crate::VfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "persisted block {} length {} exceeds u64::MAX",
+                    persisted.block_index,
+                    persisted.data.len()
+                ),
+            ))
+        })?;
+        let block_end = block_start.checked_add(block_len).ok_or_else(|| {
+            crate::VfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "persisted block {} end overflows: start={}, len={}",
+                    persisted.block_index, block_start, block_len
+                ),
+            ))
+        })?;
+        let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64;
+        let mut file_pos = block_start;
+        let mut flags = studiofs_meta::schema::BlockFlags::empty();
+        if persisted.data.len() < self.block_size as usize {
+            flags |= studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK;
+        }
+
+        while file_pos < block_end {
+            let chunk_id = file_pos / chunk_size;
+            let chunk_start = chunk_id * chunk_size;
+            let chunk_offset = file_pos - chunk_start;
+            let remaining_in_block = block_end - file_pos;
+            let remaining_in_chunk = chunk_size - chunk_offset;
+            let slice_len = remaining_in_block.min(remaining_in_chunk);
+            let block_offset = file_pos - block_start;
+            let slice_start = u32::try_from(chunk_offset).map_err(|_| {
+                crate::VfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "chunk offset {} for block {} exceeds u32::MAX",
+                        chunk_offset, persisted.block_index
+                    ),
+                ))
+            })?;
+            let slice_len_u32 = u32::try_from(slice_len).map_err(|_| {
+                crate::VfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "slice length {} for block {} exceeds u32::MAX",
+                        slice_len, persisted.block_index
+                    ),
+                ))
+            })?;
+            let slice_end = slice_start.checked_add(slice_len_u32).ok_or_else(|| {
+                crate::VfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "slice end overflow for block {}: start={}, len={}",
+                        persisted.block_index, slice_start, slice_len_u32
+                    ),
+                ))
+            })?;
+            let slice_range = studiofs_meta::schema::SliceRange::new(slice_start, slice_end)
+                .ok_or_else(|| {
+                    crate::VfsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid slice range {}..{}", slice_start, slice_end),
+                    ))
+                })?;
+            let block_offset_u32 = u32::try_from(block_offset).map_err(|_| {
+                crate::VfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "block offset {} for block {} exceeds u32::MAX",
+                        block_offset, persisted.block_index
+                    ),
+                ))
+            })?;
+            chunks
+                .entry(chunk_id)
+                .or_default()
+                .push(studiofs_meta::schema::SliceRecord {
+                    slice_id: studiofs_meta::schema::SliceId::default(),
+                    order: studiofs_meta::schema::SliceOrder::default(),
+                    range: slice_range,
+                    block: Some(studiofs_meta::schema::BlockRef {
+                        object_id: persisted.object_id,
+                        offset: block_offset_u32,
+                        length: slice_len_u32,
+                        flags,
+                    }),
+                    block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
+                });
+            file_pos = file_pos.checked_add(slice_len).ok_or_else(|| {
+                crate::VfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "file position overflow while splitting block {}",
+                        persisted.block_index
+                    ),
+                ))
+            })?;
+        }
+
+        Ok(())
     }
 
     async fn execute_drain(
@@ -1974,6 +2046,59 @@ mod tests {
         );
         assert!(uploads.lock().expect("uploads lock").is_empty());
         assert_eq!(*observed_inodes.lock().expect("observer lock"), vec![ino]);
+    }
+
+    #[test]
+    fn build_overlay_slice_records_splits_blocks_across_chunk_boundaries() {
+        let events = EventLog::default();
+        let uploads = Arc::new(StdMutex::new(Vec::new()));
+        let observed_inodes = Arc::new(StdMutex::new(Vec::new()));
+        let mut drain = test_drain(events, false, false, None, uploads, observed_inodes);
+        drain.block_size = 5 * 1024 * 1024;
+
+        let chunk_slices = drain
+            .build_overlay_slice_records(
+                41,
+                &[PersistedWriteBlock {
+                    block_index: 12,
+                    object_id: 9001,
+                    data: Bytes::from(vec![0xAB; drain.block_size as usize]),
+                }],
+                std::collections::BTreeMap::new(),
+            )
+            .expect("chunk-aware block split");
+
+        assert_eq!(
+            chunk_slices.len(),
+            2,
+            "cross-chunk block should split in two"
+        );
+        let first = &chunk_slices[0].1;
+        let second = &chunk_slices[1].1;
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(chunk_slices[0].0, studiofs_meta::schema::ChunkId(0));
+        assert_eq!(chunk_slices[1].0, studiofs_meta::schema::ChunkId(1));
+        assert_eq!(first[0].range.start, 60 * 1024 * 1024);
+        assert_eq!(
+            first[0].range.end,
+            studiofs_meta::schema::DEFAULT_CHUNK_SIZE
+        );
+        assert_eq!(first[0].block.as_ref().expect("block ref").offset, 0);
+        assert_eq!(
+            first[0].block.as_ref().expect("block ref").length,
+            4 * 1024 * 1024
+        );
+        assert_eq!(second[0].range.start, 0);
+        assert_eq!(second[0].range.end, 1024 * 1024);
+        assert_eq!(
+            second[0].block.as_ref().expect("block ref").offset,
+            4 * 1024 * 1024
+        );
+        assert_eq!(
+            second[0].block.as_ref().expect("block ref").length,
+            1024 * 1024
+        );
     }
 
     #[test]

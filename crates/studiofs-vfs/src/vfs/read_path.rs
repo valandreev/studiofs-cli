@@ -33,7 +33,7 @@ impl ReadRange {
 
 #[derive(Debug, Clone)]
 enum ReadPlanSource {
-    Dirty { data: Bytes, block_offset: u32 },
+    Dirty { data: Bytes, block_offset: u64 },
     PendingOverlay { data: Bytes, block_offset: u32 },
     PendingExtent { object_id: u64, block_offset: u32 },
     Overlay { block: BlockRef },
@@ -202,10 +202,7 @@ impl<'a> ReadPipeline<'a> {
             unresolved = next_unresolved;
             for overlap in claimed {
                 let delta = overlap.start.saturating_sub(dirty.start);
-                let Some(delta_u32) = u32::try_from(delta).ok() else {
-                    continue;
-                };
-                let Some(block_offset) = dirty.block_offset.checked_add(delta_u32) else {
+                let Some(block_offset) = dirty.block_offset.checked_add(delta) else {
                     continue;
                 };
                 plan.push(ReadPlanSpan {
@@ -241,7 +238,7 @@ impl<'a> ReadPipeline<'a> {
                     range: overlap,
                     source: ReadPlanSource::Dirty {
                         data: dirty.data.clone(),
-                        block_offset,
+                        block_offset: u64::from(block_offset),
                     },
                 });
             }
@@ -535,7 +532,7 @@ impl<'a> ReadPipeline<'a> {
                     vfs.copy_block_payload_into_range(data.as_ref(), *block_offset, dst);
                 }
                 ReadPlanSource::PendingOverlay { data, block_offset } => {
-                    vfs.copy_block_payload_into_range(data.as_ref(), *block_offset, dst);
+                    vfs.copy_block_payload_into_range(data.as_ref(), u64::from(*block_offset), dst);
                 }
                 ReadPlanSource::PendingExtent {
                     object_id,
