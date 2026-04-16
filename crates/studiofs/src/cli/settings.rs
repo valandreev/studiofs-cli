@@ -6,6 +6,8 @@ use clap::Args;
 use serde::{Deserialize, Serialize};
 use studiofs_vfs::VfsConfigRaw;
 
+use super::runtime_tuning::{PublicRuntimeTuningArgs, runtime_tuning_summary_lines};
+
 const CONFIG_FILE_NAME: &str = "config.toml";
 pub(crate) const DEFAULT_CACHE_SIZE: &str = "100GB";
 
@@ -24,7 +26,8 @@ pub struct StudioFsConfig {
 Examples:
   Persist default mount + cache settings for quick mount commands:
     studiofs settings --mount-point /mnt/studio
-    studiofs settings --cache-dir ~/.cache/studiofs --cache-size 1TB")]
+    studiofs settings --cache-dir ~/.cache/studiofs --cache-size 1TB
+    studiofs settings --read-buffer 4GB --readahead 256 --prefetch 192")]
 pub struct SettingsArgs {
     /// Default mount point used by `studiofs mount` when omitted.
     #[arg(long)]
@@ -37,6 +40,9 @@ pub struct SettingsArgs {
     /// Default max disk cache size used by `studiofs mount` when omitted.
     #[arg(long)]
     pub cache_size: Option<String>,
+
+    #[command(flatten, next_help_heading = "Runtime IO")]
+    pub runtime_tuning: PublicRuntimeTuningArgs,
 }
 
 impl SettingsArgs {
@@ -140,6 +146,11 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
         }
     }
 
+    if args.runtime_tuning.has_any() {
+        args.runtime_tuning.apply_to_vfs_config(&mut config.vfs)?;
+        changed = true;
+    }
+
     if changed {
         save_studiofs_config(&config)?;
         println!("✓ Updated studiofs settings");
@@ -164,6 +175,9 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
             .unwrap_or_else(|| DEFAULT_CACHE_SIZE.to_string())
     );
     println!("  cache-policy: auto (derived from cache-size at mount time)");
+    for line in runtime_tuning_summary_lines(&config.vfs) {
+        println!("{line}");
+    }
 
     if !changed {
         println!("  (no changes requested)");
@@ -210,6 +224,42 @@ mod tests {
             }
             other => panic!("expected Settings, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn settings_accepts_public_runtime_tuning_flags() {
+        crate::cli::parse_for_test(&[
+            "settings",
+            "--read-buffer",
+            "4GB",
+            "--readahead",
+            "256",
+            "--prefetch",
+            "192",
+            "--writeback-delay",
+            "1500",
+        ])
+        .expect("new public runtime tuning flags should parse");
+    }
+
+    #[test]
+    fn settings_rejects_zero_readahead() {
+        let err = match crate::cli::parse_for_test(&["settings", "--readahead", "0"]) {
+            Ok(_) => panic!("zero readahead should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+        assert!(err.to_string().contains("--readahead"));
+    }
+
+    #[test]
+    fn settings_rejects_zero_prefetch() {
+        let err = match crate::cli::parse_for_test(&["settings", "--prefetch", "0"]) {
+            Ok(_) => panic!("zero prefetch should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+        assert!(err.to_string().contains("--prefetch"));
     }
 
     #[test]

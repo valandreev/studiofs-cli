@@ -48,14 +48,21 @@ STUDIOFS_PYROSCOPE_TAGS=team=vfx,cache_mode=durable \
 studiofs mount myvolume Z: --profile
 ```
 
-Mount with explicit cache safety mode override:
+Mount with a small explicit IO tuning surface:
 
 ```bash
-STUDIOFS_CACHE_SAFETY_MODE=durable studiofs mount myvolume Z:
+studiofs mount myvolume Z: \
+  --cache-size 500GB \
+  --read-buffer 4GB \
+  --readahead 256 \
+  --prefetch 192 \
+  --writeback-delay 1500
 ```
 
-This overrides any persisted `settings.vfs.cache_safety_mode` value for that
-mount only.
+Use these flags for the main operator-facing data-cache and IO controls. The
+broader `STUDIOFS_*` runtime matrix is still accepted only as
+developer/transitional compatibility, and metadata-cache internals remain on
+strong built-in defaults.
 
 Mount with a local S3 endpoint (for low-latency access in hybrid networks):
 
