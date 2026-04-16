@@ -84,8 +84,8 @@ SIZE FORMATS:
 CONSISTENCY MODEL:
   Same-mount reads see accepted writes immediately.
   Other mounts converge after background upload + publish.
-  flush and the last-handle close/release path confirm local durability, not
-  remote close-to-open visibility.
+  `flush()` / `fsync()` and the last-handle close/release barrier confirm local
+  durability when dirty state remains, not remote close-to-open visibility.
 
 RUNTIME PG POLICY:
   PG batching / sync cadence is client-side and can be tuned per mount via:

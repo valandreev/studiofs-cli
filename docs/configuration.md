@@ -377,11 +377,11 @@ multipliers (`1KB = 1024B`).
 
 Operator stance for the rewrite:
 
-- normal mount UX should stay focused on local data-cache and IO behavior
-- metadata-cache knobs below are internal runtime defaults for developers and
-  diagnostics, not the primary operator-facing surface
-- there is intentionally no separate user-facing `dir-entry-cache` knob because
-  namespace resolution already runs against the local metadata database
+- Normal mount UX should stay focused on local data-cache and I/O behavior.
+- Metadata-cache knobs below are internal runtime defaults for developers and
+  diagnostics, not the primary operator-facing surface.
+- There is intentionally no separate user-facing `dir-entry-cache` knob because
+  namespace resolution already runs against the local metadata database.
 
 | Variable | Default | Description |
 |---|---|---|
