@@ -6,7 +6,7 @@ use studiofs_meta::schema::{
     CURRENT_FORMAT_VERSION, FormatInfo, InodeLifecycleState, MetadataConfig, PayloadRetentionClass,
     ROOT_INO,
 };
-use studiofs_meta::{MetaFormat, MetaFsOps, RedbMetaEngine};
+use studiofs_meta::{MetaEngine, MetaFormat, MetaFsOps, RedbMetaEngine};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
@@ -212,6 +212,65 @@ fn startup_replay_keeps_metadata_live_extent_when_pending_upload_has_same_epoch(
         vfs.live_extent_records_for_inode(ino),
         vec![(0, 9001, 5)],
         "startup replay must keep the metadata-derived block when pending upload only matches the same epoch"
+    );
+}
+
+#[test]
+fn startup_replay_prefers_overlay_metadata_live_extent_over_base_for_same_epoch() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (_rt, vfs, meta) = make_test_vfs(&tmp, "startup-replay-overlay-same-epoch");
+
+    let created = vfs
+        .create(1, b"startup-overlay-same-epoch.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = created.ino;
+    let mut attr = meta.get_attr(ino).expect("load test attr");
+    attr.size = 4096;
+    attr.committed_size = 4096;
+    attr.content_epoch = 5;
+    attr.committed_content_epoch = 4;
+    attr.upload_state = MetaUploadState::Updating;
+    meta.set_attr(&attr).expect("persist staged attr");
+    meta.set_file_block(ino, 0, &BlockRef::new_partial(9001, 4096))
+        .expect("persist base file block");
+    meta.flush_regular_file_overlay_slices_with_attr(
+        ino,
+        &[(
+            studiofs_meta::schema::ChunkId(0),
+            vec![studiofs_meta::schema::SliceRecord {
+                slice_id: studiofs_meta::schema::SliceId::default(),
+                order: studiofs_meta::schema::SliceOrder::default(),
+                range: studiofs_meta::schema::SliceRange::new(0, 4096)
+                    .expect("overlay slice range"),
+                block: Some(studiofs_meta::schema::BlockRef {
+                    object_id: 9002,
+                    offset: 0,
+                    length: 4096,
+                    flags: studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK,
+                }),
+                block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
+            }],
+        )],
+        Some(&attr),
+    )
+    .expect("persist overlay slice state");
+
+    let pending_uploads = vec![PendingUpload {
+        ino,
+        offset: 0,
+        object_id: 9002,
+        content_epoch: 5,
+        created_unix_ms: 100,
+        not_before_unix_ms: 0,
+        retry_count: 0,
+    }];
+
+    vfs.replay_dirty_uploads_from_local_backend(&pending_uploads, &[attr]);
+
+    assert_eq!(
+        vfs.live_extent_records_for_inode(ino),
+        vec![(0, 9002, 5)],
+        "startup replay must prefer overlay metadata over the published base when rebuilding same-epoch live extents"
     );
 }
 
@@ -1541,6 +1600,56 @@ fn inode_write_materializes_directly_without_populating_legacy_write_buffer() {
 
         let bytes = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
         assert_eq!(bytes.as_ref(), payload);
+    });
+}
+
+#[test]
+fn inode_write_overwrite_updates_current_block_graph_over_published_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-inode-write-overwrite");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-245-inode-write-overwrite.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let baseline = b"published-baseline";
+        let replacement = b"replacement-bytes";
+
+        vfs.write(ino, 0, baseline).await.unwrap();
+        vfs.flush(ino).await.unwrap();
+        let (published_epoch, published_blocks) = mark_all_file_blocks_uploaded(&vfs, &meta, ino);
+        publish_current_manifest(&meta, ino, published_epoch, &published_blocks);
+
+        vfs.write(ino, 0, replacement).await.unwrap();
+        vfs.flush(ino).await.unwrap();
+
+        let current_blocks = meta.get_file_blocks(ino).expect("load current file graph");
+        assert_eq!(current_blocks.len(), 1, "overwrite test should stay single-block");
+        assert_ne!(
+            current_blocks[0].1.object_id,
+            published_blocks[0].1.object_id,
+            "current file graph must advance to the replacement block instead of reusing the published base"
+        );
+
+        let spans = meta
+            .lookup_regular_file_slices(ino, 0, replacement.len() as u64)
+            .expect("load current regular-file slices");
+        assert_eq!(
+            spans.iter().filter_map(|span| span.block.as_ref()).count(),
+            1,
+            "overwrite should resolve to one block-backed span"
+        );
+        assert_eq!(
+            spans
+                .iter()
+                .filter_map(|span| span.block.as_ref())
+                .next()
+                .expect("block-backed overwrite span")
+                .object_id,
+            current_blocks[0].1.object_id,
+            "lookup_regular_file_slices and get_file_blocks must agree on the current unpublished block"
+        );
     });
 }
 

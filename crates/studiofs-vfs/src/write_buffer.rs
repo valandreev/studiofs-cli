@@ -825,6 +825,8 @@ impl StudioVfs {
         visible_size: u64,
     ) -> VfsResult<Vec<DirtyWriteSnapshot>> {
         let pending_upload_index = self.snapshot_pending_upload_index();
+        let fully_overwritten_blocks =
+            self.fully_overwritten_block_indexes_for_buffered_writes(writes, visible_size);
         let mut blocks = std::collections::BTreeMap::<u32, BytesMut>::new();
 
         for (offset, data) in writes {
@@ -843,19 +845,23 @@ impl StudioVfs {
 
                 if let std::collections::btree_map::Entry::Vacant(entry) = blocks.entry(block_index)
                 {
-                    let existing_data = match self
-                        .read_block_if_exists(ino, block_index, Some(&pending_upload_index))
-                        .await?
-                    {
-                        Some(data) => {
-                            let logical_len = self.logical_block_len(visible_size, block_index);
-                            if data.len() > logical_len {
-                                data.slice(0..logical_len)
-                            } else {
-                                data
+                    let existing_data = if fully_overwritten_blocks.contains(&block_index) {
+                        Bytes::new()
+                    } else {
+                        match self
+                            .read_block_if_exists(ino, block_index, Some(&pending_upload_index))
+                            .await?
+                        {
+                            Some(data) => {
+                                let logical_len = self.logical_block_len(visible_size, block_index);
+                                if data.len() > logical_len {
+                                    data.slice(0..logical_len)
+                                } else {
+                                    data
+                                }
                             }
+                            None => Bytes::new(),
                         }
-                        None => Bytes::new(),
                     };
                     entry.insert(BytesMut::from(existing_data.as_ref()));
                 }
@@ -893,6 +899,57 @@ impl StudioVfs {
                 }
             })
             .collect())
+    }
+
+    fn fully_overwritten_block_indexes_for_buffered_writes(
+        &self,
+        writes: &[(u64, Bytes)],
+        visible_size: u64,
+    ) -> std::collections::HashSet<u32> {
+        let mut ranges_by_block = std::collections::BTreeMap::<u32, Vec<(usize, usize)>>::new();
+
+        for (offset, data) in writes {
+            if data.is_empty() {
+                continue;
+            }
+
+            let mut remaining = data.len();
+            let mut current_offset = *offset;
+            while remaining > 0 {
+                let block_index = block_index_from_offset(current_offset, self.block_size);
+                let start = offset_within_block(current_offset, self.block_size) as usize;
+                let space_in_block = self.block_size as usize - start;
+                let written = remaining.min(space_in_block);
+                ranges_by_block
+                    .entry(block_index)
+                    .or_default()
+                    .push((start, start + written));
+                remaining -= written;
+                current_offset += written as u64;
+            }
+        }
+
+        ranges_by_block
+            .into_iter()
+            .filter_map(|(block_index, mut ranges)| {
+                let logical_len = self.logical_block_len(visible_size, block_index);
+                if logical_len == 0 {
+                    return None;
+                }
+                ranges.sort_unstable_by_key(|(start, _)| *start);
+                let mut covered_until = 0usize;
+                for (start, end) in ranges {
+                    if start > covered_until {
+                        return None;
+                    }
+                    covered_until = covered_until.max(end);
+                    if covered_until >= logical_len {
+                        return Some(block_index);
+                    }
+                }
+                None
+            })
+            .collect()
     }
 
     pub(super) async fn materialize_buffered_writes_direct(
