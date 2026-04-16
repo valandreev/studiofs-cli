@@ -235,6 +235,22 @@ impl HandleWriterRegistry {
         self.writers.lock().total_dirty_bytes
     }
 
+    pub(super) fn snapshot_dirty_inodes_by_bytes(&self) -> Vec<(Ino, usize)> {
+        let writers = self.writers.lock();
+        writers
+            .writers_by_ino
+            .iter()
+            .filter_map(|(&ino, handles)| {
+                let dirty_bytes: usize = handles
+                    .iter()
+                    .filter_map(|fh| writers.writers.get(fh))
+                    .map(|writer| writer.dirty_bytes)
+                    .sum();
+                (dirty_bytes > 0).then_some((ino, dirty_bytes))
+            })
+            .collect()
+    }
+
     pub(super) fn mark_closed(&self, fh: u64) {
         let mut writers = self.writers.lock();
         let remove = if let Some(writer) = writers.writers.get_mut(&fh) {
@@ -411,13 +427,52 @@ impl StudioVfs {
         Ok(written)
     }
 
-    pub(super) fn should_auto_materialize_handle_writers(&self, ino: Ino) -> bool {
+    pub(super) async fn materialize_handle_writers_for_limits(
+        &self,
+        ino: Ino,
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<()> {
         let per_inode_dirty = self.state.handle_writers.dirty_bytes_for_inode(ino);
-        if per_inode_dirty == 0 {
-            return false;
+        let total_dirty = self.state.handle_writers.total_dirty_bytes();
+        let max_dirty = self.max_dirty_bytes();
+        let budget_exceeded = total_dirty > max_dirty;
+        if per_inode_dirty == 0 && !budget_exceeded {
+            return Ok(());
         }
-        per_inode_dirty >= self.write_eager_flush_batch_bytes
-            || self.state.handle_writers.total_dirty_bytes() >= self.max_dirty_bytes()
+        if per_inode_dirty > 0
+            && per_inode_dirty < self.write_eager_flush_batch_bytes
+            && !budget_exceeded
+        {
+            return Ok(());
+        }
+
+        if per_inode_dirty > 0 {
+            self.materialize_handle_writers_for_inode(ino, local_sync_policy)
+                .await?;
+        }
+
+        while self.state.handle_writers.total_dirty_bytes() > max_dirty {
+            let next_ino = self
+                .state
+                .handle_writers
+                .snapshot_dirty_inodes_by_bytes()
+                .into_iter()
+                .max_by_key(|(_, dirty_bytes)| *dirty_bytes)
+                .map(|(candidate_ino, _)| candidate_ino);
+            let Some(next_ino) = next_ino else {
+                break;
+            };
+            let total_before = self.state.handle_writers.total_dirty_bytes();
+            let materialized = self
+                .materialize_handle_writers_for_inode(next_ino, local_sync_policy)
+                .await?;
+            let total_after = self.state.handle_writers.total_dirty_bytes();
+            if !materialized || total_after >= total_before {
+                break;
+            }
+        }
+
+        Ok(())
     }
 
     pub(super) async fn materialize_handle_writers_for_inode(

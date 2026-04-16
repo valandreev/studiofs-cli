@@ -176,7 +176,8 @@ impl StudioVfs {
         let materialized_handle_writers = self
             .materialize_handle_writers_for_inode(ino, local_sync_policy)
             .await?;
-        let flushed_file_data = self.has_pending_write_buffer_blocks_for_inode(ino);
+        let flushed_file_data =
+            materialized_handle_writers || self.has_pending_write_buffer_blocks_for_inode(ino);
         let residual_local_dirty_state = self.inode_has_local_dirty_state(ino);
         let had_local_dirty_state = materialized_handle_writers || residual_local_dirty_state;
         if residual_local_dirty_state {
@@ -378,17 +379,25 @@ impl StudioVfs {
         let result = async {
             self.enforce_access(ino, AccessLevel::ReadWrite)?;
             if self.ignored_entry_attr(ino).is_some() {
+                let size = offset.saturating_add(data.len() as u64);
+                let _ = self.update_ignored_entry(ino, |attr| {
+                    if size > attr.size {
+                        attr.size = size;
+                        attr.committed_size = size;
+                    }
+                    attr.touch_mtime();
+                });
                 return Ok(data.len() as u32);
             }
             let written = self
                 .record_handle_writer_state(fh, ino, offset, data)
                 .await?;
-            if matches!(local_sync_policy, LocalSyncPolicy::Strict)
-                || self.should_auto_materialize_handle_writers(ino)
-            {
+            if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
                 self.materialize_handle_writers_for_inode(ino, local_sync_policy)
                     .await?;
             }
+            self.materialize_handle_writers_for_limits(ino, local_sync_policy)
+                .await?;
             Ok(written)
         }
         .await;

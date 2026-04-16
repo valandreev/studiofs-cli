@@ -280,6 +280,14 @@ impl StudioVfs {
                 self.access_classifier,
             );
             if self.ignored_entry_attr(ino).is_some() {
+                let size = offset.saturating_add(data.len() as u64);
+                let _ = self.update_ignored_entry(ino, |attr| {
+                    if size > attr.size {
+                        attr.size = size;
+                        attr.committed_size = size;
+                    }
+                    attr.touch_mtime();
+                });
                 return Ok(data.len() as u32);
             }
             if data.is_empty() {

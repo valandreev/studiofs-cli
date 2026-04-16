@@ -1501,6 +1501,71 @@ fn flush_then_release_keeps_written_bytes_visible_to_reopened_reader() {
 }
 
 #[test]
+fn ignored_entry_writes_preserve_synthetic_attr_size() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-entry-write-size");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let inode_attr = vfs.create(1, b".DS_Store", 0, 0, 0o644).unwrap();
+        let inode_payload = b"synthetic-inode";
+        vfs.write_with_local_sync_policy(
+            inode_attr.ino,
+            0,
+            inode_payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        let inode_after = vfs.getattr(inode_attr.ino).unwrap();
+        assert_eq!(
+            inode_after.size,
+            inode_payload.len() as u64,
+            "successful ignored-entry inode writes must still advance the synthetic attr size"
+        );
+        let inode_read = vfs
+            .read(inode_attr.ino, 0, inode_payload.len() as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            inode_read.len(),
+            inode_payload.len(),
+            "ignored-entry reads should observe the updated synthetic file length"
+        );
+
+        let handle_attr = vfs.create(1, b"._synthetic", 0, 0, 0o644).unwrap();
+        let handle_payload = b"synthetic-handle";
+        let fh = vfs
+            .open_file(handle_attr.ino, OpenFlags::RDWR, false)
+            .unwrap();
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            handle_attr.ino,
+            0,
+            handle_payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        let handle_after = vfs.getattr(handle_attr.ino).unwrap();
+        assert_eq!(
+            handle_after.size,
+            handle_payload.len() as u64,
+            "successful ignored-entry handle writes must still advance the synthetic attr size"
+        );
+        let handle_read = vfs
+            .read(handle_attr.ino, 0, handle_payload.len() as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            handle_read.len(),
+            handle_payload.len(),
+            "ignored-entry handle writes should remain readable at the new synthetic length"
+        );
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn same_mount_read_keeps_opportunistic_handle_write_visible_after_write_buffer_clear() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-opportunistic-handle-read");
@@ -1567,6 +1632,62 @@ fn same_mount_read_prefers_newer_opportunistic_handle_writer_spans() {
 
         vfs.release_fh(fh1).await.unwrap();
         vfs.release_fh(fh2).await.unwrap();
+    });
+}
+
+#[test]
+fn handle_writer_global_dirty_cap_drains_older_inodes_after_limit_drop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-handle-writer-global-cap");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr1 = vfs.create(1, b"cap-a.txt", 0, 0, 0o644).unwrap();
+        let attr2 = vfs.create(1, b"cap-b.txt", 0, 0, 0o644).unwrap();
+        let attr3 = vfs.create(1, b"cap-c.txt", 0, 0, 0o644).unwrap();
+        let fh1 = vfs.open_file(attr1.ino, OpenFlags::RDWR, false).unwrap();
+        let fh2 = vfs.open_file(attr2.ino, OpenFlags::RDWR, false).unwrap();
+        let fh3 = vfs.open_file(attr3.ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.write_fh_with_local_sync_policy(
+            fh1,
+            attr1.ino,
+            0,
+            b"12345678",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        vfs.write_fh_with_local_sync_policy(
+            fh2,
+            attr2.ino,
+            0,
+            b"abcdefgh",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        assert_eq!(vfs.state.handle_writers.total_dirty_bytes(), 16);
+
+        vfs.set_max_dirty_bytes(8);
+
+        vfs.write_fh_with_local_sync_policy(
+            fh3,
+            attr3.ino,
+            0,
+            b"z",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            vfs.state.handle_writers.total_dirty_bytes() <= vfs.max_dirty_bytes(),
+            "once the runtime dirty limit drops, the next opportunistic write should drain enough handle-writer state to get back under the global cap"
+        );
+
+        vfs.release_fh(fh1).await.unwrap();
+        vfs.release_fh(fh2).await.unwrap();
+        vfs.release_fh(fh3).await.unwrap();
     });
 }
 
@@ -1930,6 +2051,38 @@ fn test_fsync_with_outcome_treats_write_committed_inode_as_clean() {
             !after_write.persisted_dirty_attrs,
             "fsync should not invent metadata work after write already committed it"
         );
+    });
+}
+
+#[test]
+fn test_fsync_with_outcome_reports_handle_writer_file_data_barrier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "fsync-outcome-handle-writer");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"fsync-outcome-handle-writer.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.write_fh_with_local_sync_policy(fh, ino, 0, b"payload", LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+
+        let after_write = vfs.fsync_with_outcome(ino, false).await.unwrap();
+        assert!(
+            after_write.flushed_file_data,
+            "fsync should report file-data work when it materializes dirty handle-writer state"
+        );
+
+        let clean = vfs.fsync_with_outcome(ino, false).await.unwrap();
+        assert!(
+            !clean.flushed_file_data,
+            "once the handle-writer state is drained, the next fsync should report a clean data path"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
     });
 }
 
