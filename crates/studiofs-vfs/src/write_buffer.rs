@@ -937,7 +937,7 @@ impl StudioVfs {
         let object_ids = drain.allocate_block_ids(block_count).await?;
         let persisted_blocks: Vec<PersistedWriteBlock> = blocks
             .into_iter()
-            .zip(object_ids.into_iter())
+            .zip(object_ids)
             .map(|(block, object_id)| PersistedWriteBlock {
                 block_index: block.block_index,
                 object_id,
