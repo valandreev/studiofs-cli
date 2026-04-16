@@ -2332,6 +2332,16 @@ mod tests {
         vfs.write_path_observability_snapshot().flush_ordered_calls
     }
 
+    fn payload_persist_calls(vfs: &StudioVfs) -> u64 {
+        vfs.write_path_observability_snapshot().payload_persist.calls
+    }
+
+    fn sync_data_calls(vfs: &StudioVfs) -> u64 {
+        vfs.write_path_observability_snapshot()
+            .block_store_sync_data
+            .calls
+    }
+
     fn winfsp_callbacks(vfs: &StudioVfs) -> studiofs_vfs::VfsWritePathWinfspCallbackStats {
         vfs.write_path_observability_snapshot().winfsp_callbacks
     }
@@ -3101,6 +3111,8 @@ mod tests {
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
         let flush_calls_before = flush_ordered_calls(&vfs);
+        let payload_persist_before = payload_persist_calls(&vfs);
+        let sync_calls_before = sync_data_calls(&vfs);
 
         <StudioFsContext as FileSystemContext>::write(
             &ctx,
@@ -3123,6 +3135,8 @@ mod tests {
         let callbacks_after = winfsp_callbacks(&vfs);
         let barriers_after = winfsp_foreground_flushes(&vfs);
         let flush_calls_after = flush_ordered_calls(&vfs);
+        let payload_persist_after = payload_persist_calls(&vfs);
+        let sync_calls_after = sync_data_calls(&vfs);
         assert_eq!(
             callbacks_after.flush,
             callbacks_before.flush + 1,
@@ -3138,8 +3152,16 @@ mod tests {
             "dirty explicit flush should not be classified as a clean skip"
         );
         assert!(
-            flush_calls_after > flush_calls_before,
-            "explicit flush should trigger the ordered flush path for buffered WinFSP writes"
+            payload_persist_after > payload_persist_before,
+            "explicit flush should still materialize buffered WinFSP writes into local payload storage"
+        );
+        assert!(
+            sync_calls_after > sync_calls_before,
+            "explicit flush should still cross the strict local payload sync barrier after buffered writes"
+        );
+        assert_eq!(
+            flush_calls_after, flush_calls_before,
+            "handle-writer flush now materializes directly instead of routing through the legacy ordered flush path"
         );
         assert!(
             !vfs.inode_has_local_dirty_state(attr.ino),
@@ -3193,6 +3215,8 @@ mod tests {
         );
         let mut file_info = winfsp::filesystem::FileInfo::default();
         let flush_calls_before = flush_ordered_calls(&vfs);
+        let payload_persist_before = payload_persist_calls(&vfs);
+        let sync_calls_before = sync_data_calls(&vfs);
 
         <StudioFsContext as FileSystemContext>::write(
             &ctx,
@@ -3210,8 +3234,17 @@ mod tests {
             "write-through / unbuffered WinFSP writes should still cross the strict local durable boundary in write()"
         );
         assert!(
-            flush_ordered_calls(&vfs) > flush_calls_before,
-            "strict WinFSP write policy should drive the ordered local flush path"
+            payload_persist_calls(&vfs) > payload_persist_before,
+            "strict WinFSP write policy should still materialize payload locally inside write()"
+        );
+        assert!(
+            sync_data_calls(&vfs) > sync_calls_before,
+            "strict WinFSP write policy should still force the local payload sync barrier in write()"
+        );
+        assert_eq!(
+            flush_ordered_calls(&vfs),
+            flush_calls_before,
+            "strict handle-writer writes now materialize directly without routing through the legacy ordered flush path"
         );
 
         ctx.spawn_wait({
