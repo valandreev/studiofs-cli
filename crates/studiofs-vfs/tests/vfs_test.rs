@@ -7980,12 +7980,24 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
         rt.shutdown_background();
     }
 
-    if let Ok(entries) = std::fs::read_dir(&spill_dir) {
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "spill") {
-                std::fs::remove_file(path).unwrap();
+    match std::fs::read_dir(&spill_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.unwrap_or_else(|err| {
+                    panic!(
+                        "failed to read entry in spill dir {}: {err}",
+                        spill_dir.display()
+                    )
+                });
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "spill") {
+                    std::fs::remove_file(path).unwrap();
+                }
             }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            panic!("failed to read spill dir {}: {err}", spill_dir.display())
         }
     }
 

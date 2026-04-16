@@ -32,7 +32,7 @@ impl ReadRange {
 }
 
 #[derive(Debug, Clone)]
-enum ReadPlanSource {
+enum ReadSegmentSource {
     Dirty { data: Bytes, block_offset: u64 },
     PendingOverlay { data: Bytes, block_offset: u32 },
     PendingExtent { object_id: u64, block_offset: u32 },
@@ -42,9 +42,9 @@ enum ReadPlanSource {
 }
 
 #[derive(Debug, Clone)]
-struct ReadPlanSpan {
+struct ReadSegment {
     range: ReadRange,
-    source: ReadPlanSource,
+    source: ReadSegmentSource,
 }
 
 struct DataReader<'a> {
@@ -76,28 +76,28 @@ impl<'a> DataReader<'a> {
     }
 
     async fn read_into(&self, buffer: &mut [u8]) -> VfsResult<usize> {
-        let mut plan = self.build_plan().await?;
-        plan.sort_by_key(|span| span.range.start);
-        Self::log_debug_target_plan(self.vfs, self.ino, self.offset, self.length, &plan);
-        let missing_remote = Self::prefetch_remote_blocks(self.vfs, &plan, false).await?;
+        let mut segments = self.build_segments().await?;
+        segments.sort_by_key(|segment| segment.range.start);
+        Self::log_debug_target_segments(self.vfs, self.ino, self.offset, self.length, &segments);
+        let missing_remote = Self::prefetch_remote_blocks(self.vfs, &segments, false).await?;
         let written =
-            Self::assemble_into(self.vfs, self.offset, &plan, &missing_remote, buffer).await?;
+            Self::assemble_into(self.vfs, self.offset, &segments, &missing_remote, buffer).await?;
         Ok(written)
     }
 
-    async fn prefetch_only(&self, prefetch: bool) -> VfsResult<()> {
-        let mut plan = self.build_plan().await?;
-        plan.sort_by_key(|span| span.range.start);
-        let _ = Self::prefetch_remote_blocks(self.vfs, &plan, prefetch).await?;
+    async fn prefetch_only(&self) -> VfsResult<()> {
+        let mut segments = self.build_segments().await?;
+        segments.sort_by_key(|segment| segment.range.start);
+        let _ = Self::prefetch_remote_blocks(self.vfs, &segments, true).await?;
         Ok(())
     }
 
-    fn log_debug_target_plan(
+    fn log_debug_target_segments(
         vfs: &StudioVfs,
         ino: Ino,
         offset: u64,
         length: u64,
-        plan: &[ReadPlanSpan],
+        segments: &[ReadSegment],
     ) {
         let Some(path) = vfs.debug_pending_target_path(ino) else {
             return;
@@ -108,14 +108,14 @@ impl<'a> DataReader<'a> {
         let mut overlay_spans = 0usize;
         let mut base_spans = 0usize;
         let mut zero_spans = 0usize;
-        for span in plan {
-            match &span.source {
-                ReadPlanSource::Dirty { .. } => dirty_spans += 1,
-                ReadPlanSource::PendingOverlay { .. } => pending_overlay_spans += 1,
-                ReadPlanSource::PendingExtent { .. } => pending_extent_spans += 1,
-                ReadPlanSource::Overlay { .. } => overlay_spans += 1,
-                ReadPlanSource::Base { .. } => base_spans += 1,
-                ReadPlanSource::Zero => zero_spans += 1,
+        for segment in segments {
+            match &segment.source {
+                ReadSegmentSource::Dirty { .. } => dirty_spans += 1,
+                ReadSegmentSource::PendingOverlay { .. } => pending_overlay_spans += 1,
+                ReadSegmentSource::PendingExtent { .. } => pending_extent_spans += 1,
+                ReadSegmentSource::Overlay { .. } => overlay_spans += 1,
+                ReadSegmentSource::Base { .. } => base_spans += 1,
+                ReadSegmentSource::Zero => zero_spans += 1,
             }
         }
         info!(
@@ -123,7 +123,7 @@ impl<'a> DataReader<'a> {
             path = %path,
             offset,
             length,
-            spans = plan.len(),
+            spans = segments.len(),
             dirty_spans,
             pending_overlay_spans,
             pending_extent_spans,
@@ -135,15 +135,15 @@ impl<'a> DataReader<'a> {
     }
 
     #[cfg(test)]
-    fn collect_data_block_refs(plan: &[ReadPlanSpan]) -> BTreeMap<u64, BlockRef> {
+    fn collect_data_block_refs(segments: &[ReadSegment]) -> BTreeMap<u64, BlockRef> {
         let mut block_refs = BTreeMap::new();
-        for span in plan {
-            let block = match &span.source {
-                ReadPlanSource::Overlay { block } | ReadPlanSource::Base { block } => block,
-                ReadPlanSource::Dirty { .. }
-                | ReadPlanSource::PendingOverlay { .. }
-                | ReadPlanSource::PendingExtent { .. }
-                | ReadPlanSource::Zero => continue,
+        for segment in segments {
+            let block = match &segment.source {
+                ReadSegmentSource::Overlay { block } | ReadSegmentSource::Base { block } => block,
+                ReadSegmentSource::Dirty { .. }
+                | ReadSegmentSource::PendingOverlay { .. }
+                | ReadSegmentSource::PendingExtent { .. }
+                | ReadSegmentSource::Zero => continue,
             };
             block_refs
                 .entry(block.object_id)
@@ -152,8 +152,8 @@ impl<'a> DataReader<'a> {
         block_refs
     }
 
-    async fn build_plan(&self) -> VfsResult<Vec<ReadPlanSpan>> {
-        Self::build_read_plan_with(
+    async fn build_segments(&self) -> VfsResult<Vec<ReadSegment>> {
+        Self::build_segments_with(
             self.vfs,
             self.ino,
             self.offset,
@@ -164,14 +164,14 @@ impl<'a> DataReader<'a> {
         .await
     }
 
-    async fn build_read_plan_with(
+    async fn build_segments_with(
         vfs: &StudioVfs,
         ino: Ino,
         offset: u64,
         length: u64,
         pending_content_epoch: Option<u64>,
         resolved_regular_file_slices: Option<&[ResolvedSliceSpan]>,
-    ) -> VfsResult<Vec<ReadPlanSpan>> {
+    ) -> VfsResult<Vec<ReadSegment>> {
         if length == 0 {
             return Ok(Vec::new());
         }
@@ -185,7 +185,7 @@ impl<'a> DataReader<'a> {
             end: read_end,
         };
         let mut unresolved = vec![requested];
-        let mut plan = Vec::new();
+        let mut segments = Vec::new();
         let pending_upload_index = vfs.snapshot_pending_upload_index();
 
         let handle_spans = vfs.snapshot_handle_writer_read_spans(ino, offset, length);
@@ -204,9 +204,9 @@ impl<'a> DataReader<'a> {
                 let Some(block_offset) = dirty.block_offset.checked_add(delta) else {
                     continue;
                 };
-                plan.push(ReadPlanSpan {
+                segments.push(ReadSegment {
                     range: overlap,
-                    source: ReadPlanSource::Dirty {
+                    source: ReadSegmentSource::Dirty {
                         data: dirty.data.clone(),
                         block_offset,
                     },
@@ -233,9 +233,9 @@ impl<'a> DataReader<'a> {
                 let Some(block_offset) = dirty.block_offset.checked_add(delta_u32) else {
                     continue;
                 };
-                plan.push(ReadPlanSpan {
+                segments.push(ReadSegment {
                     range: overlap,
-                    source: ReadPlanSource::Dirty {
+                    source: ReadSegmentSource::Dirty {
                         data: dirty.data.clone(),
                         block_offset: u64::from(block_offset),
                     },
@@ -284,17 +284,17 @@ impl<'a> DataReader<'a> {
                     let Some(block_offset) = u32::try_from(delta).ok() else {
                         continue;
                     };
-                    plan.push(ReadPlanSpan {
+                    segments.push(ReadSegment {
                         range: overlap,
                         source: match &source {
                             PendingOverlayBlockSource::Pending(data) => {
-                                ReadPlanSource::PendingOverlay {
+                                ReadSegmentSource::PendingOverlay {
                                     data: data.clone(),
                                     block_offset,
                                 }
                             }
                             PendingOverlayBlockSource::Extent(object_id) => {
-                                ReadPlanSource::PendingExtent {
+                                ReadSegmentSource::PendingExtent {
                                     object_id: *object_id,
                                     block_offset,
                                 }
@@ -307,21 +307,21 @@ impl<'a> DataReader<'a> {
 
         if !unresolved.is_empty() {
             if let Some(resolved) = resolved_regular_file_slices {
-                unresolved = Self::claim_meta_spans_into_plan(
+                unresolved = Self::claim_meta_spans_into_segments(
                     resolved.iter(),
                     unresolved,
-                    &mut plan,
+                    &mut segments,
                     requested,
                     ResolvedSliceSource::Overlay,
-                    |block| ReadPlanSource::Overlay { block },
+                    |block| ReadSegmentSource::Overlay { block },
                 );
-                unresolved = Self::claim_meta_spans_into_plan(
+                unresolved = Self::claim_meta_spans_into_segments(
                     resolved.iter(),
                     unresolved,
-                    &mut plan,
+                    &mut segments,
                     requested,
                     ResolvedSliceSource::Base,
-                    |block| ReadPlanSource::Base { block },
+                    |block| ReadSegmentSource::Base { block },
                 );
             } else {
                 let meta = vfs.meta.clone();
@@ -329,32 +329,32 @@ impl<'a> DataReader<'a> {
                     engine.lookup_regular_file_slices(ino, offset, length)
                 })
                 .await?;
-                unresolved = Self::claim_meta_spans_into_plan(
+                unresolved = Self::claim_meta_spans_into_segments(
                     resolved.iter(),
                     unresolved,
-                    &mut plan,
+                    &mut segments,
                     requested,
                     ResolvedSliceSource::Overlay,
-                    |block| ReadPlanSource::Overlay { block },
+                    |block| ReadSegmentSource::Overlay { block },
                 );
-                unresolved = Self::claim_meta_spans_into_plan(
+                unresolved = Self::claim_meta_spans_into_segments(
                     resolved.iter(),
                     unresolved,
-                    &mut plan,
+                    &mut segments,
                     requested,
                     ResolvedSliceSource::Base,
-                    |block| ReadPlanSource::Base { block },
+                    |block| ReadSegmentSource::Base { block },
                 );
             }
         }
 
         for gap in unresolved {
-            plan.push(ReadPlanSpan {
+            segments.push(ReadSegment {
                 range: gap,
-                source: ReadPlanSource::Zero,
+                source: ReadSegmentSource::Zero,
             });
         }
-        Ok(plan)
+        Ok(segments)
     }
 
     fn claim_unresolved_ranges(
@@ -385,17 +385,17 @@ impl<'a> DataReader<'a> {
         (next_unresolved, claimed)
     }
 
-    fn claim_meta_spans_into_plan<'b, I, F>(
+    fn claim_meta_spans_into_segments<'b, I, F>(
         resolved: I,
         unresolved: Vec<ReadRange>,
-        plan: &mut Vec<ReadPlanSpan>,
+        segments: &mut Vec<ReadSegment>,
         requested: ReadRange,
         source_filter: ResolvedSliceSource,
         source_ctor: F,
     ) -> Vec<ReadRange>
     where
         I: Iterator<Item = &'b ResolvedSliceSpan>,
-        F: Fn(BlockRef) -> ReadPlanSource + Copy,
+        F: Fn(BlockRef) -> ReadSegmentSource + Copy,
     {
         let mut unresolved = unresolved;
         for span in resolved {
@@ -433,7 +433,7 @@ impl<'a> DataReader<'a> {
                 let mut planned_block = block.clone();
                 planned_block.offset = block_offset;
                 planned_block.length = block_length;
-                plan.push(ReadPlanSpan {
+                segments.push(ReadSegment {
                     range: overlap,
                     source: source_ctor(planned_block),
                 });
@@ -444,15 +444,15 @@ impl<'a> DataReader<'a> {
 
     async fn prefetch_remote_blocks(
         vfs: &StudioVfs,
-        plan: &[ReadPlanSpan],
+        segments: &[ReadSegment],
         prefetch: bool,
     ) -> VfsResult<HashSet<u64>> {
         let mut cached = BTreeSet::new();
         let mut missing = BTreeMap::new();
         let mut local_pending = BTreeSet::new();
-        for span in plan {
-            match &span.source {
-                ReadPlanSource::Overlay { block } | ReadPlanSource::Base { block } => {
+        for segment in segments {
+            match &segment.source {
+                ReadSegmentSource::Overlay { block } | ReadSegmentSource::Base { block } => {
                     if vfs.local_block_backend.contains(block.object_id) {
                         cached.insert(block.object_id);
                     } else {
@@ -461,12 +461,12 @@ impl<'a> DataReader<'a> {
                             .or_insert_with(|| block.clone());
                     }
                 }
-                ReadPlanSource::PendingExtent { object_id, .. } => {
+                ReadSegmentSource::PendingExtent { object_id, .. } => {
                     local_pending.insert(*object_id);
                 }
-                ReadPlanSource::Dirty { .. }
-                | ReadPlanSource::PendingOverlay { .. }
-                | ReadPlanSource::Zero => {}
+                ReadSegmentSource::Dirty { .. }
+                | ReadSegmentSource::PendingOverlay { .. }
+                | ReadSegmentSource::Zero => {}
             }
         }
         for object_id in cached {
@@ -514,26 +514,26 @@ impl<'a> DataReader<'a> {
     async fn assemble_into(
         vfs: &StudioVfs,
         offset: u64,
-        plan: &[ReadPlanSpan],
+        segments: &[ReadSegment],
         remote_not_found: &HashSet<u64>,
         buffer: &mut [u8],
     ) -> VfsResult<usize> {
         let mut written = 0usize;
-        for span in plan {
-            let dst_start = span.range.start.saturating_sub(offset) as usize;
-            let dst_end = span.range.end.saturating_sub(offset) as usize;
+        for segment in segments {
+            let dst_start = segment.range.start.saturating_sub(offset) as usize;
+            let dst_end = segment.range.end.saturating_sub(offset) as usize;
             if dst_start >= buffer.len() || dst_end > buffer.len() || dst_start >= dst_end {
                 continue;
             }
             let dst = &mut buffer[dst_start..dst_end];
-            match &span.source {
-                ReadPlanSource::Dirty { data, block_offset } => {
+            match &segment.source {
+                ReadSegmentSource::Dirty { data, block_offset } => {
                     vfs.copy_block_payload_into_range(data.as_ref(), *block_offset, dst);
                 }
-                ReadPlanSource::PendingOverlay { data, block_offset } => {
+                ReadSegmentSource::PendingOverlay { data, block_offset } => {
                     vfs.copy_block_payload_into_range(data.as_ref(), u64::from(*block_offset), dst);
                 }
-                ReadPlanSource::PendingExtent {
+                ReadSegmentSource::PendingExtent {
                     object_id,
                     block_offset,
                 } => {
@@ -551,7 +551,7 @@ impl<'a> DataReader<'a> {
                         Some(read) => {
                             debug!(
                                 object_id,
-                                file_offset = span.range.start,
+                                file_offset = segment.range.start,
                                 block_offset,
                                 requested = dst.len(),
                                 read,
@@ -562,7 +562,7 @@ impl<'a> DataReader<'a> {
                         None => {
                             warn!(
                                 object_id,
-                                file_offset = span.range.start,
+                                file_offset = segment.range.start,
                                 block_offset,
                                 requested = dst.len(),
                                 "data_reader: pending extent missing from local backend, zeroing range"
@@ -571,11 +571,11 @@ impl<'a> DataReader<'a> {
                         }
                     }
                 }
-                ReadPlanSource::Overlay { block } | ReadPlanSource::Base { block } => {
+                ReadSegmentSource::Overlay { block } | ReadSegmentSource::Base { block } => {
                     if remote_not_found.contains(&block.object_id) {
                         warn!(
                             object_id = block.object_id,
-                            file_offset = span.range.start,
+                            file_offset = segment.range.start,
                             "data_reader: object in remote_not_found set, zeroing range (S3 NotFound during prefetch)"
                         );
                         dst.fill(0);
@@ -597,7 +597,7 @@ impl<'a> DataReader<'a> {
                             if !span_resolved {
                                 error!(
                                     object_id = block.object_id,
-                                    file_offset = span.range.start,
+                                    file_offset = segment.range.start,
                                     block_offset = block.offset,
                                     requested = dst.len(),
                                     read,
@@ -622,7 +622,7 @@ impl<'a> DataReader<'a> {
                                     vfs.copy_committed_block_payload_into_range(
                                         data.as_ref(),
                                         block,
-                                        span.range.start,
+                                        segment.range.start,
                                         dst,
                                     )?;
                                 }
@@ -630,7 +630,7 @@ impl<'a> DataReader<'a> {
                                     warn!(
                                         object_id = block.object_id,
                                         key,
-                                        file_offset = span.range.start,
+                                        file_offset = segment.range.start,
                                         block_offset = block.offset,
                                         block_length = block.length,
                                         "data_reader: S3 object not found during foreground read, zeroing range (upload incomplete or evicted before upload?)"
@@ -644,7 +644,7 @@ impl<'a> DataReader<'a> {
                         }
                     }
                 }
-                ReadPlanSource::Zero => dst.fill(0),
+                ReadSegmentSource::Zero => dst.fill(0),
             }
             written = written.max(dst_end);
         }
@@ -1036,7 +1036,7 @@ impl StudioVfs {
                     context.pending_content_epoch,
                     None,
                 );
-                data_reader.prefetch_only(true).await?;
+                data_reader.prefetch_only().await?;
             }
             Ok::<(), VfsError>(())
         }
@@ -1076,7 +1076,7 @@ impl StudioVfs {
 mod tests {
     use super::super::write_buffer::PendingBlock;
     use super::super::*;
-    use super::{DataReader, ReadPlanSource, ReadPlanSpan, ReadRange};
+    use super::{DataReader, ReadRange, ReadSegment, ReadSegmentSource};
     use bytes::{Bytes, BytesMut};
     use std::any::Any;
     use std::collections::HashSet;
@@ -1280,26 +1280,26 @@ mod tests {
             length: 8,
             flags: MetaBlockFlags::PARTIAL_BLOCK,
         };
-        let plan = vec![
-            ReadPlanSpan {
+        let segments = vec![
+            ReadSegment {
                 range: ReadRange { start: 0, end: 16 },
-                source: ReadPlanSource::Base {
+                source: ReadSegmentSource::Base {
                     block: first.clone(),
                 },
             },
-            ReadPlanSpan {
+            ReadSegment {
                 range: ReadRange { start: 16, end: 24 },
-                source: ReadPlanSource::Overlay {
+                source: ReadSegmentSource::Overlay {
                     block: second.clone(),
                 },
             },
-            ReadPlanSpan {
+            ReadSegment {
                 range: ReadRange { start: 24, end: 32 },
-                source: ReadPlanSource::Zero,
+                source: ReadSegmentSource::Zero,
             },
         ];
 
-        let refs = DataReader::collect_data_block_refs(&plan);
+        let refs = DataReader::collect_data_block_refs(&segments);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs.get(&42), Some(&first));
     }
@@ -1528,15 +1528,15 @@ mod tests {
             let mut block = BlockRef::new_full(object_id, 10);
             block.offset = 2;
             block.length = 4;
-            let plan = vec![ReadPlanSpan {
+            let segments = vec![ReadSegment {
                 range: ReadRange { start: 0, end: 4 },
-                source: ReadPlanSource::Base { block },
+                source: ReadSegmentSource::Base { block },
             }];
             let mut buffer = [0_u8; 4];
             let written = DataReader::assemble_into(
                 &vfs,
                 0,
-                &plan,
+                &segments,
                 &std::collections::HashSet::new(),
                 &mut buffer,
             )
@@ -1553,7 +1553,7 @@ mod tests {
         let (rt, vfs, meta) = make_test_vfs(&tmp, "data-reader-dirty-over-base");
         rt.block_on(async {
             let attr = vfs
-                .create(1, b"data-reader-dirty-over-base.bin", 0, 0, 0o644)
+                .create(ROOT_INO, b"data-reader-dirty-over-base.bin", 0, 0, 0o644)
                 .expect("create test file");
             let ino = attr.ino;
             let object_id = 0xDADA;
@@ -1638,7 +1638,7 @@ mod tests {
         let (rt, vfs, meta) = make_test_vfs(&tmp, "build-read-plan-dirty-over-base");
         rt.block_on(async {
             let attr = vfs
-                .create(1, b"dirty-over-base.bin", 0, 0, 0o644)
+                .create(ROOT_INO, b"dirty-over-base.bin", 0, 0, 0o644)
                 .expect("create test file");
             let ino = attr.ino;
             let object_id = 0xA11CE;
@@ -1662,25 +1662,25 @@ mod tests {
                 .pending_incarnation
                 .as_ref()
                 .map(|pending| pending.content_epoch);
-            let plan = DataReader::new(&vfs, ino, 0, 8, pending_content_epoch, None)
-                .build_plan()
+            let segments = DataReader::new(&vfs, ino, 0, 8, pending_content_epoch, None)
+                .build_segments()
                 .await
                 .expect("resolve data reader segments");
 
-            assert!(plan.iter().any(|span| {
+            assert!(segments.iter().any(|segment| {
                 matches!(
-                    &span.source,
-                    ReadPlanSource::Dirty { .. }
-                        | ReadPlanSource::PendingOverlay { .. }
-                        | ReadPlanSource::PendingExtent { .. }
-                        | ReadPlanSource::Overlay { .. }
-                        if span.range.start < 4 && span.range.end > 2
+                    &segment.source,
+                    ReadSegmentSource::Dirty { .. }
+                        | ReadSegmentSource::PendingOverlay { .. }
+                        | ReadSegmentSource::PendingExtent { .. }
+                        | ReadSegmentSource::Overlay { .. }
+                        if segment.range.start < 4 && segment.range.end > 2
                 )
             }));
-            assert!(!plan.iter().any(|span| {
-                matches!(&span.source, ReadPlanSource::Base { .. })
-                    && span.range.start < 4
-                    && span.range.end > 2
+            assert!(!segments.iter().any(|segment| {
+                matches!(&segment.source, ReadSegmentSource::Base { .. })
+                    && segment.range.start < 4
+                    && segment.range.end > 2
             }));
         });
     }
@@ -1691,9 +1691,9 @@ mod tests {
         let (rt, vfs, _meta) = make_test_vfs(&tmp, "assemble-read-plan-not-found");
         rt.block_on(async {
             let object_id = 0xF404;
-            let plan = vec![ReadPlanSpan {
+            let segments = vec![ReadSegment {
                 range: ReadRange { start: 0, end: 4 },
-                source: ReadPlanSource::Base {
+                source: ReadSegmentSource::Base {
                     block: BlockRef::new_partial(object_id, 4),
                 },
             }];
@@ -1701,9 +1701,10 @@ mod tests {
             remote_not_found.insert(object_id);
             let mut buffer = [0xAB_u8; 4];
 
-            let written = DataReader::assemble_into(&vfs, 0, &plan, &remote_not_found, &mut buffer)
-                .await
-                .expect("assemble data reader output");
+            let written =
+                DataReader::assemble_into(&vfs, 0, &segments, &remote_not_found, &mut buffer)
+                    .await
+                    .expect("assemble data reader output");
 
             assert_eq!(written, 4);
             assert_eq!(buffer, [0_u8; 4]);
