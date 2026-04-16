@@ -1512,6 +1512,39 @@ fn same_mount_read_prefers_newer_opportunistic_handle_writer_spans() {
 }
 
 #[test]
+fn inode_write_materializes_directly_without_populating_legacy_write_buffer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-inode-write-direct");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-245-inode-write-direct.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let payload = b"inode-direct";
+
+        vfs.write_with_local_sync_policy(ino, 0, payload, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+
+        assert!(
+            !vfs.has_pending_write_buffer_blocks_for_inode(ino),
+            "inode write should bypass the legacy write buffer"
+        );
+        let spans = meta
+            .lookup_regular_file_slices(ino, 0, payload.len() as u64)
+            .unwrap();
+        assert!(
+            spans.iter().any(|span| span.block.is_some()),
+            "inode write should materialize block-backed unpublished slices: {spans:?}"
+        );
+
+        let bytes = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(bytes.as_ref(), payload);
+    });
+}
+
+#[test]
 fn test_release_fh_with_outcome_orphan_cleanup_does_not_report_flush_barrier() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-orphan-cleanup");

@@ -26,8 +26,6 @@ impl StudioVfs {
             let len = end.saturating_sub(offset) as usize;
             return Ok(Bytes::from(vec![0; len]));
         }
-        self.flush_dirty_write_buffer_for_read_start(ino, offset)
-            .await?;
         let prepared = self
             .prepare_foreground_read(ino, offset, size as usize)
             .await?;
@@ -112,8 +110,6 @@ impl StudioVfs {
             }
             return Ok(len as u32);
         }
-        self.flush_dirty_write_buffer_for_read_start(ino, offset)
-            .await?;
         let prepared = self
             .prepare_foreground_read(ino, offset, buffer.len())
             .await?;
@@ -274,9 +270,44 @@ impl StudioVfs {
             .file_session
             .enter_op(ino, FileSessionOperation::Write)
             .await;
-        let result = self
-            .write_ordered_with_local_sync_policy(ino, offset, data, local_sync_policy)
-            .await;
+        let result = async {
+            self.enforce_access(ino, AccessLevel::ReadWrite)?;
+            let _ = self.state.read.observe_write_access(
+                None,
+                ino,
+                offset,
+                data.len(),
+                self.access_classifier,
+            );
+            if self.ignored_entry_attr(ino).is_some() {
+                return Ok(data.len() as u32);
+            }
+            if data.is_empty() {
+                return Ok(0);
+            }
+
+            let mut base_attr = self.getattr_async(ino).await?;
+            self.refresh_inode_incarnation_state_from_attr(ino, &base_attr);
+            self.begin_pending_incarnation(ino, &mut base_attr);
+            {
+                let mut dirty = self.state.namespace.dirty_attrs.lock();
+                let attr = dirty.entry(ino).or_insert_with(|| base_attr.clone());
+                attr.content_epoch = base_attr.content_epoch;
+                let new_size = offset.saturating_add(data.len() as u64);
+                if new_size > attr.size {
+                    attr.size = new_size;
+                }
+                attr.touch_mtime();
+                attr.touch_ctime();
+                self.update_pending_incarnation_size(ino, attr.size);
+            }
+
+            let writes = [(offset, Bytes::copy_from_slice(data))];
+            self.materialize_buffered_writes_direct(ino, &writes, local_sync_policy)
+                .await?;
+            Ok(data.len() as u32)
+        }
+        .await;
         drop(session);
         self.state.file_session.gc_if_idle(ino);
         result
