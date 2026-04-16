@@ -322,7 +322,8 @@ Notes:
 
 
 Handle-aware read path:
-- `read_into_fh(fh, ino, ...)` uses the same buffered-first read pipeline for every handle.
+- `read_into_fh(fh, ino, ...)` and handle-less `read()` build a request-scoped `DataReader` over the effective merged view for that inode.
+- The `DataReader` resolves active handle writer state first, then durable local unpublished state, then published slices, then holes.
 - Each open handle maintains its own access classifier in core VFS, so one random reader no longer suppresses sequential-media prefetch on a different handle for the same inode.
 - Handle-less `read()` calls fall back to per-inode classifier state, which preserves the buffered path without requiring bridge-specific policy code.
 - Best-effort prefetch and the normal local-data lookup path stay enabled for committed blocks regardless of platform or caller open style.
@@ -445,10 +446,11 @@ Runtime tuning knobs:
 - `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` (default `75`)
 
 On each buffered `read()`:
-1. Hot path updates the handle or fallback classifier, then enqueues a compact prefetch hint (`ino`, `stream_id`, `first_block`, `last_block`, `policy`) and returns to user work.
-2. Background worker updates read-ahead state (`record_read_for_stream`) and directory access state (`on_child_read`) regardless of transient prefetch budget limits.
-3. Worker applies prefetch budget/headroom limits, deduplicates pending/in-flight blocks, and runs `read_block_for_prefetch()` tasks.
-4. `start_prefetch` / `finish_prefetch` continue to guard in-flight deduplication.
+1. Hot path updates the handle or fallback classifier, constructs a `DataReader`, and resolves the effective merged view for the requested range.
+2. The same foreground path enqueues a compact prefetch hint (`ino`, `stream_id`, `first_block`, `last_block`, `policy`) and returns to user work.
+3. Background worker updates read-ahead state (`record_read_for_stream`) and directory access state (`on_child_read`) regardless of transient prefetch budget limits.
+4. Worker applies prefetch budget/headroom limits, deduplicates pending/in-flight blocks, and runs `read_block_for_prefetch()` tasks through the same data-reader resolution path.
+5. `start_prefetch` / `finish_prefetch` continue to guard in-flight deduplication.
 
 Worker robustness details:
 - stale hints for deleted inodes are dropped before scheduling;

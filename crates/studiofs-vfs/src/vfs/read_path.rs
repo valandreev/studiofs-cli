@@ -47,7 +47,7 @@ struct ReadPlanSpan {
     source: ReadPlanSource,
 }
 
-struct ReadPipeline<'a> {
+struct DataReader<'a> {
     vfs: &'a StudioVfs,
     ino: Ino,
     offset: u64,
@@ -56,7 +56,7 @@ struct ReadPipeline<'a> {
     resolved_regular_file_slices: Option<&'a [ResolvedSliceSpan]>,
 }
 
-impl<'a> ReadPipeline<'a> {
+impl<'a> DataReader<'a> {
     fn new(
         vfs: &'a StudioVfs,
         ino: Ino,
@@ -75,7 +75,7 @@ impl<'a> ReadPipeline<'a> {
         }
     }
 
-    async fn execute_into(&self, buffer: &mut [u8]) -> VfsResult<usize> {
+    async fn read_into(&self, buffer: &mut [u8]) -> VfsResult<usize> {
         let mut plan = self.build_plan().await?;
         plan.sort_by_key(|span| span.range.start);
         Self::log_debug_target_plan(self.vfs, self.ino, self.offset, self.length, &plan);
@@ -131,7 +131,7 @@ impl<'a> ReadPipeline<'a> {
             overlay_spans,
             base_spans,
             zero_spans,
-            "debug target read plan"
+            "debug target data reader resolution"
         );
     }
 
@@ -488,7 +488,7 @@ impl<'a> ReadPipeline<'a> {
                         key,
                         block_offset = block.offset,
                         block_length = block.length,
-                        "prefetch_remote_blocks_for_plan: S3 object not found during read prefetch — object missing from S3 (upload not complete or evicted?)"
+                        "prefetch_remote_blocks_for_reader: S3 object not found during read prefetch — object missing from S3 (upload not complete or evicted?)"
                     );
                     Ok::<(u64, bool), VfsError>((object_id, true))
                 }
@@ -496,7 +496,7 @@ impl<'a> ReadPipeline<'a> {
                     debug!(
                         object_id,
                         error = %error,
-                        "read planner prefetch failed; falling back to on-demand resolution"
+                        "data reader prefetch failed; falling back to on-demand resolution"
                     );
                     Ok::<(u64, bool), VfsError>((object_id, false))
                 }
@@ -953,7 +953,7 @@ impl StudioVfs {
             self.upload_fg_read_latency_window,
             access.policy,
         );
-        let read_pipeline = ReadPipeline::new(
+        let data_reader = DataReader::new(
             self,
             ino,
             offset,
@@ -961,7 +961,7 @@ impl StudioVfs {
             prepared.context.pending_content_epoch,
             Some(prepared.resolved_slices.as_slice()),
         );
-        let written = read_pipeline.execute_into(buffer).await?;
+        let written = data_reader.read_into(buffer).await?;
 
         self.enqueue_prefetch_hint(ino, access.stream_id, access.policy, &blocks_needed);
         guard.record_bytes(written as u64);
@@ -1029,7 +1029,7 @@ impl StudioVfs {
                 if block_len == 0 {
                     continue;
                 }
-                let read_pipeline = ReadPipeline::new(
+                let data_reader = DataReader::new(
                     self,
                     ino,
                     block_start,
@@ -1037,7 +1037,7 @@ impl StudioVfs {
                     context.pending_content_epoch,
                     None,
                 );
-                read_pipeline.prefetch_only(true).await?;
+                data_reader.prefetch_only(true).await?;
             }
             Ok::<(), VfsError>(())
         }
@@ -1077,7 +1077,7 @@ impl StudioVfs {
 mod tests {
     use super::super::write_buffer::PendingBlock;
     use super::super::*;
-    use super::{ReadPipeline, ReadPlanSource, ReadPlanSpan, ReadRange};
+    use super::{DataReader, ReadPlanSource, ReadPlanSpan, ReadRange};
     use bytes::{Bytes, BytesMut};
     use std::any::Any;
     use std::collections::HashSet;
@@ -1300,7 +1300,7 @@ mod tests {
             },
         ];
 
-        let refs = ReadPipeline::collect_data_block_refs(&plan);
+        let refs = DataReader::collect_data_block_refs(&plan);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs.get(&42), Some(&first));
     }
@@ -1534,7 +1534,7 @@ mod tests {
                 source: ReadPlanSource::Base { block },
             }];
             let mut buffer = [0_u8; 4];
-            let written = ReadPipeline::assemble_into(
+            let written = DataReader::assemble_into(
                 &vfs,
                 0,
                 &plan,
@@ -1542,14 +1542,99 @@ mod tests {
                 &mut buffer,
             )
             .await
-            .expect("assemble read plan");
+            .expect("assemble data reader output");
             assert_eq!(written, 4);
             assert_eq!(&buffer, b"2345");
         });
     }
 
     #[test]
-    fn build_read_plan_prefers_local_unpublished_span_over_committed_base_coverage() {
+    fn data_reader_prefers_local_unpublished_bytes_over_published_base() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "data-reader-dirty-over-base");
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"data-reader-dirty-over-base.bin", 0, 0, 0o644)
+                .expect("create test file");
+            let ino = attr.ino;
+            let object_id = 0xDADA;
+            vfs.block_store_put_async(object_id, Bytes::from_static(b"abcdefgh"), false)
+                .await
+                .expect("seed committed block");
+
+            let mut staged_attr = meta.get_attr(ino).expect("load staged attr");
+            staged_attr.size = 8;
+            staged_attr.committed_size = 8;
+            staged_attr.upload_state = MetaUploadState::Ready;
+            meta.set_attr(&staged_attr).expect("persist committed attr");
+            meta.set_file_block(ino, 0, &BlockRef::new_partial(object_id, 8))
+                .expect("persist committed block");
+
+            vfs.write(ino, 2, b"XY").await.expect("stage dirty patch");
+
+            let (resolved_attr, resolved_slices) = vfs
+                .resolve_read_metadata_async(ino, 0, 8)
+                .await
+                .expect("resolve read metadata");
+            let read_context = ReadRequestContext::from_attr(&vfs, ino, resolved_attr);
+            let mut buffer = [0_u8; 8];
+
+            let written = DataReader::new(
+                &vfs,
+                ino,
+                0,
+                8,
+                read_context.pending_content_epoch,
+                Some(resolved_slices.as_slice()),
+            )
+            .read_into(&mut buffer)
+            .await
+            .expect("read via data reader");
+
+            assert_eq!(written, 8);
+            assert_eq!(&buffer, b"abXYefgh");
+        });
+    }
+
+    #[test]
+    fn data_reader_zero_fills_sparse_gaps() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "data-reader-zero-fill");
+        rt.block_on(async {
+            let created = vfs
+                .create(ROOT_INO, b"data-reader-zero-fill.bin", 1000, 1000, 0o644)
+                .expect("create file");
+
+            vfs.write(created.ino, 4, b"XY")
+                .await
+                .expect("write sparse payload");
+
+            let (resolved_attr, resolved_slices) = vfs
+                .resolve_read_metadata_async(created.ino, 0, 6)
+                .await
+                .expect("resolve read metadata");
+            let read_context = ReadRequestContext::from_attr(&vfs, created.ino, resolved_attr);
+            let mut buffer = [0xAB_u8; 6];
+
+            let written = DataReader::new(
+                &vfs,
+                created.ino,
+                0,
+                6,
+                read_context.pending_content_epoch,
+                Some(resolved_slices.as_slice()),
+            )
+            .read_into(&mut buffer)
+            .await
+            .expect("read sparse range");
+
+            assert_eq!(written, 6);
+            assert_eq!(buffer, [0, 0, 0, 0, b'X', b'Y']);
+        });
+    }
+
+    #[test]
+    fn data_reader_resolution_prefers_local_unpublished_span_over_committed_base_coverage() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (rt, vfs, meta) = make_test_vfs(&tmp, "build-read-plan-dirty-over-base");
         rt.block_on(async {
@@ -1578,10 +1663,10 @@ mod tests {
                 .pending_incarnation
                 .as_ref()
                 .map(|pending| pending.content_epoch);
-            let plan = ReadPipeline::new(&vfs, ino, 0, 8, pending_content_epoch, None)
+            let plan = DataReader::new(&vfs, ino, 0, 8, pending_content_epoch, None)
                 .build_plan()
                 .await
-                .expect("build read plan");
+                .expect("resolve data reader segments");
 
             assert!(plan.iter().any(|span| {
                 matches!(
@@ -1602,7 +1687,7 @@ mod tests {
     }
 
     #[test]
-    fn assemble_read_plan_zero_fills_remote_not_found_committed_span() {
+    fn data_reader_zero_fills_remote_not_found_committed_span() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (rt, vfs, _meta) = make_test_vfs(&tmp, "assemble-read-plan-not-found");
         rt.block_on(async {
@@ -1617,10 +1702,9 @@ mod tests {
             remote_not_found.insert(object_id);
             let mut buffer = [0xAB_u8; 4];
 
-            let written =
-                ReadPipeline::assemble_into(&vfs, 0, &plan, &remote_not_found, &mut buffer)
-                    .await
-                    .expect("assemble read plan");
+            let written = DataReader::assemble_into(&vfs, 0, &plan, &remote_not_found, &mut buffer)
+                .await
+                .expect("assemble data reader output");
 
             assert_eq!(written, 4);
             assert_eq!(buffer, [0_u8; 4]);
