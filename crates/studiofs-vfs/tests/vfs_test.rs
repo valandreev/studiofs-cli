@@ -7509,11 +7509,14 @@ fn test_cache_safety_mode_changes_ingress_write_path() {
 fn test_write_fast_mode_no_spill_artifacts() {
     fn segment_file_count(dir: &std::path::Path) -> usize {
         let dir = dir.join("segments");
-        std::fs::read_dir(dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "seg"))
-            .count()
+        match std::fs::read_dir(dir) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "seg"))
+                .count(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => panic!("failed to inspect ingress segments: {error}"),
+        }
     }
 
     let _env = ScopedTestEnv::new();
@@ -7977,13 +7980,12 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
         rt.shutdown_background();
     }
 
-    for entry in std::fs::read_dir(&spill_dir)
-        .unwrap()
-        .filter_map(Result::ok)
-    {
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "spill") {
-            std::fs::remove_file(path).unwrap();
+    if let Ok(entries) = std::fs::read_dir(&spill_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "spill") {
+                std::fs::remove_file(path).unwrap();
+            }
         }
     }
 
