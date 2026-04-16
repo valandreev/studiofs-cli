@@ -16,6 +16,12 @@ An open-source, self-hosted virtual filesystem optimized for VFX and post-produc
 
 Unlike proprietary SaaS alternatives, StudioFS is **100% open-source and self-hosted**, giving you absolute control over your storage and infrastructure.
 
+
+### CAUTION
+  Project is on it`s early stages. Breaking changes will happens.
+  Use with caution.
+
+
 ## Technical Foundation
 
 StudioFS mounts S3-compatible object storage as a local cross-platform drive, using PostgreSQL for shared metadata storage and replication between clients. 
