@@ -445,6 +445,7 @@ fn epoch_finalizer_publishes_manifest_backed_zero_length_epoch() {
         let mut truncated_attr = meta.get_attr(attr.ino).expect("load published attr");
         truncated_attr.size = 0;
         truncated_attr.content_epoch = truncated_attr.content_epoch.saturating_add(1);
+        truncated_attr.upload_state = MetaUploadState::Updating;
         meta.set_attr(&truncated_attr)
             .expect("stage manifest-backed zero-length epoch");
         meta.remove_file_blocks(attr.ino)
@@ -458,10 +459,24 @@ fn epoch_finalizer_publishes_manifest_backed_zero_length_epoch() {
         );
 
         let unpublished_attr = meta.get_attr(attr.ino).expect("load unpublished attr");
+        let lifecycle = meta
+            .get_inode_lifecycle(attr.ino)
+            .expect("load lifecycle")
+            .expect("manifest-backed epoch should keep lifecycle state");
         assert_eq!(unpublished_attr.size, 0);
+        assert_ne!(
+            unpublished_attr.upload_state,
+            MetaUploadState::Ready,
+            "regression setup should keep the staged epoch on a non-ready upload path"
+        );
         assert_ne!(
             unpublished_attr.committed_content_epoch, unpublished_attr.content_epoch,
             "regression setup should leave the zero-length epoch unpublished"
+        );
+        assert_ne!(
+            lifecycle.state,
+            InodeLifecycleState::PublishReady,
+            "regression setup should continue exercising the legacy non-publish-ready path"
         );
         assert_eq!(
             meta.get_file_blocks(attr.ino)
