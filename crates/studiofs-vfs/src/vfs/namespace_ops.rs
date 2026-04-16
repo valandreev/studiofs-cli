@@ -109,6 +109,8 @@ impl StudioVfs {
             .enter_op(ino, FileSessionOperation::Flush)
             .await;
         let result: VfsResult<InodeAttr> = async {
+            self.materialize_handle_writers_for_inode(ino, LocalSyncPolicy::Strict)
+                .await?;
             self.flush_ordered(ino, LocalSyncPolicy::Strict).await?;
 
             let old_attr = self.getattr_async(ino).await?;

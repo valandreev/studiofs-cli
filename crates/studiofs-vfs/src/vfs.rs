@@ -31,6 +31,7 @@ mod deletion_cleanup;
 mod file_session;
 mod handle_drain_barrier;
 mod handle_table;
+mod handle_writer;
 mod ignored_entries;
 mod io_ops;
 mod locking;
@@ -82,14 +83,15 @@ use config::{
     CACHE_RUNTIME_MAX_TRANSIT_BUDGET_BYTES, CACHE_RUNTIME_MAX_WRITE_EAGER_BATCH_BYTES,
     CACHE_RUNTIME_MIN_TRANSIT_BUDGET_BYTES, CACHE_RUNTIME_MIN_WRITE_EAGER_BATCH_BYTES,
     CACHE_RUNTIME_SMALL_BUDGET_BYTES, CacheRuntimeTuningOverrides, DeletedInodeCleanup,
-    DirtyAttrPersistPolicy, EagerFlushOutcome, FAST_MODE_SYNC_GROUP_MAX_DELAY_MS,
-    FAST_MODE_SYNC_GROUP_MIN_BYTES_CEIL, FAST_MODE_SYNC_GROUP_MIN_BYTES_FLOOR, FsyncOutcome,
-    HandleReleaseContext, LastHandleReleaseAction, LocalSyncBarrierOutcome,
-    PAYLOAD_PUT_CONCURRENCY_MAX, PAYLOAD_PUT_CONCURRENCY_TARGET_BYTES, StickyErrorPolicy,
-    UnlinkTarget, WRITE_EAGER_DRAIN_CHUNK_MAX_BYTES, write_path_sync_trigger,
+    DirtyAttrPersistPolicy, FAST_MODE_SYNC_GROUP_MAX_DELAY_MS, FAST_MODE_SYNC_GROUP_MIN_BYTES_CEIL,
+    FAST_MODE_SYNC_GROUP_MIN_BYTES_FLOOR, FsyncOutcome, HandleReleaseContext,
+    LastHandleReleaseAction, LocalSyncBarrierOutcome, PAYLOAD_PUT_CONCURRENCY_MAX,
+    PAYLOAD_PUT_CONCURRENCY_TARGET_BYTES, StickyErrorPolicy, UnlinkTarget,
+    WRITE_EAGER_DRAIN_CHUNK_MAX_BYTES, write_path_sync_trigger,
 };
 use file_session::{FileSessionOperation, FileSessionState};
 use handle_table::HandleTable;
+use handle_writer::HandleWriterRegistry;
 use ignored_entries::IgnoredEntryRegistry;
 use locking::{DistributedFlock, FileLockState};
 use namespace::{DentryCacheValue, NamespaceState};
@@ -1803,6 +1805,7 @@ impl VfsState {
             ),
             acl: AclState::new(),
             incarnation: IncarnationState::new(),
+            handle_writers: HandleWriterRegistry::new(),
             write_buffer: WriteBufferState::new(),
             read: ReadState::new(cfg.foreground_read_speedometer_shards),
             file_lock: FileLockState::new(),
@@ -1818,6 +1821,7 @@ struct VfsState {
     namespace: NamespaceState,
     acl: AclState,
     incarnation: IncarnationState,
+    handle_writers: HandleWriterRegistry,
     write_buffer: WriteBufferState,
     read: ReadState,
     file_lock: FileLockState,
@@ -5123,28 +5127,6 @@ impl StudioVfs {
             &metrics.payload_burst_interval_max_ns,
             &metrics.payload_burst_interval_histogram,
         );
-    }
-
-    pub(super) fn note_eager_flush_outcome(&self, outcome: EagerFlushOutcome) {
-        let metrics = &self.state.metrics;
-        metrics.eager_flush_checks.fetch_add(1, Ordering::Relaxed);
-        match outcome {
-            EagerFlushOutcome::Triggered => {
-                metrics
-                    .eager_flush_triggered
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            EagerFlushOutcome::SkippedEmpty => {
-                metrics
-                    .eager_flush_skipped_empty
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            EagerFlushOutcome::SkippedBelowThreshold => {
-                metrics
-                    .eager_flush_skipped_below_threshold
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
     }
 
     pub(super) fn record_metadata_commit_observability(

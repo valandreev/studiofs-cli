@@ -6,7 +6,7 @@ use studiofs_meta::schema::{
     CURRENT_FORMAT_VERSION, FormatInfo, InodeLifecycleState, MetadataConfig, PayloadRetentionClass,
     ROOT_INO,
 };
-use studiofs_meta::{MetaFormat, MetaFsOps, RedbMetaEngine};
+use studiofs_meta::{MetaEngine, MetaFormat, MetaFsOps, RedbMetaEngine};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
@@ -212,6 +212,65 @@ fn startup_replay_keeps_metadata_live_extent_when_pending_upload_has_same_epoch(
         vfs.live_extent_records_for_inode(ino),
         vec![(0, 9001, 5)],
         "startup replay must keep the metadata-derived block when pending upload only matches the same epoch"
+    );
+}
+
+#[test]
+fn startup_replay_prefers_overlay_metadata_live_extent_over_base_for_same_epoch() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (_rt, vfs, meta) = make_test_vfs(&tmp, "startup-replay-overlay-same-epoch");
+
+    let created = vfs
+        .create(1, b"startup-overlay-same-epoch.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = created.ino;
+    let mut attr = meta.get_attr(ino).expect("load test attr");
+    attr.size = 4096;
+    attr.committed_size = 4096;
+    attr.content_epoch = 5;
+    attr.committed_content_epoch = 4;
+    attr.upload_state = MetaUploadState::Updating;
+    meta.set_attr(&attr).expect("persist staged attr");
+    meta.set_file_block(ino, 0, &BlockRef::new_partial(9001, 4096))
+        .expect("persist base file block");
+    meta.flush_regular_file_overlay_slices_with_attr(
+        ino,
+        &[(
+            studiofs_meta::schema::ChunkId(0),
+            vec![studiofs_meta::schema::SliceRecord {
+                slice_id: studiofs_meta::schema::SliceId::default(),
+                order: studiofs_meta::schema::SliceOrder::default(),
+                range: studiofs_meta::schema::SliceRange::new(0, 4096)
+                    .expect("overlay slice range"),
+                block: Some(studiofs_meta::schema::BlockRef {
+                    object_id: 9002,
+                    offset: 0,
+                    length: 4096,
+                    flags: studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK,
+                }),
+                block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
+            }],
+        )],
+        Some(&attr),
+    )
+    .expect("persist overlay slice state");
+
+    let pending_uploads = vec![PendingUpload {
+        ino,
+        offset: 0,
+        object_id: 9002,
+        content_epoch: 5,
+        created_unix_ms: 100,
+        not_before_unix_ms: 0,
+        retry_count: 0,
+    }];
+
+    vfs.replay_dirty_uploads_from_local_backend(&pending_uploads, &[attr]);
+
+    assert_eq!(
+        vfs.live_extent_records_for_inode(ino),
+        vec![(0, 9002, 5)],
+        "startup replay must prefer overlay metadata over the published base when rebuilding same-epoch live extents"
     );
 }
 
@@ -1442,6 +1501,280 @@ fn flush_then_release_keeps_written_bytes_visible_to_reopened_reader() {
 }
 
 #[test]
+fn ignored_entry_writes_preserve_synthetic_attr_size() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "ignored-entry-write-size");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let inode_attr = vfs.create(1, b".DS_Store", 0, 0, 0o644).unwrap();
+        let inode_payload = b"synthetic-inode";
+        vfs.write_with_local_sync_policy(
+            inode_attr.ino,
+            0,
+            inode_payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        let inode_after = vfs.getattr(inode_attr.ino).unwrap();
+        assert_eq!(
+            inode_after.size,
+            inode_payload.len() as u64,
+            "successful ignored-entry inode writes must still advance the synthetic attr size"
+        );
+        let inode_read = vfs
+            .read(inode_attr.ino, 0, inode_payload.len() as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            inode_read.len(),
+            inode_payload.len(),
+            "ignored-entry reads should observe the updated synthetic file length"
+        );
+
+        let handle_attr = vfs.create(1, b"._synthetic", 0, 0, 0o644).unwrap();
+        let handle_payload = b"synthetic-handle";
+        let fh = vfs
+            .open_file(handle_attr.ino, OpenFlags::RDWR, false)
+            .unwrap();
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            handle_attr.ino,
+            0,
+            handle_payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        let handle_after = vfs.getattr(handle_attr.ino).unwrap();
+        assert_eq!(
+            handle_after.size,
+            handle_payload.len() as u64,
+            "successful ignored-entry handle writes must still advance the synthetic attr size"
+        );
+        let handle_read = vfs
+            .read(handle_attr.ino, 0, handle_payload.len() as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            handle_read.len(),
+            handle_payload.len(),
+            "ignored-entry handle writes should remain readable at the new synthetic length"
+        );
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn same_mount_read_keeps_opportunistic_handle_write_visible_after_write_buffer_clear() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-opportunistic-handle-read");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-245-opportunistic-handle-read.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let payload = b"slice-writer-visible";
+
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            0,
+            payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        let overlay_spans = meta
+            .lookup_regular_file_slices(ino, 0, payload.len() as u64)
+            .unwrap();
+        assert!(
+            overlay_spans.iter().all(|span| span.block.is_none()),
+            "opportunistic handle writes should not materialize block-backed metadata before a barrier: {overlay_spans:?}"
+        );
+
+        vfs.clear_pending_blocks_for_inode(ino);
+
+        let bytes = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(bytes.as_ref(), payload);
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn same_mount_read_prefers_newer_opportunistic_handle_writer_spans() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-overlapping-handle-writers");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-245-overlapping-handle-writers.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh1 = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let fh2 = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.write_fh_with_local_sync_policy(fh1, ino, 0, b"hello", LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        vfs.write_fh_with_local_sync_policy(fh2, ino, 1, b"XYZ", LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+
+        vfs.clear_pending_blocks_for_inode(ino);
+
+        let bytes = vfs.read(ino, 0, 5).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"hXYZo");
+
+        vfs.release_fh(fh1).await.unwrap();
+        vfs.release_fh(fh2).await.unwrap();
+    });
+}
+
+#[test]
+fn handle_writer_global_dirty_cap_drains_older_inodes_after_limit_drop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-handle-writer-global-cap");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr1 = vfs.create(1, b"cap-a.txt", 0, 0, 0o644).unwrap();
+        let attr2 = vfs.create(1, b"cap-b.txt", 0, 0, 0o644).unwrap();
+        let attr3 = vfs.create(1, b"cap-c.txt", 0, 0, 0o644).unwrap();
+        let fh1 = vfs.open_file(attr1.ino, OpenFlags::RDWR, false).unwrap();
+        let fh2 = vfs.open_file(attr2.ino, OpenFlags::RDWR, false).unwrap();
+        let fh3 = vfs.open_file(attr3.ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.write_fh_with_local_sync_policy(
+            fh1,
+            attr1.ino,
+            0,
+            b"12345678",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        vfs.write_fh_with_local_sync_policy(
+            fh2,
+            attr2.ino,
+            0,
+            b"abcdefgh",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        assert_eq!(vfs.state.handle_writers.total_dirty_bytes(), 16);
+
+        vfs.set_max_dirty_bytes(8);
+
+        vfs.write_fh_with_local_sync_policy(
+            fh3,
+            attr3.ino,
+            0,
+            b"z",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            vfs.state.handle_writers.total_dirty_bytes() <= vfs.max_dirty_bytes(),
+            "once the runtime dirty limit drops, the next opportunistic write should drain enough handle-writer state to get back under the global cap"
+        );
+
+        vfs.release_fh(fh1).await.unwrap();
+        vfs.release_fh(fh2).await.unwrap();
+        vfs.release_fh(fh3).await.unwrap();
+    });
+}
+
+#[test]
+fn inode_write_materializes_directly_without_populating_legacy_write_buffer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-inode-write-direct");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-245-inode-write-direct.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let payload = b"inode-direct";
+
+        vfs.write_with_local_sync_policy(ino, 0, payload, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+
+        assert!(
+            !vfs.has_pending_write_buffer_blocks_for_inode(ino),
+            "inode write should bypass the legacy write buffer"
+        );
+        let spans = meta
+            .lookup_regular_file_slices(ino, 0, payload.len() as u64)
+            .unwrap();
+        assert!(
+            spans.iter().any(|span| span.block.is_some()),
+            "inode write should materialize block-backed unpublished slices: {spans:?}"
+        );
+
+        let bytes = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(bytes.as_ref(), payload);
+    });
+}
+
+#[test]
+fn inode_write_overwrite_updates_current_block_graph_over_published_base() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-inode-write-overwrite");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-245-inode-write-overwrite.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let baseline = b"published-baseline";
+        let replacement = b"replacement-bytes";
+
+        vfs.write(ino, 0, baseline).await.unwrap();
+        vfs.flush(ino).await.unwrap();
+        let (published_epoch, published_blocks) = mark_all_file_blocks_uploaded(&vfs, &meta, ino);
+        publish_current_manifest(&meta, ino, published_epoch, &published_blocks);
+
+        vfs.write(ino, 0, replacement).await.unwrap();
+        vfs.flush(ino).await.unwrap();
+
+        let current_blocks = meta.get_file_blocks(ino).expect("load current file graph");
+        assert_eq!(current_blocks.len(), 1, "overwrite test should stay single-block");
+        assert_ne!(
+            current_blocks[0].1.object_id,
+            published_blocks[0].1.object_id,
+            "current file graph must advance to the replacement block instead of reusing the published base"
+        );
+
+        let spans = meta
+            .lookup_regular_file_slices(ino, 0, replacement.len() as u64)
+            .expect("load current regular-file slices");
+        assert_eq!(
+            spans.iter().filter_map(|span| span.block.as_ref()).count(),
+            1,
+            "overwrite should resolve to one block-backed span"
+        );
+        assert_eq!(
+            spans
+                .iter()
+                .filter_map(|span| span.block.as_ref())
+                .next()
+                .expect("block-backed overwrite span")
+                .object_id,
+            current_blocks[0].1.object_id,
+            "lookup_regular_file_slices and get_file_blocks must agree on the current unpublished block"
+        );
+    });
+}
+
+#[test]
 fn test_release_fh_with_outcome_orphan_cleanup_does_not_report_flush_barrier() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-orphan-cleanup");
@@ -1718,6 +2051,38 @@ fn test_fsync_with_outcome_treats_write_committed_inode_as_clean() {
             !after_write.persisted_dirty_attrs,
             "fsync should not invent metadata work after write already committed it"
         );
+    });
+}
+
+#[test]
+fn test_fsync_with_outcome_reports_handle_writer_file_data_barrier() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "fsync-outcome-handle-writer");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"fsync-outcome-handle-writer.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.write_fh_with_local_sync_policy(fh, ino, 0, b"payload", LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+
+        let after_write = vfs.fsync_with_outcome(ino, false).await.unwrap();
+        assert!(
+            after_write.flushed_file_data,
+            "fsync should report file-data work when it materializes dirty handle-writer state"
+        );
+
+        let clean = vfs.fsync_with_outcome(ino, false).await.unwrap();
+        assert!(
+            !clean.flushed_file_data,
+            "once the handle-writer state is drained, the next fsync should report a clean data path"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
     });
 }
 
@@ -2426,6 +2791,169 @@ fn flush_fh_forces_strict_local_sync_when_dirty_state_remains() {
 }
 
 #[test]
+fn flush_fh_materializes_opportunistic_handle_writer_state_into_overlay_slices() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-flush-handle-writer");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-245-flush-handle-writer.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let payload = b"flush-materialize";
+
+        vfs.write_fh_with_local_sync_policy(fh, ino, 0, payload, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        assert!(vfs.state.handle_writers.has_dirty_writers(ino));
+
+        vfs.flush_fh(fh).await.unwrap();
+
+        let spans = meta
+            .lookup_regular_file_slices(ino, 0, payload.len() as u64)
+            .unwrap();
+        assert!(
+            spans.iter().any(|span| span.block.is_some()),
+            "flush_fh should materialize block-backed local unpublished slices: {spans:?}"
+        );
+        assert!(
+            !vfs.state.handle_writers.has_dirty_writers(ino),
+            "flush_fh should drain handle-writer dirty state"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn flush_fh_materializes_handle_writer_state_without_legacy_ordered_flush() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-flush-without-ordered-flush");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-245-flush-without-ordered-flush.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            0,
+            b"direct-materialize",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        let ordered_flushes_before = vfs
+            .state
+            .metrics
+            .flush_ordered_calls
+            .load(Ordering::Relaxed);
+
+        vfs.flush_fh(fh).await.unwrap();
+
+        let ordered_flushes_after = vfs
+            .state
+            .metrics
+            .flush_ordered_calls
+            .load(Ordering::Relaxed);
+        assert_eq!(
+            ordered_flushes_after, ordered_flushes_before,
+            "handle writer flush should materialize directly without routing through flush_ordered"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn write_fh_empty_payload_is_a_noop_for_handle_writer_state() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-empty-handle-write");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-245-empty-handle-write.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        let written = vfs
+            .write_fh_with_local_sync_policy(fh, ino, 0, &[], LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+
+        assert_eq!(written, 0);
+        assert!(
+            !vfs.state.handle_writers.has_dirty_writers(ino),
+            "empty handle writes should not create dirty writer state"
+        );
+        assert!(
+            !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+            "empty handle writes should not stage dirty attrs"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn handle_writer_dirty_attrs_keep_nanos_timestamps() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-handle-write-nanos");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-245-handle-write-nanos.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let before = vfs.getattr(ino).unwrap();
+
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            0,
+            b"timestamp-check",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        let dirty_attr = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .cloned()
+            .expect("dirty attr");
+        assert!(
+            dirty_attr.mtime >= before.mtime,
+            "handle-writer mtime should not go backwards"
+        );
+        assert!(
+            dirty_attr.ctime >= before.ctime,
+            "handle-writer ctime should not go backwards"
+        );
+        assert!(
+            dirty_attr.mtime > 1_000_000_000_000,
+            "handle-writer timestamps should remain in nanoseconds"
+        );
+        assert!(
+            dirty_attr.ctime > 1_000_000_000_000,
+            "handle-writer timestamps should remain in nanoseconds"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn release_fh_forces_strict_local_sync_when_last_handle_still_owns_dirty_state() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-fh-strict-local-sync");
@@ -2508,6 +3036,48 @@ fn release_fh_forces_strict_local_sync_when_last_handle_still_owns_dirty_state()
         !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
         "last-handle release should preserve the committed local attr state"
     );
+}
+
+#[test]
+fn release_fh_materializes_opportunistic_handle_writer_state() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-release-handle-writer");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-245-release-handle-writer.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let payload = b"release-materialize";
+
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            0,
+            payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        assert!(vfs.state.handle_writers.has_dirty_writers(ino));
+
+        let outcome = vfs.release_fh_with_outcome(fh).await.unwrap();
+        assert!(outcome.closed_last_handle);
+        assert!(outcome.flushed_local_dirty_state);
+
+        let spans = meta
+            .lookup_regular_file_slices(ino, 0, payload.len() as u64)
+            .unwrap();
+        assert!(
+            spans.iter().any(|span| span.block.is_some()),
+            "last-handle release should materialize block-backed local unpublished slices: {spans:?}"
+        );
+        assert!(
+            !vfs.state.handle_writers.has_dirty_writers(ino),
+            "last-handle release should drain handle-writer dirty state"
+        );
+    });
 }
 
 #[test]

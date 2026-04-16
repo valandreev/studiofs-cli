@@ -33,7 +33,7 @@ impl ReadRange {
 
 #[derive(Debug, Clone)]
 enum ReadPlanSource {
-    Dirty { data: Bytes, block_offset: u32 },
+    Dirty { data: Bytes, block_offset: u64 },
     PendingOverlay { data: Bytes, block_offset: u32 },
     PendingExtent { object_id: u64, block_offset: u32 },
     Overlay { block: BlockRef },
@@ -189,6 +189,32 @@ impl<'a> ReadPipeline<'a> {
         let mut plan = Vec::new();
         let pending_upload_index = vfs.snapshot_pending_upload_index();
 
+        let handle_spans = vfs.snapshot_handle_writer_read_spans(ino, offset, length);
+        for dirty in handle_spans {
+            if unresolved.is_empty() {
+                break;
+            }
+            let dirty_range = ReadRange {
+                start: dirty.start,
+                end: dirty.end,
+            };
+            let (next_unresolved, claimed) = Self::claim_unresolved_ranges(unresolved, dirty_range);
+            unresolved = next_unresolved;
+            for overlap in claimed {
+                let delta = overlap.start.saturating_sub(dirty.start);
+                let Some(block_offset) = dirty.block_offset.checked_add(delta) else {
+                    continue;
+                };
+                plan.push(ReadPlanSpan {
+                    range: overlap,
+                    source: ReadPlanSource::Dirty {
+                        data: dirty.data.clone(),
+                        block_offset,
+                    },
+                });
+            }
+        }
+
         let dirty_spans = vfs.snapshot_pending_dirty_slice_read_spans(ino, offset, length);
         for dirty in dirty_spans {
             if unresolved.is_empty() {
@@ -212,7 +238,7 @@ impl<'a> ReadPipeline<'a> {
                     range: overlap,
                     source: ReadPlanSource::Dirty {
                         data: dirty.data.clone(),
-                        block_offset,
+                        block_offset: u64::from(block_offset),
                     },
                 });
             }
@@ -506,7 +532,7 @@ impl<'a> ReadPipeline<'a> {
                     vfs.copy_block_payload_into_range(data.as_ref(), *block_offset, dst);
                 }
                 ReadPlanSource::PendingOverlay { data, block_offset } => {
-                    vfs.copy_block_payload_into_range(data.as_ref(), *block_offset, dst);
+                    vfs.copy_block_payload_into_range(data.as_ref(), u64::from(*block_offset), dst);
                 }
                 ReadPlanSource::PendingExtent {
                     object_id,
