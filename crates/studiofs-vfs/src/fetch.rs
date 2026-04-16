@@ -22,7 +22,7 @@ use opendal::ErrorKind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use studiofs_cache::local::LocalBlockBackend;
+use studiofs_cache::CachedStore;
 use studiofs_data::object::{CLOUD_FRAGMENT_SIZE, read_object, validate_cloud_fragment_layout};
 use studiofs_data::store::{DataError, DataStore};
 use tokio::sync::broadcast;
@@ -147,8 +147,8 @@ pub struct FetchScheduler {
     inflight: DashMap<u64, broadcast::Sender<BroadcastResult>>,
     /// S3 data store (read-optimised operator).
     data_store: Arc<DataStore>,
-    /// Shared local block backend used by the foreground read path.
-    local_block_backend: Arc<dyn LocalBlockBackend>,
+    /// Shared cached-store runtime used by the foreground read path.
+    cached_store: Arc<CachedStore>,
     /// Maximum attempts per fetch operation.
     max_fetch_attempts: u32,
     /// Maximum attempts for best-effort prefetch fetches.
@@ -197,11 +197,11 @@ impl FetchScheduler {
     ///
     /// # Arguments
     /// - `data_store`: read-optimised `DataStore` (no `ConcurrentLimitLayer` — AIMD manages concurrency).
-    /// - `block_store`: shared local block backend used by the committed read path.
+    /// - `cached_store`: shared cached-store runtime used by the committed read path.
     /// - `aimd_config`: AIMD parameters (use [`AimdConfig::fetch_default()`] for sane defaults).
     pub fn new(
         data_store: Arc<DataStore>,
-        block_store: Arc<dyn LocalBlockBackend>,
+        cached_store: Arc<CachedStore>,
         aimd_config: AimdConfig,
         default_prefetch_reserve_slots: usize,
         qos: Arc<QosController>,
@@ -236,7 +236,7 @@ impl FetchScheduler {
             aimd: AimdController::new(aimd_config),
             inflight: DashMap::new(),
             data_store,
-            local_block_backend: block_store,
+            cached_store,
             max_fetch_attempts,
             prefetch_max_fetch_attempts,
             request_timeout: Duration::from_secs(request_timeout_s),
@@ -563,7 +563,7 @@ impl FetchScheduler {
     }
 
     async fn block_store_get_async(&self, object_id: u64) -> Result<Option<Bytes>, FetchError> {
-        let block_store = self.local_block_backend.clone();
+        let cached_store = self.cached_store.clone();
         let submitted_at = Instant::now();
         let (result, timing) = task::spawn_blocking(move || {
             let io_started = Instant::now();
@@ -571,7 +571,7 @@ impl FetchScheduler {
                 .checked_duration_since(submitted_at)
                 .unwrap_or_default()
                 .to_nanos_u64();
-            let result = block_store.get(object_id);
+            let result = cached_store.get(object_id);
             let backend_io_ns = io_started.elapsed().to_nanos_u64();
             (
                 result,
@@ -595,7 +595,7 @@ impl FetchScheduler {
         payload: Bytes,
         evictable: bool,
     ) -> Result<(), FetchError> {
-        let block_store = self.local_block_backend.clone();
+        let cached_store = self.cached_store.clone();
         let submitted_at = Instant::now();
         let (result, timing) = task::spawn_blocking(move || {
             let io_started = Instant::now();
@@ -603,7 +603,7 @@ impl FetchScheduler {
                 .checked_duration_since(submitted_at)
                 .unwrap_or_default()
                 .to_nanos_u64();
-            let result = block_store.put(object_id, payload.as_ref(), evictable);
+            let result = cached_store.put(object_id, payload.as_ref(), evictable);
             let backend_io_ns = io_started.elapsed().to_nanos_u64();
             (
                 result,

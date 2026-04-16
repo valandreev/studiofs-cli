@@ -312,7 +312,7 @@ impl CommitCoordinator {
         extent_plan: &FinalizeExtentPlan,
     ) -> VfsResult<bool> {
         let pending_same_epoch = vfs
-            .upload_coordinator()
+            .cached_store()
             .snapshot_pending_uploads()
             .into_iter()
             .any(|pending| pending.ino == ino && pending.content_epoch == content_epoch);
@@ -343,7 +343,7 @@ async fn requeue_missing_manifest_uploads(
     content_epoch: u64,
     required_blocks: &[(u32, BlockRef)],
 ) {
-    let pending = vfs.upload_coordinator().snapshot_pending_uploads();
+    let pending = vfs.cached_store().snapshot_pending_uploads();
     let pending_keys: std::collections::HashSet<(u64, u64)> = pending
         .into_iter()
         .filter(|op| op.ino == ino && op.content_epoch == content_epoch)
@@ -380,7 +380,7 @@ async fn requeue_missing_manifest_uploads(
             content_epoch,
             "commit reconcile: requeueing missing manifest upload"
         );
-        vfs.upload_coordinator()
+        vfs.cached_store()
             .submit_upload(ino, offset, block_ref.object_id, content_epoch);
     }
 }

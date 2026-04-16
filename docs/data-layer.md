@@ -12,6 +12,7 @@ active data-path descriptions below use the final model.
 - Object key generation and sharding based on chunk/object IDs.
 - Object payload validation (xxh64 checksums).
 - Read/write connection profile separation (`IoProfile`).
+- Serve as the remote object-store boundary behind the VFS `CachedStore` pipeline.
 - Hybrid cloud layout for chunks: one 16 MiB chunk is stored as four 4 MiB block objects.
 
 ## S3 Key Layout
@@ -39,6 +40,11 @@ Legacy `DataStore::put_block/get_block/...` APIs still use the historical:
 <volume>/data/chunks/<hash>/<slice_id>_<block_index>_<block_size>
 ```
 These are retained for compatibility/tests; VFS read/write path uses `<volume>/objects/.../<block_index>`.
+
+In the active Local-First runtime, `CachedStore` owns local cache hits,
+staged writeback, upload rereads, and background queueing. `DataStore` is the
+remote object-store edge that `CachedStore`/VFS call for block download,
+range reads, and eventual upload.
 
 ## Object Format (Version 2)
 
@@ -92,7 +98,7 @@ To prevent background S3 uploads from overwhelming the connection pool and starv
 |---------|-------------|--------------|--------------|---------|-------------|
 | **Default** | 128 | 60s | 10s | 3 | Used for general-purpose/mixed I/O workloads. |
 | **Read** | 512 | 30s | 3s | 0 | Dedicated pool for foreground fetches. Retries are handled by `FetchScheduler`. |
-| **Write** | 256 | 90s | 10s | 0 | Dedicated pool for `UploadQueue`. Retries and backoff are handled dynamically. |
+| **Write** | 256 | 90s | 10s | 0 | Dedicated pool for cached-store background writeback/uploads. Retries and backoff are handled dynamically. |
 
 ## Note on Metadata
 

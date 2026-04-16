@@ -754,9 +754,7 @@ impl UploadSubmissionPort for VfsUploadSubmitter<'_> {
             })
             .collect();
 
-        self.vfs
-            .upload_coordinator
-            .submit_uploads_batch(&upload_ops);
+        self.vfs.cached_store.submit_uploads_batch(&upload_ops);
         for (upload_ino, _, _, _) in &upload_ops {
             self.vfs.state.file_session.note_background_transition(
                 *upload_ino,
@@ -765,7 +763,7 @@ impl UploadSubmissionPort for VfsUploadSubmitter<'_> {
             );
         }
         if !upload_ops.is_empty() {
-            self.vfs.upload_coordinator.flush_upload_journal().await;
+            self.vfs.cached_store.flush_upload_journal().await;
         }
 
         let mut live_extents = Vec::with_capacity(persisted_blocks.len());

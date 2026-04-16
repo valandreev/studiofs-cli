@@ -58,7 +58,7 @@ enum UploadPutOutcome {
     Failed(VfsError),
 }
 
-trait UploadCoordinatorPort: Clone + Send + Sync + 'static {
+trait CachedStorePort: Clone + Send + Sync + 'static {
     fn complete_upload(&self, op: &PendingUpload);
     fn requeue_upload(&self, op: PendingUpload) -> bool;
     fn cancel_upload(&self, op: &PendingUpload);
@@ -146,7 +146,7 @@ struct UploadProcessor<C, L, M, R, S, P> {
 
 impl<C, L, M, R, S, P> UploadProcessor<C, L, M, R, S, P>
 where
-    C: UploadCoordinatorPort,
+    C: CachedStorePort,
     L: UploadLocalBlockPort,
     M: UploadMetaPort,
     R: RemoteUploadPort,
@@ -539,21 +539,21 @@ where
 }
 
 #[derive(Clone)]
-struct VfsUploadCoordinatorPort {
+struct VfsCachedStorePort {
     vfs: Arc<StudioVfs>,
 }
 
-impl UploadCoordinatorPort for VfsUploadCoordinatorPort {
+impl CachedStorePort for VfsCachedStorePort {
     fn complete_upload(&self, op: &PendingUpload) {
-        self.vfs.upload_coordinator.complete_upload(op);
+        self.vfs.cached_store.complete_upload(op);
     }
 
     fn requeue_upload(&self, op: PendingUpload) -> bool {
-        self.vfs.upload_coordinator.requeue_upload(op)
+        self.vfs.cached_store.requeue_upload(op)
     }
 
     fn cancel_upload(&self, op: &PendingUpload) {
-        self.vfs.upload_coordinator.cancel_upload(op);
+        self.vfs.cached_store.cancel_upload(op);
     }
 }
 
@@ -1012,7 +1012,7 @@ impl UploadPolicyPort for VfsUploadPolicyPort {
 pub(crate) struct UploadLifecycleWorker {
     vfs: Arc<StudioVfs>,
     processor: UploadProcessor<
-        VfsUploadCoordinatorPort,
+        VfsCachedStorePort,
         VfsUploadLocalBlockPort,
         VfsUploadMetaPort,
         VfsRemoteUploadPort,
@@ -1024,7 +1024,7 @@ pub(crate) struct UploadLifecycleWorker {
 impl UploadLifecycleWorker {
     pub(crate) fn new(vfs: Arc<StudioVfs>) -> Self {
         let processor = UploadProcessor {
-            coordinator: VfsUploadCoordinatorPort { vfs: vfs.clone() },
+            coordinator: VfsCachedStorePort { vfs: vfs.clone() },
             local_blocks: VfsUploadLocalBlockPort { vfs: vfs.clone() },
             meta: VfsUploadMetaPort { vfs: vfs.clone() },
             remote: VfsRemoteUploadPort { vfs: vfs.clone() },
@@ -1264,7 +1264,7 @@ mod tests {
         pending_inodes: FakePendingInodes,
     }
 
-    impl UploadCoordinatorPort for FakeCoordinator {
+    impl CachedStorePort for FakeCoordinator {
         fn complete_upload(&self, op: &PendingUpload) {
             self.completed.lock().push(op.object_id);
             self.pending_inodes.lock().remove(&op.ino);

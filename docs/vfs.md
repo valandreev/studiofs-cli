@@ -7,8 +7,7 @@ the canonical SFS-242 rewrite contract. The rewrite source of truth lives in
 The VFS (`studiofs-vfs`) is the platform-agnostic core of StudioFS. It orchestrates metadata operations, data block management, caching, background tasks, and exposes a file-system–like API consumed by the FUSE and WinFSP bridges.
 
 This document uses the frozen chunk/slice/block vocabulary for the active data
-path. Where upload-orchestration helpers still expose historical names, those
-are called out explicitly.
+path.
 
 
 - `flush()`/`fsync()` and the local `WriteBuffer -> local block backend -> sync_data() -> metadata`
@@ -25,7 +24,7 @@ Holds all runtime state:
 | `meta` | `MetaExecutor<dyn VfsMeta>` | Typed metadata executor used by `run_meta(...)` |
 | `data_write` | `Arc<DataStore>` | S3 write/delete path (write-optimized profile) |
 | `local_block_backend` | `Arc<dyn LocalBlockBackend>` | Cache 3.0 local data store for committed extents and upload rereads |
-| `upload_coordinator` | `Arc<UploadCoordinator>` | Pending-upload pinning and in-memory upload queue orchestration, with upload intent persisted via local-backend lifecycle flags |
+| `cached_store` | `Arc<CachedStore>` | Canonical local cache + staged-writeback runtime; owns pending-upload pinning and queue orchestration |
 | `fetch_scheduler` | `Arc<FetchScheduler>` | Adaptive S3 fetcher (read path) |
 | `readahead` | `Arc<ReadAheadTracker>` | Sequential prefetch |
 | `dir_prefetch` | `Arc<DirAccessTracker>` | Directory-level prefetch |
@@ -178,7 +177,7 @@ Legacy ingress-artifact note:
 
 ### 3. Background Upload Worker
 
-Consumes from upload queue channel:
+Consumes from the cached-store writeback queue:
 
 ```
 Persisted extent queued
@@ -348,14 +347,14 @@ Adaptive S3 block fetcher with deduplication and congestion control.
 | `AimdController` | TCP-cwnd–style concurrency limiter |
 | `DashMap<u64, broadcast::Sender>` | Singleflight dedup |
 | `DataStore` | S3 connection (read-optimized pool) |
-| local block backend | Populate on fetch |
+| `CachedStore` | Local cache hit path and cache population on fetch |
 
 ### Fetch Flow
 
 ```
 fetch_block(object_id)
   │
-  ├─ Fast path: check local data store + upload-orchestration layer → hit? return
+  ├─ Fast path: check `CachedStore` local payload state → hit? return
   │
   ├─ Singleflight check: join existing in-flight fetch? → wait + return
   │
@@ -365,7 +364,7 @@ fetch_block(object_id)
   ├─ S3 GET with configurable timeout (default 45s)
   ├─ Decode object from `opendal::Buffer` + verify checksum incrementally
   ├─ Return zero-copy payload when a single payload chunk is available
-  ├─ Populate local data store + upload-orchestration layer
+  ├─ Populate `CachedStore`
   ├─ Resolve AIMD permit (success/failure)
   │
   ├─ Broadcast result to singleflight waiters
@@ -383,7 +382,7 @@ Prefetch reads use `fetch_block_prefetch()`:
 
 | Metric | Meaning |
 |--------|---------|
-| `cache_hits` | Served from the local data store / upload-orchestration layer |
+| `cache_hits` | Served from `CachedStore` local payload state |
 | `s3_fetches` | Downloads from S3 |
 | `s3_errors` | Failed S3 requests |
 | `singleflight_joins` | Deduplicated requests |

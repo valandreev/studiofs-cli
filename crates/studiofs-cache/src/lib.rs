@@ -1,7 +1,7 @@
 //! StudioFS Cache Layer.
 //!
-//! `upload_coordinator` provides upload-queue and pending-upload tracking at
-//! the write-path boundary.
+//! `cached_store` provides the unified local cache + staged-writeback runtime
+//! used by the production mount path.
 //! `benchmark_cache` provides the lightweight in-memory benchmark surface used
 //! by `studiofs test-cache`.
 //! `v3` provides contract detection plus the file-per-block local backend.
@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub mod benchmark_cache;
+pub mod cached_store;
 pub mod local;
 pub mod metrics;
-pub mod upload_coordinator;
 pub mod upload_queue;
 // --- Cache v3: contract detection + file-per-block backend ---
 pub mod v3;
@@ -23,7 +23,7 @@ pub use benchmark_cache::{
     BenchmarkCache, BenchmarkCacheConfig, BenchmarkCacheStats, CacheReadLevel, CacheReadTrace,
     DEFAULT_MEMORY_CACHE_SIZE,
 };
-pub use upload_coordinator::{UploadCoordinator, UploadCoordinatorConfig};
+pub use cached_store::{CachedStore, CachedStoreConfig};
 pub use upload_queue::PendingUpload;
 
 const CACHE_V3_OPEN_LOCK_RETRY_ATTEMPTS: usize = 40;

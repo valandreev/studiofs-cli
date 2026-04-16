@@ -71,6 +71,18 @@ pub trait LocalBlockBackend: Send + Sync {
     fn mark_uploading(&self, object_id: u64);
     fn mark_upload_failed(&self, object_id: u64);
     fn mark_uploaded(&self, object_id: u64);
+    fn pin(&self, object_id: u64);
+    fn unpin(&self, object_id: u64);
+    fn pin_batch(&self, object_ids: &[u64]) {
+        for &object_id in object_ids {
+            self.pin(object_id);
+        }
+    }
+    fn unpin_batch(&self, object_ids: &[u64]) {
+        for &object_id in object_ids {
+            self.unpin(object_id);
+        }
+    }
 
     fn remove(&self, object_id: u64);
     fn remove_batch(&self, object_ids: &[u64]);

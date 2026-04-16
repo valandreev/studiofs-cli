@@ -157,7 +157,7 @@ impl StudioVfs {
         let mut evicted = Vec::new();
         let mut deferred_pinned = Vec::new();
         for &object_id in object_ids {
-            if self.upload_coordinator.is_pinned(object_id) {
+            if self.cached_store.is_pinned(object_id) {
                 // Record for post-upload cleanup instead of silently skipping.
                 deferred_pinned.push(object_id);
             } else {
@@ -205,7 +205,7 @@ impl StudioVfs {
         let mut deferred_pinned = 0;
         let mut pending_evictions_to_add = Vec::new();
         for object_id in object_ids {
-            if self.upload_coordinator.is_pinned(object_id) {
+            if self.cached_store.is_pinned(object_id) {
                 pending_evictions_to_add.push(object_id);
                 deferred_pinned += 1;
                 continue;
