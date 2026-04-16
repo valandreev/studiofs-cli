@@ -93,7 +93,7 @@ Implications:
 | Metadata-cache and operator surface | `crates/studiofs/src/cli/mount/*.rs`, `docs/configuration.md` | `cmd/flags.go`, `cmd/mount.go`, `cmd/mount_unix.go`, `cmd/mount_windows.go`, `docs/en/guide/cache.md` | Coherent mount/cache flags, strong internal metadata-cache defaults, operator-facing terminology |
 | Bridge and mount behavior | `crates/studiofs-fuse/src/lib.rs`, `crates/studiofs-winfsp/src/*.rs` | `pkg/vfs/vfs.go`, `pkg/vfs/vfs_unix.go`, `pkg/vfs/vfs_windows.go`, `cmd/mount*.go` | Performance-sensitive bridge/mount patterns and callback expectations |
 
-## 6. Metadata Cache Contract And Operator Stance
+## 7. Metadata Cache Contract And Operator Stance
 
 StudioFS keeps metadata-cache behavior explicit, but it does not treat every
 metadata cache as a first-class operator knob.
@@ -116,7 +116,7 @@ metadata cache as a first-class operator knob.
   supports it, but those changes should be evaluated against Local-First
   semantics and bridge behavior instead of parity with every JuiceFS switch.
 
-## 7. Mutation Visibility And Invalidation Matrix
+## 8. Mutation Visibility And Invalidation Matrix
 
 | Mutation or transition | Visibility contract | Invalidation contract |
 |---|---|---|
@@ -131,7 +131,7 @@ metadata cache as a first-class operator knob.
 | Publish finalization | Remote visibility flips atomically at the file-version boundary. Other mounts observe the new state after metadata invalidation polling/expiration rather than synchronous close-to-open. | The writing mount must invalidate stale inode attr state immediately. Other mounts converge through metadata invalidation/expiration instead of a per-close global barrier. |
 | Remote metadata invalidation apply | A mount keeps its newer local unpublished state ahead of foreign published updates while still converging unaffected inodes/directories to the newer published state. | Broad foreign namespace apply events bump namespace epoch, while affected attr caches invalidate or expire before serving the newer published state. |
 
-## 8. Current StudioFS Concepts: Delete, Retain, Rename, Simplify
+## 9. Current StudioFS Concepts: Delete, Retain, Rename, Simplify
 
 | Current concept | Decision in this rewrite |
 |---|---|
@@ -143,7 +143,7 @@ metadata cache as a first-class operator knob.
 | File-version publication boundary (`incarnation`, manifest-like switch) | Retain the semantic requirement: remote visibility changes atomically at a file-version boundary. |
 | `STUDIOFS_*` tuning sprawl | Simplify into a JuiceFS-inspired CLI/config surface with only transitional env vars where necessary. |
 
-## 9. Rust-Native Implementation Rules
+## 10. Rust-Native Implementation Rules
 
 Rust-native implementation means:
 
@@ -162,7 +162,7 @@ Review guardrails:
 - Reject generic `anyhow`-style library errors where callers need domain decisions.
 - Reject designs that require remote readers to reason about writer-local unpublished RAM state.
 
-## 10. Historical Docs And Issues That Are No Longer Authoritative
+## 11. Historical Docs And Issues That Are No Longer Authoritative
 
 | Source | Status after this contract |
 |---|---|
@@ -176,7 +176,7 @@ Supporting implementation snapshots such as `docs/architecture.md`, `docs/vfs.md
 and `docs/configuration.md` still describe in-flight code, but they are not
 authoritative for the rewrite target when they conflict with this contract.
 
-## 11. Glossary For Downstream Issues
+## 12. Glossary For Downstream Issues
 
 | Term to use in new issues | Type | Meaning |
 |---|---|---|
@@ -190,4 +190,4 @@ authoritative for the rewrite target when they conflict with this contract.
 | `Rust-native implementation` | StudioFS rewrite rule | A design that embraces ownership, type-driven state, explicit async boundaries, and testable modules instead of a Go-shaped transliteration. |
 
 Downstream issues should cite this file directly and then name the relevant row
-from section 8 instead of re-explaining the rewrite target.
+from section 6 instead of re-explaining the rewrite target.
