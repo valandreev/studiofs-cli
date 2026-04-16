@@ -5,7 +5,7 @@
 //! - the active Cache 3.0 local block backend backed by a file-per-block
 //!   payload store plus redb lifecycle index.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -183,6 +183,7 @@ pub struct CacheV3LocalBlockBackend {
     payload_store: FilePayloadStore,
     budget_governor: CacheBudgetGovernor,
     eviction_pass_lock: Mutex<()>,
+    runtime_pinned: Mutex<HashMap<u64, usize>>,
     eviction_scan_skipped_non_evictable: AtomicU64,
     pending_access_touches: Mutex<PendingAccessTouches>,
     last_dirty_orphan_prune_at: Mutex<Instant>,
@@ -280,6 +281,7 @@ impl CacheV3LocalBlockBackend {
                 .map(CacheBudgetGovernor::bounded)
                 .unwrap_or_else(CacheBudgetGovernor::unbounded),
             eviction_pass_lock: Mutex::new(()),
+            runtime_pinned: Mutex::new(HashMap::new()),
             eviction_scan_skipped_non_evictable: AtomicU64::new(0),
             pending_access_touches: Mutex::new(PendingAccessTouches::new()),
             last_dirty_orphan_prune_at: Mutex::new(
@@ -463,23 +465,14 @@ impl CacheV3LocalBlockBackend {
                 break;
             }
             cursor = page.entries.last().map(|entry| entry.access_order);
-            if page.skipped_non_evictable > 0 {
-                let skipped_total = self
-                    .eviction_scan_skipped_non_evictable
-                    .fetch_add(page.skipped_non_evictable, Ordering::Relaxed)
-                    .saturating_add(page.skipped_non_evictable);
-                debug!(
-                    operation,
-                    scanned_rows = page.scanned_rows,
-                    skipped_non_evictable = page.skipped_non_evictable,
-                    skipped_non_evictable_total = skipped_total,
-                    "cache-v3 eviction candidate scan skipped non-evictable rows"
-                );
-            }
-
+            let mut skipped_non_evictable = page.skipped_non_evictable;
             for candidate in page.entries {
                 if estimated_current <= target_bytes {
                     break;
+                }
+                if self.is_runtime_pinned(candidate.object_id) {
+                    skipped_non_evictable = skipped_non_evictable.saturating_add(1);
+                    continue;
                 }
                 batch.push(candidate.object_id);
                 estimated_current = estimated_current.saturating_sub(candidate.payload_len);
@@ -488,6 +481,19 @@ impl CacheV3LocalBlockBackend {
                         .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
                     batch.clear();
                 }
+            }
+            if skipped_non_evictable > 0 {
+                let skipped_total = self
+                    .eviction_scan_skipped_non_evictable
+                    .fetch_add(skipped_non_evictable, Ordering::Relaxed)
+                    .saturating_add(skipped_non_evictable);
+                debug!(
+                    operation,
+                    scanned_rows = page.scanned_rows,
+                    skipped_non_evictable,
+                    skipped_non_evictable_total = skipped_total,
+                    "cache-v3 eviction candidate scan skipped non-evictable rows"
+                );
             }
             if !batch.is_empty() {
                 self.remove_batch_internal(&batch)
@@ -573,6 +579,38 @@ impl CacheV3LocalBlockBackend {
             needed: payload_len,
             free: self.budget_governor.free_bytes(current_after_evict),
         })
+    }
+
+    fn is_runtime_pinned(&self, object_id: u64) -> bool {
+        self.runtime_pinned.lock().contains_key(&object_id)
+    }
+
+    fn runtime_pinned_evictable_bytes(&self) -> u64 {
+        let object_ids = self
+            .runtime_pinned
+            .lock()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        object_ids
+            .into_iter()
+            .filter_map(|object_id| self.index.get_entry(object_id).ok().flatten())
+            .filter(|entry| {
+                entry.lifecycle == LocalBlockLifecycleState::Uploaded && entry.evictable
+            })
+            .fold(0_u64, |total, entry| {
+                total.saturating_add(entry.payload_len)
+            })
+    }
+
+    fn forget_runtime_pins(&self, object_ids: &[u64]) {
+        if object_ids.is_empty() {
+            return;
+        }
+        let mut runtime_pinned = self.runtime_pinned.lock();
+        for object_id in object_ids {
+            runtime_pinned.remove(object_id);
+        }
     }
 }
 
@@ -744,14 +782,52 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
     }
 
     fn pin(&self, object_id: u64) {
-        if let Err(error) = self.index.set_runtime_pinned(object_id, true) {
-            warn!(object_id, error = ?error, "cache-v3 index pin failed");
-        }
+        let mut runtime_pinned = self.runtime_pinned.lock();
+        let count = runtime_pinned.entry(object_id).or_default();
+        *count = count.saturating_add(1);
     }
 
     fn unpin(&self, object_id: u64) {
-        if let Err(error) = self.index.set_runtime_pinned(object_id, false) {
-            warn!(object_id, error = ?error, "cache-v3 index unpin failed");
+        let mut runtime_pinned = self.runtime_pinned.lock();
+        let std::collections::hash_map::Entry::Occupied(mut entry) =
+            runtime_pinned.entry(object_id)
+        else {
+            return;
+        };
+        let count = entry.get_mut();
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            entry.remove();
+        }
+    }
+
+    fn pin_batch(&self, object_ids: &[u64]) {
+        if object_ids.is_empty() {
+            return;
+        }
+        let mut runtime_pinned = self.runtime_pinned.lock();
+        for object_id in object_ids {
+            let count = runtime_pinned.entry(*object_id).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+
+    fn unpin_batch(&self, object_ids: &[u64]) {
+        if object_ids.is_empty() {
+            return;
+        }
+        let mut runtime_pinned = self.runtime_pinned.lock();
+        for object_id in object_ids {
+            let std::collections::hash_map::Entry::Occupied(mut entry) =
+                runtime_pinned.entry(*object_id)
+            else {
+                continue;
+            };
+            let count = entry.get_mut();
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                entry.remove();
+            }
         }
     }
 
@@ -760,6 +836,7 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
             warn!(object_id, error = ?error, "cache-v3 index remove failed");
             return;
         }
+        self.forget_runtime_pins(&[object_id]);
         self.forget_access_touches(&[object_id]);
         self.payload_store.remove(object_id);
     }
@@ -774,7 +851,9 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
                 error = ?error,
                 "cache-v3 index remove_batch failed"
             );
+            return;
         }
+        self.forget_runtime_pins(object_ids);
     }
 
     fn dirty_object_ids(&self) -> Vec<u64> {
@@ -848,7 +927,7 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
                     self.remove_orphaned_index_entry(object_id, "is_evictable");
                     false
                 } else {
-                    entry.evictable
+                    entry.evictable && !self.is_runtime_pinned(object_id)
                 }
             }
             Ok(None) => false,
@@ -865,11 +944,16 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
 
     fn storage_stats(&self) -> LocalBlockStorageStats {
         match self.index.stats() {
-            Ok(stats) => LocalBlockStorageStats {
-                current_bytes: stats.current_bytes,
-                dirty_bytes: stats.dirty_bytes,
-                evictable_bytes: stats.evictable_bytes,
-            },
+            Ok(stats) => {
+                let runtime_pinned_evictable_bytes = self.runtime_pinned_evictable_bytes();
+                LocalBlockStorageStats {
+                    current_bytes: stats.current_bytes,
+                    dirty_bytes: stats.dirty_bytes,
+                    evictable_bytes: stats
+                        .evictable_bytes
+                        .saturating_sub(runtime_pinned_evictable_bytes),
+                }
+            }
             Err(error) => {
                 warn!(error = ?error, "cache-v3 index storage stats lookup failed");
                 LocalBlockStorageStats::default()
@@ -882,7 +966,7 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
             Ok(Some(entry)) => Some(LocalBlockObjectStats {
                 payload_len: entry.payload_len,
                 lifecycle: entry.lifecycle,
-                evictable: entry.evictable,
+                evictable: entry.evictable && !self.is_runtime_pinned(object_id),
             }),
             Ok(None) => None,
             Err(error) => {
@@ -1460,6 +1544,37 @@ mod tests {
             "oldest uploaded block should be reclaimed during pressure maintenance"
         );
         assert!(backend.contains(21));
+    }
+
+    #[test]
+    fn cache_v3_runtime_pins_do_not_persist_across_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let config = CacheV3LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x7A; 16],
+        };
+        let backend =
+            CacheV3LocalBlockBackend::open_with_budget(config.clone(), Some(100)).unwrap();
+        backend.put(20, &[0x01; 30], true).unwrap();
+        backend.pin(20);
+        assert!(
+            !backend.is_evictable(20),
+            "runtime pin must make an uploaded block non-evictable in-process"
+        );
+        assert_eq!(backend.storage_stats().evictable_bytes, 0);
+        assert!(!backend.object_stats(20).unwrap().evictable);
+        drop(backend);
+
+        let reopened = CacheV3LocalBlockBackend::open_with_budget(config, Some(100)).unwrap();
+        assert!(
+            reopened.is_evictable(20),
+            "runtime pin state must be cleared on reopen instead of persisting in redb"
+        );
+        assert_eq!(reopened.storage_stats().evictable_bytes, 30);
+        assert!(reopened.object_stats(20).unwrap().evictable);
     }
 
     #[test]

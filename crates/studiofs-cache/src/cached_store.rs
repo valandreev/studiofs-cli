@@ -5,7 +5,7 @@
 //! Benchmark-only cache helpers live in `benchmark_cache`.
 
 use parking_lot::Mutex;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,26 +35,44 @@ impl CachedStoreConfig {
 
 #[derive(Debug, Default)]
 struct PinnedState {
-    objects: HashSet<ObjectId>,
+    objects: HashMap<ObjectId, usize>,
 }
 
 impl PinnedState {
-    fn insert(&mut self, object_id: ObjectId) {
-        self.objects.insert(object_id);
+    fn insert(&mut self, object_id: ObjectId) -> bool {
+        let count = self.objects.entry(object_id).or_default();
+        let first_pin = *count == 0;
+        *count = count.saturating_add(1);
+        first_pin
     }
 
-    fn insert_many(&mut self, object_ids: impl IntoIterator<Item = ObjectId>) {
+    fn insert_many(&mut self, object_ids: impl IntoIterator<Item = ObjectId>) -> Vec<ObjectId> {
+        let mut first_pins = Vec::new();
         for object_id in object_ids {
-            self.objects.insert(object_id);
+            if self.insert(object_id) {
+                first_pins.push(object_id);
+            }
         }
+        first_pins
     }
 
     fn contains(&self, object_id: ObjectId) -> bool {
-        self.objects.contains(&object_id)
+        self.objects.contains_key(&object_id)
     }
 
-    fn remove(&mut self, object_id: ObjectId) {
-        self.objects.remove(&object_id);
+    fn remove(&mut self, object_id: ObjectId) -> bool {
+        let std::collections::hash_map::Entry::Occupied(mut entry) = self.objects.entry(object_id)
+        else {
+            return false;
+        };
+        let count = entry.get_mut();
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            entry.remove();
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -179,8 +197,10 @@ impl CachedStore {
     }
 
     pub fn pin(&self, object_id: ObjectId) {
-        self.pinned.lock().insert(object_id);
-        self.local_block_backend.pin(object_id);
+        let first_pin = self.pinned.lock().insert(object_id);
+        if first_pin {
+            self.local_block_backend.pin(object_id);
+        }
     }
 
     pub fn is_pinned(&self, object_id: ObjectId) -> bool {
@@ -188,8 +208,10 @@ impl CachedStore {
     }
 
     pub fn unpin(&self, object_id: ObjectId) {
-        self.pinned.lock().remove(object_id);
-        self.local_block_backend.unpin(object_id);
+        let last_pin = self.pinned.lock().remove(object_id);
+        if last_pin {
+            self.local_block_backend.unpin(object_id);
+        }
     }
 
     pub fn submit_upload(&self, ino: u64, offset: u64, object_id: ObjectId, content_epoch: u64) {
@@ -202,13 +224,11 @@ impl CachedStore {
     }
 
     pub fn submit_uploads_batch(&self, ops: &[(u64, u64, ObjectId, u64)]) {
-        {
+        let first_pins = {
             let mut pinned = self.pinned.lock();
-            pinned.insert_many(ops.iter().map(|(_, _, object_id, _)| *object_id));
-        }
-        for (_, _, object_id, _) in ops {
-            self.local_block_backend.pin(*object_id);
-        }
+            pinned.insert_many(ops.iter().map(|(_, _, object_id, _)| *object_id))
+        };
+        self.local_block_backend.pin_batch(&first_pins);
         for (ino, offset, object_id, content_epoch) in ops {
             self.upload_queue
                 .submit(*ino, *offset, *object_id, *content_epoch);
@@ -368,6 +388,45 @@ mod tests {
         assert!(
             cached_store.contains(20),
             "pinned uploaded block must survive pressure maintenance"
+        );
+    }
+
+    #[test]
+    fn double_pin_requires_double_unpin_before_eviction_can_resume() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, _rx) = temp_cached_store_with_budget(&dir, 100);
+
+        cached_store.put(20, &[0x01; 30], true).expect("put 20");
+        cached_store.put(21, &[0x02; 30], true).expect("put 21");
+        cached_store.put(22, &[0x03; 30], true).expect("put 22");
+        cached_store.put(23, &[0x04; 5], true).expect("put 23");
+
+        cached_store.pin(20);
+        cached_store.pin(20);
+        cached_store.unpin(20);
+
+        cached_store
+            .run_pressure_maintenance()
+            .expect("run pressure maintenance");
+
+        assert!(
+            cached_store.contains(20),
+            "single unpin must not release an object that still has another pin"
+        );
+
+        cached_store.unpin(20);
+        assert!(
+            cached_store.is_evictable(20),
+            "object should become evictable again after the final unpin"
+        );
+        cached_store.put(24, &[0x05; 30], true).expect("put 24");
+        cached_store
+            .run_pressure_maintenance()
+            .expect("run pressure maintenance after final unpin");
+
+        assert!(
+            !cached_store.contains(20),
+            "object becomes evictable again after the final unpin"
         );
     }
 }

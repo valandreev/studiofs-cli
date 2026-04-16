@@ -1185,6 +1185,14 @@ mod tests {
             self.inner.unpin(object_id);
         }
 
+        fn pin_batch(&self, object_ids: &[u64]) {
+            self.inner.pin_batch(object_ids);
+        }
+
+        fn unpin_batch(&self, object_ids: &[u64]) {
+            self.inner.unpin_batch(object_ids);
+        }
+
         fn remove(&self, object_id: u64) {
             self.inner.remove(object_id);
         }
