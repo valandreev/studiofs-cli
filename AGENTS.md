@@ -201,6 +201,10 @@ test: add destroy tests fixes
 
 ## Architecture Overview
 
+For the SFS-242 rewrite, the canonical architecture contract is
+`docs/juicefs-local-first-rust-contract.md`. If older redesign notes or this
+AGENTS snapshot differ from that contract, the contract wins.
+
 ### High-Level Components
 
 ```

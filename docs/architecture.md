@@ -1,5 +1,10 @@
 # Architecture Overview
 
+For the SFS-242 rewrite, the canonical target contract now lives in
+[juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
+This page remains a codebase snapshot and implementation overview; when it
+conflicts with the rewrite target, the contract wins.
+
 ## System Design
 
 StudioFS mounts S3-compatible object storage as a local filesystem with a
@@ -12,11 +17,9 @@ Core principles:
 - Runtime file visibility is split into local-visible overlay state and remote-visible base state.
 - Regular files now use chunk-local overlay/base slice graphs in metadata, not a flat block table.
 - Cache 3.0 (`studiofs-cache::v3`) is the active local data store; remaining cache helpers are a narrow upload-orchestration layer.
-- The canonical chunk/slice/block vocabulary for follow-up work is frozen in
-  [chunk-slice-block-vocabulary.md](./chunk-slice-block-vocabulary.md).
-- The execution guardrails and implementation order for the data plane redesign are
-  captured in
-  [data-plane-redesign-guardrails.md](./data-plane-redesign-guardrails.md).
+- The canonical rewrite vocabulary, Local-First visibility rules, JuiceFS
+  reference map, and Rust-native guardrails are captured in
+  [juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
 
 - `flush()` and `close()` must make accepted data readable locally without waiting for S3/upload/metadata.
 - Remote readers observe only coarse states: `uploading`, `updating`, `ready`.

@@ -1,5 +1,10 @@
 # Chunk, Slice, Block Vocabulary ADR
 
+For the SFS-242 rewrite, this ADR is now historical background. The canonical
+rewrite contract lives in
+[juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md),
+which supersedes this ADR when the two differ.
+
 ## Status: ACCEPTED
 ## Date: 2026-04-02
 ## Issue: SFS-154

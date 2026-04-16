@@ -1,5 +1,10 @@
 # Data Plane Redesign Guardrails
 
+For the SFS-242 rewrite, this proposal is now historical background. The
+canonical rewrite contract lives in
+[juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md),
+which supersedes this note when the two differ.
+
 ## Status: PROPOSAL
 ## Date: 2026-04-02
 ## Issue: SFS-155
