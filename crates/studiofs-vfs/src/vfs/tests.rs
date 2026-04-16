@@ -424,6 +424,77 @@ fn zeroio_snapshot_reports_delete_before_publish_cleanup_visibility() {
 }
 
 #[test]
+fn epoch_finalizer_publishes_manifest_backed_zero_length_epoch() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "manifest-finalizer-zero-length");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"manifest-finalizer-zero-length.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let payload = b"manifest-backed-finalization";
+        vfs.write(attr.ino, 0, payload)
+            .await
+            .expect("write test payload");
+
+        let (published_epoch, published_blocks) =
+            mark_all_file_blocks_uploaded(&vfs, &meta, attr.ino);
+        publish_current_manifest(&meta, attr.ino, published_epoch, &published_blocks);
+
+        let mut truncated_attr = meta.get_attr(attr.ino).expect("load published attr");
+        truncated_attr.size = 0;
+        truncated_attr.content_epoch = truncated_attr.content_epoch.saturating_add(1);
+        meta.set_attr(&truncated_attr)
+            .expect("stage manifest-backed zero-length epoch");
+        meta.remove_file_blocks(attr.ino)
+            .expect("remove unpublished blocks for zero-length truncate");
+
+        assert!(
+            !meta
+                .has_local_regular_file_overlay(attr.ino)
+                .expect("query overlay state"),
+            "regression setup should exercise the legacy manifest-backed path"
+        );
+
+        let unpublished_attr = meta.get_attr(attr.ino).expect("load unpublished attr");
+        assert_eq!(unpublished_attr.size, 0);
+        assert_ne!(
+            unpublished_attr.committed_content_epoch, unpublished_attr.content_epoch,
+            "regression setup should leave the zero-length epoch unpublished"
+        );
+        assert_eq!(
+            meta.get_file_blocks(attr.ino)
+                .expect("load unpublished manifest")
+                .len(),
+            0,
+            "regression setup should not require remote object visibility checks"
+        );
+
+        let status = super::commit::CommitCoordinator::finalize_inode_epoch(
+            &vfs,
+            attr.ino,
+            unpublished_attr.content_epoch,
+        )
+        .await
+        .expect("finalize zero-length manifest-backed epoch");
+        assert!(
+            matches!(status, super::commit::EpochFinalizeStatus::Published),
+            "manifest-backed zero-length epoch should still publish"
+        );
+
+        let published_attr = meta.get_attr(attr.ino).expect("load published attr");
+        assert_eq!(published_attr.size, 0);
+        assert_eq!(published_attr.committed_size, 0);
+        assert_eq!(published_attr.upload_state, MetaUploadState::Ready);
+        assert_eq!(
+            published_attr.committed_content_epoch,
+            published_attr.content_epoch
+        );
+    });
+}
+
+#[test]
 fn zeroio_snapshot_reports_repeated_restart_replay_as_health_signal() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "zeroio-repeated-replay");
