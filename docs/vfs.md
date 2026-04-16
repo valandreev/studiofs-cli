@@ -1,5 +1,9 @@
 # VFS Layer
 
+This page is a current implementation snapshot for `studiofs-vfs`. It is not
+the canonical SFS-242 rewrite contract. The rewrite source of truth lives in
+[juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
+
 The VFS (`studiofs-vfs`) is the platform-agnostic core of StudioFS. It orchestrates metadata operations, data block management, caching, background tasks, and exposes a file-system–like API consumed by the FUSE and WinFSP bridges.
 
 This document uses the frozen chunk/slice/block vocabulary for the active data

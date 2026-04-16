@@ -1,5 +1,9 @@
 # Configuration Reference
 
+This page describes the current operator surface in the repository. It is not
+the canonical SFS-242 rewrite contract. The rewrite source of truth lives in
+[juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
+
 ## Global
 
 ```bash

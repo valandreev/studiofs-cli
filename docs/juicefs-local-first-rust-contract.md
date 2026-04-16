@@ -128,8 +128,8 @@ Review guardrails:
 
 | Source | Status after this contract |
 |---|---|
-| `docs/chunk-slice-block-vocabulary.md` | Historical background only. Vocabulary is now controlled by this contract. |
-| `docs/data-plane-redesign-guardrails.md` | Historical background only. Rewrite sequencing and deletion intent must now be interpreted through this contract. |
+| `docs/chunk-slice-block-vocabulary.md` | Removed from active docs. Its vocabulary freeze is now absorbed by this contract. |
+| `docs/data-plane-redesign-guardrails.md` | Removed from active docs. Its sequencing and deletion guidance is now absorbed by this contract. |
 | `SFS-154` | Historical vocabulary freeze that is superseded by this contract. |
 | `SFS-155` | Historical guardrail issue that is superseded by this contract. |
 | `SFS-148` | Historical redesign umbrella referenced by older guardrails; SFS-242 is the active umbrella. |

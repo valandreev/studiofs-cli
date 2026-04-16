@@ -1,12 +1,18 @@
 # Cache 3.0 Contract and Runtime Safety
 
+This file documents the current `v3` local-backend layout and safety rules for
+the in-tree implementation. It is not the canonical SFS-242 rewrite contract.
+The rewrite source of truth lives in
+[juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
+
 ## Purpose
 
 Define the Cache 3.0 disk layout, backend-detection rules, startup safety
 reconciliation, and operator remediation for stale local cache state.
 
-This document is the source of truth for runtime behavior and operator-facing
-safety expectations.
+This document is the source of truth only for the current Cache 3.0 `v3`
+backend implementation details and operator-facing safety expectations while
+that implementation remains in service.
 
 ## 1. Versioned Disk Layout (v1)
 

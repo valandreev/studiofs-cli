@@ -1,5 +1,9 @@
 # Cache System
 
+This page is a current implementation snapshot for the cache subsystem. It is
+not the canonical SFS-242 rewrite contract. The rewrite source of truth lives
+in [juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
+
 The cache subsystem (`studiofs-cache`) is now a Cache 3.0-first local data
 plane with a narrow upload orchestration layer.
 
