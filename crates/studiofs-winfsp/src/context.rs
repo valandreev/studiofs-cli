@@ -2333,7 +2333,9 @@ mod tests {
     }
 
     fn payload_persist_calls(vfs: &StudioVfs) -> u64 {
-        vfs.write_path_observability_snapshot().payload_persist.calls
+        vfs.write_path_observability_snapshot()
+            .payload_persist
+            .calls
     }
 
     fn sync_data_calls(vfs: &StudioVfs) -> u64 {
