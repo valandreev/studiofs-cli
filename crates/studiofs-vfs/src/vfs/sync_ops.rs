@@ -30,6 +30,7 @@ impl StudioVfs {
     }
 
     fn close_handle_for_release(&self, fh: u64) -> Option<HandleReleaseContext> {
+        self.state.handle_writers.mark_closed(fh);
         let Some((open_file, remaining)) = self.handle_table.close(fh) else {
             debug!("release_fh: unknown fh={}", fh);
             return None;
@@ -172,8 +173,11 @@ impl StudioVfs {
         sticky_error_policy: StickyErrorPolicy,
         dirty_attr_persist_policy: DirtyAttrPersistPolicy,
     ) -> VfsResult<LocalSyncBarrierOutcome> {
+        let materialized_handle_writers = self
+            .materialize_handle_writers_for_inode(ino, local_sync_policy)
+            .await?;
         let flushed_file_data = self.has_pending_write_buffer_blocks_for_inode(ino);
-        let had_local_dirty_state = self.inode_has_local_dirty_state(ino);
+        let had_local_dirty_state = materialized_handle_writers || self.inode_has_local_dirty_state(ino);
         if had_local_dirty_state {
             self.flush_ordered(ino, local_sync_policy).await?;
         }
@@ -209,7 +213,7 @@ impl StudioVfs {
     }
 
     fn local_sync_policy_for_barrier(&self, ino: Ino) -> LocalSyncPolicy {
-        if self.inode_has_local_dirty_state(ino) {
+        if self.inode_has_local_dirty_state(ino) || self.inode_has_dirty_handle_writers(ino) {
             LocalSyncPolicy::Strict
         } else {
             LocalSyncPolicy::Opportunistic
@@ -357,6 +361,11 @@ impl StudioVfs {
         data: &[u8],
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<u32> {
+        let session = self
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Write)
+            .await;
         let open_file = self.handle_table.get(fh);
         let _ = self.state.read.observe_write_access(
             open_file.as_ref(),
@@ -365,7 +374,21 @@ impl StudioVfs {
             data.len(),
             self.access_classifier,
         );
-        self.write_with_local_sync_policy(ino, offset, data, local_sync_policy)
-            .await
+        let result = async {
+            self.enforce_access(ino, AccessLevel::ReadWrite)?;
+            if self.ignored_entry_attr(ino).is_some() {
+                return Ok(data.len() as u32);
+            }
+            let written = self.record_handle_writer_state(fh, ino, offset, data).await?;
+            if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
+                self.materialize_handle_writers_for_inode(ino, local_sync_policy)
+                    .await?;
+            }
+            Ok(written)
+        }
+        .await;
+        drop(session);
+        self.state.file_session.gc_if_idle(ino);
+        result
     }
 }

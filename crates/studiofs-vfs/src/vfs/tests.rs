@@ -1442,6 +1442,88 @@ fn flush_then_release_keeps_written_bytes_visible_to_reopened_reader() {
 }
 
 #[test]
+fn same_mount_read_keeps_opportunistic_handle_write_visible_after_write_buffer_clear() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-opportunistic-handle-read");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-245-opportunistic-handle-read.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let payload = b"slice-writer-visible";
+
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            0,
+            payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        let overlay_spans = meta
+            .lookup_regular_file_slices(ino, 0, payload.len() as u64)
+            .unwrap();
+        assert!(
+            overlay_spans.iter().all(|span| span.block.is_none()),
+            "opportunistic handle writes should not materialize block-backed metadata before a barrier: {overlay_spans:?}"
+        );
+
+        vfs.clear_pending_blocks_for_inode(ino);
+
+        let bytes = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(bytes.as_ref(), payload);
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn same_mount_read_prefers_newer_opportunistic_handle_writer_spans() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-overlapping-handle-writers");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-245-overlapping-handle-writers.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh1 = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let fh2 = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.write_fh_with_local_sync_policy(
+            fh1,
+            ino,
+            0,
+            b"hello",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        vfs.write_fh_with_local_sync_policy(
+            fh2,
+            ino,
+            1,
+            b"XYZ",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        vfs.clear_pending_blocks_for_inode(ino);
+
+        let bytes = vfs.read(ino, 0, 5).await.unwrap();
+        assert_eq!(bytes.as_ref(), b"hXYZo");
+
+        vfs.release_fh(fh1).await.unwrap();
+        vfs.release_fh(fh2).await.unwrap();
+    });
+}
+
+#[test]
 fn test_release_fh_with_outcome_orphan_cleanup_does_not_report_flush_barrier() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-orphan-cleanup");
@@ -2426,6 +2508,48 @@ fn flush_fh_forces_strict_local_sync_when_dirty_state_remains() {
 }
 
 #[test]
+fn flush_fh_materializes_opportunistic_handle_writer_state_into_overlay_slices() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-flush-handle-writer");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-245-flush-handle-writer.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let payload = b"flush-materialize";
+
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            0,
+            payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        assert!(vfs.state.handle_writers.has_dirty_writers(ino));
+
+        vfs.flush_fh(fh).await.unwrap();
+
+        let spans = meta
+            .lookup_regular_file_slices(ino, 0, payload.len() as u64)
+            .unwrap();
+        assert!(
+            spans.iter().any(|span| span.block.is_some()),
+            "flush_fh should materialize block-backed local unpublished slices: {spans:?}"
+        );
+        assert!(
+            !vfs.state.handle_writers.has_dirty_writers(ino),
+            "flush_fh should drain handle-writer dirty state"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn release_fh_forces_strict_local_sync_when_last_handle_still_owns_dirty_state() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-fh-strict-local-sync");
@@ -2508,6 +2632,48 @@ fn release_fh_forces_strict_local_sync_when_last_handle_still_owns_dirty_state()
         !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
         "last-handle release should preserve the committed local attr state"
     );
+}
+
+#[test]
+fn release_fh_materializes_opportunistic_handle_writer_state() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-release-handle-writer");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-245-release-handle-writer.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let payload = b"release-materialize";
+
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            0,
+            payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        assert!(vfs.state.handle_writers.has_dirty_writers(ino));
+
+        let outcome = vfs.release_fh_with_outcome(fh).await.unwrap();
+        assert!(outcome.closed_last_handle);
+        assert!(outcome.flushed_local_dirty_state);
+
+        let spans = meta
+            .lookup_regular_file_slices(ino, 0, payload.len() as u64)
+            .unwrap();
+        assert!(
+            spans.iter().any(|span| span.block.is_some()),
+            "last-handle release should materialize block-backed local unpublished slices: {spans:?}"
+        );
+        assert!(
+            !vfs.state.handle_writers.has_dirty_writers(ino),
+            "last-handle release should drain handle-writer dirty state"
+        );
+    });
 }
 
 #[test]

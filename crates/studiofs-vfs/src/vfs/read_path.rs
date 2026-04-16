@@ -189,6 +189,35 @@ impl<'a> ReadPipeline<'a> {
         let mut plan = Vec::new();
         let pending_upload_index = vfs.snapshot_pending_upload_index();
 
+        let handle_spans = vfs.snapshot_handle_writer_read_spans(ino, offset, length);
+        for dirty in handle_spans {
+            if unresolved.is_empty() {
+                break;
+            }
+            let dirty_range = ReadRange {
+                start: dirty.start,
+                end: dirty.end,
+            };
+            let (next_unresolved, claimed) = Self::claim_unresolved_ranges(unresolved, dirty_range);
+            unresolved = next_unresolved;
+            for overlap in claimed {
+                let delta = overlap.start.saturating_sub(dirty.start);
+                let Some(delta_u32) = u32::try_from(delta).ok() else {
+                    continue;
+                };
+                let Some(block_offset) = dirty.block_offset.checked_add(delta_u32) else {
+                    continue;
+                };
+                plan.push(ReadPlanSpan {
+                    range: overlap,
+                    source: ReadPlanSource::Dirty {
+                        data: dirty.data.clone(),
+                        block_offset,
+                    },
+                });
+            }
+        }
+
         let dirty_spans = vfs.snapshot_pending_dirty_slice_read_spans(ino, offset, length);
         for dirty in dirty_spans {
             if unresolved.is_empty() {

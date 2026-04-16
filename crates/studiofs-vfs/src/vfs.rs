@@ -29,6 +29,7 @@ mod commit;
 mod config;
 mod deletion_cleanup;
 mod file_session;
+mod handle_writer;
 mod handle_drain_barrier;
 mod handle_table;
 mod ignored_entries;
@@ -89,6 +90,7 @@ use config::{
     UnlinkTarget, WRITE_EAGER_DRAIN_CHUNK_MAX_BYTES, write_path_sync_trigger,
 };
 use file_session::{FileSessionOperation, FileSessionState};
+use handle_writer::HandleWriterRegistry;
 use handle_table::HandleTable;
 use ignored_entries::IgnoredEntryRegistry;
 use locking::{DistributedFlock, FileLockState};
@@ -1803,6 +1805,7 @@ impl VfsState {
             ),
             acl: AclState::new(),
             incarnation: IncarnationState::new(),
+            handle_writers: HandleWriterRegistry::new(),
             write_buffer: WriteBufferState::new(),
             read: ReadState::new(cfg.foreground_read_speedometer_shards),
             file_lock: FileLockState::new(),
@@ -1818,6 +1821,7 @@ struct VfsState {
     namespace: NamespaceState,
     acl: AclState,
     incarnation: IncarnationState,
+    handle_writers: HandleWriterRegistry,
     write_buffer: WriteBufferState,
     read: ReadState,
     file_lock: FileLockState,
