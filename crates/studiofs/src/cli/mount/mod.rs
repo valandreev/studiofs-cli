@@ -168,6 +168,8 @@ impl MountArgs {
 
 #[cfg(test)]
 mod tests {
+    use clap::error::ErrorKind;
+
     #[test]
     fn mount_accepts_public_runtime_tuning_flags() {
         let mount_point = if cfg!(windows) { "Z:" } else { "/mnt/studio" };
@@ -185,5 +187,29 @@ mod tests {
             "1500",
         ])
         .expect("new public runtime tuning flags should parse");
+    }
+
+    #[test]
+    fn mount_rejects_zero_readahead() {
+        let mount_point = if cfg!(windows) { "Z:" } else { "/mnt/studio" };
+        let err =
+            match crate::cli::parse_for_test(&["mount", "demo", mount_point, "--readahead", "0"]) {
+                Ok(_) => panic!("zero readahead should be rejected"),
+                Err(err) => err,
+            };
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+        assert!(err.to_string().contains("--readahead"));
+    }
+
+    #[test]
+    fn mount_rejects_zero_prefetch() {
+        let mount_point = if cfg!(windows) { "Z:" } else { "/mnt/studio" };
+        let err =
+            match crate::cli::parse_for_test(&["mount", "demo", mount_point, "--prefetch", "0"]) {
+                Ok(_) => panic!("zero prefetch should be rejected"),
+                Err(err) => err,
+            };
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+        assert!(err.to_string().contains("--prefetch"));
     }
 }

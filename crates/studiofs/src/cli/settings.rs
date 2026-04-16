@@ -243,6 +243,26 @@ mod tests {
     }
 
     #[test]
+    fn settings_rejects_zero_readahead() {
+        let err = match crate::cli::parse_for_test(&["settings", "--readahead", "0"]) {
+            Ok(_) => panic!("zero readahead should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+        assert!(err.to_string().contains("--readahead"));
+    }
+
+    #[test]
+    fn settings_rejects_zero_prefetch() {
+        let err = match crate::cli::parse_for_test(&["settings", "--prefetch", "0"]) {
+            Ok(_) => panic!("zero prefetch should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+        assert!(err.to_string().contains("--prefetch"));
+    }
+
+    #[test]
     fn settings_rejects_cache_safety_mode_flag() {
         let err = match crate::cli::parse_for_test(&["settings", "--cache-safety-mode", "durable"])
         {

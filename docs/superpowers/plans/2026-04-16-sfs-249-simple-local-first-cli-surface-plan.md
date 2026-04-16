@@ -78,8 +78,8 @@ Wire new mount/settings fields to existing validated config fields:
 Preserve precedence:
 
 1. CLI flags
-2. persisted `settings`
-3. env overrides
+2. env overrides
+3. persisted `settings`
 4. built-in defaults
 
 - [ ] **Step 4: Run focused tests to verify the plumbing passes**
