@@ -82,7 +82,6 @@ impl<'a> DataReader<'a> {
         let missing_remote = Self::prefetch_remote_blocks(self.vfs, &plan, false).await?;
         let written =
             Self::assemble_into(self.vfs, self.offset, &plan, &missing_remote, buffer).await?;
-        drop(plan);
         Ok(written)
     }
 
@@ -556,7 +555,7 @@ impl<'a> DataReader<'a> {
                                 block_offset,
                                 requested = dst.len(),
                                 read,
-                                "assemble_read_plan: short local read for pending extent; padding tail with zeros"
+                                "data_reader: short local read for pending extent; padding tail with zeros"
                             );
                             dst[read..].fill(0);
                         }
@@ -566,7 +565,7 @@ impl<'a> DataReader<'a> {
                                 file_offset = span.range.start,
                                 block_offset,
                                 requested = dst.len(),
-                                "assemble_read_plan: pending extent missing from local backend, zeroing range"
+                                "data_reader: pending extent missing from local backend, zeroing range"
                             );
                             dst.fill(0);
                         }
@@ -577,7 +576,7 @@ impl<'a> DataReader<'a> {
                         warn!(
                             object_id = block.object_id,
                             file_offset = span.range.start,
-                            "assemble_read_plan: object in remote_not_found set, zeroing range (S3 NotFound during prefetch)"
+                            "data_reader: object in remote_not_found set, zeroing range (S3 NotFound during prefetch)"
                         );
                         dst.fill(0);
                     } else {
@@ -602,7 +601,7 @@ impl<'a> DataReader<'a> {
                                     block_offset = block.offset,
                                     requested = dst.len(),
                                     read,
-                                    "assemble_read_plan: short local backend read for committed block; evicting and refetching"
+                                    "data_reader: short local backend read for committed block; evicting and refetching"
                                 );
                                 dst.fill(0);
                                 if let Err(evict_error) =
@@ -611,7 +610,7 @@ impl<'a> DataReader<'a> {
                                     warn!(
                                         object_id = block.object_id,
                                         error = %evict_error,
-                                        "assemble_read_plan: failed to evict short-read local block before refetch"
+                                        "data_reader: failed to evict short-read local block before refetch"
                                     );
                                 }
                             }
@@ -634,7 +633,7 @@ impl<'a> DataReader<'a> {
                                         file_offset = span.range.start,
                                         block_offset = block.offset,
                                         block_length = block.length,
-                                        "assemble_read_plan: S3 object not found during foreground read, zeroing range (upload incomplete or evicted before upload?)"
+                                        "data_reader: S3 object not found during foreground read, zeroing range (upload incomplete or evicted before upload?)"
                                     );
                                     dst.fill(0);
                                 }
