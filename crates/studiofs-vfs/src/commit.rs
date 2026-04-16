@@ -74,8 +74,7 @@ impl CommitCoordinator {
             })
         })
         .await?;
-        let lifecycle = meta.lifecycle;
-        let Some(lifecycle) = lifecycle else {
+        let Some(lifecycle) = meta.lifecycle else {
             tracing::debug!(
                 ino,
                 content_epoch,

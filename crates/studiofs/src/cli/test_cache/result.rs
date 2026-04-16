@@ -293,7 +293,7 @@ impl From<CachePipelineMetricsSnapshot> for CachePipelineReport {
                 stats: to_report(&item.stats),
             })
             .collect();
-        by_kind.sort_by(|a, b| b.stats.submitted.cmp(&a.stats.submitted));
+        by_kind.sort_by_key(|item| std::cmp::Reverse(item.stats.submitted));
 
         Self {
             materialize_batches: snapshot.materialize_batches.into(),

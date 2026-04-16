@@ -851,11 +851,8 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
                 });
             }
         };
-        let uploads = fragment_keys
-            .iter()
-            .zip(object_bytes.into_iter())
-            .enumerate()
-            .map(|(fragment_index, (key, payload))| {
+        let uploads = fragment_keys.iter().zip(object_bytes).enumerate().map(
+            |(fragment_index, (key, payload))| {
                 let key = key.clone();
                 let cancel_token = cancel_token.clone();
                 async move {
@@ -867,7 +864,8 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
                         .map(|_| (fragment_index, key))
                         .map_err(|error| (fragment_index, err_key, error))
                 }
-            });
+            },
+        );
         let done = join_all(uploads).await;
         drop(upload_qos);
 
@@ -1151,10 +1149,7 @@ impl UploadLifecycleWorker {
         fair: &mut crate::qos::FairInodeScheduler<PendingUpload>,
         delayed: &mut DelayedUploads,
     ) {
-        loop {
-            let Some((&not_before_unix_ms, _)) = delayed.first_key_value() else {
-                break;
-            };
+        while let Some((&not_before_unix_ms, _)) = delayed.first_key_value() {
             if not_before_unix_ms > now_unix_millis() {
                 break;
             }
