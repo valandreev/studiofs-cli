@@ -383,7 +383,9 @@ impl StudioVfs {
             let written = self
                 .record_handle_writer_state(fh, ino, offset, data)
                 .await?;
-            if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
+            if matches!(local_sync_policy, LocalSyncPolicy::Strict)
+                || self.should_auto_materialize_handle_writers(ino)
+            {
                 self.materialize_handle_writers_for_inode(ino, local_sync_policy)
                     .await?;
             }
