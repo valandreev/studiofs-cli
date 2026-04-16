@@ -426,6 +426,44 @@ impl CacheIndex {
         Ok(())
     }
 
+    pub fn set_runtime_pinned(&self, object_id: u64, pinned: bool) -> Result<(), CacheIndexError> {
+        let txn = self.db.begin_write().map_err(storage_error)?;
+        {
+            let mut blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+            let mut dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
+            let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
+            let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
+
+            let Some(old) = read_entry_write(&blocks, object_id)? else {
+                return Ok(());
+            };
+            if old.lifecycle != LocalBlockLifecycleState::Uploaded {
+                return Ok(());
+            }
+
+            let desired_evictable = !pinned;
+            if old.evictable == desired_evictable {
+                return Ok(());
+            }
+
+            let mut new = old.clone();
+            new.evictable = desired_evictable;
+
+            apply_entry_change(
+                object_id,
+                Some(&old),
+                Some(&new),
+                &mut blocks,
+                &mut dirty_order,
+                &mut access_order,
+                &mut counters,
+            )?;
+        }
+
+        txn.commit().map_err(storage_error)?;
+        Ok(())
+    }
+
     pub fn remove(&self, object_id: u64) -> Result<(), CacheIndexError> {
         let txn = self.db.begin_write().map_err(storage_error)?;
         {

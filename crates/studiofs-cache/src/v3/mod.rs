@@ -743,6 +743,18 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
         }
     }
 
+    fn pin(&self, object_id: u64) {
+        if let Err(error) = self.index.set_runtime_pinned(object_id, true) {
+            warn!(object_id, error = ?error, "cache-v3 index pin failed");
+        }
+    }
+
+    fn unpin(&self, object_id: u64) {
+        if let Err(error) = self.index.set_runtime_pinned(object_id, false) {
+            warn!(object_id, error = ?error, "cache-v3 index unpin failed");
+        }
+    }
+
     fn remove(&self, object_id: u64) {
         if let Err(error) = self.index.remove(object_id) {
             warn!(object_id, error = ?error, "cache-v3 index remove failed");

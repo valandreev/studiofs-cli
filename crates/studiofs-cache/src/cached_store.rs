@@ -43,6 +43,12 @@ impl PinnedState {
         self.objects.insert(object_id);
     }
 
+    fn insert_many(&mut self, object_ids: impl IntoIterator<Item = ObjectId>) {
+        for object_id in object_ids {
+            self.objects.insert(object_id);
+        }
+    }
+
     fn contains(&self, object_id: ObjectId) -> bool {
         self.objects.contains(&object_id)
     }
@@ -157,7 +163,7 @@ impl CachedStore {
     }
 
     pub fn is_evictable(&self, object_id: ObjectId) -> bool {
-        self.local_block_backend.is_evictable(object_id)
+        self.local_block_backend.is_evictable(object_id) && !self.is_pinned(object_id)
     }
 
     pub fn storage_stats(&self) -> LocalBlockStorageStats {
@@ -174,6 +180,7 @@ impl CachedStore {
 
     pub fn pin(&self, object_id: ObjectId) {
         self.pinned.lock().insert(object_id);
+        self.local_block_backend.pin(object_id);
     }
 
     pub fn is_pinned(&self, object_id: ObjectId) -> bool {
@@ -182,6 +189,7 @@ impl CachedStore {
 
     pub fn unpin(&self, object_id: ObjectId) {
         self.pinned.lock().remove(object_id);
+        self.local_block_backend.unpin(object_id);
     }
 
     pub fn submit_upload(&self, ino: u64, offset: u64, object_id: ObjectId, content_epoch: u64) {
@@ -194,8 +202,19 @@ impl CachedStore {
     }
 
     pub fn submit_uploads_batch(&self, ops: &[(u64, u64, ObjectId, u64)]) {
+        {
+            let mut pinned = self.pinned.lock();
+            pinned.insert_many(ops.iter().map(|(_, _, object_id, _)| *object_id));
+        }
+        for (_, _, object_id, _) in ops {
+            self.local_block_backend.pin(*object_id);
+        }
         for (ino, offset, object_id, content_epoch) in ops {
-            self.submit_upload(*ino, *offset, *object_id, *content_epoch);
+            self.upload_queue
+                .submit(*ino, *offset, *object_id, *content_epoch);
+            self.metrics
+                .upload_queue
+                .record_submit(self.upload_queue.pending_count());
         }
     }
 
@@ -260,7 +279,7 @@ impl CachedStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::open_local_block_backend;
+    use crate::{open_local_block_backend, open_local_block_backend_with_budget};
 
     fn temp_cached_store(
         dir: &tempfile::TempDir,
@@ -268,6 +287,20 @@ mod tests {
         let backend = open_local_block_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
             .expect("open backend")
             .backend;
+        CachedStore::open(CachedStoreConfig::new(dir.path()), backend).expect("open cached store")
+    }
+
+    fn temp_cached_store_with_budget(
+        dir: &tempfile::TempDir,
+        budget_bytes: u64,
+    ) -> (Arc<CachedStore>, mpsc::UnboundedReceiver<PendingUpload>) {
+        let backend = open_local_block_backend_with_budget(
+            dir.path(),
+            "00000000-0000-0000-0000-000000000001",
+            budget_bytes,
+        )
+        .expect("open budgeted backend")
+        .backend;
         CachedStore::open(CachedStoreConfig::new(dir.path()), backend).expect("open cached store")
     }
 
@@ -315,5 +348,26 @@ mod tests {
         assert_eq!(requeued.object_id, 303);
         assert_eq!(cached_store.pending_upload_count(), 1);
         assert!(cached_store.is_pinned(303));
+    }
+
+    #[test]
+    fn pressure_maintenance_does_not_evict_pinned_uploaded_blocks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, _rx) = temp_cached_store_with_budget(&dir, 100);
+
+        cached_store.put(20, &[0x01; 30], true).expect("put 20");
+        cached_store.put(21, &[0x02; 30], true).expect("put 21");
+        cached_store.put(22, &[0x03; 30], true).expect("put 22");
+        cached_store.put(23, &[0x04; 5], true).expect("put 23");
+        cached_store.pin(20);
+
+        cached_store
+            .run_pressure_maintenance()
+            .expect("run pressure maintenance");
+
+        assert!(
+            cached_store.contains(20),
+            "pinned uploaded block must survive pressure maintenance"
+        );
     }
 }

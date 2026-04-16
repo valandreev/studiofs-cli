@@ -1177,6 +1177,14 @@ mod tests {
             self.inner.mark_uploaded(object_id);
         }
 
+        fn pin(&self, object_id: u64) {
+            self.inner.pin(object_id);
+        }
+
+        fn unpin(&self, object_id: u64) {
+            self.inner.unpin(object_id);
+        }
+
         fn remove(&self, object_id: u64) {
             self.inner.remove(object_id);
         }
