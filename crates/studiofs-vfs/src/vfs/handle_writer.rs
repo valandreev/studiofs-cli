@@ -1,6 +1,4 @@
-use super::{
-    Bytes, FileType, Ino, LocalSyncPolicy, StudioVfs, VfsResult, now_unix_secs,
-};
+use super::{Bytes, FileType, Ino, LocalSyncPolicy, StudioVfs, VfsResult, now_unix_secs};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -191,7 +189,9 @@ impl StudioVfs {
         offset: u64,
         length: u64,
     ) -> Vec<HandleWriterReadSpan> {
-        self.state.handle_writers.snapshot_read_spans(ino, offset, length)
+        self.state
+            .handle_writers
+            .snapshot_read_spans(ino, offset, length)
     }
 
     pub(super) fn inode_has_dirty_handle_writers(&self, ino: Ino) -> bool {
@@ -237,20 +237,24 @@ impl StudioVfs {
         ino: Ino,
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<bool> {
-        let writes = self.state.handle_writers.snapshot_materialization_writes(ino);
+        let writes = self
+            .state
+            .handle_writers
+            .snapshot_materialization_writes(ino);
         if writes.is_empty() {
             return Ok(false);
         }
-        for write in writes {
-            self.write_ordered_with_local_sync_policy(
-                ino,
-                write.offset,
-                write.data.as_ref(),
-                local_sync_policy,
-            )
+        let max_seq = writes
+            .last()
+            .map(|write| write.seq)
+            .expect("non-empty writes have a max seq");
+        let buffered_writes: Vec<(u64, Bytes)> = writes
+            .into_iter()
+            .map(|write| (write.offset, write.data))
+            .collect();
+        self.materialize_buffered_writes_direct(ino, &buffered_writes, local_sync_policy)
             .await?;
-            self.state.handle_writers.mark_materialized(ino, write.seq);
-        }
+        self.state.handle_writers.mark_materialized(ino, max_seq);
         Ok(true)
     }
 }

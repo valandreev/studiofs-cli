@@ -1119,6 +1119,154 @@ impl<'a> OrderedWriteSession<'a> {
 }
 
 impl StudioVfs {
+    async fn build_dirty_write_snapshots_from_buffered_writes(
+        &self,
+        ino: Ino,
+        writes: &[(u64, Bytes)],
+        visible_size: u64,
+    ) -> VfsResult<Vec<DirtyWriteSnapshot>> {
+        let pending_upload_index = self.snapshot_pending_upload_index();
+        let mut blocks = std::collections::BTreeMap::<u32, BytesMut>::new();
+
+        for (offset, data) in writes {
+            if data.is_empty() {
+                continue;
+            }
+
+            let mut remaining = data.len();
+            let mut current_offset = *offset;
+            let mut data_offset = 0usize;
+            while remaining > 0 {
+                let block_index = block_index_from_offset(current_offset, self.block_size);
+                let offset_in_block = offset_within_block(current_offset, self.block_size) as usize;
+                let space_in_block = self.block_size as usize - offset_in_block;
+                let to_write = remaining.min(space_in_block);
+
+                if let std::collections::btree_map::Entry::Vacant(entry) = blocks.entry(block_index)
+                {
+                    let existing_data = match self
+                        .read_block_if_exists(ino, block_index, Some(&pending_upload_index))
+                        .await?
+                    {
+                        Some(data) => {
+                            let logical_len = self.logical_block_len(visible_size, block_index);
+                            if data.len() > logical_len {
+                                data.slice(0..logical_len)
+                            } else {
+                                data
+                            }
+                        }
+                        None => Bytes::new(),
+                    };
+                    entry.insert(BytesMut::from(existing_data.as_ref()));
+                }
+
+                let block = blocks
+                    .get_mut(&block_index)
+                    .expect("block buffer inserted before write");
+                let end_pos = offset_in_block + to_write;
+                if block.len() < end_pos {
+                    block.resize(end_pos, 0);
+                }
+                block[offset_in_block..end_pos]
+                    .copy_from_slice(&data[data_offset..data_offset + to_write]);
+
+                remaining -= to_write;
+                current_offset += to_write as u64;
+                data_offset += to_write;
+            }
+        }
+
+        Ok(blocks
+            .into_iter()
+            .filter_map(|(block_index, mut data)| {
+                let logical_len = self.logical_block_len(visible_size, block_index);
+                if data.len() > logical_len {
+                    data.truncate(logical_len);
+                }
+                if data.is_empty() {
+                    None
+                } else {
+                    Some(DirtyWriteSnapshot {
+                        block_index,
+                        data: data.freeze(),
+                    })
+                }
+            })
+            .collect())
+    }
+
+    pub(super) async fn materialize_buffered_writes_direct(
+        &self,
+        ino: Ino,
+        writes: &[(u64, Bytes)],
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+
+        let dirty_attr = { self.state.namespace.dirty_attrs.lock().get(&ino).cloned() };
+        let visible_size = if let Some(attr) = dirty_attr.as_ref() {
+            attr.size
+        } else {
+            self.getattr_async(ino).await?.size
+        };
+        let content_epoch = if let Some(attr) = dirty_attr.as_ref() {
+            attr.content_epoch
+        } else {
+            self.current_content_epoch_async(ino).await?
+        };
+
+        let blocks = self
+            .build_dirty_write_snapshots_from_buffered_writes(ino, writes, visible_size)
+            .await?;
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        let block_count = u32::try_from(blocks.len()).map_err(|_| {
+            VfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "requested direct materialization block count {} exceeds u32::MAX",
+                    blocks.len()
+                ),
+            ))
+        })?;
+        let drain = self.write_buffer_drain();
+        let object_ids = drain.allocate_block_ids(block_count).await?;
+        let persisted_blocks: Vec<PersistedWriteBlock> = blocks
+            .into_iter()
+            .zip(object_ids.into_iter())
+            .map(|(block, object_id)| PersistedWriteBlock {
+                block_index: block.block_index,
+                object_id,
+                data: block.data,
+            })
+            .collect();
+
+        let attr_to_clear = dirty_attr.clone();
+        let _outcome = drain
+            .execute_drain(
+                ino,
+                persisted_blocks,
+                std::collections::BTreeMap::new(),
+                content_epoch,
+                dirty_attr,
+                PayloadPersistConfig {
+                    put_concurrency: self.payload_put_concurrency,
+                    local_sync_policy,
+                },
+            )
+            .await?;
+        if let Some(attr) = attr_to_clear.as_ref() {
+            self.clear_matching_dirty_attr_if_committed(ino, attr);
+        }
+
+        Ok(())
+    }
+
     fn write_buffer_drain(&self) -> WriteBufferDrain<'_> {
         WriteBufferDrainCore {
             local_blocks: VfsLocalBlockWriter { vfs: self },

@@ -1494,24 +1494,12 @@ fn same_mount_read_prefers_newer_opportunistic_handle_writer_spans() {
         let fh1 = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
         let fh2 = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
 
-        vfs.write_fh_with_local_sync_policy(
-            fh1,
-            ino,
-            0,
-            b"hello",
-            LocalSyncPolicy::Opportunistic,
-        )
-        .await
-        .unwrap();
-        vfs.write_fh_with_local_sync_policy(
-            fh2,
-            ino,
-            1,
-            b"XYZ",
-            LocalSyncPolicy::Opportunistic,
-        )
-        .await
-        .unwrap();
+        vfs.write_fh_with_local_sync_policy(fh1, ino, 0, b"hello", LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        vfs.write_fh_with_local_sync_policy(fh2, ino, 1, b"XYZ", LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
 
         vfs.clear_pending_blocks_for_inode(ino);
 
@@ -2520,15 +2508,9 @@ fn flush_fh_materializes_opportunistic_handle_writer_state_into_overlay_slices()
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
         let payload = b"flush-materialize";
 
-        vfs.write_fh_with_local_sync_policy(
-            fh,
-            ino,
-            0,
-            payload,
-            LocalSyncPolicy::Opportunistic,
-        )
-        .await
-        .unwrap();
+        vfs.write_fh_with_local_sync_policy(fh, ino, 0, payload, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
         assert!(vfs.state.handle_writers.has_dirty_writers(ino));
 
         vfs.flush_fh(fh).await.unwrap();
@@ -2543,6 +2525,50 @@ fn flush_fh_materializes_opportunistic_handle_writer_state_into_overlay_slices()
         assert!(
             !vfs.state.handle_writers.has_dirty_writers(ino),
             "flush_fh should drain handle-writer dirty state"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn flush_fh_materializes_handle_writer_state_without_legacy_ordered_flush() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-flush-without-ordered-flush");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-245-flush-without-ordered-flush.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            0,
+            b"direct-materialize",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        let ordered_flushes_before = vfs
+            .state
+            .metrics
+            .flush_ordered_calls
+            .load(Ordering::Relaxed);
+
+        vfs.flush_fh(fh).await.unwrap();
+
+        let ordered_flushes_after = vfs
+            .state
+            .metrics
+            .flush_ordered_calls
+            .load(Ordering::Relaxed);
+        assert_eq!(
+            ordered_flushes_after, ordered_flushes_before,
+            "handle writer flush should materialize directly without routing through flush_ordered"
         );
 
         vfs.release_fh(fh).await.unwrap();

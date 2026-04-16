@@ -177,8 +177,9 @@ impl StudioVfs {
             .materialize_handle_writers_for_inode(ino, local_sync_policy)
             .await?;
         let flushed_file_data = self.has_pending_write_buffer_blocks_for_inode(ino);
-        let had_local_dirty_state = materialized_handle_writers || self.inode_has_local_dirty_state(ino);
-        if had_local_dirty_state {
+        let residual_local_dirty_state = self.inode_has_local_dirty_state(ino);
+        let had_local_dirty_state = materialized_handle_writers || residual_local_dirty_state;
+        if residual_local_dirty_state {
             self.flush_ordered(ino, local_sync_policy).await?;
         }
         if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
@@ -379,7 +380,9 @@ impl StudioVfs {
             if self.ignored_entry_attr(ino).is_some() {
                 return Ok(data.len() as u32);
             }
-            let written = self.record_handle_writer_state(fh, ino, offset, data).await?;
+            let written = self
+                .record_handle_writer_state(fh, ino, offset, data)
+                .await?;
             if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
                 self.materialize_handle_writers_for_inode(ino, local_sync_policy)
                     .await?;

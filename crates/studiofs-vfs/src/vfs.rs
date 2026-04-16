@@ -29,9 +29,9 @@ mod commit;
 mod config;
 mod deletion_cleanup;
 mod file_session;
-mod handle_writer;
 mod handle_drain_barrier;
 mod handle_table;
+mod handle_writer;
 mod ignored_entries;
 mod io_ops;
 mod locking;
@@ -90,8 +90,8 @@ use config::{
     UnlinkTarget, WRITE_EAGER_DRAIN_CHUNK_MAX_BYTES, write_path_sync_trigger,
 };
 use file_session::{FileSessionOperation, FileSessionState};
-use handle_writer::HandleWriterRegistry;
 use handle_table::HandleTable;
+use handle_writer::HandleWriterRegistry;
 use ignored_entries::IgnoredEntryRegistry;
 use locking::{DistributedFlock, FileLockState};
 use namespace::{DentryCacheValue, NamespaceState};
