@@ -1524,7 +1524,13 @@ mod tests {
         ProfilingWindowStatus, TimelineEntryKind, TimelineEntrySource,
         lock_investigation_test_mutex, set_test_store_base_dir,
     };
+    #[cfg(windows)]
+    use std::collections::HashSet;
     use std::io;
+    #[cfg(windows)]
+    use std::path::Path;
+    #[cfg(windows)]
+    use std::sync::OnceLock;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
@@ -1606,8 +1612,47 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn windows_test_mount_claims() -> &'static Mutex<HashSet<String>> {
+        static CLAIMS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        CLAIMS.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+
+    #[cfg(windows)]
+    fn windows_test_mount_point_is_available(mount_point: &str) -> bool {
+        let drive_root = format!("{mount_point}\\");
+        if Path::new(&drive_root).exists() {
+            return false;
+        }
+
+        !matches!(
+            utils::read_pid_file(mount_point),
+            Ok((pid, _, _)) if pid != std::process::id() && utils::is_process_running(pid)
+        )
+    }
+
+    #[cfg(windows)]
+    fn reserve_windows_test_mount_point(excluded: &[&str]) -> String {
+        let mut claims = windows_test_mount_claims()
+            .lock()
+            .expect("lock claimed test mount points");
+        for letter in (b'D'..=b'Z').rev() {
+            let mount_point = format!("{}:", char::from(letter));
+            if claims.contains(&mount_point)
+                || excluded.iter().any(|excluded| *excluded == mount_point)
+            {
+                continue;
+            }
+            if windows_test_mount_point_is_available(&mount_point) {
+                claims.insert(mount_point.clone());
+                return mount_point;
+            }
+        }
+        panic!("no free Windows drive letters available for mount-session tests");
+    }
+
+    #[cfg(windows)]
     fn startup_mount_point(_: &TempDir) -> String {
-        "Z:".to_string()
+        reserve_windows_test_mount_point(&[])
     }
 
     fn mount_command(
@@ -1698,7 +1743,7 @@ mod tests {
         #[cfg(not(windows))]
         let cli_mount_point = temp.path().join("cli-mnt").to_string_lossy().into_owned();
         #[cfg(windows)]
-        let cli_mount_point = "Y:".to_string();
+        let cli_mount_point = reserve_windows_test_mount_point(&[settings_mount_point.as_str()]);
 
         let startup = resolve_mount_startup(
             &mount_command(
@@ -2054,7 +2099,7 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let persisted_run_id = Arc::new(Mutex::new(None::<String>));
         #[cfg(windows)]
-        let mount_point = "Q:".to_string();
+        let mount_point = reserve_windows_test_mount_point(&[]);
         #[cfg(not(windows))]
         let mount_point = temp
             .path()
@@ -2347,7 +2392,7 @@ mod tests {
         drop(engine);
         let events = Arc::new(Mutex::new(Vec::new()));
         #[cfg(windows)]
-        let mount_point = "R:".to_string();
+        let mount_point = reserve_windows_test_mount_point(&[]);
         #[cfg(not(windows))]
         let mount_point = temp
             .path()

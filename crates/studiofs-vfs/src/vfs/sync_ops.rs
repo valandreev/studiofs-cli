@@ -345,6 +345,18 @@ impl StudioVfs {
 
     /// Write file data using the buffered write path.
     pub async fn write_fh(&self, fh: u64, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
+        self.write_fh_with_local_sync_policy(fh, ino, offset, data, LocalSyncPolicy::Strict)
+            .await
+    }
+
+    pub async fn write_fh_with_local_sync_policy(
+        &self,
+        fh: u64,
+        ino: Ino,
+        offset: u64,
+        data: &[u8],
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<u32> {
         let open_file = self.handle_table.get(fh);
         let _ = self.state.read.observe_write_access(
             open_file.as_ref(),
@@ -353,6 +365,7 @@ impl StudioVfs {
             data.len(),
             self.access_classifier,
         );
-        self.write(ino, offset, data).await
+        self.write_with_local_sync_policy(ino, offset, data, local_sync_policy)
+            .await
     }
 }

@@ -609,12 +609,6 @@ fn local_backend_budget_honors_runtime_dirty_window() {
     let runtime_tuning = CacheRuntimeTuning {
         max_dirty_bytes: 1024 * 1024,
         write_eager_flush_batch_bytes: 512 * 1024,
-        max_ingress_segment_bytes: 16 * 1024 * 1024,
-        ingress_checkpoint_interval_secs: 15,
-        ingress_checkpoint_min_append_bytes: 16 * 1024 * 1024,
-        ingress_checkpoint_min_mutations: 64,
-        ingress_checkpoint_max_segment_lag: 2,
-        ingress_checkpoint_max_live_segments: 4,
         upload_cache_io_slots: 16,
         transit_memory_budget_bytes: 1024 * 1024,
     };
@@ -630,12 +624,6 @@ fn local_backend_budget_never_drops_below_block_size() {
     let runtime_tuning = CacheRuntimeTuning {
         max_dirty_bytes: 128 * 1024,
         write_eager_flush_batch_bytes: 128 * 1024,
-        max_ingress_segment_bytes: 16 * 1024 * 1024,
-        ingress_checkpoint_interval_secs: 15,
-        ingress_checkpoint_min_append_bytes: 16 * 1024 * 1024,
-        ingress_checkpoint_min_mutations: 64,
-        ingress_checkpoint_max_segment_lag: 2,
-        ingress_checkpoint_max_live_segments: 4,
         upload_cache_io_slots: 16,
         transit_memory_budget_bytes: 1024 * 1024,
     };
@@ -666,10 +654,6 @@ fn cache_runtime_tuning_uses_internal_config_overrides_when_non_default() {
     assert_eq!(resolved.max_dirty_bytes, 1024 * 1024);
     assert_eq!(resolved.write_eager_flush_batch_bytes, 1024 * 1024);
     assert_eq!(resolved.upload_cache_io_slots, 7);
-    assert_eq!(
-        resolved.ingress_checkpoint_interval_secs,
-        derived.ingress_checkpoint_interval_secs
-    );
 }
 
 #[test]
@@ -2770,106 +2754,6 @@ fn committed_copy_rejects_short_payload() {
         message.contains("committed block payload too short"),
         "error message should highlight short committed payload"
     );
-}
-
-#[test]
-fn test_ingress_checkpoint_due_on_timer_with_pending_churn() {
-    let policy = IngressCheckpointPolicy {
-        min_append_bytes: 1024,
-        min_mutations: 8,
-        max_segment_lag: 2,
-        max_live_segments: 4,
-    };
-    assert!(ingress_checkpoint_due_with_policy(
-        IngressCheckpointState {
-            pending_bytes: 0,
-            pending_mutations: 1,
-            active_segment_lag: 0,
-            live_segment_count: 1,
-            timer_fired: true,
-        },
-        policy,
-    ));
-    assert!(!ingress_checkpoint_due_with_policy(
-        IngressCheckpointState {
-            pending_bytes: 0,
-            pending_mutations: 1,
-            active_segment_lag: 0,
-            live_segment_count: 1,
-            timer_fired: false,
-        },
-        policy,
-    ));
-}
-
-#[test]
-fn test_ingress_checkpoint_due_on_threshold_notify() {
-    let policy = IngressCheckpointPolicy {
-        min_append_bytes: 4096,
-        min_mutations: 8,
-        max_segment_lag: 2,
-        max_live_segments: 4,
-    };
-    assert!(ingress_checkpoint_due_with_policy(
-        IngressCheckpointState {
-            pending_bytes: 4096,
-            pending_mutations: 0,
-            active_segment_lag: 0,
-            live_segment_count: 1,
-            timer_fired: false,
-        },
-        policy,
-    ));
-    assert!(ingress_checkpoint_due_with_policy(
-        IngressCheckpointState {
-            pending_bytes: 0,
-            pending_mutations: 8,
-            active_segment_lag: 0,
-            live_segment_count: 1,
-            timer_fired: false,
-        },
-        policy,
-    ));
-    assert!(!ingress_checkpoint_due_with_policy(
-        IngressCheckpointState {
-            pending_bytes: 1024,
-            pending_mutations: 1,
-            active_segment_lag: 0,
-            live_segment_count: 1,
-            timer_fired: false,
-        },
-        policy,
-    ));
-}
-
-#[test]
-fn test_ingress_checkpoint_due_on_segment_lag_or_live_segment_spread() {
-    let policy = IngressCheckpointPolicy {
-        min_append_bytes: 4096,
-        min_mutations: 8,
-        max_segment_lag: 2,
-        max_live_segments: 4,
-    };
-    assert!(ingress_checkpoint_due_with_policy(
-        IngressCheckpointState {
-            pending_bytes: 1024,
-            pending_mutations: 1,
-            active_segment_lag: 2,
-            live_segment_count: 1,
-            timer_fired: false,
-        },
-        policy,
-    ));
-    assert!(ingress_checkpoint_due_with_policy(
-        IngressCheckpointState {
-            pending_bytes: 1024,
-            pending_mutations: 1,
-            active_segment_lag: 0,
-            live_segment_count: 4,
-            timer_fired: false,
-        },
-        policy,
-    ));
 }
 
 #[test]

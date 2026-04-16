@@ -113,35 +113,11 @@ fn sync_directory_impl(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn sync_directory_impl(path: &Path) -> io::Result<()> {
-    use std::fs::OpenOptions;
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    static LOGGED_UNSUPPORTED_DIRECTORY_SYNC: AtomicBool = AtomicBool::new(false);
-
-    // FILE_FLAG_BACKUP_SEMANTICS is required to open directory handles on
-    // Windows through OpenOptions/File APIs.
-    let dir = OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?;
-
-    match dir.sync_all() {
-        Ok(()) => Ok(()),
-        Err(error) if is_windows_sync_unsupported_error(&error) => {
-            if !LOGGED_UNSUPPORTED_DIRECTORY_SYNC.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    path = %path.display(),
-                    error = ?error,
-                    "cache-v3 directory sync is unsupported on this Windows filesystem (warning will be logged once)"
-                );
-            }
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+fn sync_directory_impl(_path: &Path) -> io::Result<()> {
+    // Directory-handle syncs are best-effort only. On Windows they commonly
+    // fail with AccessDenied/NotSupported depending on the filesystem, so we
+    // intentionally skip them and rely on file-level syncs plus atomic rename.
+    Ok(())
 }
 
 #[cfg(unix)]

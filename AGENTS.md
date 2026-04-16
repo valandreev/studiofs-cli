@@ -310,13 +310,12 @@ guarantee.
 
 ### Overview
 
-The monolithic `VfsState` struct (68 fields) was decomposed into 11 cohesive subsystems to improve maintainability, reduce lock contention, and clarify ownership boundaries.
+The monolithic `VfsState` struct (68 fields) was decomposed into 10 cohesive subsystems to improve maintainability, reduce lock contention, and clarify ownership boundaries.
 
 ### Subsystems
 
 ```
-VfsState (composed of 11 subsystems)
-├── ingress: IngressState             # Legacy ingress checkpoint/artifact state + observability
+VfsState (composed of 10 subsystems)
 ├── upload: UploadState               # Upload queue, cancellation, pending evictions
 ├── file_session: FileSessionState    # Per-inode operation ordering and handle tracking
 ├── namespace: NamespaceState         # Dentry cache, path shortcuts, attr cache
@@ -340,7 +339,7 @@ To prevent deadlocks, a strict lock ordering is enforced (Tier 0 = highest prior
 1. **Tier 1**: `ShutdownState` — shutdown flags are checked before any other operation
 2. **Tier 2**: `WriteBufferState` — pending write blocks
 3. **Tier 3**: reserved `DirtyBufferState` slot — no active subsystem
-4. **Tier 4**: `IngressState` — ingress checkpoint / artifact state
+4. **Tier 4**: reserved legacy `IngressState` slot — no active subsystem
 5. **Tier 5**: `NamespaceState` — dentry/attr caches
 6. **Tier 6**: `IncarnationState` — inode incarnation tracking
 7. **Tier 7**: `UploadState` — upload queue and cancellations

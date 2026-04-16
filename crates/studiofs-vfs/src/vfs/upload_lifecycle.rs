@@ -210,10 +210,6 @@ impl StudioVfs {
         crate::upload::upload_log_is_idle(pending_uploads, self.upload_scheduler.in_flight())
             && ingress.dirty_mem_blocks == 0
             && ingress.dirty_mem_bytes == 0
-            && ingress.spill_records == 0
-            && ingress.spill_bytes == 0
-            && ingress.checkpoint_pending_bytes == 0
-            && ingress.checkpoint_pending_mutations == 0
     }
 
     pub(super) fn upload_pipeline_summary_is_active(
@@ -288,15 +284,7 @@ impl StudioVfs {
             .shutdown
             .slab_flusher_stopped
             .store(true, Ordering::Release);
-        self.state
-            .ingress
-            .ingress_checkpoint_stopped
-            .store(true, Ordering::Release);
         self.state.shutdown.shutdown_notify.notify_waiters();
-        self.state
-            .ingress
-            .ingress_checkpoint_notify
-            .notify_waiters();
         self.join_background_tasks(background_join_timeout).await;
 
         // Reset the active-access-class telemetry counters for any handles that
@@ -321,12 +309,6 @@ impl StudioVfs {
             elapsed_ms = t0.elapsed().as_millis() as u64,
             "VFS shutdown: write buffer drain complete"
         );
-
-        if let Err(e) =
-            crate::ingress_wal::reset_ingress_artifacts_for_fast_mode(self.ingress_wal.spill_dir())
-        {
-            warn!("VFS shutdown: failed to remove ingress artifacts: {}", e);
-        }
 
         // Phase 2: attempt graceful upload drain (bounded by user timeout),
         // then cancel uploader work so network-blocked requests are aborted.

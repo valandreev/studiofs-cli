@@ -15,8 +15,9 @@ use studiofs_vfs::vfs::{ExplicitFlushOutcome, ReleaseFhOutcome};
 use studiofs_vfs::{
     BarrierObservabilityPort, BridgeVfsErrorKind, DeferredCleanupHintPort, DeleteCleanupPort,
     FlushGatePort, HandleDrainBarrier, HandleDrainDeleteRequest, HandleDrainRequest,
-    HandleReleasePort, KernelInvalidator, LocalSyncBarrierPort, NamespacePathStyle, OpenFlags,
-    StudioVfs, classify_vfs_error, is_hidden_non_macos_root_metadata_name, normalize_attr_times,
+    HandleReleasePort, KernelInvalidator, LocalSyncBarrierPort, LocalSyncPolicy,
+    NamespacePathStyle, OpenFlags, StudioVfs, classify_vfs_error,
+    is_hidden_non_macos_root_metadata_name, normalize_attr_times,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, error, trace, warn};
@@ -40,6 +41,8 @@ const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0020;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x0080;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 const FILE_DIRECTORY_FILE_OPTION: u32 = 0x0000_0001;
+const FILE_WRITE_THROUGH_OPTION: u32 = 0x0000_0002;
+const FILE_NO_INTERMEDIATE_BUFFERING_OPTION: u32 = 0x0000_0008;
 const FILE_READ_DATA_ACCESS: FILE_ACCESS_RIGHTS = 0x0001;
 const FILE_WRITE_DATA_ACCESS: FILE_ACCESS_RIGHTS = 0x0002;
 const FILE_APPEND_DATA_ACCESS: FILE_ACCESS_RIGHTS = 0x0004;
@@ -79,18 +82,38 @@ pub struct StudioFileHandle {
     fh: u64,
     /// Open flags derived from WinFSP `CreateOptions`.
     open_flags: OpenFlags,
+    /// Buffered handles defer the strict local barrier to explicit flush/close.
+    write_local_sync_policy: LocalSyncPolicy,
     /// WinFSP directory buffer for efficient directory enumeration.
     dir_buffer: DirBuffer,
 }
 
 impl StudioFileHandle {
+    #[cfg(test)]
     fn new(ino: Ino, is_dir: bool, fh: u64, open_flags: OpenFlags) -> Self {
+        Self::new_with_local_sync_policy(
+            ino,
+            is_dir,
+            fh,
+            open_flags,
+            LocalSyncPolicy::Opportunistic,
+        )
+    }
+
+    fn new_with_local_sync_policy(
+        ino: Ino,
+        is_dir: bool,
+        fh: u64,
+        open_flags: OpenFlags,
+        write_local_sync_policy: LocalSyncPolicy,
+    ) -> Self {
         ensure_winfsp_runtime_loaded_or_panic();
         Self {
             ino,
             is_dir,
             fh,
             open_flags,
+            write_local_sync_policy,
             dir_buffer: DirBuffer::new(),
         }
     }
@@ -149,12 +172,13 @@ impl SendConstBuffer {
 
 /// Map WinFSP granted access to StudioFS open flags.
 ///
-/// As part of SFS-122, StudioFS removed the Windows direct-I/O product surface.
-/// `FILE_NO_INTERMEDIATE_BUFFERING` and `FILE_WRITE_THROUGH` therefore no longer
-/// select an alternate VFS path and are intentionally ignored here so all
-/// Windows handles use the buffered runtime model. What still matters is the
+/// As part of SFS-122, StudioFS removed the Windows direct-I/O product surface,
+/// so `FILE_NO_INTERMEDIATE_BUFFERING` and `FILE_WRITE_THROUGH` no longer
+/// select an alternate read/write data plane. What still matters here is the
 /// actual access mask: treating every Windows handle as RDWR confuses the VFS
-/// classifier, sticky-error reporting, and last-handle release policy.
+/// classifier, sticky-error reporting, and last-handle release policy. The
+/// stricter write barrier policy for write-through / unbuffered handles is
+/// derived separately from `CreateOptions`.
 fn open_flags_from_access(granted_access: FILE_ACCESS_RIGHTS, _create_options: u32) -> OpenFlags {
     let wants_read = (granted_access & (FILE_READ_DATA_ACCESS | FILE_GENERIC_READ_ACCESS)) != 0;
     let wants_write = (granted_access
@@ -165,6 +189,14 @@ fn open_flags_from_access(granted_access: FILE_ACCESS_RIGHTS, _create_options: u
         (true, false) => OpenFlags::RDONLY,
         (false, true) => OpenFlags::WRONLY,
         (false, false) => OpenFlags::RDONLY,
+    }
+}
+
+fn write_local_sync_policy_from_create_options(create_options: u32) -> LocalSyncPolicy {
+    if (create_options & (FILE_WRITE_THROUGH_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_OPTION)) != 0 {
+        LocalSyncPolicy::Strict
+    } else {
+        LocalSyncPolicy::Opportunistic
     }
 }
 
@@ -185,6 +217,7 @@ struct CreateCallbackPlan {
     parent_ino: Ino,
     name: Vec<u8>,
     open_flags: OpenFlags,
+    write_local_sync_policy: LocalSyncPolicy,
     kind: CreateCallbackKind,
 }
 
@@ -1269,6 +1302,7 @@ impl StudioFsContext {
         &self,
         attr: &InodeAttr,
         open_flags: OpenFlags,
+        write_local_sync_policy: LocalSyncPolicy,
     ) -> winfsp::Result<StudioFileHandle> {
         let is_dir = attr.kind == FileType::Directory;
         let fh = if is_dir {
@@ -1278,7 +1312,13 @@ impl StudioFsContext {
                 .open_file(attr.ino, open_flags, false)
                 .map_err(vfs_to_winfsp_err)?
         };
-        Ok(StudioFileHandle::new(attr.ino, is_dir, fh, open_flags))
+        Ok(StudioFileHandle::new_with_local_sync_policy(
+            attr.ino,
+            is_dir,
+            fh,
+            open_flags,
+            write_local_sync_policy,
+        ))
     }
 
     fn write_open_file_info(out: &mut OpenFileInfo, attr: &InodeAttr) {
@@ -1302,6 +1342,7 @@ impl StudioFsContext {
             parent_ino,
             name,
             open_flags: open_flags_from_access(granted_access, create_options),
+            write_local_sync_policy: write_local_sync_policy_from_create_options(create_options),
             kind: resolve_create_callback_kind(
                 create_options,
                 extra_buffer,
@@ -1332,9 +1373,15 @@ impl StudioFsContext {
         };
         Self::write_open_file_info(file_info, &attr);
         if opens_symlink {
-            Ok(StudioFileHandle::new(attr.ino, false, 0, plan.open_flags))
+            Ok(StudioFileHandle::new_with_local_sync_policy(
+                attr.ino,
+                false,
+                0,
+                plan.open_flags,
+                plan.write_local_sync_policy,
+            ))
         } else {
-            self.open_file_handle_for_attr(&attr, plan.open_flags)
+            self.open_file_handle_for_attr(&attr, plan.open_flags, plan.write_local_sync_policy)
         }
     }
 
@@ -1473,8 +1520,9 @@ impl FileSystemContext for StudioFsContext {
         }
         let attr = resolve_path(&self.vfs, file_name)?;
         let open_flags = open_flags_from_access(granted_access, create_options);
+        let write_local_sync_policy = write_local_sync_policy_from_create_options(create_options);
         Self::write_open_file_info(file_info, &attr);
-        let handle = self.open_file_handle_for_attr(&attr, open_flags)?;
+        let handle = self.open_file_handle_for_attr(&attr, open_flags, write_local_sync_policy)?;
         let display_path = file_name.to_string_lossy();
         // #region debug log
         if debug_agent_path_matches(&display_path) {
@@ -1671,6 +1719,7 @@ impl FileSystemContext for StudioFsContext {
 
         let ino = context.ino;
         let fh = context.fh;
+        let local_sync_policy = context.write_local_sync_policy;
         let in_buf = SendConstBuffer::from_slice(buffer);
         let vfs = self.vfs.clone();
         let written = self
@@ -1682,7 +1731,8 @@ impl FileSystemContext for StudioFsContext {
                 //   is not accessed after this callback returns.
                 // - `u8` alignment is always valid (alignment = 1).
                 let data = unsafe { in_buf.as_slice() };
-                vfs.write_fh(fh, ino, actual_offset, data).await
+                vfs.write_fh_with_local_sync_policy(fh, ino, actual_offset, data, local_sync_policy)
+                    .await
             })
             .map_err(vfs_to_winfsp_err)?;
 
@@ -2191,16 +2241,17 @@ mod tests {
     use super::{
         CreateCallbackKind, FILE_ACTION_MODIFIED, FILE_APPEND_DATA_ACCESS,
         FILE_DIRECTORY_FILE_OPTION, FILE_GENERIC_READ_ACCESS, FILE_GENERIC_WRITE_ACCESS,
-        FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
-        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_READ_DATA_ACCESS,
-        FILE_WRITE_DATA_ACCESS, FileSizeCallbackAction, STATUS_ACCESS_DENIED, STATUS_DATA_ERROR,
+        FILE_NO_INTERMEDIATE_BUFFERING_OPTION, FILE_NOTIFY_CHANGE_ATTRIBUTES,
+        FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
+        FILE_NOTIFY_CHANGE_SIZE, FILE_READ_DATA_ACCESS, FILE_WRITE_DATA_ACCESS,
+        FILE_WRITE_THROUGH_OPTION, FileSizeCallbackAction, STATUS_ACCESS_DENIED, STATUS_DATA_ERROR,
         STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER, STATUS_IO_TIMEOUT,
         STATUS_OBJECT_NAME_NOT_FOUND, StudioFileHandle, StudioFsContext, WinfspKernelInvalidator,
         attr_to_file_info, build_basic_info_setattr_args, build_notify_info,
         encode_symlink_reparse, hidden_non_macos_root_path_component, ino_to_windows_path,
         maybe_hide_non_macos_root_entry, notify_filter_for_kind, open_flags_from_access,
         resolve_create_callback_kind, resolve_file_size_callback_action, unix_nanos_to_filetime,
-        vfs_to_winfsp_err,
+        vfs_to_winfsp_err, write_local_sync_policy_from_create_options,
     };
     use parking_lot::Mutex;
     use std::sync::Arc;
@@ -2212,7 +2263,7 @@ mod tests {
         MetadataConfig, ROOT_INO, RedbMetaEngine, SetattrArgs, TimeSpec,
     };
     use studiofs_vfs::VfsError;
-    use studiofs_vfs::{KernelInvalidator, OpenFlags, StudioVfs, VfsConfig};
+    use studiofs_vfs::{KernelInvalidator, LocalSyncPolicy, OpenFlags, StudioVfs, VfsConfig};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
     use winfsp::U16CString;
@@ -2992,6 +3043,175 @@ mod tests {
             after_second_barriers.flush_skipped_clean,
             after_first_barriers.flush_skipped_clean + 1,
             "second flush callback should also be attributed as a clean skip"
+        );
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh).await }
+        })
+        .expect("release_fh");
+    }
+
+    #[test]
+    fn buffered_write_callback_leaves_inode_dirty_until_explicit_flush() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("write_callback_buffered_until_flush");
+        let attr = vfs
+            .create(ROOT_INO, b"buffered-write-callback.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+        let handle = StudioFileHandle::new(attr.ino, false, fh, OpenFlags::RDWR);
+        let mut file_info = winfsp::filesystem::FileInfo::default();
+
+        <StudioFsContext as FileSystemContext>::write(
+            &ctx,
+            &handle,
+            b"dirty",
+            0,
+            false,
+            false,
+            &mut file_info,
+        )
+        .expect("write callback");
+
+        assert!(
+            vfs.inode_has_local_dirty_state(attr.ino),
+            "ordinary buffered WinFSP writes should leave local dirty state for explicit flush/close"
+        );
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh).await }
+        })
+        .expect("release_fh");
+    }
+
+    #[test]
+    fn explicit_flush_callback_drains_buffered_write_callback_state() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("write_callback_explicit_flush");
+        let attr = vfs
+            .create(ROOT_INO, b"buffered-write-flush.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+        let handle = StudioFileHandle::new(attr.ino, false, fh, OpenFlags::RDWR);
+        let mut file_info = winfsp::filesystem::FileInfo::default();
+        let callbacks_before = winfsp_callbacks(&vfs);
+        let barriers_before = winfsp_foreground_flushes(&vfs);
+        let flush_calls_before = flush_ordered_calls(&vfs);
+
+        <StudioFsContext as FileSystemContext>::write(
+            &ctx,
+            &handle,
+            b"dirty",
+            0,
+            false,
+            false,
+            &mut file_info,
+        )
+        .expect("write callback");
+        assert!(
+            vfs.inode_has_local_dirty_state(attr.ino),
+            "ordinary buffered WinFSP writes should leave local dirty state before explicit flush"
+        );
+
+        ctx.run_flush_callback(attr.ino, fh)
+            .expect("explicit flush callback");
+
+        let callbacks_after = winfsp_callbacks(&vfs);
+        let barriers_after = winfsp_foreground_flushes(&vfs);
+        let flush_calls_after = flush_ordered_calls(&vfs);
+        assert_eq!(
+            callbacks_after.flush,
+            callbacks_before.flush + 1,
+            "explicit flush callback should still be observable"
+        );
+        assert_eq!(
+            barriers_after.flush,
+            barriers_before.flush + 1,
+            "explicit flush callback should own the strict local-durability barrier after buffered writes"
+        );
+        assert_eq!(
+            barriers_after.flush_skipped_clean, barriers_before.flush_skipped_clean,
+            "dirty explicit flush should not be classified as a clean skip"
+        );
+        assert!(
+            flush_calls_after > flush_calls_before,
+            "explicit flush should trigger the ordered flush path for buffered WinFSP writes"
+        );
+        assert!(
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "explicit flush should drain the buffered local dirty state"
+        );
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh).await }
+        })
+        .expect("release_fh");
+    }
+
+    #[test]
+    fn write_create_options_select_expected_local_sync_policy() {
+        assert_eq!(
+            write_local_sync_policy_from_create_options(0),
+            LocalSyncPolicy::Opportunistic
+        );
+        assert_eq!(
+            write_local_sync_policy_from_create_options(FILE_WRITE_THROUGH_OPTION),
+            LocalSyncPolicy::Strict
+        );
+        assert_eq!(
+            write_local_sync_policy_from_create_options(FILE_NO_INTERMEDIATE_BUFFERING_OPTION),
+            LocalSyncPolicy::Strict
+        );
+        assert_eq!(
+            write_local_sync_policy_from_create_options(
+                FILE_WRITE_THROUGH_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_OPTION
+            ),
+            LocalSyncPolicy::Strict
+        );
+    }
+
+    #[test]
+    fn write_through_write_callback_commits_local_state_immediately() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("write_callback_write_through");
+        let attr = vfs
+            .create(ROOT_INO, b"write-through-callback.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+        let handle = StudioFileHandle::new_with_local_sync_policy(
+            attr.ino,
+            false,
+            fh,
+            OpenFlags::RDWR,
+            LocalSyncPolicy::Strict,
+        );
+        let mut file_info = winfsp::filesystem::FileInfo::default();
+        let flush_calls_before = flush_ordered_calls(&vfs);
+
+        <StudioFsContext as FileSystemContext>::write(
+            &ctx,
+            &handle,
+            b"durable",
+            0,
+            false,
+            false,
+            &mut file_info,
+        )
+        .expect("write callback");
+
+        assert!(
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "write-through / unbuffered WinFSP writes should still cross the strict local durable boundary in write()"
+        );
+        assert!(
+            flush_ordered_calls(&vfs) > flush_calls_before,
+            "strict WinFSP write policy should drive the ordered local flush path"
         );
 
         ctx.spawn_wait({

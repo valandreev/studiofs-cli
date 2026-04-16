@@ -8,7 +8,7 @@
 //! 1.  `ShutdownState` — shutdown flags
 //! 2.  `WriteBufferState` — pending write blocks
 //! 3.  reserved legacy `DirtyBufferState` slot — kept for ordering compatibility
-//! 4.  `IngressState` — legacy ingress checkpoint / artifact state
+//! 4.  reserved legacy `IngressState` slot — no active subsystem
 //! 5.  `NamespaceState` — dentry/attr caches
 //! 6.  `IncarnationState` — inode incarnation tracking
 //! 7.  `UploadState` — upload queue and cancellations
@@ -40,7 +40,7 @@ pub enum LockTier {
     WriteBuffer = 2,
     /// Tier 3: reserved legacy DirtyBufferState slot
     DirtyBuffer = 3,
-    /// Tier 4: IngressState (legacy ingress artifact state)
+    /// Tier 4: reserved legacy IngressState slot
     Ingress = 4,
     /// Tier 5: NamespaceState
     Namespace = 5,

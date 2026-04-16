@@ -1,5 +1,5 @@
 use super::{
-    AccessLevel, BlockRef, Bytes, ExplicitFlushOutcome, FileSessionOperation, Ino,
+    AccessLevel, BlockRef, Bytes, ExplicitFlushOutcome, FileSessionOperation, Ino, LocalSyncPolicy,
     StickyErrorPolicy, StudioVfs, VfsError, VfsMeta, VfsResult, block_index_from_offset, debug,
     error, format_object_fragment_keys, offset_within_block, run_meta, warn,
 };
@@ -258,12 +258,25 @@ impl StudioVfs {
     /// durable: payload blocks and overlay/attr metadata are persisted locally
     /// before `write()` returns.
     pub async fn write(&self, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
+        self.write_with_local_sync_policy(ino, offset, data, LocalSyncPolicy::Strict)
+            .await
+    }
+
+    pub async fn write_with_local_sync_policy(
+        &self,
+        ino: Ino,
+        offset: u64,
+        data: &[u8],
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<u32> {
         let session = self
             .state
             .file_session
             .enter_op(ino, FileSessionOperation::Write)
             .await;
-        let result = self.write_ordered(ino, offset, data).await;
+        let result = self
+            .write_ordered_with_local_sync_policy(ino, offset, data, local_sync_policy)
+            .await;
         drop(session);
         self.state.file_session.gc_if_idle(ino);
         result

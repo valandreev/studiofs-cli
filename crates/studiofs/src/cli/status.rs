@@ -4,9 +4,7 @@ use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
 use crate::cli::cache_layout::describe_cache_layout_state;
 use crate::cli::utils::format_bytes;
 use clap::Args;
-use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 use studiofs_cache::v3::{
     CacheBackendDetection, CacheBackendKind, CacheIndex, detect_cache_backends,
 };
@@ -16,28 +14,23 @@ use studiofs_vfs::VfsWritePathObservabilitySnapshot;
 #[cfg(test)]
 use uuid::Uuid;
 
-const INGRESS_SEGMENT_MAGIC: [u8; 4] = *b"ISG1";
-
-const INGRESS_RECORD_PUT: u8 = 1;
-const INGRESS_RECORD_INVALIDATE: u8 = 2;
-const INGRESS_RECORD_HEADER_LEN: usize = 37;
 const WRITE_PATH_STALE_WARN_MS: u64 = 5_000;
 
-#[derive(Debug, Default)]
-struct SpillDirStats {
-    records: usize,
-    bytes: u64,
-    oldest_age_secs: u64,
-    checkpoint_age_secs: u64,
-    checkpoint_segment_id: u64,
-    checkpoint_offset: u64,
+#[derive(Debug, Default, Clone, Copy)]
+struct LegacyIngressArtifactStats {
+    segment_count: usize,
+    checkpoint_count: usize,
+    state_present: bool,
+    spill_file_count: usize,
 }
 
-#[derive(Debug, Clone)]
-struct SegmentRecordStat {
-    seq: u64,
-    len: u64,
-    created_unix_ms: u64,
+impl LegacyIngressArtifactStats {
+    fn has_any(self) -> bool {
+        self.segment_count > 0
+            || self.checkpoint_count > 0
+            || self.state_present
+            || self.spill_file_count > 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -189,124 +182,28 @@ fn scan_cache_usage(
     }
 }
 
-fn scan_spill_dir(spill_dir: &Path) -> anyhow::Result<SpillDirStats> {
-    let mut stats = SpillDirStats::default();
-    let now = std::time::SystemTime::now();
-    let mut live = std::collections::HashMap::<(u64, u32), SegmentRecordStat>::new();
-
-    let segment_dir = spill_dir.join("segments");
-    let segment_entries = match std::fs::read_dir(&segment_dir) {
-        Ok(entries) => Some(entries),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e.into()),
-    };
-    if let Some(entries) = segment_entries {
-        let mut files: Vec<(u64, PathBuf)> = entries
+fn scan_legacy_ingress_artifacts(spill_dir: &Path) -> anyhow::Result<LegacyIngressArtifactStats> {
+    let count_files_with_extension = |dir: &Path, extension: &str| -> anyhow::Result<usize> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(entries
             .filter_map(Result::ok)
-            .filter_map(|entry| {
+            .filter(|entry| {
                 let path = entry.path();
-                if !path.is_file() || path.extension().is_none_or(|ext| ext != "seg") {
-                    return None;
-                }
-                let stem = path.file_stem()?.to_str()?;
-                let id = u64::from_str_radix(stem, 16).ok()?;
-                Some((id, path))
+                path.is_file() && path.extension().is_some_and(|ext| ext == extension)
             })
-            .collect();
-        files.sort_unstable_by_key(|(id, _)| *id);
+            .count())
+    };
 
-        for (_id, path) in files {
-            let mut file = std::fs::File::open(path)?;
-            loop {
-                let mut header = [0u8; INGRESS_RECORD_HEADER_LEN];
-                match std::io::Read::read_exact(&mut file, &mut header) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                    Err(e) => return Err(e.into()),
-                }
-                if header[0..4] != INGRESS_SEGMENT_MAGIC {
-                    anyhow::bail!("invalid ingress segment magic in status scan");
-                }
-                let kind = header[4];
-                let ino = u64::from_le_bytes(header[5..13].try_into().unwrap());
-                let block_index = u32::from_le_bytes(header[13..17].try_into().unwrap());
-                let seq = u64::from_le_bytes(header[17..25].try_into().unwrap());
-                let created_unix_ms = u64::from_le_bytes(header[25..33].try_into().unwrap());
-                let payload_len_u32 = u32::from_le_bytes(header[33..37].try_into().unwrap());
-                let payload_len = usize::try_from(payload_len_u32)
-                    .map_err(|_| anyhow::anyhow!("ingress record payload length exceeds usize"))?;
-                if payload_len > 0 {
-                    let offset = i64::from(payload_len_u32);
-                    std::io::Seek::seek(&mut file, std::io::SeekFrom::Current(offset))?;
-                }
-                let key = (ino, block_index);
-                match kind {
-                    INGRESS_RECORD_PUT => {
-                        let should_replace = live
-                            .get(&key)
-                            .map(|current| seq >= current.seq)
-                            .unwrap_or(true);
-                        if should_replace {
-                            live.insert(
-                                key,
-                                SegmentRecordStat {
-                                    seq,
-                                    len: u64::try_from(payload_len).map_err(|_| {
-                                        anyhow::anyhow!("ingress record payload length too large")
-                                    })?,
-                                    created_unix_ms,
-                                },
-                            );
-                        }
-                    }
-                    INGRESS_RECORD_INVALIDATE => {
-                        let should_replace = live
-                            .get(&key)
-                            .map(|current| seq >= current.seq)
-                            .unwrap_or(true);
-                        if should_replace {
-                            live.remove(&key);
-                        }
-                    }
-                    _ => anyhow::bail!("unknown ingress segment record kind in status scan"),
-                }
-            }
-        }
-    }
-
-    for record in live.values() {
-        stats.records = stats.records.saturating_add(1);
-        stats.bytes = stats.bytes.saturating_add(record.len);
-        let modified = UNIX_EPOCH + std::time::Duration::from_millis(record.created_unix_ms);
-        let age_secs = now
-            .duration_since(modified)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        stats.oldest_age_secs = stats.oldest_age_secs.max(age_secs);
-    }
-
-    let checkpoint_path = spill_dir.join("checkpoints").join("latest.json");
-    if let Ok(bytes) = std::fs::read(&checkpoint_path) {
-        let checkpoint: Value = serde_json::from_slice(&bytes)?;
-        stats.checkpoint_segment_id = checkpoint
-            .get("covered_segment_id")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        stats.checkpoint_offset = checkpoint
-            .get("covered_offset")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        if let Ok(meta) = std::fs::metadata(&checkpoint_path)
-            && let Ok(modified) = meta.modified()
-        {
-            stats.checkpoint_age_secs = now
-                .duration_since(modified)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-        }
-    }
-
-    Ok(stats)
+    Ok(LegacyIngressArtifactStats {
+        segment_count: count_files_with_extension(&spill_dir.join("segments"), "seg")?,
+        checkpoint_count: usize::from(spill_dir.join("checkpoints").join("latest.json").exists()),
+        state_present: spill_dir.join("state.json").exists(),
+        spill_file_count: count_files_with_extension(spill_dir, "spill")?,
+    })
 }
 
 fn scan_pending_uploads(
@@ -351,7 +248,7 @@ pub fn run(
 
     let cache_path = local_cache_path(meta_dir, cache_dir, &format_info.uuid);
     let cache_backend_detection = detect_backends(&cache_path);
-    let spill_stats = scan_spill_dir(&cache_path.join("ingress_spill"))?;
+    let legacy_ingress = scan_legacy_ingress_artifacts(&cache_path.join("ingress_spill"))?;
     let pending_uploads = scan_pending_uploads(
         &cache_path,
         &format_info.uuid,
@@ -424,7 +321,7 @@ pub fn run(
         "inspect the cache root manually"
     };
     let reconcile_needed = pending_uploads > 0
-        || spill_stats.records > 0
+        || legacy_ingress.has_any()
         || cache_usage
             .and_then(|stats| stats.map(|stats| stats.dirty_bytes > 0))
             .unwrap_or(false);
@@ -481,17 +378,20 @@ pub fn run(
         println!("  Evictable bytes:     unknown");
     }
 
-    println!("\nLocal Ingress");
-    println!("─────────────");
-    println!("  Spill records:      {}", spill_stats.records);
-    println!("  Spill bytes:        {}", format_bytes(spill_stats.bytes));
-    println!("  Oldest spill age:   {}s", spill_stats.oldest_age_secs);
-    println!("  Checkpoint age:     {}s", spill_stats.checkpoint_age_secs);
-    println!(
-        "  Checkpoint cursor:  {:016x}@{}",
-        spill_stats.checkpoint_segment_id, spill_stats.checkpoint_offset
-    );
     println!("  Pending uploads:    {}", pending_uploads);
+    if legacy_ingress.has_any() {
+        println!(
+            "  Legacy ingress:     present (segments={}, checkpoints={}, state={}, spill_files={})",
+            legacy_ingress.segment_count,
+            legacy_ingress.checkpoint_count,
+            if legacy_ingress.state_present {
+                "yes"
+            } else {
+                "no"
+            },
+            legacy_ingress.spill_file_count
+        );
+    }
 
     if verbosity.is_verbose() {
         println!("\nMounted Write Path");
@@ -693,58 +593,6 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn scan_spill_dir_counts_records_bytes_and_oldest_age() {
-        let tmp = tempfile::tempdir().unwrap();
-        let spill_dir = tmp.path().join("ingress_spill");
-        let segment_dir = spill_dir.join("segments");
-        std::fs::create_dir_all(&segment_dir).unwrap();
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(segment_dir.join("0000000000000001.seg"))
-            .unwrap();
-        file.write_all(&INGRESS_SEGMENT_MAGIC).unwrap();
-        file.write_all(&[INGRESS_RECORD_PUT]).unwrap();
-        file.write_all(&42u64.to_le_bytes()).unwrap();
-        file.write_all(&7u32.to_le_bytes()).unwrap();
-        file.write_all(&1u64.to_le_bytes()).unwrap();
-        file.write_all(&100u64.to_le_bytes()).unwrap();
-        file.write_all(&(3u32).to_le_bytes()).unwrap();
-        file.write_all(b"abc").unwrap();
-        file.write_all(&INGRESS_SEGMENT_MAGIC).unwrap();
-        file.write_all(&[INGRESS_RECORD_PUT]).unwrap();
-        file.write_all(&42u64.to_le_bytes()).unwrap();
-        file.write_all(&8u32.to_le_bytes()).unwrap();
-        file.write_all(&2u64.to_le_bytes()).unwrap();
-        file.write_all(&200u64.to_le_bytes()).unwrap();
-        file.write_all(&(5u32).to_le_bytes()).unwrap();
-        file.write_all(b"hello").unwrap();
-        std::fs::write(spill_dir.join("ignore.tmp"), b"x").unwrap();
-
-        let stats = scan_spill_dir(&spill_dir).unwrap();
-        assert_eq!(stats.records, 2);
-        assert_eq!(stats.bytes, 8);
-        assert_eq!(stats.checkpoint_segment_id, 0);
-    }
-
-    #[test]
-    fn scan_spill_dir_reads_checkpoint_cursor() {
-        let tmp = tempfile::tempdir().unwrap();
-        let spill_dir = tmp.path().join("ingress_spill");
-        let checkpoint_dir = spill_dir.join("checkpoints");
-        std::fs::create_dir_all(&checkpoint_dir).unwrap();
-        std::fs::write(
-            checkpoint_dir.join("latest.json"),
-            br#"{"version":1,"covered_segment_id":3,"covered_offset":4096,"next_seq":7,"entries":[]}"#,
-        )
-        .unwrap();
-
-        let stats = scan_spill_dir(&spill_dir).unwrap();
-        assert_eq!(stats.checkpoint_segment_id, 3);
-        assert_eq!(stats.checkpoint_offset, 4096);
-    }
-
-    #[test]
     fn scan_pending_uploads_supports_cache_v3_selection() {
         let tmp = tempfile::tempdir().unwrap();
         let layout = studiofs_cache::v3::CacheV3Layout::from_cache_root(tmp.path());
@@ -758,6 +606,32 @@ mod tests {
             scan_pending_uploads(tmp.path(), &volume_uuid.to_string(), Some(&detection)).unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn scan_legacy_ingress_artifacts_detects_reconcile_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spill_dir = tmp.path().join("ingress_spill");
+        std::fs::create_dir_all(spill_dir.join("segments")).unwrap();
+        std::fs::create_dir_all(spill_dir.join("checkpoints")).unwrap();
+        let mut segment =
+            std::fs::File::create(spill_dir.join("segments").join("0000000000000001.seg")).unwrap();
+        segment.write_all(b"legacy").unwrap();
+        std::fs::write(
+            spill_dir.join("checkpoints").join("latest.json"),
+            br#"{"version":1}"#,
+        )
+        .unwrap();
+        std::fs::write(spill_dir.join("state.json"), br#"{"version":1}"#).unwrap();
+        std::fs::write(spill_dir.join("legacy.spill"), b"legacy").unwrap();
+
+        let stats = scan_legacy_ingress_artifacts(&spill_dir).unwrap();
+
+        assert!(stats.has_any());
+        assert_eq!(stats.segment_count, 1);
+        assert_eq!(stats.checkpoint_count, 1);
+        assert!(stats.state_present);
+        assert_eq!(stats.spill_file_count, 1);
     }
 
     #[test]

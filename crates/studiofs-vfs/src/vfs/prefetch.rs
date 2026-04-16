@@ -5,6 +5,7 @@ use super::{
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tracing::info;
 
 #[derive(Debug, Clone)]
 pub(super) enum PrefetchWorkItem {
@@ -175,6 +176,20 @@ impl<'a> PrefetchHintPlanner<'a> {
             self.last_block,
             self.policy.readahead_policy(),
         );
+        if let Some(path) = self.vfs.debug_pending_target_path(self.ino) {
+            info!(
+                ino = self.ino,
+                path = %path,
+                stream_id = self.stream_id,
+                access_class = self.policy.class.as_str(),
+                hint_first_block = self.first_block,
+                hint_last_block = self.last_block,
+                planned_prefetch_blocks = to_prefetch.len(),
+                first_prefetch_block = to_prefetch.first().copied().unwrap_or(u32::MAX),
+                last_prefetch_block = to_prefetch.last().copied().unwrap_or(u32::MAX),
+                "debug target prefetch plan"
+            );
+        }
         let siblings = self.vfs.dir_prefetch.on_child_read(self.ino);
         (to_prefetch, siblings)
     }
@@ -461,18 +476,37 @@ impl StudioVfs {
         let Some(range) = PrefetchHintRange::from_blocks_needed(blocks_needed) else {
             return;
         };
-        if !self
+        let update = self
             .state
             .read
-            .record_prefetch_hint_range(ino, stream_id, range)
-        {
-            return;
+            .record_prefetch_hint_range(ino, stream_id, range);
+        if let Some(path) = self.debug_pending_target_path(ino) {
+            let (effective_first_block, effective_last_block, suppressed) = match update {
+                PrefetchHintUpdate::Suppress => (range.first_block, range.last_block, true),
+                PrefetchHintUpdate::Store(stored) => (stored.first_block, stored.last_block, false),
+            };
+            info!(
+                ino,
+                path = %path,
+                stream_id,
+                access_class = policy.class.as_str(),
+                prefetch_enabled = policy.prefetch_enabled,
+                requested_first_block = range.first_block,
+                requested_last_block = range.last_block,
+                effective_first_block,
+                effective_last_block,
+                suppressed,
+                "debug target prefetch hint"
+            );
         }
+        let PrefetchHintUpdate::Store(stored) = update else {
+            return;
+        };
         let _ = self.prefetch_tx.send(PrefetchWorkItem::ReadHint {
             ino,
             stream_id,
-            first_block: range.first_block,
-            last_block: range.last_block,
+            first_block: stored.first_block,
+            last_block: stored.last_block,
             policy,
         });
     }

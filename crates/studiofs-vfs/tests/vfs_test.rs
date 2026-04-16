@@ -195,12 +195,6 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     {
         config.write_eager_flush_batch_bytes = Some(bytes);
     }
-    if let Ok(v) = std::env::var("STUDIOFS_INGRESS_SEGMENT_MAX_BYTES")
-        && let Some(bytes) = parse_size_bytes(&v)
-        && bytes > 0
-    {
-        config.max_ingress_segment_bytes = Some(bytes);
-    }
     if let Some(ms) = parse_env_u64("STUDIOFS_SLAB_FLUSH_INTERVAL_MS") {
         config.slab_flush_interval_ms = Some(ms);
     }
@@ -417,21 +411,6 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     }
     if let Some(value) = parse_env_usize("STUDIOFS_QOS_FETCH_SLOTS") {
         config.qos_fetch_slots = Some(value);
-    }
-    if let Some(value) = parse_env_u64("STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS") {
-        config.ingress_checkpoint_interval_secs = Some(value);
-    }
-    if let Some(value) = parse_env_u64("STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES") {
-        config.ingress_checkpoint_min_append_bytes = Some(value);
-    }
-    if let Some(value) = parse_env_u64("STUDIOFS_INGRESS_CHECKPOINT_MIN_MUTATIONS") {
-        config.ingress_checkpoint_min_mutations = Some(value);
-    }
-    if let Some(value) = parse_env_u64("STUDIOFS_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG") {
-        config.ingress_checkpoint_max_segment_lag = Some(value);
-    }
-    if let Some(value) = parse_env_u64("STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS") {
-        config.ingress_checkpoint_max_live_segments = Some(value);
     }
     if let Ok(value) = std::env::var("STUDIOFS_CACHE_SAFETY_MODE") {
         let value = value.trim().to_ascii_lowercase();
@@ -4090,7 +4069,6 @@ impl ScopedTestEnv {
             "STUDIOFS_S3_SECRET_KEY",
             "STUDIOFS_MAX_DIRTY_BYTES",
             "STUDIOFS_MAX_SPILL_BYTES",
-            "STUDIOFS_INGRESS_SEGMENT_MAX_BYTES",
             "STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH",
             "STUDIOFS_SLAB_FLUSH_INTERVAL_MS",
             "STUDIOFS_FOREGROUND_DRAIN_ASSIST",
@@ -4143,11 +4121,6 @@ impl ScopedTestEnv {
             "STUDIOFS_PREFETCH_MAX_PER_CYCLE",
             "STUDIOFS_PREFETCH_PAUSE_ON_NETERR_MS",
             "STUDIOFS_MAX_DRAIN_BATCH",
-            "STUDIOFS_INGRESS_CHECKPOINT_INTERVAL_SECS",
-            "STUDIOFS_INGRESS_CHECKPOINT_MIN_APPEND_BYTES",
-            "STUDIOFS_INGRESS_CHECKPOINT_MIN_MUTATIONS",
-            "STUDIOFS_INGRESS_CHECKPOINT_MAX_SEGMENT_LAG",
-            "STUDIOFS_INGRESS_CHECKPOINT_MAX_LIVE_SEGMENTS",
             "STUDIOFS_JANITOR_INTERVAL_SECS",
             "STUDIOFS_JANITOR_SKIP_NEWER_SECS",
             "STUDIOFS_JANITOR_MAX_DELETES",
@@ -4807,7 +4780,6 @@ fn local_reads_of_pending_incarnation_prefer_materialized_extent_over_spill() {
                 let ingress = vfs.ingress_stats();
                 vfs.live_extent_records_for_inode(attr.ino).len() == 2
                     && vfs.pending_uploads_for_inode(attr.ino).len() == 2
-                    && ingress.spill_records == 0
                     && ingress.dirty_mem_blocks == 0
             })
             .await,
@@ -4885,7 +4857,7 @@ fn partial_overwrite_after_materialization_reuses_pending_extent_as_write_base()
                 let ingress = vfs.ingress_stats();
                 vfs.live_extent_records_for_inode(attr.ino).len() == 1
                     && vfs.pending_uploads_for_inode(attr.ino).len() == 1
-                    && ingress.spill_records == 0
+                    && ingress.dirty_mem_blocks == 0
             })
             .await,
             "baseline pending block must be materialized before the follow-up partial write"
@@ -7004,8 +6976,6 @@ fn upload_backlog_does_not_create_local_backpressure_after_write_commit() {
                 stats.dirty_mem_bytes, 0,
                 "write() should leave no pending write-buffer bytes once the local durable barrier completes"
             );
-            assert_eq!(stats.spill_bytes, 0);
-
             vfs.flush(attr.ino).await.unwrap();
             assert_eq!(
                 vfs.ingress_pressure_for(partial_payload.len()).lane,
@@ -7423,10 +7393,6 @@ fn test_ingress_prefers_spill_before_backpressure() {
         vfs.write(attr.ino, 0, &payload).await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
 
-        let stats = vfs.ingress_stats();
-        assert_eq!(stats.spill_records, 0);
-        assert_eq!(stats.spill_bytes, 0);
-        assert_eq!(stats.forced_spill_blocks, 0);
         assert_eq!(
             vfs.ingress_pressure_for(1).lane,
             VfsIngressLane::DirtyMem,
@@ -7502,9 +7468,7 @@ fn test_cache_safety_mode_changes_ingress_write_path() {
             .await
             .unwrap();
         durable_vfs.flush(durable_attr.ino).await.unwrap();
-        let durable_stats = durable_vfs.ingress_stats();
-        assert_eq!(durable_stats.spill_bytes, 0);
-        assert_eq!(durable_stats.spill_records, 0);
+        let _durable_stats = durable_vfs.ingress_stats();
         assert_eq!(
             durable_vfs
                 .meta()
@@ -7527,9 +7491,7 @@ fn test_cache_safety_mode_changes_ingress_write_path() {
         );
         fast_vfs.write(fast_attr.ino, 0, &payload).await.unwrap();
         fast_vfs.flush(fast_attr.ino).await.unwrap();
-        let fast_stats = fast_vfs.ingress_stats();
-        assert_eq!(fast_stats.spill_bytes, 0);
-        assert_eq!(fast_stats.spill_records, 0);
+        let _fast_stats = fast_vfs.ingress_stats();
         assert_eq!(
             fast_vfs
                 .meta()
@@ -7705,7 +7667,6 @@ fn test_ingress_pressure_stays_clean_after_partial_write_is_locally_committed() 
             stats.dirty_mem_bytes == 0,
             "the first partial payload should already be durably committed out of the write buffer"
         );
-        assert_eq!(stats.spill_bytes, 0);
         assert_eq!(
             vfs.ingress_pressure_for(payload.len()).lane,
             VfsIngressLane::DirtyMem,
@@ -7777,8 +7738,8 @@ fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
             Err(_) => {
                 let stats = vfs.ingress_stats();
                 panic!(
-                    "flush timed out after 30s: dirty_mem={} spill={} wait_ms={}",
-                    stats.dirty_mem_bytes, stats.spill_bytes, stats.write_backpressure_wait_ms
+                    "flush timed out after 30s: dirty_mem={} wait_ms={}",
+                    stats.dirty_mem_bytes, stats.write_backpressure_wait_ms
                 );
             }
         }
@@ -7788,7 +7749,6 @@ fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
             stats.dirty_mem_bytes == 0,
             "foreground writes should leave no dirty-memory tail once each write crosses the local durable boundary"
         );
-        assert_eq!(stats.spill_bytes, 0);
         assert_eq!(
             stats.write_backpressure_wait_ms, 0,
             "sequential locally committed writes must not accumulate ingress backpressure wait time"
@@ -7854,9 +7814,6 @@ fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
         }
 
         let stats = vfs.ingress_stats();
-        assert_eq!(stats.spill_records, 0);
-        assert_eq!(stats.spill_bytes, 0);
-        assert_eq!(stats.forced_spill_blocks, 0);
         assert_eq!(
             stats.write_backpressure_wait_ms, 0,
             "with sufficient local budget, concurrent foreground writers should not block"
@@ -10347,7 +10304,6 @@ async fn create_should_ignore_ds_store_without_persisting_metadata_or_data() {
     assert!(vfs.wait_for_uploads_idle(Duration::from_millis(250)).await);
     let ingress = vfs.ingress_stats();
     assert_eq!(ingress.dirty_mem_bytes, 0);
-    assert_eq!(ingress.spill_bytes, 0);
     assert!(vfs.meta().lookup(1, b".DS_Store").is_err());
     assert!(vfs.lookup(1, b".DS_Store").is_err());
     assert!(vfs.readdir(1).unwrap().is_empty());
@@ -10371,7 +10327,6 @@ async fn create_should_ignore_appledouble_without_persisting_metadata_or_data() 
     assert!(vfs.wait_for_uploads_idle(Duration::from_millis(250)).await);
     let ingress = vfs.ingress_stats();
     assert_eq!(ingress.dirty_mem_bytes, 0);
-    assert_eq!(ingress.spill_bytes, 0);
     assert!(vfs.meta().lookup(1, b"._photo.jpg").is_err());
     assert!(vfs.lookup(1, b"._photo.jpg").is_err());
     assert!(vfs.readdir(1).unwrap().is_empty());
@@ -10466,7 +10421,6 @@ async fn mkdir_should_blackhole_root_macos_metadata_dirs_without_persisting_chil
     assert!(vfs.wait_for_uploads_idle(Duration::from_millis(250)).await);
     let ingress = vfs.ingress_stats();
     assert_eq!(ingress.dirty_mem_bytes, 0);
-    assert_eq!(ingress.spill_bytes, 0);
 
     vfs.rmdir(1, b".Spotlight-V100").unwrap();
     assert!(vfs.lookup(1, b".Spotlight-V100").is_err());
@@ -12097,6 +12051,203 @@ async fn shutdown_with_pending_uploads_completes_within_bound() {
     tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
         .await
         .expect("shutdown should stay bounded even with offline pending uploads");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zeroio_shutdown_snapshot_uses_runtime_dir_without_ingress_spill() {
+    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+    let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    let _restore_upload_timeout = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS");
+    let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
+    let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
+    unsafe {
+        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "64MB");
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS", "1");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
+        std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let volume_suffix = format!("zeroio-runtime-layout-{}", std::process::id());
+    let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let vfs = make_vfs_with_meta(meta, &format_info, &cache_dir_str);
+    let payload = vec![0x33u8; format_info.block_size as usize];
+    let attr = vfs
+        .create(1, b"zeroio-runtime-layout.bin", 0, 0, 0o644)
+        .unwrap();
+    vfs.write(attr.ino, 0, &payload).await.unwrap();
+    vfs.flush(attr.ino).await.unwrap();
+
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            !vfs.pending_uploads_for_inode(attr.ino).is_empty()
+        })
+        .await,
+        "offline upload scenario should queue pending uploads before shutdown"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), vfs.shutdown(Duration::ZERO))
+        .await
+        .expect("shutdown should stay bounded even with offline pending uploads");
+
+    let runtime_snapshot_path = cache_dir.join("runtime").join("zeroio-last-shutdown.json");
+    assert!(
+        runtime_snapshot_path.exists(),
+        "zeroio shutdown snapshot should be persisted under cache/runtime"
+    );
+    assert!(
+        !cache_dir.join("ingress_spill").exists(),
+        "runtime cleanup should not recreate legacy ingress_spill"
+    );
+
+    drop(vfs);
+    let reopened = reopen_vfs(&db_path, &cache_dir);
+    let runtime_snapshot = reopened.zeroio_runtime_snapshot();
+    let last_graceful_shutdown = runtime_snapshot
+        .last_graceful_shutdown
+        .expect("reopened zeroio snapshot should include persisted graceful shutdown state");
+    assert!(
+        last_graceful_shutdown.local_payload_sync_ok,
+        "graceful shutdown snapshot should record successful local payload sync"
+    );
+}
+
+#[test]
+fn zeroio_fast_mode_self_heals_legacy_ingress_artifacts_on_startup() {
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    unsafe {
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let format_info = make_format_info_with_endpoint(
+        &format!("zeroio-legacy-fast-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    let legacy_spill_dir = cache_dir.join("ingress_spill");
+    std::fs::create_dir_all(legacy_spill_dir.join("segments")).unwrap();
+    std::fs::create_dir_all(legacy_spill_dir.join("checkpoints")).unwrap();
+    std::fs::write(
+        legacy_spill_dir
+            .join("segments")
+            .join("0000000000000001.seg"),
+        b"legacy-segment",
+    )
+    .unwrap();
+    std::fs::write(
+        legacy_spill_dir.join("checkpoints").join("latest.json"),
+        br#"{"version":1}"#,
+    )
+    .unwrap();
+    std::fs::write(legacy_spill_dir.join("state.json"), br#"{"version":1}"#).unwrap();
+    std::fs::write(legacy_spill_dir.join("legacy.spill"), b"legacy-spill").unwrap();
+
+    let vfs = make_local_zeroio_test_vfs(
+        &db_path,
+        &cache_dir_str,
+        &format_info,
+        VfsConfigRaw {
+            cache_safety_mode: Some(CacheSafetyMode::Fast),
+            ..VfsConfigRaw::default()
+        }
+        .validate()
+        .expect("fast config should validate"),
+    )
+    .2;
+
+    assert!(legacy_spill_dir.join("segments").exists());
+    assert!(legacy_spill_dir.join("checkpoints").exists());
+    assert!(
+        std::fs::read_dir(legacy_spill_dir.join("segments"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "fast-mode startup should clear legacy ingress segment files"
+    );
+    assert!(
+        std::fs::read_dir(legacy_spill_dir.join("checkpoints"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "fast-mode startup should clear legacy ingress checkpoints"
+    );
+    assert!(
+        !legacy_spill_dir.join("state.json").exists(),
+        "fast-mode startup should remove legacy ingress state files"
+    );
+    assert!(
+        !legacy_spill_dir.join("legacy.spill").exists(),
+        "fast-mode startup should remove legacy ingress spill files"
+    );
+
+    drop(vfs);
+}
+
+#[test]
+fn zeroio_durable_mode_rejects_legacy_ingress_artifacts_on_startup() {
+    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
+    unsafe {
+        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("meta.redb");
+    let cache_dir = tmp.path().join("cache");
+    let cache_dir_str = cache_dir.to_str().unwrap().to_string();
+    let format_info = make_format_info_with_endpoint(
+        &format!("zeroio-legacy-durable-{}", std::process::id()),
+        "http://127.0.0.1:59999",
+    );
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
+    meta.init_root(0, 0).unwrap();
+    meta.set_format_info(&format_info).unwrap();
+
+    let legacy_spill_dir = cache_dir.join("ingress_spill");
+    std::fs::create_dir_all(legacy_spill_dir.join("segments")).unwrap();
+    std::fs::write(
+        legacy_spill_dir
+            .join("segments")
+            .join("0000000000000001.seg"),
+        b"legacy-segment",
+    )
+    .unwrap();
+
+    let error = match StudioVfs::new(
+        meta,
+        &DataStoreConfig::from(&format_info),
+        &cache_dir_str,
+        16 * 1024 * 1024,
+        16 * 1024 * 1024,
+        VfsConfigRaw {
+            cache_safety_mode: Some(CacheSafetyMode::Durable),
+            ..VfsConfigRaw::default()
+        }
+        .validate()
+        .expect("durable config should validate"),
+    ) {
+        Ok(_) => panic!("durable startup should reject unresolved legacy ingress artifacts"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("legacy ingress artifacts detected"),
+        "durable startup should explain why the mount was rejected"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
