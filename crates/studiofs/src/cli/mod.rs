@@ -20,6 +20,7 @@ pub mod mount_profile_stub;
 #[cfg(not(unix))]
 pub use self::mount_profile_stub as mount_profile;
 pub mod mount_profile_types;
+pub mod runtime_tuning;
 pub mod settings;
 pub mod snapshot;
 pub mod status;
@@ -89,22 +90,16 @@ EXAMPLES:
     studiofs fsck myvolume
     studiofs fsck myvolume --repair
 
-ENV TUNING:
-  STUDIOFS_JANITOR_INTERVAL_SECS    Auto-janitor cycle interval (default: 1800).
-  STUDIOFS_JANITOR_SKIP_NEWER_SECS  Grace window for orphan deletion (default: 900).
-  STUDIOFS_JANITOR_MAX_DELETES      Max janitor deletes per cycle (default: 500).
-  STUDIOFS_JANITOR_LEASE_TTL_SECS   Janitor lease TTL in metadata store (default: 2700).
-  STUDIOFS_UPLOAD_MAX_ATTEMPTS      Max upload retries (default: 10).
-  STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS  Per-upload request timeout (default: 120).
-  STUDIOFS_FETCH_MAX_ATTEMPTS       Max fetch retries (default: 8).
-  STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS  Per-fetch request timeout (default: 45).
-  STUDIOFS_XATTR_MAX_BYTES          Max bytes allowed per xattr value (default: 4MB).
-
-CACHE 3.0 OPERATOR MODEL:
-  Cache behavior is intentionally two-knob:
+LOCAL-FIRST OPERATOR MODEL:
+  Primary mount knobs:
     --cache-dir
     --cache-size
-  Internal cache thresholds are derived automatically at mount time.
+    --read-buffer
+    --readahead
+    --prefetch
+    --writeback-delay
+  Metadata-cache internals stay on strong built-in defaults.
+  Additional STUDIOFS_* env overrides are transitional/developer-oriented.
   Use `studiofs status <name>` to inspect runtime usage/dirty/evictable bytes,
   layout readiness, and reconcile signals.
 

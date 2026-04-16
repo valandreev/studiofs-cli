@@ -3,6 +3,7 @@
 use super::MountCommand;
 use super::backend::{BackendLaunch, MountBackend, default_mount_backend};
 use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
+use crate::cli::runtime_tuning::PublicRuntimeTuningArgs;
 use crate::cli::{mount_profile, mount_profile_types, settings, utils};
 use crate::diagnostics::{
     DiagnosticsDataSource, LiveMountDiagnosticsSource, LiveMountRuntimeFingerprint,
@@ -339,13 +340,15 @@ fn validate_endpoint_override(endpoint: Option<&str>) -> anyhow::Result<()> {
 fn build_mount_config_from_raw(
     vfs_config_raw: VfsConfigRaw,
     principal: Option<&str>,
+    runtime_tuning: &PublicRuntimeTuningArgs,
 ) -> anyhow::Result<ResolvedMountConfig> {
-    build_mount_config_with(vfs_config_raw, principal, overlay_vfs_env)
+    build_mount_config_with(vfs_config_raw, principal, runtime_tuning, overlay_vfs_env)
 }
 
 fn build_mount_config_with<F>(
     vfs_config_raw: VfsConfigRaw,
     principal: Option<&str>,
+    runtime_tuning: &PublicRuntimeTuningArgs,
     overlay_config: F,
 ) -> anyhow::Result<ResolvedMountConfig>
 where
@@ -355,6 +358,7 @@ where
     if let Some(principal) = principal {
         vfs_config_raw.principal = Some(principal.to_string());
     }
+    runtime_tuning.apply_to_vfs_config(&mut vfs_config_raw)?;
 
     let vfs_config = vfs_config_raw
         .validate()
@@ -469,7 +473,11 @@ fn resolve_mount_startup(
     let ResolvedMountConfig {
         vfs_config,
         cache_mode,
-    } = build_mount_config_from_raw(settings_config.vfs, command.principal.as_deref())?;
+    } = build_mount_config_from_raw(
+        settings_config.vfs,
+        command.principal.as_deref(),
+        &command.runtime_tuning,
+    )?;
 
     validate_endpoint_override(command.endpoint.as_deref())?;
     let mount_point = resolve_runtime_mount_point(resolved_settings.mount_point);
@@ -1674,6 +1682,7 @@ mod tests {
             profile: None,
             snapshot_id: None,
             endpoint: None,
+            runtime_tuning: PublicRuntimeTuningArgs::default(),
         }
     }
 
@@ -1765,6 +1774,39 @@ mod tests {
         assert_eq!(startup.cache_size, "96GB");
         assert_eq!(startup.launch_mode, MountLaunchMode::Foreground);
         assert!(startup.run_in_foreground);
+    }
+
+    #[test]
+    fn build_mount_config_prefers_public_runtime_tuning_over_env_and_settings() {
+        let resolved = build_mount_config_with(
+            VfsConfigRaw {
+                read_buffer_mb: Some(1024),
+                readahead_width: Some(64),
+                prefetch_concurrency: Some(32),
+                upload_delay_ms: Some(250),
+                ..VfsConfigRaw::default()
+            },
+            None,
+            &PublicRuntimeTuningArgs {
+                read_buffer: Some("4GB".to_string()),
+                readahead: Some(256),
+                prefetch: Some(192),
+                writeback_delay: Some(1500),
+            },
+            |mut config| {
+                config.read_buffer_mb = Some(2048);
+                config.readahead_width = Some(128);
+                config.prefetch_concurrency = Some(96);
+                config.upload_delay_ms = Some(1000);
+                config
+            },
+        )
+        .expect("mount config resolved");
+
+        assert_eq!(resolved.vfs_config.read_buffer_mb, 4096);
+        assert_eq!(resolved.vfs_config.readahead_width, 256);
+        assert_eq!(resolved.vfs_config.prefetch_concurrency, 192);
+        assert_eq!(resolved.vfs_config.upload_delay_ms, 1500);
     }
 
     #[test]

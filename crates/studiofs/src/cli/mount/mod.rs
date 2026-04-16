@@ -6,6 +6,8 @@ mod session;
 use clap::Args;
 use std::path::PathBuf;
 
+use super::runtime_tuning::PublicRuntimeTuningArgs;
+
 pub(crate) use session::MountSession;
 
 #[derive(Debug, Clone)]
@@ -21,6 +23,7 @@ pub(crate) struct MountCommand {
     pub(crate) profile: Option<super::mount_profile_types::MountProfileMode>,
     pub(crate) snapshot_id: Option<String>,
     pub(crate) endpoint: Option<String>,
+    pub(crate) runtime_tuning: PublicRuntimeTuningArgs,
 }
 
 impl MountCommand {
@@ -38,6 +41,7 @@ impl MountCommand {
             profile: args.profile,
             snapshot_id: args.snapshot_id,
             endpoint: args.endpoint,
+            runtime_tuning: args.runtime_tuning,
         })
     }
 }
@@ -63,8 +67,11 @@ EXAMPLES:
   Basic mount (Linux/macOS):
     studiofs mount myvolume /mnt/studio
 
-  Local data cache two-knob mount (location + size):
+  Local data cache mount (location + size):
     studiofs mount myvolume Z: --cache-dir D:\\cache\\studiofs --cache-size 500GB
+
+  Local-First IO tuned mount:
+    studiofs mount myvolume /mnt/studio --read-buffer 4GB --readahead 256 --prefetch 192
 
   Debug logging:
     studiofs --log-level debug mount myvolume /mnt/studio
@@ -80,19 +87,21 @@ PYROSCOPE PROFILING:
 
 SIZE FORMATS:
   --cache-size accepts: KB, MB, GB, TB (e.g. 512MB, 4GB, 1TB)
+  --read-buffer accepts the same size formats.
+
+RUNTIME IO:
+  Tune only the main Local-First IO controls here:
+    --read-buffer
+    --readahead
+    --prefetch
+    --writeback-delay
+  Metadata-cache internals stay on strong built-in defaults.
 
 CONSISTENCY MODEL:
   Same-mount reads see accepted writes immediately.
   Other mounts converge after background upload + publish.
   `flush()` / `fsync()` and the last-handle close/release barrier confirm local
   durability when dirty state remains, not remote close-to-open visibility.
-
-RUNTIME PG POLICY:
-  PG batching / sync cadence is client-side and can be tuned per mount via:
-    STUDIOFS_PG_FLUSH_INTERVAL_SECS
-    STUDIOFS_PG_FLUSH_OPS_THRESHOLD
-    STUDIOFS_PG_FLUSH_IDLE_MS
-    STUDIOFS_PG_SYNC_POLL_SECS
 
 ACL PRINCIPAL:
   By default, the mount uses STUDIOFS_PRINCIPAL (or '*' when unset).
@@ -113,6 +122,9 @@ pub(crate) struct MountArgs {
     /// Maximum disk cache size (e.g. 100GB, 50GB, 1TB)
     #[arg(long)]
     cache_size: Option<String>,
+
+    #[command(flatten, next_help_heading = "Runtime IO")]
+    runtime_tuning: PublicRuntimeTuningArgs,
 
     /// Principal identity used for ACL checks in this mount instance.
     #[arg(long)]
@@ -151,5 +163,27 @@ impl MountArgs {
         super::winfsp_bootstrap::ensure_mountmgr_bootstrap()?;
 
         MountSession::prepare(MountCommand::from_args(self)?)?.launch()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn mount_accepts_public_runtime_tuning_flags() {
+        let mount_point = if cfg!(windows) { "Z:" } else { "/mnt/studio" };
+        crate::cli::parse_for_test(&[
+            "mount",
+            "demo",
+            mount_point,
+            "--read-buffer",
+            "4GB",
+            "--readahead",
+            "256",
+            "--prefetch",
+            "192",
+            "--writeback-delay",
+            "1500",
+        ])
+        .expect("new public runtime tuning flags should parse");
     }
 }

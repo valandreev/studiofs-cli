@@ -18,9 +18,17 @@ StudioFS stores global defaults for mount in the OS-standard config path under:
 
 Values in the config file are used by `studiofs mount` when the corresponding
 CLI flags are omitted.
-The operator-facing mount surface intentionally exposes only two local data
-cache knobs today: `cache_dir` and `cache_size`. Internal cache thresholds and
-metadata-cache defaults are derived or fixed automatically at mount time.
+The operator-facing mount surface intentionally stays small. Regular operators
+should primarily use:
+
+- `cache_dir`
+- `cache_size`
+- `read_buffer`
+- `readahead`
+- `prefetch`
+- `writeback_delay`
+
+Metadata-cache defaults and most runtime heuristics remain internal.
 
 Priority for each setting:
 
@@ -28,6 +36,14 @@ Priority for each setting:
 2. Value from `config.toml`
 3. Built-in default (`cache-size=100GB`)
 4. For `mount-point`, no implicit default is used; `cache-dir` still falls back to `<meta-dir>/cache` when neither CLI nor config provides a value.
+
+For the public runtime IO knobs (`--read-buffer`, `--readahead`, `--prefetch`,
+`--writeback-delay`) the effective precedence is:
+
+1. CLI flag
+2. Transitional `STUDIOFS_*` environment override for the same setting
+3. Persisted `studiofs settings` default
+4. Built-in VFS default
 
 ## Commands
 
@@ -76,6 +92,10 @@ without requiring `discover`.
 studiofs mount <name> [<mount-point>] \
   [--cache-dir <path>] \
   [--cache-size <e.g. 100GB>] \
+  [--read-buffer <e.g. 4GB>] \
+  [--readahead <blocks>] \
+  [--prefetch <count>] \
+  [--writeback-delay <ms>] \
   [--principal <name>] \
   [--snapshot-id <uuid>] \
   [--foreground] \
@@ -86,7 +106,7 @@ Notes:
 - You can persist defaults with `studiofs settings`.
 - If `<mount-point>` is omitted, `studiofs mount` uses the configured default from `settings` on non-Windows platforms.
 - Precedence for mount path knobs is: CLI args -> persisted `studiofs settings` values -> built-in defaults.
-- VFS/runtime tuning starts from persisted `settings.vfs`, then applies supported `STUDIOFS_*` environment overrides for the current process, then validates the final typed config before mount startup continues.
+- Public runtime IO tuning starts from persisted `studiofs settings` values, then applies transitional `STUDIOFS_*` env overrides, and finally applies explicit mount flags before validation.
 - Cross-client metadata convergence is handled through PostgreSQL sync.
 - Client-side PG batching/sync policy is controlled at mount/runtime via environment variables, not stored in the volume.
 - If `<mount-point>` does not already end with `<name>`, StudioFS mounts at `<mount-point>/<name>` and creates the directory automatically.
@@ -99,6 +119,7 @@ Notes:
 - `--detach` runs the mount as a background daemon.
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
 - `--cache-size` uses the shared size parser and accepts fractional values (for example `1.5GB`); the value must be greater than `0`.
+- `--read-buffer` uses the same size parser and is rounded up to MiB units for VFS config.
 - Local data-cache backend provisioning is automatic for the per-volume root under `<cache-dir>/<volume-uuid>` and is owned by `studiofs-cache`; the CLI only resolves cache location and budget inputs.
 - Internal runtime thresholds (dirty headroom, upload local-I/O slots, transit headroom) are derived automatically from cache budget.
 - On Windows and macOS, StudioFS uses the buffered-first runtime path for every mount. Foreground `flush()` / `close()` confirm local acceptance and surface sticky upload errors deterministically, while upload and manifest publication continue asynchronously.
@@ -151,7 +172,7 @@ Remove-ItemProperty -Path 'HKLM:\SOFTWARE\WinFsp' -Name 'MountUseMountmgrFromFSD
 ### `settings`
 
 ```bash
-studiofs settings [--mount-point <path>] [--cache-dir <path>] [--cache-size <e.g. 200GB>]
+studiofs settings [--mount-point <path>] [--cache-dir <path>] [--cache-size <e.g. 200GB>] [--read-buffer <e.g. 4GB>] [--readahead <blocks>] [--prefetch <count>] [--writeback-delay <ms>]
 ```
 
 Stores global defaults in `config.toml` for future `studiofs mount` runs.
@@ -163,7 +184,8 @@ Notes:
 - `studiofs settings --mount-point` creates the mount directory if needed on non-Windows systems.
 - `studiofs settings --cache-dir` creates the cache directory if needed.
 - `studiofs settings` with no options prints current defaults and leaves the file unchanged.
-- `settings.vfs` values act as persisted runtime defaults for `studiofs mount`; supported `STUDIOFS_*` environment variables still override them for a single mount process before final validation.
+- `studiofs settings` persists the small public runtime IO defaults without turning the full internal `settings.vfs` structure into a user-facing product surface.
+- Supported transitional `STUDIOFS_*` environment variables still override persisted runtime defaults for a single mount process before explicit CLI flags are applied.
 - Internal cache thresholds are derived from cache budget and are not configurable through `studiofs settings`.
 
 ### `umount`
@@ -378,80 +400,50 @@ multipliers (`1KB = 1024B`).
 Operator stance for the rewrite:
 
 - Normal mount UX should stay focused on local data-cache and I/O behavior.
-- Metadata-cache knobs below are internal runtime defaults for developers and
+- Metadata-cache knobs are internal runtime defaults for developers and
   diagnostics, not the primary operator-facing surface.
 - There is intentionally no separate user-facing `dir-entry-cache` knob because
   namespace resolution already runs against the local metadata database.
 
-| Variable | Default | Description |
+### Public mount/runtime knobs
+
+| Surface | Default | Description |
 |---|---|---|
-| `STUDIOFS_JANITOR_INTERVAL_SECS` | `1800` | Background janitor interval |
-| `STUDIOFS_JANITOR_SKIP_NEWER_SECS` | `900` | Janitor grace window |
-| `STUDIOFS_JANITOR_MAX_DELETES` | `500` | Janitor delete cap |
-| `STUDIOFS_JANITOR_LEASE_TTL_SECS` | `2700` | Janitor lease TTL |
-| `STUDIOFS_PG_SYNC_POLL_SECS` | `2` | Background PG delta sync / flush loop period |
-| `STUDIOFS_PG_FLUSH_INTERVAL_SECS` | `60` | Max interval before the client flushes accumulated local PG metadata events |
-| `STUDIOFS_PG_FLUSH_OPS_THRESHOLD` | `500` | Client-side PG metadata flush op batch threshold |
-| `STUDIOFS_PG_FLUSH_IDLE_MS` | `5000` | Idle grace before PG flush of accumulated local metadata events |
-| `STUDIOFS_PRINCIPAL` | `*` | Principal identity used by VFS ACL checks (`no_access` / `ro` / `rw`) |
-| `--cache-size` (CLI/config) | `100GB` | Local data-cache budget input; internal dirty/upload/transit thresholds are derived automatically |
-| `STUDIOFS_XATTR_MAX_BYTES` | `4MB` | Maximum bytes per xattr value when writing metadata (enforced in VFS before metadata persistence) |
-| `STUDIOFS_DENTRY_CACHE_CAPACITY` | `65536` | Max number of `(parent_ino, name)` dentry cache entries (positive + negative) |
-| `STUDIOFS_DENTRY_CACHE_BYTES` | `64MB` | Max in-memory bytes for dentry cache entries (hard cap, SLRU eviction) |
-| `STUDIOFS_PATH_SHORTCUT_CACHE_CAPACITY` | `16384` | Max number of full-path shortcut cache entries in `NamespaceResolver` |
-| `STUDIOFS_PATH_SHORTCUT_CACHE_BYTES` | `16MB` | Max in-memory bytes for full-path shortcut cache entries |
-| `STUDIOFS_ATTR_READ_CACHE_CAPACITY` | `65536` | Max number of inode attribute read-through cache entries |
-| `STUDIOFS_ATTR_READ_CACHE_BYTES` | `32MB` | Max in-memory bytes for attribute read-through cache entries |
-| `STUDIOFS_EFFECTIVE_ACL_CACHE_CAPACITY` | `65536` | Max number of cached effective ACL entries before ACL cache reset |
-| `STUDIOFS_READDIR_ATTR_BATCH_CHUNK` | `256` | Max inode attrs fetched per post-`readdir` hydration chunk |
-| `STUDIOFS_READDIR_ATTR_BATCH_MAX_INODES` | `4096` | Max directory children hydrated into attr cache per `readdir` call |
-| `STUDIOFS_MAX_DRAIN_BATCH` | `1024` | Max dirty `WriteBuffer` blocks persisted per local drain cycle |
-| `STUDIOFS_FUSE_MAX_WRITE_BYTES` | `16777216` | FUSE kernel max single write request size (`fuser::KernelConfig::set_max_write`) |
-| `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` | `16777216` on Linux, `1048576` on macOS | FUSE kernel max readahead size (`fuser::KernelConfig::set_max_readahead`); higher overrides are clamped to the negotiated kernel/libfuse limit |
-| `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` | `1000` | WinFSP FileInfo metadata timeout; accepts milliseconds or `-1` / `max` for NT Cache Manager delegation |
-| `STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS` | `1000` | WinFSP DirInfo metadata timeout; accepts milliseconds or `-1` / `max` |
-| `STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS` | `1000` | WinFSP VolumeInfo metadata timeout; accepts milliseconds or `-1` / `max` |
-| `STUDIOFS_WINFSP_SECTOR_SIZE` | `4096` | WinFSP exposed sector size in bytes (must be positive and fit `u16`) |
-| `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` | `1048576` | WinFSP exposed allocation unit size in bytes (must be a positive multiple of sector size) |
-| `STUDIOFS_PUBLISH_VISIBILITY_TIMEOUT_SECS` | `30` | Max time to wait for uploaded objects to become visible before publishing a manifest |
-| `STUDIOFS_FOREGROUND_DRAIN_ASSIST` | `true` | Allows foreground writes to assist local drain when backpressured |
-| `STUDIOFS_UPLOAD_MAX_ATTEMPTS` | `10` | Max attempts for upload retries |
-| `STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS` | `120` | Per-upload request timeout |
-| `STUDIOFS_UPLOAD_RETRY_BASE_MS` | `200` | Upload retry base delay |
-| `STUDIOFS_UPLOAD_RETRY_MAX_MS` | `5000` | Upload retry max delay |
-| `STUDIOFS_FETCH_MAX_ATTEMPTS` | `8` | Max attempts for foreground fetch retries |
-| `STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS` | `4` | Max attempts for best-effort prefetch fetches |
-| `STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS` | `45` | Per-fetch request timeout |
-| `STUDIOFS_FETCH_RETRY_BASE_MS` | `50` | Fetch retry base delay |
-| `STUDIOFS_FETCH_RETRY_MAX_MS` | `2000` | Fetch retry max delay |
-| `STUDIOFS_FETCH_PREFETCH_RESERVE` | `0` | Reserved fetch slots kept free for foreground reads; `0` uses the runtime default |
-| `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` | `75` | Max time a prefetch waits for a fetch slot before skipping |
-| `STUDIOFS_QOS_ACCEPT_SLOTS` | `64` | QoS semaphore slots for accept operations |
-| `STUDIOFS_QOS_MATERIALIZE_SLOTS` | `2` | QoS semaphore slots for materialization |
-| `STUDIOFS_QOS_UPLOAD_SLOTS` | `4` | QoS semaphore slots for uploads |
-| `STUDIOFS_QOS_COMMIT_SLOTS` | `4` | QoS semaphore slots for commits |
-| `STUDIOFS_QOS_FETCH_SLOTS` | `128` | QoS semaphore slots for fetches |
-| `STUDIOFS_UPLOAD_WORKER_COUNT` | `4` | Upload worker pool size |
-| `STUDIOFS_FETCH_MAX_ATTEMPTS` | `8` | Foreground fetch max retry attempts |
-| `STUDIOFS_FETCH_REQUEST_TIMEOUT_SECS` | `45` | Per-attempt S3 GET timeout |
-| `STUDIOFS_FETCH_RETRY_BASE_MS` | `50` | Fetch retry base backoff |
-| `STUDIOFS_FETCH_RETRY_MAX_MS` | `2000` | Fetch retry max backoff |
-| `STUDIOFS_PREFETCH_FETCH_MAX_ATTEMPTS` | `4` | Prefetch fetch retry attempts |
-| `STUDIOFS_FETCH_PREFETCH_ACQUIRE_WAIT_MS` | `75` | Max wait for prefetch AIMD permit before skipping |
-| `STUDIOFS_UPLOAD_MAX_ATTEMPTS` | `10` | Upload retry attempts |
-| `STUDIOFS_UPLOAD_REQUEST_TIMEOUT_SECS` | `120` | Per-attempt upload timeout |
-| `STUDIOFS_UPLOAD_RETRY_BASE_MS` | `200` | Upload retry base backoff |
-| `STUDIOFS_UPLOAD_RETRY_MAX_MS` | `5000` | Upload retry max backoff |
-| `STUDIOFS_UPLOAD_DELAY_MS` | `2000` | Delay uploads for overwrite/delete coalescing |
-| `STUDIOFS_UPLOAD_REQUEUE_BASE_MS` | `5000` | Base backoff for exhausted upload requeue |
-| `STUDIOFS_UPLOAD_REQUEUE_MAX_MS` | `120000` | Max backoff for exhausted upload requeue |
-| `STUDIOFS_UPLOAD_STATS_INTERVAL_SECS` | `1` | Upload metrics log interval |
-| `STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS` | `500` | User idle grace |
-| `STUDIOFS_UPLOAD_FG_READ_LATENCY_TARGET_MS` | `35` | Foreground-read P90 latency target for upload throttling |
-| `STUDIOFS_UPLOAD_FG_READ_LATENCY_WINDOW_MS` | `1500` | Foreground-read speedometer window |
-| `STUDIOFS_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS` | `2` | Keep last P90 for this many windows when samples pause |
-| `STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS` | `5` | Max graceful upload-drain wait before forced uploader cancellation |
-| `STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS`| `10` | Metadata flush timeout upon shutdown|
+| `--cache-dir` | `<meta-dir>/cache` | Local data-cache root |
+| `--cache-size` | `100GB` | Local data-cache budget |
+| `--read-buffer` | `2048MB` | Foreground read-buffer budget |
+| `--readahead` | `128` | Sequential readahead width in blocks |
+| `--prefetch` | `128` | Prefetch concurrency budget |
+| `--writeback-delay` | `2000ms` | Background upload coalescing delay |
+| `--principal` / `STUDIOFS_PRINCIPAL` | `*` | Principal used for ACL checks |
+
+### Transitional and expert overrides
+
+The current code still accepts additional `STUDIOFS_*` runtime overrides through
+the existing raw/validated VFS config pipeline. They are no longer documented as
+the normal operator API.
+
+Use them only when one of these is true:
+
+- you are migrating existing scripts during the `SFS-249` cleanup window
+- you are debugging or benchmarking a specific runtime heuristic
+- you are working on bridge-specific tuning that belongs to `SFS-250`
+- you are changing maintenance/recovery behavior that belongs to `SFS-251`
+
+Important families that remain supported in code today:
+
+- metadata-cache internals: `STUDIOFS_DENTRY_CACHE_*`,
+  `STUDIOFS_PATH_SHORTCUT_CACHE_*`, `STUDIOFS_ATTR_READ_CACHE_*`,
+  `STUDIOFS_READDIR_ATTR_BATCH_*`,
+  `STUDIOFS_EFFECTIVE_ACL_CACHE_CAPACITY`,
+  `STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS`
+- read/upload/fetch internals: `STUDIOFS_FETCH_*`, `STUDIOFS_UPLOAD_*`,
+  `STUDIOFS_QOS_*`, `STUDIOFS_PREFETCH_*`
+- janitor/admin policy: `STUDIOFS_JANITOR_*`, `STUDIOFS_PG_*`
+- bridge-specific knobs: `STUDIOFS_FUSE_*`, `STUDIOFS_WINFSP_*`
+
+If an override is still needed regularly by ordinary operators, promote it to a
+documented CLI/config flag instead of teaching the whole env matrix again.
 
 Internal metadata-cache defaults:
 
