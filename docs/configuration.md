@@ -430,6 +430,15 @@ Use them only when one of these is true:
 - you are working on bridge-specific tuning that belongs to `SFS-250`
 - you are changing maintenance/recovery behavior that belongs to `SFS-251`
 
+For the new public IO knobs, the current migration mapping is:
+
+| Public flag | Transitional env override |
+|---|---|
+| `--read-buffer` | `STUDIOFS_READ_BUFFER_MB` |
+| `--readahead` | `STUDIOFS_READAHEAD_WIDTH` |
+| `--prefetch` | `STUDIOFS_PREFETCH_CONCURRENCY` |
+| `--writeback-delay` | `STUDIOFS_UPLOAD_DELAY_MS` |
+
 Important families that remain supported in code today:
 
 - metadata-cache internals: `STUDIOFS_DENTRY_CACHE_*`,

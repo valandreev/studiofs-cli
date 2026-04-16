@@ -4,6 +4,7 @@ use studiofs_vfs::{VfsConfig, VfsConfigRaw, parse_size_bytes};
 #[derive(Debug, Args, Default, Clone)]
 pub(crate) struct PublicRuntimeTuningArgs {
     /// Read buffer budget for foreground reads (for example 4GB).
+    /// Rounded up to the nearest MiB for the internal VFS config.
     #[arg(long, value_name = "SIZE")]
     pub(crate) read_buffer: Option<String>,
 
