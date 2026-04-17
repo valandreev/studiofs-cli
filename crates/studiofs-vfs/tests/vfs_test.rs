@@ -7744,7 +7744,7 @@ fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
         .unwrap();
         vfs.start().expect("failed to start StudioVfs background workers");
 
-        let payload = vec![0x55u8; 512 * 1024];
+        let payload = vec![0x55u8; format_info.block_size as usize];
 
         let first = vfs.create(1, b"local-dirty-full.bin", 0, 0, 0o644).unwrap();
         vfs.write(first.ino, 0, &payload).await.unwrap();
