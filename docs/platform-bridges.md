@@ -45,6 +45,7 @@ Path walks are centralized in VFS `NamespaceResolver`:
 | File info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
 | Dir info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
 | Volume info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
+| Allow open in kernel mode | Enabled by default. Override: `STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE` |
 | Case sensitive | Yes |
 | Unicode on disk | Yes |
 | Persistent ACLs | Yes |
@@ -53,6 +54,8 @@ Path walks are centralized in VFS `NamespaceResolver`:
 | Filesystem name | "StudioFS" |
 
 `STUDIOFS_WINFSP_SECTOR_SIZE` and `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` are the primary WinFSP bridge throughput geometry controls for local block I/O.
+StudioFS forces WinFSP `FlushAndPurgeOnCleanup` off so non-delete `cleanup`
+callbacks stay observational under the Local-First contract.
 
 Windows mount-point handling:
 - StudioFS requests Mount Manager drive syntax (`\\.\X:`) internally for drive-letter mounts.
@@ -101,7 +104,8 @@ WinFSP callback barrier semantics:
 - `cleanup` with delete finalizes `unlink()` / `rmdir()` in the cleanup callback itself.
 - Non-delete `cleanup` is observational only; for real file handles it records that the callback happened, but any remaining dirty local state is deferred to a later explicit `flush` or the last-handle `close` / `release_fh()` path.
 - `fh == 0` contexts, such as directories, do not have a `release_fh()` fallback; they stay observational unless an explicit `flush` callback makes local state visible.
-- `overwrite` and EOF-changing `set_file_size` publish the new size before the callback returns; they are not backgroundable flush barriers.
+- `close` is the release-path hook for WinFSP. It may attribute the fallback last-handle local-durability barrier, but it must not force synchronous publish/upload.
+- `overwrite` and EOF-changing `set_file_size` commit the new local EOF before the callback returns; they are not backgroundable flush barriers.
 
 **Attribute mapping:**
 - `InodeAttr.win_attrs` → Win32 `FILE_ATTRIBUTE_*` flags
@@ -150,13 +154,15 @@ Current signature includes additional policy controls:
 |--------|-------|
 | `fsname` | `"studiofs"` |
 | `auto_unmount` | Yes |
-| `allow_other` | Yes |
-| Kernel `max_write` | `16777216` bytes by default. Override: `STUDIOFS_FUSE_MAX_WRITE_BYTES` |
-| Kernel `max_readahead` | `16777216` bytes on Linux, `1048576` bytes on macOS by default. Override: `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` |
+| `allow_other` | macOS: yes. Linux: opt-in via `STUDIOFS_FUSE_ALLOW_OTHER=1` |
+| Kernel `max_write` | `16777216` bytes by default. Override: `STUDIOFS_FUSE_MAX_WRITE_BYTES` in `Filesystem::init()` |
+| Kernel `max_readahead` | `16777216` bytes on Linux, `1048576` bytes on macOS by default. Override: `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` in `Filesystem::init()` |
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
 
 `STUDIOFS_FUSE_MAX_WRITE_BYTES` and `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` are the primary FUSE bridge throughput controls for local block I/O.
+On Linux, `allow_other` also requires `user_allow_other` to be enabled in
+`/etc/fuse.conf`; otherwise `fusermount` rejects the mount request.
 
 On macOS, StudioFS handles `getxattr` / `setxattr` / `listxattr` /
 `removexattr` natively (including `com.apple.ResourceFork`) so Finder metadata
@@ -265,6 +271,12 @@ Implements `fuser::Filesystem` trait.
 but the internal block eviction work is batched and routed through the
 background local-I/O pool.
 
+FUSE callback barrier semantics:
+- `flush` is a handle-backed explicit local-durability barrier and routes through the shared handle-drain barrier path.
+- `fsync` is inode-scoped. It persists local unpublished state for the inode, including dirty handle-writer state, but does not force remote publication.
+- `release` is the fallback last-handle local-durability barrier only. Clean release is observational.
+- Size-changing `setattr` / truncate paths commit the new local EOF before the callback returns.
+
 **UID/GID remapping:** root-owned inodes (uid=0) are remapped to the mounting user's UID/GID.
 
 **errno mappings:**
@@ -279,9 +291,10 @@ background local-I/O pool.
 ### Mount Lifecycle
 
 ```
-mount_and_serve(vfs, rt, mount_point, foreground)
+mount_and_serve(vfs, rt, mount_point, volume_name, foreground, read_only)
   │
   ├─ Build mount options
+  ├─ Configure kernel `max_write` / `max_readahead` in `Filesystem::init()`
   ├─ `fuser::Session::new(...).run()` — blocks until unmount
   │
   └─ Shutdown:
