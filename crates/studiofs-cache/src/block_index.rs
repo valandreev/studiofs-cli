@@ -20,7 +20,9 @@ use redb::{
 
 use crate::local::{LocalBlockLifecycleState, LocalBlockOrigin, LocalBlockUploadState};
 
+const LEGACY_INDEX_FORMAT_VERSION: u64 = 1;
 const INDEX_FORMAT_VERSION: u64 = 2;
+const LEGACY_ENTRY_ENCODING_VERSION: u8 = 1;
 const ENTRY_ENCODING_VERSION: u8 = 2;
 const NO_DIRTY_ORDER: u64 = u64::MAX;
 
@@ -53,6 +55,13 @@ const ENTRY_OFFSET_ACCESS_ORDER: usize = 24;
 const ENTRY_OFFSET_LAST_ACCESS_UNIX_MILLIS: usize = 32;
 const ENTRY_OFFSET_PAYLOAD_KEY_LEN: usize = 40;
 const ENTRY_HEADER_LEN: usize = 44;
+const LEGACY_ENTRY_OFFSET_LIFECYCLE: usize = 1;
+const LEGACY_ENTRY_OFFSET_EVICTABLE: usize = 2;
+const LEGACY_ENTRY_OFFSET_PAYLOAD_LEN: usize = 4;
+const LEGACY_ENTRY_OFFSET_DIRTY_ORDER: usize = 12;
+const LEGACY_ENTRY_OFFSET_ACCESS_ORDER: usize = 20;
+const LEGACY_ENTRY_OFFSET_PAYLOAD_KEY_LEN: usize = 28;
+const LEGACY_ENTRY_HEADER_LEN: usize = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CacheIndexError {
@@ -737,12 +746,16 @@ impl CacheIndex {
 
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
-            if let Some(found) = counters
+            let found_index_format = counters
                 .get(COUNTER_INDEX_FORMAT)
                 .map_err(storage_error)?
-                .map(|value| value.value())
-            {
-                if found != INDEX_FORMAT_VERSION {
+                .map(|value| value.value());
+            if let Some(found) = found_index_format {
+                if found == LEGACY_INDEX_FORMAT_VERSION {
+                    counters
+                        .insert(COUNTER_INDEX_FORMAT, &INDEX_FORMAT_VERSION)
+                        .map_err(storage_error)?;
+                } else if found != INDEX_FORMAT_VERSION {
                     return Err(CacheIndexError::UnsupportedFormat {
                         expected: INDEX_FORMAT_VERSION,
                         found,
@@ -1099,16 +1112,26 @@ fn encode_entry(entry: &StoredEntry) -> Result<Vec<u8>, CacheIndexError> {
 }
 
 fn decode_entry(raw: &[u8], object_id: u64) -> Result<StoredEntry, CacheIndexError> {
-    if raw.len() < ENTRY_HEADER_LEN {
+    let Some(&version) = raw.get(ENTRY_OFFSET_VERSION) else {
         return Err(CacheIndexError::Corruption(format!(
             "entry too short for object_id={object_id}: len={}",
             raw.len()
         )));
+    };
+    match version {
+        LEGACY_ENTRY_ENCODING_VERSION => decode_legacy_entry(raw, object_id),
+        ENTRY_ENCODING_VERSION => decode_current_entry(raw, object_id),
+        _ => Err(CacheIndexError::Corruption(format!(
+            "unknown entry encoding version for object_id={object_id}: {version}",
+        ))),
     }
-    if !matches!(raw.get(ENTRY_OFFSET_VERSION), Some(&ENTRY_ENCODING_VERSION)) {
+}
+
+fn decode_current_entry(raw: &[u8], object_id: u64) -> Result<StoredEntry, CacheIndexError> {
+    if raw.len() < ENTRY_HEADER_LEN {
         return Err(CacheIndexError::Corruption(format!(
-            "unknown entry encoding version for object_id={object_id}: {}",
-            raw[ENTRY_OFFSET_VERSION]
+            "entry too short for object_id={object_id}: len={}",
+            raw.len()
         )));
     }
 
@@ -1173,6 +1196,77 @@ fn decode_entry(raw: &[u8], object_id: u64) -> Result<StoredEntry, CacheIndexErr
         origin,
         upload_state,
         last_access_unix_millis,
+        evictable,
+        dirty_order,
+        access_order,
+    })
+}
+
+fn decode_legacy_entry(raw: &[u8], object_id: u64) -> Result<StoredEntry, CacheIndexError> {
+    if raw.len() < LEGACY_ENTRY_HEADER_LEN {
+        return Err(CacheIndexError::Corruption(format!(
+            "entry too short for object_id={object_id}: len={}",
+            raw.len()
+        )));
+    }
+
+    let lifecycle = decode_lifecycle(raw[LEGACY_ENTRY_OFFSET_LIFECYCLE]).ok_or_else(|| {
+        CacheIndexError::Corruption(format!(
+            "invalid lifecycle value for object_id={object_id}: {}",
+            raw[LEGACY_ENTRY_OFFSET_LIFECYCLE]
+        ))
+    })?;
+    let evictable = raw[LEGACY_ENTRY_OFFSET_EVICTABLE] != 0;
+    let payload_len = read_u64_field(
+        raw,
+        LEGACY_ENTRY_OFFSET_PAYLOAD_LEN,
+        object_id,
+        "payload_len",
+    )?;
+    let dirty_order_raw = read_u64_field(
+        raw,
+        LEGACY_ENTRY_OFFSET_DIRTY_ORDER,
+        object_id,
+        "dirty_order",
+    )?;
+    let access_order = read_u64_field(
+        raw,
+        LEGACY_ENTRY_OFFSET_ACCESS_ORDER,
+        object_id,
+        "access_order",
+    )?;
+    let payload_key_len = usize::try_from(read_u32_field(
+        raw,
+        LEGACY_ENTRY_OFFSET_PAYLOAD_KEY_LEN,
+        object_id,
+        "payload_key_len",
+    )?)
+    .map_err(|_| {
+        CacheIndexError::Corruption(format!(
+            "payload key length does not fit usize for object_id={object_id}"
+        ))
+    })?;
+
+    if raw.len() != LEGACY_ENTRY_HEADER_LEN + payload_key_len {
+        return Err(CacheIndexError::Corruption(format!(
+            "payload key length mismatch for object_id={object_id}: encoded={payload_key_len}, total_len={}",
+            raw.len()
+        )));
+    }
+    let payload_key = raw[LEGACY_ENTRY_HEADER_LEN..].to_vec();
+    let dirty_order = if dirty_order_raw == NO_DIRTY_ORDER {
+        None
+    } else {
+        Some(dirty_order_raw)
+    };
+
+    Ok(StoredEntry {
+        payload_key,
+        payload_len,
+        lifecycle,
+        origin: infer_legacy_origin(lifecycle, evictable),
+        upload_state: infer_legacy_upload_state(lifecycle),
+        last_access_unix_millis: 0,
         evictable,
         dirty_order,
         access_order,
@@ -1265,6 +1359,27 @@ fn decode_upload_state(raw: u8) -> Option<LocalBlockUploadState> {
         1 => Some(LocalBlockUploadState::Pending),
         2 => Some(LocalBlockUploadState::Uploading),
         _ => None,
+    }
+}
+
+fn infer_legacy_origin(lifecycle: LocalBlockLifecycleState, evictable: bool) -> LocalBlockOrigin {
+    if matches!(
+        lifecycle,
+        LocalBlockLifecycleState::Dirty | LocalBlockLifecycleState::Uploading
+    ) || !evictable
+    {
+        LocalBlockOrigin::Local
+    } else {
+        LocalBlockOrigin::Downloaded
+    }
+}
+
+fn infer_legacy_upload_state(lifecycle: LocalBlockLifecycleState) -> LocalBlockUploadState {
+    match lifecycle {
+        LocalBlockLifecycleState::Missing => LocalBlockUploadState::None,
+        LocalBlockLifecycleState::Dirty => LocalBlockUploadState::Pending,
+        LocalBlockLifecycleState::Uploading => LocalBlockUploadState::Uploading,
+        LocalBlockLifecycleState::Uploaded => LocalBlockUploadState::None,
     }
 }
 

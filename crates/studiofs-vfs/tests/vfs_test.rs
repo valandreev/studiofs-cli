@@ -20,8 +20,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use studiofs_cache::open_local_block_backend;
-use studiofs_cache::v3::{CacheV3Layout, CacheV3LocalBlockBackend};
+use studiofs_cache::runtime::CacheV3Layout;
+use studiofs_cache::{PersistentLocalBlockBackend, open_local_block_backend};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_key,
     format_object_fragment_keys, format_object_key, read_object,
@@ -6454,7 +6454,7 @@ fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
             assert!(
                 vfs.local_block_backend()
                     .as_any()
-                    .is::<CacheV3LocalBlockBackend>(),
+                    .is::<PersistentLocalBlockBackend>(),
                 "cache-v3 marker should select cache-v3 backend"
             );
 
@@ -6504,7 +6504,7 @@ fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
             assert!(
                 vfs.local_block_backend()
                     .as_any()
-                    .is::<CacheV3LocalBlockBackend>(),
+                    .is::<PersistentLocalBlockBackend>(),
                 "restart must keep using cache-v3 backend contract"
             );
 

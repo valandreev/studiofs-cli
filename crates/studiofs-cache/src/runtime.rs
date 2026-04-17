@@ -1259,6 +1259,39 @@ mod tests {
     }
 
     #[test]
+    fn cache_v3_backend_reopens_legacy_v1_index_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let legacy_backend =
+            crate::v3::CacheV3LocalBlockBackend::open(crate::v3::CacheV3LocalBlockBackendConfig {
+                cache_root: temp.path().to_path_buf(),
+                volume_uuid: [0x12; 16],
+            })
+            .unwrap();
+        legacy_backend.put(7, b"legacy-pending", false).unwrap();
+        legacy_backend.mark_uploading(7);
+        legacy_backend.sync_data().unwrap();
+        drop(legacy_backend);
+
+        let reopened = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x12; 16],
+        })
+        .unwrap();
+        assert_eq!(
+            reopened.lifecycle_state(7),
+            LocalBlockLifecycleState::Uploading
+        );
+        let stats = reopened.object_stats(7).unwrap();
+        assert_eq!(stats.origin, LocalBlockOrigin::Local);
+        assert_eq!(stats.upload_state, LocalBlockUploadState::Uploading);
+        assert_eq!(reopened.dirty_object_ids(), vec![7]);
+        assert_eq!(reopened.get(7).unwrap().as_ref(), b"legacy-pending");
+    }
+
+    #[test]
     fn cache_v3_backend_object_stats_distinguish_local_pending_and_downloaded_cache() {
         let temp = tempfile::tempdir().unwrap();
         let layout = CacheV3Layout::from_cache_root(temp.path());
