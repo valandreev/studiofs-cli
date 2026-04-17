@@ -14,8 +14,6 @@ pub(super) struct VfsBootstrapPlan {
     readahead_base_width: u32,
     pub(super) readahead_max_width: u32,
     readahead_min_prefetch: u32,
-    readahead_seq_step: u8,
-    readahead_random_penalty: u8,
     fetch_aimd_config: crate::aimd::AimdConfig,
     upload_aimd_config: crate::aimd::AimdConfig,
     max_dirty_bytes: usize,
@@ -51,7 +49,6 @@ pub(super) struct VfsBootstrapPlan {
     readdir_attr_batch_chunk: usize,
     readdir_attr_batch_max_inodes: usize,
     prefetch_foreground_reserve: usize,
-    prefetch_max_per_cycle: usize,
     prefetch_pause_on_neterr: Duration,
 }
 
@@ -136,8 +133,6 @@ impl VfsBootstrapPlan {
             readahead_base_width,
             readahead_max_width,
             readahead_min_prefetch,
-            readahead_seq_step: config.readahead_seq_step,
-            readahead_random_penalty: config.readahead_random_penalty,
             fetch_aimd_config: build_fetch_aimd_config(readahead_max_width, config),
             upload_aimd_config: build_upload_aimd_config(config),
             max_dirty_bytes,
@@ -181,7 +176,6 @@ impl VfsBootstrapPlan {
             readdir_attr_batch_chunk: config.readdir_attr_batch_chunk,
             readdir_attr_batch_max_inodes: config.readdir_attr_batch_max_inodes,
             prefetch_foreground_reserve: config.prefetch_foreground_reserve,
-            prefetch_max_per_cycle: config.prefetch_max_per_cycle,
             prefetch_pause_on_neterr: Duration::from_millis(config.prefetch_pause_on_neterr_ms),
         })
     }
@@ -316,9 +310,6 @@ impl VfsBootstrapResources {
             plan.readahead_base_width,
             plan.readahead_max_width,
             plan.readahead_min_prefetch,
-            plan.readahead_seq_step,
-            plan.readahead_random_penalty,
-            4,
         ));
         let dir_prefetch = Arc::new(DirAccessTracker::new(2));
         let (prefetch_tx, prefetch_rx) = tokio::sync::mpsc::unbounded_channel::<PrefetchWorkItem>();
@@ -481,8 +472,6 @@ impl VfsBootstrap {
             dir_prefetch_max_batch: plan.dir_prefetch_max_batch,
             readdir_attr_batch_chunk: plan.readdir_attr_batch_chunk,
             readdir_attr_batch_max_inodes: plan.readdir_attr_batch_max_inodes,
-            prefetch_foreground_reserve: plan.prefetch_foreground_reserve,
-            prefetch_max_per_cycle: plan.prefetch_max_per_cycle,
             prefetch_pause_on_neterr: plan.prefetch_pause_on_neterr,
             fetch_scheduler: resources.fetch_scheduler,
             distributed_flock: None,

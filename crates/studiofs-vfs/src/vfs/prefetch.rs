@@ -125,15 +125,9 @@ impl<'a> PrefetchBatchBuilder<'a> {
         {
             return Vec::new();
         }
-        let mut budget = self.available_budget();
-        if budget == 0 {
-            return Vec::new();
-        }
-
-        let primary_blocks = Self::primary_blocks_within_budget(
+        let primary_blocks = Self::primary_blocks_within_eof(
             to_prefetch,
             read_context.eof_block(self.vfs.block_size),
-            &mut budget,
         );
         let mut planned = Vec::new();
         if !primary_blocks.is_empty() {
@@ -143,7 +137,7 @@ impl<'a> PrefetchBatchBuilder<'a> {
                 Some(read_context),
             ));
         }
-        self.append_sibling_batches(&mut planned, siblings, &mut budget);
+        self.append_sibling_batches(&mut planned, siblings);
         planned
     }
 
@@ -194,49 +188,22 @@ impl<'a> PrefetchBatchBuilder<'a> {
         (to_prefetch, siblings)
     }
 
-    fn available_budget(&self) -> usize {
-        let window = self.vfs.fetch_scheduler.window().floor().max(1.0) as usize;
-        let in_flight = self.vfs.fetch_scheduler.in_flight();
-        let available = window.saturating_sub(in_flight);
-        let cycle_cap = self.vfs.prefetch_max_per_cycle.max(window / 2).max(1);
-        available
-            .saturating_sub(self.vfs.prefetch_foreground_reserve)
-            .min(cycle_cap)
-    }
-
-    fn primary_blocks_within_budget(
-        to_prefetch: Vec<u32>,
-        eof_block: Option<u32>,
-        budget: &mut usize,
-    ) -> Vec<u32> {
+    fn primary_blocks_within_eof(to_prefetch: Vec<u32>, eof_block: Option<u32>) -> Vec<u32> {
         let mut primary_blocks = Vec::new();
         for block_idx in to_prefetch {
-            if *budget == 0 {
-                break;
-            }
             if let Some(max_block) = eof_block
                 && block_idx > max_block
             {
                 continue;
             }
             primary_blocks.push(block_idx);
-            *budget = budget.saturating_sub(1);
         }
         primary_blocks
     }
 
-    fn append_sibling_batches(
-        &self,
-        planned: &mut Vec<PrefetchBatch>,
-        siblings: Vec<Ino>,
-        budget: &mut usize,
-    ) {
+    fn append_sibling_batches(&self, planned: &mut Vec<PrefetchBatch>, siblings: Vec<Ino>) {
         for sibling_ino in siblings.into_iter().take(self.vfs.dir_prefetch_max_batch) {
-            if *budget == 0 {
-                break;
-            }
             planned.push(PrefetchBatch::single(sibling_ino, 0, None));
-            *budget = budget.saturating_sub(1);
         }
     }
 }
@@ -658,5 +625,36 @@ mod tests {
                 .contains_key(&(ino, stream_id))
         );
         assert!(!vfs.readahead.debug_has_stream(key));
+    }
+
+    #[test]
+    fn plan_prefetch_batches_from_hint_yields_primary_batch_for_sequential_read() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-reader-primary-batch");
+
+        let created = vfs
+            .create(ROOT_INO, b"prefetch-budget-caps.bin", 1000, 1000, 0o644)
+            .expect("create file");
+        let stream_id = 123;
+        let key = ReadStreamKey {
+            ino: created.ino,
+            stream_id,
+        };
+        let policy = AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_tracker);
+
+        let _ = vfs
+            .readahead
+            .record_read_for_stream(key, 0, 0, policy.readahead_policy());
+        let planned = vfs.plan_prefetch_batches_from_hint(created.ino, stream_id, 1, 1, policy);
+
+        assert_eq!(
+            planned.len(),
+            1,
+            "sequential reads should still yield one primary batch"
+        );
+        assert!(
+            planned[0].block_indices.len() >= policy.readahead_min_prefetch as usize,
+            "legacy reserve/cycle caps should not suppress sequential prefetch"
+        );
     }
 }

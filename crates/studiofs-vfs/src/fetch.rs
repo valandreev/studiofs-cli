@@ -262,8 +262,32 @@ impl FetchScheduler {
     /// 4. Retry with exponential backoff on transient errors.
     /// 5. Cache population on success.
     pub async fn fetch_block(&self, object_id: u64, keys: &[String]) -> Result<Bytes, FetchError> {
-        self.fetch_block_with_class(object_id, keys, FetchClass::Foreground)
-            .await
+        self.fetch_block_with_class(
+            object_id,
+            keys,
+            FetchClass::Foreground,
+            LocalCacheHint::CheckFastPath,
+        )
+        .await
+    }
+
+    /// Fetch a block after the caller already confirmed a local cache miss.
+    ///
+    /// This preserves singleflight and cache population while skipping the
+    /// eager pre-singleflight whole-block cache lookup, so the read path does
+    /// not immediately repeat a just-failed direct `read_into()` probe.
+    pub async fn fetch_block_after_local_miss(
+        &self,
+        object_id: u64,
+        keys: &[String],
+    ) -> Result<Bytes, FetchError> {
+        self.fetch_block_with_class(
+            object_id,
+            keys,
+            FetchClass::Foreground,
+            LocalCacheHint::ConfirmedMiss,
+        )
+        .await
     }
 
     /// Best-effort prefetch fetch.
@@ -275,8 +299,13 @@ impl FetchScheduler {
         object_id: u64,
         keys: &[String],
     ) -> Result<Bytes, FetchError> {
-        self.fetch_block_with_class(object_id, keys, FetchClass::Prefetch)
-            .await
+        self.fetch_block_with_class(
+            object_id,
+            keys,
+            FetchClass::Prefetch,
+            LocalCacheHint::CheckFastPath,
+        )
+        .await
     }
 
     async fn fetch_block_with_class(
@@ -284,11 +313,14 @@ impl FetchScheduler {
         object_id: u64,
         keys: &[String],
         class: FetchClass,
+        local_cache_hint: LocalCacheHint,
     ) -> Result<Bytes, FetchError> {
         // ── Fast path: cache ────────────────────────────────────────
-        if let Some(cached) = self.block_store_get_async(object_id).await? {
-            self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(cached);
+        if matches!(local_cache_hint, LocalCacheHint::CheckFastPath) {
+            if let Some(cached) = self.block_store_get_async(object_id).await? {
+                self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(cached);
+            }
         }
 
         if matches!(class, FetchClass::Prefetch) && !self.prefetch_admission_open() {
@@ -322,7 +354,27 @@ impl FetchScheduler {
             };
 
             match action {
-                Action::Fetch => break,
+                Action::Fetch => {
+                    if matches!(local_cache_hint, LocalCacheHint::ConfirmedMiss) {
+                        match self.block_store_get_async(object_id).await {
+                            Ok(Some(cached)) => {
+                                self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+                                if let Some((_, tx)) = self.inflight.remove(&object_id) {
+                                    let _ = tx.send(true);
+                                }
+                                return Ok(cached);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                if let Some((_, tx)) = self.inflight.remove(&object_id) {
+                                    let _ = tx.send(false);
+                                }
+                                return Err(error);
+                            }
+                        }
+                    }
+                    break;
+                }
                 Action::Wait(mut rx) => {
                     // Wait for the fetcher to finish (with a generous timeout
                     // to avoid infinite hangs).
@@ -968,6 +1020,12 @@ enum FetchClass {
     Prefetch,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalCacheHint {
+    CheckFastPath,
+    ConfirmedMiss,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // In-flight cleanup guard (panic safety)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1001,5 +1059,154 @@ impl Drop for InFlightCleanup<'_> {
                 let _ = tx.send(false);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{StudioVfs, VfsConfig};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
+    use studiofs_meta::{MetaFormat, RedbMetaEngine};
+    use tempfile::TempDir;
+    use tokio::runtime::Runtime;
+
+    fn test_format_info(volume_suffix: &str) -> FormatInfo {
+        let volume_name = format!("fetch-{volume_suffix}-{}", std::process::id());
+        FormatInfo {
+            format_version: CURRENT_FORMAT_VERSION,
+            name: volume_name.clone(),
+            uuid: format!("fetch-uuid-{volume_suffix}"),
+            endpoint: "http://127.0.0.1:9000".into(),
+            bucket: "studiofs-test".into(),
+            access_key: "test".into(),
+            secret_key: "test".into(),
+            region: "us-east-1".into(),
+            data_prefix: format!("{volume_name}/objects/"),
+            metadata: MetadataConfig::default(),
+            block_size: 4 * 1024 * 1024,
+        }
+    }
+
+    fn make_unstarted_test_vfs(
+        tmp: &TempDir,
+        volume_suffix: &str,
+    ) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
+        let db_path = tmp.path().join("meta.redb");
+        let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
+        meta.init_root(0, 0).expect("init root");
+
+        let format_info = test_format_info(volume_suffix);
+        meta.set_format_info(&format_info).expect("set format info");
+        let data_config = studiofs_data::store::DataStoreConfig::from(&format_info);
+
+        let cache_dir = tmp.path().join("cache");
+        let rt = Arc::new(Runtime::new().expect("runtime"));
+        let _guard = rt.enter();
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            cache_dir.to_str().expect("cache dir str"),
+            64 * 1024 * 1024,
+            32 * 1024 * 1024,
+            VfsConfig::default()
+                .try_into()
+                .expect("default VFS config should validate"),
+        )
+        .expect("create vfs");
+        (rt, vfs, meta)
+    }
+
+    #[test]
+    fn fetch_block_after_local_miss_skips_eager_cache_get_before_waiting() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "skip-eager-cache-get");
+
+        rt.block_on(async {
+            let scheduler = vfs.fetch_scheduler().clone();
+            let object_id = 0xFA77;
+            let keys = vec!["unused/test/key".to_string()];
+            let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+            scheduler.inflight.insert(object_id, tx.clone());
+
+            let io_calls_before = scheduler.metrics.local_cache_io_calls.load(Ordering::Relaxed);
+            let joins_before = scheduler.metrics.singleflight_joins.load(Ordering::Relaxed);
+
+            let task = tokio::spawn({
+                let scheduler = scheduler.clone();
+                let keys = keys.clone();
+                async move { scheduler.fetch_block_after_local_miss(object_id, &keys).await }
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    if scheduler.metrics.singleflight_joins.load(Ordering::Relaxed) > joins_before {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("fetch should join singleflight waiter");
+
+            assert_eq!(
+                scheduler.metrics.local_cache_io_calls.load(Ordering::Relaxed),
+                io_calls_before,
+                "confirmed local misses should not issue an eager whole-block cache get before waiting"
+            );
+
+            vfs.local_block_backend()
+                .put(object_id, b"payload-from-cache", false)
+                .expect("seed cache for waiter");
+            let _ = tx.send(true);
+
+            let data = task
+                .await
+                .expect("fetch task should join cleanly")
+                .expect("waiter should load data from cache after notification");
+            assert_eq!(data.as_ref(), b"payload-from-cache");
+            assert_eq!(
+                scheduler.metrics.local_cache_io_calls.load(Ordering::Relaxed),
+                io_calls_before + 1,
+                "waiter should perform exactly one cache get after notification"
+            );
+        });
+    }
+
+    #[test]
+    fn fetch_block_after_local_miss_rechecks_cache_when_becoming_fetcher() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "recheck-cache-before-fetch");
+
+        rt.block_on(async {
+            let scheduler = vfs.fetch_scheduler().clone();
+            let object_id = 0xFA88;
+            let keys = vec!["unused/test/key".to_string()];
+            let io_calls_before = scheduler
+                .metrics
+                .local_cache_io_calls
+                .load(Ordering::Relaxed);
+
+            vfs.local_block_backend()
+                .put(object_id, b"payload-from-cache", false)
+                .expect("seed cache for fetcher recheck");
+
+            let data = scheduler
+                .fetch_block_after_local_miss(object_id, &keys)
+                .await
+                .expect("fetcher-side cache recheck should avoid remote fetch");
+            assert_eq!(data.as_ref(), b"payload-from-cache");
+            assert_eq!(
+                scheduler
+                    .metrics
+                    .local_cache_io_calls
+                    .load(Ordering::Relaxed),
+                io_calls_before + 1,
+                "fetcher should do exactly one cache get when rechecking after a confirmed miss"
+            );
+        });
     }
 }

@@ -2109,8 +2109,6 @@ pub struct StudioVfs {
     dir_prefetch_max_batch: usize,
     readdir_attr_batch_chunk: usize,
     readdir_attr_batch_max_inodes: usize,
-    prefetch_foreground_reserve: usize,
-    prefetch_max_per_cycle: usize,
     prefetch_pause_on_neterr: Duration,
     /// Adaptive fetch scheduler (AIMD + singleflight).
     /// Replaces the old `FetchThrottle`, `inflight_fetches`, and VFS-retry.
