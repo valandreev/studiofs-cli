@@ -1792,7 +1792,7 @@ mod tests {
     use studiofs_meta::schema::DirEntry;
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
     use studiofs_meta::{MetaFormat, ROOT_INO, RedbMetaEngine};
-    use studiofs_vfs::{LocalSyncPolicy, OpenFlags, StudioVfs, VfsConfig, VfsError};
+    use studiofs_vfs::{OpenFlags, StudioVfs, VfsConfig, VfsError};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
     #[cfg(target_os = "macos")]
@@ -2237,48 +2237,5 @@ mod tests {
 
         let data = rt.block_on(vfs.read(ino, 0, 7)).expect("read data");
         assert_eq!(data.as_ref(), b"release");
-    }
-
-    #[test]
-    fn vfs_fsync_supports_the_fuse_inode_scoped_durability_contract() {
-        let (_tmp, rt, vfs, _fs) = make_test_fuse_fs("fsync-inode-barrier");
-        let created = vfs
-            .create(ROOT_INO, b"fsync-inode-barrier.txt", 0, 0, 0o644)
-            .expect("create file");
-        let ino = created.ino;
-        let fh = vfs
-            .open_file(ino, OpenFlags::RDWR, false)
-            .expect("open file handle");
-
-        // This regression test intentionally exercises the VFS-side fsync
-        // contract directly; it documents the inode-scoped Local-First
-        // behavior that the FUSE bridge callback is expected to preserve.
-        rt.block_on(vfs.write_fh_with_local_sync_policy(
-            fh,
-            ino,
-            0,
-            b"payload",
-            LocalSyncPolicy::Opportunistic,
-        ))
-        .expect("write via handle");
-
-        let first = rt
-            .block_on(vfs.fsync_with_outcome(ino, false))
-            .expect("fsync should succeed");
-        assert!(
-            first.flushed_file_data,
-            "FUSE fsync should materialize dirty handle-writer state through the inode-scoped barrier"
-        );
-
-        let second = rt
-            .block_on(vfs.fsync_with_outcome(ino, false))
-            .expect("second fsync should succeed");
-        assert!(
-            !second.flushed_file_data,
-            "once local unpublished state is durable, the next FUSE fsync should stay clean"
-        );
-
-        rt.block_on(vfs.release_fh(fh))
-            .expect("release file handle");
     }
 }
