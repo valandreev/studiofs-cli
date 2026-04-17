@@ -12137,7 +12137,7 @@ async fn zeroio_shutdown_snapshot_uses_runtime_dir_without_ingress_spill() {
 }
 
 #[test]
-fn zeroio_fast_mode_self_heals_legacy_ingress_artifacts_on_startup() {
+fn zeroio_fast_mode_ignores_legacy_ingress_artifacts_on_startup() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     unsafe {
         std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
@@ -12182,36 +12182,34 @@ fn zeroio_fast_mode_self_heals_legacy_ingress_artifacts_on_startup() {
     )
     .2;
 
-    assert!(legacy_spill_dir.join("segments").exists());
-    assert!(legacy_spill_dir.join("checkpoints").exists());
     assert!(
-        std::fs::read_dir(legacy_spill_dir.join("segments"))
-            .unwrap()
-            .next()
-            .is_none(),
-        "fast-mode startup should clear legacy ingress segment files"
+        legacy_spill_dir
+            .join("segments")
+            .join("0000000000000001.seg")
+            .exists(),
+        "fast-mode startup should ignore unsupported legacy ingress segments"
     );
     assert!(
-        std::fs::read_dir(legacy_spill_dir.join("checkpoints"))
-            .unwrap()
-            .next()
-            .is_none(),
-        "fast-mode startup should clear legacy ingress checkpoints"
+        legacy_spill_dir
+            .join("checkpoints")
+            .join("latest.json")
+            .exists(),
+        "fast-mode startup should leave legacy checkpoint files untouched"
     );
     assert!(
-        !legacy_spill_dir.join("state.json").exists(),
-        "fast-mode startup should remove legacy ingress state files"
+        legacy_spill_dir.join("state.json").exists(),
+        "fast-mode startup should not special-case legacy ingress state files"
     );
     assert!(
-        !legacy_spill_dir.join("legacy.spill").exists(),
-        "fast-mode startup should remove legacy ingress spill files"
+        legacy_spill_dir.join("legacy.spill").exists(),
+        "fast-mode startup should leave legacy spill files untouched"
     );
 
     drop(vfs);
 }
 
 #[test]
-fn zeroio_durable_mode_rejects_legacy_ingress_artifacts_on_startup() {
+fn zeroio_durable_mode_ignores_legacy_ingress_artifacts_on_startup() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     unsafe {
         std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
@@ -12239,7 +12237,7 @@ fn zeroio_durable_mode_rejects_legacy_ingress_artifacts_on_startup() {
     )
     .unwrap();
 
-    let error = match StudioVfs::new(
+    let vfs = StudioVfs::new(
         meta,
         &DataStoreConfig::from(&format_info),
         &cache_dir_str,
@@ -12251,17 +12249,18 @@ fn zeroio_durable_mode_rejects_legacy_ingress_artifacts_on_startup() {
         }
         .validate()
         .expect("durable config should validate"),
-    ) {
-        Ok(_) => panic!("durable startup should reject unresolved legacy ingress artifacts"),
-        Err(error) => error,
-    };
+    )
+    .expect("durable startup should ignore unsupported legacy ingress artifacts");
 
     assert!(
-        error
-            .to_string()
-            .contains("legacy ingress artifacts detected"),
-        "durable startup should explain why the mount was rejected"
+        legacy_spill_dir
+            .join("segments")
+            .join("0000000000000001.seg")
+            .exists(),
+        "durable startup should leave unsupported legacy ingress artifacts untouched"
     );
+
+    drop(vfs);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
