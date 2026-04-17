@@ -26,9 +26,9 @@ pub(super) struct PendingDirtyReadSpan {
 }
 
 #[derive(Debug, Clone)]
-struct DirtyWriteSnapshot {
-    block_index: u32,
-    data: Bytes,
+pub(super) struct DirtyWriteSnapshot {
+    pub(super) block_index: u32,
+    pub(super) data: Bytes,
 }
 
 #[derive(Debug, Clone)]
@@ -888,7 +888,7 @@ impl<'a> LocalDirtyFlushSession<'a> {
 }
 
 impl StudioVfs {
-    async fn build_dirty_write_snapshots_from_buffered_writes(
+    pub(super) async fn build_dirty_write_snapshots_from_buffered_writes(
         &self,
         ino: Ino,
         writes: &[(u64, Bytes)],
@@ -1051,6 +1051,88 @@ impl StudioVfs {
             return Ok(());
         }
 
+        if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+            let (completed_blocks, buffered_blocks): (Vec<_>, Vec<_>) = blocks
+                .into_iter()
+                .partition(|block| block.data.len() == self.block_size as usize);
+
+            if !completed_blocks.is_empty() {
+                let attr_to_persist = if buffered_blocks.is_empty() {
+                    dirty_attr.clone()
+                } else {
+                    self.derive_opportunistic_prefix_attr(
+                        ino,
+                        dirty_attr.as_ref(),
+                        &completed_blocks,
+                    )
+                    .await?
+                };
+                self.persist_dirty_write_snapshots_direct(
+                    ino,
+                    completed_blocks,
+                    content_epoch,
+                    attr_to_persist,
+                    local_sync_policy,
+                )
+                .await?;
+            }
+
+            if !buffered_blocks.is_empty() {
+                self.stage_dirty_write_snapshots(ino, buffered_blocks);
+            }
+
+            return Ok(());
+        }
+
+        self.persist_dirty_write_snapshots_direct(
+            ino,
+            blocks,
+            content_epoch,
+            dirty_attr,
+            local_sync_policy,
+        )
+        .await
+    }
+
+    pub(super) async fn derive_opportunistic_prefix_attr(
+        &self,
+        ino: Ino,
+        dirty_attr: Option<&InodeAttr>,
+        completed_blocks: &[DirtyWriteSnapshot],
+    ) -> VfsResult<Option<InodeAttr>> {
+        let Some(max_completed_end) = completed_blocks
+            .iter()
+            .map(|block| {
+                (u64::from(block.block_index) + 1).saturating_mul(u64::from(self.block_size))
+            })
+            .max()
+        else {
+            return Ok(None);
+        };
+
+        let persisted_attr = run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            engine.get_attr(ino)
+        })
+        .await?;
+        let mut attr = dirty_attr
+            .cloned()
+            .unwrap_or_else(|| persisted_attr.clone());
+        attr.size = persisted_attr.size.max(max_completed_end);
+        Ok(Some(attr))
+    }
+
+    pub(super) async fn persist_dirty_write_snapshots_direct(
+        &self,
+        ino: Ino,
+        blocks: Vec<DirtyWriteSnapshot>,
+        content_epoch: u64,
+        attr_to_persist: Option<InodeAttr>,
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<()> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
         let block_count = u32::try_from(blocks.len()).map_err(|_| {
             VfsError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1072,25 +1154,54 @@ impl StudioVfs {
             })
             .collect();
 
-        let attr_to_clear = dirty_attr.clone();
+        let persisted_block_indexes: Vec<u32> = persisted_blocks
+            .iter()
+            .map(|block| block.block_index)
+            .collect();
+        let attr_to_clear = attr_to_persist.clone();
         let _outcome = drain
             .execute_drain(
                 ino,
                 persisted_blocks,
                 std::collections::BTreeMap::new(),
                 content_epoch,
-                dirty_attr,
+                attr_to_persist,
                 PayloadPersistConfig {
                     put_concurrency: self.payload_put_concurrency,
                     local_sync_policy,
                 },
             )
             .await?;
+        for block_index in persisted_block_indexes {
+            self.clear_pending_block(ino, block_index);
+        }
         if let Some(attr) = attr_to_clear.as_ref() {
             self.clear_matching_dirty_attr_if_committed(ino, attr);
         }
 
         Ok(())
+    }
+
+    fn stage_dirty_write_snapshots(&self, ino: Ino, blocks: Vec<DirtyWriteSnapshot>) {
+        for block in blocks {
+            let reserved_object_id = self
+                .state
+                .local_dirty
+                .pending_blocks
+                .lock()
+                .get(&(ino, block.block_index))
+                .and_then(|pending| pending.reserved_object_id);
+            self.replace_pending_local_dirty_block(
+                ino,
+                block.block_index,
+                PendingBlock {
+                    data: BytesMut::from(block.data.as_ref()),
+                    dirty: true,
+                    reserved_object_id,
+                },
+            );
+            self.clear_pending_dirty_slices_for_block(ino, block.block_index);
+        }
     }
 
     fn local_dirty_drain(&self) -> LocalDirtyDrain<'_> {

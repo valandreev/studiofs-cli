@@ -1883,6 +1883,11 @@ fn normalize_data_prefix(format_info: &FormatInfo) -> String {
 }
 
 fn validate_volume_block_size(block_size: u32) -> VfsResult<()> {
+    if block_size == 0 {
+        return Err(VfsError::Other(
+            "volume block_size 0 is invalid; block_size must be non-zero".to_string(),
+        ));
+    }
     let cloud_logical_block_capacity = CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT;
     if (block_size as usize) > cloud_logical_block_capacity {
         return Err(VfsError::Other(format!(
@@ -4894,6 +4899,11 @@ impl StudioVfs {
         }
     }
 
+    fn total_pending_write_buffer_bytes(&self) -> usize {
+        self.total_pending_local_dirty_bytes()
+            .saturating_add(self.state.handle_writers.total_dirty_bytes())
+    }
+
     fn per_second(total: u64, elapsed: Duration) -> f64 {
         let secs = elapsed.as_secs_f64();
         if secs <= f64::EPSILON {
@@ -5637,7 +5647,7 @@ impl StudioVfs {
     /// Describe whether a new locally materialized payload would still fit in
     /// the in-memory dirty buffer or would hit local backpressure.
     pub fn ingress_pressure_for(&self, next_bytes: usize) -> VfsIngressPressure {
-        let dirty_mem_bytes = self.total_pending_local_dirty_bytes();
+        let dirty_mem_bytes = self.total_pending_write_buffer_bytes();
         let dirty_mem_limit = self.max_dirty_bytes.load(Ordering::Acquire);
         let lane = if dirty_mem_bytes == 0
             || dirty_mem_bytes.saturating_add(next_bytes) <= dirty_mem_limit

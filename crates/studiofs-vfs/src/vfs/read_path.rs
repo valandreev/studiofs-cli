@@ -1746,10 +1746,13 @@ mod tests {
             vfs.write(created.ino, 0, &payload)
                 .await
                 .expect("write payload");
+            vfs.flush(created.ino)
+                .await
+                .expect("materialize pending local state");
 
             assert!(
                 !vfs.has_pending_local_dirty_blocks_for_inode(created.ino),
-                "foreground write should materialize local pending extents before read"
+                "explicit flush should materialize local pending extents before read"
             );
             assert!(
                 !vfs.pending_uploads_for_inode(created.ino).is_empty(),
