@@ -4011,7 +4011,7 @@ fn test_crash_recovery_replays_local_committed_block_before_remote_fetch() {
             assert_eq!(
                 read.as_ref(),
                 replacement_payload.as_slice(),
-                "read after restart with offline endpoint should use committed block-store state; runtime_stats={:?} meta_blocks={:?}",
+                "read after restart with offline endpoint should use committed block-store state; ingress_stats={:?} meta_blocks={:?}",
                 vfs.ingress_stats(),
                 vfs.meta().get_file_blocks(ino).ok(),
             );

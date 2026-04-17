@@ -231,13 +231,14 @@ impl VfsBootstrapPlan {
 
 fn remove_retired_ingress_spill(cache_root: &Path) -> VfsResult<()> {
     let retired_dir = cache_root.join("ingress_spill");
-    let metadata = match std::fs::metadata(&retired_dir) {
+    let metadata = match std::fs::symlink_metadata(&retired_dir) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(VfsError::Io(error)),
     };
+    let file_type = metadata.file_type();
 
-    if metadata.is_dir() {
+    if file_type.is_dir() && !file_type.is_symlink() {
         std::fs::remove_dir_all(&retired_dir).map_err(VfsError::Io)?;
     } else {
         std::fs::remove_file(&retired_dir).map_err(VfsError::Io)?;
@@ -586,6 +587,8 @@ impl StudioVfs {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    #[cfg(unix)]
+    use std::{fs, os::unix::fs::symlink};
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, MetadataConfig};
     use studiofs_meta::{MetaEngine, MetaFormat, RedbMetaEngine};
     use tempfile::TempDir;
@@ -891,6 +894,61 @@ mod tests {
         assert_eq!(
             plan.local_backend_budget_bytes, plan.minimum_local_backend_budget_bytes,
             "when clamped, bootstrap plan should use the computed minimum local backend budget"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_retired_ingress_spill_removes_broken_symlink() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cache_root = tmp.path().join("cache");
+        fs::create_dir_all(&cache_root).expect("create cache root");
+        let retired_path = cache_root.join("ingress_spill");
+        let missing_target = tmp.path().join("missing-ingress-target");
+        symlink(&missing_target, &retired_path).expect("create broken retired symlink");
+
+        assert!(
+            fs::symlink_metadata(&retired_path).is_ok(),
+            "test setup should create a broken symlink entry"
+        );
+
+        remove_retired_ingress_spill(&cache_root)
+            .expect("broken retired ingress symlink should be removed");
+
+        assert!(
+            fs::symlink_metadata(&retired_path).is_err(),
+            "cleanup should remove the broken ingress_spill symlink itself"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_retired_ingress_spill_removes_symlink_without_touching_target() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cache_root = tmp.path().join("cache");
+        fs::create_dir_all(&cache_root).expect("create cache root");
+        let target_dir = tmp.path().join("retired-target");
+        fs::create_dir_all(&target_dir).expect("create symlink target");
+        let sentinel = target_dir.join("sentinel.txt");
+        fs::write(&sentinel, b"keep").expect("write target sentinel");
+
+        let retired_path = cache_root.join("ingress_spill");
+        symlink(&target_dir, &retired_path).expect("create retired symlink");
+
+        remove_retired_ingress_spill(&cache_root)
+            .expect("retired ingress symlink should be removed");
+
+        assert!(
+            fs::symlink_metadata(&retired_path).is_err(),
+            "cleanup should remove the cache-root symlink entry"
+        );
+        assert!(
+            target_dir.exists(),
+            "cleanup should not remove the symlink target"
+        );
+        assert!(
+            sentinel.exists(),
+            "cleanup should leave target contents intact"
         );
     }
 }
