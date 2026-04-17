@@ -524,8 +524,8 @@ mod tests {
     }
 
     #[test]
-    fn load_parses_legacy_and_canonical_postgres_flags() {
-        let legacy = crate::cli::parse_for_test(&[
+    fn load_parses_canonical_and_legacy_postgres_flags() {
+        let canonical = crate::cli::parse_for_test(&[
             "load",
             "--path-to-dump",
             "reports/metadata.json",
@@ -533,7 +533,7 @@ mod tests {
             "postgres://user:pass@127.0.0.1:5432",
         ])
         .unwrap();
-        match legacy.command {
+        match canonical.command {
             crate::cli::Commands::Load(LoadArgs {
                 path_to_dump,
                 postgresql_address,
@@ -544,7 +544,7 @@ mod tests {
             other => panic!("expected Load, got {other:?}"),
         }
 
-        let canonical = crate::cli::parse_for_test(&[
+        let legacy = crate::cli::parse_for_test(&[
             "load",
             "--path-to-dump",
             "reports/metadata.json",
@@ -552,7 +552,7 @@ mod tests {
             "postgres://user:pass@127.0.0.1:5432",
         ])
         .unwrap();
-        match canonical.command {
+        match legacy.command {
             crate::cli::Commands::Load(LoadArgs {
                 postgresql_address, ..
             }) => assert_eq!(postgresql_address, "postgres://user:pass@127.0.0.1:5432"),
