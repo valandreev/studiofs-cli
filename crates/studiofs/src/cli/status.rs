@@ -273,7 +273,7 @@ pub fn run(
         if detection.has_cache_v3_contract() {
             "none"
         } else {
-            "mount will provision the Cache 3.0 layout on first use"
+            "mount will provision the local cache layout on first use"
         }
     } else {
         "inspect the cache root manually"
@@ -290,7 +290,7 @@ pub fn run(
     println!("  Cache layout state:  {}", contract_state);
     if let Some(detection) = cache_backend_detection.as_ref() {
         println!(
-            "  Cache 3.0 marker:    {} ({})",
+            "  Local cache marker:  {} ({})",
             detection.layout.layout_marker.display(),
             if detection.has_cache_v3_contract() {
                 "present"
@@ -299,7 +299,7 @@ pub fn run(
             }
         );
         println!(
-            "  Cache 3.0 index:     {} ({})",
+            "  Local cache index:   {} ({})",
             detection.layout.redb_index_path.display(),
             if detection.v3_index_exists {
                 "present"
@@ -308,7 +308,7 @@ pub fn run(
             }
         );
         println!(
-            "  Cache 3.0 payload:   {} ({})",
+            "  Local cache payload: {} ({})",
             detection.layout.payload_blocks_dir.display(),
             if detection.v3_payload_blocks_dir_exists {
                 "present"

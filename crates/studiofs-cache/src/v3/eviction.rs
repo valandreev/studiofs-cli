@@ -1,4 +1,4 @@
-//! Cache 3.0 budget governor and eviction thresholds.
+//! Budget governor and eviction thresholds for the current `v3` local cache backend.
 //!
 //! The governor keeps budget policy separate from backend I/O mechanics so
 //! `mod.rs` can focus on applying deterministic eviction passes.

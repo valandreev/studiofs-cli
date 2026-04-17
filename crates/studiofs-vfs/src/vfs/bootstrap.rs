@@ -80,7 +80,7 @@ impl VfsBootstrapPlan {
                 block_size,
                 max_dirty_bytes = cache_runtime_tuning.max_dirty_bytes,
                 write_eager_flush_batch_bytes = cache_runtime_tuning.write_eager_flush_batch_bytes,
-                "configured cache_size is below Cache 3.0 local durability requirements; clamping local backend budget upward"
+                "configured cache_size is below current local-cache durability requirements; clamping local backend budget upward"
             );
         }
         validate_volume_block_size(block_size)?;
@@ -300,7 +300,7 @@ impl VfsBootstrapResources {
                 cache_root = %opened_local_backend.detection.layout.cache_root.display(),
                 layout_marker = %opened_local_backend.detection.layout.layout_marker.display(),
                 cache_v3_root = %opened_local_backend.detection.layout.v3_root.display(),
-                "using Cache 3.0 file-per-block local backend under the v3 subtree"
+                "using current file-per-block local backend under the v3 subtree"
             );
         }
         let local_block_backend = opened_local_backend.backend;
@@ -534,7 +534,7 @@ impl StudioVfs {
         )
     }
 
-    /// Create a new VFS instance reusing a prepared Cache 3.0 runtime.
+    /// Create a new VFS instance reusing a prepared local-cache runtime.
     pub fn new_with_prepared_cache_runtime<M>(
         meta: Arc<M>,
         data_config: &DataStoreConfig,

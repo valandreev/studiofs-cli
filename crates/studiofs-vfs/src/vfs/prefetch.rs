@@ -632,7 +632,7 @@ mod tests {
     #[test]
     fn plan_prefetch_batches_from_hint_clears_stale_hint_for_missing_inode() {
         let tmp = TempDir::new().expect("tempdir");
-        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-planner-missing-inode");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-reader-missing-inode");
         let ino = 9_302;
         let stream_id = 88;
         let key = ReadStreamKey { ino, stream_id };

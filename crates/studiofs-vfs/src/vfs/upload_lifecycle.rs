@@ -295,8 +295,8 @@ impl StudioVfs {
             self.state.read.decrement_active_access_class(class);
         }
 
-        // Phase 1: flush pending WriteBuffer state inline into the local backend +
-        // metadata so local durability is established before shutdown.
+        // Phase 1: flush pending local dirty state inline into the local backend
+        // + metadata so local durability is established before shutdown.
         let dirty_before = self.total_pending_write_buffer_bytes();
         info!(
             dirty_bytes = dirty_before,

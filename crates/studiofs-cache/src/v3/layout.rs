@@ -7,9 +7,9 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Layout contract version for Cache 3.0.
+/// Layout contract version for the current `v3` local cache backend.
 pub const CACHE_V3_LAYOUT_VERSION: u32 = 1;
-/// Dedicated Cache 3.0 subtree under the per-volume cache root.
+/// Dedicated `v3` subtree under the per-volume cache root.
 pub const CACHE_V3_SUBTREE: &str = "v3";
 /// Marker file used to indicate the v3 layout has been provisioned.
 pub const CACHE_V3_LAYOUT_MARKER_FILE: &str = "LAYOUT_V1";
@@ -19,7 +19,7 @@ pub const CACHE_V3_TMP_DIR: &str = "tmp";
 pub const CACHE_V3_PAYLOAD_DIR: &str = "payload";
 /// Nested tree under `payload/` holding block files.
 pub const CACHE_V3_PAYLOAD_BLOCKS_DIR: &str = "blocks";
-/// Extension used by committed Cache 3.0 payload files.
+/// Extension used by committed `v3` payload files.
 pub const CACHE_V3_PAYLOAD_BLOCK_FILE_EXTENSION: &str = "block";
 /// Number of shard directories in the payload block tree.
 pub const CACHE_V3_PAYLOAD_SHARD_COUNT: usize = 256 * 256;

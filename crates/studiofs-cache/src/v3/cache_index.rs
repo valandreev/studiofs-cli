@@ -1,4 +1,4 @@
-//! Cache 3.0 metadata index backed by redb.
+//! Metadata index for the current `v3` local cache backend, backed by redb.
 //!
 //! The index is the source of truth for block lifecycle state, replay ordering,
 //! and space accounting. Accounting counters are updated atomically with row

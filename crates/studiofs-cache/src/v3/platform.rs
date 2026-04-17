@@ -1,4 +1,4 @@
-//! Platform-specific primitives for Cache 3.0 payload files.
+//! Platform-specific primitives for `v3` payload files.
 
 use std::fs::File;
 use std::io;

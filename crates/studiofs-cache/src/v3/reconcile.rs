@@ -1,6 +1,6 @@
-//! Cache 3.0 startup reconciliation.
+//! Startup reconciliation for the current `v3` local cache backend.
 //!
-//! Startup reconciliation is intentionally scoped to the Cache 3.0 subtree.
+//! Startup reconciliation is intentionally scoped to the `v3` subtree.
 //! It never mutates unrelated files under the cache root.
 
 use std::io;
@@ -58,7 +58,7 @@ pub enum CacheV3StartupReconcileError {
     Index(#[from] CacheIndexError),
 }
 
-/// Reconcile startup state for Cache 3.0.
+/// Reconcile startup state for the current `v3` local cache backend.
 ///
 /// `Lightweight` mode:
 /// - delete orphan temp files under `v3/tmp/**`;

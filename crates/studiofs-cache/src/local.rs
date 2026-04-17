@@ -1,4 +1,4 @@
-//! Active local block backend contract used by the Cache 3.0 data path.
+//! Active local block backend contract used by the current local-cache data path.
 //!
 //! The goal is to keep VFS/data-path code independent of backend internals
 //! while still exposing the block lifecycle states required for upload replay

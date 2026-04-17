@@ -158,8 +158,8 @@ impl StudioVfs {
         pending_content_epoch: Option<u64>,
         pending_upload_index: Option<&PendingUploadCatalog>,
     ) -> Option<PendingOverlayBlockSource> {
-        // Stage 1 — WriteBuffer: newest local bytes not yet represented by
-        // committed local-backend metadata.
+        // Stage 1 — local dirty state: newest local bytes not yet represented
+        // by committed local-backend metadata.
         if let Some(pending_block) = self
             .state
             .write_buffer

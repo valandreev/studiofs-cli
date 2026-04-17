@@ -1,4 +1,4 @@
-//! Core VFS implementation — Block-based architecture.
+//! Core VFS implementation for the current Local-First data plane.
 //!
 //! Key design:
 //! - Files are split into fixed-size blocks (default 16MB)
@@ -9,14 +9,14 @@
 //!
 //! Write Path:
 //! 1. Split data into blocks
-//! 2. Merge dirty bytes into the per-file `WriteBuffer`
-//! 3. Persist full dirty blocks locally via the Cache 3.0 backend `put(...)`
+//! 2. Merge accepted bytes into local dirty state
+//! 3. Persist full dirty blocks locally via the current local cache backend `put(...)`
 //! 4. Apply local `sync_data()` barriers (strict for fsync / durable mode,
 //!    grouped in fast mode) and persist extent metadata / attrs
 //! 5. Queue committed extents for async upload + remote publish
 //!
 //! Read Path:
-//! 1. Check the `WriteBuffer` overlay for newer local bytes
+//! 1. Check local writer state for newer local bytes
 //! 2. Resolve local metadata refs to committed local extents in the local backend
 //!    (inline on the active runtime worker, no per-op blocking-pool hop)
 //! 3. Fall back to remote fetch
@@ -971,7 +971,7 @@ struct UploadState {
     upload_fallback_wait_max_ns: AtomicU64,
     upload_fallback_read_ns: AtomicU64,
     upload_fallback_read_max_ns: AtomicU64,
-    /// Dynamic slot cost adjusted from buffered-first foreground-read pressure.
+    /// Dynamic slot cost adjusted from foreground-read pressure on the Local-First path.
     upload_cache_io_foreground_cost: AtomicU32,
 }
 
@@ -2058,7 +2058,7 @@ pub struct StudioVfs {
     upload_fg_read_latency_window: Duration,
     /// Sticky horizon for using last known foreground P90 in the throttle loop.
     upload_fg_read_latency_sticky_window: Duration,
-    /// Handle-aware access classifier tuning derived from VFS read settings.
+    /// Handle-aware access tracking tuning derived from VFS read settings.
     access_classifier: AccessClassifierConfig,
     /// Grace window after the last foreground read to keep user priority.
     upload_user_idle_grace: Duration,

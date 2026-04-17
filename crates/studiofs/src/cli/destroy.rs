@@ -81,12 +81,12 @@ impl DestroyArgs {
 fn describe_destroy_cache_scope(detection: Option<&CacheBackendDetection>) -> &'static str {
     if let Some(detection) = detection {
         if detection.has_cache_v3_contract() {
-            "local cleanup removes the entire metadata directory (`meta_dir`), including the default cache root and its Cache 3.0 subtree"
+            "local cleanup removes the entire metadata directory (`meta_dir`), including the default cache root and its active local-cache subtree"
         } else {
             "local cleanup removes the entire metadata directory (`meta_dir`), including any default cache-root contents under it"
         }
     } else {
-        "local cleanup removes the entire metadata directory (`meta_dir`); Cache 3.0 layout state could not be inspected"
+        "local cleanup removes the entire metadata directory (`meta_dir`); local cache layout state could not be inspected"
     }
 }
 
@@ -119,7 +119,7 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
         Ok(detection) => Some(detection),
         Err(error) => {
             println!(
-                "Warning: Failed to inspect Cache 3.0 layout state at '{}': {error}",
+                "Warning: Failed to inspect local cache layout state at '{}': {error}",
                 default_cache_root.display()
             );
             None
@@ -179,7 +179,7 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
     );
     if let Some(detection) = cache_backend_detection.as_ref() {
         println!(
-            "  Cache 3.0 marker: {} ({})",
+            "  Local cache marker: {} ({})",
             detection.layout.layout_marker.display(),
             if detection.has_cache_v3_contract() {
                 "present"
@@ -188,7 +188,7 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
             }
         );
         println!(
-            "  Cache 3.0 index: {} ({})",
+            "  Local cache index: {} ({})",
             detection.layout.redb_index_path.display(),
             if detection.v3_index_exists {
                 "present"
@@ -362,11 +362,11 @@ mod tests {
         assert_eq!(describe_cache_layout_state(None), "unknown");
         assert_eq!(
             describe_cache_layout_state(Some(&detection(false))),
-            "Cache 3.0 not initialized"
+            "Local cache layout not initialized"
         );
         assert_eq!(
             describe_cache_layout_state(Some(&detection(true))),
-            "Cache 3.0 ready"
+            "Local cache layout ready"
         );
     }
 
@@ -374,7 +374,7 @@ mod tests {
     fn destroy_cleanup_scope_is_layout_aware() {
         assert_eq!(
             describe_destroy_cache_scope(Some(&detection(true))),
-            "local cleanup removes the entire metadata directory (`meta_dir`), including the default cache root and its Cache 3.0 subtree"
+            "local cleanup removes the entire metadata directory (`meta_dir`), including the default cache root and its active local-cache subtree"
         );
         assert_eq!(
             describe_destroy_cache_scope(Some(&detection(false))),
@@ -382,7 +382,7 @@ mod tests {
         );
         assert_eq!(
             describe_destroy_cache_scope(None),
-            "local cleanup removes the entire metadata directory (`meta_dir`); Cache 3.0 layout state could not be inspected"
+            "local cleanup removes the entire metadata directory (`meta_dir`); local cache layout state could not be inspected"
         );
     }
 

@@ -175,8 +175,8 @@ impl SendConstBuffer {
 /// As part of SFS-122, StudioFS removed the Windows direct-I/O product surface,
 /// so `FILE_NO_INTERMEDIATE_BUFFERING` and `FILE_WRITE_THROUGH` no longer
 /// select an alternate read/write data plane. What still matters here is the
-/// actual access mask: treating every Windows handle as RDWR confuses the VFS
-/// classifier, sticky-error reporting, and last-handle release policy. The
+/// actual access mask: treating every Windows handle as RDWR confuses VFS
+/// access tracking, sticky-error reporting, and last-handle release policy. The
 /// stricter write barrier policy for write-through / unbuffered handles is
 /// derived separately from `CreateOptions`.
 fn open_flags_from_access(granted_access: FILE_ACCESS_RIGHTS, _create_options: u32) -> OpenFlags {
