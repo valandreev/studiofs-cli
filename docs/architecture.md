@@ -93,7 +93,7 @@ Reads prefer local state in this order:
 
 Historical ingress artifacts note:
 - Retired `ingress_spill` directories are outside the active Local-First contract.
-- Startup recovery operates on Cache 3.0 plus `cache/runtime` state only.
+- Startup removes a detected retired `ingress_spill` directory and then operates on Cache 3.0 plus `cache/runtime` state only.
 
 Metadata lookups are served from local `redb`, where local staged blocks
 override committed blocks, and local overlay attrs/dentries/symlinks/xattrs override the remote-visible base view.

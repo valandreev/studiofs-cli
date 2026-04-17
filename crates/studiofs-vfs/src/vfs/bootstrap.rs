@@ -229,6 +229,27 @@ impl VfsBootstrapPlan {
     }
 }
 
+fn remove_retired_ingress_spill(cache_root: &Path) -> VfsResult<()> {
+    let retired_dir = cache_root.join("ingress_spill");
+    let metadata = match std::fs::metadata(&retired_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(VfsError::Io(error)),
+    };
+
+    if metadata.is_dir() {
+        std::fs::remove_dir_all(&retired_dir).map_err(VfsError::Io)?;
+    } else {
+        std::fs::remove_file(&retired_dir).map_err(VfsError::Io)?;
+    }
+
+    warn!(
+        retired_path = %retired_dir.display(),
+        "startup removed retired ingress_spill state from the old cache layout"
+    );
+    Ok(())
+}
+
 struct VfsBootstrapResources {
     zeroio_runtime_state_dir: PathBuf,
     local_block_backend: Arc<dyn LocalBlockBackend>,
@@ -252,6 +273,8 @@ impl VfsBootstrapResources {
         config: &VfsConfigValidated,
         cache_runtime: Option<PreparedCacheV3Runtime>,
     ) -> VfsResult<Self> {
+        remove_retired_ingress_spill(Path::new(cache_dir))?;
+
         let zeroio_runtime_state_dir =
             PathBuf::from(cache_dir).join(super::ZEROIO_RUNTIME_STATE_DIR);
         std::fs::create_dir_all(&zeroio_runtime_state_dir).map_err(VfsError::Io)?;

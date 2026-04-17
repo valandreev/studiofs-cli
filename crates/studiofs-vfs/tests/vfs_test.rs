@@ -2193,7 +2193,7 @@ fn test_crash_recovery_replays_pending_journal() {
 
 #[test]
 #[ignore = "requires live S3 backend; run with --ignored and valid .env"]
-fn test_crash_recovery_replays_ingress_spill_before_metadata_flush() {
+fn test_crash_recovery_replays_local_committed_block_before_metadata_flush() {
     // Keep S3 settings stable for this long-running crash/restart scenario.
     // Other tests intentionally toggle endpoint reachability; pinning online
     // values here avoids inheriting a stale offline endpoint.
@@ -3847,7 +3847,7 @@ fn remote_attr_cache_refreshes_after_nested_publish_sync() {
 
 #[test]
 #[ignore = "requires live S3 backend; run with --ignored and valid .env"]
-fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
+fn test_crash_recovery_replays_local_committed_block_before_remote_fetch() {
     let _env = ScopedTestEnv::new();
 
     let boot_rt = tokio::runtime::Builder::new_current_thread()
@@ -3918,7 +3918,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
                     Duration::from_secs(15),
                 )
                 .await,
-                "baseline object should exist before replacement spill replay test"
+                "baseline object should exist before replacement local-commit replay test"
             );
             vfs.shutdown(Duration::from_secs(15)).await;
         });
@@ -4011,7 +4011,7 @@ fn test_crash_recovery_replays_ingress_spill_before_remote_fetch() {
             assert_eq!(
                 read.as_ref(),
                 replacement_payload.as_slice(),
-                "read after restart with offline endpoint should use committed block-store state; ingress={:?} meta_blocks={:?}",
+                "read after restart with offline endpoint should use committed block-store state; runtime_stats={:?} meta_blocks={:?}",
                 vfs.ingress_stats(),
                 vfs.meta().get_file_blocks(ino).ok(),
             );
@@ -12137,7 +12137,7 @@ async fn zeroio_shutdown_snapshot_uses_runtime_dir_without_ingress_spill() {
 }
 
 #[test]
-fn zeroio_fast_mode_ignores_legacy_ingress_artifacts_on_startup() {
+fn zeroio_fast_mode_removes_retired_ingress_spill_on_startup() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     unsafe {
         std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
@@ -12153,7 +12153,6 @@ fn zeroio_fast_mode_ignores_legacy_ingress_artifacts_on_startup() {
     );
     let legacy_spill_dir = cache_dir.join("ingress_spill");
     std::fs::create_dir_all(legacy_spill_dir.join("segments")).unwrap();
-    std::fs::create_dir_all(legacy_spill_dir.join("checkpoints")).unwrap();
     std::fs::write(
         legacy_spill_dir
             .join("segments")
@@ -12161,14 +12160,6 @@ fn zeroio_fast_mode_ignores_legacy_ingress_artifacts_on_startup() {
         b"legacy-segment",
     )
     .unwrap();
-    std::fs::write(
-        legacy_spill_dir.join("checkpoints").join("latest.json"),
-        br#"{"version":1}"#,
-    )
-    .unwrap();
-    std::fs::write(legacy_spill_dir.join("state.json"), br#"{"version":1}"#).unwrap();
-    std::fs::write(legacy_spill_dir.join("legacy.spill"), b"legacy-spill").unwrap();
-
     let vfs = make_local_zeroio_test_vfs(
         &db_path,
         &cache_dir_str,
@@ -12183,33 +12174,15 @@ fn zeroio_fast_mode_ignores_legacy_ingress_artifacts_on_startup() {
     .2;
 
     assert!(
-        legacy_spill_dir
-            .join("segments")
-            .join("0000000000000001.seg")
-            .exists(),
-        "fast-mode startup should ignore unsupported legacy ingress segments"
-    );
-    assert!(
-        legacy_spill_dir
-            .join("checkpoints")
-            .join("latest.json")
-            .exists(),
-        "fast-mode startup should leave legacy checkpoint files untouched"
-    );
-    assert!(
-        legacy_spill_dir.join("state.json").exists(),
-        "fast-mode startup should not special-case legacy ingress state files"
-    );
-    assert!(
-        legacy_spill_dir.join("legacy.spill").exists(),
-        "fast-mode startup should leave legacy spill files untouched"
+        !legacy_spill_dir.exists(),
+        "fast-mode startup should delete unsupported ingress_spill layouts instead of leaving disk garbage behind"
     );
 
     drop(vfs);
 }
 
 #[test]
-fn zeroio_durable_mode_ignores_legacy_ingress_artifacts_on_startup() {
+fn zeroio_durable_mode_removes_retired_ingress_spill_on_startup() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     unsafe {
         std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
@@ -12250,14 +12223,13 @@ fn zeroio_durable_mode_ignores_legacy_ingress_artifacts_on_startup() {
         .validate()
         .expect("durable config should validate"),
     )
-    .expect("durable startup should ignore unsupported legacy ingress artifacts");
+    .expect(
+        "durable startup should delete unsupported ingress_spill layouts instead of refusing the mount",
+    );
 
     assert!(
-        legacy_spill_dir
-            .join("segments")
-            .join("0000000000000001.seg")
-            .exists(),
-        "durable startup should leave unsupported legacy ingress artifacts untouched"
+        !legacy_spill_dir.exists(),
+        "durable startup should remove retired ingress_spill directories after provisioning the active runtime"
     );
 
     drop(vfs);

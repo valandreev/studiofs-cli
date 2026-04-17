@@ -251,8 +251,8 @@ Set-Location E:\dev\studiofs-cli; Get-Content .env | Where-Object { $_ -match '^
 - Keep `NO_PROXY` including `localhost,127.0.0.1,::1` (and your direct RustFS/S3 host if needed).
 
 ### Intermittent VFS crash-recovery failures
-- `test_crash_recovery_replays_ingress_spill_before_metadata_flush` and
-  `test_crash_recovery_replays_ingress_spill_before_remote_fetch` have shown
+- `test_crash_recovery_replays_local_committed_block_before_metadata_flush` and
+  `test_crash_recovery_replays_local_committed_block_before_remote_fetch` have shown
   non-deterministic failures during full-suite runs.
 - Current tracking issue: [SFS-30](https://linear.app/valandreev/issue/SFS-30/stabilize-crash-recovery-vfs-tests-env-isolation-deterministic-startup)
 - `--test-threads=1` can reduce noise for reproductions, but does not fully
