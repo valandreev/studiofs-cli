@@ -37,6 +37,22 @@ Ignored integration tests in this matrix should be run with
 | Readahead / prefetch | sequential and random readers must remain classified separately; prefetch ramps up only after the intended threshold | `handle_aware_read_policy_keeps_sequential_and_random_streams_separate`; `test_prefetch_after_threshold`; `test_random_seek_scales_back_to_base_width` | `cargo test -p studiofs-vfs --test vfs_test handle_aware_read_policy_keeps_sequential_and_random_streams_separate -- --nocapture` |
 | Writeback-heavy foreground QoS | sequential reads must stay useful while background upload is active and recover after upload drains | `foreground_read_baseline_during_and_post_upload_are_comparable`; `sequential_foreground_read_throughput_during_upload_meets_minimum` | `cargo test -p studiofs-vfs --test vfs_test foreground_read_baseline_during_and_post_upload_are_comparable -- --ignored --nocapture --test-threads=1` |
 
+### Local Cache Exhaustion Note
+
+The append and overwrite guarantees above apply only after a write is accepted
+into the local-first path. If the local cache cannot persist more bytes,
+StudioFS must fail locally before remote publication is even relevant.
+
+Pair append/overwrite changes with this local-backend pressure guard:
+
+```bash
+cargo test -p studiofs-cache cache_v3_backend_returns_capacity_exhausted_for_non_evictable_pressure -- --nocapture
+```
+
+This is a focused local-backend capacity regression, not a full mounted
+`ENOSPC` scenario. Use it as the current disk-full-style acceptance check until
+the matrix grows a dedicated end-to-end local-volume exhaustion workflow.
+
 ## Platform Bridge Matrix
 
 Run these when a change touches bridge callback sequencing, flush ownership, or
@@ -133,6 +149,27 @@ cargo run -p studiofs -- test-cache <mounted-path> \
 When the mounted runtime exposes upload-state metadata, inspect the human
 summary or JSON `buffered_read_comparison` section for the
 `baseline-read`, `during-upload-read`, and `post-upload-read` phases.
+
+### Small-File Random I/O / Metadata-Sensitive Run
+
+Use this mounted recipe when you want a latency-sensitive small-file benchmark
+instead of the larger throughput-oriented defaults:
+
+```bash
+cargo run -p studiofs -- test-cache <mounted-path> \
+  --access-pattern random \
+  --block-size 64KB \
+  --read-size 4KB \
+  --sizes 4KB,16KB,64KB \
+  --concurrency 16 \
+  --io-depth 64 \
+  --warmup-runs 1
+```
+
+Prefer the mounted path for this recipe because it exercises namespace lookups,
+VFS policy, cache behavior, and small-read amplification together. Use the same
+shape against a direct-shim path only when isolating local cache behavior from
+the mounted filesystem stack.
 
 ### Writeback-Heavy End-To-End Run
 

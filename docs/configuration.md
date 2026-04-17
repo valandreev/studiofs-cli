@@ -115,6 +115,7 @@ Notes:
 - On Windows, StudioFS mounts drive letters through WinFSP Mount Manager syntax (`\\.\X:`). If Mount Manager access is denied, mount fails with an explicit error (run elevated or configure WinFSP `MountUseMountmgrFromFSD=1`).
 - On Windows, `studiofs mount` now performs a one-time bootstrap: if `MountUseMountmgrFromFSD=1` is missing, StudioFS requests UAC elevation once to set it automatically. After that, regular mounts can run from non-elevated terminals.
 - In non-interactive Windows sessions (for example CI/background services), UAC cannot be confirmed; preconfigure `MountUseMountmgrFromFSD=1` manually before running `studiofs mount`.
+- If mount still fails after the registry setup, especially immediately after a WinFSP install or upgrade, refresh the WinFSP runtime state before retrying. Restart the WinFSP service stack or reboot Windows if needed.
 - `STUDIOFS_DAEMON_MOUNT_POINT` is not used for Windows mounts.
 - `--detach` runs the mount as a background daemon.
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
@@ -348,11 +349,11 @@ Note:
 Loads a dump into PostgreSQL.
 
 ```bash
-studiofs load --path-to-dump <dump.json> --postgresql-adress <postgres-server-dsn>
+studiofs load --path-to-dump <dump.json> --postgresql-address <postgres-server-dsn>
 ```
 
 Alias:
-- `--postgresql-address` is supported as alias for `--postgresql-adress`.
+- Legacy alias: `--postgresql-adress`.
 
 What it does:
 - restores/updates target volume record in `volumes` (matched by UUID from dump),
