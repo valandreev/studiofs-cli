@@ -9,6 +9,10 @@ The authoritative matrix — what each job checks, what is not covered
 automatically, and the compile/unit/smoke distinctions — lives in
 [docs/contributing.md](contributing.md#verification-matrix).
 
+For the focused `SFS-253` Local-First validation and benchmark surface, use
+[docs/local-first-validation-matrix.md](local-first-validation-matrix.md)
+before jumping to the broader workspace commands below.
+
 ---
 
 ## Test Layers

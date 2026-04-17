@@ -312,6 +312,9 @@ Notes:
   - `...-memory.pprof.gz`
 - `direct-shim` output includes blocking-task pressure counters for cache hot paths (`active`, `active_peak`, `submitted/started/completed`, wait-before-exec and execution timings).
 - Current built-in workload volumes are modest (`128MB` direct-shim, `64MB` e2e); for representative measurements on fast NVMe systems, pass larger block/read and concurrency settings.
+- For the focused `SFS-253` benchmark recipes and the surrounding Local-First
+  validation matrix, see
+  [docs/local-first-validation-matrix.md](./local-first-validation-matrix.md).
 
 ### `destroy`
 
