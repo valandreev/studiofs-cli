@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 
 use crate::local::{
     LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState, LocalBlockObjectStats,
-    LocalBlockStorageStats,
+    LocalBlockOrigin, LocalBlockStorageStats, LocalBlockUploadState,
 };
 
 pub mod cache_index;
@@ -966,6 +966,21 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
             Ok(Some(entry)) => Some(LocalBlockObjectStats {
                 payload_len: entry.payload_len,
                 lifecycle: entry.lifecycle,
+                origin: if matches!(
+                    entry.lifecycle,
+                    LocalBlockLifecycleState::Dirty | LocalBlockLifecycleState::Uploading
+                ) || !entry.evictable
+                {
+                    LocalBlockOrigin::Local
+                } else {
+                    LocalBlockOrigin::Downloaded
+                },
+                upload_state: match entry.lifecycle {
+                    LocalBlockLifecycleState::Dirty => LocalBlockUploadState::Pending,
+                    LocalBlockLifecycleState::Uploading => LocalBlockUploadState::Uploading,
+                    _ => LocalBlockUploadState::None,
+                },
+                last_access_unix_millis: 0,
                 evictable: entry.evictable && !self.is_runtime_pinned(object_id),
             }),
             Ok(None) => None,

@@ -4,7 +4,7 @@ use crate::cli::cache_layout::describe_cache_layout_state;
 use clap::Args;
 use std::io::{self, Write};
 use std::path::Path;
-use studiofs_cache::v3::{CacheBackendDetection, detect_cache_backends};
+use studiofs_cache::runtime::{CacheBackendDetection, detect_cache_backends};
 use studiofs_data::{DataStore, DataStoreConfig, store::DataError};
 use studiofs_meta::engine::MetaError;
 use thiserror::Error;
@@ -342,7 +342,7 @@ async fn delete_optional_manifest(operator: &opendal::Operator, path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use studiofs_cache::v3::CacheV3Layout;
+    use studiofs_cache::runtime::CacheV3Layout;
 
     fn detection(marker: bool) -> CacheBackendDetection {
         let temp = tempfile::tempdir().unwrap();

@@ -16,8 +16,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 #[cfg(test)]
-use studiofs_cache::v3::CacheV3Layout;
-use studiofs_cache::{DEFAULT_MEMORY_CACHE_SIZE, PreparedCacheV3Runtime, prepare_cache_v3_runtime};
+use studiofs_cache::runtime::CacheV3Layout;
+use studiofs_cache::{
+    DEFAULT_MEMORY_CACHE_SIZE, PreparedLocalBlockRuntime, prepare_local_block_runtime,
+};
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::{
     FormatInfo, MetaEngine, MetaFormat, MetaReplication, MetaSnapshots, MetadataBackend,
@@ -67,7 +69,7 @@ struct ResolvedMountStartup {
 struct PreparedVolumeCacheRuntime {
     cache_path: PathBuf,
     cache_path_str: String,
-    cache_runtime: PreparedCacheV3Runtime,
+    cache_runtime: PreparedLocalBlockRuntime,
 }
 
 pub(crate) struct MountSession {
@@ -870,9 +872,9 @@ fn prepare_volume_cache_runtime(
     volume_uuid: &str,
 ) -> anyhow::Result<PreparedVolumeCacheRuntime> {
     let cache_path = cache_dir.join(volume_uuid);
-    let cache_runtime = prepare_cache_v3_runtime(&cache_path).map_err(|source| {
+    let cache_runtime = prepare_local_block_runtime(&cache_path).map_err(|source| {
         anyhow::anyhow!(
-            "failed to prepare cache-v3 runtime at '{}': {source}",
+            "failed to prepare local block runtime at '{}': {source}",
             cache_path.display()
         )
     })?;

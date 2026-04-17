@@ -5,7 +5,7 @@ use crate::cli::cache_layout::describe_cache_layout_state;
 use crate::cli::utils::format_bytes;
 use clap::Args;
 use std::path::{Path, PathBuf};
-use studiofs_cache::v3::{
+use studiofs_cache::runtime::{
     CacheBackendDetection, CacheBackendKind, CacheIndex, detect_cache_backends,
 };
 use studiofs_cache::{OpenLocalBlockBackendError, open_local_block_backend};
@@ -534,6 +534,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn scan_pending_uploads_supports_cache_v3_selection() {
         let tmp = tempfile::tempdir().unwrap();
@@ -548,6 +549,29 @@ mod tests {
             scan_pending_uploads(tmp.path(), &volume_uuid.to_string(), Some(&detection)).unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn scan_cache_usage_reads_runtime_written_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let volume_uuid = Uuid::new_v4();
+        {
+            let backend =
+                studiofs_cache::open_local_block_backend(tmp.path(), &volume_uuid.to_string())
+                    .expect("open local block backend")
+                    .backend;
+            backend.put(10, b"dirty", false).unwrap();
+            backend.put(11, b"cached", true).unwrap();
+            backend.sync_data().unwrap();
+        }
+
+        let detection = detect_backends(tmp.path()).unwrap();
+        let usage = scan_cache_usage(Some(&detection))
+            .expect("scan cache usage")
+            .expect("cache usage present");
+        assert_eq!(usage.usage_bytes, 11);
+        assert_eq!(usage.dirty_bytes, 5);
+        assert_eq!(usage.evictable_bytes, 6);
     }
 
     #[test]

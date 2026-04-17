@@ -1,4 +1,5 @@
 use super::*;
+use studiofs_cache::LocalBlockPayloadSyncMode;
 
 #[derive(Debug, Clone)]
 pub(super) struct VfsBootstrapPlan {
@@ -8,7 +9,7 @@ pub(super) struct VfsBootstrapPlan {
     cache_runtime_tuning: CacheRuntimeTuning,
     pub(super) minimum_local_backend_budget_bytes: u64,
     pub(super) local_backend_budget_bytes: u64,
-    payload_sync_mode: CacheV3PayloadSyncMode,
+    payload_sync_mode: LocalBlockPayloadSyncMode,
     pub(super) access_tracker: AccessTrackerConfig,
     readahead_base_width: u32,
     pub(super) readahead_max_width: u32,
@@ -127,9 +128,9 @@ impl VfsBootstrapPlan {
             minimum_local_backend_budget_bytes,
             local_backend_budget_bytes,
             payload_sync_mode: if matches!(config.cache_safety_mode, CacheSafetyMode::Durable) {
-                CacheV3PayloadSyncMode::Durable
+                LocalBlockPayloadSyncMode::Durable
             } else {
-                CacheV3PayloadSyncMode::Fast
+                LocalBlockPayloadSyncMode::Fast
             },
             access_tracker,
             readahead_base_width,
@@ -272,7 +273,7 @@ impl VfsBootstrapResources {
         cache_dir: &str,
         plan: &VfsBootstrapPlan,
         config: &VfsConfigValidated,
-        cache_runtime: Option<PreparedCacheV3Runtime>,
+        cache_runtime: Option<PreparedLocalBlockRuntime>,
     ) -> VfsResult<Self> {
         remove_retired_ingress_spill(Path::new(cache_dir))?;
 
@@ -384,7 +385,7 @@ impl VfsBootstrap {
         cache_size: u64,
         memory_cache_budget_bytes: u64,
         config: VfsConfigValidated,
-        cache_runtime: Option<PreparedCacheV3Runtime>,
+        cache_runtime: Option<PreparedLocalBlockRuntime>,
     ) -> VfsResult<Self>
     where
         M: ?Sized + VfsMeta + 'static,
@@ -542,7 +543,7 @@ impl StudioVfs {
         cache_size: u64,
         memory_cache_budget_bytes: u64,
         config: VfsConfigValidated,
-        cache_runtime: PreparedCacheV3Runtime,
+        cache_runtime: PreparedLocalBlockRuntime,
     ) -> VfsResult<Arc<Self>>
     where
         M: ?Sized + VfsMeta + 'static,
@@ -565,7 +566,7 @@ impl StudioVfs {
         cache_size: u64,
         memory_cache_budget_bytes: u64,
         config: VfsConfigValidated,
-        cache_runtime: Option<PreparedCacheV3Runtime>,
+        cache_runtime: Option<PreparedLocalBlockRuntime>,
     ) -> VfsResult<Arc<Self>>
     where
         M: ?Sized + VfsMeta + 'static,
@@ -642,7 +643,7 @@ mod tests {
         let mapped = map_open_local_block_backend_error("E:\\cache-root", source);
         match mapped {
             VfsError::Other(message) => {
-                assert!(message.contains("failed to provision cache-v3 layout"));
+                assert!(message.contains("failed to provision local block runtime layout"));
                 assert!(message.contains("E:\\cache-root\\v3"));
             }
             other => panic!("unexpected error variant: {other}"),
@@ -650,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn studio_vfs_new_selects_cache_v3_placeholder_backend_for_v3_only_layout() {
+    fn studio_vfs_new_selects_local_block_runtime_for_v3_only_layout() {
         let tmp = TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("meta.redb");
         let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
@@ -681,8 +682,8 @@ mod tests {
         assert!(
             vfs.local_block_backend()
                 .as_any()
-                .is::<studiofs_cache::v3::CacheV3LocalBlockBackend>(),
-            "v3-only layout should select the cache-v3 placeholder backend"
+                .is::<studiofs_cache::runtime::CacheV3LocalBlockBackend>(),
+            "v3-only layout should select the current local block runtime backend"
         );
     }
 

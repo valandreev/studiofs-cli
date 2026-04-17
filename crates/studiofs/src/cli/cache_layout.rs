@@ -1,4 +1,4 @@
-use studiofs_cache::v3::CacheBackendDetection;
+use studiofs_cache::runtime::CacheBackendDetection;
 
 pub(crate) fn describe_cache_layout_state(
     detection: Option<&CacheBackendDetection>,
