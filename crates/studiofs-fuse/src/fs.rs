@@ -2240,8 +2240,8 @@ mod tests {
     }
 
     #[test]
-    fn fuse_fsync_uses_inode_scoped_local_durability_barrier() {
-        let (_tmp, _rt, vfs, fs) = make_test_fuse_fs("fsync-inode-barrier");
+    fn vfs_fsync_supports_the_fuse_inode_scoped_durability_contract() {
+        let (_tmp, rt, vfs, _fs) = make_test_fuse_fs("fsync-inode-barrier");
         let created = vfs
             .create(ROOT_INO, b"fsync-inode-barrier.txt", 0, 0, 0o644)
             .expect("create file");
@@ -2250,36 +2250,35 @@ mod tests {
             .open_file(ino, OpenFlags::RDWR, false)
             .expect("open file handle");
 
-        fs.rt
-            .block_on(fs.vfs.write_fh_with_local_sync_policy(
-                fh,
-                ino,
-                0,
-                b"payload",
-                LocalSyncPolicy::Opportunistic,
-            ))
-            .expect("write via handle");
+        // This regression test intentionally exercises the VFS-side fsync
+        // contract directly; it documents the inode-scoped Local-First
+        // behavior that the FUSE bridge callback is expected to preserve.
+        rt.block_on(vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            0,
+            b"payload",
+            LocalSyncPolicy::Opportunistic,
+        ))
+        .expect("write via handle");
 
-        let first = fs
-            .rt
-            .block_on(fs.vfs.fsync_with_outcome(ino, false))
+        let first = rt
+            .block_on(vfs.fsync_with_outcome(ino, false))
             .expect("fsync should succeed");
         assert!(
             first.flushed_file_data,
             "FUSE fsync should materialize dirty handle-writer state through the inode-scoped barrier"
         );
 
-        let second = fs
-            .rt
-            .block_on(fs.vfs.fsync_with_outcome(ino, false))
+        let second = rt
+            .block_on(vfs.fsync_with_outcome(ino, false))
             .expect("second fsync should succeed");
         assert!(
             !second.flushed_file_data,
             "once local unpublished state is durable, the next FUSE fsync should stay clean"
         );
 
-        fs.rt
-            .block_on(fs.vfs.release_fh(fh))
+        rt.block_on(vfs.release_fh(fh))
             .expect("release file handle");
     }
 }

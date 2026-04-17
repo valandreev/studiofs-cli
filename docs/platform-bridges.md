@@ -161,6 +161,8 @@ Current signature includes additional policy controls:
 | macOS: `local` | Yes |
 
 `STUDIOFS_FUSE_MAX_WRITE_BYTES` and `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` are the primary FUSE bridge throughput controls for local block I/O.
+On Linux, `allow_other` also requires `user_allow_other` to be enabled in
+`/etc/fuse.conf`; otherwise `fusermount` rejects the mount request.
 
 On macOS, StudioFS handles `getxattr` / `setxattr` / `listxattr` /
 `removexattr` natively (including `com.apple.ResourceFork`) so Finder metadata

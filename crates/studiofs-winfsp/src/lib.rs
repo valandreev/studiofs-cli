@@ -376,7 +376,7 @@ fn apply_volume_params(
     volume_params.volume_info_timeout(options.volume_info_timeout_ms);
     // Keep cleanup observational for non-delete callbacks; foreground local
     // durability barriers belong to explicit flush/fsync paths and the
-    // last-handle release fallback.
+    // WinFSP close -> shared last-handle release fallback.
     volume_params.flush_and_purge_on_cleanup(false);
     Ok(())
 }
