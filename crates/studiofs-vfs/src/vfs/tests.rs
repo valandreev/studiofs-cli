@@ -1864,6 +1864,12 @@ fn write_fh_buffers_partial_tail_after_full_block_boundary_until_flush() {
             vfs.inode_has_dirty_handle_writers(ino) || vfs.has_pending_local_dirty_blocks_for_inode(ino),
             "the partial tail should remain buffered after the full-block prefix is accepted"
         );
+        let persisted_attr = meta.get_attr(ino).unwrap();
+        assert_eq!(
+            persisted_attr.size,
+            block_size as u64,
+            "durable local metadata should advance to the accepted full-block prefix before flush drains the buffered tail"
+        );
 
         vfs.flush_fh(fh).await.unwrap();
 

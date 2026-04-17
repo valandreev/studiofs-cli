@@ -1060,7 +1060,12 @@ impl StudioVfs {
                 let attr_to_persist = if buffered_blocks.is_empty() {
                     dirty_attr.clone()
                 } else {
-                    None
+                    self.derive_opportunistic_prefix_attr(
+                        ino,
+                        dirty_attr.as_ref(),
+                        &completed_blocks,
+                    )
+                    .await?
                 };
                 self.persist_dirty_write_snapshots_direct(
                     ino,
@@ -1087,6 +1092,33 @@ impl StudioVfs {
             local_sync_policy,
         )
         .await
+    }
+
+    pub(super) async fn derive_opportunistic_prefix_attr(
+        &self,
+        ino: Ino,
+        dirty_attr: Option<&InodeAttr>,
+        completed_blocks: &[DirtyWriteSnapshot],
+    ) -> VfsResult<Option<InodeAttr>> {
+        let Some(max_completed_end) = completed_blocks
+            .iter()
+            .map(|block| {
+                (u64::from(block.block_index) + 1).saturating_mul(u64::from(self.block_size))
+            })
+            .max()
+        else {
+            return Ok(None);
+        };
+
+        let persisted_attr = run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            engine.get_attr(ino)
+        })
+        .await?;
+        let mut attr = dirty_attr
+            .cloned()
+            .unwrap_or_else(|| persisted_attr.clone());
+        attr.size = persisted_attr.size.max(max_completed_end);
+        Ok(Some(attr))
     }
 
     pub(super) async fn persist_dirty_write_snapshots_direct(

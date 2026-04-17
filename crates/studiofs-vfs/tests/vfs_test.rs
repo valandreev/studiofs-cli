@@ -10013,6 +10013,12 @@ fn write_buffers_partial_tail_until_flush() {
             vfs.ingress_stats().dirty_mem_bytes > 0,
             "the partial tail should remain buffered in local dirty state before flush"
         );
+        let persisted_attr = vfs.meta().get_attr(attr.ino).unwrap();
+        assert_eq!(
+            persisted_attr.size,
+            block_size as u64,
+            "durable local metadata should advance to the accepted full-block prefix before the buffered tail is flushed"
+        );
 
         let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
         assert_eq!(read.as_ref(), payload.as_slice());

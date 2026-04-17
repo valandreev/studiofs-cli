@@ -200,15 +200,16 @@ impl HandleWriterRegistry {
             writer.ino = ino;
             writer.open = true;
             writer.logical_size = writer.logical_size.max(current_size);
+            assert!(block_size > 0, "block_size must be non-zero");
             let mut current_offset = offset;
             let mut data_offset = 0usize;
             let mut remaining = data.len();
+            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
             while remaining > 0 {
-                let block_index = (current_offset / u64::from(block_size.max(1))) as u32;
-                let offset_in_block = (current_offset % u64::from(block_size.max(1))) as usize;
+                let block_index = (current_offset / u64::from(block_size)) as u32;
+                let offset_in_block = (current_offset % u64::from(block_size)) as usize;
                 let space_in_block = block_size as usize - offset_in_block;
                 let chunk_len = remaining.min(space_in_block);
-                let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
                 writer.upsert_write(
                     block_index,
                     seq,
@@ -670,12 +671,15 @@ impl StudioVfs {
             .into_iter()
             .filter(|block| completed_block_indexes.contains(&block.block_index))
             .collect();
+        let attr_to_persist = self
+            .derive_opportunistic_prefix_attr(ino, dirty_attr.as_ref(), &completed_blocks)
+            .await?;
 
         self.persist_dirty_write_snapshots_direct(
             ino,
             completed_blocks,
             content_epoch,
-            None,
+            attr_to_persist,
             local_sync_policy,
         )
         .await?;

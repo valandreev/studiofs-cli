@@ -1884,6 +1884,11 @@ fn normalize_data_prefix(format_info: &FormatInfo) -> String {
 }
 
 fn validate_volume_block_size(block_size: u32) -> VfsResult<()> {
+    if block_size == 0 {
+        return Err(VfsError::Other(
+            "volume block_size 0 is invalid; block_size must be non-zero".to_string(),
+        ));
+    }
     let cloud_logical_block_capacity = CLOUD_FRAGMENT_SIZE * CLOUD_FRAGMENT_COUNT;
     if (block_size as usize) > cloud_logical_block_capacity {
         return Err(VfsError::Other(format!(

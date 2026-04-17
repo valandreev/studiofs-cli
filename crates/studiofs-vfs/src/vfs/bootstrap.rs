@@ -874,6 +874,24 @@ mod tests {
     }
 
     #[test]
+    fn build_vfs_bootstrap_plan_rejects_zero_block_size() {
+        let config: VfsConfigValidated = VfsConfig::default()
+            .try_into()
+            .expect("default VFS config should validate");
+        let mut format_info = test_format_info("bootstrap-zero-block-size");
+        format_info.block_size = 0;
+
+        let error =
+            VfsBootstrapPlan::build(format_info, 64 * 1024 * 1024, 32 * 1024 * 1024, &config)
+                .expect_err("zero block size should fail before bootstrap IO starts");
+
+        assert!(
+            error.to_string().contains("block_size must be non-zero"),
+            "bootstrap plan should reject volumes whose block size is zero"
+        );
+    }
+
+    #[test]
     fn build_vfs_bootstrap_plan_clamps_local_backend_budget_for_tiny_cache() {
         let config: VfsConfigValidated = VfsConfig::default()
             .try_into()
