@@ -16,23 +16,6 @@ use uuid::Uuid;
 
 const WRITE_PATH_STALE_WARN_MS: u64 = 5_000;
 
-#[derive(Debug, Default, Clone, Copy)]
-struct LegacyIngressArtifactStats {
-    segment_count: usize,
-    checkpoint_count: usize,
-    state_present: bool,
-    spill_file_count: usize,
-}
-
-impl LegacyIngressArtifactStats {
-    fn has_any(self) -> bool {
-        self.segment_count > 0
-            || self.checkpoint_count > 0
-            || self.state_present
-            || self.spill_file_count > 0
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 struct CacheUsageStats {
     usage_bytes: u64,
@@ -182,30 +165,6 @@ fn scan_cache_usage(
     }
 }
 
-fn scan_legacy_ingress_artifacts(spill_dir: &Path) -> anyhow::Result<LegacyIngressArtifactStats> {
-    let count_files_with_extension = |dir: &Path, extension: &str| -> anyhow::Result<usize> {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => return Err(error.into()),
-        };
-        Ok(entries
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                let path = entry.path();
-                path.is_file() && path.extension().is_some_and(|ext| ext == extension)
-            })
-            .count())
-    };
-
-    Ok(LegacyIngressArtifactStats {
-        segment_count: count_files_with_extension(&spill_dir.join("segments"), "seg")?,
-        checkpoint_count: usize::from(spill_dir.join("checkpoints").join("latest.json").exists()),
-        state_present: spill_dir.join("state.json").exists(),
-        spill_file_count: count_files_with_extension(spill_dir, "spill")?,
-    })
-}
-
 fn scan_pending_uploads(
     cache_dir: &Path,
     volume_uuid: &str,
@@ -248,7 +207,6 @@ pub fn run(
 
     let cache_path = local_cache_path(meta_dir, cache_dir, &format_info.uuid);
     let cache_backend_detection = detect_backends(&cache_path);
-    let legacy_ingress = scan_legacy_ingress_artifacts(&cache_path.join("ingress_spill"))?;
     let pending_uploads = scan_pending_uploads(
         &cache_path,
         &format_info.uuid,
@@ -321,7 +279,6 @@ pub fn run(
         "inspect the cache root manually"
     };
     let reconcile_needed = pending_uploads > 0
-        || legacy_ingress.has_any()
         || cache_usage
             .and_then(|stats| stats.map(|stats| stats.dirty_bytes > 0))
             .unwrap_or(false);
@@ -379,19 +336,6 @@ pub fn run(
     }
 
     println!("  Pending uploads:    {}", pending_uploads);
-    if legacy_ingress.has_any() {
-        println!(
-            "  Legacy ingress:     present (segments={}, checkpoints={}, state={}, spill_files={})",
-            legacy_ingress.segment_count,
-            legacy_ingress.checkpoint_count,
-            if legacy_ingress.state_present {
-                "yes"
-            } else {
-                "no"
-            },
-            legacy_ingress.spill_file_count
-        );
-    }
 
     if verbosity.is_verbose() {
         println!("\nMounted Write Path");
@@ -590,8 +534,6 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-
     #[test]
     fn scan_pending_uploads_supports_cache_v3_selection() {
         let tmp = tempfile::tempdir().unwrap();
@@ -606,32 +548,6 @@ mod tests {
             scan_pending_uploads(tmp.path(), &volume_uuid.to_string(), Some(&detection)).unwrap(),
             0
         );
-    }
-
-    #[test]
-    fn scan_legacy_ingress_artifacts_detects_reconcile_state() {
-        let tmp = tempfile::tempdir().unwrap();
-        let spill_dir = tmp.path().join("ingress_spill");
-        std::fs::create_dir_all(spill_dir.join("segments")).unwrap();
-        std::fs::create_dir_all(spill_dir.join("checkpoints")).unwrap();
-        let mut segment =
-            std::fs::File::create(spill_dir.join("segments").join("0000000000000001.seg")).unwrap();
-        segment.write_all(b"legacy").unwrap();
-        std::fs::write(
-            spill_dir.join("checkpoints").join("latest.json"),
-            br#"{"version":1}"#,
-        )
-        .unwrap();
-        std::fs::write(spill_dir.join("state.json"), br#"{"version":1}"#).unwrap();
-        std::fs::write(spill_dir.join("legacy.spill"), b"legacy").unwrap();
-
-        let stats = scan_legacy_ingress_artifacts(&spill_dir).unwrap();
-
-        assert!(stats.has_any());
-        assert_eq!(stats.segment_count, 1);
-        assert_eq!(stats.checkpoint_count, 1);
-        assert!(stats.state_present);
-        assert_eq!(stats.spill_file_count, 1);
     }
 
     #[test]

@@ -148,7 +148,7 @@ Local durability notes:
 - `write()` only pays that persist boundary after enough completed full-block data accumulates (`STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES`, default `32MB`) or when `flush()` / backpressure / shutdown forces the batch out.
 - Reserved object IDs make retrying the same dirty block idempotent across metadata failures.
 - `cache_safety_mode` no longer changes the foreground persistence path. Both modes use the same local durability flow.
-- `fast` mode removes legacy ingress artifacts during startup self-heal; `durable` mode preserves checkpoint/state metadata for startup recovery compatibility.
+- Historical `ingress_spill` directories are outside the active Local-First contract and are deleted during startup cleanup.
 
 ### File Session Ordering Model
 
@@ -171,9 +171,9 @@ Local durability notes:
   `file_session_stats()` does not need a full-table scan of active sessions.
 
 Legacy ingress-artifact note:
-- The legacy artifact subsystem lives in [`crates/studiofs-vfs/src/ingress_wal.rs`].
-- `cache_safety_mode=durable` preserves checkpoint/state metadata there for startup recovery compatibility.
-- `cache_safety_mode=fast` self-heals by discarding those artifacts on startup.
+- `ingress_spill` is no longer part of the active runtime or recovery path.
+- ZeroIO runtime state lives under `cache/runtime`, and Cache 3.0 remains the only supported local payload backend.
+- Startup removes a detected retired `ingress_spill` directory instead of carrying a compatibility recovery path for it.
 
 ### 3. Background Upload Worker
 

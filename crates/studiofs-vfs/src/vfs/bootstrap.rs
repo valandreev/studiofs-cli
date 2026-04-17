@@ -229,83 +229,25 @@ impl VfsBootstrapPlan {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-struct LegacyIngressArtifactScan {
-    segment_count: usize,
-    checkpoint_count: usize,
-    state_present: bool,
-    spill_file_count: usize,
-}
-
-impl LegacyIngressArtifactScan {
-    fn has_any(self) -> bool {
-        self.segment_count > 0
-            || self.checkpoint_count > 0
-            || self.state_present
-            || self.spill_file_count > 0
-    }
-}
-
-fn scan_legacy_ingress_artifacts(spill_dir: &Path) -> VfsResult<LegacyIngressArtifactScan> {
-    let count_files_with_extension = |dir: &Path, extension: &str| -> VfsResult<usize> {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => return Err(VfsError::Io(error)),
-        };
-        Ok(entries
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                let path = entry.path();
-                path.is_file() && path.extension().is_some_and(|ext| ext == extension)
-            })
-            .count())
-    };
-
-    Ok(LegacyIngressArtifactScan {
-        segment_count: count_files_with_extension(&spill_dir.join("segments"), "seg")?,
-        checkpoint_count: usize::from(spill_dir.join("checkpoints").join("latest.json").exists()),
-        state_present: spill_dir.join("state.json").exists(),
-        spill_file_count: count_files_with_extension(spill_dir, "spill")?,
-    })
-}
-
-fn reset_legacy_ingress_artifacts(spill_dir: &Path) -> VfsResult<()> {
-    let segment_dir = spill_dir.join("segments");
-    let checkpoint_dir = spill_dir.join("checkpoints");
-
-    std::fs::create_dir_all(spill_dir).map_err(VfsError::Io)?;
-    if let Err(error) = std::fs::remove_dir_all(&segment_dir)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(VfsError::Io(error));
-    }
-    if let Err(error) = std::fs::remove_dir_all(&checkpoint_dir)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(VfsError::Io(error));
-    }
-    std::fs::create_dir_all(&segment_dir).map_err(VfsError::Io)?;
-    std::fs::create_dir_all(&checkpoint_dir).map_err(VfsError::Io)?;
-
-    if let Err(error) = std::fs::remove_file(spill_dir.join("state.json"))
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(VfsError::Io(error));
-    }
-
-    let entries = match std::fs::read_dir(spill_dir) {
-        Ok(entries) => entries,
+fn remove_retired_ingress_spill(cache_root: &Path) -> VfsResult<()> {
+    let retired_dir = cache_root.join("ingress_spill");
+    let metadata = match std::fs::symlink_metadata(&retired_dir) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(VfsError::Io(error)),
     };
-    for entry in entries {
-        let entry = entry.map_err(VfsError::Io)?;
-        let path = entry.path();
-        if path.is_file() && path.extension().is_some_and(|ext| ext == "spill") {
-            std::fs::remove_file(path).map_err(VfsError::Io)?;
-        }
+    let file_type = metadata.file_type();
+
+    if file_type.is_dir() && !file_type.is_symlink() {
+        std::fs::remove_dir_all(&retired_dir).map_err(VfsError::Io)?;
+    } else {
+        std::fs::remove_file(&retired_dir).map_err(VfsError::Io)?;
     }
+
+    warn!(
+        retired_path = %retired_dir.display(),
+        "startup removed retired ingress_spill state from the old cache layout"
+    );
     Ok(())
 }
 
@@ -332,29 +274,7 @@ impl VfsBootstrapResources {
         config: &VfsConfigValidated,
         cache_runtime: Option<PreparedCacheV3Runtime>,
     ) -> VfsResult<Self> {
-        let legacy_spill_dir = PathBuf::from(cache_dir).join("ingress_spill");
-        let legacy_ingress = scan_legacy_ingress_artifacts(&legacy_spill_dir)?;
-        if legacy_ingress.has_any() {
-            match plan.cache_safety_mode {
-                CacheSafetyMode::Fast => {
-                    warn!(
-                        spill_dir = %legacy_spill_dir.display(),
-                        segments = legacy_ingress.segment_count,
-                        checkpoints = legacy_ingress.checkpoint_count,
-                        state_present = legacy_ingress.state_present,
-                        spill_files = legacy_ingress.spill_file_count,
-                        "startup detected legacy ingress artifacts; fast mode will discard them during self-heal"
-                    );
-                    reset_legacy_ingress_artifacts(&legacy_spill_dir)?;
-                }
-                CacheSafetyMode::Durable => {
-                    return Err(VfsError::Other(format!(
-                        "legacy ingress artifacts detected under '{}'; mount once with STUDIOFS_CACHE_SAFETY_MODE=fast to self-heal the old ingress_spill layout before using durable mode",
-                        legacy_spill_dir.display()
-                    )));
-                }
-            }
-        }
+        remove_retired_ingress_spill(Path::new(cache_dir))?;
 
         let zeroio_runtime_state_dir =
             PathBuf::from(cache_dir).join(super::ZEROIO_RUNTIME_STATE_DIR);
@@ -667,6 +587,8 @@ impl StudioVfs {
 mod tests {
     use super::*;
     use std::sync::Arc;
+    #[cfg(unix)]
+    use std::{fs, os::unix::fs::symlink};
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, MetadataConfig};
     use studiofs_meta::{MetaEngine, MetaFormat, RedbMetaEngine};
     use tempfile::TempDir;
@@ -972,6 +894,61 @@ mod tests {
         assert_eq!(
             plan.local_backend_budget_bytes, plan.minimum_local_backend_budget_bytes,
             "when clamped, bootstrap plan should use the computed minimum local backend budget"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_retired_ingress_spill_removes_broken_symlink() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cache_root = tmp.path().join("cache");
+        fs::create_dir_all(&cache_root).expect("create cache root");
+        let retired_path = cache_root.join("ingress_spill");
+        let missing_target = tmp.path().join("missing-ingress-target");
+        symlink(&missing_target, &retired_path).expect("create broken retired symlink");
+
+        assert!(
+            fs::symlink_metadata(&retired_path).is_ok(),
+            "test setup should create a broken symlink entry"
+        );
+
+        remove_retired_ingress_spill(&cache_root)
+            .expect("broken retired ingress symlink should be removed");
+
+        assert!(
+            fs::symlink_metadata(&retired_path).is_err(),
+            "cleanup should remove the broken ingress_spill symlink itself"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_retired_ingress_spill_removes_symlink_without_touching_target() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cache_root = tmp.path().join("cache");
+        fs::create_dir_all(&cache_root).expect("create cache root");
+        let target_dir = tmp.path().join("retired-target");
+        fs::create_dir_all(&target_dir).expect("create symlink target");
+        let sentinel = target_dir.join("sentinel.txt");
+        fs::write(&sentinel, b"keep").expect("write target sentinel");
+
+        let retired_path = cache_root.join("ingress_spill");
+        symlink(&target_dir, &retired_path).expect("create retired symlink");
+
+        remove_retired_ingress_spill(&cache_root)
+            .expect("retired ingress symlink should be removed");
+
+        assert!(
+            fs::symlink_metadata(&retired_path).is_err(),
+            "cleanup should remove the cache-root symlink entry"
+        );
+        assert!(
+            target_dir.exists(),
+            "cleanup should not remove the symlink target"
+        );
+        assert!(
+            sentinel.exists(),
+            "cleanup should leave target contents intact"
         );
     }
 }
