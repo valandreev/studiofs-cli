@@ -1691,7 +1691,7 @@ fn handle_writer_global_dirty_cap_drains_older_inodes_after_limit_drop() {
 }
 
 #[test]
-fn inode_write_materializes_directly_without_populating_legacy_local_dirty() {
+fn inode_write_materializes_directly_without_populating_pending_local_dirty_state() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-inode-write-direct");
     let _guard = rt.enter();
@@ -1708,7 +1708,7 @@ fn inode_write_materializes_directly_without_populating_legacy_local_dirty() {
 
         assert!(
             !vfs.has_pending_local_dirty_blocks_for_inode(ino),
-            "inode write should bypass the legacy write buffer"
+            "inode write should bypass pending local dirty staging"
         );
         let spans = meta
             .lookup_regular_file_slices(ino, 0, payload.len() as u64)

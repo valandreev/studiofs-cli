@@ -1151,21 +1151,11 @@ impl StudioVfs {
         if bytes == 0 {
             return;
         }
-        let previous = self
-            .state
-            .local_dirty
-            .pending_bytes
-            .fetch_sub(bytes, Ordering::Relaxed);
-        if previous < bytes {
-            self.state
-                .local_dirty
-                .pending_bytes
-                .store(0, Ordering::Relaxed);
-            debug_assert!(
-                previous >= bytes,
-                "pending local-dirty bytes underflow: previous={previous}, subtract={bytes}"
-            );
-        }
+        let _ = self.state.local_dirty.pending_bytes.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |pending| Some(pending.saturating_sub(bytes)),
+        );
     }
 
     fn replace_pending_local_dirty_block(&self, ino: Ino, block_index: u32, block: PendingBlock) {
@@ -1599,10 +1589,60 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+    use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
+    use studiofs_meta::{MetaFormat, RedbMetaEngine};
+    use tempfile::TempDir;
+    use tokio::runtime::Runtime;
 
     type UploadRecord = (u64, u64, u64, u64);
     type SharedUploads = Arc<StdMutex<Vec<UploadRecord>>>;
     type SharedInodes = Arc<StdMutex<Vec<Ino>>>;
+
+    fn test_format_info(volume_suffix: &str) -> FormatInfo {
+        let volume_name = format!("local-dirty-{volume_suffix}-{}", std::process::id());
+        FormatInfo {
+            format_version: CURRENT_FORMAT_VERSION,
+            name: volume_name.clone(),
+            uuid: format!("local-dirty-uuid-{volume_suffix}"),
+            endpoint: "http://127.0.0.1:9000".into(),
+            bucket: "studiofs-test".into(),
+            access_key: "test".into(),
+            secret_key: "test".into(),
+            region: "us-east-1".into(),
+            data_prefix: format!("{volume_name}/objects/"),
+            metadata: MetadataConfig::default(),
+            block_size: 4 * 1024 * 1024,
+        }
+    }
+
+    fn make_unstarted_test_vfs(
+        tmp: &TempDir,
+        volume_suffix: &str,
+    ) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
+        let db_path = tmp.path().join("meta.redb");
+        let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
+        meta.init_root(0, 0).expect("init root");
+
+        let format_info = test_format_info(volume_suffix);
+        meta.set_format_info(&format_info).expect("set format info");
+        let data_config = DataStoreConfig::from(&format_info);
+
+        let cache_dir = tmp.path().join("cache");
+        let rt = Arc::new(Runtime::new().expect("runtime"));
+        let _guard = rt.enter();
+        let vfs = StudioVfs::new(
+            meta.clone(),
+            &data_config,
+            cache_dir.to_str().expect("cache dir str"),
+            64 * 1024 * 1024,
+            32 * 1024 * 1024,
+            VfsConfig::default()
+                .try_into()
+                .expect("default VFS config should validate"),
+        )
+        .expect("create vfs");
+        (rt, vfs, meta)
+    }
 
     fn single_block_fixture(
         ino: Ino,
@@ -1627,6 +1667,24 @@ mod tests {
                 data: Bytes::from_static(data),
             }],
         )
+    }
+
+    #[test]
+    fn subtract_pending_local_dirty_bytes_saturates_without_panicking() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-bytes-underflow");
+        let _guard = rt.enter();
+        vfs.state
+            .local_dirty
+            .pending_bytes
+            .store(1, Ordering::Relaxed);
+
+        vfs.subtract_pending_local_dirty_bytes(2);
+
+        assert_eq!(
+            vfs.state.local_dirty.pending_bytes.load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]

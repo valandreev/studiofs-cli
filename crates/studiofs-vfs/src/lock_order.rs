@@ -75,7 +75,7 @@ impl LockTier {
     pub fn name(&self) -> &'static str {
         match self {
             LockTier::Shutdown => "Shutdown",
-            LockTier::LocalDirty => "LocalDirtyState",
+            LockTier::LocalDirty => "LocalDirty",
             LockTier::DirtyBuffer => "DirtyBuffer",
             LockTier::Ingress => "Ingress",
             LockTier::Namespace => "Namespace",
@@ -240,5 +240,10 @@ mod tests {
         // Should NOT be able to acquire Tier 3 (DirtyBuffer) while holding Tier 5
         // This would violate ordering since 3 < 5
         let _guard3 = LockOrderGuard::acquire(LockTier::DirtyBuffer);
+    }
+
+    #[test]
+    fn local_dirty_lock_name_matches_tier_vocabulary() {
+        assert_eq!(LockTier::LocalDirty.name(), "LocalDirty");
     }
 }
