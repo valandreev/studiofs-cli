@@ -1706,6 +1706,55 @@ fn handle_writer_global_dirty_cap_drains_older_inodes_after_limit_drop() {
 }
 
 #[test]
+fn ingress_pressure_counts_buffered_handle_writer_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-ingress-pressure-handle-writers");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-257-ingress-pressure-handle-writers.txt", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        let payload = b"buffer-me";
+
+        vfs.set_max_dirty_bytes(payload.len());
+        assert_eq!(
+            vfs.ingress_pressure_for(payload.len()).lane,
+            VfsIngressLane::DirtyMem,
+            "clean ingress state should accept the first buffered handle write"
+        );
+
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            attr.ino,
+            0,
+            payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            vfs.inode_has_dirty_handle_writers(attr.ino),
+            "setup should keep the payload buffered in the handle-writer registry"
+        );
+        let pressure = vfs.ingress_pressure_for(1);
+        assert_eq!(
+            pressure.dirty_mem_bytes,
+            payload.len(),
+            "ingress pressure should include buffered handle-writer bytes before they materialize into local_dirty"
+        );
+        assert_eq!(
+            pressure.lane,
+            VfsIngressLane::Backpressure,
+            "once buffered handle-writer bytes consume the dirty budget, follow-up ingress should see backpressure"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn inode_write_keeps_partial_state_buffered_until_flush() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-inode-write-direct");

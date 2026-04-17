@@ -4895,6 +4895,11 @@ impl StudioVfs {
         }
     }
 
+    fn total_pending_write_buffer_bytes(&self) -> usize {
+        self.total_pending_local_dirty_bytes()
+            .saturating_add(self.state.handle_writers.total_dirty_bytes())
+    }
+
     fn per_second(total: u64, elapsed: Duration) -> f64 {
         let secs = elapsed.as_secs_f64();
         if secs <= f64::EPSILON {
@@ -5638,7 +5643,7 @@ impl StudioVfs {
     /// Describe whether a new locally materialized payload would still fit in
     /// the in-memory dirty buffer or would hit local backpressure.
     pub fn ingress_pressure_for(&self, next_bytes: usize) -> VfsIngressPressure {
-        let dirty_mem_bytes = self.total_pending_local_dirty_bytes();
+        let dirty_mem_bytes = self.total_pending_write_buffer_bytes();
         let dirty_mem_limit = self.max_dirty_bytes.load(Ordering::Acquire);
         let lane = if dirty_mem_bytes == 0
             || dirty_mem_bytes.saturating_add(next_bytes) <= dirty_mem_limit
