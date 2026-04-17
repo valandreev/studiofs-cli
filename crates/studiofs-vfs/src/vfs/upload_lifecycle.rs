@@ -246,18 +246,18 @@ impl StudioVfs {
         if let Err(error) = self.local_block_backend.sync_data() {
             warn!(error = %error, "local cache backend sync failed during shutdown");
             tracing::info!(
-                "upload coordinator checkpoint persisted, but local cache backend sync failed"
+                "cached-store upload journal persisted, but local cache backend sync failed"
             );
             false
         } else {
             tracing::info!("local cache backend sync persisted");
-            tracing::info!("upload coordinator checkpoint persisted");
+            tracing::info!("cached-store upload journal persisted");
             true
         }
     }
 
-    /// Best-effort graceful shutdown: drain dirty buffers, persist final
-    /// checkpoint state, cancel uploader tasks, then persist upload state.
+    /// Best-effort graceful shutdown: drain pending local state, persist the
+    /// cached-store upload journal, cancel uploader tasks, then persist upload state.
     pub async fn shutdown(&self, upload_drain_timeout: Duration) {
         if self
             .state

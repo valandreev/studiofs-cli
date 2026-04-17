@@ -6899,7 +6899,7 @@ fn upload_backlog_does_not_create_local_backpressure_after_write_commit() {
                 assert_eq!(
                     vfs.ingress_pressure_for(payload.len()).lane,
                     VfsIngressLane::DirtyMem,
-                    "upload backlog alone should not force write-buffer backpressure"
+                    "upload backlog alone should not force local-dirty backpressure"
                 );
                 let name = format!("spill-only-{idx}.bin");
                 let attr = vfs.create(1, name.as_bytes(), 0, 0, 0o644).unwrap();
@@ -6974,7 +6974,7 @@ fn upload_backlog_does_not_create_local_backpressure_after_write_commit() {
             );
             assert_eq!(
                 stats.dirty_mem_bytes, 0,
-                "write() should leave no pending write-buffer bytes once the local durable barrier completes"
+                "write() should leave no pending local-dirty bytes once the local durable barrier completes"
             );
             vfs.flush(attr.ino).await.unwrap();
             assert_eq!(
@@ -7725,7 +7725,7 @@ fn test_ingress_backpressure_wait_time_accumulates_until_drain() {
 
         let payload = vec![0x55u8; 512 * 1024];
 
-        let first = vfs.create(1, b"write-buffer-full.bin", 0, 0, 0o644).unwrap();
+        let first = vfs.create(1, b"local-dirty-full.bin", 0, 0, 0o644).unwrap();
         vfs.write(first.ino, 0, &payload).await.unwrap();
         assert_eq!(
             vfs.ingress_pressure_for(payload.len()).lane,

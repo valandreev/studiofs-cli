@@ -48,7 +48,9 @@ fn active_docs_drop_superseded_io_architecture_terms() {
         "buffered-first",
         "Cache 3.0",
         "WriteBuffer",
+        "write-buffer",
         "UploadCoordinator",
+        "upload coordinator",
         "ReadPipeline",
         "access classifier",
         "planner",
@@ -128,6 +130,26 @@ fn runtime_metric_names_drop_superseded_write_buffer_and_flush_ordered_terms() {
     assert!(
         hits.is_empty(),
         "runtime metrics still expose superseded write-buffer/flush-ordered names:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn runtime_and_regression_surfaces_drop_lowercase_transitional_terms() {
+    let files = [
+        "crates/studiofs-vfs/src/vfs/upload_lifecycle.rs",
+        "crates/studiofs-vfs/tests/vfs_test.rs",
+    ];
+    let forbidden_terms = ["write-buffer", "upload coordinator"];
+
+    let hits: Vec<_> = files
+        .iter()
+        .flat_map(|path| collect_term_hits(path, &forbidden_terms))
+        .collect();
+
+    assert!(
+        hits.is_empty(),
+        "runtime and regression surfaces still use transitional lowercase vocabulary:\n{}",
         hits.join("\n")
     );
 }

@@ -476,7 +476,7 @@ Metadata cache observability is emitted through the existing `upload pipeline` /
 
 - dentry cache, full-path shortcut cache, and attr read cache metrics: hits/misses/evictions, occupancy, protected-tier (hotset) occupancy, and hot-hit contribution
 - ingress artifact counters/checkpoint stats (expected to remain at zero during normal local-cache foreground operation unless recovering older artifacts)
-- local write-buffer persist batch metrics (batch size in blocks/bytes, batch duration histogram, concurrent batch depth/peak)
+- local dirty-state persist batch metrics (batch size in blocks/bytes, batch duration histogram, concurrent batch depth/peak)
 - cache shim read/write throughput and latency histograms
 - VFS synchronous read fast-path counters (`vfs_read_sync_fast_path_hits`, `vfs_read_sync_fast_path_misses`)
 - queue depth/backpressure metrics (`upload_queue_depth`, `upload_queue_depth_peak`, `write_backpressure_wait_ms`, `write_backpressure_events`)
