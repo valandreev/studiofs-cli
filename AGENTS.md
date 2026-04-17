@@ -279,23 +279,24 @@ Tunable at runtime (see `crates/studiofs/src/cli/mount.rs` for full list):
 - Restrict **network access** to application servers
 - Enable **audit logging** for compliance
 
-## WinFSP Barrier Policy (SFS-197)
+## Bridge Local-First Callback Contract (SFS-250)
 
-Keep `crates/studiofs-winfsp/src/context.rs` and `crates/studiofs-vfs/src/vfs.rs`
-aligned on these rules whenever WinFSP callback sequencing changes:
+Keep `crates/studiofs-winfsp/src/context.rs`,
+`crates/studiofs-fuse/src/fs.rs`, and
+`crates/studiofs-vfs/src/vfs/handle_drain_barrier.rs` aligned on these rules
+whenever bridge callback sequencing changes:
 
-- `flush` for a file handle is a mandatory explicit local-durability barrier when the inode still has dirty unpublished state. Success means the accepted writes are durable in the local unpublished view; it must not wait for S3 upload or PostgreSQL publish. Repeated clean callbacks may short-circuit, and concurrent duplicate callbacks may coalesce per inode.
-- `cleanup` with `FspCleanupDelete` must finalize delete in cleanup. `set_delete`/`can_delete` only validate intent; they must not delete.
-- Non-delete `cleanup` is observational only. It must not own a foreground local-dirty-state barrier; explicit `flush` and the last-handle `close`/`release_fh` path retain that responsibility.
-- `close` is a release path, not an independent publish or upload contract. It may observe and attribute the fallback local-durability barrier when cleanup did not drain the inode first.
-- `overwrite` and `set_file_size` must commit the new local EOF and attrs before returning; they are not backgroundable flush callbacks, and they must not force global publish of the new epoch.
-- `release_fh` must push any remaining local dirty state through the existing local payload/metadata pipeline before the last handle disappears, including open-unlink/orphan lifecycles and sticky upload error reporting. When dirty unpublished state is still present, the fallback release barrier must reach the strict local durable boundary; it must not drag S3 upload or PostgreSQL publish into the foreground path.
-- Mounted Windows validation aimed at AJA-style sequential writers should treat any non-zero non-delete `cleanup` foreground barriers, `cleanup_skipped_clean`, or `cleanup_flush_fh` callback counts (that is, any cleanup barrier attribution, including skipped-clean) as concrete follow-up evidence for `SFS-192`, because those indicate avoidable callback-side flush work is still present.
+- Explicit bridge `flush` remains a mandatory local-durability barrier when an inode still has dirty unpublished state. Success means local durability only; it must not wait for S3 upload or PostgreSQL publish.
+- FUSE `fsync` is an inode-scoped local-durability barrier. It may persist dirty handle-writer state even though the callback itself is not handle-keyed, and it must not force remote publication.
+- WinFSP `cleanup` with `FspCleanupDelete` finalizes delete in cleanup. `set_delete`/`can_delete` only validate intent; they must not delete.
+- Non-delete WinFSP `cleanup` is observational only. It must not own a foreground local-dirty-state barrier; explicit `flush` and the last-handle `close`/`release_fh` path retain that responsibility.
+- FUSE `release` and WinFSP `close`/`release_fh` are release paths, not independent publish or upload contracts. When dirty unpublished state remains, the last-handle fallback barrier must reach strict local durability without dragging remote publication into the foreground path.
+- WinFSP `overwrite`, WinFSP `set_file_size`, and FUSE size-changing `setattr` / truncate paths must commit the new local EOF and attrs before returning; they are not backgroundable flush callbacks.
+- Mounted Windows validation aimed at AJA-style sequential writers should treat any non-zero non-delete `cleanup` foreground barriers, `cleanup_skipped_clean`, or `cleanup_flush_fh` callback counts as concrete follow-up evidence for `SFS-192`, because those indicate avoidable callback-side flush work is still present.
 
-Future defer/coalesce work may target non-delete `cleanup`, repeated clean callback
-paths, and duplicate concurrent callback barriers, but it must not weaken explicit
-`flush`, delete cleanup, overwrite/EOF transitions, or the VFS last-handle release
-guarantee.
+Future defer/coalesce work may target repeated clean callback paths and duplicate
+concurrent barriers, but it must not weaken explicit `flush`, `fsync`, delete
+cleanup, EOF transitions, or the VFS last-handle release guarantee.
 
 ## Agent-Specific Instructions
 
