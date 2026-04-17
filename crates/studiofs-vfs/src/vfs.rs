@@ -1566,7 +1566,7 @@ struct MetricsState {
     /// Current number of items queued in the prefetch worker's pending queue.
     /// Useful for detecting backpressure under high handle-count workloads.
     prefetch_queue_depth: AtomicU64,
-    flush_ordered_calls: AtomicU64,
+    flush_barrier_calls: AtomicU64,
     local_cache_io_calls: AtomicU64,
     local_cache_io_handoff_total_ns: AtomicU64,
     local_cache_io_handoff_max_ns: AtomicU64,
@@ -1639,7 +1639,7 @@ impl MetricsState {
             ignored_entries: Mutex::new(IgnoredEntryRegistry::default()),
             next_ignored_ino: AtomicU64::new(1u64 << 63),
             prefetch_queue_depth: AtomicU64::new(0),
-            flush_ordered_calls: AtomicU64::new(0),
+            flush_barrier_calls: AtomicU64::new(0),
             local_cache_io_calls: AtomicU64::new(0),
             local_cache_io_handoff_total_ns: AtomicU64::new(0),
             local_cache_io_handoff_max_ns: AtomicU64::new(0),
@@ -1718,7 +1718,7 @@ impl MetricsState {
         self.materialize_batch_stats.reset();
         self.prefetch_queue_depth.store(0, Ordering::Relaxed);
         reset_atomic!(
-            flush_ordered_calls,
+            flush_barrier_calls,
             local_cache_io_calls,
             local_cache_io_handoff_total_ns,
             local_cache_io_handoff_max_ns,
@@ -2998,14 +2998,14 @@ impl StudioVfs {
                     shutdown_ts = event.generated_unix_ms;
                     last_graceful_shutdown = Some(VfsZeroIoShutdownSnapshot {
                         generated_unix_ms: event.generated_unix_ms,
-                        accepted_write_buffer_bytes_before: Self::zeroio_event_u64(
+                        accepted_local_dirty_bytes_before: Self::zeroio_event_u64(
                             &event.fields,
-                            "accepted_write_buffer_bytes_before",
+                            "accepted_local_dirty_bytes_before",
                         )
                         .unwrap_or(0),
-                        accepted_write_buffer_bytes_after: Self::zeroio_event_u64(
+                        accepted_local_dirty_bytes_after: Self::zeroio_event_u64(
                             &event.fields,
-                            "accepted_write_buffer_bytes_after",
+                            "accepted_local_dirty_bytes_after",
                         )
                         .unwrap_or(0),
                         pending_uploads_after: Self::zeroio_event_u64(
@@ -5282,7 +5282,7 @@ impl StudioVfs {
             };
         }
         load_metrics!(
-            flush_ordered_calls: flush_ordered_calls,
+            flush_barrier_calls: flush_barrier_calls,
             local_cache_io_calls: local_cache_io_calls,
             local_cache_handoff_total_ns: local_cache_io_handoff_total_ns,
             local_cache_handoff_max_ns: local_cache_io_handoff_max_ns,
@@ -5386,8 +5386,8 @@ impl StudioVfs {
             generated_unix_ms: now_unix_millis(),
             uptime_secs: elapsed.as_secs_f64(),
             backend_tag: self.write_path_backend_tag.clone(),
-            flush_ordered_calls,
-            flush_ordered_calls_per_sec: Self::per_second(flush_ordered_calls, elapsed),
+            flush_barrier_calls,
+            flush_barrier_calls_per_sec: Self::per_second(flush_barrier_calls, elapsed),
             block_store_sync_data: VfsWritePathSyncDataStats {
                 calls: sync_calls,
                 calls_per_sec: Self::per_second(sync_calls, elapsed),

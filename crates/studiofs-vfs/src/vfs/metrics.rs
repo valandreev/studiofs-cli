@@ -195,8 +195,8 @@ pub struct VfsWritePathObservabilitySnapshot {
     pub generated_unix_ms: u64,
     pub uptime_secs: f64,
     pub backend_tag: String,
-    pub flush_ordered_calls: u64,
-    pub flush_ordered_calls_per_sec: f64,
+    pub flush_barrier_calls: u64,
+    pub flush_barrier_calls_per_sec: f64,
     pub block_store_sync_data: VfsWritePathSyncDataStats,
     #[serde(default)]
     pub local_cache_io: VfsWritePathLocalCacheIoStats,
@@ -266,8 +266,8 @@ pub struct VfsZeroIoStartupReplaySnapshot {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VfsZeroIoShutdownSnapshot {
     pub generated_unix_ms: u64,
-    pub accepted_write_buffer_bytes_before: u64,
-    pub accepted_write_buffer_bytes_after: u64,
+    pub accepted_local_dirty_bytes_before: u64,
+    pub accepted_local_dirty_bytes_after: u64,
     pub pending_uploads_after: usize,
     pub uploader_drained_before_cancel: bool,
     pub metadata_flush_outcome: String,

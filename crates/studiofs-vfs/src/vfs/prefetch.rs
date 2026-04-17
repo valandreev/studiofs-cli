@@ -79,7 +79,7 @@ impl PrefetchReadContext {
     }
 }
 
-struct PrefetchHintPlanner<'a> {
+struct PrefetchBatchBuilder<'a> {
     vfs: &'a StudioVfs,
     ino: Ino,
     stream_id: u64,
@@ -88,7 +88,7 @@ struct PrefetchHintPlanner<'a> {
     policy: AccessPolicy,
 }
 
-impl<'a> PrefetchHintPlanner<'a> {
+impl<'a> PrefetchBatchBuilder<'a> {
     fn new(
         vfs: &'a StudioVfs,
         ino: Ino,
@@ -519,7 +519,7 @@ impl StudioVfs {
         last_block: u32,
         policy: AccessPolicy,
     ) -> Vec<PrefetchBatch> {
-        PrefetchHintPlanner::new(self, ino, stream_id, first_block, last_block, policy)
+        PrefetchBatchBuilder::new(self, ino, stream_id, first_block, last_block, policy)
             .plan_batches()
     }
 }

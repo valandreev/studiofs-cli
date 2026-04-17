@@ -2851,7 +2851,7 @@ fn flush_fh_materializes_handle_writer_state_without_legacy_ordered_flush() {
         let ordered_flushes_before = vfs
             .state
             .metrics
-            .flush_ordered_calls
+            .flush_barrier_calls
             .load(Ordering::Relaxed);
 
         vfs.flush_fh(fh).await.unwrap();
@@ -2859,11 +2859,11 @@ fn flush_fh_materializes_handle_writer_state_without_legacy_ordered_flush() {
         let ordered_flushes_after = vfs
             .state
             .metrics
-            .flush_ordered_calls
+            .flush_barrier_calls
             .load(Ordering::Relaxed);
         assert_eq!(
             ordered_flushes_after, ordered_flushes_before,
-            "handle writer flush should materialize directly without routing through flush_ordered"
+            "handle writer flush should materialize directly without routing through the flush barrier path"
         );
 
         vfs.release_fh(fh).await.unwrap();

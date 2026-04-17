@@ -82,3 +82,63 @@ fn cli_surface_avoids_cache_30_product_wording() {
         hits.join("\n")
     );
 }
+
+#[test]
+fn cli_and_regression_surfaces_drop_buffered_first_wording() {
+    let files = [
+        "crates/studiofs/src/cli/test_cache/reporting/human.rs",
+        "crates/studiofs-vfs/tests/vfs_test.rs",
+    ];
+
+    let hits: Vec<_> = files
+        .iter()
+        .flat_map(|path| collect_term_hits(path, &["Buffered-first", "buffered-first"]))
+        .collect();
+
+    assert!(
+        hits.is_empty(),
+        "CLI and regression surfaces still use buffered-first wording:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn runtime_metric_names_drop_superseded_write_buffer_and_flush_ordered_terms() {
+    let files = [
+        "crates/studiofs-vfs/src/vfs.rs",
+        "crates/studiofs-vfs/src/vfs/metrics.rs",
+        "crates/studiofs-vfs/src/vfs/upload_lifecycle.rs",
+        "crates/studiofs/src/cli/status.rs",
+    ];
+    let forbidden_terms = [
+        "accepted_write_buffer_bytes_before",
+        "accepted_write_buffer_bytes_after",
+        "flush_ordered_calls",
+        "flush_ordered_calls_per_sec",
+    ];
+
+    let hits: Vec<_> = files
+        .iter()
+        .flat_map(|path| collect_term_hits(path, &forbidden_terms))
+        .collect();
+
+    assert!(
+        hits.is_empty(),
+        "runtime metrics still expose superseded write-buffer/flush-ordered names:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn prefetch_helper_name_drops_planner_wording() {
+    let hits = collect_term_hits(
+        "crates/studiofs-vfs/src/vfs/prefetch.rs",
+        &["PrefetchHintPlanner"],
+    );
+
+    assert!(
+        hits.is_empty(),
+        "prefetch helper still uses planner wording:\n{}",
+        hits.join("\n")
+    );
+}

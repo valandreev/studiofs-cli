@@ -846,7 +846,7 @@ impl<'a> OrderedWriteSession<'a> {
         self.vfs
             .state
             .metrics
-            .flush_ordered_calls
+            .flush_barrier_calls
             .fetch_add(1, Ordering::Relaxed);
         self.vfs.enforce_access(self.ino, AccessLevel::ReadWrite)?;
         if self.vfs.ignored_entry_attr(self.ino).is_some() {

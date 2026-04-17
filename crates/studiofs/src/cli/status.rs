@@ -366,8 +366,8 @@ pub fn run(
             println!("  Backend tag:               {}", snapshot.backend_tag);
             println!("  Uptime:                    {:.1}s", snapshot.uptime_secs);
             println!(
-                "  flush_ordered calls:       {} ({:.2}/s)",
-                snapshot.flush_ordered_calls, snapshot.flush_ordered_calls_per_sec
+                "  flush barrier calls:       {} ({:.2}/s)",
+                snapshot.flush_barrier_calls, snapshot.flush_barrier_calls_per_sec
             );
             println!(
                 "  block_store_sync_data calls: {} ({:.2}/s)",
@@ -583,8 +583,8 @@ mod tests {
             generated_unix_ms: 123,
             uptime_secs: 4.0,
             backend_tag: "cache-v3".to_string(),
-            flush_ordered_calls: 11,
-            flush_ordered_calls_per_sec: 2.5,
+            flush_barrier_calls: 11,
+            flush_barrier_calls_per_sec: 2.5,
             block_store_sync_data: Default::default(),
             local_cache_io: Default::default(),
             winfsp_callbacks: Default::default(),
@@ -602,7 +602,7 @@ mod tests {
         let loaded = read_write_path_observability(tmp.path()).expect("metrics");
         assert_eq!(loaded.0, metrics_path);
         assert_eq!(loaded.1.backend_tag, "cache-v3");
-        assert_eq!(loaded.1.flush_ordered_calls, 11);
+        assert_eq!(loaded.1.flush_barrier_calls, 11);
     }
 
     #[test]

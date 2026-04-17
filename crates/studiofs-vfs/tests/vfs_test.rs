@@ -10947,9 +10947,9 @@ async fn test_xattr_on_directory() {
 }
 
 // =============================================================================
-// Buffered-first correctness and performance coverage (SFS-121)
+// Local-First correctness and performance coverage (SFS-121)
 //
-// These tests encode the target user experience for the buffered-first
+// These tests encode the target user experience for the Local-First
 // architecture on Windows and macOS: background upload must not break or
 // heavily degrade foreground local reading, and the entire write→flush→upload
 // finalization lifecycle must be transparent to readers.
@@ -11177,7 +11177,7 @@ fn sequential_foreground_read_throughput_during_upload_meets_minimum() {
 }
 
 /// Compare buffered foreground-read performance across the three scheduler
-/// phases that matter for buffered-first regressions:
+/// phases that matter for Local-First regressions:
 /// - steady-state read with no pending upload
 /// - read while a new overwrite is uploading
 /// - read again after that upload fully drains
@@ -12923,7 +12923,7 @@ fn local_reads_through_upload_with_partial_tail_block() {
 /// waits for epoch finalization.  Neither task must ever see `RemoteContentPending`
 /// or incorrect data.
 ///
-/// This is part of the SFS-121 / SFS-123 buffered-first coverage suite.
+/// This is part of the SFS-121 / SFS-123 Local-First coverage suite.
 #[test]
 #[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn concurrent_reads_through_upload_finalization() {
