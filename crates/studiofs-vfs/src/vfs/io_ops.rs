@@ -286,7 +286,7 @@ impl StudioVfs {
                 ino,
                 offset,
                 data.len(),
-                self.access_classifier,
+                self.access_tracker,
             );
             if self.ignored_entry_attr(ino).is_some() {
                 let size = offset.saturating_add(data.len() as u64);

@@ -104,7 +104,7 @@ use startup::StartupChannels;
 use startup::StartupState;
 
 use crate::access::{
-    AccessClass, AccessClassifierConfig, AccessDecision, AccessPolicy, HandleAccessState,
+    AccessClass, AccessDecision, AccessPolicy, AccessTrackerConfig, HandleAccessState,
 };
 use crate::incarnation::{
     CommittedIncarnation, InodeIncarnationState, PendingIncarnation, VfsUploadState,
@@ -1301,15 +1301,15 @@ impl ReadState {
         ino: Ino,
         offset: u64,
         len: usize,
-        classifier: AccessClassifierConfig,
+        tracker: AccessTrackerConfig,
     ) -> AccessDecision {
         if let Some(open_file) = open_file {
-            let decision = open_file.observe_read(offset, len, classifier);
+            let decision = open_file.observe_read(offset, len, tracker);
             self.record_access_class_transition(decision.previous_class, decision.class, true);
             return decision;
         }
         let state = self.fallback_access_state(ino, false);
-        let decision = state.lock().observe_read(offset, len, classifier);
+        let decision = state.lock().observe_read(offset, len, tracker);
         self.record_access_class_transition(decision.previous_class, decision.class, false);
         decision
     }
@@ -1320,15 +1320,15 @@ impl ReadState {
         ino: Ino,
         offset: u64,
         len: usize,
-        classifier: AccessClassifierConfig,
+        tracker: AccessTrackerConfig,
     ) -> AccessDecision {
         if let Some(open_file) = open_file {
-            let decision = open_file.observe_write(offset, len, classifier);
+            let decision = open_file.observe_write(offset, len, tracker);
             self.record_access_class_transition(decision.previous_class, decision.class, true);
             return decision;
         }
         let state = self.fallback_access_state(ino, true);
-        let decision = state.lock().observe_write(offset, len, classifier);
+        let decision = state.lock().observe_write(offset, len, tracker);
         self.record_access_class_transition(decision.previous_class, decision.class, false);
         decision
     }
@@ -2059,7 +2059,7 @@ pub struct StudioVfs {
     /// Sticky horizon for using last known foreground P90 in the throttle loop.
     upload_fg_read_latency_sticky_window: Duration,
     /// Handle-aware access tracking tuning derived from VFS read settings.
-    access_classifier: AccessClassifierConfig,
+    access_tracker: AccessTrackerConfig,
     /// Grace window after the last foreground read to keep user priority.
     upload_user_idle_grace: Duration,
     /// Upload worker pool size.

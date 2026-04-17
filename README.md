@@ -146,7 +146,7 @@ breakdown with per-level latency distributions.
 On mounts started by newer StudioFS builds, `test-cache` `e2e` mode also emits
 `buffered_read_comparison` with `baseline-read`, `during-upload-read`, and
 `post-upload-read` phases, and the terminal summary renders the same mounted
-comparison as a `Buffered-first read comparison` table.
+comparison as a `Local-First read comparison` table.
 
 ## Development
 

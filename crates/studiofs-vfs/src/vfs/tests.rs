@@ -916,7 +916,7 @@ fn foreground_speedometer_trim_drops_expired_samples() {
             access_class: AccessClass::SequentialMediaRead,
             policy: AccessPolicy::from_class(
                 AccessClass::SequentialMediaRead,
-                AccessClassifierConfig {
+                AccessTrackerConfig {
                     block_size: 4096,
                     readahead_base_width: 8,
                     readahead_max_width: 32,
@@ -962,7 +962,7 @@ fn foreground_read_scope_records_sample_and_clears_inflight() {
             Duration::from_secs(1),
             AccessPolicy::from_class(
                 AccessClass::SequentialMediaRead,
-                AccessClassifierConfig {
+                AccessTrackerConfig {
                     block_size: 4096,
                     readahead_base_width: 8,
                     readahead_max_width: 32,
@@ -1007,9 +1007,8 @@ fn release_fh_clears_per_stream_read_tracking() {
         let fh = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
         let stream_id = vfs.get_open_file(fh).unwrap().stream_id();
         let key = ReadStreamKey { ino, stream_id };
-        let policy =
-            AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_classifier)
-                .readahead_policy();
+        let policy = AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_tracker)
+            .readahead_policy();
 
         let _ = vfs.readahead.record_read_for_stream(key, 0, 0, policy);
         vfs.state
@@ -1051,14 +1050,14 @@ fn fallback_read_access_tracking_does_not_increment_active_handle_counts() {
             .create(1, b"fallback-access-tracking.bin", 0, 0, 0o644)
             .unwrap();
         let ino = attr.ino;
-        let block = vfs.access_classifier.block_size as usize;
+        let block = vfs.access_tracker.block_size as usize;
 
         let mut last = AccessClass::RandomInteractiveRead;
         for step in 0..4u64 {
             last = vfs
                 .state
                 .read
-                .observe_read_access(None, ino, step * block as u64, block, vfs.access_classifier)
+                .observe_read_access(None, ino, step * block as u64, block, vfs.access_tracker)
                 .class;
         }
 
@@ -1098,7 +1097,7 @@ fn handle_read_access_tracking_promotes_active_class_counts() {
             .unwrap();
         let ino = attr.ino;
         let fh = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
-        let block = vfs.access_classifier.block_size as usize;
+        let block = vfs.access_tracker.block_size as usize;
 
         assert_eq!(
             vfs.state
@@ -1125,7 +1124,7 @@ fn handle_read_access_tracking_promotes_active_class_counts() {
                     ino,
                     step * block as u64,
                     block,
-                    vfs.access_classifier,
+                    vfs.access_tracker,
                 )
                 .class;
         }
@@ -1165,16 +1164,16 @@ fn clear_access_tracking_clears_fallback_states_and_hints() {
             .create(1, b"clear-access-tracking.bin", 0, 0, 0o644)
             .unwrap();
         let ino = attr.ino;
-        let block = vfs.access_classifier.block_size as usize;
+        let block = vfs.access_tracker.block_size as usize;
 
         let _ = vfs
             .state
             .read
-            .observe_read_access(None, ino, 0, block, vfs.access_classifier);
+            .observe_read_access(None, ino, 0, block, vfs.access_tracker);
         let _ = vfs
             .state
             .read
-            .observe_write_access(None, ino, 0, block, vfs.access_classifier);
+            .observe_write_access(None, ino, 0, block, vfs.access_tracker);
         vfs.state
             .read
             .prefetch_last_hint

@@ -301,7 +301,7 @@ Notes:
   `buffered_read_comparison` with `baseline-read`, `during-upload-read`, and
   `post-upload-read` rows plus the pending-upload observations used to gate
   each phase.
-- The terminal summary prints the same `Buffered-first read comparison` table
+- The terminal summary prints the same `Local-First read comparison` table
   when that mounted upload-state metadata is available.
 - `--profile=pyroscope` enables on-demand Pyroscope profiling. The run still
   completes if profiling backends or the endpoint are missing; the command emits

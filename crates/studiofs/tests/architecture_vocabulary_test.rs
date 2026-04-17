@@ -18,10 +18,12 @@ fn read_workspace_file(path: &str) -> String {
 fn collect_term_hits(path: &str, terms: &[&str]) -> Vec<String> {
     let contents = read_workspace_file(path);
     let mut hits = Vec::new();
+    let lowered_terms: Vec<_> = terms.iter().map(|term| term.to_lowercase()).collect();
 
     for (line_number, line) in contents.lines().enumerate() {
-        for term in terms {
-            if line.contains(term) {
+        let lowered_line = line.to_lowercase();
+        for (term, lowered_term) in terms.iter().zip(lowered_terms.iter()) {
+            if lowered_line.contains(lowered_term) {
                 hits.push(format!("{path}:{}: found `{term}`", line_number + 1));
             }
         }
@@ -39,6 +41,7 @@ fn active_docs_drop_superseded_io_architecture_terms() {
         "docs/cache.md",
         "docs/cache-v3-contract.md",
         "docs/configuration.md",
+        "docs/examples.md",
         "docs/vfs.md",
     ];
     let forbidden_terms = [
@@ -139,6 +142,32 @@ fn prefetch_helper_name_drops_planner_wording() {
     assert!(
         hits.is_empty(),
         "prefetch helper still uses planner wording:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn access_tracking_surface_drops_classifier_wording() {
+    let files = [
+        "crates/studiofs-vfs/src/access.rs",
+        "crates/studiofs-vfs/src/vfs.rs",
+        "crates/studiofs-vfs/src/vfs/bootstrap.rs",
+        "crates/studiofs-vfs/src/vfs/file_session.rs",
+        "crates/studiofs-vfs/src/vfs/io_ops.rs",
+        "crates/studiofs-vfs/src/vfs/prefetch.rs",
+        "crates/studiofs-vfs/src/vfs/read_path.rs",
+        "crates/studiofs-vfs/src/vfs/sync_ops.rs",
+        "crates/studiofs-vfs/src/vfs/tests.rs",
+    ];
+
+    let hits: Vec<_> = files
+        .iter()
+        .flat_map(|path| collect_term_hits(path, &["AccessClassifierConfig", "access_classifier"]))
+        .collect();
+
+    assert!(
+        hits.is_empty(),
+        "access tracking surface still uses classifier wording:\n{}",
         hits.join("\n")
     );
 }

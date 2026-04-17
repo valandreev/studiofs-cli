@@ -60,14 +60,14 @@ impl AccessClass {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct AccessClassifierConfig {
+pub(crate) struct AccessTrackerConfig {
     pub(crate) block_size: u32,
     pub(crate) readahead_base_width: u32,
     pub(crate) readahead_max_width: u32,
     pub(crate) readahead_min_prefetch: u32,
 }
 
-impl AccessClassifierConfig {
+impl AccessTrackerConfig {
     fn block_size_u64(self) -> u64 {
         u64::from(self.block_size.max(1))
     }
@@ -99,7 +99,7 @@ impl Default for AccessPolicy {
 }
 
 impl AccessPolicy {
-    pub(crate) fn from_class(class: AccessClass, cfg: AccessClassifierConfig) -> Self {
+    pub(crate) fn from_class(class: AccessClass, cfg: AccessTrackerConfig) -> Self {
         let base_width = cfg.readahead_base_width.max(1);
         let max_width = cfg.readahead_max_width.max(base_width);
         let min_prefetch = cfg.readahead_min_prefetch.max(1).min(max_width);
@@ -212,7 +212,7 @@ impl HandleAccessState {
         &mut self,
         offset: u64,
         len: usize,
-        cfg: AccessClassifierConfig,
+        cfg: AccessTrackerConfig,
     ) -> AccessDecision {
         let previous_class = self.current_class;
         let (first_block, last_block, span_blocks) = block_span(offset, len, cfg.block_size_u64());
@@ -319,7 +319,7 @@ impl HandleAccessState {
         &mut self,
         offset: u64,
         len: usize,
-        cfg: AccessClassifierConfig,
+        cfg: AccessTrackerConfig,
     ) -> AccessDecision {
         let previous_class = self.current_class;
         let (first_block, last_block, span_blocks) = block_span(offset, len, cfg.block_size_u64());
@@ -412,8 +412,8 @@ fn clamp_u32(value: u64) -> u32 {
 mod tests {
     use super::*;
 
-    fn config() -> AccessClassifierConfig {
-        AccessClassifierConfig {
+    fn config() -> AccessTrackerConfig {
+        AccessTrackerConfig {
             block_size: 1024,
             readahead_base_width: 32,
             readahead_max_width: 256,
@@ -474,7 +474,7 @@ mod tests {
 
         // Switch to read at the next contiguous position — block 3.
         // With the soft reset, last_last_block=Some(2) is preserved, so the
-        // classifier detects contiguous-forward from the very first read.
+        // tracking detects contiguous-forward from the very first read.
         let r1 = state.observe_read(3072, 1024, cfg);
         // gain=2 → sequential_score=2, below threshold(4) → stays on the
         // read-side random class instead of inheriting the old writer label.
@@ -586,7 +586,7 @@ mod tests {
     #[test]
     fn read_classifier_promotes_on_sub_block_forward_progress() {
         let mut state = HandleAccessState::new(15, OpenFlags::RDONLY);
-        let cfg = AccessClassifierConfig {
+        let cfg = AccessTrackerConfig {
             block_size: 4096,
             readahead_base_width: 32,
             readahead_max_width: 256,

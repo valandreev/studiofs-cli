@@ -222,7 +222,7 @@ Notes:
   `during-upload-read`, and `post-upload-read` phases plus the pending-upload
   wait observations used to bracket them.
 - The terminal summary shows the same mounted comparison as a
-  `Buffered-first read comparison` table, including wait target/observation and
+  `Local-First read comparison` table, including wait target/observation and
   pending upload counts before and after each read phase.
 - `e2e` mode still keeps filesystem-level read/write reports; cache internals
   continue to be emitted through mount logs (`upload pipeline counters`).

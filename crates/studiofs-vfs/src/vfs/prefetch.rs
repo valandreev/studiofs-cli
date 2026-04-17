@@ -595,8 +595,7 @@ mod tests {
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-hint-range-merge");
         let ino = 9_301;
         let stream_id = 77;
-        let policy =
-            AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_classifier);
+        let policy = AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_tracker);
 
         vfs.enqueue_prefetch_hint(ino, stream_id, policy, &[(2, 0, 1), (3, 0, 1)]);
         assert_eq!(
@@ -636,8 +635,7 @@ mod tests {
         let ino = 9_302;
         let stream_id = 88;
         let key = ReadStreamKey { ino, stream_id };
-        let policy =
-            AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_classifier);
+        let policy = AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_tracker);
 
         let _ = vfs
             .readahead
