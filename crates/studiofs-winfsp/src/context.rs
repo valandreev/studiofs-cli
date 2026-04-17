@@ -2846,6 +2846,11 @@ mod tests {
             async move { vfs.write(attr.ino, 0, b"dirty").await }
         })
         .expect("dirty write");
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.flush(attr.ino).await }
+        })
+        .expect("commit dirty write");
 
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
@@ -3015,6 +3020,11 @@ mod tests {
             async move { vfs.write(attr.ino, 0, b"dirty").await }
         })
         .expect("dirty write");
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.flush(attr.ino).await }
+        })
+        .expect("commit dirty write");
 
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
@@ -3272,6 +3282,11 @@ mod tests {
             async move { vfs.write(attr.ino, 0, b"dirty").await }
         })
         .expect("dirty write");
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.flush(attr.ino).await }
+        })
+        .expect("commit dirty write");
 
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
@@ -3339,6 +3354,11 @@ mod tests {
             async move { vfs.write(attr.ino, 0, b"dirty").await }
         })
         .expect("dirty write");
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.flush(attr.ino).await }
+        })
+        .expect("commit dirty write");
 
         ctx.run_cleanup_non_delete_callback(attr.ino, fh)
             .expect("cleanup callback");
@@ -3376,6 +3396,11 @@ mod tests {
             async move { vfs.write(attr.ino, 0, b"dirty").await }
         })
         .expect("dirty write");
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.flush(attr.ino).await }
+        })
+        .expect("commit dirty write");
 
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
@@ -3480,6 +3505,11 @@ mod tests {
             async move { vfs.write(attr.ino, 0, b"dirty").await }
         })
         .expect("dirty write");
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.flush(attr.ino).await }
+        })
+        .expect("commit dirty write");
 
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
@@ -3601,6 +3631,11 @@ mod tests {
             async move { vfs.write(attr.ino, 0, b"dirty").await }
         })
         .expect("dirty write");
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.flush(attr.ino).await }
+        })
+        .expect("commit dirty write");
 
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
@@ -3675,6 +3710,11 @@ mod tests {
             async move { vfs.write(attr.ino, 0, b"dirty").await }
         })
         .expect("dirty write");
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.flush(attr.ino).await }
+        })
+        .expect("commit dirty write");
 
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
@@ -3732,6 +3772,11 @@ mod tests {
             async move { vfs.write(attr.ino, 0, b"dirty").await }
         })
         .expect("dirty write");
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.flush(attr.ino).await }
+        })
+        .expect("commit dirty write");
 
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
@@ -3782,6 +3827,11 @@ mod tests {
             async move { vfs.write(attr.ino, 0, b"dirty").await }
         })
         .expect("dirty write");
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.flush(attr.ino).await }
+        })
+        .expect("commit dirty write");
 
         ctx.run_cleanup_non_delete_callback(attr.ino, fh)
             .expect("cleanup callback");

@@ -6969,18 +6969,24 @@ fn upload_backlog_does_not_create_local_backpressure_after_write_commit() {
 
             assert_eq!(
                 vfs.ingress_pressure_for(partial_payload.len()).lane,
-                VfsIngressLane::DirtyMem,
-                "durably persisted local state should not keep consuming foreground dirty-memory budget"
+                VfsIngressLane::Backpressure,
+                "buffered partial writes should continue consuming foreground dirty-memory budget until flush"
             );
             assert_eq!(
-                stats.dirty_mem_bytes, 0,
-                "write() should leave no pending local-dirty bytes once the local durable barrier completes"
+                stats.dirty_mem_bytes,
+                partial_payload.len(),
+                "partial writes should remain accounted as pending local-dirty bytes before flush"
             );
             vfs.flush(attr.ino).await.unwrap();
+            let stats_after_flush = vfs.ingress_stats();
             assert_eq!(
                 vfs.ingress_pressure_for(partial_payload.len()).lane,
                 VfsIngressLane::DirtyMem,
-                "an explicit flush should remain clean after write already persisted local state"
+                "explicit flush should clear the buffered dirty bytes so upload backlog alone does not create backpressure"
+            );
+            assert_eq!(
+                stats_after_flush.dirty_mem_bytes, 0,
+                "explicit flush should leave no pending local-dirty bytes behind"
             );
         });
         rt.shutdown_background();
@@ -7611,7 +7617,7 @@ fn test_write_fast_mode_no_spill_artifacts() {
 }
 
 #[test]
-fn test_ingress_pressure_stays_clean_after_partial_write_is_locally_committed() {
+fn test_ingress_pressure_reflects_buffered_partial_write_until_flush() {
     type EnvRestore = ScopedEnvVar;
 
     let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
@@ -7666,14 +7672,29 @@ fn test_ingress_pressure_stays_clean_after_partial_write_is_locally_committed() 
         vfs.write(attr.ino, 0, &payload).await.unwrap();
 
         let stats = vfs.ingress_stats();
-        assert!(
-            stats.dirty_mem_bytes == 0,
-            "the first partial payload should already be durably committed out of the write buffer"
+        assert_eq!(
+            stats.dirty_mem_bytes,
+            payload.len(),
+            "the first partial payload should remain buffered in dirty memory until flush"
+        );
+        assert_eq!(
+            vfs.ingress_pressure_for(payload.len()).lane,
+            VfsIngressLane::Backpressure,
+            "with the dirty budget fully consumed by the buffered partial payload, the next payload should see backpressure until flush"
+        );
+
+        vfs.flush(attr.ino).await.unwrap();
+
+        let stats_after_flush = vfs.ingress_stats();
+        assert_eq!(
+            stats_after_flush.dirty_mem_bytes,
+            0,
+            "explicit flush should clear the buffered partial payload from dirty memory"
         );
         assert_eq!(
             vfs.ingress_pressure_for(payload.len()).lane,
             VfsIngressLane::DirtyMem,
-            "once the first partial payload is locally committed, the next payload should start from a clean local budget"
+            "once the buffered partial payload is flushed, the next payload should start from a clean local budget"
         );
     });
     rt.shutdown_background();
@@ -9312,7 +9333,7 @@ fn make_local_zeroio_test_vfs(
 }
 
 #[test]
-fn write_returns_after_small_new_file_is_locally_durable() {
+fn write_returns_after_small_new_file_is_locally_readable_until_flush() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     unsafe {
         std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
@@ -9357,18 +9378,32 @@ fn write_returns_after_small_new_file_is_locally_durable() {
         assert_eq!(read.as_ref(), payload);
 
         let persisted_attr = meta.get_attr(attr.ino).unwrap();
+        assert_eq!(
+            persisted_attr.size, 0,
+            "small partial writes should leave durable metadata at the pre-barrier size"
+        );
+        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        assert_eq!(
+            blocks.len(),
+            0,
+            "small partial writes should stay buffered until flush"
+        );
+
+        vfs.flush(attr.ino).await.unwrap();
+
+        let persisted_attr = meta.get_attr(attr.ino).unwrap();
         assert_eq!(persisted_attr.size, payload.len() as u64);
         let blocks = meta.get_file_blocks(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             1,
-            "small write must durably materialize a partial block before write() returns"
+            "flush should materialize the buffered partial block"
         );
         let block = &blocks[0].1;
         assert_eq!(block.length as usize, payload.len());
         assert!(
             block.flags.contains(BlockFlags::PARTIAL_BLOCK),
-            "small write should persist as a partial block"
+            "flush should persist the small write as a partial block"
         );
     });
     rt.shutdown_background();
@@ -9545,7 +9580,7 @@ fn truncate_of_published_file_keeps_committed_size_and_pending_incarnation() {
 }
 
 #[test]
-fn append_after_create_is_locally_durable_without_flush() {
+fn append_after_create_stays_buffered_until_flush() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     unsafe {
         std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
@@ -9590,12 +9625,26 @@ fn append_after_create_is_locally_durable_without_flush() {
         assert_eq!(read.as_ref(), expected);
 
         let persisted_attr = meta.get_attr(attr.ino).unwrap();
+        assert_eq!(
+            persisted_attr.size, 0,
+            "ordinary append-before-flush should keep the durable local metadata at the pre-barrier size"
+        );
+        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        assert_eq!(
+            blocks.len(),
+            0,
+            "ordinary append-before-flush should not durably materialize a partial local block before the barrier"
+        );
+
+        vfs.flush(attr.ino).await.unwrap();
+
+        let persisted_attr = meta.get_attr(attr.ino).unwrap();
         assert_eq!(persisted_attr.size, expected.len() as u64);
         let blocks = meta.get_file_blocks(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             1,
-            "append-after-create should durably persist the unpublished local block before write() returns"
+            "flush should materialize the buffered append into one local block"
         );
         assert_eq!(blocks[0].1.length as usize, expected.len());
     });
@@ -9899,7 +9948,7 @@ fn write_persists_full_blocks_without_explicit_flush() {
 }
 
 #[test]
-fn write_persists_partial_tail_before_returning() {
+fn write_buffers_partial_tail_until_flush() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -9955,21 +10004,33 @@ fn write_persists_partial_tail_before_returning() {
             "the live inode view should expose the newly written tail bytes"
         );
 
+        assert_eq!(
+            vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
+            1,
+            "write() should eagerly accept the completed full block but keep the partial tail buffered until flush"
+        );
+        assert!(
+            vfs.ingress_stats().dirty_mem_bytes > 0,
+            "the partial tail should remain buffered in local dirty state before flush"
+        );
+
+        let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(read.as_ref(), payload.as_slice());
+
+        vfs.flush(attr.ino).await.unwrap();
+
         let persisted_attr = vfs.meta().get_attr(attr.ino).unwrap();
         assert_eq!(
             persisted_attr.size,
             payload.len() as u64,
-            "the durable local metadata should advance the file size before write() returns"
+            "flush should advance the durable local metadata to include the tail bytes"
         );
         assert_eq!(
             vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
             2,
-            "write() should durably persist both the full block and the partial tail block"
+            "flush should materialize the buffered partial tail block"
         );
         assert_eq!(vfs.ingress_stats().dirty_mem_bytes, 0);
-
-        let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
-        assert_eq!(read.as_ref(), payload.as_slice());
     });
     rt.shutdown_background();
 }
@@ -10054,7 +10115,7 @@ fn read_from_start_does_not_depend_on_draining_dirty_tail() {
 }
 
 #[test]
-fn write_persists_full_blocks_and_tail_without_buffered_relief() {
+fn write_persists_full_blocks_and_buffers_tail_without_buffered_relief() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -10111,13 +10172,13 @@ fn write_persists_full_blocks_and_tail_without_buffered_relief() {
 
         assert_eq!(
             vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
-            2,
-            "the tail block should be durably persisted alongside the initial full block"
+            1,
+            "the tail block should remain buffered while the initial full block stays durably persisted"
         );
         assert_eq!(
             vfs.ingress_stats().dirty_mem_bytes,
-            0,
-            "foreground success should not leave a buffered tail block behind"
+            tail_len,
+            "foreground success should keep the partial tail buffered until an explicit barrier"
         );
 
         let live_attr = vfs.getattr(attr.ino).unwrap();
@@ -10129,8 +10190,8 @@ fn write_persists_full_blocks_and_tail_without_buffered_relief() {
         let persisted_attr = vfs.meta().get_attr(attr.ino).unwrap();
         assert_eq!(
             persisted_attr.size,
-            (block_size + tail_len) as u64,
-            "the durable local metadata should preserve the latest logical size"
+            block_size as u64,
+            "durable local metadata should stay at the full-block prefix until the buffered tail is flushed"
         );
 
         let read = vfs
@@ -10139,6 +10200,25 @@ fn write_persists_full_blocks_and_tail_without_buffered_relief() {
             .unwrap();
         assert_eq!(&read[..block_size], first.as_slice());
         assert_eq!(&read[block_size..], tail.as_slice());
+
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert_eq!(
+            vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
+            2,
+            "flush should durably persist the buffered tail block alongside the initial full block"
+        );
+        assert_eq!(
+            vfs.ingress_stats().dirty_mem_bytes,
+            0,
+            "flush should clear the buffered tail block from dirty memory"
+        );
+        let persisted_attr = vfs.meta().get_attr(attr.ino).unwrap();
+        assert_eq!(
+            persisted_attr.size,
+            (block_size + tail_len) as u64,
+            "flush should advance the durable local metadata to the latest logical size"
+        );
     });
     rt.shutdown_background();
 }

@@ -344,16 +344,25 @@ fn zeroio_snapshot_distinguishes_single_store_payload_classes_and_publish_backlo
         vfs.write(pinned.ino, 0, b"pinned-unpublished-payload")
             .await
             .unwrap();
+        vfs.flush(pinned.ino)
+            .await
+            .expect("materialize pinned unpublished payload");
 
         let publish_ready = vfs.create(1, b"publish-ready.bin", 0, 0, 0o644).unwrap();
         vfs.write(publish_ready.ino, 0, b"publish-ready-payload")
             .await
             .unwrap();
+        vfs.flush(publish_ready.ino)
+            .await
+            .expect("materialize publish-ready payload");
 
         let published = vfs.create(1, b"published.bin", 0, 0, 0o644).unwrap();
         vfs.write(published.ino, 0, b"published-warm-payload")
             .await
             .unwrap();
+        vfs.flush(published.ino)
+            .await
+            .expect("materialize published warm payload");
 
         let (publish_ready_epoch, publish_ready_blocks) =
             mark_all_file_blocks_uploaded(&vfs, &meta, publish_ready.ino);
@@ -496,6 +505,9 @@ fn epoch_finalizer_publishes_manifest_backed_zero_length_epoch() {
         vfs.write(attr.ino, 0, payload)
             .await
             .expect("write test payload");
+        vfs.flush(attr.ino)
+            .await
+            .expect("materialize unpublished blocks before publish setup");
 
         let (published_epoch, published_blocks) =
             mark_all_file_blocks_uploaded(&vfs, &meta, attr.ino);
@@ -580,6 +592,9 @@ fn zeroio_snapshot_reports_repeated_restart_replay_as_health_signal() {
     let ino = created.ino;
     rt.block_on(async {
         vfs.write(ino, 0, b"replay-health-payload").await.unwrap();
+        vfs.flush(ino)
+            .await
+            .expect("materialize replay health payload");
     });
     let attr = meta.get_attr(ino).expect("load replay attr");
     let block = meta
@@ -1398,7 +1413,7 @@ fn test_release_fh_reports_sticky_error_after_persisting_current_changes() {
 }
 
 #[test]
-fn test_release_fh_with_outcome_keeps_write_committed_inode_clean_on_close() {
+fn test_release_fh_with_outcome_materializes_pending_inode_dirty_state_on_last_close() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-outcome-close-ownership");
     let _guard = rt.enter();
@@ -1410,8 +1425,8 @@ fn test_release_fh_with_outcome_keeps_write_committed_inode_clean_on_close() {
 
         vfs.write(ino, 0, b"payload").await.unwrap();
         assert!(
-            !vfs.inode_has_local_dirty_state(ino),
-            "write should already cross the local durable barrier"
+            vfs.inode_has_local_dirty_state(ino),
+            "partial inode writes should remain pending until an explicit barrier or last close"
         );
 
         let first = vfs.release_fh_with_outcome(fh1).await.unwrap();
@@ -1431,8 +1446,8 @@ fn test_release_fh_with_outcome_keeps_write_committed_inode_clean_on_close() {
             "the final close should report last-handle ownership"
         );
         assert!(
-            !second.flushed_local_dirty_state,
-            "the final close should stay clean once write already persisted local state"
+            second.flushed_local_dirty_state,
+            "the final close should report that it materialized the pending inode dirty state"
         );
         assert_eq!(vfs.open_count(ino), 0, "all handles should be closed");
     });
@@ -1691,7 +1706,7 @@ fn handle_writer_global_dirty_cap_drains_older_inodes_after_limit_drop() {
 }
 
 #[test]
-fn inode_write_materializes_directly_without_populating_pending_local_dirty_state() {
+fn inode_write_keeps_partial_state_buffered_until_flush() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-inode-write-direct");
     let _guard = rt.enter();
@@ -1707,19 +1722,108 @@ fn inode_write_materializes_directly_without_populating_pending_local_dirty_stat
             .unwrap();
 
         assert!(
-            !vfs.has_pending_local_dirty_blocks_for_inode(ino),
-            "inode write should bypass pending local dirty staging"
+            vfs.has_pending_local_dirty_blocks_for_inode(ino),
+            "ordinary opportunistic inode writes should keep partial state buffered until the flush barrier"
         );
         let spans = meta
             .lookup_regular_file_slices(ino, 0, payload.len() as u64)
             .unwrap();
         assert!(
-            spans.iter().any(|span| span.block.is_some()),
-            "inode write should materialize block-backed unpublished slices: {spans:?}"
+            spans.iter().all(|span| span.block.is_none()),
+            "ordinary opportunistic inode writes should not materialize block-backed unpublished slices before flush: {spans:?}"
         );
 
         let bytes = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
         assert_eq!(bytes.as_ref(), payload);
+
+        vfs.flush(ino).await.unwrap();
+
+        let spans = meta
+            .lookup_regular_file_slices(ino, 0, payload.len() as u64)
+            .unwrap();
+        assert!(
+            spans.iter().any(|span| span.block.is_some()),
+            "flush should materialize block-backed unpublished slices for the buffered inode write: {spans:?}"
+        );
+    });
+}
+
+#[test]
+fn write_fh_default_buffers_partial_state_until_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-257-write-fh-default-buffered");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-257-write-fh-default-buffered.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let payload = b"buffer-me";
+
+        vfs.write_fh(fh, ino, 0, payload).await.unwrap();
+
+        assert!(
+            vfs.inode_has_dirty_handle_writers(ino),
+            "default buffered handle writes should stay in handle-writer state until an explicit barrier"
+        );
+        let spans = meta
+            .lookup_regular_file_slices(ino, 0, payload.len() as u64)
+            .unwrap();
+        assert!(
+            spans.iter().all(|span| span.block.is_none()),
+            "default buffered handle writes should not materialize block-backed unpublished slices before flush: {spans:?}"
+        );
+
+        vfs.flush_fh(fh).await.unwrap();
+
+        let spans = meta
+            .lookup_regular_file_slices(ino, 0, payload.len() as u64)
+            .unwrap();
+        assert!(
+            spans.iter().any(|span| span.block.is_some()),
+            "flush_fh should materialize block-backed unpublished slices for the buffered handle write: {spans:?}"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn write_fh_buffers_partial_tail_after_full_block_boundary_until_flush() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-257-write-fh-full-block-plus-tail");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-257-write-fh-full-block-plus-tail.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let block_size = vfs.block_size as usize;
+        let mut payload = vec![0x41u8; block_size];
+        payload.extend_from_slice(&vec![0x42u8; block_size / 8]);
+
+        vfs.write_fh(fh, ino, 0, &payload).await.unwrap();
+
+        assert_eq!(
+            meta.get_file_blocks(ino).unwrap().len(),
+            1,
+            "buffered handle writes should eagerly accept the completed full block but keep the tail buffered until flush"
+        );
+        assert!(
+            vfs.inode_has_dirty_handle_writers(ino) || vfs.has_pending_local_dirty_blocks_for_inode(ino),
+            "the partial tail should remain buffered after the full-block prefix is accepted"
+        );
+
+        vfs.flush_fh(fh).await.unwrap();
+
+        assert_eq!(
+            meta.get_file_blocks(ino).unwrap().len(),
+            2,
+            "flush should materialize the buffered tail block"
+        );
+        vfs.release_fh(fh).await.unwrap();
     });
 }
 
@@ -1873,7 +1977,7 @@ fn test_release_fh_orphan_cleanup_waits_for_final_handle_before_clearing_live_ex
 }
 
 #[test]
-fn test_unlink_immediate_cleanup_keeps_write_committed_inode_clean() {
+fn test_unlink_immediate_cleanup_clears_pending_inode_dirty_state() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "unlink-immediate-cleanup");
     let _guard = rt.enter();
@@ -1885,8 +1989,8 @@ fn test_unlink_immediate_cleanup_keeps_write_committed_inode_clean() {
 
         vfs.write(ino, 0, b"payload").await.unwrap();
         assert!(
-            !vfs.inode_has_local_dirty_state(ino),
-            "write should already leave the inode locally durable before unlink"
+            vfs.inode_has_local_dirty_state(ino),
+            "partial inode writes should remain pending until unlink removes the inode"
         );
 
         vfs.unlink(1, b"unlink-immediate-cleanup.txt").unwrap();
@@ -1903,7 +2007,7 @@ fn test_unlink_immediate_cleanup_keeps_write_committed_inode_clean() {
 }
 
 #[test]
-fn test_rename_over_existing_target_discards_clean_persisted_local_state() {
+fn test_rename_over_existing_target_discards_pending_local_state() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "rename-displaced-cleanup");
     let _guard = rt.enter();
@@ -1914,8 +2018,8 @@ fn test_rename_over_existing_target_discards_clean_persisted_local_state() {
         vfs.write(source.ino, 0, b"source").await.unwrap();
         vfs.write(displaced.ino, 0, b"target").await.unwrap();
         assert!(
-            !vfs.inode_has_local_dirty_state(displaced.ino),
-            "overwrite target should already be locally durable before it is displaced"
+            vfs.inode_has_local_dirty_state(displaced.ino),
+            "a displaced overwrite target may still carry pending local state before rename"
         );
 
         vfs.rename(1, b"rename-source.txt", 1, b"rename-target.txt")
@@ -1933,7 +2037,7 @@ fn test_rename_over_existing_target_discards_clean_persisted_local_state() {
 }
 
 #[test]
-fn test_flush_fh_with_outcome_treats_write_committed_inode_as_clean() {
+fn test_flush_fh_with_outcome_materializes_pending_inode_dirty_state() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-handle-outcome");
     let _guard = rt.enter();
@@ -1953,14 +2057,14 @@ fn test_flush_fh_with_outcome_treats_write_committed_inode_as_clean() {
         let payload = b"payload";
         vfs.write(ino, 0, payload).await.unwrap();
         assert!(
-            !vfs.inode_has_local_dirty_state(ino),
-            "write should already persist local dirty state before flush_fh"
+            vfs.inode_has_local_dirty_state(ino),
+            "partial inode writes should stay buffered until the explicit flush barrier"
         );
 
         let after_write = vfs.flush_fh_with_outcome(fh).await.unwrap();
         assert!(
-            !after_write.flushed_local_dirty_state,
-            "flush_fh should report a clean skip once write already crossed the barrier"
+            after_write.flushed_local_dirty_state,
+            "flush_fh should report that it materialized the pending inode dirty state"
         );
 
         let after = vfs.getattr(ino).unwrap();
@@ -1975,7 +2079,7 @@ fn test_flush_fh_with_outcome_treats_write_committed_inode_as_clean() {
 }
 
 #[test]
-fn test_flush_with_outcome_treats_write_committed_inode_as_clean() {
+fn test_flush_with_outcome_materializes_pending_inode_dirty_state() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-inode-outcome");
     let _guard = rt.enter();
@@ -1994,14 +2098,14 @@ fn test_flush_with_outcome_treats_write_committed_inode_as_clean() {
         let payload = b"payload";
         vfs.write(ino, 0, payload).await.unwrap();
         assert!(
-            !vfs.inode_has_local_dirty_state(ino),
-            "write should already persist local dirty state before inode flush"
+            vfs.inode_has_local_dirty_state(ino),
+            "partial inode writes should stay buffered until the explicit inode flush barrier"
         );
 
         let after_write = vfs.flush_with_outcome(ino).await.unwrap();
         assert!(
-            !after_write.flushed_local_dirty_state,
-            "flush_with_outcome should report a clean skip once write already crossed the barrier"
+            after_write.flushed_local_dirty_state,
+            "flush_with_outcome should report that it materialized the pending inode dirty state"
         );
 
         let after = vfs.getattr(ino).unwrap();
@@ -2014,7 +2118,7 @@ fn test_flush_with_outcome_treats_write_committed_inode_as_clean() {
 }
 
 #[test]
-fn test_fsync_with_outcome_treats_write_committed_inode_as_clean() {
+fn test_fsync_with_outcome_materializes_pending_inode_dirty_state() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "fsync-outcome-clean-data");
     let _guard = rt.enter();
@@ -2037,18 +2141,18 @@ fn test_fsync_with_outcome_treats_write_committed_inode_as_clean() {
         let payload = b"payload";
         vfs.write(ino, 0, payload).await.unwrap();
         assert!(
-            !vfs.inode_has_local_dirty_state(ino),
-            "write should already persist local dirty state before fsync"
+            vfs.inode_has_local_dirty_state(ino),
+            "partial inode writes should remain pending until fsync forces the local barrier"
         );
 
         let after_write = vfs.fsync_with_outcome(ino, false).await.unwrap();
         assert!(
-            !after_write.flushed_file_data,
-            "fsync should report clean data once write already crossed the local barrier"
+            after_write.flushed_file_data,
+            "fsync should report that it flushed the pending file data"
         );
         assert!(
             !after_write.persisted_dirty_attrs,
-            "fsync should not invent metadata work after write already committed it"
+            "fsync should not report extra dirty-attr work once the file-data barrier already committed the pending state"
         );
     });
 }

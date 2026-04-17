@@ -259,11 +259,12 @@ impl StudioVfs {
 
     /// Write data to a file at the given offset.
     ///
-    /// ZeroIO foreground success now means the unpublished local state is
-    /// durable: payload blocks and overlay/attr metadata are persisted locally
-    /// before `write()` returns.
+    /// Ordinary foreground writes now keep Local-First visibility immediately,
+    /// eagerly accepting completed full blocks while allowing the current
+    /// partial tail block to remain buffered until an explicit durability
+    /// barrier (`flush`, `fsync`, size-changing ops, last-handle release).
     pub async fn write(&self, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
-        self.write_with_local_sync_policy(ino, offset, data, LocalSyncPolicy::Strict)
+        self.write_with_local_sync_policy(ino, offset, data, LocalSyncPolicy::Opportunistic)
             .await
     }
 

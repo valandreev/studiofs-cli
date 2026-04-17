@@ -351,7 +351,7 @@ impl StudioVfs {
 
     /// Write file data using the buffered write path.
     pub async fn write_fh(&self, fh: u64, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
-        self.write_fh_with_local_sync_policy(fh, ino, offset, data, LocalSyncPolicy::Strict)
+        self.write_fh_with_local_sync_policy(fh, ino, offset, data, LocalSyncPolicy::Opportunistic)
             .await
     }
 
@@ -397,6 +397,9 @@ impl StudioVfs {
                 .await?;
             if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
                 self.materialize_handle_writers_for_inode(ino, local_sync_policy)
+                    .await?;
+            } else {
+                self.materialize_completed_handle_writer_blocks_for_inode(ino, local_sync_policy)
                     .await?;
             }
             self.materialize_handle_writers_for_limits(ino, local_sync_policy)

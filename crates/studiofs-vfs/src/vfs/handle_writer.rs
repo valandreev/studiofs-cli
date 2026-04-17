@@ -14,6 +14,7 @@ pub(super) struct HandleWriterReadSpan {
 
 #[derive(Debug, Clone)]
 pub(super) struct BufferedHandleWrite {
+    pub(super) block_index: u32,
     pub(super) offset: u64,
     pub(super) seq: u64,
     pub(super) data: Bytes,
@@ -52,7 +53,7 @@ impl HandleSliceWriter {
         }
     }
 
-    fn upsert_write(&mut self, seq: u64, offset: u64, data: &[u8]) {
+    fn upsert_write(&mut self, block_index: u32, seq: u64, offset: u64, data: &[u8]) {
         if data.is_empty() {
             return;
         }
@@ -81,25 +82,42 @@ impl HandleSliceWriter {
             let existing_end = start.saturating_add(existing.data.len() as u64);
             if start < offset {
                 let keep_len = (offset - start) as usize;
-                self.insert_slice(start, existing.seq, existing.data.slice(0..keep_len));
+                self.insert_slice(
+                    existing.block_index,
+                    start,
+                    existing.seq,
+                    existing.data.slice(0..keep_len),
+                );
             }
             if existing_end > end {
                 let keep_from = (end - start) as usize;
-                self.insert_slice(end, existing.seq, existing.data.slice(keep_from..));
+                self.insert_slice(
+                    existing.block_index,
+                    end,
+                    existing.seq,
+                    existing.data.slice(keep_from..),
+                );
             }
         }
 
-        self.insert_slice(offset, seq, payload);
+        self.insert_slice(block_index, offset, seq, payload);
         self.logical_size = self.logical_size.max(end);
     }
 
-    fn insert_slice(&mut self, offset: u64, seq: u64, data: Bytes) {
+    fn insert_slice(&mut self, block_index: u32, offset: u64, seq: u64, data: Bytes) {
         if data.is_empty() {
             return;
         }
         self.dirty_bytes = self.dirty_bytes.saturating_add(data.len());
-        self.writes
-            .insert(offset, BufferedHandleWrite { offset, seq, data });
+        self.writes.insert(
+            offset,
+            BufferedHandleWrite {
+                block_index,
+                offset,
+                seq,
+                data,
+            },
+        );
     }
 
     fn snapshot_read_spans(&self, offset: u64, end: u64, spans: &mut Vec<HandleWriterReadSpan>) {
@@ -136,6 +154,22 @@ impl HandleSliceWriter {
         });
         self.dirty_bytes = self.dirty_bytes.saturating_sub(removed_bytes);
     }
+
+    fn mark_blocks_materialized(&mut self, seqs_by_block: &HashMap<u32, u64>) {
+        let mut removed_bytes = 0usize;
+        self.writes.retain(|_, write| {
+            let should_remove = seqs_by_block
+                .get(&write.block_index)
+                .is_some_and(|cutoff| write.seq <= *cutoff);
+            if should_remove {
+                removed_bytes = removed_bytes.saturating_add(write.data.len());
+                false
+            } else {
+                true
+            }
+        });
+        self.dirty_bytes = self.dirty_bytes.saturating_sub(removed_bytes);
+    }
 }
 
 impl HandleWriterRegistry {
@@ -151,10 +185,10 @@ impl HandleWriterRegistry {
         fh: u64,
         ino: Ino,
         current_size: u64,
+        block_size: u32,
         offset: u64,
         data: &[u8],
     ) -> u32 {
-        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let mut writers = self.writers.lock();
         let previous_ino = writers.writers.get(&fh).map(|writer| writer.ino);
         let (old_dirty_bytes, new_dirty_bytes) = {
@@ -166,7 +200,25 @@ impl HandleWriterRegistry {
             writer.ino = ino;
             writer.open = true;
             writer.logical_size = writer.logical_size.max(current_size);
-            writer.upsert_write(seq, offset, data);
+            let mut current_offset = offset;
+            let mut data_offset = 0usize;
+            let mut remaining = data.len();
+            while remaining > 0 {
+                let block_index = (current_offset / u64::from(block_size.max(1))) as u32;
+                let offset_in_block = (current_offset % u64::from(block_size.max(1))) as usize;
+                let space_in_block = block_size as usize - offset_in_block;
+                let chunk_len = remaining.min(space_in_block);
+                let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+                writer.upsert_write(
+                    block_index,
+                    seq,
+                    current_offset,
+                    &data[data_offset..data_offset + chunk_len],
+                );
+                current_offset = current_offset.saturating_add(chunk_len as u64);
+                data_offset += chunk_len;
+                remaining -= chunk_len;
+            }
             (old_dirty_bytes, writer.dirty_bytes)
         };
         Self::adjust_total_dirty_bytes(
@@ -325,6 +377,47 @@ impl HandleWriterRegistry {
         }
     }
 
+    pub(super) fn mark_blocks_materialized(&self, ino: Ino, seqs_by_block: &HashMap<u32, u64>) {
+        let mut writers = self.writers.lock();
+        let mut empty_closed = Vec::new();
+        let inode_handles: Vec<u64> = writers
+            .writers_by_ino
+            .get(&ino)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        for fh in inode_handles {
+            let Some((old_dirty_bytes, new_dirty_bytes, remove_closed)) =
+                (match writers.writers.get_mut(&fh) {
+                    Some(writer) => {
+                        let old_dirty_bytes = writer.dirty_bytes;
+                        writer.mark_blocks_materialized(seqs_by_block);
+                        Some((
+                            old_dirty_bytes,
+                            writer.dirty_bytes,
+                            writer.writes.is_empty() && !writer.open,
+                        ))
+                    }
+                    None => None,
+                })
+            else {
+                continue;
+            };
+            Self::adjust_total_dirty_bytes(
+                &mut writers.total_dirty_bytes,
+                old_dirty_bytes,
+                new_dirty_bytes,
+            );
+            if remove_closed {
+                empty_closed.push(fh);
+            }
+        }
+        for fh in empty_closed {
+            Self::remove_writer(&mut writers, fh);
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn open_writer_for_test(&self, fh: u64, ino: Ino, current_size: u64) {
         let mut writers = self.writers.lock();
@@ -411,10 +504,10 @@ impl StudioVfs {
             };
         self.refresh_inode_incarnation_state_from_attr(ino, &base_attr);
         self.begin_pending_incarnation(ino, &mut base_attr);
-        let written = self
-            .state
-            .handle_writers
-            .write(fh, ino, base_attr.size, offset, data);
+        let written =
+            self.state
+                .handle_writers
+                .write(fh, ino, base_attr.size, self.block_size, offset, data);
         {
             let mut dirty = self.state.namespace.dirty_attrs.lock();
             let attr = dirty.entry(ino).or_insert_with(|| base_attr.clone());
@@ -453,7 +546,18 @@ impl StudioVfs {
             return Ok(());
         }
 
-        if per_inode_dirty > 0 {
+        if per_inode_dirty > 0 && !budget_exceeded {
+            self.materialize_completed_handle_writer_blocks_for_inode(ino, local_sync_policy)
+                .await?;
+            let per_inode_dirty_after = self.state.handle_writers.dirty_bytes_for_inode(ino);
+            if per_inode_dirty_after == 0
+                || (per_inode_dirty_after < self.write_eager_flush_batch_bytes && !budget_exceeded)
+            {
+                return Ok(());
+            }
+        }
+
+        if self.state.handle_writers.dirty_bytes_for_inode(ino) > 0 {
             self.materialize_handle_writers_for_inode(ino, local_sync_policy)
                 .await?;
         }
@@ -511,6 +615,75 @@ impl StudioVfs {
         self.state.handle_writers.mark_materialized(ino, max_seq);
         Ok(true)
     }
+
+    pub(super) async fn materialize_completed_handle_writer_blocks_for_inode(
+        &self,
+        ino: Ino,
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<bool> {
+        let writes = self
+            .state
+            .handle_writers
+            .snapshot_materialization_writes(ino);
+        if writes.is_empty() {
+            return Ok(false);
+        }
+
+        let dirty_attr = { self.state.namespace.dirty_attrs.lock().get(&ino).cloned() };
+        let visible_size = if let Some(attr) = dirty_attr.as_ref() {
+            attr.size
+        } else {
+            self.getattr_async(ino).await?.size
+        };
+        let content_epoch = if let Some(attr) = dirty_attr.as_ref() {
+            attr.content_epoch
+        } else {
+            self.current_content_epoch_async(ino).await?
+        };
+
+        let buffered_writes: Vec<(u64, Bytes)> = writes
+            .iter()
+            .map(|write| (write.offset, write.data.clone()))
+            .collect();
+        let snapshots = self
+            .build_dirty_write_snapshots_from_buffered_writes(ino, &buffered_writes, visible_size)
+            .await?;
+        let completed_block_indexes: HashSet<u32> = snapshots
+            .iter()
+            .filter(|block| block.data.len() == self.block_size as usize)
+            .map(|block| block.block_index)
+            .collect();
+        if completed_block_indexes.is_empty() {
+            return Ok(false);
+        }
+
+        let mut seqs_by_block = HashMap::<u32, u64>::new();
+        for write in &writes {
+            if completed_block_indexes.contains(&write.block_index) {
+                seqs_by_block
+                    .entry(write.block_index)
+                    .and_modify(|seq| *seq = (*seq).max(write.seq))
+                    .or_insert(write.seq);
+            }
+        }
+        let completed_blocks: Vec<_> = snapshots
+            .into_iter()
+            .filter(|block| completed_block_indexes.contains(&block.block_index))
+            .collect();
+
+        self.persist_dirty_write_snapshots_direct(
+            ino,
+            completed_blocks,
+            content_epoch,
+            None,
+            local_sync_policy,
+        )
+        .await?;
+        self.state
+            .handle_writers
+            .mark_blocks_materialized(ino, &seqs_by_block);
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -524,7 +697,7 @@ mod tests {
         let ino = 7;
 
         registry.open_writer_for_test(fh, ino, 0);
-        registry.write(fh, ino, 0, 0, b"abc");
+        registry.write(fh, ino, 0, 4096, 0, b"abc");
         assert!(registry.has_dirty_writers(ino));
 
         let materialized = registry.snapshot_materialization_writes(ino);
@@ -544,8 +717,8 @@ mod tests {
         let ino = 9;
 
         registry.open_writer_for_test(fh, ino, 0);
-        registry.write(fh, ino, 0, 0, b"abcdef");
-        registry.write(fh, ino, 6, 2, b"XY");
+        registry.write(fh, ino, 0, 4096, 0, b"abcdef");
+        registry.write(fh, ino, 6, 4096, 2, b"XY");
 
         let mut materialized = registry.snapshot_materialization_writes(ino);
         materialized.sort_by_key(|write| write.offset);
