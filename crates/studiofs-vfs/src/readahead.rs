@@ -5,22 +5,12 @@
 //!
 //! ## Algorithm
 //!
-//! Each inode gets a `ReadState` that keeps the last block index read and a
-//! *score* (0–`MAX_SCORE`), plus a dynamic prefetch width.  On every recorded
-//! read:
-//!
-//! - If the new first block follows the previous last block consecutively
-//!   the score increments (up to MAX_SCORE), and after a confirmed streak the
-//!   dynamic width ramps up (doubling each streak interval) up to a configured
-//!   cap.
-//! - Sequential velocity is tracked with an EWMA over microsecond sample
-//!   windows; very short reads are accumulated until a minimum sample age.
-//! - If the reader is still inside the same block, the score is unchanged.
-//! - Any other jump decrements the score by 2.
-//!
-//! The number of blocks to prefetch equals the current score (capped at
-//! dynamic width). So only truly sequential readers get aggressive prefetching
-//! while random readers are quickly quieted and reset toward baseline.
+//! Each inode gets a compact `ReadState` that tracks only the previous block
+//! and whether the stream is currently sequential. Once a read crosses a block
+//! boundary contiguously, the tracker opens a fixed prefetch window derived
+//! from the configured base/minimum settings. Large seeks or long idle gaps
+//! reset the stream back to "cold" so the next reader has to prove sequential
+//! progress again.
 //!
 //! ## In-flight deduplication
 //!
@@ -29,7 +19,6 @@
 
 use dashmap::DashMap;
 use std::collections::HashSet;
-use std::convert::TryFrom;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -50,18 +39,7 @@ pub struct ReadAheadPolicy {
 }
 
 /// Maximum sequential score.  Capped to prevent unbounded ramp-up.
-const MAX_SCORE: u8 = 255;
-const VELOCITY_SAMPLE_ALPHA: f64 = 0.25;
-const VELOCITY_SAMPLE_MIN_AGE_US: u64 = 1_000;
-const VELOCITY_SAMPLE_MAX_AGE_US: u64 = 2_000_000;
-/// Idle gap beyond which velocity and score begin soft-decaying instead of
-/// hard-resetting.  Media players frequently pause for 2–5 seconds during
-/// user interaction, scrubbing, or re-buffering; a hard reset at 2 s forces
-/// the prefetch window to restart from scratch.  The soft-decay range
-/// [VELOCITY_SAMPLE_MAX_AGE_US .. VELOCITY_SOFT_DECAY_LIMIT_US] halves the
-/// EMA velocity, cuts score by 75 %, and collapses the width, preserving
-/// enough state so the next sequential read can recover quickly.
-const VELOCITY_SOFT_DECAY_LIMIT_US: u64 = 10_000_000; // 10 s
+const READ_STATE_IDLE_RESET_US: u64 = 10_000_000; // 10 s
 const LARGE_SEEK_RESET_BLOCK_DELTA: u32 = 256;
 const READAHEAD_DASHMAP_SHARDS: usize = 256;
 
@@ -72,20 +50,12 @@ const READAHEAD_DASHMAP_SHARDS: usize = 256;
 struct ReadState {
     /// Last block index completed by the previous read.
     last_block: u32,
-    /// Score representing how strongly sequential the access pattern is.
-    score: u8,
-    /// Confirmed sequential read streak length.
-    sequential_streak: u16,
-    /// Dynamic width ramped up for sustained sequential readers.
+    /// Whether recent reads established sequential forward progress.
+    sequential_ready: bool,
+    /// Fixed prefetch width once the sequential window opens.
     current_width: u32,
     /// Monotonic timestamp (microseconds) when this inode was last read.
     last_read_at_micros: u64,
-    /// EWMA estimate of read velocity in blocks/sec.
-    velocity_blocks_per_sec_ema: f64,
-    /// Start timestamp for the current velocity sampling window.
-    velocity_sample_anchor_micros: u64,
-    /// Accumulated blocks inside the current velocity sampling window.
-    velocity_sample_blocks: u32,
 }
 
 // =============================================================================
@@ -104,15 +74,6 @@ pub struct ReadAheadTracker {
     base_width: u32,
     /// Lower bound for prefetch depth once sequential access is detected.
     min_prefetch_on_seq: u32,
-    /// Score increase per sequential span block.
-    sequential_step: u8,
-    /// Score penalty for random jumps.
-    random_penalty: u8,
-    /// Number of consecutive sequential blocks required for a ramp-up step.
-    /// Width doubling is conservative: bounded doublings per record_read call.
-    sequential_ramp_trigger: u16,
-    /// Maximum ramp-up doublings allowed per single record_read call.
-    max_ramp_steps_per_call: u8,
 }
 
 impl ReadAheadTracker {
@@ -135,28 +96,6 @@ impl ReadAheadTracker {
             .unwrap_or(u64::MAX)
     }
 
-    fn velocity_width_target(&self, blocks_per_sec: f64, base_width: u32, max_width: u32) -> u32 {
-        if !blocks_per_sec.is_finite() || blocks_per_sec <= 0.0 {
-            return base_width;
-        }
-        let multiplier: u32 = if blocks_per_sec >= 512.0 {
-            8
-        } else if blocks_per_sec >= 256.0 {
-            6
-        } else if blocks_per_sec >= 128.0 {
-            4
-        } else if blocks_per_sec >= 64.0 {
-            3
-        } else if blocks_per_sec >= 32.0 {
-            2
-        } else {
-            1
-        };
-        base_width
-            .saturating_mul(multiplier)
-            .clamp(base_width, max_width)
-    }
-
     fn record_read_with_stamp(
         &self,
         key: ReadStreamKey,
@@ -168,41 +107,23 @@ impl ReadAheadTracker {
         let now_micros = now_micros.max(1);
         let base_width = policy.base_width.max(1);
         let max_width = policy.max_width.max(base_width);
-        let min_prefetch_on_seq = policy.min_prefetch_on_seq.max(1).min(max_width);
+        let fixed_width = policy
+            .min_prefetch_on_seq
+            .max(base_width)
+            .clamp(base_width, max_width);
         let mut state = self.states.entry(key).or_insert(ReadState {
             last_block: u32::MAX,
-            score: 0,
-            sequential_streak: 0,
+            sequential_ready: false,
             current_width: base_width,
             last_read_at_micros: 0,
-            velocity_blocks_per_sec_ema: 0.0,
-            velocity_sample_anchor_micros: 0,
-            velocity_sample_blocks: 0,
         });
 
         if state.last_read_at_micros > 0
-            && now_micros.saturating_sub(state.last_read_at_micros) > VELOCITY_SAMPLE_MAX_AGE_US
+            && now_micros.saturating_sub(state.last_read_at_micros) > READ_STATE_IDLE_RESET_US
         {
-            let idle_us = now_micros.saturating_sub(state.last_read_at_micros);
-            if idle_us > VELOCITY_SOFT_DECAY_LIMIT_US {
-                // Hard reset: idle exceeded the soft-decay window.
-                state.score = 0;
-                state.sequential_streak = 0;
-                state.current_width = base_width;
-                state.velocity_blocks_per_sec_ema = 0.0;
-            } else {
-                // Soft decay: preserve partial state so resumed sequential
-                // reads recover quickly after short media-player pauses.
-                state.score /= 4;
-                state.sequential_streak /= 2;
-                state.current_width = state.current_width.max(base_width) / 2;
-                state.current_width = state.current_width.max(base_width);
-                state.velocity_blocks_per_sec_ema *= 0.5;
-            }
-            // Re-seed anchor with "now" so resumed sequential reads can build
-            // fresh velocity samples immediately after idle reset.
-            state.velocity_sample_anchor_micros = now_micros;
-            state.velocity_sample_blocks = 0;
+            state.sequential_ready = false;
+            state.current_width = base_width;
+            state.last_block = u32::MAX;
         }
 
         // Detect sequential continuation: the new read must start exactly at
@@ -215,112 +136,35 @@ impl ReadAheadTracker {
         let is_sequential =
             state.last_block != u32::MAX && first_block == state.last_block.saturating_add(1);
 
-        let span_blocks = last_block.saturating_sub(first_block).saturating_add(1);
-        let seq_gain = u8::try_from(
-            (self.sequential_step as u32)
-                .saturating_mul(span_blocks)
-                .min(MAX_SCORE as u32),
-        )
-        .unwrap_or(MAX_SCORE);
-
+        let was_ready = state.sequential_ready;
         if is_sequential {
-            state.score = state.score.saturating_add(seq_gain);
-            let streak_add = span_blocks.min(u16::MAX as u32) as u16;
-            state.sequential_streak = state.sequential_streak.saturating_add(streak_add);
-
-            let prev_bucket = state
-                .sequential_streak
-                .saturating_sub(streak_add)
-                .checked_div(self.sequential_ramp_trigger)
-                .unwrap_or(0);
-            let next_bucket = state
-                .sequential_streak
-                .checked_div(self.sequential_ramp_trigger)
-                .unwrap_or(0);
-            if next_bucket > prev_bucket {
-                let ramp_steps = next_bucket
-                    .saturating_sub(prev_bucket)
-                    .min(self.max_ramp_steps_per_call as u16)
-                    as usize;
-                // Conservative ramp-up: even if a read span crosses multiple
-                // thresholds, apply only bounded doublings per call.
-                let mut next_width = state.current_width;
-                for _ in 0..ramp_steps {
-                    next_width = next_width.saturating_mul(2);
-                }
-                state.current_width = next_width.clamp(base_width, max_width);
-            }
-            if state.last_read_at_micros > 0 {
-                if state.velocity_sample_anchor_micros == 0 {
-                    state.velocity_sample_anchor_micros = state.last_read_at_micros.max(1);
-                }
-                state.velocity_sample_blocks =
-                    state.velocity_sample_blocks.saturating_add(span_blocks);
-                let sample_delta = now_micros.saturating_sub(state.velocity_sample_anchor_micros);
-                if (VELOCITY_SAMPLE_MIN_AGE_US..=VELOCITY_SAMPLE_MAX_AGE_US).contains(&sample_delta)
-                {
-                    let sampled_blocks = state.velocity_sample_blocks.max(1);
-                    let inst_bps = (sampled_blocks as f64 * 1_000_000.0) / sample_delta as f64;
-                    if inst_bps.is_finite() && inst_bps > 0.0 {
-                        state.velocity_blocks_per_sec_ema =
-                            if state.velocity_blocks_per_sec_ema > 0.0 {
-                                state.velocity_blocks_per_sec_ema * (1.0 - VELOCITY_SAMPLE_ALPHA)
-                                    + inst_bps * VELOCITY_SAMPLE_ALPHA
-                            } else {
-                                // Soft-start EMA to avoid immediate aggressive
-                                // widening from a single fast first sample.
-                                inst_bps * VELOCITY_SAMPLE_ALPHA
-                            };
-                        state.velocity_sample_anchor_micros = now_micros;
-                        state.velocity_sample_blocks = 0;
-                        let velocity_width = self.velocity_width_target(
-                            state.velocity_blocks_per_sec_ema,
-                            base_width,
-                            max_width,
-                        );
-                        state.current_width = state
-                            .current_width
-                            .max(velocity_width)
-                            .clamp(base_width, max_width);
-                    }
-                }
-            }
+            state.sequential_ready = true;
+            state.current_width = fixed_width;
         } else if is_same_block {
-            // Keep score as-is.
-        } else {
-            let large_seek_jump = state.last_block != u32::MAX
-                && first_block.abs_diff(state.last_block) >= LARGE_SEEK_RESET_BLOCK_DELTA;
-            if large_seek_jump {
-                state.score = 0;
-                state.velocity_blocks_per_sec_ema = 0.0;
-            } else {
-                state.score = state.score.saturating_sub(self.random_penalty);
-                state.velocity_blocks_per_sec_ema *= 0.5;
+            if !state.sequential_ready {
+                state.current_width = base_width;
             }
-            state.sequential_streak = 0;
+        } else {
+            let _large_seek_jump = state.last_block != u32::MAX
+                && first_block.abs_diff(state.last_block) >= LARGE_SEEK_RESET_BLOCK_DELTA;
+            state.sequential_ready = false;
             state.current_width = base_width;
-            state.velocity_sample_anchor_micros = 0;
-            state.velocity_sample_blocks = 0;
         }
 
         state.last_block = last_block;
         state.last_read_at_micros = now_micros;
-        let score = state.score;
         let current_width = state.current_width.clamp(base_width, max_width);
+        let sequential_ready = state.sequential_ready;
         drop(state);
 
-        if score == 0 || !policy.prefetch_enabled {
+        if !policy.prefetch_enabled {
             return Vec::new();
         }
 
-        // Return up to `min(score, width)` blocks beyond last_block.
-        let mut prefetch_count = current_width.min(score as u32);
-        if (is_sequential || is_same_block) && score > 0 {
-            // For small sequential reads over high-latency links, keep a
-            // minimum look-ahead window to avoid throughput oscillation.
-            prefetch_count = prefetch_count.max(min_prefetch_on_seq.min(current_width));
+        if !(is_sequential || (is_same_block && (was_ready || sequential_ready))) {
+            return Vec::new();
         }
-        (1..=prefetch_count)
+        (1..=current_width)
             .filter_map(|i| {
                 let block = last_block.checked_add(i)?;
                 if self.inflight.contains_key(&(key.ino, block)) {
@@ -344,17 +188,10 @@ impl ReadAheadTracker {
     pub fn new_with_tuning(
         width: u32,
         min_prefetch_on_seq: u32,
-        sequential_step: u8,
-        random_penalty: u8,
+        _sequential_step: u8,
+        _random_penalty: u8,
     ) -> Self {
-        Self::new_with_bounds(
-            width,
-            width,
-            min_prefetch_on_seq,
-            sequential_step,
-            random_penalty,
-            4,
-        )
+        Self::new_with_bounds(width, width, min_prefetch_on_seq, 1, 1, 4)
     }
 
     /// Create a tracker with dynamic width bounds and custom tuning.
@@ -362,26 +199,19 @@ impl ReadAheadTracker {
         base_width: u32,
         max_width: u32,
         min_prefetch_on_seq: u32,
-        sequential_step: u8,
-        random_penalty: u8,
-        sequential_ramp_trigger: u16,
+        _sequential_step: u8,
+        _random_penalty: u8,
+        _sequential_ramp_trigger: u16,
     ) -> Self {
         let base_width = base_width.max(1);
         let width = max_width.max(base_width);
         let min_prefetch_on_seq = min_prefetch_on_seq.max(1).min(width);
-        let sequential_step = sequential_step.max(1);
-        let random_penalty = random_penalty.max(1);
-        let sequential_ramp_trigger = sequential_ramp_trigger.max(1);
         Self {
             states: DashMap::with_capacity_and_shard_amount(4_096, READAHEAD_DASHMAP_SHARDS),
             inflight: DashMap::with_capacity_and_shard_amount(16_384, READAHEAD_DASHMAP_SHARDS),
             width,
             base_width,
             min_prefetch_on_seq,
-            sequential_step,
-            random_penalty,
-            sequential_ramp_trigger,
-            max_ramp_steps_per_call: 2,
         }
     }
 
@@ -532,38 +362,42 @@ mod tests {
         let tracker = ReadAheadTracker::new_with_bounds(8, 64, 1, 8, 2, 2);
         let mut t = 1_000_000u64;
 
-        // First read: block 0 (score stays 0 — no prior history)
+        // First read: block 0 establishes baseline state only.
         let p = tracker.record_read_at_micros(1, 0, 0, t);
         assert!(p.is_empty());
 
-        // Second read: block 1 (sequential after 0)
-        t = t.saturating_add(500);
+        // Second read: block 1 opens the fixed sequential window.
+        t = t.saturating_add(500_000);
         let p = tracker.record_read_at_micros(1, 1, 1, t);
-        assert_eq!(p.len(), 8, "score=8, width=8 should prefetch 8 blocks");
+        assert_eq!(
+            p.len(),
+            8,
+            "sequential reads should use the configured window"
+        );
         assert_eq!(p[0], 2, "prefetch should start immediately after read head");
 
-        // Third read crosses ramp threshold (trigger=2) and doubles width.
-        t = t.saturating_add(500);
+        // Continued sequential reads keep the same stable width.
+        t = t.saturating_add(500_000);
         let p = tracker.record_read_at_micros(1, 2, 2, t);
-        assert!(p.len() >= 8, "ramped width should allow deeper prefetch");
-        assert!(
-            tracker.debug_width(1).unwrap_or(8) >= 16,
-            "sequential ramp should raise width above base"
+        assert_eq!(
+            p.len(),
+            8,
+            "the simplified model should avoid widening surprises"
         );
+        assert_eq!(tracker.debug_width(1), Some(8));
 
-        // Keep going; width should continue to ramp but stay capped at max width.
         let mut last = 2u32;
         for _ in 0..20 {
             last += 1;
-            t = t.saturating_add(500);
+            t = t.saturating_add(500_000);
             let _ = tracker.record_read_at_micros(1, last, last, t);
         }
-        assert_eq!(tracker.debug_width(1), Some(64));
-        t = t.saturating_add(500);
+        assert_eq!(tracker.debug_width(1), Some(8));
+        t = t.saturating_add(500_000);
         let blocks = tracker.record_read_at_micros(1, last + 1, last + 1, t);
         assert!(
-            blocks.len() <= 64,
-            "prefetch depth should not exceed max width"
+            blocks.len() <= 8,
+            "prefetch depth should stay on the configured fixed window"
         );
     }
 
@@ -573,23 +407,23 @@ mod tests {
         let mut t = 1_000_000u64;
 
         let _ = tracker.record_read_at_micros(1, 0, 0, t);
-        t = t.saturating_add(500);
+        t = t.saturating_add(500_000);
         let _ = tracker.record_read_at_micros(1, 1, 1, t);
-        t = t.saturating_add(500);
+        t = t.saturating_add(500_000);
         let _ = tracker.record_read_at_micros(1, 2, 2, t);
-        assert!(
-            tracker.debug_width(1).unwrap_or(8) >= 16,
-            "sequential stream should widen before random reset"
-        );
+        assert_eq!(tracker.debug_width(1), Some(8));
 
-        // Random jump resets width ramp.
-        t = t.saturating_add(500);
-        let _ = tracker.record_read_at_micros(1, 1000, 1000, t);
+        t = t.saturating_add(500_000);
+        let random = tracker.record_read_at_micros(1, 1000, 1000, t);
+        assert!(
+            random.is_empty(),
+            "random jump should suppress immediate prefetch"
+        );
         assert_eq!(tracker.debug_width(1), Some(8));
     }
 
     #[test]
-    fn test_large_span_ramps_up_by_two_steps_per_call() {
+    fn test_large_span_opens_the_same_fixed_window() {
         let tracker = ReadAheadTracker::new_with_bounds(8, 128, 1, 8, 2, 4);
         let mut t = 1_000_000u64;
 
@@ -597,10 +431,10 @@ mod tests {
         let _ = tracker.record_read_at_micros(1, 0, 0, t);
         assert_eq!(tracker.debug_width(1), Some(8));
 
-        // span=8 crosses two ramp buckets (trigger=4). Width should 8 -> 32.
-        t = t.saturating_add(500);
-        let _ = tracker.record_read_at_micros(1, 1, 8, t);
-        assert_eq!(tracker.debug_width(1), Some(32));
+        t = t.saturating_add(500_000);
+        let p = tracker.record_read_at_micros(1, 1, 8, t);
+        assert_eq!(tracker.debug_width(1), Some(8));
+        assert_eq!(p.len(), 8);
     }
 
     #[test]
@@ -804,61 +638,16 @@ mod tests {
     }
 
     #[test]
-    fn test_velocity_ramp_expands_window_without_streak_buckets() {
-        let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4, 8, 2, u16::MAX);
-        let mut t = 1_000_000u64;
-        let _ = tracker.record_read_at_micros(1, 0, 0, t);
-
-        for block in 1..=32u32 {
-            t = t.saturating_add(1_000); // ~1000 blocks/sec
-            let _ = tracker.record_read_at_micros(1, block, block, t);
-        }
-
-        let widened = tracker.debug_width(1).unwrap_or(16);
-        assert!(
-            widened >= 64,
-            "high read velocity should widen prefetch window, got {widened}"
-        );
-    }
-
-    #[test]
-    fn test_slow_velocity_keeps_base_window() {
+    fn test_large_seek_hard_resets_window_and_prefetch_state() {
         let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4, 8, 2, u16::MAX);
         let mut t = 1_000_000u64;
         let _ = tracker.record_read_at_micros(1, 0, 0, t);
 
         for block in 1..=8u32 {
-            t = t.saturating_add(1_000_000); // ~1 block/sec
+            t = t.saturating_add(1_000_000);
             let _ = tracker.record_read_at_micros(1, block, block, t);
         }
-
         assert_eq!(tracker.debug_width(1), Some(16));
-    }
-
-    #[test]
-    fn test_stale_velocity_sample_does_not_expand_window() {
-        let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4, 8, 2, u16::MAX);
-        let mut t = 1_000_000u64;
-        let _ = tracker.record_read_at_micros(1, 0, 0, t);
-
-        // Gap exceeds VELOCITY_SAMPLE_MAX_AGE_US, so velocity sample is ignored.
-        t = t.saturating_add(VELOCITY_SAMPLE_MAX_AGE_US + 1);
-        let _ = tracker.record_read_at_micros(1, 1, 1, t);
-
-        assert_eq!(tracker.debug_width(1), Some(16));
-    }
-
-    #[test]
-    fn test_large_seek_hard_resets_velocity_and_score() {
-        let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4, 8, 2, u16::MAX);
-        let mut t = 1_000_000u64;
-        let _ = tracker.record_read_at_micros(1, 0, 0, t);
-
-        for block in 1..=32u32 {
-            t = t.saturating_add(1_000);
-            let _ = tracker.record_read_at_micros(1, block, block, t);
-        }
-        assert!(tracker.debug_width(1).unwrap_or(16) > 16);
 
         // Jump far enough to trigger hard reset path.
         t = t.saturating_add(1_000);
@@ -876,73 +665,51 @@ mod tests {
     }
 
     #[test]
-    fn test_sub_ms_samples_accumulate_and_update_velocity() {
+    fn test_idle_gap_resets_window_before_prefetch_resumes() {
         let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4, 8, 2, u16::MAX);
         let mut t = 1_000_000u64;
         let _ = tracker.record_read_at_micros(1, 0, 0, t);
-
-        for block in 1..=32u32 {
-            t = t.saturating_add(500); // below per-call min age
+        for block in 1..=8u32 {
+            t = t.saturating_add(1_000_000);
             let _ = tracker.record_read_at_micros(1, block, block, t);
         }
+        assert_eq!(tracker.debug_width(1), Some(16));
 
+        t = t.saturating_add(15_000_000);
+        let reset = tracker.record_read_at_micros(1, 9, 9, t);
         assert!(
-            tracker.debug_width(1).unwrap_or(16) > 16,
-            "sub-ms bursts should still contribute to velocity via accumulation"
+            reset.is_empty(),
+            "reads after an idle reset should rebuild the sequential signal first"
+        );
+        assert_eq!(tracker.debug_width(1), Some(16));
+
+        t = t.saturating_add(1_000_000);
+        let resumed = tracker.record_read_at_micros(1, 10, 10, t);
+        assert!(
+            !resumed.is_empty(),
+            "the next contiguous read should re-open the fixed sequential prefetch window"
         );
     }
 
     #[test]
-    fn test_velocity_recovers_after_idle_reset() {
-        let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4, 8, 2, u16::MAX);
+    fn test_predictable_window_stays_stable_across_sequential_reads() {
+        let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4, 8, 2, 2);
         let mut t = 1_000_000u64;
         let _ = tracker.record_read_at_micros(1, 0, 0, t);
-        for block in 1..=16u32 {
-            t = t.saturating_add(1_000);
-            let _ = tracker.record_read_at_micros(1, block, block, t);
-        }
-        assert!(tracker.debug_width(1).unwrap_or(16) > 16);
 
-        // Long idle period triggers stale-reset path.
-        t = t.saturating_add(VELOCITY_SAMPLE_MAX_AGE_US + 10);
-        let _ = tracker.record_read_at_micros(1, 17, 17, t);
-
-        // Continued sequential reads should re-enable velocity widening.
-        for block in 18..=64u32 {
-            t = t.saturating_add(1_000);
-            let _ = tracker.record_read_at_micros(1, block, block, t);
-        }
+        t = t.saturating_add(1_000_000);
+        let second = tracker.record_read_at_micros(1, 1, 1, t);
         assert!(
-            tracker.debug_width(1).unwrap_or(16) > 16,
-            "velocity-based widening should recover after pause/resume"
+            second.len() >= 16,
+            "first sequential continuation should open the configured minimum window"
         );
-    }
 
-    #[test]
-    fn test_soft_decay_preserves_partial_state_for_media_player_pause() {
-        let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4, 8, 2, u16::MAX);
-        let mut t = 1_000_000u64;
-        let _ = tracker.record_read_at_micros(1, 0, 0, t);
-
-        // Build up sequential score and velocity.
-        for block in 1..=32u32 {
-            t = t.saturating_add(1_000);
-            let _ = tracker.record_read_at_micros(1, block, block, t);
-        }
-        let pre_width = tracker.debug_width(1).unwrap_or(16);
-        assert!(pre_width > 16, "should have ramped up before pause");
-
-        // Simulate a media-player pause: idle for 5 seconds (within soft-decay
-        // range: 2s < 5s < 10s).
-        t = t.saturating_add(5_000_000);
-        let p = tracker.record_read_at_micros(1, 33, 33, t);
-
-        // Soft decay should preserve *some* score so sequential continues.
-        // With the soft path the score is reduced to score/4 (still > 0 for
-        // high prior scores), so prefetch should still produce blocks.
-        assert!(
-            !p.is_empty(),
-            "soft-decayed state should still produce prefetch suggestions after short pause"
+        t = t.saturating_add(1_000_000);
+        let third = tracker.record_read_at_micros(1, 2, 2, t);
+        assert_eq!(
+            second.len(),
+            third.len(),
+            "steady sequential reads should keep a predictable window instead of velocity-driven swings"
         );
     }
 }

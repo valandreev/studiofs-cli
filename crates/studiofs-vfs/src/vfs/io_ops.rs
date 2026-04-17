@@ -161,6 +161,16 @@ impl StudioVfs {
         }
     }
 
+    pub(super) async fn fetch_block_for_ref_after_local_miss(
+        &self,
+        block: &BlockRef,
+    ) -> Result<Bytes, crate::fetch::FetchError> {
+        let keys = format_object_fragment_keys(&self.data_prefix, block.object_id);
+        self.fetch_scheduler
+            .fetch_block_after_local_miss(block.object_id, &keys)
+            .await
+    }
+
     pub(super) fn copy_block_payload_into_range(
         &self,
         data: &[u8],

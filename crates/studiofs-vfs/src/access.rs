@@ -103,29 +103,22 @@ impl AccessPolicy {
         let base_width = cfg.readahead_base_width.max(1);
         let max_width = cfg.readahead_max_width.max(base_width);
         let min_prefetch = cfg.readahead_min_prefetch.max(1).min(max_width);
-        let widened_base_width = base_width.saturating_mul(2).max(base_width);
-        let widened_max_width = max_width.saturating_mul(2).max(widened_base_width);
-        let random_readahead_floor = widened_base_width;
-        let random_readahead_ceiling = base_width.saturating_mul(4).max(random_readahead_floor);
-        let random_readahead_width = max_width
-            .min(random_readahead_ceiling)
-            .max(random_readahead_floor);
         match class {
             AccessClass::SequentialMediaRead => Self {
                 class,
                 prefetch_enabled: true,
                 cache_promotion_on_read: false,
-                readahead_base_width: widened_base_width,
-                readahead_max_width: widened_max_width,
-                readahead_min_prefetch: min_prefetch.max(base_width),
+                readahead_base_width: base_width,
+                readahead_max_width: max_width,
+                readahead_min_prefetch: min_prefetch,
                 upload_pressure_boost: 3,
             },
             AccessClass::RandomInteractiveRead => Self {
                 class,
                 prefetch_enabled: true,
                 cache_promotion_on_read: true,
-                readahead_base_width: base_width.max(1),
-                readahead_max_width: random_readahead_width,
+                readahead_base_width: base_width,
+                readahead_max_width: max_width,
                 readahead_min_prefetch: min_prefetch,
                 upload_pressure_boost: 2,
             },
@@ -571,16 +564,24 @@ mod tests {
     }
 
     #[test]
-    fn read_policies_bias_toward_more_aggressive_prefetch() {
+    fn read_policies_keep_the_configured_prefetch_window() {
         let cfg = config();
         let sequential = AccessPolicy::from_class(AccessClass::SequentialMediaRead, cfg);
         let random = AccessPolicy::from_class(AccessClass::RandomInteractiveRead, cfg);
 
         assert!(sequential.prefetch_enabled);
         assert!(random.prefetch_enabled);
-        assert!(sequential.readahead_base_width > cfg.readahead_base_width);
-        assert!(sequential.readahead_max_width > cfg.readahead_max_width);
-        assert!(random.readahead_max_width > random.readahead_base_width);
+        assert_eq!(sequential.readahead_base_width, cfg.readahead_base_width);
+        assert_eq!(sequential.readahead_max_width, cfg.readahead_max_width);
+        assert_eq!(
+            sequential.readahead_min_prefetch,
+            cfg.readahead_min_prefetch
+        );
+        assert_eq!(random.readahead_base_width, cfg.readahead_base_width);
+        assert_eq!(random.readahead_max_width, cfg.readahead_max_width);
+        assert_eq!(random.readahead_min_prefetch, cfg.readahead_min_prefetch);
+        assert!(!sequential.cache_promotion_on_read);
+        assert!(random.cache_promotion_on_read);
     }
 
     #[test]

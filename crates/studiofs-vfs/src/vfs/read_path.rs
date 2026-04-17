@@ -7,7 +7,7 @@ use crate::VfsMeta;
 use crate::runtime::run_meta;
 use bytes::Bytes;
 use futures::future::join_all;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
 use studiofs_meta::MetaError;
@@ -79,16 +79,14 @@ impl<'a> DataReader<'a> {
         let mut segments = self.build_segments().await?;
         segments.sort_by_key(|segment| segment.range.start);
         Self::log_debug_target_segments(self.vfs, self.ino, self.offset, self.length, &segments);
-        let missing_remote = Self::prefetch_remote_blocks(self.vfs, &segments, false).await?;
-        let written =
-            Self::assemble_into(self.vfs, self.offset, &segments, &missing_remote, buffer).await?;
+        let written = Self::assemble_into(self.vfs, self.offset, &segments, buffer).await?;
         Ok(written)
     }
 
     async fn prefetch_only(&self) -> VfsResult<()> {
         let mut segments = self.build_segments().await?;
         segments.sort_by_key(|segment| segment.range.start);
-        let _ = Self::prefetch_remote_blocks(self.vfs, &segments, true).await?;
+        Self::populate_missing_remote_blocks(self.vfs, &segments, true).await?;
         Ok(())
     }
 
@@ -442,11 +440,11 @@ impl<'a> DataReader<'a> {
         unresolved
     }
 
-    async fn prefetch_remote_blocks(
+    async fn populate_missing_remote_blocks(
         vfs: &StudioVfs,
         segments: &[ReadSegment],
         prefetch: bool,
-    ) -> VfsResult<HashSet<u64>> {
+    ) -> VfsResult<()> {
         let mut cached = BTreeSet::new();
         let mut missing = BTreeMap::new();
         let mut local_pending = BTreeSet::new();
@@ -476,11 +474,11 @@ impl<'a> DataReader<'a> {
             vfs.local_block_backend.advise_will_need(object_id);
         }
         if missing.is_empty() {
-            return Ok(HashSet::new());
+            return Ok(());
         }
         let fetches = missing.into_iter().map(|(object_id, block)| async move {
             match vfs.fetch_block_for_ref(&block, prefetch).await {
-                Ok(_) => Ok::<(u64, bool), VfsError>((object_id, false)),
+                Ok(_) => Ok::<(), VfsError>(()),
                 Err(crate::fetch::FetchError::NotFound { ref key }) => {
                     warn!(
                         object_id,
@@ -489,7 +487,7 @@ impl<'a> DataReader<'a> {
                         block_length = block.length,
                         "prefetch_remote_blocks_for_reader: S3 object not found during read prefetch — object missing from S3 (upload not complete or evicted?)"
                     );
-                    Ok::<(u64, bool), VfsError>((object_id, true))
+                    Ok::<(), VfsError>(())
                 }
                 Err(error) => {
                     debug!(
@@ -497,25 +495,20 @@ impl<'a> DataReader<'a> {
                         error = %error,
                         "data reader prefetch failed; falling back to on-demand resolution"
                     );
-                    Ok::<(u64, bool), VfsError>((object_id, false))
+                    Ok::<(), VfsError>(())
                 }
             }
         });
-        let mut not_found = HashSet::new();
         for result in join_all(fetches).await {
-            let (object_id, was_not_found) = result?;
-            if was_not_found {
-                not_found.insert(object_id);
-            }
+            result?;
         }
-        Ok(not_found)
+        Ok(())
     }
 
     async fn assemble_into(
         vfs: &StudioVfs,
         offset: u64,
         segments: &[ReadSegment],
-        remote_not_found: &HashSet<u64>,
         buffer: &mut [u8],
     ) -> VfsResult<usize> {
         let mut written = 0usize;
@@ -572,74 +565,65 @@ impl<'a> DataReader<'a> {
                     }
                 }
                 ReadSegmentSource::Overlay { block } | ReadSegmentSource::Base { block } => {
-                    if remote_not_found.contains(&block.object_id) {
-                        warn!(
-                            object_id = block.object_id,
-                            file_offset = segment.range.start,
-                            "data_reader: object in remote_not_found set, zeroing range (S3 NotFound during prefetch)"
-                        );
-                        dst.fill(0);
-                    } else {
-                        let block_offset = usize::try_from(block.offset).map_err(|_| {
-                            VfsError::Other(format!(
-                                "block offset does not fit usize: object_id={}, offset={}",
-                                block.object_id, block.offset
-                            ))
-                        })?;
-                        let mut span_resolved = false;
-                        if let Some(read) = vfs
-                            .block_store_read_into_async(block.object_id, block_offset, dst)
-                            .await?
-                        {
-                            if read == dst.len() {
-                                span_resolved = true;
-                            }
-                            if !span_resolved {
-                                error!(
+                    let block_offset = usize::try_from(block.offset).map_err(|_| {
+                        VfsError::Other(format!(
+                            "block offset does not fit usize: object_id={}, offset={}",
+                            block.object_id, block.offset
+                        ))
+                    })?;
+                    let mut span_resolved = false;
+                    if let Some(read) = vfs
+                        .block_store_read_into_async(block.object_id, block_offset, dst)
+                        .await?
+                    {
+                        if read == dst.len() {
+                            span_resolved = true;
+                        }
+                        if !span_resolved {
+                            error!(
+                                object_id = block.object_id,
+                                file_offset = segment.range.start,
+                                block_offset = block.offset,
+                                requested = dst.len(),
+                                read,
+                                "data_reader: short local backend read for committed block; evicting and refetching"
+                            );
+                            dst.fill(0);
+                            if let Err(evict_error) =
+                                vfs.block_store_remove_async(block.object_id).await
+                            {
+                                warn!(
                                     object_id = block.object_id,
-                                    file_offset = segment.range.start,
-                                    block_offset = block.offset,
-                                    requested = dst.len(),
-                                    read,
-                                    "data_reader: short local backend read for committed block; evicting and refetching"
+                                    error = %evict_error,
+                                    "data_reader: failed to evict short-read local block before refetch"
                                 );
-                                dst.fill(0);
-                                if let Err(evict_error) =
-                                    vfs.block_store_remove_async(block.object_id).await
-                                {
-                                    warn!(
-                                        object_id = block.object_id,
-                                        error = %evict_error,
-                                        "data_reader: failed to evict short-read local block before refetch"
-                                    );
-                                }
                             }
                         }
+                    }
 
-                        if !span_resolved {
-                            match vfs.fetch_block_for_ref(block, false).await {
-                                Ok(data) => {
-                                    vfs.copy_committed_block_payload_into_range(
-                                        data.as_ref(),
-                                        block,
-                                        segment.range.start,
-                                        dst,
-                                    )?;
-                                }
-                                Err(crate::fetch::FetchError::NotFound { key }) => {
-                                    warn!(
-                                        object_id = block.object_id,
-                                        key,
-                                        file_offset = segment.range.start,
-                                        block_offset = block.offset,
-                                        block_length = block.length,
-                                        "data_reader: S3 object not found during foreground read, zeroing range (upload incomplete or evicted before upload?)"
-                                    );
-                                    dst.fill(0);
-                                }
-                                Err(error) => {
-                                    return Err(VfsError::Fetch(error));
-                                }
+                    if !span_resolved {
+                        match vfs.fetch_block_for_ref_after_local_miss(block).await {
+                            Ok(data) => {
+                                vfs.copy_committed_block_payload_into_range(
+                                    data.as_ref(),
+                                    block,
+                                    segment.range.start,
+                                    dst,
+                                )?;
+                            }
+                            Err(crate::fetch::FetchError::NotFound { key }) => {
+                                warn!(
+                                    object_id = block.object_id,
+                                    key,
+                                    file_offset = segment.range.start,
+                                    block_offset = block.offset,
+                                    block_length = block.length,
+                                    "data_reader: S3 object not found during foreground read, zeroing range (upload incomplete or evicted before upload?)"
+                                );
+                                dst.fill(0);
+                            }
+                            Err(error) => {
+                                return Err(VfsError::Fetch(error));
                             }
                         }
                     }
@@ -1079,7 +1063,6 @@ mod tests {
     use super::{DataReader, ReadRange, ReadSegment, ReadSegmentSource};
     use bytes::{Bytes, BytesMut};
     use std::any::Any;
-    use std::collections::HashSet;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::time::Instant;
@@ -1532,9 +1515,14 @@ mod tests {
     }
 
     #[test]
-    fn assemble_read_plan_reports_written_for_committed_cache_hit() {
+    fn committed_local_cache_hit_uses_direct_backend_read_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let (rt, vfs, _meta) = make_test_vfs(&tmp, "assemble-read-plan-written");
+        let (rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, "assemble-read-plan-written");
+        let inner = vfs.local_block_backend.clone();
+        let counting_backend = Arc::new(CountingLocalBlockBackend::new(inner));
+        Arc::get_mut(&mut vfs)
+            .expect("unstarted test VFS should be uniquely owned")
+            .local_block_backend = counting_backend.clone();
         rt.block_on(async {
             let object_id = 0xCC77;
             vfs.block_store_put_async(object_id, Bytes::from_static(b"0123456789"), false)
@@ -1549,17 +1537,21 @@ mod tests {
                 source: ReadSegmentSource::Base { block },
             }];
             let mut buffer = [0_u8; 4];
-            let written = DataReader::assemble_into(
-                &vfs,
-                0,
-                &segments,
-                &std::collections::HashSet::new(),
-                &mut buffer,
-            )
-            .await
-            .expect("assemble data reader output");
+            counting_backend.reset_counters();
+            let written = DataReader::assemble_into(&vfs, 0, &segments, &mut buffer)
+                .await
+                .expect("assemble data reader output");
             assert_eq!(written, 4);
             assert_eq!(&buffer, b"2345");
+            assert_eq!(
+                counting_backend.get_calls(),
+                0,
+                "committed local hits should stay on direct partial read_into()"
+            );
+            assert!(
+                counting_backend.read_into_calls() > 0,
+                "committed local hits should use direct partial read_into()"
+            );
         });
     }
 
@@ -1698,32 +1690,6 @@ mod tests {
                     && segment.range.start < 4
                     && segment.range.end > 2
             }));
-        });
-    }
-
-    #[test]
-    fn data_reader_zero_fills_remote_not_found_committed_span() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let (rt, vfs, _meta) = make_test_vfs(&tmp, "assemble-read-plan-not-found");
-        rt.block_on(async {
-            let object_id = 0xF404;
-            let segments = vec![ReadSegment {
-                range: ReadRange { start: 0, end: 4 },
-                source: ReadSegmentSource::Base {
-                    block: BlockRef::new_partial(object_id, 4),
-                },
-            }];
-            let mut remote_not_found = HashSet::new();
-            remote_not_found.insert(object_id);
-            let mut buffer = [0xAB_u8; 4];
-
-            let written =
-                DataReader::assemble_into(&vfs, 0, &segments, &remote_not_found, &mut buffer)
-                    .await
-                    .expect("assemble data reader output");
-
-            assert_eq!(written, 4);
-            assert_eq!(buffer, [0_u8; 4]);
         });
     }
 

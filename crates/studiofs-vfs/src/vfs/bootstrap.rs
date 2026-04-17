@@ -51,7 +51,6 @@ pub(super) struct VfsBootstrapPlan {
     readdir_attr_batch_chunk: usize,
     readdir_attr_batch_max_inodes: usize,
     prefetch_foreground_reserve: usize,
-    prefetch_max_per_cycle: usize,
     prefetch_pause_on_neterr: Duration,
 }
 
@@ -181,7 +180,6 @@ impl VfsBootstrapPlan {
             readdir_attr_batch_chunk: config.readdir_attr_batch_chunk,
             readdir_attr_batch_max_inodes: config.readdir_attr_batch_max_inodes,
             prefetch_foreground_reserve: config.prefetch_foreground_reserve,
-            prefetch_max_per_cycle: config.prefetch_max_per_cycle,
             prefetch_pause_on_neterr: Duration::from_millis(config.prefetch_pause_on_neterr_ms),
         })
     }
@@ -481,8 +479,6 @@ impl VfsBootstrap {
             dir_prefetch_max_batch: plan.dir_prefetch_max_batch,
             readdir_attr_batch_chunk: plan.readdir_attr_batch_chunk,
             readdir_attr_batch_max_inodes: plan.readdir_attr_batch_max_inodes,
-            prefetch_foreground_reserve: plan.prefetch_foreground_reserve,
-            prefetch_max_per_cycle: plan.prefetch_max_per_cycle,
             prefetch_pause_on_neterr: plan.prefetch_pause_on_neterr,
             fetch_scheduler: resources.fetch_scheduler,
             distributed_flock: None,
