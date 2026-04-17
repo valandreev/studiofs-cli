@@ -131,14 +131,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use studiofs_cache::LocalBlockPayloadSyncMode;
 use studiofs_cache::OpenLocalBlockBackendError;
-use studiofs_cache::PreparedCacheV3Runtime;
+use studiofs_cache::PreparedLocalBlockRuntime;
 use studiofs_cache::local::{LocalBlockBackend, LocalBlockLifecycleState};
 use studiofs_cache::metrics::{LatencyHistogram, LatencyHistogramSnapshot, MaterializeBatchStats};
 use studiofs_cache::open_local_block_backend_with_budget_and_sync_mode;
 use studiofs_cache::open_prepared_local_block_backend_with_budget_and_sync_mode;
 use studiofs_cache::upload_queue::PendingUpload;
-use studiofs_cache::v3::CacheV3PayloadSyncMode;
 use studiofs_cache::{CachedStore, CachedStoreConfig};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, format_object_fragment_keys,
@@ -2628,7 +2628,7 @@ fn map_cache_backend_detection_error(cache_dir: &str, source: std::io::Error) ->
 
 fn map_cache_backend_provision_error(cache_root: &str, source: std::io::Error) -> VfsError {
     VfsError::Other(format!(
-        "failed to provision cache-v3 layout under '{cache_root}': {source}"
+        "failed to provision local block runtime layout under '{cache_root}': {source}"
     ))
 }
 
@@ -2643,9 +2643,9 @@ fn map_open_local_block_backend_error(
         OpenLocalBlockBackendError::ProvisionCacheV3Layout { cache_root, source } => {
             map_cache_backend_provision_error(&cache_root, source)
         }
-        OpenLocalBlockBackendError::OpenCacheV3Backend { source, .. } => {
-            VfsError::Other(format!("failed to open cache-v3 backend: {source}"))
-        }
+        OpenLocalBlockBackendError::OpenCacheV3Backend { source, .. } => VfsError::Other(format!(
+            "failed to open local block runtime backend: {source}"
+        )),
     }
 }
 

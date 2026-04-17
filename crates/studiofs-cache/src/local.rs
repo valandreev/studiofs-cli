@@ -25,6 +25,26 @@ pub enum LocalBlockLifecycleState {
     Uploaded,
 }
 
+/// Where a persisted local block originated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalBlockOrigin {
+    /// Materialized locally by the write path and may need upload/publish work.
+    Local,
+    /// Downloaded from the published remote view for read-cache reuse.
+    Downloaded,
+}
+
+/// Upload state tracked per persisted local block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalBlockUploadState {
+    /// No upload work is pending for this block.
+    None,
+    /// The block is durably accepted locally and queued for background upload.
+    Pending,
+    /// The block is currently being uploaded by the background pipeline.
+    Uploading,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LocalBlockStorageStats {
     pub current_bytes: u64,
@@ -36,6 +56,9 @@ pub struct LocalBlockStorageStats {
 pub struct LocalBlockObjectStats {
     pub payload_len: u64,
     pub lifecycle: LocalBlockLifecycleState,
+    pub origin: LocalBlockOrigin,
+    pub upload_state: LocalBlockUploadState,
+    pub last_access_unix_millis: u64,
     pub evictable: bool,
 }
 
