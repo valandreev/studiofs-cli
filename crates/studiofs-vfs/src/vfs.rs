@@ -34,6 +34,8 @@ mod handle_table;
 mod handle_writer;
 mod ignored_entries;
 mod io_ops;
+#[path = "local_dirty.rs"]
+mod local_dirty;
 mod locking;
 mod metrics;
 mod misc_ops;
@@ -47,8 +49,6 @@ mod statfs;
 mod sync_ops;
 mod upload_lifecycle;
 mod workers;
-#[path = "write_buffer.rs"]
-mod write_buffer;
 
 pub use config::{
     CacheSafetyMode, ExplicitFlushOutcome, LocalSyncPolicy, ReleaseFhOutcome, VfsConfig,
@@ -117,7 +117,7 @@ use crate::runtime::{
     run_local_cache_io, run_local_cache_io_blocking, run_meta,
 };
 use crate::utils::{now_unix_millis, now_unix_secs};
-use crate::vfs::write_buffer::WriteBufferState;
+use crate::vfs::local_dirty::LocalDirtyState;
 use bytes::{Buf, Bytes, BytesMut};
 use futures::FutureExt;
 use opendal::options::WriteOptions;
@@ -1806,7 +1806,7 @@ impl VfsState {
             acl: AclState::new(),
             incarnation: IncarnationState::new(),
             handle_writers: HandleWriterRegistry::new(),
-            write_buffer: WriteBufferState::new(),
+            local_dirty: LocalDirtyState::new(),
             read: ReadState::new(cfg.foreground_read_speedometer_shards),
             file_lock: FileLockState::new(),
             shutdown: ShutdownState::new(),
@@ -1822,7 +1822,7 @@ struct VfsState {
     acl: AclState,
     incarnation: IncarnationState,
     handle_writers: HandleWriterRegistry,
-    write_buffer: WriteBufferState,
+    local_dirty: LocalDirtyState,
     read: ReadState,
     file_lock: FileLockState,
     shutdown: ShutdownState,
@@ -3696,7 +3696,7 @@ impl StudioVfs {
     fn inode_has_unmaterialized_overlay_for_finalize(&self, ino: Ino) -> bool {
         if self
             .state
-            .write_buffer
+            .local_dirty
             .pending_blocks
             .lock()
             .keys()
@@ -4007,7 +4007,7 @@ impl StudioVfs {
             pending_epochs = ?pending_epochs,
             sticky_error = ?sticky_error,
             has_local_dirty_state = self.inode_has_local_dirty_state(ino),
-            has_pending_write_buffer_blocks = self.has_pending_write_buffer_blocks_for_inode(ino),
+            has_pending_local_dirty_blocks = self.has_pending_local_dirty_blocks_for_inode(ino),
             attr_present = attr.is_some(),
             size,
             committed_size,
@@ -4399,7 +4399,7 @@ impl StudioVfs {
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<()> {
         {
-            let mut local_sync_group = self.state.write_buffer.local_sync_group.lock().await;
+            let mut local_sync_group = self.state.local_dirty.local_sync_group.lock().await;
             let pending_before = local_sync_group.pending_bytes;
             if pending_before == 0 && persisted_bytes > 0 {
                 local_sync_group.last_sync_at = Instant::now();
@@ -4428,10 +4428,10 @@ impl StudioVfs {
         }
 
         let sync_gate_wait_started = Instant::now();
-        let _sync_gate = self.state.write_buffer.local_sync_gate.lock().await;
+        let _sync_gate = self.state.local_dirty.local_sync_gate.lock().await;
         self.record_sync_data_queue_wait(sync_gate_wait_started.elapsed());
         let bytes_to_sync = {
-            let mut local_sync_group = self.state.write_buffer.local_sync_group.lock().await;
+            let mut local_sync_group = self.state.local_dirty.local_sync_group.lock().await;
             let trigger = write_path_sync_trigger(
                 self.cache_safety_mode,
                 local_sync_policy,
@@ -4461,7 +4461,7 @@ impl StudioVfs {
 
         match self.block_store_sync_data_async().await {
             Ok(()) => {
-                let mut local_sync_group = self.state.write_buffer.local_sync_group.lock().await;
+                let mut local_sync_group = self.state.local_dirty.local_sync_group.lock().await;
                 local_sync_group.last_sync_at = Instant::now();
                 drop(local_sync_group);
                 self.state
@@ -4471,7 +4471,7 @@ impl StudioVfs {
                 Ok(())
             }
             Err(error) => {
-                let mut local_sync_group = self.state.write_buffer.local_sync_group.lock().await;
+                let mut local_sync_group = self.state.local_dirty.local_sync_group.lock().await;
                 local_sync_group.pending_bytes =
                     local_sync_group.pending_bytes.saturating_add(bytes_to_sync);
                 Err(error)
@@ -4854,9 +4854,9 @@ impl StudioVfs {
     /// Snapshot accepted local-ingress state for diagnostics and backpressure
     /// observability.
     pub fn ingress_stats(&self) -> VfsIngressStats {
-        let pending = self.state.write_buffer.pending_blocks.lock();
+        let pending = self.state.local_dirty.pending_blocks.lock();
         let dirty_mem_blocks = pending.len();
-        let dirty_mem_bytes = self.total_pending_write_buffer_bytes();
+        let dirty_mem_bytes = self.total_pending_local_dirty_bytes();
         drop(pending);
 
         VfsIngressStats {
@@ -4864,27 +4864,27 @@ impl StudioVfs {
             dirty_mem_blocks,
             write_backpressure_wait_ms: self
                 .state
-                .write_buffer
+                .local_dirty
                 .write_backpressure_wait_ms
                 .load(Ordering::Relaxed),
             write_backpressure_events: self
                 .state
-                .write_buffer
+                .local_dirty
                 .write_backpressure_events
                 .load(Ordering::Relaxed),
             fast_backpressure_wait_ms: self
                 .state
-                .write_buffer
+                .local_dirty
                 .fast_backpressure_wait_ms
                 .load(Ordering::Relaxed),
             fast_backpressure_events: self
                 .state
-                .write_buffer
+                .local_dirty
                 .fast_backpressure_events
                 .load(Ordering::Relaxed),
             fast_backpressure_stall_max_ms: self
                 .state
-                .write_buffer
+                .local_dirty
                 .fast_backpressure_stall_max_ms
                 .load(Ordering::Relaxed),
             prefetch_queue_depth: self
@@ -5265,7 +5265,7 @@ impl StudioVfs {
     /// Returns true when the inode still has local dirty state that requires a
     /// flush barrier before close/flush callback completion.
     pub fn inode_has_local_dirty_state(&self, ino: Ino) -> bool {
-        self.has_pending_write_buffer_blocks_for_inode(ino)
+        self.has_pending_local_dirty_blocks_for_inode(ino)
             || self.state.namespace.dirty_attrs.lock().contains_key(&ino)
     }
 
@@ -5559,17 +5559,17 @@ impl StudioVfs {
             write_backpressure: VfsWritePathBackpressureStats {
                 events: self
                     .state
-                    .write_buffer
+                    .local_dirty
                     .write_backpressure_events
                     .load(Ordering::Relaxed),
                 wait_total_ms: self
                     .state
-                    .write_buffer
+                    .local_dirty
                     .write_backpressure_wait_ms
                     .load(Ordering::Relaxed),
                 stall_max_ms: self
                     .state
-                    .write_buffer
+                    .local_dirty
                     .fast_backpressure_stall_max_ms
                     .load(Ordering::Relaxed),
             },
@@ -5638,7 +5638,7 @@ impl StudioVfs {
     /// Describe whether a new locally materialized payload would still fit in
     /// the in-memory dirty buffer or would hit local backpressure.
     pub fn ingress_pressure_for(&self, next_bytes: usize) -> VfsIngressPressure {
-        let dirty_mem_bytes = self.total_pending_write_buffer_bytes();
+        let dirty_mem_bytes = self.total_pending_local_dirty_bytes();
         let dirty_mem_limit = self.max_dirty_bytes.load(Ordering::Acquire);
         let lane = if dirty_mem_bytes == 0
             || dirty_mem_bytes.saturating_add(next_bytes) <= dirty_mem_limit

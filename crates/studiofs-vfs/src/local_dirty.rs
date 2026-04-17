@@ -91,7 +91,7 @@ trait DrainCommitObserverPort {
     fn on_metadata_committed(&self, ino: Ino, committed_attr: Option<&InodeAttr>);
 }
 
-struct WriteBufferDrainCore<L, C, B, U, O> {
+struct LocalDirtyDrainCore<L, C, B, U, O> {
     local_blocks: L,
     commit_meta: C,
     block_ids: B,
@@ -101,7 +101,7 @@ struct WriteBufferDrainCore<L, C, B, U, O> {
     put_concurrency: usize,
 }
 
-type WriteBufferDrain<'a> = WriteBufferDrainCore<
+type LocalDirtyDrain<'a> = LocalDirtyDrainCore<
     VfsLocalBlockWriter<'a>,
     VfsOverlayCommitter<'a>,
     VfsBlockIdAllocator<'a>,
@@ -109,10 +109,10 @@ type WriteBufferDrain<'a> = WriteBufferDrainCore<
     VfsDrainCommitObserver<'a>,
 >;
 
-struct OrderedWriteSession<'a> {
+struct LocalDirtyFlushSession<'a> {
     ino: Ino,
     vfs: &'a StudioVfs,
-    drain: WriteBufferDrain<'a>,
+    drain: LocalDirtyDrain<'a>,
 }
 
 #[derive(Debug)]
@@ -150,7 +150,7 @@ pub(super) struct LocalSyncGroupState {
     pub(super) last_sync_at: Instant,
 }
 
-pub(super) struct WriteBufferState {
+pub(super) struct LocalDirtyState {
     pub(super) pending_blocks: Mutex<std::collections::HashMap<(Ino, u32), PendingBlock>>,
     pub(super) pending_block_indexes:
         Mutex<std::collections::HashMap<Ino, std::collections::BTreeSet<u32>>>,
@@ -167,7 +167,7 @@ pub(super) struct WriteBufferState {
     pub(super) local_sync_gate: tokio::sync::Mutex<()>,
 }
 
-impl WriteBufferState {
+impl LocalDirtyState {
     pub(super) fn new() -> Self {
         Self {
             pending_blocks: Mutex::new(std::collections::HashMap::new()),
@@ -208,7 +208,7 @@ fn assign_reserved_object_ids(
 
             let object_id = fresh_ids
                 .next()
-                .expect("missing fresh object id for write buffer block");
+                .expect("missing fresh object id for local dirty block");
             current.reserved_object_id = Some(object_id);
             block.object_id = object_id;
             continue;
@@ -216,7 +216,7 @@ fn assign_reserved_object_ids(
 
         block.object_id = fresh_ids
             .next()
-            .expect("missing fresh object id for write buffer block");
+            .expect("missing fresh object id for local dirty block");
     }
 }
 
@@ -289,7 +289,7 @@ fn commit_persisted_block_state(
     (removed_bytes, removed_block_indexes)
 }
 
-impl<L, C, B, U, O> WriteBufferDrainCore<L, C, B, U, O>
+impl<L, C, B, U, O> LocalDirtyDrainCore<L, C, B, U, O>
 where
     L: LocalBlockWriterPort,
     C: OverlayCommitPort,
@@ -629,9 +629,9 @@ where
     }
 }
 
-impl<'a> WriteBufferDrain<'a> {
-    fn for_inode(self, vfs: &'a StudioVfs, ino: Ino) -> OrderedWriteSession<'a> {
-        OrderedWriteSession {
+impl<'a> LocalDirtyDrain<'a> {
+    fn for_inode(self, vfs: &'a StudioVfs, ino: Ino) -> LocalDirtyFlushSession<'a> {
+        LocalDirtyFlushSession {
             ino,
             vfs,
             drain: self,
@@ -708,7 +708,7 @@ impl LocalBlockWriterPort for VfsLocalBlockWriter<'_> {
                 stage,
                 object_count = object_ids.len(),
                 error = %error,
-                "write-buffer cleanup of uncommitted block-store entries failed"
+                "local-dirty cleanup of uncommitted block-store entries failed"
             );
         }
     }
@@ -784,7 +784,7 @@ impl DrainCommitObserverPort for VfsDrainCommitObserver<'_> {
     }
 }
 
-impl<'a> OrderedWriteSession<'a> {
+impl<'a> LocalDirtyFlushSession<'a> {
     async fn drain_snapshot(
         &self,
         blocks: Vec<DirtyWriteSnapshot>,
@@ -796,7 +796,7 @@ impl<'a> OrderedWriteSession<'a> {
         let mut fresh_object_ids = std::collections::VecDeque::new();
         let persisted_blocks = loop {
             let prepare_result = {
-                let mut pending = self.vfs.state.write_buffer.pending_blocks.lock();
+                let mut pending = self.vfs.state.local_dirty.pending_blocks.lock();
                 self.drain.try_prepare_persisted_blocks(
                     &mut pending,
                     self.ino,
@@ -834,7 +834,7 @@ impl<'a> OrderedWriteSession<'a> {
             )
             .await?;
         self.vfs
-            .commit_persisted_write_buffer_blocks(self.ino, &outcome.persisted_blocks);
+            .commit_persisted_local_dirty_blocks(self.ino, &outcome.persisted_blocks);
         if let Some(attr) = attr_to_clear.as_ref() {
             self.vfs
                 .clear_matching_dirty_attr_if_committed(self.ino, attr);
@@ -853,7 +853,7 @@ impl<'a> OrderedWriteSession<'a> {
             return Ok(());
         }
 
-        let blocks_to_buffer = self.vfs.snapshot_dirty_write_buffer_blocks(self.ino);
+        let blocks_to_buffer = self.vfs.snapshot_dirty_local_dirty_blocks(self.ino);
         let dirty_attr = {
             self.vfs
                 .state
@@ -870,7 +870,7 @@ impl<'a> OrderedWriteSession<'a> {
         };
         let chunk_slices = self
             .vfs
-            .snapshot_dirty_write_buffer_chunk_slices(self.ino, &blocks_to_buffer);
+            .snapshot_dirty_local_dirty_chunk_slices(self.ino, &blocks_to_buffer);
         self.drain_snapshot(
             blocks_to_buffer,
             chunk_slices,
@@ -1060,7 +1060,7 @@ impl StudioVfs {
                 ),
             ))
         })?;
-        let drain = self.write_buffer_drain();
+        let drain = self.local_dirty_drain();
         let object_ids = drain.allocate_block_ids(block_count).await?;
         let persisted_blocks: Vec<PersistedWriteBlock> = blocks
             .into_iter()
@@ -1093,8 +1093,8 @@ impl StudioVfs {
         Ok(())
     }
 
-    fn write_buffer_drain(&self) -> WriteBufferDrain<'_> {
-        WriteBufferDrainCore {
+    fn local_dirty_drain(&self) -> LocalDirtyDrain<'_> {
+        LocalDirtyDrainCore {
             local_blocks: VfsLocalBlockWriter { vfs: self },
             commit_meta: VfsOverlayCommitter { vfs: self },
             block_ids: VfsBlockIdAllocator { vfs: self },
@@ -1105,20 +1105,17 @@ impl StudioVfs {
         }
     }
 
-    fn ordered_write_session(&self, ino: Ino) -> OrderedWriteSession<'_> {
-        self.write_buffer_drain().for_inode(self, ino)
+    fn local_dirty_flush_session(&self, ino: Ino) -> LocalDirtyFlushSession<'_> {
+        self.local_dirty_drain().for_inode(self, ino)
     }
 
-    pub(super) fn total_pending_write_buffer_bytes(&self) -> usize {
-        self.state
-            .write_buffer
-            .pending_bytes
-            .load(Ordering::Relaxed)
+    pub(super) fn total_pending_local_dirty_bytes(&self) -> usize {
+        self.state.local_dirty.pending_bytes.load(Ordering::Relaxed)
     }
 
-    pub(super) fn has_pending_write_buffer_blocks_for_inode(&self, ino: Ino) -> bool {
+    pub(super) fn has_pending_local_dirty_blocks_for_inode(&self, ino: Ino) -> bool {
         self.state
-            .write_buffer
+            .local_dirty
             .pending_block_indexes
             .lock()
             .get(&ino)
@@ -1126,7 +1123,7 @@ impl StudioVfs {
     }
 
     fn clear_matching_dirty_attr_if_committed(&self, ino: Ino, attr: &InodeAttr) {
-        if self.has_pending_write_buffer_blocks_for_inode(ino) {
+        if self.has_pending_local_dirty_blocks_for_inode(ino) {
             return;
         }
         let mut dirty_attrs = self.state.namespace.dirty_attrs.lock();
@@ -1140,40 +1137,40 @@ impl StudioVfs {
         }
     }
 
-    fn add_pending_write_buffer_bytes(&self, bytes: usize) {
+    fn add_pending_local_dirty_bytes(&self, bytes: usize) {
         if bytes == 0 {
             return;
         }
         self.state
-            .write_buffer
+            .local_dirty
             .pending_bytes
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
-    fn subtract_pending_write_buffer_bytes(&self, bytes: usize) {
+    fn subtract_pending_local_dirty_bytes(&self, bytes: usize) {
         if bytes == 0 {
             return;
         }
         let previous = self
             .state
-            .write_buffer
+            .local_dirty
             .pending_bytes
             .fetch_sub(bytes, Ordering::Relaxed);
         if previous < bytes {
             self.state
-                .write_buffer
+                .local_dirty
                 .pending_bytes
                 .store(0, Ordering::Relaxed);
             debug_assert!(
                 previous >= bytes,
-                "pending write-buffer bytes underflow: previous={previous}, subtract={bytes}"
+                "pending local-dirty bytes underflow: previous={previous}, subtract={bytes}"
             );
         }
     }
 
-    fn replace_pending_write_buffer_block(&self, ino: Ino, block_index: u32, block: PendingBlock) {
-        let mut pending = self.state.write_buffer.pending_blocks.lock();
-        let mut indexes = self.state.write_buffer.pending_block_indexes.lock();
+    fn replace_pending_local_dirty_block(&self, ino: Ino, block_index: u32, block: PendingBlock) {
+        let mut pending = self.state.local_dirty.pending_blocks.lock();
+        let mut indexes = self.state.local_dirty.pending_block_indexes.lock();
         let new_len = block.data.len();
         let old_len = pending
             .insert((ino, block_index), block)
@@ -1183,22 +1180,22 @@ impl StudioVfs {
         drop(indexes);
         drop(pending);
         match new_len.cmp(&old_len) {
-            std::cmp::Ordering::Greater => self.add_pending_write_buffer_bytes(new_len - old_len),
-            std::cmp::Ordering::Less => self.subtract_pending_write_buffer_bytes(old_len - new_len),
+            std::cmp::Ordering::Greater => self.add_pending_local_dirty_bytes(new_len - old_len),
+            std::cmp::Ordering::Less => self.subtract_pending_local_dirty_bytes(old_len - new_len),
             std::cmp::Ordering::Equal => {}
         }
     }
 
     fn clear_pending_dirty_slices_for_inode(&self, ino: Ino) {
         self.state
-            .write_buffer
+            .local_dirty
             .pending_chunk_slices
             .lock()
             .remove(&ino);
     }
 
     fn clear_pending_dirty_slices_for_block(&self, ino: Ino, block_index: u32) {
-        let mut pending_chunk_slices = self.state.write_buffer.pending_chunk_slices.lock();
+        let mut pending_chunk_slices = self.state.local_dirty.pending_chunk_slices.lock();
         if let Some(chunks) = pending_chunk_slices.get_mut(&ino) {
             chunks.retain(|_, slices| {
                 slices.retain(|slice| slice.block_index != block_index);
@@ -1216,7 +1213,7 @@ impl StudioVfs {
         }
         let block_index_set: std::collections::HashSet<u32> =
             block_indexes.iter().copied().collect();
-        let mut pending_chunk_slices = self.state.write_buffer.pending_chunk_slices.lock();
+        let mut pending_chunk_slices = self.state.local_dirty.pending_chunk_slices.lock();
         if let Some(chunks) = pending_chunk_slices.get_mut(&ino) {
             chunks.retain(|_, slices| {
                 slices.retain(|slice| !block_index_set.contains(&slice.block_index));
@@ -1229,7 +1226,7 @@ impl StudioVfs {
     }
 
     fn clear_pending_dirty_slices_exceeding_len(&self, ino: Ino, block_index: u32, new_len: usize) {
-        let mut pending_chunk_slices = self.state.write_buffer.pending_chunk_slices.lock();
+        let mut pending_chunk_slices = self.state.local_dirty.pending_chunk_slices.lock();
         let Some(chunks) = pending_chunk_slices.get_mut(&ino) else {
             return;
         };
@@ -1266,8 +1263,8 @@ impl StudioVfs {
 
     pub(super) fn clear_pending_blocks_for_inode(&self, ino: Ino) {
         let mut removed_bytes = 0usize;
-        let mut pending = self.state.write_buffer.pending_blocks.lock();
-        let mut indexes = self.state.write_buffer.pending_block_indexes.lock();
+        let mut pending = self.state.local_dirty.pending_blocks.lock();
+        let mut indexes = self.state.local_dirty.pending_block_indexes.lock();
         pending.retain(|(candidate, _), block| {
             if *candidate == ino {
                 removed_bytes += block.data.len();
@@ -1278,13 +1275,13 @@ impl StudioVfs {
         indexes.remove(&ino);
         drop(indexes);
         drop(pending);
-        self.subtract_pending_write_buffer_bytes(removed_bytes);
+        self.subtract_pending_local_dirty_bytes(removed_bytes);
         self.clear_pending_dirty_slices_for_inode(ino);
     }
 
     pub(super) fn clear_pending_block(&self, ino: Ino, block_index: u32) {
-        let mut pending = self.state.write_buffer.pending_blocks.lock();
-        let mut indexes = self.state.write_buffer.pending_block_indexes.lock();
+        let mut pending = self.state.local_dirty.pending_blocks.lock();
+        let mut indexes = self.state.local_dirty.pending_block_indexes.lock();
         if let Some(removed) = pending.remove(&(ino, block_index)) {
             if let Some(inode_indexes) = indexes.get_mut(&ino) {
                 inode_indexes.remove(&block_index);
@@ -1294,17 +1291,17 @@ impl StudioVfs {
             }
             drop(indexes);
             drop(pending);
-            self.subtract_pending_write_buffer_bytes(removed.data.len());
+            self.subtract_pending_local_dirty_bytes(removed.data.len());
             self.clear_pending_dirty_slices_for_block(ino, block_index);
         }
     }
 
-    fn snapshot_dirty_write_buffer_blocks(&self, ino: Ino) -> Vec<DirtyWriteSnapshot> {
+    fn snapshot_dirty_local_dirty_blocks(&self, ino: Ino) -> Vec<DirtyWriteSnapshot> {
         // Point-in-time view of dirty local-visible payload. Writers may race
         // ahead after this snapshot; commit keeps newer bytes dirty so a later
         // flush retries with the fresh view instead of dropping updates.
-        let pending = self.state.write_buffer.pending_blocks.lock();
-        let indexes = self.state.write_buffer.pending_block_indexes.lock();
+        let pending = self.state.local_dirty.pending_blocks.lock();
+        let indexes = self.state.local_dirty.pending_block_indexes.lock();
         indexes
             .get(&ino)
             .into_iter()
@@ -1321,7 +1318,7 @@ impl StudioVfs {
             .collect()
     }
 
-    fn snapshot_dirty_write_buffer_chunk_slices(
+    fn snapshot_dirty_local_dirty_chunk_slices(
         &self,
         ino: Ino,
         blocks: &[DirtyWriteSnapshot],
@@ -1337,13 +1334,7 @@ impl StudioVfs {
         }
 
         let mut slices_by_chunk = std::collections::BTreeMap::<u64, Vec<PendingDirtySlice>>::new();
-        if let Some(chunks) = self
-            .state
-            .write_buffer
-            .pending_chunk_slices
-            .lock()
-            .get(&ino)
-        {
+        if let Some(chunks) = self.state.local_dirty.pending_chunk_slices.lock().get(&ino) {
             for (chunk_id, slices) in chunks {
                 let filtered: Vec<_> = slices
                     .iter()
@@ -1378,8 +1369,8 @@ impl StudioVfs {
         let Some(end) = offset.checked_add(length) else {
             return Vec::new();
         };
-        let pending_blocks = self.state.write_buffer.pending_blocks.lock();
-        let pending_chunk_slices = self.state.write_buffer.pending_chunk_slices.lock();
+        let pending_blocks = self.state.local_dirty.pending_blocks.lock();
+        let pending_chunk_slices = self.state.local_dirty.pending_chunk_slices.lock();
         let Some(chunks) = pending_chunk_slices.get(&ino) else {
             return Vec::new();
         };
@@ -1435,13 +1426,13 @@ impl StudioVfs {
         spans
     }
 
-    fn commit_persisted_write_buffer_blocks(&self, ino: Ino, blocks: &[PersistedWriteBlock]) {
+    fn commit_persisted_local_dirty_blocks(&self, ino: Ino, blocks: &[PersistedWriteBlock]) {
         if blocks.is_empty() {
             return;
         }
 
-        let mut pending = self.state.write_buffer.pending_blocks.lock();
-        let mut indexes = self.state.write_buffer.pending_block_indexes.lock();
+        let mut pending = self.state.local_dirty.pending_blocks.lock();
+        let mut indexes = self.state.local_dirty.pending_block_indexes.lock();
         let (removed_bytes, removed_block_indexes) =
             commit_persisted_block_state(&mut pending, ino, blocks);
         if let Some(inode_indexes) = indexes.get_mut(&ino) {
@@ -1454,7 +1445,7 @@ impl StudioVfs {
         }
         drop(indexes);
         drop(pending);
-        self.subtract_pending_write_buffer_bytes(removed_bytes);
+        self.subtract_pending_local_dirty_bytes(removed_bytes);
         self.clear_pending_dirty_slices_for_blocks(ino, &removed_block_indexes);
     }
 
@@ -1467,14 +1458,14 @@ impl StudioVfs {
         let mut changed = false;
 
         {
-            let mut pending = self.state.write_buffer.pending_blocks.lock();
+            let mut pending = self.state.local_dirty.pending_blocks.lock();
             if let Some(block) = pending.get_mut(&(ino, block_index))
                 && block.data.len() > new_len
             {
                 let old_len = block.data.len();
                 block.data.truncate(new_len);
                 block.dirty = true;
-                self.subtract_pending_write_buffer_bytes(old_len - block.data.len());
+                self.subtract_pending_local_dirty_bytes(old_len - block.data.len());
                 changed = true;
             }
         }
@@ -1513,12 +1504,12 @@ impl StudioVfs {
     ) {
         let reserved_object_id = self
             .state
-            .write_buffer
+            .local_dirty
             .pending_blocks
             .lock()
             .get(&(ino, block_index))
             .and_then(|block| block.reserved_object_id);
-        self.replace_pending_write_buffer_block(
+        self.replace_pending_local_dirty_block(
             ino,
             block_index,
             PendingBlock {
@@ -1566,19 +1557,19 @@ impl StudioVfs {
         Ok(Some(data))
     }
 
-    pub(super) async fn flush_ordered(
+    pub(super) async fn flush_local_dirty_state(
         &self,
         ino: Ino,
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<()> {
-        self.ordered_write_session(ino)
+        self.local_dirty_flush_session(ino)
             .flush(local_sync_policy)
             .await
     }
 
     pub(super) async fn flush_pending_blocks_for_shutdown(&self) {
         let mut inos: BTreeSet<Ino> = {
-            let pending = self.state.write_buffer.pending_blocks.lock();
+            let pending = self.state.local_dirty.pending_blocks.lock();
             pending.keys().map(|(ino, _)| *ino).collect()
         };
         {
@@ -1840,14 +1831,14 @@ mod tests {
         committed_attr: Option<InodeAttr>,
         uploads: SharedUploads,
         observed_inodes: SharedInodes,
-    ) -> WriteBufferDrainCore<
+    ) -> LocalDirtyDrainCore<
         TestLocalBlockWriter,
         TestOverlayCommitter,
         PanicBlockIds,
         TestUploadSubmitter,
         TestDrainObserver,
     > {
-        WriteBufferDrainCore {
+        LocalDirtyDrainCore {
             local_blocks: TestLocalBlockWriter {
                 events: events.clone(),
                 fail_persist,

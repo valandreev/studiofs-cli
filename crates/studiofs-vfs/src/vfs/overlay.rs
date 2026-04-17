@@ -162,7 +162,7 @@ impl StudioVfs {
         // by committed local-backend metadata.
         if let Some(pending_block) = self
             .state
-            .write_buffer
+            .local_dirty
             .pending_blocks
             .lock()
             .get(&(ino, block_index))
@@ -228,7 +228,7 @@ impl StudioVfs {
     pub(super) fn inode_has_local_overlay(&self, ino: Ino) -> bool {
         if self
             .state
-            .write_buffer
+            .local_dirty
             .pending_blocks
             .lock()
             .keys()

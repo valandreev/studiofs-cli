@@ -326,7 +326,7 @@ VfsState (composed of 10 subsystems)
 ├── namespace: NamespaceState         # Dentry cache, path shortcuts, attr cache
 ├── acl: AclState                     # ACL state (minimal, placeholder)
 ├── incarnation: IncarnationState     # Inode incarnation tracking
-├── write_buffer: local dirty-state staging  # Current implementation home for pending local bytes
+├── local_dirty: local dirty-state staging  # Current implementation home for pending local bytes
 ├── read: ReadState                   # Foreground read tracking, P90 latency, prefetch hints
 ├── file_lock: FileLockState          # File locking state
 ├── shutdown: ShutdownState           # Shutdown flags, tokens, task handles
@@ -342,7 +342,7 @@ have a stable placeholder.
 To prevent deadlocks, a strict lock ordering is enforced (Tier 0 = highest priority):
 
 1. **Tier 1**: `ShutdownState` — shutdown flags are checked before any other operation
-2. **Tier 2**: `write_buffer` subsystem — pending local dirty-state bookkeeping
+2. **Tier 2**: `local_dirty` subsystem — pending local dirty-state bookkeeping
 3. **Tier 3**: reserved `DirtyBufferState` slot — no active subsystem
 4. **Tier 4**: reserved legacy `IngressState` slot — no active subsystem
 5. **Tier 5**: `NamespaceState` — dentry/attr caches

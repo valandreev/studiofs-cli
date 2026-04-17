@@ -177,11 +177,11 @@ impl StudioVfs {
             .materialize_handle_writers_for_inode(ino, local_sync_policy)
             .await?;
         let flushed_file_data =
-            materialized_handle_writers || self.has_pending_write_buffer_blocks_for_inode(ino);
+            materialized_handle_writers || self.has_pending_local_dirty_blocks_for_inode(ino);
         let residual_local_dirty_state = self.inode_has_local_dirty_state(ino);
         let had_local_dirty_state = materialized_handle_writers || residual_local_dirty_state;
         if residual_local_dirty_state {
-            self.flush_ordered(ino, local_sync_policy).await?;
+            self.flush_local_dirty_state(ino, local_sync_policy).await?;
         }
         if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
             self.maybe_block_store_sync_data_async(0, LocalSyncPolicy::Strict)
@@ -312,7 +312,7 @@ impl StudioVfs {
 
     /// fsync — flush data (and optionally metadata) to durable storage.
     ///
-    /// 1. Flushes pending write buffer to the dirty-mem / slab pipeline.
+    /// 1. Flushes pending local dirty state to the dirty-mem / slab pipeline.
     /// 2. If `!datasync`, also commits dirty attrs to redb.
     ///
     /// S3 upload remains async — same as LucidLink behaviour.
