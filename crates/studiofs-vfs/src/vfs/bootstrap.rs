@@ -1,4 +1,5 @@
 use super::*;
+use studiofs_cache::LocalBlockPayloadSyncMode;
 
 #[derive(Debug, Clone)]
 pub(super) struct VfsBootstrapPlan {

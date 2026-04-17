@@ -131,7 +131,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use studiofs_cache::LocalBlockPayloadSyncMode;
 use studiofs_cache::OpenLocalBlockBackendError;
 use studiofs_cache::PreparedLocalBlockRuntime;
 use studiofs_cache::local::{LocalBlockBackend, LocalBlockLifecycleState};

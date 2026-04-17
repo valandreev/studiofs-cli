@@ -1021,19 +1021,22 @@ struct PendingAccessTouches {
 
 impl PendingAccessTouches {
     fn new() -> Self {
-        Self {
+        let pending = Self {
             object_ids: Vec::new(),
             object_set: HashSet::new(),
             last_flush_at: Instant::now(),
             failed_flushes: 0,
             next_retry_at: None,
-        }
+        };
+        pending.debug_assert_consistent();
+        pending
     }
 
     fn enqueue(&mut self, object_id: u64) {
         if self.object_set.insert(object_id) {
             self.object_ids.push(object_id);
         }
+        self.debug_assert_consistent();
     }
 
     fn forget_many(&mut self, object_ids: &[u64]) {
@@ -1046,11 +1049,14 @@ impl PendingAccessTouches {
         }
         self.object_ids
             .retain(|candidate| self.object_set.contains(candidate));
+        self.debug_assert_consistent();
     }
 
     fn take_all(&mut self) -> Vec<u64> {
         self.object_set.clear();
-        std::mem::take(&mut self.object_ids)
+        let drained = std::mem::take(&mut self.object_ids);
+        self.debug_assert_consistent();
+        drained
     }
 
     fn take_ready_for_flush(&mut self, force: bool, now: Instant) -> Option<Vec<u64>> {
@@ -1090,6 +1096,20 @@ impl PendingAccessTouches {
     fn record_flush_success(&mut self) {
         self.failed_flushes = 0;
         self.next_retry_at = None;
+    }
+
+    fn debug_assert_consistent(&self) {
+        debug_assert_eq!(
+            self.object_ids.len(),
+            self.object_set.len(),
+            "pending touch queue lost set/vector parity"
+        );
+        debug_assert!(
+            self.object_ids
+                .iter()
+                .all(|object_id| self.object_set.contains(object_id)),
+            "pending touch queue contains object ids missing from the dedupe set"
+        );
     }
 }
 
@@ -1754,5 +1774,15 @@ mod tests {
             pending.take_ready_for_flush(false, retry_at).is_some(),
             "retry should resume once backoff elapses"
         );
+    }
+
+    #[test]
+    fn pending_access_touches_dedupes_duplicate_enqueue() {
+        let mut pending = PendingAccessTouches::new();
+        pending.enqueue(7);
+        pending.enqueue(7);
+        pending.enqueue(8);
+
+        assert_eq!(pending.take_all(), vec![7, 8]);
     }
 }

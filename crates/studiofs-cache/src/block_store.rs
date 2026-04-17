@@ -8,12 +8,12 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use lru::LruCache;
 use parking_lot::Mutex;
 use tracing::warn;
+use uuid::Uuid;
 
 use super::CacheV3PayloadSyncMode;
 use super::layout::CacheV3Layout;
@@ -560,11 +560,7 @@ fn read_fd_shard_idx(object_id: u64) -> usize {
 
 fn next_temp_token() -> String {
     let seq = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{:08x}-{:016x}-{:032x}", std::process::id(), seq, nanos)
+    format!("{:016x}-{}", seq, Uuid::new_v4().simple())
 }
 
 #[cfg(test)]

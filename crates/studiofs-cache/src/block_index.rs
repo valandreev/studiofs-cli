@@ -1073,7 +1073,11 @@ fn allocate_sequence(
     counters: &mut redb::Table<'_, &str, u64>,
     counter_name: &'static str,
 ) -> Result<u64, CacheIndexError> {
-    let current = required_counter(counters, counter_name)?;
+    let current = counters
+        .get(counter_name)
+        .map_err(storage_error)?
+        .map(|value| value.value())
+        .unwrap_or(0);
     let next = current.checked_add(1).ok_or_else(|| {
         CacheIndexError::Corruption(format!(
             "counter '{counter_name}' overflow while allocating sequence"
@@ -1754,6 +1758,24 @@ mod tests {
             reopened_entry.last_access_unix_millis,
             after_touch.last_access_unix_millis
         );
+    }
+
+    #[test]
+    fn allocate_sequence_recovers_missing_sequence_counter() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cache.redb");
+        let index = open_index(&db_path);
+
+        let txn = index.db.begin_write().unwrap();
+        {
+            let mut counters = txn.open_table(COUNTERS_TABLE).unwrap();
+            counters.remove(COUNTER_NEXT_ACCESS_SEQ).unwrap();
+        }
+        txn.commit().unwrap();
+
+        upsert_uploaded(&index, 55, 5);
+        let entry = index.get_entry(55).unwrap().unwrap();
+        assert_eq!(entry.access_order, 0);
     }
 
     #[test]
