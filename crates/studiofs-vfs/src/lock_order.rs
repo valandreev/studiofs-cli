@@ -6,7 +6,7 @@
 //! # Lock Ordering (Tier 1 = highest priority)
 //!
 //! 1.  `ShutdownState` — shutdown flags
-//! 2.  `write_buffer` subsystem — pending local dirty-state bookkeeping
+//! 2.  `local_dirty` subsystem — pending local dirty-state bookkeeping
 //! 3.  reserved legacy `DirtyBufferState` slot — kept for ordering compatibility
 //! 4.  reserved legacy `IngressState` slot — no active subsystem
 //! 5.  `NamespaceState` — dentry/attr caches
@@ -36,8 +36,8 @@ use tracing::warn;
 pub enum LockTier {
     /// Tier 1: ShutdownState
     Shutdown = 1,
-    /// Tier 2: `write_buffer` subsystem
-    WriteBuffer = 2,
+    /// Tier 2: `local_dirty` subsystem
+    LocalDirty = 2,
     /// Tier 3: reserved legacy DirtyBufferState slot
     DirtyBuffer = 3,
     /// Tier 4: reserved legacy IngressState slot
@@ -60,7 +60,7 @@ impl LockTier {
     pub const fn level(self) -> u8 {
         match self {
             LockTier::Shutdown => 1,
-            LockTier::WriteBuffer => 2,
+            LockTier::LocalDirty => 2,
             LockTier::DirtyBuffer => 3,
             LockTier::Ingress => 4,
             LockTier::Namespace => 5,
@@ -75,7 +75,7 @@ impl LockTier {
     pub fn name(&self) -> &'static str {
         match self {
             LockTier::Shutdown => "Shutdown",
-            LockTier::WriteBuffer => "LocalDirtyState",
+            LockTier::LocalDirty => "LocalDirty",
             LockTier::DirtyBuffer => "DirtyBuffer",
             LockTier::Ingress => "Ingress",
             LockTier::Namespace => "Namespace",
@@ -240,5 +240,10 @@ mod tests {
         // Should NOT be able to acquire Tier 3 (DirtyBuffer) while holding Tier 5
         // This would violate ordering since 3 < 5
         let _guard3 = LockOrderGuard::acquire(LockTier::DirtyBuffer);
+    }
+
+    #[test]
+    fn local_dirty_lock_name_matches_tier_vocabulary() {
+        assert_eq!(LockTier::LocalDirty.name(), "LocalDirty");
     }
 }

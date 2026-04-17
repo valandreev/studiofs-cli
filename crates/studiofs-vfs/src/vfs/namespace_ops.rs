@@ -111,7 +111,8 @@ impl StudioVfs {
         let result: VfsResult<InodeAttr> = async {
             self.materialize_handle_writers_for_inode(ino, LocalSyncPolicy::Strict)
                 .await?;
-            self.flush_ordered(ino, LocalSyncPolicy::Strict).await?;
+            self.flush_local_dirty_state(ino, LocalSyncPolicy::Strict)
+                .await?;
 
             let old_attr = self.getattr_async(ino).await?;
             let mut attr = old_attr.clone();
@@ -170,7 +171,10 @@ impl StudioVfs {
             self.state.namespace.attr_read_cache.lock().remove(ino);
 
             let flush_result = match self.fail_size_change_setattr_before_flush_for_test() {
-                Ok(()) => self.flush_ordered(ino, LocalSyncPolicy::Strict).await,
+                Ok(()) => {
+                    self.flush_local_dirty_state(ino, LocalSyncPolicy::Strict)
+                        .await
+                }
                 Err(error) => Err(error),
             };
             if let Err(error) = flush_result {

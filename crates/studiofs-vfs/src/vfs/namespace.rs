@@ -1037,7 +1037,7 @@ impl StudioVfs {
 
 #[cfg(test)]
 mod tests {
-    use super::super::write_buffer::PendingBlock;
+    use super::super::local_dirty::PendingBlock;
     use super::*;
     use bytes::BytesMut;
     use std::sync::Arc;
@@ -1442,7 +1442,7 @@ mod tests {
             "zero-sized uploading regular files without local state should surface the remote placeholder"
         );
 
-        vfs.state.write_buffer.pending_blocks.lock().insert(
+        vfs.state.local_dirty.pending_blocks.lock().insert(
             (ino, 0),
             PendingBlock {
                 data: BytesMut::from(&b"local"[..]),

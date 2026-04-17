@@ -133,6 +133,37 @@ fn runtime_metric_names_drop_superseded_write_buffer_and_flush_ordered_terms() {
 }
 
 #[test]
+fn internal_vfs_types_and_helpers_drop_write_buffer_wording() {
+    let files = [
+        "AGENTS.md",
+        "crates/studiofs-vfs/src/lock_order.rs",
+        "crates/studiofs-vfs/src/vfs.rs",
+        "crates/studiofs-vfs/src/local_dirty.rs",
+        "crates/studiofs-vfs/src/vfs/namespace_ops.rs",
+        "crates/studiofs-vfs/src/vfs/sync_ops.rs",
+    ];
+    let forbidden_terms = [
+        "WriteBufferState",
+        "WriteBufferDrain",
+        "OrderedWriteSession",
+        "flush_ordered",
+        "LockTier::WriteBuffer",
+        "write_buffer:",
+    ];
+
+    let hits: Vec<_> = files
+        .iter()
+        .flat_map(|path| collect_term_hits(path, &forbidden_terms))
+        .collect();
+
+    assert!(
+        hits.is_empty(),
+        "internal VFS surfaces still expose write-buffer vocabulary:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
 fn prefetch_helper_name_drops_planner_wording() {
     let hits = collect_term_hits(
         "crates/studiofs-vfs/src/vfs/prefetch.rs",

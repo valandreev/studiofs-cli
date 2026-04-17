@@ -1074,7 +1074,7 @@ impl StudioVfs {
 
 #[cfg(test)]
 mod tests {
-    use super::super::write_buffer::PendingBlock;
+    use super::super::local_dirty::PendingBlock;
     use super::super::*;
     use super::{DataReader, ReadRange, ReadSegment, ReadSegmentSource};
     use bytes::{Bytes, BytesMut};
@@ -1397,7 +1397,7 @@ mod tests {
             let ino = 9_001;
             let mut cached_attr = InodeAttr::new_file(ino, ROOT_INO, 1000, 1000, 0o644);
             cached_attr.size = 5;
-            vfs.state.write_buffer.pending_blocks.lock().insert(
+            vfs.state.local_dirty.pending_blocks.lock().insert(
                 (ino, 0),
                 PendingBlock {
                     data: BytesMut::from(&b"stale"[..]),
@@ -1406,14 +1406,14 @@ mod tests {
                 },
             );
             vfs.state
-                .write_buffer
+                .local_dirty
                 .pending_block_indexes
                 .lock()
                 .entry(ino)
                 .or_default()
                 .insert(0);
             vfs.state
-                .write_buffer
+                .local_dirty
                 .pending_bytes
                 .fetch_add(5, AtomicOrdering::Relaxed);
             vfs.refresh_inode_incarnation_state_from_attr(ino, &cached_attr);
@@ -1432,7 +1432,7 @@ mod tests {
             assert!(!vfs.state.namespace.dirty_attrs.lock().contains_key(&ino));
             assert!(
                 !vfs.state
-                    .write_buffer
+                    .local_dirty
                     .pending_blocks
                     .lock()
                     .contains_key(&(ino, 0))
@@ -1455,7 +1455,7 @@ mod tests {
         let ino = 9_101;
         let mut cached_attr = InodeAttr::new_file(ino, ROOT_INO, 1000, 1000, 0o644);
         cached_attr.size = 5;
-        vfs.state.write_buffer.pending_blocks.lock().insert(
+        vfs.state.local_dirty.pending_blocks.lock().insert(
             (ino, 0),
             PendingBlock {
                 data: BytesMut::from(&b"stale"[..]),
@@ -1464,14 +1464,14 @@ mod tests {
             },
         );
         vfs.state
-            .write_buffer
+            .local_dirty
             .pending_block_indexes
             .lock()
             .entry(ino)
             .or_default()
             .insert(0);
         vfs.state
-            .write_buffer
+            .local_dirty
             .pending_bytes
             .fetch_add(5, AtomicOrdering::Relaxed);
         vfs.refresh_inode_incarnation_state_from_attr(ino, &cached_attr);
@@ -1489,7 +1489,7 @@ mod tests {
         assert!(!vfs.state.namespace.dirty_attrs.lock().contains_key(&ino));
         assert!(
             !vfs.state
-                .write_buffer
+                .local_dirty
                 .pending_blocks
                 .lock()
                 .contains_key(&(ino, 0))
@@ -1748,7 +1748,7 @@ mod tests {
                 .expect("write payload");
 
             assert!(
-                !vfs.has_pending_write_buffer_blocks_for_inode(created.ino),
+                !vfs.has_pending_local_dirty_blocks_for_inode(created.ino),
                 "foreground write should materialize local pending extents before read"
             );
             assert!(

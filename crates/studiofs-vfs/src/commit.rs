@@ -214,7 +214,7 @@ impl CommitCoordinator {
         // published. dirty_attrs entries captured at write time carry
         // committed_content_epoch=0 / committed_size=0 because the file had not
         // been published yet. After publication those values are stale: if a
-        // subsequent flush_ordered finds this dirty_attr and the write buffer is
+        // subsequent flush_local_dirty_state finds this dirty_attr and the local dirty state is
         // empty it will call engine.set_attr with committed_epoch=0, reverting
         // INODES_TABLE back to {Uploading}. That triggers a second spurious
         // finalize_inode_epoch which (a) emits a garbage

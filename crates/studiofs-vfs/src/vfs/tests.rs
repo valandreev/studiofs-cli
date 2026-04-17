@@ -1565,7 +1565,7 @@ fn ignored_entry_writes_preserve_synthetic_attr_size() {
 }
 
 #[test]
-fn same_mount_read_keeps_opportunistic_handle_write_visible_after_write_buffer_clear() {
+fn same_mount_read_keeps_opportunistic_handle_write_visible_after_local_dirty_clear() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-opportunistic-handle-read");
     let _guard = rt.enter();
@@ -1691,7 +1691,7 @@ fn handle_writer_global_dirty_cap_drains_older_inodes_after_limit_drop() {
 }
 
 #[test]
-fn inode_write_materializes_directly_without_populating_legacy_write_buffer() {
+fn inode_write_materializes_directly_without_populating_pending_local_dirty_state() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-inode-write-direct");
     let _guard = rt.enter();
@@ -1707,8 +1707,8 @@ fn inode_write_materializes_directly_without_populating_legacy_write_buffer() {
             .unwrap();
 
         assert!(
-            !vfs.has_pending_write_buffer_blocks_for_inode(ino),
-            "inode write should bypass the legacy write buffer"
+            !vfs.has_pending_local_dirty_blocks_for_inode(ino),
+            "inode write should bypass pending local dirty staging"
         );
         let spans = meta
             .lookup_regular_file_slices(ino, 0, payload.len() as u64)
@@ -2618,7 +2618,7 @@ fn strict_local_sync_flushes_pending_group_commit_bytes() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "strict-local-sync-group");
     rt.block_on(async {
-        let mut group = vfs.state.write_buffer.local_sync_group.lock().await;
+        let mut group = vfs.state.local_dirty.local_sync_group.lock().await;
         group.pending_bytes = 4096;
         group.last_sync_at = Instant::now();
     });
@@ -2659,7 +2659,7 @@ fn strict_local_sync_flushes_pending_group_commit_bytes() {
         "strict sync should account for pending group-commit bytes"
     );
     rt.block_on(async {
-        let group = vfs.state.write_buffer.local_sync_group.lock().await;
+        let group = vfs.state.local_dirty.local_sync_group.lock().await;
         assert_eq!(group.pending_bytes, 0);
     });
 }
@@ -2669,7 +2669,7 @@ fn opportunistic_local_sync_defers_when_threshold_not_reached() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "opportunistic-local-sync-group");
     rt.block_on(async {
-        let mut group = vfs.state.write_buffer.local_sync_group.lock().await;
+        let mut group = vfs.state.local_dirty.local_sync_group.lock().await;
         group.pending_bytes = 1024;
         group.last_sync_at = Instant::now();
     });
@@ -2734,7 +2734,7 @@ fn flush_fh_forces_strict_local_sync_when_dirty_state_remains() {
         .insert(ino, dirty_attr.clone());
 
     rt.block_on(async {
-        let mut group = vfs.state.write_buffer.local_sync_group.lock().await;
+        let mut group = vfs.state.local_dirty.local_sync_group.lock().await;
         group.pending_bytes = 4096;
         group.last_sync_at = Instant::now();
     });
@@ -2773,7 +2773,7 @@ fn flush_fh_forces_strict_local_sync_when_dirty_state_remains() {
         "explicit flush should account for the pending local durable sync bytes"
     );
     rt.block_on(async {
-        let group = vfs.state.write_buffer.local_sync_group.lock().await;
+        let group = vfs.state.local_dirty.local_sync_group.lock().await;
         assert_eq!(
             group.pending_bytes, 0,
             "explicit flush should drain pending local sync bytes"
@@ -2975,7 +2975,7 @@ fn release_fh_forces_strict_local_sync_when_last_handle_still_owns_dirty_state()
         .insert(ino, dirty_attr.clone());
 
     rt.block_on(async {
-        let mut group = vfs.state.write_buffer.local_sync_group.lock().await;
+        let mut group = vfs.state.local_dirty.local_sync_group.lock().await;
         group.pending_bytes = 8192;
         group.last_sync_at = Instant::now();
     });
@@ -3025,7 +3025,7 @@ fn release_fh_forces_strict_local_sync_when_last_handle_still_owns_dirty_state()
         "last-handle release should account for the pending local sync bytes"
     );
     rt.block_on(async {
-        let group = vfs.state.write_buffer.local_sync_group.lock().await;
+        let group = vfs.state.local_dirty.local_sync_group.lock().await;
         assert_eq!(
             group.pending_bytes, 0,
             "last-handle release should drain pending local sync bytes"
