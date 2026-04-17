@@ -14,8 +14,6 @@ pub(super) struct VfsBootstrapPlan {
     readahead_base_width: u32,
     pub(super) readahead_max_width: u32,
     readahead_min_prefetch: u32,
-    readahead_seq_step: u8,
-    readahead_random_penalty: u8,
     fetch_aimd_config: crate::aimd::AimdConfig,
     upload_aimd_config: crate::aimd::AimdConfig,
     max_dirty_bytes: usize,
@@ -135,8 +133,6 @@ impl VfsBootstrapPlan {
             readahead_base_width,
             readahead_max_width,
             readahead_min_prefetch,
-            readahead_seq_step: config.readahead_seq_step,
-            readahead_random_penalty: config.readahead_random_penalty,
             fetch_aimd_config: build_fetch_aimd_config(readahead_max_width, config),
             upload_aimd_config: build_upload_aimd_config(config),
             max_dirty_bytes,
@@ -314,9 +310,6 @@ impl VfsBootstrapResources {
             plan.readahead_base_width,
             plan.readahead_max_width,
             plan.readahead_min_prefetch,
-            plan.readahead_seq_step,
-            plan.readahead_random_penalty,
-            4,
         ));
         let dir_prefetch = Arc::new(DirAccessTracker::new(2));
         let (prefetch_tx, prefetch_rx) = tokio::sync::mpsc::unbounded_channel::<PrefetchWorkItem>();

@@ -8,9 +8,9 @@
 //! Each inode gets a compact `ReadState` that tracks only the previous block
 //! and whether the stream is currently sequential. Once a read crosses a block
 //! boundary contiguously, the tracker opens a fixed prefetch window derived
-//! from the configured base/minimum settings. Large seeks or long idle gaps
-//! reset the stream back to "cold" so the next reader has to prove sequential
-//! progress again.
+//! from the configured base/minimum settings. Non-sequential jumps or long
+//! idle gaps reset the stream back to "cold" so the next reader has to prove
+//! sequential progress again.
 //!
 //! ## In-flight deduplication
 //!
@@ -38,9 +38,8 @@ pub struct ReadAheadPolicy {
     pub prefetch_enabled: bool,
 }
 
-/// Maximum sequential score.  Capped to prevent unbounded ramp-up.
+/// Maximum idle gap before the read state resets back to cold, in microseconds.
 const READ_STATE_IDLE_RESET_US: u64 = 10_000_000; // 10 s
-const LARGE_SEEK_RESET_BLOCK_DELTA: u32 = 256;
 const READAHEAD_DASHMAP_SHARDS: usize = 256;
 
 // =============================================================================
@@ -145,8 +144,6 @@ impl ReadAheadTracker {
                 state.current_width = base_width;
             }
         } else {
-            let _large_seek_jump = state.last_block != u32::MAX
-                && first_block.abs_diff(state.last_block) >= LARGE_SEEK_RESET_BLOCK_DELTA;
             state.sequential_ready = false;
             state.current_width = base_width;
         }
@@ -181,28 +178,16 @@ impl ReadAheadTracker {
     /// `width` — maximum number of blocks to prefetch ahead (e.g. 8 = 32 MB
     /// look-ahead with 4 MB blocks).
     pub fn new(width: u32) -> Self {
-        Self::new_with_bounds(width, width, 1, 1, 2, 4)
+        Self::new_with_bounds(width, width, 1)
     }
 
-    /// Create a tracker with custom scoring and prefetch tuning.
-    pub fn new_with_tuning(
-        width: u32,
-        min_prefetch_on_seq: u32,
-        _sequential_step: u8,
-        _random_penalty: u8,
-    ) -> Self {
-        Self::new_with_bounds(width, width, min_prefetch_on_seq, 1, 1, 4)
+    /// Create a tracker with a custom sequential prefetch floor.
+    pub fn new_with_tuning(width: u32, min_prefetch_on_seq: u32) -> Self {
+        Self::new_with_bounds(width, width, min_prefetch_on_seq)
     }
 
-    /// Create a tracker with dynamic width bounds and custom tuning.
-    pub fn new_with_bounds(
-        base_width: u32,
-        max_width: u32,
-        min_prefetch_on_seq: u32,
-        _sequential_step: u8,
-        _random_penalty: u8,
-        _sequential_ramp_trigger: u16,
-    ) -> Self {
+    /// Create a tracker with dynamic width bounds.
+    pub fn new_with_bounds(base_width: u32, max_width: u32, min_prefetch_on_seq: u32) -> Self {
         let base_width = base_width.max(1);
         let width = max_width.max(base_width);
         let min_prefetch_on_seq = min_prefetch_on_seq.max(1).min(width);
@@ -345,12 +330,6 @@ mod tests {
     fn test_no_prefetch_on_first_read() {
         let tracker = ReadAheadTracker::new(8);
         let blocks = tracker.record_read(1, 0, 0);
-        // First read — no prior state, score starts at 0 → increments to 1.
-        // Min(width=8, score=1) = 1 block prefetch.
-        // BUT score was 0 before increment... let me trace:
-        // initial score=0, last_block=u32::MAX
-        // is_sequential: last_block=MAX → false → score = 0.saturating_sub(2) = 0
-        // result: score=0 → no prefetch
         assert!(
             blocks.is_empty(),
             "first read of a brand-new inode should not trigger prefetch"
@@ -359,7 +338,7 @@ mod tests {
 
     #[test]
     fn test_sequential_ramp_up() {
-        let tracker = ReadAheadTracker::new_with_bounds(8, 64, 1, 8, 2, 2);
+        let tracker = ReadAheadTracker::new_with_bounds(8, 64, 1);
         let mut t = 1_000_000u64;
 
         // First read: block 0 establishes baseline state only.
@@ -403,7 +382,7 @@ mod tests {
 
     #[test]
     fn test_random_seek_scales_back_to_base_width() {
-        let tracker = ReadAheadTracker::new_with_bounds(8, 64, 1, 8, 2, 2);
+        let tracker = ReadAheadTracker::new_with_bounds(8, 64, 1);
         let mut t = 1_000_000u64;
 
         let _ = tracker.record_read_at_micros(1, 0, 0, t);
@@ -424,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_large_span_opens_the_same_fixed_window() {
-        let tracker = ReadAheadTracker::new_with_bounds(8, 128, 1, 8, 2, 4);
+        let tracker = ReadAheadTracker::new_with_bounds(8, 128, 1);
         let mut t = 1_000_000u64;
 
         // Establish baseline state.
@@ -438,24 +417,19 @@ mod tests {
     }
 
     #[test]
-    fn test_random_read_kills_score() {
+    fn test_random_jump_resets_prefetch_state() {
         let tracker = ReadAheadTracker::new(8);
 
-        // Build up sequential score
+        // Build up sequential state.
         for i in 0..8u32 {
             tracker.record_read(1, i, i);
         }
-        // After 7 sequential reads (0 is skipped — first read sees no prior state),
-        // score is around 7.
 
-        // Now do 5 random jumps, each to a completely different address.
-        // Each decrements score by 2, so 4 random reads take score from 7 → 0.
         let jump_positions = [1000u32, 50000, 200000, 999999, 123456];
         for pos in jump_positions {
             let _ = tracker.record_read(1, pos, pos);
         }
 
-        // After 5 random jumps from ~7, score should be 0 (7 - 2*4 = -1 → 0).
         let final_blocks = tracker.record_read(1, 9_000_000, 9_000_000);
         assert!(
             final_blocks.is_empty(),
@@ -551,10 +525,10 @@ mod tests {
     }
 
     #[test]
-    fn test_same_block_reads_do_not_decay_score() {
+    fn test_same_block_reads_keep_prefetch_active() {
         let tracker = ReadAheadTracker::new(8);
 
-        // Establish initial sequential signal (score=1).
+        // Establish initial sequential signal.
         let _ = tracker.record_read(1, 0, 0);
         let _ = tracker.record_read(1, 1, 1);
 
@@ -598,7 +572,7 @@ mod tests {
 
         tracker.evict(1);
 
-        // After evict, state is gone — next read should not see sequential score
+        // After evict, state is gone — next read should not see prior sequential state.
         let p = tracker.record_read(1, 6, 6);
         assert!(
             p.is_empty(),
@@ -622,7 +596,7 @@ mod tests {
 
     #[test]
     fn test_aggressive_min_prefetch_window() {
-        let tracker = ReadAheadTracker::new_with_tuning(64, 16, 4, 2);
+        let tracker = ReadAheadTracker::new_with_tuning(64, 16);
 
         // Initial read establishes baseline (no prefetch yet).
         let p0 = tracker.record_read(1, 0, 0);
@@ -638,8 +612,8 @@ mod tests {
     }
 
     #[test]
-    fn test_large_seek_hard_resets_window_and_prefetch_state() {
-        let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4, 8, 2, u16::MAX);
+    fn test_far_jump_resets_window_and_prefetch_state() {
+        let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4);
         let mut t = 1_000_000u64;
         let _ = tracker.record_read_at_micros(1, 0, 0, t);
 
@@ -649,24 +623,19 @@ mod tests {
         }
         assert_eq!(tracker.debug_width(1), Some(16));
 
-        // Jump far enough to trigger hard reset path.
+        // A far non-sequential jump should clear the current sequential state.
         t = t.saturating_add(1_000);
-        let prefetch = tracker.record_read_at_micros(
-            1,
-            32 + LARGE_SEEK_RESET_BLOCK_DELTA + 32,
-            32 + LARGE_SEEK_RESET_BLOCK_DELTA + 32,
-            t,
-        );
+        let prefetch = tracker.record_read_at_micros(1, 320, 320, t);
         assert!(
             prefetch.is_empty(),
-            "large seek should reset score and suppress immediate prefetch"
+            "far jumps should reset sequential state and suppress immediate prefetch"
         );
         assert_eq!(tracker.debug_width(1), Some(16));
     }
 
     #[test]
     fn test_idle_gap_resets_window_before_prefetch_resumes() {
-        let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4, 8, 2, u16::MAX);
+        let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4);
         let mut t = 1_000_000u64;
         let _ = tracker.record_read_at_micros(1, 0, 0, t);
         for block in 1..=8u32 {
@@ -693,7 +662,7 @@ mod tests {
 
     #[test]
     fn test_predictable_window_stays_stable_across_sequential_reads() {
-        let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4, 8, 2, 2);
+        let tracker = ReadAheadTracker::new_with_bounds(16, 256, 4);
         let mut t = 1_000_000u64;
         let _ = tracker.record_read_at_micros(1, 0, 0, t);
 

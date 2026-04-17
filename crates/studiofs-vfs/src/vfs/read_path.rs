@@ -485,7 +485,7 @@ impl<'a> DataReader<'a> {
                         key,
                         block_offset = block.offset,
                         block_length = block.length,
-                        "prefetch_remote_blocks_for_reader: S3 object not found during read prefetch — object missing from S3 (upload not complete or evicted?)"
+                        "populate_missing_remote_blocks: S3 object not found during read prefetch — object missing from S3 (upload not complete or evicted?)"
                     );
                     Ok::<(), VfsError>(())
                 }
@@ -588,7 +588,6 @@ impl<'a> DataReader<'a> {
                                 read,
                                 "data_reader: short local backend read for committed block; evicting and refetching"
                             );
-                            dst.fill(0);
                             if let Err(evict_error) =
                                 vfs.block_store_remove_async(block.object_id).await
                             {

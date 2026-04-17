@@ -273,9 +273,9 @@ impl FetchScheduler {
 
     /// Fetch a block after the caller already confirmed a local cache miss.
     ///
-    /// This preserves singleflight and cache population but skips the initial
-    /// whole-block cache lookup so the read path does not immediately repeat a
-    /// just-failed direct `read_into()` probe.
+    /// This preserves singleflight and cache population while skipping the
+    /// eager pre-singleflight whole-block cache lookup, so the read path does
+    /// not immediately repeat a just-failed direct `read_into()` probe.
     pub async fn fetch_block_after_local_miss(
         &self,
         object_id: u64,
@@ -354,7 +354,27 @@ impl FetchScheduler {
             };
 
             match action {
-                Action::Fetch => break,
+                Action::Fetch => {
+                    if matches!(local_cache_hint, LocalCacheHint::ConfirmedMiss) {
+                        match self.block_store_get_async(object_id).await {
+                            Ok(Some(cached)) => {
+                                self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+                                if let Some((_, tx)) = self.inflight.remove(&object_id) {
+                                    let _ = tx.send(true);
+                                }
+                                return Ok(cached);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                if let Some((_, tx)) = self.inflight.remove(&object_id) {
+                                    let _ = tx.send(false);
+                                }
+                                return Err(error);
+                            }
+                        }
+                    }
+                    break;
+                }
                 Action::Wait(mut rx) => {
                     // Wait for the fetcher to finish (with a generous timeout
                     // to avoid infinite hangs).
@@ -1152,6 +1172,40 @@ mod tests {
                 scheduler.metrics.local_cache_io_calls.load(Ordering::Relaxed),
                 io_calls_before + 1,
                 "waiter should perform exactly one cache get after notification"
+            );
+        });
+    }
+
+    #[test]
+    fn fetch_block_after_local_miss_rechecks_cache_when_becoming_fetcher() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "recheck-cache-before-fetch");
+
+        rt.block_on(async {
+            let scheduler = vfs.fetch_scheduler().clone();
+            let object_id = 0xFA88;
+            let keys = vec!["unused/test/key".to_string()];
+            let io_calls_before = scheduler
+                .metrics
+                .local_cache_io_calls
+                .load(Ordering::Relaxed);
+
+            vfs.local_block_backend()
+                .put(object_id, b"payload-from-cache", false)
+                .expect("seed cache for fetcher recheck");
+
+            let data = scheduler
+                .fetch_block_after_local_miss(object_id, &keys)
+                .await
+                .expect("fetcher-side cache recheck should avoid remote fetch");
+            assert_eq!(data.as_ref(), b"payload-from-cache");
+            assert_eq!(
+                scheduler
+                    .metrics
+                    .local_cache_io_calls
+                    .load(Ordering::Relaxed),
+                io_calls_before + 1,
+                "fetcher should do exactly one cache get when rechecking after a confirmed miss"
             );
         });
     }
