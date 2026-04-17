@@ -50,7 +50,7 @@ pub(super) struct BenchmarkReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) advanced_metrics: Option<AdvancedMetricsReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) buffered_read_comparison: Option<MountedBufferedReadComparisonReport>,
+    pub(super) local_first_read_comparison: Option<MountedLocalFirstReadComparisonReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) stream_results: Option<Vec<StreamResultReport>>,
     pub(super) writes: OpReport,
@@ -58,14 +58,14 @@ pub(super) struct BenchmarkReport {
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MountedBufferedReadComparisonReport {
+pub(super) struct MountedLocalFirstReadComparisonReport {
     pub(super) cache_path: String,
     pub(super) upload_dir: String,
-    pub(super) phases: Vec<MountedBufferedReadPhaseReport>,
+    pub(super) phases: Vec<MountedLocalFirstReadPhaseReport>,
 }
 
 #[derive(Debug, Serialize)]
-pub(super) struct MountedBufferedReadPhaseReport {
+pub(super) struct MountedLocalFirstReadPhaseReport {
     pub(super) phase: String,
     pub(super) wait_target: String,
     pub(super) target_state_observed: bool,
@@ -510,7 +510,7 @@ pub(crate) fn sample_report() -> BenchmarkReport {
                 },
             }),
         }),
-        buffered_read_comparison: None,
+        local_first_read_comparison: None,
         stream_results: None,
         writes: OpReport {
             operations: 16,

@@ -273,7 +273,7 @@ pub fn run(
         if detection.has_cache_v3_contract() {
             "none"
         } else {
-            "mount will provision the Cache 3.0 layout on first use"
+            "mount will provision the local cache layout on first use"
         }
     } else {
         "inspect the cache root manually"
@@ -290,7 +290,7 @@ pub fn run(
     println!("  Cache layout state:  {}", contract_state);
     if let Some(detection) = cache_backend_detection.as_ref() {
         println!(
-            "  Cache 3.0 marker:    {} ({})",
+            "  Local cache marker:  {} ({})",
             detection.layout.layout_marker.display(),
             if detection.has_cache_v3_contract() {
                 "present"
@@ -299,7 +299,7 @@ pub fn run(
             }
         );
         println!(
-            "  Cache 3.0 index:     {} ({})",
+            "  Local cache index:   {} ({})",
             detection.layout.redb_index_path.display(),
             if detection.v3_index_exists {
                 "present"
@@ -308,7 +308,7 @@ pub fn run(
             }
         );
         println!(
-            "  Cache 3.0 payload:   {} ({})",
+            "  Local cache payload: {} ({})",
             detection.layout.payload_blocks_dir.display(),
             if detection.v3_payload_blocks_dir_exists {
                 "present"
@@ -366,8 +366,8 @@ pub fn run(
             println!("  Backend tag:               {}", snapshot.backend_tag);
             println!("  Uptime:                    {:.1}s", snapshot.uptime_secs);
             println!(
-                "  flush_ordered calls:       {} ({:.2}/s)",
-                snapshot.flush_ordered_calls, snapshot.flush_ordered_calls_per_sec
+                "  flush barrier calls:       {} ({:.2}/s)",
+                snapshot.flush_barrier_calls, snapshot.flush_barrier_calls_per_sec
             );
             println!(
                 "  block_store_sync_data calls: {} ({:.2}/s)",
@@ -583,8 +583,8 @@ mod tests {
             generated_unix_ms: 123,
             uptime_secs: 4.0,
             backend_tag: "cache-v3".to_string(),
-            flush_ordered_calls: 11,
-            flush_ordered_calls_per_sec: 2.5,
+            flush_barrier_calls: 11,
+            flush_barrier_calls_per_sec: 2.5,
             block_store_sync_data: Default::default(),
             local_cache_io: Default::default(),
             winfsp_callbacks: Default::default(),
@@ -602,7 +602,7 @@ mod tests {
         let loaded = read_write_path_observability(tmp.path()).expect("metrics");
         assert_eq!(loaded.0, metrics_path);
         assert_eq!(loaded.1.backend_tag, "cache-v3");
-        assert_eq!(loaded.1.flush_ordered_calls, 11);
+        assert_eq!(loaded.1.flush_barrier_calls, 11);
     }
 
     #[test]

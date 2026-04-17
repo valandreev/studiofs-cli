@@ -16,7 +16,7 @@ studiofs-cli/
     ├── studiofs/           # CLI binary (main.rs)
     ├── studiofs-meta/      # Metadata engine (PostgreSQL + Redb)
     ├── studiofs-data/      # S3 object storage layer
-    ├── studiofs-cache/     # Block caching layer
+    ├── studiofs-cache/     # Local cache backend + staged writeback pipeline
     ├── studiofs-vfs/       # Virtual File System implementation
     ├── studiofs-fuse/      # Unix FUSE bridge
     └── studiofs-winfsp/    # Windows WinFSP bridge
@@ -238,15 +238,15 @@ AGENTS snapshot differ from that contract, the contract wins.
 
 ### Data Flow
 
-1. **Write Path**: Application → per-file `WriteBuffer` → local block backend → `sync_data()` → local extent metadata → upload queue
-2. **Read Path**: Application → VFS → Cache lookup → S3 fetch (if miss) → Response
-3. **Sync Path**: VFS → PostgreSQL delta batches → Remote clients invalidate cache
+1. **Write Path**: Application → handle writer state → local cache backend → `sync_data()` → local unpublished slices/attrs → background upload + publish
+2. **Read Path**: Application → VFS → writer state → local unpublished state → published state → local cache / S3 fetch as needed
+3. **Sync Path**: local publish + PostgreSQL delta batches → remote mounts invalidate/refresh toward the newer published state
 
 ### Cache Note
 
 - Cache-v2 storage code has been removed from the workspace.
-- Cache 3.0 (`v3`) is the only local backend implementation.
-- `UploadCoordinator` owns upload queue + pending-upload pinning for production.
+- The current on-disk local cache backend lives under the `v3` subtree; treat that as an implementation detail, not the product architecture name.
+- `CachedStore` owns staged writeback queue management and pending-upload pinning for production mounts.
 - `BenchmarkCache` owns the lightweight in-memory benchmark cache surface.
 
 ### Environment Variables
@@ -326,7 +326,7 @@ VfsState (composed of 10 subsystems)
 ├── namespace: NamespaceState         # Dentry cache, path shortcuts, attr cache
 ├── acl: AclState                     # ACL state (minimal, placeholder)
 ├── incarnation: IncarnationState     # Inode incarnation tracking
-├── write_buffer: WriteBufferState    # Pending per-file blocks for writes
+├── write_buffer: local dirty-state staging  # Current implementation home for pending local bytes
 ├── read: ReadState                   # Foreground read tracking, P90 latency, prefetch hints
 ├── file_lock: FileLockState          # File locking state
 ├── shutdown: ShutdownState           # Shutdown flags, tokens, task handles
@@ -342,7 +342,7 @@ have a stable placeholder.
 To prevent deadlocks, a strict lock ordering is enforced (Tier 0 = highest priority):
 
 1. **Tier 1**: `ShutdownState` — shutdown flags are checked before any other operation
-2. **Tier 2**: `WriteBufferState` — pending write blocks
+2. **Tier 2**: `write_buffer` subsystem — pending local dirty-state bookkeeping
 3. **Tier 3**: reserved `DirtyBufferState` slot — no active subsystem
 4. **Tier 4**: reserved legacy `IngressState` slot — no active subsystem
 5. **Tier 5**: `NamespaceState` — dentry/attr caches
@@ -371,6 +371,6 @@ fn new(
 
 1. **State access**: Use `self.state.subsystem.field` instead of direct fields on `VfsState`
 2. **Lock release before IO**: Always release mutex locks before performing local block backend writes, metadata flushes, file deletions, or ingress artifact cleanup
-3. **Batch operations**: Prefer batch local block backend / metadata operations when draining `WriteBuffer`; avoid per-block IO while holding hot locks
+3. **Batch operations**: Prefer batch local block backend / metadata operations when draining local dirty state; avoid per-block IO while holding hot locks
 4. **Atomic ordering**: Use `Release`/`Acquire` for critical data (throttling metrics), `Relaxed` for non-critical counters
 5. **notify_waiters outside lock**: Always call `notify_waiters()` after releasing the mutex to avoid lock contention

@@ -79,7 +79,7 @@ impl PrefetchReadContext {
     }
 }
 
-struct PrefetchHintPlanner<'a> {
+struct PrefetchBatchBuilder<'a> {
     vfs: &'a StudioVfs,
     ino: Ino,
     stream_id: u64,
@@ -88,7 +88,7 @@ struct PrefetchHintPlanner<'a> {
     policy: AccessPolicy,
 }
 
-impl<'a> PrefetchHintPlanner<'a> {
+impl<'a> PrefetchBatchBuilder<'a> {
     fn new(
         vfs: &'a StudioVfs,
         ino: Ino,
@@ -519,7 +519,7 @@ impl StudioVfs {
         last_block: u32,
         policy: AccessPolicy,
     ) -> Vec<PrefetchBatch> {
-        PrefetchHintPlanner::new(self, ino, stream_id, first_block, last_block, policy)
+        PrefetchBatchBuilder::new(self, ino, stream_id, first_block, last_block, policy)
             .plan_batches()
     }
 }
@@ -595,8 +595,7 @@ mod tests {
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-hint-range-merge");
         let ino = 9_301;
         let stream_id = 77;
-        let policy =
-            AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_classifier);
+        let policy = AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_tracker);
 
         vfs.enqueue_prefetch_hint(ino, stream_id, policy, &[(2, 0, 1), (3, 0, 1)]);
         assert_eq!(
@@ -632,12 +631,11 @@ mod tests {
     #[test]
     fn plan_prefetch_batches_from_hint_clears_stale_hint_for_missing_inode() {
         let tmp = TempDir::new().expect("tempdir");
-        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-planner-missing-inode");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "prefetch-reader-missing-inode");
         let ino = 9_302;
         let stream_id = 88;
         let key = ReadStreamKey { ino, stream_id };
-        let policy =
-            AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_classifier);
+        let policy = AccessPolicy::from_class(AccessClass::SequentialMediaRead, vfs.access_tracker);
 
         let _ = vfs
             .readahead

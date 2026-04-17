@@ -6,7 +6,7 @@
 //! # Lock Ordering (Tier 1 = highest priority)
 //!
 //! 1.  `ShutdownState` — shutdown flags
-//! 2.  `WriteBufferState` — pending write blocks
+//! 2.  `write_buffer` subsystem — pending local dirty-state bookkeeping
 //! 3.  reserved legacy `DirtyBufferState` slot — kept for ordering compatibility
 //! 4.  reserved legacy `IngressState` slot — no active subsystem
 //! 5.  `NamespaceState` — dentry/attr caches
@@ -36,7 +36,7 @@ use tracing::warn;
 pub enum LockTier {
     /// Tier 1: ShutdownState
     Shutdown = 1,
-    /// Tier 2: WriteBufferState
+    /// Tier 2: `write_buffer` subsystem
     WriteBuffer = 2,
     /// Tier 3: reserved legacy DirtyBufferState slot
     DirtyBuffer = 3,
@@ -75,7 +75,7 @@ impl LockTier {
     pub fn name(&self) -> &'static str {
         match self {
             LockTier::Shutdown => "Shutdown",
-            LockTier::WriteBuffer => "WriteBuffer",
+            LockTier::WriteBuffer => "LocalDirtyState",
             LockTier::DirtyBuffer => "DirtyBuffer",
             LockTier::Ingress => "Ingress",
             LockTier::Namespace => "Namespace",

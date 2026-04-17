@@ -295,8 +295,8 @@ impl StudioVfs {
             self.state.read.decrement_active_access_class(class);
         }
 
-        // Phase 1: flush pending WriteBuffer state inline into the local backend +
-        // metadata so local durability is established before shutdown.
+        // Phase 1: flush pending local dirty state inline into the local backend
+        // + metadata so local durability is established before shutdown.
         let dirty_before = self.total_pending_write_buffer_bytes();
         info!(
             dirty_bytes = dirty_before,
@@ -382,8 +382,8 @@ impl StudioVfs {
         let recoverable_on_restart = dirty_after == 0 && local_payload_sync_ok;
         let shutdown_snapshot = VfsZeroIoShutdownSnapshot {
             generated_unix_ms: now_unix_millis(),
-            accepted_write_buffer_bytes_before: dirty_before as u64,
-            accepted_write_buffer_bytes_after: dirty_after as u64,
+            accepted_local_dirty_bytes_before: dirty_before as u64,
+            accepted_local_dirty_bytes_after: dirty_after as u64,
             pending_uploads_after,
             uploader_drained_before_cancel: drained,
             metadata_flush_outcome: metadata_flush_outcome.to_string(),
@@ -395,8 +395,8 @@ impl StudioVfs {
             "shutdown_local_state",
             "zeroio graceful shutdown local durability",
             serde_json::json!({
-                "accepted_write_buffer_bytes_before": shutdown_snapshot.accepted_write_buffer_bytes_before,
-                "accepted_write_buffer_bytes_after": shutdown_snapshot.accepted_write_buffer_bytes_after,
+                "accepted_local_dirty_bytes_before": shutdown_snapshot.accepted_local_dirty_bytes_before,
+                "accepted_local_dirty_bytes_after": shutdown_snapshot.accepted_local_dirty_bytes_after,
                 "pending_uploads_after": shutdown_snapshot.pending_uploads_after,
                 "uploader_drained_before_cancel": shutdown_snapshot.uploader_drained_before_cancel,
                 "metadata_flush_outcome": shutdown_snapshot.metadata_flush_outcome,

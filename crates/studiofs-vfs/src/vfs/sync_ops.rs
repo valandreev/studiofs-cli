@@ -374,7 +374,7 @@ impl StudioVfs {
             ino,
             offset,
             data.len(),
-            self.access_classifier,
+            self.access_tracker,
         );
         let result = async {
             self.enforce_access(ino, AccessLevel::ReadWrite)?;

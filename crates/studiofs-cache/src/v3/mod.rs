@@ -1,8 +1,8 @@
-//! Cache 3.0 contract and local backend.
+//! Current `v3` local-cache contract and backend.
 //!
 //! This module defines:
-//! - the non-mutating detection contract for Cache 3.0 layout state;
-//! - the active Cache 3.0 local block backend backed by a file-per-block
+//! - the non-mutating detection contract for the current `v3` layout state;
+//! - the active local block backend backed by a file-per-block
 //!   payload store plus redb lifecycle index.
 
 use std::collections::{HashMap, HashSet};
@@ -121,14 +121,14 @@ pub fn detect_cache_backends(cache_root: &Path) -> io::Result<CacheBackendDetect
     })
 }
 
-/// Configuration for opening the Cache 3.0 local backend.
+/// Configuration for opening the current `v3` local backend.
 #[derive(Debug, Clone)]
 pub struct CacheV3LocalBlockBackendConfig {
     pub cache_root: PathBuf,
     pub volume_uuid: [u8; 16],
 }
 
-/// Payload-store sync cadence policy for Cache 3.0.
+/// Payload-store sync cadence policy for the current `v3` local backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CacheV3PayloadSyncMode {
     /// Keep per-write file+directory barriers at payload commit time.
@@ -138,7 +138,7 @@ pub enum CacheV3PayloadSyncMode {
     Fast,
 }
 
-/// Errors returned while opening the Cache 3.0 local backend.
+/// Errors returned while opening the current `v3` local backend.
 #[derive(Debug, thiserror::Error)]
 pub enum CacheV3LocalBlockBackendError {
     #[error("I/O error: {0}")]
@@ -174,7 +174,7 @@ impl CacheV3LocalBlockBackendError {
     }
 }
 
-/// Cache 3.0 local backend backed by file-per-block payload files and redb index.
+/// Current `v3` local backend backed by file-per-block payload files and redb index.
 #[derive(Debug)]
 pub struct CacheV3LocalBlockBackend {
     layout: CacheV3Layout,

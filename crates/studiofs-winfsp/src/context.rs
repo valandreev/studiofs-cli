@@ -175,8 +175,8 @@ impl SendConstBuffer {
 /// As part of SFS-122, StudioFS removed the Windows direct-I/O product surface,
 /// so `FILE_NO_INTERMEDIATE_BUFFERING` and `FILE_WRITE_THROUGH` no longer
 /// select an alternate read/write data plane. What still matters here is the
-/// actual access mask: treating every Windows handle as RDWR confuses the VFS
-/// classifier, sticky-error reporting, and last-handle release policy. The
+/// actual access mask: treating every Windows handle as RDWR confuses VFS
+/// access tracking, sticky-error reporting, and last-handle release policy. The
 /// stricter write barrier policy for write-through / unbuffered handles is
 /// derived separately from `CreateOptions`.
 fn open_flags_from_access(granted_access: FILE_ACCESS_RIGHTS, _create_options: u32) -> OpenFlags {
@@ -2328,8 +2328,8 @@ mod tests {
         (tmp, vfs, ctx, queue)
     }
 
-    fn flush_ordered_calls(vfs: &StudioVfs) -> u64 {
-        vfs.write_path_observability_snapshot().flush_ordered_calls
+    fn flush_barrier_calls(vfs: &StudioVfs) -> u64 {
+        vfs.write_path_observability_snapshot().flush_barrier_calls
     }
 
     fn payload_persist_calls(vfs: &StudioVfs) -> u64 {
@@ -2774,11 +2774,11 @@ mod tests {
         })
         .expect("pre-clean flush");
 
-        let before = flush_ordered_calls(&vfs);
+        let before = flush_barrier_calls(&vfs);
         let flushed = ctx
             .flush_callback_path_if_dirty(attr.ino, Some(fh))
             .expect("callback flush guard");
-        let after = flush_ordered_calls(&vfs);
+        let after = flush_barrier_calls(&vfs);
         assert!(
             !flushed,
             "clean inode should skip callback-driven synchronous flush"
@@ -2849,7 +2849,7 @@ mod tests {
 
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
-        let flush_calls_before = flush_ordered_calls(&vfs);
+        let flush_calls_before = flush_barrier_calls(&vfs);
 
         ctx.run_cleanup_non_delete_callback(attr.ino, fh)
             .expect("cleanup callback");
@@ -2859,7 +2859,7 @@ mod tests {
         );
         let callbacks_after_cleanup = winfsp_callbacks(&vfs);
         let barriers_after_cleanup = winfsp_foreground_flushes(&vfs);
-        let flush_calls_after_cleanup = flush_ordered_calls(&vfs);
+        let flush_calls_after_cleanup = flush_barrier_calls(&vfs);
         assert_eq!(
             callbacks_after_cleanup.cleanup,
             callbacks_before.cleanup + 1,
@@ -2885,7 +2885,7 @@ mod tests {
         );
         let callbacks_after_close = winfsp_callbacks(&vfs);
         let barriers_after_close = winfsp_foreground_flushes(&vfs);
-        let flush_calls_after_close = flush_ordered_calls(&vfs);
+        let flush_calls_after_close = flush_barrier_calls(&vfs);
         assert_eq!(
             callbacks_after_close.close,
             callbacks_before.close + 1,
@@ -2919,11 +2919,11 @@ mod tests {
         })
         .expect("pre-clean flush");
 
-        let before = flush_ordered_calls(&vfs);
+        let before = flush_barrier_calls(&vfs);
         let flushed = ctx
             .flush_callback_path_if_dirty(attr.ino, None)
             .expect("callback flush guard");
-        let after = flush_ordered_calls(&vfs);
+        let after = flush_barrier_calls(&vfs);
         assert!(!flushed, "clean inode should skip flush callback barrier");
         assert_eq!(
             after, before,
@@ -2955,7 +2955,7 @@ mod tests {
 
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
-        let flush_calls_before = flush_ordered_calls(&vfs);
+        let flush_calls_before = flush_barrier_calls(&vfs);
         let ctx = Arc::new(ctx);
         let start = Arc::new(Barrier::new(4));
         let mut joins = Vec::new();
@@ -2974,7 +2974,7 @@ mod tests {
         }
         let callbacks_after_cleanup = winfsp_callbacks(&vfs);
         let barriers_after_cleanup = winfsp_foreground_flushes(&vfs);
-        let flush_calls_after_cleanup = flush_ordered_calls(&vfs);
+        let flush_calls_after_cleanup = flush_barrier_calls(&vfs);
         assert_eq!(
             callbacks_after_cleanup.cleanup,
             callbacks_before.cleanup + 4,
@@ -3112,7 +3112,7 @@ mod tests {
         let mut file_info = winfsp::filesystem::FileInfo::default();
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
-        let flush_calls_before = flush_ordered_calls(&vfs);
+        let flush_calls_before = flush_barrier_calls(&vfs);
         let payload_persist_before = payload_persist_calls(&vfs);
         let sync_calls_before = sync_data_calls(&vfs);
 
@@ -3136,7 +3136,7 @@ mod tests {
 
         let callbacks_after = winfsp_callbacks(&vfs);
         let barriers_after = winfsp_foreground_flushes(&vfs);
-        let flush_calls_after = flush_ordered_calls(&vfs);
+        let flush_calls_after = flush_barrier_calls(&vfs);
         let payload_persist_after = payload_persist_calls(&vfs);
         let sync_calls_after = sync_data_calls(&vfs);
         assert_eq!(
@@ -3216,7 +3216,7 @@ mod tests {
             LocalSyncPolicy::Strict,
         );
         let mut file_info = winfsp::filesystem::FileInfo::default();
-        let flush_calls_before = flush_ordered_calls(&vfs);
+        let flush_calls_before = flush_barrier_calls(&vfs);
         let payload_persist_before = payload_persist_calls(&vfs);
         let sync_calls_before = sync_data_calls(&vfs);
 
@@ -3244,7 +3244,7 @@ mod tests {
             "strict WinFSP write policy should still force the local payload sync barrier in write()"
         );
         assert_eq!(
-            flush_ordered_calls(&vfs),
+            flush_barrier_calls(&vfs),
             flush_calls_before,
             "strict handle-writer writes now materialize directly without routing through the legacy ordered flush path"
         );
@@ -3275,7 +3275,7 @@ mod tests {
 
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
-        let flush_calls_before = flush_ordered_calls(&vfs);
+        let flush_calls_before = flush_barrier_calls(&vfs);
         let ctx = Arc::new(ctx);
         // Keep the fanout intentionally small so constrained Windows runners
         // still exercise the coalescing path without oversubscribing threads.
@@ -3297,7 +3297,7 @@ mod tests {
 
         let callbacks_after = winfsp_callbacks(&vfs);
         let barriers_after = winfsp_foreground_flushes(&vfs);
-        let flush_calls_after = flush_ordered_calls(&vfs);
+        let flush_calls_after = flush_barrier_calls(&vfs);
         assert_eq!(
             callbacks_after.flush,
             callbacks_before.flush + CONCURRENT_FLUSH_CALLBACKS as u64,
@@ -3379,7 +3379,7 @@ mod tests {
 
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
-        let flush_calls_before = flush_ordered_calls(&vfs);
+        let flush_calls_before = flush_barrier_calls(&vfs);
 
         ctx.run_cleanup_non_delete_callback(attr.ino, fh)
             .expect("cleanup callback");
@@ -3403,7 +3403,7 @@ mod tests {
             .expect("explicit flush callback");
         let callbacks_after_flush = winfsp_callbacks(&vfs);
         let barriers_after_flush = winfsp_foreground_flushes(&vfs);
-        let flush_calls_after_flush = flush_ordered_calls(&vfs);
+        let flush_calls_after_flush = flush_barrier_calls(&vfs);
         assert!(
             !ctx.has_deferred_cleanup_hint(attr.ino),
             "explicit flush should clear the deferred cleanup hint before close"
@@ -3430,7 +3430,7 @@ mod tests {
         ctx.run_close_callback(attr.ino, fh);
         let callbacks_after_close = winfsp_callbacks(&vfs);
         let barriers_after_close = winfsp_foreground_flushes(&vfs);
-        let flush_calls_after_close = flush_ordered_calls(&vfs);
+        let flush_calls_after_close = flush_barrier_calls(&vfs);
         assert_eq!(
             callbacks_after_close.close,
             callbacks_before.close + 1,
@@ -3483,7 +3483,7 @@ mod tests {
 
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
-        let flush_calls_before = flush_ordered_calls(&vfs);
+        let flush_calls_before = flush_barrier_calls(&vfs);
 
         ctx.run_cleanup_non_delete_callback(attr.ino, fh1)
             .expect("cleanup callback");
@@ -3495,7 +3495,7 @@ mod tests {
         ctx.run_close_callback(attr.ino, fh1);
         let callbacks_after_first_close = winfsp_callbacks(&vfs);
         let barriers_after_first_close = winfsp_foreground_flushes(&vfs);
-        let flush_calls_after_first_close = flush_ordered_calls(&vfs);
+        let flush_calls_after_first_close = flush_barrier_calls(&vfs);
         assert!(
             !ctx.has_deferred_cleanup_hint(attr.ino),
             "closing a non-final handle should keep the inode hint-free"
@@ -3526,7 +3526,7 @@ mod tests {
         ctx.run_close_callback(attr.ino, fh2);
         let callbacks_after_second_close = winfsp_callbacks(&vfs);
         let barriers_after_second_close = winfsp_foreground_flushes(&vfs);
-        let flush_calls_after_second_close = flush_ordered_calls(&vfs);
+        let flush_calls_after_second_close = flush_barrier_calls(&vfs);
         assert!(
             !ctx.has_deferred_cleanup_hint(attr.ino),
             "the final close should also leave the inode hint-free"
@@ -3641,10 +3641,10 @@ mod tests {
             "repeated cleanup callbacks should not create clean-skip attribution"
         );
 
-        let flush_calls_before_close = flush_ordered_calls(&vfs);
+        let flush_calls_before_close = flush_barrier_calls(&vfs);
         ctx.run_close_callback(attr.ino, fh);
         let after_close_barriers = winfsp_foreground_flushes(&vfs);
-        let flush_calls_after_close = flush_ordered_calls(&vfs);
+        let flush_calls_after_close = flush_barrier_calls(&vfs);
         assert_eq!(
             after_close_barriers.close, barriers_before.close,
             "close should not own a fallback barrier once write already committed local state"
@@ -3735,13 +3735,13 @@ mod tests {
 
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
-        let flush_calls_before = flush_ordered_calls(&vfs);
+        let flush_calls_before = flush_barrier_calls(&vfs);
 
         ctx.run_close_callback(attr.ino, fh);
 
         let callbacks_after = winfsp_callbacks(&vfs);
         let barriers_after = winfsp_foreground_flushes(&vfs);
-        let flush_calls_after = flush_ordered_calls(&vfs);
+        let flush_calls_after = flush_barrier_calls(&vfs);
         assert_eq!(
             callbacks_after.close,
             callbacks_before.close + 1,
@@ -3790,12 +3790,12 @@ mod tests {
             "cleanup should not leave a deferred-close hint once write already committed local state"
         );
 
-        let flush_calls_before = flush_ordered_calls(&vfs);
+        let flush_calls_before = flush_barrier_calls(&vfs);
         let close_barriers_before = winfsp_foreground_flushes(&vfs);
 
         ctx.run_close_callback(attr.ino, fh);
 
-        let flush_calls_after_first_close = flush_ordered_calls(&vfs);
+        let flush_calls_after_first_close = flush_barrier_calls(&vfs);
         let close_barriers_after_first_close = winfsp_foreground_flushes(&vfs);
         assert!(
             !ctx.has_deferred_cleanup_hint(attr.ino),
@@ -3822,7 +3822,7 @@ mod tests {
 
         ctx.run_close_callback(attr.ino, fh);
 
-        let flush_calls_after_second_close = flush_ordered_calls(&vfs);
+        let flush_calls_after_second_close = flush_barrier_calls(&vfs);
         let close_barriers_after_second_close = winfsp_foreground_flushes(&vfs);
         assert!(
             !ctx.has_deferred_cleanup_hint(attr.ino),

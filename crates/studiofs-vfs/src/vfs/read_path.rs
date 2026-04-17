@@ -924,7 +924,7 @@ impl StudioVfs {
             ino,
             offset,
             buffer.len(),
-            self.access_classifier,
+            self.access_tracker,
         );
         if let Some(path) = self.debug_pending_target_path(ino) {
             info!(

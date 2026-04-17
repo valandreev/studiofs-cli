@@ -12,8 +12,8 @@ use tokio::sync::Semaphore;
 use super::TestCacheParams;
 use super::profiling::{cpu_utilization_percent, process_cpu_time};
 use super::result::{
-    BenchmarkProfileReport, BenchmarkReport, CpuProfileReport, MountedBufferedReadComparisonReport,
-    MountedBufferedReadPhaseReport,
+    BenchmarkProfileReport, BenchmarkReport, CpuProfileReport,
+    MountedLocalFirstReadComparisonReport, MountedLocalFirstReadPhaseReport,
 };
 use super::telemetry::{
     PhaseTelemetry, build_advanced_metrics, phase_telemetry_to_report,
@@ -493,7 +493,7 @@ pub(super) async fn run_mounted_end_to_end(
         }
 
         let cache_upload_dir = cache_path.map(|path| path.join("upload"));
-        let mut baseline_buffered_read_phase = None;
+        let mut baseline_local_first_read_phase = None;
         if let Some(upload_dir) = cache_upload_dir.as_deref() {
             let cache_path_for_log = upload_dir.parent().unwrap_or(upload_dir);
             tracing::info!(
@@ -530,7 +530,7 @@ pub(super) async fn run_mounted_end_to_end(
             let (baseline_reads, _) =
                 run_mounted_read_phase(params, &files, &order, size_class_bounds).await?;
             let baseline_wall = baseline_wall_start.elapsed();
-            baseline_buffered_read_phase = Some(MountedBufferedReadPhaseReport {
+            baseline_local_first_read_phase = Some(MountedLocalFirstReadPhaseReport {
                 phase: "baseline-read".to_string(),
                 wait_target: idle_before_baseline.target.label().to_string(),
                 target_state_observed: idle_before_baseline.observed,
@@ -612,13 +612,13 @@ pub(super) async fn run_mounted_end_to_end(
             artifacts: Vec::new(),
             warnings: Vec::new(),
         });
-        let buffered_read_comparison = match (
+        let local_first_read_comparison = match (
             cache_path,
             cache_upload_dir.as_deref(),
-            baseline_buffered_read_phase,
+            baseline_local_first_read_phase,
         ) {
             (Some(cache_path), Some(upload_dir), Some(baseline_phase)) => {
-                let during_phase = MountedBufferedReadPhaseReport {
+                let during_phase = MountedLocalFirstReadPhaseReport {
                     phase: "during-upload-read".to_string(),
                     wait_target: during_upload_observation
                         .as_ref()
@@ -659,7 +659,7 @@ pub(super) async fn run_mounted_end_to_end(
                 let (post_reads, _) =
                     run_mounted_read_phase(params, &files, &order, size_class_bounds).await?;
                 let post_wall = post_wall_start.elapsed();
-                let post_phase = MountedBufferedReadPhaseReport {
+                let post_phase = MountedLocalFirstReadPhaseReport {
                     phase: "post-upload-read".to_string(),
                     wait_target: idle_before_post.target.label().to_string(),
                     target_state_observed: idle_before_post.observed,
@@ -669,7 +669,7 @@ pub(super) async fn run_mounted_end_to_end(
                     results: phase_telemetry_to_report(&post_reads, post_wall),
                 };
 
-                Some(MountedBufferedReadComparisonReport {
+                Some(MountedLocalFirstReadComparisonReport {
                     cache_path: cache_path.display().to_string(),
                     upload_dir: upload_dir.display().to_string(),
                     phases: vec![baseline_phase, during_phase, post_phase],
@@ -725,7 +725,7 @@ pub(super) async fn run_mounted_end_to_end(
             profile,
             advanced_metrics: Some(advanced_metrics),
             stream_results,
-            buffered_read_comparison,
+            local_first_read_comparison,
             writes: writes.overall.to_report(writes_wall.as_secs_f64() * 1000.0),
             reads: reads.overall.to_report(reads_wall.as_secs_f64() * 1000.0),
         })

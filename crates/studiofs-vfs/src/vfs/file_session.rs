@@ -1,4 +1,4 @@
-use crate::access::{AccessClass, AccessClassifierConfig, AccessDecision, HandleAccessState};
+use crate::access::{AccessClass, AccessDecision, AccessTrackerConfig, HandleAccessState};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -95,7 +95,7 @@ impl OpenFile {
         &self,
         offset: u64,
         len: usize,
-        cfg: AccessClassifierConfig,
+        cfg: AccessTrackerConfig,
     ) -> AccessDecision {
         self.access_state.lock().observe_read(offset, len, cfg)
     }
@@ -104,7 +104,7 @@ impl OpenFile {
         &self,
         offset: u64,
         len: usize,
-        cfg: AccessClassifierConfig,
+        cfg: AccessTrackerConfig,
     ) -> AccessDecision {
         self.access_state.lock().observe_write(offset, len, cfg)
     }

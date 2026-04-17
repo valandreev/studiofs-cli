@@ -200,7 +200,7 @@ fn open_cache_v3_backend_budgeted(
     })
 }
 
-/// Open the Cache 3.0 local backend for a cache root.
+/// Open the current local cache backend for a cache root.
 pub fn open_local_block_backend(
     cache_root: impl AsRef<Path>,
     volume_uuid: &str,
@@ -213,7 +213,7 @@ pub fn open_local_block_backend(
     )
 }
 
-/// Open the selected local backend with an explicit Cache 3.0 budget.
+/// Open the selected local backend with an explicit local-cache budget.
 pub fn open_local_block_backend_with_budget(
     cache_root: impl AsRef<Path>,
     volume_uuid: &str,
@@ -227,7 +227,7 @@ pub fn open_local_block_backend_with_budget(
     )
 }
 
-/// Open the selected local backend with an explicit Cache 3.0 budget and
+/// Open the selected local backend with an explicit local-cache budget and
 /// payload-store sync policy.
 pub fn open_local_block_backend_with_budget_and_sync_mode(
     cache_root: impl AsRef<Path>,
@@ -243,7 +243,7 @@ pub fn open_local_block_backend_with_budget_and_sync_mode(
     )
 }
 
-/// Open the selected local backend using an already prepared Cache 3.0 runtime.
+/// Open the selected local backend using an already prepared local-cache runtime.
 pub fn open_prepared_local_block_backend_with_budget_and_sync_mode(
     prepared: PreparedCacheV3Runtime,
     volume_uuid: &str,

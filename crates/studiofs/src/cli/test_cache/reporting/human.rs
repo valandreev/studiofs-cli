@@ -167,9 +167,9 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
         )
     );
 
-    if let Some(comparison) = &report.buffered_read_comparison {
+    if let Some(comparison) = &report.local_first_read_comparison {
         out.push('\n');
-        let _ = writeln!(&mut out, "Buffered-first read comparison");
+        let _ = writeln!(&mut out, "Local-First read comparison");
         let _ = writeln!(&mut out, "Cache path: {}", comparison.cache_path);
         let _ = writeln!(&mut out, "Upload dir: {}", comparison.upload_dir);
         let rows: Vec<Vec<String>> = comparison
@@ -431,7 +431,7 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
 mod tests {
     use super::*;
     use crate::cli::test_cache::result::{
-        MountedBufferedReadComparisonReport, MountedBufferedReadPhaseReport, OpReport,
+        MountedLocalFirstReadComparisonReport, MountedLocalFirstReadPhaseReport, OpReport,
         sample_report,
     };
 
@@ -449,14 +449,14 @@ mod tests {
     }
 
     #[test]
-    fn render_human_summary_includes_buffered_read_comparison_when_present() {
+    fn render_human_summary_includes_local_first_read_comparison_when_present() {
         let mut report = sample_report();
         report.mode = "e2e".to_string();
-        report.buffered_read_comparison = Some(MountedBufferedReadComparisonReport {
+        report.local_first_read_comparison = Some(MountedLocalFirstReadComparisonReport {
             cache_path: r"D:\test-cache\vol-123".to_string(),
             upload_dir: r"D:\test-cache\vol-123\upload".to_string(),
             phases: vec![
-                MountedBufferedReadPhaseReport {
+                MountedLocalFirstReadPhaseReport {
                     phase: "baseline-read".to_string(),
                     wait_target: "idle".to_string(),
                     target_state_observed: true,
@@ -474,7 +474,7 @@ mod tests {
                         throughput_bytes_per_sec: 1_700.0 * 1024.0 * 1024.0,
                     },
                 },
-                MountedBufferedReadPhaseReport {
+                MountedLocalFirstReadPhaseReport {
                     phase: "during-upload-read".to_string(),
                     wait_target: "active".to_string(),
                     target_state_observed: true,
@@ -492,7 +492,7 @@ mod tests {
                         throughput_bytes_per_sec: 1_500.0 * 1024.0 * 1024.0,
                     },
                 },
-                MountedBufferedReadPhaseReport {
+                MountedLocalFirstReadPhaseReport {
                     phase: "post-upload-read".to_string(),
                     wait_target: "idle".to_string(),
                     target_state_observed: true,
@@ -515,7 +515,7 @@ mod tests {
 
         let summary = render_human_summary(&report);
 
-        assert!(summary.contains("Buffered-first read comparison"));
+        assert!(summary.contains("Local-First read comparison"));
         assert!(summary.contains("baseline-read"));
         assert!(summary.contains("during-upload-read"));
         assert!(summary.contains("post-upload-read"));

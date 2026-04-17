@@ -9,7 +9,7 @@ pub(super) struct VfsBootstrapPlan {
     pub(super) minimum_local_backend_budget_bytes: u64,
     pub(super) local_backend_budget_bytes: u64,
     payload_sync_mode: CacheV3PayloadSyncMode,
-    pub(super) access_classifier: AccessClassifierConfig,
+    pub(super) access_tracker: AccessTrackerConfig,
     readahead_base_width: u32,
     pub(super) readahead_max_width: u32,
     readahead_min_prefetch: u32,
@@ -80,7 +80,7 @@ impl VfsBootstrapPlan {
                 block_size,
                 max_dirty_bytes = cache_runtime_tuning.max_dirty_bytes,
                 write_eager_flush_batch_bytes = cache_runtime_tuning.write_eager_flush_batch_bytes,
-                "configured cache_size is below Cache 3.0 local durability requirements; clamping local backend budget upward"
+                "configured cache_size is below current local-cache durability requirements; clamping local backend budget upward"
             );
         }
         validate_volume_block_size(block_size)?;
@@ -90,7 +90,7 @@ impl VfsBootstrapPlan {
         let readahead_max_width =
             derive_readahead_max_width(config.read_buffer_mb, block_size, readahead_base_width);
         let readahead_min_prefetch = config.readahead_min_prefetch;
-        let access_classifier = AccessClassifierConfig {
+        let access_tracker = AccessTrackerConfig {
             block_size,
             readahead_base_width,
             readahead_max_width,
@@ -131,7 +131,7 @@ impl VfsBootstrapPlan {
             } else {
                 CacheV3PayloadSyncMode::Fast
             },
-            access_classifier,
+            access_tracker,
             readahead_base_width,
             readahead_max_width,
             readahead_min_prefetch,
@@ -300,7 +300,7 @@ impl VfsBootstrapResources {
                 cache_root = %opened_local_backend.detection.layout.cache_root.display(),
                 layout_marker = %opened_local_backend.detection.layout.layout_marker.display(),
                 cache_v3_root = %opened_local_backend.detection.layout.v3_root.display(),
-                "using Cache 3.0 file-per-block local backend under the v3 subtree"
+                "using current file-per-block local backend under the v3 subtree"
             );
         }
         let local_block_backend = opened_local_backend.backend;
@@ -449,7 +449,7 @@ impl VfsBootstrap {
             upload_fg_read_latency_target_ns: plan.upload_fg_read_latency_target_ns,
             upload_fg_read_latency_window: plan.upload_fg_read_latency_window,
             upload_fg_read_latency_sticky_window: plan.upload_fg_read_latency_sticky_window,
-            access_classifier: plan.access_classifier,
+            access_tracker: plan.access_tracker,
             upload_user_idle_grace: plan.upload_user_idle_grace,
             upload_worker_count: plan.upload_worker_count,
             publish_visibility_timeout: plan.publish_visibility_timeout,
@@ -534,7 +534,7 @@ impl StudioVfs {
         )
     }
 
-    /// Create a new VFS instance reusing a prepared Cache 3.0 runtime.
+    /// Create a new VFS instance reusing a prepared local-cache runtime.
     pub fn new_with_prepared_cache_runtime<M>(
         meta: Arc<M>,
         data_config: &DataStoreConfig,
@@ -836,7 +836,7 @@ mod tests {
             "non-empty data prefix should end with a single trailing slash"
         );
         assert_eq!(
-            missing_slash_plan.access_classifier.block_size,
+            missing_slash_plan.access_tracker.block_size,
             missing_slash_plan.block_size(),
             "bootstrap plan should thread normalized block size into access classification"
         );

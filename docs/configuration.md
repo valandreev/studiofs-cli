@@ -122,8 +122,8 @@ Notes:
 - `--read-buffer` uses the same size parser and is rounded up to MiB units for VFS config.
 - Local data-cache backend provisioning is automatic for the per-volume root under `<cache-dir>/<volume-uuid>` and is owned by `studiofs-cache`; the CLI only resolves cache location and budget inputs.
 - Internal runtime thresholds (dirty headroom, upload local-I/O slots, transit headroom) are derived automatically from cache budget.
-- On Windows and macOS, StudioFS uses the buffered-first runtime path for every mount. Foreground `flush()` / `close()` confirm local acceptance and surface sticky upload errors deterministically, while upload and manifest publication continue asynchronously.
-- Buffered-first reads are now classified per handle in core VFS, so sequential media readers keep prefetch/L1 promotion behavior even when another handle on the same inode is doing random seeks.
+- On Windows and macOS, StudioFS uses the standard Local-First runtime path for every mount. Foreground `flush()` / `close()` confirm local acceptance and surface sticky upload errors deterministically, while upload and file-version publication continue asynchronously.
+- Read access is tracked per handle in core VFS, so sequential media readers keep prefetch/L1 promotion behavior even when another handle on the same inode is doing random seeks.
 - `--principal` overrides `STUDIOFS_PRINCIPAL` for this mount process.
 - `--profile` enables optional Pyroscope profiling for the mount runtime.
 - `--profile=off` disables profiling explicitly, even if `STUDIOFS_PROFILE` is set.
@@ -301,7 +301,7 @@ Notes:
   `buffered_read_comparison` with `baseline-read`, `during-upload-read`, and
   `post-upload-read` rows plus the pending-upload observations used to gate
   each phase.
-- The terminal summary prints the same `Buffered-first read comparison` table
+- The terminal summary prints the same `Local-First read comparison` table
   when that mounted upload-state metadata is available.
 - `--profile=pyroscope` enables on-demand Pyroscope profiling. The run still
   completes if profiling backends or the endpoint are missing; the command emits
@@ -471,7 +471,7 @@ Internal metadata-cache defaults:
 Metadata cache observability is emitted through the existing `upload pipeline` / `upload pipeline counters` log events and includes:
 
 - dentry cache, full-path shortcut cache, and attr read cache metrics: hits/misses/evictions, occupancy, protected-tier (hotset) occupancy, and hot-hit contribution
-- ingress artifact counters/checkpoint stats (expected to remain at zero on normal Cache 3.0 foreground operation unless recovering older artifacts)
+- ingress artifact counters/checkpoint stats (expected to remain at zero during normal local-cache foreground operation unless recovering older artifacts)
 - local write-buffer persist batch metrics (batch size in blocks/bytes, batch duration histogram, concurrent batch depth/peak)
 - cache shim read/write throughput and latency histograms
 - VFS synchronous read fast-path counters (`vfs_read_sync_fast_path_hits`, `vfs_read_sync_fast_path_misses`)

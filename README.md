@@ -82,9 +82,9 @@ studiofs mount myvolume Z:
 studiofs mount myvolume /mnt/studio
 ```
 
-Windows and macOS use the buffered-first runtime path for mounts. Foreground
-I/O follows the standard buffered read/write flow while upload and manifest
-publication continue asynchronously in the background.
+Windows and macOS use the standard Local-First runtime path for mounts.
+Foreground I/O follows normal buffered read/write flow while upload and
+file-version publication continue asynchronously in the background.
 
 Attach another client to an existing volume:
 
@@ -146,7 +146,7 @@ breakdown with per-level latency distributions.
 On mounts started by newer StudioFS builds, `test-cache` `e2e` mode also emits
 `buffered_read_comparison` with `baseline-read`, `during-upload-read`, and
 `post-upload-read` phases, and the terminal summary renders the same mounted
-comparison as a `Buffered-first read comparison` table.
+comparison as a `Local-First read comparison` table.
 
 ## Development
 
@@ -186,7 +186,7 @@ Infra-heavy ignored suite:
 cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1
 ```
 
-Focused buffered-first regression:
+Focused Local-First regression:
 
 ```bash
 cargo test -p studiofs-vfs --test vfs_test foreground_read_baseline_during_and_post_upload_are_comparable -- --ignored --nocapture --test-threads=1
@@ -210,11 +210,11 @@ Useful test/runtime variables include:
 
 Recent notes:
 - Added documentation for "Completion-aware local read semantics" (SFS-123) in [docs/vfs.md](docs/vfs.md).
-  This documents the buffered-first local overlay model, the foreground-vs-background
+  This documents Local-First read resolution, the foreground-vs-background
   fetch priority split, and the current observability counters.
 - Finalized the committed read path (SFS-139): foreground reads, readahead,
-  and upload cache rereads now use the Cache 3.0 local block backend as the primary
-  committed cache, while async VFS workers route blocking local cache mutations
+  and upload cache rereads now use the current `v3` local cache backend as the
+  primary committed cache, while async VFS workers route blocking local cache mutations
   through Tokio's blocking pool.
 - Reduced Windows local-cache growth stalls (SFS-146): the data file is marked
   sparse on Windows when possible, physical growth is serialized separately
@@ -233,7 +233,7 @@ Project docs live in [docs/](docs/):
 - [docs/contributing.md](docs/contributing.md) - verification matrix, CI ownership, platform-specific code rules
 - [docs/tests.md](docs/tests.md) - test matrix and infra expectations
 - [docs/metadata.md](docs/metadata.md) - local `redb` + PostgreSQL metadata model
-- [docs/cache.md](docs/cache.md) - cache, upload queue, and writeback behavior
+- [docs/cache.md](docs/cache.md) - local cache backend, staged writeback, and upload flow
 - [docs/vfs.md](docs/vfs.md) - filesystem runtime behavior
 - [docs/data-layer.md](docs/data-layer.md) - S3 object I/O and format details
 - [docs/platform-bridges.md](docs/platform-bridges.md) - WinFSP and FUSE integration

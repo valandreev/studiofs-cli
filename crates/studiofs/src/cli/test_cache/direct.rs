@@ -572,7 +572,7 @@ pub(super) async fn run_direct(
         cache_pipeline: Some(cache_pipeline),
         profile,
         advanced_metrics: Some(advanced_metrics),
-        buffered_read_comparison: None,
+        local_first_read_comparison: None,
         stream_results,
         work_root: None,
         writes: writes.overall.to_report(writes_wall.as_secs_f64() * 1000.0),

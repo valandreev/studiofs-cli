@@ -5,9 +5,9 @@ pub(crate) fn describe_cache_layout_state(
 ) -> &'static str {
     if let Some(detection) = detection {
         if detection.has_cache_v3_contract() {
-            "Cache 3.0 ready"
+            "Local cache layout ready"
         } else {
-            "Cache 3.0 not initialized"
+            "Local cache layout not initialized"
         }
     } else {
         "unknown"

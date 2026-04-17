@@ -1,4 +1,4 @@
-//! Core VFS implementation — Block-based architecture.
+//! Core VFS implementation for the current Local-First data plane.
 //!
 //! Key design:
 //! - Files are split into fixed-size blocks (default 16MB)
@@ -9,14 +9,14 @@
 //!
 //! Write Path:
 //! 1. Split data into blocks
-//! 2. Merge dirty bytes into the per-file `WriteBuffer`
-//! 3. Persist full dirty blocks locally via the Cache 3.0 backend `put(...)`
+//! 2. Merge accepted bytes into local dirty state
+//! 3. Persist full dirty blocks locally via the current local cache backend `put(...)`
 //! 4. Apply local `sync_data()` barriers (strict for fsync / durable mode,
 //!    grouped in fast mode) and persist extent metadata / attrs
 //! 5. Queue committed extents for async upload + remote publish
 //!
 //! Read Path:
-//! 1. Check the `WriteBuffer` overlay for newer local bytes
+//! 1. Check local writer state for newer local bytes
 //! 2. Resolve local metadata refs to committed local extents in the local backend
 //!    (inline on the active runtime worker, no per-op blocking-pool hop)
 //! 3. Fall back to remote fetch
@@ -104,7 +104,7 @@ use startup::StartupChannels;
 use startup::StartupState;
 
 use crate::access::{
-    AccessClass, AccessClassifierConfig, AccessDecision, AccessPolicy, HandleAccessState,
+    AccessClass, AccessDecision, AccessPolicy, AccessTrackerConfig, HandleAccessState,
 };
 use crate::incarnation::{
     CommittedIncarnation, InodeIncarnationState, PendingIncarnation, VfsUploadState,
@@ -971,7 +971,7 @@ struct UploadState {
     upload_fallback_wait_max_ns: AtomicU64,
     upload_fallback_read_ns: AtomicU64,
     upload_fallback_read_max_ns: AtomicU64,
-    /// Dynamic slot cost adjusted from buffered-first foreground-read pressure.
+    /// Dynamic slot cost adjusted from foreground-read pressure on the Local-First path.
     upload_cache_io_foreground_cost: AtomicU32,
 }
 
@@ -1301,15 +1301,15 @@ impl ReadState {
         ino: Ino,
         offset: u64,
         len: usize,
-        classifier: AccessClassifierConfig,
+        tracker: AccessTrackerConfig,
     ) -> AccessDecision {
         if let Some(open_file) = open_file {
-            let decision = open_file.observe_read(offset, len, classifier);
+            let decision = open_file.observe_read(offset, len, tracker);
             self.record_access_class_transition(decision.previous_class, decision.class, true);
             return decision;
         }
         let state = self.fallback_access_state(ino, false);
-        let decision = state.lock().observe_read(offset, len, classifier);
+        let decision = state.lock().observe_read(offset, len, tracker);
         self.record_access_class_transition(decision.previous_class, decision.class, false);
         decision
     }
@@ -1320,15 +1320,15 @@ impl ReadState {
         ino: Ino,
         offset: u64,
         len: usize,
-        classifier: AccessClassifierConfig,
+        tracker: AccessTrackerConfig,
     ) -> AccessDecision {
         if let Some(open_file) = open_file {
-            let decision = open_file.observe_write(offset, len, classifier);
+            let decision = open_file.observe_write(offset, len, tracker);
             self.record_access_class_transition(decision.previous_class, decision.class, true);
             return decision;
         }
         let state = self.fallback_access_state(ino, true);
-        let decision = state.lock().observe_write(offset, len, classifier);
+        let decision = state.lock().observe_write(offset, len, tracker);
         self.record_access_class_transition(decision.previous_class, decision.class, false);
         decision
     }
@@ -1566,7 +1566,7 @@ struct MetricsState {
     /// Current number of items queued in the prefetch worker's pending queue.
     /// Useful for detecting backpressure under high handle-count workloads.
     prefetch_queue_depth: AtomicU64,
-    flush_ordered_calls: AtomicU64,
+    flush_barrier_calls: AtomicU64,
     local_cache_io_calls: AtomicU64,
     local_cache_io_handoff_total_ns: AtomicU64,
     local_cache_io_handoff_max_ns: AtomicU64,
@@ -1639,7 +1639,7 @@ impl MetricsState {
             ignored_entries: Mutex::new(IgnoredEntryRegistry::default()),
             next_ignored_ino: AtomicU64::new(1u64 << 63),
             prefetch_queue_depth: AtomicU64::new(0),
-            flush_ordered_calls: AtomicU64::new(0),
+            flush_barrier_calls: AtomicU64::new(0),
             local_cache_io_calls: AtomicU64::new(0),
             local_cache_io_handoff_total_ns: AtomicU64::new(0),
             local_cache_io_handoff_max_ns: AtomicU64::new(0),
@@ -1718,7 +1718,7 @@ impl MetricsState {
         self.materialize_batch_stats.reset();
         self.prefetch_queue_depth.store(0, Ordering::Relaxed);
         reset_atomic!(
-            flush_ordered_calls,
+            flush_barrier_calls,
             local_cache_io_calls,
             local_cache_io_handoff_total_ns,
             local_cache_io_handoff_max_ns,
@@ -2058,8 +2058,8 @@ pub struct StudioVfs {
     upload_fg_read_latency_window: Duration,
     /// Sticky horizon for using last known foreground P90 in the throttle loop.
     upload_fg_read_latency_sticky_window: Duration,
-    /// Handle-aware access classifier tuning derived from VFS read settings.
-    access_classifier: AccessClassifierConfig,
+    /// Handle-aware access tracking tuning derived from VFS read settings.
+    access_tracker: AccessTrackerConfig,
     /// Grace window after the last foreground read to keep user priority.
     upload_user_idle_grace: Duration,
     /// Upload worker pool size.
@@ -2998,14 +2998,14 @@ impl StudioVfs {
                     shutdown_ts = event.generated_unix_ms;
                     last_graceful_shutdown = Some(VfsZeroIoShutdownSnapshot {
                         generated_unix_ms: event.generated_unix_ms,
-                        accepted_write_buffer_bytes_before: Self::zeroio_event_u64(
+                        accepted_local_dirty_bytes_before: Self::zeroio_event_u64(
                             &event.fields,
-                            "accepted_write_buffer_bytes_before",
+                            "accepted_local_dirty_bytes_before",
                         )
                         .unwrap_or(0),
-                        accepted_write_buffer_bytes_after: Self::zeroio_event_u64(
+                        accepted_local_dirty_bytes_after: Self::zeroio_event_u64(
                             &event.fields,
-                            "accepted_write_buffer_bytes_after",
+                            "accepted_local_dirty_bytes_after",
                         )
                         .unwrap_or(0),
                         pending_uploads_after: Self::zeroio_event_u64(
@@ -5282,7 +5282,7 @@ impl StudioVfs {
             };
         }
         load_metrics!(
-            flush_ordered_calls: flush_ordered_calls,
+            flush_barrier_calls: flush_barrier_calls,
             local_cache_io_calls: local_cache_io_calls,
             local_cache_handoff_total_ns: local_cache_io_handoff_total_ns,
             local_cache_handoff_max_ns: local_cache_io_handoff_max_ns,
@@ -5386,8 +5386,8 @@ impl StudioVfs {
             generated_unix_ms: now_unix_millis(),
             uptime_secs: elapsed.as_secs_f64(),
             backend_tag: self.write_path_backend_tag.clone(),
-            flush_ordered_calls,
-            flush_ordered_calls_per_sec: Self::per_second(flush_ordered_calls, elapsed),
+            flush_barrier_calls,
+            flush_barrier_calls_per_sec: Self::per_second(flush_barrier_calls, elapsed),
             block_store_sync_data: VfsWritePathSyncDataStats {
                 calls: sync_calls,
                 calls_per_sec: Self::per_second(sync_calls, elapsed),

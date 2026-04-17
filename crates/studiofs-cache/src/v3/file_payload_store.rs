@@ -1,4 +1,4 @@
-//! Cache 3.0 file-per-block payload storage.
+//! File-per-block payload storage for the current `v3` local cache backend.
 
 use std::array;
 use std::collections::HashSet;
