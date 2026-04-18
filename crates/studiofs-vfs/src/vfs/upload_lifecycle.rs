@@ -186,8 +186,7 @@ impl StudioVfs {
     pub(super) fn pending_age_stats_ms(&self) -> (u64, u64) {
         let now_ms = now_unix_millis();
         let mut ages: Vec<u64> = self
-            .cached_store
-            .snapshot_pending_uploads()
+            .truth_pending_uploads_snapshot()
             .into_iter()
             .map(|op| now_ms.saturating_sub(op.created_unix_ms))
             .collect();
@@ -300,19 +299,19 @@ impl StudioVfs {
         let dirty_before = self.total_pending_local_dirty_bytes();
         info!(
             dirty_bytes = dirty_before,
-            pending_uploads = self.cached_store.pending_upload_count(),
+            pending_uploads = self.truth_pending_uploads_snapshot().len(),
             "VFS shutdown: flushing pending local dirty state"
         );
         self.flush_pending_blocks_for_shutdown().await;
         info!(
-            pending_uploads = self.cached_store.pending_upload_count(),
+            pending_uploads = self.truth_pending_uploads_snapshot().len(),
             elapsed_ms = t0.elapsed().as_millis() as u64,
             "VFS shutdown: local dirty drain complete"
         );
 
         // Phase 2: attempt graceful upload drain (bounded by user timeout),
         // then cancel uploader work so network-blocked requests are aborted.
-        let pending = self.cached_store.pending_upload_count();
+        let pending = self.truth_pending_uploads_snapshot().len();
         let mut drained = pending == 0;
         if pending > 0 {
             if upload_drain_timeout.is_zero() {
@@ -336,11 +335,11 @@ impl StudioVfs {
         self.request_uploader_shutdown();
 
         if !drained {
-            let pending_ops = self.cached_store.snapshot_pending_uploads();
+            let pending_ops = self.truth_pending_uploads_snapshot();
             let sample_object_ids: Vec<u64> =
                 pending_ops.iter().take(8).map(|op| op.object_id).collect();
             info!(
-                pending = self.cached_store.pending_upload_count(),
+                pending = pending_ops.len(),
                 pending_queue_ops = pending_ops.len(),
                 pending_object_ids_sample = ?sample_object_ids,
                 "VFS shutdown: uploader cancelled; remaining dirty uploads will replay on next startup"
@@ -378,7 +377,7 @@ impl StudioVfs {
         self.sync_meta().prepare_for_close();
         let local_payload_sync_ok = self.persist_cache().await;
         let dirty_after = self.total_pending_local_dirty_bytes();
-        let pending_uploads_after = self.cached_store.pending_upload_count();
+        let pending_uploads_after = self.truth_pending_uploads_snapshot().len();
         let recoverable_on_restart = dirty_after == 0 && local_payload_sync_ok;
         let shutdown_snapshot = VfsZeroIoShutdownSnapshot {
             generated_unix_ms: now_unix_millis(),

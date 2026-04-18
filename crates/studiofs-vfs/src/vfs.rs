@@ -2652,6 +2652,177 @@ fn map_open_local_block_backend_error(
 }
 
 impl StudioVfs {
+    fn runtime_pending_uploads_match_dirty_index(
+        &self,
+        runtime_pending_uploads: &[PendingUpload],
+        dirty_count: usize,
+    ) -> bool {
+        runtime_pending_uploads.len() == dirty_count
+            && runtime_pending_uploads.iter().all(|op| {
+                matches!(
+                    self.local_block_backend.lifecycle_state(op.object_id),
+                    LocalBlockLifecycleState::Dirty | LocalBlockLifecycleState::Uploading
+                )
+            })
+    }
+
+    fn pending_upload_from_persistent_state(
+        &self,
+        ino: Ino,
+        offset: u64,
+        object_id: u64,
+        content_epoch: u64,
+        runtime_pending: Option<&PendingUpload>,
+        now_ms: u64,
+    ) -> PendingUpload {
+        let fallback_created_ms = self
+            .local_block_backend
+            .object_stats(object_id)
+            .map(|stats| stats.last_access_unix_millis)
+            .filter(|created| *created > 0)
+            .unwrap_or(now_ms);
+        PendingUpload {
+            ino,
+            offset,
+            object_id,
+            content_epoch,
+            created_unix_ms: runtime_pending
+                .map(|op| op.created_unix_ms)
+                .filter(|created| *created > 0)
+                .unwrap_or(fallback_created_ms),
+            not_before_unix_ms: runtime_pending.map(|op| op.not_before_unix_ms).unwrap_or(0),
+            retry_count: runtime_pending.map(|op| op.retry_count).unwrap_or(0),
+        }
+    }
+
+    fn persistent_pending_uploads_snapshot(
+        &self,
+        runtime_pending_by_object: &HashMap<u64, PendingUpload>,
+    ) -> Vec<PendingUpload> {
+        let mut dirty_objects: HashSet<u64> = self
+            .local_block_backend
+            .dirty_object_ids()
+            .into_iter()
+            .collect();
+        if dirty_objects.is_empty() {
+            return Vec::new();
+        }
+
+        let now_ms = now_unix_millis();
+        let meta = self.sync_meta();
+        let attrs = match meta.list_inode_attrs() {
+            Ok(attrs) => attrs,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "failed to enumerate inode attrs while rebuilding pending upload truth view"
+                );
+                return Vec::new();
+            }
+        };
+
+        let mut pending = Vec::with_capacity(dirty_objects.len());
+        for attr in attrs {
+            let ino = attr.ino;
+            let blocks = match meta.get_file_blocks(ino) {
+                Ok(blocks) => blocks,
+                Err(error) => {
+                    warn!(
+                        ino,
+                        error = %error,
+                        "failed to enumerate file blocks while rebuilding pending upload truth view"
+                    );
+                    continue;
+                }
+            };
+
+            for (block_index, block_ref) in &blocks {
+                if dirty_objects.remove(&block_ref.object_id) {
+                    let offset = (*block_index as u64).saturating_mul(self.block_size as u64);
+                    pending.push(self.pending_upload_from_persistent_state(
+                        ino,
+                        offset,
+                        block_ref.object_id,
+                        attr.content_epoch,
+                        runtime_pending_by_object.get(&block_ref.object_id),
+                        now_ms,
+                    ));
+                }
+            }
+
+            if dirty_objects.is_empty() {
+                break;
+            }
+
+            if attr.size == 0 {
+                continue;
+            }
+
+            match meta.lookup_regular_file_slices(ino, 0, attr.size) {
+                Ok(spans) => {
+                    for span in spans {
+                        let Some(block) = span.block else {
+                            continue;
+                        };
+                        if !dirty_objects.remove(&block.object_id) {
+                            continue;
+                        }
+                        let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
+                        let absolute_start = chunk_base.saturating_add(u64::from(span.range.start));
+                        let block_index = block_index_from_offset(absolute_start, self.block_size);
+                        let offset = u64::from(block_index).saturating_mul(self.block_size as u64);
+                        pending.push(self.pending_upload_from_persistent_state(
+                            ino,
+                            offset,
+                            block.object_id,
+                            attr.content_epoch,
+                            runtime_pending_by_object.get(&block.object_id),
+                            now_ms,
+                        ));
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        ino,
+                        error = %error,
+                        "failed to enumerate overlay slices while rebuilding pending upload truth view"
+                    );
+                }
+            }
+
+            if dirty_objects.is_empty() {
+                break;
+            }
+        }
+
+        if !dirty_objects.is_empty() {
+            debug!(
+                pending_objects_without_metadata = dirty_objects.len(),
+                "pending upload truth view skipped dirty objects without metadata mapping"
+            );
+        }
+
+        pending.sort_by_key(|op| (op.created_unix_ms, op.object_id));
+        pending
+    }
+
+    pub(crate) fn truth_pending_uploads_snapshot(&self) -> Vec<PendingUpload> {
+        let runtime_pending_uploads = self.cached_store.snapshot_pending_uploads();
+        let dirty_count = self.local_block_backend.dirty_object_count();
+        if dirty_count == 0 {
+            return Vec::new();
+        }
+        if self.runtime_pending_uploads_match_dirty_index(&runtime_pending_uploads, dirty_count) {
+            return runtime_pending_uploads;
+        }
+
+        let runtime_pending_by_object: HashMap<u64, PendingUpload> = runtime_pending_uploads
+            .into_iter()
+            .map(|op| (op.object_id, op))
+            .collect();
+        self.persistent_pending_uploads_snapshot(&runtime_pending_by_object)
+    }
+
     fn attr_read_cache_snapshot(metrics: AttrReadCacheMetrics) -> VfsAttrReadCacheSnapshot {
         VfsAttrReadCacheSnapshot {
             hits: metrics.hits,
@@ -2949,7 +3120,7 @@ impl StudioVfs {
         let backend_non_evictable_bytes = storage_stats
             .current_bytes
             .saturating_sub(storage_stats.evictable_bytes);
-        let pending_uploads = self.cached_store.snapshot_pending_uploads();
+        let pending_uploads = self.truth_pending_uploads_snapshot();
         let mut pending_uploads_by_inode: HashMap<Ino, Vec<PendingUpload>> = HashMap::new();
         for op in pending_uploads {
             pending_uploads_by_inode.entry(op.ino).or_default().push(op);
@@ -4133,8 +4304,7 @@ impl StudioVfs {
         }
 
         let pending_uploads: Vec<_> = self
-            .cached_store
-            .snapshot_pending_uploads()
+            .truth_pending_uploads_snapshot()
             .into_iter()
             .filter(|op| inos.contains(&op.ino))
             .collect();
@@ -4299,8 +4469,7 @@ impl StudioVfs {
 
     pub fn pending_uploads_for_inode(&self, ino: Ino) -> Vec<(u64, u64, u64)> {
         let mut out: Vec<_> = self
-            .cached_store
-            .snapshot_pending_uploads()
+            .truth_pending_uploads_snapshot()
             .into_iter()
             .filter(|op| op.ino == ino)
             .map(|op| (op.offset, op.object_id, op.content_epoch))
@@ -4538,8 +4707,9 @@ impl StudioVfs {
     }
 
     pub fn upload_stats(&self) -> VfsUploadStats {
+        let pending_uploads = self.truth_pending_uploads_snapshot();
         VfsUploadStats {
-            pending_uploads: self.cached_store.pending_upload_count(),
+            pending_uploads: pending_uploads.len(),
             upload_requeues: self.state.upload.upload_requeues.load(Ordering::Relaxed),
             canceled_deleted: self
                 .state

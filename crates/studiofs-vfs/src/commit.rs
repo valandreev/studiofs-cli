@@ -343,7 +343,7 @@ async fn requeue_missing_manifest_uploads(
     content_epoch: u64,
     required_blocks: &[(u32, BlockRef)],
 ) {
-    let pending = vfs.cached_store().snapshot_pending_uploads();
+    let pending = vfs.truth_pending_uploads_snapshot();
     let pending_keys: std::collections::HashSet<(u64, u64)> = pending
         .into_iter()
         .filter(|op| op.ino == ino && op.content_epoch == content_epoch)

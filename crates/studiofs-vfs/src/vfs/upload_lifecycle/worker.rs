@@ -24,6 +24,7 @@ use tracing::{debug, error, info, warn};
 
 const UPLOAD_WORKER_YIELD_EVERY_OPS: u32 = super::super::UPLOAD_WORKER_YIELD_EVERY_OPS;
 
+type ReadyUploads = VecDeque<PendingUpload>;
 type DelayedUploads = BTreeMap<u64, VecDeque<PendingUpload>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -841,16 +842,6 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
             Ok(fragments) => fragments,
             Err(error) => return UploadPutOutcome::Failed(error),
         };
-        let upload_qos = match self.vfs.qos.acquire_upload().await {
-            Ok(permit) => permit,
-            Err(error) => {
-                return UploadPutOutcome::Failed(VfsError::QosFailure {
-                    stage: Cow::Borrowed("upload_qos"),
-                    object_id: op.object_id,
-                    message: error.to_string(),
-                });
-            }
-        };
         let uploads = fragment_keys.iter().zip(object_bytes).enumerate().map(
             |(fragment_index, (key, payload))| {
                 let key = key.clone();
@@ -867,7 +858,6 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
             },
         );
         let done = join_all(uploads).await;
-        drop(upload_qos);
 
         let mut first_error = None;
         let mut saw_cancel = false;
@@ -1048,20 +1038,20 @@ impl UploadLifecycleWorker {
             "upload worker pool started"
         );
 
-        let mut fair = crate::qos::FairInodeScheduler::<PendingUpload>::default();
+        let mut ready = ReadyUploads::default();
         let mut delayed = DelayedUploads::default();
         let mut dispatched_since_yield = 0u32;
         let mut inbound_closed = false;
         loop {
             Self::reap_ready_workers(&mut workers);
-            Self::promote_ready_uploads(&mut fair, &mut delayed);
+            Self::promote_ready_uploads(&mut ready, &mut delayed);
 
-            while !fair.is_empty() {
+            while !ready.is_empty() {
                 Self::reap_ready_workers(&mut workers);
                 let Some(permit) = permits.clone().try_acquire_owned().ok() else {
                     break;
                 };
-                let Some(op) = fair.pop() else {
+                let Some(op) = ready.pop_front() else {
                     drop(permit);
                     break;
                 };
@@ -1083,18 +1073,18 @@ impl UploadLifecycleWorker {
                     dispatched_since_yield = 0;
                     tokio::task::yield_now().await;
                     Self::reap_ready_workers(&mut workers);
-                    Self::promote_ready_uploads(&mut fair, &mut delayed);
+                    Self::promote_ready_uploads(&mut ready, &mut delayed);
                 }
             }
 
             if self.vfs.uploader_shutdown_requested() {
                 break;
             }
-            if inbound_closed && fair.is_empty() && delayed.is_empty() && workers.is_empty() {
+            if inbound_closed && ready.is_empty() && delayed.is_empty() && workers.is_empty() {
                 break;
             }
 
-            let next_delayed_wait = if fair.is_empty() {
+            let next_delayed_wait = if ready.is_empty() {
                 Self::next_delayed_wait(&delayed)
             } else {
                 None
@@ -1119,7 +1109,7 @@ impl UploadLifecycleWorker {
                 }
                 inbound = rx.recv(), if !inbound_closed => {
                     match inbound {
-                        Some(op) => Self::enqueue_pending_upload(&mut fair, &mut delayed, op),
+                        Some(op) => Self::enqueue_pending_upload(&mut ready, &mut delayed, op),
                         None => inbound_closed = true,
                     }
                 }
@@ -1131,7 +1121,7 @@ impl UploadLifecycleWorker {
     }
 
     fn enqueue_pending_upload(
-        fair: &mut crate::qos::FairInodeScheduler<PendingUpload>,
+        ready: &mut ReadyUploads,
         delayed: &mut DelayedUploads,
         op: PendingUpload,
     ) {
@@ -1141,14 +1131,11 @@ impl UploadLifecycleWorker {
                 .or_default()
                 .push_back(op);
         } else {
-            fair.push(op.ino, op);
+            ready.push_back(op);
         }
     }
 
-    fn promote_ready_uploads(
-        fair: &mut crate::qos::FairInodeScheduler<PendingUpload>,
-        delayed: &mut DelayedUploads,
-    ) {
+    fn promote_ready_uploads(ready: &mut ReadyUploads, delayed: &mut DelayedUploads) {
         while let Some((&not_before_unix_ms, _)) = delayed.first_key_value() {
             if not_before_unix_ms > now_unix_millis() {
                 break;
@@ -1157,7 +1144,7 @@ impl UploadLifecycleWorker {
                 break;
             };
             while let Some(op) = ready_ops.pop_front() {
-                fair.push(op.ino, op);
+                ready.push_back(op);
             }
         }
     }
@@ -1724,24 +1711,24 @@ mod tests {
 
     #[tokio::test]
     async fn delayed_retry_ops_wait_until_due_before_dispatch() {
-        let mut fair = crate::qos::FairInodeScheduler::<PendingUpload>::default();
+        let mut ready = ReadyUploads::default();
         let mut delayed = DelayedUploads::default();
         let mut op = make_pending_upload();
         op.not_before_unix_ms = now_unix_millis().saturating_add(20);
 
-        UploadLifecycleWorker::enqueue_pending_upload(&mut fair, &mut delayed, op.clone());
-        UploadLifecycleWorker::promote_ready_uploads(&mut fair, &mut delayed);
+        UploadLifecycleWorker::enqueue_pending_upload(&mut ready, &mut delayed, op.clone());
+        UploadLifecycleWorker::promote_ready_uploads(&mut ready, &mut delayed);
 
-        assert!(fair.is_empty());
+        assert!(ready.is_empty());
         assert_eq!(delayed.len(), 1);
 
         tokio::time::sleep(Duration::from_millis(25)).await;
-        UploadLifecycleWorker::promote_ready_uploads(&mut fair, &mut delayed);
+        UploadLifecycleWorker::promote_ready_uploads(&mut ready, &mut delayed);
 
-        let Some(ready) = fair.pop() else {
+        let Some(ready_op) = ready.pop_front() else {
             panic!("expected delayed upload to become dispatchable");
         };
-        assert_eq!(ready.object_id, op.object_id);
+        assert_eq!(ready_op.object_id, op.object_id);
         assert!(delayed.is_empty());
     }
 }
