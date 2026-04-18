@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures::future::join_all;
 use opendal::Buffer;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,8 +24,55 @@ use tracing::{debug, error, info, warn};
 
 const UPLOAD_WORKER_YIELD_EVERY_OPS: u32 = super::super::UPLOAD_WORKER_YIELD_EVERY_OPS;
 
-type ReadyUploads = VecDeque<PendingUpload>;
+#[derive(Debug, Default)]
+struct ReadyUploads {
+    per_inode: BTreeMap<Ino, VecDeque<PendingUpload>>,
+    ready_inodes: VecDeque<Ino>,
+    ready_set: HashSet<Ino>,
+}
+
 type DelayedUploads = BTreeMap<u64, VecDeque<PendingUpload>>;
+
+impl ReadyUploads {
+    fn push_back(&mut self, op: PendingUpload) {
+        let ino = op.ino;
+        self.per_inode.entry(ino).or_default().push_back(op);
+        if self.ready_set.insert(ino) {
+            self.ready_inodes.push_back(ino);
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<PendingUpload> {
+        while let Some(ino) = self.ready_inodes.pop_front() {
+            self.ready_set.remove(&ino);
+            let mut remove_inode = false;
+            let item = {
+                let queue = self.per_inode.get_mut(&ino)?;
+                let item = queue.pop_front();
+                if queue.is_empty() {
+                    remove_inode = true;
+                } else {
+                    self.ready_inodes.push_back(ino);
+                    self.ready_set.insert(ino);
+                }
+                item
+            };
+
+            if remove_inode {
+                self.per_inode.remove(&ino);
+            }
+
+            if item.is_some() {
+                return item;
+            }
+        }
+        None
+    }
+
+    fn is_empty(&self) -> bool {
+        self.per_inode.is_empty()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UploadOutcome {
@@ -1730,5 +1777,32 @@ mod tests {
         };
         assert_eq!(ready_op.object_id, op.object_id);
         assert!(delayed.is_empty());
+    }
+
+    #[test]
+    fn ready_uploads_rotate_across_inodes() {
+        let mut ready = ReadyUploads::default();
+        for (ino, object_id) in [(10, 101), (10, 102), (20, 201), (20, 202), (30, 301)] {
+            ready.push_back(PendingUpload {
+                ino,
+                offset: 0,
+                object_id,
+                content_epoch: 1,
+                created_unix_ms: object_id,
+                not_before_unix_ms: 0,
+                retry_count: 0,
+            });
+        }
+
+        let mut order = Vec::new();
+        while let Some(op) = ready.pop_front() {
+            order.push(op.object_id);
+        }
+
+        assert_eq!(
+            order,
+            vec![101, 201, 301, 102, 202],
+            "ready queue should rotate across inodes instead of letting one inode monopolize dispatch"
+        );
     }
 }
