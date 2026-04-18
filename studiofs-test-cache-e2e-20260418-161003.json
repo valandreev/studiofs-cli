@@ -1,0 +1,280 @@
+{
+  "run_id": "60d9cf78-50fa-46d4-826e-ccc9126dbd94",
+  "mode": "e2e",
+  "cache_dir": "Z:",
+  "started_at": "2026-04-18T16:09:50Z",
+  "completed_at": "2026-04-18T16:10:03Z",
+  "total_elapsed_ms": 13429.1674,
+  "block_size": 4194304,
+  "read_size": 4194304,
+  "concurrency": 2,
+  "sequential_streams": false,
+  "io_depth": 32,
+  "warmup_runs": 0,
+  "sizes": "explicit-list(3)",
+  "workload_files": 3,
+  "workload_small_files": 0,
+  "workload_medium_files": 0,
+  "workload_large_files": 3,
+  "access_pattern": "sequential",
+  "l1_limit": 2147483648,
+  "work_root": "Z:.studiofs-test-cache",
+  "volume": "test",
+  "mount_point": "Z:",
+  "advanced_metrics": {
+    "size_class_boundaries": {
+      "small_max_bytes": 10240,
+      "medium_max_bytes": 4194304
+    },
+    "size_class_stats": {
+      "writes": [
+        {
+          "class": "small",
+          "operations": 0,
+          "bytes": 0,
+          "avg_latency_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0,
+          "p99_ms": 0.0,
+          "throughput_bytes_per_sec": 0.0
+        },
+        {
+          "class": "medium",
+          "operations": 0,
+          "bytes": 0,
+          "avg_latency_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0,
+          "p99_ms": 0.0,
+          "throughput_bytes_per_sec": 0.0
+        },
+        {
+          "class": "large",
+          "operations": 3,
+          "bytes": 352321536,
+          "avg_latency_ms": 836.0131666666666,
+          "p50_ms": 377.6544,
+          "p95_ms": 2049.7175,
+          "p99_ms": 2049.7175,
+          "throughput_bytes_per_sec": 107908219.97511739
+        }
+      ],
+      "reads": [
+        {
+          "class": "small",
+          "operations": 0,
+          "bytes": 0,
+          "avg_latency_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0,
+          "p99_ms": 0.0,
+          "throughput_bytes_per_sec": 0.0
+        },
+        {
+          "class": "medium",
+          "operations": 0,
+          "bytes": 0,
+          "avg_latency_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0,
+          "p99_ms": 0.0,
+          "throughput_bytes_per_sec": 0.0
+        },
+        {
+          "class": "large",
+          "operations": 3,
+          "bytes": 12582912,
+          "avg_latency_ms": 9.676166666666665,
+          "p50_ms": 9.8823,
+          "p95_ms": 10.0134,
+          "p99_ms": 10.0134,
+          "throughput_bytes_per_sec": 1167386790.6148236
+        }
+      ]
+    }
+  },
+  "local_first_read_comparison": {
+    "cache_path": "d:\\cache\\506547a9-ddd0-4fc6-a8d0-d3fdaec00677",
+    "upload_dir": "d:\\cache\\506547a9-ddd0-4fc6-a8d0-d3fdaec00677\\upload",
+    "phases": [
+      {
+        "phase": "baseline-read",
+        "wait_target": "idle",
+        "target_state_observed": true,
+        "wait_ms": 0.1522,
+        "pending_uploads_before": 0,
+        "pending_uploads_after": 0,
+        "results": {
+          "operations": 3,
+          "bytes": 12582912,
+          "elapsed_ms": 29.8809,
+          "avg_latency_ms": 9.9603,
+          "p50_ms": 10.1656,
+          "p95_ms": 10.1669,
+          "p99_ms": 10.1669,
+          "throughput_bytes_per_sec": 1157336718.0817306,
+          "operations_log": [
+            {
+              "operation_index": 0,
+              "work_index": 0,
+              "worker_id": 0,
+              "target": "Z:.studiofs-test-cache\\test_cache_file_000000.bin",
+              "size_class": "large",
+              "bytes": 4194304,
+              "elapsed_ms": 9.5484,
+              "throughput_bytes_per_sec": 439267730.7192828
+            },
+            {
+              "operation_index": 1,
+              "work_index": 1,
+              "worker_id": 1,
+              "target": "Z:.studiofs-test-cache\\test_cache_file_000001.bin",
+              "size_class": "large",
+              "bytes": 4194304,
+              "elapsed_ms": 10.1669,
+              "throughput_bytes_per_sec": 412545023.5568364
+            },
+            {
+              "operation_index": 2,
+              "work_index": 2,
+              "worker_id": 2,
+              "target": "Z:.studiofs-test-cache\\test_cache_file_000002.bin",
+              "size_class": "large",
+              "bytes": 4194304,
+              "elapsed_ms": 10.1656,
+              "throughput_bytes_per_sec": 412597780.7507673
+            }
+          ]
+        }
+      },
+      {
+        "phase": "during-upload-read",
+        "wait_target": "active",
+        "target_state_observed": false,
+        "wait_ms": 10097.7783,
+        "pending_uploads_before": 0,
+        "pending_uploads_after": 0,
+        "results": {
+          "operations": 3,
+          "bytes": 12582912,
+          "elapsed_ms": 29.0285,
+          "avg_latency_ms": 9.676166666666665,
+          "p50_ms": 9.8823,
+          "p95_ms": 10.0134,
+          "p99_ms": 10.0134,
+          "throughput_bytes_per_sec": 1167386790.6148236,
+          "operations_log": [
+            {
+              "operation_index": 0,
+              "work_index": 0,
+              "worker_id": 0,
+              "target": "Z:.studiofs-test-cache\\test_cache_file_000000.bin",
+              "size_class": "large",
+              "bytes": 4194304,
+              "elapsed_ms": 10.0134,
+              "throughput_bytes_per_sec": 418869115.38538355
+            },
+            {
+              "operation_index": 1,
+              "work_index": 1,
+              "worker_id": 4,
+              "target": "Z:.studiofs-test-cache\\test_cache_file_000001.bin",
+              "size_class": "large",
+              "bytes": 4194304,
+              "elapsed_ms": 9.8823,
+              "throughput_bytes_per_sec": 424425892.7577588
+            },
+            {
+              "operation_index": 2,
+              "work_index": 2,
+              "worker_id": 1,
+              "target": "Z:.studiofs-test-cache\\test_cache_file_000002.bin",
+              "size_class": "large",
+              "bytes": 4194304,
+              "elapsed_ms": 9.1328,
+              "throughput_bytes_per_sec": 459257182.9011913
+            }
+          ]
+        }
+      },
+      {
+        "phase": "post-upload-read",
+        "wait_target": "idle",
+        "target_state_observed": true,
+        "wait_ms": 0.058,
+        "pending_uploads_before": 0,
+        "pending_uploads_after": 0,
+        "results": {
+          "operations": 3,
+          "bytes": 12582912,
+          "elapsed_ms": 24.3604,
+          "avg_latency_ms": 8.120133333333333,
+          "p50_ms": 8.0849,
+          "p95_ms": 8.2105,
+          "p99_ms": 8.2105,
+          "throughput_bytes_per_sec": 1429405309.613877,
+          "operations_log": [
+            {
+              "operation_index": 0,
+              "work_index": 0,
+              "worker_id": 0,
+              "target": "Z:.studiofs-test-cache\\test_cache_file_000000.bin",
+              "size_class": "large",
+              "bytes": 4194304,
+              "elapsed_ms": 8.065,
+              "throughput_bytes_per_sec": 520062492.25046504
+            },
+            {
+              "operation_index": 1,
+              "work_index": 1,
+              "worker_id": 3,
+              "target": "Z:.studiofs-test-cache\\test_cache_file_000001.bin",
+              "size_class": "large",
+              "bytes": 4194304,
+              "elapsed_ms": 8.084900000000001,
+              "throughput_bytes_per_sec": 518782421.55128694
+            },
+            {
+              "operation_index": 2,
+              "work_index": 2,
+              "worker_id": 4,
+              "target": "Z:.studiofs-test-cache\\test_cache_file_000002.bin",
+              "size_class": "large",
+              "bytes": 4194304,
+              "elapsed_ms": 8.210500000000001,
+              "throughput_bytes_per_sec": 510846355.2767797
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "mounted_memory": {
+    "mount_pid": 6988,
+    "rss_bytes_steady_state": 43220992,
+    "rss_bytes_peak": 111497216,
+    "dirty_bytes_steady_state": 0,
+    "dirty_bytes_peak": 2097152,
+    "dirty_limit_bytes": 1677721600
+  },
+  "writes": {
+    "operations": 3,
+    "bytes": 352321536,
+    "elapsed_ms": 2508.0395,
+    "avg_latency_ms": 836.0131666666666,
+    "p50_ms": 377.6544,
+    "p95_ms": 2049.7175,
+    "p99_ms": 2049.7175,
+    "throughput_bytes_per_sec": 107908219.97511739
+  },
+  "reads": {
+    "operations": 3,
+    "bytes": 12582912,
+    "elapsed_ms": 29.0285,
+    "avg_latency_ms": 9.676166666666665,
+    "p50_ms": 9.8823,
+    "p95_ms": 10.0134,
+    "p99_ms": 10.0134,
+    "throughput_bytes_per_sec": 1167386790.6148236
+  }
+}

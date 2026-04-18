@@ -1,0 +1,184 @@
+{
+  "run_id": "b3d54131-8588-48f9-b1c3-2341ad142892",
+  "mode": "e2e",
+  "cache_dir": "Z:",
+  "started_at": "2026-04-18T15:23:14Z",
+  "completed_at": "2026-04-18T15:23:28Z",
+  "total_elapsed_ms": 14011.5117,
+  "block_size": 4194304,
+  "read_size": 67108864,
+  "concurrency": 2,
+  "sequential_streams": false,
+  "io_depth": 32,
+  "warmup_runs": 0,
+  "sizes": "explicit-list(3)",
+  "workload_files": 3,
+  "workload_small_files": 0,
+  "workload_medium_files": 0,
+  "workload_large_files": 3,
+  "access_pattern": "sequential",
+  "l1_limit": 2147483648,
+  "work_root": "Z:.studiofs-test-cache",
+  "volume": "test",
+  "mount_point": "Z:",
+  "advanced_metrics": {
+    "size_class_boundaries": {
+      "small_max_bytes": 10240,
+      "medium_max_bytes": 4194304
+    },
+    "size_class_stats": {
+      "writes": [
+        {
+          "class": "small",
+          "operations": 0,
+          "bytes": 0,
+          "avg_latency_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0,
+          "p99_ms": 0.0,
+          "throughput_bytes_per_sec": 0.0
+        },
+        {
+          "class": "medium",
+          "operations": 0,
+          "bytes": 0,
+          "avg_latency_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0,
+          "p99_ms": 0.0,
+          "throughput_bytes_per_sec": 0.0
+        },
+        {
+          "class": "large",
+          "operations": 3,
+          "bytes": 352321536,
+          "avg_latency_ms": 881.3439333333333,
+          "p50_ms": 318.0741,
+          "p95_ms": 2224.3465,
+          "p99_ms": 2224.3465,
+          "throughput_bytes_per_sec": 94158996.95021535
+        }
+      ],
+      "reads": [
+        {
+          "class": "small",
+          "operations": 0,
+          "bytes": 0,
+          "avg_latency_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0,
+          "p99_ms": 0.0,
+          "throughput_bytes_per_sec": 0.0
+        },
+        {
+          "class": "medium",
+          "operations": 0,
+          "bytes": 0,
+          "avg_latency_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0,
+          "p99_ms": 0.0,
+          "throughput_bytes_per_sec": 0.0
+        },
+        {
+          "class": "large",
+          "operations": 3,
+          "bytes": 150994944,
+          "avg_latency_ms": 75.54336666666667,
+          "p50_ms": 97.2935,
+          "p95_ms": 98.4892,
+          "p99_ms": 98.4892,
+          "throughput_bytes_per_sec": 1475600413.5728512
+        }
+      ]
+    }
+  },
+  "local_first_read_comparison": {
+    "cache_path": "d:\\cache\\506547a9-ddd0-4fc6-a8d0-d3fdaec00677",
+    "upload_dir": "d:\\cache\\506547a9-ddd0-4fc6-a8d0-d3fdaec00677\\upload",
+    "phases": [
+      {
+        "phase": "baseline-read",
+        "wait_target": "idle",
+        "target_state_observed": true,
+        "wait_ms": 0.0846,
+        "pending_uploads_before": 0,
+        "pending_uploads_after": 0,
+        "results": {
+          "operations": 3,
+          "bytes": 150994944,
+          "elapsed_ms": 246.3443,
+          "avg_latency_ms": 82.11476666666667,
+          "p50_ms": 107.0018,
+          "p95_ms": 107.5556,
+          "p99_ms": 107.5556,
+          "throughput_bytes_per_sec": 1350177531.9358976
+        }
+      },
+      {
+        "phase": "during-upload-read",
+        "wait_target": "active",
+        "target_state_observed": false,
+        "wait_ms": 10001.7196,
+        "pending_uploads_before": 0,
+        "pending_uploads_after": 0,
+        "results": {
+          "operations": 3,
+          "bytes": 150994944,
+          "elapsed_ms": 226.6301,
+          "avg_latency_ms": 75.54336666666667,
+          "p50_ms": 97.2935,
+          "p95_ms": 98.4892,
+          "p99_ms": 98.4892,
+          "throughput_bytes_per_sec": 1475600413.5728512
+        }
+      },
+      {
+        "phase": "post-upload-read",
+        "wait_target": "idle",
+        "target_state_observed": true,
+        "wait_ms": 0.0538,
+        "pending_uploads_before": 0,
+        "pending_uploads_after": 0,
+        "results": {
+          "operations": 3,
+          "bytes": 150994944,
+          "elapsed_ms": 223.4683,
+          "avg_latency_ms": 74.48943333333332,
+          "p50_ms": 97.2295,
+          "p95_ms": 100.2021,
+          "p99_ms": 100.2021,
+          "throughput_bytes_per_sec": 1456102759.937511
+        }
+      }
+    ]
+  },
+  "mounted_memory": {
+    "mount_pid": 2132,
+    "rss_bytes_steady_state": 48472064,
+    "rss_bytes_peak": 115646464,
+    "dirty_bytes_steady_state": 8,
+    "dirty_bytes_peak": 2097160,
+    "dirty_limit_bytes": 1677721600
+  },
+  "writes": {
+    "operations": 3,
+    "bytes": 352321536,
+    "elapsed_ms": 2644.0318,
+    "avg_latency_ms": 881.3439333333333,
+    "p50_ms": 318.0741,
+    "p95_ms": 2224.3465,
+    "p99_ms": 2224.3465,
+    "throughput_bytes_per_sec": 94158996.95021535
+  },
+  "reads": {
+    "operations": 3,
+    "bytes": 150994944,
+    "elapsed_ms": 226.6301,
+    "avg_latency_ms": 75.54336666666667,
+    "p50_ms": 97.2935,
+    "p95_ms": 98.4892,
+    "p99_ms": 98.4892,
+    "throughput_bytes_per_sec": 1475600413.5728512
+  }
+}

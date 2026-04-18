@@ -39,7 +39,7 @@ pub use cache_index::{
     DirtyReplayEntry, EvictionCandidateEntry,
 };
 use eviction::{CacheBudgetGovernor, EVICTION_CANDIDATE_PAGE_SIZE, EVICTION_DELETE_BATCH_SIZE};
-pub use file_payload_store::{FilePayloadStore, FilePayloadStoreError};
+pub use file_payload_store::{FilePayloadStore, FilePayloadStoreError, PayloadBatchEntry};
 pub use layout::{
     LOCAL_BLOCK_LAYOUT_MARKER_FILE, LOCAL_BLOCK_LAYOUT_VERSION, LOCAL_BLOCK_PAYLOAD_SHARD_COUNT,
     LOCAL_BLOCK_REDB_INDEX_FILE, LOCAL_BLOCK_SUBTREE, LocalBlockLayout,
@@ -817,7 +817,7 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
         }
 
         let mut updates = Vec::with_capacity(entries.len());
-        let mut written_object_ids = Vec::with_capacity(entries.len());
+        let mut persisted_entries = Vec::with_capacity(entries.len());
         let mut estimated_current = self
             .index
             .stats()
@@ -860,7 +860,6 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
                         estimated_current = current_after_evict;
                         continue;
                     }
-                    self.payload_store.remove_batch(&written_object_ids);
                     return Err(LocalBlockBackendError::CapacityExhausted {
                         needed: payload_len,
                         free: self.budget_governor.free_bytes(current_after_evict),
@@ -868,12 +867,6 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
                 }
                 estimated_current = current_after_evict;
             }
-
-            if let Err(error) = self.payload_store.put(entry.object_id, entry.data.as_ref()) {
-                self.payload_store.remove_batch(&written_object_ids);
-                return Err(LocalBlockBackendError::Other(Box::new(error)));
-            }
-            written_object_ids.push(entry.object_id);
             estimated_current = estimated_current.saturating_add(payload_len);
 
             let lifecycle = if entry.evictable {
@@ -904,16 +897,28 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
                 },
                 evictable: entry.evictable,
             });
+            persisted_entries.push(PayloadBatchEntry {
+                object_id: entry.object_id,
+                data: entry.data.as_ref(),
+            });
         }
 
         if updates.is_empty() {
             return Ok(());
         }
 
+        if let Err(error) = self.payload_store.put_batch(&persisted_entries) {
+            return Err(LocalBlockBackendError::Other(Box::new(error)));
+        }
+
         if let Err(error) = self.index.upsert_many(&updates) {
+            let written_object_ids: Vec<u64> = persisted_entries
+                .iter()
+                .map(|entry| entry.object_id)
+                .collect();
             self.payload_store.remove_batch(&written_object_ids);
             warn!(
-                object_count = written_object_ids.len(),
+                object_count = persisted_entries.len(),
                 error = ?error,
                 "local block runtime batch index upsert failed after payload writes; removed payloads for rollback"
             );

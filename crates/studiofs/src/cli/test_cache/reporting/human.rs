@@ -98,8 +98,8 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
     );
     let _ = writeln!(
         &mut out,
-        "Config:    sizes {}, warmups {}, sequential-streams {}",
-        report.sizes, report.warmup_runs, report.sequential_streams
+        "Config:    sizes {}, repeat {}, warmups {}, sequential-streams {}",
+        report.sizes, report.workload_repeat, report.warmup_runs, report.sequential_streams
     );
     if report.sequential_streams {
         let effective = report.concurrency.min(report.io_depth.max(1));
@@ -192,6 +192,11 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
                     } else {
                         "no".to_string()
                     },
+                    if phase.valid_for_target {
+                        "yes".to_string()
+                    } else {
+                        "no".to_string()
+                    },
                     format_duration_ms(phase.wait_ms),
                     phase.pending_uploads_before.to_string(),
                     phase.pending_uploads_after.to_string(),
@@ -210,6 +215,7 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
                     "P95",
                     "Target",
                     "Observed",
+                    "Valid",
                     "Wait",
                     "Pending before",
                     "Pending after",
@@ -217,6 +223,21 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
                 &rows,
             )
         );
+        for phase in comparison
+            .phases
+            .iter()
+            .filter(|phase| !phase.valid_for_target)
+        {
+            let _ = writeln!(
+                &mut out,
+                "Phase {} invalid: {}",
+                phase.phase,
+                phase
+                    .validation_message
+                    .clone()
+                    .unwrap_or_else(|| "target state was not observed".to_string())
+            );
+        }
     }
 
     if let Some(memory) = &report.mounted_memory {
@@ -492,9 +513,12 @@ mod tests {
                     phase: "baseline-read".to_string(),
                     wait_target: "idle".to_string(),
                     target_state_observed: true,
+                    valid_for_target: true,
+                    required_pending_uploads: 0,
                     wait_ms: 120.0,
                     pending_uploads_before: 0,
                     pending_uploads_after: 0,
+                    validation_message: None,
                     results: OpReport {
                         operations: 16,
                         bytes: 128 * 1024 * 1024,
@@ -504,15 +528,19 @@ mod tests {
                         p95_ms: 7.3,
                         p99_ms: 7.8,
                         throughput_bytes_per_sec: 1_700.0 * 1024.0 * 1024.0,
+                        operations_log: Vec::new(),
                     },
                 },
                 MountedLocalFirstReadPhaseReport {
                     phase: "during-upload-read".to_string(),
                     wait_target: "active".to_string(),
                     target_state_observed: true,
+                    valid_for_target: true,
+                    required_pending_uploads: 1,
                     wait_ms: 18.0,
                     pending_uploads_before: 3,
                     pending_uploads_after: 2,
+                    validation_message: None,
                     results: OpReport {
                         operations: 16,
                         bytes: 128 * 1024 * 1024,
@@ -522,15 +550,19 @@ mod tests {
                         p95_ms: 8.4,
                         p99_ms: 9.0,
                         throughput_bytes_per_sec: 1_500.0 * 1024.0 * 1024.0,
+                        operations_log: Vec::new(),
                     },
                 },
                 MountedLocalFirstReadPhaseReport {
                     phase: "post-upload-read".to_string(),
                     wait_target: "idle".to_string(),
                     target_state_observed: true,
+                    valid_for_target: true,
+                    required_pending_uploads: 0,
                     wait_ms: 240.0,
                     pending_uploads_before: 0,
                     pending_uploads_after: 0,
+                    validation_message: None,
                     results: OpReport {
                         operations: 16,
                         bytes: 128 * 1024 * 1024,
@@ -540,6 +572,7 @@ mod tests {
                         p95_ms: 7.5,
                         p99_ms: 7.9,
                         throughput_bytes_per_sec: 1_650.0 * 1024.0 * 1024.0,
+                        operations_log: Vec::new(),
                     },
                 },
             ],

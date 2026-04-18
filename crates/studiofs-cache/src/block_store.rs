@@ -33,6 +33,12 @@ const READ_HINT_MIN_LEN: usize = 512 * 1024;
 
 static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, Debug)]
+pub struct PayloadBatchEntry<'a> {
+    pub object_id: u64,
+    pub data: &'a [u8],
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FilePayloadStoreError {
     #[error("I/O error: {0}")]
@@ -223,6 +229,81 @@ impl FilePayloadStore {
         Ok(())
     }
 
+    pub fn put_batch(
+        &self,
+        entries: &[PayloadBatchEntry<'_>],
+    ) -> Result<(), FilePayloadStoreError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let durable_sync = matches!(self.sync_mode, LocalBlockPayloadSyncMode::Durable);
+        let mut prepared_dirs = HashSet::new();
+        let mut staged = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let payload_path = self.layout.payload_block_path(entry.object_id);
+            let payload_dir = payload_path
+                .parent()
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "payload path has no parent directory: {}",
+                        payload_path.display()
+                    ))
+                })?
+                .to_path_buf();
+            if prepared_dirs.insert(payload_dir.clone()) {
+                std::fs::create_dir_all(&payload_dir)?;
+            }
+            let temp_path = self.write_temp_payload_file(
+                &self.layout.tmp_dir,
+                entry.object_id,
+                entry.data,
+                durable_sync,
+            )?;
+            staged.push(StagedBatchPayload {
+                entry: *entry,
+                payload_path,
+                payload_dir,
+                temp_path,
+            });
+        }
+
+        let mut renamed_object_ids = Vec::with_capacity(staged.len());
+        let mut synced_dirs = HashSet::new();
+        for idx in 0..staged.len() {
+            let staged_entry = &staged[idx];
+            if let Err(error) = self.commit_staged_batch_payload(staged_entry, durable_sync) {
+                self.cleanup_staged_batch_payloads(&staged[idx + 1..]);
+                self.remove_batch(&renamed_object_ids);
+                return Err(error);
+            }
+            renamed_object_ids.push(staged_entry.entry.object_id);
+            self.invalidate_cached_read_handle(staged_entry.entry.object_id);
+            synced_dirs.insert(staged_entry.payload_dir.clone());
+        }
+
+        if durable_sync {
+            if let Err(error) = self.sync_directory_put_barrier(&self.layout.tmp_dir) {
+                self.remove_batch(&renamed_object_ids);
+                return Err(error);
+            }
+            for dir in synced_dirs {
+                if let Err(error) = self.sync_directory_put_barrier(&dir) {
+                    self.remove_batch(&renamed_object_ids);
+                    return Err(error);
+                }
+            }
+        } else {
+            for staged_entry in &staged {
+                self.record_grouped_sync_targets(
+                    staged_entry.entry.object_id,
+                    &staged_entry.payload_dir,
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn remove(&self, object_id: u64) {
         self.invalidate_cached_read_handle(object_id);
         self.pending_grouped_sync
@@ -286,6 +367,42 @@ impl FilePayloadStore {
         }
         drop(temp_file);
         Ok(temp_path)
+    }
+
+    fn commit_staged_batch_payload(
+        &self,
+        staged: &StagedBatchPayload<'_>,
+        durable_sync: bool,
+    ) -> Result<(), FilePayloadStoreError> {
+        match platform::rename_atomic(&staged.temp_path, &staged.payload_path) {
+            Ok(()) => Ok(()),
+            Err(error) if platform::is_cross_device_link_error(&error) => {
+                let _ = std::fs::remove_file(&staged.temp_path);
+                let payload_local_temp = self.write_temp_payload_file(
+                    &staged.payload_dir,
+                    staged.entry.object_id,
+                    staged.entry.data,
+                    durable_sync,
+                )?;
+                if let Err(rename_error) =
+                    platform::rename_atomic(&payload_local_temp, &staged.payload_path)
+                {
+                    let _ = std::fs::remove_file(&payload_local_temp);
+                    return Err(FilePayloadStoreError::Io(rename_error));
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&staged.temp_path);
+                Err(FilePayloadStoreError::Io(error))
+            }
+        }
+    }
+
+    fn cleanup_staged_batch_payloads(&self, staged: &[StagedBatchPayload<'_>]) {
+        for entry in staged {
+            let _ = std::fs::remove_file(&entry.temp_path);
+        }
     }
 
     #[cfg(test)]
@@ -766,4 +883,56 @@ mod tests {
         );
         assert_eq!(after_failure.pending_grouped_dir_syncs, pending_dirs.len());
     }
+
+    #[test]
+    fn fast_mode_put_batch_defers_barriers_until_grouped_sync_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let store =
+            FilePayloadStore::open_with_sync_mode(layout, LocalBlockPayloadSyncMode::Fast).unwrap();
+        let entries = [
+            PayloadBatchEntry {
+                object_id: 8201,
+                data: b"one",
+            },
+            PayloadBatchEntry {
+                object_id: 8202,
+                data: b"two",
+            },
+        ];
+
+        store.put_batch(&entries).unwrap();
+
+        let before_sync = store.sync_barrier_snapshot();
+        assert_eq!(before_sync.per_put_file_sync_calls, 0);
+        assert_eq!(before_sync.per_put_dir_sync_calls, 0);
+        assert!(
+            before_sync.pending_grouped_file_syncs >= entries.len(),
+            "fast mode batched put should queue every payload for grouped sync_data barriers"
+        );
+        assert!(
+            before_sync.pending_grouped_dir_syncs >= 1,
+            "fast mode batched put should queue directories for grouped sync_data barriers"
+        );
+        assert_eq!(store.get(8201).unwrap().as_ref(), b"one");
+        assert_eq!(store.get(8202).unwrap().as_ref(), b"two");
+
+        store.sync_data().unwrap();
+
+        let after_sync = store.sync_barrier_snapshot();
+        assert_eq!(after_sync.pending_grouped_file_syncs, 0);
+        assert_eq!(after_sync.pending_grouped_dir_syncs, 0);
+        assert!(
+            after_sync.grouped_file_sync_calls >= entries.len() as u64,
+            "grouped sync_data should sync all queued payload files from batched put"
+        );
+    }
+}
+
+#[derive(Debug)]
+struct StagedBatchPayload<'a> {
+    entry: PayloadBatchEntry<'a>,
+    payload_path: PathBuf,
+    payload_dir: PathBuf,
+    temp_path: PathBuf,
 }

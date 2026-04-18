@@ -1,0 +1,4363 @@
+{
+  "run_id": "38be357c-1854-45be-8c04-da1ba816838e",
+  "mode": "e2e",
+  "cache_dir": "Z:\\",
+  "started_at": "2026-04-18T18:35:01Z",
+  "completed_at": "2026-04-18T18:35:55Z",
+  "total_elapsed_ms": 54321.8646,
+  "block_size": 4194304,
+  "read_size": 67108864,
+  "concurrency": 2,
+  "sequential_streams": false,
+  "io_depth": 32,
+  "warmup_runs": 0,
+  "sizes": "explicit-list(3) x16",
+  "workload_repeat": 16,
+  "workload_files": 48,
+  "workload_small_files": 0,
+  "workload_medium_files": 0,
+  "workload_large_files": 48,
+  "access_pattern": "sequential",
+  "l1_limit": 2147483648,
+  "work_root": "Z:\\.studiofs-test-cache",
+  "volume": "test",
+  "mount_point": "Z:",
+  "advanced_metrics": {
+    "size_class_boundaries": {
+      "small_max_bytes": 10240,
+      "medium_max_bytes": 4194304
+    },
+    "size_class_stats": {
+      "writes": [
+        {
+          "class": "small",
+          "operations": 0,
+          "bytes": 0,
+          "avg_latency_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0,
+          "p99_ms": 0.0,
+          "throughput_bytes_per_sec": 0.0
+        },
+        {
+          "class": "medium",
+          "operations": 0,
+          "bytes": 0,
+          "avg_latency_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0,
+          "p99_ms": 0.0,
+          "throughput_bytes_per_sec": 0.0
+        },
+        {
+          "class": "large",
+          "operations": 48,
+          "bytes": 5637144576,
+          "avg_latency_ms": 1103.75160625,
+          "p50_ms": 500.1373,
+          "p95_ms": 2845.9036,
+          "p99_ms": 2882.3868,
+          "throughput_bytes_per_sec": 1122008827.158645
+        }
+      ],
+      "reads": [
+        {
+          "class": "small",
+          "operations": 0,
+          "bytes": 0,
+          "avg_latency_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0,
+          "p99_ms": 0.0,
+          "throughput_bytes_per_sec": 0.0
+        },
+        {
+          "class": "medium",
+          "operations": 0,
+          "bytes": 0,
+          "avg_latency_ms": 0.0,
+          "p50_ms": 0.0,
+          "p95_ms": 0.0,
+          "p99_ms": 0.0,
+          "throughput_bytes_per_sec": 0.0
+        },
+        {
+          "class": "large",
+          "operations": 48,
+          "bytes": 2415919104,
+          "avg_latency_ms": 2465.8916666666664,
+          "p50_ms": 2755.1683,
+          "p95_ms": 3592.1347,
+          "p99_ms": 3601.0511,
+          "throughput_bytes_per_sec": 538273461.253908
+        }
+      ]
+    }
+  },
+  "local_first_read_comparison": {
+    "cache_path": "d:\\cache\\506547a9-ddd0-4fc6-a8d0-d3fdaec00677",
+    "upload_dir": "d:\\cache\\506547a9-ddd0-4fc6-a8d0-d3fdaec00677\\upload",
+    "phases": [
+      {
+        "phase": "baseline-read",
+        "wait_target": "idle",
+        "target_state_observed": true,
+        "valid_for_target": true,
+        "required_pending_uploads": 0,
+        "wait_ms": 44787.7603,
+        "pending_uploads_before": 0,
+        "pending_uploads_after": 0,
+        "results": {
+          "operations": 48,
+          "bytes": 2415919104,
+          "elapsed_ms": 8883.687,
+          "avg_latency_ms": 185.0768125,
+          "p50_ms": 243.7059,
+          "p95_ms": 267.4575,
+          "p99_ms": 273.1691,
+          "throughput_bytes_per_sec": 6726664164.501402,
+          "operations_log": [
+            {
+              "operation_index": 0,
+              "work_index": 0,
+              "worker_id": 0,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000000.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 59.4501,
+              "throughput_bytes_per_sec": 282206690.98958623
+            },
+            {
+              "operation_index": 1,
+              "work_index": 1,
+              "worker_id": 1,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000001.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 267.45750000000004,
+              "throughput_bytes_per_sec": 250914122.8045577
+            },
+            {
+              "operation_index": 2,
+              "work_index": 2,
+              "worker_id": 2,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000002.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 273.1691,
+              "throughput_bytes_per_sec": 245667844.56953588
+            },
+            {
+              "operation_index": 3,
+              "work_index": 3,
+              "worker_id": 3,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000003.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 58.399,
+              "throughput_bytes_per_sec": 287286015.17149264
+            },
+            {
+              "operation_index": 4,
+              "work_index": 4,
+              "worker_id": 4,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000004.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 262.7007,
+              "throughput_bytes_per_sec": 255457499.7325854
+            },
+            {
+              "operation_index": 5,
+              "work_index": 5,
+              "worker_id": 6,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000005.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 252.23919999999998,
+              "throughput_bytes_per_sec": 266052477.1724617
+            },
+            {
+              "operation_index": 6,
+              "work_index": 6,
+              "worker_id": 8,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000006.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 55.9583,
+              "throughput_bytes_per_sec": 299816398.9971103
+            },
+            {
+              "operation_index": 7,
+              "work_index": 7,
+              "worker_id": 7,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000007.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 261.4997,
+              "throughput_bytes_per_sec": 256630749.48078334
+            },
+            {
+              "operation_index": 8,
+              "work_index": 8,
+              "worker_id": 10,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000008.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 259.32,
+              "throughput_bytes_per_sec": 258787845.1334259
+            },
+            {
+              "operation_index": 9,
+              "work_index": 9,
+              "worker_id": 11,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000009.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 54.6042,
+              "throughput_bytes_per_sec": 307251383.5932035
+            },
+            {
+              "operation_index": 10,
+              "work_index": 10,
+              "worker_id": 9,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000010.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 258.02160000000003,
+              "throughput_bytes_per_sec": 260090100.9837936
+            },
+            {
+              "operation_index": 11,
+              "work_index": 11,
+              "worker_id": 12,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000011.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 262.5747,
+              "throughput_bytes_per_sec": 255580084.44834936
+            },
+            {
+              "operation_index": 12,
+              "work_index": 12,
+              "worker_id": 13,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000012.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 59.491099999999996,
+              "throughput_bytes_per_sec": 282012200.1442233
+            },
+            {
+              "operation_index": 13,
+              "work_index": 13,
+              "worker_id": 14,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000013.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 262.93519999999995,
+              "throughput_bytes_per_sec": 255229668.75488722
+            },
+            {
+              "operation_index": 14,
+              "work_index": 14,
+              "worker_id": 15,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000014.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 259.762,
+              "throughput_bytes_per_sec": 258347502.71402285
+            },
+            {
+              "operation_index": 15,
+              "work_index": 15,
+              "worker_id": 16,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000015.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 50.6725,
+              "throughput_bytes_per_sec": 331091144.1116977
+            },
+            {
+              "operation_index": 16,
+              "work_index": 16,
+              "worker_id": 17,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000016.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 266.0499,
+              "throughput_bytes_per_sec": 252241643.39095786
+            },
+            {
+              "operation_index": 17,
+              "work_index": 17,
+              "worker_id": 18,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000017.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 260.37739999999997,
+              "throughput_bytes_per_sec": 257736900.36078402
+            },
+            {
+              "operation_index": 18,
+              "work_index": 18,
+              "worker_id": 19,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000018.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 53.4313,
+              "throughput_bytes_per_sec": 313996028.5450663
+            },
+            {
+              "operation_index": 19,
+              "work_index": 19,
+              "worker_id": 20,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000019.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 260.3511,
+              "throughput_bytes_per_sec": 257762936.28104514
+            },
+            {
+              "operation_index": 20,
+              "work_index": 20,
+              "worker_id": 21,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000020.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 263.3488,
+              "throughput_bytes_per_sec": 254828820.1806881
+            },
+            {
+              "operation_index": 21,
+              "work_index": 21,
+              "worker_id": 22,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000021.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 54.6127,
+              "throughput_bytes_per_sec": 307203562.54131365
+            },
+            {
+              "operation_index": 22,
+              "work_index": 22,
+              "worker_id": 23,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000022.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 250.51289999999997,
+              "throughput_bytes_per_sec": 267885861.36681986
+            },
+            {
+              "operation_index": 23,
+              "work_index": 23,
+              "worker_id": 24,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000023.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 253.33099999999996,
+              "throughput_bytes_per_sec": 264905850.44862258
+            },
+            {
+              "operation_index": 24,
+              "work_index": 24,
+              "worker_id": 25,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000024.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 55.4526,
+              "throughput_bytes_per_sec": 302550574.72508055
+            },
+            {
+              "operation_index": 25,
+              "work_index": 25,
+              "worker_id": 26,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000025.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 254.68809999999996,
+              "throughput_bytes_per_sec": 263494305.38764867
+            },
+            {
+              "operation_index": 26,
+              "work_index": 26,
+              "worker_id": 28,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000026.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 255.51950000000002,
+              "throughput_bytes_per_sec": 262636957.25766525
+            },
+            {
+              "operation_index": 27,
+              "work_index": 27,
+              "worker_id": 29,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000027.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 58.1625,
+              "throughput_bytes_per_sec": 288454175.8005588
+            },
+            {
+              "operation_index": 28,
+              "work_index": 28,
+              "worker_id": 27,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000028.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 268.87100000000004,
+              "throughput_bytes_per_sec": 249595025.12357226
+            },
+            {
+              "operation_index": 29,
+              "work_index": 29,
+              "worker_id": 30,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000029.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 262.2254,
+              "throughput_bytes_per_sec": 255920532.4884622
+            },
+            {
+              "operation_index": 30,
+              "work_index": 30,
+              "worker_id": 5,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000030.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 60.4225,
+              "throughput_bytes_per_sec": 277665041.9959452
+            },
+            {
+              "operation_index": 31,
+              "work_index": 31,
+              "worker_id": 31,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000031.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 254.61479999999997,
+              "throughput_bytes_per_sec": 263570161.67167032
+            },
+            {
+              "operation_index": 32,
+              "work_index": 32,
+              "worker_id": 16,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000032.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 241.3631,
+              "throughput_bytes_per_sec": 278041109.017907
+            },
+            {
+              "operation_index": 33,
+              "work_index": 33,
+              "worker_id": 19,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000033.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 59.0287,
+              "throughput_bytes_per_sec": 284221336.40076774
+            },
+            {
+              "operation_index": 34,
+              "work_index": 34,
+              "worker_id": 11,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000034.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 237.09130000000002,
+              "throughput_bytes_per_sec": 283050723.4976568
+            },
+            {
+              "operation_index": 35,
+              "work_index": 35,
+              "worker_id": 25,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000035.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 245.9541,
+              "throughput_bytes_per_sec": 272851170.1980166
+            },
+            {
+              "operation_index": 36,
+              "work_index": 36,
+              "worker_id": 8,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000036.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 60.776700000000005,
+              "throughput_bytes_per_sec": 276046840.31874055
+            },
+            {
+              "operation_index": 37,
+              "work_index": 37,
+              "worker_id": 22,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000037.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 246.3003,
+              "throughput_bytes_per_sec": 272467650.26270777
+            },
+            {
+              "operation_index": 38,
+              "work_index": 38,
+              "worker_id": 3,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000038.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 240.881,
+              "throughput_bytes_per_sec": 278597581.37835693
+            },
+            {
+              "operation_index": 39,
+              "work_index": 39,
+              "worker_id": 13,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000039.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 65.42190000000001,
+              "throughput_bytes_per_sec": 256446480.45990714
+            },
+            {
+              "operation_index": 40,
+              "work_index": 40,
+              "worker_id": 29,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000040.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 243.7059,
+              "throughput_bytes_per_sec": 275368236.8789594
+            },
+            {
+              "operation_index": 41,
+              "work_index": 41,
+              "worker_id": 5,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000041.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 240.8356,
+              "throughput_bytes_per_sec": 278650099.90217394
+            },
+            {
+              "operation_index": 42,
+              "work_index": 42,
+              "worker_id": 0,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000042.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 65.49549999999999,
+              "throughput_bytes_per_sec": 256158300.9519738
+            },
+            {
+              "operation_index": 43,
+              "work_index": 43,
+              "worker_id": 19,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000043.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 209.134,
+              "throughput_bytes_per_sec": 320889305.4214045
+            },
+            {
+              "operation_index": 44,
+              "work_index": 44,
+              "worker_id": 8,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000044.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 207.754,
+              "throughput_bytes_per_sec": 323020803.4502344
+            },
+            {
+              "operation_index": 45,
+              "work_index": 45,
+              "worker_id": 13,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000045.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 65.79010000000001,
+              "throughput_bytes_per_sec": 255011255.49284768
+            },
+            {
+              "operation_index": 46,
+              "work_index": 46,
+              "worker_id": 0,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000046.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 204.3337,
+              "throughput_bytes_per_sec": 328427782.59288603
+            },
+            {
+              "operation_index": 47,
+              "work_index": 47,
+              "worker_id": 13,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000047.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 159.59470000000002,
+              "throughput_bytes_per_sec": 420495567.8352727
+            }
+          ]
+        }
+      },
+      {
+        "phase": "during-upload-read",
+        "wait_target": "active",
+        "target_state_observed": true,
+        "valid_for_target": true,
+        "required_pending_uploads": 4,
+        "wait_ms": 0.5829,
+        "pending_uploads_before": 1261,
+        "pending_uploads_after": 1183,
+        "results": {
+          "operations": 48,
+          "bytes": 2415919104,
+          "elapsed_ms": 118362.8,
+          "avg_latency_ms": 2465.8916666666664,
+          "p50_ms": 2755.1683,
+          "p95_ms": 3592.1347,
+          "p99_ms": 3601.0511,
+          "throughput_bytes_per_sec": 538273461.253908,
+          "operations_log": [
+            {
+              "operation_index": 0,
+              "work_index": 0,
+              "worker_id": 0,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000000.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 1192.1068,
+              "throughput_bytes_per_sec": 14073584.682177806
+            },
+            {
+              "operation_index": 1,
+              "work_index": 1,
+              "worker_id": 1,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000001.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3499.5878000000002,
+              "throughput_bytes_per_sec": 19176219.55362857
+            },
+            {
+              "operation_index": 2,
+              "work_index": 2,
+              "worker_id": 2,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000002.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3476.4419000000003,
+              "throughput_bytes_per_sec": 19303893.44346586
+            },
+            {
+              "operation_index": 3,
+              "work_index": 3,
+              "worker_id": 3,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000003.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 1226.4505,
+              "throughput_bytes_per_sec": 13679488.899062784
+            },
+            {
+              "operation_index": 4,
+              "work_index": 4,
+              "worker_id": 5,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000004.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3601.0510999999997,
+              "throughput_bytes_per_sec": 18635909.9430719
+            },
+            {
+              "operation_index": 5,
+              "work_index": 5,
+              "worker_id": 6,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000005.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3355.238,
+              "throughput_bytes_per_sec": 20001223.162112493
+            },
+            {
+              "operation_index": 6,
+              "work_index": 6,
+              "worker_id": 7,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000006.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 1224.6508000000001,
+              "throughput_bytes_per_sec": 13699591.753012368
+            },
+            {
+              "operation_index": 7,
+              "work_index": 7,
+              "worker_id": 4,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000007.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3490.8539,
+              "throughput_bytes_per_sec": 19224197.265889585
+            },
+            {
+              "operation_index": 8,
+              "work_index": 8,
+              "worker_id": 9,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000008.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3365.8017,
+              "throughput_bytes_per_sec": 19938448.54258645
+            },
+            {
+              "operation_index": 9,
+              "work_index": 9,
+              "worker_id": 10,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000009.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 1227.3092000000001,
+              "throughput_bytes_per_sec": 13669917.898439936
+            },
+            {
+              "operation_index": 10,
+              "work_index": 10,
+              "worker_id": 8,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000010.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3555.5822,
+              "throughput_bytes_per_sec": 18874226.56126471
+            },
+            {
+              "operation_index": 11,
+              "work_index": 11,
+              "worker_id": 11,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000011.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3445.4813,
+              "throughput_bytes_per_sec": 19477355.4568414
+            },
+            {
+              "operation_index": 12,
+              "work_index": 12,
+              "worker_id": 12,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000012.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 1136.5666,
+              "throughput_bytes_per_sec": 14761313.591302084
+            },
+            {
+              "operation_index": 13,
+              "work_index": 13,
+              "worker_id": 13,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000013.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3516.6418999999996,
+              "throughput_bytes_per_sec": 19083223.68564169
+            },
+            {
+              "operation_index": 14,
+              "work_index": 14,
+              "worker_id": 14,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000014.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3454.8386,
+              "throughput_bytes_per_sec": 19424601.774450477
+            },
+            {
+              "operation_index": 15,
+              "work_index": 15,
+              "worker_id": 15,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000015.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 1109.279,
+              "throughput_bytes_per_sec": 15124433.077701824
+            },
+            {
+              "operation_index": 16,
+              "work_index": 16,
+              "worker_id": 16,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000016.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3543.2544999999996,
+              "throughput_bytes_per_sec": 18939893.817957476
+            },
+            {
+              "operation_index": 17,
+              "work_index": 17,
+              "worker_id": 17,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000017.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3480.6537999999996,
+              "throughput_bytes_per_sec": 19280534.019212138
+            },
+            {
+              "operation_index": 18,
+              "work_index": 18,
+              "worker_id": 18,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000018.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 1202.8774,
+              "throughput_bytes_per_sec": 13947569.38653931
+            },
+            {
+              "operation_index": 19,
+              "work_index": 19,
+              "worker_id": 19,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000019.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3532.5982,
+              "throughput_bytes_per_sec": 18997027.173936736
+            },
+            {
+              "operation_index": 20,
+              "work_index": 20,
+              "worker_id": 20,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000020.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3486.5161000000003,
+              "throughput_bytes_per_sec": 19248115.33209326
+            },
+            {
+              "operation_index": 21,
+              "work_index": 21,
+              "worker_id": 21,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000021.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 1226.1128,
+              "throughput_bytes_per_sec": 13683256.548663385
+            },
+            {
+              "operation_index": 22,
+              "work_index": 22,
+              "worker_id": 22,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000022.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3592.7943,
+              "throughput_bytes_per_sec": 18678738.162104078
+            },
+            {
+              "operation_index": 23,
+              "work_index": 23,
+              "worker_id": 23,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000023.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3356.4839,
+              "throughput_bytes_per_sec": 19993798.86791651
+            },
+            {
+              "operation_index": 24,
+              "work_index": 24,
+              "worker_id": 24,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000024.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 1185.5249,
+              "throughput_bytes_per_sec": 14151719.630688483
+            },
+            {
+              "operation_index": 25,
+              "work_index": 25,
+              "worker_id": 25,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000025.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3592.1347,
+              "throughput_bytes_per_sec": 18682168.015581377
+            },
+            {
+              "operation_index": 26,
+              "work_index": 26,
+              "worker_id": 26,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000026.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3395.7008,
+              "throughput_bytes_per_sec": 19762890.770588502
+            },
+            {
+              "operation_index": 27,
+              "work_index": 27,
+              "worker_id": 27,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000027.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 1275.7065,
+              "throughput_bytes_per_sec": 13151313.409471536
+            },
+            {
+              "operation_index": 28,
+              "work_index": 28,
+              "worker_id": 28,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000028.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3474.7945,
+              "throughput_bytes_per_sec": 19313045.41894492
+            },
+            {
+              "operation_index": 29,
+              "work_index": 29,
+              "worker_id": 29,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000029.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3459.2181,
+              "throughput_bytes_per_sec": 19400009.49925649
+            },
+            {
+              "operation_index": 30,
+              "work_index": 30,
+              "worker_id": 30,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000030.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 1154.2842,
+              "throughput_bytes_per_sec": 14534735.89952977
+            },
+            {
+              "operation_index": 31,
+              "work_index": 31,
+              "worker_id": 31,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000031.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 3556.4114999999997,
+              "throughput_bytes_per_sec": 18869825.384379733
+            },
+            {
+              "operation_index": 32,
+              "work_index": 32,
+              "worker_id": 15,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000032.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 2802.3734,
+              "throughput_bytes_per_sec": 23947152.795555368
+            },
+            {
+              "operation_index": 33,
+              "work_index": 33,
+              "worker_id": 12,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000033.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 1241.4531,
+              "throughput_bytes_per_sec": 13514176.250395605
+            },
+            {
+              "operation_index": 34,
+              "work_index": 34,
+              "worker_id": 30,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000034.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 2755.1683000000003,
+              "throughput_bytes_per_sec": 24357446.330955535
+            },
+            {
+              "operation_index": 35,
+              "work_index": 35,
+              "worker_id": 24,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000035.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 2662.271,
+              "throughput_bytes_per_sec": 25207375.207107015
+            },
+            {
+              "operation_index": 36,
+              "work_index": 36,
+              "worker_id": 0,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000036.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 1015.5453000000001,
+              "throughput_bytes_per_sec": 16520401.404053565
+            },
+            {
+              "operation_index": 37,
+              "work_index": 37,
+              "worker_id": 18,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000037.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 2946.3398,
+              "throughput_bytes_per_sec": 22777027.95855386
+            },
+            {
+              "operation_index": 38,
+              "work_index": 38,
+              "worker_id": 7,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000038.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 2719.0389999999998,
+              "throughput_bytes_per_sec": 24681096.519763052
+            },
+            {
+              "operation_index": 39,
+              "work_index": 39,
+              "worker_id": 21,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000039.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 1028.2545,
+              "throughput_bytes_per_sec": 16316209.65432196
+            },
+            {
+              "operation_index": 40,
+              "work_index": 40,
+              "worker_id": 3,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000040.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 2716.777,
+              "throughput_bytes_per_sec": 24701646.104925063
+            },
+            {
+              "operation_index": 41,
+              "work_index": 41,
+              "worker_id": 10,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000041.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 2712.4389,
+              "throughput_bytes_per_sec": 24741152.32604871
+            },
+            {
+              "operation_index": 42,
+              "work_index": 42,
+              "worker_id": 27,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000042.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 1167.7341000000001,
+              "throughput_bytes_per_sec": 14367325.575231552
+            },
+            {
+              "operation_index": 43,
+              "work_index": 43,
+              "worker_id": 0,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000043.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 2102.1328000000003,
+              "throughput_bytes_per_sec": 31924179.100387946
+            },
+            {
+              "operation_index": 44,
+              "work_index": 44,
+              "worker_id": 21,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000044.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 2009.5421,
+              "throughput_bytes_per_sec": 33395102.297185015
+            },
+            {
+              "operation_index": 45,
+              "work_index": 45,
+              "worker_id": 12,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000045.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 1031.093,
+              "throughput_bytes_per_sec": 16271292.696197141
+            },
+            {
+              "operation_index": 46,
+              "work_index": 46,
+              "worker_id": 27,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000046.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 1932.5831,
+              "throughput_bytes_per_sec": 34724956.458534695
+            },
+            {
+              "operation_index": 47,
+              "work_index": 47,
+              "worker_id": 6,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000047.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 1127.1071,
+              "throughput_bytes_per_sec": 59540804.951011315
+            }
+          ]
+        }
+      },
+      {
+        "phase": "post-upload-read",
+        "wait_target": "idle",
+        "target_state_observed": true,
+        "valid_for_target": true,
+        "required_pending_uploads": 0,
+        "wait_ms": 43425.672900000005,
+        "pending_uploads_before": 0,
+        "pending_uploads_after": 0,
+        "results": {
+          "operations": 48,
+          "bytes": 2415919104,
+          "elapsed_ms": 8751.8732,
+          "avg_latency_ms": 182.33069166666667,
+          "p50_ms": 233.7909,
+          "p95_ms": 266.146,
+          "p99_ms": 271.7886,
+          "throughput_bytes_per_sec": 6841595073.886603,
+          "operations_log": [
+            {
+              "operation_index": 0,
+              "work_index": 0,
+              "worker_id": 0,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000000.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 59.7205,
+              "throughput_bytes_per_sec": 280928927.25278586
+            },
+            {
+              "operation_index": 1,
+              "work_index": 1,
+              "worker_id": 2,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000001.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 255.05939999999998,
+              "throughput_bytes_per_sec": 263110726.36413324
+            },
+            {
+              "operation_index": 2,
+              "work_index": 2,
+              "worker_id": 4,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000002.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 271.7886,
+              "throughput_bytes_per_sec": 246915669.01628694
+            },
+            {
+              "operation_index": 3,
+              "work_index": 3,
+              "worker_id": 5,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000003.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 61.6821,
+              "throughput_bytes_per_sec": 271994889.9275479
+            },
+            {
+              "operation_index": 4,
+              "work_index": 4,
+              "worker_id": 3,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000004.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 247.1179,
+              "throughput_bytes_per_sec": 271566179.544258
+            },
+            {
+              "operation_index": 5,
+              "work_index": 5,
+              "worker_id": 6,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000005.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 271.32210000000003,
+              "throughput_bytes_per_sec": 247340205.60802087
+            },
+            {
+              "operation_index": 6,
+              "work_index": 6,
+              "worker_id": 7,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000006.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 57.863499999999995,
+              "throughput_bytes_per_sec": 289944714.71653116
+            },
+            {
+              "operation_index": 7,
+              "work_index": 7,
+              "worker_id": 10,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000007.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 245.3167,
+              "throughput_bytes_per_sec": 273560112.295657
+            },
+            {
+              "operation_index": 8,
+              "work_index": 8,
+              "worker_id": 8,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000008.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 258.92179999999996,
+              "throughput_bytes_per_sec": 259185839.12208244
+            },
+            {
+              "operation_index": 9,
+              "work_index": 9,
+              "worker_id": 9,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000009.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 60.80350000000001,
+              "throughput_bytes_per_sec": 275925168.78140235
+            },
+            {
+              "operation_index": 10,
+              "work_index": 10,
+              "worker_id": 11,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000010.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 259.24760000000003,
+              "throughput_bytes_per_sec": 258860116.73782128
+            },
+            {
+              "operation_index": 11,
+              "work_index": 11,
+              "worker_id": 12,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000011.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 257.2979,
+              "throughput_bytes_per_sec": 260821654.58793092
+            },
+            {
+              "operation_index": 12,
+              "work_index": 12,
+              "worker_id": 13,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000012.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 62.0745,
+              "throughput_bytes_per_sec": 270275491.54644823
+            },
+            {
+              "operation_index": 13,
+              "work_index": 13,
+              "worker_id": 14,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000013.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 259.83230000000003,
+              "throughput_bytes_per_sec": 258277604.43947884
+            },
+            {
+              "operation_index": 14,
+              "work_index": 14,
+              "worker_id": 15,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000014.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 265.8366,
+              "throughput_bytes_per_sec": 252444035.1704769
+            },
+            {
+              "operation_index": 15,
+              "work_index": 15,
+              "worker_id": 17,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000015.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 61.6753,
+              "throughput_bytes_per_sec": 272024878.67914706
+            },
+            {
+              "operation_index": 16,
+              "work_index": 16,
+              "worker_id": 16,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000016.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 235.6798,
+              "throughput_bytes_per_sec": 284745930.7076805
+            },
+            {
+              "operation_index": 17,
+              "work_index": 17,
+              "worker_id": 18,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000017.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 266.146,
+              "throughput_bytes_per_sec": 252150563.97616348
+            },
+            {
+              "operation_index": 18,
+              "work_index": 18,
+              "worker_id": 19,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000018.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 63.15129999999999,
+              "throughput_bytes_per_sec": 265666993.39522704
+            },
+            {
+              "operation_index": 19,
+              "work_index": 19,
+              "worker_id": 20,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000019.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 249.12300000000002,
+              "throughput_bytes_per_sec": 269380442.5926149
+            },
+            {
+              "operation_index": 20,
+              "work_index": 20,
+              "worker_id": 21,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000020.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 262.8526,
+              "throughput_bytes_per_sec": 255309873.29020143
+            },
+            {
+              "operation_index": 21,
+              "work_index": 21,
+              "worker_id": 22,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000021.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 65.25240000000001,
+              "throughput_bytes_per_sec": 257112627.2750121
+            },
+            {
+              "operation_index": 22,
+              "work_index": 22,
+              "worker_id": 23,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000022.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 257.44840000000005,
+              "throughput_bytes_per_sec": 260669182.64009407
+            },
+            {
+              "operation_index": 23,
+              "work_index": 23,
+              "worker_id": 24,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000023.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 257.0982,
+              "throughput_bytes_per_sec": 261024246.76641065
+            },
+            {
+              "operation_index": 24,
+              "work_index": 24,
+              "worker_id": 25,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000024.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 56.792,
+              "throughput_bytes_per_sec": 295415128.8913931
+            },
+            {
+              "operation_index": 25,
+              "work_index": 25,
+              "worker_id": 26,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000025.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 245.0075,
+              "throughput_bytes_per_sec": 273905345.7547218
+            },
+            {
+              "operation_index": 26,
+              "work_index": 26,
+              "worker_id": 27,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000026.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 259.7717,
+              "throughput_bytes_per_sec": 258337855.8942333
+            },
+            {
+              "operation_index": 27,
+              "work_index": 27,
+              "worker_id": 28,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000027.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 63.279199999999996,
+              "throughput_bytes_per_sec": 265130026.9282798
+            },
+            {
+              "operation_index": 28,
+              "work_index": 28,
+              "worker_id": 29,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000028.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 250.76870000000002,
+              "throughput_bytes_per_sec": 267612600.7751366
+            },
+            {
+              "operation_index": 29,
+              "work_index": 29,
+              "worker_id": 1,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000029.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 261.5725,
+              "throughput_bytes_per_sec": 256559324.85257435
+            },
+            {
+              "operation_index": 30,
+              "work_index": 30,
+              "worker_id": 30,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000030.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 58.1401,
+              "throughput_bytes_per_sec": 288565310.34518343
+            },
+            {
+              "operation_index": 31,
+              "work_index": 31,
+              "worker_id": 31,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000031.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 251.60349999999997,
+              "throughput_bytes_per_sec": 266724683.87760904
+            },
+            {
+              "operation_index": 32,
+              "work_index": 32,
+              "worker_id": 25,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000032.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 238.73059999999998,
+              "throughput_bytes_per_sec": 281107088.91109896
+            },
+            {
+              "operation_index": 33,
+              "work_index": 33,
+              "worker_id": 7,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000033.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 63.51220000000001,
+              "throughput_bytes_per_sec": 264157374.4886809
+            },
+            {
+              "operation_index": 34,
+              "work_index": 34,
+              "worker_id": 30,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000034.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 241.3824,
+              "throughput_bytes_per_sec": 278018877.9297911
+            },
+            {
+              "operation_index": 35,
+              "work_index": 35,
+              "worker_id": 0,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000035.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 229.9275,
+              "throughput_bytes_per_sec": 291869671.96181405
+            },
+            {
+              "operation_index": 36,
+              "work_index": 36,
+              "worker_id": 5,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000036.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 61.6676,
+              "throughput_bytes_per_sec": 272058844.5147857
+            },
+            {
+              "operation_index": 37,
+              "work_index": 37,
+              "worker_id": 17,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000037.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 233.52700000000002,
+              "throughput_bytes_per_sec": 287370899.2964411
+            },
+            {
+              "operation_index": 38,
+              "work_index": 38,
+              "worker_id": 13,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000038.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 233.7909,
+              "throughput_bytes_per_sec": 287046518.9192565
+            },
+            {
+              "operation_index": 39,
+              "work_index": 39,
+              "worker_id": 28,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000039.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 66.86359999999999,
+              "throughput_bytes_per_sec": 250917031.09015968
+            },
+            {
+              "operation_index": 40,
+              "work_index": 40,
+              "worker_id": 9,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000040.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 229.7592,
+              "throughput_bytes_per_sec": 292083468.25720143
+            },
+            {
+              "operation_index": 41,
+              "work_index": 41,
+              "worker_id": 22,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000041.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 233.1169,
+              "throughput_bytes_per_sec": 287876443.10644144
+            },
+            {
+              "operation_index": 42,
+              "work_index": 42,
+              "worker_id": 19,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000042.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 64.5096,
+              "throughput_bytes_per_sec": 260073167.40454134
+            },
+            {
+              "operation_index": 43,
+              "work_index": 43,
+              "worker_id": 7,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000043.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 195.1448,
+              "throughput_bytes_per_sec": 343892658.16972834
+            },
+            {
+              "operation_index": 44,
+              "work_index": 44,
+              "worker_id": 5,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000044.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 197.87179999999998,
+              "throughput_bytes_per_sec": 339153249.730381
+            },
+            {
+              "operation_index": 45,
+              "work_index": 45,
+              "worker_id": 19,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000045.bin",
+              "size_class": "large",
+              "bytes": 16777216,
+              "elapsed_ms": 75.2439,
+              "throughput_bytes_per_sec": 222971111.27945253
+            },
+            {
+              "operation_index": 46,
+              "work_index": 46,
+              "worker_id": 28,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000046.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 188.3031,
+              "throughput_bytes_per_sec": 356387462.5537232
+            },
+            {
+              "operation_index": 47,
+              "work_index": 47,
+              "worker_id": 19,
+              "target": "Z:\\.studiofs-test-cache\\test_cache_file_000047.bin",
+              "size_class": "large",
+              "bytes": 67108864,
+              "elapsed_ms": 139.2749,
+              "throughput_bytes_per_sec": 481844639.6299692
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "mounted_memory": {
+    "mount_pid": 50440,
+    "rss_bytes_steady_state": 97943552,
+    "rss_bytes_peak": 1217949696,
+    "dirty_bytes_steady_state": 8,
+    "dirty_bytes_peak": 931135496,
+    "dirty_limit_bytes": 1677721600
+  },
+  "mounted_write_path_window": {
+    "before": {
+      "publisher_pid": 50440,
+      "generated_unix_ms": 1776537301227,
+      "uptime_secs": 221.1823206,
+      "pending_uploads": 0,
+      "backend_tag": "local-block-runtime",
+      "flush_barrier_calls": 2,
+      "flush_barrier_calls_per_sec": 0.009042314026612123,
+      "block_store_sync_data": {
+        "calls": 325,
+        "calls_per_sec": 1.4693760293244704,
+        "deferred_calls": 216,
+        "synced_bytes": 13942969934,
+        "synced_gib": 12.985402656719089,
+        "calls_per_gib": 25.028103370505335,
+        "total_ms": 8363.54,
+        "avg_ms": 25.733969230769233,
+        "max_ms": 293.8132,
+        "latency_quantiles_ms": {
+          "p50": 25.0,
+          "p95": 100.0,
+          "p99": 250.0
+        },
+        "latency_quantiles_saturated": {
+          "p50": false,
+          "p95": false,
+          "p99": false
+        },
+        "latency_histogram": {
+          "bucket_upper_bounds_ns": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2000000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2000000000,
+            5000000000
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            59,
+            209,
+            1,
+            43,
+            12,
+            1,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "queue_wait_total_ms": 17483.536,
+        "queue_wait_avg_ms": 46.747422459893045,
+        "queue_wait_max_ms": 566.1349,
+        "queue_wait_latency_quantiles_ms": {
+          "p50": 0.05,
+          "p95": 500.0,
+          "p99": 1000.0
+        },
+        "queue_wait_latency_quantiles_saturated": {
+          "p50": false,
+          "p95": false,
+          "p99": false
+        },
+        "queue_wait_latency_histogram": {
+          "bucket_upper_bounds_ns": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2000000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2000000000,
+            5000000000
+          ],
+          "bucket_counts": [
+            311,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            2,
+            3,
+            21,
+            30,
+            6,
+            0,
+            0,
+            0
+          ]
+        },
+        "barrier_interval_avg_ms": 521.4946592592593,
+        "barrier_interval_max_ms": 80401.2046,
+        "barrier_interval_quantiles_ms": {
+          "p50": 100.0,
+          "p95": 500.0,
+          "p99": 500.0
+        },
+        "barrier_interval_quantiles_saturated": {
+          "p50": false,
+          "p95": false,
+          "p99": false
+        },
+        "barrier_interval_histogram": {
+          "bucket_upper_bounds_ns": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2000000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2000000000,
+            5000000000
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            16,
+            258,
+            18,
+            30,
+            0,
+            0,
+            0,
+            2
+          ]
+        }
+      },
+      "local_cache_io": {
+        "execution_model": "inline-runtime-worker-with-blocking-isolation",
+        "calls": 28122,
+        "handoff_total_ms": 123.4343,
+        "handoff_avg_ms": 0.004389243297062798,
+        "handoff_max_ms": 0.6581,
+        "backend_io_total_ms": 49894.2277,
+        "backend_io_avg_ms": 1.7742062335538011,
+        "backend_io_max_ms": 680.7774,
+        "handoff_histogram": {
+          "bucket_upper_bounds_ns": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2000000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2000000000,
+            5000000000
+          ],
+          "bucket_counts": [
+            27991,
+            75,
+            54,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "backend_io_histogram": {
+          "bucket_upper_bounds_ns": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2000000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2000000000,
+            5000000000
+          ],
+          "bucket_counts": [
+            106,
+            259,
+            711,
+            3495,
+            4672,
+            15055,
+            3237,
+            40,
+            403,
+            109,
+            34,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0
+          ]
+        }
+      },
+      "winfsp_callbacks": {
+        "write": 6514,
+        "overwrite": 0,
+        "cleanup": 54,
+        "flush": 0,
+        "close": 169,
+        "cleanup_flush_fh": 0
+      },
+      "winfsp_write_path": {
+        "write_bytes": 13653726806,
+        "avg_write_bytes": 2096058.7666564323,
+        "callback": {
+          "calls": 6514,
+          "calls_per_sec": 29.45081678467569,
+          "total_ms": 77654.5914,
+          "avg_ms": 11.921183819465766,
+          "max_ms": 802.8459,
+          "latency_quantiles_ms": {
+            "p50": 1.0,
+            "p95": 100.0,
+            "p99": 250.0
+          },
+          "latency_quantiles_saturated": {
+            "p50": false,
+            "p95": false,
+            "p99": false
+          },
+          "latency_histogram": {
+            "bucket_upper_bounds_ns": [
+              50000,
+              100000,
+              250000,
+              500000,
+              1000000,
+              2000000,
+              5000000,
+              10000000,
+              25000000,
+              50000000,
+              100000000,
+              250000000,
+              500000000,
+              1000000000,
+              2000000000,
+              5000000000
+            ],
+            "bucket_counts": [
+              0,
+              0,
+              0,
+              2330,
+              1594,
+              558,
+              766,
+              619,
+              86,
+              46,
+              363,
+              93,
+              40,
+              19,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        "vfs_write": {
+          "calls": 6514,
+          "calls_per_sec": 29.45081678467569,
+          "total_ms": 77385.0786,
+          "avg_ms": 11.879809425852011,
+          "max_ms": 802.2693,
+          "latency_quantiles_ms": {
+            "p50": 1.0,
+            "p95": 100.0,
+            "p99": 250.0
+          },
+          "latency_quantiles_saturated": {
+            "p50": false,
+            "p95": false,
+            "p99": false
+          },
+          "latency_histogram": {
+            "bucket_upper_bounds_ns": [
+              50000,
+              100000,
+              250000,
+              500000,
+              1000000,
+              2000000,
+              5000000,
+              10000000,
+              25000000,
+              50000000,
+              100000000,
+              250000000,
+              500000000,
+              1000000000,
+              2000000000,
+              5000000000
+            ],
+            "bucket_counts": [
+              0,
+              0,
+              0,
+              2364,
+              1562,
+              560,
+              772,
+              614,
+              81,
+              47,
+              362,
+              93,
+              40,
+              19,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        "post_write_getattr": {
+          "calls": 6514,
+          "calls_per_sec": 29.45081678467569,
+          "total_ms": 267.4166,
+          "avg_ms": 0.04105259441203561,
+          "max_ms": 10.7325,
+          "latency_quantiles_ms": {
+            "p50": 0.05,
+            "p95": 0.25,
+            "p99": 1.0
+          },
+          "latency_quantiles_saturated": {
+            "p50": false,
+            "p95": false,
+            "p99": false
+          },
+          "latency_histogram": {
+            "bucket_upper_bounds_ns": [
+              50000,
+              100000,
+              250000,
+              500000,
+              1000000,
+              2000000,
+              5000000,
+              10000000,
+              25000000,
+              50000000,
+              100000000,
+              250000000,
+              500000000,
+              1000000000,
+              2000000000,
+              5000000000
+            ],
+            "bucket_counts": [
+              5881,
+              49,
+              309,
+              165,
+              66,
+              23,
+              20,
+              0,
+              1,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        }
+      },
+      "vfs_write_path": {
+        "calls": 6514,
+        "write_bytes": 13653726806,
+        "avg_write_bytes": 2096058.7666564323,
+        "record_handle_writer_state": {
+          "calls": 6514,
+          "calls_per_sec": 29.45081678467569,
+          "total_ms": 13332.9326,
+          "avg_ms": 2.046811882100092,
+          "max_ms": 67.8181,
+          "latency_quantiles_ms": {
+            "p50": 0.5,
+            "p95": 10.0,
+            "p99": 25.0
+          },
+          "latency_quantiles_saturated": {
+            "p50": false,
+            "p95": false,
+            "p99": false
+          },
+          "latency_histogram": {
+            "bucket_upper_bounds_ns": [
+              50000,
+              100000,
+              250000,
+              500000,
+              1000000,
+              2000000,
+              5000000,
+              10000000,
+              25000000,
+              50000000,
+              100000000,
+              250000000,
+              500000000,
+              1000000000,
+              2000000000,
+              5000000000
+            ],
+            "bucket_counts": [
+              1,
+              0,
+              34,
+              3281,
+              821,
+              589,
+              874,
+              836,
+              60,
+              15,
+              3,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        "materialize_completed": {
+          "calls": 6245,
+          "calls_per_sec": 28.23462554809636,
+          "total_ms": 48721.0084,
+          "avg_ms": 7.801602626100881,
+          "max_ms": 796.568,
+          "latency_quantiles_ms": {
+            "p50": 0.05,
+            "p95": 5.0,
+            "p99": 250.0
+          },
+          "latency_quantiles_saturated": {
+            "p50": false,
+            "p95": false,
+            "p99": false
+          },
+          "latency_histogram": {
+            "bucket_upper_bounds_ns": [
+              50000,
+              100000,
+              250000,
+              500000,
+              1000000,
+              2000000,
+              5000000,
+              10000000,
+              25000000,
+              50000000,
+              100000000,
+              250000000,
+              500000000,
+              1000000000,
+              2000000000,
+              5000000000
+            ],
+            "bucket_counts": [
+              5493,
+              184,
+              83,
+              33,
+              63,
+              45,
+              61,
+              9,
+              3,
+              6,
+              118,
+              88,
+              40,
+              19,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        "materialize_strict": {
+          "calls": 269,
+          "calls_per_sec": 1.2161912365793308,
+          "total_ms": 14708.5945,
+          "avg_ms": 54.67878996282528,
+          "max_ms": 97.2715,
+          "latency_quantiles_ms": {
+            "p50": 100.0,
+            "p95": 100.0,
+            "p99": 100.0
+          },
+          "latency_quantiles_saturated": {
+            "p50": false,
+            "p95": false,
+            "p99": false
+          },
+          "latency_histogram": {
+            "bucket_upper_bounds_ns": [
+              50000,
+              100000,
+              250000,
+              500000,
+              1000000,
+              2000000,
+              5000000,
+              10000000,
+              25000000,
+              50000000,
+              100000000,
+              250000000,
+              500000000,
+              1000000000,
+              2000000000,
+              5000000000
+            ],
+            "bucket_counts": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              104,
+              165,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        "materialize_for_limits": {
+          "calls": 6514,
+          "calls_per_sec": 29.45081678467569,
+          "total_ms": 233.396,
+          "avg_ms": 0.03582990482038686,
+          "max_ms": 23.4721,
+          "latency_quantiles_ms": {
+            "p50": 0.05,
+            "p95": 0.05,
+            "p99": 2.0
+          },
+          "latency_quantiles_saturated": {
+            "p50": false,
+            "p95": false,
+            "p99": false
+          },
+          "latency_histogram": {
+            "bucket_upper_bounds_ns": [
+              50000,
+              100000,
+              250000,
+              500000,
+              1000000,
+              2000000,
+              5000000,
+              10000000,
+              25000000,
+              50000000,
+              100000000,
+              250000000,
+              500000000,
+              1000000000,
+              2000000000,
+              5000000000
+            ],
+            "bucket_counts": [
+              6369,
+              7,
+              15,
+              19,
+              37,
+              36,
+              26,
+              3,
+              2,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        }
+      },
+      "winfsp_foreground_flushes": {
+        "cleanup": 0,
+        "flush": 0,
+        "close": 1,
+        "cleanup_skipped_clean": 0,
+        "flush_skipped_clean": 0,
+        "close_skipped_clean": 2
+      },
+      "write_backpressure": {
+        "events": 0,
+        "wait_total_ms": 0,
+        "stall_max_ms": 0
+      },
+      "dirty_pressure": {
+        "pending_local_dirty_bytes": 0,
+        "handle_writer_dirty_bytes": 268435464,
+        "total_dirty_bytes": 268435464,
+        "dirty_limit_bytes": 1677721600
+      },
+      "payload_burst": {
+        "bursts": 541,
+        "bursts_per_sec": 2.44594594419858,
+        "total_blocks": 3459,
+        "total_bytes": 13942969934,
+        "avg_blocks_per_burst": 6.393715341959335,
+        "avg_bytes_per_burst": 25772587.67837338,
+        "max_blocks_per_burst": 8,
+        "max_bytes_per_burst": 33554432,
+        "avg_interval_ms": 312.89679555555557,
+        "max_interval_ms": 80025.9287
+      },
+      "payload_persist": {
+        "calls": 541,
+        "calls_per_sec": 2.44594594419858,
+        "total_ms": 37431.2394,
+        "avg_ms": 69.18898225508318,
+        "max_ms": 652.6687,
+        "latency_quantiles_ms": {
+          "p50": 50.0,
+          "p95": 500.0,
+          "p99": 1000.0
+        },
+        "latency_quantiles_saturated": {
+          "p50": false,
+          "p95": false,
+          "p99": false
+        },
+        "latency_histogram": {
+          "bucket_upper_bounds_ns": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2000000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2000000000,
+            5000000000
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            264,
+            153,
+            51,
+            30,
+            33,
+            10,
+            0,
+            0,
+            0
+          ]
+        }
+      },
+      "metadata_commit": {
+        "calls": 542,
+        "calls_per_sec": 2.450467101211886,
+        "total_ms": 2806.3729,
+        "avg_ms": 5.177809778597786,
+        "max_ms": 22.6784,
+        "latency_quantiles_ms": {
+          "p50": 5.0,
+          "p95": 25.0,
+          "p99": 25.0
+        },
+        "latency_quantiles_saturated": {
+          "p50": false,
+          "p95": false,
+          "p99": false
+        },
+        "latency_histogram": {
+          "bucket_upper_bounds_ns": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2000000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2000000000,
+            5000000000
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            10,
+            239,
+            131,
+            76,
+            86,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      },
+      "metadata_commit_cadence": {
+        "events": 542,
+        "events_per_sec": 2.450467101211886,
+        "avg_interval_ms": 312.31855822550835,
+        "max_interval_ms": 79903.1256,
+        "interval_quantiles_ms": {
+          "p50": 100.0,
+          "p95": 250.0,
+          "p99": 250.0
+        },
+        "interval_quantiles_saturated": {
+          "p50": false,
+          "p95": false,
+          "p99": false
+        },
+        "interval_histogram": {
+          "bucket_upper_bounds_ns": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2000000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2000000000,
+            5000000000
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            9,
+            46,
+            17,
+            18,
+            17,
+            38,
+            349,
+            44,
+            1,
+            0,
+            0,
+            0,
+            2
+          ]
+        }
+      },
+      "eager_flush": {
+        "checks": 0,
+        "triggered": 0,
+        "skipped_empty": 0,
+        "skipped_below_threshold": 0
+      },
+      "tuning": {
+        "eager_flush_threshold_bytes": 104857600,
+        "eager_flush_drain_chunk_bytes": 33554432,
+        "payload_put_concurrency": 8,
+        "sync_group_min_bytes": 134217728,
+        "sync_group_max_delay_ms": 100
+      }
+    },
+    "after": {
+      "publisher_pid": 50440,
+      "generated_unix_ms": 1776537310631,
+      "uptime_secs": 230.5861481,
+      "pending_uploads": 1183,
+      "backend_tag": "local-block-runtime",
+      "flush_barrier_calls": 2,
+      "flush_barrier_calls_per_sec": 0.008673547897303202,
+      "block_store_sync_data": {
+        "calls": 365,
+        "calls_per_sec": 1.5829224912578346,
+        "deferred_calls": 340,
+        "synced_bytes": 19580114510,
+        "synced_gib": 18.23540265671909,
+        "calls_per_gib": 20.016009894111697,
+        "total_ms": 11192.541,
+        "avg_ms": 30.66449589041096,
+        "max_ms": 293.8132,
+        "latency_quantiles_ms": {
+          "p50": 25.0,
+          "p95": 250.0,
+          "p99": 250.0
+        },
+        "latency_quantiles_saturated": {
+          "p50": false,
+          "p95": false,
+          "p99": false
+        },
+        "latency_histogram": {
+          "bucket_upper_bounds_ns": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2000000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2000000000,
+            5000000000
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            59,
+            210,
+            5,
+            72,
+            18,
+            1,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "queue_wait_total_ms": 23602.7479,
+        "queue_wait_avg_ms": 51.76041206140351,
+        "queue_wait_max_ms": 566.1349,
+        "queue_wait_latency_quantiles_ms": {
+          "p50": 0.05,
+          "p95": 500.0,
+          "p99": 1000.0
+        },
+        "queue_wait_latency_quantiles_saturated": {
+          "p50": false,
+          "p95": false,
+          "p99": false
+        },
+        "queue_wait_latency_histogram": {
+          "bucket_upper_bounds_ns": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2000000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2000000000,
+            5000000000
+          ],
+          "bucket_counts": [
+            348,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            6,
+            5,
+            11,
+            44,
+            35,
+            6,
+            0,
+            0,
+            0
+          ]
+        },
+        "barrier_interval_avg_ms": 602.0156722527473,
+        "barrier_interval_max_ms": 80401.2046,
+        "barrier_interval_quantiles_ms": {
+          "p50": 100.0,
+          "p95": 500.0,
+          "p99": 500.0
+        },
+        "barrier_interval_quantiles_saturated": {
+          "p50": false,
+          "p95": false,
+          "p99": false
+        },
+        "barrier_interval_histogram": {
+          "bucket_upper_bounds_ns": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2000000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2000000000,
+            5000000000
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            19,
+            277,
+            34,
+            31,
+            0,
+            0,
+            0,
+            3
+          ]
+        }
+      },
+      "local_cache_io": {
+        "execution_model": "inline-runtime-worker-with-blocking-isolation",
+        "calls": 30889,
+        "handoff_total_ms": 132.865,
+        "handoff_avg_ms": 0.004301369419534462,
+        "handoff_max_ms": 0.6581,
+        "backend_io_total_ms": 59713.1569,
+        "backend_io_avg_ms": 1.9331528019683384,
+        "backend_io_max_ms": 680.7774,
+        "handoff_histogram": {
+          "bucket_upper_bounds_ns": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2000000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2000000000,
+            5000000000
+          ],
+          "bucket_counts": [
+            30744,
+            81,
+            62,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        "backend_io_histogram": {
+          "bucket_upper_bounds_ns": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2000000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2000000000,
+            5000000000
+          ],
+          "bucket_counts": [
+            146,
+            314,
+            737,
+            3503,
+            5761,
+            15540,
+            4094,
+            58,
+            471,
+            212,
+            52,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0
+          ]
+        }
+      },
+      "winfsp_callbacks": {
+        "write": 9202,
+        "overwrite": 0,
+        "cleanup": 102,
+        "flush": 0,
+        "close": 359,
+        "cleanup_flush_fh": 0
+      },
+      "winfsp_write_path": {
+        "write_bytes": 19290871382,
+        "avg_write_bytes": 2096378.1114975004,
+        "callback": {
+          "calls": 9202,
+          "calls_per_sec": 39.906993875492034,
+          "total_ms": 121304.1102,
+          "avg_ms": 13.182363638339492,
+          "max_ms": 802.8459,
+          "latency_quantiles_ms": {
+            "p50": 2.0,
+            "p95": 100.0,
+            "p99": 250.0
+          },
+          "latency_quantiles_saturated": {
+            "p50": false,
+            "p95": false,
+            "p99": false
+          },
+          "latency_histogram": {
+            "bucket_upper_bounds_ns": [
+              50000,
+              100000,
+              250000,
+              500000,
+              1000000,
+              2000000,
+              5000000,
+              10000000,
+              25000000,
+              50000000,
+              100000000,
+              250000000,
+              500000000,
+              1000000000,
+              2000000000,
+              5000000000
+            ],
+            "bucket_counts": [
+              0,
+              0,
+              0,
+              2348,
+              1824,
+              768,
+              1368,
+              1777,
+              368,
+              74,
+              394,
+              199,
+              60,
+              22,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        "vfs_write": {
+          "calls": 9202,
+          "calls_per_sec": 39.906993875492034,
+          "total_ms": 120701.0709,
+          "avg_ms": 13.116830134753314,
+          "max_ms": 802.2693,
+          "latency_quantiles_ms": {
+            "p50": 2.0,
+            "p95": 100.0,
+            "p99": 250.0
+          },
+          "latency_quantiles_saturated": {
+            "p50": false,
+            "p95": false,
+            "p99": false
+          },
+          "latency_histogram": {
+            "bucket_upper_bounds_ns": [
+              50000,
+              100000,
+              250000,
+              500000,
+              1000000,
+              2000000,
+              5000000,
+              10000000,
+              25000000,
+              50000000,
+              100000000,
+              250000000,
+              500000000,
+              1000000000,
+              2000000000,
+              5000000000
+            ],
+            "bucket_counts": [
+              0,
+              0,
+              0,
+              2382,
+              1794,
+              769,
+              1384,
+              1779,
+              346,
+              74,
+              394,
+              199,
+              59,
+              22,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        "post_write_getattr": {
+          "calls": 9202,
+          "calls_per_sec": 39.906993875492034,
+          "total_ms": 599.9109,
+          "avg_ms": 0.0651935340143447,
+          "max_ms": 10.7325,
+          "latency_quantiles_ms": {
+            "p50": 0.05,
+            "p95": 0.5,
+            "p99": 2.0
+          },
+          "latency_quantiles_saturated": {
+            "p50": false,
+            "p95": false,
+            "p99": false
+          },
+          "latency_histogram": {
+            "bucket_upper_bounds_ns": [
+              50000,
+              100000,
+              250000,
+              500000,
+              1000000,
+              2000000,
+              5000000,
+              10000000,
+              25000000,
+              50000000,
+              100000000,
+              250000000,
+              500000000,
+              1000000000,
+              2000000000,
+              5000000000
+            ],
+            "bucket_counts": [
+              8257,
+              94,
+              326,
+              222,
+              162,
+              71,
+              62,
+              7,
+              1,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        }
+      },
+      "vfs_write_path": {
+        "calls": 9202,
+        "write_bytes": 19290871382,
+        "avg_write_bytes": 2096378.1114975004,
+        "record_handle_writer_state": {
+          "calls": 9202,
+          "calls_per_sec": 39.906993875492034,
+          "total_ms": 28927.8346,
+          "avg_ms": 3.14364644642469,
+          "max_ms": 67.8181,
+          "latency_quantiles_ms": {
+            "p50": 2.0,
+            "p95": 10.0,
+            "p99": 25.0
+          },
+          "latency_quantiles_saturated": {
+            "p50": false,
+            "p95": false,
+            "p99": false
+          },
+          "latency_histogram": {
+            "bucket_upper_bounds_ns": [
+              50000,
+              100000,
+              250000,
+              500000,
+              1000000,
+              2000000,
+              5000000,
+              10000000,
+              25000000,
+              50000000,
+              100000000,
+              250000000,
+              500000000,
+              1000000000,
+              2000000000,
+              5000000000
+            ],
+            "bucket_counts": [
+              1,
+              0,
+              34,
+              3327,
+              1078,
+              801,
+              1615,
+              2023,
+              283,
+              37,
+              3,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        "materialize_completed": {
+          "calls": 8933,
+          "calls_per_sec": 38.74040168330475,
+          "total_ms": 75859.906,
+          "avg_ms": 8.49209739169372,
+          "max_ms": 796.568,
+          "latency_quantiles_ms": {
+            "p50": 0.05,
+            "p95": 10.0,
+            "p99": 250.0
+          },
+          "latency_quantiles_saturated": {
+            "p50": false,
+            "p95": false,
+            "p99": false
+          },
+          "latency_histogram": {
+            "bucket_upper_bounds_ns": [
+              50000,
+              100000,
+              250000,
+              500000,
+              1000000,
+              2000000,
+              5000000,
+              10000000,
+              25000000,
+              50000000,
+              100000000,
+              250000000,
+              500000000,
+              1000000000,
+              2000000000,
+              5000000000
+            ],
+            "bucket_counts": [
+              7368,
+              427,
+              188,
+              58,
+              148,
+              138,
+              131,
+              37,
+              7,
+              6,
+              158,
+              187,
+              58,
+              22,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        "materialize_strict": {
+          "calls": 269,
+          "calls_per_sec": 1.1665921921872808,
+          "total_ms": 14708.5945,
+          "avg_ms": 54.67878996282528,
+          "max_ms": 97.2715,
+          "latency_quantiles_ms": {
+            "p50": 100.0,
+            "p95": 100.0,
+            "p99": 100.0
+          },
+          "latency_quantiles_saturated": {
+            "p50": false,
+            "p95": false,
+            "p99": false
+          },
+          "latency_histogram": {
+            "bucket_upper_bounds_ns": [
+              50000,
+              100000,
+              250000,
+              500000,
+              1000000,
+              2000000,
+              5000000,
+              10000000,
+              25000000,
+              50000000,
+              100000000,
+              250000000,
+              500000000,
+              1000000000,
+              2000000000,
+              5000000000
+            ],
+            "bucket_counts": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              104,
+              165,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        "materialize_for_limits": {
+          "calls": 9202,
+          "calls_per_sec": 39.906993875492034,
+          "total_ms": 615.724,
+          "avg_ms": 0.06691197565746576,
+          "max_ms": 23.4721,
+          "latency_quantiles_ms": {
+            "p50": 0.05,
+            "p95": 0.05,
+            "p99": 5.0
+          },
+          "latency_quantiles_saturated": {
+            "p50": false,
+            "p95": false,
+            "p99": false
+          },
+          "latency_histogram": {
+            "bucket_upper_bounds_ns": [
+              50000,
+              100000,
+              250000,
+              500000,
+              1000000,
+              2000000,
+              5000000,
+              10000000,
+              25000000,
+              50000000,
+              100000000,
+              250000000,
+              500000000,
+              1000000000,
+              2000000000,
+              5000000000
+            ],
+            "bucket_counts": [
+              8893,
+              13,
+              24,
+              33,
+              64,
+              79,
+              75,
+              16,
+              5,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          }
+        }
+      },
+      "winfsp_foreground_flushes": {
+        "cleanup": 0,
+        "flush": 0,
+        "close": 17,
+        "cleanup_skipped_clean": 0,
+        "flush_skipped_clean": 0,
+        "close_skipped_clean": 18
+      },
+      "write_backpressure": {
+        "events": 0,
+        "wait_total_ms": 0,
+        "stall_max_ms": 0
+      },
+      "dirty_pressure": {
+        "pending_local_dirty_bytes": 0,
+        "handle_writer_dirty_bytes": 8,
+        "total_dirty_bytes": 8,
+        "dirty_limit_bytes": 1677721600
+      },
+      "payload_burst": {
+        "bursts": 717,
+        "bursts_per_sec": 3.1094669211831985,
+        "total_blocks": 4803,
+        "total_bytes": 19580114510,
+        "avg_blocks_per_burst": 6.698744769874477,
+        "avg_bytes_per_burst": 27308388.437935844,
+        "max_blocks_per_burst": 8,
+        "max_bytes_per_burst": 33554432,
+        "avg_interval_ms": 306.05266103351954,
+        "max_interval_ms": 80025.9287
+      },
+      "payload_persist": {
+        "calls": 717,
+        "calls_per_sec": 3.1094669211831985,
+        "total_ms": 51863.6704,
+        "avg_ms": 72.33426834030683,
+        "max_ms": 652.6687,
+        "latency_quantiles_ms": {
+          "p50": 50.0,
+          "p95": 500.0,
+          "p99": 1000.0
+        },
+        "latency_quantiles_saturated": {
+          "p50": false,
+          "p95": false,
+          "p99": false
+        },
+        "latency_histogram": {
+          "bucket_upper_bounds_ns": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2000000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2000000000,
+            5000000000
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            297,
+            218,
+            76,
+            76,
+            40,
+            10,
+            0,
+            0,
+            0
+          ]
+        }
+      },
+      "metadata_commit": {
+        "calls": 718,
+        "calls_per_sec": 3.1138036951318497,
+        "total_ms": 3367.9722,
+        "avg_ms": 4.690769080779945,
+        "max_ms": 22.6784,
+        "latency_quantiles_ms": {
+          "p50": 5.0,
+          "p95": 25.0,
+          "p99": 25.0
+        },
+        "latency_quantiles_saturated": {
+          "p50": false,
+          "p95": false,
+          "p99": false
+        },
+        "latency_histogram": {
+          "bucket_upper_bounds_ns": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2000000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2000000000,
+            5000000000
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            10,
+            328,
+            195,
+            86,
+            99,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      },
+      "metadata_commit_cadence": {
+        "events": 718,
+        "events_per_sec": 3.1138036951318497,
+        "avg_interval_ms": 305.62780013947,
+        "max_interval_ms": 79903.1256,
+        "interval_quantiles_ms": {
+          "p50": 100.0,
+          "p95": 250.0,
+          "p99": 250.0
+        },
+        "interval_quantiles_saturated": {
+          "p50": false,
+          "p95": false,
+          "p99": false
+        },
+        "interval_histogram": {
+          "bucket_upper_bounds_ns": [
+            50000,
+            100000,
+            250000,
+            500000,
+            1000000,
+            2000000,
+            5000000,
+            10000000,
+            25000000,
+            50000000,
+            100000000,
+            250000000,
+            500000000,
+            1000000000,
+            2000000000,
+            5000000000
+          ],
+          "bucket_counts": [
+            0,
+            0,
+            0,
+            0,
+            14,
+            72,
+            40,
+            31,
+            55,
+            84,
+            369,
+            47,
+            2,
+            0,
+            0,
+            0,
+            3
+          ]
+        }
+      },
+      "eager_flush": {
+        "checks": 0,
+        "triggered": 0,
+        "skipped_empty": 0,
+        "skipped_below_threshold": 0
+      },
+      "tuning": {
+        "eager_flush_threshold_bytes": 104857600,
+        "eager_flush_drain_chunk_bytes": 33554432,
+        "payload_put_concurrency": 8,
+        "sync_group_min_bytes": 134217728,
+        "sync_group_max_delay_ms": 100
+      }
+    }
+  },
+  "writes": {
+    "operations": 48,
+    "bytes": 5637144576,
+    "elapsed_ms": 52980.0771,
+    "avg_latency_ms": 1103.75160625,
+    "p50_ms": 500.1373,
+    "p95_ms": 2845.9036,
+    "p99_ms": 2882.3868,
+    "throughput_bytes_per_sec": 1122008827.158645,
+    "operations_log": [
+      {
+        "operation_index": 0,
+        "work_index": 0,
+        "worker_id": 0,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000000.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 301.81190000000004,
+        "throughput_bytes_per_sec": 55588318.41951891
+      },
+      {
+        "operation_index": 1,
+        "work_index": 1,
+        "worker_id": 1,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000001.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 375.7686,
+        "throughput_bytes_per_sec": 178590930.69511396
+      },
+      {
+        "operation_index": 2,
+        "work_index": 2,
+        "worker_id": 3,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000002.bin",
+        "size_class": "large",
+        "bytes": 268435456,
+        "elapsed_ms": 2339.8905999999997,
+        "throughput_bytes_per_sec": 114721370.30679981
+      },
+      {
+        "operation_index": 3,
+        "work_index": 3,
+        "worker_id": 5,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000003.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 103.55720000000001,
+        "throughput_bytes_per_sec": 162009169.81146652
+      },
+      {
+        "operation_index": 4,
+        "work_index": 4,
+        "worker_id": 7,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000004.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 412.8471,
+        "throughput_bytes_per_sec": 162551375.55768225
+      },
+      {
+        "operation_index": 5,
+        "work_index": 5,
+        "worker_id": 9,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000005.bin",
+        "size_class": "large",
+        "bytes": 268435456,
+        "elapsed_ms": 2748.4723999999997,
+        "throughput_bytes_per_sec": 97667146.30279715
+      },
+      {
+        "operation_index": 6,
+        "work_index": 6,
+        "worker_id": 10,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000006.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 232.8567,
+        "throughput_bytes_per_sec": 72049530.89174587
+      },
+      {
+        "operation_index": 7,
+        "work_index": 7,
+        "worker_id": 11,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000007.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 506.87669999999997,
+        "throughput_bytes_per_sec": 132396821.55443327
+      },
+      {
+        "operation_index": 8,
+        "work_index": 8,
+        "worker_id": 12,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000008.bin",
+        "size_class": "large",
+        "bytes": 268435456,
+        "elapsed_ms": 2597.5659,
+        "throughput_bytes_per_sec": 103341153.34667736
+      },
+      {
+        "operation_index": 9,
+        "work_index": 9,
+        "worker_id": 13,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000009.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 280.8096,
+        "throughput_bytes_per_sec": 59745877.63381309
+      },
+      {
+        "operation_index": 10,
+        "work_index": 10,
+        "worker_id": 14,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000010.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 589.5227,
+        "throughput_bytes_per_sec": 113835928.62497069
+      },
+      {
+        "operation_index": 11,
+        "work_index": 11,
+        "worker_id": 15,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000011.bin",
+        "size_class": "large",
+        "bytes": 268435456,
+        "elapsed_ms": 2882.3867999999998,
+        "throughput_bytes_per_sec": 93129574.42075436
+      },
+      {
+        "operation_index": 12,
+        "work_index": 12,
+        "worker_id": 16,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000012.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 224.635,
+        "throughput_bytes_per_sec": 74686562.64607029
+      },
+      {
+        "operation_index": 13,
+        "work_index": 13,
+        "worker_id": 17,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000013.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 683.4716,
+        "throughput_bytes_per_sec": 98188226.10917558
+      },
+      {
+        "operation_index": 14,
+        "work_index": 14,
+        "worker_id": 18,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000014.bin",
+        "size_class": "large",
+        "bytes": 268435456,
+        "elapsed_ms": 2561.4075000000003,
+        "throughput_bytes_per_sec": 104799980.47948247
+      },
+      {
+        "operation_index": 15,
+        "work_index": 15,
+        "worker_id": 19,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000015.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 270.66459999999995,
+        "throughput_bytes_per_sec": 61985261.463819064
+      },
+      {
+        "operation_index": 16,
+        "work_index": 16,
+        "worker_id": 20,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000016.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 484.5097,
+        "throughput_bytes_per_sec": 138508814.16821995
+      },
+      {
+        "operation_index": 17,
+        "work_index": 17,
+        "worker_id": 21,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000017.bin",
+        "size_class": "large",
+        "bytes": 268435456,
+        "elapsed_ms": 2399.9645,
+        "throughput_bytes_per_sec": 111849761.11104977
+      },
+      {
+        "operation_index": 18,
+        "work_index": 18,
+        "worker_id": 22,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000018.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 132.881,
+        "throughput_bytes_per_sec": 126257448.39367555
+      },
+      {
+        "operation_index": 19,
+        "work_index": 19,
+        "worker_id": 23,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000019.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 600.2626,
+        "throughput_bytes_per_sec": 111799175.89401706
+      },
+      {
+        "operation_index": 20,
+        "work_index": 20,
+        "worker_id": 24,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000020.bin",
+        "size_class": "large",
+        "bytes": 268435456,
+        "elapsed_ms": 2877.6587999999997,
+        "throughput_bytes_per_sec": 93282586.52485138
+      },
+      {
+        "operation_index": 21,
+        "work_index": 21,
+        "worker_id": 25,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000021.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 165.093,
+        "throughput_bytes_per_sec": 101622818.65372851
+      },
+      {
+        "operation_index": 22,
+        "work_index": 22,
+        "worker_id": 26,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000022.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 500.1373,
+        "throughput_bytes_per_sec": 134180881.92982207
+      },
+      {
+        "operation_index": 23,
+        "work_index": 23,
+        "worker_id": 27,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000023.bin",
+        "size_class": "large",
+        "bytes": 268435456,
+        "elapsed_ms": 2652.5674,
+        "throughput_bytes_per_sec": 101198354.46971112
+      },
+      {
+        "operation_index": 24,
+        "work_index": 24,
+        "worker_id": 28,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000024.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 188.7951,
+        "throughput_bytes_per_sec": 88864679.22101793
+      },
+      {
+        "operation_index": 25,
+        "work_index": 25,
+        "worker_id": 29,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000025.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 624.6578000000001,
+        "throughput_bytes_per_sec": 107433004.11841491
+      },
+      {
+        "operation_index": 26,
+        "work_index": 26,
+        "worker_id": 30,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000026.bin",
+        "size_class": "large",
+        "bytes": 268435456,
+        "elapsed_ms": 2818.8827,
+        "throughput_bytes_per_sec": 95227607.73266657
+      },
+      {
+        "operation_index": 27,
+        "work_index": 27,
+        "worker_id": 31,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000027.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 197.6567,
+        "throughput_bytes_per_sec": 84880583.35487743
+      },
+      {
+        "operation_index": 28,
+        "work_index": 28,
+        "worker_id": 8,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000028.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 501.0744,
+        "throughput_bytes_per_sec": 133929939.3463326
+      },
+      {
+        "operation_index": 29,
+        "work_index": 29,
+        "worker_id": 6,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000029.bin",
+        "size_class": "large",
+        "bytes": 268435456,
+        "elapsed_ms": 2343.4907,
+        "throughput_bytes_per_sec": 114545133.88937281
+      },
+      {
+        "operation_index": 30,
+        "work_index": 30,
+        "worker_id": 4,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000030.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 166.98389999999998,
+        "throughput_bytes_per_sec": 100472057.48578157
+      },
+      {
+        "operation_index": 31,
+        "work_index": 31,
+        "worker_id": 2,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000031.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 543.2945,
+        "throughput_bytes_per_sec": 123522075.04401387
+      },
+      {
+        "operation_index": 32,
+        "work_index": 32,
+        "worker_id": 5,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000032.bin",
+        "size_class": "large",
+        "bytes": 268435456,
+        "elapsed_ms": 2726.7979,
+        "throughput_bytes_per_sec": 98443473.20349629
+      },
+      {
+        "operation_index": 33,
+        "work_index": 33,
+        "worker_id": 25,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000033.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 103.1912,
+        "throughput_bytes_per_sec": 162583786.21432835
+      },
+      {
+        "operation_index": 34,
+        "work_index": 34,
+        "worker_id": 22,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000034.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 468.40749999999997,
+        "throughput_bytes_per_sec": 143270259.33615497
+      },
+      {
+        "operation_index": 35,
+        "work_index": 35,
+        "worker_id": 10,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000035.bin",
+        "size_class": "large",
+        "bytes": 268435456,
+        "elapsed_ms": 2717.3035,
+        "throughput_bytes_per_sec": 98787439.82775572
+      },
+      {
+        "operation_index": 36,
+        "work_index": 36,
+        "worker_id": 16,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000036.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 85.05409999999999,
+        "throughput_bytes_per_sec": 197253465.73533788
+      },
+      {
+        "operation_index": 37,
+        "work_index": 37,
+        "worker_id": 28,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000037.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 365.9737,
+        "throughput_bytes_per_sec": 183370728.55235225
+      },
+      {
+        "operation_index": 38,
+        "work_index": 38,
+        "worker_id": 4,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000038.bin",
+        "size_class": "large",
+        "bytes": 268435456,
+        "elapsed_ms": 2835.7679,
+        "throughput_bytes_per_sec": 94660587.70183554
+      },
+      {
+        "operation_index": 39,
+        "work_index": 39,
+        "worker_id": 19,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000039.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 96.03739999999999,
+        "throughput_bytes_per_sec": 174694608.558749
+      },
+      {
+        "operation_index": 40,
+        "work_index": 40,
+        "worker_id": 0,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000040.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 416.3327,
+        "throughput_bytes_per_sec": 161190470.98630494
+      },
+      {
+        "operation_index": 41,
+        "work_index": 41,
+        "worker_id": 13,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000041.bin",
+        "size_class": "large",
+        "bytes": 268435456,
+        "elapsed_ms": 2845.9035999999996,
+        "throughput_bytes_per_sec": 94323453.54213685
+      },
+      {
+        "operation_index": 42,
+        "work_index": 42,
+        "worker_id": 31,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000042.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 91.3408,
+        "throughput_bytes_per_sec": 183677130.04484305
+      },
+      {
+        "operation_index": 43,
+        "work_index": 43,
+        "worker_id": 25,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000043.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 220.8406,
+        "throughput_bytes_per_sec": 303879196.1260747
+      },
+      {
+        "operation_index": 44,
+        "work_index": 44,
+        "worker_id": 16,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000044.bin",
+        "size_class": "large",
+        "bytes": 268435456,
+        "elapsed_ms": 2728.4469,
+        "throughput_bytes_per_sec": 98383976.61321539
+      },
+      {
+        "operation_index": 45,
+        "work_index": 45,
+        "worker_id": 19,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000045.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 76.39890000000001,
+        "throughput_bytes_per_sec": 219600229.84624124
+      },
+      {
+        "operation_index": 46,
+        "work_index": 46,
+        "worker_id": 31,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000046.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 190.8564,
+        "throughput_bytes_per_sec": 351619667.98074365
+      },
+      {
+        "operation_index": 47,
+        "work_index": 47,
+        "worker_id": 1,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000047.bin",
+        "size_class": "large",
+        "bytes": 268435456,
+        "elapsed_ms": 2700.9689999999996,
+        "throughput_bytes_per_sec": 99384871.13328588
+      }
+    ]
+  },
+  "reads": {
+    "operations": 48,
+    "bytes": 2415919104,
+    "elapsed_ms": 118362.8,
+    "avg_latency_ms": 2465.8916666666664,
+    "p50_ms": 2755.1683,
+    "p95_ms": 3592.1347,
+    "p99_ms": 3601.0511,
+    "throughput_bytes_per_sec": 538273461.253908,
+    "operations_log": [
+      {
+        "operation_index": 0,
+        "work_index": 0,
+        "worker_id": 0,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000000.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 1192.1068,
+        "throughput_bytes_per_sec": 14073584.682177806
+      },
+      {
+        "operation_index": 1,
+        "work_index": 1,
+        "worker_id": 1,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000001.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3499.5878000000002,
+        "throughput_bytes_per_sec": 19176219.55362857
+      },
+      {
+        "operation_index": 2,
+        "work_index": 2,
+        "worker_id": 2,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000002.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3476.4419000000003,
+        "throughput_bytes_per_sec": 19303893.44346586
+      },
+      {
+        "operation_index": 3,
+        "work_index": 3,
+        "worker_id": 3,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000003.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 1226.4505,
+        "throughput_bytes_per_sec": 13679488.899062784
+      },
+      {
+        "operation_index": 4,
+        "work_index": 4,
+        "worker_id": 5,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000004.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3601.0510999999997,
+        "throughput_bytes_per_sec": 18635909.9430719
+      },
+      {
+        "operation_index": 5,
+        "work_index": 5,
+        "worker_id": 6,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000005.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3355.238,
+        "throughput_bytes_per_sec": 20001223.162112493
+      },
+      {
+        "operation_index": 6,
+        "work_index": 6,
+        "worker_id": 7,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000006.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 1224.6508000000001,
+        "throughput_bytes_per_sec": 13699591.753012368
+      },
+      {
+        "operation_index": 7,
+        "work_index": 7,
+        "worker_id": 4,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000007.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3490.8539,
+        "throughput_bytes_per_sec": 19224197.265889585
+      },
+      {
+        "operation_index": 8,
+        "work_index": 8,
+        "worker_id": 9,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000008.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3365.8017,
+        "throughput_bytes_per_sec": 19938448.54258645
+      },
+      {
+        "operation_index": 9,
+        "work_index": 9,
+        "worker_id": 10,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000009.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 1227.3092000000001,
+        "throughput_bytes_per_sec": 13669917.898439936
+      },
+      {
+        "operation_index": 10,
+        "work_index": 10,
+        "worker_id": 8,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000010.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3555.5822,
+        "throughput_bytes_per_sec": 18874226.56126471
+      },
+      {
+        "operation_index": 11,
+        "work_index": 11,
+        "worker_id": 11,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000011.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3445.4813,
+        "throughput_bytes_per_sec": 19477355.4568414
+      },
+      {
+        "operation_index": 12,
+        "work_index": 12,
+        "worker_id": 12,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000012.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 1136.5666,
+        "throughput_bytes_per_sec": 14761313.591302084
+      },
+      {
+        "operation_index": 13,
+        "work_index": 13,
+        "worker_id": 13,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000013.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3516.6418999999996,
+        "throughput_bytes_per_sec": 19083223.68564169
+      },
+      {
+        "operation_index": 14,
+        "work_index": 14,
+        "worker_id": 14,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000014.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3454.8386,
+        "throughput_bytes_per_sec": 19424601.774450477
+      },
+      {
+        "operation_index": 15,
+        "work_index": 15,
+        "worker_id": 15,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000015.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 1109.279,
+        "throughput_bytes_per_sec": 15124433.077701824
+      },
+      {
+        "operation_index": 16,
+        "work_index": 16,
+        "worker_id": 16,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000016.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3543.2544999999996,
+        "throughput_bytes_per_sec": 18939893.817957476
+      },
+      {
+        "operation_index": 17,
+        "work_index": 17,
+        "worker_id": 17,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000017.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3480.6537999999996,
+        "throughput_bytes_per_sec": 19280534.019212138
+      },
+      {
+        "operation_index": 18,
+        "work_index": 18,
+        "worker_id": 18,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000018.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 1202.8774,
+        "throughput_bytes_per_sec": 13947569.38653931
+      },
+      {
+        "operation_index": 19,
+        "work_index": 19,
+        "worker_id": 19,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000019.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3532.5982,
+        "throughput_bytes_per_sec": 18997027.173936736
+      },
+      {
+        "operation_index": 20,
+        "work_index": 20,
+        "worker_id": 20,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000020.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3486.5161000000003,
+        "throughput_bytes_per_sec": 19248115.33209326
+      },
+      {
+        "operation_index": 21,
+        "work_index": 21,
+        "worker_id": 21,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000021.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 1226.1128,
+        "throughput_bytes_per_sec": 13683256.548663385
+      },
+      {
+        "operation_index": 22,
+        "work_index": 22,
+        "worker_id": 22,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000022.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3592.7943,
+        "throughput_bytes_per_sec": 18678738.162104078
+      },
+      {
+        "operation_index": 23,
+        "work_index": 23,
+        "worker_id": 23,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000023.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3356.4839,
+        "throughput_bytes_per_sec": 19993798.86791651
+      },
+      {
+        "operation_index": 24,
+        "work_index": 24,
+        "worker_id": 24,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000024.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 1185.5249,
+        "throughput_bytes_per_sec": 14151719.630688483
+      },
+      {
+        "operation_index": 25,
+        "work_index": 25,
+        "worker_id": 25,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000025.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3592.1347,
+        "throughput_bytes_per_sec": 18682168.015581377
+      },
+      {
+        "operation_index": 26,
+        "work_index": 26,
+        "worker_id": 26,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000026.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3395.7008,
+        "throughput_bytes_per_sec": 19762890.770588502
+      },
+      {
+        "operation_index": 27,
+        "work_index": 27,
+        "worker_id": 27,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000027.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 1275.7065,
+        "throughput_bytes_per_sec": 13151313.409471536
+      },
+      {
+        "operation_index": 28,
+        "work_index": 28,
+        "worker_id": 28,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000028.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3474.7945,
+        "throughput_bytes_per_sec": 19313045.41894492
+      },
+      {
+        "operation_index": 29,
+        "work_index": 29,
+        "worker_id": 29,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000029.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3459.2181,
+        "throughput_bytes_per_sec": 19400009.49925649
+      },
+      {
+        "operation_index": 30,
+        "work_index": 30,
+        "worker_id": 30,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000030.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 1154.2842,
+        "throughput_bytes_per_sec": 14534735.89952977
+      },
+      {
+        "operation_index": 31,
+        "work_index": 31,
+        "worker_id": 31,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000031.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 3556.4114999999997,
+        "throughput_bytes_per_sec": 18869825.384379733
+      },
+      {
+        "operation_index": 32,
+        "work_index": 32,
+        "worker_id": 15,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000032.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 2802.3734,
+        "throughput_bytes_per_sec": 23947152.795555368
+      },
+      {
+        "operation_index": 33,
+        "work_index": 33,
+        "worker_id": 12,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000033.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 1241.4531,
+        "throughput_bytes_per_sec": 13514176.250395605
+      },
+      {
+        "operation_index": 34,
+        "work_index": 34,
+        "worker_id": 30,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000034.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 2755.1683000000003,
+        "throughput_bytes_per_sec": 24357446.330955535
+      },
+      {
+        "operation_index": 35,
+        "work_index": 35,
+        "worker_id": 24,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000035.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 2662.271,
+        "throughput_bytes_per_sec": 25207375.207107015
+      },
+      {
+        "operation_index": 36,
+        "work_index": 36,
+        "worker_id": 0,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000036.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 1015.5453000000001,
+        "throughput_bytes_per_sec": 16520401.404053565
+      },
+      {
+        "operation_index": 37,
+        "work_index": 37,
+        "worker_id": 18,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000037.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 2946.3398,
+        "throughput_bytes_per_sec": 22777027.95855386
+      },
+      {
+        "operation_index": 38,
+        "work_index": 38,
+        "worker_id": 7,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000038.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 2719.0389999999998,
+        "throughput_bytes_per_sec": 24681096.519763052
+      },
+      {
+        "operation_index": 39,
+        "work_index": 39,
+        "worker_id": 21,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000039.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 1028.2545,
+        "throughput_bytes_per_sec": 16316209.65432196
+      },
+      {
+        "operation_index": 40,
+        "work_index": 40,
+        "worker_id": 3,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000040.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 2716.777,
+        "throughput_bytes_per_sec": 24701646.104925063
+      },
+      {
+        "operation_index": 41,
+        "work_index": 41,
+        "worker_id": 10,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000041.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 2712.4389,
+        "throughput_bytes_per_sec": 24741152.32604871
+      },
+      {
+        "operation_index": 42,
+        "work_index": 42,
+        "worker_id": 27,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000042.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 1167.7341000000001,
+        "throughput_bytes_per_sec": 14367325.575231552
+      },
+      {
+        "operation_index": 43,
+        "work_index": 43,
+        "worker_id": 0,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000043.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 2102.1328000000003,
+        "throughput_bytes_per_sec": 31924179.100387946
+      },
+      {
+        "operation_index": 44,
+        "work_index": 44,
+        "worker_id": 21,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000044.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 2009.5421,
+        "throughput_bytes_per_sec": 33395102.297185015
+      },
+      {
+        "operation_index": 45,
+        "work_index": 45,
+        "worker_id": 12,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000045.bin",
+        "size_class": "large",
+        "bytes": 16777216,
+        "elapsed_ms": 1031.093,
+        "throughput_bytes_per_sec": 16271292.696197141
+      },
+      {
+        "operation_index": 46,
+        "work_index": 46,
+        "worker_id": 27,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000046.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 1932.5831,
+        "throughput_bytes_per_sec": 34724956.458534695
+      },
+      {
+        "operation_index": 47,
+        "work_index": 47,
+        "worker_id": 6,
+        "target": "Z:\\.studiofs-test-cache\\test_cache_file_000047.bin",
+        "size_class": "large",
+        "bytes": 67108864,
+        "elapsed_ms": 1127.1071,
+        "throughput_bytes_per_sec": 59540804.951011315
+      }
+    ]
+  }
+}

@@ -251,6 +251,7 @@ pub(super) fn build_work_sizes(
     block_size: u64,
     size_input: &WorkloadSizeInput,
     size_class_bounds: SizeClassBounds,
+    workload_repeat: usize,
 ) -> WorkloadPlan {
     let mut rng = XorShift64::new(0x5ed0_f00d_beef);
     let small_max = size_class_bounds.small_max.max(1);
@@ -287,13 +288,16 @@ pub(super) fn build_work_sizes(
             for _ in 0..WORKLOAD_FILES_PER_TIER {
                 sizes.push(large_size);
             }
-            WorkloadPlan {
-                sizes,
-                source: size_input.display_label(),
-                small_files: WORKLOAD_FILES_PER_TIER,
-                medium_files: WORKLOAD_FILES_PER_TIER,
-                large_files: WORKLOAD_FILES_PER_TIER,
-            }
+            repeat_workload_plan(
+                WorkloadPlan {
+                    sizes,
+                    source: size_input.display_label(),
+                    small_files: WORKLOAD_FILES_PER_TIER,
+                    medium_files: WORKLOAD_FILES_PER_TIER,
+                    large_files: WORKLOAD_FILES_PER_TIER,
+                },
+                workload_repeat,
+            )
         }
         WorkloadSizeInput::Percentages {
             small,
@@ -326,13 +330,16 @@ pub(super) fn build_work_sizes(
                 sizes.push(large_size);
             }
 
-            WorkloadPlan {
-                sizes,
-                source: size_input.display_label(),
-                small_files: small_count,
-                medium_files: medium_count,
-                large_files: large_count,
-            }
+            repeat_workload_plan(
+                WorkloadPlan {
+                    sizes,
+                    source: size_input.display_label(),
+                    small_files: small_count,
+                    medium_files: medium_count,
+                    large_files: large_count,
+                },
+                workload_repeat,
+            )
         }
         WorkloadSizeInput::ExplicitList(items) => {
             let mut small_files = 0usize;
@@ -345,14 +352,37 @@ pub(super) fn build_work_sizes(
                     SizeClass::Large => large_files += 1,
                 }
             }
-            WorkloadPlan {
-                sizes: items.clone(),
-                source: size_input.display_label(),
-                small_files,
-                medium_files,
-                large_files,
-            }
+            repeat_workload_plan(
+                WorkloadPlan {
+                    sizes: items.clone(),
+                    source: size_input.display_label(),
+                    small_files,
+                    medium_files,
+                    large_files,
+                },
+                workload_repeat,
+            )
         }
+    }
+}
+
+fn repeat_workload_plan(plan: WorkloadPlan, workload_repeat: usize) -> WorkloadPlan {
+    let repeat = workload_repeat.max(1);
+    if repeat == 1 {
+        return plan;
+    }
+
+    let mut sizes = Vec::with_capacity(plan.sizes.len().saturating_mul(repeat));
+    for _ in 0..repeat {
+        sizes.extend_from_slice(&plan.sizes);
+    }
+
+    WorkloadPlan {
+        sizes,
+        source: format!("{} x{}", plan.source, repeat),
+        small_files: plan.small_files.saturating_mul(repeat),
+        medium_files: plan.medium_files.saturating_mul(repeat),
+        large_files: plan.large_files.saturating_mul(repeat),
     }
 }
 
@@ -410,7 +440,7 @@ mod tests {
             small_max: SMALL_FILE_MAX_BYTES,
             medium_max: block_size,
         };
-        let plan = build_work_sizes(block_size, &WorkloadSizeInput::Default, bounds);
+        let plan = build_work_sizes(block_size, &WorkloadSizeInput::Default, bounds, 1);
         let sizes = plan.sizes;
         assert_eq!(sizes.len(), WORKLOAD_FILES_PER_TIER * 3);
 
@@ -483,6 +513,7 @@ mod tests {
             DEFAULT_BLOCK_SIZE as u64,
             &WorkloadSizeInput::ExplicitList(vec![1024, 4 * 1024, 8 * 1024]),
             bounds,
+            1,
         );
         assert_eq!(plan.small_files, 1);
         assert_eq!(plan.medium_files, 1);
@@ -492,11 +523,38 @@ mod tests {
             DEFAULT_BLOCK_SIZE as u64,
             &WorkloadSizeInput::Default,
             bounds,
+            1,
         );
         assert!(
             default_plan.sizes[..WORKLOAD_FILES_PER_TIER]
                 .iter()
                 .all(|size| *size <= bounds.small_max)
         );
+    }
+
+    #[test]
+    fn workload_repeat_duplicates_explicit_size_lists() {
+        let plan = build_work_sizes(
+            DEFAULT_BLOCK_SIZE as u64,
+            &WorkloadSizeInput::ExplicitList(vec![
+                4 * 1024,
+                DEFAULT_BLOCK_SIZE as u64,
+                128 * 1024 * 1024,
+            ]),
+            SizeClassBounds {
+                small_max: SMALL_FILE_MAX_BYTES,
+                medium_max: DEFAULT_BLOCK_SIZE as u64,
+            },
+            4,
+        );
+
+        assert_eq!(plan.sizes.len(), 12);
+        assert_eq!(plan.small_files, 4);
+        assert_eq!(plan.medium_files, 4);
+        assert_eq!(plan.large_files, 4);
+        assert_eq!(plan.source, "explicit-list(3) x4");
+        assert_eq!(plan.sizes[0], 4 * 1024);
+        assert_eq!(plan.sizes[3], 4 * 1024);
+        assert_eq!(plan.sizes[4], DEFAULT_BLOCK_SIZE as u64);
     }
 }

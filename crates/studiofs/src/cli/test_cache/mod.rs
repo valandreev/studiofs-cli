@@ -45,12 +45,15 @@ struct TestCacheParams {
     read_size: u64,
     size_class_small_max: u64,
     size_class_medium_max: u64,
+    workload_repeat: usize,
     concurrency: usize,
     sequential_streams: bool,
     io_depth: usize,
     warmup_runs: u32,
     sizes: WorkloadSizeInput,
     access_pattern: TestCacheAccessPattern,
+    during_upload_min_pending: usize,
+    during_upload_timeout: std::time::Duration,
     l1_limit: u64,
     profile: bool,
     run_id: String,
@@ -77,12 +80,15 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
         read_size,
         small_max,
         medium_max,
+        workload_repeat,
         concurrency,
         sequential_streams,
         io_depth,
         warmup_runs,
         sizes,
         access_pattern,
+        during_upload_min_pending,
+        during_upload_timeout_ms,
         l1_limit,
         profile,
         json_output,
@@ -92,6 +98,15 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
     }
     if concurrency == 0 {
         return Err(anyhow!("--concurrency must be >= 1"));
+    }
+    if workload_repeat == 0 {
+        return Err(anyhow!("--workload-repeat must be >= 1"));
+    }
+    if during_upload_min_pending == 0 {
+        return Err(anyhow!("--during-upload-min-pending must be >= 1"));
+    }
+    if during_upload_timeout_ms == 0 {
+        return Err(anyhow!("--during-upload-timeout-ms must be >= 1"));
     }
     let block_size = parse_size_arg(
         "block-size",
@@ -161,12 +176,15 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
         read_size,
         size_class_small_max,
         size_class_medium_max,
+        workload_repeat,
         concurrency,
         sequential_streams,
         io_depth,
         warmup_runs,
         sizes,
         access_pattern,
+        during_upload_min_pending,
+        during_upload_timeout: std::time::Duration::from_millis(during_upload_timeout_ms),
         l1_limit,
         profile: profile.is_some(),
         run_id: run_id.clone(),

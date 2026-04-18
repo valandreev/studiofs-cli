@@ -6,7 +6,7 @@ use std::ffi::c_void;
 use std::fs::OpenOptions as StdOpenOptions;
 use std::io::Write as _;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
@@ -1696,6 +1696,7 @@ impl FileSystemContext for StudioFsContext {
         file_info: &mut FileInfo,
     ) -> winfsp::Result<u32> {
         self.vfs.note_winfsp_write_callback();
+        let callback_started = Instant::now();
         // Resolve actual write offset
         let actual_offset = if write_to_eof {
             let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
@@ -1722,6 +1723,7 @@ impl FileSystemContext for StudioFsContext {
         let local_sync_policy = context.write_local_sync_policy;
         let in_buf = SendConstBuffer::from_slice(buffer);
         let vfs = self.vfs.clone();
+        let vfs_write_started = Instant::now();
         let written = self
             .spawn_wait(async move {
                 // SAFETY:
@@ -1735,9 +1737,18 @@ impl FileSystemContext for StudioFsContext {
                     .await
             })
             .map_err(vfs_to_winfsp_err)?;
+        let vfs_write_elapsed = vfs_write_started.elapsed();
 
+        let post_write_getattr_started = Instant::now();
         let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
         *file_info = attr_to_file_info(&attr);
+        let post_write_getattr_elapsed = post_write_getattr_started.elapsed();
+        self.vfs.record_winfsp_write_callback_observability(
+            buffer.len(),
+            callback_started.elapsed(),
+            vfs_write_elapsed,
+            post_write_getattr_elapsed,
+        );
 
         trace!(
             ino = context.ino,

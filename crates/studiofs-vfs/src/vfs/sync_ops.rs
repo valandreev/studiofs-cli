@@ -9,6 +9,8 @@ use tracing::debug;
 use crate::VfsMeta;
 use crate::runtime::run_meta;
 
+use std::time::Instant;
+
 impl StudioVfs {
     /// Release a file handle.
     ///
@@ -392,18 +394,37 @@ impl StudioVfs {
                 });
                 return Ok(data.len() as u32);
             }
-            let written = self
-                .record_handle_writer_state(fh, ino, offset, data)
-                .await?;
+            self.note_vfs_write_call(data.len());
+
+            let record_handle_writer_state_started = Instant::now();
+            let written = self.record_handle_writer_state(fh, ino, offset, data).await;
+            self.record_vfs_write_record_handle_writer_state(
+                record_handle_writer_state_started.elapsed(),
+            );
+            let written = written?;
             if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
-                self.materialize_handle_writers_for_inode(ino, local_sync_policy)
-                    .await?;
+                let materialize_strict_started = Instant::now();
+                let strict_result = self
+                    .materialize_handle_writers_for_inode(ino, local_sync_policy)
+                    .await;
+                self.record_vfs_write_materialize_strict(materialize_strict_started.elapsed());
+                strict_result?;
             } else {
-                self.materialize_completed_handle_writer_blocks_for_inode(ino, local_sync_policy)
-                    .await?;
+                let materialize_completed_started = Instant::now();
+                let completed_result = self
+                    .materialize_completed_handle_writer_blocks_for_inode(ino, local_sync_policy)
+                    .await;
+                self.record_vfs_write_materialize_completed(
+                    materialize_completed_started.elapsed(),
+                );
+                completed_result?;
             }
-            self.materialize_handle_writers_for_limits(ino, local_sync_policy)
-                .await?;
+            let materialize_for_limits_started = Instant::now();
+            let limits_result = self
+                .materialize_handle_writers_for_limits(ino, local_sync_policy)
+                .await;
+            self.record_vfs_write_materialize_for_limits(materialize_for_limits_started.elapsed());
+            limits_result?;
             Ok(written)
         }
         .await;

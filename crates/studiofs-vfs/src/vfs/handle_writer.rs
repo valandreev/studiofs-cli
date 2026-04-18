@@ -1,7 +1,10 @@
-use super::{Bytes, FileType, Ino, LocalSyncPolicy, StudioVfs, VfsResult};
+use super::{Bytes, FileType, Ino, LocalSyncPolicy, StudioVfs, VfsError, VfsResult};
+use super::local_dirty::DirtyWriteSnapshot;
+use bytes::BytesMut;
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use studiofs_meta::schema::offset_within_block;
 
 #[derive(Debug, Clone)]
 pub(super) struct HandleWriterReadSpan {
@@ -475,6 +478,186 @@ impl HandleWriterRegistry {
 }
 
 impl StudioVfs {
+    fn fully_overwritten_full_block_indexes_for_handle_writes(
+        &self,
+        writes: &[BufferedHandleWrite],
+        visible_size: u64,
+    ) -> std::collections::HashSet<u32> {
+        let mut ranges_by_block = std::collections::BTreeMap::<u32, Vec<(usize, usize)>>::new();
+
+        for write in writes {
+            if write.data.is_empty() {
+                continue;
+            }
+            let start = offset_within_block(write.offset, self.block_size) as usize;
+            let end = start.saturating_add(write.data.len());
+            ranges_by_block
+                .entry(write.block_index)
+                .or_default()
+                .push((start, end));
+        }
+
+        ranges_by_block
+            .into_iter()
+            .filter_map(|(block_index, mut ranges)| {
+                let logical_len = self.logical_block_len(visible_size, block_index);
+                if logical_len != self.block_size as usize {
+                    return None;
+                }
+                ranges.sort_unstable_by_key(|(start, _)| *start);
+                let mut covered_until = 0usize;
+                for (start, end) in ranges {
+                    if start > covered_until {
+                        return None;
+                    }
+                    covered_until = covered_until.max(end);
+                    if covered_until >= logical_len {
+                        return Some(block_index);
+                    }
+                }
+                None
+            })
+            .collect()
+    }
+
+    fn fully_overwritten_full_block_indexes_for_current_handle_write(
+        &self,
+        writes: &[BufferedHandleWrite],
+        visible_size: u64,
+    ) -> std::collections::HashSet<u32> {
+        let Some(current_seq) = writes.last().map(|write| write.seq) else {
+            return HashSet::new();
+        };
+
+        let mut ranges_by_block = std::collections::BTreeMap::<u32, Vec<(usize, usize)>>::new();
+        for write in writes.iter().filter(|write| write.seq == current_seq) {
+            if write.data.is_empty() {
+                continue;
+            }
+            let start = offset_within_block(write.offset, self.block_size) as usize;
+            let end = start.saturating_add(write.data.len());
+            ranges_by_block
+                .entry(write.block_index)
+                .or_default()
+                .push((start, end));
+        }
+
+        ranges_by_block
+            .into_iter()
+            .filter_map(|(block_index, mut ranges)| {
+                let logical_len = self.logical_block_len(visible_size, block_index);
+                if logical_len != self.block_size as usize {
+                    return None;
+                }
+                ranges.sort_unstable_by_key(|(start, _)| *start);
+                let mut covered_until = 0usize;
+                for (start, end) in ranges {
+                    if start > covered_until {
+                        return None;
+                    }
+                    covered_until = covered_until.max(end);
+                    if covered_until >= logical_len {
+                        return Some(block_index);
+                    }
+                }
+                None
+            })
+            .collect()
+    }
+
+    async fn build_dirty_write_snapshots_for_handle_writer_blocks(
+        &self,
+        ino: Ino,
+        writes: &[BufferedHandleWrite],
+        visible_size: u64,
+        selected_block_indexes: &HashSet<u32>,
+        fully_overwritten_blocks: &HashSet<u32>,
+    ) -> VfsResult<Vec<DirtyWriteSnapshot>> {
+        if selected_block_indexes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let pending_upload_index = self.snapshot_pending_upload_index();
+        let mut blocks = std::collections::BTreeMap::<u32, BytesMut>::new();
+
+        for write in writes {
+            if write.data.is_empty() || !selected_block_indexes.contains(&write.block_index) {
+                continue;
+            }
+
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                blocks.entry(write.block_index)
+            {
+                let existing_data = if fully_overwritten_blocks.contains(&write.block_index) {
+                    Bytes::new()
+                } else {
+                    let pending_content_epoch = self.pending_content_epoch_for_inode(ino);
+                    match self
+                        .read_pending_overlay_block_async(
+                            ino,
+                            write.block_index,
+                            pending_content_epoch,
+                            Some(&pending_upload_index),
+                        )
+                        .await?
+                    {
+                        Some(data) => {
+                            let logical_len = self.logical_block_len(visible_size, write.block_index);
+                            if data.len() > logical_len {
+                                data.slice(0..logical_len)
+                            } else {
+                                data
+                            }
+                        }
+                        None => match self.get_file_block_async(ino, write.block_index).await? {
+                            Some(block_ref) => {
+                                if let Some(cached) =
+                                    self.block_store_get_async(block_ref.object_id).await?
+                                {
+                                    cached
+                                } else {
+                                    self.fetch_block_for_ref(&block_ref, false)
+                                        .await
+                                        .map_err(|e| VfsError::Other(e.to_string()))?
+                                }
+                            }
+                            None => Bytes::new(),
+                        },
+                    }
+                };
+                entry.insert(BytesMut::from(existing_data.as_ref()));
+            }
+
+            let offset_in_block = offset_within_block(write.offset, self.block_size) as usize;
+            let block = blocks
+                .get_mut(&write.block_index)
+                .expect("block buffer inserted before write");
+            let end_pos = offset_in_block + write.data.len();
+            if block.len() < end_pos {
+                block.resize(end_pos, 0);
+            }
+            block[offset_in_block..end_pos].copy_from_slice(write.data.as_ref());
+        }
+
+        Ok(blocks
+            .into_iter()
+            .filter_map(|(block_index, mut data)| {
+                let logical_len = self.logical_block_len(visible_size, block_index);
+                if data.len() > logical_len {
+                    data.truncate(logical_len);
+                }
+                if data.len() == self.block_size as usize {
+                    Some(DirtyWriteSnapshot {
+                        block_index,
+                        data: data.freeze(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+
     pub(super) fn snapshot_handle_writer_read_spans(
         &self,
         ino: Ino,
@@ -641,22 +824,16 @@ impl StudioVfs {
         } else {
             self.current_content_epoch_async(ino).await?
         };
-
-        let buffered_writes: Vec<(u64, Bytes)> = writes
-            .iter()
-            .map(|write| (write.offset, write.data.clone()))
-            .collect();
-        let snapshots = self
-            .build_dirty_write_snapshots_from_buffered_writes(ino, &buffered_writes, visible_size)
-            .await?;
-        let completed_block_indexes: HashSet<u32> = snapshots
-            .iter()
-            .filter(|block| block.data.len() == self.block_size as usize)
-            .map(|block| block.block_index)
-            .collect();
+        let completed_block_indexes =
+            self.fully_overwritten_full_block_indexes_for_handle_writes(&writes, visible_size);
         if completed_block_indexes.is_empty() {
             return Ok(false);
         }
+        let current_write_full_block_indexes =
+            self.fully_overwritten_full_block_indexes_for_current_handle_write(
+                &writes,
+                visible_size,
+            );
 
         let mut seqs_by_block = HashMap::<u32, u64>::new();
         for write in &writes {
@@ -667,10 +844,56 @@ impl StudioVfs {
                     .or_insert(write.seq);
             }
         }
-        let completed_blocks: Vec<_> = snapshots
-            .into_iter()
-            .filter(|block| completed_block_indexes.contains(&block.block_index))
-            .collect();
+        let current_write_crosses_boundary_with_partial_tail = writes
+            .last()
+            .map(|latest| latest.seq)
+            .map(|current_seq| {
+                let touched_blocks: BTreeSet<u32> = writes
+                    .iter()
+                    .filter(|write| write.seq == current_seq)
+                    .map(|write| write.block_index)
+                    .collect();
+                let Some(&tail_block_index) = touched_blocks.iter().next_back() else {
+                    return false;
+                };
+                if touched_blocks.len() < 2 {
+                    return false;
+                }
+                let tail_is_partial = !completed_block_indexes.contains(&tail_block_index);
+                let completed_prefix_in_current_callback = touched_blocks
+                    .iter()
+                    .copied()
+                    .filter(|block_index| *block_index != tail_block_index)
+                    .any(|block_index| completed_block_indexes.contains(&block_index));
+                completed_prefix_in_current_callback && tail_is_partial
+            })
+            .unwrap_or(false);
+        let enough_completed_blocks =
+            completed_block_indexes.len() >= self.payload_put_concurrency.max(2);
+        let budget_exceeded =
+            self.state.handle_writers.total_dirty_bytes() > self.max_dirty_bytes();
+        let should_materialize_now = matches!(local_sync_policy, LocalSyncPolicy::Strict)
+            || !current_write_full_block_indexes.is_empty()
+            || current_write_crosses_boundary_with_partial_tail
+            || enough_completed_blocks
+            || budget_exceeded
+            || self.state.handle_writers.dirty_bytes_for_inode(ino)
+                >= self.write_eager_flush_batch_bytes;
+        if !should_materialize_now {
+            return Ok(false);
+        }
+        let completed_blocks = self
+            .build_dirty_write_snapshots_for_handle_writer_blocks(
+                ino,
+                &writes,
+                visible_size,
+                &completed_block_indexes,
+                &completed_block_indexes,
+            )
+            .await?;
+        if completed_blocks.is_empty() {
+            return Ok(false);
+        }
         let attr_to_persist = self
             .derive_opportunistic_prefix_attr(ino, dirty_attr.as_ref(), &completed_blocks)
             .await?;
