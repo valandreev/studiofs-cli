@@ -1630,8 +1630,15 @@ mod tests {
             !backend.contains(10),
             "once the older pending block finishes upload, low-space admission should reclaim it before rejecting a new local block"
         );
-        assert!(backend.contains(11));
-        assert_eq!(backend.lifecycle_state(11), LocalBlockLifecycleState::Dirty);
+        assert!(
+            backend.contains(11),
+            "the new block should be admitted after reclaiming the older uploaded block"
+        );
+        assert_eq!(
+            backend.lifecycle_state(11),
+            LocalBlockLifecycleState::Dirty,
+            "the newly admitted local block remains dirty until a later upload transition marks it uploaded"
+        );
     }
 
     #[test]
