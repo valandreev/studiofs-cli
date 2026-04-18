@@ -9,6 +9,12 @@ This document is the single canonical mount contract for the SFS-242 rewrite.
 If any older StudioFS redesign note, ADR, or implementation snapshot disagrees
 with this file, this file wins.
 
+The rewrite is not required to preserve behavioral compatibility with the old
+mount/runtime model when that older behavior conflicts with this contract.
+During the rewrite, implementation choices should optimize for converging on
+this contract, not for carrying forward legacy semantics that belong to the
+pre-SFS-242 design.
+
 JuiceFS remains the design reference for data-model and IO economics. StudioFS
 is not trying to preserve the old "PG in the middle of every important mount
 decision" model. The target mount contract is now:
@@ -387,6 +393,9 @@ Review guardrails:
   decisions.
 - Reject publication paths that expose a peer-visible version before every
   referenced payload block is already durable in S3.
+- Reject rewrite decisions whose main purpose is preserving legacy pre-rewrite
+  behavior that conflicts with this contract. Backward-compatibility with the
+  old mount mode is not a design goal when it weakens the target semantics.
 
 ## 15. Historical Docs And Issues That Are No Longer Authoritative
 
