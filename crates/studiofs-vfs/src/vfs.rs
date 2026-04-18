@@ -66,13 +66,14 @@ pub use metrics::{
     VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot,
     VfsNamespaceCacheSnapshot, VfsRuntimeEvent, VfsSynchronizationStateSnapshot,
     VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
-    VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathEagerFlushStats,
-    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
-    VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
-    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
-    VfsWritePathWinfspCallbackStats, VfsWritePathWinfspForegroundFlushStats,
-    VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
-    VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
+    VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats,
+    VfsWritePathEagerFlushStats, VfsWritePathLatencyQuantilesMs,
+    VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
+    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
+    VfsWritePathTuningStats, VfsWritePathWinfspCallbackStats,
+    VfsWritePathWinfspForegroundFlushStats, VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry,
+    VfsZeroIoHealthSignal, VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot,
+    VfsZeroIoStartupReplaySnapshot,
 };
 pub use namespace::{KernelInvalidator, NamespaceParent, NamespacePathStyle, NamespaceResolver};
 
@@ -5978,6 +5979,12 @@ impl StudioVfs {
                     .local_dirty
                     .fast_backpressure_stall_max_ms
                     .load(Ordering::Relaxed),
+            },
+            dirty_pressure: VfsWritePathDirtyPressureStats {
+                pending_local_dirty_bytes: self.total_pending_local_dirty_bytes(),
+                handle_writer_dirty_bytes: self.state.handle_writers.total_dirty_bytes(),
+                total_dirty_bytes: self.total_pending_write_buffer_bytes(),
+                dirty_limit_bytes: self.max_dirty_bytes(),
             },
             payload_burst: VfsWritePathBurstStats {
                 bursts: payload_burst_count,

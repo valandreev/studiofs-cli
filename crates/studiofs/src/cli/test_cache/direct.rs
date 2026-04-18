@@ -574,6 +574,7 @@ pub(super) async fn run_direct(
         advanced_metrics: Some(advanced_metrics),
         local_first_read_comparison: None,
         stream_results,
+        mounted_memory: None,
         work_root: None,
         writes: writes.overall.to_report(writes_wall.as_secs_f64() * 1000.0),
         reads: reads

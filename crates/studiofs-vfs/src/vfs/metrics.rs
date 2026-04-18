@@ -135,6 +135,14 @@ pub struct VfsWritePathBackpressureStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsWritePathDirtyPressureStats {
+    pub pending_local_dirty_bytes: usize,
+    pub handle_writer_dirty_bytes: usize,
+    pub total_dirty_bytes: usize,
+    pub dirty_limit_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsWritePathBurstStats {
     pub bursts: u64,
     pub bursts_per_sec: f64,
@@ -204,6 +212,8 @@ pub struct VfsWritePathObservabilitySnapshot {
     #[serde(default)]
     pub winfsp_foreground_flushes: VfsWritePathWinfspForegroundFlushStats,
     pub write_backpressure: VfsWritePathBackpressureStats,
+    #[serde(default)]
+    pub dirty_pressure: VfsWritePathDirtyPressureStats,
     #[serde(default)]
     pub payload_burst: VfsWritePathBurstStats,
     #[serde(default)]

@@ -215,6 +215,34 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
         );
     }
 
+    if let Some(memory) = &report.mounted_memory {
+        out.push('\n');
+        let _ = writeln!(&mut out, "Mounted memory");
+        let rows = vec![vec![
+            memory.mount_pid.to_string(),
+            format_bytes(memory.rss_bytes_steady_state),
+            format_bytes(memory.rss_bytes_peak),
+            format_bytes(memory.dirty_bytes_steady_state),
+            format_bytes(memory.dirty_bytes_peak),
+            format_bytes(memory.dirty_limit_bytes),
+        ]];
+        let _ = write!(
+            &mut out,
+            "{}",
+            format_table(
+                &[
+                    "PID",
+                    "Steady RSS",
+                    "Peak RSS",
+                    "Dirty pressure",
+                    "Peak dirty",
+                    "Dirty limit",
+                ],
+                &rows,
+            )
+        );
+    }
+
     if let Some(advanced) = &report.advanced_metrics {
         out.push('\n');
         let _ = writeln!(&mut out, "Size-class latency and throughput");
@@ -431,8 +459,8 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
 mod tests {
     use super::*;
     use crate::cli::test_cache::result::{
-        MountedLocalFirstReadComparisonReport, MountedLocalFirstReadPhaseReport, OpReport,
-        sample_report,
+        MountedLocalFirstReadComparisonReport, MountedLocalFirstReadPhaseReport,
+        MountedMemoryReport, OpReport, sample_report,
     };
 
     #[test]
@@ -520,5 +548,28 @@ mod tests {
         assert!(summary.contains("during-upload-read"));
         assert!(summary.contains("post-upload-read"));
         assert!(summary.contains("Pending before"));
+    }
+
+    #[test]
+    fn render_human_summary_includes_mounted_memory_gate_surface_when_present() {
+        let mut report = sample_report();
+        report.mode = "e2e".to_string();
+        report.mounted_memory = Some(MountedMemoryReport {
+            mount_pid: 4242,
+            rss_bytes_steady_state: 1_400 * 1024 * 1024,
+            rss_bytes_peak: 1_650 * 1024 * 1024,
+            dirty_bytes_steady_state: 512 * 1024 * 1024,
+            dirty_bytes_peak: 768 * 1024 * 1024,
+            dirty_limit_bytes: 2 * 1024 * 1024 * 1024,
+        });
+
+        let summary = render_human_summary(&report);
+
+        assert!(summary.contains("Mounted memory"));
+        assert!(summary.contains("PID"));
+        assert!(summary.contains("Steady RSS"));
+        assert!(summary.contains("Peak RSS"));
+        assert!(summary.contains("Dirty pressure"));
+        assert!(summary.contains("Dirty limit"));
     }
 }

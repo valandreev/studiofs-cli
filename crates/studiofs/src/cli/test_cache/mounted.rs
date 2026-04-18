@@ -1,3 +1,4 @@
+use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
 use anyhow::{Context, Result, anyhow};
 use std::path::Path;
 use std::sync::{
@@ -5,15 +6,18 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
+use studiofs_vfs::VfsWritePathObservabilitySnapshot;
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
+use tokio::sync::watch;
 
 use super::TestCacheParams;
 use super::profiling::{cpu_utilization_percent, process_cpu_time};
 use super::result::{
     BenchmarkProfileReport, BenchmarkReport, CpuProfileReport,
-    MountedLocalFirstReadComparisonReport, MountedLocalFirstReadPhaseReport,
+    MountedLocalFirstReadComparisonReport, MountedLocalFirstReadPhaseReport, MountedMemoryReport,
 };
 use super::telemetry::{
     PhaseTelemetry, build_advanced_metrics, phase_telemetry_to_report,
@@ -51,6 +55,141 @@ struct PendingUploadObservation {
     observed: bool,
     waited: Duration,
     pending_uploads: usize,
+}
+
+const MOUNTED_MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Default)]
+struct MountedMemoryAccumulator {
+    mount_pid: u32,
+    rss_bytes_steady_state: Option<u64>,
+    rss_bytes_peak: u64,
+    dirty_bytes_steady_state: Option<u64>,
+    dirty_bytes_peak: u64,
+    dirty_limit_bytes: u64,
+}
+
+impl MountedMemoryAccumulator {
+    fn new(mount_pid: u32) -> Self {
+        Self {
+            mount_pid,
+            ..Self::default()
+        }
+    }
+
+    fn observe_rss(&mut self, rss_bytes: u64) {
+        self.rss_bytes_steady_state = Some(rss_bytes);
+        self.rss_bytes_peak = self.rss_bytes_peak.max(rss_bytes);
+    }
+
+    fn observe_dirty_pressure(&mut self, dirty_bytes: u64, dirty_limit_bytes: u64) {
+        self.dirty_bytes_steady_state = Some(dirty_bytes);
+        self.dirty_bytes_peak = self.dirty_bytes_peak.max(dirty_bytes);
+        self.dirty_limit_bytes = self.dirty_limit_bytes.max(dirty_limit_bytes);
+    }
+
+    fn into_report(self) -> Option<MountedMemoryReport> {
+        if self.rss_bytes_steady_state.is_none() && self.dirty_bytes_steady_state.is_none() {
+            return None;
+        }
+        Some(MountedMemoryReport {
+            mount_pid: self.mount_pid,
+            rss_bytes_steady_state: self.rss_bytes_steady_state.unwrap_or_default(),
+            rss_bytes_peak: self.rss_bytes_peak,
+            dirty_bytes_steady_state: self.dirty_bytes_steady_state.unwrap_or_default(),
+            dirty_bytes_peak: self.dirty_bytes_peak,
+            dirty_limit_bytes: self.dirty_limit_bytes,
+        })
+    }
+}
+
+fn sample_mount_process_rss(system: &mut System, pid: Pid) -> Option<u64> {
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().with_memory(),
+    );
+    system.process(pid).map(|process| process.memory())
+}
+
+async fn read_dirty_pressure_snapshot(
+    metrics_path: &Path,
+) -> Result<Option<VfsWritePathObservabilitySnapshot>> {
+    match fs::read(metrics_path).await {
+        Ok(bytes) => serde_json::from_slice::<VfsWritePathObservabilitySnapshot>(&bytes)
+            .map(Some)
+            .context("parse write-path observability snapshot"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("read {}", metrics_path.display())),
+    }
+}
+
+fn spawn_mounted_memory_sampler(
+    mount_pid: u32,
+    metrics_path: Option<&Path>,
+) -> (
+    watch::Sender<bool>,
+    tokio::task::JoinHandle<MountedMemoryAccumulator>,
+) {
+    let pid = Pid::from_u32(mount_pid);
+    let metrics_path = metrics_path.map(Path::to_path_buf);
+    let (stop_tx, mut stop_rx) = watch::channel(false);
+    let handle = tokio::spawn(async move {
+        let mut system = System::new();
+        let mut accumulator = MountedMemoryAccumulator::new(mount_pid);
+        let mut warned_metrics_error = false;
+
+        loop {
+            if let Some(rss_bytes) = sample_mount_process_rss(&mut system, pid) {
+                accumulator.observe_rss(rss_bytes);
+            }
+            if let Some(metrics_path) = metrics_path.as_deref() {
+                match read_dirty_pressure_snapshot(metrics_path).await {
+                    Ok(Some(snapshot)) => accumulator.observe_dirty_pressure(
+                        snapshot.dirty_pressure.total_dirty_bytes as u64,
+                        snapshot.dirty_pressure.dirty_limit_bytes as u64,
+                    ),
+                    Ok(None) => {}
+                    Err(error) => {
+                        if !warned_metrics_error {
+                            tracing::warn!(
+                                target: "studiofs.cache.profile",
+                                mount_pid,
+                                metrics_path = %metrics_path.display(),
+                                error = %error,
+                                "mounted memory sampler failed to read write-path observability snapshot"
+                            );
+                            warned_metrics_error = true;
+                        }
+                    }
+                }
+            }
+
+            tokio::select! {
+                changed = stop_rx.changed() => {
+                    if changed.is_err() || *stop_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(MOUNTED_MEMORY_SAMPLE_INTERVAL) => {}
+            }
+        }
+
+        if let Some(rss_bytes) = sample_mount_process_rss(&mut system, pid) {
+            accumulator.observe_rss(rss_bytes);
+        }
+        if let Some(metrics_path) = metrics_path.as_deref()
+            && let Ok(Some(snapshot)) = read_dirty_pressure_snapshot(metrics_path).await
+        {
+            accumulator.observe_dirty_pressure(
+                snapshot.dirty_pressure.total_dirty_bytes as u64,
+                snapshot.dirty_pressure.dirty_limit_bytes as u64,
+            );
+        }
+
+        accumulator
+    });
+    (stop_tx, handle)
 }
 
 async fn scan_pending_uploads(upload_dir: &Path) -> Result<usize> {
@@ -458,6 +597,7 @@ async fn clear_mount_artifacts(path: &Path) -> Result<()> {
 
 pub(super) async fn run_mounted_end_to_end(
     params: &TestCacheParams,
+    mount_pid: u32,
     volume: &str,
     mount_point: &Path,
     work_root: &Path,
@@ -493,6 +633,10 @@ pub(super) async fn run_mounted_end_to_end(
         }
 
         let cache_upload_dir = cache_path.map(|path| path.join("upload"));
+        let write_path_observability_path =
+            cache_path.map(|path| path.join(WRITE_PATH_OBSERVABILITY_FILE));
+        let (mounted_memory_stop, mounted_memory_handle) =
+            spawn_mounted_memory_sampler(mount_pid, write_path_observability_path.as_deref());
         let mut baseline_local_first_read_phase = None;
         if let Some(upload_dir) = cache_upload_dir.as_deref() {
             let cache_path_for_log = upload_dir.parent().unwrap_or(upload_dir);
@@ -692,6 +836,11 @@ pub(super) async fn run_mounted_end_to_end(
             writes_wall.as_secs_f64() * 1000.0,
             reads_wall.as_secs_f64() * 1000.0,
         );
+        let _ = mounted_memory_stop.send(true);
+        let mounted_memory = mounted_memory_handle
+            .await
+            .map_err(|error| anyhow!("mounted memory sampler panicked: {error}"))?
+            .into_report();
 
         let _ = fs::remove_dir_all(work_root).await;
         let total_elapsed_ms = (Instant::now() - started).as_secs_f64() * 1000.0;
@@ -725,6 +874,7 @@ pub(super) async fn run_mounted_end_to_end(
             profile,
             advanced_metrics: Some(advanced_metrics),
             stream_results,
+            mounted_memory,
             local_first_read_comparison,
             writes: writes.overall.to_report(writes_wall.as_secs_f64() * 1000.0),
             reads: reads.overall.to_report(reads_wall.as_secs_f64() * 1000.0),
