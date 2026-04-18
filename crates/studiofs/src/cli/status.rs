@@ -611,6 +611,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let metrics_path = tmp.path().join(WRITE_PATH_OBSERVABILITY_FILE);
         let snapshot = VfsWritePathObservabilitySnapshot {
+            publisher_pid: 42,
             generated_unix_ms: 123,
             uptime_secs: 4.0,
             backend_tag: "local-block-runtime".to_string(),

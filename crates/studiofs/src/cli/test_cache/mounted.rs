@@ -1,5 +1,6 @@
 use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
 use anyhow::{Context, Result, anyhow};
+use std::future::Future;
 use std::path::Path;
 use std::sync::{
     Arc, Mutex,
@@ -59,6 +60,22 @@ struct PendingUploadObservation {
 
 const MOUNTED_MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 
+struct MeasuredMountedPhaseResult {
+    started: Instant,
+    started_at: String,
+    writes: PhaseTelemetry,
+    writes_by_stream: Vec<PhaseTelemetry>,
+    writes_wall: Duration,
+    writes_cpu: Duration,
+    reads: PhaseTelemetry,
+    reads_by_stream: Vec<PhaseTelemetry>,
+    reads_wall: Duration,
+    reads_cpu: Duration,
+    total_wall: Duration,
+    total_cpu: Duration,
+    during_upload_observation: Option<PendingUploadObservation>,
+}
+
 #[derive(Default)]
 struct MountedMemoryAccumulator {
     mount_pid: u32,
@@ -114,11 +131,17 @@ fn sample_mount_process_rss(system: &mut System, pid: Pid) -> Option<u64> {
 
 async fn read_dirty_pressure_snapshot(
     metrics_path: &Path,
+    expected_publisher_pid: u32,
 ) -> Result<Option<VfsWritePathObservabilitySnapshot>> {
     match fs::read(metrics_path).await {
-        Ok(bytes) => serde_json::from_slice::<VfsWritePathObservabilitySnapshot>(&bytes)
-            .map(Some)
-            .context("parse write-path observability snapshot"),
+        Ok(bytes) => {
+            let snapshot = serde_json::from_slice::<VfsWritePathObservabilitySnapshot>(&bytes)
+                .context("parse write-path observability snapshot")?;
+            if snapshot.publisher_pid != expected_publisher_pid {
+                return Ok(None);
+            }
+            Ok(Some(snapshot))
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err).with_context(|| format!("read {}", metrics_path.display())),
     }
@@ -144,7 +167,7 @@ fn spawn_mounted_memory_sampler(
                 accumulator.observe_rss(rss_bytes);
             }
             if let Some(metrics_path) = metrics_path.as_deref() {
-                match read_dirty_pressure_snapshot(metrics_path).await {
+                match read_dirty_pressure_snapshot(metrics_path, mount_pid).await {
                     Ok(Some(snapshot)) => accumulator.observe_dirty_pressure(
                         snapshot.dirty_pressure.total_dirty_bytes as u64,
                         snapshot.dirty_pressure.dirty_limit_bytes as u64,
@@ -179,7 +202,7 @@ fn spawn_mounted_memory_sampler(
             accumulator.observe_rss(rss_bytes);
         }
         if let Some(metrics_path) = metrics_path.as_deref()
-            && let Ok(Some(snapshot)) = read_dirty_pressure_snapshot(metrics_path).await
+            && let Ok(Some(snapshot)) = read_dirty_pressure_snapshot(metrics_path, mount_pid).await
         {
             accumulator.observe_dirty_pressure(
                 snapshot.dirty_pressure.total_dirty_bytes as u64,
@@ -190,6 +213,26 @@ fn spawn_mounted_memory_sampler(
         accumulator
     });
     (stop_tx, handle)
+}
+
+async fn sample_mounted_memory_during<F, Fut, T>(
+    mount_pid: u32,
+    metrics_path: Option<&Path>,
+    work: F,
+) -> Result<(T, Option<MountedMemoryReport>)>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let (mounted_memory_stop, mounted_memory_handle) =
+        spawn_mounted_memory_sampler(mount_pid, metrics_path);
+    let result = work().await;
+    let _ = mounted_memory_stop.send(true);
+    let mounted_memory = mounted_memory_handle
+        .await
+        .map_err(|error| anyhow!("mounted memory sampler panicked: {error}"))?
+        .into_report();
+    result.map(|value| (value, mounted_memory))
 }
 
 async fn scan_pending_uploads(upload_dir: &Path) -> Result<usize> {
@@ -635,8 +678,6 @@ pub(super) async fn run_mounted_end_to_end(
         let cache_upload_dir = cache_path.map(|path| path.join("upload"));
         let write_path_observability_path =
             cache_path.map(|path| path.join(WRITE_PATH_OBSERVABILITY_FILE));
-        let (mounted_memory_stop, mounted_memory_handle) =
-            spawn_mounted_memory_sampler(mount_pid, write_path_observability_path.as_deref());
         let mut baseline_local_first_read_phase = None;
         if let Some(upload_dir) = cache_upload_dir.as_deref() {
             let cache_path_for_log = upload_dir.parent().unwrap_or(upload_dir);
@@ -685,72 +726,107 @@ pub(super) async fn run_mounted_end_to_end(
             });
         }
 
-        let started = Instant::now();
-        let started_cpu = process_cpu_time();
-        let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let (measured, mounted_memory) = sample_mounted_memory_during(
+            mount_pid,
+            write_path_observability_path.as_deref(),
+            || async {
+                let started = Instant::now();
+                let started_cpu = process_cpu_time();
+                let started_at =
+                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-        tracing::info!(
-            target: "studiofs.cache.profile",
-            run_id = %params.run_id,
-            phase = "e2e-write",
-            "cache benchmark phase start"
-        );
-        let writes_wall_start = Instant::now();
-        let writes_cpu_start = process_cpu_time();
-        let (writes, writes_by_stream) =
-            run_mounted_write_phase(params, &files, &order, size_class_bounds).await?;
-        let writes_wall = writes_wall_start.elapsed();
-        let writes_cpu = writes_cpu_start
-            .and_then(|start_cpu| {
-                process_cpu_time().map(|end_cpu| end_cpu.saturating_sub(start_cpu))
-            })
-            .unwrap_or_default();
+                tracing::info!(
+                    target: "studiofs.cache.profile",
+                    run_id = %params.run_id,
+                    phase = "e2e-write",
+                    "cache benchmark phase start"
+                );
+                let writes_wall_start = Instant::now();
+                let writes_cpu_start = process_cpu_time();
+                let (writes, writes_by_stream) =
+                    run_mounted_write_phase(params, &files, &order, size_class_bounds).await?;
+                let writes_wall = writes_wall_start.elapsed();
+                let writes_cpu = writes_cpu_start
+                    .and_then(|start_cpu| {
+                        process_cpu_time().map(|end_cpu| end_cpu.saturating_sub(start_cpu))
+                    })
+                    .unwrap_or_default();
 
-        let during_upload_observation = if let Some(upload_dir) = cache_upload_dir.as_deref() {
-            Some(
-                wait_for_pending_upload_target(
-                    upload_dir,
-                    PendingUploadTarget::Active,
-                    Duration::from_secs(10),
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
+                let during_upload_observation =
+                    if let Some(upload_dir) = cache_upload_dir.as_deref() {
+                        Some(
+                            wait_for_pending_upload_target(
+                                upload_dir,
+                                PendingUploadTarget::Active,
+                                Duration::from_secs(10),
+                            )
+                            .await?,
+                        )
+                    } else {
+                        None
+                    };
 
-        tracing::info!(
-            target: "studiofs.cache.profile",
-            run_id = %params.run_id,
-            phase = "e2e-read",
-            "cache benchmark phase start"
-        );
-        let reads_wall_start = Instant::now();
-        let reads_cpu_start = process_cpu_time();
-        let (reads, reads_by_stream) =
-            run_mounted_read_phase(params, &files, &order, size_class_bounds).await?;
-        let reads_wall = reads_wall_start.elapsed();
-        let reads_cpu = reads_cpu_start
-            .and_then(|start_cpu| {
-                process_cpu_time().map(|end_cpu| end_cpu.saturating_sub(start_cpu))
-            })
-            .unwrap_or_default();
+                tracing::info!(
+                    target: "studiofs.cache.profile",
+                    run_id = %params.run_id,
+                    phase = "e2e-read",
+                    "cache benchmark phase start"
+                );
+                let reads_wall_start = Instant::now();
+                let reads_cpu_start = process_cpu_time();
+                let (reads, reads_by_stream) =
+                    run_mounted_read_phase(params, &files, &order, size_class_bounds).await?;
+                let reads_wall = reads_wall_start.elapsed();
+                let reads_cpu = reads_cpu_start
+                    .and_then(|start_cpu| {
+                        process_cpu_time().map(|end_cpu| end_cpu.saturating_sub(start_cpu))
+                    })
+                    .unwrap_or_default();
 
-        let total_wall = Instant::now() - started;
-        let total_cpu = started_cpu
-            .and_then(|cpu_start| {
-                process_cpu_time().map(|cpu_end| cpu_end.saturating_sub(cpu_start))
-            })
-            .unwrap_or_default();
+                let total_wall = Instant::now() - started;
+                let total_cpu = started_cpu
+                    .and_then(|cpu_start| {
+                        process_cpu_time().map(|cpu_end| cpu_end.saturating_sub(cpu_start))
+                    })
+                    .unwrap_or_default();
+
+                Ok::<_, anyhow::Error>(MeasuredMountedPhaseResult {
+                    started,
+                    started_at,
+                    writes,
+                    writes_by_stream,
+                    writes_wall,
+                    writes_cpu,
+                    reads,
+                    reads_by_stream,
+                    reads_wall,
+                    reads_cpu,
+                    total_wall,
+                    total_cpu,
+                    during_upload_observation,
+                })
+            },
+        )
+        .await?;
+
         let profile = params.profile.then_some(BenchmarkProfileReport {
             enabled: true,
             profile_mode: "pyroscope".to_string(),
             cpu_profile: CpuProfileReport {
-                total_wall_ms: total_wall.as_secs_f64() * 1000.0,
-                total_cpu_ms: total_cpu.as_secs_f64() * 1000.0,
-                cpu_utilization_percent: cpu_utilization_percent(total_cpu, total_wall),
-                write_phase_cpu_percent: cpu_utilization_percent(writes_cpu, writes_wall),
-                read_phase_cpu_percent: cpu_utilization_percent(reads_cpu, reads_wall),
+                total_wall_ms: measured.total_wall.as_secs_f64() * 1000.0,
+                total_cpu_ms: measured.total_cpu.as_secs_f64() * 1000.0,
+                cpu_utilization_percent: cpu_utilization_percent(
+                    measured.total_cpu,
+                    measured.total_wall,
+                ),
+                write_phase_cpu_percent: cpu_utilization_percent(
+                    measured.writes_cpu,
+                    measured.writes_wall,
+                ),
+                read_phase_cpu_percent: cpu_utilization_percent(
+                    measured.reads_cpu,
+                    measured.reads_wall,
+                ),
             },
             endpoint: None,
             artifacts: Vec::new(),
@@ -764,24 +840,28 @@ pub(super) async fn run_mounted_end_to_end(
             (Some(cache_path), Some(upload_dir), Some(baseline_phase)) => {
                 let during_phase = MountedLocalFirstReadPhaseReport {
                     phase: "during-upload-read".to_string(),
-                    wait_target: during_upload_observation
+                    wait_target: measured
+                        .during_upload_observation
                         .as_ref()
                         .map(|observation| observation.target.label().to_string())
                         .unwrap_or_else(|| PendingUploadTarget::Active.label().to_string()),
-                    target_state_observed: during_upload_observation
+                    target_state_observed: measured
+                        .during_upload_observation
                         .as_ref()
                         .map(|observation| observation.observed)
                         .unwrap_or(false),
-                    wait_ms: during_upload_observation
+                    wait_ms: measured
+                        .during_upload_observation
                         .as_ref()
                         .map(|observation| observation.waited.as_secs_f64() * 1000.0)
                         .unwrap_or_default(),
-                    pending_uploads_before: during_upload_observation
+                    pending_uploads_before: measured
+                        .during_upload_observation
                         .as_ref()
                         .map(|observation| observation.pending_uploads)
                         .unwrap_or_default(),
                     pending_uploads_after: scan_pending_uploads(upload_dir).await?,
-                    results: phase_telemetry_to_report(&reads, reads_wall),
+                    results: phase_telemetry_to_report(&measured.reads, measured.reads_wall),
                 };
 
                 let idle_before_post = wait_for_pending_upload_target(
@@ -823,34 +903,29 @@ pub(super) async fn run_mounted_end_to_end(
         };
         let advanced_metrics = build_advanced_metrics(
             size_class_bounds,
-            &writes,
-            &reads,
+            &measured.writes,
+            &measured.reads,
             None,
             None,
-            writes_wall.as_secs_f64() * 1000.0,
-            reads_wall.as_secs_f64() * 1000.0,
+            measured.writes_wall.as_secs_f64() * 1000.0,
+            measured.reads_wall.as_secs_f64() * 1000.0,
         );
         let stream_results = stream_reports_from_telemetry(
-            &writes_by_stream,
-            &reads_by_stream,
-            writes_wall.as_secs_f64() * 1000.0,
-            reads_wall.as_secs_f64() * 1000.0,
+            &measured.writes_by_stream,
+            &measured.reads_by_stream,
+            measured.writes_wall.as_secs_f64() * 1000.0,
+            measured.reads_wall.as_secs_f64() * 1000.0,
         );
-        let _ = mounted_memory_stop.send(true);
-        let mounted_memory = mounted_memory_handle
-            .await
-            .map_err(|error| anyhow!("mounted memory sampler panicked: {error}"))?
-            .into_report();
 
         let _ = fs::remove_dir_all(work_root).await;
-        let total_elapsed_ms = (Instant::now() - started).as_secs_f64() * 1000.0;
+        let total_elapsed_ms = (Instant::now() - measured.started).as_secs_f64() * 1000.0;
         let completed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
         Ok::<_, anyhow::Error>(BenchmarkReport {
             run_id: params.run_id.clone(),
             mode: "e2e".to_string(),
             cache_dir: params.target.display().to_string(),
-            started_at,
+            started_at: measured.started_at,
             completed_at,
             total_elapsed_ms,
             block_size: params.block_size,
@@ -876,13 +951,82 @@ pub(super) async fn run_mounted_end_to_end(
             stream_results,
             mounted_memory,
             local_first_read_comparison,
-            writes: writes.overall.to_report(writes_wall.as_secs_f64() * 1000.0),
-            reads: reads.overall.to_report(reads_wall.as_secs_f64() * 1000.0),
+            writes: measured
+                .writes
+                .overall
+                .to_report(measured.writes_wall.as_secs_f64() * 1000.0),
+            reads: measured
+                .reads
+                .overall
+                .to_report(measured.reads_wall.as_secs_f64() * 1000.0),
         })
     }
     .await;
     match benchmark_result {
         Ok(report) => Ok(report),
         Err(err) => Err(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use studiofs_vfs::{VfsWritePathDirtyPressureStats, VfsWritePathObservabilitySnapshot};
+    use tempfile::tempdir;
+
+    async fn write_snapshot(
+        path: &Path,
+        publisher_pid: u32,
+        total_dirty_bytes: usize,
+        dirty_limit_bytes: usize,
+    ) {
+        let snapshot = VfsWritePathObservabilitySnapshot {
+            publisher_pid,
+            dirty_pressure: VfsWritePathDirtyPressureStats {
+                total_dirty_bytes,
+                dirty_limit_bytes,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&snapshot).expect("serialize snapshot");
+        fs::write(path, bytes).await.expect("write snapshot");
+    }
+
+    #[tokio::test]
+    async fn read_dirty_pressure_snapshot_ignores_mismatched_publisher_pid() {
+        let temp = tempdir().expect("tempdir");
+        let metrics_path = temp.path().join("write_path_observability.json");
+        write_snapshot(&metrics_path, 7, 512, 1024).await;
+
+        let snapshot = read_dirty_pressure_snapshot(&metrics_path, 42)
+            .await
+            .expect("read snapshot");
+
+        assert!(snapshot.is_none());
+    }
+
+    #[tokio::test]
+    async fn sample_mounted_memory_during_scopes_collection_to_measured_run() {
+        let temp = tempdir().expect("tempdir");
+        let metrics_path = temp.path().join("write_path_observability.json");
+        let mount_pid = std::process::id();
+
+        write_snapshot(&metrics_path, mount_pid, 64, 1024).await;
+        let (_, mounted_memory) =
+            sample_mounted_memory_during(mount_pid, Some(&metrics_path), || async {
+                write_snapshot(&metrics_path, mount_pid, 256, 1024).await;
+                tokio::time::sleep(MOUNTED_MEMORY_SAMPLE_INTERVAL * 2).await;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .expect("sample measured run");
+
+        write_snapshot(&metrics_path, mount_pid, 4096, 1024).await;
+        tokio::time::sleep(MOUNTED_MEMORY_SAMPLE_INTERVAL * 2).await;
+
+        let mounted_memory = mounted_memory.expect("mounted memory");
+        assert_eq!(mounted_memory.dirty_bytes_peak, 256);
+        assert_eq!(mounted_memory.dirty_limit_bytes, 1024);
     }
 }

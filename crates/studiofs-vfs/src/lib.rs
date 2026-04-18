@@ -41,7 +41,7 @@ pub use vfs::{
     VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot, VfsNamespaceCacheSnapshot,
     VfsResult, VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot,
     VfsUploadStats, VfsWritePathBackpressureStats, VfsWritePathBurstStats,
-    VfsWritePathEagerFlushStats, VfsWritePathLatencyQuantilesMs,
+    VfsWritePathDirtyPressureStats, VfsWritePathEagerFlushStats, VfsWritePathLatencyQuantilesMs,
     VfsWritePathLatencyQuantilesSaturated, VfsWritePathObservabilitySnapshot,
     VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
     VfsWritePathWinfspCallbackStats, VfsWritePathWinfspForegroundFlushStats,

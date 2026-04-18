@@ -200,6 +200,8 @@ pub struct VfsWritePathTuningStats {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsWritePathObservabilitySnapshot {
+    #[serde(default)]
+    pub publisher_pid: u32,
     pub generated_unix_ms: u64,
     pub uptime_secs: f64,
     pub backend_tag: String,

@@ -5790,6 +5790,7 @@ impl StudioVfs {
             payload_burst_interval_histogram.bucket_counts.iter().sum();
 
         VfsWritePathObservabilitySnapshot {
+            publisher_pid: std::process::id(),
             generated_unix_ms: now_unix_millis(),
             uptime_secs: elapsed.as_secs_f64(),
             backend_tag: self.write_path_backend_tag.clone(),
