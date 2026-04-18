@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures::future::join_all;
 use opendal::Buffer;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,7 +24,55 @@ use tracing::{debug, error, info, warn};
 
 const UPLOAD_WORKER_YIELD_EVERY_OPS: u32 = super::super::UPLOAD_WORKER_YIELD_EVERY_OPS;
 
+#[derive(Debug, Default)]
+struct ReadyUploads {
+    per_inode: BTreeMap<Ino, VecDeque<PendingUpload>>,
+    ready_inodes: VecDeque<Ino>,
+    ready_set: HashSet<Ino>,
+}
+
 type DelayedUploads = BTreeMap<u64, VecDeque<PendingUpload>>;
+
+impl ReadyUploads {
+    fn push_back(&mut self, op: PendingUpload) {
+        let ino = op.ino;
+        self.per_inode.entry(ino).or_default().push_back(op);
+        if self.ready_set.insert(ino) {
+            self.ready_inodes.push_back(ino);
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<PendingUpload> {
+        while let Some(ino) = self.ready_inodes.pop_front() {
+            self.ready_set.remove(&ino);
+            let mut remove_inode = false;
+            let item = {
+                let queue = self.per_inode.get_mut(&ino)?;
+                let item = queue.pop_front();
+                if queue.is_empty() {
+                    remove_inode = true;
+                } else {
+                    self.ready_inodes.push_back(ino);
+                    self.ready_set.insert(ino);
+                }
+                item
+            };
+
+            if remove_inode {
+                self.per_inode.remove(&ino);
+            }
+
+            if item.is_some() {
+                return item;
+            }
+        }
+        None
+    }
+
+    fn is_empty(&self) -> bool {
+        self.per_inode.is_empty()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UploadOutcome {
@@ -841,16 +889,6 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
             Ok(fragments) => fragments,
             Err(error) => return UploadPutOutcome::Failed(error),
         };
-        let upload_qos = match self.vfs.qos.acquire_upload().await {
-            Ok(permit) => permit,
-            Err(error) => {
-                return UploadPutOutcome::Failed(VfsError::QosFailure {
-                    stage: Cow::Borrowed("upload_qos"),
-                    object_id: op.object_id,
-                    message: error.to_string(),
-                });
-            }
-        };
         let uploads = fragment_keys.iter().zip(object_bytes).enumerate().map(
             |(fragment_index, (key, payload))| {
                 let key = key.clone();
@@ -867,7 +905,6 @@ impl RemoteUploadPort for VfsRemoteUploadPort {
             },
         );
         let done = join_all(uploads).await;
-        drop(upload_qos);
 
         let mut first_error = None;
         let mut saw_cancel = false;
@@ -1048,20 +1085,20 @@ impl UploadLifecycleWorker {
             "upload worker pool started"
         );
 
-        let mut fair = crate::qos::FairInodeScheduler::<PendingUpload>::default();
+        let mut ready = ReadyUploads::default();
         let mut delayed = DelayedUploads::default();
         let mut dispatched_since_yield = 0u32;
         let mut inbound_closed = false;
         loop {
             Self::reap_ready_workers(&mut workers);
-            Self::promote_ready_uploads(&mut fair, &mut delayed);
+            Self::promote_ready_uploads(&mut ready, &mut delayed);
 
-            while !fair.is_empty() {
+            while !ready.is_empty() {
                 Self::reap_ready_workers(&mut workers);
                 let Some(permit) = permits.clone().try_acquire_owned().ok() else {
                     break;
                 };
-                let Some(op) = fair.pop() else {
+                let Some(op) = ready.pop_front() else {
                     drop(permit);
                     break;
                 };
@@ -1083,18 +1120,18 @@ impl UploadLifecycleWorker {
                     dispatched_since_yield = 0;
                     tokio::task::yield_now().await;
                     Self::reap_ready_workers(&mut workers);
-                    Self::promote_ready_uploads(&mut fair, &mut delayed);
+                    Self::promote_ready_uploads(&mut ready, &mut delayed);
                 }
             }
 
             if self.vfs.uploader_shutdown_requested() {
                 break;
             }
-            if inbound_closed && fair.is_empty() && delayed.is_empty() && workers.is_empty() {
+            if inbound_closed && ready.is_empty() && delayed.is_empty() && workers.is_empty() {
                 break;
             }
 
-            let next_delayed_wait = if fair.is_empty() {
+            let next_delayed_wait = if ready.is_empty() {
                 Self::next_delayed_wait(&delayed)
             } else {
                 None
@@ -1119,7 +1156,7 @@ impl UploadLifecycleWorker {
                 }
                 inbound = rx.recv(), if !inbound_closed => {
                     match inbound {
-                        Some(op) => Self::enqueue_pending_upload(&mut fair, &mut delayed, op),
+                        Some(op) => Self::enqueue_pending_upload(&mut ready, &mut delayed, op),
                         None => inbound_closed = true,
                     }
                 }
@@ -1131,7 +1168,7 @@ impl UploadLifecycleWorker {
     }
 
     fn enqueue_pending_upload(
-        fair: &mut crate::qos::FairInodeScheduler<PendingUpload>,
+        ready: &mut ReadyUploads,
         delayed: &mut DelayedUploads,
         op: PendingUpload,
     ) {
@@ -1141,14 +1178,11 @@ impl UploadLifecycleWorker {
                 .or_default()
                 .push_back(op);
         } else {
-            fair.push(op.ino, op);
+            ready.push_back(op);
         }
     }
 
-    fn promote_ready_uploads(
-        fair: &mut crate::qos::FairInodeScheduler<PendingUpload>,
-        delayed: &mut DelayedUploads,
-    ) {
+    fn promote_ready_uploads(ready: &mut ReadyUploads, delayed: &mut DelayedUploads) {
         while let Some((&not_before_unix_ms, _)) = delayed.first_key_value() {
             if not_before_unix_ms > now_unix_millis() {
                 break;
@@ -1157,7 +1191,7 @@ impl UploadLifecycleWorker {
                 break;
             };
             while let Some(op) = ready_ops.pop_front() {
-                fair.push(op.ino, op);
+                ready.push_back(op);
             }
         }
     }
@@ -1724,24 +1758,51 @@ mod tests {
 
     #[tokio::test]
     async fn delayed_retry_ops_wait_until_due_before_dispatch() {
-        let mut fair = crate::qos::FairInodeScheduler::<PendingUpload>::default();
+        let mut ready = ReadyUploads::default();
         let mut delayed = DelayedUploads::default();
         let mut op = make_pending_upload();
         op.not_before_unix_ms = now_unix_millis().saturating_add(20);
 
-        UploadLifecycleWorker::enqueue_pending_upload(&mut fair, &mut delayed, op.clone());
-        UploadLifecycleWorker::promote_ready_uploads(&mut fair, &mut delayed);
+        UploadLifecycleWorker::enqueue_pending_upload(&mut ready, &mut delayed, op.clone());
+        UploadLifecycleWorker::promote_ready_uploads(&mut ready, &mut delayed);
 
-        assert!(fair.is_empty());
+        assert!(ready.is_empty());
         assert_eq!(delayed.len(), 1);
 
         tokio::time::sleep(Duration::from_millis(25)).await;
-        UploadLifecycleWorker::promote_ready_uploads(&mut fair, &mut delayed);
+        UploadLifecycleWorker::promote_ready_uploads(&mut ready, &mut delayed);
 
-        let Some(ready) = fair.pop() else {
+        let Some(ready_op) = ready.pop_front() else {
             panic!("expected delayed upload to become dispatchable");
         };
-        assert_eq!(ready.object_id, op.object_id);
+        assert_eq!(ready_op.object_id, op.object_id);
         assert!(delayed.is_empty());
+    }
+
+    #[test]
+    fn ready_uploads_rotate_across_inodes() {
+        let mut ready = ReadyUploads::default();
+        for (ino, object_id) in [(10, 101), (10, 102), (20, 201), (20, 202), (30, 301)] {
+            ready.push_back(PendingUpload {
+                ino,
+                offset: 0,
+                object_id,
+                content_epoch: 1,
+                created_unix_ms: object_id,
+                not_before_unix_ms: 0,
+                retry_count: 0,
+            });
+        }
+
+        let mut order = Vec::new();
+        while let Some(op) = ready.pop_front() {
+            order.push(op.object_id);
+        }
+
+        assert_eq!(
+            order,
+            vec![101, 201, 301, 102, 202],
+            "ready queue should rotate across inodes instead of letting one inode monopolize dispatch"
+        );
     }
 }

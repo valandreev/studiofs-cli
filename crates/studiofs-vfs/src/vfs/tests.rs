@@ -275,6 +275,161 @@ fn startup_replay_prefers_overlay_metadata_live_extent_over_base_for_same_epoch(
 }
 
 #[test]
+fn pending_upload_views_rebuild_from_persistent_state_without_runtime_queue() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-views-persistent-state");
+
+    let created = vfs
+        .create(1, b"persistent-pending.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = created.ino;
+    let object_id = 7_001;
+    let payload = vec![0xAB; 4096];
+
+    vfs.local_block_backend()
+        .put(object_id, &payload, false)
+        .expect("persist local block");
+    vfs.local_block_backend()
+        .sync_data()
+        .expect("sync local block");
+
+    let mut attr = meta.get_attr(ino).expect("load test attr");
+    attr.size = payload.len() as u64;
+    attr.committed_size = 0;
+    attr.content_epoch = 5;
+    attr.committed_content_epoch = 4;
+    attr.upload_state = MetaUploadState::Uploading;
+    meta.set_attr(&attr).expect("persist staged attr");
+    meta.set_file_block(
+        ino,
+        0,
+        &BlockRef::new_partial(object_id, payload.len() as u32),
+    )
+    .expect("persist current file block");
+
+    assert_eq!(
+        vfs.pending_uploads_for_inode(ino),
+        vec![(0, object_id, attr.content_epoch)],
+        "pending upload helpers must rebuild from persistent dirty/uploading state even when the runtime notification queue is empty"
+    );
+
+    let pending_upload_index = vfs.snapshot_pending_upload_index();
+    assert_eq!(
+        pending_upload_index.latest_extent_record(ino, 0, Some(attr.content_epoch)),
+        Some(ExtentRecordId {
+            object_id,
+            content_epoch: attr.content_epoch,
+        }),
+        "pending upload catalog must derive live extents from persistent state instead of the runtime queue"
+    );
+}
+
+#[test]
+fn pending_upload_truth_ignores_deleted_inode_local_blocks() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-views-deleted-inode");
+
+    let created = vfs
+        .create(1, b"deleted-pending.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = created.ino;
+    let object_id = 7_002;
+    let payload = vec![0xCD; 4096];
+
+    vfs.local_block_backend()
+        .put(object_id, &payload, false)
+        .expect("persist local block");
+    vfs.local_block_backend()
+        .sync_data()
+        .expect("sync local block");
+
+    let mut attr = meta.get_attr(ino).expect("load test attr");
+    attr.size = payload.len() as u64;
+    attr.committed_size = 0;
+    attr.content_epoch = 6;
+    attr.committed_content_epoch = 5;
+    attr.nlink = 0;
+    attr.upload_state = MetaUploadState::Uploading;
+    meta.set_attr(&attr).expect("persist deleted attr");
+    meta.set_file_block(
+        ino,
+        0,
+        &BlockRef::new_partial(object_id, payload.len() as u32),
+    )
+    .expect("persist deleted file block");
+
+    assert!(
+        vfs.pending_uploads_for_inode(ino).is_empty(),
+        "deleted inodes must keep local blocks readable without advertising them as pending uploads"
+    );
+
+    let pending_upload_index = vfs.snapshot_pending_upload_index();
+    assert_eq!(
+        pending_upload_index.latest_extent_record(ino, 0, Some(attr.content_epoch)),
+        None,
+        "pending upload catalog must not expose deleted inode blocks as uploadable extents"
+    );
+}
+
+#[test]
+fn pending_upload_truth_candidate_filter_keeps_unpublished_lifecycle_states() {
+    for state in [
+        InodeLifecycleState::LocalOnly,
+        InodeLifecycleState::Uploading,
+        InodeLifecycleState::PublishReady,
+        InodeLifecycleState::DeletedBeforePublish,
+    ] {
+        let record = studiofs_meta::schema::InodeLifecycleRecord {
+            ino: 42,
+            state,
+            local_visible_size: 4096,
+            published_size: 0,
+            local_content_epoch: 7,
+            published_content_epoch: 0,
+            has_published_base: matches!(state, InodeLifecycleState::DeletedBeforePublish),
+            retention: if matches!(state, InodeLifecycleState::DeletedBeforePublish) {
+                PayloadRetentionClass::DeletedBeforePublish
+            } else {
+                PayloadRetentionClass::PinnedUnpublished
+            },
+            deferred_cleanup_object_ids: if matches!(
+                state,
+                InodeLifecycleState::DeletedBeforePublish
+            ) {
+                vec![7002]
+            } else {
+                Vec::new()
+            },
+        };
+        assert!(
+            StudioVfs::lifecycle_record_may_reference_pending_uploads(&record),
+            "state {state:?} should remain a pending-upload candidate"
+        );
+    }
+}
+
+#[test]
+fn pending_upload_truth_candidate_filter_excludes_non_uploadable_lifecycle_states() {
+    let state = InodeLifecycleState::Published;
+    let retention = PayloadRetentionClass::PublishedWarm;
+    let record = studiofs_meta::schema::InodeLifecycleRecord {
+        ino: 42,
+        state,
+        local_visible_size: 4096,
+        published_size: 4096,
+        local_content_epoch: 7,
+        published_content_epoch: 7,
+        has_published_base: true,
+        retention,
+        deferred_cleanup_object_ids: vec![7002],
+    };
+    assert!(
+        !StudioVfs::lifecycle_record_may_reference_pending_uploads(&record),
+        "state {state:?} should not remain a pending-upload candidate"
+    );
+}
+
+#[test]
 fn startup_replay_removes_orphan_dirty_blocks_and_clears_pending_evictions() {
     let tmp = TempDir::new().expect("tempdir");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "startup-replay-orphan-cleanup");

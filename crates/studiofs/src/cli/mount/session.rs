@@ -845,7 +845,6 @@ where
     );
     set_usize!("STUDIOFS_QOS_ACCEPT_SLOTS", qos_accept_slots);
     set_usize!("STUDIOFS_QOS_MATERIALIZE_SLOTS", qos_materialize_slots);
-    set_usize!("STUDIOFS_QOS_UPLOAD_SLOTS", qos_upload_slots);
     set_usize!("STUDIOFS_QOS_COMMIT_SLOTS", qos_commit_slots);
     set_usize!("STUDIOFS_QOS_FETCH_SLOTS", qos_fetch_slots);
     if let Some(mode) = parse_env_cache_safety_mode_with(&read_var, "STUDIOFS_CACHE_SAFETY_MODE") {

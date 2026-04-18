@@ -403,9 +403,6 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     if let Some(value) = parse_env_usize("STUDIOFS_QOS_MATERIALIZE_SLOTS") {
         config.qos_materialize_slots = Some(value);
     }
-    if let Some(value) = parse_env_usize("STUDIOFS_QOS_UPLOAD_SLOTS") {
-        config.qos_upload_slots = Some(value);
-    }
     if let Some(value) = parse_env_usize("STUDIOFS_QOS_COMMIT_SLOTS") {
         config.qos_commit_slots = Some(value);
     }
@@ -4105,7 +4102,6 @@ impl ScopedTestEnv {
             "STUDIOFS_FETCH_DECREASE_COOLDOWN_SECS",
             "STUDIOFS_QOS_ACCEPT_SLOTS",
             "STUDIOFS_QOS_MATERIALIZE_SLOTS",
-            "STUDIOFS_QOS_UPLOAD_SLOTS",
             "STUDIOFS_QOS_COMMIT_SLOTS",
             "STUDIOFS_QOS_FETCH_SLOTS",
             "STUDIOFS_READ_BUFFER_MB",
@@ -6746,7 +6742,6 @@ fn slow_s3_does_not_stall_local_reads_and_writes() {
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
-    let _restore_qos_upload = ScopedEnvVar::capture("STUDIOFS_QOS_UPLOAD_SLOTS");
     let _restore_qos_materialize = ScopedEnvVar::capture("STUDIOFS_QOS_MATERIALIZE_SLOTS");
     let _restore_qos_commit = ScopedEnvVar::capture("STUDIOFS_QOS_COMMIT_SLOTS");
     unsafe {
@@ -6758,7 +6753,6 @@ fn slow_s3_does_not_stall_local_reads_and_writes() {
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
         std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "0");
         std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "2");
-        std::env::set_var("STUDIOFS_QOS_UPLOAD_SLOTS", "1");
         std::env::set_var("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
         std::env::set_var("STUDIOFS_QOS_COMMIT_SLOTS", "1");
     }
@@ -6846,7 +6840,6 @@ fn upload_backlog_does_not_create_local_backpressure_after_write_commit() {
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
-    let _restore_qos_upload = ScopedEnvVar::capture("STUDIOFS_QOS_UPLOAD_SLOTS");
     let _restore_qos_materialize = ScopedEnvVar::capture("STUDIOFS_QOS_MATERIALIZE_SLOTS");
     let _restore_qos_commit = ScopedEnvVar::capture("STUDIOFS_QOS_COMMIT_SLOTS");
 
@@ -6871,7 +6864,6 @@ fn upload_backlog_does_not_create_local_backpressure_after_write_commit() {
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
         std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-        std::env::set_var("STUDIOFS_QOS_UPLOAD_SLOTS", "1");
         std::env::set_var("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
         std::env::set_var("STUDIOFS_QOS_COMMIT_SLOTS", "1");
     }
@@ -6940,7 +6932,6 @@ fn upload_backlog_does_not_create_local_backpressure_after_write_commit() {
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
         std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-        std::env::set_var("STUDIOFS_QOS_UPLOAD_SLOTS", "1");
         std::env::set_var("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
         std::env::set_var("STUDIOFS_QOS_COMMIT_SLOTS", "1");
     }
@@ -7000,7 +6991,6 @@ fn single_large_file_upload_does_not_starve_small_foreground_io() {
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
-    let _restore_qos_upload = ScopedEnvVar::capture("STUDIOFS_QOS_UPLOAD_SLOTS");
     let _restore_qos_materialize = ScopedEnvVar::capture("STUDIOFS_QOS_MATERIALIZE_SLOTS");
 
     unsafe {
@@ -7008,7 +6998,6 @@ fn single_large_file_upload_does_not_starve_small_foreground_io() {
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "256MB");
         std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "400");
         std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "1");
-        std::env::set_var("STUDIOFS_QOS_UPLOAD_SLOTS", "1");
         std::env::set_var("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
     }
 
@@ -7243,7 +7232,6 @@ fn twenty_four_hour_soak_no_global_fs_stall() {
     let _restore_requeue_base = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_BASE_MS");
     let _restore_requeue_max = ScopedEnvVar::capture("STUDIOFS_UPLOAD_REQUEUE_MAX_MS");
     let _restore_upload_workers = ScopedEnvVar::capture("STUDIOFS_UPLOAD_WORKER_COUNT");
-    let _restore_qos_upload = ScopedEnvVar::capture("STUDIOFS_QOS_UPLOAD_SLOTS");
     let _restore_qos_materialize = ScopedEnvVar::capture("STUDIOFS_QOS_MATERIALIZE_SLOTS");
     let _restore_qos_commit = ScopedEnvVar::capture("STUDIOFS_QOS_COMMIT_SLOTS");
     unsafe {
@@ -7254,7 +7242,6 @@ fn twenty_four_hour_soak_no_global_fs_stall() {
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", "50");
         std::env::set_var("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", "100");
         std::env::set_var("STUDIOFS_UPLOAD_WORKER_COUNT", "2");
-        std::env::set_var("STUDIOFS_QOS_UPLOAD_SLOTS", "1");
         std::env::set_var("STUDIOFS_QOS_MATERIALIZE_SLOTS", "1");
         std::env::set_var("STUDIOFS_QOS_COMMIT_SLOTS", "1");
     }

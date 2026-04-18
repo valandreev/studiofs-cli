@@ -112,7 +112,7 @@ impl StudioVfs {
     }
 
     pub(super) fn snapshot_pending_upload_index(&self) -> PendingUploadCatalog {
-        PendingUploadCatalog::from_ops(self.cached_store.snapshot_pending_uploads())
+        PendingUploadCatalog::from_ops(self.truth_pending_uploads_snapshot())
     }
 
     pub(super) fn pending_live_extent_record(
@@ -136,12 +136,8 @@ impl StudioVfs {
         }
 
         let block_offset = (block_index as u64).saturating_mul(self.block_size as u64);
-        let recovered = if let Some(pending_uploads) = pending_upload_index {
-            pending_uploads.latest_extent_record(ino, block_offset, pending_content_epoch)
-        } else {
-            PendingUploadCatalog::from_ops(self.cached_store.snapshot_pending_uploads())
-                .latest_extent_record(ino, block_offset, pending_content_epoch)
-        }?;
+        let recovered =
+            pending_upload_index?.latest_extent_record(ino, block_offset, pending_content_epoch)?;
 
         self.state
             .incarnation
