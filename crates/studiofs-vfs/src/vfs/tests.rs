@@ -372,6 +372,61 @@ fn pending_upload_truth_ignores_deleted_inode_local_blocks() {
 }
 
 #[test]
+fn pending_upload_truth_candidate_filter_keeps_unpublished_lifecycle_states() {
+    for state in [
+        InodeLifecycleState::LocalOnly,
+        InodeLifecycleState::Uploading,
+        InodeLifecycleState::PublishReady,
+    ] {
+        let record = studiofs_meta::schema::InodeLifecycleRecord {
+            ino: 42,
+            state,
+            local_visible_size: 4096,
+            published_size: 0,
+            local_content_epoch: 7,
+            published_content_epoch: 0,
+            has_published_base: false,
+            retention: PayloadRetentionClass::PinnedUnpublished,
+            deferred_cleanup_object_ids: Vec::new(),
+        };
+        assert!(
+            StudioVfs::lifecycle_record_may_reference_pending_uploads(&record),
+            "state {state:?} should remain a pending-upload candidate"
+        );
+    }
+}
+
+#[test]
+fn pending_upload_truth_candidate_filter_excludes_non_uploadable_lifecycle_states() {
+    for (state, retention) in [
+        (
+            InodeLifecycleState::Published,
+            PayloadRetentionClass::PublishedWarm,
+        ),
+        (
+            InodeLifecycleState::DeletedBeforePublish,
+            PayloadRetentionClass::DeletedBeforePublish,
+        ),
+    ] {
+        let record = studiofs_meta::schema::InodeLifecycleRecord {
+            ino: 42,
+            state,
+            local_visible_size: 4096,
+            published_size: 4096,
+            local_content_epoch: 7,
+            published_content_epoch: 7,
+            has_published_base: true,
+            retention,
+            deferred_cleanup_object_ids: vec![7002],
+        };
+        assert!(
+            !StudioVfs::lifecycle_record_may_reference_pending_uploads(&record),
+            "state {state:?} should not remain a pending-upload candidate"
+        );
+    }
+}
+
+#[test]
 fn startup_replay_removes_orphan_dirty_blocks_and_clears_pending_evictions() {
     let tmp = TempDir::new().expect("tempdir");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "startup-replay-orphan-cleanup");

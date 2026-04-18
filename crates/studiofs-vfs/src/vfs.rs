@@ -2665,6 +2665,17 @@ impl StudioVfs {
             })
     }
 
+    fn lifecycle_record_may_reference_pending_uploads(
+        record: &studiofs_meta::schema::InodeLifecycleRecord,
+    ) -> bool {
+        matches!(
+            record.state,
+            InodeLifecycleState::LocalOnly
+                | InodeLifecycleState::Uploading
+                | InodeLifecycleState::PublishReady
+        )
+    }
+
     fn pending_upload_from_persistent_state(
         &self,
         ino: Ino,
@@ -2694,35 +2705,23 @@ impl StudioVfs {
         }
     }
 
-    fn persistent_pending_uploads_snapshot(
+    fn collect_pending_uploads_from_attrs<I>(
         &self,
+        meta: &Arc<dyn VfsMeta>,
+        attrs: I,
         runtime_pending_by_object: &HashMap<u64, PendingUpload>,
-    ) -> Vec<PendingUpload> {
-        let mut dirty_objects: HashSet<u64> = self
-            .local_block_backend
-            .dirty_object_ids()
-            .into_iter()
-            .collect();
-        if dirty_objects.is_empty() {
-            return Vec::new();
-        }
-
-        let now_ms = now_unix_millis();
-        let meta = self.sync_meta();
-        let attrs = match meta.list_inode_attrs() {
-            Ok(attrs) => attrs,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "failed to enumerate inode attrs while rebuilding pending upload truth view"
-                );
-                return Vec::new();
-            }
-        };
-
-        let mut pending = Vec::with_capacity(dirty_objects.len());
+        dirty_objects: &mut HashSet<u64>,
+        pending: &mut Vec<PendingUpload>,
+        scanned_inodes: &mut HashSet<Ino>,
+        now_ms: u64,
+    ) where
+        I: IntoIterator<Item = InodeAttr>,
+    {
         for attr in attrs {
             let ino = attr.ino;
+            if !scanned_inodes.insert(ino) {
+                continue;
+            }
             let inode_deleted = attr.nlink == 0;
             let blocks = match meta.get_file_blocks(ino) {
                 Ok(blocks) => blocks,
@@ -2797,6 +2796,90 @@ impl StudioVfs {
                 break;
             }
         }
+    }
+
+    fn persistent_pending_uploads_snapshot(
+        &self,
+        runtime_pending_by_object: &HashMap<u64, PendingUpload>,
+    ) -> Vec<PendingUpload> {
+        let mut dirty_objects: HashSet<u64> = self
+            .local_block_backend
+            .dirty_object_ids()
+            .into_iter()
+            .collect();
+        if dirty_objects.is_empty() {
+            return Vec::new();
+        }
+
+        let now_ms = now_unix_millis();
+        let meta = self.sync_meta();
+        let mut pending = Vec::with_capacity(dirty_objects.len());
+        let mut scanned_inodes = HashSet::new();
+
+        match meta.list_inode_lifecycles() {
+            Ok(records) => {
+                let candidate_inos: Vec<_> = records
+                    .iter()
+                    .filter(|record| Self::lifecycle_record_may_reference_pending_uploads(record))
+                    .map(|record| record.ino)
+                    .collect();
+                if !candidate_inos.is_empty() {
+                    match meta.get_attrs_batch(&candidate_inos) {
+                        Ok(attrs) => {
+                            self.collect_pending_uploads_from_attrs(
+                                &meta,
+                                attrs,
+                                runtime_pending_by_object,
+                                &mut dirty_objects,
+                                &mut pending,
+                                &mut scanned_inodes,
+                                now_ms,
+                            );
+                        }
+                        Err(error) => {
+                            warn!(
+                                error = %error,
+                                candidate_inodes = candidate_inos.len(),
+                                "failed to batch-fetch lifecycle-selected inode attrs while rebuilding pending upload truth view"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "failed to enumerate inode lifecycles while rebuilding pending upload truth view"
+                );
+            }
+        }
+
+        if !dirty_objects.is_empty() {
+            debug!(
+                unresolved_dirty_objects = dirty_objects.len(),
+                candidate_inodes_scanned = scanned_inodes.len(),
+                "pending upload truth view falling back to full inode attr scan"
+            );
+            let attrs = match meta.list_inode_attrs() {
+                Ok(attrs) => attrs,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "failed to enumerate inode attrs while rebuilding pending upload truth view"
+                    );
+                    return Vec::new();
+                }
+            };
+            self.collect_pending_uploads_from_attrs(
+                &meta,
+                attrs,
+                runtime_pending_by_object,
+                &mut dirty_objects,
+                &mut pending,
+                &mut scanned_inodes,
+                now_ms,
+            );
+        }
 
         if !dirty_objects.is_empty() {
             debug!(
@@ -2809,17 +2892,44 @@ impl StudioVfs {
         pending
     }
 
-    pub(crate) fn truth_pending_uploads_snapshot(&self) -> Vec<PendingUpload> {
+    fn stable_runtime_pending_uploads_snapshot(&self) -> Option<Vec<PendingUpload>> {
         let runtime_pending_uploads = self.cached_store.snapshot_pending_uploads();
         let dirty_count = self.local_block_backend.dirty_object_count();
         if dirty_count == 0 {
-            return Vec::new();
+            return Some(Vec::new());
         }
         if self.runtime_pending_uploads_match_dirty_index(&runtime_pending_uploads, dirty_count) {
+            return Some(runtime_pending_uploads);
+        }
+
+        let retry_runtime_pending_uploads = self.cached_store.snapshot_pending_uploads();
+        let retry_dirty_count = self.local_block_backend.dirty_object_count();
+        if retry_dirty_count == 0 {
+            return Some(Vec::new());
+        }
+        if self.runtime_pending_uploads_match_dirty_index(
+            &retry_runtime_pending_uploads,
+            retry_dirty_count,
+        ) {
+            return Some(retry_runtime_pending_uploads);
+        }
+
+        debug!(
+            runtime_pending_count = retry_runtime_pending_uploads.len(),
+            dirty_count = retry_dirty_count,
+            "pending upload truth view falling back to persistent rebuild after runtime mismatch"
+        );
+        None
+    }
+
+    pub(crate) fn truth_pending_uploads_snapshot(&self) -> Vec<PendingUpload> {
+        if let Some(runtime_pending_uploads) = self.stable_runtime_pending_uploads_snapshot() {
             return runtime_pending_uploads;
         }
 
-        let runtime_pending_by_object: HashMap<u64, PendingUpload> = runtime_pending_uploads
+        let runtime_pending_by_object: HashMap<u64, PendingUpload> = self
+            .cached_store
+            .snapshot_pending_uploads()
             .into_iter()
             .map(|op| (op.object_id, op))
             .collect();
