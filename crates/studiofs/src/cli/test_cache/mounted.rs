@@ -111,11 +111,13 @@ impl MountedMemoryAccumulator {
         }
         Some(MountedMemoryReport {
             mount_pid: self.mount_pid,
-            rss_bytes_steady_state: self.rss_bytes_steady_state.unwrap_or_default(),
-            rss_bytes_peak: self.rss_bytes_peak,
-            dirty_bytes_steady_state: self.dirty_bytes_steady_state.unwrap_or_default(),
-            dirty_bytes_peak: self.dirty_bytes_peak,
-            dirty_limit_bytes: self.dirty_limit_bytes,
+            rss_bytes_steady_state: self.rss_bytes_steady_state,
+            rss_bytes_peak: self.rss_bytes_steady_state.map(|_| self.rss_bytes_peak),
+            dirty_bytes_steady_state: self.dirty_bytes_steady_state,
+            dirty_bytes_peak: self.dirty_bytes_steady_state.map(|_| self.dirty_bytes_peak),
+            dirty_limit_bytes: self
+                .dirty_bytes_steady_state
+                .map(|_| self.dirty_limit_bytes),
         })
     }
 }
@@ -1026,7 +1028,7 @@ mod tests {
         tokio::time::sleep(MOUNTED_MEMORY_SAMPLE_INTERVAL * 2).await;
 
         let mounted_memory = mounted_memory.expect("mounted memory");
-        assert_eq!(mounted_memory.dirty_bytes_peak, 256);
-        assert_eq!(mounted_memory.dirty_limit_bytes, 1024);
+        assert_eq!(mounted_memory.dirty_bytes_peak, Some(256));
+        assert_eq!(mounted_memory.dirty_limit_bytes, Some(1024));
     }
 }

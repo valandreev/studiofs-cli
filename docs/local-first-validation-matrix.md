@@ -156,7 +156,9 @@ summary or JSON `local_first_read_comparison` section for the
 `baseline-read`, `during-upload-read`, and `post-upload-read` phases. When
 mounted process observability is available, inspect the `Mounted memory`
 terminal table or JSON `mounted_memory` section for `rss_bytes_peak`,
-`rss_bytes_steady_state`, `dirty_bytes_peak`, and `dirty_limit_bytes`.
+`rss_bytes_steady_state`, `dirty_bytes_peak`, and `dirty_limit_bytes`. These
+fields are best-effort and may be omitted when the measured run does not expose
+that signal.
 
 ### Small-File Random I/O / Metadata-Sensitive Run
 
@@ -256,7 +258,7 @@ StudioFS versus JuiceFS comparison:
 - Use `mounted_memory.rss_bytes_steady_state`,
   `mounted_memory.dirty_bytes_peak`, and `mounted_memory.dirty_limit_bytes` as
   diagnostics when the peak-RSS gate fails; they help distinguish dirty-state
-  pressure from other runtime memory growth.
+  pressure from other runtime memory growth when those samples are present.
 - Treat `local_first_read_comparison` and `mounted_memory` as StudioFS-only
   diagnostics. They strengthen comparability, but they are not required to map
   1:1 onto JuiceFS counters.

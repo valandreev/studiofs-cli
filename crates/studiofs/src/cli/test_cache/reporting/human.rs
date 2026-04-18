@@ -11,6 +11,10 @@ fn format_duration_ms(ms: f64) -> String {
     }
 }
 
+fn format_optional_bytes(value: Option<u64>) -> String {
+    value.map(format_bytes).unwrap_or_else(|| "n/a".to_string())
+}
+
 fn format_table(headers: &[&str], rows: &[Vec<String>]) -> String {
     let mut widths: Vec<usize> = headers.iter().map(|header| header.len()).collect();
     for row in rows {
@@ -220,11 +224,11 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
         let _ = writeln!(&mut out, "Mounted memory");
         let rows = vec![vec![
             memory.mount_pid.to_string(),
-            format_bytes(memory.rss_bytes_steady_state),
-            format_bytes(memory.rss_bytes_peak),
-            format_bytes(memory.dirty_bytes_steady_state),
-            format_bytes(memory.dirty_bytes_peak),
-            format_bytes(memory.dirty_limit_bytes),
+            format_optional_bytes(memory.rss_bytes_steady_state),
+            format_optional_bytes(memory.rss_bytes_peak),
+            format_optional_bytes(memory.dirty_bytes_steady_state),
+            format_optional_bytes(memory.dirty_bytes_peak),
+            format_optional_bytes(memory.dirty_limit_bytes),
         ]];
         let _ = write!(
             &mut out,
@@ -234,7 +238,7 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
                     "PID",
                     "Steady RSS",
                     "Peak RSS",
-                    "Dirty pressure",
+                    "Steady dirty",
                     "Peak dirty",
                     "Dirty limit",
                 ],
@@ -556,11 +560,11 @@ mod tests {
         report.mode = "e2e".to_string();
         report.mounted_memory = Some(MountedMemoryReport {
             mount_pid: 4242,
-            rss_bytes_steady_state: 1_400 * 1024 * 1024,
-            rss_bytes_peak: 1_650 * 1024 * 1024,
-            dirty_bytes_steady_state: 512 * 1024 * 1024,
-            dirty_bytes_peak: 768 * 1024 * 1024,
-            dirty_limit_bytes: 2 * 1024 * 1024 * 1024,
+            rss_bytes_steady_state: Some(1_400 * 1024 * 1024),
+            rss_bytes_peak: Some(1_650 * 1024 * 1024),
+            dirty_bytes_steady_state: Some(512 * 1024 * 1024),
+            dirty_bytes_peak: Some(768 * 1024 * 1024),
+            dirty_limit_bytes: Some(2 * 1024 * 1024 * 1024),
         });
 
         let summary = render_human_summary(&report);
@@ -569,7 +573,26 @@ mod tests {
         assert!(summary.contains("PID"));
         assert!(summary.contains("Steady RSS"));
         assert!(summary.contains("Peak RSS"));
-        assert!(summary.contains("Dirty pressure"));
+        assert!(summary.contains("Steady dirty"));
         assert!(summary.contains("Dirty limit"));
+    }
+
+    #[test]
+    fn render_human_summary_marks_unavailable_mounted_memory_samples() {
+        let mut report = sample_report();
+        report.mode = "e2e".to_string();
+        report.mounted_memory = Some(MountedMemoryReport {
+            mount_pid: 4242,
+            rss_bytes_steady_state: Some(1_400 * 1024 * 1024),
+            rss_bytes_peak: Some(1_650 * 1024 * 1024),
+            dirty_bytes_steady_state: None,
+            dirty_bytes_peak: None,
+            dirty_limit_bytes: None,
+        });
+
+        let summary = render_human_summary(&report);
+
+        assert!(summary.contains("Steady dirty"));
+        assert!(summary.contains("n/a"));
     }
 }

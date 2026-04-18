@@ -142,7 +142,7 @@ pub(crate) fn save_benchmark_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::test_cache::result::sample_report;
+    use crate::cli::test_cache::result::{MountedMemoryReport, sample_report};
     use chrono::TimeZone;
     use tempfile::tempdir;
 
@@ -193,5 +193,44 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["mode"], "direct-shim");
         assert!(content.contains("\n  \"mode\""));
+    }
+
+    #[test]
+    fn save_benchmark_report_omits_unavailable_dirty_pressure_fields() {
+        let temp = tempdir().unwrap();
+        let mut report = sample_report();
+        report.mode = "e2e".to_string();
+        report.mounted_memory = Some(MountedMemoryReport {
+            mount_pid: 4242,
+            rss_bytes_steady_state: Some(1_400 * 1024 * 1024),
+            rss_bytes_peak: Some(1_650 * 1024 * 1024),
+            dirty_bytes_steady_state: None,
+            dirty_bytes_peak: None,
+            dirty_limit_bytes: None,
+        });
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 19, 15, 12, 55)
+            .single()
+            .unwrap();
+
+        let saved =
+            save_benchmark_report_in(&report, Some(Path::new("cache-run.json")), temp.path(), now)
+                .unwrap();
+
+        let content = std::fs::read_to_string(saved).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["mounted_memory"]["mount_pid"], 4242);
+        assert!(
+            parsed["mounted_memory"]
+                .get("rss_bytes_steady_state")
+                .is_some()
+        );
+        assert!(
+            parsed["mounted_memory"]
+                .get("dirty_bytes_steady_state")
+                .is_none()
+        );
+        assert!(parsed["mounted_memory"].get("dirty_bytes_peak").is_none());
+        assert!(parsed["mounted_memory"].get("dirty_limit_bytes").is_none());
     }
 }

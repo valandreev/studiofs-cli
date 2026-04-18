@@ -225,8 +225,10 @@ Notes:
   `Local-First read comparison` table, including wait target/observation and
   pending upload counts before and after each read phase.
 - When mounted runtime observability is available, `e2e` output also includes
-  `mounted_memory` for mounted-process RSS and dirty-pressure snapshots, and
-  the terminal summary prints the same data as a `Mounted memory` table.
+  `mounted_memory` for mounted-process RSS and, when available, dirty-pressure
+  snapshots. These fields are best-effort and may be omitted when StudioFS
+  cannot observe that signal for the measured run; the terminal summary prints
+  the same data as a `Mounted memory` table.
 - `e2e` mode still keeps filesystem-level read/write reports; cache internals
   continue to be emitted through mount logs (`upload pipeline counters`).
 

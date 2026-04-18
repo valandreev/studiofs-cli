@@ -306,6 +306,8 @@ Notes:
   JSON output also includes `mounted_memory` with `mount_pid`,
   `rss_bytes_steady_state`, `rss_bytes_peak`, `dirty_bytes_steady_state`,
   `dirty_bytes_peak`, and `dirty_limit_bytes`.
+  RSS and dirty-pressure fields are best-effort samples and may be omitted when
+  StudioFS cannot observe that signal for the measured run.
 - The terminal summary prints the same `Local-First read comparison` table
   when that mounted upload-state metadata is available.
 - The terminal summary prints a matching `Mounted memory` table when mounted

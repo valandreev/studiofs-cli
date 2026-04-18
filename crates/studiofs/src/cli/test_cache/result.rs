@@ -62,11 +62,16 @@ pub(super) struct BenchmarkReport {
 #[derive(Debug, Serialize)]
 pub(super) struct MountedMemoryReport {
     pub(super) mount_pid: u32,
-    pub(super) rss_bytes_steady_state: u64,
-    pub(super) rss_bytes_peak: u64,
-    pub(super) dirty_bytes_steady_state: u64,
-    pub(super) dirty_bytes_peak: u64,
-    pub(super) dirty_limit_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) rss_bytes_steady_state: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) rss_bytes_peak: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) dirty_bytes_steady_state: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) dirty_bytes_peak: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) dirty_limit_bytes: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
