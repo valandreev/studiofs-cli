@@ -434,11 +434,11 @@ impl CacheV3LocalBlockBackend {
                 break;
             }
 
-            let stats = self
+            let dirty_object_count = self
                 .index
-                .stats()
+                .dirty_object_count()
                 .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
-            if stats.dirty_bytes == 0 {
+            if dirty_object_count == 0 {
                 break;
             }
 
@@ -448,7 +448,7 @@ impl CacheV3LocalBlockBackend {
                 current_bytes = current_after_evict,
                 target_bytes,
                 payload_len,
-                dirty_bytes = stats.dirty_bytes,
+                dirty_object_count,
                 wait_ms = LOW_SPACE_UPLOAD_DRAIN_WAIT.as_millis(),
                 "cache-v3 low-space put waiting briefly for pending upload drain"
             );
@@ -840,8 +840,6 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
                 error = ?error,
                 "cache-v3 index mark_upload_failed failed"
             );
-        } else {
-            self.note_storage_state_change();
         }
     }
 
