@@ -883,7 +883,7 @@ fn cache_backend_detection_errors_are_structured() {
     );
     let mapped = map_cache_backend_detection_error("E:\\cache-root", error);
     match mapped {
-        VfsError::CacheBackendDetection { cache_root, source } => {
+        VfsError::LocalBlockRuntimeDetection { cache_root, source } => {
             assert_eq!(cache_root, "E:\\cache-root");
             assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
         }

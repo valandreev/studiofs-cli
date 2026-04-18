@@ -16,8 +16,6 @@ pub mod local;
 pub mod metrics;
 pub mod runtime;
 pub mod upload_queue;
-// --- Cache v3: contract detection + file-per-block backend ---
-pub mod v3;
 
 // --- Re-exports ---
 pub use benchmark_cache::{
@@ -26,51 +24,46 @@ pub use benchmark_cache::{
 };
 pub use cached_store::{CachedStore, CachedStoreConfig};
 pub use runtime::{
-    CacheBackendDetection as LocalBlockRuntimeDetection, CacheBackendKind as LocalBlockBackendKind,
-    CacheV3LocalBlockBackend as PersistentLocalBlockBackend,
-    CacheV3LocalBlockBackendConfig as PersistentLocalBlockBackendConfig,
-    CacheV3LocalBlockBackendError as PersistentLocalBlockBackendError,
-    CacheV3PayloadSyncMode as LocalBlockPayloadSyncMode,
+    LocalBlockBackendConfig as PersistentLocalBlockBackendConfig, LocalBlockBackendKind,
+    LocalBlockBackendOpenError as PersistentLocalBlockBackendError,
+    LocalBlockBackendRuntime as PersistentLocalBlockBackend, LocalBlockLayout,
+    LocalBlockPayloadSyncMode, LocalBlockRuntimeDetection,
 };
 pub use upload_queue::PendingUpload;
 
-const CACHE_V3_OPEN_LOCK_RETRY_ATTEMPTS: usize = 40;
-const CACHE_V3_OPEN_LOCK_RETRY_DELAY: Duration = Duration::from_millis(25);
+const LOCAL_BLOCK_OPEN_LOCK_RETRY_ATTEMPTS: usize = 40;
+const LOCAL_BLOCK_OPEN_LOCK_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 /// Open result for the selected local backend implementation.
 pub struct OpenedLocalBlockBackend {
-    pub detection: runtime::CacheBackendDetection,
-    pub backend_kind: runtime::CacheBackendKind,
+    pub detection: runtime::LocalBlockRuntimeDetection,
+    pub backend_kind: runtime::LocalBlockBackendKind,
     pub backend: Arc<dyn local::LocalBlockBackend>,
 }
 
-/// Prepared cache-v3 runtime state for a per-volume cache root.
+/// Prepared local block runtime state for a per-volume cache root.
 #[derive(Debug, Clone)]
-pub struct PreparedCacheV3Runtime {
-    pub layout: runtime::CacheV3Layout,
-    pub detection: runtime::CacheBackendDetection,
+pub struct PreparedLocalBlockRuntime {
+    pub layout: runtime::LocalBlockLayout,
+    pub detection: runtime::LocalBlockRuntimeDetection,
 }
 
-pub type PreparedLocalBlockRuntime = PreparedCacheV3Runtime;
-
-/// Errors surfaced while provisioning cache-v3 runtime state.
+/// Errors surfaced while provisioning the local block runtime state.
 #[derive(Debug, thiserror::Error)]
-pub enum PrepareCacheV3RuntimeError {
+pub enum PrepareLocalBlockRuntimeError {
     #[error("failed to inspect cache backend contract at '{cache_root}': {source}")]
     DetectCacheBackend {
         cache_root: String,
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to provision cache-v3 layout under '{cache_root}': {source}")]
-    ProvisionCacheV3Layout {
+    #[error("failed to provision local block runtime layout under '{cache_root}': {source}")]
+    ProvisionLocalBlockLayout {
         cache_root: String,
         #[source]
         source: std::io::Error,
     },
 }
-
-pub type PrepareLocalBlockRuntimeError = PrepareCacheV3RuntimeError;
 
 /// Errors surfaced while selecting and opening the local backend.
 #[derive(Debug, thiserror::Error)]
@@ -81,70 +74,64 @@ pub enum OpenLocalBlockBackendError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to provision cache-v3 layout under '{cache_root}': {source}")]
-    ProvisionCacheV3Layout {
+    #[error("failed to provision local block runtime layout under '{cache_root}': {source}")]
+    ProvisionLocalBlockLayout {
         cache_root: String,
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to open cache-v3 backend at '{cache_root}': {source}")]
-    OpenCacheV3Backend {
+    #[error("failed to open local block backend at '{cache_root}': {source}")]
+    OpenLocalBlockBackend {
         cache_root: String,
         #[source]
-        source: Box<runtime::CacheV3LocalBlockBackendError>,
+        source: Box<runtime::LocalBlockBackendOpenError>,
     },
 }
 
-/// Ensure the cache-v3 runtime contract exists for a per-volume cache root.
-pub fn prepare_cache_v3_runtime(
+/// Ensure the local block runtime contract exists for a per-volume cache root.
+pub fn prepare_local_block_runtime(
     cache_root: impl AsRef<Path>,
-) -> Result<PreparedCacheV3Runtime, PrepareCacheV3RuntimeError> {
+) -> Result<PreparedLocalBlockRuntime, PrepareLocalBlockRuntimeError> {
     let cache_root = cache_root.as_ref();
     let cache_root_display = cache_root.display().to_string();
 
     let mut detection = runtime::detect_cache_backends(cache_root).map_err(|source| {
-        PrepareCacheV3RuntimeError::DetectCacheBackend {
+        PrepareLocalBlockRuntimeError::DetectCacheBackend {
             cache_root: cache_root_display.clone(),
             source,
         }
     })?;
     if detection.needs_runtime_provisioning() {
         detection.layout.provision().map_err(|source| {
-            PrepareCacheV3RuntimeError::ProvisionCacheV3Layout {
+            PrepareLocalBlockRuntimeError::ProvisionLocalBlockLayout {
                 cache_root: cache_root_display.clone(),
                 source,
             }
         })?;
         detection = runtime::detect_cache_backends(cache_root).map_err(|source| {
-            PrepareCacheV3RuntimeError::DetectCacheBackend {
+            PrepareLocalBlockRuntimeError::DetectCacheBackend {
                 cache_root: cache_root_display.clone(),
                 source,
             }
         })?;
     }
 
-    Ok(PreparedCacheV3Runtime {
+    Ok(PreparedLocalBlockRuntime {
         layout: detection.layout.clone(),
         detection,
     })
 }
 
-pub fn prepare_local_block_runtime(
-    cache_root: impl AsRef<Path>,
-) -> Result<PreparedLocalBlockRuntime, PrepareLocalBlockRuntimeError> {
-    prepare_cache_v3_runtime(cache_root)
-}
-
 fn open_detected_local_block_backend_budgeted(
-    detection: runtime::CacheBackendDetection,
+    detection: runtime::LocalBlockRuntimeDetection,
     volume_uuid: &str,
     cache_budget_bytes: Option<u64>,
-    payload_sync_mode: runtime::CacheV3PayloadSyncMode,
+    payload_sync_mode: runtime::LocalBlockPayloadSyncMode,
 ) -> Result<OpenedLocalBlockBackend, OpenLocalBlockBackendError> {
     let cache_root = detection.layout.cache_root.as_path();
     let cache_root_display = cache_root.display().to_string();
-    let backend_kind = runtime::CacheBackendKind::CacheV3;
-    let backend = open_cache_v3_backend_budgeted(
+    let backend_kind = runtime::LocalBlockBackendKind::Current;
+    let backend = open_current_local_block_backend_budgeted(
         cache_root,
         &cache_root_display,
         volume_uuid,
@@ -159,36 +146,36 @@ fn open_detected_local_block_backend_budgeted(
     })
 }
 
-fn open_cache_v3_backend(
+fn open_current_local_block_backend(
     cache_root: &Path,
     cache_root_display: &str,
     volume_uuid: &str,
 ) -> Result<Arc<dyn local::LocalBlockBackend>, OpenLocalBlockBackendError> {
-    open_cache_v3_backend_budgeted(
+    open_current_local_block_backend_budgeted(
         cache_root,
         cache_root_display,
         volume_uuid,
         None,
-        runtime::CacheV3PayloadSyncMode::Durable,
+        runtime::LocalBlockPayloadSyncMode::Durable,
     )
 }
 
-fn open_cache_v3_backend_budgeted(
+fn open_current_local_block_backend_budgeted(
     cache_root: &Path,
     cache_root_display: &str,
     volume_uuid: &str,
     cache_budget_bytes: Option<u64>,
-    payload_sync_mode: runtime::CacheV3PayloadSyncMode,
+    payload_sync_mode: runtime::LocalBlockPayloadSyncMode,
 ) -> Result<Arc<dyn local::LocalBlockBackend>, OpenLocalBlockBackendError> {
     let volume_uuid = local::derive_backend_volume_uuid(volume_uuid);
-    let mut last_conflict: Option<Box<runtime::CacheV3LocalBlockBackendError>> = None;
+    let mut last_conflict: Option<Box<runtime::LocalBlockBackendOpenError>> = None;
 
-    for attempt in 0..=CACHE_V3_OPEN_LOCK_RETRY_ATTEMPTS {
-        let config = runtime::CacheV3LocalBlockBackendConfig {
+    for attempt in 0..=LOCAL_BLOCK_OPEN_LOCK_RETRY_ATTEMPTS {
+        let config = runtime::LocalBlockBackendConfig {
             cache_root: cache_root.to_path_buf(),
             volume_uuid,
         };
-        match runtime::CacheV3LocalBlockBackend::open_with_budget_and_sync_mode(
+        match runtime::LocalBlockBackendRuntime::open_with_budget_and_sync_mode(
             config,
             cache_budget_bytes,
             payload_sync_mode,
@@ -196,13 +183,13 @@ fn open_cache_v3_backend_budgeted(
             Ok(backend) => return Ok(Arc::new(backend) as Arc<dyn local::LocalBlockBackend>),
             Err(source)
                 if source.is_transient_open_lock_conflict()
-                    && attempt < CACHE_V3_OPEN_LOCK_RETRY_ATTEMPTS =>
+                    && attempt < LOCAL_BLOCK_OPEN_LOCK_RETRY_ATTEMPTS =>
             {
                 last_conflict = Some(Box::new(source));
-                std::thread::sleep(CACHE_V3_OPEN_LOCK_RETRY_DELAY);
+                std::thread::sleep(LOCAL_BLOCK_OPEN_LOCK_RETRY_DELAY);
             }
             Err(source) => {
-                return Err(OpenLocalBlockBackendError::OpenCacheV3Backend {
+                return Err(OpenLocalBlockBackendError::OpenLocalBlockBackend {
                     cache_root: cache_root_display.to_owned(),
                     source: Box::new(source),
                 });
@@ -211,8 +198,8 @@ fn open_cache_v3_backend_budgeted(
     }
 
     let source =
-        last_conflict.expect("cache-v3 open loop must capture the final transient conflict");
-    Err(OpenLocalBlockBackendError::OpenCacheV3Backend {
+        last_conflict.expect("local block open loop must capture the final transient conflict");
+    Err(OpenLocalBlockBackendError::OpenLocalBlockBackend {
         cache_root: cache_root_display.to_owned(),
         source,
     })
@@ -227,7 +214,7 @@ pub fn open_local_block_backend(
         cache_root.as_ref(),
         volume_uuid,
         None,
-        runtime::CacheV3PayloadSyncMode::Durable,
+        runtime::LocalBlockPayloadSyncMode::Durable,
     )
 }
 
@@ -241,7 +228,7 @@ pub fn open_local_block_backend_with_budget(
         cache_root,
         volume_uuid,
         cache_budget_bytes,
-        runtime::CacheV3PayloadSyncMode::Durable,
+        runtime::LocalBlockPayloadSyncMode::Durable,
     )
 }
 
@@ -251,7 +238,7 @@ pub fn open_local_block_backend_with_budget_and_sync_mode(
     cache_root: impl AsRef<Path>,
     volume_uuid: &str,
     cache_budget_bytes: u64,
-    payload_sync_mode: runtime::CacheV3PayloadSyncMode,
+    payload_sync_mode: runtime::LocalBlockPayloadSyncMode,
 ) -> Result<OpenedLocalBlockBackend, OpenLocalBlockBackendError> {
     open_local_block_backend_budgeted(
         cache_root.as_ref(),
@@ -263,10 +250,10 @@ pub fn open_local_block_backend_with_budget_and_sync_mode(
 
 /// Open the selected local backend using an already prepared local-cache runtime.
 pub fn open_prepared_local_block_backend_with_budget_and_sync_mode(
-    prepared: PreparedCacheV3Runtime,
+    prepared: PreparedLocalBlockRuntime,
     volume_uuid: &str,
     cache_budget_bytes: u64,
-    payload_sync_mode: runtime::CacheV3PayloadSyncMode,
+    payload_sync_mode: runtime::LocalBlockPayloadSyncMode,
 ) -> Result<OpenedLocalBlockBackend, OpenLocalBlockBackendError> {
     open_detected_local_block_backend_budgeted(
         prepared.detection,
@@ -280,17 +267,17 @@ fn open_local_block_backend_budgeted(
     cache_root: &Path,
     volume_uuid: &str,
     cache_budget_bytes: Option<u64>,
-    payload_sync_mode: runtime::CacheV3PayloadSyncMode,
+    payload_sync_mode: runtime::LocalBlockPayloadSyncMode,
 ) -> Result<OpenedLocalBlockBackend, OpenLocalBlockBackendError> {
     let cache_root_display = cache_root.display().to_string();
 
-    let detection = prepare_cache_v3_runtime(cache_root)
+    let detection = prepare_local_block_runtime(cache_root)
         .map_err(|source| match source {
-            PrepareCacheV3RuntimeError::DetectCacheBackend { cache_root, source } => {
+            PrepareLocalBlockRuntimeError::DetectCacheBackend { cache_root, source } => {
                 OpenLocalBlockBackendError::DetectCacheBackend { cache_root, source }
             }
-            PrepareCacheV3RuntimeError::ProvisionCacheV3Layout { cache_root, source } => {
-                OpenLocalBlockBackendError::ProvisionCacheV3Layout { cache_root, source }
+            PrepareLocalBlockRuntimeError::ProvisionLocalBlockLayout { cache_root, source } => {
+                OpenLocalBlockBackendError::ProvisionLocalBlockLayout { cache_root, source }
             }
         })?
         .detection;
@@ -302,10 +289,11 @@ fn open_local_block_backend_budgeted(
             payload_sync_mode,
         ),
         None => {
-            let backend = open_cache_v3_backend(cache_root, &cache_root_display, volume_uuid)?;
+            let backend =
+                open_current_local_block_backend(cache_root, &cache_root_display, volume_uuid)?;
             Ok(OpenedLocalBlockBackend {
                 detection,
-                backend_kind: runtime::CacheBackendKind::CacheV3,
+                backend_kind: runtime::LocalBlockBackendKind::Current,
                 backend,
             })
         }
@@ -315,16 +303,20 @@ fn open_local_block_backend_budgeted(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{CacheBackendKind, CacheV3Layout};
+    use crate::runtime::{LocalBlockBackendKind, LocalBlockLayout, LocalBlockPayloadSyncMode};
 
     #[test]
-    fn prepare_cache_v3_runtime_creates_contract_paths() {
+    fn prepare_local_block_runtime_creates_contract_paths() {
         let temp = tempfile::tempdir().expect("tempdir");
 
-        let prepared = prepare_cache_v3_runtime(temp.path()).expect("prepare cache-v3 runtime");
+        let prepared =
+            prepare_local_block_runtime(temp.path()).expect("prepare local block runtime");
 
-        assert_eq!(prepared.layout, CacheV3Layout::from_cache_root(temp.path()));
-        assert!(prepared.detection.has_cache_v3_contract());
+        assert_eq!(
+            prepared.layout,
+            LocalBlockLayout::from_cache_root(temp.path())
+        );
+        assert!(prepared.detection.has_runtime_layout());
         assert!(prepared.layout.layout_marker.exists());
         assert!(prepared.layout.tmp_dir.exists());
         assert!(prepared.layout.payload_blocks_dir.exists());
@@ -332,60 +324,62 @@ mod tests {
     }
 
     #[test]
-    fn prepare_cache_v3_runtime_is_idempotent() {
+    fn prepare_local_block_runtime_is_idempotent() {
         let temp = tempfile::tempdir().expect("tempdir");
 
-        let first = prepare_cache_v3_runtime(temp.path()).expect("first prepare");
-        let second = prepare_cache_v3_runtime(temp.path()).expect("second prepare");
+        let first = prepare_local_block_runtime(temp.path()).expect("first prepare");
+        let second = prepare_local_block_runtime(temp.path()).expect("second prepare");
 
         assert_eq!(first.layout, second.layout);
         assert_eq!(first.detection, second.detection);
-        assert!(second.detection.has_cache_v3_contract());
+        assert!(second.detection.has_runtime_layout());
     }
 
     #[test]
-    fn prepared_cache_v3_runtime_opens_cache_v3_backend() {
+    fn prepared_local_block_runtime_opens_local_block_backend() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let prepared = prepare_cache_v3_runtime(temp.path()).expect("prepare cache-v3 runtime");
+        let prepared =
+            prepare_local_block_runtime(temp.path()).expect("prepare local block runtime");
 
         let opened = open_local_block_backend(
             &prepared.layout.cache_root,
             "00000000-0000-0000-0000-000000000001",
         )
-        .expect("open cache-v3 backend");
+        .expect("open local block backend");
 
-        assert_eq!(opened.backend_kind, CacheBackendKind::CacheV3);
-        assert!(opened.detection.has_cache_v3_contract());
+        assert_eq!(opened.backend_kind, LocalBlockBackendKind::Current);
+        assert!(opened.detection.has_runtime_layout());
     }
 
     #[test]
-    fn prepared_cache_v3_runtime_reuses_detection_to_open_budgeted_backend() {
+    fn prepared_local_block_runtime_reuses_detection_to_open_budgeted_backend() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let prepared = prepare_cache_v3_runtime(temp.path()).expect("prepare cache-v3 runtime");
+        let prepared =
+            prepare_local_block_runtime(temp.path()).expect("prepare local block runtime");
 
         let opened = open_prepared_local_block_backend_with_budget_and_sync_mode(
             prepared.clone(),
             "00000000-0000-0000-0000-000000000001",
             64 * 1024 * 1024,
-            runtime::CacheV3PayloadSyncMode::Durable,
+            LocalBlockPayloadSyncMode::Durable,
         )
-        .expect("open prepared cache-v3 backend");
+        .expect("open prepared local block backend");
 
-        assert_eq!(opened.backend_kind, CacheBackendKind::CacheV3);
+        assert_eq!(opened.backend_kind, LocalBlockBackendKind::Current);
         assert_eq!(opened.detection, prepared.detection);
     }
 
     #[test]
-    fn cache_v3_root_opens_cache_v3_backend() {
+    fn local_block_runtime_root_opens_local_block_backend() {
         let temp = tempfile::tempdir().expect("tempdir");
         let cache_root = temp.path();
-        let layout = CacheV3Layout::from_cache_root(cache_root);
-        std::fs::create_dir_all(&layout.v3_root).expect("create v3 root");
+        let layout = LocalBlockLayout::from_cache_root(cache_root);
+        std::fs::create_dir_all(&layout.runtime_root).expect("create v3 root");
         std::fs::write(&layout.layout_marker, b"v1").expect("create marker");
 
         let opened = open_local_block_backend(cache_root, "00000000-0000-0000-0000-000000000001")
-            .expect("open cache-v3 backend");
+            .expect("open local block backend");
 
-        assert_eq!(opened.backend_kind, CacheBackendKind::CacheV3);
+        assert_eq!(opened.backend_kind, LocalBlockBackendKind::Current);
     }
 }

@@ -290,11 +290,11 @@ impl VfsBootstrapResources {
             ),
         }
         .map_err(|source| map_open_local_block_backend_error(cache_dir, source))?;
-        if opened_local_backend.detection.has_cache_v3_contract() {
+        if opened_local_backend.detection.has_runtime_layout() {
             info!(
                 cache_root = %opened_local_backend.detection.layout.cache_root.display(),
                 layout_marker = %opened_local_backend.detection.layout.layout_marker.display(),
-                cache_v3_root = %opened_local_backend.detection.layout.v3_root.display(),
+                runtime_root = %opened_local_backend.detection.layout.runtime_root.display(),
                 "using current file-per-block local backend under the v3 subtree"
             );
         }
@@ -476,7 +476,7 @@ impl VfsBootstrap {
             fetch_scheduler: resources.fetch_scheduler,
             distributed_flock: None,
             kernel_invalidator: RwLock::new(None),
-            write_path_backend_tag: "cache-v3".to_string(),
+            write_path_backend_tag: "local-block-runtime".to_string(),
             write_path_started_at: Instant::now(),
             #[cfg(test)]
             fail_next_size_change_setattr_before_flush: std::sync::atomic::AtomicBool::new(false),
@@ -612,7 +612,7 @@ mod tests {
         };
         let mapped = map_open_local_block_backend_error("E:\\cache-root", source);
         match mapped {
-            VfsError::CacheBackendDetection { cache_root, source } => {
+            VfsError::LocalBlockRuntimeDetection { cache_root, source } => {
                 assert_eq!(cache_root, "E:\\cache-root");
                 assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
             }
@@ -622,7 +622,7 @@ mod tests {
 
     #[test]
     fn open_local_block_backend_provision_errors_surface_clear_runtime_message() {
-        let source = OpenLocalBlockBackendError::ProvisionCacheV3Layout {
+        let source = OpenLocalBlockBackendError::ProvisionLocalBlockLayout {
             cache_root: "E:\\cache-root\\v3".to_string(),
             source: std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -646,13 +646,13 @@ mod tests {
         let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
         meta.init_root(0, 0).expect("init root");
 
-        let format_info = test_format_info("cache-v3-bootstrap");
+        let format_info = test_format_info("local-block-runtime-bootstrap");
         meta.set_format_info(&format_info).expect("set format info");
         let data_config = DataStoreConfig::from(&format_info);
         let cache_dir = tmp.path().join("cache");
-        let layout = studiofs_cache::v3::CacheV3Layout::from_cache_root(&cache_dir);
-        std::fs::create_dir_all(&layout.v3_root).expect("create v3 root");
-        std::fs::write(&layout.layout_marker, b"v1").expect("create v3 marker");
+        let layout = studiofs_cache::runtime::LocalBlockLayout::from_cache_root(&cache_dir);
+        std::fs::create_dir_all(&layout.runtime_root).expect("create runtime root");
+        std::fs::write(&layout.layout_marker, b"v1").expect("create runtime marker");
 
         let rt = Runtime::new().expect("runtime");
         let _guard = rt.enter();
@@ -671,8 +671,8 @@ mod tests {
         assert!(
             vfs.local_block_backend()
                 .as_any()
-                .is::<studiofs_cache::runtime::CacheV3LocalBlockBackend>(),
-            "v3-only layout should select the current local block runtime backend"
+                .is::<studiofs_cache::runtime::LocalBlockBackendRuntime>(),
+            "layout-only runtime root should select the current local block runtime backend"
         );
     }
 
@@ -790,8 +790,8 @@ mod tests {
             "constructor should carry bootstrap ACL principal into the assembled VFS"
         );
         assert_eq!(
-            vfs.write_path_backend_tag, "cache-v3",
-            "constructor should preserve the cache-v3 write-path backend tag in the assembled VFS"
+            vfs.write_path_backend_tag, "local-block-runtime",
+            "constructor should preserve the local-block-runtime write-path backend tag in the assembled VFS"
         );
     }
 

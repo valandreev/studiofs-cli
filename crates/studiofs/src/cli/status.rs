@@ -6,7 +6,7 @@ use crate::cli::utils::format_bytes;
 use clap::Args;
 use std::path::{Path, PathBuf};
 use studiofs_cache::runtime::{
-    CacheBackendDetection, CacheBackendKind, CacheIndex, detect_cache_backends,
+    CacheIndex, LocalBlockBackendKind, LocalBlockRuntimeDetection, detect_cache_backends,
 };
 use studiofs_cache::{OpenLocalBlockBackendError, open_local_block_backend};
 use studiofs_meta::counters;
@@ -77,8 +77,8 @@ impl StatusArgs {
 
 fn detect_backends_or_warn(
     cache_path: &Path,
-    detector: impl FnOnce(&Path) -> std::io::Result<CacheBackendDetection>,
-) -> Option<CacheBackendDetection> {
+    detector: impl FnOnce(&Path) -> std::io::Result<LocalBlockRuntimeDetection>,
+) -> Option<LocalBlockRuntimeDetection> {
     match detector(cache_path) {
         Ok(detection) => Some(detection),
         Err(error) => {
@@ -91,7 +91,7 @@ fn detect_backends_or_warn(
     }
 }
 
-fn detect_backends(cache_path: &Path) -> Option<CacheBackendDetection> {
+fn detect_backends(cache_path: &Path) -> Option<LocalBlockRuntimeDetection> {
     detect_backends_or_warn(cache_path, detect_cache_backends)
 }
 
@@ -141,8 +141,8 @@ fn map_cache_backend_error(cache_dir: &Path, source: OpenLocalBlockBackendError)
     )
 }
 
-fn scan_v3_cache(
-    cache_backend_detection: &CacheBackendDetection,
+fn scan_local_block_cache(
+    cache_backend_detection: &LocalBlockRuntimeDetection,
 ) -> anyhow::Result<CacheUsageStats> {
     // Status is allowed to open the index directly to read aggregate counters.
     let index = CacheIndex::open(&cache_backend_detection.layout.redb_index_path)?;
@@ -155,11 +155,11 @@ fn scan_v3_cache(
 }
 
 fn scan_cache_usage(
-    cache_backend_detection: Option<&CacheBackendDetection>,
+    cache_backend_detection: Option<&LocalBlockRuntimeDetection>,
 ) -> anyhow::Result<Option<CacheUsageStats>> {
     match cache_backend_detection {
-        Some(detection) if detection.runtime_backend() == Some(CacheBackendKind::CacheV3) => {
-            scan_v3_cache(detection).map(Some)
+        Some(detection) if detection.runtime_backend() == Some(LocalBlockBackendKind::Current) => {
+            scan_local_block_cache(detection).map(Some)
         }
         _ => Ok(None),
     }
@@ -168,12 +168,12 @@ fn scan_cache_usage(
 fn scan_pending_uploads(
     cache_dir: &Path,
     volume_uuid: &str,
-    cache_backend_detection: Option<&CacheBackendDetection>,
+    cache_backend_detection: Option<&LocalBlockRuntimeDetection>,
 ) -> anyhow::Result<usize> {
     let Some(detection) = cache_backend_detection else {
         return Ok(0);
     };
-    if detection.runtime_backend() != Some(CacheBackendKind::CacheV3) {
+    if detection.runtime_backend() != Some(LocalBlockBackendKind::Current) {
         return Ok(0);
     }
 
@@ -266,11 +266,11 @@ pub fn run(
     println!("  Root:                {}", cache_path.display());
     let runtime_ready = cache_backend_detection
         .as_ref()
-        .and_then(CacheBackendDetection::runtime_backend)
-        == Some(CacheBackendKind::CacheV3);
+        .and_then(LocalBlockRuntimeDetection::runtime_backend)
+        == Some(LocalBlockBackendKind::Current);
     let contract_state = describe_cache_layout_state(cache_backend_detection.as_ref());
     let remediation = if let Some(detection) = cache_backend_detection.as_ref() {
-        if detection.has_cache_v3_contract() {
+        if detection.has_runtime_layout() {
             "none"
         } else {
             "mount will provision the local cache layout on first use"
@@ -282,7 +282,7 @@ pub fn run(
         || cache_usage
             .and_then(|stats| stats.map(|stats| stats.dirty_bytes > 0))
             .unwrap_or(false);
-    println!("  Backend version:     {}", CacheBackendKind::CacheV3);
+    println!("  Runtime:             {}", LocalBlockBackendKind::Current);
     println!(
         "  Runtime readiness:   {}",
         if runtime_ready { "ready" } else { "blocked" }
@@ -292,7 +292,7 @@ pub fn run(
         println!(
             "  Local cache marker:  {} ({})",
             detection.layout.layout_marker.display(),
-            if detection.has_cache_v3_contract() {
+            if detection.has_runtime_layout() {
                 "present"
             } else {
                 "absent"
@@ -301,7 +301,7 @@ pub fn run(
         println!(
             "  Local cache index:   {} ({})",
             detection.layout.redb_index_path.display(),
-            if detection.v3_index_exists {
+            if detection.index_exists {
                 "present"
             } else {
                 "absent"
@@ -310,11 +310,15 @@ pub fn run(
         println!(
             "  Local cache payload: {} ({})",
             detection.layout.payload_blocks_dir.display(),
-            if detection.v3_payload_blocks_dir_exists {
+            if detection.payload_blocks_dir_exists {
                 "present"
             } else {
                 "absent"
             }
+        );
+        println!(
+            "  Disk subtree:        {}",
+            detection.layout.runtime_root.display()
         );
     }
     println!("  Init guidance:       {}", remediation);
@@ -536,15 +540,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scan_pending_uploads_supports_cache_v3_selection() {
+    fn scan_pending_uploads_supports_current_local_block_runtime() {
         let tmp = tempfile::tempdir().unwrap();
-        let layout = studiofs_cache::v3::CacheV3Layout::from_cache_root(tmp.path());
-        std::fs::create_dir_all(&layout.v3_root).unwrap();
+        let layout = studiofs_cache::runtime::LocalBlockLayout::from_cache_root(tmp.path());
+        std::fs::create_dir_all(&layout.runtime_root).unwrap();
         std::fs::write(&layout.layout_marker, b"v1").unwrap();
         let volume_uuid = Uuid::new_v4();
 
         let detection = detect_backends(tmp.path()).unwrap();
-        assert_eq!(detection.runtime_backend(), Some(CacheBackendKind::CacheV3));
+        assert_eq!(
+            detection.runtime_backend(),
+            Some(LocalBlockBackendKind::Current)
+        );
         assert_eq!(
             scan_pending_uploads(tmp.path(), &volume_uuid.to_string(), Some(&detection)).unwrap(),
             0
@@ -606,7 +613,7 @@ mod tests {
         let snapshot = VfsWritePathObservabilitySnapshot {
             generated_unix_ms: 123,
             uptime_secs: 4.0,
-            backend_tag: "cache-v3".to_string(),
+            backend_tag: "local-block-runtime".to_string(),
             flush_barrier_calls: 11,
             flush_barrier_calls_per_sec: 2.5,
             block_store_sync_data: Default::default(),
@@ -625,7 +632,7 @@ mod tests {
 
         let loaded = read_write_path_observability(tmp.path()).expect("metrics");
         assert_eq!(loaded.0, metrics_path);
-        assert_eq!(loaded.1.backend_tag, "cache-v3");
+        assert_eq!(loaded.1.backend_tag, "local-block-runtime");
         assert_eq!(loaded.1.flush_barrier_calls, 11);
     }
 

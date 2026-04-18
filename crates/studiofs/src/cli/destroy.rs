@@ -4,7 +4,7 @@ use crate::cli::cache_layout::describe_cache_layout_state;
 use clap::Args;
 use std::io::{self, Write};
 use std::path::Path;
-use studiofs_cache::runtime::{CacheBackendDetection, detect_cache_backends};
+use studiofs_cache::runtime::{LocalBlockRuntimeDetection, detect_cache_backends};
 use studiofs_data::{DataStore, DataStoreConfig, store::DataError};
 use studiofs_meta::engine::MetaError;
 use thiserror::Error;
@@ -78,9 +78,9 @@ impl DestroyArgs {
     }
 }
 
-fn describe_destroy_cache_scope(detection: Option<&CacheBackendDetection>) -> &'static str {
+fn describe_destroy_cache_scope(detection: Option<&LocalBlockRuntimeDetection>) -> &'static str {
     if let Some(detection) = detection {
-        if detection.has_cache_v3_contract() {
+        if detection.has_runtime_layout() {
             "local cleanup removes the entire metadata directory (`meta_dir`), including the default cache root and its active local-cache subtree"
         } else {
             "local cleanup removes the entire metadata directory (`meta_dir`), including any default cache-root contents under it"
@@ -181,7 +181,7 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
         println!(
             "  Local cache marker: {} ({})",
             detection.layout.layout_marker.display(),
-            if detection.has_cache_v3_contract() {
+            if detection.has_runtime_layout() {
                 "present"
             } else {
                 "absent"
@@ -190,7 +190,7 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
         println!(
             "  Local cache index: {} ({})",
             detection.layout.redb_index_path.display(),
-            if detection.v3_index_exists {
+            if detection.index_exists {
                 "present"
             } else {
                 "absent"
@@ -342,18 +342,18 @@ async fn delete_optional_manifest(operator: &opendal::Operator, path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use studiofs_cache::runtime::CacheV3Layout;
+    use studiofs_cache::runtime::LocalBlockLayout;
 
-    fn detection(marker: bool) -> CacheBackendDetection {
+    fn detection(marker: bool) -> LocalBlockRuntimeDetection {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
-        CacheBackendDetection {
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        LocalBlockRuntimeDetection {
             layout,
-            v3_layout_marker_exists: marker,
-            v3_index_exists: false,
-            v3_payload_blocks_dir_exists: false,
-            v3_tmp_dir_exists: false,
-            v3_index_dir_exists: false,
+            layout_marker_exists: marker,
+            index_exists: false,
+            payload_blocks_dir_exists: false,
+            tmp_dir_exists: false,
+            index_dir_exists: false,
         }
     }
 

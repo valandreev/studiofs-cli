@@ -1,10 +1,10 @@
-use studiofs_cache::runtime::CacheBackendDetection;
+use studiofs_cache::runtime::LocalBlockRuntimeDetection;
 
 pub(crate) fn describe_cache_layout_state(
-    detection: Option<&CacheBackendDetection>,
+    detection: Option<&LocalBlockRuntimeDetection>,
 ) -> &'static str {
     if let Some(detection) = detection {
-        if detection.has_cache_v3_contract() {
+        if detection.has_runtime_layout() {
             "Local block runtime ready"
         } else {
             "Local block runtime not initialized"

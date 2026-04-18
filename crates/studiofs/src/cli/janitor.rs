@@ -8,7 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use opendal::services::S3;
 use opendal::{EntryMode, ErrorKind, Operator};
-use studiofs_cache::runtime::{CacheBackendDetection, CacheBackendKind, detect_cache_backends};
+use studiofs_cache::runtime::{
+    LocalBlockBackendKind, LocalBlockRuntimeDetection, detect_cache_backends,
+};
 use studiofs_cache::{OpenLocalBlockBackendError, open_local_block_backend};
 use studiofs_data::object::{format_object_fragment_keys, parse_object_id_from_key};
 use studiofs_meta::open_meta_engine;
@@ -157,7 +159,7 @@ fn inspect_local_cache_runtime(
     volume_uuid: &str,
 ) -> anyhow::Result<(
     PathBuf,
-    Option<CacheBackendDetection>,
+    Option<LocalBlockRuntimeDetection>,
     Option<JanitorLocalCacheState>,
 )> {
     let cache_path = local_cache_path(meta_dir, cache_dir, volume_uuid);
@@ -171,7 +173,7 @@ fn inspect_local_cache_runtime(
             return Ok((cache_path, None, None));
         }
     };
-    if detection.runtime_backend() != Some(CacheBackendKind::CacheV3) {
+    if detection.runtime_backend() != Some(LocalBlockBackendKind::Current) {
         return Ok((cache_path, Some(detection), None));
     }
     if detection.needs_runtime_provisioning() {
@@ -437,7 +439,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use studiofs_cache::runtime::CacheV3Layout;
+    use studiofs_cache::runtime::LocalBlockLayout;
 
     #[test]
     fn janitor_parses_flags_and_defaults() {
@@ -510,8 +512,8 @@ mod tests {
         assert_eq!(
             detection
                 .as_ref()
-                .and_then(CacheBackendDetection::runtime_backend),
-            Some(CacheBackendKind::CacheV3)
+                .and_then(LocalBlockRuntimeDetection::runtime_backend),
+            Some(LocalBlockBackendKind::Current)
         );
         assert_eq!(
             local_cache_state,
@@ -543,8 +545,8 @@ mod tests {
         assert_eq!(
             detection
                 .as_ref()
-                .and_then(CacheBackendDetection::runtime_backend),
-            Some(CacheBackendKind::CacheV3)
+                .and_then(LocalBlockRuntimeDetection::runtime_backend),
+            Some(LocalBlockBackendKind::Current)
         );
         assert_eq!(
             local_cache_state, None,
@@ -561,8 +563,8 @@ mod tests {
         std::fs::create_dir_all(&meta_dir).unwrap();
 
         let cache_root = cache_base.join(volume_uuid);
-        let layout = CacheV3Layout::from_cache_root(&cache_root);
-        std::fs::create_dir_all(layout.v3_root.as_path()).unwrap();
+        let layout = LocalBlockLayout::from_cache_root(&cache_root);
+        std::fs::create_dir_all(layout.runtime_root.as_path()).unwrap();
         std::fs::write(&layout.layout_marker, b"v3\n").unwrap();
 
         let (inspected_path, detection, local_cache_state) =
@@ -573,8 +575,8 @@ mod tests {
         assert_eq!(
             detection
                 .as_ref()
-                .and_then(CacheBackendDetection::runtime_backend),
-            Some(CacheBackendKind::CacheV3)
+                .and_then(LocalBlockRuntimeDetection::runtime_backend),
+            Some(LocalBlockBackendKind::Current)
         );
         assert_eq!(local_cache_state, None);
         assert!(

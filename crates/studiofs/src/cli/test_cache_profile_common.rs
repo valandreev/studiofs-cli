@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn render_write_path_summary_includes_winfsp_callback_breakdown() {
         let snapshot = VfsWritePathObservabilitySnapshot {
-            backend_tag: "cache-v3".to_string(),
+            backend_tag: "local-block-runtime".to_string(),
             winfsp_callbacks: VfsWritePathWinfspCallbackStats {
                 write: 11,
                 overwrite: 2,
@@ -270,7 +270,7 @@ mod tests {
     #[test]
     fn render_write_path_summary_emits_follow_up_for_cleanup_barrier_regressions() {
         let snapshot = VfsWritePathObservabilitySnapshot {
-            backend_tag: "cache-v3".to_string(),
+            backend_tag: "local-block-runtime".to_string(),
             winfsp_callbacks: VfsWritePathWinfspCallbackStats {
                 cleanup: 5,
                 ..Default::default()
@@ -291,7 +291,7 @@ mod tests {
     #[test]
     fn render_write_path_summary_emits_follow_up_for_cleanup_skipped_clean_regressions() {
         let snapshot = VfsWritePathObservabilitySnapshot {
-            backend_tag: "cache-v3".to_string(),
+            backend_tag: "local-block-runtime".to_string(),
             winfsp_callbacks: VfsWritePathWinfspCallbackStats {
                 cleanup: 6,
                 ..Default::default()
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn render_write_path_summary_emits_follow_up_for_cleanup_flush_fh_callbacks() {
         let snapshot = VfsWritePathObservabilitySnapshot {
-            backend_tag: "cache-v3".to_string(),
+            backend_tag: "local-block-runtime".to_string(),
             winfsp_callbacks: VfsWritePathWinfspCallbackStats {
                 cleanup: 4,
                 cleanup_flush_fh: 2,
@@ -331,7 +331,7 @@ mod tests {
     #[test]
     fn collect_write_path_artifacts_writes_json_and_summary_artifacts() {
         let snapshot = VfsWritePathObservabilitySnapshot {
-            backend_tag: "cache-v3".to_string(),
+            backend_tag: "local-block-runtime".to_string(),
             winfsp_callbacks: VfsWritePathWinfspCallbackStats {
                 cleanup: 3,
                 close: 1,

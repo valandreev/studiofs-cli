@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 #[cfg(test)]
-use studiofs_cache::runtime::CacheV3Layout;
+use studiofs_cache::runtime::LocalBlockLayout;
 use studiofs_cache::{
     DEFAULT_MEMORY_CACHE_SIZE, PreparedLocalBlockRuntime, prepare_local_block_runtime,
 };
@@ -1716,9 +1716,9 @@ mod tests {
         );
         assert_eq!(
             prepared.cache_runtime.layout,
-            CacheV3Layout::from_cache_root(&prepared.cache_path)
+            LocalBlockLayout::from_cache_root(&prepared.cache_path)
         );
-        assert!(prepared.cache_runtime.detection.has_cache_v3_contract());
+        assert!(prepared.cache_runtime.detection.has_runtime_layout());
     }
 
     #[test]

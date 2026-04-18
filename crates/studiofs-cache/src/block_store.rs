@@ -1,4 +1,7 @@
-//! File-per-block payload storage for the current `v3` local cache backend.
+//! File-per-block payload storage for the current local block runtime.
+//!
+//! The runtime still persists payloads under the `v3/` subtree as an on-disk
+//! implementation detail.
 
 use std::array;
 use std::collections::HashSet;
@@ -15,8 +18,8 @@ use parking_lot::Mutex;
 use tracing::warn;
 use uuid::Uuid;
 
-use super::CacheV3PayloadSyncMode;
-use super::layout::CacheV3Layout;
+use super::LocalBlockPayloadSyncMode;
+use super::layout::LocalBlockLayout;
 use super::platform;
 
 const TEMP_FILE_CREATE_ATTEMPTS: usize = 32;
@@ -38,24 +41,25 @@ pub enum FilePayloadStoreError {
     TempFileCreateExhausted { object_id: u64, dir: PathBuf },
 }
 
-/// File-per-block payload store rooted under Cache v3 layout.
+/// File-per-block payload store rooted under the current local block runtime
+/// layout.
 #[derive(Debug, Clone)]
 pub struct FilePayloadStore {
-    layout: CacheV3Layout,
-    sync_mode: CacheV3PayloadSyncMode,
+    layout: LocalBlockLayout,
+    sync_mode: LocalBlockPayloadSyncMode,
     read_handles: Arc<ReadHandleCache>,
     pending_grouped_sync: Arc<PendingGroupedSync>,
     barrier_counters: Arc<SyncBarrierCounters>,
 }
 
 impl FilePayloadStore {
-    pub fn open(layout: CacheV3Layout) -> Result<Self, FilePayloadStoreError> {
-        Self::open_with_sync_mode(layout, CacheV3PayloadSyncMode::Durable)
+    pub fn open(layout: LocalBlockLayout) -> Result<Self, FilePayloadStoreError> {
+        Self::open_with_sync_mode(layout, LocalBlockPayloadSyncMode::Durable)
     }
 
     pub fn open_with_sync_mode(
-        layout: CacheV3Layout,
-        sync_mode: CacheV3PayloadSyncMode,
+        layout: LocalBlockLayout,
+        sync_mode: LocalBlockPayloadSyncMode,
     ) -> Result<Self, FilePayloadStoreError> {
         std::fs::create_dir_all(&layout.payload_blocks_dir)?;
         std::fs::create_dir_all(&layout.tmp_dir)?;
@@ -83,7 +87,7 @@ impl FilePayloadStore {
                     object_id,
                     path = %path.display(),
                     error = ?error,
-                    "cache-v3 payload get metadata failed"
+                    "local block runtime payload get metadata failed"
                 );
                 return None;
             }
@@ -95,7 +99,7 @@ impl FilePayloadStore {
                     object_id,
                     path = %path.display(),
                     payload_len = metadata.len(),
-                    "cache-v3 payload get length exceeds addressable usize"
+                    "local block runtime payload get length exceeds addressable usize"
                 );
                 return None;
             }
@@ -107,7 +111,7 @@ impl FilePayloadStore {
                     object_id,
                     path = %path.display(),
                     error = ?error,
-                    "cache-v3 payload get failed"
+                    "local block runtime payload get failed"
                 );
                 return None;
             }
@@ -131,7 +135,7 @@ impl FilePayloadStore {
                     data_offset,
                     path = %path.display(),
                     error = ?error,
-                    "cache-v3 payload read_into advise_will_need failed"
+                    "local block runtime payload read_into advise_will_need failed"
                 );
             }
         }
@@ -144,7 +148,7 @@ impl FilePayloadStore {
                     data_offset,
                     path = %path.display(),
                     error = ?error,
-                    "cache-v3 payload read_into failed"
+                    "local block runtime payload read_into failed"
                 );
                 None
             }
@@ -158,7 +162,7 @@ impl FilePayloadStore {
                 warn!(
                     object_id,
                     error = ?error,
-                    "cache-v3 payload contains check failed"
+                    "local block runtime payload contains check failed"
                 );
                 false
             }
@@ -183,7 +187,7 @@ impl FilePayloadStore {
             &self.layout.tmp_dir,
             object_id,
             data,
-            matches!(self.sync_mode, CacheV3PayloadSyncMode::Durable),
+            matches!(self.sync_mode, LocalBlockPayloadSyncMode::Durable),
         )?;
         match platform::rename_atomic(&temp_path, &payload_path) {
             Ok(()) => {}
@@ -195,7 +199,7 @@ impl FilePayloadStore {
                     payload_dir,
                     object_id,
                     data,
-                    matches!(self.sync_mode, CacheV3PayloadSyncMode::Durable),
+                    matches!(self.sync_mode, LocalBlockPayloadSyncMode::Durable),
                 )?;
                 if let Err(rename_error) =
                     platform::rename_atomic(&payload_local_temp, &payload_path)
@@ -210,7 +214,7 @@ impl FilePayloadStore {
             }
         }
         self.invalidate_cached_read_handle(object_id);
-        if matches!(self.sync_mode, CacheV3PayloadSyncMode::Durable) {
+        if matches!(self.sync_mode, LocalBlockPayloadSyncMode::Durable) {
             self.sync_directory_put_barrier(&self.layout.tmp_dir)?;
             self.sync_directory_put_barrier(payload_dir)?;
         } else {
@@ -233,7 +237,7 @@ impl FilePayloadStore {
                 object_id,
                 path = %payload_path.display(),
                 error = ?error,
-                "cache-v3 payload remove failed"
+                "local block runtime payload remove failed"
             );
         }
     }
@@ -245,7 +249,7 @@ impl FilePayloadStore {
     }
 
     pub fn sync_data(&self) -> Result<(), FilePayloadStoreError> {
-        if matches!(self.sync_mode, CacheV3PayloadSyncMode::Fast) {
+        if matches!(self.sync_mode, LocalBlockPayloadSyncMode::Fast) {
             let (pending_object_ids, pending_dirs) = self.take_grouped_sync_targets();
             return self.sync_pending_grouped_targets(
                 pending_object_ids,
@@ -258,7 +262,7 @@ impl FilePayloadStore {
         for dir in [
             self.layout.payload_blocks_dir.as_path(),
             self.layout.payload_root.as_path(),
-            self.layout.v3_root.as_path(),
+            self.layout.runtime_root.as_path(),
         ] {
             self.sync_directory_grouped_barrier(dir)?;
         }
@@ -361,7 +365,7 @@ impl FilePayloadStore {
                 object_id,
                 path = %path.display(),
                 error = ?error,
-                "cache-v3 payload open advise_random failed"
+                "local block runtime payload open advise_random failed"
             );
         }
 
@@ -394,7 +398,7 @@ impl FilePayloadStore {
         directories.insert(payload_dir.to_path_buf());
         directories.insert(self.layout.payload_blocks_dir.clone());
         directories.insert(self.layout.payload_root.clone());
-        directories.insert(self.layout.v3_root.clone());
+        directories.insert(self.layout.runtime_root.clone());
     }
 
     fn take_grouped_sync_targets(&self) -> (Vec<u64>, Vec<PathBuf>) {
@@ -454,7 +458,7 @@ impl FilePayloadStore {
                 warn!(
                     object_id,
                     path = %path.display(),
-                    "cache-v3 grouped payload sync skipped because file could not be opened for writing"
+                    "local block runtime grouped payload sync skipped because file could not be opened for writing"
                 );
                 return Ok(());
             }
@@ -570,7 +574,7 @@ mod tests {
     #[test]
     fn write_and_cold_reopen_roundtrip() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open(layout.clone()).unwrap();
         store.put(42, b"payload").unwrap();
         drop(store);
@@ -582,7 +586,7 @@ mod tests {
     #[test]
     fn read_into_supports_partial_ranges() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open(layout).unwrap();
         store.put(7, b"abcdef").unwrap();
 
@@ -595,7 +599,7 @@ mod tests {
     #[test]
     fn staged_temp_file_does_not_override_committed_payload_without_rename() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open(layout.clone()).unwrap();
         store.put(9001, b"committed").unwrap();
 
@@ -614,7 +618,7 @@ mod tests {
     #[test]
     fn hot_read_into_reuses_cached_descriptors() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open(layout).unwrap();
         store.put(700, b"abcdef").unwrap();
 
@@ -635,7 +639,7 @@ mod tests {
     #[test]
     fn overwrite_invalidates_cached_descriptor() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open(layout).unwrap();
         store.put(1337, b"old").unwrap();
 
@@ -651,7 +655,7 @@ mod tests {
     #[test]
     fn descriptor_cache_is_bounded() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         let store = FilePayloadStore::open(layout).unwrap();
         let capacity_to_fill = READ_FD_CACHE_CAPACITY.saturating_add(4);
 
@@ -669,9 +673,10 @@ mod tests {
     #[test]
     fn durable_mode_keeps_per_put_sync_barriers() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         let store =
-            FilePayloadStore::open_with_sync_mode(layout, CacheV3PayloadSyncMode::Durable).unwrap();
+            FilePayloadStore::open_with_sync_mode(layout, LocalBlockPayloadSyncMode::Durable)
+                .unwrap();
         store.put(7001, b"payload").unwrap();
 
         let stats = store.sync_barrier_snapshot();
@@ -690,9 +695,9 @@ mod tests {
     #[test]
     fn fast_mode_defers_put_barriers_until_grouped_sync_data() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         let store =
-            FilePayloadStore::open_with_sync_mode(layout, CacheV3PayloadSyncMode::Fast).unwrap();
+            FilePayloadStore::open_with_sync_mode(layout, LocalBlockPayloadSyncMode::Fast).unwrap();
         store.put(8001, b"one").unwrap();
         store.put(8002, b"two").unwrap();
 
@@ -725,9 +730,9 @@ mod tests {
     #[test]
     fn fast_mode_requeues_grouped_sync_targets_after_grouped_sync_failure() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         let store =
-            FilePayloadStore::open_with_sync_mode(layout, CacheV3PayloadSyncMode::Fast).unwrap();
+            FilePayloadStore::open_with_sync_mode(layout, LocalBlockPayloadSyncMode::Fast).unwrap();
         store.put(8101, b"one").unwrap();
         store.put(8102, b"two").unwrap();
 
