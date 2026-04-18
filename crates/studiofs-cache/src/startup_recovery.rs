@@ -1,7 +1,8 @@
-//! Startup reconciliation for the current `v3` local cache backend.
+//! Startup reconciliation for the current local block runtime.
 //!
-//! Startup reconciliation is intentionally scoped to the `v3` subtree.
-//! It never mutates unrelated files under the cache root.
+//! Startup reconciliation is intentionally scoped to the runtime's current
+//! `v3/` subtree implementation detail. It never mutates unrelated files under
+//! the cache root.
 
 use std::io;
 use std::path::Path;
@@ -62,7 +63,7 @@ pub enum LocalBlockStartupReconcileError {
     Index(#[from] CacheIndexError),
 }
 
-/// Reconcile startup state for the current `v3` local cache backend.
+/// Reconcile startup state for the current local block runtime.
 ///
 /// `Lightweight` mode:
 /// - delete orphan temp files under `v3/tmp/**`;

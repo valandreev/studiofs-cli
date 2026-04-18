@@ -1,4 +1,7 @@
-//! File-per-block payload storage for the current `v3` local cache backend.
+//! File-per-block payload storage for the current local block runtime.
+//!
+//! The runtime still persists payloads under the `v3/` subtree as an on-disk
+//! implementation detail.
 
 use std::array;
 use std::collections::HashSet;
@@ -38,7 +41,8 @@ pub enum FilePayloadStoreError {
     TempFileCreateExhausted { object_id: u64, dir: PathBuf },
 }
 
-/// File-per-block payload store rooted under Cache v3 layout.
+/// File-per-block payload store rooted under the current local block runtime
+/// layout.
 #[derive(Debug, Clone)]
 pub struct FilePayloadStore {
     layout: LocalBlockLayout,

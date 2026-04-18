@@ -4,7 +4,7 @@
 
 `SFS-256` through `SFS-260` established the new production data-plane runtime around a file-per-block local backend, persistent index, simplified read/write paths, index-driven upload recovery, and one shared cache budget. `SFS-261` is the cleanup step that removes superseded production code, tests, docs, and operator-facing terminology so the repository teaches and exposes one active runtime model.
 
-The canonical rewrite contract remains [docs/juicefs-local-first-rust-contract.md](../juicefs-local-first-rust-contract.md). This cleanup must preserve the current on-disk subtree shape under `<cache-root>/v3/**` as an implementation detail while removing `cache-v3` as the product/runtime identity in public surfaces.
+The canonical rewrite contract remains [docs/juicefs-local-first-rust-contract.md](../../juicefs-local-first-rust-contract.md). This cleanup must preserve the current on-disk subtree shape under `<cache-root>/v3/**` as an implementation detail while removing `cache-v3` as the product/runtime identity in public surfaces.
 
 ## Goal
 
@@ -82,8 +82,8 @@ The user-visible message should become “current local block runtime” or simi
 
 Active documentation should describe one runtime model:
 
-- keep [docs/architecture.md](../architecture.md) aligned with the canonical contract and current implementation;
-- replace or rewrite [docs/cache-v3-contract.md](../cache-v3-contract.md) so it no longer presents `cache-v3` as the runtime identity;
+- keep [docs/architecture.md](../../architecture.md) aligned with the canonical contract and current implementation;
+- replace or rewrite [docs/local-block-runtime-layout.md](../../local-block-runtime-layout.md) so it no longer presents `cache-v3` as the runtime identity;
 - keep explicit mention that the current disk layout still lives under `v3/` as an implementation detail;
 - preserve real operational guidance for readonly inspection, startup reconciliation scope, and stale-artifact remediation.
 

@@ -141,7 +141,7 @@ fn map_cache_backend_error(cache_dir: &Path, source: OpenLocalBlockBackendError)
     )
 }
 
-fn scan_v3_cache(
+fn scan_local_block_cache(
     cache_backend_detection: &LocalBlockRuntimeDetection,
 ) -> anyhow::Result<CacheUsageStats> {
     // Status is allowed to open the index directly to read aggregate counters.
@@ -159,7 +159,7 @@ fn scan_cache_usage(
 ) -> anyhow::Result<Option<CacheUsageStats>> {
     match cache_backend_detection {
         Some(detection) if detection.runtime_backend() == Some(LocalBlockBackendKind::Current) => {
-            scan_v3_cache(detection).map(Some)
+            scan_local_block_cache(detection).map(Some)
         }
         _ => Ok(None),
     }
