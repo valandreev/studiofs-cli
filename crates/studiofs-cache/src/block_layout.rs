@@ -28,22 +28,11 @@ pub const LOCAL_BLOCK_INDEX_DIR: &str = "index";
 /// redb index file location inside the runtime subtree.
 pub const LOCAL_BLOCK_REDB_INDEX_FILE: &str = "cache.redb";
 
-pub const CACHE_V3_LAYOUT_VERSION: u32 = LOCAL_BLOCK_LAYOUT_VERSION;
-pub const CACHE_V3_SUBTREE: &str = LOCAL_BLOCK_SUBTREE;
-pub const CACHE_V3_LAYOUT_MARKER_FILE: &str = LOCAL_BLOCK_LAYOUT_MARKER_FILE;
-pub const CACHE_V3_TMP_DIR: &str = LOCAL_BLOCK_TMP_DIR;
-pub const CACHE_V3_PAYLOAD_DIR: &str = LOCAL_BLOCK_PAYLOAD_DIR;
-pub const CACHE_V3_PAYLOAD_BLOCKS_DIR: &str = LOCAL_BLOCK_PAYLOAD_BLOCKS_DIR;
-pub const CACHE_V3_PAYLOAD_BLOCK_FILE_EXTENSION: &str = LOCAL_BLOCK_PAYLOAD_BLOCK_FILE_EXTENSION;
-pub const CACHE_V3_PAYLOAD_SHARD_COUNT: usize = LOCAL_BLOCK_PAYLOAD_SHARD_COUNT;
-pub const CACHE_V3_INDEX_DIR: &str = LOCAL_BLOCK_INDEX_DIR;
-pub const CACHE_V3_REDB_INDEX_FILE: &str = LOCAL_BLOCK_REDB_INDEX_FILE;
-
 /// Fully resolved local block runtime paths for a cache root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalBlockLayout {
     pub cache_root: PathBuf,
-    pub v3_root: PathBuf,
+    pub runtime_root: PathBuf,
     pub layout_marker: PathBuf,
     pub tmp_dir: PathBuf,
     pub payload_root: PathBuf,
@@ -51,8 +40,6 @@ pub struct LocalBlockLayout {
     pub index_dir: PathBuf,
     pub redb_index_path: PathBuf,
 }
-
-pub type CacheV3Layout = LocalBlockLayout;
 
 impl LocalBlockLayout {
     /// Resolve all runtime paths from a per-volume cache root.
@@ -65,7 +52,7 @@ impl LocalBlockLayout {
 
         Self {
             cache_root,
-            v3_root: runtime_root.clone(),
+            runtime_root: runtime_root.clone(),
             layout_marker: runtime_root.join(LOCAL_BLOCK_LAYOUT_MARKER_FILE),
             tmp_dir: runtime_root.join(LOCAL_BLOCK_TMP_DIR),
             payload_root,
@@ -87,7 +74,7 @@ impl LocalBlockLayout {
 
     /// Resolve the canonical payload block path for an object id.
     pub fn payload_block_path(&self, object_id: u64) -> PathBuf {
-        self.v3_root
+        self.runtime_root
             .join(self.payload_block_relative_path(object_id))
     }
 
@@ -146,7 +133,7 @@ mod tests {
         let layout = LocalBlockLayout::from_cache_root("/cache/vol-a");
 
         assert_eq!(layout.cache_root, PathBuf::from("/cache/vol-a"));
-        assert_eq!(layout.v3_root, PathBuf::from("/cache/vol-a/v3"));
+        assert_eq!(layout.runtime_root, PathBuf::from("/cache/vol-a/v3"));
         assert_eq!(
             layout.layout_marker,
             PathBuf::from("/cache/vol-a/v3/LAYOUT_V1")

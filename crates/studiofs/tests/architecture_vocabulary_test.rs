@@ -39,7 +39,7 @@ fn active_docs_drop_superseded_io_architecture_terms() {
         "AGENTS.md",
         "docs/architecture.md",
         "docs/cache.md",
-        "docs/cache-v3-contract.md",
+        "docs/local-block-runtime-layout.md",
         "docs/configuration.md",
         "docs/examples.md",
         "docs/vfs.md",
@@ -47,6 +47,8 @@ fn active_docs_drop_superseded_io_architecture_terms() {
     let forbidden_terms = [
         "buffered-first",
         "Cache 3.0",
+        "cache-v3",
+        "CacheV3",
         "WriteBuffer",
         "write-buffer",
         "UploadCoordinator",
@@ -69,21 +71,23 @@ fn active_docs_drop_superseded_io_architecture_terms() {
 }
 
 #[test]
-fn cli_surface_avoids_cache_30_product_wording() {
+fn cli_surface_avoids_legacy_runtime_product_wording() {
     let files = [
         "crates/studiofs/src/cli/cache_layout.rs",
         "crates/studiofs/src/cli/destroy.rs",
         "crates/studiofs/src/cli/status.rs",
+        "crates/studiofs/src/cli/test_cache_profile_common.rs",
+        "crates/studiofs/src/cli/test_cache_profile_stub.rs",
     ];
 
     let hits: Vec<_> = files
         .iter()
-        .flat_map(|path| collect_term_hits(path, &["Cache 3.0"]))
+        .flat_map(|path| collect_term_hits(path, &["Cache 3.0", "cache-v3", "CacheV3"]))
         .collect();
 
     assert!(
         hits.is_empty(),
-        "CLI surface still uses Cache 3.0 product wording:\n{}",
+        "CLI surface still uses legacy runtime product wording:\n{}",
         hits.join("\n")
     );
 }

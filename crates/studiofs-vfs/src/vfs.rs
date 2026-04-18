@@ -212,7 +212,7 @@ pub enum VfsError {
     Fetch(#[from] crate::fetch::FetchError),
 
     #[error("cache backend detection failed for root '{cache_root}': {source}")]
-    CacheBackendDetection {
+    LocalBlockRuntimeDetection {
         cache_root: String,
         #[source]
         source: std::io::Error,
@@ -2621,7 +2621,7 @@ impl<'a> StartupReplayCoordinator<'a> {
 }
 
 fn map_cache_backend_detection_error(cache_dir: &str, source: std::io::Error) -> VfsError {
-    VfsError::CacheBackendDetection {
+    VfsError::LocalBlockRuntimeDetection {
         cache_root: cache_dir.to_string(),
         source,
     }
@@ -2641,12 +2641,12 @@ fn map_open_local_block_backend_error(
         OpenLocalBlockBackendError::DetectCacheBackend { source, .. } => {
             map_cache_backend_detection_error(cache_dir, source)
         }
-        OpenLocalBlockBackendError::ProvisionCacheV3Layout { cache_root, source } => {
+        OpenLocalBlockBackendError::ProvisionLocalBlockLayout { cache_root, source } => {
             map_cache_backend_provision_error(&cache_root, source)
         }
-        OpenLocalBlockBackendError::OpenCacheV3Backend { source, .. } => VfsError::Other(format!(
-            "failed to open local block runtime backend: {source}"
-        )),
+        OpenLocalBlockBackendError::OpenLocalBlockBackend { source, .. } => VfsError::Other(
+            format!("failed to open local block runtime backend: {source}"),
+        ),
     }
 }
 

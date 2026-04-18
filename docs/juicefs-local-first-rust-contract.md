@@ -89,7 +89,7 @@ Implications:
 | Regular-file vocabulary and schema | `crates/studiofs-meta/src/redb_engine/{blocks.rs,chunk_state.rs,replication.rs}` | `docs/en/introduction/architecture.md`, `pkg/meta/slice.go`, `pkg/meta/*.go` | Chunk/slice/block language, immutable block references, slice overlap model |
 | Writer path | `crates/studiofs-vfs/src/local_dirty.rs`, `crates/studiofs-vfs/src/vfs/upload_lifecycle.rs` | `pkg/vfs/writer.go` | Per-file writer ownership, chunk/slice decomposition, flush-driven slice materialization |
 | Reader path, readahead, prefetch | `crates/studiofs-vfs/src/vfs/read_path.rs`, `crates/studiofs-vfs/src/readahead.rs`, `crates/studiofs-vfs/src/vfs/prefetch.rs` | `pkg/vfs/reader.go`, `pkg/chunk/prefetch.go`, `docs/en/guide/cache.md` | `dataReader`-style resolution, adaptive readahead, whole-block prefetch |
-| Cache, staging, object-store handoff | `crates/studiofs-cache/src/cached_store.rs`, `crates/studiofs-cache/src/v3/*.rs`, `crates/studiofs-data/src/store.rs` | `pkg/chunk/cached_store.go`, `pkg/chunk/cache_eviction.go`, `docs/en/guide/cache.md` | Cached-store lifecycle, cache/download/writeback structure, eviction and background upload concepts |
+| Cache, staging, object-store handoff | `crates/studiofs-cache/src/{cached_store.rs,runtime.rs,block_*.rs,startup_recovery.rs}`, `crates/studiofs-data/src/store.rs` | `pkg/chunk/cached_store.go`, `pkg/chunk/cache_eviction.go`, `docs/en/guide/cache.md` | Cached-store lifecycle, cache/download/writeback structure, eviction and background upload concepts |
 | Metadata-cache and operator surface | `crates/studiofs/src/cli/mount/*.rs`, `docs/configuration.md` | `cmd/flags.go`, `cmd/mount.go`, `cmd/mount_unix.go`, `cmd/mount_windows.go`, `docs/en/guide/cache.md` | Coherent mount/cache flags, strong internal metadata-cache defaults, operator-facing terminology |
 | Bridge and mount behavior | `crates/studiofs-fuse/src/lib.rs`, `crates/studiofs-winfsp/src/*.rs` | `pkg/vfs/vfs.go`, `pkg/vfs/vfs_unix.go`, `pkg/vfs/vfs_windows.go`, `cmd/mount*.go` | Performance-sensitive bridge/mount patterns and callback expectations |
 
@@ -138,7 +138,7 @@ metadata cache as a first-class operator knob.
 | `WriteBuffer` as the canonical architecture | Delete as the target design. Transitional code may remain only until slice-writer replacement lands. |
 | `ReadPipeline` as the canonical foreground read engine | Delete as the target design. Replace with a direct merged reader over writer/local unpublished/published state. |
 | `UploadCoordinator` as the canonical upload architecture | Simplify/delete as a top-level design concept. Replace with one cached-store-style staging/upload pipeline. |
-| Cache 3.0 as product architecture vocabulary | Rename/simplify. It may remain as an implementation detail for the local backend, but not as the rewrite's conceptual model. |
+| Versioned local runtime subtree as product architecture vocabulary | Rename/simplify. The current `v3/` subtree may remain as an implementation detail for the local backend, but not as the rewrite's conceptual model. |
 | `overlay` / `base` wording | Retain the semantics, but prefer `local unpublished state` and `published state` in new architecture docs and issues. |
 | File-version publication boundary (`incarnation`, manifest-like switch) | Retain the semantic requirement: remote visibility changes atomically at a file-version boundary. |
 | `STUDIOFS_*` tuning sprawl | Simplify into a JuiceFS-inspired CLI/config surface with only transitional env vars where necessary. |

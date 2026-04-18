@@ -60,7 +60,7 @@ mod tests {
     #[test]
     fn windows_stub_exports_write_path_summary_when_profile_requested() {
         let snapshot = VfsWritePathObservabilitySnapshot {
-            backend_tag: "cache-v3".to_string(),
+            backend_tag: "local-block-runtime".to_string(),
             winfsp_callbacks: VfsWritePathWinfspCallbackStats {
                 cleanup: 2,
                 close: 1,

@@ -1,29 +1,29 @@
-# Local Cache Layout Contract and Runtime Safety
+# Local Block Runtime Layout and Safety
 
-This file documents the current `v3` local-cache layout and safety rules for
-the in-tree implementation. It is not the canonical SFS-242 rewrite contract.
-The rewrite source of truth lives in
+This file documents the current local block runtime disk layout and safety
+rules for the in-tree implementation. It is not the canonical SFS-242 rewrite
+contract. The rewrite source of truth lives in
 [juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
 
 ## Purpose
 
-Define the current local-cache disk layout, backend-detection rules, startup
-safety reconciliation, and operator remediation for stale local cache state.
+Define the current local block runtime disk layout, detection rules, startup
+reconciliation behavior, and operator remediation for stale local cache state.
 
-This document is the source of truth only for the current `v3` implementation
-details and operator-facing safety expectations while that implementation
+This document is the source of truth only for the current implementation
+details and operator-facing safety expectations while the present runtime
 remains in service.
 
 ## 1. Versioned Disk Layout (v1)
 
-All local cache data lives under a dedicated `v3/` subtree inside the
+All local runtime data lives under a dedicated `v3/` subtree inside the
 per-volume cache root.
 
 ```text
 <cache-root>/
 └── v3/
-    ├── LAYOUT_V1                  # layout contract marker (required for v3 detection)
-    ├── tmp/                       # temporary files for atomic write/rename flows
+    ├── LAYOUT_V1
+    ├── tmp/
     ├── payload/
     │   └── blocks/
     │       ├── 00/
@@ -31,7 +31,7 @@ per-volume cache root.
     │       └── ff/
     │           └── <object-id>.block
     └── index/
-        └── cache.redb             # redb index database file
+        └── cache.redb
 ```
 
 Notes:
@@ -40,12 +40,11 @@ Notes:
 - Payload blocks are sharded into two levels (`00/00`..`ff/ff`) using a stable
   hash of `object_id`.
 
-## 2. Mount/Status Detection Contract
+## 2. Mount and Status Detection Contract
 
 Detection is read-only and must not mutate cache state.
 
-- The current local-cache layout is detected when `<cache-root>/v3/LAYOUT_V1`
-  exists.
+- The current layout is detected when `<cache-root>/v3/LAYOUT_V1` exists.
 - If no local contract exists yet, bootstrap provisions the `v3/` subtree
   before opening the backend.
 - Non-contract files under `<cache-root>` are ignored by backend open logic.
@@ -63,7 +62,7 @@ supporting signals only.
 | Mixed read/write with uploads | Mounted volume under sustained upload pressure | No foreground-latency regressions beyond target envelope |
 | Crash/restart recovery | Forced restart with dirty local state | Correct recovery with bounded startup time |
 | Disk footprint stability | Same object set over repeated runs | No unbounded growth; usage remains explainable and bounded |
-| Status/inspection safety | `studiofs status` against empty and `v3`-provisioned roots | No mutations, no destructive side effects |
+| Status/inspection safety | `studiofs status` against empty and provisioned roots | No mutations, no destructive side effects |
 
 ## 4. Runtime Rules
 
@@ -75,7 +74,7 @@ supporting signals only.
 
 ## 5. Startup Reconciliation and Repair Behavior
 
-On backend startup, reconciliation runs before normal reads/writes.
+On backend startup, reconciliation runs before normal reads and writes.
 
 Default startup mode (`lightweight`):
 
@@ -84,7 +83,7 @@ Default startup mode (`lightweight`):
    missing.
 
 Optional full sweep mode (`full`), enabled via
-`STUDIOFS_CACHE_V3_STARTUP_RECONCILE_MODE=full`:
+`STUDIOFS_LOCAL_BLOCK_STARTUP_RECONCILE_MODE=full`:
 
 1. Scan all index object ids and prune stale rows whose payload files are
    missing.
@@ -101,7 +100,7 @@ Safety rules:
 When cache-root artifacts outside `v3/**` are discovered:
 
 1. Treat them as non-runtime artifacts.
-2. Use `studiofs status` for current runtime health and `v3` counters.
+2. Use `studiofs status` for current runtime health and local counters.
 3. Archive or remove stale artifacts as part of local maintenance.
-4. Re-run mount; the current local-cache implementation reuses/provisions only
-   the `v3/` subtree.
+4. Re-run mount; the current implementation reuses or provisions only the
+   `v3/` subtree.

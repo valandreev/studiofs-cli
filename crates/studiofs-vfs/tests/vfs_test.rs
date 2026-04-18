@@ -20,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use studiofs_cache::runtime::CacheV3Layout;
+use studiofs_cache::runtime::LocalBlockLayout;
 use studiofs_cache::{PersistentLocalBlockBackend, open_local_block_backend};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_key,
@@ -93,8 +93,8 @@ fn make_format_info(volume_suffix: &str) -> FormatInfo {
 }
 
 fn create_cache_v3_layout_marker(cache_root: &std::path::Path) {
-    let layout = CacheV3Layout::from_cache_root(cache_root);
-    std::fs::create_dir_all(&layout.v3_root).unwrap();
+    let layout = LocalBlockLayout::from_cache_root(cache_root);
+    std::fs::create_dir_all(&layout.runtime_root).unwrap();
     std::fs::write(&layout.layout_marker, b"v1").unwrap();
 }
 
@@ -6414,7 +6414,7 @@ fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
     create_cache_v3_layout_marker(&cache_dir);
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
     let mut format_info = make_format_info_with_endpoint(
-        &format!("cache-v3-replay-{}", std::process::id()),
+        &format!("local-block-runtime-replay-{}", std::process::id()),
         "http://127.0.0.1:59999",
     );
     format_info.block_size = 512 * 1024;
@@ -6451,10 +6451,10 @@ fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
                 vfs.local_block_backend()
                     .as_any()
                     .is::<PersistentLocalBlockBackend>(),
-                "cache-v3 marker should select cache-v3 backend"
+                "local-block-runtime marker should select local-block-runtime backend"
             );
 
-            let attr = vfs.create(1, b"cache-v3-replay.bin", 0, 0, 0o644).unwrap();
+            let attr = vfs.create(1, b"local-block-runtime-replay.bin", 0, 0, 0o644).unwrap();
             ino = attr.ino;
             vfs.write(attr.ino, 0, &payload).await.unwrap();
             vfs.flush(attr.ino).await.unwrap();
@@ -6464,12 +6464,12 @@ fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
                     vfs.pending_uploads_for_inode(attr.ino).len() == 2
                 })
                 .await,
-                "offline cache-v3 run should queue dirty uploads before restart"
+                "offline local-block-runtime run should queue dirty uploads before restart"
             );
             dirty_before = vfs.local_block_backend().dirty_object_ids();
             assert!(
                 !dirty_before.is_empty(),
-                "offline cache-v3 run should retain dirty replay candidates in local backend"
+                "offline local-block-runtime run should retain dirty replay candidates in local backend"
             );
 
             let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
@@ -6501,7 +6501,7 @@ fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
                 vfs.local_block_backend()
                     .as_any()
                     .is::<PersistentLocalBlockBackend>(),
-                "restart must keep using cache-v3 backend contract"
+                "restart must keep using local-block-runtime backend contract"
             );
 
             let read = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
@@ -6511,17 +6511,17 @@ fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
                     !vfs.pending_uploads_for_inode(ino).is_empty()
                 })
                 .await,
-                "cache-v3 restart should replay pending uploads from persisted dirty index state"
+                "local-block-runtime restart should replay pending uploads from persisted dirty index state"
             );
             let dirty_after = vfs.local_block_backend().dirty_object_ids();
             assert!(
                 !dirty_after.is_empty(),
-                "cache-v3 restart should expose dirty replay candidates from index"
+                "local-block-runtime restart should expose dirty replay candidates from index"
             );
             for object_id in &dirty_before {
                 assert!(
                     dirty_after.contains(object_id),
-                    "cache-v3 replay lost dirty object {object_id}"
+                    "local-block-runtime replay lost dirty object {object_id}"
                 );
             }
             vfs.shutdown(Duration::from_secs(10)).await;

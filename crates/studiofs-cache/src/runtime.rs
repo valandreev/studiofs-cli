@@ -41,11 +41,11 @@ pub use cache_index::{
 use eviction::{CacheBudgetGovernor, EVICTION_CANDIDATE_PAGE_SIZE, EVICTION_DELETE_BATCH_SIZE};
 pub use file_payload_store::{FilePayloadStore, FilePayloadStoreError};
 pub use layout::{
-    CACHE_V3_LAYOUT_MARKER_FILE, CACHE_V3_LAYOUT_VERSION, CACHE_V3_PAYLOAD_SHARD_COUNT,
-    CACHE_V3_REDB_INDEX_FILE, CACHE_V3_SUBTREE, CacheV3Layout,
+    LOCAL_BLOCK_LAYOUT_MARKER_FILE, LOCAL_BLOCK_LAYOUT_VERSION, LOCAL_BLOCK_PAYLOAD_SHARD_COUNT,
+    LOCAL_BLOCK_REDB_INDEX_FILE, LOCAL_BLOCK_SUBTREE, LocalBlockLayout,
 };
-pub use reconcile::{CacheV3StartupReconcileError, CacheV3StartupReconcileReport};
-use reconcile::{CacheV3StartupReconcileMode, reconcile_startup_state};
+pub use reconcile::{LocalBlockStartupReconcileError, LocalBlockStartupReconcileReport};
+use reconcile::{LocalBlockStartupReconcileMode, reconcile_startup_state};
 
 const ACCESS_TOUCH_MIN_INTERVAL: Duration = Duration::from_secs(60);
 const ACCESS_TOUCH_BATCH_SIZE: usize = 128;
@@ -61,19 +61,19 @@ const LOW_SPACE_UPLOAD_DRAIN_RETRIES: usize = 4;
 
 /// Backend kind available on the runtime path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CacheBackendKind {
-    CacheV3,
+pub enum LocalBlockBackendKind {
+    Current,
 }
 
-impl CacheBackendKind {
+impl LocalBlockBackendKind {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::CacheV3 => "cache-v3",
+            Self::Current => "local-block-runtime",
         }
     }
 }
 
-impl fmt::Display for CacheBackendKind {
+impl fmt::Display for LocalBlockBackendKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -81,64 +81,64 @@ impl fmt::Display for CacheBackendKind {
 
 /// Detection snapshot for a per-volume cache root.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CacheBackendDetection {
-    pub layout: CacheV3Layout,
-    pub v3_layout_marker_exists: bool,
-    pub v3_index_exists: bool,
-    pub v3_payload_blocks_dir_exists: bool,
-    pub v3_tmp_dir_exists: bool,
-    pub v3_index_dir_exists: bool,
+pub struct LocalBlockRuntimeDetection {
+    pub layout: LocalBlockLayout,
+    pub layout_marker_exists: bool,
+    pub index_exists: bool,
+    pub payload_blocks_dir_exists: bool,
+    pub tmp_dir_exists: bool,
+    pub index_dir_exists: bool,
 }
 
-impl CacheBackendDetection {
-    pub fn has_cache_v3_contract(&self) -> bool {
-        self.v3_layout_marker_exists
+impl LocalBlockRuntimeDetection {
+    pub fn has_runtime_layout(&self) -> bool {
+        self.layout_marker_exists
     }
 
     pub const fn needs_runtime_provisioning(&self) -> bool {
-        !self.v3_layout_marker_exists
-            || !self.v3_payload_blocks_dir_exists
-            || !self.v3_tmp_dir_exists
-            || !self.v3_index_dir_exists
+        !self.layout_marker_exists
+            || !self.payload_blocks_dir_exists
+            || !self.tmp_dir_exists
+            || !self.index_dir_exists
     }
 
-    pub fn runtime_backend(&self) -> Option<CacheBackendKind> {
-        if !self.has_cache_v3_contract() {
+    pub fn runtime_backend(&self) -> Option<LocalBlockBackendKind> {
+        if !self.has_runtime_layout() {
             None
         } else {
-            Some(CacheBackendKind::CacheV3)
+            Some(LocalBlockBackendKind::Current)
         }
     }
 }
 
 /// Detect backend contracts for a per-volume cache root.
-pub fn detect_cache_backends(cache_root: &Path) -> io::Result<CacheBackendDetection> {
-    let layout = CacheV3Layout::from_cache_root(cache_root);
-    let v3_layout_marker_exists = layout.layout_marker.try_exists()?;
-    let v3_index_exists = layout.redb_index_path.try_exists()?;
-    let v3_payload_blocks_dir_exists = layout.payload_blocks_dir.try_exists()?;
-    let v3_tmp_dir_exists = layout.tmp_dir.try_exists()?;
-    let v3_index_dir_exists = layout.index_dir.try_exists()?;
-    Ok(CacheBackendDetection {
+pub fn detect_cache_backends(cache_root: &Path) -> io::Result<LocalBlockRuntimeDetection> {
+    let layout = LocalBlockLayout::from_cache_root(cache_root);
+    let layout_marker_exists = layout.layout_marker.try_exists()?;
+    let index_exists = layout.redb_index_path.try_exists()?;
+    let payload_blocks_dir_exists = layout.payload_blocks_dir.try_exists()?;
+    let tmp_dir_exists = layout.tmp_dir.try_exists()?;
+    let index_dir_exists = layout.index_dir.try_exists()?;
+    Ok(LocalBlockRuntimeDetection {
         layout,
-        v3_layout_marker_exists,
-        v3_index_exists,
-        v3_payload_blocks_dir_exists,
-        v3_tmp_dir_exists,
-        v3_index_dir_exists,
+        layout_marker_exists,
+        index_exists,
+        payload_blocks_dir_exists,
+        tmp_dir_exists,
+        index_dir_exists,
     })
 }
 
-/// Configuration for opening the current `v3` local backend.
+/// Configuration for opening the current local block backend.
 #[derive(Debug, Clone)]
-pub struct CacheV3LocalBlockBackendConfig {
+pub struct LocalBlockBackendConfig {
     pub cache_root: PathBuf,
     pub volume_uuid: [u8; 16],
 }
 
-/// Payload-store sync cadence policy for the current `v3` local backend.
+/// Payload-store sync cadence policy for the current local block backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CacheV3PayloadSyncMode {
+pub enum LocalBlockPayloadSyncMode {
     /// Keep per-write file+directory barriers at payload commit time.
     #[default]
     Durable,
@@ -146,34 +146,34 @@ pub enum CacheV3PayloadSyncMode {
     Fast,
 }
 
-/// Errors returned while opening the current `v3` local backend.
+/// Errors returned while opening the current local block backend.
 #[derive(Debug, thiserror::Error)]
-pub enum CacheV3LocalBlockBackendError {
+pub enum LocalBlockBackendOpenError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
-    #[error("cache-v3 layout marker is missing at '{path}'")]
+    #[error("local block layout marker is missing at '{path}'")]
     MissingLayoutMarker { path: PathBuf },
-    #[error("failed to open cache-v3 index at '{path}': {source}")]
+    #[error("failed to open local block index at '{path}': {source}")]
     OpenCacheIndex {
         path: PathBuf,
         #[source]
         source: CacheIndexError,
     },
-    #[error("failed to open cache-v3 payload store at '{cache_root}': {source}")]
+    #[error("failed to open local block payload store at '{cache_root}': {source}")]
     OpenPayloadStore {
         cache_root: PathBuf,
         #[source]
         source: FilePayloadStoreError,
     },
-    #[error("failed to reconcile cache-v3 startup state under '{cache_root}': {source}")]
+    #[error("failed to reconcile local block startup state under '{cache_root}': {source}")]
     StartupReconcile {
         cache_root: PathBuf,
         #[source]
-        source: CacheV3StartupReconcileError,
+        source: LocalBlockStartupReconcileError,
     },
 }
 
-impl CacheV3LocalBlockBackendError {
+impl LocalBlockBackendOpenError {
     pub fn is_transient_open_lock_conflict(&self) -> bool {
         match self {
             Self::OpenCacheIndex { source, .. } => source.is_database_lock_conflict(),
@@ -182,10 +182,10 @@ impl CacheV3LocalBlockBackendError {
     }
 }
 
-/// Current `v3` local backend backed by file-per-block payload files and redb index.
+/// Current local backend backed by file-per-block payload files and redb index.
 #[derive(Debug)]
-pub struct CacheV3LocalBlockBackend {
-    layout: CacheV3Layout,
+pub struct LocalBlockBackendRuntime {
+    layout: LocalBlockLayout,
     volume_uuid: [u8; 16],
     index: CacheIndex,
     payload_store: FilePayloadStore,
@@ -201,7 +201,7 @@ pub struct CacheV3LocalBlockBackend {
 }
 
 struct DirtyValidationGuard<'a> {
-    backend: &'a CacheV3LocalBlockBackend,
+    backend: &'a LocalBlockBackendRuntime,
 }
 
 impl Drop for DirtyValidationGuard<'_> {
@@ -212,44 +212,42 @@ impl Drop for DirtyValidationGuard<'_> {
     }
 }
 
-impl Drop for CacheV3LocalBlockBackend {
+impl Drop for LocalBlockBackendRuntime {
     fn drop(&mut self) {
         self.flush_access_touches(true, "drop");
     }
 }
 
-impl CacheV3LocalBlockBackend {
-    pub fn open(
-        config: CacheV3LocalBlockBackendConfig,
-    ) -> Result<Self, CacheV3LocalBlockBackendError> {
-        Self::open_with_budget_and_sync_mode(config, None, CacheV3PayloadSyncMode::Durable)
+impl LocalBlockBackendRuntime {
+    pub fn open(config: LocalBlockBackendConfig) -> Result<Self, LocalBlockBackendOpenError> {
+        Self::open_with_budget_and_sync_mode(config, None, LocalBlockPayloadSyncMode::Durable)
     }
 
     pub fn open_with_budget(
-        config: CacheV3LocalBlockBackendConfig,
+        config: LocalBlockBackendConfig,
         cache_budget_bytes: Option<u64>,
-    ) -> Result<Self, CacheV3LocalBlockBackendError> {
+    ) -> Result<Self, LocalBlockBackendOpenError> {
         Self::open_with_budget_and_sync_mode(
             config,
             cache_budget_bytes,
-            CacheV3PayloadSyncMode::Durable,
+            LocalBlockPayloadSyncMode::Durable,
         )
     }
 
     pub fn open_with_budget_and_sync_mode(
-        config: CacheV3LocalBlockBackendConfig,
+        config: LocalBlockBackendConfig,
         cache_budget_bytes: Option<u64>,
-        payload_sync_mode: CacheV3PayloadSyncMode,
-    ) -> Result<Self, CacheV3LocalBlockBackendError> {
-        let layout = CacheV3Layout::from_cache_root(&config.cache_root);
+        payload_sync_mode: LocalBlockPayloadSyncMode,
+    ) -> Result<Self, LocalBlockBackendOpenError> {
+        let layout = LocalBlockLayout::from_cache_root(&config.cache_root);
         if !layout.layout_marker.try_exists()? {
-            return Err(CacheV3LocalBlockBackendError::MissingLayoutMarker {
+            return Err(LocalBlockBackendOpenError::MissingLayoutMarker {
                 path: layout.layout_marker.clone(),
             });
         }
 
         let index = CacheIndex::open(&layout.redb_index_path).map_err(|source| {
-            CacheV3LocalBlockBackendError::OpenCacheIndex {
+            LocalBlockBackendOpenError::OpenCacheIndex {
                 path: layout.redb_index_path.clone(),
                 source,
             }
@@ -257,17 +255,17 @@ impl CacheV3LocalBlockBackend {
 
         let payload_store =
             FilePayloadStore::open_with_sync_mode(layout.clone(), payload_sync_mode).map_err(
-                |source| CacheV3LocalBlockBackendError::OpenPayloadStore {
-                    cache_root: layout.v3_root.clone(),
+                |source| LocalBlockBackendOpenError::OpenPayloadStore {
+                    cache_root: layout.runtime_root.clone(),
                     source,
                 },
             )?;
 
-        let startup_reconcile_mode = CacheV3StartupReconcileMode::from_env();
+        let startup_reconcile_mode = LocalBlockStartupReconcileMode::from_env();
         let startup_reconcile_report =
             reconcile_startup_state(&layout, &index, startup_reconcile_mode).map_err(|source| {
-                CacheV3LocalBlockBackendError::StartupReconcile {
-                    cache_root: layout.v3_root.clone(),
+                LocalBlockBackendOpenError::StartupReconcile {
+                    cache_root: layout.runtime_root.clone(),
                     source,
                 }
             })?;
@@ -278,7 +276,7 @@ impl CacheV3LocalBlockBackend {
                 stale_index_entries_removed = startup_reconcile_report.stale_index_entries_removed,
                 orphan_payload_files_removed =
                     startup_reconcile_report.orphan_payload_files_removed,
-                "cache-v3 startup reconciliation repaired cache artifacts"
+                "local block runtime startup reconciliation repaired cache artifacts"
             );
         }
 
@@ -313,7 +311,7 @@ impl CacheV3LocalBlockBackend {
                 warn!(
                     object_id,
                     error = ?error,
-                    "cache-v3 index lookup failed while checking payload presence"
+                    "local block runtime index lookup failed while checking payload presence"
                 );
                 false
             }
@@ -337,14 +335,15 @@ impl CacheV3LocalBlockBackend {
     fn remove_orphaned_index_entry(&self, object_id: u64, operation: &'static str) {
         warn!(
             object_id,
-            operation, "cache-v3 detected index entry without payload; pruning stale index entry"
+            operation,
+            "local block runtime detected index entry without payload; pruning stale index entry"
         );
         if let Err(error) = self.index.remove(object_id) {
             warn!(
                 object_id,
                 operation,
                 error = ?error,
-                "cache-v3 failed to prune stale index entry"
+                "local block runtime failed to prune stale index entry"
             );
         }
     }
@@ -357,7 +356,7 @@ impl CacheV3LocalBlockBackend {
                     object_id,
                     operation,
                     error = ?error,
-                    "cache-v3 payload existence probe failed"
+                    "local block runtime payload existence probe failed"
                 );
                 false
             }
@@ -389,14 +388,14 @@ impl CacheV3LocalBlockBackend {
         warn!(
             operation,
             orphan_count = object_ids.len(),
-            "cache-v3 pruning stale index entries that no longer have payload files"
+            "local block runtime pruning stale index entries that no longer have payload files"
         );
         if let Err(error) = self.index.remove_batch(object_ids) {
             warn!(
                 operation,
                 orphan_count = object_ids.len(),
                 error = ?error,
-                "cache-v3 batch prune of stale index entries failed"
+                "local block runtime batch prune of stale index entries failed"
             );
         } else {
             self.forget_access_touches(object_ids);
@@ -458,7 +457,7 @@ impl CacheV3LocalBlockBackend {
                 payload_len,
                 dirty_object_count,
                 wait_ms = LOW_SPACE_UPLOAD_DRAIN_WAIT.as_millis(),
-                "cache-v3 low-space put waiting briefly for pending upload drain"
+                "local block runtime low-space put waiting briefly for pending upload drain"
             );
             self.wait_for_storage_state_change(observed_epoch);
             current_after_evict =
@@ -487,7 +486,7 @@ impl CacheV3LocalBlockBackend {
                 operation,
                 count = pending_ids.len(),
                 error = ?error,
-                "cache-v3 batched access touch failed"
+                "local block runtime batched access touch failed"
             );
             let mut pending = self.pending_access_touches.lock();
             pending.requeue_after_failure(pending_ids);
@@ -561,7 +560,7 @@ impl CacheV3LocalBlockBackend {
                     scanned_rows = page.scanned_rows,
                     skipped_non_evictable,
                     skipped_non_evictable_total = skipped_total,
-                    "cache-v3 eviction candidate scan skipped non-evictable rows"
+                    "local block runtime eviction candidate scan skipped non-evictable rows"
                 );
             }
             if !batch.is_empty() {
@@ -581,7 +580,7 @@ impl CacheV3LocalBlockBackend {
                 operation,
                 current_bytes = final_current,
                 target_bytes,
-                "cache-v3 budget pressure remained above target after deterministic eviction pass"
+                "local block runtime budget pressure remained above target after deterministic eviction pass"
             );
         }
         Ok(final_current)
@@ -646,7 +645,7 @@ impl CacheV3LocalBlockBackend {
                 payload_len,
                 current_bytes = current_after_evict,
                 budget_bytes = ?self.budget_governor.budget_bytes(),
-                "cache-v3 skipped evictable put because budget remained under hard pressure"
+                "local block runtime skipped evictable put because budget remained under hard pressure"
             );
             return Ok(true);
         }
@@ -690,7 +689,7 @@ impl CacheV3LocalBlockBackend {
     }
 }
 
-impl LocalBlockBackend for CacheV3LocalBlockBackend {
+impl LocalBlockBackend for LocalBlockBackendRuntime {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -733,7 +732,7 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
                 warn!(
                     object_id,
                     error = ?error,
-                    "cache-v3 index get_for_upload lookup failed"
+                    "local block runtime index get_for_upload lookup failed"
                 );
                 return None;
             }
@@ -804,7 +803,7 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
                 object_id,
                 volume_uuid = ?self.volume_uuid,
                 error = ?error,
-                "cache-v3 index upsert failed after payload write; removed payload for rollback"
+                "local block runtime index upsert failed after payload write; removed payload for rollback"
             );
             return Err(LocalBlockBackendError::Other(Box::new(error)));
         }
@@ -831,13 +830,13 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
                     debug!(
                         current_bytes,
                         target_bytes,
-                        "cache-v3 background pressure maintenance eviction pass completed"
+                        "local block runtime background pressure maintenance eviction pass completed"
                     );
                 }
                 None => {
                     debug!(
                         target_bytes,
-                        "cache-v3 background pressure maintenance skipped because another eviction pass is in progress"
+                        "local block runtime background pressure maintenance skipped because another eviction pass is in progress"
                     );
                 }
             }
@@ -847,7 +846,7 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
 
     fn mark_uploading(&self, object_id: u64) {
         if let Err(error) = self.index.mark_uploading(object_id) {
-            warn!(object_id, error = ?error, "cache-v3 index mark_uploading failed");
+            warn!(object_id, error = ?error, "local block runtime index mark_uploading failed");
         }
     }
 
@@ -856,14 +855,14 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
             warn!(
                 object_id,
                 error = ?error,
-                "cache-v3 index mark_upload_failed failed"
+                "local block runtime index mark_upload_failed failed"
             );
         }
     }
 
     fn mark_uploaded(&self, object_id: u64) {
         if let Err(error) = self.index.mark_uploaded(object_id) {
-            warn!(object_id, error = ?error, "cache-v3 index mark_uploaded failed");
+            warn!(object_id, error = ?error, "local block runtime index mark_uploaded failed");
         } else {
             self.note_storage_state_change();
         }
@@ -921,7 +920,7 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
 
     fn remove(&self, object_id: u64) {
         if let Err(error) = self.index.remove(object_id) {
-            warn!(object_id, error = ?error, "cache-v3 index remove failed");
+            warn!(object_id, error = ?error, "local block runtime index remove failed");
             return;
         }
         self.forget_runtime_pins(&[object_id]);
@@ -938,7 +937,7 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
             warn!(
                 count = object_ids.len(),
                 error = ?error,
-                "cache-v3 index remove_batch failed"
+                "local block runtime index remove_batch failed"
             );
             return;
         }
@@ -970,7 +969,7 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
             Err(error) => {
                 warn!(
                     error = ?error,
-                    "cache-v3 index dirty snapshot failed"
+                    "local block runtime index dirty snapshot failed"
                 );
                 Vec::new()
             }
@@ -981,7 +980,7 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
         match self.index.dirty_object_count() {
             Ok(count) => count,
             Err(error) => {
-                warn!(error = ?error, "cache-v3 index dirty count lookup failed");
+                warn!(error = ?error, "local block runtime index dirty count lookup failed");
                 0
             }
         }
@@ -1002,7 +1001,7 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
                 warn!(
                     object_id,
                     error = ?error,
-                    "cache-v3 index lifecycle lookup failed"
+                    "local block runtime index lifecycle lookup failed"
                 );
                 LocalBlockLifecycleState::Missing
             }
@@ -1024,7 +1023,7 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
                 warn!(
                     object_id,
                     error = ?error,
-                    "cache-v3 index evictable lookup failed"
+                    "local block runtime index evictable lookup failed"
                 );
                 false
             }
@@ -1044,7 +1043,7 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
                 }
             }
             Err(error) => {
-                warn!(error = ?error, "cache-v3 index storage stats lookup failed");
+                warn!(error = ?error, "local block runtime index storage stats lookup failed");
                 LocalBlockStorageStats::default()
             }
         }
@@ -1065,7 +1064,7 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
                 warn!(
                     object_id,
                     error = ?error,
-                    "cache-v3 index object stats lookup failed"
+                    "local block runtime index object stats lookup failed"
                 );
                 None
             }
@@ -1076,7 +1075,7 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
         match self.index.access_order_object_ids() {
             Ok(object_ids) => object_ids,
             Err(error) => {
-                warn!(error = ?error, "cache-v3 index object id snapshot failed");
+                warn!(error = ?error, "local block runtime index object id snapshot failed");
                 Vec::new()
             }
         }
@@ -1193,8 +1192,8 @@ mod tests {
     use crate::local::{LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState};
     use crate::local::{LocalBlockOrigin, LocalBlockUploadState};
 
-    fn create_v3_marker(layout: &CacheV3Layout) {
-        std::fs::create_dir_all(&layout.v3_root).unwrap();
+    fn create_v3_marker(layout: &LocalBlockLayout) {
+        std::fs::create_dir_all(&layout.runtime_root).unwrap();
         std::fs::write(&layout.layout_marker, b"v1").unwrap();
     }
 
@@ -1203,52 +1202,55 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let detection = detect_cache_backends(temp.path()).unwrap();
 
-        assert!(!detection.has_cache_v3_contract());
-        assert!(!detection.v3_index_exists);
-        assert!(!detection.v3_payload_blocks_dir_exists);
-        assert!(!detection.v3_tmp_dir_exists);
-        assert!(!detection.v3_index_dir_exists);
+        assert!(!detection.has_runtime_layout());
+        assert!(!detection.index_exists);
+        assert!(!detection.payload_blocks_dir_exists);
+        assert!(!detection.tmp_dir_exists);
+        assert!(!detection.index_dir_exists);
         assert!(detection.needs_runtime_provisioning());
         assert_eq!(detection.runtime_backend(), None);
     }
 
     #[test]
-    fn detects_v3_only_layout() {
+    fn detects_current_runtime_layout() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
         let detection = detect_cache_backends(temp.path()).unwrap();
-        assert!(detection.has_cache_v3_contract());
-        assert!(!detection.v3_index_exists);
-        assert!(!detection.v3_payload_blocks_dir_exists);
-        assert!(!detection.v3_tmp_dir_exists);
-        assert!(!detection.v3_index_dir_exists);
+        assert!(detection.has_runtime_layout());
+        assert!(!detection.index_exists);
+        assert!(!detection.payload_blocks_dir_exists);
+        assert!(!detection.tmp_dir_exists);
+        assert!(!detection.index_dir_exists);
         assert!(detection.needs_runtime_provisioning());
-        assert_eq!(detection.runtime_backend(), Some(CacheBackendKind::CacheV3));
+        assert_eq!(
+            detection.runtime_backend(),
+            Some(LocalBlockBackendKind::Current)
+        );
     }
 
     #[test]
-    fn cache_v3_backend_requires_layout_marker() {
+    fn local_block_backend_requires_layout_marker() {
         let temp = tempfile::tempdir().unwrap();
-        let err = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+        let err = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0xAB; 16],
         })
         .unwrap_err();
         assert!(matches!(
             err,
-            CacheV3LocalBlockBackendError::MissingLayoutMarker { .. }
+            LocalBlockBackendOpenError::MissingLayoutMarker { .. }
         ));
     }
 
     #[test]
-    fn cache_v3_backend_satisfies_local_block_backend_contract() {
+    fn local_block_backend_satisfies_local_block_backend_contract() {
         assert_local_block_backend_contract(|| {
             let temp = tempfile::tempdir().unwrap();
-            let layout = CacheV3Layout::from_cache_root(temp.path());
+            let layout = LocalBlockLayout::from_cache_root(temp.path());
             create_v3_marker(&layout);
-            let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+            let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
                 cache_root: temp.path().to_path_buf(),
                 volume_uuid: [0xCA; 16],
             })
@@ -1258,12 +1260,12 @@ mod tests {
     }
 
     #[test]
-    fn cache_v3_backend_roundtrips_payload_and_index_state() {
+    fn local_block_backend_roundtrips_payload_and_index_state() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0xCD; 16],
         })
@@ -1276,18 +1278,18 @@ mod tests {
     }
 
     #[test]
-    fn cache_v3_fast_sync_mode_defers_payload_store_barriers_until_sync_data() {
+    fn local_block_fast_sync_mode_defers_payload_store_barriers_until_sync_data() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = CacheV3LocalBlockBackend::open_with_budget_and_sync_mode(
-            CacheV3LocalBlockBackendConfig {
+        let backend = LocalBlockBackendRuntime::open_with_budget_and_sync_mode(
+            LocalBlockBackendConfig {
                 cache_root: temp.path().to_path_buf(),
                 volume_uuid: [0xCE; 16],
             },
             None,
-            CacheV3PayloadSyncMode::Fast,
+            LocalBlockPayloadSyncMode::Fast,
         )
         .unwrap();
         backend.put(101, b"one", false).unwrap();
@@ -1310,10 +1312,10 @@ mod tests {
     #[test]
     fn cache_v3_backend_uses_index_state_after_reopen() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x11; 16],
         })
@@ -1329,7 +1331,7 @@ mod tests {
         index.mark_uploaded(1).unwrap();
         drop(index);
 
-        let reopened = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+        let reopened = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x11; 16],
         })
@@ -1352,23 +1354,22 @@ mod tests {
     }
 
     #[test]
-    fn cache_v3_backend_reopens_legacy_v1_index_state() {
+    fn local_block_backend_reopens_existing_index_state() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let legacy_backend =
-            crate::v3::CacheV3LocalBlockBackend::open(crate::v3::CacheV3LocalBlockBackendConfig {
-                cache_root: temp.path().to_path_buf(),
-                volume_uuid: [0x12; 16],
-            })
-            .unwrap();
-        legacy_backend.put(7, b"legacy-pending", false).unwrap();
-        legacy_backend.mark_uploading(7);
-        legacy_backend.sync_data().unwrap();
-        drop(legacy_backend);
+        let existing_backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+            cache_root: temp.path().to_path_buf(),
+            volume_uuid: [0x12; 16],
+        })
+        .unwrap();
+        existing_backend.put(7, b"legacy-pending", false).unwrap();
+        existing_backend.mark_uploading(7);
+        existing_backend.sync_data().unwrap();
+        drop(existing_backend);
 
-        let reopened = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+        let reopened = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x12; 16],
         })
@@ -1387,10 +1388,10 @@ mod tests {
     #[test]
     fn cache_v3_backend_object_stats_distinguish_local_pending_and_downloaded_cache() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x21; 16],
         })
@@ -1412,10 +1413,10 @@ mod tests {
     #[test]
     fn cache_v3_backend_get_refreshes_access_order() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x22; 16],
         })
@@ -1432,10 +1433,10 @@ mod tests {
     #[test]
     fn cache_v3_backend_read_into_refreshes_access_order() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x23; 16],
         })
@@ -1454,10 +1455,10 @@ mod tests {
     #[test]
     fn cache_v3_backend_persists_blocks_in_file_per_block_payload_layout() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x33; 16],
         })
@@ -1466,7 +1467,7 @@ mod tests {
 
         assert!(
             layout.payload_block_path(0xABCD).exists(),
-            "cache-v3 must persist each block as an individual payload file"
+            "local block runtime must persist each block as an individual payload file"
         );
         let entry = backend.index.get_entry(0xABCD).unwrap().unwrap();
         assert_eq!(entry.origin, LocalBlockOrigin::Local);
@@ -1477,10 +1478,10 @@ mod tests {
     #[test]
     fn cache_v3_backend_reopens_with_existing_payload_file() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x44; 16],
         })
@@ -1489,7 +1490,7 @@ mod tests {
         backend.sync_data().unwrap();
         drop(backend);
 
-        let reopened = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+        let reopened = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x44; 16],
         })
@@ -1500,10 +1501,10 @@ mod tests {
     #[test]
     fn cache_v3_backend_open_reconciles_stale_index_entries() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x45; 16],
         })
@@ -1517,7 +1518,7 @@ mod tests {
         assert!(index_before.get_entry(501).unwrap().is_some());
         drop(index_before);
 
-        let reopened = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+        let reopened = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x45; 16],
         })
@@ -1531,14 +1532,14 @@ mod tests {
     #[test]
     fn cache_v3_backend_open_removes_orphan_temp_files() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
         let staged_tmp_dir_file = layout.tmp_dir.join("pending").join("write.tmp");
         std::fs::create_dir_all(staged_tmp_dir_file.parent().unwrap()).unwrap();
         std::fs::write(&staged_tmp_dir_file, b"staged").unwrap();
 
-        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x46; 16],
         })
@@ -1551,10 +1552,10 @@ mod tests {
     #[test]
     fn cache_v3_backend_failed_upload_requeues_without_losing_payload_bytes() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x55; 16],
         })
@@ -1586,10 +1587,10 @@ mod tests {
     #[test]
     fn cache_v3_backend_prunes_missing_payload_entries_from_dirty_replay() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x66; 16],
         })
@@ -1613,10 +1614,10 @@ mod tests {
     #[test]
     fn cache_v3_backend_object_stats_do_not_prune_missing_payload_entries() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x67; 16],
         })
@@ -1641,11 +1642,11 @@ mod tests {
     #[test]
     fn cache_v3_backend_enforces_budget_with_deterministic_eviction_order() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = CacheV3LocalBlockBackend::open_with_budget(
-            CacheV3LocalBlockBackendConfig {
+        let backend = LocalBlockBackendRuntime::open_with_budget(
+            LocalBlockBackendConfig {
                 cache_root: temp.path().to_path_buf(),
                 volume_uuid: [0x71; 16],
             },
@@ -1669,11 +1670,11 @@ mod tests {
     #[test]
     fn cache_v3_backend_returns_capacity_exhausted_for_non_evictable_pressure() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = CacheV3LocalBlockBackend::open_with_budget(
-            CacheV3LocalBlockBackendConfig {
+        let backend = LocalBlockBackendRuntime::open_with_budget(
+            LocalBlockBackendConfig {
                 cache_root: temp.path().to_path_buf(),
                 volume_uuid: [0x72; 16],
             },
@@ -1695,12 +1696,12 @@ mod tests {
     #[test]
     fn cache_v3_backend_waits_for_pending_upload_drain_before_capacity_exhausted() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
         let backend = std::sync::Arc::new(
-            CacheV3LocalBlockBackend::open_with_budget(
-                CacheV3LocalBlockBackendConfig {
+            LocalBlockBackendRuntime::open_with_budget(
+                LocalBlockBackendConfig {
                     cache_root: temp.path().to_path_buf(),
                     volume_uuid: [0x7B; 16],
                 },
@@ -1738,11 +1739,11 @@ mod tests {
     #[test]
     fn cache_v3_retry_low_space_reclaims_when_pending_upload_already_finished() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = CacheV3LocalBlockBackend::open_with_budget(
-            CacheV3LocalBlockBackendConfig {
+        let backend = LocalBlockBackendRuntime::open_with_budget(
+            LocalBlockBackendConfig {
                 cache_root: temp.path().to_path_buf(),
                 volume_uuid: [0x7C; 16],
             },
@@ -1777,11 +1778,11 @@ mod tests {
     #[test]
     fn cache_v3_background_pressure_reclaims_to_low_watermark() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = CacheV3LocalBlockBackend::open_with_budget(
-            CacheV3LocalBlockBackendConfig {
+        let backend = LocalBlockBackendRuntime::open_with_budget(
+            LocalBlockBackendConfig {
                 cache_root: temp.path().to_path_buf(),
                 volume_uuid: [0x73; 16],
             },
@@ -1811,15 +1812,15 @@ mod tests {
     #[test]
     fn cache_v3_runtime_pins_do_not_persist_across_reopen() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let config = CacheV3LocalBlockBackendConfig {
+        let config = LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x7A; 16],
         };
         let backend =
-            CacheV3LocalBlockBackend::open_with_budget(config.clone(), Some(100)).unwrap();
+            LocalBlockBackendRuntime::open_with_budget(config.clone(), Some(100)).unwrap();
         backend.put(20, &[0x01; 30], true).unwrap();
         backend.pin(20);
         assert!(
@@ -1830,7 +1831,7 @@ mod tests {
         assert!(!backend.object_stats(20).unwrap().evictable);
         drop(backend);
 
-        let reopened = CacheV3LocalBlockBackend::open_with_budget(config, Some(100)).unwrap();
+        let reopened = LocalBlockBackendRuntime::open_with_budget(config, Some(100)).unwrap();
         assert!(
             reopened.is_evictable(20),
             "runtime pin state must be cleared on reopen instead of persisting in redb"
@@ -1842,11 +1843,11 @@ mod tests {
     #[test]
     fn cache_v3_eviction_tracks_skipped_non_evictable_scan_rows() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = CacheV3LocalBlockBackend::open_with_budget(
-            CacheV3LocalBlockBackendConfig {
+        let backend = LocalBlockBackendRuntime::open_with_budget(
+            LocalBlockBackendConfig {
                 cache_root: temp.path().to_path_buf(),
                 volume_uuid: [0x74; 16],
             },
@@ -1879,10 +1880,10 @@ mod tests {
     #[test]
     fn dirty_validation_gate_allows_single_runner_per_interval() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = CacheV3Layout::from_cache_root(temp.path());
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = CacheV3LocalBlockBackend::open(CacheV3LocalBlockBackendConfig {
+        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x77; 16],
         })
