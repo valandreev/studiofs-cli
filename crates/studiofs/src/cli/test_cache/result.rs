@@ -53,8 +53,25 @@ pub(super) struct BenchmarkReport {
     pub(super) local_first_read_comparison: Option<MountedLocalFirstReadComparisonReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) stream_results: Option<Vec<StreamResultReport>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) mounted_memory: Option<MountedMemoryReport>,
     pub(super) writes: OpReport,
     pub(super) reads: OpReport,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct MountedMemoryReport {
+    pub(super) mount_pid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) rss_bytes_steady_state: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) rss_bytes_peak: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) dirty_bytes_steady_state: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) dirty_bytes_peak: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) dirty_limit_bytes: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -512,6 +529,7 @@ pub(crate) fn sample_report() -> BenchmarkReport {
         }),
         local_first_read_comparison: None,
         stream_results: None,
+        mounted_memory: None,
         writes: OpReport {
             operations: 16,
             bytes: 128 * 1024 * 1024,

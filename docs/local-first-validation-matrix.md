@@ -152,8 +152,13 @@ cargo run -p studiofs -- test-cache <mounted-path> \
 ```
 
 When the mounted runtime exposes upload-state metadata, inspect the human
-summary or JSON `buffered_read_comparison` section for the
-`baseline-read`, `during-upload-read`, and `post-upload-read` phases.
+summary or JSON `local_first_read_comparison` section for the
+`baseline-read`, `during-upload-read`, and `post-upload-read` phases. When
+mounted process observability is available, inspect the `Mounted memory`
+terminal table or JSON `mounted_memory` section for `rss_bytes_peak`,
+`rss_bytes_steady_state`, `dirty_bytes_peak`, and `dirty_limit_bytes`. These
+fields are best-effort and may be omitted when the measured run does not expose
+that signal.
 
 ### Small-File Random I/O / Metadata-Sensitive Run
 
@@ -223,13 +228,40 @@ Do not treat these as parity failures:
 - StudioFS remote visibility flips at a file-version publish boundary after
   upload plus publish; it is intentionally eventual rather than close-to-open.
 - StudioFS benchmark output may surface Local-First specific metadata such as
-  `buffered_read_comparison` phases or cache-level counters that do not have a
-  1:1 JuiceFS label.
+  `local_first_read_comparison`, `mounted_memory`, or cache-level counters
+  that do not have a 1:1 JuiceFS label.
 
 When a JuiceFS reference comparison is useful, reuse the same workload shape
 (block size, read size, concurrency, access pattern, warm/cold setup) and
 compare throughput/latency trends, not identical callback timing or visibility
 semantics.
+
+### SFS-262 Mounted Default Gate
+
+For `SFS-262`, lock the default mounted benchmark recipe to a same-host
+StudioFS versus JuiceFS comparison:
+
+- Use default-mounted StudioFS and default-mounted JuiceFS unless the ticket is
+  explicitly about a non-default tuning surface. If you override any knob,
+  record every override in the benchmark notes.
+- Run the mounted sequential recipe above on both filesystems with the same
+  block size, read size, size list, concurrency, queue depth, warm-up count,
+  and backing hardware. Use the sequential run to compare write throughput and
+  sequential read throughput.
+- Run the mounted random recipe above on both filesystems with the same
+  workload shape. Use that run to compare mounted read throughput on the random
+  path.
+- Treat the throughput gate as `>= 90%` of the comparable JuiceFS result for
+  each required phase.
+- Treat the mounted memory gate as
+  `mounted_memory.rss_bytes_peak <= min(2 GiB, juicefs_peak_rss * 1.15)`.
+- Use `mounted_memory.rss_bytes_steady_state`,
+  `mounted_memory.dirty_bytes_peak`, and `mounted_memory.dirty_limit_bytes` as
+  diagnostics when the peak-RSS gate fails; they help distinguish dirty-state
+  pressure from other runtime memory growth when those samples are present.
+- Treat `local_first_read_comparison` and `mounted_memory` as StudioFS-only
+  diagnostics. They strengthen comparability, but they are not required to map
+  1:1 onto JuiceFS counters.
 
 ## Larger Manual Validation After The Targeted Matrix Passes
 
@@ -279,4 +311,5 @@ record:
 - warm/cold setup
 - writeback delay or equivalent batching knobs
 - observed throughput / latency
+- peak RSS and steady RSS for the mounted process when available
 - any semantic differences that make the comparison non-equivalent

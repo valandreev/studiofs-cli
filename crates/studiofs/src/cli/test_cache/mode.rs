@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
 pub(super) struct ActiveMount {
+    pub(super) pid: u32,
     pub(super) mount_point: PathBuf,
     pub(super) volume: String,
     pub(super) cache_path: Option<PathBuf>,
@@ -14,6 +15,7 @@ pub(super) enum ResolvedRunMode {
         cache_dir: PathBuf,
     },
     MountedE2E {
+        pid: u32,
         volume: String,
         mount_point: PathBuf,
         work_root: PathBuf,
@@ -140,6 +142,7 @@ where
             continue;
         }
         mounts.push(ActiveMount {
+            pid: pid as u32,
             mount_point: PathBuf::from(mount_point),
             volume: volume.to_string(),
             cache_path,
@@ -164,6 +167,7 @@ pub(super) fn resolve_run_mode(target: &Path) -> Result<ResolvedRunMode> {
 
     if let Some(active) = best {
         Ok(ResolvedRunMode::MountedE2E {
+            pid: active.pid,
             volume: active.volume,
             mount_point: active.mount_point,
             work_root: target.join(".studiofs-test-cache"),
@@ -292,6 +296,7 @@ mod tests {
 
         let mounts = active_mounts_in(temp.path(), |pid| pid == 77).unwrap();
         assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].pid, 77);
         assert_eq!(mounts[0].mount_point, PathBuf::from("/mnt/live"));
         assert_eq!(mounts[0].volume, "live-vol");
         assert_eq!(mounts[0].cache_path, Some(PathBuf::from("/cache/live")));

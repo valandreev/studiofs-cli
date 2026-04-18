@@ -299,11 +299,19 @@ Notes:
   - `size_class_stats` with p50/p95/p99 + throughput per `small`/`medium`/`large`
   - direct-shim only: `cache_levels` with L1 hits, misses, bytes served, and lookup latency histograms
 - On mounts started by newer StudioFS builds, `e2e` JSON output also includes
-  `buffered_read_comparison` with `baseline-read`, `during-upload-read`, and
-  `post-upload-read` rows plus the pending-upload observations used to gate
-  each phase.
+  `local_first_read_comparison` with `baseline-read`,
+  `during-upload-read`, and `post-upload-read` rows plus the pending-upload
+  observations used to gate each phase.
+- When the mounted runtime exposes process and write-path observability, `e2e`
+  JSON output also includes `mounted_memory` with `mount_pid`,
+  `rss_bytes_steady_state`, `rss_bytes_peak`, `dirty_bytes_steady_state`,
+  `dirty_bytes_peak`, and `dirty_limit_bytes`.
+  RSS and dirty-pressure fields are best-effort samples and may be omitted when
+  StudioFS cannot observe that signal for the measured run.
 - The terminal summary prints the same `Local-First read comparison` table
   when that mounted upload-state metadata is available.
+- The terminal summary prints a matching `Mounted memory` table when mounted
+  RSS and dirty-pressure samples are available.
 - `--profile=pyroscope` enables on-demand Pyroscope profiling. The run still
   completes if profiling backends or the endpoint are missing; the command emits
   warnings and continues.

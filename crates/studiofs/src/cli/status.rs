@@ -611,6 +611,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let metrics_path = tmp.path().join(WRITE_PATH_OBSERVABILITY_FILE);
         let snapshot = VfsWritePathObservabilitySnapshot {
+            publisher_pid: 42,
             generated_unix_ms: 123,
             uptime_secs: 4.0,
             backend_tag: "local-block-runtime".to_string(),
@@ -621,6 +622,7 @@ mod tests {
             winfsp_callbacks: Default::default(),
             winfsp_foreground_flushes: Default::default(),
             write_backpressure: Default::default(),
+            dirty_pressure: Default::default(),
             payload_burst: Default::default(),
             payload_persist: Default::default(),
             metadata_commit: Default::default(),

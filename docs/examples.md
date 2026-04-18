@@ -218,12 +218,17 @@ Notes:
 - `direct-shim` `advanced_metrics.cache_levels` reports L1 hit/miss counters,
   bytes served from L1, and L1 lookup latency distributions.
 - On mounts started by newer StudioFS builds, `e2e` JSON output also includes
-  `buffered_read_comparison`, which records `baseline-read`,
+  `local_first_read_comparison`, which records `baseline-read`,
   `during-upload-read`, and `post-upload-read` phases plus the pending-upload
   wait observations used to bracket them.
 - The terminal summary shows the same mounted comparison as a
   `Local-First read comparison` table, including wait target/observation and
   pending upload counts before and after each read phase.
+- When mounted runtime observability is available, `e2e` output also includes
+  `mounted_memory` for mounted-process RSS and, when available, dirty-pressure
+  snapshots. These fields are best-effort and may be omitted when StudioFS
+  cannot observe that signal for the measured run; the terminal summary prints
+  the same data as a `Mounted memory` table.
 - `e2e` mode still keeps filesystem-level read/write reports; cache internals
   continue to be emitted through mount logs (`upload pipeline counters`).
 

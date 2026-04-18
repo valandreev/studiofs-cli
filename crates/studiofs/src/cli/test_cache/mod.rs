@@ -197,6 +197,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
         match &resolved_mode {
             ResolvedRunMode::DirectShim { cache_dir } => run_direct(&params, cache_dir).await,
             ResolvedRunMode::MountedE2E {
+                pid,
                 volume,
                 mount_point,
                 work_root,
@@ -204,6 +205,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
             } => {
                 run_mounted_end_to_end(
                     &params,
+                    *pid,
                     volume,
                     mount_point,
                     work_root,
