@@ -136,15 +136,8 @@ impl StudioVfs {
         }
 
         let block_offset = (block_index as u64).saturating_mul(self.block_size as u64);
-        let recovered = if let Some(pending_uploads) = pending_upload_index {
-            pending_uploads.latest_extent_record(ino, block_offset, pending_content_epoch)
-        } else {
-            self.snapshot_pending_upload_index().latest_extent_record(
-                ino,
-                block_offset,
-                pending_content_epoch,
-            )
-        }?;
+        let recovered =
+            pending_upload_index?.latest_extent_record(ino, block_offset, pending_content_epoch)?;
 
         self.state
             .incarnation

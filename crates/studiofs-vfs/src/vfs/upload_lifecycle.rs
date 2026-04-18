@@ -5,6 +5,7 @@ pub(super) use worker::UploadLifecycleWorker;
 use super::{Ino, StudioVfs, VfsError, VfsIngressStats, VfsZeroIoShutdownSnapshot, info, warn};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+use studiofs_cache::upload_queue::PendingUpload;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -183,11 +184,10 @@ impl StudioVfs {
         }
     }
 
-    pub(super) fn pending_age_stats_ms(&self) -> (u64, u64) {
+    pub(super) fn pending_age_stats_ms(&self, pending_uploads: &[PendingUpload]) -> (u64, u64) {
         let now_ms = now_unix_millis();
-        let mut ages: Vec<u64> = self
-            .truth_pending_uploads_snapshot()
-            .into_iter()
+        let mut ages: Vec<u64> = pending_uploads
+            .iter()
             .map(|op| now_ms.saturating_sub(op.created_unix_ms))
             .collect();
         if ages.is_empty() {

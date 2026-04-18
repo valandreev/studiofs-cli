@@ -288,7 +288,8 @@ impl StudioVfs {
             if let Err(error) = self.block_store_run_pressure_maintenance_async().await {
                 warn!(error = %error, "background local backend pressure maintenance failed");
             }
-            let pending = self.truth_pending_uploads_snapshot().len();
+            let pending_uploads = self.truth_pending_uploads_snapshot();
+            let pending = pending_uploads.len();
             let pending_upload_bytes = pending as u64 * u64::from(self.block_size);
             let metadata_backlog = self.sync_meta().replication_backlog();
             let pending_metadata_ops = metadata_backlog.total_ops();
@@ -319,7 +320,7 @@ impl StudioVfs {
                 false
             };
 
-            let (p95_ms, max_ms) = self.pending_age_stats_ms();
+            let (p95_ms, max_ms) = self.pending_age_stats_ms(&pending_uploads);
             let ingress = self.ingress_stats();
             let materialize_batches = self.state.metrics.materialize_batch_stats.snapshot();
             let upload_queue = self.cached_store.cache_pipeline_metrics().upload_queue;

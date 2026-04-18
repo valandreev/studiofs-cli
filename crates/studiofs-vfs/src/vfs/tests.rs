@@ -377,6 +377,7 @@ fn pending_upload_truth_candidate_filter_keeps_unpublished_lifecycle_states() {
         InodeLifecycleState::LocalOnly,
         InodeLifecycleState::Uploading,
         InodeLifecycleState::PublishReady,
+        InodeLifecycleState::DeletedBeforePublish,
     ] {
         let record = studiofs_meta::schema::InodeLifecycleRecord {
             ino: 42,
@@ -385,9 +386,20 @@ fn pending_upload_truth_candidate_filter_keeps_unpublished_lifecycle_states() {
             published_size: 0,
             local_content_epoch: 7,
             published_content_epoch: 0,
-            has_published_base: false,
-            retention: PayloadRetentionClass::PinnedUnpublished,
-            deferred_cleanup_object_ids: Vec::new(),
+            has_published_base: matches!(state, InodeLifecycleState::DeletedBeforePublish),
+            retention: if matches!(state, InodeLifecycleState::DeletedBeforePublish) {
+                PayloadRetentionClass::DeletedBeforePublish
+            } else {
+                PayloadRetentionClass::PinnedUnpublished
+            },
+            deferred_cleanup_object_ids: if matches!(
+                state,
+                InodeLifecycleState::DeletedBeforePublish
+            ) {
+                vec![7002]
+            } else {
+                Vec::new()
+            },
         };
         assert!(
             StudioVfs::lifecycle_record_may_reference_pending_uploads(&record),
@@ -398,32 +410,23 @@ fn pending_upload_truth_candidate_filter_keeps_unpublished_lifecycle_states() {
 
 #[test]
 fn pending_upload_truth_candidate_filter_excludes_non_uploadable_lifecycle_states() {
-    for (state, retention) in [
-        (
-            InodeLifecycleState::Published,
-            PayloadRetentionClass::PublishedWarm,
-        ),
-        (
-            InodeLifecycleState::DeletedBeforePublish,
-            PayloadRetentionClass::DeletedBeforePublish,
-        ),
-    ] {
-        let record = studiofs_meta::schema::InodeLifecycleRecord {
-            ino: 42,
-            state,
-            local_visible_size: 4096,
-            published_size: 4096,
-            local_content_epoch: 7,
-            published_content_epoch: 7,
-            has_published_base: true,
-            retention,
-            deferred_cleanup_object_ids: vec![7002],
-        };
-        assert!(
-            !StudioVfs::lifecycle_record_may_reference_pending_uploads(&record),
-            "state {state:?} should not remain a pending-upload candidate"
-        );
-    }
+    let state = InodeLifecycleState::Published;
+    let retention = PayloadRetentionClass::PublishedWarm;
+    let record = studiofs_meta::schema::InodeLifecycleRecord {
+        ino: 42,
+        state,
+        local_visible_size: 4096,
+        published_size: 4096,
+        local_content_epoch: 7,
+        published_content_epoch: 7,
+        has_published_base: true,
+        retention,
+        deferred_cleanup_object_ids: vec![7002],
+    };
+    assert!(
+        !StudioVfs::lifecycle_record_may_reference_pending_uploads(&record),
+        "state {state:?} should not remain a pending-upload candidate"
+    );
 }
 
 #[test]
