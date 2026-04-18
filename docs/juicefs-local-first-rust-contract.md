@@ -58,8 +58,14 @@ Invariants:
 - Blocks are immutable and are never edited in place.
 - Cross-client visibility changes at file-version granularity, not block by
   block.
-- Each mount reserves disjoint inode and block-ID ranges before local
-  allocation so concurrent clients do not collide on foreground-created keys.
+- Each discovered client owns disjoint inode and block-ID ranges before local
+  foreground allocation so concurrent clients do not collide on
+  foreground-created keys.
+- The initial client slot plus initial ID ranges are reserved during
+  bootstrap/discover and persisted locally for later mounts of that client.
+- If the active range is nearing exhaustion, StudioFS reserves the next
+  disjoint range from available space and persists that extension locally
+  before foreground allocation crosses the current range boundary.
 - The disjoint-range rule is part of the contract, not a disposable
   implementation trick.
 
@@ -157,10 +163,13 @@ Rules:
   visible through local invalidation/apply.
 - Cross-client file locks, when enabled, are the only normal foreground reason
   for a mounted client to talk to PostgreSQL directly.
-- Per-client inode/block preallocation remains mandatory. A client obtains a
-  persistent PG client slot, derives disjoint ID ranges from it, persists that
-  slot locally, and allocates foreground inode/block IDs without further PG
-  round-trips.
+- Per-client inode/block preallocation remains mandatory. A discovered client
+  obtains a persistent PG client slot, derives disjoint ID ranges from it,
+  persists that slot and the active ranges locally, and allocates foreground
+  inode/block IDs without further PG round-trips while the current range still
+  has headroom.
+- When the active range is nearing exhaustion, the client reserves and persists
+  the next disjoint range before switching local allocation to it.
 
 ## 8. Mutation Visibility And Invalidation Matrix
 
@@ -246,7 +255,7 @@ contract.
 | `Local-First` | Retained StudioFS semantic | The writing mount observes accepted changes immediately through the merged local view. |
 | `eventual consistency` | Retained StudioFS semantic | Other mounts converge later through upload plus replication/apply, not synchronously on each write. |
 | `cached-store pipeline` | Borrowed JuiceFS concept | Unified cache, staging, download, upload, and eviction pipeline. |
-| `client slot` | StudioFS target semantic | Persistent PG-assigned client identity used to derive disjoint local inode/block ID ranges. |
+| `client slot` | StudioFS target semantic | Persistent PG-assigned client identity, established during bootstrap/discover, used to derive disjoint local inode/block ID ranges across later mounts of the same client. |
 | `Fast Local Authority` | StudioFS target semantic | The single target mount contract: local foreground authority, PG for replication/bootstrap/locks, S3 for payload replication. |
 
 Downstream issues should cite this file directly and then name the relevant

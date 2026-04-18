@@ -45,8 +45,10 @@ studiofs (CLI)
   foreign state through invalidation and replay
 - crash recovery rebuilds pending local state from local metadata and
   upload/replication bookkeeping
-- each client reserves a persistent PG client slot and derives disjoint local
-  inode/block ID ranges from it before foreground allocation
+- each discovered client reserves a persistent PG client slot and derives its
+  disjoint local inode/block ID ranges from it during bootstrap/discover;
+  later mounts reuse the persisted slot/ranges without needing a fresh PG
+  reservation
 
 Core invariants:
 - local `size` and local slices may be ahead of peer-visible replicated state
