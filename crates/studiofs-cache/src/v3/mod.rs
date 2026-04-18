@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use tracing::{debug, warn};
 
 use crate::local::{
@@ -50,6 +50,8 @@ const ACCESS_TOUCH_FLUSH_INTERVAL: Duration = Duration::ZERO;
 const ACCESS_TOUCH_RETRY_BASE_BACKOFF_MS: u64 = 10;
 const ACCESS_TOUCH_RETRY_MAX_EXPONENT: u8 = 8;
 const DIRTY_ORPHAN_PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(30);
+const LOW_SPACE_UPLOAD_DRAIN_WAIT: Duration = Duration::from_millis(25);
+const LOW_SPACE_UPLOAD_DRAIN_RETRIES: usize = 4;
 
 /// Backend kind available on the runtime path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +190,8 @@ pub struct CacheV3LocalBlockBackend {
     pending_access_touches: Mutex<PendingAccessTouches>,
     last_dirty_orphan_prune_at: Mutex<Instant>,
     dirty_validation_in_progress: AtomicBool,
+    storage_state_epoch: Mutex<u64>,
+    storage_state_changed: Condvar,
 }
 
 struct DirtyValidationGuard<'a> {
@@ -290,6 +294,8 @@ impl CacheV3LocalBlockBackend {
                     .unwrap_or_else(Instant::now),
             ),
             dirty_validation_in_progress: AtomicBool::new(false),
+            storage_state_epoch: Mutex::new(0),
+            storage_state_changed: Condvar::new(),
         })
     }
 
@@ -395,7 +401,62 @@ impl CacheV3LocalBlockBackend {
         self.index.remove_batch(object_ids)?;
         self.forget_access_touches(object_ids);
         self.payload_store.remove_batch(object_ids);
+        self.note_storage_state_change();
         Ok(())
+    }
+
+    fn note_storage_state_change(&self) {
+        let mut epoch = self.storage_state_epoch.lock();
+        *epoch = (*epoch).wrapping_add(1);
+        self.storage_state_changed.notify_all();
+    }
+
+    fn wait_for_storage_state_change(&self, observed_epoch: u64) {
+        let mut epoch = self.storage_state_epoch.lock();
+        if *epoch != observed_epoch {
+            return;
+        }
+        self.storage_state_changed
+            .wait_for(&mut epoch, LOW_SPACE_UPLOAD_DRAIN_WAIT);
+    }
+
+    fn retry_non_evictable_put_after_upload_drain(
+        &self,
+        target_bytes: u64,
+        payload_len: u64,
+        mut current_after_evict: u64,
+    ) -> Result<u64, LocalBlockBackendError> {
+        for attempt in 0..LOW_SPACE_UPLOAD_DRAIN_RETRIES {
+            if !self
+                .budget_governor
+                .exceeds_budget_after_insert(current_after_evict, payload_len)
+            {
+                break;
+            }
+
+            let stats = self
+                .index
+                .stats()
+                .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
+            if stats.dirty_bytes == 0 {
+                break;
+            }
+
+            let observed_epoch = *self.storage_state_epoch.lock();
+            debug!(
+                attempt = attempt + 1,
+                current_bytes = current_after_evict,
+                target_bytes,
+                payload_len,
+                dirty_bytes = stats.dirty_bytes,
+                wait_ms = LOW_SPACE_UPLOAD_DRAIN_WAIT.as_millis(),
+                "cache-v3 low-space put waiting briefly for pending upload drain"
+            );
+            self.wait_for_storage_state_change(observed_epoch);
+            current_after_evict =
+                self.evict_to_target_bytes(target_bytes, "put_low_space_retry")?;
+        }
+        Ok(current_after_evict)
     }
 
     fn flush_access_touches(&self, force: bool, operation: &'static str) {
@@ -556,7 +617,14 @@ impl CacheV3LocalBlockBackend {
             return Ok(false);
         };
 
-        let current_after_evict = self.evict_to_target_bytes(target_bytes, "put")?;
+        let mut current_after_evict = self.evict_to_target_bytes(target_bytes, "put")?;
+        if !evictable {
+            current_after_evict = self.retry_non_evictable_put_after_upload_drain(
+                target_bytes,
+                payload_len,
+                current_after_evict,
+            )?;
+        }
         if !self
             .budget_governor
             .exceeds_budget_after_insert(current_after_evict, payload_len)
@@ -772,12 +840,16 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
                 error = ?error,
                 "cache-v3 index mark_upload_failed failed"
             );
+        } else {
+            self.note_storage_state_change();
         }
     }
 
     fn mark_uploaded(&self, object_id: u64) {
         if let Err(error) = self.index.mark_uploaded(object_id) {
             warn!(object_id, error = ?error, "cache-v3 index mark_uploaded failed");
+        } else {
+            self.note_storage_state_change();
         }
     }
 
@@ -839,6 +911,7 @@ impl LocalBlockBackend for CacheV3LocalBlockBackend {
         self.forget_runtime_pins(&[object_id]);
         self.forget_access_touches(&[object_id]);
         self.payload_store.remove(object_id);
+        self.note_storage_state_change();
     }
 
     fn remove_batch(&self, object_ids: &[u64]) {
@@ -1528,6 +1601,42 @@ mod tests {
     }
 
     #[test]
+    fn cache_v3_backend_waits_for_pending_upload_drain_before_capacity_exhausted() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = std::sync::Arc::new(
+            CacheV3LocalBlockBackend::open_with_budget(
+                CacheV3LocalBlockBackendConfig {
+                    cache_root: temp.path().to_path_buf(),
+                    volume_uuid: [0x7B; 16],
+                },
+                Some(32),
+            )
+            .unwrap(),
+        );
+        backend.put(10, &[0xAA; 32], false).unwrap();
+        backend.mark_uploading(10);
+
+        let background = std::sync::Arc::clone(&backend);
+        let join = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            background.mark_uploaded(10);
+        });
+
+        backend.put(11, &[0xBB; 16], false).unwrap();
+
+        join.join().unwrap();
+        assert!(
+            !backend.contains(10),
+            "once the older pending block finishes upload, low-space admission should reclaim it before rejecting a new local block"
+        );
+        assert!(backend.contains(11));
+        assert_eq!(backend.lifecycle_state(11), LocalBlockLifecycleState::Dirty);
+    }
+
+    #[test]
     fn cache_v3_background_pressure_reclaims_to_low_watermark() {
         let temp = tempfile::tempdir().unwrap();
         let layout = CacheV3Layout::from_cache_root(temp.path());
@@ -1612,6 +1721,15 @@ mod tests {
 
         backend.run_pressure_maintenance().unwrap();
 
+        assert!(
+            backend.contains(30),
+            "pressure maintenance must keep local pending blocks while reclaiming disposable cache"
+        );
+        assert!(
+            !backend.contains(31),
+            "the oldest disposable downloaded/uploaded block should be reclaimed first"
+        );
+        assert!(backend.contains(32));
         assert!(
             backend
                 .eviction_scan_skipped_non_evictable
