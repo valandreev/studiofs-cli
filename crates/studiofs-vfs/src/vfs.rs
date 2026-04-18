@@ -2650,6 +2650,14 @@ fn map_open_local_block_backend_error(
     }
 }
 
+struct PendingUploadTruthRebuildState<'a> {
+    runtime_pending_by_object: &'a HashMap<u64, PendingUpload>,
+    dirty_objects: &'a mut HashSet<u64>,
+    pending: &'a mut Vec<PendingUpload>,
+    scanned_inodes: &'a mut HashSet<Ino>,
+    now_ms: u64,
+}
+
 impl StudioVfs {
     fn runtime_pending_uploads_match_dirty_index(
         &self,
@@ -2709,17 +2717,13 @@ impl StudioVfs {
         &self,
         meta: &Arc<dyn VfsMeta>,
         attrs: I,
-        runtime_pending_by_object: &HashMap<u64, PendingUpload>,
-        dirty_objects: &mut HashSet<u64>,
-        pending: &mut Vec<PendingUpload>,
-        scanned_inodes: &mut HashSet<Ino>,
-        now_ms: u64,
+        state: &mut PendingUploadTruthRebuildState<'_>,
     ) where
         I: IntoIterator<Item = InodeAttr>,
     {
         for attr in attrs {
             let ino = attr.ino;
-            if !scanned_inodes.insert(ino) {
+            if !state.scanned_inodes.insert(ino) {
                 continue;
             }
             let inode_deleted = attr.nlink == 0;
@@ -2736,23 +2740,25 @@ impl StudioVfs {
             };
 
             for (block_index, block_ref) in &blocks {
-                if dirty_objects.remove(&block_ref.object_id) {
+                if state.dirty_objects.remove(&block_ref.object_id) {
                     if inode_deleted {
                         continue;
                     }
                     let offset = (*block_index as u64).saturating_mul(self.block_size as u64);
-                    pending.push(self.pending_upload_from_persistent_state(
-                        ino,
-                        offset,
-                        block_ref.object_id,
-                        attr.content_epoch,
-                        runtime_pending_by_object.get(&block_ref.object_id),
-                        now_ms,
-                    ));
+                    state
+                        .pending
+                        .push(self.pending_upload_from_persistent_state(
+                            ino,
+                            offset,
+                            block_ref.object_id,
+                            attr.content_epoch,
+                            state.runtime_pending_by_object.get(&block_ref.object_id),
+                            state.now_ms,
+                        ));
                 }
             }
 
-            if dirty_objects.is_empty() {
+            if state.dirty_objects.is_empty() {
                 break;
             }
 
@@ -2766,21 +2772,23 @@ impl StudioVfs {
                         let Some(block) = span.block else {
                             continue;
                         };
-                        if !dirty_objects.remove(&block.object_id) {
+                        if !state.dirty_objects.remove(&block.object_id) {
                             continue;
                         }
                         let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
                         let absolute_start = chunk_base.saturating_add(u64::from(span.range.start));
                         let block_index = block_index_from_offset(absolute_start, self.block_size);
                         let offset = u64::from(block_index).saturating_mul(self.block_size as u64);
-                        pending.push(self.pending_upload_from_persistent_state(
-                            ino,
-                            offset,
-                            block.object_id,
-                            attr.content_epoch,
-                            runtime_pending_by_object.get(&block.object_id),
-                            now_ms,
-                        ));
+                        state
+                            .pending
+                            .push(self.pending_upload_from_persistent_state(
+                                ino,
+                                offset,
+                                block.object_id,
+                                attr.content_epoch,
+                                state.runtime_pending_by_object.get(&block.object_id),
+                                state.now_ms,
+                            ));
                     }
                 }
                 Err(error) => {
@@ -2792,7 +2800,7 @@ impl StudioVfs {
                 }
             }
 
-            if dirty_objects.is_empty() {
+            if state.dirty_objects.is_empty() {
                 break;
             }
         }
@@ -2815,6 +2823,13 @@ impl StudioVfs {
         let meta = self.sync_meta();
         let mut pending = Vec::with_capacity(dirty_objects.len());
         let mut scanned_inodes = HashSet::new();
+        let mut state = PendingUploadTruthRebuildState {
+            runtime_pending_by_object,
+            dirty_objects: &mut dirty_objects,
+            pending: &mut pending,
+            scanned_inodes: &mut scanned_inodes,
+            now_ms,
+        };
 
         match meta.list_inode_lifecycles() {
             Ok(records) => {
@@ -2826,15 +2841,7 @@ impl StudioVfs {
                 if !candidate_inos.is_empty() {
                     match meta.get_attrs_batch(&candidate_inos) {
                         Ok(attrs) => {
-                            self.collect_pending_uploads_from_attrs(
-                                &meta,
-                                attrs,
-                                runtime_pending_by_object,
-                                &mut dirty_objects,
-                                &mut pending,
-                                &mut scanned_inodes,
-                                now_ms,
-                            );
+                            self.collect_pending_uploads_from_attrs(&meta, attrs, &mut state);
                         }
                         Err(error) => {
                             warn!(
@@ -2854,10 +2861,10 @@ impl StudioVfs {
             }
         }
 
-        if !dirty_objects.is_empty() {
+        if !state.dirty_objects.is_empty() {
             debug!(
-                unresolved_dirty_objects = dirty_objects.len(),
-                candidate_inodes_scanned = scanned_inodes.len(),
+                unresolved_dirty_objects = state.dirty_objects.len(),
+                candidate_inodes_scanned = state.scanned_inodes.len(),
                 "pending upload truth view falling back to full inode attr scan"
             );
             let attrs = match meta.list_inode_attrs() {
@@ -2870,20 +2877,12 @@ impl StudioVfs {
                     return Vec::new();
                 }
             };
-            self.collect_pending_uploads_from_attrs(
-                &meta,
-                attrs,
-                runtime_pending_by_object,
-                &mut dirty_objects,
-                &mut pending,
-                &mut scanned_inodes,
-                now_ms,
-            );
+            self.collect_pending_uploads_from_attrs(&meta, attrs, &mut state);
         }
 
-        if !dirty_objects.is_empty() {
+        if !state.dirty_objects.is_empty() {
             debug!(
-                pending_objects_without_metadata = dirty_objects.len(),
+                pending_objects_without_metadata = state.dirty_objects.len(),
                 "pending upload truth view skipped dirty objects without metadata mapping"
             );
         }
