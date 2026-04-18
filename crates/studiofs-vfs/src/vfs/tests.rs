@@ -325,6 +325,53 @@ fn pending_upload_views_rebuild_from_persistent_state_without_runtime_queue() {
 }
 
 #[test]
+fn pending_upload_truth_ignores_deleted_inode_local_blocks() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-views-deleted-inode");
+
+    let created = vfs
+        .create(1, b"deleted-pending.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = created.ino;
+    let object_id = 7_002;
+    let payload = vec![0xCD; 4096];
+
+    vfs.local_block_backend()
+        .put(object_id, &payload, false)
+        .expect("persist local block");
+    vfs.local_block_backend()
+        .sync_data()
+        .expect("sync local block");
+
+    let mut attr = meta.get_attr(ino).expect("load test attr");
+    attr.size = payload.len() as u64;
+    attr.committed_size = 0;
+    attr.content_epoch = 6;
+    attr.committed_content_epoch = 5;
+    attr.nlink = 0;
+    attr.upload_state = MetaUploadState::Uploading;
+    meta.set_attr(&attr).expect("persist deleted attr");
+    meta.set_file_block(
+        ino,
+        0,
+        &BlockRef::new_partial(object_id, payload.len() as u32),
+    )
+    .expect("persist deleted file block");
+
+    assert!(
+        vfs.pending_uploads_for_inode(ino).is_empty(),
+        "deleted inodes must keep local blocks readable without advertising them as pending uploads"
+    );
+
+    let pending_upload_index = vfs.snapshot_pending_upload_index();
+    assert_eq!(
+        pending_upload_index.latest_extent_record(ino, 0, Some(attr.content_epoch)),
+        None,
+        "pending upload catalog must not expose deleted inode blocks as uploadable extents"
+    );
+}
+
+#[test]
 fn startup_replay_removes_orphan_dirty_blocks_and_clears_pending_evictions() {
     let tmp = TempDir::new().expect("tempdir");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "startup-replay-orphan-cleanup");

@@ -2723,6 +2723,7 @@ impl StudioVfs {
         let mut pending = Vec::with_capacity(dirty_objects.len());
         for attr in attrs {
             let ino = attr.ino;
+            let inode_deleted = attr.nlink == 0;
             let blocks = match meta.get_file_blocks(ino) {
                 Ok(blocks) => blocks,
                 Err(error) => {
@@ -2737,6 +2738,9 @@ impl StudioVfs {
 
             for (block_index, block_ref) in &blocks {
                 if dirty_objects.remove(&block_ref.object_id) {
+                    if inode_deleted {
+                        continue;
+                    }
                     let offset = (*block_index as u64).saturating_mul(self.block_size as u64);
                     pending.push(self.pending_upload_from_persistent_state(
                         ino,
@@ -2753,7 +2757,7 @@ impl StudioVfs {
                 break;
             }
 
-            if attr.size == 0 {
+            if inode_deleted || attr.size == 0 {
                 continue;
             }
 
