@@ -134,7 +134,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use studiofs_cache::OpenLocalBlockBackendError;
 use studiofs_cache::PreparedLocalBlockRuntime;
-use studiofs_cache::local::{LocalBlockBackend, LocalBlockLifecycleState};
+use studiofs_cache::local::{LocalBlockBackend, LocalBlockLifecycleState, LocalBlockPut};
 use studiofs_cache::metrics::{LatencyHistogram, LatencyHistogramSnapshot, MaterializeBatchStats};
 use studiofs_cache::open_local_block_backend_with_budget_and_sync_mode;
 use studiofs_cache::open_prepared_local_block_backend_with_budget_and_sync_mode;
@@ -335,14 +335,14 @@ const DEFAULT_FETCH_MAX_WINDOW: f64 = 0.0;
 const DEFAULT_FETCH_INCREASE_STEP: f64 = 0.0;
 const DEFAULT_FETCH_DECREASE_FACTOR: f64 = 0.85;
 const DEFAULT_FETCH_DECREASE_COOLDOWN_SECS: u64 = 3;
-const DEFAULT_UPLOAD_INITIAL_WINDOW: f64 = 16.0;
+const DEFAULT_UPLOAD_INITIAL_WINDOW: f64 = 4.0;
 const DEFAULT_UPLOAD_MIN_WINDOW: f64 = 1.0;
-const DEFAULT_UPLOAD_MAX_WINDOW: f64 = 512.0;
-const DEFAULT_UPLOAD_INCREASE_STEP: f64 = 2.0;
+const DEFAULT_UPLOAD_MAX_WINDOW: f64 = 16.0;
+const DEFAULT_UPLOAD_INCREASE_STEP: f64 = 1.0;
 const DEFAULT_UPLOAD_DECREASE_FACTOR: f64 = 0.85;
 const DEFAULT_UPLOAD_DECREASE_COOLDOWN_SECS: u64 = 3;
 const DEFAULT_SLAB_FLUSH_INTERVAL_MS: u64 = 10;
-const DEFAULT_UPLOAD_WORKER_COUNT: usize = 128;
+const DEFAULT_UPLOAD_WORKER_COUNT: usize = 16;
 const MIN_UPLOAD_WORKER_COUNT: usize = 1;
 const DEFAULT_UPLOAD_MAX_ATTEMPTS: u32 = 4;
 const DEFAULT_UPLOAD_REQUEST_TIMEOUT_SECS: u64 = 15;
@@ -4716,9 +4716,7 @@ impl StudioVfs {
     }
 
     async fn block_store_get_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
-        let block_store = self.local_block_backend.clone();
-        let (result, timing) =
-            run_local_cache_io_blocking(move || Ok(block_store.get(object_id))).await?;
+        let (result, timing) = run_local_cache_io(|| self.local_block_backend.get(object_id));
         self.record_local_cache_io_timing(timing);
         Ok(result)
     }
@@ -4729,28 +4727,17 @@ impl StudioVfs {
         data_offset: usize,
         out: &mut [u8],
     ) -> VfsResult<Option<usize>> {
-        let block_store = self.local_block_backend.clone();
-        let out_len = out.len();
-        let (result, timing) = run_local_cache_io_blocking(move || {
-            if !block_store.contains(object_id) {
-                return Ok((Vec::new(), None));
-            }
-            let mut scratch = vec![0_u8; out_len];
-            let read = block_store.read_into(object_id, data_offset, &mut scratch);
-            Ok((scratch, read))
-        })
-        .await?;
+        let (result, timing) = run_local_cache_io(|| {
+            self.local_block_backend
+                .read_into(object_id, data_offset, out)
+        });
         self.record_local_cache_io_timing(timing);
-        let (scratch, read) = result;
-        if let Some(read) = read {
+        if let Some(read) = result {
             if read > out.len() {
                 return Err(VfsError::Other(format!(
                     "local backend returned oversized read: object_id={object_id}, read={read}, out_len={}",
                     out.len()
                 )));
-            }
-            if read > 0 {
-                out[..read].copy_from_slice(&scratch[..read]);
             }
             Ok(Some(read))
         } else {
@@ -4778,6 +4765,7 @@ impl StudioVfs {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn block_store_put_async(
         &self,
         object_id: u64,
@@ -4789,6 +4777,21 @@ impl StudioVfs {
             block_store
                 .put(object_id, data.as_ref(), evictable)
                 .map_err(|error| VfsError::Other(format!("block store put failed: {error}")))
+        })
+        .await?;
+        self.record_local_cache_io_timing(timing);
+        Ok(())
+    }
+
+    async fn block_store_put_batch_async(&self, entries: Vec<LocalBlockPut>) -> VfsResult<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let block_store = self.local_block_backend.clone();
+        let ((), timing) = run_local_cache_io_blocking(move || {
+            block_store
+                .put_batch(&entries)
+                .map_err(|error| VfsError::Other(format!("block store batch put failed: {error}")))
         })
         .await?;
         self.record_local_cache_io_timing(timing);

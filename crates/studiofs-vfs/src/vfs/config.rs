@@ -837,8 +837,20 @@ mod tests {
         );
         assert_eq!(validated.qos_fetch_slots, defaults.qos_fetch_slots);
         assert_eq!(
-            validated.upload_worker_count, 128,
+            validated.upload_worker_count, 16,
             "validation should materialize upload worker default"
+        );
+        assert_eq!(
+            validated.upload_initial_window, 4.0,
+            "validation should materialize the foreground-friendly upload initial window default"
+        );
+        assert_eq!(
+            validated.upload_max_window, 16.0,
+            "validation should materialize the clamped upload max window default"
+        );
+        assert_eq!(
+            validated.upload_increase_step, 1.0,
+            "validation should materialize the gentler upload AIMD growth default"
         );
         assert_eq!(
             validated.upload_requeue_base_ms,

@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 
 use crate::local::{
     LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState, LocalBlockObjectStats,
-    LocalBlockOrigin, LocalBlockStorageStats, LocalBlockUploadState,
+    LocalBlockOrigin, LocalBlockPut, LocalBlockStorageStats, LocalBlockUploadState,
 };
 
 #[path = "block_index.rs"]
@@ -804,6 +804,118 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
                 volume_uuid = ?self.volume_uuid,
                 error = ?error,
                 "local block runtime index upsert failed after payload write; removed payload for rollback"
+            );
+            return Err(LocalBlockBackendError::Other(Box::new(error)));
+        }
+
+        Ok(())
+    }
+
+    fn put_batch(&self, entries: &[LocalBlockPut]) -> Result<(), LocalBlockBackendError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut updates = Vec::with_capacity(entries.len());
+        let mut written_object_ids = Vec::with_capacity(entries.len());
+        let mut estimated_current = self
+            .index
+            .stats()
+            .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?
+            .current_bytes;
+
+        for entry in entries {
+            let payload_len = u64::try_from(entry.data.len()).map_err(|_| {
+                LocalBlockBackendError::Io(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "payload length exceeds u64",
+                ))
+            })?;
+
+            if let Some(target_bytes) = self
+                .budget_governor
+                .target_before_insert(estimated_current, payload_len)
+            {
+                let mut current_after_evict =
+                    self.evict_to_target_bytes(target_bytes, "put_batch")?;
+                if !entry.evictable {
+                    current_after_evict = self.retry_non_evictable_put_after_upload_drain(
+                        target_bytes,
+                        payload_len,
+                        current_after_evict,
+                    )?;
+                }
+                if self
+                    .budget_governor
+                    .exceeds_budget_after_insert(current_after_evict, payload_len)
+                {
+                    if entry.evictable {
+                        warn!(
+                            object_id = entry.object_id,
+                            payload_len,
+                            current_bytes = current_after_evict,
+                            budget_bytes = ?self.budget_governor.budget_bytes(),
+                            "local block runtime skipped evictable batch put because budget remained under hard pressure"
+                        );
+                        estimated_current = current_after_evict;
+                        continue;
+                    }
+                    self.payload_store.remove_batch(&written_object_ids);
+                    return Err(LocalBlockBackendError::CapacityExhausted {
+                        needed: payload_len,
+                        free: self.budget_governor.free_bytes(current_after_evict),
+                    });
+                }
+                estimated_current = current_after_evict;
+            }
+
+            if let Err(error) = self.payload_store.put(entry.object_id, entry.data.as_ref()) {
+                self.payload_store.remove_batch(&written_object_ids);
+                return Err(LocalBlockBackendError::Other(Box::new(error)));
+            }
+            written_object_ids.push(entry.object_id);
+            estimated_current = estimated_current.saturating_add(payload_len);
+
+            let lifecycle = if entry.evictable {
+                LocalBlockLifecycleState::Uploaded
+            } else {
+                LocalBlockLifecycleState::Dirty
+            };
+            let payload_key = self
+                .layout
+                .payload_block_relative_path(entry.object_id)
+                .to_string_lossy()
+                .into_owned()
+                .into_bytes();
+            updates.push(CacheIndexUpsert {
+                object_id: entry.object_id,
+                payload_key,
+                payload_len,
+                lifecycle,
+                origin: if entry.evictable {
+                    LocalBlockOrigin::Downloaded
+                } else {
+                    LocalBlockOrigin::Local
+                },
+                upload_state: if entry.evictable {
+                    LocalBlockUploadState::None
+                } else {
+                    LocalBlockUploadState::Pending
+                },
+                evictable: entry.evictable,
+            });
+        }
+
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        if let Err(error) = self.index.upsert_many(&updates) {
+            self.payload_store.remove_batch(&written_object_ids);
+            warn!(
+                object_count = written_object_ids.len(),
+                error = ?error,
+                "local block runtime batch index upsert failed after payload writes; removed payloads for rollback"
             );
             return Err(LocalBlockBackendError::Other(Box::new(error)));
         }

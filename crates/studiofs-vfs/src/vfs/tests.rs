@@ -1015,7 +1015,7 @@ fn vfs_config_raw_validate_clamps_and_normalizes() {
         DEFAULT_PREFETCH_CONCURRENCY_MIN
     );
     assert_eq!(validated.slab_flush_interval_ms, 1);
-    assert_eq!(validated.upload_worker_count, 128);
+    assert_eq!(validated.upload_worker_count, 16);
     assert_eq!(validated.principal, "*");
 }
 
@@ -3657,11 +3657,21 @@ fn local_cache_io_stats_track_direct_partial_read_into() {
         .metrics
         .local_cache_io_backend_total_ns
         .load(Ordering::Relaxed);
+    let handoff_before = vfs
+        .state
+        .metrics
+        .local_cache_io_handoff_total_ns
+        .load(Ordering::Relaxed);
 
     rt.block_on(async {
         vfs.block_store_put_async(0xBB66, Bytes::from_static(b"payload"), false)
             .await
             .expect("block store put");
+        let handoff_before_read = vfs
+            .state
+            .metrics
+            .local_cache_io_handoff_total_ns
+            .load(Ordering::Relaxed);
         let mut out = [0_u8; 3];
         let read = vfs
             .block_store_read_into_async(0xBB66, 2, &mut out)
@@ -3669,6 +3679,15 @@ fn local_cache_io_stats_track_direct_partial_read_into() {
             .expect("block store read_into");
         assert_eq!(read, Some(3));
         assert_eq!(&out, b"ylo");
+        let handoff_after_read = vfs
+            .state
+            .metrics
+            .local_cache_io_handoff_total_ns
+            .load(Ordering::Relaxed);
+        assert_eq!(
+            handoff_after_read, handoff_before_read,
+            "direct read_into should stay on the runtime worker and avoid blocking-pool handoff"
+        );
     });
 
     let calls_after = vfs
@@ -3681,6 +3700,11 @@ fn local_cache_io_stats_track_direct_partial_read_into() {
         .metrics
         .local_cache_io_backend_total_ns
         .load(Ordering::Relaxed);
+    let handoff_after = vfs
+        .state
+        .metrics
+        .local_cache_io_handoff_total_ns
+        .load(Ordering::Relaxed);
 
     assert!(
         calls_after >= calls_before + 2,
@@ -3689,6 +3713,10 @@ fn local_cache_io_stats_track_direct_partial_read_into() {
     assert!(
         backend_after >= backend_before,
         "direct read_into should contribute backend execution timing"
+    );
+    assert!(
+        handoff_after >= handoff_before,
+        "overall local-cache handoff accounting must remain monotonic"
     );
 }
 

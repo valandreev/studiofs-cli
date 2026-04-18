@@ -76,6 +76,7 @@ pub enum UploadError {
 pub struct UploadScheduler {
     aimd: AimdController,
     data_store: Arc<DataStore>,
+    max_concurrency_hint: usize,
     max_attempts: u32,
     request_timeout: Duration,
     retry_base_delay: Duration,
@@ -90,6 +91,11 @@ impl UploadScheduler {
         let request_timeout_s = config.upload_request_timeout_secs.max(1);
         let retry_base_ms = config.upload_retry_base_ms.max(1);
         let retry_max_ms = config.upload_retry_max_ms.max(retry_base_ms);
+        let max_concurrency_hint = if aimd_config.max_window.is_finite() {
+            aimd_config.max_window.clamp(1.0, usize::MAX as f64).floor() as usize
+        } else {
+            1
+        };
 
         debug!(
             initial_window = aimd_config.initial_window,
@@ -104,6 +110,7 @@ impl UploadScheduler {
         Self {
             aimd: AimdController::new(aimd_config),
             data_store,
+            max_concurrency_hint,
             max_attempts,
             request_timeout: Duration::from_secs(request_timeout_s),
             retry_base_delay: Duration::from_millis(retry_base_ms),
@@ -278,6 +285,10 @@ impl UploadScheduler {
 
     pub fn in_flight(&self) -> usize {
         self.aimd.in_flight()
+    }
+
+    pub fn max_concurrency_hint(&self) -> usize {
+        self.max_concurrency_hint.max(1)
     }
 
     /// Log a periodic summary line for upload pipeline health.

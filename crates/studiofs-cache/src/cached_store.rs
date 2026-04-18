@@ -13,7 +13,8 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::local::{
-    LocalBlockBackend, LocalBlockLifecycleState, LocalBlockObjectStats, LocalBlockStorageStats,
+    LocalBlockBackend, LocalBlockLifecycleState, LocalBlockObjectStats, LocalBlockPut,
+    LocalBlockStorageStats,
 };
 use crate::metrics::{CachePipelineMetrics, CachePipelineMetricsSnapshot};
 use crate::upload_queue::{PendingUpload, UploadQueue};
@@ -138,6 +139,13 @@ impl CachedStore {
         evictable: bool,
     ) -> Result<(), crate::local::LocalBlockBackendError> {
         self.local_block_backend.put(object_id, data, evictable)
+    }
+
+    pub fn put_batch(
+        &self,
+        entries: &[LocalBlockPut],
+    ) -> Result<(), crate::local::LocalBlockBackendError> {
+        self.local_block_backend.put_batch(entries)
     }
 
     pub fn sync_data(&self) -> Result<(), crate::local::LocalBlockBackendError> {
