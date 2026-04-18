@@ -362,11 +362,11 @@ mod tests {
         assert_eq!(describe_cache_layout_state(None), "unknown");
         assert_eq!(
             describe_cache_layout_state(Some(&detection(false))),
-            "Local cache layout not initialized"
+            "Local block runtime not initialized"
         );
         assert_eq!(
             describe_cache_layout_state(Some(&detection(true))),
-            "Local cache layout ready"
+            "Local block runtime ready"
         );
     }
 

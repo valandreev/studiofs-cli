@@ -1,5 +1,6 @@
 //! `studiofs janitor` — remove orphaned data objects not referenced by metadata.
 
+use crate::cli::cache_layout::describe_cache_layout_state;
 use clap::Args;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -7,6 +8,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use opendal::services::S3;
 use opendal::{EntryMode, ErrorKind, Operator};
+use studiofs_cache::runtime::{CacheBackendDetection, CacheBackendKind, detect_cache_backends};
+use studiofs_cache::{OpenLocalBlockBackendError, open_local_block_backend};
 use studiofs_data::object::{format_object_fragment_keys, parse_object_id_from_key};
 use studiofs_meta::open_meta_engine;
 
@@ -34,6 +37,7 @@ struct JanitorCycleContext<'a> {
 }
 
 struct JanitorOptions {
+    cache_dir: Option<PathBuf>,
     dry_run: bool,
     loop_mode: bool,
     interval_minutes: u64,
@@ -54,6 +58,7 @@ impl JanitorRunRequest {
             name: args.name,
             meta_dir,
             options: JanitorOptions {
+                cache_dir: args.cache_dir,
                 dry_run: args.dry_run,
                 loop_mode: args.r#loop,
                 interval_minutes: args.interval_minutes,
@@ -75,6 +80,10 @@ EXAMPLES:
 pub(crate) struct JanitorArgs {
     /// Volume name
     name: String,
+
+    /// Override local cache base directory (defaults to `<meta-dir>/cache`)
+    #[arg(long)]
+    cache_dir: Option<PathBuf>,
 
     /// Do not delete, only report what would be deleted
     #[arg(long)]
@@ -114,6 +123,80 @@ fn normalize_prefix(format_info: &studiofs_meta::FormatInfo) -> String {
     } else {
         format!("{}/", raw)
     }
+}
+
+fn local_cache_path(
+    meta_dir: &std::path::Path,
+    cache_dir: Option<&std::path::Path>,
+    volume_uuid: &str,
+) -> PathBuf {
+    let base = cache_dir
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| meta_dir.join("cache"));
+    base.join(volume_uuid)
+}
+
+fn map_cache_backend_error(
+    cache_dir: &std::path::Path,
+    source: OpenLocalBlockBackendError,
+) -> anyhow::Error {
+    anyhow::anyhow!(
+        "failed to open local cache backend at '{}': {source}",
+        cache_dir.display()
+    )
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct JanitorLocalCacheState {
+    pending_uploads: usize,
+}
+
+fn inspect_local_cache_runtime(
+    meta_dir: &std::path::Path,
+    cache_dir: Option<&std::path::Path>,
+    volume_uuid: &str,
+) -> anyhow::Result<(
+    PathBuf,
+    Option<CacheBackendDetection>,
+    Option<JanitorLocalCacheState>,
+)> {
+    let cache_path = local_cache_path(meta_dir, cache_dir, volume_uuid);
+    let detection = match detect_cache_backends(&cache_path) {
+        Ok(detection) => detection,
+        Err(error) => {
+            eprintln!(
+                "warning: failed to inspect local cache layout at '{}': {error}",
+                cache_path.display()
+            );
+            return Ok((cache_path, None, None));
+        }
+    };
+    if detection.runtime_backend() != Some(CacheBackendKind::CacheV3) {
+        return Ok((cache_path, Some(detection), None));
+    }
+    if detection.needs_runtime_provisioning() {
+        eprintln!(
+            "warning: local cache runtime at '{}' is incomplete; skipping pending-upload inspection",
+            cache_path.display()
+        );
+        return Ok((cache_path, Some(detection), None));
+    }
+
+    let store = match open_local_block_backend(&cache_path, volume_uuid) {
+        Ok(store) => store.backend,
+        Err(source) => {
+            let error = map_cache_backend_error(&cache_path, source);
+            eprintln!("warning: {error}");
+            return Ok((cache_path, Some(detection), None));
+        }
+    };
+    Ok((
+        cache_path,
+        Some(detection),
+        Some(JanitorLocalCacheState {
+            pending_uploads: store.dirty_object_count(),
+        }),
+    ))
 }
 
 async fn run_one_cycle(ctx: JanitorCycleContext<'_>) -> anyhow::Result<JanitorStats> {
@@ -228,6 +311,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         options,
     } = request;
     let JanitorOptions {
+        cache_dir,
         dry_run,
         loop_mode,
         interval_minutes,
@@ -247,6 +331,8 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
     let format_info = engine.get_format_info()?;
 
     let prefix = normalize_prefix(&format_info);
+    let (cache_path, cache_backend_detection, local_cache_state) =
+        inspect_local_cache_runtime(meta_dir.as_path(), cache_dir.as_deref(), &format_info.uuid)?;
 
     let mut builder = S3::default()
         .endpoint(&format_info.endpoint)
@@ -271,6 +357,17 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
         if dry_run { "dry-run" } else { "delete" }
     );
     println!("  Prefix:    {}", prefix);
+    println!("  Cache root: {}", cache_path.display());
+    println!(
+        "  Local cache state: {}",
+        describe_cache_layout_state(cache_backend_detection.as_ref())
+    );
+    if let Some(local_cache_state) = local_cache_state {
+        println!(
+            "  Local pending uploads: {}",
+            local_cache_state.pending_uploads
+        );
+    }
     println!("  Grace:     {} minutes", skip_newer_minutes);
     println!("  Max delete: {}", max_deletes);
 
@@ -340,12 +437,15 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use studiofs_cache::runtime::CacheV3Layout;
 
     #[test]
     fn janitor_parses_flags_and_defaults() {
         let cli = crate::cli::parse_for_test(&[
             "janitor",
             "vol",
+            "--cache-dir",
+            "D:\\cache\\studiofs",
             "--dry-run",
             "--loop",
             "--interval-minutes",
@@ -360,6 +460,7 @@ mod tests {
         match cli.command {
             crate::cli::Commands::Janitor(JanitorArgs {
                 name,
+                cache_dir,
                 dry_run,
                 r#loop,
                 interval_minutes,
@@ -367,6 +468,7 @@ mod tests {
                 max_deletes,
             }) => {
                 assert_eq!(name, "vol");
+                assert_eq!(cache_dir, Some(PathBuf::from("D:\\cache\\studiofs")));
                 assert!(dry_run);
                 assert!(r#loop);
                 assert_eq!(interval_minutes, 45);
@@ -375,5 +477,117 @@ mod tests {
             }
             other => panic!("expected Janitor, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn janitor_inspects_local_runtime_via_generic_backend_api() {
+        let temp = tempfile::tempdir().unwrap();
+        let meta_dir = temp.path().join("meta");
+        let cache_base = temp.path().join("cache-root");
+        let volume_uuid = "de305d54-75b4-431b-adb2-eb6b9e546014";
+        std::fs::create_dir_all(&meta_dir).unwrap();
+
+        let cache_root = cache_base.join(volume_uuid);
+        let backend = studiofs_cache::open_local_block_backend_with_budget(
+            &cache_root,
+            volume_uuid,
+            4 * 1024 * 1024,
+        )
+        .unwrap()
+        .backend;
+        backend.put(11, b"dirty", false).unwrap();
+        backend.put(22, b"uploaded", true).unwrap();
+        backend.sync_data().unwrap();
+        backend.mark_uploading(22);
+        backend.mark_uploaded(22);
+        drop(backend);
+
+        let (inspected_path, detection, local_cache_state) =
+            inspect_local_cache_runtime(&meta_dir, Some(cache_base.as_path()), volume_uuid)
+                .unwrap();
+
+        assert_eq!(inspected_path, cache_root);
+        assert_eq!(
+            detection
+                .as_ref()
+                .and_then(CacheBackendDetection::runtime_backend),
+            Some(CacheBackendKind::CacheV3)
+        );
+        assert_eq!(
+            local_cache_state,
+            Some(JanitorLocalCacheState { pending_uploads: 1 })
+        );
+    }
+
+    #[test]
+    fn janitor_local_cache_inspection_is_best_effort_when_backend_is_locked() {
+        let temp = tempfile::tempdir().unwrap();
+        let meta_dir = temp.path().join("meta");
+        let cache_base = temp.path().join("cache-root");
+        let volume_uuid = "de305d54-75b4-431b-adb2-eb6b9e546014";
+        std::fs::create_dir_all(&meta_dir).unwrap();
+
+        let cache_root = cache_base.join(volume_uuid);
+        let _backend_guard = studiofs_cache::open_local_block_backend_with_budget(
+            &cache_root,
+            volume_uuid,
+            4 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let (inspected_path, detection, local_cache_state) =
+            inspect_local_cache_runtime(&meta_dir, Some(cache_base.as_path()), volume_uuid)
+                .unwrap();
+
+        assert_eq!(inspected_path, cache_root);
+        assert_eq!(
+            detection
+                .as_ref()
+                .and_then(CacheBackendDetection::runtime_backend),
+            Some(CacheBackendKind::CacheV3)
+        );
+        assert_eq!(
+            local_cache_state, None,
+            "janitor should warn and continue when the local backend cannot be opened"
+        );
+    }
+
+    #[test]
+    fn janitor_local_cache_inspection_does_not_provision_missing_runtime_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let meta_dir = temp.path().join("meta");
+        let cache_base = temp.path().join("cache-root");
+        let volume_uuid = "de305d54-75b4-431b-adb2-eb6b9e546014";
+        std::fs::create_dir_all(&meta_dir).unwrap();
+
+        let cache_root = cache_base.join(volume_uuid);
+        let layout = CacheV3Layout::from_cache_root(&cache_root);
+        std::fs::create_dir_all(layout.v3_root.as_path()).unwrap();
+        std::fs::write(&layout.layout_marker, b"v3\n").unwrap();
+
+        let (inspected_path, detection, local_cache_state) =
+            inspect_local_cache_runtime(&meta_dir, Some(cache_base.as_path()), volume_uuid)
+                .unwrap();
+
+        assert_eq!(inspected_path, cache_root);
+        assert_eq!(
+            detection
+                .as_ref()
+                .and_then(CacheBackendDetection::runtime_backend),
+            Some(CacheBackendKind::CacheV3)
+        );
+        assert_eq!(local_cache_state, None);
+        assert!(
+            !layout.payload_blocks_dir.exists(),
+            "janitor inspection should not provision missing runtime directories"
+        );
+        assert!(
+            !layout.index_dir.exists(),
+            "janitor inspection should remain read-only for missing runtime directories"
+        );
+        assert!(
+            !layout.tmp_dir.exists(),
+            "janitor inspection should not create tmp directories as a side effect"
+        );
     }
 }

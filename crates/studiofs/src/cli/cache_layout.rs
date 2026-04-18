@@ -5,9 +5,9 @@ pub(crate) fn describe_cache_layout_state(
 ) -> &'static str {
     if let Some(detection) = detection {
         if detection.has_cache_v3_contract() {
-            "Local cache layout ready"
+            "Local block runtime ready"
         } else {
-            "Local cache layout not initialized"
+            "Local block runtime not initialized"
         }
     } else {
         "unknown"
