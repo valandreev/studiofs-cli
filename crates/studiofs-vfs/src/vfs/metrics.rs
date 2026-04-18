@@ -105,6 +105,14 @@ pub struct VfsWritePathWinfspWritePathStats {
     pub write_bytes: u64,
     pub avg_write_bytes: f64,
     #[serde(default)]
+    pub strict_calls: u64,
+    #[serde(default)]
+    pub strict_bytes: u64,
+    #[serde(default)]
+    pub opportunistic_calls: u64,
+    #[serde(default)]
+    pub opportunistic_bytes: u64,
+    #[serde(default)]
     pub callback: VfsWritePathStageLatencyStats,
     #[serde(default)]
     pub vfs_write: VfsWritePathStageLatencyStats,

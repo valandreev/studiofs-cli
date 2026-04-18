@@ -344,11 +344,12 @@ impl StudioVfs {
     /// Flush all buffered blocks for a file.
     ///
     /// `write()` may have already coalesced and persisted some full blocks, but
-    /// `flush()` is still the definitive "persist everything that is left"
-    /// barrier for the inode. When dirty unpublished state remains, success
-    /// means the inode crossed the strict local durable boundary; upload and
-    /// publish remain deferred background work. WinFSP file-scoped `Flush`
-    /// relies on this remaining a mandatory dirty-inode barrier.
+    /// `flush()` is still the definitive "materialize everything that is left"
+    /// barrier for the inode. In durable mode success means the inode crossed
+    /// the strict local durable boundary; in fast mode success only means the
+    /// inode reached the latest local unpublished state and upload/publish
+    /// remain deferred background work. WinFSP file-scoped `Flush` relies on
+    /// this remaining a foreground dirty-inode drain path.
     pub async fn flush_with_outcome(&self, ino: Ino) -> VfsResult<ExplicitFlushOutcome> {
         self.flush_inode_barrier_with_outcome(ino, StickyErrorPolicy::Ignore)
             .await

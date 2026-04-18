@@ -1,5 +1,5 @@
-use super::{Bytes, FileType, Ino, LocalSyncPolicy, StudioVfs, VfsError, VfsResult};
 use super::local_dirty::DirtyWriteSnapshot;
+use super::{Bytes, FileType, Ino, LocalSyncPolicy, StudioVfs, VfsError, VfsResult};
 use bytes::BytesMut;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -602,7 +602,8 @@ impl StudioVfs {
                         .await?
                     {
                         Some(data) => {
-                            let logical_len = self.logical_block_len(visible_size, write.block_index);
+                            let logical_len =
+                                self.logical_block_len(visible_size, write.block_index);
                             if data.len() > logical_len {
                                 data.slice(0..logical_len)
                             } else {
@@ -829,11 +830,8 @@ impl StudioVfs {
         if completed_block_indexes.is_empty() {
             return Ok(false);
         }
-        let current_write_full_block_indexes =
-            self.fully_overwritten_full_block_indexes_for_current_handle_write(
-                &writes,
-                visible_size,
-            );
+        let current_write_full_block_indexes = self
+            .fully_overwritten_full_block_indexes_for_current_handle_write(&writes, visible_size);
 
         let mut seqs_by_block = HashMap::<u32, u64>::new();
         for write in &writes {

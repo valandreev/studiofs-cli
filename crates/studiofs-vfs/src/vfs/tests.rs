@@ -27,9 +27,10 @@ fn test_format_info(volume_suffix: &str) -> FormatInfo {
     }
 }
 
-fn make_unstarted_test_vfs(
+fn make_unstarted_test_vfs_with_config(
     tmp: &TempDir,
     volume_suffix: &str,
+    cfg: VfsConfig,
 ) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
     let db_path = tmp.path().join("meta.redb");
     let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
@@ -48,12 +49,17 @@ fn make_unstarted_test_vfs(
         cache_dir.to_str().expect("cache dir str"),
         64 * 1024 * 1024,
         32 * 1024 * 1024,
-        VfsConfig::default()
-            .try_into()
-            .expect("default VFS config should validate"),
+        cfg.try_into().expect("test VFS config should validate"),
     )
     .expect("create vfs");
     (rt, vfs, meta)
+}
+
+fn make_unstarted_test_vfs(
+    tmp: &TempDir,
+    volume_suffix: &str,
+) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
+    make_unstarted_test_vfs_with_config(tmp, volume_suffix, VfsConfig::default())
 }
 
 fn make_test_vfs(
@@ -61,6 +67,17 @@ fn make_test_vfs(
     volume_suffix: &str,
 ) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
     let (rt, vfs, meta) = make_unstarted_test_vfs(tmp, volume_suffix);
+    let _guard = rt.enter();
+    vfs.start().expect("start vfs background workers");
+    (rt, vfs, meta)
+}
+
+fn make_test_vfs_with_config(
+    tmp: &TempDir,
+    volume_suffix: &str,
+    cfg: VfsConfig,
+) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
+    let (rt, vfs, meta) = make_unstarted_test_vfs_with_config(tmp, volume_suffix, cfg);
     let _guard = rt.enter();
     vfs.start().expect("start vfs background workers");
     (rt, vfs, meta)
@@ -3259,11 +3276,93 @@ fn opportunistic_local_sync_ignores_elapsed_window_in_fast_mode() {
 }
 
 #[test]
-fn flush_fh_forces_strict_local_sync_when_dirty_state_remains() {
+fn flush_fh_keeps_opportunistic_local_sync_in_fast_mode() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-fh-strict-local-sync");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-fh-fast-local-sync");
     let attr = vfs
-        .create(1, b"flush-fh-strict-local-sync.txt", 0, 0, 0o644)
+        .create(1, b"flush-fh-fast-local-sync.txt", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = attr.ino;
+    let fh = vfs
+        .open_file(ino, OpenFlags::RDWR, false)
+        .expect("open writable handle");
+
+    let mut dirty_attr = vfs.getattr(ino).expect("load attr");
+    dirty_attr.size = 4096;
+    dirty_attr.touch_mtime();
+    dirty_attr.touch_ctime();
+    vfs.state
+        .namespace
+        .dirty_attrs
+        .lock()
+        .insert(ino, dirty_attr.clone());
+
+    rt.block_on(async {
+        let mut group = vfs.state.local_dirty.local_sync_group.lock().await;
+        group.pending_bytes = 4096;
+        group.last_sync_at = Instant::now();
+    });
+
+    let calls_before = vfs
+        .state
+        .metrics
+        .block_store_sync_data_calls
+        .load(Ordering::Relaxed);
+    let synced_before = vfs
+        .state
+        .metrics
+        .block_store_sync_data_synced_bytes
+        .load(Ordering::Relaxed);
+
+    rt.block_on(async {
+        vfs.flush_fh(fh).await.expect("flush_fh barrier");
+    });
+
+    let calls_after = vfs
+        .state
+        .metrics
+        .block_store_sync_data_calls
+        .load(Ordering::Relaxed);
+    let synced_after = vfs
+        .state
+        .metrics
+        .block_store_sync_data_synced_bytes
+        .load(Ordering::Relaxed);
+    assert_eq!(
+        calls_after, calls_before,
+        "fast-mode flush should no longer force sync_data for dirty unpublished state"
+    );
+    assert_eq!(
+        synced_after, synced_before,
+        "fast-mode flush should leave grouped sync bytes pending until an explicit strict barrier"
+    );
+    rt.block_on(async {
+        let group = vfs.state.local_dirty.local_sync_group.lock().await;
+        assert_eq!(
+            group.pending_bytes, 4096,
+            "fast-mode flush should keep pending local sync bytes queued"
+        );
+    });
+    assert!(
+        !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+        "explicit flush should commit the dirty local attr state"
+    );
+
+    rt.block_on(async {
+        vfs.release_fh(fh).await.expect("release handle");
+    });
+}
+
+#[test]
+fn flush_fh_forces_strict_local_sync_in_durable_mode() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = VfsConfig {
+        cache_safety_mode: CacheSafetyMode::Durable,
+        ..VfsConfig::default()
+    };
+    let (rt, vfs, _meta) = make_test_vfs_with_config(&tmp, "flush-fh-durable-local-sync", cfg);
+    let attr = vfs
+        .create(1, b"flush-fh-durable-local-sync.txt", 0, 0, 0o644)
         .expect("create test file");
     let ino = attr.ino;
     let fh = vfs
@@ -3313,22 +3412,22 @@ fn flush_fh_forces_strict_local_sync_when_dirty_state_remains() {
         .load(Ordering::Relaxed);
     assert!(
         calls_after > calls_before,
-        "explicit flush must force local sync_data for dirty unpublished state"
+        "durable-mode flush must still force local sync_data for dirty unpublished state"
     );
     assert!(
         synced_after >= synced_before + 4096,
-        "explicit flush should account for the pending local durable sync bytes"
+        "durable-mode flush should still account for the pending local durable sync bytes"
     );
     rt.block_on(async {
         let group = vfs.state.local_dirty.local_sync_group.lock().await;
         assert_eq!(
             group.pending_bytes, 0,
-            "explicit flush should drain pending local sync bytes"
+            "durable-mode flush should drain pending local sync bytes"
         );
     });
     assert!(
         !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
-        "explicit flush should commit the dirty local attr state"
+        "durable-mode flush should commit the dirty local attr state"
     );
 
     rt.block_on(async {
@@ -3500,11 +3599,100 @@ fn handle_writer_dirty_attrs_keep_nanos_timestamps() {
 }
 
 #[test]
-fn release_fh_forces_strict_local_sync_when_last_handle_still_owns_dirty_state() {
+fn release_fh_keeps_opportunistic_local_sync_in_fast_mode() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-fh-strict-local-sync");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-fh-fast-local-sync");
     let attr = vfs
-        .create(1, b"release-fh-strict-local-sync.txt", 0, 0, 0o644)
+        .create(1, b"release-fh-fast-local-sync.txt", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = attr.ino;
+    let fh = vfs
+        .open_file(ino, OpenFlags::RDWR, false)
+        .expect("open writable handle");
+
+    let mut dirty_attr = vfs.getattr(ino).expect("load attr");
+    dirty_attr.size = 8192;
+    dirty_attr.touch_mtime();
+    dirty_attr.touch_ctime();
+    vfs.state
+        .namespace
+        .dirty_attrs
+        .lock()
+        .insert(ino, dirty_attr.clone());
+
+    rt.block_on(async {
+        let mut group = vfs.state.local_dirty.local_sync_group.lock().await;
+        group.pending_bytes = 8192;
+        group.last_sync_at = Instant::now();
+    });
+
+    let calls_before = vfs
+        .state
+        .metrics
+        .block_store_sync_data_calls
+        .load(Ordering::Relaxed);
+    let synced_before = vfs
+        .state
+        .metrics
+        .block_store_sync_data_synced_bytes
+        .load(Ordering::Relaxed);
+
+    rt.block_on(async {
+        let outcome = vfs
+            .release_fh_with_outcome(fh)
+            .await
+            .expect("release_fh barrier");
+        assert!(
+            outcome.closed_last_handle,
+            "the only handle should own the last-handle release path"
+        );
+        assert!(
+            outcome.flushed_local_dirty_state,
+            "last-handle release should report draining dirty local state"
+        );
+    });
+
+    let calls_after = vfs
+        .state
+        .metrics
+        .block_store_sync_data_calls
+        .load(Ordering::Relaxed);
+    let synced_after = vfs
+        .state
+        .metrics
+        .block_store_sync_data_synced_bytes
+        .load(Ordering::Relaxed);
+    assert_eq!(
+        calls_after, calls_before,
+        "fast-mode last-handle release should no longer force sync_data when dirty state remains"
+    );
+    assert_eq!(
+        synced_after, synced_before,
+        "fast-mode last-handle release should leave grouped sync bytes pending until fsync"
+    );
+    rt.block_on(async {
+        let group = vfs.state.local_dirty.local_sync_group.lock().await;
+        assert_eq!(
+            group.pending_bytes, 8192,
+            "fast-mode last-handle release should keep pending local sync bytes queued"
+        );
+    });
+    assert!(
+        !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+        "last-handle release should preserve the committed local attr state"
+    );
+}
+
+#[test]
+fn release_fh_forces_strict_local_sync_in_durable_mode() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = VfsConfig {
+        cache_safety_mode: CacheSafetyMode::Durable,
+        ..VfsConfig::default()
+    };
+    let (rt, vfs, _meta) = make_test_vfs_with_config(&tmp, "release-fh-durable-local-sync", cfg);
+    let attr = vfs
+        .create(1, b"release-fh-durable-local-sync.txt", 0, 0, 0o644)
         .expect("create test file");
     let ino = attr.ino;
     let fh = vfs
@@ -3565,22 +3753,22 @@ fn release_fh_forces_strict_local_sync_when_last_handle_still_owns_dirty_state()
         .load(Ordering::Relaxed);
     assert!(
         calls_after > calls_before,
-        "last-handle release must force local sync_data when dirty state remains"
+        "durable-mode last-handle release must still force local sync_data when dirty state remains"
     );
     assert!(
         synced_after >= synced_before + 8192,
-        "last-handle release should account for the pending local sync bytes"
+        "durable-mode last-handle release should still account for the pending local sync bytes"
     );
     rt.block_on(async {
         let group = vfs.state.local_dirty.local_sync_group.lock().await;
         assert_eq!(
             group.pending_bytes, 0,
-            "last-handle release should drain pending local sync bytes"
+            "durable-mode last-handle release should drain pending local sync bytes"
         );
     });
     assert!(
         !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
-        "last-handle release should preserve the committed local attr state"
+        "durable-mode last-handle release should preserve the committed local attr state"
     );
 }
 
@@ -3758,6 +3946,7 @@ fn write_path_observability_reports_winfsp_write_callback_breakdown() {
     vfs.note_winfsp_write_callback();
     vfs.record_winfsp_write_callback_observability(
         256 * 1024,
+        LocalSyncPolicy::Strict,
         Duration::from_millis(6),
         Duration::from_millis(5),
         Duration::from_millis(1),
@@ -3776,6 +3965,19 @@ fn write_path_observability_reports_winfsp_write_callback_breakdown() {
     assert!(
         snapshot.winfsp_write_path.avg_write_bytes >= 256.0 * 1024.0,
         "observability should expose average bytes per write callback"
+    );
+    assert_eq!(
+        snapshot.winfsp_write_path.strict_calls, 1,
+        "observability should attribute strict WinFSP callbacks"
+    );
+    assert_eq!(
+        snapshot.winfsp_write_path.strict_bytes,
+        256 * 1024,
+        "observability should surface bytes written through the strict WinFSP path"
+    );
+    assert_eq!(
+        snapshot.winfsp_write_path.opportunistic_calls, 0,
+        "observability should keep opportunistic counts separate"
     );
     assert_eq!(
         snapshot.winfsp_write_path.callback.calls, 1,

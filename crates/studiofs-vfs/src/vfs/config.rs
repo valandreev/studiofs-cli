@@ -59,6 +59,11 @@ pub(super) const CACHE_RUNTIME_HUGE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024 * 102
 pub enum CacheSafetyMode {
     /// Prefer a single local NVMe payload write (L2 cache) and recover
     /// best-effort by self-healing stale ingress artifacts on startup.
+    ///
+    /// In this mode ordinary `flush` / `close` / last-handle `release`
+    /// materialize local unpublished state but do not force a crash-safe local
+    /// `sync_data()` barrier. `fsync` remains the explicit strict durability
+    /// boundary.
     #[default]
     Fast,
     /// Keep a durable local accept path via append-only ingress WAL +

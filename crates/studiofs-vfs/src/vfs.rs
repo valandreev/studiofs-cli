@@ -1642,6 +1642,10 @@ struct MetricsState {
     winfsp_write_callback_getattr_total_ns: AtomicU64,
     winfsp_write_callback_getattr_max_ns: AtomicU64,
     winfsp_write_callback_getattr_histogram: LatencyHistogram,
+    winfsp_write_callback_strict_calls: AtomicU64,
+    winfsp_write_callback_strict_bytes: AtomicU64,
+    winfsp_write_callback_opportunistic_calls: AtomicU64,
+    winfsp_write_callback_opportunistic_bytes: AtomicU64,
     winfsp_overwrite_callbacks: AtomicU64,
     winfsp_cleanup_callbacks: AtomicU64,
     winfsp_flush_callbacks: AtomicU64,
@@ -1743,6 +1747,10 @@ impl MetricsState {
             winfsp_write_callback_getattr_total_ns: AtomicU64::new(0),
             winfsp_write_callback_getattr_max_ns: AtomicU64::new(0),
             winfsp_write_callback_getattr_histogram: LatencyHistogram::default(),
+            winfsp_write_callback_strict_calls: AtomicU64::new(0),
+            winfsp_write_callback_strict_bytes: AtomicU64::new(0),
+            winfsp_write_callback_opportunistic_calls: AtomicU64::new(0),
+            winfsp_write_callback_opportunistic_bytes: AtomicU64::new(0),
             winfsp_overwrite_callbacks: AtomicU64::new(0),
             winfsp_cleanup_callbacks: AtomicU64::new(0),
             winfsp_flush_callbacks: AtomicU64::new(0),
@@ -2775,6 +2783,10 @@ struct PendingUploadTruthRebuildResult {
 }
 
 impl StudioVfs {
+    pub fn cache_safety_mode(&self) -> CacheSafetyMode {
+        self.cache_safety_mode
+    }
+
     fn filter_runtime_pending_uploads_to_dirty_index(
         &self,
         runtime_pending_uploads: Vec<PendingUpload>,
@@ -5688,6 +5700,7 @@ impl StudioVfs {
     pub fn record_winfsp_write_callback_observability(
         &self,
         write_bytes: usize,
+        local_sync_policy: LocalSyncPolicy,
         callback_elapsed: Duration,
         vfs_write_elapsed: Duration,
         post_write_getattr_elapsed: Duration,
@@ -5707,6 +5720,24 @@ impl StudioVfs {
         metrics
             .winfsp_write_callback_bytes
             .fetch_add(write_bytes as u64, Ordering::Relaxed);
+        match local_sync_policy {
+            LocalSyncPolicy::Strict => {
+                metrics
+                    .winfsp_write_callback_strict_calls
+                    .fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .winfsp_write_callback_strict_bytes
+                    .fetch_add(write_bytes as u64, Ordering::Relaxed);
+            }
+            LocalSyncPolicy::Opportunistic => {
+                metrics
+                    .winfsp_write_callback_opportunistic_calls
+                    .fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .winfsp_write_callback_opportunistic_bytes
+                    .fetch_add(write_bytes as u64, Ordering::Relaxed);
+            }
+        }
         observe_stage_latency(
             &metrics.winfsp_write_callback_total_ns,
             &metrics.winfsp_write_callback_max_ns,
@@ -6191,6 +6222,26 @@ impl StudioVfs {
                             .winfsp_write_callbacks
                             .load(Ordering::Relaxed) as f64
                 },
+                strict_calls: self
+                    .state
+                    .metrics
+                    .winfsp_write_callback_strict_calls
+                    .load(Ordering::Relaxed),
+                strict_bytes: self
+                    .state
+                    .metrics
+                    .winfsp_write_callback_strict_bytes
+                    .load(Ordering::Relaxed),
+                opportunistic_calls: self
+                    .state
+                    .metrics
+                    .winfsp_write_callback_opportunistic_calls
+                    .load(Ordering::Relaxed),
+                opportunistic_bytes: self
+                    .state
+                    .metrics
+                    .winfsp_write_callback_opportunistic_bytes
+                    .load(Ordering::Relaxed),
                 callback: Self::build_stage_latency_stats(
                     self.state
                         .metrics
