@@ -9,11 +9,15 @@ orchestrates metadata operations, local cache access, background tasks, and the
 Local-First visibility rules consumed by the FUSE and WinFSP bridges.
 
 Active invariants:
-- `flush()` / `fsync()` / last-handle release establish durable local
-  unpublished state without waiting for remote upload or publish.
+- `write()` makes bytes visible immediately through writer state.
+- `flush()` / ordinary `close()` / last-handle release materialize accepted
+  bytes into the local authority view without waiting for remote upload or
+  replication.
+- `fsync()` is the explicit strict request for a crash-safe local sync
+  boundary.
 - Same-mount reads observe accepted writes immediately through writer state.
 - Remote visibility is file-version atomic and advances only after background
-  upload plus publish succeed.
+  upload plus replication/apply succeed.
 
 ## Core Struct: `StudioVfs`
 
@@ -89,10 +93,12 @@ data arrives
 
 Handle-aware write path:
 - `write_fh(fh, ino, offset, data)` buffers data identically to `write()`.
-- `flush_fh()` runs the ordered local-durability step for the inode and then
-  surfaces any sticky async-upload error for that inode.
-- Foreground `flush()` / `close()` keep local persistence and error reporting
-  deterministic without waiting for remote upload or publish.
+- `flush_fh()` runs the foreground local materialization step for the inode and
+  then surfaces any sticky async-upload error for that inode.
+- The canonical mount contract is single-mode Fast Local Authority: ordinary
+  `flush()` / `close()` stop at local materialization, while `fsync()` remains
+  the explicit strict local-durability request. Historical
+  `cache_safety_mode=fast|durable` code paths are transitional only.
 - Foreground backpressure is driven by local dirty-state pressure; upload
   backlog alone does not stall writes.
 
@@ -104,14 +110,16 @@ dirty local state for this inode
   ├─ Take a point-in-time snapshot of accepted bytes
   ├─ Reserve/reuse per-block object IDs
   ├─ local backend `put(...)` committed payloads locally
-  ├─ local backend `sync_data()`
+  ├─ local backend `sync_data()` for the explicit strict local sync boundary requested by `fsync()`
   ├─ Persist local unpublished slices + attrs in metadata
   └─ Enqueue uploads for the committed payloads
 ```
 
 Local durability notes:
 - Accepted bytes stay in local dirty state until the local backend ->
-  `sync_data()` -> metadata sequence succeeds.
+  metadata sequence succeeds.
+- `fsync()` is the explicit API that additionally demands the strict local
+  `sync_data()` boundary.
 - Reserved object IDs make retrying the same dirty block idempotent across
   metadata failures.
 - Historical `ingress_spill` directories are outside the active Local-First

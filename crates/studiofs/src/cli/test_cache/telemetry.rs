@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use super::result::{
     AdvancedMetricsReport, CacheLevelReport, CacheLevelsReport, CachePipelineReport,
-    LatencyHistogramReport, OpReport, SizeClassBoundaryReport, SizeClassOpReport,
-    SizeClassStatsReport, StreamResultReport,
+    LatencyHistogramReport, OpReport, OperationLogReport, SizeClassBoundaryReport,
+    SizeClassOpReport, SizeClassStatsReport, StreamResultReport,
 };
 use super::workload::{SizeClass, SizeClassBounds};
 
@@ -80,6 +80,7 @@ impl LatencySamples {
             p95_ms,
             p99_ms,
             throughput_bytes_per_sec,
+            operations_log: Vec::new(),
         }
     }
 
@@ -213,6 +214,18 @@ impl SizeClassLatencySamples {
 pub(super) struct PhaseTelemetry {
     pub(super) overall: LatencySamples,
     by_size: SizeClassLatencySamples,
+    operation_logs: Vec<PhaseOperationLog>,
+}
+
+#[derive(Clone)]
+pub(super) struct PhaseOperationLog {
+    pub(super) operation_index: u64,
+    pub(super) work_index: usize,
+    pub(super) worker_id: usize,
+    pub(super) target: String,
+    pub(super) size_class: SizeClass,
+    pub(super) bytes: u64,
+    pub(super) elapsed: Duration,
 }
 
 impl PhaseTelemetry {
@@ -221,9 +234,58 @@ impl PhaseTelemetry {
         self.by_size.get_mut(class).record(elapsed, bytes);
     }
 
+    pub(super) fn record_operation(
+        &mut self,
+        operation_index: u64,
+        work_index: usize,
+        worker_id: usize,
+        target: impl Into<String>,
+        class: SizeClass,
+        elapsed: Duration,
+        bytes: u64,
+    ) {
+        self.record(class, elapsed, bytes);
+        self.operation_logs.push(PhaseOperationLog {
+            operation_index,
+            work_index,
+            worker_id,
+            target: target.into(),
+            size_class: class,
+            bytes,
+            elapsed,
+        });
+    }
+
+    fn operation_reports(&self) -> Vec<OperationLogReport> {
+        let mut logs = self.operation_logs.clone();
+        logs.sort_by_key(|log| log.operation_index);
+        logs.into_iter()
+            .map(|log| {
+                let elapsed_ms = log.elapsed.as_secs_f64() * 1000.0;
+                let throughput_bytes_per_sec = if elapsed_ms <= f64::EPSILON {
+                    0.0
+                } else {
+                    log.bytes as f64 / (elapsed_ms / 1000.0)
+                };
+                OperationLogReport {
+                    operation_index: log.operation_index,
+                    work_index: log.work_index,
+                    worker_id: log.worker_id,
+                    target: log.target,
+                    size_class: log.size_class.label().to_string(),
+                    bytes: log.bytes,
+                    elapsed_ms,
+                    throughput_bytes_per_sec,
+                }
+            })
+            .collect()
+    }
+
     pub(super) fn merge_from_ref(&mut self, other: &Self) {
         self.overall.merge_from_ref(&other.overall);
         self.by_size.merge_from_ref(&other.by_size);
+        self.operation_logs
+            .extend(other.operation_logs.iter().cloned());
     }
 }
 
@@ -301,8 +363,14 @@ pub(super) fn stream_reports_from_telemetry(
             .enumerate()
             .map(|(idx, (writes, reads))| StreamResultReport {
                 stream_id: idx,
-                writes: writes.overall.to_report(writes_wall_elapsed_ms),
-                reads: reads.overall.to_report(reads_wall_elapsed_ms),
+                writes: phase_telemetry_to_report(
+                    writes,
+                    Duration::from_secs_f64(writes_wall_elapsed_ms / 1000.0),
+                ),
+                reads: phase_telemetry_to_report(
+                    reads,
+                    Duration::from_secs_f64(reads_wall_elapsed_ms / 1000.0),
+                ),
             })
             .collect(),
     )
@@ -312,9 +380,11 @@ pub(super) fn phase_telemetry_to_report(
     telemetry: &PhaseTelemetry,
     wall_elapsed: Duration,
 ) -> OpReport {
-    telemetry
+    let mut report = telemetry
         .overall
-        .to_report(wall_elapsed.as_secs_f64() * 1000.0)
+        .to_report(wall_elapsed.as_secs_f64() * 1000.0);
+    report.operations_log = telemetry.operation_reports();
+    report
 }
 
 pub(super) fn build_advanced_metrics(
@@ -382,5 +452,41 @@ mod tests {
         left.merge_from_ref(&right);
         assert_eq!(left.sample_keep_every, 2);
         assert_eq!(left.samples_ns, vec![1, 3, 10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn phase_telemetry_to_report_preserves_full_operation_log() {
+        let mut telemetry = PhaseTelemetry::default();
+        telemetry.record_operation(
+            9,
+            3,
+            2,
+            "Z:\\bench\\0003.bin",
+            SizeClass::Medium,
+            Duration::from_millis(12),
+            4 * 1024 * 1024,
+        );
+        telemetry.record_operation(
+            4,
+            1,
+            0,
+            "Z:\\bench\\0001.bin",
+            SizeClass::Small,
+            Duration::from_millis(3),
+            512 * 1024,
+        );
+
+        let report = phase_telemetry_to_report(&telemetry, Duration::from_millis(20));
+
+        assert_eq!(report.operations, 2);
+        assert_eq!(report.operations_log.len(), 2);
+        assert_eq!(report.operations_log[0].operation_index, 4);
+        assert_eq!(report.operations_log[0].worker_id, 0);
+        assert_eq!(report.operations_log[0].target, "Z:\\bench\\0001.bin");
+        assert_eq!(report.operations_log[0].size_class, "small");
+        assert_eq!(report.operations_log[1].operation_index, 9);
+        assert_eq!(report.operations_log[1].worker_id, 2);
+        assert_eq!(report.operations_log[1].target, "Z:\\bench\\0003.bin");
+        assert_eq!(report.operations_log[1].size_class, "medium");
     }
 }

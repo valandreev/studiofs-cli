@@ -145,6 +145,23 @@ pub struct CacheIndex {
     last_touch_access_shards: [Mutex<LruCache<u64, Instant>>; TOUCH_ACCESS_LRU_SHARDS],
 }
 
+fn normalize_upsert(mut update: CacheIndexUpsert) -> CacheIndexUpsert {
+    if matches!(
+        update.lifecycle,
+        LocalBlockLifecycleState::Dirty | LocalBlockLifecycleState::Uploading
+    ) {
+        update.evictable = false;
+    }
+    if matches!(update.upload_state, LocalBlockUploadState::Uploading) {
+        update.lifecycle = LocalBlockLifecycleState::Uploading;
+    } else if matches!(update.upload_state, LocalBlockUploadState::Pending) {
+        update.lifecycle = LocalBlockLifecycleState::Dirty;
+    } else if update.origin == LocalBlockOrigin::Downloaded {
+        update.lifecycle = LocalBlockLifecycleState::Uploaded;
+    }
+    update
+}
+
 impl CacheIndex {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, CacheIndexError> {
         let path = path.as_ref().to_path_buf();
@@ -195,19 +212,7 @@ impl CacheIndex {
     }
 
     pub fn upsert(&self, mut update: CacheIndexUpsert) -> Result<(), CacheIndexError> {
-        if matches!(
-            update.lifecycle,
-            LocalBlockLifecycleState::Dirty | LocalBlockLifecycleState::Uploading
-        ) {
-            update.evictable = false;
-        }
-        if matches!(update.upload_state, LocalBlockUploadState::Uploading) {
-            update.lifecycle = LocalBlockLifecycleState::Uploading;
-        } else if matches!(update.upload_state, LocalBlockUploadState::Pending) {
-            update.lifecycle = LocalBlockLifecycleState::Dirty;
-        } else if update.origin == LocalBlockOrigin::Downloaded {
-            update.lifecycle = LocalBlockLifecycleState::Uploaded;
-        }
+        update = normalize_upsert(update);
 
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
@@ -241,6 +246,52 @@ impl CacheIndex {
                 &mut access_order,
                 &mut counters,
             )?;
+        }
+
+        txn.commit().map_err(storage_error)?;
+        Ok(())
+    }
+
+    pub fn upsert_many(&self, updates: &[CacheIndexUpsert]) -> Result<(), CacheIndexError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let txn = self.db.begin_write().map_err(storage_error)?;
+        {
+            let mut blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+            let mut dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
+            let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
+            let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
+
+            for update in updates.iter().cloned().map(normalize_upsert) {
+                let old = read_entry_write(&blocks, update.object_id)?;
+                let mut new = StoredEntry {
+                    payload_key: update.payload_key,
+                    payload_len: update.payload_len,
+                    lifecycle: update.lifecycle,
+                    origin: update.origin,
+                    upload_state: update.upload_state,
+                    last_access_unix_millis: now_unix_millis(),
+                    evictable: update.evictable,
+                    dirty_order: None,
+                    access_order: allocate_sequence(&mut counters, COUNTER_NEXT_ACCESS_SEQ)?,
+                };
+                if is_dirty_like(new.lifecycle) {
+                    new.dirty_order =
+                        Some(allocate_sequence(&mut counters, COUNTER_NEXT_DIRTY_SEQ)?);
+                }
+
+                apply_entry_change(
+                    update.object_id,
+                    old.as_ref(),
+                    Some(&new),
+                    &mut blocks,
+                    &mut dirty_order,
+                    &mut access_order,
+                    &mut counters,
+                )?;
+            }
         }
 
         txn.commit().map_err(storage_error)?;
@@ -1494,6 +1545,50 @@ mod tests {
         assert_eq!(stats.dirty_bytes, 0);
         assert_eq!(stats.evictable_bytes, 100);
         assert_eq!(index.dirty_object_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn upsert_many_batches_accounting_and_lifecycle_updates() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cache.redb");
+        let index = open_index(&db_path);
+
+        index
+            .upsert_many(&[
+                CacheIndexUpsert {
+                    object_id: 21,
+                    payload_key: b"payload/21.block".to_vec(),
+                    payload_len: 64,
+                    lifecycle: LocalBlockLifecycleState::Dirty,
+                    origin: LocalBlockOrigin::Local,
+                    upload_state: LocalBlockUploadState::Pending,
+                    evictable: false,
+                },
+                CacheIndexUpsert {
+                    object_id: 22,
+                    payload_key: b"payload/22.block".to_vec(),
+                    payload_len: 32,
+                    lifecycle: LocalBlockLifecycleState::Uploaded,
+                    origin: LocalBlockOrigin::Downloaded,
+                    upload_state: LocalBlockUploadState::None,
+                    evictable: true,
+                },
+            ])
+            .expect("batch upsert");
+
+        let stats = index.stats().expect("index stats after batch upsert");
+        assert_eq!(stats.current_bytes, 96);
+        assert_eq!(stats.dirty_bytes, 64);
+        assert_eq!(stats.evictable_bytes, 32);
+        assert_eq!(index.dirty_object_count().unwrap(), 1);
+
+        let dirty = index
+            .dirty_uploading_entries()
+            .expect("dirty/uploading entries after batch upsert");
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].object_id, 21);
+        assert_eq!(dirty[0].payload_len, 64);
+        assert_eq!(dirty[0].lifecycle, LocalBlockLifecycleState::Dirty);
     }
 
     #[test]

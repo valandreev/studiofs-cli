@@ -42,11 +42,11 @@ pub(super) const CACHE_RUNTIME_MAX_DIRTY_BYTES_HUGE: usize = 8 * 1024 * 1024 * 1
 pub(super) const CACHE_RUNTIME_MIN_WRITE_EAGER_BATCH_BYTES: usize = 16 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_MAX_WRITE_EAGER_BATCH_BYTES: usize = 128 * 1024 * 1024;
 pub(super) const WRITE_EAGER_DRAIN_CHUNK_MAX_BYTES: usize = 32 * 1024 * 1024;
-pub(super) const PAYLOAD_PUT_CONCURRENCY_TARGET_BYTES: usize = 8 * 1024 * 1024;
+pub(super) const PAYLOAD_PUT_CONCURRENCY_TARGET_BYTES: usize = 32 * 1024 * 1024;
 pub(super) const PAYLOAD_PUT_CONCURRENCY_MAX: usize = 32;
 pub(super) const FAST_MODE_SYNC_GROUP_MIN_BYTES_FLOOR: u64 = 32 * 1024 * 1024;
 pub(super) const FAST_MODE_SYNC_GROUP_MIN_BYTES_CEIL: u64 = 256 * 1024 * 1024;
-pub(super) const FAST_MODE_SYNC_GROUP_MAX_DELAY_MS: u64 = 25;
+pub(super) const FAST_MODE_SYNC_GROUP_MAX_DELAY_MS: u64 = 100;
 pub(super) const CACHE_RUNTIME_MIN_TRANSIT_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_MAX_TRANSIT_BUDGET_BYTES: usize = 4 * 1024 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_SMALL_BUDGET_BYTES: u64 = 128 * 1024 * 1024 * 1024;
@@ -59,6 +59,11 @@ pub(super) const CACHE_RUNTIME_HUGE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024 * 102
 pub enum CacheSafetyMode {
     /// Prefer a single local NVMe payload write (L2 cache) and recover
     /// best-effort by self-healing stale ingress artifacts on startup.
+    ///
+    /// In this mode ordinary `flush` / `close` / last-handle `release`
+    /// materialize local unpublished state but do not force a crash-safe local
+    /// `sync_data()` barrier. `fsync` remains the explicit strict durability
+    /// boundary.
     #[default]
     Fast,
     /// Keep a durable local accept path via append-only ingress WAL +
@@ -136,16 +141,15 @@ pub(super) enum LocalSyncTrigger {
     Explicit,
     DurableMode,
     BytesThreshold,
-    TimeWindow,
 }
 
 pub(super) fn write_path_sync_trigger(
     cache_safety_mode: CacheSafetyMode,
     local_sync_policy: LocalSyncPolicy,
     pending_bytes: u64,
-    elapsed_since_last_sync: Duration,
+    _elapsed_since_last_sync: Duration,
     group_min_bytes: u64,
-    group_max_delay: Duration,
+    _group_max_delay: Duration,
 ) -> Option<LocalSyncTrigger> {
     if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
         return Some(LocalSyncTrigger::Explicit);
@@ -155,9 +159,6 @@ pub(super) fn write_path_sync_trigger(
     }
     if pending_bytes >= group_min_bytes {
         return Some(LocalSyncTrigger::BytesThreshold);
-    }
-    if elapsed_since_last_sync >= group_max_delay {
-        return Some(LocalSyncTrigger::TimeWindow);
     }
     None
 }
@@ -837,8 +838,20 @@ mod tests {
         );
         assert_eq!(validated.qos_fetch_slots, defaults.qos_fetch_slots);
         assert_eq!(
-            validated.upload_worker_count, 128,
+            validated.upload_worker_count, 16,
             "validation should materialize upload worker default"
+        );
+        assert_eq!(
+            validated.upload_initial_window, 4.0,
+            "validation should materialize the foreground-friendly upload initial window default"
+        );
+        assert_eq!(
+            validated.upload_max_window, 16.0,
+            "validation should materialize the clamped upload max window default"
+        );
+        assert_eq!(
+            validated.upload_increase_step, 1.0,
+            "validation should materialize the gentler upload AIMD growth default"
         );
         assert_eq!(
             validated.upload_requeue_base_ms,
@@ -951,7 +964,7 @@ mod tests {
     }
 
     #[test]
-    fn local_sync_policy_fast_mode_waits_until_threshold_or_window() {
+    fn local_sync_policy_fast_mode_waits_until_threshold_only() {
         let bytes_trigger = write_path_sync_trigger(
             CacheSafetyMode::Fast,
             LocalSyncPolicy::Opportunistic,
@@ -970,7 +983,7 @@ mod tests {
             64 * 1024 * 1024,
             Duration::from_millis(25),
         );
-        assert_eq!(window_trigger, Some(LocalSyncTrigger::TimeWindow));
+        assert_eq!(window_trigger, None);
 
         let deferred = write_path_sync_trigger(
             CacheSafetyMode::Fast,

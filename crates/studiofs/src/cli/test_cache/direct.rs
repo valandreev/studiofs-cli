@@ -15,7 +15,8 @@ use super::result::{
     BenchmarkProfileReport, BenchmarkReport, CachePipelineReport, CpuProfileReport,
 };
 use super::telemetry::{
-    DirectReadTelemetry, PhaseTelemetry, build_advanced_metrics, stream_reports_from_telemetry,
+    DirectReadTelemetry, PhaseTelemetry, build_advanced_metrics, phase_telemetry_to_report,
+    stream_reports_from_telemetry,
 };
 use super::workload::{
     SizeClassBounds, build_access_sequence, build_work_sizes, classify_size, deterministic_bytes,
@@ -85,7 +86,15 @@ async fn run_shim_writes(
                 let mut s = stats
                     .lock()
                     .map_err(|_| anyhow!("shim write latency stats lock poisoned"))?;
-                s.record(class, elapsed, sizes[work_index]);
+                s.record_operation(
+                    op_index as u64,
+                    work_index,
+                    worker_id,
+                    format!("object:{object_id}"),
+                    class,
+                    elapsed,
+                    sizes[work_index],
+                );
             }
         }));
     }
@@ -121,7 +130,7 @@ async fn run_shim_reads(
     let sizes: Arc<[u64]> = Arc::from(sizes.to_vec());
     let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
 
-    for _ in 0..worker_count {
+    for worker_id in 0..worker_count {
         let cache = Arc::clone(&cache);
         let order = Arc::clone(&order);
         let sizes = Arc::clone(&sizes);
@@ -172,7 +181,15 @@ async fn run_shim_reads(
                 let mut s = stats
                     .lock()
                     .map_err(|_| anyhow!("shim read latency stats lock poisoned"))?;
-                s.phase.record(class, elapsed, read as u64);
+                s.phase.record_operation(
+                    op_index as u64,
+                    work_index,
+                    worker_id,
+                    format!("object:{object_id}"),
+                    class,
+                    elapsed,
+                    read as u64,
+                );
                 match trace.level {
                     CacheReadLevel::L1 => {
                         s.cache_levels
@@ -245,7 +262,15 @@ async fn run_shim_writes_sequential_streams(
                     size_class_bounds.small_max,
                     size_class_bounds.medium_max,
                 );
-                telemetry.record(class, elapsed, sizes[work_index]);
+                telemetry.record_operation(
+                    work_index as u64,
+                    work_index,
+                    stream_id,
+                    format!("object:{object_id}"),
+                    class,
+                    elapsed,
+                    sizes[work_index],
+                );
             }
             Ok::<_, anyhow::Error>((stream_id, telemetry))
         }));
@@ -312,7 +337,15 @@ async fn run_shim_reads_sequential_streams(
                     size_class_bounds.small_max,
                     size_class_bounds.medium_max,
                 );
-                telemetry.phase.record(class, elapsed, read as u64);
+                telemetry.phase.record_operation(
+                    work_index as u64,
+                    work_index,
+                    stream_id,
+                    format!("object:{object_id}"),
+                    class,
+                    elapsed,
+                    read as u64,
+                );
                 match trace.level {
                     CacheReadLevel::L1 => {
                         telemetry.cache_levels.record_l1(
@@ -355,7 +388,12 @@ pub(super) async fn run_direct(
         small_max: params.size_class_small_max,
         medium_max: params.size_class_medium_max,
     };
-    let workload = build_work_sizes(params.block_size, &params.sizes, size_class_bounds);
+    let workload = build_work_sizes(
+        params.block_size,
+        &params.sizes,
+        size_class_bounds,
+        params.workload_repeat,
+    );
     let work_sizes = workload.sizes.clone();
     let order = build_access_sequence(
         work_sizes.len(),
@@ -560,6 +598,7 @@ pub(super) async fn run_direct(
         io_depth: params.io_depth,
         warmup_runs: params.warmup_runs,
         sizes: workload.source,
+        workload_repeat: params.workload_repeat,
         workload_files: work_sizes.len(),
         workload_small_files: workload.small_files,
         workload_medium_files: workload.medium_files,
@@ -575,11 +614,9 @@ pub(super) async fn run_direct(
         local_first_read_comparison: None,
         stream_results,
         mounted_memory: None,
+        mounted_write_path_window: None,
         work_root: None,
-        writes: writes.overall.to_report(writes_wall.as_secs_f64() * 1000.0),
-        reads: reads
-            .phase
-            .overall
-            .to_report(reads_wall.as_secs_f64() * 1000.0),
+        writes: phase_telemetry_to_report(&writes, writes_wall),
+        reads: phase_telemetry_to_report(&reads.phase, reads_wall),
     })
 }

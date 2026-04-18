@@ -1,7 +1,8 @@
 use super::{
-    AccessLevel, DirtyAttrPersistPolicy, ExplicitFlushOutcome, FileSessionOperation, FsyncOutcome,
-    HandleReleaseContext, Ino, LastHandleReleaseAction, LocalSyncBarrierOutcome, LocalSyncPolicy,
-    OpenFile, OpenFlags, ReleaseFhOutcome, StickyErrorPolicy, StudioVfs, VfsResult,
+    AccessLevel, CacheSafetyMode, DirtyAttrPersistPolicy, ExplicitFlushOutcome,
+    FileSessionOperation, FsyncOutcome, HandleReleaseContext, Ino, LastHandleReleaseAction,
+    LocalSyncBarrierOutcome, LocalSyncPolicy, OpenFile, OpenFlags, ReleaseFhOutcome,
+    StickyErrorPolicy, StudioVfs, VfsResult,
 };
 use std::sync::Arc;
 use tracing::debug;
@@ -9,22 +10,24 @@ use tracing::debug;
 use crate::VfsMeta;
 use crate::runtime::run_meta;
 
+use std::time::Instant;
+
 impl StudioVfs {
     /// Release a file handle.
     ///
     /// If the inode was unlinked while this handle was open (orphan) and this
     /// was the last open handle, perform the deferred deletion now.
     ///
-    /// This is also the mandatory last-handle local-state drain point. If a
-    /// writable handle reaches release with dirty blocks or attrs still
-    /// pending, `release_fh` must push that state through the current local
+    /// This is also the last-handle local-state drain point. If a writable
+    /// handle reaches release with dirty blocks or attrs still pending,
+    /// `release_fh` must push that state through the current local
     /// payload/metadata pipeline before the handle disappears so later opens,
     /// open-unlink cleanup, and sticky-error reporting all see a coherent
-    /// inode. When dirty unpublished state is still present, the final release
-    /// must drive that inode through the strict local durability barrier so a
-    /// clean reboot can replay the accepted epoch without involving publish.
-    /// Clean last-handle closes still short-circuit without inventing extra
-    /// work on the foreground path.
+    /// inode. In durable mode this remains a strict local-durability barrier;
+    /// in fast mode it only guarantees that local unpublished state is
+    /// materialized, not that payload bytes have crossed a crash-safe sync
+    /// boundary. Clean last-handle closes still short-circuit without
+    /// inventing extra work on the foreground path.
     pub async fn release_fh(&self, fh: u64) -> VfsResult<()> {
         self.release_fh_with_outcome(fh).await.map(|_| ())
     }
@@ -215,7 +218,9 @@ impl StudioVfs {
     }
 
     fn local_sync_policy_for_barrier(&self, ino: Ino) -> LocalSyncPolicy {
-        if self.inode_has_local_dirty_state(ino) || self.inode_has_dirty_handle_writers(ino) {
+        let has_pending_local_state =
+            self.inode_has_local_dirty_state(ino) || self.inode_has_dirty_handle_writers(ino);
+        if has_pending_local_state && matches!(self.cache_safety_mode, CacheSafetyMode::Durable) {
             LocalSyncPolicy::Strict
         } else {
             LocalSyncPolicy::Opportunistic
@@ -258,7 +263,9 @@ impl StudioVfs {
     /// This is the explicit per-handle barrier used by FUSE and by WinFSP
     /// callback paths that decide to make dirty state explicit while the handle
     /// is still valid. Clean handles should return quickly; dirty handles must
-    /// persist current local state before success or error is reported.
+    /// persist current local state before success or error is reported. In
+    /// durable mode this is a strict local-durability barrier; in fast mode it
+    /// materializes local unpublished state without forcing a crash-safe sync.
     pub async fn flush_fh_with_outcome(&self, fh: u64) -> VfsResult<ExplicitFlushOutcome> {
         let Some(open_file) = self.handle_table.get(fh) else {
             return Ok(ExplicitFlushOutcome::default());
@@ -392,18 +399,37 @@ impl StudioVfs {
                 });
                 return Ok(data.len() as u32);
             }
-            let written = self
-                .record_handle_writer_state(fh, ino, offset, data)
-                .await?;
+            self.note_vfs_write_call(data.len());
+
+            let record_handle_writer_state_started = Instant::now();
+            let written = self.record_handle_writer_state(fh, ino, offset, data).await;
+            self.record_vfs_write_record_handle_writer_state(
+                record_handle_writer_state_started.elapsed(),
+            );
+            let written = written?;
             if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
-                self.materialize_handle_writers_for_inode(ino, local_sync_policy)
-                    .await?;
+                let materialize_strict_started = Instant::now();
+                let strict_result = self
+                    .materialize_handle_writers_for_inode(ino, local_sync_policy)
+                    .await;
+                self.record_vfs_write_materialize_strict(materialize_strict_started.elapsed());
+                strict_result?;
             } else {
-                self.materialize_completed_handle_writer_blocks_for_inode(ino, local_sync_policy)
-                    .await?;
+                let materialize_completed_started = Instant::now();
+                let completed_result = self
+                    .materialize_completed_handle_writer_blocks_for_inode(ino, local_sync_policy)
+                    .await;
+                self.record_vfs_write_materialize_completed(
+                    materialize_completed_started.elapsed(),
+                );
+                completed_result?;
             }
-            self.materialize_handle_writers_for_limits(ino, local_sync_policy)
-                .await?;
+            let materialize_for_limits_started = Instant::now();
+            let limits_result = self
+                .materialize_handle_writers_for_limits(ino, local_sync_policy)
+                .await;
+            self.record_vfs_write_materialize_for_limits(materialize_for_limits_started.elapsed());
+            limits_result?;
             Ok(written)
         }
         .await;

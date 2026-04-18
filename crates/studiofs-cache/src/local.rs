@@ -62,6 +62,13 @@ pub struct LocalBlockObjectStats {
     pub evictable: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBlockPut {
+    pub object_id: u64,
+    pub data: Bytes,
+    pub evictable: bool,
+}
+
 /// Backend-agnostic error surface for local block operations.
 #[derive(Debug, thiserror::Error)]
 pub enum LocalBlockBackendError {
@@ -88,6 +95,12 @@ pub trait LocalBlockBackend: Send + Sync {
         data: &[u8],
         evictable: bool,
     ) -> Result<(), LocalBlockBackendError>;
+    fn put_batch(&self, entries: &[LocalBlockPut]) -> Result<(), LocalBlockBackendError> {
+        for entry in entries {
+            self.put(entry.object_id, entry.data.as_ref(), entry.evictable)?;
+        }
+        Ok(())
+    }
     fn sync_data(&self) -> Result<(), LocalBlockBackendError>;
     fn run_pressure_maintenance(&self) -> Result<(), LocalBlockBackendError>;
 

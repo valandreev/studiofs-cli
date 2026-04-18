@@ -11,16 +11,17 @@ StudioFS mounts S3-compatible object storage as a Local-First filesystem with a
 JuiceFS-inspired, Rust-native chunk/slice/block data plane.
 
 Core principles:
-- Foreground metadata operations read and write local `redb`; foreground payload
-  durability flows through the local cache backend before remote publication.
-- PostgreSQL is the shared replication bus and checkpoint store, not the hot
-  read path.
+- Foreground metadata operations read and write local `redb`; the local `redb`
+  view is the only metadata authority used by mounted foreground IO.
+- PostgreSQL is the bootstrap source, ordered replication bus, checkpoint
+  store, and shared-lock authority when cross-client file locks are enabled.
 - File payloads live in immutable blocks addressed by chunk-relative slices.
-- Runtime visibility is split into `writer state`, `local unpublished state`,
-  and `published state`.
+- Runtime visibility is split into `writer state`, local authority view, and
+  asynchronously replicated shared state.
 - The current `v3` subtree is an implementation detail of the local cache
   backend, not the architecture name of the product.
-- Remote visibility switches atomically at the file-version boundary.
+- Remote visibility switches atomically at the file-version boundary after peer
+  replay/apply, not on local `close()`.
 
 ## Workspace Graph
 
@@ -36,21 +37,24 @@ studiofs (CLI)
 
 ## Metadata Architecture
 
-`PgMetaEngine` keeps one local-first view and one published/shared view:
+`PgMetaEngine` keeps a local authority view and a replication path:
 
-- bootstrap loads the latest published checkpoint from `metadata_state`
+- bootstrap loads the latest replicated checkpoint from `metadata_state`
 - steady-state sync exchanges ordered delta events through `event_log`
-- local reads resolve against local `redb` first, then converge toward newer
-  foreign published state through invalidation and replay
-- crash recovery rebuilds pending unpublished state from local metadata and
-  upload/publish bookkeeping
+- local reads resolve against local `redb` only, then converge toward newer
+  foreign state through invalidation and replay
+- crash recovery rebuilds pending local state from local metadata and
+  upload/replication bookkeeping
+- each discovered client reserves a persistent PG client slot and derives its
+  disjoint local inode/block ID ranges from it during bootstrap/discover;
+  later mounts reuse the persisted slot/ranges without needing a fresh PG
+  reservation
 
 Core invariants:
-- local `size` and local slices may be ahead of remote-visible committed state
-- the writing mount keeps newer local unpublished data ahead of foreign
-  published state
-- foreign apply updates the published/base tables and must not clobber newer
-  local unpublished state
+- local `size` and local slices may be ahead of peer-visible replicated state
+- the writing mount keeps newer local state ahead of foreign replicated state
+- foreign apply updates replicated/base tables and must not clobber newer local
+  authority state
 - ordinary restart/reopen recovers pending convergence without requiring local
   metadata wipe + `discover`
 
@@ -60,27 +64,28 @@ Core invariants:
 2. StudioFS updates local metadata in `redb`.
 3. Accepted bytes enter handle-owned writer state and become immediately
    readable on the writing mount.
-4. `flush(ino)` / `fsync(ino)` / last-handle release materialize durable local
-   unpublished slices and attrs through local backend + `sync_data()` +
-   metadata commit.
+4. `flush(ino)` / `close(ino)` / last-handle release materialize accepted bytes
+   into the local authority view through local backend + metadata commit.
 5. `CachedStore` queues persisted payloads for background upload.
 6. Background workers upload immutable blocks to object storage.
-7. Epoch finalization publishes the new file version only after the referenced
-   objects and metadata line up.
-8. Other clients converge later through PostgreSQL invalidation/replay and
-   published-state refresh.
+7. `fsync(ino)` is the explicit strict request for a crash-safe local sync
+   boundary.
+8. Epoch finalization publishes the new file version only after the referenced
+   objects and replication metadata line up.
+9. Other clients converge later through PostgreSQL invalidation/replay and
+   local apply into their own `redb`.
 
 ## Read Resolution
 
 Reads resolve data in this order:
 1. active writer state for the current mount/handle
-2. durable local unpublished state
-3. published state
-4. zero-fill for holes, with local cache / object-store fetches supplying the
-   block payloads needed by the selected slice view
+2. local authority view in `redb`
+3. local cache / object-store fetches supplying the block payloads needed by
+   the selected slice view
+4. zero-fill for holes
 
-Metadata lookups are served from local `redb`, where the local unpublished view
-outranks the published/base tables on the writing mount.
+Metadata lookups are served from local `redb`; PostgreSQL is not part of the
+foreground read path.
 
 ## Cache and Upload Runtime
 

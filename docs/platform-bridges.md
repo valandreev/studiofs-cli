@@ -100,11 +100,11 @@ I/O buffer behavior on Windows callbacks:
 - `read_directory`: per-entry UTF-16 conversion reuses a single `Vec<u16>` buffer and only falls back to lossy replacement semantics for invalid UTF-8 names.
 
 WinFSP callback barrier semantics:
-- Explicit `flush(context=Some(..))` remains a mandatory dirty-inode foreground barrier.
+- Explicit `flush(context=Some(..))` remains a mandatory dirty-inode foreground drain.
 - `cleanup` with delete finalizes `unlink()` / `rmdir()` in the cleanup callback itself.
 - Non-delete `cleanup` is observational only; for real file handles it records that the callback happened, but any remaining dirty local state is deferred to a later explicit `flush` or the last-handle `close` / `release_fh()` path.
 - `fh == 0` contexts, such as directories, do not have a `release_fh()` fallback; they stay observational unless an explicit `flush` callback makes local state visible.
-- `close` is the release-path hook for WinFSP. It may attribute the fallback last-handle local-durability barrier, but it must not force synchronous publish/upload.
+- `close` is the release-path hook for WinFSP. Under the canonical Fast Local Authority contract it materializes the newest local state but must not force synchronous PG/S3 replication; `fsync` remains the explicit strict local-durability request. Historical `cache_safety_mode=fast|durable` differences are transitional only.
 - `overwrite` and EOF-changing `set_file_size` commit the new local EOF before the callback returns; they are not backgroundable flush barriers.
 
 **Attribute mapping:**
@@ -274,7 +274,7 @@ background local-I/O pool.
 FUSE callback barrier semantics:
 - `flush` is a handle-backed explicit local-durability barrier and routes through the shared handle-drain barrier path.
 - `fsync` is inode-scoped. It persists local unpublished state for the inode, including dirty handle-writer state, but does not force remote publication.
-- `release` is the fallback last-handle local-durability barrier only. Clean release is observational.
+- `release` materializes the remaining local state for the last handle but must not force synchronous PG/S3 replication; `fsync` remains the explicit strict local-durability request.
 - Size-changing `setattr` / truncate paths commit the new local EOF before the callback returns.
 
 **UID/GID remapping:** root-owned inodes (uid=0) are remapped to the mounting user's UID/GID.

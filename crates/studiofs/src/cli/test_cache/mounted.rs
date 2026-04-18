@@ -19,6 +19,7 @@ use super::profiling::{cpu_utilization_percent, process_cpu_time};
 use super::result::{
     BenchmarkProfileReport, BenchmarkReport, CpuProfileReport,
     MountedLocalFirstReadComparisonReport, MountedLocalFirstReadPhaseReport, MountedMemoryReport,
+    MountedWritePathWindowReport,
 };
 use super::telemetry::{
     PhaseTelemetry, build_advanced_metrics, phase_telemetry_to_report,
@@ -43,9 +44,9 @@ impl PendingUploadTarget {
         }
     }
 
-    fn matches(self, pending_uploads: usize) -> bool {
+    fn matches(self, pending_uploads: usize, required_pending_uploads: usize) -> bool {
         match self {
-            Self::Active => pending_uploads > 0,
+            Self::Active => pending_uploads >= required_pending_uploads.max(1),
             Self::Idle => pending_uploads == 0,
         }
     }
@@ -54,6 +55,7 @@ impl PendingUploadTarget {
 struct PendingUploadObservation {
     target: PendingUploadTarget,
     observed: bool,
+    required_pending_uploads: usize,
     waited: Duration,
     pending_uploads: usize,
 }
@@ -131,7 +133,7 @@ fn sample_mount_process_rss(system: &mut System, pid: Pid) -> Option<u64> {
     system.process(pid).map(|process| process.memory())
 }
 
-async fn read_dirty_pressure_snapshot(
+async fn read_write_path_observability_snapshot(
     metrics_path: &Path,
     expected_publisher_pid: u32,
 ) -> Result<Option<VfsWritePathObservabilitySnapshot>> {
@@ -169,7 +171,7 @@ fn spawn_mounted_memory_sampler(
                 accumulator.observe_rss(rss_bytes);
             }
             if let Some(metrics_path) = metrics_path.as_deref() {
-                match read_dirty_pressure_snapshot(metrics_path, mount_pid).await {
+                match read_write_path_observability_snapshot(metrics_path, mount_pid).await {
                     Ok(Some(snapshot)) => accumulator.observe_dirty_pressure(
                         snapshot.dirty_pressure.total_dirty_bytes as u64,
                         snapshot.dirty_pressure.dirty_limit_bytes as u64,
@@ -204,7 +206,8 @@ fn spawn_mounted_memory_sampler(
             accumulator.observe_rss(rss_bytes);
         }
         if let Some(metrics_path) = metrics_path.as_deref()
-            && let Ok(Some(snapshot)) = read_dirty_pressure_snapshot(metrics_path, mount_pid).await
+            && let Ok(Some(snapshot)) =
+                read_write_path_observability_snapshot(metrics_path, mount_pid).await
         {
             accumulator.observe_dirty_pressure(
                 snapshot.dirty_pressure.total_dirty_bytes as u64,
@@ -237,7 +240,7 @@ where
     result.map(|value| (value, mounted_memory))
 }
 
-async fn scan_pending_uploads(upload_dir: &Path) -> Result<usize> {
+async fn scan_legacy_pending_upload_artifacts(upload_dir: &Path) -> Result<usize> {
     let mut entries = match fs::read_dir(upload_dir).await {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -258,18 +261,42 @@ async fn scan_pending_uploads(upload_dir: &Path) -> Result<usize> {
     Ok(pending_uploads)
 }
 
+async fn scan_pending_uploads(
+    metrics_path: Option<&Path>,
+    expected_publisher_pid: u32,
+    upload_dir: Option<&Path>,
+) -> Result<usize> {
+    if let Some(metrics_path) = metrics_path
+        && let Some(snapshot) =
+            read_write_path_observability_snapshot(metrics_path, expected_publisher_pid).await?
+    {
+        return Ok(snapshot.pending_uploads);
+    }
+
+    if let Some(upload_dir) = upload_dir {
+        return scan_legacy_pending_upload_artifacts(upload_dir).await;
+    }
+
+    Ok(0)
+}
+
 async fn wait_for_pending_upload_target(
-    upload_dir: &Path,
+    metrics_path: Option<&Path>,
+    expected_publisher_pid: u32,
+    upload_dir: Option<&Path>,
     target: PendingUploadTarget,
+    required_pending_uploads: usize,
     timeout: Duration,
 ) -> Result<PendingUploadObservation> {
     let start = Instant::now();
     loop {
-        let pending_uploads = scan_pending_uploads(upload_dir).await?;
-        if target.matches(pending_uploads) {
+        let pending_uploads =
+            scan_pending_uploads(metrics_path, expected_publisher_pid, upload_dir).await?;
+        if target.matches(pending_uploads, required_pending_uploads) {
             return Ok(PendingUploadObservation {
                 target,
                 observed: true,
+                required_pending_uploads,
                 waited: start.elapsed(),
                 pending_uploads,
             });
@@ -278,12 +305,37 @@ async fn wait_for_pending_upload_target(
             return Ok(PendingUploadObservation {
                 target,
                 observed: false,
+                required_pending_uploads,
                 waited: start.elapsed(),
                 pending_uploads,
             });
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+fn pending_upload_validation_message(observation: &PendingUploadObservation) -> Option<String> {
+    if observation.observed {
+        return None;
+    }
+
+    Some(match observation.target {
+        PendingUploadTarget::Active => format!(
+            "did not observe pending_uploads >= {} before timeout",
+            observation.required_pending_uploads.max(1)
+        ),
+        PendingUploadTarget::Idle => "did not observe pending_uploads == 0 before timeout".into(),
+    })
+}
+
+fn build_mounted_write_path_window(
+    before: Option<VfsWritePathObservabilitySnapshot>,
+    after: Option<VfsWritePathObservabilitySnapshot>,
+) -> Option<MountedWritePathWindowReport> {
+    if before.is_none() && after.is_none() {
+        return None;
+    }
+    Some(MountedWritePathWindowReport { before, after })
 }
 
 async fn run_mounted_write_phase(
@@ -374,7 +426,7 @@ async fn run_filesystem_writes(
     let order: Arc<[usize]> = Arc::from(order.to_vec());
     let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
 
-    for _ in 0..worker_count {
+    for worker_id in 0..worker_count {
         let files = Arc::clone(&files);
         let order = Arc::clone(&order);
         let stats = Arc::clone(&stats);
@@ -417,7 +469,15 @@ async fn run_filesystem_writes(
                 let mut s = stats
                     .lock()
                     .map_err(|_| anyhow!("filesystem write latency stats lock poisoned"))?;
-                s.record(class, elapsed, item.size);
+                s.record_operation(
+                    op_index as u64,
+                    work_index,
+                    worker_id,
+                    item.path.display().to_string(),
+                    class,
+                    elapsed,
+                    item.size,
+                );
             }
         }));
     }
@@ -452,7 +512,7 @@ async fn run_filesystem_reads(
     let order: Arc<[usize]> = Arc::from(order.to_vec());
     let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::with_capacity(worker_count);
 
-    for _ in 0..worker_count {
+    for worker_id in 0..worker_count {
         let files = Arc::clone(&files);
         let order = Arc::clone(&order);
         let stats = Arc::clone(&stats);
@@ -493,7 +553,15 @@ async fn run_filesystem_reads(
                 let mut s = stats
                     .lock()
                     .map_err(|_| anyhow!("filesystem read latency stats lock poisoned"))?;
-                s.record(class, elapsed, read_len as u64);
+                s.record_operation(
+                    op_index as u64,
+                    work_index,
+                    worker_id,
+                    item.path.display().to_string(),
+                    class,
+                    elapsed,
+                    read_len as u64,
+                );
             }
         }));
     }
@@ -554,7 +622,15 @@ async fn run_filesystem_writes_sequential_streams(
                     size_class_bounds.small_max,
                     size_class_bounds.medium_max,
                 );
-                telemetry.record(class, elapsed, item.size);
+                telemetry.record_operation(
+                    work_index as u64,
+                    work_index,
+                    stream_id,
+                    item.path.display().to_string(),
+                    class,
+                    elapsed,
+                    item.size,
+                );
             }
             Ok::<_, anyhow::Error>((stream_id, telemetry))
         }));
@@ -612,7 +688,15 @@ async fn run_filesystem_reads_sequential_streams(
                     size_class_bounds.small_max,
                     size_class_bounds.medium_max,
                 );
-                telemetry.record(class, elapsed, read_len as u64);
+                telemetry.record_operation(
+                    work_index as u64,
+                    work_index,
+                    stream_id,
+                    item.path.display().to_string(),
+                    class,
+                    elapsed,
+                    read_len as u64,
+                );
             }
             Ok::<_, anyhow::Error>((stream_id, telemetry))
         }));
@@ -657,7 +741,12 @@ pub(super) async fn run_mounted_end_to_end(
             small_max: params.size_class_small_max,
             medium_max: params.size_class_medium_max,
         };
-        let workload = build_work_sizes(params.block_size, &params.sizes, size_class_bounds);
+        let workload = build_work_sizes(
+            params.block_size,
+            &params.sizes,
+            size_class_bounds,
+            params.workload_repeat,
+        );
         if workload.sizes.is_empty() {
             anyhow::bail!("nothing to benchmark");
         }
@@ -693,14 +782,20 @@ pub(super) async fn run_mounted_end_to_end(
             );
             let _ = run_mounted_write_phase(params, &files, &order, size_class_bounds).await?;
             let _ = wait_for_pending_upload_target(
-                upload_dir,
+                write_path_observability_path.as_deref(),
+                mount_pid,
+                Some(upload_dir),
                 PendingUploadTarget::Active,
-                Duration::from_secs(10),
+                params.during_upload_min_pending,
+                params.during_upload_timeout,
             )
             .await?;
             let idle_before_baseline = wait_for_pending_upload_target(
-                upload_dir,
+                write_path_observability_path.as_deref(),
+                mount_pid,
+                Some(upload_dir),
                 PendingUploadTarget::Idle,
+                0,
                 Duration::from_secs(60),
             )
             .await?;
@@ -721,13 +816,25 @@ pub(super) async fn run_mounted_end_to_end(
                 phase: "baseline-read".to_string(),
                 wait_target: idle_before_baseline.target.label().to_string(),
                 target_state_observed: idle_before_baseline.observed,
+                valid_for_target: idle_before_baseline.observed,
+                required_pending_uploads: idle_before_baseline.required_pending_uploads,
                 wait_ms: idle_before_baseline.waited.as_secs_f64() * 1000.0,
                 pending_uploads_before: idle_before_baseline.pending_uploads,
-                pending_uploads_after: scan_pending_uploads(upload_dir).await?,
+                pending_uploads_after: scan_pending_uploads(
+                    write_path_observability_path.as_deref(),
+                    mount_pid,
+                    Some(upload_dir),
+                )
+                .await?,
+                validation_message: pending_upload_validation_message(&idle_before_baseline),
                 results: phase_telemetry_to_report(&baseline_reads, baseline_wall),
             });
         }
 
+        let measured_write_path_before = match write_path_observability_path.as_deref() {
+            Some(path) => read_write_path_observability_snapshot(path, mount_pid).await?,
+            None => None,
+        };
         let (measured, mounted_memory) = sample_mounted_memory_during(
             mount_pid,
             write_path_observability_path.as_deref(),
@@ -758,9 +865,12 @@ pub(super) async fn run_mounted_end_to_end(
                     if let Some(upload_dir) = cache_upload_dir.as_deref() {
                         Some(
                             wait_for_pending_upload_target(
-                                upload_dir,
+                                write_path_observability_path.as_deref(),
+                                mount_pid,
+                                Some(upload_dir),
                                 PendingUploadTarget::Active,
-                                Duration::from_secs(10),
+                                params.during_upload_min_pending,
+                                params.during_upload_timeout,
                             )
                             .await?,
                         )
@@ -810,6 +920,12 @@ pub(super) async fn run_mounted_end_to_end(
             },
         )
         .await?;
+        let measured_write_path_after = match write_path_observability_path.as_deref() {
+            Some(path) => read_write_path_observability_snapshot(path, mount_pid).await?,
+            None => None,
+        };
+        let mounted_write_path_window =
+            build_mounted_write_path_window(measured_write_path_before, measured_write_path_after);
 
         let profile = params.profile.then_some(BenchmarkProfileReport {
             enabled: true,
@@ -852,6 +968,16 @@ pub(super) async fn run_mounted_end_to_end(
                         .as_ref()
                         .map(|observation| observation.observed)
                         .unwrap_or(false),
+                    valid_for_target: measured
+                        .during_upload_observation
+                        .as_ref()
+                        .map(|observation| observation.observed)
+                        .unwrap_or(false),
+                    required_pending_uploads: measured
+                        .during_upload_observation
+                        .as_ref()
+                        .map(|observation| observation.required_pending_uploads)
+                        .unwrap_or(params.during_upload_min_pending),
                     wait_ms: measured
                         .during_upload_observation
                         .as_ref()
@@ -862,13 +988,25 @@ pub(super) async fn run_mounted_end_to_end(
                         .as_ref()
                         .map(|observation| observation.pending_uploads)
                         .unwrap_or_default(),
-                    pending_uploads_after: scan_pending_uploads(upload_dir).await?,
+                    pending_uploads_after: scan_pending_uploads(
+                        write_path_observability_path.as_deref(),
+                        mount_pid,
+                        Some(upload_dir),
+                    )
+                    .await?,
+                    validation_message: measured
+                        .during_upload_observation
+                        .as_ref()
+                        .and_then(pending_upload_validation_message),
                     results: phase_telemetry_to_report(&measured.reads, measured.reads_wall),
                 };
 
                 let idle_before_post = wait_for_pending_upload_target(
-                    upload_dir,
+                    write_path_observability_path.as_deref(),
+                    mount_pid,
+                    Some(upload_dir),
                     PendingUploadTarget::Idle,
+                    0,
                     Duration::from_secs(60),
                 )
                 .await?;
@@ -889,9 +1027,17 @@ pub(super) async fn run_mounted_end_to_end(
                     phase: "post-upload-read".to_string(),
                     wait_target: idle_before_post.target.label().to_string(),
                     target_state_observed: idle_before_post.observed,
+                    valid_for_target: idle_before_post.observed,
+                    required_pending_uploads: idle_before_post.required_pending_uploads,
                     wait_ms: idle_before_post.waited.as_secs_f64() * 1000.0,
                     pending_uploads_before: idle_before_post.pending_uploads,
-                    pending_uploads_after: scan_pending_uploads(upload_dir).await?,
+                    pending_uploads_after: scan_pending_uploads(
+                        write_path_observability_path.as_deref(),
+                        mount_pid,
+                        Some(upload_dir),
+                    )
+                    .await?,
+                    validation_message: pending_upload_validation_message(&idle_before_post),
                     results: phase_telemetry_to_report(&post_reads, post_wall),
                 };
 
@@ -937,6 +1083,7 @@ pub(super) async fn run_mounted_end_to_end(
             io_depth: params.io_depth,
             warmup_runs: params.warmup_runs,
             sizes: workload.source,
+            workload_repeat: params.workload_repeat,
             workload_files: files.len(),
             workload_small_files: workload.small_files,
             workload_medium_files: workload.medium_files,
@@ -952,15 +1099,10 @@ pub(super) async fn run_mounted_end_to_end(
             advanced_metrics: Some(advanced_metrics),
             stream_results,
             mounted_memory,
+            mounted_write_path_window,
             local_first_read_comparison,
-            writes: measured
-                .writes
-                .overall
-                .to_report(measured.writes_wall.as_secs_f64() * 1000.0),
-            reads: measured
-                .reads
-                .overall
-                .to_report(measured.reads_wall.as_secs_f64() * 1000.0),
+            writes: phase_telemetry_to_report(&measured.writes, measured.writes_wall),
+            reads: phase_telemetry_to_report(&measured.reads, measured.reads_wall),
         })
     }
     .await;
@@ -982,6 +1124,17 @@ mod tests {
         total_dirty_bytes: usize,
         dirty_limit_bytes: usize,
     ) {
+        write_snapshot_with_pending(path, publisher_pid, total_dirty_bytes, dirty_limit_bytes, 0)
+            .await;
+    }
+
+    async fn write_snapshot_with_pending(
+        path: &Path,
+        publisher_pid: u32,
+        total_dirty_bytes: usize,
+        dirty_limit_bytes: usize,
+        pending_uploads: usize,
+    ) {
         let snapshot = VfsWritePathObservabilitySnapshot {
             publisher_pid,
             dirty_pressure: VfsWritePathDirtyPressureStats {
@@ -989,6 +1142,7 @@ mod tests {
                 dirty_limit_bytes,
                 ..Default::default()
             },
+            pending_uploads,
             ..Default::default()
         };
         let bytes = serde_json::to_vec(&snapshot).expect("serialize snapshot");
@@ -996,12 +1150,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_dirty_pressure_snapshot_ignores_mismatched_publisher_pid() {
+    async fn read_write_path_observability_snapshot_ignores_mismatched_publisher_pid() {
         let temp = tempdir().expect("tempdir");
         let metrics_path = temp.path().join("write_path_observability.json");
         write_snapshot(&metrics_path, 7, 512, 1024).await;
 
-        let snapshot = read_dirty_pressure_snapshot(&metrics_path, 42)
+        let snapshot = read_write_path_observability_snapshot(&metrics_path, 42)
             .await
             .expect("read snapshot");
 
@@ -1030,5 +1184,47 @@ mod tests {
         let mounted_memory = mounted_memory.expect("mounted memory");
         assert_eq!(mounted_memory.dirty_bytes_peak, Some(256));
         assert_eq!(mounted_memory.dirty_limit_bytes, Some(1024));
+    }
+
+    #[test]
+    fn pending_upload_validation_message_explains_missing_active_uploads() {
+        let observation = PendingUploadObservation {
+            target: PendingUploadTarget::Active,
+            observed: false,
+            required_pending_uploads: 4,
+            waited: Duration::from_secs(10),
+            pending_uploads: 0,
+        };
+
+        assert_eq!(
+            pending_upload_validation_message(&observation).as_deref(),
+            Some("did not observe pending_uploads >= 4 before timeout")
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_pending_uploads_prefers_live_snapshot_pending_count() {
+        let temp = tempdir().expect("tempdir");
+        let metrics_path = temp.path().join("write_path_observability.json");
+        let upload_dir = temp.path().join("upload");
+        fs::create_dir_all(&upload_dir)
+            .await
+            .expect("create legacy upload dir");
+        fs::write(upload_dir.join("legacy.pending"), b"legacy")
+            .await
+            .expect("write legacy pending artifact");
+        write_snapshot_with_pending(&metrics_path, 42, 0, 1024, 7).await;
+
+        assert_eq!(
+            scan_pending_uploads(Some(&metrics_path), 42, Some(&upload_dir))
+                .await
+                .expect("scan pending uploads"),
+            7
+        );
+    }
+
+    #[test]
+    fn mounted_write_path_window_is_absent_when_both_snapshots_missing() {
+        assert!(build_mounted_write_path_window(None, None).is_none());
     }
 }

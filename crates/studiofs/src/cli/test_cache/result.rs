@@ -1,6 +1,7 @@
 use crate::cli::test_cache_profile_types::ProfileArtifactKind;
 use serde::Serialize;
 use studiofs_cache::metrics::CachePipelineMetricsSnapshot;
+use studiofs_vfs::VfsWritePathObservabilitySnapshot;
 
 #[derive(Debug, Serialize)]
 pub(super) struct OpReport {
@@ -11,6 +12,20 @@ pub(super) struct OpReport {
     pub(super) p50_ms: f64,
     pub(super) p95_ms: f64,
     pub(super) p99_ms: f64,
+    pub(super) throughput_bytes_per_sec: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) operations_log: Vec<OperationLogReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct OperationLogReport {
+    pub(super) operation_index: u64,
+    pub(super) work_index: usize,
+    pub(super) worker_id: usize,
+    pub(super) target: String,
+    pub(super) size_class: String,
+    pub(super) bytes: u64,
+    pub(super) elapsed_ms: f64,
     pub(super) throughput_bytes_per_sec: f64,
 }
 
@@ -29,6 +44,7 @@ pub(super) struct BenchmarkReport {
     pub(super) io_depth: usize,
     pub(super) warmup_runs: u32,
     pub(super) sizes: String,
+    pub(super) workload_repeat: usize,
     pub(super) workload_files: usize,
     pub(super) workload_small_files: usize,
     pub(super) workload_medium_files: usize,
@@ -55,6 +71,8 @@ pub(super) struct BenchmarkReport {
     pub(super) stream_results: Option<Vec<StreamResultReport>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) mounted_memory: Option<MountedMemoryReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) mounted_write_path_window: Option<MountedWritePathWindowReport>,
     pub(super) writes: OpReport,
     pub(super) reads: OpReport,
 }
@@ -82,13 +100,25 @@ pub(super) struct MountedLocalFirstReadComparisonReport {
 }
 
 #[derive(Debug, Serialize)]
+pub(super) struct MountedWritePathWindowReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) before: Option<VfsWritePathObservabilitySnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) after: Option<VfsWritePathObservabilitySnapshot>,
+}
+
+#[derive(Debug, Serialize)]
 pub(super) struct MountedLocalFirstReadPhaseReport {
     pub(super) phase: String,
     pub(super) wait_target: String,
     pub(super) target_state_observed: bool,
+    pub(super) valid_for_target: bool,
+    pub(super) required_pending_uploads: usize,
     pub(super) wait_ms: f64,
     pub(super) pending_uploads_before: usize,
     pub(super) pending_uploads_after: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) validation_message: Option<String>,
     pub(super) results: OpReport,
 }
 
@@ -342,6 +372,7 @@ pub(crate) fn sample_report() -> BenchmarkReport {
         io_depth: 32,
         warmup_runs: 0,
         sizes: "default".to_string(),
+        workload_repeat: 1,
         workload_files: DEFAULT_WORKLOAD_FILES,
         workload_small_files: WORKLOAD_FILES_PER_TIER,
         workload_medium_files: WORKLOAD_FILES_PER_TIER,
@@ -530,6 +561,7 @@ pub(crate) fn sample_report() -> BenchmarkReport {
         local_first_read_comparison: None,
         stream_results: None,
         mounted_memory: None,
+        mounted_write_path_window: None,
         writes: OpReport {
             operations: 16,
             bytes: 128 * 1024 * 1024,
@@ -539,6 +571,7 @@ pub(crate) fn sample_report() -> BenchmarkReport {
             p95_ms: 8.3,
             p99_ms: 8.8,
             throughput_bytes_per_sec: 1_375.53 * 1024.0 * 1024.0,
+            operations_log: Vec::new(),
         },
         reads: OpReport {
             operations: 16,
@@ -549,6 +582,7 @@ pub(crate) fn sample_report() -> BenchmarkReport {
             p95_ms: 8.1,
             p99_ms: 8.6,
             throughput_bytes_per_sec: 1_375.53 * 1024.0 * 1024.0,
+            operations_log: Vec::new(),
         },
     }
 }

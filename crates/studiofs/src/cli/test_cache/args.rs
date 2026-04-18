@@ -9,12 +9,15 @@ pub(crate) struct TestCacheRunRequest {
     pub(super) read_size: Option<String>,
     pub(super) small_max: Option<String>,
     pub(super) medium_max: Option<String>,
+    pub(super) workload_repeat: usize,
     pub(super) concurrency: usize,
     pub(super) sequential_streams: bool,
     pub(super) io_depth: usize,
     pub(super) warmup_runs: u32,
     pub(super) sizes: Option<String>,
     pub(super) access_pattern: TestCacheAccessPattern,
+    pub(super) during_upload_min_pending: usize,
+    pub(super) during_upload_timeout_ms: u64,
     pub(super) l1_limit: Option<String>,
     pub(super) profile: Option<TestCacheProfileMode>,
     pub(super) json_output: Option<PathBuf>,
@@ -28,12 +31,15 @@ impl From<TestCacheArgs> for TestCacheRunRequest {
             read_size: args.read_size,
             small_max: args.small_max,
             medium_max: args.medium_max,
+            workload_repeat: args.workload_repeat,
             concurrency: args.concurrency,
             sequential_streams: args.sequential_streams,
             io_depth: args.io_depth,
             warmup_runs: args.warmup_runs,
             sizes: args.sizes,
             access_pattern: args.access_pattern,
+            during_upload_min_pending: args.during_upload_min_pending,
+            during_upload_timeout_ms: args.during_upload_timeout_ms,
             l1_limit: args.l1_limit,
             profile: args.profile,
             json_output: args.json_output,
@@ -68,6 +74,10 @@ pub(crate) struct TestCacheArgs {
     #[arg(long)]
     medium_max: Option<String>,
 
+    /// Repeat the generated workload this many times.
+    #[arg(long, default_value_t = 1)]
+    workload_repeat: usize,
+
     /// Number of concurrent streams.
     #[arg(long, default_value_t = 1)]
     concurrency: usize,
@@ -93,6 +103,14 @@ pub(crate) struct TestCacheArgs {
     /// Access pattern: `sequential`, `random`, or `mixed`.
     #[arg(long, value_enum, default_value_t = TestCacheAccessPattern::Sequential)]
     access_pattern: TestCacheAccessPattern,
+
+    /// Minimum pending uploads required for the `during-upload-read` phase to count as observed.
+    #[arg(long, default_value_t = 1)]
+    during_upload_min_pending: usize,
+
+    /// Timeout in milliseconds while waiting for active uploads before `during-upload-read`.
+    #[arg(long, default_value_t = 10_000)]
+    during_upload_timeout_ms: u64,
 
     /// In-memory L1 cache limit (e.g. 2GB).
     #[arg(long)]
@@ -146,12 +164,16 @@ mod tests {
                 read_size,
                 small_max,
                 medium_max,
+                workload_repeat,
                 access_pattern,
                 l1_limit,
                 json_output,
                 profile,
+                during_upload_min_pending,
+                during_upload_timeout_ms,
             }) => {
                 assert_eq!(path, PathBuf::from("/tmp/studiofs-cache"));
+                assert_eq!(workload_repeat, 1);
                 assert_eq!(concurrency, 1);
                 assert!(!sequential_streams);
                 assert_eq!(io_depth, 32);
@@ -162,6 +184,8 @@ mod tests {
                 assert_eq!(small_max.as_deref(), None);
                 assert_eq!(medium_max.as_deref(), None);
                 assert!(matches!(access_pattern, TestCacheAccessPattern::Sequential));
+                assert_eq!(during_upload_min_pending, 1);
+                assert_eq!(during_upload_timeout_ms, 10_000);
                 assert!(l1_limit.is_none());
                 assert!(json_output.is_none());
                 assert!(profile.is_none());
@@ -209,12 +233,15 @@ mod tests {
                 read_size,
                 small_max,
                 medium_max,
+                workload_repeat,
                 access_pattern,
                 concurrency,
                 sequential_streams,
                 io_depth,
                 warmup_runs,
                 sizes,
+                during_upload_min_pending,
+                during_upload_timeout_ms,
                 l1_limit,
                 json_output,
                 profile,
@@ -224,12 +251,15 @@ mod tests {
                 assert_eq!(read_size.unwrap(), "1MB");
                 assert_eq!(small_max.unwrap(), "64KB");
                 assert_eq!(medium_max.unwrap(), "16MB");
+                assert_eq!(workload_repeat, 1);
                 assert!(matches!(access_pattern, TestCacheAccessPattern::Random));
                 assert_eq!(concurrency, 16);
                 assert!(sequential_streams);
                 assert_eq!(io_depth, 64);
                 assert_eq!(warmup_runs, 2);
                 assert_eq!(sizes.unwrap(), "small=60,medium=30,large=10");
+                assert_eq!(during_upload_min_pending, 1);
+                assert_eq!(during_upload_timeout_ms, 10_000);
                 assert_eq!(l1_limit.unwrap(), "4GB");
                 assert_eq!(
                     json_output.unwrap(),
@@ -249,6 +279,35 @@ mod tests {
         match cli.command {
             crate::cli::Commands::TestCache(TestCacheArgs { profile, .. }) => {
                 assert!(matches!(profile, Some(TestCacheProfileMode::Pyroscope)));
+            }
+            other => panic!("expected TestCache, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_cache_parses_workload_and_during_upload_overrides() {
+        let cli = crate::cli::parse_for_test(&[
+            "test-cache",
+            "Z:\\bench",
+            "--workload-repeat",
+            "12",
+            "--during-upload-min-pending",
+            "4",
+            "--during-upload-timeout-ms",
+            "30000",
+        ])
+        .unwrap();
+
+        match cli.command {
+            crate::cli::Commands::TestCache(TestCacheArgs {
+                workload_repeat,
+                during_upload_min_pending,
+                during_upload_timeout_ms,
+                ..
+            }) => {
+                assert_eq!(workload_repeat, 12);
+                assert_eq!(during_upload_min_pending, 4);
+                assert_eq!(during_upload_timeout_ms, 30_000);
             }
             other => panic!("expected TestCache, got {other:?}"),
         }

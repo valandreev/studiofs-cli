@@ -220,6 +220,7 @@ fn assign_reserved_object_ids(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn run_bounded_tasks<I, F, Fut, T, E>(
     items: I,
     concurrency: usize,
@@ -657,16 +658,17 @@ impl LocalBlockWriterPort for VfsLocalBlockWriter<'_> {
         let persisted_bytes: u64 = persisted_blocks.iter().map(|b| b.data.len() as u64).sum();
         let started = Instant::now();
         let result: VfsResult<()> = async {
-            run_bounded_tasks(
-                persisted_blocks.iter().cloned(),
-                persist_config.put_concurrency,
-                |block| async move {
-                    self.vfs
-                        .block_store_put_async(block.object_id, block.data, false)
-                        .await
-                },
-            )
-            .await?;
+            for chunk in persisted_blocks.chunks(persist_config.put_concurrency.max(1)) {
+                let batch = chunk
+                    .iter()
+                    .map(|block| studiofs_cache::local::LocalBlockPut {
+                        object_id: block.object_id,
+                        data: block.data.clone(),
+                        evictable: false,
+                    })
+                    .collect();
+                self.vfs.block_store_put_batch_async(batch).await?;
+            }
             self.vfs
                 .maybe_block_store_sync_data_async(
                     persisted_bytes,

@@ -1077,11 +1077,16 @@ impl UploadLifecycleWorker {
 
     pub(crate) async fn run(self, mut rx: tokio::sync::mpsc::UnboundedReceiver<PendingUpload>) {
         info!("background uploader started");
-        let worker_count = self.vfs.upload_worker_count.max(1);
+        let worker_count = self
+            .vfs
+            .upload_worker_count
+            .max(1)
+            .min(self.vfs.upload_scheduler.max_concurrency_hint());
         let permits = Arc::new(Semaphore::new(worker_count));
         let mut workers = JoinSet::new();
         info!(
             upload_worker_count = worker_count,
+            upload_max_concurrency_hint = self.vfs.upload_scheduler.max_concurrency_hint(),
             "upload worker pool started"
         );
 

@@ -101,6 +101,41 @@ pub struct VfsWritePathWinfspCallbackStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsWritePathWinfspWritePathStats {
+    pub write_bytes: u64,
+    pub avg_write_bytes: f64,
+    #[serde(default)]
+    pub strict_calls: u64,
+    #[serde(default)]
+    pub strict_bytes: u64,
+    #[serde(default)]
+    pub opportunistic_calls: u64,
+    #[serde(default)]
+    pub opportunistic_bytes: u64,
+    #[serde(default)]
+    pub callback: VfsWritePathStageLatencyStats,
+    #[serde(default)]
+    pub vfs_write: VfsWritePathStageLatencyStats,
+    #[serde(default)]
+    pub post_write_getattr: VfsWritePathStageLatencyStats,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsWritePathVfsWriteStats {
+    pub calls: u64,
+    pub write_bytes: u64,
+    pub avg_write_bytes: f64,
+    #[serde(default)]
+    pub record_handle_writer_state: VfsWritePathStageLatencyStats,
+    #[serde(default)]
+    pub materialize_completed: VfsWritePathStageLatencyStats,
+    #[serde(default)]
+    pub materialize_strict: VfsWritePathStageLatencyStats,
+    #[serde(default)]
+    pub materialize_for_limits: VfsWritePathStageLatencyStats,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsWritePathWinfspForegroundFlushStats {
     pub cleanup: u64,
     pub flush: u64,
@@ -204,6 +239,8 @@ pub struct VfsWritePathObservabilitySnapshot {
     pub publisher_pid: u32,
     pub generated_unix_ms: u64,
     pub uptime_secs: f64,
+    #[serde(default)]
+    pub pending_uploads: usize,
     pub backend_tag: String,
     pub flush_barrier_calls: u64,
     pub flush_barrier_calls_per_sec: f64,
@@ -211,6 +248,10 @@ pub struct VfsWritePathObservabilitySnapshot {
     #[serde(default)]
     pub local_cache_io: VfsWritePathLocalCacheIoStats,
     pub winfsp_callbacks: VfsWritePathWinfspCallbackStats,
+    #[serde(default)]
+    pub winfsp_write_path: VfsWritePathWinfspWritePathStats,
+    #[serde(default)]
+    pub vfs_write_path: VfsWritePathVfsWriteStats,
     #[serde(default)]
     pub winfsp_foreground_flushes: VfsWritePathWinfspForegroundFlushStats,
     pub write_backpressure: VfsWritePathBackpressureStats,
