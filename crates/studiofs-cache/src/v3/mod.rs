@@ -439,6 +439,8 @@ impl CacheV3LocalBlockBackend {
                 .dirty_object_count()
                 .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
             if dirty_object_count == 0 {
+                current_after_evict =
+                    self.evict_to_target_bytes(target_bytes, "put_low_space_retry")?;
                 break;
             }
 
@@ -1638,6 +1640,45 @@ mod tests {
             backend.lifecycle_state(11),
             LocalBlockLifecycleState::Dirty,
             "the newly admitted local block remains dirty until a later upload transition marks it uploaded"
+        );
+    }
+
+    #[test]
+    fn cache_v3_retry_low_space_reclaims_when_pending_upload_already_finished() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = CacheV3Layout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = CacheV3LocalBlockBackend::open_with_budget(
+            CacheV3LocalBlockBackendConfig {
+                cache_root: temp.path().to_path_buf(),
+                volume_uuid: [0x7C; 16],
+            },
+            Some(32),
+        )
+        .unwrap();
+        backend.put(10, &[0xAA; 32], false).unwrap();
+        backend.mark_uploading(10);
+
+        let current_after_evict = backend.index.stats().unwrap().current_bytes;
+        let target_bytes = backend
+            .budget_governor
+            .target_before_insert(current_after_evict, 16)
+            .expect("budget pressure should require eviction before insert");
+
+        backend.mark_uploaded(10);
+
+        let current_after_retry = backend
+            .retry_non_evictable_put_after_upload_drain(target_bytes, 16, current_after_evict)
+            .unwrap();
+
+        assert!(
+            current_after_retry <= target_bytes,
+            "retry should run one more eviction pass after the pending upload becomes evictable"
+        );
+        assert!(
+            !backend.contains(10),
+            "the uploaded block should be reclaimed once it becomes evictable"
         );
     }
 

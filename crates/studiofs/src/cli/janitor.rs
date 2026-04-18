@@ -161,19 +161,40 @@ fn inspect_local_cache_runtime(
     Option<JanitorLocalCacheState>,
 )> {
     let cache_path = local_cache_path(meta_dir, cache_dir, volume_uuid);
-    let detection = detect_cache_backends(&cache_path)?;
+    let detection = match detect_cache_backends(&cache_path) {
+        Ok(detection) => detection,
+        Err(error) => {
+            eprintln!(
+                "warning: failed to inspect local cache layout at '{}': {error}",
+                cache_path.display()
+            );
+            return Ok((cache_path, None, None));
+        }
+    };
     if detection.runtime_backend() != Some(CacheBackendKind::CacheV3) {
         return Ok((cache_path, Some(detection), None));
     }
+    if detection.needs_runtime_provisioning() {
+        eprintln!(
+            "warning: local cache runtime at '{}' is incomplete; skipping pending-upload inspection",
+            cache_path.display()
+        );
+        return Ok((cache_path, Some(detection), None));
+    }
 
-    let store = open_local_block_backend(&cache_path, volume_uuid)
-        .map_err(|source| map_cache_backend_error(&cache_path, source))?
-        .backend;
+    let store = match open_local_block_backend(&cache_path, volume_uuid) {
+        Ok(store) => store.backend,
+        Err(source) => {
+            let error = map_cache_backend_error(&cache_path, source);
+            eprintln!("warning: {error}");
+            return Ok((cache_path, Some(detection), None));
+        }
+    };
     Ok((
         cache_path,
         Some(detection),
         Some(JanitorLocalCacheState {
-            pending_uploads: store.dirty_object_ids().len(),
+            pending_uploads: store.dirty_object_count(),
         }),
     ))
 }
@@ -416,6 +437,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use studiofs_cache::runtime::CacheV3Layout;
 
     #[test]
     fn janitor_parses_flags_and_defaults() {
@@ -494,6 +516,78 @@ mod tests {
         assert_eq!(
             local_cache_state,
             Some(JanitorLocalCacheState { pending_uploads: 1 })
+        );
+    }
+
+    #[test]
+    fn janitor_local_cache_inspection_is_best_effort_when_backend_is_locked() {
+        let temp = tempfile::tempdir().unwrap();
+        let meta_dir = temp.path().join("meta");
+        let cache_base = temp.path().join("cache-root");
+        let volume_uuid = "de305d54-75b4-431b-adb2-eb6b9e546014";
+        std::fs::create_dir_all(&meta_dir).unwrap();
+
+        let cache_root = cache_base.join(volume_uuid);
+        let _backend_guard = studiofs_cache::open_local_block_backend_with_budget(
+            &cache_root,
+            volume_uuid,
+            4 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let (inspected_path, detection, local_cache_state) =
+            inspect_local_cache_runtime(&meta_dir, Some(cache_base.as_path()), volume_uuid)
+                .unwrap();
+
+        assert_eq!(inspected_path, cache_root);
+        assert_eq!(
+            detection
+                .as_ref()
+                .and_then(CacheBackendDetection::runtime_backend),
+            Some(CacheBackendKind::CacheV3)
+        );
+        assert_eq!(
+            local_cache_state, None,
+            "janitor should warn and continue when the local backend cannot be opened"
+        );
+    }
+
+    #[test]
+    fn janitor_local_cache_inspection_does_not_provision_missing_runtime_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let meta_dir = temp.path().join("meta");
+        let cache_base = temp.path().join("cache-root");
+        let volume_uuid = "de305d54-75b4-431b-adb2-eb6b9e546014";
+        std::fs::create_dir_all(&meta_dir).unwrap();
+
+        let cache_root = cache_base.join(volume_uuid);
+        let layout = CacheV3Layout::from_cache_root(&cache_root);
+        std::fs::create_dir_all(layout.v3_root.as_path()).unwrap();
+        std::fs::write(&layout.layout_marker, b"v3\n").unwrap();
+
+        let (inspected_path, detection, local_cache_state) =
+            inspect_local_cache_runtime(&meta_dir, Some(cache_base.as_path()), volume_uuid)
+                .unwrap();
+
+        assert_eq!(inspected_path, cache_root);
+        assert_eq!(
+            detection
+                .as_ref()
+                .and_then(CacheBackendDetection::runtime_backend),
+            Some(CacheBackendKind::CacheV3)
+        );
+        assert_eq!(local_cache_state, None);
+        assert!(
+            !layout.payload_blocks_dir.exists(),
+            "janitor inspection should not provision missing runtime directories"
+        );
+        assert!(
+            !layout.index_dir.exists(),
+            "janitor inspection should remain read-only for missing runtime directories"
+        );
+        assert!(
+            !layout.tmp_dir.exists(),
+            "janitor inspection should not create tmp directories as a side effect"
         );
     }
 }
