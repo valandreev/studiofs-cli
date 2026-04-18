@@ -19,13 +19,12 @@ use crate::vfs::{
     DEFAULT_PREFETCH_FOREGROUND_RESERVE, DEFAULT_PREFETCH_MAX_PER_CYCLE,
     DEFAULT_PREFETCH_PAUSE_ON_NETERR_MS, DEFAULT_PUBLISH_VISIBILITY_TIMEOUT_SECS,
     DEFAULT_QOS_ACCEPT_SLOTS, DEFAULT_QOS_COMMIT_SLOTS, DEFAULT_QOS_FETCH_SLOTS,
-    DEFAULT_QOS_MATERIALIZE_SLOTS, DEFAULT_QOS_UPLOAD_SLOTS, DEFAULT_READ_BUFFER_MB,
-    DEFAULT_READAHEAD_MIN_PREFETCH, DEFAULT_READAHEAD_RANDOM_PENALTY, DEFAULT_READAHEAD_SEQ_STEP,
-    DEFAULT_READAHEAD_WIDTH, DEFAULT_READDIR_ATTR_BATCH_CHUNK,
-    DEFAULT_READDIR_ATTR_BATCH_MAX_INODES, DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS,
-    DEFAULT_SLAB_FLUSH_INTERVAL_MS, DEFAULT_TRANSIT_MEMORY_BUDGET_BYTES,
-    DEFAULT_UPLOAD_CACHE_IO_SLOTS, DEFAULT_UPLOAD_DECREASE_COOLDOWN_SECS,
-    DEFAULT_UPLOAD_DECREASE_FACTOR, DEFAULT_UPLOAD_DELAY_MS,
+    DEFAULT_QOS_MATERIALIZE_SLOTS, DEFAULT_READ_BUFFER_MB, DEFAULT_READAHEAD_MIN_PREFETCH,
+    DEFAULT_READAHEAD_RANDOM_PENALTY, DEFAULT_READAHEAD_SEQ_STEP, DEFAULT_READAHEAD_WIDTH,
+    DEFAULT_READDIR_ATTR_BATCH_CHUNK, DEFAULT_READDIR_ATTR_BATCH_MAX_INODES,
+    DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS, DEFAULT_SLAB_FLUSH_INTERVAL_MS,
+    DEFAULT_TRANSIT_MEMORY_BUDGET_BYTES, DEFAULT_UPLOAD_CACHE_IO_SLOTS,
+    DEFAULT_UPLOAD_DECREASE_COOLDOWN_SECS, DEFAULT_UPLOAD_DECREASE_FACTOR, DEFAULT_UPLOAD_DELAY_MS,
     DEFAULT_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS, DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS,
     DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS, DEFAULT_UPLOAD_INCREASE_STEP,
     DEFAULT_UPLOAD_INITIAL_WINDOW, DEFAULT_UPLOAD_MAX_ATTEMPTS, DEFAULT_UPLOAD_MAX_WINDOW,
@@ -325,8 +324,6 @@ pub struct VfsConfig {
     pub qos_accept_slots: usize,
     /// QoS slots for materialization.
     pub qos_materialize_slots: usize,
-    /// QoS slots for uploads.
-    pub qos_upload_slots: usize,
     /// QoS slots for commits.
     pub qos_commit_slots: usize,
     /// QoS slots for fetches.
@@ -414,7 +411,6 @@ pub struct VfsConfigRaw {
     pub shutdown_metadata_flush_timeout_secs: Option<u64>,
     pub qos_accept_slots: Option<usize>,
     pub qos_materialize_slots: Option<usize>,
-    pub qos_upload_slots: Option<usize>,
     pub qos_commit_slots: Option<usize>,
     pub qos_fetch_slots: Option<usize>,
     pub foreground_read_speedometer_shards: Option<usize>,
@@ -561,7 +557,6 @@ impl VfsConfigRaw {
             shutdown_metadata_flush_timeout_secs,
             qos_accept_slots,
             qos_materialize_slots,
-            qos_upload_slots,
             qos_commit_slots,
             qos_fetch_slots,
             foreground_read_speedometer_shards,
@@ -630,7 +625,6 @@ fn normalize_vfs_config(
     cfg.shutdown_metadata_flush_timeout_secs = cfg.shutdown_metadata_flush_timeout_secs.max(1);
     cfg.qos_accept_slots = cfg.qos_accept_slots.max(1);
     cfg.qos_materialize_slots = cfg.qos_materialize_slots.max(1);
-    cfg.qos_upload_slots = cfg.qos_upload_slots.max(1);
     cfg.qos_commit_slots = cfg.qos_commit_slots.max(1);
     cfg.qos_fetch_slots = cfg.qos_fetch_slots.max(1);
     cfg.foreground_read_speedometer_shards = cfg.foreground_read_speedometer_shards.max(1);
@@ -731,7 +725,6 @@ impl From<VfsConfig> for VfsConfigRaw {
             shutdown_metadata_flush_timeout_secs: Some(cfg.shutdown_metadata_flush_timeout_secs),
             qos_accept_slots: Some(cfg.qos_accept_slots),
             qos_materialize_slots: Some(cfg.qos_materialize_slots),
-            qos_upload_slots: Some(cfg.qos_upload_slots),
             qos_commit_slots: Some(cfg.qos_commit_slots),
             qos_fetch_slots: Some(cfg.qos_fetch_slots),
             foreground_read_speedometer_shards: Some(cfg.foreground_read_speedometer_shards),
@@ -815,7 +808,6 @@ impl Default for VfsConfig {
             shutdown_metadata_flush_timeout_secs: DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS,
             qos_accept_slots: DEFAULT_QOS_ACCEPT_SLOTS,
             qos_materialize_slots: DEFAULT_QOS_MATERIALIZE_SLOTS,
-            qos_upload_slots: DEFAULT_QOS_UPLOAD_SLOTS,
             qos_commit_slots: DEFAULT_QOS_COMMIT_SLOTS,
             qos_fetch_slots: DEFAULT_QOS_FETCH_SLOTS,
             foreground_read_speedometer_shards: FOREGROUND_READ_SPEEDOMETER_SHARDS,
