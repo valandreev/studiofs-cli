@@ -300,7 +300,7 @@ impl PgMetaEngine {
         command_timeout: Duration,
     ) -> MetaResult<()> {
         #[cfg(test)]
-        if let Ok(message) = std::env::var("STUDIOFS_PG_SCHEMA_ENSURE_TEST_ERROR") {
+        if let Some(message) = tests::schema_ensure_test_override() {
             return Err(MetaError::Storage(message));
         }
 
@@ -669,8 +669,8 @@ impl PgMetaEngine {
 
     fn can_refresh_local_id_headroom(&self) -> MetaResult<bool> {
         #[cfg(test)]
-        if let Ok(value) = std::env::var("STUDIOFS_PG_HEADROOM_REFRESH_TEST_OVERRIDE") {
-            return Ok(value == "1");
+        if let Some(value) = tests::headroom_refresh_test_override() {
+            return Ok(value);
         }
 
         let postgres_url = self.postgres_url.clone();
@@ -764,22 +764,17 @@ impl PgMetaEngine {
             MetaError::Storage(format!("pg {} id allocation overflow", spec.kind_label))
         })?;
         if end > lease.leased_end {
-            let additional_ids = end.saturating_sub(lease.leased_end);
             let refreshed = self.reserve_local_id_lease(
                 slot,
                 spec,
-                additional_ids,
+                count,
                 self.can_refresh_local_id_headroom()?,
             )?;
-            if refreshed.next != lease.leased_end {
-                return Err(MetaError::Storage(format!(
-                    "stale pg {} id lease cursor",
-                    spec.kind_label
-                )));
-            }
-            lease.leased_end = refreshed.leased_end;
-            lease.reserved_end = refreshed.reserved_end;
+            *lease = refreshed;
         }
+        let end = lease.next.checked_add(count).ok_or_else(|| {
+            MetaError::Storage(format!("pg {} id allocation overflow", spec.kind_label))
+        })?;
         if end > lease.reserved_end {
             return Err(MetaError::Storage(format!(
                 "pg local {} id headroom exhausted",
@@ -3951,6 +3946,7 @@ impl crate::engine::MetaEngine for PgMetaEngine {
 mod tests {
     use super::*;
     use crate::pg_dsn::ensure_studiofs_database;
+    use std::cell::{Cell, RefCell};
     use tempfile::tempdir;
     use uuid::Uuid;
 
@@ -4139,6 +4135,58 @@ mod tests {
             .expect("seed flushed event seq");
     }
 
+    thread_local! {
+        static TEST_SCHEMA_ENSURE_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
+        static TEST_HEADROOM_REFRESH_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    struct TestSchemaEnsureOverrideGuard {
+        previous: Option<String>,
+    }
+
+    impl Drop for TestSchemaEnsureOverrideGuard {
+        fn drop(&mut self) {
+            TEST_SCHEMA_ENSURE_OVERRIDE.with(|override_state| {
+                *override_state.borrow_mut() = self.previous.take();
+            });
+        }
+    }
+
+    fn set_schema_ensure_test_override(message: &str) -> TestSchemaEnsureOverrideGuard {
+        let previous = TEST_SCHEMA_ENSURE_OVERRIDE
+            .with(|override_state| override_state.borrow_mut().replace(message.to_string()));
+        TestSchemaEnsureOverrideGuard { previous }
+    }
+
+    pub(super) fn schema_ensure_test_override() -> Option<String> {
+        TEST_SCHEMA_ENSURE_OVERRIDE.with(|override_state| override_state.borrow().clone())
+    }
+
+    struct TestHeadroomRefreshOverrideGuard {
+        previous: Option<bool>,
+    }
+
+    impl Drop for TestHeadroomRefreshOverrideGuard {
+        fn drop(&mut self) {
+            TEST_HEADROOM_REFRESH_OVERRIDE.with(|override_state| {
+                override_state.set(self.previous.take());
+            });
+        }
+    }
+
+    fn set_headroom_refresh_test_override(value: bool) -> TestHeadroomRefreshOverrideGuard {
+        let previous = TEST_HEADROOM_REFRESH_OVERRIDE.with(|override_state| {
+            let previous = override_state.get();
+            override_state.set(Some(value));
+            previous
+        });
+        TestHeadroomRefreshOverrideGuard { previous }
+    }
+
+    pub(super) fn headroom_refresh_test_override() -> Option<bool> {
+        TEST_HEADROOM_REFRESH_OVERRIDE.with(Cell::get)
+    }
+
     struct TestEnvGuard {
         key: &'static str,
         previous: Option<String>,
@@ -4223,6 +4271,11 @@ mod tests {
             lock_notify_handle: Mutex::new(None),
             lock_renew_handle: Mutex::new(None),
         };
+
+        PgMetaEngine::persist_client_slot(&engine.local, 0).expect("persist unit test client slot");
+        engine
+            .prime_local_id_ranges(0)
+            .expect("prime unit test local id ranges");
 
         (dir, engine)
     }
@@ -4691,8 +4744,7 @@ mod tests {
 
     #[test]
     fn open_with_persisted_ranges_does_not_mask_non_transient_schema_errors() {
-        let _schema_error = set_test_env(
-            "STUDIOFS_PG_SCHEMA_ENSURE_TEST_ERROR",
+        let _schema_error = set_schema_ensure_test_override(
             "postgres file lock lease schema ensure failed: permission denied (sqlstate=42501)",
         );
         let dir = tempdir().expect("tempdir");
@@ -4830,7 +4882,7 @@ mod tests {
 
     #[test]
     fn next_inode_refreshes_reserved_headroom_when_pg_is_available() {
-        let _pg_refresh = set_test_env("STUDIOFS_PG_HEADROOM_REFRESH_TEST_OVERRIDE", "1");
+        let _pg_refresh = set_headroom_refresh_test_override(true);
         let (_dir, pg) = temp_pg_engine_for_unit();
 
         PgMetaEngine::persist_client_slot(&pg.local, 0).expect("persist client slot");
