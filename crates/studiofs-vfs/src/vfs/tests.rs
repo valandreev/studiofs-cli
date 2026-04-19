@@ -3333,7 +3333,7 @@ fn opportunistic_local_sync_ignores_elapsed_window_in_fast_mode() {
 }
 
 #[test]
-fn flush_fh_keeps_opportunistic_local_sync_in_fast_mode() {
+fn flush_fh_enforces_strict_local_durability_in_single_mode() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-fh-fast-local-sync");
     let attr = vfs
@@ -3385,19 +3385,19 @@ fn flush_fh_keeps_opportunistic_local_sync_in_fast_mode() {
         .metrics
         .block_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
-    assert_eq!(
-        calls_after, calls_before,
-        "fast-mode flush should no longer force sync_data for dirty unpublished state"
+    assert!(
+        calls_after > calls_before,
+        "explicit flush must force sync_data when dirty unpublished state remains"
     );
-    assert_eq!(
-        synced_after, synced_before,
-        "fast-mode flush should leave grouped sync bytes pending until an explicit strict barrier"
+    assert!(
+        synced_after >= synced_before + 4096,
+        "explicit flush should account for the pending local durable sync bytes"
     );
     rt.block_on(async {
         let group = vfs.state.local_dirty.local_sync_group.lock().await;
         assert_eq!(
-            group.pending_bytes, 4096,
-            "fast-mode flush should keep pending local sync bytes queued"
+            group.pending_bytes, 0,
+            "explicit flush should drain pending local sync bytes"
         );
     });
     assert!(
@@ -3411,7 +3411,7 @@ fn flush_fh_keeps_opportunistic_local_sync_in_fast_mode() {
 }
 
 #[test]
-fn flush_fh_ignores_legacy_durable_mode_and_keeps_opportunistic_local_sync() {
+fn flush_fh_default_config_enforces_strict_local_durability() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cfg = VfsConfig::default();
     let (rt, vfs, _meta) = make_test_vfs_with_config(&tmp, "flush-fh-durable-local-sync", cfg);
@@ -3464,24 +3464,24 @@ fn flush_fh_ignores_legacy_durable_mode_and_keeps_opportunistic_local_sync() {
         .metrics
         .block_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
-    assert_eq!(
-        calls_after, calls_before,
-        "legacy durable-mode flush should follow the single Fast Local Authority barrier model"
+    assert!(
+        calls_after > calls_before,
+        "default-config explicit flush must force sync_data when dirty unpublished state remains"
     );
-    assert_eq!(
-        synced_after, synced_before,
-        "legacy durable-mode flush should leave grouped sync bytes pending until an explicit strict barrier"
+    assert!(
+        synced_after >= synced_before + 4096,
+        "default-config explicit flush should account for the pending local durable sync bytes"
     );
     rt.block_on(async {
         let group = vfs.state.local_dirty.local_sync_group.lock().await;
         assert_eq!(
-            group.pending_bytes, 4096,
-            "legacy durable-mode flush should keep pending local sync bytes queued"
+            group.pending_bytes, 0,
+            "default-config explicit flush should drain pending local sync bytes"
         );
     });
     assert!(
         !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
-        "legacy durable-mode flush should still commit the dirty local attr state"
+        "default-config explicit flush should still commit the dirty local attr state"
     );
 
     rt.block_on(async {
@@ -3653,7 +3653,7 @@ fn handle_writer_dirty_attrs_keep_nanos_timestamps() {
 }
 
 #[test]
-fn release_fh_keeps_opportunistic_local_sync_in_fast_mode() {
+fn release_fh_enforces_strict_local_durability_on_last_handle() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-fh-fast-local-sync");
     let attr = vfs
@@ -3716,19 +3716,19 @@ fn release_fh_keeps_opportunistic_local_sync_in_fast_mode() {
         .metrics
         .block_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
-    assert_eq!(
-        calls_after, calls_before,
-        "fast-mode last-handle release should no longer force sync_data when dirty state remains"
+    assert!(
+        calls_after > calls_before,
+        "last-handle release must force sync_data when dirty unpublished state remains"
     );
-    assert_eq!(
-        synced_after, synced_before,
-        "fast-mode last-handle release should leave grouped sync bytes pending until fsync"
+    assert!(
+        synced_after >= synced_before + 8192,
+        "last-handle release should account for the pending local durable sync bytes"
     );
     rt.block_on(async {
         let group = vfs.state.local_dirty.local_sync_group.lock().await;
         assert_eq!(
-            group.pending_bytes, 8192,
-            "fast-mode last-handle release should keep pending local sync bytes queued"
+            group.pending_bytes, 0,
+            "last-handle release should drain pending local sync bytes"
         );
     });
     assert!(
@@ -3738,7 +3738,7 @@ fn release_fh_keeps_opportunistic_local_sync_in_fast_mode() {
 }
 
 #[test]
-fn release_fh_ignores_legacy_durable_mode_and_keeps_opportunistic_local_sync() {
+fn release_fh_default_config_enforces_strict_local_durability() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let cfg = VfsConfig::default();
     let (rt, vfs, _meta) = make_test_vfs_with_config(&tmp, "release-fh-durable-local-sync", cfg);
@@ -3802,24 +3802,24 @@ fn release_fh_ignores_legacy_durable_mode_and_keeps_opportunistic_local_sync() {
         .metrics
         .block_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
-    assert_eq!(
-        calls_after, calls_before,
-        "legacy durable-mode last-handle release should follow the single Fast Local Authority barrier model"
+    assert!(
+        calls_after > calls_before,
+        "default-config last-handle release must force sync_data when dirty unpublished state remains"
     );
-    assert_eq!(
-        synced_after, synced_before,
-        "legacy durable-mode last-handle release should leave grouped sync bytes pending until fsync"
+    assert!(
+        synced_after >= synced_before + 8192,
+        "default-config last-handle release should account for the pending local durable sync bytes"
     );
     rt.block_on(async {
         let group = vfs.state.local_dirty.local_sync_group.lock().await;
         assert_eq!(
-            group.pending_bytes, 8192,
-            "legacy durable-mode last-handle release should keep pending local sync bytes queued"
+            group.pending_bytes, 0,
+            "default-config last-handle release should drain pending local sync bytes"
         );
     });
     assert!(
         !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
-        "legacy durable-mode last-handle release should preserve the committed local attr state"
+        "default-config last-handle release should preserve the committed local attr state"
     );
 }
 

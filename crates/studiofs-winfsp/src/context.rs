@@ -3126,8 +3126,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_flush_callback_drains_buffered_write_callback_state_without_forcing_sync_in_fast_mode()
-     {
+    fn explicit_flush_callback_drains_buffered_write_callback_state_and_forces_sync_data() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("write_callback_explicit_flush");
         let attr = vfs
             .create(ROOT_INO, b"buffered-write-flush.txt", 0, 0, 0o644)
@@ -3184,9 +3183,9 @@ mod tests {
             payload_persist_after > payload_persist_before,
             "explicit flush should still materialize buffered WinFSP writes into local payload storage"
         );
-        assert_eq!(
-            sync_calls_after, sync_calls_before,
-            "fast-mode explicit flush should no longer force the local payload sync barrier after buffered writes"
+        assert!(
+            sync_calls_after > sync_calls_before,
+            "explicit flush callback should force the local payload sync barrier after buffered writes"
         );
         assert_eq!(
             flush_calls_after, flush_calls_before,
