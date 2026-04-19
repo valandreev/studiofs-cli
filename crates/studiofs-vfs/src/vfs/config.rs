@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 use studiofs_meta::types::Ino;
 
 use crate::vfs::{
@@ -46,7 +45,6 @@ pub(super) const PAYLOAD_PUT_CONCURRENCY_TARGET_BYTES: usize = 32 * 1024 * 1024;
 pub(super) const PAYLOAD_PUT_CONCURRENCY_MAX: usize = 32;
 pub(super) const FAST_MODE_SYNC_GROUP_MIN_BYTES_FLOOR: u64 = 32 * 1024 * 1024;
 pub(super) const FAST_MODE_SYNC_GROUP_MIN_BYTES_CEIL: u64 = 256 * 1024 * 1024;
-pub(super) const FAST_MODE_SYNC_GROUP_MAX_DELAY_MS: u64 = 100;
 pub(super) const CACHE_RUNTIME_MIN_TRANSIT_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_MAX_TRANSIT_BUDGET_BYTES: usize = 4 * 1024 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_SMALL_BUDGET_BYTES: u64 = 128 * 1024 * 1024 * 1024;
@@ -127,9 +125,7 @@ pub(super) enum LocalSyncTrigger {
 pub(super) fn write_path_sync_trigger(
     local_sync_policy: LocalSyncPolicy,
     pending_bytes: u64,
-    _elapsed_since_last_sync: Duration,
     group_min_bytes: u64,
-    _group_max_delay: Duration,
 ) -> Option<LocalSyncTrigger> {
     if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
         return Some(LocalSyncTrigger::Explicit);
@@ -902,13 +898,7 @@ mod tests {
 
     #[test]
     fn local_sync_policy_strict_always_triggers_sync() {
-        let trigger = write_path_sync_trigger(
-            LocalSyncPolicy::Strict,
-            1,
-            Duration::from_millis(1),
-            64 * 1024 * 1024,
-            Duration::from_millis(25),
-        );
+        let trigger = write_path_sync_trigger(LocalSyncPolicy::Strict, 1, 64 * 1024 * 1024);
         assert_eq!(trigger, Some(LocalSyncTrigger::Explicit));
     }
 
@@ -917,28 +907,12 @@ mod tests {
         let bytes_trigger = write_path_sync_trigger(
             LocalSyncPolicy::Opportunistic,
             64 * 1024 * 1024,
-            Duration::from_millis(1),
             64 * 1024 * 1024,
-            Duration::from_millis(25),
         );
         assert_eq!(bytes_trigger, Some(LocalSyncTrigger::BytesThreshold));
 
-        let window_trigger = write_path_sync_trigger(
-            LocalSyncPolicy::Opportunistic,
-            1024,
-            Duration::from_millis(30),
-            64 * 1024 * 1024,
-            Duration::from_millis(25),
-        );
-        assert_eq!(window_trigger, None);
-
-        let deferred = write_path_sync_trigger(
-            LocalSyncPolicy::Opportunistic,
-            1024,
-            Duration::from_millis(1),
-            64 * 1024 * 1024,
-            Duration::from_millis(25),
-        );
+        let deferred =
+            write_path_sync_trigger(LocalSyncPolicy::Opportunistic, 1024, 64 * 1024 * 1024);
         assert_eq!(deferred, None);
     }
 }

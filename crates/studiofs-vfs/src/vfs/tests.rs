@@ -3226,109 +3226,11 @@ fn opportunistic_local_sync_defers_when_threshold_not_reached() {
         .load(Ordering::Relaxed);
     assert_eq!(
         calls_after, calls_before,
-        "opportunistic sync should not force sync_data under threshold/window"
+        "opportunistic sync should not force sync_data while below the byte threshold"
     );
     assert!(
         deferred_after > deferred_before,
         "opportunistic defer should be tracked"
-    );
-}
-
-#[test]
-fn opportunistic_local_sync_ignores_short_elapsed_window_under_relaxed_delay() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "opportunistic-local-sync-relaxed-window");
-    rt.block_on(async {
-        let mut group = vfs.state.local_dirty.local_sync_group.lock().await;
-        group.pending_bytes = 1024;
-        group.last_sync_at = Instant::now()
-            .checked_sub(Duration::from_millis(50))
-            .unwrap_or_else(Instant::now);
-    });
-
-    let calls_before = vfs
-        .state
-        .metrics
-        .block_store_sync_data_calls
-        .load(Ordering::Relaxed);
-    let deferred_before = vfs
-        .state
-        .metrics
-        .block_store_sync_data_deferred_calls
-        .load(Ordering::Relaxed);
-
-    rt.block_on(async {
-        vfs.maybe_block_store_sync_data_async(0, LocalSyncPolicy::Opportunistic)
-            .await
-            .expect("opportunistic local sync with relaxed delay");
-    });
-
-    let calls_after = vfs
-        .state
-        .metrics
-        .block_store_sync_data_calls
-        .load(Ordering::Relaxed);
-    let deferred_after = vfs
-        .state
-        .metrics
-        .block_store_sync_data_deferred_calls
-        .load(Ordering::Relaxed);
-    assert_eq!(
-        calls_after, calls_before,
-        "opportunistic sync should keep deferring while the relaxed delay window has not elapsed"
-    );
-    assert!(
-        deferred_after > deferred_before,
-        "defer accounting should still increase under the relaxed delay window"
-    );
-}
-
-#[test]
-fn opportunistic_local_sync_ignores_elapsed_window_in_fast_mode() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "opportunistic-local-sync-ignore-window");
-    rt.block_on(async {
-        let mut group = vfs.state.local_dirty.local_sync_group.lock().await;
-        group.pending_bytes = 4 * 1024 * 1024;
-        group.last_sync_at = Instant::now()
-            .checked_sub(Duration::from_millis(250))
-            .unwrap_or_else(Instant::now);
-    });
-
-    let calls_before = vfs
-        .state
-        .metrics
-        .block_store_sync_data_calls
-        .load(Ordering::Relaxed);
-    let deferred_before = vfs
-        .state
-        .metrics
-        .block_store_sync_data_deferred_calls
-        .load(Ordering::Relaxed);
-
-    rt.block_on(async {
-        vfs.maybe_block_store_sync_data_async(0, LocalSyncPolicy::Opportunistic)
-            .await
-            .expect("opportunistic local sync should ignore elapsed window");
-    });
-
-    let calls_after = vfs
-        .state
-        .metrics
-        .block_store_sync_data_calls
-        .load(Ordering::Relaxed);
-    let deferred_after = vfs
-        .state
-        .metrics
-        .block_store_sync_data_deferred_calls
-        .load(Ordering::Relaxed);
-    assert_eq!(
-        calls_after, calls_before,
-        "fast-mode opportunistic sync should not force sync_data only because the time window elapsed"
-    );
-    assert!(
-        deferred_after > deferred_before,
-        "defer accounting should still increase when fast mode ignores the elapsed window"
     );
 }
 
@@ -3981,11 +3883,6 @@ fn write_path_observability_reports_active_tuning_knobs() {
     assert_eq!(
         snapshot.tuning.sync_group_min_bytes, vfs.local_sync_group_min_bytes,
         "observability should report the active sync-data group minimum"
-    );
-    assert_eq!(
-        snapshot.tuning.sync_group_max_delay_ms,
-        vfs.local_sync_group_max_delay.as_millis() as u64,
-        "observability should report the active sync-data delay cap"
     );
 }
 

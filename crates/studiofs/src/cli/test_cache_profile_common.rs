@@ -143,10 +143,6 @@ pub(crate) fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
         format_bytes(snapshot.tuning.sync_group_min_bytes)
     ));
     out.push_str(&format!(
-        "sync_group_max_delay_ms: {}\n",
-        snapshot.tuning.sync_group_max_delay_ms
-    ));
-    out.push_str(&format!(
         "payload_burst_avg: {}\n",
         format_bytes(snapshot.payload_burst.avg_bytes_per_burst.round() as u64)
     ));
