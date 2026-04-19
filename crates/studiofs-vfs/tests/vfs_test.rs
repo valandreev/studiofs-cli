@@ -4320,12 +4320,15 @@ fn committed_file_mutation_enters_updating_state() {
             ino = attr.ino;
             vfs.write(ino, 0, &baseline_payload).await.unwrap();
             vfs.flush(ino).await.unwrap();
-            wait_until_blocks(&vfs, ino, Duration::from_secs(15))
+            wait_until_blocks(&vfs, ino, Duration::from_secs(30))
                 .expect("baseline file must reach committed block refs before mutation");
             assert!(
-                wait_until(Duration::from_secs(15), || {
+                wait_until(Duration::from_secs(30), || {
                     meta.get_attr(ino)
-                        .map(|attr| attr.committed_size == baseline_payload.len() as u64)
+                        .map(|attr| {
+                            attr.upload_state == UploadState::Ready
+                                && attr.committed_size == baseline_payload.len() as u64
+                        })
                         .unwrap_or(false)
                 })
                 .await,
@@ -4538,12 +4541,15 @@ fn local_reads_prefer_pending_overlay_over_committed_base() {
             ino = attr.ino;
             vfs.write(ino, 0, &baseline_payload).await.unwrap();
             vfs.flush(ino).await.unwrap();
-            wait_until_blocks(&vfs, ino, Duration::from_secs(15))
+            wait_until_blocks(&vfs, ino, Duration::from_secs(30))
                 .expect("baseline file must commit before overlay read test");
             assert!(
-                wait_until(Duration::from_secs(15), || {
+                wait_until(Duration::from_secs(30), || {
                     meta.get_attr(ino)
-                        .map(|attr| attr.committed_size == baseline_payload.len() as u64)
+                        .map(|attr| {
+                            attr.upload_state == UploadState::Ready
+                                && attr.committed_size == baseline_payload.len() as u64
+                        })
                         .unwrap_or(false)
                 })
                 .await,
@@ -4997,12 +5003,15 @@ fn single_inode_never_has_two_pending_incarnations() {
             ino = attr.ino;
             vfs.write(ino, 0, &baseline_payload).await.unwrap();
             vfs.flush(ino).await.unwrap();
-            wait_until_blocks(&vfs, ino, Duration::from_secs(15))
+            wait_until_blocks(&vfs, ino, Duration::from_secs(30))
                 .expect("baseline file must commit before pending incarnation test");
             assert!(
-                wait_until(Duration::from_secs(15), || {
+                wait_until(Duration::from_secs(30), || {
                     meta.get_attr(ino)
-                        .map(|attr| attr.committed_size == baseline_payload.len() as u64)
+                        .map(|attr| {
+                            attr.upload_state == UploadState::Ready
+                                && attr.committed_size == baseline_payload.len() as u64
+                        })
                         .unwrap_or(false)
                 })
                 .await,

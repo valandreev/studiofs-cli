@@ -1,6 +1,6 @@
 //! `studiofs settings` — configure global defaults for mounts.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 use serde::{Deserialize, Serialize};
@@ -63,26 +63,32 @@ fn config_toml_path() -> anyhow::Result<PathBuf> {
 }
 
 pub fn load_studiofs_config() -> anyhow::Result<StudioFsConfig> {
-    let path = config_toml_path()?;
+    load_studiofs_config_from_path(&config_toml_path()?)
+}
+
+fn read_studiofs_config_from_path(path: &Path) -> anyhow::Result<StudioFsConfig> {
     if !path.exists() {
         return Ok(StudioFsConfig::default());
     }
 
-    let bytes = std::fs::read_to_string(&path).map_err(|e| {
+    let bytes = std::fs::read_to_string(path).map_err(|e| {
         anyhow::anyhow!(
             "failed to read config file '{}': {e}",
             path.to_string_lossy()
         )
     })?;
 
-    let mut config: StudioFsConfig = toml::from_str(&bytes)
-        .map_err(|e| anyhow::anyhow!("failed to parse config file '{}': {e}", path.display()))?;
+    toml::from_str(&bytes)
+        .map_err(|e| anyhow::anyhow!("failed to parse config file '{}': {e}", path.display()))
+}
+
+fn load_studiofs_config_from_path(path: &Path) -> anyhow::Result<StudioFsConfig> {
+    let mut config = read_studiofs_config_from_path(path)?;
     strip_removed_public_settings(&mut config);
     Ok(config)
 }
 
-fn save_studiofs_config(config: &StudioFsConfig) -> anyhow::Result<()> {
-    let path = config_toml_path()?;
+fn save_studiofs_config_to_path(path: &Path, config: &StudioFsConfig) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -90,12 +96,12 @@ fn save_studiofs_config(config: &StudioFsConfig) -> anyhow::Result<()> {
     let content = toml::to_string_pretty(config).map_err(|e| {
         anyhow::anyhow!("failed to serialize config file '{}': {e}", path.display())
     })?;
-    std::fs::write(&path, content)?;
+    std::fs::write(path, content)?;
     Ok(())
 }
 
-fn strip_removed_public_settings(config: &mut StudioFsConfig) {
-    config.vfs.upload_delay_ms = None;
+fn strip_removed_public_settings(config: &mut StudioFsConfig) -> bool {
+    config.vfs.upload_delay_ms.take().is_some()
 }
 
 #[cfg(windows)]
@@ -117,9 +123,12 @@ fn ensure_mount_point_exists(mount_point: &str) -> anyhow::Result<()> {
 }
 
 pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
-    let mut config = load_studiofs_config()?;
-    strip_removed_public_settings(&mut config);
-    let mut changed = false;
+    run_with_config_path(args, &config_toml_path()?)
+}
+
+fn run_with_config_path(args: SettingsArgs, config_path: &Path) -> anyhow::Result<()> {
+    let mut config = read_studiofs_config_from_path(config_path)?;
+    let mut changed = strip_removed_public_settings(&mut config);
 
     if let Some(mount_point) = args.mount_point {
         let mount_point = mount_point.trim().to_string();
@@ -159,11 +168,9 @@ pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
     }
 
     if changed {
-        save_studiofs_config(&config)?;
+        save_studiofs_config_to_path(config_path, &config)?;
         println!("✓ Updated studiofs settings");
-        if let Ok(path) = config_toml_path() {
-            println!("  Saved to {}", path.display());
-        }
+        println!("  Saved to {}", config_path.display());
     }
 
     println!("Current studiofs settings:");
@@ -296,5 +303,25 @@ mod tests {
         };
         assert_eq!(err.kind(), ErrorKind::UnknownArgument);
         assert!(err.to_string().contains("--slab-flush-interval"));
+    }
+
+    #[test]
+    fn settings_run_rewrites_legacy_removed_fields_without_explicit_changes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "cache_size = \"50GB\"\n[vfs]\nupload_delay_ms = 1500\n",
+        )
+        .expect("write config");
+
+        run_with_config_path(SettingsArgs::default(), &config_path).expect("run settings");
+
+        let saved = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(saved.contains("cache_size = \"50GB\""));
+        assert!(
+            !saved.contains("upload_delay_ms"),
+            "legacy upload_delay_ms should be removed from persisted settings"
+        );
     }
 }
