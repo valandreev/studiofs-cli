@@ -618,7 +618,7 @@ impl PgMetaEngine {
     fn start_lock_notify_listener(
         engine: std::sync::Weak<Self>,
         shutdown: Arc<AtomicBool>,
-    ) -> std::thread::JoinHandle<()> {
+    ) -> MetaResult<std::thread::JoinHandle<()>> {
         std::thread::Builder::new()
             .name("pg-lock-notify".into())
             .spawn(move || {
@@ -719,13 +719,13 @@ impl PgMetaEngine {
                     }
                 }
             })
-            .expect("spawn pg-lock-notify thread")
+            .map_err(|e| MetaError::Storage(format!("failed to spawn pg-lock-notify thread: {e}")))
     }
 
     fn start_lock_renew_worker(
         engine: std::sync::Weak<Self>,
         shutdown: Arc<AtomicBool>,
-    ) -> std::thread::JoinHandle<()> {
+    ) -> MetaResult<std::thread::JoinHandle<()>> {
         std::thread::Builder::new()
             .name("pg-lock-renew".into())
             .spawn(move || {
@@ -776,7 +776,7 @@ impl PgMetaEngine {
                     }
                 }
             })
-            .expect("spawn pg-lock-renew thread")
+            .map_err(|e| MetaError::Storage(format!("failed to spawn pg-lock-renew thread: {e}")))
     }
 
     fn load_pg_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>> {
@@ -1046,7 +1046,7 @@ impl PgMetaEngine {
             let notify_handle = Self::start_lock_notify_listener(
                 Arc::downgrade(&engine),
                 engine.poll_shutdown.clone(),
-            );
+            )?;
             *engine
                 .lock_notify_handle
                 .lock()
@@ -1054,7 +1054,7 @@ impl PgMetaEngine {
             let renew_handle = Self::start_lock_renew_worker(
                 Arc::downgrade(&engine),
                 engine.poll_shutdown.clone(),
-            );
+            )?;
             *engine
                 .lock_renew_handle
                 .lock()
@@ -2460,8 +2460,8 @@ impl MetaEngineCore for PgMetaEngine {
         })?;
         match &outcome {
             FileLockLeaseAcquireOutcome::Acquired(snapshot) => {
-                self.cache_file_lock_lease(Some(snapshot.clone()));
                 self.remember_held_file_lock(snapshot.ino, lease_ttl);
+                self.cache_file_lock_lease(Some(snapshot.clone()));
             }
             FileLockLeaseAcquireOutcome::Blocked(snapshot) => {
                 self.cache_file_lock_lease(Some(snapshot.clone()));
@@ -2744,8 +2744,8 @@ impl MetaEngineCore for PgMetaEngine {
         })?;
         match &outcome {
             FileLockLeaseRenewOutcome::Renewed(snapshot) => {
-                self.cache_file_lock_lease(Some(snapshot.clone()));
                 self.remember_held_file_lock(snapshot.ino, lease_ttl);
+                self.cache_file_lock_lease(Some(snapshot.clone()));
             }
             FileLockLeaseRenewOutcome::Lost(snapshot) => {
                 self.forget_held_file_lock(ino);
