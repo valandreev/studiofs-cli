@@ -2224,9 +2224,11 @@ impl MetaEngineCore for PgMetaEngine {
                             lease_expires_at_unix_ms,
                             exclusive_owner: (kind == HardLockKind::Exclusive)
                                 .then(|| client_id.clone()),
-                            shared_owners: (kind == HardLockKind::Shared)
-                                .then(|| [client_id.clone()].into_iter().collect())
-                                .unwrap_or_default(),
+                            shared_owners: if kind == HardLockKind::Shared {
+                                [client_id.clone()].into_iter().collect()
+                            } else {
+                                Default::default()
+                            },
                         }),
                         Some(current) => {
                             let is_self_exclusive =
@@ -2247,8 +2249,8 @@ impl MetaEngineCore for PgMetaEngine {
                                     }
                                 }
                                 HardLockKind::Exclusive => {
-                                    let shared_conflict = !current.shared_owners.is_empty()
-                                        && !(current.shared_owners.len() == 1 && is_self_shared);
+                                    let shared_conflict = !(current.shared_owners.is_empty()
+                                        || (current.shared_owners.len() == 1 && is_self_shared));
                                     if (current.exclusive_owner.is_none() || is_self_exclusive)
                                         && !shared_conflict
                                     {

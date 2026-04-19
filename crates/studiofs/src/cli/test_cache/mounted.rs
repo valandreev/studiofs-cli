@@ -22,7 +22,7 @@ use super::result::{
     MountedWritePathWindowReport,
 };
 use super::telemetry::{
-    PhaseTelemetry, build_advanced_metrics, phase_telemetry_to_report,
+    PhaseOperationLog, PhaseTelemetry, build_advanced_metrics, phase_telemetry_to_report,
     stream_reports_from_telemetry,
 };
 use super::workload::{
@@ -469,15 +469,15 @@ async fn run_filesystem_writes(
                 let mut s = stats
                     .lock()
                     .map_err(|_| anyhow!("filesystem write latency stats lock poisoned"))?;
-                s.record_operation(
-                    op_index as u64,
+                s.record_operation(PhaseOperationLog {
+                    operation_index: op_index as u64,
                     work_index,
                     worker_id,
-                    item.path.display().to_string(),
-                    class,
+                    target: item.path.display().to_string(),
+                    size_class: class,
+                    bytes: item.size,
                     elapsed,
-                    item.size,
-                );
+                });
             }
         }));
     }
@@ -553,15 +553,15 @@ async fn run_filesystem_reads(
                 let mut s = stats
                     .lock()
                     .map_err(|_| anyhow!("filesystem read latency stats lock poisoned"))?;
-                s.record_operation(
-                    op_index as u64,
+                s.record_operation(PhaseOperationLog {
+                    operation_index: op_index as u64,
                     work_index,
                     worker_id,
-                    item.path.display().to_string(),
-                    class,
+                    target: item.path.display().to_string(),
+                    size_class: class,
+                    bytes: read_len as u64,
                     elapsed,
-                    read_len as u64,
-                );
+                });
             }
         }));
     }
@@ -622,15 +622,15 @@ async fn run_filesystem_writes_sequential_streams(
                     size_class_bounds.small_max,
                     size_class_bounds.medium_max,
                 );
-                telemetry.record_operation(
-                    work_index as u64,
+                telemetry.record_operation(PhaseOperationLog {
+                    operation_index: work_index as u64,
                     work_index,
-                    stream_id,
-                    item.path.display().to_string(),
-                    class,
+                    worker_id: stream_id,
+                    target: item.path.display().to_string(),
+                    size_class: class,
+                    bytes: item.size,
                     elapsed,
-                    item.size,
-                );
+                });
             }
             Ok::<_, anyhow::Error>((stream_id, telemetry))
         }));
@@ -688,15 +688,15 @@ async fn run_filesystem_reads_sequential_streams(
                     size_class_bounds.small_max,
                     size_class_bounds.medium_max,
                 );
-                telemetry.record_operation(
-                    work_index as u64,
+                telemetry.record_operation(PhaseOperationLog {
+                    operation_index: work_index as u64,
                     work_index,
-                    stream_id,
-                    item.path.display().to_string(),
-                    class,
+                    worker_id: stream_id,
+                    target: item.path.display().to_string(),
+                    size_class: class,
+                    bytes: read_len as u64,
                     elapsed,
-                    read_len as u64,
-                );
+                });
             }
             Ok::<_, anyhow::Error>((stream_id, telemetry))
         }));
