@@ -3,7 +3,9 @@ fn test_replica_apply_keeps_namespace_in_base_only() {
     let engine = temp_engine();
 
     let remote_ino = 555;
-    let remote_attr = InodeAttr::new_file(remote_ino, ROOT_INO, 1000, 1000, 0o644);
+    let mut remote_attr = InodeAttr::new_file(remote_ino, ROOT_INO, 1000, 1000, 0o644);
+    remote_attr.content_epoch = 1;
+    remote_attr.committed_content_epoch = 1;
     engine
         .apply_replica_events_to_base(&[
             crate::events::MetaEvent::SetAttr {

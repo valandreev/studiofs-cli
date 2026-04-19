@@ -35,18 +35,46 @@ impl MetaNamespace for RedbMetaEngine {
         let tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let current_inodes = txn
+            .open_table(INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base_inodes = txn
+            .open_table(BASE_INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let inode_tombstones = txn
+            .open_table(INODE_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base_regular_file = txn
+            .open_table(REGULAR_FILE_BASE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         let overlay_dentries =
             Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
-
-        Self::lookup_merged_from_opened_tables(
+        let key = encode_dentry_key(parent, name);
+        let entry = Self::lookup_merged_from_opened_tables(
             &base,
             &current,
             &tombstones,
             parent,
             name,
             &overlay_dentries,
-        )?
-        .ok_or(MetaError::EntryNotFound {
+        )?;
+        let visible = match entry {
+            Some(entry)
+                if overlay_dentries.contains(&key)
+                    || Self::remote_namespace_entry_visible_from_opened_tables(
+                        &base_inodes,
+                        &current_inodes,
+                        &inode_tombstones,
+                        &base_regular_file,
+                        &entry,
+                    )? =>
+            {
+                Some(entry)
+            }
+            _ => None,
+        };
+
+        visible.ok_or(MetaError::EntryNotFound {
             parent,
             name: String::from_utf8_lossy(name).to_string(),
         })
@@ -66,16 +94,47 @@ impl MetaNamespace for RedbMetaEngine {
         let tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let current_inodes = txn
+            .open_table(INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base_inodes = txn
+            .open_table(BASE_INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let inode_tombstones = txn
+            .open_table(INODE_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base_regular_file = txn
+            .open_table(REGULAR_FILE_BASE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         let overlay_dentries =
             Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
 
-        Self::readdir_merged_from_opened_tables(
+        let merged = Self::readdir_merged_from_opened_tables(
             &base,
             &current,
             &tombstones,
             parent,
             &overlay_dentries,
-        )
+        )?;
+        let mut visible = Vec::with_capacity(merged.len());
+        for entry in merged {
+            let key = encode_dentry_key(parent, &entry.name);
+            if overlay_dentries.contains(&key)
+                || Self::remote_namespace_entry_visible_from_opened_tables(
+                    &base_inodes,
+                    &current_inodes,
+                    &inode_tombstones,
+                    &base_regular_file,
+                    &DirEntryValue {
+                        ino: entry.ino,
+                        kind: entry.kind,
+                    },
+                )?
+            {
+                visible.push(entry);
+            }
+        }
+        Ok(visible)
     }
 
     fn add_entry(&self, parent: Ino, name: &[u8], entry: &DirEntryValue) -> MetaResult<()> {

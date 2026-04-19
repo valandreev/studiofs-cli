@@ -155,6 +155,79 @@ impl RedbMetaEngine {
         Self::lookup_in_opened_dentry_table(current, parent, name)
     }
 
+    pub(super) fn regular_file_has_published_base_from_opened_table<T>(
+        table: &T,
+        ino: Ino,
+    ) -> MetaResult<bool>
+    where
+        T: ReadableTable<&'static [u8], &'static [u8]>,
+    {
+        let prefix = regular_file_chunk_prefix(ino);
+        for row in table
+            .range(prefix.as_ref()..)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            if !key.value().starts_with(prefix.as_ref()) {
+                break;
+            }
+
+            let chunk_state: RegularFileChunkState = decode(value.value())?;
+            if chunk_state
+                .slices
+                .values()
+                .any(|slice| slice.block_state == BlockRefState::Published && slice.block.is_some())
+            {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    pub(super) fn remote_namespace_entry_visible_from_opened_tables<
+        TBaseInodes,
+        TCurrentInodes,
+        TTombstones,
+        TBaseChunks,
+    >(
+        base_inodes: &TBaseInodes,
+        current_inodes: &TCurrentInodes,
+        inode_tombstones: &TTombstones,
+        base_regular_file: &TBaseChunks,
+        entry: &DirEntryValue,
+    ) -> MetaResult<bool>
+    where
+        TBaseInodes: ReadableTable<u64, &'static [u8]>,
+        TCurrentInodes: ReadableTable<u64, &'static [u8]>,
+        TTombstones: ReadableTable<u64, u8>,
+        TBaseChunks: ReadableTable<&'static [u8], &'static [u8]>,
+    {
+        if entry.kind != FileType::RegularFile {
+            return Ok(true);
+        }
+
+        let attr = match Self::resolve_attr_from_opened_tables(
+            base_inodes,
+            current_inodes,
+            inode_tombstones,
+            entry.ino,
+            true,
+        ) {
+            Ok(attr) => attr,
+            Err(MetaError::InodeNotFound(_)) => return Ok(false),
+            Err(err) => return Err(err),
+        };
+
+        let has_published_base = attr.committed_size > 0
+            || attr.committed_content_epoch > 0
+            || Self::regular_file_has_published_base_from_opened_table(
+                base_regular_file,
+                entry.ino,
+            )?;
+        Ok(has_published_base)
+    }
+
     pub(super) fn readdir_merged_from_opened_tables<TBase, TCurrent, TTombstones>(
         base: &TBase,
         current: &TCurrent,
@@ -392,17 +465,44 @@ impl RedbMetaEngine {
         let tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let current_inodes = txn
+            .open_table(INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base_inodes = txn
+            .open_table(BASE_INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let inode_tombstones = txn
+            .open_table(INODE_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base_regular_file = txn
+            .open_table(REGULAR_FILE_BASE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         let overlay_dentries =
             Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
-
-        Self::lookup_merged_from_opened_tables(
+        let key = encode_dentry_key(parent, name);
+        let entry = Self::lookup_merged_from_opened_tables(
             &base,
             &current,
             &tombstones,
             parent,
             name,
             &overlay_dentries,
-        )
+        )?;
+        Ok(match entry {
+            Some(entry)
+                if overlay_dentries.contains(&key)
+                    || Self::remote_namespace_entry_visible_from_opened_tables(
+                        &base_inodes,
+                        &current_inodes,
+                        &inode_tombstones,
+                        &base_regular_file,
+                        &entry,
+                    )? =>
+            {
+                Some(entry)
+            }
+            _ => None,
+        })
     }
 
     pub(super) fn get_attr_merged_in_write_txn(
@@ -435,16 +535,46 @@ impl RedbMetaEngine {
         let tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let current_inodes = txn
+            .open_table(INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base_inodes = txn
+            .open_table(BASE_INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let inode_tombstones = txn
+            .open_table(INODE_TOMBSTONES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let base_regular_file = txn
+            .open_table(REGULAR_FILE_BASE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         let overlay_dentries =
             Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
-
-        Self::readdir_merged_from_opened_tables(
+        let merged = Self::readdir_merged_from_opened_tables(
             &base,
             &current,
             &tombstones,
             parent,
             &overlay_dentries,
-        )
+        )?;
+        let mut visible = Vec::with_capacity(merged.len());
+        for entry in merged {
+            let key = encode_dentry_key(parent, &entry.name);
+            if overlay_dentries.contains(&key)
+                || Self::remote_namespace_entry_visible_from_opened_tables(
+                    &base_inodes,
+                    &current_inodes,
+                    &inode_tombstones,
+                    &base_regular_file,
+                    &DirEntryValue {
+                        ino: entry.ino,
+                        kind: entry.kind,
+                    },
+                )?
+            {
+                visible.push(entry);
+            }
+        }
+        Ok(visible)
     }
 
     pub(super) fn has_entries_merged_in_write_txn(

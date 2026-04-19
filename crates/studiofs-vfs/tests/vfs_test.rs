@@ -3051,11 +3051,10 @@ fn remote_clients_see_uploading_marker_without_precise_progress() {
 
         import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &format_info);
         let remote_vfs = make_vfs_with_meta(remote_meta.clone(), &format_info, &remote_cache_str);
-        let remote_attr = remote_vfs.lookup(1, b"uploading-remote.txt").unwrap();
-        assert_eq!(remote_attr.ino, attr.ino);
-        assert_eq!(remote_attr.size, 0);
-        assert_eq!(remote_attr.committed_size, 0);
-        assert_eq!(remote_attr.upload_state, UploadState::Uploading);
+        assert!(matches!(
+            remote_vfs.lookup(1, b"uploading-remote.txt"),
+            Err(VfsError::Meta(MetaError::EntryNotFound { .. }))
+        ));
     });
     rt.shutdown_background();
 }
@@ -3106,16 +3105,9 @@ fn remote_open_on_uploading_new_file_returns_transient_unavailable() {
 
         import_remote_snapshot(writer_meta.as_ref(), remote_meta.as_ref(), &format_info);
         let remote_vfs = make_vfs_with_meta(remote_meta.clone(), &format_info, &remote_cache_str);
-        let remote_attr = remote_vfs.lookup(1, b"remote-open-uploading.txt").unwrap();
         assert!(matches!(
-            remote_vfs.open_file(remote_attr.ino, OpenFlags::RDONLY, false),
-            Err(VfsError::RemoteContentPending)
-        ));
-        assert!(matches!(
-            remote_vfs
-                .read(remote_attr.ino, 0, payload.len() as u32)
-                .await,
-            Err(VfsError::RemoteContentPending)
+            remote_vfs.lookup(1, b"remote-open-uploading.txt"),
+            Err(VfsError::Meta(MetaError::EntryNotFound { .. }))
         ));
     });
     rt.shutdown_background();
@@ -3771,19 +3763,15 @@ fn remote_attr_cache_refreshes_after_nested_publish_sync() {
 
         assert!(
             wait_until(Duration::from_secs(12), || {
-                remote_vfs
-                    .lookup(remote_dir.ino, b"remote.bin")
-                    .map(|attr| attr.size == 0 && attr.committed_size == 0)
-                    .unwrap_or(false)
+                matches!(
+                    remote_vfs.lookup(remote_dir.ino, b"remote.bin"),
+                    Err(VfsError::Meta(MetaError::EntryNotFound { .. }))
+                )
             })
             .await,
-            "remote peer should observe uploading placeholder before publish"
+            "remote peer should keep the new file hidden before first publish"
         );
 
-        let cached_remote = remote_vfs
-            .lookup(remote_dir.ino, b"remote.bin")
-            .expect("lookup uploading placeholder");
-        assert_eq!(cached_remote.size, 0);
         spy.clear();
 
         writer_vfs.write(file.ino, 0, &payload).await.unwrap();

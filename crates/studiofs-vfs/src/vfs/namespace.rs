@@ -1428,7 +1428,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_upload_placeholder_visible_requires_absent_local_overlay() {
+    fn remote_upload_placeholder_visibility_is_disabled_before_first_publish() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (_rt, vfs, _meta) = make_test_vfs(&tmp, "remote-upload-placeholder-visibility");
         let ino = 9_201;
@@ -1438,8 +1438,8 @@ mod tests {
         attr.committed_size = 0;
 
         assert!(
-            vfs.remote_upload_placeholder_visible(ino, &attr),
-            "zero-sized uploading regular files without local state should surface the remote placeholder"
+            !vfs.remote_upload_placeholder_visible(ino, &attr),
+            "remote namespace should stay hidden until the first published version exists"
         );
 
         vfs.state.local_dirty.pending_blocks.lock().insert(
@@ -1453,7 +1453,7 @@ mod tests {
 
         assert!(
             !vfs.remote_upload_placeholder_visible(ino, &attr),
-            "local overlay state must suppress the remote placeholder so reads stay locally visible"
+            "local overlay state should not re-enable the retired remote placeholder path"
         );
     }
 

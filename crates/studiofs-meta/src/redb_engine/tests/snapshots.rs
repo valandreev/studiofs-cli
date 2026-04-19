@@ -143,15 +143,14 @@ fn test_regular_file_graph_tables_roundtrip_and_project_remote_overlay() {
         .insert(ChunkId(11), overlay_chunk.clone());
 
     let mut base_slices = BTreeMap::new();
-    base_slices.insert(
+    let mut base_slice = SliceRecord::new(
         SliceId(3),
-        SliceRecord::new(
-            SliceId(3),
-            SliceOrder(3),
-            SliceRange::new(0, 4096).expect("valid base slice"),
-            BlockRef::new_partial(401, 4096),
-        ),
+        SliceOrder(3),
+        SliceRange::new(0, 4096).expect("valid base slice"),
+        BlockRef::new_partial(401, 4096),
     );
+    base_slice.block_state = BlockRefState::Published;
+    base_slices.insert(SliceId(3), base_slice);
     let base_chunk = RegularFileChunkState {
         next_slice_id: SliceId(4),
         next_slice_order: SliceOrder(4),

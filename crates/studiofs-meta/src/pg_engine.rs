@@ -5528,15 +5528,10 @@ mod tests {
         let remote_dir = remote
             .lookup(ROOT_INO, b"drafts")
             .expect("lookup dir after rename");
-        let remote_file = remote
-            .lookup(remote_dir.ino, b"final.bin")
-            .expect("lookup final after rename");
-        assert_eq!(remote_file.ino, file.ino);
-        let remote_attr_before = remote
-            .get_attr(remote_file.ino)
-            .expect("attr before publish");
-        assert_eq!(remote_attr_before.size, 0);
-        assert_eq!(remote_attr_before.committed_size, 0);
+        assert!(matches!(
+            remote.lookup(remote_dir.ino, b"final.bin"),
+            Err(MetaError::EntryNotFound { .. })
+        ));
 
         let batch2_start = batch1_end;
         set_file_state(&writer, file.ino, block_size + 4096, 1);
@@ -6084,24 +6079,13 @@ mod tests {
             .expect("set staged block");
         a.flush_metadata().expect("flush uploading marker");
 
-        assert!(wait_visible(
-            &b,
-            ROOT_INO,
-            b"uploading.bin",
-            Duration::from_secs(10)
-        ));
-
-        let remote = b.lookup(ROOT_INO, b"uploading.bin").expect("lookup remote");
-        let remote_attr = b.get_attr(remote.ino).expect("get remote attr");
-        assert_eq!(remote_attr.upload_state, UploadState::Uploading);
-        assert_eq!(remote_attr.size, 0);
-        assert_eq!(remote_attr.committed_size, 0);
-        assert!(
-            b.get_file_block(remote.ino, 0)
-                .expect("get remote block")
-                .is_none(),
-            "staged file blocks must not replicate through PG before publish"
-        );
+        assert!(wait_until(Duration::from_secs(10), || {
+            let _ = b.sync_metadata();
+            matches!(
+                b.lookup(ROOT_INO, b"uploading.bin"),
+                Err(MetaError::EntryNotFound { .. })
+            )
+        }));
     }
 
     #[test]
@@ -6215,13 +6199,10 @@ mod tests {
         assert!(wait_until(Duration::from_secs(12), || {
             let _ = b.sync_metadata();
             match b.lookup(ROOT_INO, b"drafts") {
-                Ok(remote_dir) => match b.lookup(remote_dir.ino, b"final.bin") {
-                    Ok(remote_file) => b
-                        .get_attr(remote_file.ino)
-                        .map(|attr| attr.size == 0 && attr.committed_size == 0)
-                        .unwrap_or(false),
-                    Err(_) => false,
-                },
+                Ok(remote_dir) => matches!(
+                    b.lookup(remote_dir.ino, b"final.bin"),
+                    Err(MetaError::EntryNotFound { .. })
+                ),
                 Err(_) => false,
             }
         }));
