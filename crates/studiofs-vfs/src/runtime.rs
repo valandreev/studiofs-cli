@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use studiofs_meta::engine::{
-    DeferredDeleteRecord, MetadataReplicationBacklog, PendingCreateRecord, UndoLogKind,
-    UndoLogRecord,
+    DeferredDeleteRecord, MetadataAuthorityStatus, MetadataReplicationBacklog, PendingCreateRecord,
+    UndoLogKind, UndoLogRecord,
 };
 use studiofs_meta::{
     AccessLevel, BatchFlushEntry, BatchFlushResult, BlockRef, ChunkId, DirEntry, DirEntryValue,
@@ -462,6 +462,7 @@ impl<M: ?Sized + MetaReplication> MetaReplication for RuntimeMetaHandle<M> {
     forward_method!(fn metadata_version_token(&self) -> Option<String>);
     forward_method!(fn namespace_version_token(&self) -> Option<String>);
     forward_method!(fn replication_backlog(&self) -> MetadataReplicationBacklog);
+    forward_method!(fn metadata_authority_status(&self) -> MetadataAuthorityStatus);
     forward_method!(fn remote_metadata_size(&self) -> MetaResult<Option<u64>>);
     forward_method!(fn prepare_for_close(&self));
 }

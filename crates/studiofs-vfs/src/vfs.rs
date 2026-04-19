@@ -146,6 +146,7 @@ use studiofs_data::object::{
 };
 use studiofs_data::store::{DataError, DataStore, DataStoreConfig, IoProfile};
 
+use studiofs_meta::engine::MetadataAuthorityStatus;
 use studiofs_meta::schema::{
     DEFAULT_CHUNK_SIZE, DirEntry, FormatInfo, InodeLifecycleState, PayloadRetentionClass, ROOT_INO,
     SetattrArgs, UploadState as MetaUploadState, chunk_start_offset,
@@ -2208,6 +2209,8 @@ pub struct StudioVfs {
     write_path_backend_tag: String,
     write_path_started_at: Instant,
     known_file_lock_overrides: Mutex<HashMap<Ino, FileLockLease>>,
+    #[cfg(test)]
+    metadata_authority_override: Mutex<Option<MetadataAuthorityStatus>>,
     #[cfg(test)]
     fail_next_inline_dirty_attr_persist: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -5687,6 +5690,27 @@ impl StudioVfs {
         flags.contains(OpenFlags::WRONLY) || flags.contains(OpenFlags::RDWR)
     }
 
+    fn metadata_authority_status(&self) -> MetadataAuthorityStatus {
+        #[cfg(test)]
+        if let Some(status) = *self.metadata_authority_override.lock() {
+            return status;
+        }
+
+        self.meta.sync_view().metadata_authority_status()
+    }
+
+    pub(super) fn enforce_metadata_mutation_authority(&self, ino: Ino) -> VfsResult<()> {
+        if self.metadata_authority_status().allows_new_mutations() {
+            return Ok(());
+        }
+        Err(VfsError::Meta(MetaError::AccessDenied {
+            ino,
+            principal: "metadata-authority".to_string(),
+            required: AccessLevel::ReadWrite,
+            actual: AccessLevel::ReadOnly,
+        }))
+    }
+
     fn known_file_lock_lease_snapshot(&self, ino: Ino) -> Option<FileLockLease> {
         if let Some(lease) = self.known_file_lock_overrides.lock().get(&ino).cloned() {
             return Some(lease);
@@ -5745,6 +5769,12 @@ impl StudioVfs {
         } else {
             overrides.remove(&ino);
         }
+    }
+
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub fn set_metadata_authority_status_for_test(&self, status: Option<MetadataAuthorityStatus>) {
+        *self.metadata_authority_override.lock() = status;
     }
 
     pub fn note_winfsp_write_callback(&self) {

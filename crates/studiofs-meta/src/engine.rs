@@ -115,6 +115,38 @@ pub struct MetadataReplicationBacklog {
     pub inflight_ops: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataAuthorityStatus {
+    pub inode_id_headroom: bool,
+    pub block_id_headroom: bool,
+}
+
+impl MetadataAuthorityStatus {
+    pub const fn writable() -> Self {
+        Self {
+            inode_id_headroom: true,
+            block_id_headroom: true,
+        }
+    }
+
+    pub const fn read_only() -> Self {
+        Self {
+            inode_id_headroom: false,
+            block_id_headroom: false,
+        }
+    }
+
+    pub const fn allows_new_mutations(self) -> bool {
+        self.inode_id_headroom && self.block_id_headroom
+    }
+}
+
+impl Default for MetadataAuthorityStatus {
+    fn default() -> Self {
+        Self::writable()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeferredDeleteRecord {
     pub ino: Ino,
@@ -697,6 +729,12 @@ pub trait MetaReplication: Send + Sync {
 
     /// Best-effort count of local metadata mutations not yet durably pushed to remote.
     fn replication_backlog(&self) -> MetadataReplicationBacklog;
+
+    /// Best-effort local metadata authority status for deciding whether new
+    /// mutations should still be accepted.
+    fn metadata_authority_status(&self) -> MetadataAuthorityStatus {
+        MetadataAuthorityStatus::writable()
+    }
 
     /// Return the estimated size of remote metadata in bytes, if applicable.
     fn remote_metadata_size(&self) -> MetaResult<Option<u64>>;

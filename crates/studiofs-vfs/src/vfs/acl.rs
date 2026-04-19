@@ -167,6 +167,9 @@ impl StudioVfs {
     pub(super) fn enforce_access(&self, ino: Ino, required: AccessLevel) -> VfsResult<()> {
         let actual = self.effective_access_level(ino)?;
         if Self::access_satisfies(actual, required) {
+            if required == AccessLevel::ReadWrite {
+                self.enforce_metadata_mutation_authority(ino)?;
+            }
             return Ok(());
         }
         if actual == AccessLevel::NoAccess {
@@ -187,6 +190,9 @@ impl StudioVfs {
     ) -> VfsResult<()> {
         if let Some(actual) = self.effective_access_level_cached(ino) {
             if Self::access_satisfies(actual, required) {
+                if required == AccessLevel::ReadWrite {
+                    self.enforce_metadata_mutation_authority(ino)?;
+                }
                 return Ok(());
             }
             if actual == AccessLevel::NoAccess {
@@ -208,6 +214,9 @@ impl StudioVfs {
         .await?;
         self.effective_access_level_cache_insert(ino, actual);
         if Self::access_satisfies(actual, required) {
+            if required == AccessLevel::ReadWrite {
+                self.enforce_metadata_mutation_authority(ino)?;
+            }
             return Ok(());
         }
         if actual == AccessLevel::NoAccess {
