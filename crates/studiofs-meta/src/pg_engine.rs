@@ -7,7 +7,7 @@ use crate::engine::{
 use crate::events::MetaEvent;
 use crate::redb_engine::{RedbMetaEngine, RedbSnapshot};
 use crate::types::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
@@ -54,11 +54,15 @@ pub struct PgMetaEngine {
     inflight_replication_ops: AtomicU32,
     pending_state: Mutex<PendingReplicationState>,
     janitor_lock: Mutex<Option<PgJanitorLock>>,
+    file_lock_cache: Mutex<HashMap<Ino, FileLockLease>>,
+    held_file_locks: Mutex<HashMap<Ino, HeldFileLockLease>>,
     /// Signals the background poll thread to exit.
     poll_shutdown: Arc<AtomicBool>,
     /// Handle to the background poll thread, used by `prepare_for_close()`
     /// to join the thread so `Database::drop()` runs before process exit.
     poll_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    lock_notify_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    lock_renew_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -114,6 +118,12 @@ struct PgJanitorLock {
     _runtime: tokio::runtime::Runtime,
     _client: tokio_postgres::Client,
     connection_task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug, Clone)]
+struct HeldFileLockLease {
+    lease_ttl: Duration,
+    next_renew_at: Instant,
 }
 
 impl PgMetaEngine {
@@ -408,6 +418,264 @@ impl PgMetaEngine {
         Ok(())
     }
 
+    fn lock_notify_channel(volume_id: i64) -> String {
+        format!("studiofs_lock_vol_{volume_id}")
+    }
+
+    fn encode_file_lock_notify_payload(ino: Ino, generation: u64) -> String {
+        format!("{ino}:{generation}")
+    }
+
+    fn parse_file_lock_notify_payload(payload: &str) -> Option<Ino> {
+        let ino = payload.split(':').next()?.trim().parse::<u64>().ok()?;
+        Some(ino)
+    }
+
+    fn decode_hard_lock_kind(raw: i16) -> MetaResult<HardLockKind> {
+        match raw {
+            1 => Ok(HardLockKind::Shared),
+            2 => Ok(HardLockKind::Exclusive),
+            other => Err(MetaError::Storage(format!(
+                "invalid hard lock kind in postgres row: {other}"
+            ))),
+        }
+    }
+
+    fn cache_file_lock_lease(&self, snapshot: Option<FileLockLease>) {
+        if let Ok(mut cache) = self.file_lock_cache.lock() {
+            if let Some(snapshot) = snapshot {
+                cache.insert(snapshot.ino, snapshot);
+            }
+        }
+    }
+
+    fn remove_cached_file_lock_lease(&self, ino: Ino) {
+        if let Ok(mut cache) = self.file_lock_cache.lock() {
+            cache.remove(&ino);
+        }
+    }
+
+    fn upsert_cached_file_lock_lease(&self, snapshot: Option<FileLockLease>, ino: Ino) {
+        if let Some(snapshot) = snapshot {
+            self.cache_file_lock_lease(Some(snapshot));
+        } else {
+            self.remove_cached_file_lock_lease(ino);
+        }
+    }
+
+    fn remember_held_file_lock(&self, ino: Ino, lease_ttl: Duration) {
+        if let Ok(mut held) = self.held_file_locks.lock() {
+            held.insert(
+                ino,
+                HeldFileLockLease {
+                    lease_ttl,
+                    next_renew_at: Instant::now() + Self::half_duration(lease_ttl),
+                },
+            );
+        }
+    }
+
+    fn forget_held_file_lock(&self, ino: Ino) {
+        if let Ok(mut held) = self.held_file_locks.lock() {
+            held.remove(&ino);
+        }
+    }
+
+    fn current_file_lock_lease_from_row(
+        row: tokio_postgres::Row,
+        now_ms: i64,
+    ) -> MetaResult<Option<FileLockLease>> {
+        let ino_raw: i64 = row.get(0);
+        let kind_raw: i16 = row.get(1);
+        let exclusive_owner: Option<String> = row.get(2);
+        let shared_owners: Vec<String> = row.get(3);
+        let lease_expires_at_unix_ms: i64 = row.get(4);
+        let generation_raw: i64 = row.get(5);
+        if lease_expires_at_unix_ms <= now_ms {
+            return Ok(None);
+        }
+        let ino = u64::try_from(ino_raw).map_err(|_| {
+            MetaError::Storage(format!(
+                "invalid negative inode in lock lease row: {ino_raw}"
+            ))
+        })?;
+        let generation = u64::try_from(generation_raw).map_err(|_| {
+            MetaError::Storage(format!(
+                "invalid negative generation in lock lease row: {generation_raw}"
+            ))
+        })?;
+        Ok(Some(FileLockLease {
+            ino,
+            kind: Self::decode_hard_lock_kind(kind_raw)?,
+            generation,
+            lease_expires_at_unix_ms,
+            exclusive_owner,
+            shared_owners: shared_owners.into_iter().collect(),
+        }))
+    }
+
+    fn half_duration(duration: Duration) -> Duration {
+        let millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        Duration::from_millis((millis / 2).max(1))
+    }
+
+    fn refresh_known_file_lock_lease(&self, ino: Ino) -> MetaResult<Option<FileLockLease>> {
+        let snapshot = self.current_file_lock_lease(ino)?;
+        self.upsert_cached_file_lock_lease(snapshot.clone(), ino);
+        Ok(snapshot)
+    }
+
+    fn start_lock_notify_listener(
+        engine: std::sync::Weak<Self>,
+        shutdown: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::Builder::new()
+            .name("pg-lock-notify".into())
+            .spawn(move || {
+                while !shutdown.load(Ordering::Acquire) {
+                    let Some(engine_arc) = engine.upgrade() else {
+                        break;
+                    };
+                    let channel = Self::lock_notify_channel(engine_arc.volume_id);
+                    let connect_result = engine_arc.run_async(async {
+                        let connect = tokio_postgres::connect(
+                            &engine_arc.postgres_url,
+                            tokio_postgres::NoTls,
+                        );
+                        let (client, mut connection) =
+                            tokio::time::timeout(engine_arc.connect_timeout, connect)
+                                .await
+                                .map_err(|_| {
+                                    Self::pg_timeout_error(
+                                        "lock notify connect",
+                                        engine_arc.connect_timeout,
+                                    )
+                                })?
+                                .map_err(|e| {
+                                    MetaError::Storage(format!(
+                                        "postgres lock notify connect failed: {}",
+                                        Self::format_pg_error(e)
+                                    ))
+                                })?;
+                        client
+                            .batch_execute(&format!("LISTEN {channel}"))
+                            .await
+                            .map_err(|e| {
+                                MetaError::Storage(format!(
+                                    "postgres LISTEN {channel} failed: {}",
+                                    Self::format_pg_error(e)
+                                ))
+                            })?;
+
+                        while !shutdown.load(Ordering::Acquire) {
+                            let message = tokio::time::timeout(
+                                Duration::from_millis(250),
+                                std::future::poll_fn(|cx| connection.poll_message(cx)),
+                            )
+                            .await;
+                            match message {
+                                Ok(Some(Ok(tokio_postgres::AsyncMessage::Notification(
+                                    notification,
+                                )))) => {
+                                    if let Some(ino) =
+                                        Self::parse_file_lock_notify_payload(notification.payload())
+                                    {
+                                        engine_arc.refresh_known_file_lock_lease(ino)?;
+                                    }
+                                }
+                                Ok(Some(Ok(tokio_postgres::AsyncMessage::Notice(_)))) => {}
+                                Ok(Some(Ok(_))) => {}
+                                Ok(Some(Err(err))) => {
+                                    return Err(MetaError::Storage(format!(
+                                        "postgres lock notify poll failed: {}",
+                                        Self::format_pg_error(err)
+                                    )));
+                                }
+                                Ok(None) => {
+                                    return Ok(());
+                                }
+                                Err(_) => {
+                                    let cached_inos: Vec<Ino> = engine_arc
+                                        .file_lock_cache
+                                        .lock()
+                                        .map(|cache| cache.keys().copied().collect())
+                                        .unwrap_or_default();
+                                    for ino in cached_inos {
+                                        engine_arc.refresh_known_file_lock_lease(ino)?;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(())
+                    });
+                    if shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if connect_result.is_err() {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                }
+            })
+            .expect("spawn pg-lock-notify thread")
+    }
+
+    fn start_lock_renew_worker(
+        engine: std::sync::Weak<Self>,
+        shutdown: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::Builder::new()
+            .name("pg-lock-renew".into())
+            .spawn(move || {
+                while !shutdown.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let Some(engine_arc) = engine.upgrade() else {
+                        break;
+                    };
+                    let now = Instant::now();
+                    let due: Vec<(Ino, Duration)> = match engine_arc.held_file_locks.lock() {
+                        Ok(held) => held
+                            .iter()
+                            .filter_map(|(&ino, state)| {
+                                (state.next_renew_at <= now).then_some((ino, state.lease_ttl))
+                            })
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    };
+
+                    for (ino, lease_ttl) in due {
+                        if shutdown.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let result = engine_arc.renew_file_lock_lease(ino, lease_ttl);
+                        match result {
+                            Ok(FileLockLeaseRenewOutcome::Renewed(_)) => {
+                                if let Ok(mut held) = engine_arc.held_file_locks.lock()
+                                    && let Some(state) = held.get_mut(&ino)
+                                {
+                                    state.next_renew_at =
+                                        Instant::now() + Self::half_duration(lease_ttl);
+                                }
+                            }
+                            Ok(FileLockLeaseRenewOutcome::Lost(_)) => {
+                                engine_arc.forget_held_file_lock(ino);
+                            }
+                            Err(_) => {
+                                if let Ok(mut held) = engine_arc.held_file_locks.lock()
+                                    && let Some(state) = held.get_mut(&ino)
+                                {
+                                    state.next_renew_at = Instant::now()
+                                        + Self::half_duration(
+                                            lease_ttl.min(Duration::from_secs(1)),
+                                        );
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .expect("spawn pg-lock-renew thread")
+    }
+
     fn load_pg_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>> {
         let postgres_url = self.postgres_url.clone();
         let volume_id = self.volume_id;
@@ -648,8 +916,12 @@ impl PgMetaEngine {
             inflight_replication_ops: AtomicU32::new(0),
             pending_state: Mutex::new(PendingReplicationState::default()),
             janitor_lock: Mutex::new(None),
+            file_lock_cache: Mutex::new(HashMap::new()),
+            held_file_locks: Mutex::new(HashMap::new()),
             poll_shutdown: poll_shutdown.clone(),
             poll_handle: Mutex::new(None),
+            lock_notify_handle: Mutex::new(None),
+            lock_renew_handle: Mutex::new(None),
         });
 
         // Bootstrap from the last checkpoint if present, then catch up from
@@ -667,6 +939,22 @@ impl PgMetaEngine {
                 poll_shutdown,
             );
             *engine.poll_handle.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
+            let notify_handle = Self::start_lock_notify_listener(
+                Arc::downgrade(&engine),
+                engine.poll_shutdown.clone(),
+            );
+            *engine
+                .lock_notify_handle
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(notify_handle);
+            let renew_handle = Self::start_lock_renew_worker(
+                Arc::downgrade(&engine),
+                engine.poll_shutdown.clone(),
+            );
+            *engine
+                .lock_renew_handle
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(renew_handle);
         }
         Ok(engine)
     }
@@ -1876,6 +2164,534 @@ impl MetaEngineCore for PgMetaEngine {
     fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>> {
         self.load_pg_global_snapshot_pins()
     }
+
+    fn acquire_file_lock_lease(
+        &self,
+        ino: Ino,
+        kind: HardLockKind,
+        lease_ttl: Duration,
+    ) -> MetaResult<FileLockLeaseAcquireOutcome> {
+        let postgres_url = self.postgres_url.clone();
+        let volume_id = self.volume_id;
+        let client_id = self.client_id.clone();
+        let connect_timeout = self.connect_timeout;
+        let command_timeout = self.command_timeout;
+        let outcome = self.run_async(async move {
+            Self::with_postgres_client_timeout(
+                postgres_url,
+                connect_timeout,
+                command_timeout,
+                "acquire file lock lease",
+                move |client| async move {
+                    let mut client = client;
+                    let tx = client.transaction().await.map_err(|e| {
+                        MetaError::Storage(format!(
+                            "postgres file lock acquire begin tx failed: {}",
+                            Self::format_pg_error(e)
+                        ))
+                    })?;
+                    let now_ms = Self::now_millis();
+                    let lease_expires_at_unix_ms = now_ms
+                        .checked_add(i64::try_from(lease_ttl.as_millis()).unwrap_or(i64::MAX))
+                        .unwrap_or(i64::MAX);
+                    let row = tx
+                        .query_opt(
+                            r#"
+                            SELECT ino, kind, exclusive_owner, shared_owners, lease_expires_at_unix_ms, generation
+                            FROM file_lock_leases
+                            WHERE vol = $1 AND ino = $2
+                            FOR UPDATE
+                            "#,
+                            &[&volume_id, &(ino as i64)],
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres file lock acquire select failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                    let current = match row {
+                        Some(row) => Self::current_file_lock_lease_from_row(row, now_ms)?,
+                        None => None,
+                    };
+
+                    let maybe_next = match current.as_ref() {
+                        None => Some(FileLockLease {
+                            ino,
+                            kind,
+                            generation: 1,
+                            lease_expires_at_unix_ms,
+                            exclusive_owner: (kind == HardLockKind::Exclusive)
+                                .then(|| client_id.clone()),
+                            shared_owners: (kind == HardLockKind::Shared)
+                                .then(|| [client_id.clone()].into_iter().collect())
+                                .unwrap_or_default(),
+                        }),
+                        Some(current) => {
+                            let is_self_exclusive =
+                                current.exclusive_owner.as_deref() == Some(client_id.as_str());
+                            let is_self_shared = current.shared_owners.contains(client_id.as_str());
+                            match kind {
+                                HardLockKind::Shared => {
+                                    if current.exclusive_owner.is_none() || is_self_exclusive {
+                                        let mut next = current.clone();
+                                        next.kind = HardLockKind::Shared;
+                                        next.generation = next.generation.saturating_add(1);
+                                        next.lease_expires_at_unix_ms = lease_expires_at_unix_ms;
+                                        next.exclusive_owner = None;
+                                        next.shared_owners.insert(client_id.clone());
+                                        Some(next)
+                                    } else {
+                                        None
+                                    }
+                                }
+                                HardLockKind::Exclusive => {
+                                    let shared_conflict = !current.shared_owners.is_empty()
+                                        && !(current.shared_owners.len() == 1 && is_self_shared);
+                                    if (current.exclusive_owner.is_none() || is_self_exclusive)
+                                        && !shared_conflict
+                                    {
+                                        Some(FileLockLease {
+                                            ino,
+                                            kind: HardLockKind::Exclusive,
+                                            generation: current.generation.saturating_add(1),
+                                            lease_expires_at_unix_ms,
+                                            exclusive_owner: Some(client_id.clone()),
+                                            shared_owners: Default::default(),
+                                        })
+                                    } else {
+                                        None
+                                    }
+                                }
+                            }
+                        }
+                    };
+
+                    let outcome = if let Some(next) = maybe_next {
+                        let shared_owners: Vec<String> =
+                            next.shared_owners.iter().cloned().collect();
+                        tx.execute(
+                            r#"
+                            INSERT INTO file_lock_leases (
+                                vol,
+                                ino,
+                                kind,
+                                exclusive_owner,
+                                shared_owners,
+                                lease_expires_at_unix_ms,
+                                generation,
+                                updated_at
+                            )
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+                            ON CONFLICT (vol, ino) DO UPDATE
+                            SET kind = EXCLUDED.kind,
+                                exclusive_owner = EXCLUDED.exclusive_owner,
+                                shared_owners = EXCLUDED.shared_owners,
+                                lease_expires_at_unix_ms = EXCLUDED.lease_expires_at_unix_ms,
+                                generation = EXCLUDED.generation,
+                                updated_at = now()
+                            "#,
+                            &[
+                                &volume_id,
+                                &(ino as i64),
+                                &(next.kind as i16),
+                                &next.exclusive_owner,
+                                &shared_owners,
+                                &next.lease_expires_at_unix_ms,
+                                &(i64::try_from(next.generation).unwrap_or(i64::MAX)),
+                            ],
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres file lock acquire upsert failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                        let channel = Self::lock_notify_channel(volume_id);
+                        let payload =
+                            Self::encode_file_lock_notify_payload(ino, next.generation);
+                        let _ = tx
+                            .execute("SELECT pg_notify($1, $2)", &[&channel, &payload])
+                            .await;
+                        tx.commit().await.map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres file lock acquire commit failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                        FileLockLeaseAcquireOutcome::Acquired(next)
+                    } else {
+                        tx.rollback().await.map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres file lock acquire rollback failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                        FileLockLeaseAcquireOutcome::Blocked(current.ok_or_else(|| {
+                            MetaError::Storage(
+                                "file lock acquire was blocked without a live conflicting lease"
+                                    .to_string(),
+                            )
+                        })?)
+                    };
+                    Ok(outcome)
+                },
+            )
+            .await
+        })?;
+        match &outcome {
+            FileLockLeaseAcquireOutcome::Acquired(snapshot) => {
+                self.cache_file_lock_lease(Some(snapshot.clone()));
+                self.remember_held_file_lock(snapshot.ino, lease_ttl);
+            }
+            FileLockLeaseAcquireOutcome::Blocked(snapshot) => {
+                self.cache_file_lock_lease(Some(snapshot.clone()));
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn release_file_lock_lease(&self, ino: Ino) -> MetaResult<FileLockLeaseReleaseOutcome> {
+        let postgres_url = self.postgres_url.clone();
+        let volume_id = self.volume_id;
+        let client_id = self.client_id.clone();
+        let connect_timeout = self.connect_timeout;
+        let command_timeout = self.command_timeout;
+        let outcome = self.run_async(async move {
+            Self::with_postgres_client_timeout(
+                postgres_url,
+                connect_timeout,
+                command_timeout,
+                "release file lock lease",
+                move |client| async move {
+                    let mut client = client;
+                    let tx = client.transaction().await.map_err(|e| {
+                        MetaError::Storage(format!(
+                            "postgres file lock release begin tx failed: {}",
+                            Self::format_pg_error(e)
+                        ))
+                    })?;
+                    let now_ms = Self::now_millis();
+                    let row = tx
+                        .query_opt(
+                            r#"
+                            SELECT ino, kind, exclusive_owner, shared_owners, lease_expires_at_unix_ms, generation
+                            FROM file_lock_leases
+                            WHERE vol = $1 AND ino = $2
+                            FOR UPDATE
+                            "#,
+                            &[&volume_id, &(ino as i64)],
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres file lock release select failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                    let current = match row {
+                        Some(row) => Self::current_file_lock_lease_from_row(row, now_ms)?,
+                        None => None,
+                    };
+                    let Some(current) = current else {
+                        tx.rollback().await.map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres file lock release rollback failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                        return Ok(FileLockLeaseReleaseOutcome::NotHeld(None));
+                    };
+
+                    let is_self_exclusive =
+                        current.exclusive_owner.as_deref() == Some(client_id.as_str());
+                    let is_self_shared = current.shared_owners.contains(client_id.as_str());
+                    if !is_self_exclusive && !is_self_shared {
+                        tx.rollback().await.map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres file lock release rollback failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                        return Ok(FileLockLeaseReleaseOutcome::NotHeld(Some(current)));
+                    }
+
+                    let next = if is_self_exclusive {
+                        None
+                    } else {
+                        let mut next = current.clone();
+                        next.shared_owners.remove(client_id.as_str());
+                        if next.shared_owners.is_empty() {
+                            None
+                        } else {
+                            next.generation = next.generation.saturating_add(1);
+                            Some(next)
+                        }
+                    };
+
+                    if let Some(next) = next.clone() {
+                        let shared_owners: Vec<String> =
+                            next.shared_owners.iter().cloned().collect();
+                        tx.execute(
+                            r#"
+                            UPDATE file_lock_leases
+                            SET kind = $3,
+                                exclusive_owner = $4,
+                                shared_owners = $5,
+                                lease_expires_at_unix_ms = $6,
+                                generation = $7,
+                                updated_at = now()
+                            WHERE vol = $1 AND ino = $2
+                            "#,
+                            &[
+                                &volume_id,
+                                &(ino as i64),
+                                &(next.kind as i16),
+                                &next.exclusive_owner,
+                                &shared_owners,
+                                &next.lease_expires_at_unix_ms,
+                                &(i64::try_from(next.generation).unwrap_or(i64::MAX)),
+                            ],
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres file lock release update failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                    } else {
+                        tx.execute(
+                            "DELETE FROM file_lock_leases WHERE vol = $1 AND ino = $2",
+                            &[&volume_id, &(ino as i64)],
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres file lock release delete failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                    }
+                    let generation = next.as_ref().map(|lease| lease.generation).unwrap_or_else(|| {
+                        current.generation.saturating_add(1)
+                    });
+                    let channel = Self::lock_notify_channel(volume_id);
+                    let payload = Self::encode_file_lock_notify_payload(ino, generation);
+                    let _ = tx
+                        .execute("SELECT pg_notify($1, $2)", &[&channel, &payload])
+                        .await;
+                    tx.commit().await.map_err(|e| {
+                        MetaError::Storage(format!(
+                            "postgres file lock release commit failed: {}",
+                            Self::format_pg_error(e)
+                        ))
+                    })?;
+                    Ok(FileLockLeaseReleaseOutcome::Released(next))
+                },
+            )
+            .await
+        })?;
+        self.forget_held_file_lock(ino);
+        match &outcome {
+            FileLockLeaseReleaseOutcome::Released(snapshot)
+            | FileLockLeaseReleaseOutcome::NotHeld(snapshot) => {
+                self.upsert_cached_file_lock_lease(snapshot.clone(), ino);
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn renew_file_lock_lease(
+        &self,
+        ino: Ino,
+        lease_ttl: Duration,
+    ) -> MetaResult<FileLockLeaseRenewOutcome> {
+        let postgres_url = self.postgres_url.clone();
+        let volume_id = self.volume_id;
+        let client_id = self.client_id.clone();
+        let connect_timeout = self.connect_timeout;
+        let command_timeout = self.command_timeout;
+        let outcome = self.run_async(async move {
+            Self::with_postgres_client_timeout(
+                postgres_url,
+                connect_timeout,
+                command_timeout,
+                "renew file lock lease",
+                move |client| async move {
+                    let mut client = client;
+                    let tx = client.transaction().await.map_err(|e| {
+                        MetaError::Storage(format!(
+                            "postgres file lock renew begin tx failed: {}",
+                            Self::format_pg_error(e)
+                        ))
+                    })?;
+                    let now_ms = Self::now_millis();
+                    let lease_expires_at_unix_ms = now_ms
+                        .checked_add(i64::try_from(lease_ttl.as_millis()).unwrap_or(i64::MAX))
+                        .unwrap_or(i64::MAX);
+                    let row = tx
+                        .query_opt(
+                            r#"
+                            SELECT ino, kind, exclusive_owner, shared_owners, lease_expires_at_unix_ms, generation
+                            FROM file_lock_leases
+                            WHERE vol = $1 AND ino = $2
+                            FOR UPDATE
+                            "#,
+                            &[&volume_id, &(ino as i64)],
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres file lock renew select failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                    let current = match row {
+                        Some(row) => Self::current_file_lock_lease_from_row(row, now_ms)?,
+                        None => None,
+                    };
+                    let Some(mut current) = current else {
+                        tx.rollback().await.map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres file lock renew rollback failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                        return Ok(FileLockLeaseRenewOutcome::Lost(None));
+                    };
+
+                    let is_self_exclusive =
+                        current.exclusive_owner.as_deref() == Some(client_id.as_str());
+                    let is_self_shared = current.shared_owners.contains(client_id.as_str());
+                    if !is_self_exclusive && !is_self_shared {
+                        tx.rollback().await.map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres file lock renew rollback failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                        return Ok(FileLockLeaseRenewOutcome::Lost(Some(current)));
+                    }
+
+                    current.generation = current.generation.saturating_add(1);
+                    current.lease_expires_at_unix_ms = lease_expires_at_unix_ms;
+                    let shared_owners: Vec<String> =
+                        current.shared_owners.iter().cloned().collect();
+                    tx.execute(
+                        r#"
+                        UPDATE file_lock_leases
+                        SET kind = $3,
+                            exclusive_owner = $4,
+                            shared_owners = $5,
+                            lease_expires_at_unix_ms = $6,
+                            generation = $7,
+                            updated_at = now()
+                        WHERE vol = $1 AND ino = $2
+                        "#,
+                        &[
+                            &volume_id,
+                            &(ino as i64),
+                            &(current.kind as i16),
+                            &current.exclusive_owner,
+                            &shared_owners,
+                            &current.lease_expires_at_unix_ms,
+                            &(i64::try_from(current.generation).unwrap_or(i64::MAX)),
+                        ],
+                    )
+                    .await
+                    .map_err(|e| {
+                        MetaError::Storage(format!(
+                            "postgres file lock renew update failed: {}",
+                            Self::format_pg_error(e)
+                        ))
+                    })?;
+                    let channel = Self::lock_notify_channel(volume_id);
+                    let payload =
+                        Self::encode_file_lock_notify_payload(ino, current.generation);
+                    let _ = tx
+                        .execute("SELECT pg_notify($1, $2)", &[&channel, &payload])
+                        .await;
+                    tx.commit().await.map_err(|e| {
+                        MetaError::Storage(format!(
+                            "postgres file lock renew commit failed: {}",
+                            Self::format_pg_error(e)
+                        ))
+                    })?;
+                    Ok(FileLockLeaseRenewOutcome::Renewed(current))
+                },
+            )
+            .await
+        })?;
+        match &outcome {
+            FileLockLeaseRenewOutcome::Renewed(snapshot) => {
+                self.cache_file_lock_lease(Some(snapshot.clone()));
+                self.remember_held_file_lock(snapshot.ino, lease_ttl);
+            }
+            FileLockLeaseRenewOutcome::Lost(snapshot) => {
+                self.forget_held_file_lock(ino);
+                self.upsert_cached_file_lock_lease(snapshot.clone(), ino);
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn current_file_lock_lease(&self, ino: Ino) -> MetaResult<Option<FileLockLease>> {
+        let postgres_url = self.postgres_url.clone();
+        let volume_id = self.volume_id;
+        let connect_timeout = self.connect_timeout;
+        let command_timeout = self.command_timeout;
+        let snapshot = self.run_async(async move {
+            Self::with_postgres_client_timeout(
+                postgres_url,
+                connect_timeout,
+                command_timeout,
+                "read current file lock lease",
+                move |client| async move {
+                    let now_ms = Self::now_millis();
+                    let row = client
+                        .query_opt(
+                            r#"
+                            SELECT ino, kind, exclusive_owner, shared_owners, lease_expires_at_unix_ms, generation
+                            FROM file_lock_leases
+                            WHERE vol = $1 AND ino = $2
+                            "#,
+                            &[&volume_id, &(ino as i64)],
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres file lock read failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                    match row {
+                        Some(row) => Self::current_file_lock_lease_from_row(row, now_ms),
+                        None => Ok(None),
+                    }
+                },
+            )
+            .await
+        })?;
+        self.upsert_cached_file_lock_lease(snapshot.clone(), ino);
+        Ok(snapshot)
+    }
+
+    fn known_file_lock_lease(&self, ino: Ino) -> Option<FileLockLease> {
+        let now_ms = Self::now_millis();
+        let mut cache = self.file_lock_cache.lock().ok()?;
+        let expired = cache
+            .get(&ino)
+            .map(|lease| lease.lease_expires_at_unix_ms <= now_ms)
+            .unwrap_or(false);
+        if expired {
+            cache.remove(&ino);
+            return None;
+        }
+        cache.get(&ino).cloned()
+    }
 }
 
 impl MetaFormat for PgMetaEngine {
@@ -2394,6 +3210,16 @@ impl MetaReplication for PgMetaEngine {
         {
             let _ = handle.join();
         }
+        if let Ok(mut guard) = self.lock_notify_handle.lock()
+            && let Some(handle) = guard.take()
+        {
+            let _ = handle.join();
+        }
+        if let Ok(mut guard) = self.lock_renew_handle.lock()
+            && let Some(handle) = guard.take()
+        {
+            let _ = handle.join();
+        }
     }
 }
 impl crate::engine::MetaEngine for PgMetaEngine {
@@ -2653,8 +3479,12 @@ mod tests {
             inflight_replication_ops: AtomicU32::new(0),
             pending_state: Mutex::new(PendingReplicationState::default()),
             janitor_lock: Mutex::new(None),
+            file_lock_cache: Mutex::new(HashMap::new()),
+            held_file_locks: Mutex::new(HashMap::new()),
             poll_shutdown: Arc::new(AtomicBool::new(false)),
             poll_handle: Mutex::new(None),
+            lock_notify_handle: Mutex::new(None),
+            lock_renew_handle: Mutex::new(None),
         };
 
         (dir, engine)
@@ -2740,6 +3570,17 @@ mod tests {
                     snapshot_payload BYTEA NOT NULL DEFAULT ''::bytea,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                     PRIMARY KEY (vol, id)
+                );
+                CREATE TABLE IF NOT EXISTS file_lock_leases (
+                    vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+                    ino BIGINT NOT NULL,
+                    kind SMALLINT NOT NULL,
+                    exclusive_owner TEXT,
+                    shared_owners TEXT[] NOT NULL DEFAULT '{}',
+                    lease_expires_at_unix_ms BIGINT NOT NULL,
+                    generation BIGINT NOT NULL DEFAULT 1,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (vol, ino)
                 );
                 ALTER TABLE event_log
                     ADD COLUMN IF NOT EXISTS batch_version BIGINT;
@@ -2967,6 +3808,263 @@ mod tests {
             PgMetaEngine::load_persisted_flushed_event_seq(&pg.local)
                 .expect("reload flushed event seq"),
             19
+        );
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_file_lock_lease_blocks_peer_until_release() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-file-lock-blocks-peer");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open_with_options(
+            &db_a,
+            PgOpenOptions {
+                background_poll: false,
+            },
+        )
+        .expect("open a");
+        let b = PgMetaEngine::open_with_options(
+            &db_b,
+            PgOpenOptions {
+                background_poll: false,
+            },
+        )
+        .expect("open b");
+        let file = a
+            .create_file(ROOT_INO, b"locked.txt", 0, 0, 0o644)
+            .expect("create file");
+        a.flush_metadata().expect("flush file create");
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"locked.txt",
+            Duration::from_secs(10)
+        ));
+
+        let ttl = Duration::from_secs(2);
+        let acquired = a
+            .acquire_file_lock_lease(file.ino, HardLockKind::Exclusive, ttl)
+            .expect("a acquire exclusive lease");
+        assert!(matches!(acquired, FileLockLeaseAcquireOutcome::Acquired(_)));
+
+        let blocked = b
+            .acquire_file_lock_lease(file.ino, HardLockKind::Exclusive, ttl)
+            .expect("b conflicting acquire result");
+        assert!(matches!(blocked, FileLockLeaseAcquireOutcome::Blocked(_)));
+
+        let released = a
+            .release_file_lock_lease(file.ino)
+            .expect("a release lease");
+        assert!(matches!(
+            released,
+            FileLockLeaseReleaseOutcome::Released(None)
+        ));
+
+        let acquired_after_release = b
+            .acquire_file_lock_lease(file.ino, HardLockKind::Exclusive, ttl)
+            .expect("b acquire after release");
+        assert!(matches!(
+            acquired_after_release,
+            FileLockLeaseAcquireOutcome::Acquired(_)
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_file_lock_lease_expires_for_peer() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-file-lock-expiry");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open_with_options(
+            &db_a,
+            PgOpenOptions {
+                background_poll: false,
+            },
+        )
+        .expect("open a");
+        let b = PgMetaEngine::open_with_options(
+            &db_b,
+            PgOpenOptions {
+                background_poll: false,
+            },
+        )
+        .expect("open b");
+        let file = a
+            .create_file(ROOT_INO, b"expiring.txt", 0, 0, 0o644)
+            .expect("create file");
+        a.flush_metadata().expect("flush file create");
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"expiring.txt",
+            Duration::from_secs(10)
+        ));
+
+        let ttl = Duration::from_millis(150);
+        let acquired = a
+            .acquire_file_lock_lease(file.ino, HardLockKind::Exclusive, ttl)
+            .expect("a acquire lease");
+        assert!(matches!(acquired, FileLockLeaseAcquireOutcome::Acquired(_)));
+
+        std::thread::sleep(Duration::from_millis(350));
+
+        let peer_acquired = b
+            .acquire_file_lock_lease(file.ino, HardLockKind::Exclusive, ttl)
+            .expect("b acquire after expiry");
+        assert!(matches!(
+            peer_acquired,
+            FileLockLeaseAcquireOutcome::Acquired(_)
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_file_lock_lease_renew_keeps_peer_blocked() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-file-lock-renew");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open_with_options(
+            &db_a,
+            PgOpenOptions {
+                background_poll: false,
+            },
+        )
+        .expect("open a");
+        let b = PgMetaEngine::open_with_options(
+            &db_b,
+            PgOpenOptions {
+                background_poll: false,
+            },
+        )
+        .expect("open b");
+        let file = a
+            .create_file(ROOT_INO, b"renew.txt", 0, 0, 0o644)
+            .expect("create file");
+        a.flush_metadata().expect("flush file create");
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"renew.txt",
+            Duration::from_secs(10)
+        ));
+
+        let ttl = Duration::from_secs(3);
+        let acquired = a
+            .acquire_file_lock_lease(file.ino, HardLockKind::Exclusive, ttl)
+            .expect("a acquire lease");
+        assert!(matches!(acquired, FileLockLeaseAcquireOutcome::Acquired(_)));
+
+        std::thread::sleep(Duration::from_millis(500));
+
+        let renewed = a
+            .renew_file_lock_lease(file.ino, ttl)
+            .expect("a renew lease");
+        assert!(
+            matches!(renewed, FileLockLeaseRenewOutcome::Renewed(_)),
+            "expected renewed lease, got {renewed:?}"
+        );
+
+        std::thread::sleep(Duration::from_secs(1));
+
+        let blocked = b
+            .acquire_file_lock_lease(file.ino, HardLockKind::Exclusive, ttl)
+            .expect("b conflicting acquire after renew");
+        assert!(matches!(blocked, FileLockLeaseAcquireOutcome::Blocked(_)));
+
+        std::thread::sleep(Duration::from_millis(3500));
+
+        let acquired_after_renewed_expiry = b
+            .acquire_file_lock_lease(file.ino, HardLockKind::Exclusive, ttl)
+            .expect("b acquire after renewed expiry");
+        assert!(matches!(
+            acquired_after_renewed_expiry,
+            FileLockLeaseAcquireOutcome::Acquired(_)
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_file_lock_known_state_refreshes_from_notify() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let _poll_guard = set_test_env("STUDIOFS_PG_SYNC_POLL_SECS", "3600");
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-file-lock-notify-refresh");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+        let file = a
+            .create_file(ROOT_INO, b"notify.txt", 0, 0, 0o644)
+            .expect("create file");
+        a.flush_metadata().expect("flush file create");
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"notify.txt",
+            Duration::from_secs(10)
+        ));
+
+        let ttl = Duration::from_secs(2);
+        a.acquire_file_lock_lease(file.ino, HardLockKind::Exclusive, ttl)
+            .expect("a acquire lease");
+
+        let blocked = b
+            .acquire_file_lock_lease(file.ino, HardLockKind::Exclusive, ttl)
+            .expect("b conflicting acquire result");
+        assert!(matches!(blocked, FileLockLeaseAcquireOutcome::Blocked(_)));
+        assert!(
+            b.known_file_lock_lease(file.ino).is_some(),
+            "blocked peer should cache the known conflicting lease"
+        );
+
+        a.release_file_lock_lease(file.ino)
+            .expect("a release lease");
+
+        assert!(
+            wait_until(Duration::from_secs(10), || b
+                .known_file_lock_lease(file.ino)
+                .is_none()),
+            "peer known lock cache should clear after NOTIFY-driven refresh"
         );
     }
 

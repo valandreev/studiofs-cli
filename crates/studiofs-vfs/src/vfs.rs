@@ -2205,7 +2205,7 @@ pub struct StudioVfs {
     /// Adaptive fetch scheduler (AIMD + singleflight).
     /// Replaces the old `FetchThrottle`, `inflight_fetches`, and VFS-retry.
     fetch_scheduler: Arc<crate::fetch::FetchScheduler>,
-    /// Optional serverless distributed lock manager for bimodal consistency.
+    /// Optional metadata-backed hard-lock coordination for cross-client flock.
     distributed_flock: Option<DistributedFlock>,
     /// Optional kernel cache invalidator (set by platform bridge after mount).
     kernel_invalidator: RwLock<Option<Arc<dyn KernelInvalidator>>>,

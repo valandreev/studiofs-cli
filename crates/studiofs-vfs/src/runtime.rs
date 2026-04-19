@@ -179,6 +179,34 @@ impl<M: ?Sized + MetaEngineCore> MetaEngineCore for RuntimeMetaHandle<M> {
     forward_method!(fn try_acquire_global_janitor_lock(&self) -> MetaResult<bool>);
     forward_method!(fn release_global_janitor_lock(&self) -> MetaResult<()>);
     forward_method!(fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>>);
+    forward_method!(
+        fn acquire_file_lock_lease(
+            &self,
+            ino: Ino,
+            kind: studiofs_meta::HardLockKind,
+            lease_ttl: Duration,
+        ) -> MetaResult<studiofs_meta::FileLockLeaseAcquireOutcome>
+    );
+    forward_method!(
+        fn release_file_lock_lease(
+            &self,
+            ino: Ino,
+        ) -> MetaResult<studiofs_meta::FileLockLeaseReleaseOutcome>
+    );
+    forward_method!(
+        fn renew_file_lock_lease(
+            &self,
+            ino: Ino,
+            lease_ttl: Duration,
+        ) -> MetaResult<studiofs_meta::FileLockLeaseRenewOutcome>
+    );
+    forward_method!(
+        fn current_file_lock_lease(
+            &self,
+            ino: Ino,
+        ) -> MetaResult<Option<studiofs_meta::FileLockLease>>
+    );
+    forward_method!(fn known_file_lock_lease(&self, ino: Ino) -> Option<studiofs_meta::FileLockLease>);
 }
 
 impl<M: ?Sized + MetaFormat> MetaFormat for RuntimeMetaHandle<M> {

@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 // =============================================================================
@@ -116,6 +116,49 @@ pub enum AccessLevel {
     /// Read-write access.
     #[default]
     ReadWrite = 2,
+}
+
+/// Global hard-lock mode coordinated through PostgreSQL leases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+pub enum HardLockKind {
+    Shared = 1,
+    Exclusive = 2,
+}
+
+/// Authoritative or known snapshot of one inode hard-lock lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileLockLease {
+    pub ino: Ino,
+    pub kind: HardLockKind,
+    pub generation: u64,
+    pub lease_expires_at_unix_ms: i64,
+    #[serde(default)]
+    pub exclusive_owner: Option<String>,
+    #[serde(default)]
+    pub shared_owners: BTreeSet<String>,
+}
+
+/// Outcome when trying to acquire a hard-lock lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileLockLeaseAcquireOutcome {
+    Acquired(FileLockLease),
+    Blocked(FileLockLease),
+}
+
+/// Outcome when releasing a hard-lock lease for the current client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileLockLeaseReleaseOutcome {
+    Released(Option<FileLockLease>),
+    NotHeld(Option<FileLockLease>),
+}
+
+/// Outcome when renewing a hard-lock lease for the current client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileLockLeaseRenewOutcome {
+    Renewed(FileLockLease),
+    Lost(Option<FileLockLease>),
 }
 
 impl AccessLevel {
