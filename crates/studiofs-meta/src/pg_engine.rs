@@ -570,8 +570,47 @@ impl PgMetaEngine {
         Duration::from_millis((millis / 2).max(1))
     }
 
-    fn refresh_known_file_lock_lease(&self, ino: Ino) -> MetaResult<Option<FileLockLease>> {
-        let snapshot = self.current_file_lock_lease(ino)?;
+    async fn current_file_lock_lease_with_client<C>(
+        client: &C,
+        volume_id: i64,
+        ino: Ino,
+    ) -> MetaResult<Option<FileLockLease>>
+    where
+        C: tokio_postgres::GenericClient + Sync,
+    {
+        let now_ms = Self::now_millis();
+        let row = client
+            .query_opt(
+                r#"
+                SELECT ino, kind, exclusive_owner, shared_owners, lease_expires_at_unix_ms, generation
+                FROM file_lock_leases
+                WHERE vol = $1 AND ino = $2
+                "#,
+                &[&volume_id, &(ino as i64)],
+            )
+            .await
+            .map_err(|e| {
+                MetaError::Storage(format!(
+                    "postgres file lock read failed: {}",
+                    Self::format_pg_error(e)
+                ))
+            })?;
+        match row {
+            Some(row) => Self::current_file_lock_lease_from_row(row, now_ms),
+            None => Ok(None),
+        }
+    }
+
+    async fn refresh_known_file_lock_lease_with_client<C>(
+        &self,
+        client: &C,
+        ino: Ino,
+    ) -> MetaResult<Option<FileLockLease>>
+    where
+        C: tokio_postgres::GenericClient + Sync,
+    {
+        let snapshot =
+            Self::current_file_lock_lease_with_client(client, self.volume_id, ino).await?;
         self.upsert_cached_file_lock_lease(snapshot.clone(), ino);
         Ok(snapshot)
     }
@@ -634,7 +673,9 @@ impl PgMetaEngine {
                                     if let Some(ino) =
                                         Self::parse_file_lock_notify_payload(notification.payload())
                                     {
-                                        engine_arc.refresh_known_file_lock_lease(ino)?;
+                                        engine_arc
+                                            .refresh_known_file_lock_lease_with_client(&client, ino)
+                                            .await?;
                                     }
                                 }
                                 Ok(Some(Ok(tokio_postgres::AsyncMessage::Notice(_)))) => {}
@@ -656,7 +697,11 @@ impl PgMetaEngine {
                                             .map(|cache| cache.keys().copied().collect())
                                             .unwrap_or_default();
                                         for ino in cached_inos {
-                                            engine_arc.refresh_known_file_lock_lease(ino)?;
+                                            engine_arc
+                                                .refresh_known_file_lock_lease_with_client(
+                                                    &client, ino,
+                                                )
+                                                .await?;
                                         }
                                         next_safety_refresh =
                                             Instant::now() + safety_refresh_interval;
@@ -2253,8 +2298,32 @@ impl MetaEngineCore for PgMetaEngine {
                     let lease_expires_at_unix_ms = now_ms
                         .checked_add(i64::try_from(lease_ttl.as_millis()).unwrap_or(i64::MAX))
                         .unwrap_or(i64::MAX);
+                    tx.execute(
+                        r#"
+                        INSERT INTO file_lock_leases (
+                            vol,
+                            ino,
+                            kind,
+                            exclusive_owner,
+                            shared_owners,
+                            lease_expires_at_unix_ms,
+                            generation,
+                            updated_at
+                        )
+                        VALUES ($1, $2, $3, NULL, '{}', 0, 0, now())
+                        ON CONFLICT (vol, ino) DO NOTHING
+                        "#,
+                        &[&volume_id, &(ino as i64), &(HardLockKind::Shared as i16)],
+                    )
+                    .await
+                    .map_err(|e| {
+                        MetaError::Storage(format!(
+                            "postgres file lock acquire ensure row failed: {}",
+                            Self::format_pg_error(e)
+                        ))
+                    })?;
                     let row = tx
-                        .query_opt(
+                        .query_one(
                             r#"
                             SELECT ino, kind, exclusive_owner, shared_owners, lease_expires_at_unix_ms, generation
                             FROM file_lock_leases
@@ -2270,10 +2339,7 @@ impl MetaEngineCore for PgMetaEngine {
                                 Self::format_pg_error(e)
                             ))
                         })?;
-                    let current = match row {
-                        Some(row) => Self::current_file_lock_lease_from_row(row, now_ms)?,
-                        None => None,
-                    };
+                    let current = Self::current_file_lock_lease_from_row(row, now_ms)?;
 
                     let maybe_next = match current.as_ref() {
                         None => Some(FileLockLease {
@@ -2334,24 +2400,14 @@ impl MetaEngineCore for PgMetaEngine {
                             next.shared_owners.iter().cloned().collect();
                         tx.execute(
                             r#"
-                            INSERT INTO file_lock_leases (
-                                vol,
-                                ino,
-                                kind,
-                                exclusive_owner,
-                                shared_owners,
-                                lease_expires_at_unix_ms,
-                                generation,
-                                updated_at
-                            )
-                            VALUES ($1, $2, $3, $4, $5, $6, $7, now())
-                            ON CONFLICT (vol, ino) DO UPDATE
-                            SET kind = EXCLUDED.kind,
-                                exclusive_owner = EXCLUDED.exclusive_owner,
-                                shared_owners = EXCLUDED.shared_owners,
-                                lease_expires_at_unix_ms = EXCLUDED.lease_expires_at_unix_ms,
-                                generation = EXCLUDED.generation,
+                            UPDATE file_lock_leases
+                            SET kind = $3,
+                                exclusive_owner = $4,
+                                shared_owners = $5,
+                                lease_expires_at_unix_ms = $6,
+                                generation = $7,
                                 updated_at = now()
+                            WHERE vol = $1 AND ino = $2
                             "#,
                             &[
                                 &volume_id,
@@ -2366,7 +2422,7 @@ impl MetaEngineCore for PgMetaEngine {
                         .await
                         .map_err(|e| {
                             MetaError::Storage(format!(
-                                "postgres file lock acquire upsert failed: {}",
+                                "postgres file lock acquire update failed: {}",
                                 Self::format_pg_error(e)
                             ))
                         })?;
@@ -2711,27 +2767,7 @@ impl MetaEngineCore for PgMetaEngine {
                 command_timeout,
                 "read current file lock lease",
                 move |client| async move {
-                    let now_ms = Self::now_millis();
-                    let row = client
-                        .query_opt(
-                            r#"
-                            SELECT ino, kind, exclusive_owner, shared_owners, lease_expires_at_unix_ms, generation
-                            FROM file_lock_leases
-                            WHERE vol = $1 AND ino = $2
-                            "#,
-                            &[&volume_id, &(ino as i64)],
-                        )
-                        .await
-                        .map_err(|e| {
-                            MetaError::Storage(format!(
-                                "postgres file lock read failed: {}",
-                                Self::format_pg_error(e)
-                            ))
-                        })?;
-                    match row {
-                        Some(row) => Self::current_file_lock_lease_from_row(row, now_ms),
-                        None => Ok(None),
-                    }
+                    Self::current_file_lock_lease_with_client(&client, volume_id, ino).await
                 },
             )
             .await
@@ -3964,6 +4000,81 @@ mod tests {
             acquired_after_release,
             FileLockLeaseAcquireOutcome::Acquired(_)
         ));
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_file_lock_first_acquire_serializes_concurrent_racers() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-file-lock-first-acquire-race");
+        let info = volume.format_info();
+        seed_local(&db_a, &info);
+        seed_local(&db_b, &info);
+
+        let a = PgMetaEngine::open_with_options(
+            &db_a,
+            PgOpenOptions {
+                background_poll: false,
+            },
+        )
+        .expect("open a");
+        let b = PgMetaEngine::open_with_options(
+            &db_b,
+            PgOpenOptions {
+                background_poll: false,
+            },
+        )
+        .expect("open b");
+        let file = a
+            .create_file(ROOT_INO, b"first-acquire-race.txt", 0, 0, 0o644)
+            .expect("create file");
+        a.flush_metadata().expect("flush file create");
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"first-acquire-race.txt",
+            Duration::from_secs(10)
+        ));
+
+        let ttl = Duration::from_secs(2);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let barrier_a = Arc::clone(&barrier);
+        let barrier_b = Arc::clone(&barrier);
+        let a2 = Arc::clone(&a);
+        let b2 = Arc::clone(&b);
+
+        let acquire_a = std::thread::spawn(move || {
+            barrier_a.wait();
+            a2.acquire_file_lock_lease(file.ino, HardLockKind::Exclusive, ttl)
+        });
+        let acquire_b = std::thread::spawn(move || {
+            barrier_b.wait();
+            b2.acquire_file_lock_lease(file.ino, HardLockKind::Exclusive, ttl)
+        });
+
+        let outcome_a = acquire_a
+            .join()
+            .expect("join acquire a")
+            .expect("acquire a");
+        let outcome_b = acquire_b
+            .join()
+            .expect("join acquire b")
+            .expect("acquire b");
+        let acquired_count = [outcome_a, outcome_b]
+            .into_iter()
+            .filter(|outcome| matches!(outcome, FileLockLeaseAcquireOutcome::Acquired(_)))
+            .count();
+        assert_eq!(
+            acquired_count, 1,
+            "exactly one concurrent first-acquire attempt should win the lease row"
+        );
     }
 
     #[test]
