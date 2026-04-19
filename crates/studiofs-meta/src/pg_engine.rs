@@ -1122,7 +1122,6 @@ impl PgMetaEngine {
         let _ = engine.restore_pending_state_from_local_log();
         let _ = engine.prime_local_id_ranges(client_slot);
         if options.background_poll {
-            engine.ensure_lock_notify_listener_started()?;
             let handle = Self::start_background_poll(
                 Arc::downgrade(&engine),
                 engine.poll_interval,
@@ -2848,6 +2847,10 @@ impl MetaEngineCore for PgMetaEngine {
         Ok(snapshot)
     }
 
+    fn ensure_known_file_lock_monitoring(&self) -> MetaResult<()> {
+        self.ensure_lock_notify_listener_started()
+    }
+
     fn known_file_lock_lease(&self, ino: Ino) -> Option<FileLockLease> {
         let now_ms = Self::now_millis();
         let mut cache = self.file_lock_cache.lock().ok()?;
@@ -4373,7 +4376,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
-    fn test_pg_open_starts_notify_listener_but_defers_renew_worker_until_first_lock_usage() {
+    fn test_pg_passive_lock_monitoring_starts_notify_listener_but_defers_renew_worker() {
         let Some(dsn) = pg_dsn() else {
             return;
         };
@@ -4390,8 +4393,8 @@ mod tests {
                 .lock_notify_handle
                 .lock()
                 .expect("lock notify handle")
-                .is_some(),
-            "open should eagerly start the pg lock notify listener for passive peers"
+                .is_none(),
+            "open alone should not eagerly start the pg lock notify listener"
         );
         assert!(
             engine
@@ -4400,6 +4403,26 @@ mod tests {
                 .expect("lock renew handle")
                 .is_none(),
             "open should still defer the pg lock renew worker until a lock is held"
+        );
+
+        engine
+            .ensure_known_file_lock_monitoring()
+            .expect("start passive lock monitoring");
+        assert!(
+            engine
+                .lock_notify_handle
+                .lock()
+                .expect("lock notify handle after passive monitoring")
+                .is_some(),
+            "passive lock monitoring should start the pg lock notify listener"
+        );
+        assert!(
+            engine
+                .lock_renew_handle
+                .lock()
+                .expect("lock renew handle after passive monitoring")
+                .is_none(),
+            "passive lock monitoring should not eagerly start the pg lock renew worker"
         );
 
         let file = engine

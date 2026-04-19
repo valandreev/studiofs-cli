@@ -206,6 +206,7 @@ impl<M: ?Sized + MetaEngineCore> MetaEngineCore for RuntimeMetaHandle<M> {
             ino: Ino,
         ) -> MetaResult<Option<studiofs_meta::FileLockLease>>
     );
+    forward_method!(fn ensure_known_file_lock_monitoring(&self) -> MetaResult<()>);
     forward_method!(fn known_file_lock_lease(&self, ino: Ino) -> Option<studiofs_meta::FileLockLease>);
 }
 

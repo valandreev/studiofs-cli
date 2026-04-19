@@ -5706,6 +5706,7 @@ impl StudioVfs {
             return Some(lease);
         }
 
+        let _ = self.meta.sync_view().ensure_known_file_lock_monitoring();
         self.meta.sync_view().known_file_lock_lease(ino)
     }
 
