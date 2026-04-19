@@ -580,7 +580,7 @@ fn redb_partial_update_does_not_expose_new_blocks_before_publish() {
 
     let snapshot = engine.export_remote_snapshot().unwrap();
     let remote = temp_engine();
-    remote.import_snapshot(&snapshot).unwrap();
+    remote.import_remote_snapshot(&snapshot).unwrap();
 
     let remote_attr = remote.get_attr(file.ino).unwrap();
     assert_eq!(remote_attr.size, 4096);
@@ -588,6 +588,97 @@ fn redb_partial_update_does_not_expose_new_blocks_before_publish() {
     assert_eq!(remote_attr.upload_state, UploadState::Updating);
     let remote_block = remote.get_file_block(file.ino, 0).unwrap().unwrap();
     assert_eq!(remote_block.object_id, 301);
+}
+
+#[test]
+fn new_unpublished_file_is_hidden_from_remote_snapshot() {
+    let engine = temp_engine();
+
+    let file = engine
+        .create_file(ROOT_INO, b"hidden-until-publish.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+    let block = BlockRef::new_partial(303, 4096);
+    engine.set_file_block(file.ino, 0, &block).unwrap();
+
+    let snapshot = engine.export_remote_snapshot().unwrap();
+    let remote = temp_engine();
+    remote.import_remote_snapshot(&snapshot).unwrap();
+
+    assert!(matches!(
+        remote.lookup(ROOT_INO, b"hidden-until-publish.bin"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
+    assert!(matches!(
+        remote.get_attr(file.ino),
+        Err(MetaError::InodeNotFound(ino)) if ino == file.ino
+    ));
+
+    assert!(engine.publish_file_manifest(file.ino, 1).unwrap());
+    let published_snapshot = engine.export_remote_snapshot().unwrap();
+    let published_remote = temp_engine();
+    published_remote
+        .import_remote_snapshot(&published_snapshot)
+        .unwrap();
+
+    let published_file = published_remote
+        .lookup(ROOT_INO, b"hidden-until-publish.bin")
+        .unwrap();
+    let published_attr = published_remote.get_attr(published_file.ino).unwrap();
+    assert_eq!(published_attr.size, 4096);
+    assert_eq!(published_attr.committed_size, 4096);
+    assert_eq!(published_attr.upload_state, UploadState::Ready);
+    let published_block = published_remote
+        .get_file_block(published_file.ino, 0)
+        .unwrap()
+        .unwrap();
+    assert_eq!(published_block.object_id, block.object_id);
+}
+
+#[test]
+fn empty_new_file_is_hidden_from_remote_snapshot() {
+    let engine = temp_engine();
+
+    engine
+        .create_file(ROOT_INO, b"empty-hidden.txt", 1000, 1000, 0o644)
+        .unwrap();
+
+    let snapshot = engine.export_remote_snapshot().unwrap();
+    let remote = temp_engine();
+    remote.import_remote_snapshot(&snapshot).unwrap();
+
+    assert!(matches!(
+        remote.lookup(ROOT_INO, b"empty-hidden.txt"),
+        Err(MetaError::EntryNotFound { .. })
+    ));
+}
+
+#[test]
+fn published_empty_file_is_visible_from_remote_snapshot() {
+    let engine = temp_engine();
+
+    let file = engine
+        .create_file(ROOT_INO, b"empty-visible.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+
+    let snapshot = engine.export_remote_snapshot().unwrap();
+    let remote = temp_engine();
+    remote.import_remote_snapshot(&snapshot).unwrap();
+
+    let remote_file = remote.lookup(ROOT_INO, b"empty-visible.txt").unwrap();
+    assert_eq!(remote_file.ino, file.ino);
+    let remote_attr = remote.get_attr(remote_file.ino).unwrap();
+    assert_eq!(remote_attr.size, 0);
+    assert_eq!(remote_attr.committed_size, 0);
+    assert_eq!(remote_attr.committed_content_epoch, 1);
+    assert_eq!(remote_attr.upload_state, UploadState::Ready);
 }
 
 #[test]

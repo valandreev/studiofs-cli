@@ -103,6 +103,8 @@ pub(super) const EVENT_LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition:
 
 /// Snapshot definitions: snapshot_id (uuid text) -> MetadataSnapshot (postcard)
 pub(super) const SNAPSHOTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots");
+pub(super) const REMOTE_NAMESPACE_VISIBILITY_FILTER_SETTING: &str =
+    "remote_namespace_visibility_filter";
 
 /// Serializable full snapshot of redb metadata state.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]

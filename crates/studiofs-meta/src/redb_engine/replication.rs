@@ -3,16 +3,51 @@ use super::*;
 impl RedbMetaEngine {
     pub fn export_remote_snapshot(&self) -> MetaResult<RedbSnapshot> {
         let mut snapshot = self.export_snapshot()?;
+        let mut published_regular_inodes = HashSet::new();
+        for (ino, bytes) in &snapshot.regular_file_base {
+            let regular: RegularFileBaseState = decode(bytes)?;
+            if regular.chunks.values().any(|chunk| {
+                chunk.slices.values().any(|slice| {
+                    slice.block_state == BlockRefState::Published && slice.block.is_some()
+                })
+            }) {
+                published_regular_inodes.insert(*ino);
+            }
+        }
 
         let mut projected_inodes = Vec::with_capacity(snapshot.inodes.len());
+        let mut hidden_regular_inodes = HashSet::new();
         for (ino, bytes) in snapshot.inodes.drain(..) {
             let mut attr: InodeAttr = decode(&bytes)?;
             if attr.kind == FileType::RegularFile {
+                let visible_in_remote_namespace =
+                    Self::regular_file_remote_visible_without_published_base(&attr)
+                        || published_regular_inodes.contains(&ino);
+                if !visible_in_remote_namespace {
+                    hidden_regular_inodes.insert(ino);
+                    continue;
+                }
                 attr.size = attr.committed_size;
             }
             projected_inodes.push((ino, encode(&attr)?));
         }
         snapshot.inodes = projected_inodes;
+        snapshot.dentries = snapshot
+            .dentries
+            .drain(..)
+            .filter_map(|(key, bytes)| {
+                decode::<DirEntryValue>(&bytes)
+                    .ok()
+                    .filter(|entry| !hidden_regular_inodes.contains(&entry.ino))
+                    .map(|_| (key, bytes))
+            })
+            .collect();
+        snapshot
+            .regular_file_overlay
+            .retain(|(ino, _)| !hidden_regular_inodes.contains(ino));
+        snapshot
+            .regular_file_base
+            .retain(|(ino, _)| !hidden_regular_inodes.contains(ino));
 
         let mut referenced_objects = BTreeMap::new();
         for (_, bytes) in &snapshot.regular_file_base {

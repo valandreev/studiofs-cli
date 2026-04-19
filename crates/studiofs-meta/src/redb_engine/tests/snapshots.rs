@@ -143,15 +143,14 @@ fn test_regular_file_graph_tables_roundtrip_and_project_remote_overlay() {
         .insert(ChunkId(11), overlay_chunk.clone());
 
     let mut base_slices = BTreeMap::new();
-    base_slices.insert(
+    let mut base_slice = SliceRecord::new(
         SliceId(3),
-        SliceRecord::new(
-            SliceId(3),
-            SliceOrder(3),
-            SliceRange::new(0, 4096).expect("valid base slice"),
-            BlockRef::new_partial(401, 4096),
-        ),
+        SliceOrder(3),
+        SliceRange::new(0, 4096).expect("valid base slice"),
+        BlockRef::new_partial(401, 4096),
     );
+    base_slice.block_state = BlockRefState::Published;
+    base_slices.insert(SliceId(3), base_slice);
     let base_chunk = RegularFileChunkState {
         next_slice_id: SliceId(4),
         next_slice_order: SliceOrder(4),
@@ -314,6 +313,33 @@ fn test_import_snapshot_rebuilds_pending_compaction_rows() {
             .unwrap()
             .is_some()
     );
+}
+
+#[test]
+fn test_import_snapshot_keeps_unpublished_regular_file_visible() {
+    let source = temp_engine();
+    let file = source
+        .create_file(ROOT_INO, b"snapshot-local-only.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = source.get_attr(file.ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    source.set_attr(&attr).unwrap();
+    let block = BlockRef::new_partial(40_001, 4096);
+    source.set_file_block(file.ino, 0, &block).unwrap();
+
+    let snapshot = source.export_snapshot().unwrap();
+    let imported = temp_engine();
+    imported.import_snapshot(&snapshot).unwrap();
+
+    let imported_file = imported.lookup(ROOT_INO, b"snapshot-local-only.bin").unwrap();
+    assert_eq!(imported_file.ino, file.ino);
+    let imported_attr = imported.get_attr(imported_file.ino).unwrap();
+    assert_eq!(imported_attr.size, 4096);
+    assert_eq!(imported_attr.committed_size, 0);
+    assert_eq!(imported_attr.upload_state, UploadState::Uploading);
+    let imported_block = imported.get_file_block(imported_file.ino, 0).unwrap().unwrap();
+    assert_eq!(imported_block.object_id, block.object_id);
 }
 
 #[test]

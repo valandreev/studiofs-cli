@@ -1,9 +1,17 @@
+fn mark_empty_file_published(engine: &RedbMetaEngine, ino: Ino) {
+    let mut attr = engine.get_attr(ino).unwrap();
+    attr.content_epoch = 1;
+    attr.committed_content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+}
+
 #[test]
 fn test_detect_local_overlay_state_for_dentry_only_against_base() {
     let source = temp_engine();
-    source
+    let file = source
         .create_file(ROOT_INO, b"base_name.txt", 1000, 1000, 0o644)
         .unwrap();
+    mark_empty_file_published(&source, file.ino);
     let snapshot = source.export_snapshot().unwrap();
 
     let engine = temp_engine();
@@ -18,9 +26,10 @@ fn test_detect_local_overlay_state_for_dentry_only_against_base() {
 #[test]
 fn test_detect_overlay_dentries_against_imported_base() {
     let source = temp_engine();
-    source
+    let file = source
         .create_file(ROOT_INO, b"base.txt", 1000, 1000, 0o644)
         .unwrap();
+    mark_empty_file_published(&source, file.ino);
     let snapshot = source.export_snapshot().unwrap();
 
     let engine = temp_engine();
@@ -44,7 +53,9 @@ fn test_detect_overlay_dentries_against_imported_base() {
 fn test_lookup_and_readdir_fall_back_to_base_when_no_local_overlay() {
     let engine = temp_engine();
 
-    let base_attr = InodeAttr::new_file(77, ROOT_INO, 1000, 1000, 0o644);
+    let mut base_attr = InodeAttr::new_file(77, ROOT_INO, 1000, 1000, 0o644);
+    base_attr.content_epoch = 1;
+    base_attr.committed_content_epoch = 1;
     let base_entry = DirEntryValue {
         ino: 77,
         kind: FileType::RegularFile,
@@ -75,6 +86,7 @@ fn test_local_overlay_wins_over_base_read_path() {
     let file = source
         .create_file(ROOT_INO, b"shared.txt", 1000, 1000, 0o644)
         .unwrap();
+    mark_empty_file_published(&source, file.ino);
     let snapshot = source.export_snapshot().unwrap();
 
     let engine = temp_engine();
@@ -97,9 +109,10 @@ fn test_local_overlay_wins_over_base_read_path() {
 #[test]
 fn test_unlink_base_only_entry_creates_local_tombstone() {
     let source = temp_engine();
-    source
+    let file = source
         .create_file(ROOT_INO, b"remote.txt", 1000, 1000, 0o644)
         .unwrap();
+    mark_empty_file_published(&source, file.ino);
     let snapshot = source.export_snapshot().unwrap();
 
     let engine = temp_engine();
@@ -118,6 +131,7 @@ fn test_rename_base_only_entry_creates_local_overlay_mapping() {
     let file = source
         .create_file(ROOT_INO, b"remote.txt", 1000, 1000, 0o644)
         .unwrap();
+    mark_empty_file_published(&source, file.ino);
     let snapshot = source.export_snapshot().unwrap();
 
     let engine = temp_engine();
@@ -138,6 +152,7 @@ fn test_link_base_only_entry_creates_local_overlay_mapping() {
     let file = source
         .create_file(ROOT_INO, b"remote.txt", 1000, 1000, 0o644)
         .unwrap();
+    mark_empty_file_published(&source, file.ino);
     let snapshot = source.export_snapshot().unwrap();
 
     let engine = temp_engine();
@@ -157,6 +172,7 @@ fn test_add_entry_rejects_name_visible_from_base() {
     let file = source
         .create_file(ROOT_INO, b"remote.txt", 1000, 1000, 0o644)
         .unwrap();
+    mark_empty_file_published(&source, file.ino);
     let snapshot = source.export_snapshot().unwrap();
 
     let engine = temp_engine();
@@ -179,6 +195,7 @@ fn test_remove_entry_base_only_creates_local_tombstone() {
     let file = source
         .create_file(ROOT_INO, b"remote.txt", 1000, 1000, 0o644)
         .unwrap();
+    mark_empty_file_published(&source, file.ino);
     let snapshot = source.export_snapshot().unwrap();
 
     let engine = temp_engine();
@@ -194,12 +211,14 @@ fn test_remove_entry_base_only_creates_local_tombstone() {
 #[test]
 fn test_lookup_merged_in_write_txn_matches_read_lookup() {
     let source = temp_engine();
-    source
+    let base_only = source
         .create_file(ROOT_INO, b"base-only.txt", 1000, 1000, 0o644)
         .unwrap();
-    source
+    let shared = source
         .create_file(ROOT_INO, b"shared.txt", 1000, 1000, 0o644)
         .unwrap();
+    mark_empty_file_published(&source, base_only.ino);
+    mark_empty_file_published(&source, shared.ino);
     let snapshot = source.export_snapshot().unwrap();
 
     let engine = temp_engine();
@@ -239,12 +258,14 @@ fn test_lookup_merged_in_write_txn_matches_read_lookup() {
 #[test]
 fn test_readdir_merged_in_write_txn_matches_read_readdir() {
     let source = temp_engine();
-    source
+    let base_a = source
         .create_file(ROOT_INO, b"base-a.txt", 1000, 1000, 0o644)
         .unwrap();
-    source
+    let base_b = source
         .create_file(ROOT_INO, b"base-b.txt", 1000, 1000, 0o644)
         .unwrap();
+    mark_empty_file_published(&source, base_a.ino);
+    mark_empty_file_published(&source, base_b.ino);
     let snapshot = source.export_snapshot().unwrap();
 
     let engine = temp_engine();

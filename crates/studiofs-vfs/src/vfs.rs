@@ -4767,13 +4767,8 @@ impl StudioVfs {
             });
     }
 
-    fn remote_upload_placeholder_visible(&self, ino: Ino, attr: &InodeAttr) -> bool {
-        attr.kind == FileType::RegularFile
-            && attr.upload_state == MetaUploadState::Uploading
-            && attr.size == 0
-            && attr.committed_size == 0
-            && !self.inode_has_local_overlay(ino)
-            && !self.inode_has_pending_uploads(ino)
+    fn remote_upload_placeholder_visible(&self, _ino: Ino, _attr: &InodeAttr) -> bool {
+        false
     }
 
     pub fn live_extent_records_for_inode(&self, ino: Ino) -> Vec<(u32, u64, u64)> {
