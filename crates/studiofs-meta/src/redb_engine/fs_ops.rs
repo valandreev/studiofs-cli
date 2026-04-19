@@ -704,6 +704,48 @@ impl RedbMetaEngine {
         }
     }
 
+    pub(crate) fn create_file_with_ino(
+        &self,
+        ino: Ino,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> MetaResult<InodeAttr> {
+        self.execute_namespace_create(NamespaceCreateSpec::new_file(
+            ino, parent, name, uid, gid, mode,
+        ))
+    }
+
+    pub(crate) fn create_dir_with_ino(
+        &self,
+        ino: Ino,
+        parent: Ino,
+        name: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u16,
+    ) -> MetaResult<InodeAttr> {
+        self.execute_namespace_create(NamespaceCreateSpec::new_dir(
+            ino, parent, name, uid, gid, mode,
+        ))
+    }
+
+    pub(crate) fn create_symlink_with_ino(
+        &self,
+        ino: Ino,
+        parent: Ino,
+        name: &[u8],
+        target: &[u8],
+        uid: u32,
+        gid: u32,
+    ) -> MetaResult<InodeAttr> {
+        self.execute_namespace_create(NamespaceCreateSpec::new_symlink(
+            ino, parent, name, target, uid, gid,
+        ))
+    }
+
     pub(super) fn execute_namespace_delete(
         &self,
         spec: NamespaceDeleteSpec<'_>,
