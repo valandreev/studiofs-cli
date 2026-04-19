@@ -17,6 +17,25 @@ fn read_workspace_file(path: &str) -> String {
 
 fn collect_term_hits(path: &str, terms: &[&str]) -> Vec<String> {
     let contents = read_workspace_file(path);
+    collect_term_hits_from_contents(path, &contents, terms)
+}
+
+fn collect_term_hits_outside_test_modules(path: &str, terms: &[&str]) -> Vec<String> {
+    let contents = read_workspace_file(path);
+    let mut filtered = String::new();
+
+    for line in contents.lines() {
+        if line.trim() == "#[cfg(test)]" {
+            break;
+        }
+        filtered.push_str(line);
+        filtered.push('\n');
+    }
+
+    collect_term_hits_from_contents(path, &filtered, terms)
+}
+
+fn collect_term_hits_from_contents(path: &str, contents: &str, terms: &[&str]) -> Vec<String> {
     let mut hits = Vec::new();
     let lowered_terms: Vec<_> = terms.iter().map(|term| term.to_lowercase()).collect();
 
@@ -75,6 +94,10 @@ fn cli_surface_avoids_legacy_runtime_product_wording() {
     let files = [
         "crates/studiofs/src/cli/cache_layout.rs",
         "crates/studiofs/src/cli/destroy.rs",
+        "crates/studiofs/src/cli/mod.rs",
+        "crates/studiofs/src/cli/mount/mod.rs",
+        "crates/studiofs/src/cli/runtime_tuning.rs",
+        "crates/studiofs/src/cli/settings.rs",
         "crates/studiofs/src/cli/status.rs",
         "crates/studiofs/src/cli/test_cache_profile_common.rs",
         "crates/studiofs/src/cli/test_cache_profile_stub.rs",
@@ -88,6 +111,76 @@ fn cli_surface_avoids_legacy_runtime_product_wording() {
     assert!(
         hits.is_empty(),
         "CLI surface still uses legacy runtime product wording:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn active_docs_and_cli_drop_writeback_delay_surface() {
+    let files = [
+        "crates/studiofs/src/cli/mod.rs",
+        "crates/studiofs/src/cli/mount/mod.rs",
+        "crates/studiofs/src/cli/runtime_tuning.rs",
+        "crates/studiofs/src/cli/settings.rs",
+        "docs/configuration.md",
+        "docs/examples.md",
+    ];
+
+    let hits: Vec<_> = files
+        .iter()
+        .flat_map(|path| {
+            if path.starts_with("docs/") {
+                collect_term_hits(path, &["writeback-delay", "writeback_delay"])
+            } else {
+                collect_term_hits_outside_test_modules(
+                    path,
+                    &["writeback-delay", "writeback_delay"],
+                )
+            }
+        })
+        .collect();
+
+    assert!(
+        hits.is_empty(),
+        "active docs and CLI still expose writeback-delay surface:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn active_docs_and_mount_profiling_drop_cache_mode_surface() {
+    let files = [
+        "crates/studiofs/src/cli/mount_profile.rs",
+        "crates/studiofs/src/cli/mount_profile_stub.rs",
+        "crates/studiofs/src/cli/mount/session.rs",
+        "docs/configuration.md",
+    ];
+
+    let hits: Vec<_> = files
+        .iter()
+        .flat_map(|path| {
+            if path.starts_with("docs/") {
+                collect_term_hits(path, &["cache_mode", "cache mode"])
+            } else {
+                collect_term_hits_outside_test_modules(path, &["cache_mode", "cache mode"])
+            }
+        })
+        .collect();
+
+    assert!(
+        hits.is_empty(),
+        "active docs and mount profiling still expose cache-mode wording:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn validation_docs_drop_durable_mode_callback_wording() {
+    let hits = collect_term_hits("docs/local-first-validation-matrix.md", &["durable mode"]);
+
+    assert!(
+        hits.is_empty(),
+        "validation docs still describe callback semantics with durable-mode wording:\n{}",
         hits.join("\n")
     );
 }

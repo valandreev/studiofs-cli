@@ -223,10 +223,9 @@ Do not treat these as parity failures:
 
 - StudioFS same-mount accepted writes are intentionally visible immediately
   through writer state and local unpublished state.
-- StudioFS `fsync` always confirms local durability; `flush` and last-handle
-  `close` do so only in durable mode and otherwise confirm the newest local
-  unpublished state,
-  not remote publication.
+- StudioFS `fsync` always confirms local durability; explicit `flush` and
+  last-handle `close` also confirm the newest local unpublished state when
+  dirty state remains, not remote publication.
 - StudioFS remote visibility flips at a file-version publish boundary after
   upload plus publish; it is intentionally eventual rather than close-to-open.
 - StudioFS benchmark output may surface Local-First specific metadata such as

@@ -15,7 +15,6 @@ impl MountProfileSession {
         _platform: &str,
         _bridge: &str,
         _mount_mode: &str,
-        _cache_mode: &str,
         _cache_path: &Path,
     ) -> Option<Self> {
         None
@@ -50,7 +49,6 @@ pub(crate) fn runtime_profiling_backend(
     _platform: &str,
     _bridge: &str,
     _mount_mode: &str,
-    _cache_mode: &str,
     _cache_path: &Path,
 ) -> Arc<dyn RuntimeProfilingBackend> {
     Arc::new(UnsupportedRuntimeProfilingBackend)

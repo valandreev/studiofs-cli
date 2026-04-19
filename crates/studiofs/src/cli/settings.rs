@@ -75,8 +75,10 @@ pub fn load_studiofs_config() -> anyhow::Result<StudioFsConfig> {
         )
     })?;
 
-    toml::from_str(&bytes)
-        .map_err(|e| anyhow::anyhow!("failed to parse config file '{}': {e}", path.display()))
+    let mut config: StudioFsConfig = toml::from_str(&bytes)
+        .map_err(|e| anyhow::anyhow!("failed to parse config file '{}': {e}", path.display()))?;
+    strip_removed_public_settings(&mut config);
+    Ok(config)
 }
 
 fn save_studiofs_config(config: &StudioFsConfig) -> anyhow::Result<()> {
@@ -90,6 +92,10 @@ fn save_studiofs_config(config: &StudioFsConfig) -> anyhow::Result<()> {
     })?;
     std::fs::write(&path, content)?;
     Ok(())
+}
+
+fn strip_removed_public_settings(config: &mut StudioFsConfig) {
+    config.vfs.upload_delay_ms = None;
 }
 
 #[cfg(windows)]
@@ -112,6 +118,7 @@ fn ensure_mount_point_exists(mount_point: &str) -> anyhow::Result<()> {
 
 pub fn run(args: SettingsArgs) -> anyhow::Result<()> {
     let mut config = load_studiofs_config()?;
+    strip_removed_public_settings(&mut config);
     let mut changed = false;
 
     if let Some(mount_point) = args.mount_point {
@@ -236,10 +243,18 @@ mod tests {
             "256",
             "--prefetch",
             "192",
-            "--writeback-delay",
-            "1500",
         ])
         .expect("new public runtime tuning flags should parse");
+    }
+
+    #[test]
+    fn settings_rejects_writeback_delay_flag() {
+        let err = match crate::cli::parse_for_test(&["settings", "--writeback-delay", "1500"]) {
+            Ok(_) => panic!("expected unknown argument for removed writeback-delay flag"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        assert!(err.to_string().contains("--writeback-delay"));
     }
 
     #[test]

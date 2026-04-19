@@ -94,7 +94,6 @@ RUNTIME IO:
     --read-buffer
     --readahead
     --prefetch
-    --writeback-delay
   Metadata-cache internals stay on strong built-in defaults.
 
 CONSISTENCY MODEL:
@@ -183,10 +182,25 @@ mod tests {
             "256",
             "--prefetch",
             "192",
-            "--writeback-delay",
-            "1500",
         ])
         .expect("new public runtime tuning flags should parse");
+    }
+
+    #[test]
+    fn mount_rejects_writeback_delay_flag() {
+        let mount_point = if cfg!(windows) { "Z:" } else { "/mnt/studio" };
+        let err = match crate::cli::parse_for_test(&[
+            "mount",
+            "demo",
+            mount_point,
+            "--writeback-delay",
+            "1500",
+        ]) {
+            Ok(_) => panic!("expected unknown argument for removed writeback-delay flag"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        assert!(err.to_string().contains("--writeback-delay"));
     }
 
     #[test]
