@@ -97,7 +97,6 @@ LOCAL-FIRST OPERATOR MODEL:
     --read-buffer
     --readahead
     --prefetch
-    --writeback-delay
   Metadata-cache internals stay on strong built-in defaults.
   Additional STUDIOFS_* env overrides are transitional/developer-oriented.
   Use `studiofs status <name>` to inspect runtime usage/dirty/evictable bytes,

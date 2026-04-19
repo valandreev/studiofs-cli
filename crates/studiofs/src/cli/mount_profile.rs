@@ -53,7 +53,6 @@ impl MountProfileSession {
         platform: &str,
         bridge: &str,
         mount_mode: &str,
-        cache_mode: &str,
         cache_path: &Path,
     ) -> Option<Self> {
         let env_mode = read_env_profile_mode();
@@ -81,7 +80,6 @@ impl MountProfileSession {
             ("platform".to_string(), platform.to_string()),
             ("volume".to_string(), volume_name.to_string()),
             ("mount_mode".to_string(), mount_mode.to_string()),
-            ("cache_mode".to_string(), cache_mode.to_string()),
             ("bridge".to_string(), bridge.to_string()),
             ("runtime".to_string(), "mount".to_string()),
         ];
@@ -188,7 +186,6 @@ struct MountRuntimeProfilingBackend {
     platform: String,
     bridge: String,
     mount_mode: String,
-    cache_mode: String,
     output_dir: PathBuf,
     app_name: String,
     endpoint: Option<ProfileEndpoint>,
@@ -222,7 +219,6 @@ impl RuntimeProfilingBackend for MountRuntimeProfilingBackend {
                 ("platform".to_string(), self.platform.clone()),
                 ("volume".to_string(), self.volume_name.clone()),
                 ("mount_mode".to_string(), self.mount_mode.clone()),
-                ("cache_mode".to_string(), self.cache_mode.clone()),
                 ("bridge".to_string(), self.bridge.clone()),
                 ("runtime".to_string(), "attach".to_string()),
                 (
@@ -337,7 +333,6 @@ pub(crate) fn runtime_profiling_backend(
     platform: &str,
     bridge: &str,
     mount_mode: &str,
-    cache_mode: &str,
     cache_path: &Path,
 ) -> Arc<dyn RuntimeProfilingBackend> {
     Arc::new(MountRuntimeProfilingBackend {
@@ -345,7 +340,6 @@ pub(crate) fn runtime_profiling_backend(
         platform: platform.to_string(),
         bridge: bridge.to_string(),
         mount_mode: mount_mode.to_string(),
-        cache_mode: cache_mode.to_string(),
         output_dir: cache_path.join(PROFILE_DIR_NAME),
         app_name: read_app_name(),
         endpoint: read_endpoint(),
@@ -510,11 +504,6 @@ fn write_artifact(
         .find(|(key, _)| key == "mount_mode")
         .map(|(_, value)| sanitize_component(value))
         .unwrap_or_else(|| "mount".to_string());
-    let cache_mode = tags
-        .iter()
-        .find(|(key, _)| key == "cache_mode")
-        .map(|(_, value)| sanitize_component(value))
-        .unwrap_or_else(|| "cache".to_string());
     let platform = tags
         .iter()
         .find(|(key, _)| key == "platform")
@@ -527,12 +516,11 @@ fn write_artifact(
         .unwrap_or_else(|| "bridge".to_string());
     let timestamp = finished_at.format("%Y-%m-%dT%H-%M-%SZ");
     let filename = format!(
-        "{}-{}-{}-{}-{}-{}-{}.{}.pprof.gz",
+        "{}-{}-{}-{}-{}-{}.{}.pprof.gz",
         sanitize_component(app_name),
         source,
         volume,
         mount_mode,
-        cache_mode,
         platform,
         bridge,
         timestamp,

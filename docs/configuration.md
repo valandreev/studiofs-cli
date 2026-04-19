@@ -26,7 +26,6 @@ should primarily use:
 - `read_buffer`
 - `readahead`
 - `prefetch`
-- `writeback_delay`
 
 Metadata-cache defaults and most runtime heuristics remain internal.
 
@@ -37,8 +36,8 @@ Priority for each setting:
 3. Built-in default (`cache-size=100GB`)
 4. For `mount-point`, no implicit default is used; `cache-dir` still falls back to `<meta-dir>/cache` when neither CLI nor config provides a value.
 
-For the public runtime IO knobs (`--read-buffer`, `--readahead`, `--prefetch`,
-`--writeback-delay`) the effective precedence is:
+For the public runtime IO knobs (`--read-buffer`, `--readahead`, `--prefetch`)
+the effective precedence is:
 
 1. CLI flag
 2. Transitional `STUDIOFS_*` environment override for the same setting
@@ -95,7 +94,6 @@ studiofs mount <name> [<mount-point>] \
   [--read-buffer <e.g. 4GB>] \
   [--readahead <blocks>] \
   [--prefetch <count>] \
-  [--writeback-delay <ms>] \
   [--principal <name>] \
   [--snapshot-id <uuid>] \
   [--foreground] \
@@ -133,7 +131,7 @@ Notes:
 - `STUDIOFS_PYROSCOPE_APP_NAME` or `PYROSCOPE_APPLICATION_NAME` overrides the service name.
 - `STUDIOFS_PYROSCOPE_SAMPLE_RATE` or `PYROSCOPE_SAMPLE_RATE` sets the CPU sampling rate in Hz.
 - `STUDIOFS_PYROSCOPE_TAGS` or `PYROSCOPE_TAGS` adds comma-separated `key=value` labels.
-- Default mount tags include platform, volume name, mount mode, cache mode, bridge, and `runtime=mount`.
+- Default mount tags include platform, volume name, mount mode, bridge, and `runtime=mount`.
 - When no endpoint is configured, StudioFS still writes a gzipped pprof artifact under `<cache-dir>/<uuid>/profiles/`.
 - `--snapshot-id` mounts the selected snapshot as a read-only historical view.
 - `--endpoint <URL>` overrides the S3 endpoint URL for the current mount session.
@@ -173,7 +171,7 @@ Remove-ItemProperty -Path 'HKLM:\SOFTWARE\WinFsp' -Name 'MountUseMountmgrFromFSD
 ### `settings`
 
 ```bash
-studiofs settings [--mount-point <path>] [--cache-dir <path>] [--cache-size <e.g. 200GB>] [--read-buffer <e.g. 4GB>] [--readahead <blocks>] [--prefetch <count>] [--writeback-delay <ms>]
+studiofs settings [--mount-point <path>] [--cache-dir <path>] [--cache-size <e.g. 200GB>] [--read-buffer <e.g. 4GB>] [--readahead <blocks>] [--prefetch <count>]
 ```
 
 Stores global defaults in `config.toml` for future `studiofs mount` runs.
@@ -426,7 +424,6 @@ Operator stance for the rewrite:
 | `--read-buffer` | `2048MB` | Foreground read-buffer budget |
 | `--readahead` | `128` | Sequential readahead width in blocks |
 | `--prefetch` | `128` | Prefetch concurrency budget |
-| `--writeback-delay` | `2000ms` | Background upload coalescing delay |
 | `--principal` / `STUDIOFS_PRINCIPAL` | `*` | Principal used for ACL checks |
 
 ### Transitional and expert overrides
@@ -449,7 +446,6 @@ For the new public IO knobs, the current migration mapping is:
 | `--read-buffer` | `STUDIOFS_READ_BUFFER_MB` |
 | `--readahead` | `STUDIOFS_READAHEAD_WIDTH` |
 | `--prefetch` | `STUDIOFS_PREFETCH_CONCURRENCY` |
-| `--writeback-delay` | `STUDIOFS_UPLOAD_DELAY_MS` |
 
 Important families that remain supported in code today:
 
@@ -503,7 +499,7 @@ Upload local-I/O tuning notes:
 - upload local rereads use `get_for_upload()` on the local backend, which issues a best-effort post-read `DONT_NEED` advisory over the full on-disk block span (header + payload, aligned to block start) on Linux and does not refresh LRU recency.
 - adaptive upload penalty is enforced before local-cache read permits are acquired, so throttling creates disk idle gaps before background L2 reads.
 - per-upload foreground cache cost is derived internally from cache budget; there is no separate user-tuned penalty knob.
-- if `STUDIOFS_UPLOAD_DELAY_MS` already delayed an op, adaptive pre-read sleep is reduced by the already waited delay for that op.
+- if an upload worker already delayed an op for coalescing, adaptive pre-read sleep is reduced by the already waited delay for that op.
 - fetch transit-budget accounting includes assembled object payload plus bounded in-flight fragment headroom.
 - if a single fetch request exceeds the derived transit-memory budget, StudioFS returns a fetch error instead of silently clamping the credit request.
 - speedometer logs include `foreground_read_p90_present`, `foreground_read_p90_ms`, `foreground_read_window_bytes`, `foreground_read_window_coverage_ms`, and `foreground_read_throughput_bytes_per_sec` for stable parsing even when upload interference is intermittent.

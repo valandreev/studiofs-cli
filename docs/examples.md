@@ -55,8 +55,7 @@ studiofs mount myvolume Z: \
   --cache-size 500GB \
   --read-buffer 4GB \
   --readahead 256 \
-  --prefetch 192 \
-  --writeback-delay 1500
+  --prefetch 192
 ```
 
 Use these flags for the main operator-facing data-cache and IO controls. The

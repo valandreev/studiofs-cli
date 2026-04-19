@@ -1,5 +1,9 @@
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+
+use proc_macro2::LineColumn;
+use syn::spanned::Spanned;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -17,6 +21,143 @@ fn read_workspace_file(path: &str) -> String {
 
 fn collect_term_hits(path: &str, terms: &[&str]) -> Vec<String> {
     let contents = read_workspace_file(path);
+    collect_term_hits_from_contents(path, &contents, terms)
+}
+
+fn collect_term_hits_outside_test_modules(path: &str, terms: &[&str]) -> Vec<String> {
+    let contents = read_workspace_file(path);
+    let filtered = strip_cfg_test_items(&contents);
+
+    collect_term_hits_from_contents(path, &filtered, terms)
+}
+
+fn strip_cfg_test_items(contents: &str) -> String {
+    let Ok(file) = syn::parse_file(contents) else {
+        return contents.to_string();
+    };
+    let line_starts = line_start_offsets(contents);
+    let mut excluded_ranges: Vec<_> = file
+        .items
+        .iter()
+        .filter(|item| item_has_cfg_test(item))
+        .filter_map(|item| item_source_range(contents, &line_starts, item))
+        .collect();
+
+    if excluded_ranges.is_empty() {
+        return contents.to_string();
+    }
+
+    excluded_ranges.sort_unstable_by_key(|(start, _)| *start);
+    let mut filtered = String::new();
+    let mut cursor = 0usize;
+    for (start, end) in excluded_ranges {
+        let start = start.min(contents.len());
+        let end = end.min(contents.len());
+        if start > cursor {
+            filtered.push_str(&contents[cursor..start]);
+        }
+        cursor = cursor.max(end);
+    }
+    filtered.push_str(&contents[cursor..]);
+    filtered
+}
+
+fn item_has_cfg_test(item: &syn::Item) -> bool {
+    item_attrs(item).iter().any(attr_is_cfg_test)
+}
+
+fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Const(item) => &item.attrs,
+        syn::Item::Enum(item) => &item.attrs,
+        syn::Item::ExternCrate(item) => &item.attrs,
+        syn::Item::Fn(item) => &item.attrs,
+        syn::Item::ForeignMod(item) => &item.attrs,
+        syn::Item::Impl(item) => &item.attrs,
+        syn::Item::Macro(item) => &item.attrs,
+        syn::Item::Mod(item) => &item.attrs,
+        syn::Item::Static(item) => &item.attrs,
+        syn::Item::Struct(item) => &item.attrs,
+        syn::Item::Trait(item) => &item.attrs,
+        syn::Item::TraitAlias(item) => &item.attrs,
+        syn::Item::Type(item) => &item.attrs,
+        syn::Item::Union(item) => &item.attrs,
+        syn::Item::Use(item) => &item.attrs,
+        syn::Item::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn attr_is_cfg_test(attr: &syn::Attribute) -> bool {
+    if !attr.path().is_ident("cfg") {
+        return false;
+    }
+
+    attr.parse_args_with(syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+        .map(|args| {
+            args.into_iter().any(|meta| match meta {
+                syn::Meta::Path(path) => path.is_ident("test"),
+                _ => false,
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn item_source_range(
+    contents: &str,
+    line_starts: &[usize],
+    item: &syn::Item,
+) -> Option<(usize, usize)> {
+    let attrs = item_attrs(item);
+    let start = attrs.first()?.span().start();
+    let end = item.span().end();
+    Some((
+        line_column_to_offset(contents, line_starts, start),
+        line_column_to_offset(contents, line_starts, end),
+    ))
+}
+
+fn line_start_offsets(contents: &str) -> Vec<usize> {
+    let mut starts = vec![0];
+    for (index, byte) in contents.bytes().enumerate() {
+        if byte == b'\n' {
+            starts.push(index + 1);
+        }
+    }
+    starts
+}
+
+fn line_column_to_offset(contents: &str, line_starts: &[usize], location: LineColumn) -> usize {
+    let Some(&line_start) = line_starts.get(location.line.saturating_sub(1)) else {
+        return contents.len();
+    };
+    let line_end = line_starts
+        .get(location.line)
+        .copied()
+        .unwrap_or(contents.len());
+    let line = &contents[line_start..line_end];
+    let byte_in_line = line
+        .char_indices()
+        .nth(location.column)
+        .map(|(index, _)| index)
+        .unwrap_or(line.len());
+    (line_start + byte_in_line).min(contents.len())
+}
+
+fn write_temp_source(contents: &str) -> tempfile::NamedTempFile {
+    let mut file = tempfile::NamedTempFile::new().unwrap_or_else(|error| {
+        panic!("failed to create temp source file: {error}");
+    });
+    file.write_all(contents.as_bytes()).unwrap_or_else(|error| {
+        panic!(
+            "failed to write temp source '{}': {error}",
+            file.path().display()
+        );
+    });
+    file
+}
+
+fn collect_term_hits_from_contents(path: &str, contents: &str, terms: &[&str]) -> Vec<String> {
     let mut hits = Vec::new();
     let lowered_terms: Vec<_> = terms.iter().map(|term| term.to_lowercase()).collect();
 
@@ -30,6 +171,99 @@ fn collect_term_hits(path: &str, terms: &[&str]) -> Vec<String> {
     }
 
     hits
+}
+
+#[test]
+fn helper_keeps_scanning_past_cfg_test_imports() {
+    let path = write_temp_source(
+        "use std::fmt;\n\
+         #[cfg(test)]\n\
+         use std::collections::BTreeMap;\n\
+         fn production_surface() { let _ = \"cache mode\"; }\n",
+    );
+    let path_str = path.path().to_string_lossy().into_owned();
+
+    let hits = collect_term_hits_outside_test_modules(&path_str, &["cache mode"]);
+
+    assert_eq!(
+        hits.len(),
+        1,
+        "helper should keep scanning production lines"
+    );
+}
+
+#[test]
+fn helper_skips_cfg_test_modules_but_keeps_following_production_code() {
+    let path = write_temp_source(
+        "fn before() {}\n\
+         #[cfg(test)]\n\
+         mod tests {\n\
+             fn helper_surface() { let _ = \"cache mode\"; }\n\
+         }\n\
+         fn after() { let _ = \"writeback-delay\"; }\n",
+    );
+    let path_str = path.path().to_string_lossy().into_owned();
+
+    let test_hits = collect_term_hits_outside_test_modules(&path_str, &["cache mode"]);
+    let production_hits = collect_term_hits_outside_test_modules(&path_str, &["writeback-delay"]);
+
+    assert!(
+        test_hits.is_empty(),
+        "helper should ignore cfg(test) module contents"
+    );
+    assert_eq!(
+        production_hits.len(),
+        1,
+        "helper should resume scanning after cfg(test) modules"
+    );
+}
+
+#[test]
+fn helper_skips_cfg_test_module_with_trailing_comment_and_next_line_brace() {
+    let path = write_temp_source(
+        "fn before() {}\n\
+         #[cfg(test)]\n\
+         pub(in crate::tests) mod tests // comment\n\
+         {\n\
+             fn helper_surface() { let _ = \"cache mode\"; }\n\
+         }\n\
+         fn after() { let _ = \"writeback-delay\"; }\n",
+    );
+    let path_str = path.path().to_string_lossy().into_owned();
+
+    let test_hits = collect_term_hits_outside_test_modules(&path_str, &["cache mode"]);
+    let production_hits = collect_term_hits_outside_test_modules(&path_str, &["writeback-delay"]);
+
+    assert!(
+        test_hits.is_empty(),
+        "helper should ignore cfg(test) module contents even with comments and split braces"
+    );
+    assert_eq!(
+        production_hits.len(),
+        1,
+        "helper should keep scanning production code after cfg(test) module"
+    );
+}
+
+#[test]
+fn helper_ignores_braces_inside_cfg_test_module_strings() {
+    let path = write_temp_source(
+        "fn before() {}\n\
+         #[cfg(test)]\n\
+         mod tests {\n\
+             fn helper_surface() { let _ = \"{\"; }\n\
+         }\n\
+         fn after() { let _ = \"writeback-delay\"; }\n",
+    );
+    let path_str = path.path().to_string_lossy().into_owned();
+
+    let production_hits = collect_term_hits_outside_test_modules(&path_str, &["writeback-delay"]);
+
+    assert_eq!(
+        production_hits.len(),
+        1,
+        "helper should not let braces in test-only strings hide following production code"
+    );
 }
 
 #[test]
@@ -75,6 +309,10 @@ fn cli_surface_avoids_legacy_runtime_product_wording() {
     let files = [
         "crates/studiofs/src/cli/cache_layout.rs",
         "crates/studiofs/src/cli/destroy.rs",
+        "crates/studiofs/src/cli/mod.rs",
+        "crates/studiofs/src/cli/mount/mod.rs",
+        "crates/studiofs/src/cli/runtime_tuning.rs",
+        "crates/studiofs/src/cli/settings.rs",
         "crates/studiofs/src/cli/status.rs",
         "crates/studiofs/src/cli/test_cache_profile_common.rs",
         "crates/studiofs/src/cli/test_cache_profile_stub.rs",
@@ -88,6 +326,76 @@ fn cli_surface_avoids_legacy_runtime_product_wording() {
     assert!(
         hits.is_empty(),
         "CLI surface still uses legacy runtime product wording:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn active_docs_and_cli_drop_writeback_delay_surface() {
+    let files = [
+        "crates/studiofs/src/cli/mod.rs",
+        "crates/studiofs/src/cli/mount/mod.rs",
+        "crates/studiofs/src/cli/runtime_tuning.rs",
+        "crates/studiofs/src/cli/settings.rs",
+        "docs/configuration.md",
+        "docs/examples.md",
+    ];
+
+    let hits: Vec<_> = files
+        .iter()
+        .flat_map(|path| {
+            if path.starts_with("docs/") {
+                collect_term_hits(path, &["writeback-delay", "writeback_delay"])
+            } else {
+                collect_term_hits_outside_test_modules(
+                    path,
+                    &["writeback-delay", "writeback_delay"],
+                )
+            }
+        })
+        .collect();
+
+    assert!(
+        hits.is_empty(),
+        "active docs and CLI still expose writeback-delay surface:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn active_docs_and_mount_profiling_drop_cache_mode_surface() {
+    let files = [
+        "crates/studiofs/src/cli/mount_profile.rs",
+        "crates/studiofs/src/cli/mount_profile_stub.rs",
+        "crates/studiofs/src/cli/mount/session.rs",
+        "docs/configuration.md",
+    ];
+
+    let hits: Vec<_> = files
+        .iter()
+        .flat_map(|path| {
+            if path.starts_with("docs/") {
+                collect_term_hits(path, &["cache_mode", "cache mode"])
+            } else {
+                collect_term_hits_outside_test_modules(path, &["cache_mode", "cache mode"])
+            }
+        })
+        .collect();
+
+    assert!(
+        hits.is_empty(),
+        "active docs and mount profiling still expose cache-mode wording:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn validation_docs_drop_durable_mode_callback_wording() {
+    let hits = collect_term_hits("docs/local-first-validation-matrix.md", &["durable mode"]);
+
+    assert!(
+        hits.is_empty(),
+        "validation docs still describe callback semantics with durable-mode wording:\n{}",
         hits.join("\n")
     );
 }

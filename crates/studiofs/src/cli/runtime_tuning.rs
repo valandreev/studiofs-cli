@@ -18,10 +18,6 @@ pub(crate) struct PublicRuntimeTuningArgs {
     /// Prefetch concurrency budget.
     #[arg(long, value_name = "COUNT", value_parser = parse_prefetch_concurrency)]
     pub(crate) prefetch: Option<usize>,
-
-    /// Delay background writeback to coalesce overwrite/delete churn.
-    #[arg(long, value_name = "MS")]
-    pub(crate) writeback_delay: Option<u64>,
 }
 
 impl PublicRuntimeTuningArgs {
@@ -35,21 +31,15 @@ impl PublicRuntimeTuningArgs {
         if let Some(value) = self.prefetch {
             config.prefetch_concurrency = Some(value);
         }
-        if let Some(value) = self.writeback_delay {
-            config.upload_delay_ms = Some(value);
-        }
         Ok(())
     }
 
     pub(crate) fn has_any(&self) -> bool {
-        self.read_buffer.is_some()
-            || self.readahead.is_some()
-            || self.prefetch.is_some()
-            || self.writeback_delay.is_some()
+        self.read_buffer.is_some() || self.readahead.is_some() || self.prefetch.is_some()
     }
 }
 
-pub(crate) fn runtime_tuning_summary_lines(config: &VfsConfigRaw) -> [String; 4] {
+pub(crate) fn runtime_tuning_summary_lines(config: &VfsConfigRaw) -> [String; 3] {
     let defaults = VfsConfig::default();
     [
         format!(
@@ -75,13 +65,6 @@ pub(crate) fn runtime_tuning_summary_lines(config: &VfsConfigRaw) -> [String; 4]
                 .prefetch_concurrency
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| format!("default ({})", defaults.prefetch_concurrency))
-        ),
-        format!(
-            "  writeback-delay: {}",
-            config
-                .upload_delay_ms
-                .map(|value| format!("{value}ms"))
-                .unwrap_or_else(|| format!("default ({}ms)", defaults.upload_delay_ms))
         ),
     ]
 }

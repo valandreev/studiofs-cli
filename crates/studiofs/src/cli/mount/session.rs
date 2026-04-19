@@ -25,6 +25,8 @@ use studiofs_meta::{
     FormatInfo, MetaEngine, MetaFormat, MetaReplication, MetaSnapshots, MetadataBackend,
     RedbMetaEngine, open_meta_engine,
 };
+#[cfg(test)]
+use studiofs_vfs::VfsConfig;
 use studiofs_vfs::{
     StudioVfs, VfsConfigRaw, VfsConfigValidated, VfsMeta, into_vfs_meta, parse_size_bytes,
 };
@@ -51,7 +53,6 @@ struct ResolvedMountRuntimeSettings {
 #[derive(Debug)]
 struct ResolvedMountConfig {
     vfs_config: VfsConfigValidated,
-    cache_mode: String,
 }
 
 #[derive(Debug)]
@@ -59,7 +60,6 @@ struct ResolvedMountStartup {
     actual_mount_path: String,
     base_cache_path: PathBuf,
     cache_size: String,
-    cache_mode: String,
     vfs_config: VfsConfigValidated,
     run_in_foreground: bool,
     launch_mode: MountLaunchMode,
@@ -347,16 +347,17 @@ where
         vfs_config_raw.principal = Some(principal.to_string());
     }
     runtime_tuning.apply_to_vfs_config(&mut vfs_config_raw)?;
+    strip_removed_public_mount_surface(&mut vfs_config_raw);
 
     let vfs_config = vfs_config_raw
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid VFS config: {e}"))?;
-    let cache_mode = "fast-local-authority".to_string();
 
-    Ok(ResolvedMountConfig {
-        vfs_config,
-        cache_mode,
-    })
+    Ok(ResolvedMountConfig { vfs_config })
+}
+
+fn strip_removed_public_mount_surface(config: &mut VfsConfigRaw) {
+    config.upload_delay_ms = None;
 }
 
 fn resolve_mount_launch_mode(detach: bool) -> MountLaunchMode {
@@ -458,10 +459,7 @@ fn resolve_mount_startup(
         command.cache_dir.as_deref(),
         command.cache_size.as_deref(),
     )?;
-    let ResolvedMountConfig {
-        vfs_config,
-        cache_mode,
-    } = build_mount_config_from_raw(
+    let ResolvedMountConfig { vfs_config } = build_mount_config_from_raw(
         settings_config.vfs,
         command.principal.as_deref(),
         &command.runtime_tuning,
@@ -477,7 +475,6 @@ fn resolve_mount_startup(
             .cache_dir
             .unwrap_or_else(|| command.meta_dir.join("cache")),
         cache_size: resolved_settings.cache_size,
-        cache_mode,
         vfs_config,
         run_in_foreground: resolve_run_in_foreground(command.foreground, command.detach),
         launch_mode: resolve_mount_launch_mode(command.detach),
@@ -586,7 +583,6 @@ fn prepare_mount_path(name: &str, mount_point: &str) -> anyhow::Result<String> {
 fn build_mount_profile_finish(
     profile: Option<mount_profile_types::MountProfileMode>,
     name: &str,
-    cache_mode: &str,
     cache_path: &Path,
     run_in_foreground: bool,
 ) -> Option<MountProfileFinish> {
@@ -609,7 +605,7 @@ fn build_mount_profile_finish(
     let bridge = "fuse";
 
     let profiling = mount_profile::MountProfileSession::start(
-        profile, name, platform, bridge, mount_mode, cache_mode, cache_path,
+        profile, name, platform, bridge, mount_mode, cache_path,
     );
     profiling.map(|profiling| {
         let mut profiling = Some(profiling);
@@ -623,7 +619,6 @@ fn build_mount_profile_finish(
 
 fn build_runtime_profiling_backend(
     name: &str,
-    cache_mode: &str,
     cache_path: &Path,
     run_in_foreground: bool,
 ) -> Arc<dyn RuntimeProfilingBackend> {
@@ -645,9 +640,7 @@ fn build_runtime_profiling_backend(
     #[cfg(unix)]
     let bridge = "fuse";
 
-    mount_profile::runtime_profiling_backend(
-        name, platform, bridge, mount_mode, cache_mode, cache_path,
-    )
+    mount_profile::runtime_profiling_backend(name, platform, bridge, mount_mode, cache_path)
 }
 
 fn overlay_vfs_env(config: VfsConfigRaw) -> VfsConfigRaw {
@@ -756,9 +749,6 @@ where
         "STUDIOFS_UPLOAD_USER_IDLE_GRACE_MS",
         upload_user_idle_grace_ms
     );
-    if let Some(value) = parse_env_u64_any_with(&read_var, "STUDIOFS_UPLOAD_DELAY_MS") {
-        config.upload_delay_ms = Some(value);
-    }
     set_u64!("STUDIOFS_UPLOAD_REQUEUE_BASE_MS", upload_requeue_base_ms);
     set_u64!("STUDIOFS_UPLOAD_REQUEUE_MAX_MS", upload_requeue_max_ms);
     set_u64!(
@@ -909,7 +899,6 @@ impl MountSession {
             actual_mount_path,
             base_cache_path,
             cache_size,
-            cache_mode,
             vfs_config,
             run_in_foreground,
             launch_mode,
@@ -955,16 +944,11 @@ impl MountSession {
             let profiling = build_mount_profile_finish(
                 command.profile,
                 &command.name,
-                &cache_mode,
                 &cache_path,
                 run_in_foreground,
             );
-            let profiling_backend = build_runtime_profiling_backend(
-                &command.name,
-                &cache_mode,
-                &cache_path,
-                run_in_foreground,
-            );
+            let profiling_backend =
+                build_runtime_profiling_backend(&command.name, &cache_path, run_in_foreground);
             let runtime = Runtime::new()
                 .map_err(|error| anyhow::anyhow!("failed to create tokio runtime: {error}"))?;
             let _guard = runtime.enter();
@@ -1719,7 +1703,6 @@ mod tests {
 
         assert_eq!(startup.base_cache_path, meta_dir.join("cache"));
         assert_eq!(startup.cache_size, "64GB");
-        assert_eq!(startup.cache_mode, "fast-local-authority");
         assert_eq!(startup.launch_mode, MountLaunchMode::Foreground);
         assert!(startup.run_in_foreground);
         assert_eq!(startup.vfs_config.principal, "alice");
@@ -1767,7 +1750,6 @@ mod tests {
                 read_buffer_mb: Some(1024),
                 readahead_width: Some(64),
                 prefetch_concurrency: Some(32),
-                upload_delay_ms: Some(250),
                 ..VfsConfigRaw::default()
             },
             None,
@@ -1775,13 +1757,11 @@ mod tests {
                 read_buffer: Some("4GB".to_string()),
                 readahead: Some(256),
                 prefetch: Some(192),
-                writeback_delay: Some(1500),
             },
             |mut config| {
                 config.read_buffer_mb = Some(2048);
                 config.readahead_width = Some(128);
                 config.prefetch_concurrency = Some(96);
-                config.upload_delay_ms = Some(1000);
                 config
             },
         )
@@ -1790,7 +1770,38 @@ mod tests {
         assert_eq!(resolved.vfs_config.read_buffer_mb, 4096);
         assert_eq!(resolved.vfs_config.readahead_width, 256);
         assert_eq!(resolved.vfs_config.prefetch_concurrency, 192);
-        assert_eq!(resolved.vfs_config.upload_delay_ms, 1500);
+    }
+
+    #[test]
+    fn build_mount_config_ignores_removed_upload_delay_inputs() {
+        let resolved = build_mount_config_with(
+            VfsConfigRaw {
+                upload_delay_ms: Some(250),
+                ..VfsConfigRaw::default()
+            },
+            None,
+            &PublicRuntimeTuningArgs::default(),
+            |mut config| {
+                config.upload_delay_ms = Some(1000);
+                config
+            },
+        )
+        .expect("mount config resolved");
+
+        assert_eq!(
+            resolved.vfs_config.upload_delay_ms,
+            VfsConfig::default().upload_delay_ms
+        );
+    }
+
+    #[test]
+    fn overlay_vfs_env_ignores_upload_delay_env_override() {
+        let resolved = overlay_vfs_env_with(VfsConfigRaw::default(), |key| match key {
+            "STUDIOFS_UPLOAD_DELAY_MS" => Ok("1500".to_string()),
+            _ => Err(std::env::VarError::NotPresent),
+        });
+
+        assert_eq!(resolved.upload_delay_ms, None);
     }
 
     #[test]
