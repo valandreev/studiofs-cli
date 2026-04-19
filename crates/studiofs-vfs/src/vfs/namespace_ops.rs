@@ -57,8 +57,8 @@ impl StudioVfs {
 
         let mut attr = self.getattr(ino)?;
         if args.size.is_some_and(|new_size| new_size != attr.size) {
-            if let Some(fh) = fh {
-                self.enforce_mutating_handle_access(fh, ino)?;
+            if let Some(handle) = fh {
+                self.enforce_mutating_handle_access(handle, ino)?;
             } else {
                 self.enforce_no_known_foreign_hard_lock(ino)?;
             }

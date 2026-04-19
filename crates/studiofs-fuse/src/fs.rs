@@ -1618,7 +1618,7 @@ impl Filesystem for StudioFuseFs {
         &mut self,
         _req: &Request<'_>,
         _ino: u64,
-        fh: u64,
+        _fh: u64,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
