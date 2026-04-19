@@ -4013,6 +4013,16 @@ mod tests {
         })
     }
 
+    fn wait_hidden(engine: &PgMetaEngine, parent: Ino, name: &[u8], timeout: Duration) -> bool {
+        wait_until(timeout, || {
+            let _ = engine.sync_metadata();
+            matches!(
+                engine.lookup(parent, name),
+                Err(MetaError::EntryNotFound { .. })
+            )
+        })
+    }
+
     fn drop_file_lock_lease_table(dsn: &str) {
         run_async(async move {
             let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
@@ -4222,6 +4232,28 @@ mod tests {
         attr.mtime = InodeAttr::now_nanos();
         attr.ctime = attr.mtime;
         engine.set_attr(&attr).expect("set file attr");
+    }
+
+    fn create_published_small_file(
+        engine: &PgMetaEngine,
+        parent: Ino,
+        name: &[u8],
+        object_id: u64,
+    ) -> InodeAttr {
+        let file = engine
+            .create_file(parent, name, 0, 0, 0o644)
+            .expect("create published file");
+        set_file_state(engine, file.ino, 64, 1);
+        engine
+            .set_file_block(file.ino, 0, &BlockRef::new_partial(object_id, 64))
+            .expect("set published file block");
+        assert!(
+            engine
+                .publish_file_manifest(file.ino, 1)
+                .expect("publish small file"),
+            "small file publish must succeed"
+        );
+        file
     }
 
     fn temp_pg_engine_for_unit() -> (tempfile::TempDir, PgMetaEngine) {
@@ -5035,9 +5067,7 @@ mod tests {
             },
         )
         .expect("open b");
-        let file = a
-            .create_file(ROOT_INO, b"locked.txt", 0, 0, 0o644)
-            .expect("create file");
+        let file = create_published_small_file(&a, ROOT_INO, b"locked.txt", 50_201);
         a.flush_metadata().expect("flush file create");
         assert!(wait_visible(
             &b,
@@ -5104,9 +5134,7 @@ mod tests {
             },
         )
         .expect("open b");
-        let file = a
-            .create_file(ROOT_INO, b"first-acquire-race.txt", 0, 0, 0o644)
-            .expect("create file");
+        let file = create_published_small_file(&a, ROOT_INO, b"first-acquire-race.txt", 50_202);
         a.flush_metadata().expect("flush file create");
         assert!(wait_visible(
             &b,
@@ -5210,9 +5238,7 @@ mod tests {
             },
         )
         .expect("open b");
-        let file = a
-            .create_file(ROOT_INO, b"expiring.txt", 0, 0, 0o644)
-            .expect("create file");
+        let file = create_published_small_file(&a, ROOT_INO, b"expiring.txt", 50_203);
         a.flush_metadata().expect("flush file create");
         assert!(wait_visible(
             &b,
@@ -5268,9 +5294,7 @@ mod tests {
             },
         )
         .expect("open b");
-        let file = a
-            .create_file(ROOT_INO, b"renew.txt", 0, 0, 0o644)
-            .expect("create file");
+        let file = create_published_small_file(&a, ROOT_INO, b"renew.txt", 50_204);
         a.flush_metadata().expect("flush file create");
         assert!(wait_visible(
             &b,
@@ -5333,9 +5357,7 @@ mod tests {
 
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
-        let file = a
-            .create_file(ROOT_INO, b"notify.txt", 0, 0, 0o644)
-            .expect("create file");
+        let file = create_published_small_file(&a, ROOT_INO, b"notify.txt", 50_205);
         a.flush_metadata().expect("flush file create");
         assert!(wait_visible(
             &b,
@@ -5994,15 +6016,16 @@ mod tests {
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
 
-        a.create_file(ROOT_INO, b"shared.txt", 0, 0, 0o644)
-            .expect("create on a");
+        a.create_dir(ROOT_INO, b"shared", 0, 0, 0o755)
+            .expect("create dir on a");
         a.flush_metadata().expect("flush a");
         assert!(
-            wait_visible(&b, ROOT_INO, b"shared.txt", Duration::from_secs(10)),
-            "shared.txt should become visible on b"
+            wait_visible(&b, ROOT_INO, b"shared", Duration::from_secs(10)),
+            "shared dir should become visible on b"
         );
-        let entry = b.lookup(ROOT_INO, b"shared.txt").expect("lookup on b");
+        let entry = b.lookup(ROOT_INO, b"shared").expect("lookup on b");
         assert!(entry.ino > 0);
+        assert_eq!(entry.kind, FileType::Directory);
     }
 
     #[test]
@@ -6024,10 +6047,8 @@ mod tests {
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
 
-        let file = a
-            .create_file(ROOT_INO, b"remote.bin", 0, 0, 0o644)
-            .expect("create file");
-        set_file_state(&a, file.ino, 4096, 1);
+        let file = create_published_small_file(&a, ROOT_INO, b"remote.bin", 50_301);
+        set_file_state(&a, file.ino, 4096, 2);
         let block = BlockRef::new_partial(77, 4096);
         a.set_file_block(file.ino, 0, &block)
             .expect("set staged block");
@@ -6440,9 +6461,9 @@ mod tests {
         b.set_file_block(draft.ino, 0, &BlockRef::new_partial(1001, 4096))
             .expect("set local draft block");
 
-        a.create_file(ROOT_INO, b"foreign.txt", 0, 0, 0o644)
-            .expect("create foreign file");
-        a.flush_metadata().expect("flush foreign file");
+        a.create_dir(ROOT_INO, b"foreign", 0, 0, 0o755)
+            .expect("create foreign dir");
+        a.flush_metadata().expect("flush foreign dir");
 
         assert!(wait_until(Duration::from_secs(10), || {
             if let Ok(mut state) = b.pending_state.lock() {
@@ -6450,7 +6471,7 @@ mod tests {
                 state.last_mutation_at = Some(Instant::now());
             }
             let _ = b.sync_metadata();
-            b.lookup(ROOT_INO, b"foreign.txt").is_ok()
+            b.lookup(ROOT_INO, b"foreign").is_ok()
         }));
 
         let local_attr = b.get_attr(draft.ino).expect("get local draft attr");
@@ -6473,7 +6494,7 @@ mod tests {
             "syncing foreign events on b must not flush its local accepted draft into PG"
         );
         assert!(
-            c.lookup(ROOT_INO, b"foreign.txt").is_ok(),
+            c.lookup(ROOT_INO, b"foreign").is_ok(),
             "foreign namespace convergence should still work while b has local-only accepted state"
         );
     }
@@ -6507,7 +6528,7 @@ mod tests {
             .expect("set draft staged block");
         a.flush_metadata().expect("flush draft namespace");
 
-        b.create_file(ROOT_INO, b"foreign.txt", 0, 0, 0o644)
+        b.create_dir(ROOT_INO, b"foreign.txt", 0, 0, 0o755)
             .expect("create foreign");
         b.flush_metadata().expect("flush foreign");
 
@@ -6548,6 +6569,13 @@ mod tests {
         let file = a
             .create_file(ROOT_INO, b"remote.bin", 0, 0, 0o644)
             .expect("create file");
+        set_file_state(&a, file.ino, 4096, 1);
+        a.set_file_block(file.ino, 0, &BlockRef::new_partial(87, 4096))
+            .expect("set baseline remote block");
+        assert!(
+            a.publish_file_manifest(file.ino, 1)
+                .expect("publish baseline manifest")
+        );
         a.flush_metadata().expect("flush create");
         assert!(wait_visible(
             &b,
@@ -6561,12 +6589,12 @@ mod tests {
         local_attr.size = 8192;
         b.set_attr(&local_attr).expect("set local attr overlay");
 
-        set_file_state(&a, file.ino, 4096, 1);
+        set_file_state(&a, file.ino, 4096, 2);
         let block = BlockRef::new_partial(88, 4096);
         a.set_file_block(file.ino, 0, &block)
             .expect("set staged remote block");
         assert!(
-            a.publish_file_manifest(file.ino, 1)
+            a.publish_file_manifest(file.ino, 2)
                 .expect("publish remote block manifest")
         );
         a.flush_metadata().expect("flush remote block");
@@ -6618,7 +6646,7 @@ mod tests {
         conflicted_attr.size = 8192;
 
         let remote_ino = 1_234_567_890u64;
-        let remote_attr = InodeAttr::new_file(remote_ino, ROOT_INO, 0, 0, 0o644);
+        let remote_attr = InodeAttr::new_dir(remote_ino, ROOT_INO, 0, 0, 0o755);
 
         let conflict_event = MetaEvent::SetAttr {
             attr: conflicted_attr,
@@ -6631,7 +6659,7 @@ mod tests {
             name: b"unrelated.txt".to_vec(),
             entry: DirEntryValue {
                 ino: remote_ino,
-                kind: FileType::RegularFile,
+                kind: FileType::Directory,
             },
         };
 
@@ -6681,7 +6709,7 @@ mod tests {
         pg.sync_metadata().expect("sync remote batches");
         let remote = pg
             .lookup(ROOT_INO, b"unrelated.txt")
-            .expect("lookup unrelated file");
+            .expect("lookup unrelated entry");
         assert_eq!(remote.ino, remote_ino);
 
         let local = pg
@@ -6724,21 +6752,9 @@ mod tests {
         a.flush_metadata().expect("flush a");
 
         let b = PgMetaEngine::open(&db_b).expect("open b");
-        let b_file = b.lookup(ROOT_INO, b"draft.bin").expect("lookup draft");
-        let b_attr = b.get_attr(b_file.ino).expect("get b attr");
-        assert_eq!(b_attr.size, 0, "remote-visible size must stay committed");
-        assert_eq!(b_attr.committed_size, 0);
         assert!(
-            b.get_file_block(b_file.ino, 0)
-                .expect("get remote block")
-                .is_none(),
-            "checkpoint must not leak local-only staged file blocks"
-        );
-        assert!(
-            b.get_file_blocks(b_file.ino)
-                .expect("get remote blocks")
-                .is_empty(),
-            "checkpoint must not leak local-only staged file blocks"
+            wait_hidden(&b, ROOT_INO, b"draft.bin", Duration::from_secs(10)),
+            "checkpoint must keep a brand-new unpublished file hidden from peers"
         );
     }
 
@@ -6761,8 +6777,7 @@ mod tests {
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
 
-        a.create_file(ROOT_INO, b"remote-delete.txt", 0, 0, 0o644)
-            .expect("create file");
+        create_published_small_file(&a, ROOT_INO, b"remote-delete.txt", 50_302);
         a.flush_metadata().expect("flush create");
         assert!(wait_visible(
             &b,
@@ -6805,6 +6820,21 @@ mod tests {
             .create_file(ROOT_INO, b"uploading.bin", 0, 0, 0o644)
             .expect("create uploading file");
         set_file_state(&a, file.ino, 4096, 1);
+        a.set_file_block(file.ino, 0, &BlockRef::new_partial(776, 4096))
+            .expect("set baseline uploading block");
+        assert!(
+            a.publish_file_manifest(file.ino, 1)
+                .expect("publish baseline manifest")
+        );
+        a.flush_metadata().expect("flush baseline");
+        assert!(wait_visible(
+            &b,
+            ROOT_INO,
+            b"uploading.bin",
+            Duration::from_secs(10)
+        ));
+
+        set_file_state(&a, file.ino, 4096, 2);
         a.set_file_block(file.ino, 0, &BlockRef::new_partial(777, 4096))
             .expect("set local uploading block");
         a.flush_metadata().expect("flush uploading namespace");
@@ -6814,7 +6844,7 @@ mod tests {
             b.lookup(ROOT_INO, b"uploading.bin")
                 .map(|entry| {
                     b.get_attr(entry.ino)
-                        .map(|attr| attr.upload_state == UploadState::Uploading)
+                        .map(|attr| attr.upload_state == UploadState::Updating)
                         .unwrap_or(false)
                 })
                 .unwrap_or(false)
@@ -6826,24 +6856,32 @@ mod tests {
 
         assert!(wait_until(Duration::from_secs(12), || {
             let _ = a.sync_metadata();
-            a.lookup(ROOT_INO, b"uploading.bin").is_err()
+            let _ = b.sync_metadata();
+            a.lookup(ROOT_INO, b"uploading.bin").is_ok()
+                && b.lookup(ROOT_INO, b"uploading.bin").is_err()
         }));
-        assert!(
-            a.get_attr(file.ino).is_err(),
-            "writer must eventually drop the inode after peer unlink"
-        );
-        assert!(
-            a.get_file_block(file.ino, 0)
-                .expect("get local block after peer unlink")
-                .is_none(),
-            "writer must eventually drop local pending block refs after peer unlink"
-        );
+        let local_attr = a
+            .get_attr(file.ino)
+            .expect("get local attr after peer unlink");
+        assert_eq!(local_attr.upload_state, UploadState::Ready);
+        let local_block = a
+            .get_file_block(file.ino, 0)
+            .expect("get local block after peer unlink")
+            .expect("writer keeps local pending block after peer unlink");
+        assert_eq!(local_block.object_id, 777);
 
         drop(a);
         let reopened = reopen_pg_engine_with_retry(&db_a);
         reopened.sync_metadata().expect("sync reopened a");
-        assert!(reopened.lookup(ROOT_INO, b"uploading.bin").is_err());
-        assert!(reopened.get_attr(file.ino).is_err());
+        assert!(reopened.lookup(ROOT_INO, b"uploading.bin").is_ok());
+        assert_eq!(
+            reopened
+                .get_file_block(file.ino, 0)
+                .expect("get reopened local block")
+                .expect("reopened local block")
+                .object_id,
+            777
+        );
     }
 
     #[test]
@@ -6865,12 +6903,8 @@ mod tests {
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
 
-        let src = a
-            .create_file(ROOT_INO, b"src.txt", 0, 0, 0o644)
-            .expect("create src");
-        let dst = a
-            .create_file(ROOT_INO, b"dst.txt", 0, 0, 0o644)
-            .expect("create dst");
+        let src = create_published_small_file(&a, ROOT_INO, b"src.txt", 50_304);
+        let dst = create_published_small_file(&a, ROOT_INO, b"dst.txt", 50_305);
         a.flush_metadata().expect("flush seed files");
 
         assert!(wait_visible(
@@ -6927,9 +6961,7 @@ mod tests {
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
 
-        let file = a
-            .create_file(ROOT_INO, b"remote.txt", 0, 0, 0o644)
-            .expect("create on a");
+        let file = create_published_small_file(&a, ROOT_INO, b"remote.txt", 50_306);
         a.flush_metadata().expect("flush create");
         assert!(wait_visible(
             &b,
@@ -6970,8 +7002,7 @@ mod tests {
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
 
-        a.create_file(ROOT_INO, b"remote.txt", 0, 0, 0o644)
-            .expect("create on a");
+        create_published_small_file(&a, ROOT_INO, b"remote.txt", 50_307);
         a.flush_metadata().expect("flush create");
         assert!(wait_visible(
             &b,
@@ -7008,9 +7039,7 @@ mod tests {
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
 
-        let file = a
-            .create_file(ROOT_INO, b"remote.txt", 0, 0, 0o644)
-            .expect("create on a");
+        let file = create_published_small_file(&a, ROOT_INO, b"remote.txt", 50_308);
         a.flush_metadata().expect("flush create");
         assert!(wait_visible(
             &b,
@@ -7054,11 +7083,11 @@ mod tests {
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
 
-        a.create_file(ROOT_INO, b"from_a.txt", 0, 0, 0o644)
+        a.create_dir(ROOT_INO, b"from_a.txt", 0, 0, 0o755)
             .expect("create on a");
         a.flush_metadata().expect("flush a");
 
-        b.create_file(ROOT_INO, b"from_b.txt", 0, 0, 0o644)
+        b.create_dir(ROOT_INO, b"from_b.txt", 0, 0, 0o755)
             .expect("create on b");
         b.flush_metadata().expect("flush b");
 
@@ -7091,11 +7120,11 @@ mod tests {
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
 
-        a.create_file(ROOT_INO, b"from_a.txt", 0, 0, 0o644)
+        a.create_dir(ROOT_INO, b"from_a.txt", 0, 0, 0o755)
             .expect("create on a");
         a.flush_metadata().expect("flush a");
 
-        b.create_file(ROOT_INO, b"from_b.txt", 0, 0, 0o644)
+        b.create_dir(ROOT_INO, b"from_b.txt", 0, 0, 0o755)
             .expect("create on b");
         b.flush_metadata().expect("flush b");
 
@@ -7143,13 +7172,13 @@ mod tests {
 
         for i in 0..20 {
             let name = format!("a_{i:02}.txt");
-            a.create_file(dir_a_attr.ino, name.as_bytes(), 0, 0, 0o644)
-                .expect("a create file");
+            a.create_dir(dir_a_attr.ino, name.as_bytes(), 0, 0, 0o755)
+                .expect("a create dir");
         }
         for i in 0..20 {
             let name = format!("b_{i:02}.txt");
-            b.create_file(dir_b_attr.ino, name.as_bytes(), 0, 0, 0o644)
-                .expect("b create file");
+            b.create_dir(dir_b_attr.ino, name.as_bytes(), 0, 0, 0o755)
+                .expect("b create dir");
         }
 
         a.flush_metadata().expect("flush a");
@@ -7230,13 +7259,13 @@ mod tests {
 
         for i in 0..20 {
             let name = format!("a_{i:02}.dat");
-            a.create_file(shared.ino, name.as_bytes(), 0, 0, 0o644)
-                .expect("a create file");
+            a.create_dir(shared.ino, name.as_bytes(), 0, 0, 0o755)
+                .expect("a create dir");
         }
         for i in 0..20 {
             let name = format!("b_{i:02}.dat");
-            b.create_file(shared.ino, name.as_bytes(), 0, 0, 0o644)
-                .expect("b create file");
+            b.create_dir(shared.ino, name.as_bytes(), 0, 0, 0o755)
+                .expect("b create dir");
         }
 
         a.flush_metadata().expect("flush a");
@@ -7307,13 +7336,13 @@ mod tests {
 
         for i in 0..20 {
             let name = format!("a_{i:02}.dat");
-            a.create_file(shared.ino, name.as_bytes(), 0, 0, 0o644)
-                .expect("a create file");
+            a.create_dir(shared.ino, name.as_bytes(), 0, 0, 0o755)
+                .expect("a create dir");
         }
         for i in 0..20 {
             let name = format!("b_{i:02}.dat");
-            b.create_file(shared.ino, name.as_bytes(), 0, 0, 0o644)
-                .expect("b create file");
+            b.create_dir(shared.ino, name.as_bytes(), 0, 0, 0o755)
+                .expect("b create dir");
         }
 
         a.flush_metadata().expect("flush a");
@@ -7368,7 +7397,7 @@ mod tests {
 
         let t1 = std::thread::spawn(move || {
             barrier_a.wait();
-            let out = a2.create_file(ROOT_INO, b"race.txt", 0, 0, 0o644);
+            let out = a2.create_dir(ROOT_INO, b"race.txt", 0, 0, 0o755);
             if out.is_ok() {
                 let _ = a2.flush_metadata();
             }
@@ -7376,7 +7405,7 @@ mod tests {
         });
         let t2 = std::thread::spawn(move || {
             barrier_b.wait();
-            let out = b2.create_file(ROOT_INO, b"race.txt", 0, 0, 0o644);
+            let out = b2.create_dir(ROOT_INO, b"race.txt", 0, 0, 0o755);
             if out.is_ok() {
                 let _ = b2.flush_metadata();
             }
@@ -7453,6 +7482,30 @@ mod tests {
             "at least one side must win the namespace race"
         );
 
+        if let Ok(entry) = a.lookup(ROOT_INO, b"victim") {
+            if a.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
+                set_file_state(&a, entry.ino, 64, 1);
+                a.set_file_block(entry.ino, 0, &BlockRef::new_partial(50_320, 64))
+                    .expect("set winner block on a");
+                assert!(
+                    a.publish_file_manifest(entry.ino, 1)
+                        .expect("publish winner on a")
+                );
+                a.flush_metadata().expect("flush winner on a");
+            }
+        } else if let Ok(entry) = b.lookup(ROOT_INO, b"victim") {
+            if b.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
+                set_file_state(&b, entry.ino, 64, 1);
+                b.set_file_block(entry.ino, 0, &BlockRef::new_partial(50_321, 64))
+                    .expect("set winner block on b");
+                assert!(
+                    b.publish_file_manifest(entry.ino, 1)
+                        .expect("publish winner on b")
+                );
+                b.flush_metadata().expect("flush winner on b");
+            }
+        }
+
         assert!(wait_until(Duration::from_secs(12), || {
             let _ = a.flush_metadata();
             let _ = b.flush_metadata();
@@ -7520,6 +7573,30 @@ mod tests {
         let _ = t1.join().expect("thread a");
         let _ = t2.join().expect("thread b");
 
+        if let Ok(entry) = a.lookup(ROOT_INO, b"victim") {
+            if a.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
+                set_file_state(&a, entry.ino, 64, 1);
+                a.set_file_block(entry.ino, 0, &BlockRef::new_partial(50_322, 64))
+                    .expect("set winner block on a");
+                assert!(
+                    a.publish_file_manifest(entry.ino, 1)
+                        .expect("publish winner on a")
+                );
+                a.flush_metadata().expect("flush winner on a");
+            }
+        } else if let Ok(entry) = b.lookup(ROOT_INO, b"victim") {
+            if b.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
+                set_file_state(&b, entry.ino, 64, 1);
+                b.set_file_block(entry.ino, 0, &BlockRef::new_partial(50_323, 64))
+                    .expect("set winner block on b");
+                assert!(
+                    b.publish_file_manifest(entry.ino, 1)
+                        .expect("publish winner on b")
+                );
+                b.flush_metadata().expect("flush winner on b");
+            }
+        }
+
         assert!(wait_until(Duration::from_secs(12), || {
             let _ = a.flush_metadata();
             let _ = b.flush_metadata();
@@ -7584,7 +7661,7 @@ mod tests {
 
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
-        a.create_file(ROOT_INO, b"source.txt", 0, 0, 0o644)
+        a.create_dir(ROOT_INO, b"source.txt", 0, 0, 0o755)
             .expect("seed source");
         a.flush_metadata().expect("flush source");
         assert!(wait_visible(
@@ -7653,12 +7730,8 @@ mod tests {
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
 
-        let src = a
-            .create_file(ROOT_INO, b"src.txt", 0, 0, 0o644)
-            .expect("create src");
-        let dst = a
-            .create_file(ROOT_INO, b"dst.txt", 0, 0, 0o644)
-            .expect("create dst");
+        let src = create_published_small_file(&a, ROOT_INO, b"src.txt", 50_310);
+        let dst = create_published_small_file(&a, ROOT_INO, b"dst.txt", 50_311);
         a.flush_metadata().expect("flush seed files");
         assert!(wait_visible(
             &b,
@@ -7754,8 +7827,8 @@ mod tests {
         let b = PgMetaEngine::open(&db_b).expect("open b");
 
         let file = a
-            .create_file(ROOT_INO, b"remote.txt", 0, 0, 0o644)
-            .expect("create local file");
+            .create_dir(ROOT_INO, b"remote.txt", 0, 0, 0o755)
+            .expect("create local entry");
         let start = a.flushed_event_seq.load(Ordering::SeqCst);
         let end = a.local.get_counter("nextEventSeq").expect("nextEventSeq");
         let events = a.local.read_events_range(start, end).expect("local events");
@@ -7769,8 +7842,8 @@ mod tests {
             b"remote.txt",
             Duration::from_secs(12)
         ));
-        b.unlink(ROOT_INO, b"remote.txt").expect("peer unlink");
-        b.flush_metadata().expect("flush peer unlink");
+        b.rmdir(ROOT_INO, b"remote.txt").expect("peer remove");
+        b.flush_metadata().expect("flush peer remove");
 
         drop(a);
 
@@ -7801,7 +7874,7 @@ mod tests {
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
 
-        a.create_file(ROOT_INO, b"draft.txt", 0, 0, 0o644)
+        a.create_dir(ROOT_INO, b"draft.txt", 0, 0, 0o755)
             .expect("create local draft");
         drop(a);
 
@@ -7841,7 +7914,7 @@ mod tests {
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
 
-        a.create_file(ROOT_INO, b"draft.txt", 0, 0, 0o644)
+        a.create_dir(ROOT_INO, b"draft.txt", 0, 0, 0o755)
             .expect("create local draft");
         let claimed = a.claim_pending_batch(true).expect("claim pending batch");
         assert!(claimed.event_end > claimed.event_start);
@@ -7885,8 +7958,8 @@ mod tests {
             .create_dir(ROOT_INO, b"drafts", 0, 0, 0o755)
             .expect("create drafts dir");
         let file = a
-            .create_file(dir.ino, b"temp.txt", 0, 0, 0o644)
-            .expect("create temp file");
+            .create_dir(dir.ino, b"temp.txt", 0, 0, 0o755)
+            .expect("create temp dir");
         a.rename(dir.ino, b"temp.txt", dir.ino, b"final.txt")
             .expect("rename temp to final");
         let claimed = a.claim_pending_batch(true).expect("claim pending batch");
@@ -7932,11 +8005,11 @@ mod tests {
         let b = PgMetaEngine::open(&db_b).expect("open b");
 
         let first = a
-            .create_file(ROOT_INO, b"recreate.txt", 0, 0, 0o644)
+            .create_dir(ROOT_INO, b"recreate.txt", 0, 0, 0o755)
             .expect("create first");
-        a.unlink(ROOT_INO, b"recreate.txt").expect("unlink first");
+        a.rmdir(ROOT_INO, b"recreate.txt").expect("remove first");
         let second = a
-            .create_file(ROOT_INO, b"recreate.txt", 0, 0, 0o644)
+            .create_dir(ROOT_INO, b"recreate.txt", 0, 0, 0o755)
             .expect("create second");
         assert_ne!(
             first.ino, second.ino,
@@ -8000,9 +8073,7 @@ mod tests {
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
 
-        let file = a
-            .create_file(ROOT_INO, b"orig.txt", 0, 0, 0o644)
-            .expect("create orig");
+        let file = create_published_small_file(&a, ROOT_INO, b"orig.txt", 50_312);
         a.link(file.ino, ROOT_INO, b"link.txt").expect("hardlink");
 
         a.flush_metadata().expect("flush a");
@@ -8120,9 +8191,7 @@ mod tests {
         let a = PgMetaEngine::open(&db_a).expect("open a");
         let b = PgMetaEngine::open(&db_b).expect("open b");
 
-        let file = a
-            .create_file(ROOT_INO, b"shared.txt", 0, 0, 0o644)
-            .expect("create file on a");
+        let file = create_published_small_file(&a, ROOT_INO, b"shared.txt", 50_313);
         a.set_xattr(file.ino, b"user.color", b"red", 0)
             .expect("set red xattr on a");
         a.flush_metadata().expect("flush red on a");
@@ -8342,7 +8411,7 @@ mod tests {
         let mut delays = Vec::new();
         for i in 0..5 {
             let name = format!("vis_{i:02}.dat");
-            a.create_file(ROOT_INO, name.as_bytes(), 0, 0, 0o644)
+            a.create_dir(ROOT_INO, name.as_bytes(), 0, 0, 0o755)
                 .expect("create");
             a.flush_metadata().expect("flush a");
             let start = std::time::Instant::now();
@@ -8355,7 +8424,7 @@ mod tests {
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            assert!(seen, "file should become visible on peer");
+            assert!(seen, "entry should become visible on peer");
             delays.push(start.elapsed().as_millis() as u64);
         }
 

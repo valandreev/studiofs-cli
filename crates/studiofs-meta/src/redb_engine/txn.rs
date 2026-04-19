@@ -61,6 +61,16 @@ impl RedbMetaEngine {
         attr.committed_size > 0 || attr.committed_content_epoch > 0
     }
 
+    fn inode_has_local_lifecycle_from_opened_table<T>(table: &T, ino: Ino) -> MetaResult<bool>
+    where
+        T: ReadableTable<u64, &'static [u8]>,
+    {
+        table
+            .get(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))
+            .map(|value| value.is_some())
+    }
+
     fn names_equal_case_insensitive(left: &[u8], right: &[u8], right_lower: &str) -> bool {
         if left.eq_ignore_ascii_case(right) {
             return true;
@@ -249,11 +259,13 @@ impl RedbMetaEngine {
         TBaseInodes,
         TCurrentInodes,
         TTombstones,
+        TLifecycle,
         TBaseChunks,
     >(
         base_inodes: &TBaseInodes,
         current_inodes: &TCurrentInodes,
         inode_tombstones: &TTombstones,
+        inode_lifecycle: &TLifecycle,
         base_regular_file: &TBaseChunks,
         entry: &DirEntryValue,
     ) -> MetaResult<bool>
@@ -261,6 +273,7 @@ impl RedbMetaEngine {
         TBaseInodes: ReadableTable<u64, &'static [u8]>,
         TCurrentInodes: ReadableTable<u64, &'static [u8]>,
         TTombstones: ReadableTable<u64, u8>,
+        TLifecycle: ReadableTable<u64, &'static [u8]>,
         TBaseChunks: ReadableTable<&'static [u8], &'static [u8]>,
     {
         if entry.kind != FileType::RegularFile {
@@ -278,6 +291,10 @@ impl RedbMetaEngine {
             Err(MetaError::InodeNotFound(_)) => return Ok(false),
             Err(err) => return Err(err),
         };
+
+        if Self::inode_has_local_lifecycle_from_opened_table(inode_lifecycle, entry.ino)? {
+            return Ok(true);
+        }
 
         let visible_in_remote_namespace =
             Self::regular_file_remote_visible_without_published_base(&attr)
@@ -548,6 +565,9 @@ impl RedbMetaEngine {
         let inode_tombstones = txn
             .open_table(INODE_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let inode_lifecycle = txn
+            .open_table(INODE_LIFECYCLE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         let base_regular_file = txn
             .open_table(REGULAR_FILE_BASE_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -558,6 +578,7 @@ impl RedbMetaEngine {
                         &base_inodes,
                         &current_inodes,
                         &inode_tombstones,
+                        &inode_lifecycle,
                         &base_regular_file,
                         &entry,
                     )? =>
@@ -619,6 +640,9 @@ impl RedbMetaEngine {
         let inode_tombstones = txn
             .open_table(INODE_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let inode_lifecycle = txn
+            .open_table(INODE_LIFECYCLE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         let base_regular_file = txn
             .open_table(REGULAR_FILE_BASE_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -630,6 +654,7 @@ impl RedbMetaEngine {
                     &base_inodes,
                     &current_inodes,
                     &inode_tombstones,
+                    &inode_lifecycle,
                     &base_regular_file,
                     &DirEntryValue {
                         ino: entry.ino,

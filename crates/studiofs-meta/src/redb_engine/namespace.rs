@@ -44,6 +44,9 @@ impl MetaNamespace for RedbMetaEngine {
         let inode_tombstones = txn
             .open_table(INODE_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let inode_lifecycle = txn
+            .open_table(INODE_LIFECYCLE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         let base_regular_file = txn
             .open_table(REGULAR_FILE_BASE_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -68,6 +71,7 @@ impl MetaNamespace for RedbMetaEngine {
                         &base_inodes,
                         &current_inodes,
                         &inode_tombstones,
+                        &inode_lifecycle,
                         &base_regular_file,
                         &entry,
                     )? =>
@@ -106,6 +110,9 @@ impl MetaNamespace for RedbMetaEngine {
         let inode_tombstones = txn
             .open_table(INODE_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let inode_lifecycle = txn
+            .open_table(INODE_LIFECYCLE_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
         let base_regular_file = txn
             .open_table(REGULAR_FILE_BASE_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -130,6 +137,7 @@ impl MetaNamespace for RedbMetaEngine {
                     &base_inodes,
                     &current_inodes,
                     &inode_tombstones,
+                    &inode_lifecycle,
                     &base_regular_file,
                     &DirEntryValue {
                         ino: entry.ino,
