@@ -2,6 +2,7 @@ use super::*;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use studiofs_meta::engine::MetadataAuthorityStatus;
 use studiofs_meta::engine::{MetaBlocks, MetaInodes};
 use studiofs_meta::schema::{
     CURRENT_FORMAT_VERSION, FormatInfo, InodeLifecycleState, MetadataConfig, PayloadRetentionClass,
@@ -4340,5 +4341,66 @@ fn foreign_hard_lock_blocks_unlink_and_rename() {
     assert!(
         matches!(rename, Err(VfsError::WouldBlock)),
         "rename should block when the source inode is hard-locked by a peer"
+    );
+}
+
+#[test]
+fn read_only_metadata_authority_blocks_new_mutations_but_keeps_reads_open() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "offline-read-only-authority");
+    let attr = vfs
+        .create(ROOT_INO, b"offline-read-only-authority.txt", 0, 0, 0o644)
+        .expect("create file");
+    let fh = vfs
+        .open_file(attr.ino, OpenFlags::RDWR, false)
+        .expect("open writer before authority degrades");
+
+    vfs.set_metadata_authority_status_for_test(Some(MetadataAuthorityStatus::read_only()));
+
+    let blocked_open = vfs.open_file(attr.ino, OpenFlags::RDWR, false);
+    assert!(
+        matches!(
+            blocked_open,
+            Err(VfsError::Meta(MetaError::AccessDenied {
+                actual: AccessLevel::ReadOnly,
+                ..
+            }))
+        ),
+        "new write-capable opens should stop once metadata authority degrades to read-only"
+    );
+
+    let ro_fh = vfs
+        .open_file(attr.ino, OpenFlags::RDONLY, false)
+        .expect("read-only open should remain available after authority downgrade");
+    let ro_open = vfs.get_open_file(ro_fh).expect("tracked read-only open");
+    assert_eq!(ro_open.flags.bits(), OpenFlags::RDONLY.bits());
+
+    rt.block_on(async {
+        let write_error = vfs
+            .write_fh(fh, attr.ino, 0, b"abc")
+            .await
+            .expect_err("existing writer handles should also become read-only");
+        assert!(
+            matches!(
+                write_error,
+                VfsError::Meta(MetaError::AccessDenied {
+                    actual: AccessLevel::ReadOnly,
+                    ..
+                })
+            ),
+            "unexpected write error after authority downgrade: {write_error}"
+        );
+    });
+
+    let create_error = vfs.create(ROOT_INO, b"blocked-after-downgrade.txt", 0, 0, 0o644);
+    assert!(
+        matches!(
+            create_error,
+            Err(VfsError::Meta(MetaError::AccessDenied {
+                actual: AccessLevel::ReadOnly,
+                ..
+            }))
+        ),
+        "new namespace mutations should stop once metadata authority degrades to read-only"
     );
 }

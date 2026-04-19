@@ -4,7 +4,9 @@
 
 use crate::engine::*;
 use crate::types::*;
-use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction,
+};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::ErrorKind;
@@ -21,6 +23,37 @@ mod fs_ops;
 /// Metadata engine backed by redb.
 pub struct RedbMetaEngine {
     db: Arc<Database>,
+}
+
+pub(crate) struct CounterWriteTransaction<'a> {
+    txn: &'a WriteTransaction,
+}
+
+impl CounterWriteTransaction<'_> {
+    pub(crate) fn get(&self, name: &str) -> MetaResult<u64> {
+        let table = self
+            .txn
+            .open_table(COUNTERS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        match table
+            .get(name)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            Some(value) => Ok(value.value()),
+            None => Ok(0),
+        }
+    }
+
+    pub(crate) fn set(&self, name: &str, value: u64) -> MetaResult<()> {
+        let mut table = self
+            .txn
+            .open_table(COUNTERS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        table
+            .insert(name, value)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
 }
 
 impl RedbMetaEngine {
@@ -113,6 +146,21 @@ impl RedbMetaEngine {
         self.set_attr(&root)?;
         debug!("initialized root inode with uid={}, gid={}", uid, gid);
         Ok(())
+    }
+
+    pub(crate) fn write_counters<T, F>(&self, f: F) -> MetaResult<T>
+    where
+        F: FnOnce(&CounterWriteTransaction<'_>) -> MetaResult<T>,
+    {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let counters = CounterWriteTransaction { txn: &txn };
+        let out = f(&counters)?;
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(out)
     }
 }
 

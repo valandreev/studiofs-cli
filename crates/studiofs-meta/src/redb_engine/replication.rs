@@ -1001,6 +1001,10 @@ impl MetaReplication for RedbMetaEngine {
         MetadataReplicationBacklog::default()
     }
 
+    fn metadata_authority_status(&self) -> MetadataAuthorityStatus {
+        MetadataAuthorityStatus::writable()
+    }
+
     fn remote_metadata_size(&self) -> MetaResult<Option<u64>> {
         Ok(None)
     }

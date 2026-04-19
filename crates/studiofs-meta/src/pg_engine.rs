@@ -1,8 +1,8 @@
 use crate::engine::{
     BatchFlushEntry, BatchFlushResult, DeferredDeleteRecord, MetaAcl, MetaBlocks, MetaEngineCore,
     MetaError, MetaFormat, MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaRecovery,
-    MetaReplication, MetaResult, MetaSnapshots, MetaSymlink, MetaXattr, PendingCreateRecord,
-    UndoLogKind, UndoLogRecord,
+    MetaReplication, MetaResult, MetaSnapshots, MetaSymlink, MetaXattr, MetadataAuthorityStatus,
+    PendingCreateRecord, UndoLogKind, UndoLogRecord,
 };
 use crate::events::MetaEvent;
 use crate::redb_engine::{RedbMetaEngine, RedbSnapshot};
@@ -20,6 +20,12 @@ const LOCAL_PG_VERSION_COUNTER: &str = "pgLastAppliedBatchVersion";
 const LOCAL_PG_NAMESPACE_VERSION_COUNTER: &str = "pgLastAppliedNamespaceBatchVersion";
 const LOCAL_PG_CLIENT_SLOT_COUNTER: &str = "pgClientSlotPlusOne";
 const LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER: &str = "pgLastFlushedLocalEventSeq";
+const LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER: &str = "pgInodeActiveRangeStart";
+const LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER: &str = "pgInodeActiveRangeEnd";
+const LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER: &str = "pgInodeReservedRangeEnd";
+const LOCAL_PG_BLOCK_ACTIVE_RANGE_START_COUNTER: &str = "pgBlockActiveRangeStart";
+const LOCAL_PG_BLOCK_ACTIVE_RANGE_END_COUNTER: &str = "pgBlockActiveRangeEnd";
+const LOCAL_PG_BLOCK_RESERVED_RANGE_END_COUNTER: &str = "pgBlockReservedRangeEnd";
 const PG_NEXT_CLIENT_SLOT_COUNTER: &str = "next_client_slot";
 const DEFAULT_PG_FLUSH_INTERVAL_SECS: u64 = 60;
 const DEFAULT_PG_FLUSH_OPS_THRESHOLD: u32 = 500;
@@ -27,6 +33,10 @@ const PG_EVENT_INSERT_CHUNK_SIZE: usize = 512;
 const DEFAULT_PG_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_PG_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const PG_JANITOR_LOCK_SALT: i64 = 0x5f53_4653_5f4a_414e;
+const PG_INODE_ID_STRIDE: u64 = 1_000_000_000;
+const PG_BLOCK_ID_STRIDE: u64 = 10_000_000_000;
+const PG_INODE_RANGE_WINDOW: u64 = 1_000_000;
+const PG_BLOCK_RANGE_WINDOW: u64 = 10_000_000;
 
 /// PostgreSQL-backed metadata engine.
 ///
@@ -117,6 +127,48 @@ struct RecentFlush {
     batch_version: i64,
     overlay: OverlayConflictSets,
 }
+
+#[derive(Clone, Copy)]
+struct LocalIdRangeSpec {
+    kind_label: &'static str,
+    next_counter: &'static str,
+    active_start_counter: &'static str,
+    active_end_counter: &'static str,
+    reserved_end_counter: &'static str,
+    min_value: u64,
+    slot_stride: u64,
+    window_size: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LocalIdRangeState {
+    next: u64,
+    active_start: u64,
+    active_end: u64,
+    reserved_end: u64,
+}
+
+const INODE_ID_RANGE_SPEC: LocalIdRangeSpec = LocalIdRangeSpec {
+    kind_label: "inode",
+    next_counter: counters::NEXT_INODE,
+    active_start_counter: LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER,
+    active_end_counter: LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER,
+    reserved_end_counter: LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER,
+    min_value: ROOT_INO + 1,
+    slot_stride: PG_INODE_ID_STRIDE,
+    window_size: PG_INODE_RANGE_WINDOW,
+};
+
+const BLOCK_ID_RANGE_SPEC: LocalIdRangeSpec = LocalIdRangeSpec {
+    kind_label: "block",
+    next_counter: counters::NEXT_BLOCK_ID,
+    active_start_counter: LOCAL_PG_BLOCK_ACTIVE_RANGE_START_COUNTER,
+    active_end_counter: LOCAL_PG_BLOCK_ACTIVE_RANGE_END_COUNTER,
+    reserved_end_counter: LOCAL_PG_BLOCK_RESERVED_RANGE_END_COUNTER,
+    min_value: 1,
+    slot_stride: PG_BLOCK_ID_STRIDE,
+    window_size: PG_BLOCK_RANGE_WINDOW,
+};
 
 struct PgJanitorLock {
     _runtime: tokio::runtime::Runtime,
@@ -340,6 +392,189 @@ impl PgMetaEngine {
     fn reserve_counter_range_base(slot: u64, stride: u64, min_value: u64) -> u64 {
         let base = slot.saturating_mul(stride);
         base.max(min_value)
+    }
+
+    fn counter_range_limit(slot: u64, spec: LocalIdRangeSpec) -> u64 {
+        Self::reserve_counter_range_base(slot.saturating_add(1), spec.slot_stride, spec.min_value)
+    }
+
+    fn initial_local_id_range_state(slot: u64, spec: LocalIdRangeSpec) -> LocalIdRangeState {
+        let active_start = Self::reserve_counter_range_base(slot, spec.slot_stride, spec.min_value);
+        let limit = Self::counter_range_limit(slot, spec);
+        let active_end = active_start.saturating_add(spec.window_size).min(limit);
+        let reserved_end = active_end.saturating_add(spec.window_size).min(limit);
+        LocalIdRangeState {
+            next: active_start,
+            active_start,
+            active_end,
+            reserved_end,
+        }
+    }
+
+    fn load_persisted_local_id_range_state(
+        local: &RedbMetaEngine,
+        spec: LocalIdRangeSpec,
+    ) -> MetaResult<Option<LocalIdRangeState>> {
+        let active_start = local.get_counter(spec.active_start_counter)?;
+        let active_end = local.get_counter(spec.active_end_counter)?;
+        let reserved_end = local.get_counter(spec.reserved_end_counter)?;
+        if active_start == 0 || active_end == 0 || reserved_end == 0 {
+            return Ok(None);
+        }
+        Ok(Some(LocalIdRangeState {
+            next: local.get_counter(spec.next_counter)?,
+            active_start,
+            active_end,
+            reserved_end,
+        }))
+    }
+
+    fn local_id_range_state_is_valid(
+        slot: u64,
+        spec: LocalIdRangeSpec,
+        state: LocalIdRangeState,
+    ) -> bool {
+        let base = Self::reserve_counter_range_base(slot, spec.slot_stride, spec.min_value);
+        let limit = Self::counter_range_limit(slot, spec);
+        state.active_start >= base
+            && state.active_start <= state.active_end
+            && state.active_end <= state.reserved_end
+            && state.reserved_end <= limit
+            && state.next >= state.active_start
+            && state.next <= limit
+    }
+
+    fn extend_reserved_range_end(slot: u64, spec: LocalIdRangeSpec, current_end: u64) -> u64 {
+        let limit = Self::counter_range_limit(slot, spec);
+        current_end.saturating_add(spec.window_size).min(limit)
+    }
+
+    fn top_up_reserved_headroom(
+        slot: u64,
+        spec: LocalIdRangeSpec,
+        mut state: LocalIdRangeState,
+    ) -> LocalIdRangeState {
+        let limit = Self::counter_range_limit(slot, spec);
+        state.active_end = state
+            .active_end
+            .max(state.active_start.saturating_add(1).min(limit))
+            .min(limit);
+        state.reserved_end = state.reserved_end.max(state.active_end).min(limit);
+        if state.reserved_end == state.active_end && state.reserved_end < limit {
+            state.reserved_end = Self::extend_reserved_range_end(slot, spec, state.reserved_end);
+        }
+        state
+    }
+
+    fn persist_local_id_range_state_locked(
+        counters: &crate::redb_engine::CounterWriteTransaction<'_>,
+        spec: LocalIdRangeSpec,
+        state: LocalIdRangeState,
+    ) -> MetaResult<()> {
+        counters.set(spec.next_counter, state.next)?;
+        counters.set(spec.active_start_counter, state.active_start)?;
+        counters.set(spec.active_end_counter, state.active_end)?;
+        counters.set(spec.reserved_end_counter, state.reserved_end)?;
+        Ok(())
+    }
+
+    fn read_or_initialize_local_id_range_locked(
+        counters: &crate::redb_engine::CounterWriteTransaction<'_>,
+        slot: u64,
+        spec: LocalIdRangeSpec,
+    ) -> MetaResult<LocalIdRangeState> {
+        let persisted = LocalIdRangeState {
+            next: counters.get(spec.next_counter)?,
+            active_start: counters.get(spec.active_start_counter)?,
+            active_end: counters.get(spec.active_end_counter)?,
+            reserved_end: counters.get(spec.reserved_end_counter)?,
+        };
+        let mut state = if persisted.active_start == 0
+            || persisted.active_end == 0
+            || persisted.reserved_end == 0
+            || !Self::local_id_range_state_is_valid(slot, spec, persisted)
+        {
+            let mut initial = Self::initial_local_id_range_state(slot, spec);
+            let persisted_next = counters.get(spec.next_counter)?;
+            if persisted_next > initial.next {
+                initial.next = persisted_next;
+            }
+            initial
+        } else {
+            persisted
+        };
+        if state.next < state.active_start {
+            state.next = state.active_start;
+        }
+        state = Self::top_up_reserved_headroom(slot, spec, state);
+        Self::persist_local_id_range_state_locked(counters, spec, state)?;
+        Ok(state)
+    }
+
+    fn advance_active_range(
+        slot: u64,
+        spec: LocalIdRangeSpec,
+        mut state: LocalIdRangeState,
+    ) -> LocalIdRangeState {
+        let limit = Self::counter_range_limit(slot, spec);
+        if state.active_end >= limit {
+            return state;
+        }
+        if state.reserved_end <= state.active_end {
+            state.reserved_end = Self::extend_reserved_range_end(slot, spec, state.active_end);
+        }
+        state.active_start = state.active_end;
+        state.active_end = state.reserved_end;
+        state.reserved_end = Self::extend_reserved_range_end(slot, spec, state.reserved_end);
+        Self::top_up_reserved_headroom(slot, spec, state)
+    }
+
+    fn ensure_local_id_headroom(&self, slot: u64) -> MetaResult<()> {
+        self.local.write_counters(|counters| {
+            let _ = Self::read_or_initialize_local_id_range_locked(
+                counters,
+                slot,
+                INODE_ID_RANGE_SPEC,
+            )?;
+            let _ = Self::read_or_initialize_local_id_range_locked(
+                counters,
+                slot,
+                BLOCK_ID_RANGE_SPEC,
+            )?;
+            Ok(())
+        })
+    }
+
+    fn allocate_local_ids(&self, slot: u64, spec: LocalIdRangeSpec, count: u64) -> MetaResult<u64> {
+        self.local.write_counters(|counters| {
+            let mut state = Self::read_or_initialize_local_id_range_locked(counters, slot, spec)?;
+            let limit = Self::counter_range_limit(slot, spec);
+            let end = state.next.checked_add(count).ok_or_else(|| {
+                MetaError::Storage(format!("pg {} id allocation overflow", spec.kind_label))
+            })?;
+            if end > limit {
+                return Err(MetaError::Storage(format!(
+                    "pg local {} id headroom exhausted",
+                    spec.kind_label
+                )));
+            }
+            state.next = end;
+            while state.next >= state.active_end && state.active_end < limit {
+                state = Self::advance_active_range(slot, spec, state);
+            }
+            Self::persist_local_id_range_state_locked(counters, spec, state)?;
+            Ok(end - count)
+        })
+    }
+
+    fn local_id_headroom_available(
+        local: &RedbMetaEngine,
+        slot: u64,
+        spec: LocalIdRangeSpec,
+    ) -> MetaResult<bool> {
+        Ok(Self::load_persisted_local_id_range_state(local, spec)?
+            .map(|state| state.next < Self::counter_range_limit(slot, spec))
+            .unwrap_or(false))
     }
 
     fn run_async_once<T, F>(fut: F) -> MetaResult<T>
@@ -1040,21 +1275,7 @@ impl PgMetaEngine {
     }
 
     fn prime_local_id_ranges(&self, slot: u64) -> MetaResult<()> {
-        // Keep per-client ID spaces disjoint so background event-merge does not
-        // collide on inode/block keys when multiple clients mutate concurrently.
-        let inode_base = Self::reserve_counter_range_base(slot, 1_000_000_000, ROOT_INO + 1);
-        let block_base = Self::reserve_counter_range_base(slot, 10_000_000_000, 1);
-
-        let next_inode = self.local.get_counter(counters::NEXT_INODE)?;
-        if next_inode < inode_base {
-            self.local.set_counter(counters::NEXT_INODE, inode_base)?;
-        }
-        let next_block = self.local.get_counter(counters::NEXT_BLOCK_ID)?;
-        if next_block < block_base {
-            self.local
-                .set_counter(counters::NEXT_BLOCK_ID, block_base)?;
-        }
-        Ok(())
+        self.ensure_local_id_headroom(slot)
     }
 
     pub fn open(path: impl AsRef<Path>) -> MetaResult<Arc<Self>> {
@@ -1108,9 +1329,24 @@ impl PgMetaEngine {
             .unwrap_or(DEFAULT_PG_FLUSH_OPS_THRESHOLD);
         let connect_timeout = Self::default_connect_timeout();
         let command_timeout = Self::default_command_timeout();
-        Self::ensure_file_lock_lease_schema(&pg.url, connect_timeout, command_timeout)?;
+        let persisted_client_slot = Self::load_persisted_client_slot(&local)?;
+        if let Err(error) =
+            Self::ensure_file_lock_lease_schema(&pg.url, connect_timeout, command_timeout)
+        {
+            if persisted_client_slot.is_some() {
+                warn!(
+                    error = %error,
+                    "postgres lock schema unavailable during reopen; continuing from persisted client slot"
+                );
+            } else {
+                return Err(error);
+            }
+        }
 
-        let client_slot = Self::ensure_client_slot(&local, &pg.url, pg.volume_id)?;
+        let client_slot = match persisted_client_slot {
+            Some(slot) => slot,
+            None => Self::ensure_client_slot(&local, &pg.url, pg.volume_id)?,
+        };
         let restored_local_version = Self::load_persisted_local_version(&local)?;
         let restored_namespace_version = Self::load_persisted_namespace_version(&local)?;
         let restored_flushed_event_seq = Self::load_persisted_flushed_event_seq(&local)?;
@@ -2931,7 +3167,9 @@ impl MetaInodes for PgMetaEngine {
     }
 
     fn next_inode(&self) -> MetaResult<Ino> {
-        self.mutate(|local| local.next_inode())
+        let slot = Self::load_persisted_client_slot(&self.local)?
+            .ok_or_else(|| MetaError::Storage("missing persisted pg client slot".to_string()))?;
+        self.allocate_local_ids(slot, INODE_ID_RANGE_SPEC, 1)
     }
 
     fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
@@ -3093,11 +3331,20 @@ impl MetaBlocks for PgMetaEngine {
     }
 
     fn next_block_id(&self) -> MetaResult<u64> {
-        self.mutate(|local| local.next_block_id())
+        self.next_block_ids(1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| MetaError::Storage("missing allocated block id".to_string()))
     }
 
     fn next_block_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
-        self.mutate(|local| local.next_block_ids(count))
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let slot = Self::load_persisted_client_slot(&self.local)?
+            .ok_or_else(|| MetaError::Storage("missing persisted pg client slot".to_string()))?;
+        let first = self.allocate_local_ids(slot, BLOCK_ID_RANGE_SPEC, count as u64)?;
+        Ok((first..first + count as u64).collect())
     }
 
     fn flush_blocks_batch(&self, entries: &[BatchFlushEntry]) -> MetaResult<Vec<BatchFlushResult>> {
@@ -3355,6 +3602,26 @@ impl MetaReplication for PgMetaEngine {
         crate::engine::MetadataReplicationBacklog {
             pending_ops,
             inflight_ops,
+        }
+    }
+
+    fn metadata_authority_status(&self) -> MetadataAuthorityStatus {
+        let Some(slot) = Self::load_persisted_client_slot(&self.local).ok().flatten() else {
+            return MetadataAuthorityStatus::read_only();
+        };
+        MetadataAuthorityStatus {
+            inode_id_headroom: Self::local_id_headroom_available(
+                &self.local,
+                slot,
+                INODE_ID_RANGE_SPEC,
+            )
+            .unwrap_or(false),
+            block_id_headroom: Self::local_id_headroom_available(
+                &self.local,
+                slot,
+                BLOCK_ID_RANGE_SPEC,
+            )
+            .unwrap_or(false),
         }
     }
 
@@ -4050,6 +4317,190 @@ mod tests {
         assert_eq!(
             PgMetaEngine::load_persisted_client_slot(&pg.local).expect("reload client slot"),
             Some(7)
+        );
+    }
+
+    #[test]
+    fn prime_local_id_ranges_persists_reserved_headroom_boundaries() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        PgMetaEngine::persist_client_slot(&pg.local, 3).expect("persist client slot");
+        pg.prime_local_id_ranges(3)
+            .expect("prime local id headroom ranges");
+
+        let next_inode = pg
+            .local
+            .get_counter(counters::NEXT_INODE)
+            .expect("next inode counter");
+        let next_block = pg
+            .local
+            .get_counter(counters::NEXT_BLOCK_ID)
+            .expect("next block counter");
+        let inode_active_end = pg
+            .local
+            .get_counter("pgInodeActiveRangeEnd")
+            .expect("inode active range end");
+        let inode_reserved_end = pg
+            .local
+            .get_counter("pgInodeReservedRangeEnd")
+            .expect("inode reserved range end");
+        let block_active_end = pg
+            .local
+            .get_counter("pgBlockActiveRangeEnd")
+            .expect("block active range end");
+        let block_reserved_end = pg
+            .local
+            .get_counter("pgBlockReservedRangeEnd")
+            .expect("block reserved range end");
+
+        assert!(
+            inode_active_end > next_inode,
+            "inode active range must extend beyond the current cursor"
+        );
+        assert!(
+            inode_reserved_end > inode_active_end,
+            "inode reserved headroom should include at least one future window"
+        );
+        assert!(
+            block_active_end > next_block,
+            "block active range must extend beyond the current cursor"
+        );
+        assert!(
+            block_reserved_end > block_active_end,
+            "block reserved headroom should include at least one future window"
+        );
+    }
+
+    #[test]
+    fn open_with_persisted_slot_and_ranges_survives_pg_unavailable() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("meta.redb");
+        let local = RedbMetaEngine::open(&path).expect("open local redb");
+        local.init_root(0, 0).expect("init root");
+        local
+            .set_format_info(&format_info(
+                "offline-reopen",
+                "offline-reopen-uuid",
+                "postgres://127.0.0.1:1/studiofs",
+                1,
+            ))
+            .expect("set format info");
+
+        PgMetaEngine::persist_client_slot(&local, 5).expect("persist client slot");
+        local
+            .set_counter(counters::NEXT_INODE, ROOT_INO + 3)
+            .expect("persist next inode");
+        local
+            .set_counter(counters::NEXT_BLOCK_ID, 3)
+            .expect("persist next block");
+        local
+            .set_counter("pgInodeActiveRangeStart", ROOT_INO + 1)
+            .expect("persist inode active start");
+        local
+            .set_counter("pgInodeActiveRangeEnd", ROOT_INO + 9)
+            .expect("persist inode active end");
+        local
+            .set_counter("pgInodeReservedRangeEnd", ROOT_INO + 17)
+            .expect("persist inode reserved end");
+        local
+            .set_counter("pgBlockActiveRangeStart", 1)
+            .expect("persist block active start");
+        local
+            .set_counter("pgBlockActiveRangeEnd", 9)
+            .expect("persist block active end");
+        local
+            .set_counter("pgBlockReservedRangeEnd", 17)
+            .expect("persist block reserved end");
+        drop(local);
+
+        let reopened = PgMetaEngine::open_with_options(
+            &path,
+            PgOpenOptions {
+                background_poll: false,
+            },
+        );
+        let reopen_error = reopened.err().map(|err| err.to_string());
+        assert!(
+            reopen_error.is_none(),
+            "engine should reopen from persisted client slot + headroom even while PG is unavailable: {reopen_error:?}"
+        );
+    }
+
+    #[test]
+    fn next_inode_advances_persisted_active_range_when_window_boundary_is_crossed() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        PgMetaEngine::persist_client_slot(&pg.local, 0).expect("persist client slot");
+        let base = PgMetaEngine::reserve_counter_range_base(0, PG_INODE_ID_STRIDE, ROOT_INO + 1);
+        pg.local
+            .set_counter(counters::NEXT_INODE, base + 1)
+            .expect("persist next inode");
+        pg.local
+            .set_counter(LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER, base)
+            .expect("persist inode active start");
+        pg.local
+            .set_counter(LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER, base + 2)
+            .expect("persist inode active end");
+        pg.local
+            .set_counter(LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER, base + 4)
+            .expect("persist inode reserved end");
+
+        let allocated = pg.next_inode().expect("allocate boundary inode");
+        assert_eq!(allocated, base + 1);
+        assert_eq!(
+            pg.local
+                .get_counter(LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER)
+                .expect("inode active start"),
+            base + 2
+        );
+        assert_eq!(
+            pg.local
+                .get_counter(LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER)
+                .expect("inode active end"),
+            base + 4
+        );
+        assert!(
+            pg.local
+                .get_counter(LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER)
+                .expect("inode reserved end")
+                > base + 4,
+            "advancing the active range should immediately top up a future reserved window"
+        );
+    }
+
+    #[test]
+    fn next_inode_reports_read_only_headroom_once_slot_limit_is_exhausted() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        PgMetaEngine::persist_client_slot(&pg.local, 0).expect("persist client slot");
+        let limit = PgMetaEngine::counter_range_limit(0, INODE_ID_RANGE_SPEC);
+        pg.local
+            .set_counter(counters::NEXT_INODE, limit - 1)
+            .expect("persist next inode");
+        pg.local
+            .set_counter(LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER, limit - 1)
+            .expect("persist inode active start");
+        pg.local
+            .set_counter(LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER, limit)
+            .expect("persist inode active end");
+        pg.local
+            .set_counter(LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER, limit)
+            .expect("persist inode reserved end");
+        let first = pg.next_inode().expect("final inode within local headroom");
+        assert_eq!(first, limit - 1);
+
+        let error = pg.next_inode().expect_err(
+            "headroom should hard-stop new inode allocation once the slot is exhausted",
+        );
+        assert!(
+            matches!(error, MetaError::Storage(ref message) if message.contains("headroom exhausted")),
+            "unexpected exhaustion error: {error}"
+        );
+
+        let authority = MetaReplication::metadata_authority_status(&pg);
+        assert!(
+            !authority.allows_new_mutations(),
+            "slot exhaustion should surface a read-only metadata authority status"
         );
     }
 
