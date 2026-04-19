@@ -22,17 +22,98 @@ fn collect_term_hits(path: &str, terms: &[&str]) -> Vec<String> {
 
 fn collect_term_hits_outside_test_modules(path: &str, terms: &[&str]) -> Vec<String> {
     let contents = read_workspace_file(path);
+    let filtered = strip_cfg_test_items(&contents);
+
+    collect_term_hits_from_contents(path, &filtered, terms)
+}
+
+fn strip_cfg_test_items(contents: &str) -> String {
     let mut filtered = String::new();
+    let mut pending_cfg_test = false;
+    let mut skipping_test_module = false;
+    let mut test_module_brace_depth = 0usize;
 
     for line in contents.lines() {
-        if line.trim() == "#[cfg(test)]" {
-            break;
+        let trimmed = line.trim();
+
+        if skipping_test_module {
+            test_module_brace_depth = test_module_brace_depth
+                .saturating_add(line.matches('{').count())
+                .saturating_sub(line.matches('}').count());
+            if test_module_brace_depth == 0 {
+                skipping_test_module = false;
+            }
+            continue;
         }
+
+        if let Some(rest) = trimmed.strip_prefix("#[cfg(test)]") {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                pending_cfg_test = true;
+                continue;
+            }
+            if is_module_declaration(rest) {
+                skipping_test_module = true;
+                test_module_brace_depth = rest
+                    .matches('{')
+                    .count()
+                    .saturating_sub(rest.matches('}').count());
+                if test_module_brace_depth == 0 {
+                    skipping_test_module = false;
+                }
+            }
+            continue;
+        }
+
+        if pending_cfg_test {
+            if trimmed.is_empty() || trimmed.starts_with("#[") {
+                continue;
+            }
+            if is_module_declaration(trimmed) {
+                skipping_test_module = true;
+                test_module_brace_depth = line
+                    .matches('{')
+                    .count()
+                    .saturating_sub(line.matches('}').count());
+                if test_module_brace_depth == 0 {
+                    skipping_test_module = false;
+                }
+            }
+            pending_cfg_test = false;
+            continue;
+        }
+
         filtered.push_str(line);
         filtered.push('\n');
     }
 
-    collect_term_hits_from_contents(path, &filtered, terms)
+    filtered
+}
+
+fn is_module_declaration(line: &str) -> bool {
+    let line = line.trim();
+    (line.starts_with("mod ")
+        || line.starts_with("pub mod ")
+        || line.starts_with("pub(crate) mod ")
+        || line.starts_with("pub(super) mod ")
+        || line.starts_with("pub(self) mod "))
+        && line.ends_with('{')
+}
+
+fn write_temp_source(contents: &str) -> PathBuf {
+    let unique = format!(
+        "studiofs-architecture-vocabulary-test-{}-{}.rs",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("current time")
+            .as_nanos()
+    );
+    let path = std::env::temp_dir().join(unique);
+    fs::write(&path, contents).unwrap_or_else(|error| {
+        panic!("failed to write temp source '{}': {error}", path.display());
+    });
+    path
 }
 
 fn collect_term_hits_from_contents(path: &str, contents: &str, terms: &[&str]) -> Vec<String> {
@@ -49,6 +130,53 @@ fn collect_term_hits_from_contents(path: &str, contents: &str, terms: &[&str]) -
     }
 
     hits
+}
+
+#[test]
+fn helper_keeps_scanning_past_cfg_test_imports() {
+    let path = write_temp_source(
+        "use std::fmt;\n\
+         #[cfg(test)]\n\
+         use std::collections::BTreeMap;\n\
+         fn production_surface() { let _ = \"cache mode\"; }\n",
+    );
+    let path_str = path.to_string_lossy().into_owned();
+
+    let hits = collect_term_hits_outside_test_modules(&path_str, &["cache mode"]);
+
+    fs::remove_file(&path).ok();
+    assert_eq!(
+        hits.len(),
+        1,
+        "helper should keep scanning production lines"
+    );
+}
+
+#[test]
+fn helper_skips_cfg_test_modules_but_keeps_following_production_code() {
+    let path = write_temp_source(
+        "fn before() {}\n\
+         #[cfg(test)]\n\
+         mod tests {\n\
+             fn helper_surface() { let _ = \"cache mode\"; }\n\
+         }\n\
+         fn after() { let _ = \"writeback-delay\"; }\n",
+    );
+    let path_str = path.to_string_lossy().into_owned();
+
+    let test_hits = collect_term_hits_outside_test_modules(&path_str, &["cache mode"]);
+    let production_hits = collect_term_hits_outside_test_modules(&path_str, &["writeback-delay"]);
+
+    fs::remove_file(&path).ok();
+    assert!(
+        test_hits.is_empty(),
+        "helper should ignore cfg(test) module contents"
+    );
+    assert_eq!(
+        production_hits.len(),
+        1,
+        "helper should resume scanning after cfg(test) modules"
+    );
 }
 
 #[test]
