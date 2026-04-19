@@ -140,6 +140,8 @@ impl PgMetaEngine {
             PRIMARY KEY (vol, ino)
         );
     "#;
+    const LOCK_NOTIFY_IDLE_POLL_INTERVAL_MS: u64 = 250;
+    const LOCK_NOTIFY_SAFETY_REFRESH_INTERVAL_MS: u64 = 30_000;
 
     fn env_duration_ms(key: &str, default_ms: u64) -> Duration {
         Duration::from_millis(
@@ -162,6 +164,13 @@ impl PgMetaEngine {
         Self::env_duration_ms(
             "STUDIOFS_PG_COMMAND_TIMEOUT_MS",
             DEFAULT_PG_COMMAND_TIMEOUT_MS,
+        )
+    }
+
+    fn default_lock_notify_safety_refresh_interval() -> Duration {
+        Self::env_duration_ms(
+            "STUDIOFS_PG_LOCK_NOTIFY_SAFETY_REFRESH_MS",
+            Self::LOCK_NOTIFY_SAFETY_REFRESH_INTERVAL_MS,
         )
     }
 
@@ -579,6 +588,8 @@ impl PgMetaEngine {
                         break;
                     };
                     let channel = Self::lock_notify_channel(engine_arc.volume_id);
+                    let safety_refresh_interval =
+                        Self::default_lock_notify_safety_refresh_interval();
                     let connect_result = engine_arc.run_async(async {
                         let connect = tokio_postgres::connect(
                             &engine_arc.postgres_url,
@@ -609,9 +620,10 @@ impl PgMetaEngine {
                                 ))
                             })?;
 
+                        let mut next_safety_refresh = Instant::now() + safety_refresh_interval;
                         while !shutdown.load(Ordering::Acquire) {
                             let message = tokio::time::timeout(
-                                Duration::from_millis(250),
+                                Duration::from_millis(Self::LOCK_NOTIFY_IDLE_POLL_INTERVAL_MS),
                                 std::future::poll_fn(|cx| connection.poll_message(cx)),
                             )
                             .await;
@@ -637,13 +649,17 @@ impl PgMetaEngine {
                                     return Ok(());
                                 }
                                 Err(_) => {
-                                    let cached_inos: Vec<Ino> = engine_arc
-                                        .file_lock_cache
-                                        .lock()
-                                        .map(|cache| cache.keys().copied().collect())
-                                        .unwrap_or_default();
-                                    for ino in cached_inos {
-                                        engine_arc.refresh_known_file_lock_lease(ino)?;
+                                    if Instant::now() >= next_safety_refresh {
+                                        let cached_inos: Vec<Ino> = engine_arc
+                                            .file_lock_cache
+                                            .lock()
+                                            .map(|cache| cache.keys().copied().collect())
+                                            .unwrap_or_default();
+                                        for ino in cached_inos {
+                                            engine_arc.refresh_known_file_lock_lease(ino)?;
+                                        }
+                                        next_safety_refresh =
+                                            Instant::now() + safety_refresh_interval;
                                     }
                                 }
                             }
