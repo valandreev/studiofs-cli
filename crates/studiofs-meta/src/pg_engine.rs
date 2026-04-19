@@ -127,6 +127,20 @@ struct HeldFileLockLease {
 }
 
 impl PgMetaEngine {
+    const FILE_LOCK_LEASES_SCHEMA_SQL: &str = r#"
+        CREATE TABLE IF NOT EXISTS file_lock_leases (
+            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+            ino BIGINT NOT NULL,
+            kind SMALLINT NOT NULL,
+            exclusive_owner TEXT,
+            shared_owners TEXT[] NOT NULL DEFAULT '{}',
+            lease_expires_at_unix_ms BIGINT NOT NULL,
+            generation BIGINT NOT NULL DEFAULT 1,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (vol, ino)
+        );
+    "#;
+
     fn env_duration_ms(key: &str, default_ms: u64) -> Duration {
         Duration::from_millis(
             std::env::var(key)
@@ -149,6 +163,34 @@ impl PgMetaEngine {
             "STUDIOFS_PG_COMMAND_TIMEOUT_MS",
             DEFAULT_PG_COMMAND_TIMEOUT_MS,
         )
+    }
+
+    fn ensure_file_lock_lease_schema(
+        postgres_url: &str,
+        connect_timeout: Duration,
+        command_timeout: Duration,
+    ) -> MetaResult<()> {
+        Self::run_async_once(async move {
+            Self::with_postgres_client_timeout(
+                postgres_url.to_string(),
+                connect_timeout,
+                command_timeout,
+                "ensure file lock lease schema",
+                move |client| async move {
+                    client
+                        .batch_execute(Self::FILE_LOCK_LEASES_SCHEMA_SQL)
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres file lock lease schema ensure failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                    Ok(())
+                },
+            )
+            .await
+        })
     }
 
     fn format_pg_error(e: tokio_postgres::Error) -> String {
@@ -886,6 +928,7 @@ impl PgMetaEngine {
             .unwrap_or(DEFAULT_PG_FLUSH_OPS_THRESHOLD);
         let connect_timeout = Self::default_connect_timeout();
         let command_timeout = Self::default_command_timeout();
+        Self::ensure_file_lock_lease_schema(&pg.url, connect_timeout, command_timeout)?;
 
         let client_slot = Self::ensure_client_slot(&local, &pg.url, pg.volume_id)?;
         let restored_local_version = Self::load_persisted_local_version(&local)?;
@@ -3314,6 +3357,31 @@ mod tests {
         })
     }
 
+    fn drop_file_lock_lease_table(dsn: &str) {
+        run_async(async move {
+            let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+                .await
+                .map_err(|e| {
+                    MetaError::Storage(format!("postgres connect failed: {}", pg_err(e)))
+                })?;
+            let conn_task = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client
+                .execute("DROP TABLE IF EXISTS file_lock_leases", &[])
+                .await
+                .map_err(|e| {
+                    MetaError::Storage(format!(
+                        "postgres drop file_lock_leases failed: {}",
+                        pg_err(e)
+                    ))
+                })?;
+            conn_task.abort();
+            Ok::<(), MetaError>(())
+        })
+        .expect("drop file_lock_leases");
+    }
+
     fn reopen_pg_engine_with_retry(path: &std::path::Path) -> Arc<PgMetaEngine> {
         let mut reopened = None;
         assert!(wait_until(Duration::from_secs(3), || {
@@ -3880,6 +3948,37 @@ mod tests {
             acquired_after_release,
             FileLockLeaseAcquireOutcome::Acquired(_)
         ));
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_open_recreates_missing_file_lock_lease_table() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir = tempdir().expect("tempdir");
+        let db = dir.path().join("meta.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-open-recreates-file-lock-lease-table");
+        let info = volume.format_info();
+        seed_local(&db, &info);
+        drop_file_lock_lease_table(&dsn);
+
+        let engine = PgMetaEngine::open_with_options(
+            &db,
+            PgOpenOptions {
+                background_poll: false,
+            },
+        )
+        .expect("open pg engine after dropping file_lock_leases");
+        let file = engine
+            .create_file(ROOT_INO, b"recreated-lock-table.txt", 0, 0, 0o644)
+            .expect("create file");
+
+        let acquired = engine
+            .acquire_file_lock_lease(file.ino, HardLockKind::Exclusive, Duration::from_secs(2))
+            .expect("acquire lease after open-time schema ensure");
+        assert!(matches!(acquired, FileLockLeaseAcquireOutcome::Acquired(_)));
     }
 
     #[test]

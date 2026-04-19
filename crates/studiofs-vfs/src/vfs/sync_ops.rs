@@ -13,6 +13,31 @@ use crate::runtime::run_meta;
 use std::time::Instant;
 
 impl StudioVfs {
+    #[cfg(test)]
+    pub(super) fn arm_fail_next_inline_dirty_attr_persist_for_test(&self) {
+        self.fail_next_inline_dirty_attr_persist
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn fail_inline_dirty_attr_persist_for_test(&self) -> VfsResult<()> {
+        if self
+            .fail_next_inline_dirty_attr_persist
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            Err(super::VfsError::Other(
+                "simulated inline dirty attr persist failure".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(not(test))]
+    fn fail_inline_dirty_attr_persist_for_test(&self) -> VfsResult<()> {
+        Ok(())
+    }
+
     /// Release a file handle.
     ///
     /// If the inode was unlinked while this handle was open (orphan) and this
@@ -191,7 +216,8 @@ impl StudioVfs {
             );
         let residual_local_dirty_state =
             residual_pending_local_blocks || (dirty_attr_present && !persist_dirty_attr_inline);
-        let had_local_dirty_state = materialized_handle_writers || residual_local_dirty_state;
+        let had_local_dirty_state =
+            materialized_handle_writers || residual_local_dirty_state || persist_dirty_attr_inline;
         if residual_local_dirty_state {
             self.flush_local_dirty_state(ino, local_sync_policy).await?;
         }
@@ -204,12 +230,18 @@ impl StudioVfs {
             DirtyAttrPersistPolicy::Ignore => None,
             DirtyAttrPersistPolicy::PersistIfPresent if !persist_dirty_attr_inline => None,
             DirtyAttrPersistPolicy::PersistIfPresent => {
-                self.state.namespace.dirty_attrs.lock().remove(&ino)
+                self.state.namespace.dirty_attrs.lock().get(&ino).cloned()
             }
         };
         let persisted_dirty_attrs = if let Some(attr) = dirty_attr {
+            self.fail_inline_dirty_attr_persist_for_test()?;
             let meta = self.meta.clone();
-            run_meta(meta, move |engine: Arc<dyn VfsMeta>| engine.set_attr(&attr)).await?;
+            let attr_to_persist = attr.clone();
+            run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                engine.set_attr(&attr_to_persist)
+            })
+            .await?;
+            self.clear_matching_dirty_attr_if_committed(ino, &attr);
             self.state.namespace.attr_read_cache.lock().remove(ino);
             true
         } else {

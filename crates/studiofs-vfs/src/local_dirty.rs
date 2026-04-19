@@ -1235,7 +1235,7 @@ impl StudioVfs {
             .is_some_and(|indexes| !indexes.is_empty())
     }
 
-    fn clear_matching_dirty_attr_if_committed(&self, ino: Ino, attr: &InodeAttr) {
+    pub(super) fn clear_matching_dirty_attr_if_committed(&self, ino: Ino, attr: &InodeAttr) {
         if self.has_pending_local_dirty_blocks_for_inode(ino) {
             return;
         }

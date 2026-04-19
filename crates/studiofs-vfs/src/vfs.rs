@@ -2212,6 +2212,8 @@ pub struct StudioVfs {
     write_path_backend_tag: String,
     write_path_started_at: Instant,
     #[cfg(test)]
+    fail_next_inline_dirty_attr_persist: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     fail_next_size_change_setattr_before_flush: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_next_size_change_truncate_after_first_removed_block: std::sync::atomic::AtomicBool,
