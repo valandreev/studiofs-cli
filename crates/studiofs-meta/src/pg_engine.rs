@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::RuntimeFlavor;
+use tracing::warn;
 
 const LOCAL_PG_VERSION_COUNTER: &str = "pgLastAppliedBatchVersion";
 const LOCAL_PG_NAMESPACE_VERSION_COUNTER: &str = "pgLastAppliedNamespaceBatchVersion";
@@ -175,6 +176,43 @@ impl PgMetaEngine {
             "STUDIOFS_PG_LOCK_NOTIFY_SAFETY_REFRESH_MS",
             Self::LOCK_NOTIFY_SAFETY_REFRESH_INTERVAL_MS,
         )
+    }
+
+    fn default_prepare_for_close_join_timeout() -> Duration {
+        Self::env_duration_ms("STUDIOFS_PG_PREPARE_FOR_CLOSE_JOIN_TIMEOUT_MS", 2_000)
+    }
+
+    fn join_background_thread_with_timeout(
+        handle: std::thread::JoinHandle<()>,
+        timeout: Duration,
+        worker: &'static str,
+    ) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let _ = std::thread::Builder::new()
+            .name(format!("pg-close-join-{worker}"))
+            .spawn(move || {
+                let _ = tx.send(handle.join());
+            });
+
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                warn!(worker, "pg background thread panicked during shutdown join");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                warn!(
+                    worker,
+                    timeout_ms = timeout.as_millis() as u64,
+                    "pg background thread did not stop before shutdown join timeout"
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                warn!(
+                    worker,
+                    "pg background thread join helper disconnected unexpectedly"
+                );
+            }
+        }
     }
 
     fn ensure_file_lock_lease_schema(
@@ -3377,20 +3415,21 @@ impl MetaReplication for PgMetaEngine {
         // `RedbMetaEngine` / `redb::Database` can run their Drop impls
         // cleanly — preventing "Database repair aborted" on next mount.
         self.poll_shutdown.store(true, Ordering::Release);
+        let join_timeout = Self::default_prepare_for_close_join_timeout();
         if let Ok(mut guard) = self.poll_handle.lock()
             && let Some(handle) = guard.take()
         {
-            let _ = handle.join();
+            Self::join_background_thread_with_timeout(handle, join_timeout, "poll");
         }
         if let Ok(mut guard) = self.lock_notify_handle.lock()
             && let Some(handle) = guard.take()
         {
-            let _ = handle.join();
+            Self::join_background_thread_with_timeout(handle, join_timeout, "notify");
         }
         if let Ok(mut guard) = self.lock_renew_handle.lock()
             && let Some(handle) = guard.take()
         {
-            let _ = handle.join();
+            Self::join_background_thread_with_timeout(handle, join_timeout, "renew");
         }
     }
 }
@@ -3688,6 +3727,28 @@ mod tests {
         };
 
         (dir, engine)
+    }
+
+    #[test]
+    fn prepare_for_close_does_not_block_forever_on_slow_background_thread() {
+        let _join_timeout = set_test_env("STUDIOFS_PG_PREPARE_FOR_CLOSE_JOIN_TIMEOUT_MS", "50");
+        let (_dir, engine) = temp_pg_engine_for_unit();
+        *engine.poll_handle.lock().expect("poll_handle lock") = Some(
+            std::thread::Builder::new()
+                .name("pg-test-slow-close".into())
+                .spawn(|| {
+                    std::thread::sleep(Duration::from_secs(5));
+                })
+                .expect("spawn slow background thread"),
+        );
+
+        let started = Instant::now();
+        engine.prepare_for_close();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "prepare_for_close should respect the bounded join timeout for slow threads"
+        );
     }
 
     fn apply_projected_remote_range(
