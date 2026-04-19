@@ -787,16 +787,39 @@ impl StudioVfs {
         if writes.is_empty() {
             return Ok(false);
         }
+        let dirty_attr = { self.state.namespace.dirty_attrs.lock().get(&ino).cloned() };
+        let visible_size = if let Some(attr) = dirty_attr.as_ref() {
+            attr.size
+        } else {
+            self.getattr_async(ino).await?.size
+        };
+        let content_epoch = if let Some(attr) = dirty_attr.as_ref() {
+            attr.content_epoch
+        } else {
+            self.current_content_epoch_async(ino).await?
+        };
         let max_seq = writes
             .last()
             .map(|write| write.seq)
             .expect("non-empty writes have a max seq");
         let buffered_writes: Vec<(u64, Bytes)> = writes
-            .into_iter()
-            .map(|write| (write.offset, write.data))
+            .iter()
+            .map(|write| (write.offset, write.data.clone()))
             .collect();
-        self.materialize_buffered_writes_direct(ino, &buffered_writes, local_sync_policy)
+        let blocks = self
+            .build_dirty_write_snapshots_from_buffered_writes(ino, &buffered_writes, visible_size)
             .await?;
+        if blocks.is_empty() {
+            return Ok(false);
+        }
+        self.persist_dirty_write_snapshots_direct(
+            ino,
+            blocks,
+            content_epoch,
+            dirty_attr,
+            local_sync_policy,
+        )
+        .await?;
         self.state.handle_writers.mark_materialized(ino, max_seq);
         Ok(true)
     }
@@ -870,8 +893,10 @@ impl StudioVfs {
             completed_block_indexes.len() >= self.payload_put_concurrency.max(2);
         let budget_exceeded =
             self.state.handle_writers.total_dirty_bytes() > self.max_dirty_bytes();
+        let eager_single_full_block_accept = !current_write_full_block_indexes.is_empty()
+            && visible_size <= u64::from(self.block_size);
         let should_materialize_now = matches!(local_sync_policy, LocalSyncPolicy::Strict)
-            || !current_write_full_block_indexes.is_empty()
+            || eager_single_full_block_accept
             || current_write_crosses_boundary_with_partial_tail
             || enough_completed_blocks
             || budget_exceeded
