@@ -408,6 +408,11 @@ impl VfsBootstrap {
         } = self;
         let block_size = plan.block_size();
         let upload_cache_io_slots = plan.cache_runtime_tuning.upload_cache_io_slots;
+        let distributed_flock = meta.invalidation_sender_id().map(|_| DistributedFlock {
+            lease_ttl: Duration::from_secs(config.lock_ttl_secs),
+            retry_base_ms: config.lock_retry_base_ms,
+            retry_max_ms: config.lock_retry_max_ms,
+        });
 
         Arc::new(StudioVfs {
             meta: MetaExecutor::new(meta),
@@ -474,10 +479,12 @@ impl VfsBootstrap {
             readdir_attr_batch_max_inodes: plan.readdir_attr_batch_max_inodes,
             prefetch_pause_on_neterr: plan.prefetch_pause_on_neterr,
             fetch_scheduler: resources.fetch_scheduler,
-            distributed_flock: None,
+            distributed_flock,
             kernel_invalidator: RwLock::new(None),
             write_path_backend_tag: "local-block-runtime".to_string(),
             write_path_started_at: Instant::now(),
+            #[cfg(test)]
+            fail_next_inline_dirty_attr_persist: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_next_size_change_setattr_before_flush: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]

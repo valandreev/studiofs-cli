@@ -184,6 +184,30 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
 
     /// Return globally visible snapshot-pinned object ids used to protect offline snapshots.
     fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>>;
+
+    /// Acquire a PostgreSQL-backed hard-lock lease for this engine's client.
+    fn acquire_file_lock_lease(
+        &self,
+        ino: Ino,
+        kind: HardLockKind,
+        lease_ttl: std::time::Duration,
+    ) -> MetaResult<FileLockLeaseAcquireOutcome>;
+
+    /// Release this engine's current hard-lock lease for the inode, if present.
+    fn release_file_lock_lease(&self, ino: Ino) -> MetaResult<FileLockLeaseReleaseOutcome>;
+
+    /// Renew this engine's current hard-lock lease for the inode, if still owned.
+    fn renew_file_lock_lease(
+        &self,
+        ino: Ino,
+        lease_ttl: std::time::Duration,
+    ) -> MetaResult<FileLockLeaseRenewOutcome>;
+
+    /// Read the current authoritative hard-lock lease for an inode.
+    fn current_file_lock_lease(&self, ino: Ino) -> MetaResult<Option<FileLockLease>>;
+
+    /// Read the last known hard-lock lease cached locally by the engine.
+    fn known_file_lock_lease(&self, ino: Ino) -> Option<FileLockLease>;
 }
 
 pub trait MetaFormat: Send + Sync {

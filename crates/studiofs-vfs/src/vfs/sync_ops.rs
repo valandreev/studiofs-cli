@@ -13,6 +13,31 @@ use crate::runtime::run_meta;
 use std::time::Instant;
 
 impl StudioVfs {
+    #[cfg(test)]
+    pub(super) fn arm_fail_next_inline_dirty_attr_persist_for_test(&self) {
+        self.fail_next_inline_dirty_attr_persist
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn fail_inline_dirty_attr_persist_for_test(&self) -> VfsResult<()> {
+        if self
+            .fail_next_inline_dirty_attr_persist
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            Err(super::VfsError::Other(
+                "simulated inline dirty attr persist failure".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(not(test))]
+    fn fail_inline_dirty_attr_persist_for_test(&self) -> VfsResult<()> {
+        Ok(())
+    }
+
     /// Release a file handle.
     ///
     /// If the inode was unlinked while this handle was open (orphan) and this
@@ -181,8 +206,18 @@ impl StudioVfs {
             .await?;
         let flushed_file_data =
             materialized_handle_writers || self.has_pending_local_dirty_blocks_for_inode(ino);
-        let residual_local_dirty_state = self.inode_has_local_dirty_state(ino);
-        let had_local_dirty_state = materialized_handle_writers || residual_local_dirty_state;
+        let residual_pending_local_blocks = self.has_pending_local_dirty_blocks_for_inode(ino);
+        let dirty_attr_present = self.state.namespace.dirty_attrs.lock().contains_key(&ino);
+        let persist_dirty_attr_inline = !residual_pending_local_blocks
+            && dirty_attr_present
+            && matches!(
+                dirty_attr_persist_policy,
+                DirtyAttrPersistPolicy::PersistIfPresent
+            );
+        let residual_local_dirty_state =
+            residual_pending_local_blocks || (dirty_attr_present && !persist_dirty_attr_inline);
+        let had_local_dirty_state =
+            materialized_handle_writers || residual_local_dirty_state || persist_dirty_attr_inline;
         if residual_local_dirty_state {
             self.flush_local_dirty_state(ino, local_sync_policy).await?;
         }
@@ -193,13 +228,20 @@ impl StudioVfs {
 
         let dirty_attr = match dirty_attr_persist_policy {
             DirtyAttrPersistPolicy::Ignore => None,
+            DirtyAttrPersistPolicy::PersistIfPresent if !persist_dirty_attr_inline => None,
             DirtyAttrPersistPolicy::PersistIfPresent => {
-                self.state.namespace.dirty_attrs.lock().remove(&ino)
+                self.state.namespace.dirty_attrs.lock().get(&ino).cloned()
             }
         };
         let persisted_dirty_attrs = if let Some(attr) = dirty_attr {
+            self.fail_inline_dirty_attr_persist_for_test()?;
             let meta = self.meta.clone();
-            run_meta(meta, move |engine: Arc<dyn VfsMeta>| engine.set_attr(&attr)).await?;
+            let attr_to_persist = attr.clone();
+            run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                engine.set_attr(&attr_to_persist)
+            })
+            .await?;
+            self.clear_matching_dirty_attr_if_committed(ino, &attr);
             self.state.namespace.attr_read_cache.lock().remove(ino);
             true
         } else {
@@ -270,8 +312,28 @@ impl StudioVfs {
         let Some(open_file) = self.handle_table.get(fh) else {
             return Ok(ExplicitFlushOutcome::default());
         };
-        self.flush_inode_barrier_with_outcome(open_file.ino, StickyErrorPolicy::Report)
-            .await
+        let session = self
+            .state
+            .file_session
+            .enter_op(open_file.ino, FileSessionOperation::Flush)
+            .await;
+        let result: VfsResult<ExplicitFlushOutcome> = async {
+            let outcome = self
+                .local_sync_barrier_with_outcome(
+                    open_file.ino,
+                    self.local_sync_policy_for_barrier(open_file.ino),
+                    StickyErrorPolicy::Report,
+                    DirtyAttrPersistPolicy::PersistIfPresent,
+                )
+                .await?;
+            Ok(ExplicitFlushOutcome {
+                flushed_local_dirty_state: outcome.had_local_dirty_state,
+            })
+        }
+        .await;
+        drop(session);
+        self.state.file_session.gc_if_idle(open_file.ino);
+        result
     }
 
     pub async fn flush_fh(&self, fh: u64) -> VfsResult<()> {

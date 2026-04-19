@@ -234,26 +234,9 @@ impl PhaseTelemetry {
         self.by_size.get_mut(class).record(elapsed, bytes);
     }
 
-    pub(super) fn record_operation(
-        &mut self,
-        operation_index: u64,
-        work_index: usize,
-        worker_id: usize,
-        target: impl Into<String>,
-        class: SizeClass,
-        elapsed: Duration,
-        bytes: u64,
-    ) {
-        self.record(class, elapsed, bytes);
-        self.operation_logs.push(PhaseOperationLog {
-            operation_index,
-            work_index,
-            worker_id,
-            target: target.into(),
-            size_class: class,
-            bytes,
-            elapsed,
-        });
+    pub(super) fn record_operation(&mut self, operation: PhaseOperationLog) {
+        self.record(operation.size_class, operation.elapsed, operation.bytes);
+        self.operation_logs.push(operation);
     }
 
     fn operation_reports(&self) -> Vec<OperationLogReport> {
@@ -457,24 +440,24 @@ mod tests {
     #[test]
     fn phase_telemetry_to_report_preserves_full_operation_log() {
         let mut telemetry = PhaseTelemetry::default();
-        telemetry.record_operation(
-            9,
-            3,
-            2,
-            "Z:\\bench\\0003.bin",
-            SizeClass::Medium,
-            Duration::from_millis(12),
-            4 * 1024 * 1024,
-        );
-        telemetry.record_operation(
-            4,
-            1,
-            0,
-            "Z:\\bench\\0001.bin",
-            SizeClass::Small,
-            Duration::from_millis(3),
-            512 * 1024,
-        );
+        telemetry.record_operation(PhaseOperationLog {
+            operation_index: 9,
+            work_index: 3,
+            worker_id: 2,
+            target: "Z:\\bench\\0003.bin".to_string(),
+            size_class: SizeClass::Medium,
+            bytes: 4 * 1024 * 1024,
+            elapsed: Duration::from_millis(12),
+        });
+        telemetry.record_operation(PhaseOperationLog {
+            operation_index: 4,
+            work_index: 1,
+            worker_id: 0,
+            target: "Z:\\bench\\0001.bin".to_string(),
+            size_class: SizeClass::Small,
+            bytes: 512 * 1024,
+            elapsed: Duration::from_millis(3),
+        });
 
         let report = phase_telemetry_to_report(&telemetry, Duration::from_millis(20));
 

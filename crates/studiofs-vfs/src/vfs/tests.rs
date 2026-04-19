@@ -2552,6 +2552,60 @@ fn test_fsync_with_outcome_reports_handle_writer_file_data_barrier() {
 }
 
 #[test]
+fn test_flush_fh_retries_inline_dirty_attr_persist_after_transient_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "flush-fh-inline-dirty-attr-retry");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"flush-fh-inline-dirty-attr-retry.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        let mut dirty_attr = meta.get_attr(ino).expect("load attr");
+        dirty_attr.mtime = InodeAttr::now_nanos();
+        dirty_attr.ctime = dirty_attr.mtime;
+        vfs.state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .insert(ino, dirty_attr.clone());
+
+        vfs.arm_fail_next_inline_dirty_attr_persist_for_test();
+        let err = vfs
+            .flush_fh_with_outcome(fh)
+            .await
+            .expect_err("simulated inline dirty attr persist failure should fail flush_fh");
+        assert!(
+            err.to_string()
+                .contains("simulated inline dirty attr persist failure"),
+            "expected the injected inline dirty attr persist failure to surface"
+        );
+        assert!(
+            vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+            "failed inline dirty attr persist must leave dirty attrs queued for retry"
+        );
+
+        vfs.flush_fh_with_outcome(fh)
+            .await
+            .expect("retry flush_fh after transient dirty attr persist failure");
+        assert!(
+            !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+            "successful retry should clear the queued dirty attrs"
+        );
+
+        let persisted = meta.get_attr(ino).expect("load persisted attr");
+        assert_eq!(
+            persisted.mtime, dirty_attr.mtime,
+            "retry flush should eventually persist the queued dirty attr update"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn test_datasync_with_outcome_treats_already_persisted_metadata_as_clean() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "datasync-outcome-persisted-metadata");

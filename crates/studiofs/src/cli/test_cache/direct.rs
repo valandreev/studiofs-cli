@@ -15,8 +15,8 @@ use super::result::{
     BenchmarkProfileReport, BenchmarkReport, CachePipelineReport, CpuProfileReport,
 };
 use super::telemetry::{
-    DirectReadTelemetry, PhaseTelemetry, build_advanced_metrics, phase_telemetry_to_report,
-    stream_reports_from_telemetry,
+    DirectReadTelemetry, PhaseOperationLog, PhaseTelemetry, build_advanced_metrics,
+    phase_telemetry_to_report, stream_reports_from_telemetry,
 };
 use super::workload::{
     SizeClassBounds, build_access_sequence, build_work_sizes, classify_size, deterministic_bytes,
@@ -86,15 +86,15 @@ async fn run_shim_writes(
                 let mut s = stats
                     .lock()
                     .map_err(|_| anyhow!("shim write latency stats lock poisoned"))?;
-                s.record_operation(
-                    op_index as u64,
+                s.record_operation(PhaseOperationLog {
+                    operation_index: op_index as u64,
                     work_index,
                     worker_id,
-                    format!("object:{object_id}"),
-                    class,
+                    target: format!("object:{object_id}"),
+                    size_class: class,
+                    bytes: sizes[work_index],
                     elapsed,
-                    sizes[work_index],
-                );
+                });
             }
         }));
     }
@@ -181,15 +181,15 @@ async fn run_shim_reads(
                 let mut s = stats
                     .lock()
                     .map_err(|_| anyhow!("shim read latency stats lock poisoned"))?;
-                s.phase.record_operation(
-                    op_index as u64,
+                s.phase.record_operation(PhaseOperationLog {
+                    operation_index: op_index as u64,
                     work_index,
                     worker_id,
-                    format!("object:{object_id}"),
-                    class,
+                    target: format!("object:{object_id}"),
+                    size_class: class,
+                    bytes: read as u64,
                     elapsed,
-                    read as u64,
-                );
+                });
                 match trace.level {
                     CacheReadLevel::L1 => {
                         s.cache_levels
@@ -262,15 +262,15 @@ async fn run_shim_writes_sequential_streams(
                     size_class_bounds.small_max,
                     size_class_bounds.medium_max,
                 );
-                telemetry.record_operation(
-                    work_index as u64,
+                telemetry.record_operation(PhaseOperationLog {
+                    operation_index: work_index as u64,
                     work_index,
-                    stream_id,
-                    format!("object:{object_id}"),
-                    class,
+                    worker_id: stream_id,
+                    target: format!("object:{object_id}"),
+                    size_class: class,
+                    bytes: sizes[work_index],
                     elapsed,
-                    sizes[work_index],
-                );
+                });
             }
             Ok::<_, anyhow::Error>((stream_id, telemetry))
         }));
@@ -337,15 +337,15 @@ async fn run_shim_reads_sequential_streams(
                     size_class_bounds.small_max,
                     size_class_bounds.medium_max,
                 );
-                telemetry.phase.record_operation(
-                    work_index as u64,
+                telemetry.phase.record_operation(PhaseOperationLog {
+                    operation_index: work_index as u64,
                     work_index,
-                    stream_id,
-                    format!("object:{object_id}"),
-                    class,
+                    worker_id: stream_id,
+                    target: format!("object:{object_id}"),
+                    size_class: class,
+                    bytes: read as u64,
                     elapsed,
-                    read as u64,
-                );
+                });
                 match trace.level {
                     CacheReadLevel::L1 => {
                         telemetry.cache_levels.record_l1(

@@ -142,6 +142,41 @@ impl MetaEngineCore for RedbMetaEngine {
     fn get_global_snapshot_pins(&self) -> MetaResult<HashSet<u64>> {
         Ok(HashSet::new())
     }
+
+    fn acquire_file_lock_lease(
+        &self,
+        _ino: Ino,
+        _kind: HardLockKind,
+        _lease_ttl: std::time::Duration,
+    ) -> MetaResult<FileLockLeaseAcquireOutcome> {
+        Err(MetaError::Storage(
+            "file lock leases require postgres metadata backend".to_string(),
+        ))
+    }
+
+    fn release_file_lock_lease(&self, _ino: Ino) -> MetaResult<FileLockLeaseReleaseOutcome> {
+        Err(MetaError::Storage(
+            "file lock leases require postgres metadata backend".to_string(),
+        ))
+    }
+
+    fn renew_file_lock_lease(
+        &self,
+        _ino: Ino,
+        _lease_ttl: std::time::Duration,
+    ) -> MetaResult<FileLockLeaseRenewOutcome> {
+        Err(MetaError::Storage(
+            "file lock leases require postgres metadata backend".to_string(),
+        ))
+    }
+
+    fn current_file_lock_lease(&self, _ino: Ino) -> MetaResult<Option<FileLockLease>> {
+        Ok(None)
+    }
+
+    fn known_file_lock_lease(&self, _ino: Ino) -> Option<FileLockLease> {
+        None
+    }
 }
 
 #[cfg(test)]

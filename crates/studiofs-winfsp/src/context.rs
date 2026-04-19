@@ -3200,9 +3200,8 @@ mod tests {
             "fast-mode explicit flush should no longer force the local payload sync barrier after buffered writes"
         );
         assert_eq!(
-            flush_calls_after,
-            flush_calls_before + 1,
-            "explicit flush should still enter the foreground local drain path once for dirty buffered writes"
+            flush_calls_after, flush_calls_before,
+            "explicit flush should materialize dirty buffered handle state directly without routing through the legacy ordered flush path"
         );
         assert!(
             !vfs.inode_has_local_dirty_state(attr.ino),

@@ -32,8 +32,8 @@ use studiofs_meta::types::SetattrArgs;
 use studiofs_meta::types::TimeSpec;
 use studiofs_meta::{
     CURRENT_FORMAT_VERSION, FormatInfo, MetaBlocks, MetaEngine, MetaError, MetaFormat, MetaInodes,
-    MetadataBackend, MetadataConfig, PgMetaEngine, PostgresConfig, ROOT_INO, RedbMetaEngine,
-    ensure_studiofs_database,
+    MetaReplication, MetadataBackend, MetadataConfig, PgMetaEngine, PgOpenOptions, PostgresConfig,
+    ROOT_INO, RedbMetaEngine, ensure_studiofs_database,
     schema::InodeLifecycleState,
     schema::{ChunkId, SliceId, SliceOrder, SliceRange, SliceRecord},
     types::{AccessLevel, BlockFlags, BlockRef, UploadState},
@@ -3835,6 +3835,104 @@ fn remote_attr_cache_refreshes_after_nested_publish_sync() {
             "remote VFS attr cache must refresh after a pure metadata publish"
         );
         assert_eq!(refreshed.committed_size, payload.len() as u64);
+
+        writer_vfs.shutdown(Duration::from_secs(15)).await;
+        remote_vfs.shutdown(Duration::from_secs(15)).await;
+    });
+    rt.shutdown_background();
+}
+
+#[test]
+#[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+fn pg_backed_flock_blocks_conflicting_peer_until_unlock() {
+    let Some(dsn) = pg_dsn() else {
+        return;
+    };
+    let _restore_sync = ScopedEnvVar::capture("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS");
+    apply_test_online_s3_env();
+    unsafe {
+        std::env::set_var("STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS", "50");
+    }
+
+    let writer_tmp = tempfile::tempdir().unwrap();
+    let writer_db = writer_tmp.path().join("meta-a.redb");
+    let writer_cache = writer_tmp.path().join("writer-cache");
+    let writer_cache_str = writer_cache.to_str().unwrap().to_string();
+    let remote_tmp = tempfile::tempdir().unwrap();
+    let remote_db = remote_tmp.path().join("meta-b.redb");
+    let remote_cache = remote_tmp.path().join("remote-cache");
+    let remote_cache_str = remote_cache.to_str().unwrap().to_string();
+    let volume = PgTestVolume::new(&dsn, "vfs-pg-flock");
+    let mut info = volume.format_info();
+    let s3 = test_online_s3_env();
+    info.endpoint = s3.endpoint.clone();
+    info.bucket = s3.bucket.clone();
+    info.access_key = s3.access_key.clone();
+    info.secret_key = s3.secret_key.clone();
+    seed_local(&writer_db, &info);
+    seed_local(&remote_db, &info);
+
+    let writer_meta = PgMetaEngine::open_with_options(
+        &writer_db,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("open writer pg meta");
+    let remote_meta = PgMetaEngine::open_with_options(
+        &remote_db,
+        PgOpenOptions {
+            background_poll: false,
+        },
+    )
+    .expect("open remote pg meta");
+    let writer_meta_dyn: Arc<dyn MetaEngine> = writer_meta.clone();
+    let remote_meta_dyn: Arc<dyn MetaEngine> = remote_meta.clone();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        ensure_bucket().await;
+
+        let writer_vfs = make_vfs_from_meta(writer_meta_dyn, &info, &writer_cache_str);
+        let remote_vfs = make_vfs_from_meta(remote_meta_dyn, &info, &remote_cache_str);
+
+        let file = writer_vfs
+            .create(ROOT_INO, b"remote-flock.txt", 0, 0, 0o644)
+            .unwrap();
+        writer_vfs.flush(file.ino).await.unwrap();
+        writer_meta
+            .sync_metadata()
+            .expect("writer sync metadata for remote flock test");
+        let _ = remote_meta.sync_metadata();
+
+        writer_vfs
+            .flock(file.ino, LockKind::Exclusive, 1, false)
+            .await
+            .unwrap();
+
+        let blocked = remote_vfs
+            .flock(file.ino, LockKind::Exclusive, 2, false)
+            .await;
+        assert!(
+            matches!(blocked, Err(VfsError::WouldBlock)),
+            "peer exclusive flock should block while writer lease is held, got {blocked:?}"
+        );
+
+        writer_vfs
+            .flock(file.ino, LockKind::Unlock, 1, false)
+            .await
+            .unwrap();
+        remote_vfs
+            .flock(file.ino, LockKind::Exclusive, 2, false)
+            .await
+            .unwrap();
+        remote_vfs
+            .flock(file.ino, LockKind::Unlock, 2, false)
+            .await
+            .unwrap();
 
         writer_vfs.shutdown(Duration::from_secs(15)).await;
         remote_vfs.shutdown(Duration::from_secs(15)).await;
