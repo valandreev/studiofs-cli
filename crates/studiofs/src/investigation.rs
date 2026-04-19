@@ -1576,7 +1576,6 @@ mod tests {
                 endpoint_override: Some("http://127.0.0.1:9000".to_string()),
                 snapshot_id: None,
                 vfs_config: serde_json::json!({
-                    "cache_safety_mode": "fast",
                     "principal": "*"
                 }),
             },

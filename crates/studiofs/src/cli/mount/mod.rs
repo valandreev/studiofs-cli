@@ -83,7 +83,7 @@ PYROSCOPE PROFILING:
   STUDIOFS_PYROSCOPE_URL=http://localhost:4040
   STUDIOFS_PYROSCOPE_APP_NAME=studiofs.mount
   STUDIOFS_PYROSCOPE_SAMPLE_RATE=100
-  STUDIOFS_PYROSCOPE_TAGS=team=vfx,cache_mode=durable
+  STUDIOFS_PYROSCOPE_TAGS=team=vfx,cache_contract=fast-local-authority
 
 SIZE FORMATS:
   --cache-size accepts: KB, MB, GB, TB (e.g. 512MB, 4GB, 1TB)

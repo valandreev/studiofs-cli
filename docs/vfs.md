@@ -97,8 +97,8 @@ Handle-aware write path:
   then surfaces any sticky async-upload error for that inode.
 - The canonical mount contract is single-mode Fast Local Authority: ordinary
   `flush()` / `close()` stop at local materialization, while `fsync()` remains
-  the explicit strict local-durability request. Historical
-  `cache_safety_mode=fast|durable` code paths are transitional only.
+  the explicit strict local-durability request. The legacy
+  `cache_safety_mode=fast|durable` knob has been removed.
 - Foreground backpressure is driven by local dirty-state pressure; upload
   backlog alone does not stall writes.
 

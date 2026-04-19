@@ -44,7 +44,7 @@ Mount with Pyroscope profiling enabled:
 ```bash
 STUDIOFS_PROFILE=pyroscope \
 STUDIOFS_PYROSCOPE_URL=http://localhost:4040 \
-STUDIOFS_PYROSCOPE_TAGS=team=vfx,cache_mode=durable \
+STUDIOFS_PYROSCOPE_TAGS=team=vfx,cache_contract=fast-local-authority \
 studiofs mount myvolume Z: --profile
 ```
 

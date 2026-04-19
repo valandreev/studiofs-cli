@@ -257,7 +257,6 @@ Tunable at runtime (see `crates/studiofs/src/cli/mount.rs` for full list):
 - `STUDIOFS_S3_ENDPOINT`: S3 endpoint URL
 - `STUDIOFS_S3_BUCKET`: S3 bucket name
 - `STUDIOFS_PRINCIPAL`: ACL principal for access control
-- `STUDIOFS_CACHE_SAFETY_MODE`: `fast` or `durable` (default: `fast`)
 
 ## Security & Configuration Tips
 

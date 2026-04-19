@@ -6524,7 +6524,7 @@ mod tests {
                     cache_size: Some("64GB".to_string()),
                     endpoint_override: Some("http://127.0.0.1:9000".to_string()),
                     snapshot_id: None,
-                    vfs_config: serde_json::json!({"principal":"*","cache_safety_mode":"fast"}),
+                    vfs_config: serde_json::json!({"principal":"*"}),
                 },
                 workload_identity: WorkloadIdentityFingerprint {
                     case_workload: None,

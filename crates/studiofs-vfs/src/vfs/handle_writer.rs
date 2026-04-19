@@ -271,6 +271,7 @@ impl HandleWriterRegistry {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn has_dirty_writers(&self, ino: Ino) -> bool {
         let writers = self.writers.lock();
         writers.writers_by_ino.get(&ino).is_some_and(|handles| {
@@ -670,6 +671,7 @@ impl StudioVfs {
             .snapshot_read_spans(ino, offset, length)
     }
 
+    #[cfg(test)]
     pub(super) fn inode_has_dirty_handle_writers(&self, ino: Ino) -> bool {
         self.state.handle_writers.has_dirty_writers(ino)
     }

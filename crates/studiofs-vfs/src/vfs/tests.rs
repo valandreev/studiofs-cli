@@ -3411,12 +3411,9 @@ fn flush_fh_keeps_opportunistic_local_sync_in_fast_mode() {
 }
 
 #[test]
-fn flush_fh_forces_strict_local_sync_in_durable_mode() {
+fn flush_fh_ignores_legacy_durable_mode_and_keeps_opportunistic_local_sync() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let cfg = VfsConfig {
-        cache_safety_mode: CacheSafetyMode::Durable,
-        ..VfsConfig::default()
-    };
+    let cfg = VfsConfig::default();
     let (rt, vfs, _meta) = make_test_vfs_with_config(&tmp, "flush-fh-durable-local-sync", cfg);
     let attr = vfs
         .create(1, b"flush-fh-durable-local-sync.txt", 0, 0, 0o644)
@@ -3467,24 +3464,24 @@ fn flush_fh_forces_strict_local_sync_in_durable_mode() {
         .metrics
         .block_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
-    assert!(
-        calls_after > calls_before,
-        "durable-mode flush must still force local sync_data for dirty unpublished state"
+    assert_eq!(
+        calls_after, calls_before,
+        "legacy durable-mode flush should follow the single Fast Local Authority barrier model"
     );
-    assert!(
-        synced_after >= synced_before + 4096,
-        "durable-mode flush should still account for the pending local durable sync bytes"
+    assert_eq!(
+        synced_after, synced_before,
+        "legacy durable-mode flush should leave grouped sync bytes pending until an explicit strict barrier"
     );
     rt.block_on(async {
         let group = vfs.state.local_dirty.local_sync_group.lock().await;
         assert_eq!(
-            group.pending_bytes, 0,
-            "durable-mode flush should drain pending local sync bytes"
+            group.pending_bytes, 4096,
+            "legacy durable-mode flush should keep pending local sync bytes queued"
         );
     });
     assert!(
         !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
-        "durable-mode flush should commit the dirty local attr state"
+        "legacy durable-mode flush should still commit the dirty local attr state"
     );
 
     rt.block_on(async {
@@ -3741,12 +3738,9 @@ fn release_fh_keeps_opportunistic_local_sync_in_fast_mode() {
 }
 
 #[test]
-fn release_fh_forces_strict_local_sync_in_durable_mode() {
+fn release_fh_ignores_legacy_durable_mode_and_keeps_opportunistic_local_sync() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let cfg = VfsConfig {
-        cache_safety_mode: CacheSafetyMode::Durable,
-        ..VfsConfig::default()
-    };
+    let cfg = VfsConfig::default();
     let (rt, vfs, _meta) = make_test_vfs_with_config(&tmp, "release-fh-durable-local-sync", cfg);
     let attr = vfs
         .create(1, b"release-fh-durable-local-sync.txt", 0, 0, 0o644)
@@ -3808,24 +3802,24 @@ fn release_fh_forces_strict_local_sync_in_durable_mode() {
         .metrics
         .block_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
-    assert!(
-        calls_after > calls_before,
-        "durable-mode last-handle release must still force local sync_data when dirty state remains"
+    assert_eq!(
+        calls_after, calls_before,
+        "legacy durable-mode last-handle release should follow the single Fast Local Authority barrier model"
     );
-    assert!(
-        synced_after >= synced_before + 8192,
-        "durable-mode last-handle release should still account for the pending local sync bytes"
+    assert_eq!(
+        synced_after, synced_before,
+        "legacy durable-mode last-handle release should leave grouped sync bytes pending until fsync"
     );
     rt.block_on(async {
         let group = vfs.state.local_dirty.local_sync_group.lock().await;
         assert_eq!(
-            group.pending_bytes, 0,
-            "durable-mode last-handle release should drain pending local sync bytes"
+            group.pending_bytes, 8192,
+            "legacy durable-mode last-handle release should keep pending local sync bytes queued"
         );
     });
     assert!(
         !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
-        "durable-mode last-handle release should preserve the committed local attr state"
+        "legacy durable-mode last-handle release should preserve the committed local attr state"
     );
 }
 

@@ -1,8 +1,7 @@
 use super::{
-    AccessLevel, CacheSafetyMode, DirtyAttrPersistPolicy, ExplicitFlushOutcome,
-    FileSessionOperation, FsyncOutcome, HandleReleaseContext, Ino, LastHandleReleaseAction,
-    LocalSyncBarrierOutcome, LocalSyncPolicy, OpenFile, OpenFlags, ReleaseFhOutcome,
-    StickyErrorPolicy, StudioVfs, VfsResult,
+    AccessLevel, DirtyAttrPersistPolicy, ExplicitFlushOutcome, FileSessionOperation, FsyncOutcome,
+    HandleReleaseContext, Ino, LastHandleReleaseAction, LocalSyncBarrierOutcome, LocalSyncPolicy,
+    OpenFile, OpenFlags, ReleaseFhOutcome, StickyErrorPolicy, StudioVfs, VfsResult,
 };
 use std::sync::Arc;
 use tracing::debug;
@@ -259,14 +258,8 @@ impl StudioVfs {
         })
     }
 
-    fn local_sync_policy_for_barrier(&self, ino: Ino) -> LocalSyncPolicy {
-        let has_pending_local_state =
-            self.inode_has_local_dirty_state(ino) || self.inode_has_dirty_handle_writers(ino);
-        if has_pending_local_state && matches!(self.cache_safety_mode, CacheSafetyMode::Durable) {
-            LocalSyncPolicy::Strict
-        } else {
-            LocalSyncPolicy::Opportunistic
-        }
+    fn local_sync_policy_for_barrier(&self, _ino: Ino) -> LocalSyncPolicy {
+        LocalSyncPolicy::Opportunistic
     }
 
     pub(super) async fn flush_inode_barrier_with_outcome(
