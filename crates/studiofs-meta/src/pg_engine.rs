@@ -4591,15 +4591,18 @@ mod tests {
 
     #[test]
     fn persisted_pg_client_slot_roundtrips_in_local_counter() {
-        let (_dir, pg) = temp_pg_engine_for_unit();
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("meta.redb");
+        let local = RedbMetaEngine::open(&path).expect("open local redb");
+        local.init_root(0, 0).expect("init root");
 
         assert_eq!(
-            PgMetaEngine::load_persisted_client_slot(&pg.local).expect("initial client slot"),
+            PgMetaEngine::load_persisted_client_slot(&local).expect("initial client slot"),
             None
         );
-        PgMetaEngine::persist_client_slot(&pg.local, 7).expect("persist client slot");
+        PgMetaEngine::persist_client_slot(&local, 7).expect("persist client slot");
         assert_eq!(
-            PgMetaEngine::load_persisted_client_slot(&pg.local).expect("reload client slot"),
+            PgMetaEngine::load_persisted_client_slot(&local).expect("reload client slot"),
             Some(7)
         );
     }
