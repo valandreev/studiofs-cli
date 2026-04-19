@@ -618,7 +618,7 @@ impl PgMetaEngine {
         Ok(snapshot)
     }
 
-    fn ensure_lock_workers_started(&self) -> MetaResult<()> {
+    fn ensure_lock_notify_listener_started(&self) -> MetaResult<()> {
         if !self.lock_workers_enabled {
             return Ok(());
         }
@@ -628,11 +628,6 @@ impl PgMetaEngine {
             .lock()
             .map(|guard| guard.is_some())
             .unwrap_or(false)
-            && self
-                .lock_renew_handle
-                .lock()
-                .map(|guard| guard.is_some())
-                .unwrap_or(false)
         {
             return Ok(());
         }
@@ -657,6 +652,31 @@ impl PgMetaEngine {
         }
         drop(notify_guard);
 
+        Ok(())
+    }
+
+    fn ensure_lock_renew_worker_started(&self) -> MetaResult<()> {
+        if !self.lock_workers_enabled {
+            return Ok(());
+        }
+
+        if self
+            .lock_renew_handle
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        let _start_guard = self
+            .lock_worker_start_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg lock worker start state poisoned".to_string()))?;
+        let engine = self.self_weak.get().cloned().ok_or_else(|| {
+            MetaError::Storage("pg lock worker bootstrap missing self weak ref".to_string())
+        })?;
+
         let mut renew_guard = self
             .lock_renew_handle
             .lock()
@@ -669,6 +689,11 @@ impl PgMetaEngine {
         }
 
         Ok(())
+    }
+
+    fn ensure_lock_workers_started(&self) -> MetaResult<()> {
+        self.ensure_lock_notify_listener_started()?;
+        self.ensure_lock_renew_worker_started()
     }
 
     fn start_lock_notify_listener(
@@ -1097,6 +1122,7 @@ impl PgMetaEngine {
         let _ = engine.restore_pending_state_from_local_log();
         let _ = engine.prime_local_id_ranges(client_slot);
         if options.background_poll {
+            engine.ensure_lock_notify_listener_started()?;
             let handle = Self::start_background_poll(
                 Arc::downgrade(&engine),
                 engine.poll_interval,
@@ -4347,7 +4373,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
-    fn test_pg_open_defers_lock_workers_until_first_lock_usage() {
+    fn test_pg_open_starts_notify_listener_but_defers_renew_worker_until_first_lock_usage() {
         let Some(dsn) = pg_dsn() else {
             return;
         };
@@ -4364,8 +4390,8 @@ mod tests {
                 .lock_notify_handle
                 .lock()
                 .expect("lock notify handle")
-                .is_none(),
-            "open should not eagerly start the pg lock notify listener"
+                .is_some(),
+            "open should eagerly start the pg lock notify listener for passive peers"
         );
         assert!(
             engine
@@ -4373,7 +4399,7 @@ mod tests {
                 .lock()
                 .expect("lock renew handle")
                 .is_none(),
-            "open should not eagerly start the pg lock renew worker"
+            "open should still defer the pg lock renew worker until a lock is held"
         );
 
         let file = engine
