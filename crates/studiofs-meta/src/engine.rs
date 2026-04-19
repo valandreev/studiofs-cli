@@ -206,6 +206,12 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
     /// Read the current authoritative hard-lock lease for an inode.
     fn current_file_lock_lease(&self, ino: Ino) -> MetaResult<Option<FileLockLease>>;
 
+    /// Best-effort hook for engines that need background monitoring to keep
+    /// `known_file_lock_lease()` fresh for passive peers.
+    fn ensure_known_file_lock_monitoring(&self) -> MetaResult<()> {
+        Ok(())
+    }
+
     /// Read the last known hard-lock lease cached locally by the engine.
     fn known_file_lock_lease(&self, ino: Ino) -> Option<FileLockLease>;
 }

@@ -11,9 +11,10 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::RuntimeFlavor;
+use tracing::warn;
 
 const LOCAL_PG_VERSION_COUNTER: &str = "pgLastAppliedBatchVersion";
 const LOCAL_PG_NAMESPACE_VERSION_COUNTER: &str = "pgLastAppliedNamespaceBatchVersion";
@@ -56,6 +57,9 @@ pub struct PgMetaEngine {
     janitor_lock: Mutex<Option<PgJanitorLock>>,
     file_lock_cache: Mutex<HashMap<Ino, FileLockLease>>,
     held_file_locks: Mutex<HashMap<Ino, HeldFileLockLease>>,
+    self_weak: OnceLock<Weak<Self>>,
+    lock_workers_enabled: bool,
+    lock_worker_start_lock: Mutex<()>,
     /// Signals the background poll thread to exit.
     poll_shutdown: Arc<AtomicBool>,
     /// Handle to the background poll thread, used by `prepare_for_close()`
@@ -172,6 +176,43 @@ impl PgMetaEngine {
             "STUDIOFS_PG_LOCK_NOTIFY_SAFETY_REFRESH_MS",
             Self::LOCK_NOTIFY_SAFETY_REFRESH_INTERVAL_MS,
         )
+    }
+
+    fn default_prepare_for_close_join_timeout() -> Duration {
+        Self::env_duration_ms("STUDIOFS_PG_PREPARE_FOR_CLOSE_JOIN_TIMEOUT_MS", 2_000)
+    }
+
+    fn join_background_thread_with_timeout(
+        handle: std::thread::JoinHandle<()>,
+        timeout: Duration,
+        worker: &'static str,
+    ) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let _ = std::thread::Builder::new()
+            .name(format!("pg-close-join-{worker}"))
+            .spawn(move || {
+                let _ = tx.send(handle.join());
+            });
+
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                warn!(worker, "pg background thread panicked during shutdown join");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                warn!(
+                    worker,
+                    timeout_ms = timeout.as_millis() as u64,
+                    "pg background thread did not stop before shutdown join timeout"
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                warn!(
+                    worker,
+                    "pg background thread join helper disconnected unexpectedly"
+                );
+            }
+        }
     }
 
     fn ensure_file_lock_lease_schema(
@@ -615,8 +656,86 @@ impl PgMetaEngine {
         Ok(snapshot)
     }
 
+    fn ensure_lock_notify_listener_started(&self) -> MetaResult<()> {
+        if !self.lock_workers_enabled {
+            return Ok(());
+        }
+
+        if self
+            .lock_notify_handle
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        let _start_guard = self
+            .lock_worker_start_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg lock worker start state poisoned".to_string()))?;
+        let engine = self.self_weak.get().cloned().ok_or_else(|| {
+            MetaError::Storage("pg lock worker bootstrap missing self weak ref".to_string())
+        })?;
+
+        let mut notify_guard = self
+            .lock_notify_handle
+            .lock()
+            .map_err(|_| MetaError::Storage("pg lock notify handle state poisoned".to_string()))?;
+        if notify_guard.is_none() {
+            *notify_guard = Some(Self::start_lock_notify_listener(
+                engine.clone(),
+                self.poll_shutdown.clone(),
+            )?);
+        }
+        drop(notify_guard);
+
+        Ok(())
+    }
+
+    fn ensure_lock_renew_worker_started(&self) -> MetaResult<()> {
+        if !self.lock_workers_enabled {
+            return Ok(());
+        }
+
+        if self
+            .lock_renew_handle
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        let _start_guard = self
+            .lock_worker_start_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("pg lock worker start state poisoned".to_string()))?;
+        let engine = self.self_weak.get().cloned().ok_or_else(|| {
+            MetaError::Storage("pg lock worker bootstrap missing self weak ref".to_string())
+        })?;
+
+        let mut renew_guard = self
+            .lock_renew_handle
+            .lock()
+            .map_err(|_| MetaError::Storage("pg lock renew handle state poisoned".to_string()))?;
+        if renew_guard.is_none() {
+            *renew_guard = Some(Self::start_lock_renew_worker(
+                engine,
+                self.poll_shutdown.clone(),
+            )?);
+        }
+
+        Ok(())
+    }
+
+    fn ensure_lock_workers_started(&self) -> MetaResult<()> {
+        self.ensure_lock_notify_listener_started()?;
+        self.ensure_lock_renew_worker_started()
+    }
+
     fn start_lock_notify_listener(
-        engine: std::sync::Weak<Self>,
+        engine: Weak<Self>,
         shutdown: Arc<AtomicBool>,
     ) -> MetaResult<std::thread::JoinHandle<()>> {
         std::thread::Builder::new()
@@ -723,7 +842,7 @@ impl PgMetaEngine {
     }
 
     fn start_lock_renew_worker(
-        engine: std::sync::Weak<Self>,
+        engine: Weak<Self>,
         shutdown: Arc<AtomicBool>,
     ) -> MetaResult<std::thread::JoinHandle<()>> {
         std::thread::Builder::new()
@@ -1022,11 +1141,15 @@ impl PgMetaEngine {
             janitor_lock: Mutex::new(None),
             file_lock_cache: Mutex::new(HashMap::new()),
             held_file_locks: Mutex::new(HashMap::new()),
+            self_weak: OnceLock::new(),
+            lock_workers_enabled: options.background_poll,
+            lock_worker_start_lock: Mutex::new(()),
             poll_shutdown: poll_shutdown.clone(),
             poll_handle: Mutex::new(None),
             lock_notify_handle: Mutex::new(None),
             lock_renew_handle: Mutex::new(None),
         });
+        let _ = engine.self_weak.set(Arc::downgrade(&engine));
 
         // Bootstrap from the last checkpoint if present, then catch up from
         // append-only event deltas.
@@ -1043,22 +1166,6 @@ impl PgMetaEngine {
                 poll_shutdown,
             );
             *engine.poll_handle.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
-            let notify_handle = Self::start_lock_notify_listener(
-                Arc::downgrade(&engine),
-                engine.poll_shutdown.clone(),
-            )?;
-            *engine
-                .lock_notify_handle
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = Some(notify_handle);
-            let renew_handle = Self::start_lock_renew_worker(
-                Arc::downgrade(&engine),
-                engine.poll_shutdown.clone(),
-            )?;
-            *engine
-                .lock_renew_handle
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = Some(renew_handle);
         }
         Ok(engine)
     }
@@ -2275,6 +2382,7 @@ impl MetaEngineCore for PgMetaEngine {
         kind: HardLockKind,
         lease_ttl: Duration,
     ) -> MetaResult<FileLockLeaseAcquireOutcome> {
+        self.ensure_lock_workers_started()?;
         let postgres_url = self.postgres_url.clone();
         let volume_id = self.volume_id;
         let client_id = self.client_id.clone();
@@ -2626,6 +2734,7 @@ impl MetaEngineCore for PgMetaEngine {
         ino: Ino,
         lease_ttl: Duration,
     ) -> MetaResult<FileLockLeaseRenewOutcome> {
+        self.ensure_lock_workers_started()?;
         let postgres_url = self.postgres_url.clone();
         let volume_id = self.volume_id;
         let client_id = self.client_id.clone();
@@ -2774,6 +2883,10 @@ impl MetaEngineCore for PgMetaEngine {
         })?;
         self.upsert_cached_file_lock_lease(snapshot.clone(), ino);
         Ok(snapshot)
+    }
+
+    fn ensure_known_file_lock_monitoring(&self) -> MetaResult<()> {
+        self.ensure_lock_notify_listener_started()
     }
 
     fn known_file_lock_lease(&self, ino: Ino) -> Option<FileLockLease> {
@@ -3302,20 +3415,21 @@ impl MetaReplication for PgMetaEngine {
         // `RedbMetaEngine` / `redb::Database` can run their Drop impls
         // cleanly — preventing "Database repair aborted" on next mount.
         self.poll_shutdown.store(true, Ordering::Release);
+        let join_timeout = Self::default_prepare_for_close_join_timeout();
         if let Ok(mut guard) = self.poll_handle.lock()
             && let Some(handle) = guard.take()
         {
-            let _ = handle.join();
+            Self::join_background_thread_with_timeout(handle, join_timeout, "poll");
         }
         if let Ok(mut guard) = self.lock_notify_handle.lock()
             && let Some(handle) = guard.take()
         {
-            let _ = handle.join();
+            Self::join_background_thread_with_timeout(handle, join_timeout, "notify");
         }
         if let Ok(mut guard) = self.lock_renew_handle.lock()
             && let Some(handle) = guard.take()
         {
-            let _ = handle.join();
+            Self::join_background_thread_with_timeout(handle, join_timeout, "renew");
         }
     }
 }
@@ -3603,6 +3717,9 @@ mod tests {
             janitor_lock: Mutex::new(None),
             file_lock_cache: Mutex::new(HashMap::new()),
             held_file_locks: Mutex::new(HashMap::new()),
+            self_weak: OnceLock::new(),
+            lock_workers_enabled: false,
+            lock_worker_start_lock: Mutex::new(()),
             poll_shutdown: Arc::new(AtomicBool::new(false)),
             poll_handle: Mutex::new(None),
             lock_notify_handle: Mutex::new(None),
@@ -3610,6 +3727,28 @@ mod tests {
         };
 
         (dir, engine)
+    }
+
+    #[test]
+    fn prepare_for_close_does_not_block_forever_on_slow_background_thread() {
+        let _join_timeout = set_test_env("STUDIOFS_PG_PREPARE_FOR_CLOSE_JOIN_TIMEOUT_MS", "50");
+        let (_dir, engine) = temp_pg_engine_for_unit();
+        *engine.poll_handle.lock().expect("poll_handle lock") = Some(
+            std::thread::Builder::new()
+                .name("pg-test-slow-close".into())
+                .spawn(|| {
+                    std::thread::sleep(Duration::from_secs(5));
+                })
+                .expect("spawn slow background thread"),
+        );
+
+        let started = Instant::now();
+        engine.prepare_for_close();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "prepare_for_close should respect the bounded join timeout for slow threads"
+        );
     }
 
     fn apply_projected_remote_range(
@@ -4293,6 +4432,82 @@ mod tests {
                 .known_file_lock_lease(file.ino)
                 .is_none()),
             "peer known lock cache should clear after NOTIFY-driven refresh"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_passive_lock_monitoring_starts_notify_listener_but_defers_renew_worker() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir = tempdir().expect("tempdir");
+        let db = dir.path().join("meta.redb");
+        let volume = PgTestVolume::new(&dsn, "pg-lock-workers-lazy-start");
+        let info = volume.format_info();
+        seed_local(&db, &info);
+
+        let engine = PgMetaEngine::open(&db).expect("open engine");
+        assert!(
+            engine
+                .lock_notify_handle
+                .lock()
+                .expect("lock notify handle")
+                .is_none(),
+            "open alone should not eagerly start the pg lock notify listener"
+        );
+        assert!(
+            engine
+                .lock_renew_handle
+                .lock()
+                .expect("lock renew handle")
+                .is_none(),
+            "open should still defer the pg lock renew worker until a lock is held"
+        );
+
+        engine
+            .ensure_known_file_lock_monitoring()
+            .expect("start passive lock monitoring");
+        assert!(
+            engine
+                .lock_notify_handle
+                .lock()
+                .expect("lock notify handle after passive monitoring")
+                .is_some(),
+            "passive lock monitoring should start the pg lock notify listener"
+        );
+        assert!(
+            engine
+                .lock_renew_handle
+                .lock()
+                .expect("lock renew handle after passive monitoring")
+                .is_none(),
+            "passive lock monitoring should not eagerly start the pg lock renew worker"
+        );
+
+        let file = engine
+            .create_file(ROOT_INO, b"lazy-lock-workers.txt", 0, 0, 0o644)
+            .expect("create file");
+        let acquired = engine
+            .acquire_file_lock_lease(file.ino, HardLockKind::Exclusive, Duration::from_secs(2))
+            .expect("acquire lease");
+        assert!(matches!(acquired, FileLockLeaseAcquireOutcome::Acquired(_)));
+        assert!(
+            engine
+                .lock_notify_handle
+                .lock()
+                .expect("lock notify handle after acquire")
+                .is_some(),
+            "first lock usage should start the pg lock notify listener"
+        );
+        assert!(
+            engine
+                .lock_renew_handle
+                .lock()
+                .expect("lock renew handle after acquire")
+                .is_some(),
+            "first lock usage should start the pg lock renew worker"
         );
     }
 

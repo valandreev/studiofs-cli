@@ -14,6 +14,15 @@ struct TruncateMutation {
 
 impl StudioVfs {
     pub fn setattr(&self, ino: Ino, args: SetattrArgs) -> VfsResult<InodeAttr> {
+        self.setattr_with_handle(None, ino, args)
+    }
+
+    pub fn setattr_with_handle(
+        &self,
+        fh: Option<u64>,
+        ino: Ino,
+        args: SetattrArgs,
+    ) -> VfsResult<InodeAttr> {
         self.enforce_access(ino, AccessLevel::ReadWrite)?;
         if let Some(attr) = self.update_ignored_entry(ino, |attr| {
             if let Some(new_size) = args.size {
@@ -48,6 +57,11 @@ impl StudioVfs {
 
         let mut attr = self.getattr(ino)?;
         if args.size.is_some_and(|new_size| new_size != attr.size) {
+            if let Some(handle) = fh {
+                self.enforce_mutating_handle_access(handle, ino)?;
+            } else {
+                self.enforce_no_known_foreign_hard_lock(ino)?;
+            }
             return Self::run_sync_future(self.setattr_with_size_change(ino, args.clone()));
         }
 
@@ -911,6 +925,7 @@ impl StudioVfs {
 
         let meta = self.sync_meta();
         let unlink_target = self.resolve_unlink_target(&meta, parent, name)?;
+        self.enforce_no_known_foreign_hard_lock(unlink_target.ino)?;
         let Some(removed_ino) = (if unlink_target.open_handles > 0 {
             self.unlink_with_open_handles(&meta, parent, name, unlink_target)?
         } else {
@@ -993,6 +1008,7 @@ impl StudioVfs {
         if target_is_ignored {
             let source_entry = meta.lookup(parent, name)?;
             let source_attr = meta.get_attr(source_entry.ino)?;
+            self.enforce_no_known_foreign_hard_lock(source_entry.ino)?;
             let target_is_ignored_trash = self.ignored_dir_attr(new_parent).is_some()
                 && self.ignored_directory_has_probable_trash_ancestor(new_parent);
             if target_is_ignored_trash {
@@ -1018,6 +1034,13 @@ impl StudioVfs {
             }
             self.bump_namespace_for_parents([new_parent]);
             return self.unlink_inner(parent, name).await;
+        }
+        let source_entry = meta.lookup(parent, name)?;
+        self.enforce_no_known_foreign_hard_lock(source_entry.ino)?;
+        if let Ok(target_entry) = meta.lookup(new_parent, new_name)
+            && target_entry.ino != source_entry.ino
+        {
+            self.enforce_no_known_foreign_hard_lock(target_entry.ino)?;
         }
         let rename_result = meta.rename_atomic(parent, name, new_parent, new_name)?;
         namespace_mutations.record_rename(

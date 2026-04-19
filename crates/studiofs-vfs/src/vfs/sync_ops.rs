@@ -437,7 +437,7 @@ impl StudioVfs {
             .file_session
             .enter_op(ino, FileSessionOperation::Write)
             .await;
-        let open_file = self.handle_table.get(fh);
+        let open_file = self.enforce_mutating_handle_access(fh, ino).ok();
         let _ = self.state.read.observe_write_access(
             open_file.as_ref(),
             ino,
@@ -447,6 +447,7 @@ impl StudioVfs {
         );
         let result = async {
             self.enforce_access(ino, AccessLevel::ReadWrite)?;
+            self.enforce_mutating_handle_access(fh, ino)?;
             if data.is_empty() {
                 return Ok(0);
             }

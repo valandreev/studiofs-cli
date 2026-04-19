@@ -1408,6 +1408,7 @@ impl StudioFsContext {
 
     fn execute_file_size_callback(
         &self,
+        fh: u64,
         ino: Ino,
         action: FileSizeCallbackAction,
         file_info: &mut FileInfo,
@@ -1418,7 +1419,7 @@ impl StudioFsContext {
             }
             FileSizeCallbackAction::SetLogicalSize(new_size) => self
                 .vfs
-                .setattr(ino, SetattrArgs::size_only(new_size))
+                .setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(new_size))
                 .map_err(vfs_to_winfsp_err)?,
         };
         Self::write_file_info(file_info, &attr);
@@ -1988,6 +1989,7 @@ impl FileSystemContext for StudioFsContext {
         // flush barrier. Later reads/writes in the same open sequence depend on
         // size=0 being visible before the callback returns.
         self.execute_file_size_callback(
+            context.fh,
             context.ino,
             FileSizeCallbackAction::SetLogicalSize(0),
             file_info,
@@ -2049,6 +2051,7 @@ impl FileSystemContext for StudioFsContext {
         // without changing logical EOF. We don't track allocation size separately,
         // so treat allocation-size updates as a no-op for file length.
         self.execute_file_size_callback(
+            context.fh,
             context.ino,
             resolve_file_size_callback_action(new_size, set_allocation_size),
             file_info,
@@ -2279,14 +2282,15 @@ mod tests {
         vfs_to_winfsp_err, write_local_sync_policy_from_create_options,
     };
     use parking_lot::Mutex;
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::sync::Barrier;
     use studiofs_data::store::DataStoreConfig;
-    use studiofs_meta::MetaError;
     use studiofs_meta::{
-        CURRENT_FORMAT_VERSION, DirEntryValue, FileType, FormatInfo, InodeAttr, MetaFormat,
+        CURRENT_FORMAT_VERSION, DirEntryValue, FileType, FormatInfo, Ino, InodeAttr, MetaFormat,
         MetadataConfig, ROOT_INO, RedbMetaEngine, SetattrArgs, TimeSpec,
     };
+    use studiofs_meta::{FileLockLease, HardLockKind, MetaError};
     use studiofs_vfs::VfsError;
     use studiofs_vfs::{
         CacheSafetyMode, KernelInvalidator, LocalSyncPolicy, OpenFlags, StudioVfs, VfsConfig,
@@ -4044,5 +4048,88 @@ mod tests {
             build_notify_info(&overlong, studiofs_meta::FileType::RegularFile).is_none(),
             "WinFSP notify helper should skip overlong paths"
         );
+    }
+
+    fn foreign_exclusive_lock(ino: Ino) -> FileLockLease {
+        FileLockLease {
+            ino,
+            kind: HardLockKind::Exclusive,
+            generation: 1,
+            lease_expires_at_unix_ms: i64::MAX,
+            exclusive_owner: Some("client-slot:foreign".to_string()),
+            shared_owners: BTreeSet::new(),
+        }
+    }
+
+    fn empty_open_file_info() -> winfsp::filesystem::OpenFileInfo {
+        // SAFETY: WinFSP populates this output struct before the tests inspect it.
+        unsafe { std::mem::zeroed() }
+    }
+
+    #[test]
+    fn winfsp_open_blocks_write_access_but_keeps_read_access_under_foreign_hard_lock() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("foreign-lock-open");
+        let attr = vfs
+            .create(ROOT_INO, b"locked.txt", 0, 0, 0o644)
+            .expect("create file");
+        vfs.set_known_file_lock_for_test(attr.ino, Some(foreign_exclusive_lock(attr.ino)));
+
+        let path = U16CString::from_str("\\locked.txt").expect("utf16 path");
+
+        let mut read_info = empty_open_file_info();
+        let read_handle = <StudioFsContext as FileSystemContext>::open(
+            &ctx,
+            path.as_ucstr(),
+            0,
+            FILE_READ_DATA_ACCESS,
+            &mut read_info,
+        )
+        .expect("read-only peer open should still succeed");
+        assert_eq!(read_handle.open_flags.bits(), OpenFlags::RDONLY.bits());
+
+        let mut write_info = empty_open_file_info();
+        let err = match <StudioFsContext as FileSystemContext>::open(
+            &ctx,
+            path.as_ucstr(),
+            0,
+            FILE_GENERIC_WRITE_ACCESS,
+            &mut write_info,
+        ) {
+            Ok(_) => panic!("write-capable peer open should block under a foreign hard lock"),
+            Err(err) => err,
+        };
+        assert_eq!(err.to_ntstatus(), super::STATUS_UNSUCCESSFUL.0);
+    }
+
+    #[test]
+    fn winfsp_set_file_size_honors_grandfathered_writer_handle_after_lock_arrives() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("foreign-lock-grandfather");
+        let attr = vfs
+            .create(ROOT_INO, b"grow.txt", 0, 0, 0o644)
+            .expect("create file");
+        let path = U16CString::from_str("\\grow.txt").expect("utf16 path");
+        let mut open_info = empty_open_file_info();
+        let handle = <StudioFsContext as FileSystemContext>::open(
+            &ctx,
+            path.as_ucstr(),
+            0,
+            FILE_GENERIC_WRITE_ACCESS,
+            &mut open_info,
+        )
+        .expect("open writer before lock becomes known");
+
+        vfs.set_known_file_lock_for_test(attr.ino, Some(foreign_exclusive_lock(attr.ino)));
+
+        let mut file_info = winfsp::filesystem::FileInfo::default();
+        <StudioFsContext as FileSystemContext>::set_file_size(
+            &ctx,
+            &handle,
+            4,
+            false,
+            &mut file_info,
+        )
+        .expect("pre-lock writer handle should still be allowed to finish size changes");
+
+        assert_eq!(vfs.getattr(attr.ino).expect("getattr").size, 4);
     }
 }
