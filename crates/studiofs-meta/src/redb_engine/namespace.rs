@@ -47,6 +47,8 @@ impl MetaNamespace for RedbMetaEngine {
         let base_regular_file = txn
             .open_table(REGULAR_FILE_BASE_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let remote_filter_enabled =
+            Self::remote_namespace_visibility_filter_enabled_in_read_txn(&txn)?;
         let overlay_dentries =
             Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
         let key = encode_dentry_key(parent, name);
@@ -60,7 +62,8 @@ impl MetaNamespace for RedbMetaEngine {
         )?;
         let visible = match entry {
             Some(entry)
-                if overlay_dentries.contains(&key)
+                if !remote_filter_enabled
+                    || overlay_dentries.contains(&key)
                     || Self::remote_namespace_entry_visible_from_opened_tables(
                         &base_inodes,
                         &current_inodes,
@@ -106,6 +109,8 @@ impl MetaNamespace for RedbMetaEngine {
         let base_regular_file = txn
             .open_table(REGULAR_FILE_BASE_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let remote_filter_enabled =
+            Self::remote_namespace_visibility_filter_enabled_in_read_txn(&txn)?;
         let overlay_dentries =
             Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
 
@@ -119,7 +124,8 @@ impl MetaNamespace for RedbMetaEngine {
         let mut visible = Vec::with_capacity(merged.len());
         for entry in merged {
             let key = encode_dentry_key(parent, &entry.name);
-            if overlay_dentries.contains(&key)
+            if !remote_filter_enabled
+                || overlay_dentries.contains(&key)
                 || Self::remote_namespace_entry_visible_from_opened_tables(
                     &base_inodes,
                     &current_inodes,

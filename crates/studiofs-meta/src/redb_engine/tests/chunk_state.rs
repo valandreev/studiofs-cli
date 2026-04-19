@@ -1175,7 +1175,7 @@ fn redb_manifest_publish_sets_committed_head() {
 
     let snapshot = engine.export_remote_snapshot().unwrap();
     let remote = temp_engine();
-    remote.import_snapshot(&snapshot).unwrap();
+    remote.import_remote_snapshot(&snapshot).unwrap();
     let remote_attr = remote.get_attr(file.ino).unwrap();
     assert_eq!(remote_attr.size, block_size + 4096);
     assert_eq!(remote_attr.committed_size, block_size + 4096);

@@ -1,6 +1,66 @@
 use super::*;
 
 impl RedbMetaEngine {
+    pub fn set_remote_namespace_visibility_filter(&self, enabled: bool) -> MetaResult<()> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Self::set_remote_namespace_visibility_filter_in_txn(&txn, enabled)?;
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    pub(super) fn remote_namespace_visibility_filter_enabled_in_read_txn(
+        txn: &redb::ReadTransaction,
+    ) -> MetaResult<bool> {
+        let settings = txn
+            .open_table(SETTINGS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(settings
+            .get(REMOTE_NAMESPACE_VISIBILITY_FILTER_SETTING)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .is_some())
+    }
+
+    pub(super) fn remote_namespace_visibility_filter_enabled_in_write_txn(
+        txn: &redb::WriteTransaction,
+    ) -> MetaResult<bool> {
+        let settings = txn
+            .open_table(SETTINGS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(settings
+            .get(REMOTE_NAMESPACE_VISIBILITY_FILTER_SETTING)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+            .is_some())
+    }
+
+    pub(super) fn set_remote_namespace_visibility_filter_in_txn(
+        txn: &redb::WriteTransaction,
+        enabled: bool,
+    ) -> MetaResult<()> {
+        let mut settings = txn
+            .open_table(SETTINGS_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        if enabled {
+            let enabled_value = [1_u8];
+            settings
+                .insert(
+                    REMOTE_NAMESPACE_VISIBILITY_FILTER_SETTING,
+                    enabled_value.as_slice(),
+                )
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+        } else {
+            let _ = settings.remove(REMOTE_NAMESPACE_VISIBILITY_FILTER_SETTING);
+        }
+        Ok(())
+    }
+
+    pub(super) fn regular_file_remote_visible_without_published_base(attr: &InodeAttr) -> bool {
+        attr.committed_size > 0 || attr.committed_content_epoch > 0
+    }
+
     fn names_equal_case_insensitive(left: &[u8], right: &[u8], right_lower: &str) -> bool {
         if left.eq_ignore_ascii_case(right) {
             return true;
@@ -219,13 +279,13 @@ impl RedbMetaEngine {
             Err(err) => return Err(err),
         };
 
-        let has_published_base = attr.committed_size > 0
-            || attr.committed_content_epoch > 0
-            || Self::regular_file_has_published_base_from_opened_table(
-                base_regular_file,
-                entry.ino,
-            )?;
-        Ok(has_published_base)
+        let visible_in_remote_namespace =
+            Self::regular_file_remote_visible_without_published_base(&attr)
+                || Self::regular_file_has_published_base_from_opened_table(
+                    base_regular_file,
+                    entry.ino,
+                )?;
+        Ok(visible_in_remote_namespace)
     }
 
     pub(super) fn readdir_merged_from_opened_tables<TBase, TCurrent, TTombstones>(
@@ -465,6 +525,20 @@ impl RedbMetaEngine {
         let tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let overlay_dentries =
+            Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
+        let key = encode_dentry_key(parent, name);
+        let entry = Self::lookup_merged_from_opened_tables(
+            &base,
+            &current,
+            &tombstones,
+            parent,
+            name,
+            &overlay_dentries,
+        )?;
+        if !Self::remote_namespace_visibility_filter_enabled_in_write_txn(txn)? {
+            return Ok(entry);
+        }
         let current_inodes = txn
             .open_table(INODES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -477,17 +551,6 @@ impl RedbMetaEngine {
         let base_regular_file = txn
             .open_table(REGULAR_FILE_BASE_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let overlay_dentries =
-            Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
-        let key = encode_dentry_key(parent, name);
-        let entry = Self::lookup_merged_from_opened_tables(
-            &base,
-            &current,
-            &tombstones,
-            parent,
-            name,
-            &overlay_dentries,
-        )?;
         Ok(match entry {
             Some(entry)
                 if overlay_dentries.contains(&key)
@@ -535,6 +598,18 @@ impl RedbMetaEngine {
         let tombstones = txn
             .open_table(DENTRY_TOMBSTONES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let overlay_dentries =
+            Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
+        let merged = Self::readdir_merged_from_opened_tables(
+            &base,
+            &current,
+            &tombstones,
+            parent,
+            &overlay_dentries,
+        )?;
+        if !Self::remote_namespace_visibility_filter_enabled_in_write_txn(txn)? {
+            return Ok(merged);
+        }
         let current_inodes = txn
             .open_table(INODES_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -547,15 +622,6 @@ impl RedbMetaEngine {
         let base_regular_file = txn
             .open_table(REGULAR_FILE_BASE_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let overlay_dentries =
-            Self::collect_overlay_dentries_from_tables(&current, &base, &tombstones)?;
-        let merged = Self::readdir_merged_from_opened_tables(
-            &base,
-            &current,
-            &tombstones,
-            parent,
-            &overlay_dentries,
-        )?;
         let mut visible = Vec::with_capacity(merged.len());
         for entry in merged {
             let key = encode_dentry_key(parent, &entry.name);

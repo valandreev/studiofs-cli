@@ -1504,6 +1504,7 @@ impl PgMetaEngine {
                 "PgMetaEngine open requested for non-Postgres volume".to_string(),
             ));
         }
+        local.set_remote_namespace_visibility_filter(true)?;
 
         let pg = info.metadata.postgres.ok_or_else(|| {
             MetaError::Storage("missing metadata.postgres config for Postgres backend".to_string())
@@ -2272,7 +2273,7 @@ impl PgMetaEngine {
         let bytes: Vec<u8> = row.get(1);
 
         let snapshot = Self::decode_snapshot(&bytes)?;
-        self.local.import_snapshot(&snapshot)?;
+        self.local.import_remote_snapshot(&snapshot)?;
         self.persist_local_version(version)?;
         Ok(true)
     }
@@ -4236,6 +4237,9 @@ mod tests {
                 1,
             ))
             .expect("set local format info");
+        local
+            .set_remote_namespace_visibility_filter(true)
+            .expect("enable remote namespace visibility filter");
         let flushed_event_seq = local.get_counter("nextEventSeq").expect("nextEventSeq");
 
         let engine = PgMetaEngine {

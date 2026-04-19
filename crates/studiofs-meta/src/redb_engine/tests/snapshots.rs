@@ -316,6 +316,33 @@ fn test_import_snapshot_rebuilds_pending_compaction_rows() {
 }
 
 #[test]
+fn test_import_snapshot_keeps_unpublished_regular_file_visible() {
+    let source = temp_engine();
+    let file = source
+        .create_file(ROOT_INO, b"snapshot-local-only.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = source.get_attr(file.ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    source.set_attr(&attr).unwrap();
+    let block = BlockRef::new_partial(40_001, 4096);
+    source.set_file_block(file.ino, 0, &block).unwrap();
+
+    let snapshot = source.export_snapshot().unwrap();
+    let imported = temp_engine();
+    imported.import_snapshot(&snapshot).unwrap();
+
+    let imported_file = imported.lookup(ROOT_INO, b"snapshot-local-only.bin").unwrap();
+    assert_eq!(imported_file.ino, file.ino);
+    let imported_attr = imported.get_attr(imported_file.ino).unwrap();
+    assert_eq!(imported_attr.size, 4096);
+    assert_eq!(imported_attr.committed_size, 0);
+    assert_eq!(imported_attr.upload_state, UploadState::Uploading);
+    let imported_block = imported.get_file_block(imported_file.ino, 0).unwrap().unwrap();
+    assert_eq!(imported_block.object_id, block.object_id);
+}
+
+#[test]
 fn test_redb_snapshot_defaults_missing_regular_file_fields() {
     let snapshot_json = r#"{
         "settings": [],

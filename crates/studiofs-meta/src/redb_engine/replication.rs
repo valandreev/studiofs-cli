@@ -20,10 +20,10 @@ impl RedbMetaEngine {
         for (ino, bytes) in snapshot.inodes.drain(..) {
             let mut attr: InodeAttr = decode(&bytes)?;
             if attr.kind == FileType::RegularFile {
-                let has_published_base = attr.committed_size > 0
-                    || attr.committed_content_epoch > 0
-                    || published_regular_inodes.contains(&ino);
-                if !has_published_base {
+                let visible_in_remote_namespace =
+                    Self::regular_file_remote_visible_without_published_base(&attr)
+                        || published_regular_inodes.contains(&ino);
+                if !visible_in_remote_namespace {
                     hidden_regular_inodes.insert(ino);
                     continue;
                 }

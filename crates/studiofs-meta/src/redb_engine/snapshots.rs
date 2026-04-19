@@ -227,6 +227,18 @@ impl RedbMetaEngine {
     }
 
     pub fn import_snapshot(&self, snapshot: &RedbSnapshot) -> MetaResult<()> {
+        self.import_snapshot_with_namespace_mode(snapshot, false)
+    }
+
+    pub fn import_remote_snapshot(&self, snapshot: &RedbSnapshot) -> MetaResult<()> {
+        self.import_snapshot_with_namespace_mode(snapshot, true)
+    }
+
+    fn import_snapshot_with_namespace_mode(
+        &self,
+        snapshot: &RedbSnapshot,
+        enable_remote_namespace_filter: bool,
+    ) -> MetaResult<()> {
         let txn = self
             .db
             .begin_write()
@@ -248,6 +260,7 @@ impl RedbMetaEngine {
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
         }
+        Self::set_remote_namespace_visibility_filter_in_txn(&txn, enable_remote_namespace_filter)?;
         {
             let mut table = txn
                 .open_table(COUNTERS_TABLE)

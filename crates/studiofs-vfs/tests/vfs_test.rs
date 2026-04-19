@@ -972,7 +972,7 @@ fn import_remote_snapshot(
         .export_remote_snapshot()
         .expect("export remote snapshot");
     target
-        .import_snapshot(&snapshot)
+        .import_remote_snapshot(&snapshot)
         .expect("import remote snapshot");
     target
         .set_format_info(format_info)
