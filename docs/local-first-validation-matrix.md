@@ -1,46 +1,67 @@
-# Local-First Validation Matrix
+# Canonical Local-First Validation Matrix
 
-This document is the focused validation and benchmark matrix for `SFS-253`
-under the `SFS-242` rewrite umbrella.
+This document is the validation entrypoint for `SFS-270` under the
+`SFS-263` production follow-up sprint.
 
 Use it together with the canonical rewrite contract in
 [docs/juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
-The goal is to prove that StudioFS meets its own Local-First and eventual
-consistency contract while borrowing performance-relevant ideas from JuiceFS.
-It is not a literal 1:1 JuiceFS parity checklist.
+The goal is to lock the 2026-04-19 Fast Local Authority contract with one
+obvious place to verify:
+
+- fast/local contract gates that do not require live PostgreSQL or S3
+- local-offline replay and durability gates
+- infra-backed distributed visibility and lock-lease gates
+- platform bridge smoke checks when callback sequencing changes
+
+This is not a literal 1:1 JuiceFS parity checklist. It is the focused StudioFS
+contract matrix that should be consulted before future rewrites, semantics
+changes, or performance work.
 
 ## How To Use This Matrix
 
-1. Run the focused automated checks for the scenario you changed.
-2. Run the benchmark recipe that matches the performance-sensitive path you
-   touched.
-3. After the targeted matrix passes, ask an operator to run the larger manual
-   validation commands in the last section.
+1. Start with the fast/local rows that match the contract rule you changed.
+2. Add the local-offline rows when the change touches queued uploads, replay,
+   or S3-unavailable behavior.
+3. Add the infra-backed rows when the change touches PostgreSQL, peer
+   visibility, shared lock leases, or remote apply.
+4. Run the platform bridge matrix when callback sequencing or mounted I/O
+   behavior changed.
+5. After the targeted matrix passes, ask an operator to run the broader
+   workspace commands from [docs/tests.md](./tests.md) when the change is wider
+   than the focused contract surface.
 
-Ignored integration tests in this matrix should be run with
-`--test-threads=1` when they require S3, PostgreSQL, or real mount drivers.
+Ignored tests in this matrix should be run with `--test-threads=1` when they
+require live PostgreSQL, S3, or real mount drivers.
 
-## Focused Automated Scenario Matrix
+## Fast / Local Contract Matrix
 
-Some rows mix `studiofs-vfs` integration tests from `--test vfs_test` with
-library unit tests from `src/`. That is intentional: only the integration-test
-commands use `--test vfs_test`; library unit-test commands run as plain
-`cargo test -p studiofs-vfs <filter>`.
+Some rows intentionally mix `studiofs-vfs` integration tests from
+`--test vfs_test` with fast unit tests from `src/`. Integration-test commands
+use `--test vfs_test`; library unit-test commands run as plain
+`cargo test -p <crate> <filter>`.
 
 | Scenario | Contract focus | Primary checks | Focused commands |
 |---|---|---|---|
-| Append | write success immediately establishes same-mount visibility and durable local unpublished state | `append_after_create_is_locally_durable_without_flush` | `cargo test -p studiofs-vfs --test vfs_test append_after_create_is_locally_durable_without_flush -- --nocapture` |
-| Overwrite | newer local unpublished data must outrank published state on the writing mount | `overwrite_of_published_file_is_locally_readable_without_flush` | `cargo test -p studiofs-vfs --test vfs_test overwrite_of_published_file_is_locally_readable_without_flush -- --nocapture` |
-| Sparse write | uncovered gaps read as zeroes; sparse ranges do not corrupt committed payload | `test_sparse_write_at_high_offset`; `test_read_spanning_allocated_and_sparse_blocks` | `cargo test -p studiofs-vfs --test vfs_test test_sparse_write_at_high_offset -- --ignored --nocapture --test-threads=1`<br>`cargo test -p studiofs-vfs --test vfs_test test_read_spanning_allocated_and_sparse_blocks -- --ignored --nocapture --test-threads=1` |
-| Truncate | local unpublished EOF changes must be visible immediately without advancing published size early | `truncate_of_published_file_keeps_committed_size_and_pending_incarnation`; `test_truncate_shrink_then_extend_zero_fills_old_tail` | `cargo test -p studiofs-vfs --test vfs_test truncate_of_published_file_keeps_committed_size_and_pending_incarnation -- --nocapture`<br>`cargo test -p studiofs-vfs --test vfs_test test_truncate_shrink_then_extend_zero_fills_old_tail -- --ignored --nocapture --test-threads=1` |
-| Flush | `flush` is a local-durability barrier, not a remote publication barrier | `flush_with_offline_s3_keeps_data_locally_committed_and_queued` | `cargo test -p studiofs-vfs --test vfs_test flush_with_offline_s3_keeps_data_locally_committed_and_queued -- --nocapture` |
-| Fsync | `fsync` persists current local state even when remote upload is still pending | `test_fsync` | `cargo test -p studiofs-vfs --test vfs_test test_fsync -- --ignored --nocapture --test-threads=1` |
-| Close / release | last-handle release owns the fallback local-durability barrier; clean close stays observational | `close_after_explicit_flush_becomes_clean_release`; `close_owns_deferred_fallback_barrier_on_last_handle_release` | `cargo test -p studiofs-vfs close_after_explicit_flush_becomes_clean_release -- --nocapture`<br>`cargo test -p studiofs-vfs close_owns_deferred_fallback_barrier_on_last_handle_release -- --nocapture` |
-| Local read-your-writes | foreground reads must keep returning accepted bytes even when S3 is offline or upload is in flight | `offline_s3_does_not_break_local_read_after_write` | `cargo test -p studiofs-vfs --test vfs_test offline_s3_does_not_break_local_read_after_write -- --nocapture` |
-| Eventual remote visibility | other peers must switch visibility atomically at publish time rather than block-by-block | `test_pg_publish_switch_is_atomic_across_peers` | `cargo test -p studiofs-meta test_pg_publish_switch_is_atomic_across_peers -- --ignored --nocapture --test-threads=1` |
-| Cache warm / cold reads | cold local reads stay correct; repeated reads warm the fast path and remain bounded | `warm_cache_sequential_read_bounded_latency_after_write`; `committed_random_unaligned_reads_match_payload_after_publish_and_cold_reopen` | `cargo test -p studiofs-vfs --test vfs_test warm_cache_sequential_read_bounded_latency_after_write -- --nocapture`<br>`cargo test -p studiofs-vfs --test vfs_test committed_random_unaligned_reads_match_payload_after_publish_and_cold_reopen -- --ignored --nocapture --test-threads=1` |
-| Readahead / prefetch | sequential and random readers must remain classified separately; prefetch ramps up only after the intended threshold | `handle_aware_read_policy_keeps_sequential_and_random_streams_separate`; `test_prefetch_after_threshold`; `test_random_seek_scales_back_to_base_width` | `cargo test -p studiofs-vfs --test vfs_test handle_aware_read_policy_keeps_sequential_and_random_streams_separate -- --nocapture`<br>`cargo test -p studiofs-vfs test_prefetch_after_threshold -- --nocapture`<br>`cargo test -p studiofs-vfs test_random_seek_scales_back_to_base_width -- --nocapture` |
-| Writeback-heavy foreground QoS | sequential reads must stay useful while background upload is active and recover after upload drains | `foreground_read_baseline_during_and_post_upload_are_comparable`; `sequential_foreground_read_throughput_during_upload_meets_minimum` | `cargo test -p studiofs-vfs --test vfs_test foreground_read_baseline_during_and_post_upload_are_comparable -- --ignored --nocapture --test-threads=1`<br>`cargo test -p studiofs-vfs --test vfs_test sequential_foreground_read_throughput_during_upload_meets_minimum -- --ignored --nocapture --test-threads=1` |
+| Explicit `flush` and last-handle release barriers | `flush` is a local-durability barrier, and the last-handle release path owns the fallback barrier without pulling PG/S3 into the foreground | `flush_fh_enforces_strict_local_durability_in_single_mode`; `release_fh_enforces_strict_local_durability_on_last_handle`; `close_after_explicit_flush_becomes_clean_release` | `cargo test -p studiofs-vfs flush_fh_enforces_strict_local_durability_in_single_mode -- --nocapture`<br>`cargo test -p studiofs-vfs release_fh_enforces_strict_local_durability_on_last_handle -- --nocapture`<br>`cargo test -p studiofs-vfs close_after_explicit_flush_becomes_clean_release -- --nocapture` |
+| `fsync` as the strict caller-requested local crash-safe boundary | `fsync` must persist current local state without implying remote publication | `strict_local_sync_flushes_pending_group_commit_bytes`; `test_fsync_with_outcome_materializes_pending_inode_dirty_state`; `test_fsync_with_outcome_reports_handle_writer_file_data_barrier` | `cargo test -p studiofs-vfs strict_local_sync_flushes_pending_group_commit_bytes -- --nocapture`<br>`cargo test -p studiofs-vfs test_fsync_with_outcome_materializes_pending_inode_dirty_state -- --nocapture`<br>`cargo test -p studiofs-vfs test_fsync_with_outcome_reports_handle_writer_file_data_barrier -- --nocapture` |
+| Known foreign hard locks | peers may open read-only, grandfathered writers may finish, and new conflicting size / namespace mutations must block | `foreign_hard_lock_blocks_new_write_open_but_allows_readonly_open`; `existing_writer_handle_remains_usable_after_foreign_hard_lock_becomes_known`; `foreign_hard_lock_blocks_size_change_setattr_without_handle`; `foreign_hard_lock_blocks_unlink_and_rename` | `cargo test -p studiofs-vfs foreign_hard_lock_blocks_new_write_open_but_allows_readonly_open -- --nocapture`<br>`cargo test -p studiofs-vfs existing_writer_handle_remains_usable_after_foreign_hard_lock_becomes_known -- --nocapture`<br>`cargo test -p studiofs-vfs foreign_hard_lock_blocks_size_change_setattr_without_handle -- --nocapture`<br>`cargo test -p studiofs-vfs foreign_hard_lock_blocks_unlink_and_rename -- --nocapture` |
+| PG disconnect headroom exhaustion and read-only degradation | new mutations stop once local headroom is exhausted, while known readable state stays available | `read_only_metadata_authority_blocks_new_mutations_but_keeps_reads_open`; `next_inode_reports_read_only_headroom_once_slot_limit_is_exhausted`; `open_with_persisted_slot_and_ranges_survives_pg_unavailable` | `cargo test -p studiofs-vfs read_only_metadata_authority_blocks_new_mutations_but_keeps_reads_open -- --nocapture`<br>`cargo test -p studiofs-meta next_inode_reports_read_only_headroom_once_slot_limit_is_exhausted -- --nocapture`<br>`cargo test -p studiofs-meta open_with_persisted_slot_and_ranges_survives_pg_unavailable -- --nocapture` |
+| Local-only durability and replay while S3 is unavailable | accepted bytes stay readable locally, queued uploads replay after restart, and reconnect replay keeps only the live state | `flush_with_offline_s3_keeps_data_locally_committed_and_queued`; `offline_s3_does_not_break_local_read_after_write`; `recovery_after_offline_s3_preserves_local_accepted_view`; `repeated_graceful_restarts_during_upload_replay_are_idempotent`; `restart_replays_only_live_pending_extents` | `cargo test -p studiofs-vfs --test vfs_test flush_with_offline_s3_keeps_data_locally_committed_and_queued -- --nocapture`<br>`cargo test -p studiofs-vfs --test vfs_test offline_s3_does_not_break_local_read_after_write -- --nocapture`<br>`cargo test -p studiofs-vfs --test vfs_test recovery_after_offline_s3_preserves_local_accepted_view -- --nocapture`<br>`cargo test -p studiofs-vfs --test vfs_test repeated_graceful_restarts_during_upload_replay_are_idempotent -- --nocapture`<br>`cargo test -p studiofs-vfs --test vfs_test restart_replays_only_live_pending_extents -- --nocapture` |
+| Delete-before-publish orphan cleanup | unpublished deletes stay local, and orphaned payload is surfaced for later janitor cleanup instead of becoming peer-visible state | `zeroio_snapshot_reports_delete_before_publish_cleanup_visibility`; `zeroio_delete_before_publish_persists_tombstone_lifecycle` | `cargo test -p studiofs-vfs zeroio_snapshot_reports_delete_before_publish_cleanup_visibility -- --nocapture`<br>`cargo test -p studiofs-meta zeroio_delete_before_publish_persists_tombstone_lifecycle -- --nocapture` |
+
+## Infra-Backed Distributed Contract Matrix
+
+These checks require live PostgreSQL and/or S3 because they validate peer
+visibility, shared lease lifecycle, or mounted end-to-end behavior.
+
+| Scenario | Contract focus | Primary checks | Focused commands |
+|---|---|---|---|
+| PG-backed hard-lock lease lifecycle | PostgreSQL is the shared lock authority for grant, renewal, expiry, and NOTIFY-driven known-lock refresh | `test_pg_file_lock_lease_blocks_peer_until_release`; `test_pg_file_lock_lease_expires_for_peer`; `test_pg_file_lock_lease_renew_keeps_peer_blocked`; `test_pg_file_lock_known_state_refreshes_from_notify` | `cargo test -p studiofs-meta test_pg_file_lock_lease_blocks_peer_until_release -- --ignored --nocapture --test-threads=1`<br>`cargo test -p studiofs-meta test_pg_file_lock_lease_expires_for_peer -- --ignored --nocapture --test-threads=1`<br>`cargo test -p studiofs-meta test_pg_file_lock_lease_renew_keeps_peer_blocked -- --ignored --nocapture --test-threads=1`<br>`cargo test -p studiofs-meta test_pg_file_lock_known_state_refreshes_from_notify -- --ignored --nocapture --test-threads=1` |
+| Peer-visible lock enforcement | a remote peer must block on the lease while the holder still owns it | `pg_backed_flock_blocks_conflicting_peer_until_unlock` | `cargo test -p studiofs-vfs --test vfs_test pg_backed_flock_blocks_conflicting_peer_until_unlock -- --ignored --nocapture --test-threads=1` |
+| New-file first visibility and metadata-only publish apply | a new file stays hidden until its first complete version exists, and peers refresh attrs only after publish/apply | `remote_attr_cache_refreshes_after_nested_publish_sync`; `test_pg_nested_temp_rename_then_publish_visible_on_remote_peer` | `cargo test -p studiofs-vfs --test vfs_test remote_attr_cache_refreshes_after_nested_publish_sync -- --ignored --nocapture --test-threads=1`<br>`cargo test -p studiofs-meta test_pg_nested_temp_rename_then_publish_visible_on_remote_peer -- --ignored --nocapture --test-threads=1` |
+| S3 payload availability does not imply visibility | upload progress alone must not switch peer visibility, and published-file updates keep the previous committed version until the next complete publish | `upload_completion_batching_does_not_change_visibility_contract`; `remote_clients_keep_previous_committed_version_during_update`; `test_pg_publish_switch_is_atomic_across_peers`; `atomic_switch_to_new_incarnation_after_full_commit` | `cargo test -p studiofs-vfs --test vfs_test upload_completion_batching_does_not_change_visibility_contract -- --ignored --nocapture --test-threads=1`<br>`cargo test -p studiofs-vfs --test vfs_test remote_clients_keep_previous_committed_version_during_update -- --ignored --nocapture --test-threads=1`<br>`cargo test -p studiofs-meta test_pg_publish_switch_is_atomic_across_peers -- --ignored --nocapture --test-threads=1`<br>`cargo test -p studiofs-vfs --test vfs_test atomic_switch_to_new_incarnation_after_full_commit -- --ignored --nocapture --test-threads=1` |
+| Open-handle snapshot semantics across rename, overwrite, and delete | peers must converge to the right published inode/path view without exposing partial rename or delete states | `remote_snapshot_reads_nested_file_after_temp_rename_publish`; `remote_snapshot_switches_nested_overwrite_to_replacement_inode`; `test_pg_reopen_after_remote_rename_overwrite_recovers_without_discover`; `test_pg_reopen_after_publish_then_remote_unlink_recovers_without_discover` | `cargo test -p studiofs-vfs --test vfs_test remote_snapshot_reads_nested_file_after_temp_rename_publish -- --ignored --nocapture --test-threads=1`<br>`cargo test -p studiofs-vfs --test vfs_test remote_snapshot_switches_nested_overwrite_to_replacement_inode -- --ignored --nocapture --test-threads=1`<br>`cargo test -p studiofs-meta test_pg_reopen_after_remote_rename_overwrite_recovers_without_discover -- --ignored --nocapture --test-threads=1`<br>`cargo test -p studiofs-meta test_pg_reopen_after_publish_then_remote_unlink_recovers_without_discover -- --ignored --nocapture --test-threads=1` |
+| Known published reads while PG is unavailable | persisted local slot/range state must allow offline reopen without fabricating new shared truth, and already published blocks remain readable | `test_pg_remote_client_reads_committed_blocks_without_local_staged_mirror`; `open_with_persisted_slot_and_ranges_survives_pg_unavailable` | `cargo test -p studiofs-meta test_pg_remote_client_reads_committed_blocks_without_local_staged_mirror -- --ignored --nocapture --test-threads=1`<br>`cargo test -p studiofs-meta open_with_persisted_slot_and_ranges_survives_pg_unavailable -- --nocapture` |
 
 ### Local Cache Exhaustion Note
 
@@ -71,8 +92,9 @@ real mounted I/O behavior.
 
 ## Focused Benchmark Recipes
 
-These are the benchmark surfaces that matter most for `SFS-253`. Prefer these
-recipes over ad-hoc one-off runs so results stay comparable across machines.
+These are supplemental benchmark surfaces for the canonical contract. They are
+useful after the contract checks above stay green; they are not substitutes for
+the correctness-focused rows above.
 
 ### Sequential Write + Read Throughput
 
