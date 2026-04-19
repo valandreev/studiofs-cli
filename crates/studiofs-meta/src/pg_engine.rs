@@ -6053,7 +6053,7 @@ mod tests {
         a.set_file_block(file.ino, 0, &block)
             .expect("set staged block");
         assert!(
-            a.publish_file_manifest(file.ino, 1)
+            a.publish_file_manifest(file.ino, 2)
                 .expect("publish committed manifest")
         );
         a.flush_metadata().expect("flush a");
