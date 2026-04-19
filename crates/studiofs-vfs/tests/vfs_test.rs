@@ -39,9 +39,8 @@ use studiofs_meta::{
     types::{AccessLevel, BlockFlags, BlockRef, UploadState},
 };
 use studiofs_vfs::{
-    CacheSafetyMode, KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsConfigRaw,
-    VfsConfigValidated, VfsError, VfsForegroundReadProtectionStats, VfsIngressLane, VfsUploadState,
-    parse_size_bytes,
+    KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsConfigRaw, VfsConfigValidated, VfsError,
+    VfsForegroundReadProtectionStats, VfsIngressLane, VfsUploadState, parse_size_bytes,
 };
 use uuid::Uuid;
 
@@ -176,11 +175,7 @@ fn parse_env_f64(key: &str) -> Option<f64> {
 
 fn test_vfs_config_from_env() -> VfsConfigValidated {
     load_test_env();
-    // Keep existing integration tests on durable semantics unless overridden.
-    let mut config = VfsConfigRaw {
-        cache_safety_mode: Some(CacheSafetyMode::Durable),
-        ..VfsConfigRaw::default()
-    };
+    let mut config = VfsConfigRaw::default();
     if let Ok(v) = std::env::var("STUDIOFS_MAX_DIRTY_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
@@ -408,14 +403,6 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     }
     if let Some(value) = parse_env_usize("STUDIOFS_QOS_FETCH_SLOTS") {
         config.qos_fetch_slots = Some(value);
-    }
-    if let Ok(value) = std::env::var("STUDIOFS_CACHE_SAFETY_MODE") {
-        let value = value.trim().to_ascii_lowercase();
-        if value == "fast" {
-            config.cache_safety_mode = Some(CacheSafetyMode::Fast);
-        } else if value == "durable" {
-            config.cache_safety_mode = Some(CacheSafetyMode::Durable);
-        }
     }
     if let Some(value) = parse_env_usize("STUDIOFS_UPLOAD_WORKER_COUNT") {
         config.upload_worker_count = Some(value);
@@ -2228,7 +2215,6 @@ fn test_crash_recovery_replays_local_committed_block_before_metadata_flush() {
         rt.block_on(async {
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(8 * 1024 * 1024),
-                cache_safety_mode: Some(CacheSafetyMode::Durable),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -2281,7 +2267,6 @@ fn test_crash_recovery_replays_local_committed_block_before_metadata_flush() {
             let data_config_offline = DataStoreConfig::from(&offline_info);
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(8 * 1024 * 1024),
-                cache_safety_mode: Some(CacheSafetyMode::Durable),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -3978,7 +3963,6 @@ fn test_crash_recovery_replays_local_committed_block_before_remote_fetch() {
         rt.block_on(async {
             let online_vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(1),
-                cache_safety_mode: Some(CacheSafetyMode::Durable),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -4033,7 +4017,6 @@ fn test_crash_recovery_replays_local_committed_block_before_remote_fetch() {
         rt.block_on(async {
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(8 * 1024 * 1024),
-                cache_safety_mode: Some(CacheSafetyMode::Durable),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -4080,7 +4063,6 @@ fn test_crash_recovery_replays_local_committed_block_before_remote_fetch() {
         rt.block_on(async {
             let offline_vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(1),
-                cache_safety_mode: Some(CacheSafetyMode::Durable),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -7494,7 +7476,7 @@ fn test_ingress_prefers_spill_before_backpressure() {
 }
 
 #[test]
-fn test_cache_safety_mode_changes_ingress_write_path() {
+fn test_single_mode_ingress_write_path_materializes_local_blocks() {
     type EnvRestore = ScopedEnvVar;
     let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -7503,11 +7485,7 @@ fn test_cache_safety_mode_changes_ingress_write_path() {
         std::env::set_var("STUDIOFS_MAX_SPILL_BYTES", "16MB");
     }
 
-    fn build_vfs_with_mode(
-        tmp: &tempfile::TempDir,
-        volume_suffix: &str,
-        mode: CacheSafetyMode,
-    ) -> (Arc<StudioVfs>, Vec<u8>) {
+    fn build_vfs(tmp: &tempfile::TempDir, volume_suffix: &str) -> (Arc<StudioVfs>, Vec<u8>) {
         let db_path = tmp.path().join("meta.redb");
         let cache_dir = tmp.path().join("cache");
         let cache_dir_str = cache_dir.to_str().unwrap().to_string();
@@ -7517,9 +7495,7 @@ fn test_cache_safety_mode_changes_ingress_write_path() {
         meta.init_root(0, 0).unwrap();
         meta.set_format_info(&format_info).unwrap();
 
-        let mut base_raw: VfsConfigRaw = test_vfs_config_from_env().into_inner().into();
-        base_raw.cache_safety_mode = Some(mode);
-        let vfs_config = base_raw;
+        let vfs_config: VfsConfigRaw = test_vfs_config_from_env().into_inner().into();
         let vfs = StudioVfs::new(
             meta,
             &data_config,
@@ -7541,56 +7517,17 @@ fn test_cache_safety_mode_changes_ingress_write_path() {
         .build()
         .unwrap();
     rt.block_on(async {
-        let durable_tmp = tempfile::tempdir().unwrap();
-        let (durable_vfs, payload) = build_vfs_with_mode(
-            &durable_tmp,
-            &format!("mode-durable-{}", std::process::id()),
-            CacheSafetyMode::Durable,
-        );
-        let durable_attr = durable_vfs
-            .create(1, b"mode-durable.bin", 0, 0, 0o644)
-            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let (vfs, payload) = build_vfs(&tmp, &format!("single-mode-{}", std::process::id()));
+        let attr = vfs.create(1, b"single-mode.bin", 0, 0, 0o644).unwrap();
         assert_eq!(
-            durable_vfs.ingress_pressure_for(payload.len()).lane,
+            vfs.ingress_pressure_for(payload.len()).lane,
             VfsIngressLane::DirtyMem
         );
-        durable_vfs
-            .write(durable_attr.ino, 0, &payload)
-            .await
-            .unwrap();
-        durable_vfs.flush(durable_attr.ino).await.unwrap();
-        let _durable_stats = durable_vfs.ingress_stats();
-        assert_eq!(
-            durable_vfs
-                .meta()
-                .get_file_blocks(durable_attr.ino)
-                .unwrap()
-                .len(),
-            1
-        );
-
-        let fast_tmp = tempfile::tempdir().unwrap();
-        let (fast_vfs, payload) = build_vfs_with_mode(
-            &fast_tmp,
-            &format!("mode-fast-{}", std::process::id()),
-            CacheSafetyMode::Fast,
-        );
-        let fast_attr = fast_vfs.create(1, b"mode-fast.bin", 0, 0, 0o644).unwrap();
-        assert_eq!(
-            fast_vfs.ingress_pressure_for(payload.len()).lane,
-            VfsIngressLane::DirtyMem
-        );
-        fast_vfs.write(fast_attr.ino, 0, &payload).await.unwrap();
-        fast_vfs.flush(fast_attr.ino).await.unwrap();
-        let _fast_stats = fast_vfs.ingress_stats();
-        assert_eq!(
-            fast_vfs
-                .meta()
-                .get_file_blocks(fast_attr.ino)
-                .unwrap()
-                .len(),
-            1
-        );
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+        let _stats = vfs.ingress_stats();
+        assert_eq!(vfs.meta().get_file_blocks(attr.ino).unwrap().len(), 1);
     });
     rt.shutdown_background();
 }
@@ -7639,7 +7576,6 @@ fn test_write_fast_mode_no_spill_artifacts() {
         .unwrap();
     rt.block_on(async {
         let vfs_config = VfsConfigRaw {
-            cache_safety_mode: Some(CacheSafetyMode::Fast),
             max_dirty_bytes: Some(32 * 1024 * 1024),
             ..VfsConfigRaw::default()
         };
@@ -7889,7 +7825,6 @@ fn test_ingress_multi_writer_pressure_prefers_spill_without_wait() {
             ensure_bucket().await;
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(4 * 256 * 1024),
-                cache_safety_mode: Some(CacheSafetyMode::Durable),
                 slab_flush_interval_ms: Some(5000),
             ..VfsConfigRaw::default()
         };
@@ -7961,7 +7896,6 @@ fn test_ingress_multi_writer_spill_recovers_after_crash() {
         rt.block_on(async {
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(8 * 1024 * 1024),
-                cache_safety_mode: Some(CacheSafetyMode::Durable),
                 slab_flush_interval_ms: Some(5000),
                 ..VfsConfigRaw::default()
             };
@@ -8056,7 +7990,6 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
         rt.block_on(async {
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(1),
-                cache_safety_mode: Some(CacheSafetyMode::Durable),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -8115,7 +8048,6 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
         rt.block_on(async {
             let vfs_config = VfsConfigRaw {
                 max_dirty_bytes: Some(1),
-                cache_safety_mode: Some(CacheSafetyMode::Durable),
                 ..VfsConfigRaw::default()
             };
             let vfs = StudioVfs::new(
@@ -12308,7 +12240,7 @@ async fn zeroio_shutdown_snapshot_uses_runtime_dir_without_ingress_spill() {
 }
 
 #[test]
-fn zeroio_fast_mode_removes_retired_ingress_spill_on_startup() {
+fn zeroio_startup_removes_retired_ingress_spill_on_startup() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     unsafe {
         std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
@@ -12335,25 +12267,22 @@ fn zeroio_fast_mode_removes_retired_ingress_spill_on_startup() {
         &db_path,
         &cache_dir_str,
         &format_info,
-        VfsConfigRaw {
-            cache_safety_mode: Some(CacheSafetyMode::Fast),
-            ..VfsConfigRaw::default()
-        }
-        .validate()
-        .expect("fast config should validate"),
+        VfsConfigRaw::default()
+            .validate()
+            .expect("default config should validate"),
     )
     .2;
 
     assert!(
         !legacy_spill_dir.exists(),
-        "fast-mode startup should delete unsupported ingress_spill layouts instead of leaving disk garbage behind"
+        "startup should delete unsupported ingress_spill layouts instead of leaving disk garbage behind"
     );
 
     drop(vfs);
 }
 
 #[test]
-fn zeroio_durable_mode_removes_retired_ingress_spill_on_startup() {
+fn zeroio_direct_studiovfs_new_removes_retired_ingress_spill_on_startup() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     unsafe {
         std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
@@ -12387,20 +12316,17 @@ fn zeroio_durable_mode_removes_retired_ingress_spill_on_startup() {
         &cache_dir_str,
         16 * 1024 * 1024,
         16 * 1024 * 1024,
-        VfsConfigRaw {
-            cache_safety_mode: Some(CacheSafetyMode::Durable),
-            ..VfsConfigRaw::default()
-        }
-        .validate()
-        .expect("durable config should validate"),
+        VfsConfigRaw::default()
+            .validate()
+            .expect("default config should validate"),
     )
     .expect(
-        "durable startup should delete unsupported ingress_spill layouts instead of refusing the mount",
+        "startup should delete unsupported ingress_spill layouts instead of refusing the mount",
     );
 
     assert!(
         !legacy_spill_dir.exists(),
-        "durable startup should remove retired ingress_spill directories after provisioning the active runtime"
+        "startup should remove retired ingress_spill directories after provisioning the active runtime"
     );
 
     drop(vfs);

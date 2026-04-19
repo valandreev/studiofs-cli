@@ -96,9 +96,11 @@ Handle-aware write path:
 - `flush_fh()` runs the foreground local materialization step for the inode and
   then surfaces any sticky async-upload error for that inode.
 - The canonical mount contract is single-mode Fast Local Authority: ordinary
-  `flush()` / `close()` stop at local materialization, while `fsync()` remains
-  the explicit strict local-durability request. Historical
-  `cache_safety_mode=fast|durable` code paths are transitional only.
+  `flush()` and last-handle `close()` / `release()` become strict local
+  crash-safe durability barriers whenever dirty unpublished state remains.
+  `fsync()` remains the explicit caller-requested strict local-durability API,
+  but it is no longer the only callback path that reaches that boundary. The
+  legacy `cache_safety_mode=fast|durable` knob has been removed.
 - Foreground backpressure is driven by local dirty-state pressure; upload
   backlog alone does not stall writes.
 
@@ -110,7 +112,7 @@ dirty local state for this inode
   ├─ Take a point-in-time snapshot of accepted bytes
   ├─ Reserve/reuse per-block object IDs
   ├─ local backend `put(...)` committed payloads locally
-  ├─ local backend `sync_data()` for the explicit strict local sync boundary requested by `fsync()`
+  ├─ local backend `sync_data()` for explicit `flush()`, `fsync()`, or last-handle `close()` / `release()` when dirty unpublished state remains
   ├─ Persist local unpublished slices + attrs in metadata
   └─ Enqueue uploads for the committed payloads
 ```
@@ -118,8 +120,10 @@ dirty local state for this inode
 Local durability notes:
 - Accepted bytes stay in local dirty state until the local backend ->
   metadata sequence succeeds.
-- `fsync()` is the explicit API that additionally demands the strict local
-  `sync_data()` boundary.
+- `fsync()` is the explicit API that requests the strict local `sync_data()`
+  boundary directly, but explicit `flush()` and last-handle
+  `close()` / `release()` also reach that boundary when dirty unpublished
+  state still exists.
 - Reserved object IDs make retrying the same dirty block idempotent across
   metadata failures.
 - Historical `ingress_spill` directories are outside the active Local-First

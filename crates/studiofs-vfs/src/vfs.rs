@@ -51,8 +51,8 @@ mod upload_lifecycle;
 mod workers;
 
 pub use config::{
-    CacheSafetyMode, ExplicitFlushOutcome, LocalSyncPolicy, ReleaseFhOutcome, VfsConfig,
-    VfsConfigRaw, VfsConfigValidated,
+    ExplicitFlushOutcome, LocalSyncPolicy, ReleaseFhOutcome, VfsConfig, VfsConfigRaw,
+    VfsConfigValidated,
 };
 pub use file_session::{OpenFile, OpenFlags, VfsFileSessionStats};
 pub use handle_drain_barrier::{
@@ -84,7 +84,7 @@ use config::{
     CACHE_RUNTIME_MAX_TRANSIT_BUDGET_BYTES, CACHE_RUNTIME_MAX_WRITE_EAGER_BATCH_BYTES,
     CACHE_RUNTIME_MIN_TRANSIT_BUDGET_BYTES, CACHE_RUNTIME_MIN_WRITE_EAGER_BATCH_BYTES,
     CACHE_RUNTIME_SMALL_BUDGET_BYTES, CacheRuntimeTuningOverrides, DeletedInodeCleanup,
-    DirtyAttrPersistPolicy, FAST_MODE_SYNC_GROUP_MAX_DELAY_MS, FAST_MODE_SYNC_GROUP_MIN_BYTES_CEIL,
+    DirtyAttrPersistPolicy, FAST_MODE_SYNC_GROUP_MIN_BYTES_CEIL,
     FAST_MODE_SYNC_GROUP_MIN_BYTES_FLOOR, FsyncOutcome, HandleReleaseContext,
     LastHandleReleaseAction, LocalSyncBarrierOutcome, PAYLOAD_PUT_CONCURRENCY_MAX,
     PAYLOAD_PUT_CONCURRENCY_TARGET_BYTES, StickyErrorPolicy, UnlinkTarget,
@@ -2180,12 +2180,8 @@ pub struct StudioVfs {
     write_eager_flush_drain_chunk_bytes: usize,
     /// Bounded local payload-put concurrency for one eager drain.
     payload_put_concurrency: usize,
-    /// Configured local cache safety mode for write-path durability behavior.
-    cache_safety_mode: CacheSafetyMode,
     /// Fast-mode group-commit minimum bytes before forcing local sync.
     local_sync_group_min_bytes: u64,
-    /// Fast-mode group-commit maximum delay before forcing local sync.
-    local_sync_group_max_delay: Duration,
     /// Maximum bytes allowed for a single xattr value.
     max_xattr_bytes: usize,
     zeroio_runtime_state_dir: PathBuf,
@@ -2786,10 +2782,6 @@ struct PendingUploadTruthRebuildResult {
 }
 
 impl StudioVfs {
-    pub fn cache_safety_mode(&self) -> CacheSafetyMode {
-        self.cache_safety_mode
-    }
-
     fn filter_runtime_pending_uploads_to_dirty_index(
         &self,
         runtime_pending_uploads: Vec<PendingUpload>,
@@ -4913,12 +4905,9 @@ impl StudioVfs {
                 .saturating_add(persisted_bytes);
 
             let trigger = write_path_sync_trigger(
-                self.cache_safety_mode,
                 local_sync_policy,
                 local_sync_group.pending_bytes,
-                local_sync_group.last_sync_at.elapsed(),
                 self.local_sync_group_min_bytes,
-                self.local_sync_group_max_delay,
             );
             if trigger.is_none() {
                 if local_sync_group.pending_bytes > 0 {
@@ -4937,12 +4926,9 @@ impl StudioVfs {
         let bytes_to_sync = {
             let mut local_sync_group = self.state.local_dirty.local_sync_group.lock().await;
             let trigger = write_path_sync_trigger(
-                self.cache_safety_mode,
                 local_sync_policy,
                 local_sync_group.pending_bytes,
-                local_sync_group.last_sync_at.elapsed(),
                 self.local_sync_group_min_bytes,
-                self.local_sync_group_max_delay,
             );
             if trigger.is_none() {
                 if local_sync_group.pending_bytes > 0 {
@@ -6493,7 +6479,6 @@ impl StudioVfs {
                 eager_flush_drain_chunk_bytes: self.write_eager_flush_drain_chunk_bytes,
                 payload_put_concurrency: self.payload_put_concurrency,
                 sync_group_min_bytes: self.local_sync_group_min_bytes,
-                sync_group_max_delay_ms: self.local_sync_group_max_delay.as_millis() as u64,
             },
         }
     }

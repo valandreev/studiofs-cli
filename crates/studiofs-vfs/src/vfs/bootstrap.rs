@@ -21,7 +21,6 @@ pub(super) struct VfsBootstrapPlan {
     write_eager_flush_drain_chunk_bytes: usize,
     payload_put_concurrency: usize,
     local_sync_group_min_bytes: u64,
-    local_sync_group_max_delay: Duration,
     upload_cache_io_foreground_cost_base: u32,
     upload_cache_io_foreground_cost_step: u32,
     upload_fg_read_latency_target_ns: u64,
@@ -34,7 +33,6 @@ pub(super) struct VfsBootstrapPlan {
     metadata_invalidation_sync_interval: Duration,
     max_xattr_bytes: usize,
     effective_acl_cache_capacity: usize,
-    cache_safety_mode: CacheSafetyMode,
     acl_principal: String,
     upload_delay: Duration,
     upload_requeue_base: Duration,
@@ -124,11 +122,7 @@ impl VfsBootstrapPlan {
             cache_runtime_tuning,
             minimum_local_backend_budget_bytes,
             local_backend_budget_bytes,
-            payload_sync_mode: if matches!(config.cache_safety_mode, CacheSafetyMode::Durable) {
-                LocalBlockPayloadSyncMode::Durable
-            } else {
-                LocalBlockPayloadSyncMode::Fast
-            },
+            payload_sync_mode: LocalBlockPayloadSyncMode::Fast,
             access_tracker,
             readahead_base_width,
             readahead_max_width,
@@ -140,7 +134,6 @@ impl VfsBootstrapPlan {
             write_eager_flush_drain_chunk_bytes,
             payload_put_concurrency,
             local_sync_group_min_bytes,
-            local_sync_group_max_delay: Duration::from_millis(FAST_MODE_SYNC_GROUP_MAX_DELAY_MS),
             upload_cache_io_foreground_cost_base,
             upload_cache_io_foreground_cost_step,
             upload_fg_read_latency_target_ns: Duration::from_millis(
@@ -159,7 +152,6 @@ impl VfsBootstrapPlan {
             ),
             max_xattr_bytes: config.max_xattr_bytes,
             effective_acl_cache_capacity: config.effective_acl_cache_capacity,
-            cache_safety_mode: config.cache_safety_mode,
             acl_principal: config.principal.clone(),
             upload_delay: Duration::from_millis(config.upload_delay_ms),
             upload_requeue_base: Duration::from_millis(config.upload_requeue_base_ms),
@@ -209,7 +201,6 @@ impl VfsBootstrapPlan {
             write_eager_flush_drain_chunk_bytes = self.write_eager_flush_drain_chunk_bytes,
             payload_put_concurrency = self.payload_put_concurrency,
             local_sync_group_min_bytes = self.local_sync_group_min_bytes,
-            local_sync_group_max_delay_ms = self.local_sync_group_max_delay.as_millis() as u64,
             max_xattr_bytes = self.max_xattr_bytes,
             dentry_cache_capacity = config.dentry_cache_capacity,
             dentry_cache_bytes = config.dentry_cache_bytes,
@@ -462,9 +453,7 @@ impl VfsBootstrap {
             write_eager_flush_batch_bytes: plan.write_eager_flush_batch_bytes,
             write_eager_flush_drain_chunk_bytes: plan.write_eager_flush_drain_chunk_bytes,
             payload_put_concurrency: plan.payload_put_concurrency,
-            cache_safety_mode: plan.cache_safety_mode,
             local_sync_group_min_bytes: plan.local_sync_group_min_bytes,
-            local_sync_group_max_delay: plan.local_sync_group_max_delay,
             max_xattr_bytes: plan.max_xattr_bytes,
             zeroio_runtime_state_dir: resources.zeroio_runtime_state_dir,
             handle_table: HandleTable::new(),

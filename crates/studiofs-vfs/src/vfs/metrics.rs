@@ -230,7 +230,6 @@ pub struct VfsWritePathTuningStats {
     pub eager_flush_drain_chunk_bytes: usize,
     pub payload_put_concurrency: usize,
     pub sync_group_min_bytes: u64,
-    pub sync_group_max_delay_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

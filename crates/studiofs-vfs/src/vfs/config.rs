@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 use studiofs_meta::types::Ino;
 
 use crate::vfs::{
@@ -46,30 +45,11 @@ pub(super) const PAYLOAD_PUT_CONCURRENCY_TARGET_BYTES: usize = 32 * 1024 * 1024;
 pub(super) const PAYLOAD_PUT_CONCURRENCY_MAX: usize = 32;
 pub(super) const FAST_MODE_SYNC_GROUP_MIN_BYTES_FLOOR: u64 = 32 * 1024 * 1024;
 pub(super) const FAST_MODE_SYNC_GROUP_MIN_BYTES_CEIL: u64 = 256 * 1024 * 1024;
-pub(super) const FAST_MODE_SYNC_GROUP_MAX_DELAY_MS: u64 = 100;
 pub(super) const CACHE_RUNTIME_MIN_TRANSIT_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_MAX_TRANSIT_BUDGET_BYTES: usize = 4 * 1024 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_SMALL_BUDGET_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_LARGE_BUDGET_BYTES: u64 = 512 * 1024 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_HUGE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
-
-/// Local cache durability/safety mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum CacheSafetyMode {
-    /// Prefer a single local NVMe payload write (L2 cache) and recover
-    /// best-effort by self-healing stale ingress artifacts on startup.
-    ///
-    /// In this mode ordinary `flush` / `close` / last-handle `release`
-    /// materialize local unpublished state but do not force a crash-safe local
-    /// `sync_data()` barrier. `fsync` remains the explicit strict durability
-    /// boundary.
-    #[default]
-    Fast,
-    /// Keep a durable local accept path via append-only ingress WAL +
-    /// checkpoint recovery state.
-    Durable,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalSyncPolicy {
@@ -139,23 +119,16 @@ pub(super) enum LastHandleReleaseAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LocalSyncTrigger {
     Explicit,
-    DurableMode,
     BytesThreshold,
 }
 
 pub(super) fn write_path_sync_trigger(
-    cache_safety_mode: CacheSafetyMode,
     local_sync_policy: LocalSyncPolicy,
     pending_bytes: u64,
-    _elapsed_since_last_sync: Duration,
     group_min_bytes: u64,
-    _group_max_delay: Duration,
 ) -> Option<LocalSyncTrigger> {
     if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
         return Some(LocalSyncTrigger::Explicit);
-    }
-    if matches!(cache_safety_mode, CacheSafetyMode::Durable) {
-        return Some(LocalSyncTrigger::DurableMode);
     }
     if pending_bytes >= group_min_bytes {
         return Some(LocalSyncTrigger::BytesThreshold);
@@ -238,8 +211,6 @@ pub struct VfsConfig {
     pub attr_read_cache_bytes: usize,
     /// Effective ACL cache entry budget.
     pub effective_acl_cache_capacity: usize,
-    /// Local cache durability/safety policy.
-    pub cache_safety_mode: CacheSafetyMode,
     /// Principal used for ACL evaluation.
     pub principal: String,
     /// Initial fetch window.
@@ -370,7 +341,6 @@ pub struct VfsConfigRaw {
     pub attr_read_cache_capacity: Option<usize>,
     pub attr_read_cache_bytes: Option<usize>,
     pub effective_acl_cache_capacity: Option<usize>,
-    pub cache_safety_mode: Option<CacheSafetyMode>,
     pub principal: Option<String>,
     pub fetch_initial_window: Option<f64>,
     pub fetch_min_window: Option<f64>,
@@ -516,7 +486,6 @@ impl VfsConfigRaw {
             attr_read_cache_capacity,
             attr_read_cache_bytes,
             effective_acl_cache_capacity,
-            cache_safety_mode,
             principal,
             fetch_initial_window,
             fetch_min_window,
@@ -684,7 +653,6 @@ impl From<VfsConfig> for VfsConfigRaw {
             attr_read_cache_capacity: Some(cfg.attr_read_cache_capacity),
             attr_read_cache_bytes: Some(cfg.attr_read_cache_bytes),
             effective_acl_cache_capacity: Some(cfg.effective_acl_cache_capacity),
-            cache_safety_mode: Some(cfg.cache_safety_mode),
             principal: Some(cfg.principal),
             fetch_initial_window: Some(cfg.fetch_initial_window),
             fetch_min_window: Some(cfg.fetch_min_window),
@@ -767,7 +735,6 @@ impl Default for VfsConfig {
             attr_read_cache_capacity: DEFAULT_ATTR_READ_CACHE_CAPACITY,
             attr_read_cache_bytes: DEFAULT_ATTR_READ_CACHE_BYTES,
             effective_acl_cache_capacity: DEFAULT_EFFECTIVE_ACL_CACHE_CAPACITY,
-            cache_safety_mode: CacheSafetyMode::Fast,
             principal: "*".to_string(),
             fetch_initial_window: DEFAULT_FETCH_INITIAL_WINDOW,
             fetch_min_window: DEFAULT_FETCH_MIN_WINDOW,
@@ -930,69 +897,22 @@ mod tests {
     }
 
     #[test]
-    fn test_vfs_config_defaults_to_fast_cache_safety_mode() {
-        assert_eq!(
-            VfsConfig::default().cache_safety_mode,
-            CacheSafetyMode::Fast
-        );
-    }
-
-    #[test]
     fn local_sync_policy_strict_always_triggers_sync() {
-        let trigger = write_path_sync_trigger(
-            CacheSafetyMode::Fast,
-            LocalSyncPolicy::Strict,
-            1,
-            Duration::from_millis(1),
-            64 * 1024 * 1024,
-            Duration::from_millis(25),
-        );
+        let trigger = write_path_sync_trigger(LocalSyncPolicy::Strict, 1, 64 * 1024 * 1024);
         assert_eq!(trigger, Some(LocalSyncTrigger::Explicit));
     }
 
     #[test]
-    fn local_sync_policy_durable_mode_always_triggers_sync() {
-        let trigger = write_path_sync_trigger(
-            CacheSafetyMode::Durable,
-            LocalSyncPolicy::Opportunistic,
-            1,
-            Duration::from_millis(1),
-            64 * 1024 * 1024,
-            Duration::from_millis(25),
-        );
-        assert_eq!(trigger, Some(LocalSyncTrigger::DurableMode));
-    }
-
-    #[test]
-    fn local_sync_policy_fast_mode_waits_until_threshold_only() {
+    fn opportunistic_local_sync_waits_until_threshold_only() {
         let bytes_trigger = write_path_sync_trigger(
-            CacheSafetyMode::Fast,
             LocalSyncPolicy::Opportunistic,
             64 * 1024 * 1024,
-            Duration::from_millis(1),
             64 * 1024 * 1024,
-            Duration::from_millis(25),
         );
         assert_eq!(bytes_trigger, Some(LocalSyncTrigger::BytesThreshold));
 
-        let window_trigger = write_path_sync_trigger(
-            CacheSafetyMode::Fast,
-            LocalSyncPolicy::Opportunistic,
-            1024,
-            Duration::from_millis(30),
-            64 * 1024 * 1024,
-            Duration::from_millis(25),
-        );
-        assert_eq!(window_trigger, None);
-
-        let deferred = write_path_sync_trigger(
-            CacheSafetyMode::Fast,
-            LocalSyncPolicy::Opportunistic,
-            1024,
-            Duration::from_millis(1),
-            64 * 1024 * 1024,
-            Duration::from_millis(25),
-        );
+        let deferred =
+            write_path_sync_trigger(LocalSyncPolicy::Opportunistic, 1024, 64 * 1024 * 1024);
         assert_eq!(deferred, None);
     }
 }

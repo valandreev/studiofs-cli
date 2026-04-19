@@ -29,8 +29,8 @@ decision" model. The target mount contract is now:
 - cross-client behavior is Local-First plus eventual consistency.
 
 `StudioFS Fast Local Authority` is not an extra mount mode. It is the only
-target mount contract. Historical `cache_safety_mode=fast|durable` behavior in
-the codebase is a transitional implementation detail, not the product model.
+target mount contract. The historical `cache_safety_mode=fast|durable` knob has
+been removed from the codebase and is not part of the product model.
 
 The main idea of this contract is a strict separation between two kinds of
 guarantees:
@@ -355,7 +355,7 @@ Rules:
 | `ReadPipeline` as the canonical foreground read engine | Delete as the target design. Replace with a direct merged reader over writer/local authority/block state. |
 | `UploadCoordinator` as the canonical upload architecture | Simplify/delete as a top-level design concept. Replace with one cached-store-style staging/upload pipeline. |
 | `published` / `local unpublished` as separate architecture authorities | Simplify. They may remain as internal lifecycle labels inside local metadata, but they must not imply PG as a foreground authority. |
-| `cache_safety_mode=fast|durable` as a product-level mount contract | Delete from the target product contract. A single Fast Local Authority mount model is the target. Transitional knobs may exist in code only while migration is in flight. |
+| `cache_safety_mode=fast|durable` as a product-level mount contract | Deleted from the product contract and implementation. A single Fast Local Authority mount model is the target. |
 | Versioned local runtime subtree as product architecture vocabulary | Rename/simplify. The current `v3/` subtree may remain as an implementation detail for the local backend, but not as the rewrite's conceptual model. |
 | File-version atomic visibility | Retain. Peers must not observe half-published file versions. |
 | `STUDIOFS_*` tuning sprawl | Simplify into a JuiceFS-inspired CLI/config surface with only transitional env vars where necessary. |

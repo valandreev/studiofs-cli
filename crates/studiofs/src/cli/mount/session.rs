@@ -298,20 +298,6 @@ where
         .filter(|v| *v > 0.0)
 }
 
-fn parse_env_cache_safety_mode_with<F>(
-    read_var: &F,
-    key: &str,
-) -> Option<studiofs_vfs::CacheSafetyMode>
-where
-    F: Fn(&str) -> Result<String, std::env::VarError>,
-{
-    match read_var(key).ok()?.trim().to_ascii_lowercase().as_str() {
-        "fast" => Some(studiofs_vfs::CacheSafetyMode::Fast),
-        "durable" => Some(studiofs_vfs::CacheSafetyMode::Durable),
-        _ => None,
-    }
-}
-
 fn validate_endpoint_override(endpoint: Option<&str>) -> anyhow::Result<()> {
     let Some(ep) = endpoint else {
         return Ok(());
@@ -365,7 +351,7 @@ where
     let vfs_config = vfs_config_raw
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid VFS config: {e}"))?;
-    let cache_mode = format!("{:?}", vfs_config.cache_safety_mode).to_ascii_lowercase();
+    let cache_mode = "fast-local-authority".to_string();
 
     Ok(ResolvedMountConfig {
         vfs_config,
@@ -847,9 +833,6 @@ where
     set_usize!("STUDIOFS_QOS_MATERIALIZE_SLOTS", qos_materialize_slots);
     set_usize!("STUDIOFS_QOS_COMMIT_SLOTS", qos_commit_slots);
     set_usize!("STUDIOFS_QOS_FETCH_SLOTS", qos_fetch_slots);
-    if let Some(mode) = parse_env_cache_safety_mode_with(&read_var, "STUDIOFS_CACHE_SAFETY_MODE") {
-        config.cache_safety_mode = Some(mode);
-    }
     if let Ok(principal) = read_var("STUDIOFS_PRINCIPAL") {
         let principal = principal.trim();
         if !principal.is_empty() {
@@ -1736,7 +1719,7 @@ mod tests {
 
         assert_eq!(startup.base_cache_path, meta_dir.join("cache"));
         assert_eq!(startup.cache_size, "64GB");
-        assert_eq!(startup.cache_mode, "fast");
+        assert_eq!(startup.cache_mode, "fast-local-authority");
         assert_eq!(startup.launch_mode, MountLaunchMode::Foreground);
         assert!(startup.run_in_foreground);
         assert_eq!(startup.vfs_config.principal, "alice");

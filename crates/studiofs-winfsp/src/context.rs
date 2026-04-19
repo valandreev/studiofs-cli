@@ -13,10 +13,10 @@ use studiofs_meta::types::{SetattrArgs, TimeSpec};
 use studiofs_meta::{FileType, Ino, InodeAttr, MetaError, ROOT_INO};
 use studiofs_vfs::vfs::{ExplicitFlushOutcome, ReleaseFhOutcome};
 use studiofs_vfs::{
-    BarrierObservabilityPort, BridgeVfsErrorKind, CacheSafetyMode, DeferredCleanupHintPort,
-    DeleteCleanupPort, FlushGatePort, HandleDrainBarrier, HandleDrainDeleteRequest,
-    HandleDrainRequest, HandleReleasePort, KernelInvalidator, LocalSyncBarrierPort,
-    LocalSyncPolicy, NamespacePathStyle, OpenFlags, StudioVfs, classify_vfs_error,
+    BarrierObservabilityPort, BridgeVfsErrorKind, DeferredCleanupHintPort, DeleteCleanupPort,
+    FlushGatePort, HandleDrainBarrier, HandleDrainDeleteRequest, HandleDrainRequest,
+    HandleReleasePort, KernelInvalidator, LocalSyncBarrierPort, LocalSyncPolicy,
+    NamespacePathStyle, OpenFlags, StudioVfs, classify_vfs_error,
     is_hidden_non_macos_root_metadata_name, normalize_attr_times,
 };
 use tokio::runtime::Handle;
@@ -192,15 +192,8 @@ fn open_flags_from_access(granted_access: FILE_ACCESS_RIGHTS, _create_options: u
     }
 }
 
-fn write_local_sync_policy_from_create_options(
-    create_options: u32,
-    cache_safety_mode: CacheSafetyMode,
-) -> LocalSyncPolicy {
-    if matches!(cache_safety_mode, CacheSafetyMode::Fast) {
-        LocalSyncPolicy::Opportunistic
-    } else if (create_options & (FILE_WRITE_THROUGH_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_OPTION))
-        != 0
-    {
+fn write_local_sync_policy_from_create_options(create_options: u32) -> LocalSyncPolicy {
+    if (create_options & (FILE_WRITE_THROUGH_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_OPTION)) != 0 {
         LocalSyncPolicy::Strict
     } else {
         LocalSyncPolicy::Opportunistic
@@ -1349,10 +1342,7 @@ impl StudioFsContext {
             parent_ino,
             name,
             open_flags: open_flags_from_access(granted_access, create_options),
-            write_local_sync_policy: write_local_sync_policy_from_create_options(
-                create_options,
-                self.vfs.cache_safety_mode(),
-            ),
+            write_local_sync_policy: write_local_sync_policy_from_create_options(create_options),
             kind: resolve_create_callback_kind(
                 create_options,
                 extra_buffer,
@@ -1531,10 +1521,7 @@ impl FileSystemContext for StudioFsContext {
         }
         let attr = resolve_path(&self.vfs, file_name)?;
         let open_flags = open_flags_from_access(granted_access, create_options);
-        let write_local_sync_policy = write_local_sync_policy_from_create_options(
-            create_options,
-            self.vfs.cache_safety_mode(),
-        );
+        let write_local_sync_policy = write_local_sync_policy_from_create_options(create_options);
         Self::write_open_file_info(file_info, &attr);
         let handle = self.open_file_handle_for_attr(&attr, open_flags, write_local_sync_policy)?;
         let display_path = file_name.to_string_lossy();
@@ -2292,9 +2279,7 @@ mod tests {
     };
     use studiofs_meta::{FileLockLease, HardLockKind, MetaError};
     use studiofs_vfs::VfsError;
-    use studiofs_vfs::{
-        CacheSafetyMode, KernelInvalidator, LocalSyncPolicy, OpenFlags, StudioVfs, VfsConfig,
-    };
+    use studiofs_vfs::{KernelInvalidator, LocalSyncPolicy, OpenFlags, StudioVfs, VfsConfig};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
     use winfsp::U16CString;
@@ -3141,8 +3126,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_flush_callback_drains_buffered_write_callback_state_without_forcing_sync_in_fast_mode()
-     {
+    fn explicit_flush_callback_drains_buffered_write_callback_state_and_forces_sync_data() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("write_callback_explicit_flush");
         let attr = vfs
             .create(ROOT_INO, b"buffered-write-flush.txt", 0, 0, 0o644)
@@ -3199,9 +3183,9 @@ mod tests {
             payload_persist_after > payload_persist_before,
             "explicit flush should still materialize buffered WinFSP writes into local payload storage"
         );
-        assert_eq!(
-            sync_calls_after, sync_calls_before,
-            "fast-mode explicit flush should no longer force the local payload sync barrier after buffered writes"
+        assert!(
+            sync_calls_after > sync_calls_before,
+            "explicit flush callback should force the local payload sync barrier after buffered writes"
         );
         assert_eq!(
             flush_calls_after, flush_calls_before,
@@ -3220,54 +3204,22 @@ mod tests {
     }
 
     #[test]
-    fn write_create_options_select_expected_local_sync_policy_by_cache_mode() {
+    fn write_create_options_select_expected_local_sync_policy_by_create_options() {
         assert_eq!(
-            write_local_sync_policy_from_create_options(0, CacheSafetyMode::Fast),
+            write_local_sync_policy_from_create_options(0),
             LocalSyncPolicy::Opportunistic
         );
         assert_eq!(
-            write_local_sync_policy_from_create_options(
-                FILE_WRITE_THROUGH_OPTION,
-                CacheSafetyMode::Fast,
-            ),
-            LocalSyncPolicy::Opportunistic
+            write_local_sync_policy_from_create_options(FILE_WRITE_THROUGH_OPTION),
+            LocalSyncPolicy::Strict
         );
         assert_eq!(
-            write_local_sync_policy_from_create_options(
-                FILE_NO_INTERMEDIATE_BUFFERING_OPTION,
-                CacheSafetyMode::Fast,
-            ),
-            LocalSyncPolicy::Opportunistic
-        );
-        assert_eq!(
-            write_local_sync_policy_from_create_options(
-                FILE_WRITE_THROUGH_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_OPTION,
-                CacheSafetyMode::Fast,
-            ),
-            LocalSyncPolicy::Opportunistic
-        );
-        assert_eq!(
-            write_local_sync_policy_from_create_options(0, CacheSafetyMode::Durable),
-            LocalSyncPolicy::Opportunistic
-        );
-        assert_eq!(
-            write_local_sync_policy_from_create_options(
-                FILE_WRITE_THROUGH_OPTION,
-                CacheSafetyMode::Durable,
-            ),
+            write_local_sync_policy_from_create_options(FILE_NO_INTERMEDIATE_BUFFERING_OPTION),
             LocalSyncPolicy::Strict
         );
         assert_eq!(
             write_local_sync_policy_from_create_options(
-                FILE_NO_INTERMEDIATE_BUFFERING_OPTION,
-                CacheSafetyMode::Durable,
-            ),
-            LocalSyncPolicy::Strict
-        );
-        assert_eq!(
-            write_local_sync_policy_from_create_options(
-                FILE_WRITE_THROUGH_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_OPTION,
-                CacheSafetyMode::Durable,
+                FILE_WRITE_THROUGH_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_OPTION
             ),
             LocalSyncPolicy::Strict
         );

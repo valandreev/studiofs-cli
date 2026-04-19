@@ -3226,7 +3226,7 @@ fn opportunistic_local_sync_defers_when_threshold_not_reached() {
         .load(Ordering::Relaxed);
     assert_eq!(
         calls_after, calls_before,
-        "opportunistic sync should not force sync_data under threshold/window"
+        "opportunistic sync should not force sync_data while below the byte threshold"
     );
     assert!(
         deferred_after > deferred_before,
@@ -3235,105 +3235,7 @@ fn opportunistic_local_sync_defers_when_threshold_not_reached() {
 }
 
 #[test]
-fn opportunistic_local_sync_ignores_short_elapsed_window_under_relaxed_delay() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "opportunistic-local-sync-relaxed-window");
-    rt.block_on(async {
-        let mut group = vfs.state.local_dirty.local_sync_group.lock().await;
-        group.pending_bytes = 1024;
-        group.last_sync_at = Instant::now()
-            .checked_sub(Duration::from_millis(50))
-            .unwrap_or_else(Instant::now);
-    });
-
-    let calls_before = vfs
-        .state
-        .metrics
-        .block_store_sync_data_calls
-        .load(Ordering::Relaxed);
-    let deferred_before = vfs
-        .state
-        .metrics
-        .block_store_sync_data_deferred_calls
-        .load(Ordering::Relaxed);
-
-    rt.block_on(async {
-        vfs.maybe_block_store_sync_data_async(0, LocalSyncPolicy::Opportunistic)
-            .await
-            .expect("opportunistic local sync with relaxed delay");
-    });
-
-    let calls_after = vfs
-        .state
-        .metrics
-        .block_store_sync_data_calls
-        .load(Ordering::Relaxed);
-    let deferred_after = vfs
-        .state
-        .metrics
-        .block_store_sync_data_deferred_calls
-        .load(Ordering::Relaxed);
-    assert_eq!(
-        calls_after, calls_before,
-        "opportunistic sync should keep deferring while the relaxed delay window has not elapsed"
-    );
-    assert!(
-        deferred_after > deferred_before,
-        "defer accounting should still increase under the relaxed delay window"
-    );
-}
-
-#[test]
-fn opportunistic_local_sync_ignores_elapsed_window_in_fast_mode() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "opportunistic-local-sync-ignore-window");
-    rt.block_on(async {
-        let mut group = vfs.state.local_dirty.local_sync_group.lock().await;
-        group.pending_bytes = 4 * 1024 * 1024;
-        group.last_sync_at = Instant::now()
-            .checked_sub(Duration::from_millis(250))
-            .unwrap_or_else(Instant::now);
-    });
-
-    let calls_before = vfs
-        .state
-        .metrics
-        .block_store_sync_data_calls
-        .load(Ordering::Relaxed);
-    let deferred_before = vfs
-        .state
-        .metrics
-        .block_store_sync_data_deferred_calls
-        .load(Ordering::Relaxed);
-
-    rt.block_on(async {
-        vfs.maybe_block_store_sync_data_async(0, LocalSyncPolicy::Opportunistic)
-            .await
-            .expect("opportunistic local sync should ignore elapsed window");
-    });
-
-    let calls_after = vfs
-        .state
-        .metrics
-        .block_store_sync_data_calls
-        .load(Ordering::Relaxed);
-    let deferred_after = vfs
-        .state
-        .metrics
-        .block_store_sync_data_deferred_calls
-        .load(Ordering::Relaxed);
-    assert_eq!(
-        calls_after, calls_before,
-        "fast-mode opportunistic sync should not force sync_data only because the time window elapsed"
-    );
-    assert!(
-        deferred_after > deferred_before,
-        "defer accounting should still increase when fast mode ignores the elapsed window"
-    );
-}
-
-#[test]
-fn flush_fh_keeps_opportunistic_local_sync_in_fast_mode() {
+fn flush_fh_enforces_strict_local_durability_in_single_mode() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "flush-fh-fast-local-sync");
     let attr = vfs
@@ -3385,19 +3287,19 @@ fn flush_fh_keeps_opportunistic_local_sync_in_fast_mode() {
         .metrics
         .block_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
-    assert_eq!(
-        calls_after, calls_before,
-        "fast-mode flush should no longer force sync_data for dirty unpublished state"
+    assert!(
+        calls_after > calls_before,
+        "explicit flush must force sync_data when dirty unpublished state remains"
     );
-    assert_eq!(
-        synced_after, synced_before,
-        "fast-mode flush should leave grouped sync bytes pending until an explicit strict barrier"
+    assert!(
+        synced_after >= synced_before + 4096,
+        "explicit flush should account for the pending local durable sync bytes"
     );
     rt.block_on(async {
         let group = vfs.state.local_dirty.local_sync_group.lock().await;
         assert_eq!(
-            group.pending_bytes, 4096,
-            "fast-mode flush should keep pending local sync bytes queued"
+            group.pending_bytes, 0,
+            "explicit flush should drain pending local sync bytes"
         );
     });
     assert!(
@@ -3411,12 +3313,9 @@ fn flush_fh_keeps_opportunistic_local_sync_in_fast_mode() {
 }
 
 #[test]
-fn flush_fh_forces_strict_local_sync_in_durable_mode() {
+fn flush_fh_default_config_enforces_strict_local_durability() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let cfg = VfsConfig {
-        cache_safety_mode: CacheSafetyMode::Durable,
-        ..VfsConfig::default()
-    };
+    let cfg = VfsConfig::default();
     let (rt, vfs, _meta) = make_test_vfs_with_config(&tmp, "flush-fh-durable-local-sync", cfg);
     let attr = vfs
         .create(1, b"flush-fh-durable-local-sync.txt", 0, 0, 0o644)
@@ -3469,22 +3368,22 @@ fn flush_fh_forces_strict_local_sync_in_durable_mode() {
         .load(Ordering::Relaxed);
     assert!(
         calls_after > calls_before,
-        "durable-mode flush must still force local sync_data for dirty unpublished state"
+        "default-config explicit flush must force sync_data when dirty unpublished state remains"
     );
     assert!(
         synced_after >= synced_before + 4096,
-        "durable-mode flush should still account for the pending local durable sync bytes"
+        "default-config explicit flush should account for the pending local durable sync bytes"
     );
     rt.block_on(async {
         let group = vfs.state.local_dirty.local_sync_group.lock().await;
         assert_eq!(
             group.pending_bytes, 0,
-            "durable-mode flush should drain pending local sync bytes"
+            "default-config explicit flush should drain pending local sync bytes"
         );
     });
     assert!(
         !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
-        "durable-mode flush should commit the dirty local attr state"
+        "default-config explicit flush should still commit the dirty local attr state"
     );
 
     rt.block_on(async {
@@ -3656,7 +3555,7 @@ fn handle_writer_dirty_attrs_keep_nanos_timestamps() {
 }
 
 #[test]
-fn release_fh_keeps_opportunistic_local_sync_in_fast_mode() {
+fn release_fh_enforces_strict_local_durability_on_last_handle() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "release-fh-fast-local-sync");
     let attr = vfs
@@ -3719,19 +3618,19 @@ fn release_fh_keeps_opportunistic_local_sync_in_fast_mode() {
         .metrics
         .block_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
-    assert_eq!(
-        calls_after, calls_before,
-        "fast-mode last-handle release should no longer force sync_data when dirty state remains"
+    assert!(
+        calls_after > calls_before,
+        "last-handle release must force sync_data when dirty unpublished state remains"
     );
-    assert_eq!(
-        synced_after, synced_before,
-        "fast-mode last-handle release should leave grouped sync bytes pending until fsync"
+    assert!(
+        synced_after >= synced_before + 8192,
+        "last-handle release should account for the pending local durable sync bytes"
     );
     rt.block_on(async {
         let group = vfs.state.local_dirty.local_sync_group.lock().await;
         assert_eq!(
-            group.pending_bytes, 8192,
-            "fast-mode last-handle release should keep pending local sync bytes queued"
+            group.pending_bytes, 0,
+            "last-handle release should drain pending local sync bytes"
         );
     });
     assert!(
@@ -3741,12 +3640,9 @@ fn release_fh_keeps_opportunistic_local_sync_in_fast_mode() {
 }
 
 #[test]
-fn release_fh_forces_strict_local_sync_in_durable_mode() {
+fn release_fh_default_config_enforces_strict_local_durability() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let cfg = VfsConfig {
-        cache_safety_mode: CacheSafetyMode::Durable,
-        ..VfsConfig::default()
-    };
+    let cfg = VfsConfig::default();
     let (rt, vfs, _meta) = make_test_vfs_with_config(&tmp, "release-fh-durable-local-sync", cfg);
     let attr = vfs
         .create(1, b"release-fh-durable-local-sync.txt", 0, 0, 0o644)
@@ -3810,22 +3706,22 @@ fn release_fh_forces_strict_local_sync_in_durable_mode() {
         .load(Ordering::Relaxed);
     assert!(
         calls_after > calls_before,
-        "durable-mode last-handle release must still force local sync_data when dirty state remains"
+        "default-config last-handle release must force sync_data when dirty unpublished state remains"
     );
     assert!(
         synced_after >= synced_before + 8192,
-        "durable-mode last-handle release should still account for the pending local sync bytes"
+        "default-config last-handle release should account for the pending local durable sync bytes"
     );
     rt.block_on(async {
         let group = vfs.state.local_dirty.local_sync_group.lock().await;
         assert_eq!(
             group.pending_bytes, 0,
-            "durable-mode last-handle release should drain pending local sync bytes"
+            "default-config last-handle release should drain pending local sync bytes"
         );
     });
     assert!(
         !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
-        "durable-mode last-handle release should preserve the committed local attr state"
+        "default-config last-handle release should preserve the committed local attr state"
     );
 }
 
@@ -3987,11 +3883,6 @@ fn write_path_observability_reports_active_tuning_knobs() {
     assert_eq!(
         snapshot.tuning.sync_group_min_bytes, vfs.local_sync_group_min_bytes,
         "observability should report the active sync-data group minimum"
-    );
-    assert_eq!(
-        snapshot.tuning.sync_group_max_delay_ms,
-        vfs.local_sync_group_max_delay.as_millis() as u64,
-        "observability should report the active sync-data delay cap"
     );
 }
 

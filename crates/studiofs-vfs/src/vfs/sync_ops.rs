@@ -1,8 +1,7 @@
 use super::{
-    AccessLevel, CacheSafetyMode, DirtyAttrPersistPolicy, ExplicitFlushOutcome,
-    FileSessionOperation, FsyncOutcome, HandleReleaseContext, Ino, LastHandleReleaseAction,
-    LocalSyncBarrierOutcome, LocalSyncPolicy, OpenFile, OpenFlags, ReleaseFhOutcome,
-    StickyErrorPolicy, StudioVfs, VfsResult,
+    AccessLevel, DirtyAttrPersistPolicy, ExplicitFlushOutcome, FileSessionOperation, FsyncOutcome,
+    HandleReleaseContext, Ino, LastHandleReleaseAction, LocalSyncBarrierOutcome, LocalSyncPolicy,
+    OpenFile, OpenFlags, ReleaseFhOutcome, StickyErrorPolicy, StudioVfs, VfsResult,
 };
 use std::sync::Arc;
 use tracing::debug;
@@ -262,7 +261,7 @@ impl StudioVfs {
     fn local_sync_policy_for_barrier(&self, ino: Ino) -> LocalSyncPolicy {
         let has_pending_local_state =
             self.inode_has_local_dirty_state(ino) || self.inode_has_dirty_handle_writers(ino);
-        if has_pending_local_state && matches!(self.cache_safety_mode, CacheSafetyMode::Durable) {
+        if has_pending_local_state {
             LocalSyncPolicy::Strict
         } else {
             LocalSyncPolicy::Opportunistic
@@ -305,9 +304,9 @@ impl StudioVfs {
     /// This is the explicit per-handle barrier used by FUSE and by WinFSP
     /// callback paths that decide to make dirty state explicit while the handle
     /// is still valid. Clean handles should return quickly; dirty handles must
-    /// persist current local state before success or error is reported. In
-    /// durable mode this is a strict local-durability barrier; in fast mode it
-    /// materializes local unpublished state without forcing a crash-safe sync.
+    /// persist current local state before success or error is reported. Under
+    /// the single-mode Fast Local Authority contract this is a strict local-
+    /// durability barrier whenever dirty unpublished state remains.
     pub async fn flush_fh_with_outcome(&self, fh: u64) -> VfsResult<ExplicitFlushOutcome> {
         let Some(open_file) = self.handle_table.get(fh) else {
             return Ok(ExplicitFlushOutcome::default());
