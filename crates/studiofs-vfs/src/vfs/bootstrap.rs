@@ -483,6 +483,7 @@ impl VfsBootstrap {
             kernel_invalidator: RwLock::new(None),
             write_path_backend_tag: "local-block-runtime".to_string(),
             write_path_started_at: Instant::now(),
+            known_file_lock_overrides: Mutex::new(HashMap::new()),
             #[cfg(test)]
             fail_next_inline_dirty_attr_persist: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]

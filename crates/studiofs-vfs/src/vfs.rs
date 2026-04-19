@@ -154,7 +154,7 @@ use studiofs_meta::types::{
     AccessLevel, BlockFlags as MetaBlockFlags, BlockRef, FileType, Ino, InodeAttr,
     block_index_from_offset, offset_within_block,
 };
-use studiofs_meta::{MetaError, MetaResult};
+use studiofs_meta::{FileLockLease, HardLockKind, MetaError, MetaResult};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -2211,6 +2211,7 @@ pub struct StudioVfs {
     kernel_invalidator: RwLock<Option<Arc<dyn KernelInvalidator>>>,
     write_path_backend_tag: String,
     write_path_started_at: Instant,
+    known_file_lock_overrides: Mutex<HashMap<Ino, FileLockLease>>,
     #[cfg(test)]
     fail_next_inline_dirty_attr_persist: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -5692,6 +5693,73 @@ impl StudioVfs {
             .observe_ns(timing.backend_io_ns);
     }
 
+    fn write_access_requested(flags: OpenFlags, trunc: bool) -> bool {
+        trunc || flags.contains(OpenFlags::WRONLY) || flags.contains(OpenFlags::RDWR)
+    }
+
+    fn open_flags_allow_write(flags: OpenFlags) -> bool {
+        flags.contains(OpenFlags::WRONLY) || flags.contains(OpenFlags::RDWR)
+    }
+
+    fn known_file_lock_lease_snapshot(&self, ino: Ino) -> Option<FileLockLease> {
+        if let Some(lease) = self.known_file_lock_overrides.lock().get(&ino).cloned() {
+            return Some(lease);
+        }
+
+        self.meta.sync_view().known_file_lock_lease(ino)
+    }
+
+    fn known_hard_lock_blocks_new_mutation(&self, ino: Ino) -> Option<FileLockLease> {
+        let lease = self.known_file_lock_lease_snapshot(ino)?;
+        let self_client_id = self.meta.sync_view().invalidation_sender_id();
+        let self_exclusive_owner = self_client_id
+            .as_deref()
+            .is_some_and(|client_id| lease.exclusive_owner.as_deref() == Some(client_id));
+
+        if lease.kind == HardLockKind::Exclusive && self_exclusive_owner {
+            None
+        } else {
+            Some(lease)
+        }
+    }
+
+    pub(super) fn enforce_no_known_foreign_hard_lock(&self, ino: Ino) -> VfsResult<()> {
+        if self.known_hard_lock_blocks_new_mutation(ino).is_some() {
+            return Err(VfsError::WouldBlock);
+        }
+        Ok(())
+    }
+
+    pub(super) fn enforce_mutating_handle_access(&self, fh: u64, ino: Ino) -> VfsResult<OpenFile> {
+        let denied = || {
+            VfsError::Meta(MetaError::AccessDenied {
+                ino,
+                principal: format!("handle:{fh}"),
+                required: AccessLevel::ReadWrite,
+                actual: AccessLevel::ReadOnly,
+            })
+        };
+
+        let open_file = self.handle_table.get(fh).ok_or_else(denied)?;
+        if open_file.ino != ino {
+            return Err(denied());
+        }
+        if Self::open_flags_allow_write(open_file.flags) {
+            return Ok(open_file);
+        }
+        Err(denied())
+    }
+
+    #[doc(hidden)]
+    pub fn set_known_file_lock_for_test(&self, ino: Ino, lease: Option<FileLockLease>) {
+        let mut overrides = self.known_file_lock_overrides.lock();
+        if let Some(lease) = lease {
+            overrides.insert(ino, lease);
+        } else {
+            overrides.remove(&ino);
+        }
+    }
+
     pub fn note_winfsp_write_callback(&self) {
         self.state
             .metrics
@@ -6459,13 +6527,15 @@ impl StudioVfs {
     /// Called by FUSE `open()` / WinFSP `open()`.
     /// If `O_TRUNC` is requested (`trunc == true`), the file is truncated to 0.
     pub fn open_file(&self, ino: Ino, flags: OpenFlags, trunc: bool) -> VfsResult<u64> {
-        let required_access =
-            if trunc || flags.contains(OpenFlags::WRONLY) || flags.contains(OpenFlags::RDWR) {
-                AccessLevel::ReadWrite
-            } else {
-                AccessLevel::ReadOnly
-            };
+        let required_access = if Self::write_access_requested(flags, trunc) {
+            AccessLevel::ReadWrite
+        } else {
+            AccessLevel::ReadOnly
+        };
         self.enforce_access(ino, required_access)?;
+        if Self::write_access_requested(flags, trunc) {
+            self.enforce_no_known_foreign_hard_lock(ino)?;
+        }
         if self.ignored_entry_attr(ino).is_some() {
             let open_file = self.handle_table.open(ino, flags);
             let fh = open_file.fh;

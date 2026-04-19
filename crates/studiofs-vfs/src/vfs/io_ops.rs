@@ -292,6 +292,7 @@ impl StudioVfs {
             .await;
         let result = async {
             self.enforce_access(ino, AccessLevel::ReadWrite)?;
+            self.enforce_no_known_foreign_hard_lock(ino)?;
             let _ = self.state.read.observe_write_access(
                 None,
                 ino,

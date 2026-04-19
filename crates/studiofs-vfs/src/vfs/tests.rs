@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use studiofs_meta::engine::{MetaBlocks, MetaInodes};
@@ -6,7 +7,9 @@ use studiofs_meta::schema::{
     CURRENT_FORMAT_VERSION, FormatInfo, InodeLifecycleState, MetadataConfig, PayloadRetentionClass,
     ROOT_INO,
 };
-use studiofs_meta::{MetaEngine, MetaFormat, MetaFsOps, RedbMetaEngine};
+use studiofs_meta::{
+    FileLockLease, HardLockKind, MetaEngine, MetaFormat, MetaFsOps, RedbMetaEngine,
+};
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
@@ -4348,5 +4351,103 @@ fn build_cadence_stats_averages_over_completed_intervals() {
     assert_eq!(
         stats.avg_interval_ms, 5.0,
         "cadence averages should divide by completed intervals (events - 1), not raw histogram sample count"
+    );
+}
+
+fn foreign_exclusive_lock(ino: Ino) -> FileLockLease {
+    FileLockLease {
+        ino,
+        kind: HardLockKind::Exclusive,
+        generation: 1,
+        lease_expires_at_unix_ms: i64::MAX,
+        exclusive_owner: Some("client-slot:foreign".to_string()),
+        shared_owners: BTreeSet::new(),
+    }
+}
+
+#[test]
+fn foreign_hard_lock_blocks_new_write_open_but_allows_readonly_open() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "foreign-lock-open");
+    let attr = vfs
+        .create(ROOT_INO, b"foreign-lock-open.txt", 0, 0, 0o644)
+        .expect("create file");
+    vfs.set_known_file_lock_for_test(attr.ino, Some(foreign_exclusive_lock(attr.ino)));
+
+    let blocked = vfs.open_file(attr.ino, OpenFlags::RDWR, false);
+    assert!(
+        matches!(blocked, Err(VfsError::WouldBlock)),
+        "new write-open should block once a foreign hard lock is known"
+    );
+
+    let fh = vfs
+        .open_file(attr.ino, OpenFlags::RDONLY, false)
+        .expect("read-only open should still succeed under a foreign hard lock");
+    let open_file = vfs.get_open_file(fh).expect("tracked open file");
+    assert_eq!(open_file.flags.bits(), OpenFlags::RDONLY.bits());
+}
+
+#[test]
+fn existing_writer_handle_remains_usable_after_foreign_hard_lock_becomes_known() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "foreign-lock-grandfather");
+    let attr = vfs
+        .create(ROOT_INO, b"foreign-lock-grandfather.txt", 0, 0, 0o644)
+        .expect("create file");
+    let fh = vfs
+        .open_file(attr.ino, OpenFlags::RDWR, false)
+        .expect("open writer before lock becomes known");
+
+    vfs.set_known_file_lock_for_test(attr.ino, Some(foreign_exclusive_lock(attr.ino)));
+
+    rt.block_on(async {
+        vfs.write_fh(fh, attr.ino, 0, b"abc")
+            .await
+            .expect("pre-lock writer handle should be allowed to finish");
+    });
+
+    assert_eq!(vfs.getattr(attr.ino).expect("getattr").size, 3);
+}
+
+#[test]
+fn foreign_hard_lock_blocks_size_change_setattr_without_handle() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "foreign-lock-setattr");
+    let attr = vfs
+        .create(ROOT_INO, b"foreign-lock-setattr.txt", 0, 0, 0o644)
+        .expect("create file");
+    vfs.set_known_file_lock_for_test(attr.ino, Some(foreign_exclusive_lock(attr.ino)));
+
+    let result = vfs.setattr(attr.ino, SetattrArgs::size_only(1));
+    assert!(
+        matches!(result, Err(VfsError::WouldBlock)),
+        "inode-scoped size changes should block when a foreign hard lock is known"
+    );
+}
+
+#[test]
+fn foreign_hard_lock_blocks_unlink_and_rename() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "foreign-lock-namespace");
+    let attr = vfs
+        .create(ROOT_INO, b"foreign-lock-namespace.txt", 0, 0, 0o644)
+        .expect("create file");
+    vfs.set_known_file_lock_for_test(attr.ino, Some(foreign_exclusive_lock(attr.ino)));
+
+    let unlink = vfs.unlink(ROOT_INO, b"foreign-lock-namespace.txt");
+    assert!(
+        matches!(unlink, Err(VfsError::WouldBlock)),
+        "unlink should block when the target inode is hard-locked by a peer"
+    );
+
+    let rename = vfs.rename(
+        ROOT_INO,
+        b"foreign-lock-namespace.txt",
+        ROOT_INO,
+        b"foreign-lock-namespace-moved.txt",
+    );
+    assert!(
+        matches!(rename, Err(VfsError::WouldBlock)),
+        "rename should block when the source inode is hard-locked by a peer"
     );
 }

@@ -1314,7 +1314,7 @@ impl Filesystem for StudioFuseFs {
         atime: Option<fuser::TimeOrNow>,
         mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<u64>,
+        fh: Option<u64>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
@@ -1342,7 +1342,7 @@ impl Filesystem for StudioFuseFs {
             },
             win_attrs: None,
         };
-        match self.vfs.setattr(ino, args) {
+        match self.vfs.setattr_with_handle(fh, ino, args) {
             Ok(attr) => reply.attr(&TTL, &to_fuse_attr(&attr, self.mount_uid, self.mount_gid)),
             Err(e) => {
                 error!(
@@ -1618,7 +1618,7 @@ impl Filesystem for StudioFuseFs {
         &mut self,
         _req: &Request<'_>,
         _ino: u64,
-        _fh: u64,
+        fh: u64,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
@@ -1715,7 +1715,7 @@ impl Filesystem for StudioFuseFs {
                             size: Some(new_size),
                             ..Default::default()
                         };
-                        if let Err(e) = self.vfs.setattr(ino, args) {
+                        if let Err(e) = self.vfs.setattr_with_handle(Some(fh), ino, args) {
                             error!("fallocate setattr({ino}) -> {e}");
                             reply.error(vfs_err_to_errno(&e));
                             return;
