@@ -4,7 +4,7 @@ use super::{
     OpenFile, OpenFlags, ReleaseFhOutcome, StickyErrorPolicy, StudioVfs, VfsResult,
 };
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::VfsMeta;
 use crate::runtime::run_meta;
@@ -514,6 +514,174 @@ impl StudioVfs {
         .await;
         // For opportunistic writes `session` is already None (gate released above).
         // For strict writes `session` holds the gate until here.
+        drop(session);
+        self.state.file_session.gc_if_idle(ino);
+        result
+    }
+
+    /// Write with deferred materialization for high-throughput streaming writes.
+    ///
+    /// For `Opportunistic` writes the callback returns as soon as data is buffered
+    /// in the `HandleWriterRegistry`.  NVMe materialization and budget enforcement
+    /// are spawned as a fire-and-forget background task so the calling thread
+    /// (e.g. WinFSP dispatcher) is never blocked on local I/O.
+    ///
+    /// For `Strict` writes, behaviour is identical to
+    /// `write_fh_with_local_sync_policy` — materialization is awaited inline.
+    ///
+    /// # Safety of fire-and-forget materialization
+    ///
+    /// * Data is safely held in `HandleWriterRegistry` memory buffers.
+    /// * Any materialization error will surface at the next `Strict` barrier
+    ///   (flush / fsync / close) because those paths call
+    ///   `materialize_handle_writers_for_inode` synchronously.
+    /// * Duplicate materialization is safe: the block store uses last-writer-wins
+    ///   for overlapping ranges, and orphaned objects are reclaimed by the janitor.
+    /// * Budget enforcement runs in the background task: if dirty bytes exceed
+    ///   `3 × max_dirty_bytes` the *next* write will detect it synchronously via
+    ///   the hard-backpressure guard at the top and block until drain catches up.
+    pub async fn write_fh_with_deferred_materialize(
+        self: &Arc<Self>,
+        fh: u64,
+        ino: Ino,
+        offset: u64,
+        data: &[u8],
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<u32> {
+        // ── Hard backpressure safety valve ───────────────────────────────
+        // If background materialization falls behind and dirty memory is
+        // dangerously high, fall back to the fully-synchronous path so we
+        // exert real TCP-style backpressure on the caller and avoid OOM.
+        let hard_backpressure_threshold = self.max_dirty_bytes().saturating_mul(3);
+        if self.state.handle_writers.total_dirty_bytes() > hard_backpressure_threshold {
+            return self
+                .write_fh_with_local_sync_policy(fh, ino, offset, data, local_sync_policy)
+                .await;
+        }
+
+        // ── Acquire per-inode write gate ─────────────────────────────────
+        let mut session = Some(
+            self.state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Write)
+                .await,
+        );
+        let open_file = self.enforce_mutating_handle_access(fh, ino).ok();
+        let _ = self.state.read.observe_write_access(
+            open_file.as_ref(),
+            ino,
+            offset,
+            data.len(),
+            self.access_tracker,
+        );
+
+        // ── Buffer phase (fast: ~0.1 ms) ────────────────────────────────
+        let result = async {
+            self.enforce_access(ino, AccessLevel::ReadWrite)?;
+            self.enforce_mutating_handle_access(fh, ino)?;
+            if data.is_empty() {
+                return Ok(0);
+            }
+            if self.ignored_entry_attr(ino).is_some() {
+                let size = offset.saturating_add(data.len() as u64);
+                let _ = self.update_ignored_entry(ino, |attr| {
+                    if size > attr.size {
+                        attr.size = size;
+                        attr.committed_size = size;
+                    }
+                    attr.touch_mtime();
+                });
+                return Ok(data.len() as u32);
+            }
+            self.note_vfs_write_call(data.len());
+
+            let record_handle_writer_state_started = Instant::now();
+            let written = self.record_handle_writer_state(fh, ino, offset, data).await;
+            self.record_vfs_write_record_handle_writer_state(
+                record_handle_writer_state_started.elapsed(),
+            );
+            written
+        }
+        .await;
+
+        // Release the gate immediately — data is safe in HandleWriterRegistry.
+        if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+            session = None;
+        }
+
+        // ── Materialization phase ────────────────────────────────────────
+        match (&result, local_sync_policy) {
+            (Ok(_), LocalSyncPolicy::Opportunistic) => {
+                // Fire-and-forget: spawn materialization as background task.
+                let vfs = Arc::clone(self);
+                tokio::spawn(async move {
+                    let materialize_completed_started = Instant::now();
+                    if let Err(e) = vfs
+                        .materialize_completed_handle_writer_blocks_for_inode(
+                            ino,
+                            LocalSyncPolicy::Opportunistic,
+                        )
+                        .await
+                    {
+                        warn!(
+                            ino,
+                            error = %e,
+                            "deferred materialization (completed blocks) failed; \
+                             will retry at next strict barrier"
+                        );
+                    }
+                    vfs.record_vfs_write_materialize_completed(
+                        materialize_completed_started.elapsed(),
+                    );
+
+                    let materialize_for_limits_started = Instant::now();
+                    if let Err(e) = vfs
+                        .materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
+                        .await
+                    {
+                        warn!(
+                            ino,
+                            error = %e,
+                            "deferred materialization (budget enforcement) failed; \
+                             will retry at next strict barrier"
+                        );
+                    }
+                    vfs.record_vfs_write_materialize_for_limits(
+                        materialize_for_limits_started.elapsed(),
+                    );
+                });
+            }
+            (Ok(_), LocalSyncPolicy::Strict) => {
+                // Strict: await materialization inline (same as original).
+                let materialize_strict_started = Instant::now();
+                if let Err(e) = self
+                    .materialize_handle_writers_for_inode(ino, local_sync_policy)
+                    .await
+                {
+                    drop(session);
+                    self.state.file_session.gc_if_idle(ino);
+                    return Err(e);
+                }
+                self.record_vfs_write_materialize_strict(materialize_strict_started.elapsed());
+
+                let materialize_for_limits_started = Instant::now();
+                if let Err(e) = self
+                    .materialize_handle_writers_for_limits(ino, local_sync_policy)
+                    .await
+                {
+                    drop(session);
+                    self.state.file_session.gc_if_idle(ino);
+                    return Err(e);
+                }
+                self.record_vfs_write_materialize_for_limits(
+                    materialize_for_limits_started.elapsed(),
+                );
+            }
+            _ => {
+                // Write failed or unknown policy — nothing to materialize.
+            }
+        }
+
         drop(session);
         self.state.file_session.gc_if_idle(ino);
         result

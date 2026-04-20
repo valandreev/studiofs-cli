@@ -1542,9 +1542,15 @@ impl FileSystemContext for StudioFsContext {
     ) -> winfsp::Result<u32> {
         self.vfs.note_winfsp_write_callback();
         let callback_started = Instant::now();
-        // Resolve actual write offset
+        // Resolve actual write offset.  Prefer the in-memory dirty attr (free)
+        // and fall back to the full getattr only when there is no dirty state.
         let actual_offset = if write_to_eof {
-            let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
+            let attr = self
+                .vfs
+                .peek_dirty_attr(context.ino)
+                .map(Ok)
+                .unwrap_or_else(|| self.vfs.getattr(context.ino))
+                .map_err(vfs_to_winfsp_err)?;
             attr.size
         } else {
             offset
@@ -1552,7 +1558,12 @@ impl FileSystemContext for StudioFsContext {
 
         // Constrained I/O: paging writes must not extend the file beyond its current size
         if constrained_io {
-            let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
+            let attr = self
+                .vfs
+                .peek_dirty_attr(context.ino)
+                .map(Ok)
+                .unwrap_or_else(|| self.vfs.getattr(context.ino))
+                .map_err(vfs_to_winfsp_err)?;
             let fsize = attr.size;
             if actual_offset >= fsize {
                 return Ok(0);
@@ -1576,10 +1587,18 @@ impl FileSystemContext for StudioFsContext {
                 //   for the duration of this callback.
                 // - `spawn_wait` blocks until completion, so the source memory
                 //   is not accessed after this callback returns.
+                // - The deferred materialization background task reads from the
+                //   HandleWriterRegistry copy, NOT from `in_buf`.
                 // - `u8` alignment is always valid (alignment = 1).
                 let data = unsafe { in_buf.as_slice() };
-                vfs.write_fh_with_local_sync_policy(fh, ino, actual_offset, data, local_sync_policy)
-                    .await
+                vfs.write_fh_with_deferred_materialize(
+                    fh,
+                    ino,
+                    actual_offset,
+                    data,
+                    local_sync_policy,
+                )
+                .await
             })
             .map_err(vfs_to_winfsp_err)?;
         let vfs_write_elapsed = vfs_write_started.elapsed();
