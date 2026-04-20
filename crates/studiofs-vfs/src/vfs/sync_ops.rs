@@ -612,44 +612,60 @@ impl StudioVfs {
         // ── Materialization phase ────────────────────────────────────────
         match (&result, local_sync_policy) {
             (Ok(_), LocalSyncPolicy::Opportunistic) => {
-                // Fire-and-forget: spawn materialization as background task.
-                let vfs = Arc::clone(self);
-                tokio::spawn(async move {
-                    let materialize_completed_started = Instant::now();
-                    if let Err(e) = vfs
-                        .materialize_completed_handle_writer_blocks_for_inode(
-                            ino,
-                            LocalSyncPolicy::Opportunistic,
-                        )
-                        .await
-                    {
-                        warn!(
-                            ino,
-                            error = %e,
-                            "deferred materialization (completed blocks) failed; \
-                             will retry at next strict barrier"
+                // Coalesced fire-and-forget: spawn at most ONE materialization
+                // task per inode.  If a task is already in-flight for this inode
+                // it will naturally drain all buffered data accumulated since it
+                // started — no need for another task.
+                let already_inflight = {
+                    let mut inflight = self.state.deferred_materialize_inflight.lock();
+                    !inflight.insert(ino) // returns false if ino was NOT present (inserted)
+                };
+                if !already_inflight {
+                    let vfs = Arc::clone(self);
+                    tokio::spawn(async move {
+                        let materialize_completed_started = Instant::now();
+                        if let Err(e) = vfs
+                            .materialize_completed_handle_writer_blocks_for_inode(
+                                ino,
+                                LocalSyncPolicy::Opportunistic,
+                            )
+                            .await
+                        {
+                            warn!(
+                                ino,
+                                error = %e,
+                                "deferred materialization (completed blocks) failed; \
+                                 will retry at next strict barrier"
+                            );
+                        }
+                        vfs.record_vfs_write_materialize_completed(
+                            materialize_completed_started.elapsed(),
                         );
-                    }
-                    vfs.record_vfs_write_materialize_completed(
-                        materialize_completed_started.elapsed(),
-                    );
 
-                    let materialize_for_limits_started = Instant::now();
-                    if let Err(e) = vfs
-                        .materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
-                        .await
-                    {
-                        warn!(
-                            ino,
-                            error = %e,
-                            "deferred materialization (budget enforcement) failed; \
-                             will retry at next strict barrier"
+                        let materialize_for_limits_started = Instant::now();
+                        if let Err(e) = vfs
+                            .materialize_handle_writers_for_limits(
+                                ino,
+                                LocalSyncPolicy::Opportunistic,
+                            )
+                            .await
+                        {
+                            warn!(
+                                ino,
+                                error = %e,
+                                "deferred materialization (budget enforcement) failed; \
+                                 will retry at next strict barrier"
+                            );
+                        }
+                        vfs.record_vfs_write_materialize_for_limits(
+                            materialize_for_limits_started.elapsed(),
                         );
-                    }
-                    vfs.record_vfs_write_materialize_for_limits(
-                        materialize_for_limits_started.elapsed(),
-                    );
-                });
+
+                        // Release the inflight slot so the next write can spawn
+                        // a fresh materialization pass.
+                        vfs.state.deferred_materialize_inflight.lock().remove(&ino);
+                    });
+                }
             }
             (Ok(_), LocalSyncPolicy::Strict) => {
                 // Strict: await materialization inline (same as original).

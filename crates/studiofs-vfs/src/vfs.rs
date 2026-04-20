@@ -1903,6 +1903,7 @@ impl VfsState {
             file_lock: FileLockState::new(),
             shutdown: ShutdownState::new(),
             metrics: MetricsState::new(),
+            deferred_materialize_inflight: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -1919,6 +1920,11 @@ struct VfsState {
     file_lock: FileLockState,
     shutdown: ShutdownState,
     metrics: MetricsState,
+    /// Tracks inodes that currently have a deferred materialization task
+    /// in-flight.  Used by `write_fh_with_deferred_materialize` to ensure
+    /// at most one background materialization per inode at a time, preventing
+    /// task explosion and fragmented-block races.
+    deferred_materialize_inflight: Mutex<HashSet<Ino>>,
 }
 
 #[derive(Clone)]
