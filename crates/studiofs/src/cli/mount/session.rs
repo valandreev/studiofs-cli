@@ -2375,6 +2375,7 @@ mod tests {
             },
         )
         .expect("prepare session");
+        let actual_mount_path = session.actual_mount_path.clone();
 
         session.launch().expect("launch session");
         assert_eq!(events.lock().expect("lock events").len(), 1);
@@ -2391,7 +2392,7 @@ mod tests {
         assert_eq!(persisted_run.fingerprint.bridge, "FakeBackend");
         assert_eq!(
             persisted_run.fingerprint.runtime_configuration.mount_point,
-            mount_point
+            actual_mount_path
         );
         assert_eq!(persisted_run.timeline.len(), 3);
         assert_eq!(persisted_run.timeline[0].kind, TimelineEntryKind::Action);

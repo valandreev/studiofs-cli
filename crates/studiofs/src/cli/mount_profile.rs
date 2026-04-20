@@ -3,7 +3,7 @@ use crate::diagnostics::{
     ActiveRuntimeProfilingWindow, ProfilingBackendStartResult, ProfilingBackendStopResult,
     RuntimeProfilingBackend, RuntimeProfilingStopper, StartProfilingWindowRequest,
 };
-use crate::investigation::{ProfilingCaptureMode, ProfilingWindowStatus, ProfileArtifactRecord};
+use crate::investigation::{ProfileArtifactRecord, ProfilingCaptureMode, ProfilingWindowStatus};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use flate2::{Compression, write::GzEncoder};
