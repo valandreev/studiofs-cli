@@ -1047,6 +1047,16 @@ impl StudioVfs {
         Ok(attr)
     }
 
+    /// Returns the in-memory dirty attribute for `ino` without a metadata round-trip.
+    ///
+    /// After any successful write the dirty-attr map is always populated with an up-to-date
+    /// size and mtime. Callers that only need file info immediately after a write should prefer
+    /// this over `getattr` to avoid re-running the full `ReadMetadataResolver` on every write
+    /// callback. Returns `None` when there is no in-memory dirty state for the inode.
+    pub fn peek_dirty_attr(&self, ino: Ino) -> Option<InodeAttr> {
+        self.state.namespace.dirty_attrs.lock().get(&ino).cloned()
+    }
+
     pub(super) async fn getattr_async(&self, ino: Ino) -> VfsResult<InodeAttr> {
         let attr = self.getattr_async_unchecked(ino).await?;
         self.enforce_access_async(ino, AccessLevel::ReadOnly)

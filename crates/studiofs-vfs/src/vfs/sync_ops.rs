@@ -431,11 +431,15 @@ impl StudioVfs {
         data: &[u8],
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<u32> {
-        let session = self
-            .state
-            .file_session
-            .enter_op(ino, FileSessionOperation::Write)
-            .await;
+        // `session` is wrapped in Option so we can release it early for opportunistic writes
+        // before local-disk materialization. Strict writes hold the gate through all I/O to
+        // maintain ordering guarantees with concurrent flushes on the same inode.
+        let mut session = Some(
+            self.state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Write)
+                .await,
+        );
         let open_file = self.enforce_mutating_handle_access(fh, ino).ok();
         let _ = self.state.read.observe_write_access(
             open_file.as_ref(),
@@ -469,6 +473,19 @@ impl StudioVfs {
                 record_handle_writer_state_started.elapsed(),
             );
             let written = written?;
+
+            // Release the per-inode write gate before local-disk materialization for
+            // opportunistic writes. This lets concurrent writes to the same inode proceed
+            // through buffering while this write's materialization is in-flight.
+            //
+            // Duplicate materialization is safe: the local block store uses last-writer-wins
+            // for overlapping block ranges, and orphaned objects are reclaimed by the
+            // background janitor. Strict writes keep the gate to serialize flush/fsync
+            // callers with any concurrent materialization on the same inode.
+            if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+                session = None;
+            }
+
             if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
                 let materialize_strict_started = Instant::now();
                 let strict_result = self
@@ -495,6 +512,8 @@ impl StudioVfs {
             Ok(written)
         }
         .await;
+        // For opportunistic writes `session` is already None (gate released above).
+        // For strict writes `session` holds the gate until here.
         drop(session);
         self.state.file_session.gc_if_idle(ino);
         result

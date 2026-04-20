@@ -747,6 +747,13 @@ impl StudioVfs {
                 .await?;
         }
 
+        // Graduated backpressure: drain the dirtiest inodes until we are below the budget.
+        // We yield between iterations so that other write tasks can make forward progress
+        // (buffering new data) instead of all blocking behind a single sequential drain.
+        // This mirrors the soft-backpressure approach used by JuiceFS and avoids the
+        // burst-then-stall pattern where a single write blocks on materializing every other
+        // inode sequentially.
+        let mut stall_iterations: u32 = 0;
         while self.state.handle_writers.total_dirty_bytes() > max_dirty {
             let mut dirty_inodes = self.state.handle_writers.snapshot_dirty_inodes_by_bytes();
             dirty_inodes.sort_by_key(|(_, dirty_bytes)| std::cmp::Reverse(*dirty_bytes));
@@ -769,6 +776,17 @@ impl StudioVfs {
             }
             if !made_progress {
                 break;
+            }
+            stall_iterations = stall_iterations.saturating_add(1);
+            // Yield after each drain pass to let concurrent writers buffer new data.
+            // Back off progressively when we are still over budget after multiple passes.
+            if stall_iterations <= 2 {
+                tokio::task::yield_now().await;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    (stall_iterations.min(10) as u64).saturating_sub(2),
+                ))
+                .await;
             }
         }
 

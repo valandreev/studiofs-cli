@@ -119,19 +119,20 @@ pub(super) enum LastHandleReleaseAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LocalSyncTrigger {
     Explicit,
-    BytesThreshold,
 }
 
 pub(super) fn write_path_sync_trigger(
     local_sync_policy: LocalSyncPolicy,
-    pending_bytes: u64,
-    group_min_bytes: u64,
+    _pending_bytes: u64,
+    _group_min_bytes: u64,
 ) -> Option<LocalSyncTrigger> {
+    // Strict writes always flush — they guarantee local durability before returning.
+    // Opportunistic writes (the normal write hot path) never trigger sync_data here;
+    // the data lives in the OS page cache and is safe for the upload pipeline to read.
+    // A full sync is deferred to the next explicit flush, fsync, or file close, which
+    // all use Strict policy and will pick up any accumulated pending bytes.
     if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
         return Some(LocalSyncTrigger::Explicit);
-    }
-    if pending_bytes >= group_min_bytes {
-        return Some(LocalSyncTrigger::BytesThreshold);
     }
     None
 }
@@ -903,16 +904,18 @@ mod tests {
     }
 
     #[test]
-    fn opportunistic_local_sync_waits_until_threshold_only() {
-        let bytes_trigger = write_path_sync_trigger(
+    fn opportunistic_local_sync_never_triggers_on_write_path() {
+        // Opportunistic writes defer sync_data entirely to the next strict barrier
+        // (flush, fsync, or file close). This keeps fsync off the write hot path.
+        let above_threshold = write_path_sync_trigger(
             LocalSyncPolicy::Opportunistic,
             64 * 1024 * 1024,
             64 * 1024 * 1024,
         );
-        assert_eq!(bytes_trigger, Some(LocalSyncTrigger::BytesThreshold));
+        assert_eq!(above_threshold, None);
 
-        let deferred =
+        let below_threshold =
             write_path_sync_trigger(LocalSyncPolicy::Opportunistic, 1024, 64 * 1024 * 1024);
-        assert_eq!(deferred, None);
+        assert_eq!(below_threshold, None);
     }
 }

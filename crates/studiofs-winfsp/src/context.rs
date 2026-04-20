@@ -1585,7 +1585,16 @@ impl FileSystemContext for StudioFsContext {
         let vfs_write_elapsed = vfs_write_started.elapsed();
 
         let post_write_getattr_started = Instant::now();
-        let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
+        // After a successful write the dirty-attr map is always populated with an up-to-date
+        // size and mtime. Peek at it directly to avoid the full ReadMetadataResolver path on
+        // every write callback. Fall back to getattr only if there is no dirty state (e.g. an
+        // ignored entry or a pure constrained-IO write that extended no dirty attr).
+        let attr = self
+            .vfs
+            .peek_dirty_attr(context.ino)
+            .map(Ok)
+            .unwrap_or_else(|| self.vfs.getattr(context.ino))
+            .map_err(vfs_to_winfsp_err)?;
         *file_info = attr_to_file_info(&attr);
         let post_write_getattr_elapsed = post_write_getattr_started.elapsed();
         self.vfs.record_winfsp_write_callback_observability(
