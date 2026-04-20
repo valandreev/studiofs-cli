@@ -5979,6 +5979,7 @@ impl StudioVfs {
     pub fn inode_has_local_dirty_state(&self, ino: Ino) -> bool {
         self.has_pending_local_dirty_blocks_for_inode(ino)
             || self.state.namespace.dirty_attrs.lock().contains_key(&ino)
+            || self.inode_has_dirty_handle_writers(ino)
     }
 
     pub fn write_path_observability_snapshot(&self) -> VfsWritePathObservabilitySnapshot {
