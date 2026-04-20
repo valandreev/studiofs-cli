@@ -1486,7 +1486,39 @@ impl PgMetaEngine {
 
     fn prime_local_id_ranges(&self, slot: u64) -> MetaResult<()> {
         self.cache_client_slot(slot);
-        self.ensure_local_id_headroom(slot)
+        self.ensure_local_id_headroom(slot)?;
+        // If persisted state already has no headroom (next >= reserved_end from a
+        // previous session), extend it now so that `allows_new_mutations()` does not
+        // block every write on startup.  Without this, the engine stays read-only
+        // even when PG is healthy and the slot is not globally exhausted.
+        let pg_available = self.can_refresh_local_id_headroom().unwrap_or(false);
+        if pg_available {
+            if !self.inode_id_headroom_available.load(Ordering::Acquire) {
+                if let Ok(new_lease) =
+                    self.reserve_local_id_lease(slot, INODE_ID_RANGE_SPEC, 0, true)
+                {
+                    *self
+                        .inode_id_cache
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = new_lease;
+                    self.inode_id_headroom_available
+                        .store(new_lease.has_headroom(), Ordering::Release);
+                }
+            }
+            if !self.block_id_headroom_available.load(Ordering::Acquire) {
+                if let Ok(new_lease) =
+                    self.reserve_local_id_lease(slot, BLOCK_ID_RANGE_SPEC, 0, true)
+                {
+                    *self
+                        .block_id_cache
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = new_lease;
+                    self.block_id_headroom_available
+                        .store(new_lease.has_headroom(), Ordering::Release);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn open(path: impl AsRef<Path>) -> MetaResult<Arc<Self>> {
@@ -1594,8 +1626,13 @@ impl PgMetaEngine {
             pending_state: Mutex::new(PendingReplicationState::default()),
             inode_id_cache: Mutex::new(LocalIdLeaseCache::default()),
             block_id_cache: Mutex::new(LocalIdLeaseCache::default()),
-            inode_id_headroom_available: AtomicBool::new(false),
-            block_id_headroom_available: AtomicBool::new(false),
+            // Optimistic: assume headroom is available until proven exhausted.
+            // These flags are degraded to `false` by `allocate_local_ids` only
+            // when the reserved range is genuinely exhausted.  Starting at
+            // `false` caused `allows_new_mutations()` to block every write if
+            // `prime_local_id_ranges` failed silently (via `let _ = ...`).
+            inode_id_headroom_available: AtomicBool::new(true),
+            block_id_headroom_available: AtomicBool::new(true),
             janitor_lock: Mutex::new(None),
             file_lock_cache: Mutex::new(HashMap::new()),
             held_file_locks: Mutex::new(HashMap::new()),

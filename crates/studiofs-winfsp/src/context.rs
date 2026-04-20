@@ -3,10 +3,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::fs::OpenOptions as StdOpenOptions;
-use std::io::Write as _;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use parking_lot::Mutex;
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
@@ -48,11 +46,6 @@ const FILE_WRITE_DATA_ACCESS: FILE_ACCESS_RIGHTS = 0x0002;
 const FILE_APPEND_DATA_ACCESS: FILE_ACCESS_RIGHTS = 0x0004;
 const FILE_GENERIC_READ_ACCESS: FILE_ACCESS_RIGHTS = 0x0012_0089;
 const FILE_GENERIC_WRITE_ACCESS: FILE_ACCESS_RIGHTS = 0x0012_0116;
-const DEBUG_AGENT_SESSION_ID: &str = "78abc1";
-const DEBUG_AGENT_RUN_ID: &str = "winfsp-vfx-legacy-dir-delete-2026-04-13b";
-const DEBUG_AGENT_LOG_PATH: &str =
-    r"C:\Users\valen\AppData\Local\Temp\debug-agent\debug-78abc1.log";
-const DEBUG_AGENT_TARGET_NAME: &str = "ajadisktest.dat";
 
 // ─── NTSTATUS constants ──────────────────────────────────────────────────────
 
@@ -318,95 +311,6 @@ fn compute_file_attributes(attr: &InodeAttr) -> u32 {
     } else {
         normalized
     }
-}
-
-fn debug_agent_timestamp_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-}
-
-fn debug_agent_escape_json(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 8);
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => {
-                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-fn debug_agent_json_string(value: &str) -> String {
-    format!("\"{}\"", debug_agent_escape_json(value))
-}
-
-fn debug_agent_path_matches(path: &str) -> bool {
-    path.rsplit(['\\', '/'])
-        .next()
-        .is_some_and(|name| name.eq_ignore_ascii_case(DEBUG_AGENT_TARGET_NAME))
-}
-
-fn debug_agent_name_matches_bytes(name: &[u8]) -> bool {
-    std::str::from_utf8(name)
-        .map(|name| name.eq_ignore_ascii_case(DEBUG_AGENT_TARGET_NAME))
-        .unwrap_or(false)
-}
-
-fn debug_agent_append(hypothesis_id: &str, location: &str, message: &str, data_json: String) {
-    if let Ok(mut file) = StdOpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(DEBUG_AGENT_LOG_PATH)
-    {
-        let _ = writeln!(
-            file,
-            "{{\"sessionId\":\"{}\",\"runId\":\"{}\",\"hypothesisId\":\"{}\",\"location\":\"{}\",\"message\":\"{}\",\"data\":{},\"timestamp\":{}}}",
-            DEBUG_AGENT_SESSION_ID,
-            DEBUG_AGENT_RUN_ID,
-            debug_agent_escape_json(hypothesis_id),
-            debug_agent_escape_json(location),
-            debug_agent_escape_json(message),
-            data_json,
-            debug_agent_timestamp_ms()
-        );
-    }
-}
-
-fn debug_agent_directory_entries_json(
-    vfs: &StudioVfs,
-    entries: &[studiofs_meta::DirEntry],
-) -> String {
-    let mut out = String::from("[");
-    for (idx, entry) in entries.iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
-        }
-        let attr_state = match vfs.getattr(entry.ino) {
-            Ok(attr) => format!("attr:{:?}", attr.kind),
-            Err(err) => format!("err:{err:?}"),
-        };
-        let _ = std::fmt::Write::write_fmt(
-            &mut out,
-            format_args!(
-                "{{\"name\":{},\"ino\":{},\"dentry_kind\":{},\"attr_state\":{}}}",
-                debug_agent_json_string(&String::from_utf8_lossy(&entry.name)),
-                entry.ino,
-                debug_agent_json_string(&format!("{:?}", entry.kind)),
-                debug_agent_json_string(&attr_state)
-            ),
-        );
-    }
-    out.push(']');
-    out
 }
 
 /// Convert InodeAttr to WinFSP FileInfo.
@@ -1524,26 +1428,6 @@ impl FileSystemContext for StudioFsContext {
         let write_local_sync_policy = write_local_sync_policy_from_create_options(create_options);
         Self::write_open_file_info(file_info, &attr);
         let handle = self.open_file_handle_for_attr(&attr, open_flags, write_local_sync_policy)?;
-        let display_path = file_name.to_string_lossy();
-        // #region debug log
-        if debug_agent_path_matches(&display_path) {
-            debug_agent_append(
-                "H2",
-                "studiofs-winfsp/src/context.rs:open",
-                "winfsp open resolved attr",
-                format!(
-                    "{{\"path\":{},\"create_options\":{},\"attr_ino\":{},\"attr_kind\":{},\"handle_is_dir\":{},\"handle_fh\":{},\"open_flags\":{}}}",
-                    debug_agent_json_string(&display_path),
-                    create_options,
-                    attr.ino,
-                    debug_agent_json_string(&format!("{:?}", attr.kind)),
-                    handle.is_dir,
-                    handle.fh,
-                    handle.open_flags.bits()
-                ),
-            );
-        }
-        // #endregion
 
         debug!(
             ino = attr.ino,
@@ -1576,7 +1460,6 @@ impl FileSystemContext for StudioFsContext {
         if maybe_hide_non_macos_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
-        let display_path = file_name.to_string_lossy();
         let plan = self.resolve_create_callback_plan(
             file_name,
             create_options,
@@ -1584,46 +1467,7 @@ impl FileSystemContext for StudioFsContext {
             extra_buffer,
             extra_buffer_is_reparse_point,
         )?;
-        // #region debug log
-        if debug_agent_path_matches(&display_path) {
-            debug_agent_append(
-                "H1",
-                "studiofs-winfsp/src/context.rs:create",
-                "winfsp create resolved plan",
-                format!(
-                    "{{\"path\":{},\"create_options\":{},\"resolved_kind\":{},\"directory_option\":{},\"extra_buffer_is_reparse_point\":{},\"extra_buffer_len\":{}}}",
-                    debug_agent_json_string(&display_path),
-                    create_options,
-                    debug_agent_json_string(&format!("{:?}", plan.kind)),
-                    (create_options & FILE_DIRECTORY_FILE_OPTION) != 0,
-                    extra_buffer_is_reparse_point,
-                    extra_buffer.map_or(0, <[u8]>::len)
-                ),
-            );
-        }
-        // #endregion
         let handle = self.execute_create_callback_plan(plan, file_info)?;
-        // #region debug log
-        if debug_agent_path_matches(&display_path) {
-            let attr_result = match self.vfs.getattr(handle.ino) {
-                Ok(attr) => format!("{:?}", attr.kind),
-                Err(err) => format!("ERR:{err:?}"),
-            };
-            debug_agent_append(
-                "H1",
-                "studiofs-winfsp/src/context.rs:create",
-                "winfsp create result",
-                format!(
-                    "{{\"path\":{},\"handle_ino\":{},\"handle_is_dir\":{},\"handle_fh\":{},\"post_create_attr\":{}}}",
-                    debug_agent_json_string(&display_path),
-                    handle.ino,
-                    handle.is_dir,
-                    handle.fh,
-                    debug_agent_json_string(&attr_result)
-                ),
-            );
-        }
-        // #endregion
 
         debug!(
             ino = handle.ino,
@@ -1806,7 +1650,6 @@ impl FileSystemContext for StudioFsContext {
                 if maybe_hide_non_macos_root_entry(&self.vfs, context.ino, &entry.name)? {
                     continue;
                 }
-                let should_debug_entry = debug_agent_name_matches_bytes(&entry.name);
                 let had_invalid_utf8 = encode_entry_name_utf16_lossy(&entry.name, &mut name_u16);
                 if name_u16.len() > MAX_WINDOWS_COMPONENT_UTF16_UNITS {
                     warn!(
@@ -1835,23 +1678,6 @@ impl FileSystemContext for StudioFsContext {
                     Ok(a) => a,
                     Err(e) => {
                         let display_name = String::from_utf8_lossy(&entry.name);
-                        // #region debug log
-                        if should_debug_entry {
-                            debug_agent_append(
-                                "H3",
-                                "studiofs-winfsp/src/context.rs:read_directory",
-                                "winfsp readdir child getattr failed",
-                                format!(
-                                    "{{\"entry_name\":{},\"entry_ino\":{},\"entry_kind\":{},\"had_invalid_utf8\":{},\"error\":{}}}",
-                                    debug_agent_json_string(&display_name),
-                                    entry.ino,
-                                    debug_agent_json_string(&format!("{:?}", entry.kind)),
-                                    had_invalid_utf8,
-                                    debug_agent_json_string(&format!("{e:?}"))
-                                ),
-                            );
-                        }
-                        // #endregion
                         warn!(
                             "failed to get attr for '{}': {:?} (had_invalid_utf8={})",
                             display_name, e, had_invalid_utf8
@@ -1859,24 +1685,6 @@ impl FileSystemContext for StudioFsContext {
                         continue;
                     }
                 };
-                // #region debug log
-                if should_debug_entry {
-                    let display_name = String::from_utf8_lossy(&entry.name);
-                    debug_agent_append(
-                        "H3",
-                        "studiofs-winfsp/src/context.rs:read_directory",
-                        "winfsp readdir child getattr succeeded",
-                        format!(
-                            "{{\"entry_name\":{},\"entry_ino\":{},\"entry_kind\":{},\"child_attr_kind\":{},\"had_invalid_utf8\":{}}}",
-                            debug_agent_json_string(&display_name),
-                            entry.ino,
-                            debug_agent_json_string(&format!("{:?}", entry.kind)),
-                            debug_agent_json_string(&format!("{:?}", child_attr.kind)),
-                            had_invalid_utf8
-                        ),
-                    );
-                }
-                // #endregion
                 *dir_info.file_info_mut() = attr_to_file_info(&child_attr);
 
                 if let Err(e) = lock.write(&mut dir_info) {
@@ -1893,33 +1701,12 @@ impl FileSystemContext for StudioFsContext {
     fn set_delete(
         &self,
         context: &Self::FileContext,
-        file_name: &U16CStr,
+        _file_name: &U16CStr,
         delete_file: bool,
     ) -> winfsp::Result<()> {
-        let display_path = file_name.to_string_lossy();
         if delete_file && context.is_dir {
             let healed_orphans = self.heal_directory_orphans_for_delete(context.ino)?;
             let entries = self.vfs.readdir(context.ino).map_err(vfs_to_winfsp_err)?;
-            // #region debug log
-            if context.is_dir {
-                let entry_snapshot = debug_agent_directory_entries_json(&self.vfs, &entries);
-                debug_agent_append(
-                    "H4",
-                    "studiofs-winfsp/src/context.rs:set_delete",
-                    "winfsp set_delete directory precheck",
-                    format!(
-                        "{{\"path\":{},\"ino\":{},\"delete_file\":{},\"context_is_dir\":{},\"healed_orphans\":{},\"entry_count\":{},\"entries\":{}}}",
-                        debug_agent_json_string(&display_path),
-                        context.ino,
-                        delete_file,
-                        context.is_dir,
-                        healed_orphans,
-                        entries.len(),
-                        entry_snapshot
-                    ),
-                );
-            }
-            // #endregion
             debug!(
                 ino = context.ino,
                 healed_orphans,
@@ -1929,23 +1716,6 @@ impl FileSystemContext for StudioFsContext {
             if !entries.is_empty() {
                 return Err(winfsp::FspError::from(STATUS_DIRECTORY_NOT_EMPTY));
             }
-        } else {
-            // #region debug log
-            if debug_agent_path_matches(&display_path) {
-                debug_agent_append(
-                    "H4",
-                    "studiofs-winfsp/src/context.rs:set_delete",
-                    "winfsp set_delete non-directory path",
-                    format!(
-                        "{{\"path\":{},\"ino\":{},\"delete_file\":{},\"context_is_dir\":{}}}",
-                        debug_agent_json_string(&display_path),
-                        context.ino,
-                        delete_file,
-                        context.is_dir
-                    ),
-                );
-            }
-            // #endregion
         }
         Ok(())
     }
@@ -1993,28 +1763,6 @@ impl FileSystemContext for StudioFsContext {
         _last_change_time: u64,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        let display_path = ino_to_windows_path(&self.vfs, context.ino)
-            .unwrap_or_else(|| format!("#{}", context.ino));
-        // #region debug log
-        if debug_agent_path_matches(&display_path) {
-            debug_agent_append(
-                "H2",
-                "studiofs-winfsp/src/context.rs:set_basic_info",
-                "winfsp set_basic_info request",
-                format!(
-                    "{{\"path\":{},\"ino\":{},\"context_is_dir\":{},\"file_attributes\":{},\"directory_bit\":{},\"archive_bit\":{},\"normal_bit\":{},\"reparse_bit\":{}}}",
-                    debug_agent_json_string(&display_path),
-                    context.ino,
-                    context.is_dir,
-                    file_attributes,
-                    (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0,
-                    (file_attributes & FILE_ATTRIBUTE_ARCHIVE) != 0,
-                    (file_attributes & FILE_ATTRIBUTE_NORMAL) != 0,
-                    (file_attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
-                ),
-            );
-        }
-        // #endregion
         self.execute_basic_info_callback(
             context.ino,
             build_basic_info_setattr_args(
