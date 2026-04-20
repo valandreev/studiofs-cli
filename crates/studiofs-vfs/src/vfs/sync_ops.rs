@@ -200,6 +200,25 @@ impl StudioVfs {
         sticky_error_policy: StickyErrorPolicy,
         dirty_attr_persist_policy: DirtyAttrPersistPolicy,
     ) -> VfsResult<LocalSyncBarrierOutcome> {
+        // Wait for any in-flight deferred materialization task to finish
+        // before we run our own strict materialization pass.  Without this
+        // the flush/close path and the background task would race on
+        // HandleWriterRegistry snapshots, producing fragmented blocks.
+        //
+        // The parking_lot lock is scoped so the MutexGuard (which is !Send)
+        // is dropped before the .await point.  We then acquire the
+        // tokio::sync::Mutex which blocks until the background task releases it.
+        let task_lock = {
+            self.state
+                .deferred_materialize_inflight
+                .lock()
+                .get(&ino)
+                .cloned()
+        };
+        if let Some(task_lock) = task_lock {
+            let _guard = task_lock.lock().await;
+        }
+
         let materialized_handle_writers = self
             .materialize_handle_writers_for_inode(ino, local_sync_policy)
             .await?;
@@ -617,10 +636,20 @@ impl StudioVfs {
                 // it will naturally drain all buffered data accumulated since it
                 // started — no need for another task.
                 let already_inflight = {
-                    let mut inflight = self.state.deferred_materialize_inflight.lock();
-                    !inflight.insert(ino) // returns false if ino was NOT present (inserted)
+                    let inflight = self.state.deferred_materialize_inflight.lock();
+                    inflight.contains_key(&ino)
                 };
                 if !already_inflight {
+                    // Create a tokio::sync::Mutex and pre-acquire it so the
+                    // spawned task holds the lock for its entire lifetime.
+                    // Flush/close will `.lock().await` on the same Mutex to
+                    // wait for completion — no TOCTOU race possible.
+                    let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+                    let guard = task_lock.clone().lock_owned().await;
+                    self.state
+                        .deferred_materialize_inflight
+                        .lock()
+                        .insert(ino, Arc::clone(&task_lock));
                     let vfs = Arc::clone(self);
                     tokio::spawn(async move {
                         let materialize_completed_started = Instant::now();
@@ -661,8 +690,9 @@ impl StudioVfs {
                             materialize_for_limits_started.elapsed(),
                         );
 
-                        // Release the inflight slot so the next write can spawn
-                        // a fresh materialization pass.
+                        // Release the lock so any waiting flush/close can proceed,
+                        // then remove the map entry.
+                        drop(guard);
                         vfs.state.deferred_materialize_inflight.lock().remove(&ino);
                     });
                 }
