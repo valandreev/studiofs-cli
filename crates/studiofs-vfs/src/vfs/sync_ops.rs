@@ -268,6 +268,19 @@ impl StudioVfs {
 
         if matches!(sticky_error_policy, StickyErrorPolicy::Report) {
             self.ensure_no_upload_sticky_error(ino)?;
+        } else if let Some(msg) = self
+            .state
+            .upload
+            .upload_sticky_errors
+            .lock()
+            .get(&ino)
+            .cloned()
+        {
+            warn!(
+                ino,
+                error = %msg,
+                "sticky upload error present at flush barrier (policy=Ignore, local data safe)"
+            );
         }
 
         Ok(LocalSyncBarrierOutcome {
@@ -335,12 +348,19 @@ impl StudioVfs {
             .file_session
             .enter_op(open_file.ino, FileSessionOperation::Flush)
             .await;
+        // Flush guarantees LOCAL durability (NVMe) — not S3 upload completion.
+        // With deferred materialization the upload pipeline may still be
+        // processing blocks when flush runs.  A transient upload failure would
+        // set a sticky error that used to fail the flush, even though data was
+        // safely persisted locally.  Use Ignore here (consistent with the
+        // ino-level flush_with_outcome) so that a background upload hiccup
+        // does not surface as a flush error to the application.
         let result: VfsResult<ExplicitFlushOutcome> = async {
             let outcome = self
                 .local_sync_barrier_with_outcome(
                     open_file.ino,
                     self.local_sync_policy_for_barrier(open_file.ino),
-                    StickyErrorPolicy::Report,
+                    StickyErrorPolicy::Ignore,
                     DirtyAttrPersistPolicy::PersistIfPresent,
                 )
                 .await?;

@@ -1500,16 +1500,11 @@ fn test_sticky_upload_error_is_deterministic_across_sync_points() {
         vfs.fsync(ino, false).await.unwrap();
 
         vfs.mark_upload_sticky_error(ino, &VfsError::Other("simulated upload failure".into()));
-        let flush_err = vfs.flush_fh(fh).await.unwrap_err();
-        assert!(
-            flush_err.to_string().contains("sticky upload error"),
-            "flush_fh should surface sticky upload errors"
-        );
-        let flush_err_again = vfs.flush_fh(fh).await.unwrap_err();
-        assert!(
-            flush_err_again.to_string().contains("sticky upload error"),
-            "sticky upload errors should be deterministic across flush_fh calls"
-        );
+        // flush_fh guarantees local durability but ignores background upload
+        // errors — the data is safe in NVMe and uploads will be retried.
+        vfs.flush_fh(fh).await.unwrap();
+        // A second flush also succeeds (sticky error is harmless).
+        vfs.flush_fh(fh).await.unwrap();
         vfs.clear_upload_sticky_error(ino);
         vfs.write(ino, 0, b"payload").await.unwrap();
         vfs.flush_fh(fh).await.unwrap();
