@@ -569,7 +569,24 @@ this usually means Administrator privileges are required, or WinFSP must be conf
     let _ = rx.recv(); // blocks
 
     tracing::info!("unmounting StudioFS from {mount_point}");
-    // Stop WinFSP first so no new callbacks race with the shutdown drain.
+    // Best-effort graceful shutdown: first drain VFS background work so
+    // metadata engines (pg/redb) can stop their threads and be closed cleanly
+    // before the kernel unmounts the filesystem. Use the same env var as the
+    // mount session to control upload drain timeout.
+    let upload_secs = std::env::var("STUDIOFS_SHUTDOWN_UPLOAD_DRAIN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let upload_drain_timeout = std::time::Duration::from_secs(upload_secs);
+    // Block on the provided runtime handle so shutdown runs synchronously
+    // in the current thread before we stop/unmount the host.
+    // Run VFS shutdown synchronously on the provided runtime so background
+    // workers are drained and metadata is flushed before unmount.
+    runtime_handle.block_on(vfs.shutdown(upload_drain_timeout));
+
+    // Stop WinFSP so no new callbacks race with the shutdown drain, then
+    // unmount the volume.  Host may still hold references until unmount completes,
+    // but background threads and metadata engines have been asked to stop.
     host.stop();
     host.unmount();
 

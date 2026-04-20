@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::RuntimeFlavor;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 const LOCAL_PG_VERSION_COUNTER: &str = "pgLastAppliedBatchVersion";
@@ -78,6 +79,8 @@ pub struct PgMetaEngine {
     lock_worker_start_lock: Mutex<()>,
     /// Signals the background poll thread to exit.
     poll_shutdown: Arc<AtomicBool>,
+    /// Cancels the lock-notify listener async future immediately, even mid-await.
+    lock_notify_cancel: CancellationToken,
     /// Handle to the background poll thread, used by `prepare_for_close()`
     /// to join the thread so `Database::drop()` runs before process exit.
     poll_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -1131,6 +1134,7 @@ impl PgMetaEngine {
             *notify_guard = Some(Self::start_lock_notify_listener(
                 engine.clone(),
                 self.poll_shutdown.clone(),
+                self.lock_notify_cancel.clone(),
             )?);
         }
         drop(notify_guard);
@@ -1182,100 +1186,145 @@ impl PgMetaEngine {
     fn start_lock_notify_listener(
         engine: Weak<Self>,
         shutdown: Arc<AtomicBool>,
+        cancel: CancellationToken,
     ) -> MetaResult<std::thread::JoinHandle<()>> {
         std::thread::Builder::new()
             .name("pg-lock-notify".into())
             .spawn(move || {
                 while !shutdown.load(Ordering::Acquire) {
-                    let Some(engine_arc) = engine.upgrade() else {
-                        break;
-                    };
-                    let channel = Self::lock_notify_channel(engine_arc.volume_id);
-                    let safety_refresh_interval =
-                        Self::default_lock_notify_safety_refresh_interval();
-                    let connect_result = engine_arc.run_async(async {
-                        let connect = tokio_postgres::connect(
-                            &engine_arc.postgres_url,
-                            tokio_postgres::NoTls,
-                        );
-                        let (client, mut connection) =
-                            tokio::time::timeout(engine_arc.connect_timeout, connect)
-                                .await
-                                .map_err(|_| {
-                                    Self::pg_timeout_error(
-                                        "lock notify connect",
-                                        engine_arc.connect_timeout,
-                                    )
-                                })?
-                                .map_err(|e| {
-                                    MetaError::Storage(format!(
-                                        "postgres lock notify connect failed: {}",
-                                        Self::format_pg_error(e)
-                                    ))
-                                })?;
-                        client
-                            .batch_execute(&format!("LISTEN {channel}"))
-                            .await
-                            .map_err(|e| {
-                                MetaError::Storage(format!(
-                                    "postgres LISTEN {channel} failed: {}",
-                                    Self::format_pg_error(e)
-                                ))
-                            })?;
+                    // Upgrade briefly to snapshot the minimal runtime configuration
+                    // we need for connecting, then drop the Arc so connect doesn't
+                    // hold the engine alive. This avoids keeping Redb/engine Arcs
+                    // alive across potentially long network connect attempts.
+                    let (postgres_url, volume_id, connect_timeout, safety_refresh_interval) =
+                        match engine.upgrade() {
+                            Some(engine_arc) => {
+                                (
+                                    engine_arc.postgres_url.clone(),
+                                    engine_arc.volume_id,
+                                    engine_arc.connect_timeout,
+                                    Self::default_lock_notify_safety_refresh_interval(),
+                                )
+                            }
+                            None => break,
+                        };
 
-                        let mut next_safety_refresh = Instant::now() + safety_refresh_interval;
-                        while !shutdown.load(Ordering::Acquire) {
-                            let message = tokio::time::timeout(
-                                Duration::from_millis(Self::LOCK_NOTIFY_IDLE_POLL_INTERVAL_MS),
-                                std::future::poll_fn(|cx| connection.poll_message(cx)),
-                            )
-                            .await;
-                            match message {
-                                Ok(Some(Ok(tokio_postgres::AsyncMessage::Notification(
-                                    notification,
-                                )))) => {
-                                    if let Some(ino) =
-                                        Self::parse_file_lock_notify_payload(notification.payload())
-                                    {
-                                        engine_arc
-                                            .refresh_known_file_lock_lease_with_client(&client, ino)
-                                            .await?;
-                                    }
+                    let channel = Self::lock_notify_channel(volume_id);
+
+                    // Run the connect + listen + poll loop inside an async runtime.
+                    // All awaitable operations are raced against `cancel` so that
+                    // `prepare_for_close` can interrupt them immediately — including
+                    // in-flight `refresh_known_file_lock_lease_with_client` calls
+                    // that are triggered by file-write notifications.
+                    let weak_engine = engine.clone();
+                    let shutdown_for_task = shutdown.clone();
+                    let cancel_for_task = cancel.clone();
+                    let connect_result = (|| -> MetaResult<()> {
+                        let fut = async move {
+                            // Race connect against cancellation so we don't block
+                            // `prepare_for_close` for up to connect_timeout.
+                            let connect_result = tokio::select! {
+                                biased;
+                                _ = cancel_for_task.cancelled() => return Ok(()),
+                                r = tokio::time::timeout(
+                                    connect_timeout,
+                                    tokio_postgres::connect(&postgres_url, tokio_postgres::NoTls),
+                                ) => r,
+                            };
+                            let (client, mut connection) = connect_result
+                                .map_err(|_| Self::pg_timeout_error("lock notify connect", connect_timeout))?
+                                .map_err(|e| MetaError::Storage(format!(
+                                    "postgres lock notify connect failed: {}",
+                                    Self::format_pg_error(e)
+                                )))?;
+
+                            // After successful connect, try to upgrade the weak ref.
+                            let Some(engine_arc) = weak_engine.upgrade() else {
+                                // Engine gone: drop client and exit cleanly.
+                                return Ok(());
+                            };
+
+                            // Race LISTEN setup against cancellation.
+                            let listen_cmd = format!("LISTEN {channel}");
+                            tokio::select! {
+                                biased;
+                                _ = cancel_for_task.cancelled() => return Ok(()),
+                                r = client.batch_execute(&listen_cmd) => {
+                                    r.map_err(|e| MetaError::Storage(format!(
+                                        "postgres LISTEN {channel} failed: {}",
+                                        Self::format_pg_error(e)
+                                    )))?;
                                 }
-                                Ok(Some(Ok(tokio_postgres::AsyncMessage::Notice(_)))) => {}
-                                Ok(Some(Ok(_))) => {}
-                                Ok(Some(Err(err))) => {
-                                    return Err(MetaError::Storage(format!(
-                                        "postgres lock notify poll failed: {}",
-                                        Self::format_pg_error(err)
-                                    )));
-                                }
-                                Ok(None) => {
-                                    return Ok(());
-                                }
-                                Err(_) => {
-                                    if Instant::now() >= next_safety_refresh {
-                                        let cached_inos: Vec<Ino> = engine_arc
-                                            .file_lock_cache
-                                            .lock()
-                                            .map(|cache| cache.keys().copied().collect())
-                                            .unwrap_or_default();
-                                        for ino in cached_inos {
-                                            engine_arc
-                                                .refresh_known_file_lock_lease_with_client(
-                                                    &client, ino,
-                                                )
-                                                .await?;
+                            }
+
+                            let mut next_safety_refresh = Instant::now() + safety_refresh_interval;
+                            while !shutdown_for_task.load(Ordering::Acquire) {
+                                // Race the postgres poll against cancellation so that
+                                // `prepare_for_close` can exit immediately even while
+                                // the thread is blocked waiting for notifications.
+                                let message = tokio::select! {
+                                    biased;
+                                    _ = cancel_for_task.cancelled() => break,
+                                    msg = tokio::time::timeout(
+                                        Duration::from_millis(Self::LOCK_NOTIFY_IDLE_POLL_INTERVAL_MS),
+                                        std::future::poll_fn(|cx| connection.poll_message(cx)),
+                                    ) => msg,
+                                };
+                                match message {
+                                    Ok(Some(Ok(tokio_postgres::AsyncMessage::Notification(notification)))) => {
+                                        if let Some(ino) = Self::parse_file_lock_notify_payload(notification.payload()) {
+                                            // This is the critical path: a file write has been
+                                            // notified. Race the postgres refresh against
+                                            // cancellation so unmount is not blocked.
+                                            tokio::select! {
+                                                biased;
+                                                _ = cancel_for_task.cancelled() => break,
+                                                r = engine_arc.refresh_known_file_lock_lease_with_client(&client, ino) => { r?; }
+                                            }
                                         }
-                                        next_safety_refresh =
-                                            Instant::now() + safety_refresh_interval;
+                                    }
+                                    Ok(Some(Ok(tokio_postgres::AsyncMessage::Notice(_)))) => {}
+                                    Ok(Some(Ok(_))) => {}
+                                    Ok(Some(Err(err))) => {
+                                        return Err(MetaError::Storage(format!(
+                                            "postgres lock notify poll failed: {}",
+                                            Self::format_pg_error(err)
+                                        )));
+                                    }
+                                    Ok(None) => return Ok(()),
+                                    Err(_) => {
+                                        if Instant::now() >= next_safety_refresh {
+                                            let cached_inos: Vec<Ino> = engine_arc
+                                                .file_lock_cache
+                                                .lock()
+                                                .map(|cache| cache.keys().copied().collect())
+                                                .unwrap_or_default();
+                                            for ino in cached_inos {
+                                                // Also race the safety-refresh calls so they
+                                                // can be cancelled cleanly at shutdown.
+                                                tokio::select! {
+                                                    biased;
+                                                    _ = cancel_for_task.cancelled() => return Ok(()),
+                                                    r = engine_arc.refresh_known_file_lock_lease_with_client(&client, ino) => { r?; }
+                                                }
+                                            }
+                                            next_safety_refresh = Instant::now() + safety_refresh_interval;
+                                        }
                                     }
                                 }
                             }
-                        }
-                        Ok(())
-                    });
-                    if shutdown.load(Ordering::Acquire) {
+                            Ok(())
+                        };
+
+                        // Build a small current-thread runtime to run the future.
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| MetaError::Storage(format!("failed to build tokio runtime: {e}")))?;
+                        rt.block_on(fut)
+                    })();
+
+                    if shutdown.load(Ordering::Acquire) || cancel.is_cancelled() {
                         break;
                     }
                     if connect_result.is_err() {
@@ -1640,6 +1689,7 @@ impl PgMetaEngine {
             lock_workers_enabled: options.background_poll,
             lock_worker_start_lock: Mutex::new(()),
             poll_shutdown: poll_shutdown.clone(),
+            lock_notify_cancel: CancellationToken::new(),
             poll_handle: Mutex::new(None),
             lock_notify_handle: Mutex::new(None),
             lock_renew_handle: Mutex::new(None),
@@ -3940,6 +3990,11 @@ impl MetaReplication for PgMetaEngine {
         // is dropped before the caller proceeds with process exit, so that
         // `RedbMetaEngine` / `redb::Database` can run their Drop impls
         // cleanly — preventing "Database repair aborted" on next mount.
+        //
+        // Cancel the notify listener token first so any in-flight postgres
+        // awaits (e.g. `refresh_known_file_lock_lease_with_client`) are
+        // interrupted immediately rather than waiting up to command_timeout.
+        self.lock_notify_cancel.cancel();
         self.poll_shutdown.store(true, Ordering::Release);
         let join_timeout = Self::default_prepare_for_close_join_timeout();
         if let Ok(mut guard) = self.poll_handle.lock()
@@ -4340,6 +4395,7 @@ mod tests {
             lock_workers_enabled: false,
             lock_worker_start_lock: Mutex::new(()),
             poll_shutdown: Arc::new(AtomicBool::new(false)),
+            lock_notify_cancel: CancellationToken::new(),
             poll_handle: Mutex::new(None),
             lock_notify_handle: Mutex::new(None),
             lock_renew_handle: Mutex::new(None),
