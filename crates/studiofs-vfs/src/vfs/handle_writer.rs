@@ -501,6 +501,48 @@ impl HandleWriterRegistry {
 }
 
 impl StudioVfs {
+    fn fully_overwritten_block_indexes_for_handle_writes(
+        &self,
+        writes: &[BufferedHandleWrite],
+        visible_size: u64,
+    ) -> std::collections::HashSet<u32> {
+        let mut ranges_by_block = std::collections::BTreeMap::<u32, Vec<(usize, usize)>>::new();
+
+        for write in writes {
+            if write.data.is_empty() {
+                continue;
+            }
+            let start = offset_within_block(write.offset, self.block_size) as usize;
+            let end = start.saturating_add(write.data.len());
+            ranges_by_block
+                .entry(write.block_index)
+                .or_default()
+                .push((start, end));
+        }
+
+        ranges_by_block
+            .into_iter()
+            .filter_map(|(block_index, mut ranges)| {
+                let logical_len = self.logical_block_len(visible_size, block_index);
+                if logical_len == 0 {
+                    return None;
+                }
+                ranges.sort_unstable_by_key(|(start, _)| *start);
+                let mut covered_until = 0usize;
+                for (start, end) in ranges {
+                    if start > covered_until {
+                        return None;
+                    }
+                    covered_until = covered_until.max(end);
+                    if covered_until >= logical_len {
+                        return Some(block_index);
+                    }
+                }
+                None
+            })
+            .collect()
+    }
+
     fn fully_overwritten_full_block_indexes_for_handle_writes(
         &self,
         writes: &[BufferedHandleWrite],
@@ -595,6 +637,7 @@ impl StudioVfs {
         visible_size: u64,
         selected_block_indexes: &HashSet<u32>,
         fully_overwritten_blocks: &HashSet<u32>,
+        include_partial_blocks: bool,
     ) -> VfsResult<Vec<DirtyWriteSnapshot>> {
         if selected_block_indexes.is_empty() {
             return Ok(Vec::new());
@@ -681,7 +724,7 @@ impl StudioVfs {
                 if data.len() > logical_len {
                     data.truncate(logical_len);
                 }
-                if data.len() == self.block_size as usize {
+                if include_partial_blocks || data.len() == self.block_size as usize {
                     Some(DirtyWriteSnapshot { block_index, data })
                 } else {
                     None
@@ -891,12 +934,19 @@ impl StudioVfs {
             .last()
             .map(|write| write.seq)
             .expect("non-empty writes have a max seq");
-        let buffered_writes: Vec<(u64, Bytes)> = writes
-            .iter()
-            .map(|write| (write.offset, write.data.clone()))
-            .collect();
+        let selected_block_indexes: HashSet<u32> =
+            writes.iter().map(|write| write.block_index).collect();
+        let fully_overwritten_blocks =
+            self.fully_overwritten_block_indexes_for_handle_writes(&writes, visible_size);
         let blocks = self
-            .build_dirty_write_snapshots_from_buffered_writes(ino, &buffered_writes, visible_size)
+            .build_dirty_write_snapshots_for_handle_writer_blocks(
+                ino,
+                &writes,
+                visible_size,
+                &selected_block_indexes,
+                &fully_overwritten_blocks,
+                true,
+            )
             .await?;
         if blocks.is_empty() {
             return Ok(false);
@@ -1023,6 +1073,7 @@ impl StudioVfs {
                 visible_size,
                 &completed_block_indexes,
                 &completed_block_indexes,
+                false,
             )
             .await?;
         if completed_blocks.is_empty() {
