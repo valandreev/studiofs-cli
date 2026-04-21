@@ -1,10 +1,52 @@
 use futures::StreamExt;
+use tokio::time::MissedTickBehavior;
 
 use super::*;
 use crate::vfs::upload_lifecycle::UploadLifecycleWorker;
 use crate::{JanitorMeta, VfsMeta};
 
 impl StudioVfs {
+    pub(super) async fn background_aggressive_materialization(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(AGGRESSIVE_MATERIALIZATION_INTERVAL);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = self.state.shutdown.shutdown_notify.notified() => break,
+                _ = interval.tick() => {}
+            }
+            if self.shutdown_requested() {
+                break;
+            }
+            if !self.aggressive_materialization_should_run() {
+                continue;
+            }
+
+            let mut dirty_inodes = self.state.handle_writers.snapshot_dirty_inodes_by_bytes();
+            // #region debug log
+            self.debug_write_probe(
+                "H2",
+                "crates/studiofs-vfs/src/vfs/workers.rs:17",
+                "aggressive materialization tick",
+                serde_json::json!({
+                    "total_dirty_bytes": self.state.handle_writers.total_dirty_bytes(),
+                    "threshold_bytes": super::aggressive_materialization_threshold_bytes(self.max_dirty_bytes()),
+                    "hard_threshold_bytes": super::hard_backpressure_threshold_bytes(self.max_dirty_bytes()),
+                    "buffered_write_count": self.state.handle_writers.total_buffered_write_count(),
+                    "dirty_inode_count": dirty_inodes.len(),
+                }),
+            );
+            // #endregion debug log
+            dirty_inodes.sort_by_key(|(_, dirty_bytes)| std::cmp::Reverse(*dirty_bytes));
+            for (ino, dirty_bytes) in dirty_inodes {
+                if dirty_bytes == 0 || self.shutdown_requested() {
+                    break;
+                }
+                self.spawn_deferred_materialization_if_needed(ino).await;
+            }
+        }
+    }
+
     pub(super) async fn background_epoch_finalizer(self: Arc<Self>) {
         loop {
             let Some((ino, content_epoch)) = self.pop_epoch_finalization() else {
@@ -290,7 +332,15 @@ impl StudioVfs {
             }
             let pending_uploads = self.truth_pending_uploads_snapshot();
             let pending = pending_uploads.len();
-            let pending_upload_bytes = pending as u64 * u64::from(self.block_size);
+            let pending_upload_bytes = pending_uploads
+                .iter()
+                .map(|op| {
+                    self.local_block_backend
+                        .object_stats(op.object_id)
+                        .map(|stats| stats.payload_len)
+                        .unwrap_or(u64::from(self.block_size))
+                })
+                .sum::<u64>();
             let metadata_backlog = self.sync_meta().replication_backlog();
             let pending_metadata_ops = metadata_backlog.total_ops();
 
@@ -362,6 +412,29 @@ impl StudioVfs {
                         }),
                     );
                 }
+                // #region debug log
+                self.debug_write_probe(
+                    "H3",
+                    "crates/studiofs-vfs/src/vfs/workers.rs:389",
+                    "upload pipeline summary tick",
+                    serde_json::json!({
+                        "pending_uploads": pending,
+                        "pending_upload_bytes": pending_upload_bytes,
+                        "pending_metadata_ops": pending_metadata_ops,
+                        "inflight_metadata_ops": metadata_backlog.inflight_ops,
+                        "local_backend_dirty_count": local_backend_dirty_count,
+                        "handle_writer_total_dirty_bytes": self.state.handle_writers.total_dirty_bytes(),
+                        "handle_writer_buffered_write_count": self.state.handle_writers.total_buffered_write_count(),
+                        "pending_epoch_finalizations": self.state.upload.pending_epoch_finalizations.lock().len(),
+                        "upload_scheduler_penalty_ms": self.upload_scheduler.adaptive_penalty_ms(),
+                        "dirty_mem_bytes": ingress.dirty_mem_bytes,
+                        "write_backpressure_events": ingress.write_backpressure_events,
+                        "write_backpressure_wait_ms": ingress.write_backpressure_wait_ms,
+                        "transit_used_bytes": transit_memory.used_bytes,
+                        "transit_budget_bytes": transit_memory.budget_bytes,
+                    }),
+                );
+                // #endregion debug log
                 info!(
                     pending_uploads = %pending_uploads,
                     pending_metadata_ops,

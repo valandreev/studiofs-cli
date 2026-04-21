@@ -451,6 +451,12 @@ impl VfsBootstrap {
             ),
             max_dirty_bytes: AtomicUsize::new(plan.max_dirty_bytes),
             write_eager_flush_batch_bytes: plan.write_eager_flush_batch_bytes,
+            write_buffer_pool: BufferPool::new(
+                block_size as usize,
+                plan.payload_put_concurrency
+                    .max(WRITE_BUFFER_POOL_MIN_BUFFERS)
+                    .saturating_mul(WRITE_BUFFER_POOL_BUFFER_MULTIPLIER),
+            ),
             write_eager_flush_drain_chunk_bytes: plan.write_eager_flush_drain_chunk_bytes,
             payload_put_concurrency: plan.payload_put_concurrency,
             local_sync_group_min_bytes: plan.local_sync_group_min_bytes,

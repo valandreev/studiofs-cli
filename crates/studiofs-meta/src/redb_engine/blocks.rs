@@ -419,6 +419,99 @@ impl MetaBlocks for RedbMetaEngine {
         Ok(ids.into_iter().collect())
     }
 
+    fn mark_regular_file_overlay_object_uploaded_if_matches(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_id: u64,
+    ) -> MetaResult<bool> {
+        let txn = self
+            .db
+            .begin_write()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let changed_chunk_slices = {
+            let inodes = txn
+                .open_table(INODES_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            let attr_bytes = match inodes
+                .get(ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+            {
+                Some(g) => g.value().to_vec(),
+                None => return Ok(false),
+            };
+            let attr: InodeAttr = decode(&attr_bytes)?;
+            if attr.content_epoch != expected_epoch {
+                return Ok(false);
+            }
+            drop(inodes);
+
+            let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
+                &txn,
+                REGULAR_FILE_OVERLAY_TABLE,
+                ino,
+            )?;
+            let mut changed_chunk_slices = Vec::new();
+            let mut matched_object = false;
+
+            for (chunk_id, mut chunk_state) in overlay_chunks {
+                let mut changed = false;
+                for slice in chunk_state.slices.values_mut() {
+                    let Some(block) = slice.block.as_ref() else {
+                        continue;
+                    };
+                    if block.object_id != object_id {
+                        continue;
+                    }
+                    matched_object = true;
+                    if slice.block_state != BlockRefState::Uploaded {
+                        slice.block_state = BlockRefState::Uploaded;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    let chunk_slices: Vec<_> = chunk_state.slices.values().cloned().collect();
+                    Self::set_regular_file_chunk_state_in_txn(
+                        &txn,
+                        REGULAR_FILE_OVERLAY_TABLE,
+                        true,
+                        ino,
+                        chunk_id,
+                        chunk_slices.as_slice(),
+                    )?;
+                    changed_chunk_slices.push((chunk_id, chunk_slices));
+                }
+            }
+
+            if !matched_object {
+                return Ok(false);
+            }
+
+            if !changed_chunk_slices.is_empty() {
+                Self::append_event_in_txn(
+                    &txn,
+                    &crate::events::MetaEvent::SetRegularFileOverlaySlices {
+                        ino,
+                        chunk_slices: changed_chunk_slices.clone(),
+                    },
+                )?;
+                Self::sync_unpublished_upload_progress_lifecycle_in_txn(&txn, &attr)?;
+            }
+
+            changed_chunk_slices
+        };
+
+        if changed_chunk_slices.is_empty() {
+            txn.commit()
+                .map_err(|e| MetaError::Storage(e.to_string()))?;
+            return Ok(true);
+        }
+
+        txn.commit()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        Ok(true)
+    }
+
     fn commit_uploaded_block(
         &self,
         ino: Ino,

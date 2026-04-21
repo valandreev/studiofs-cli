@@ -17,6 +17,7 @@ use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
 };
+use studiofs_meta::MetaError;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -106,6 +107,22 @@ enum UploadPutOutcome {
     Failed(VfsError),
 }
 
+fn is_fragmented_block_lookup_error(error: &VfsError) -> bool {
+    matches!(error, VfsError::Meta(MetaError::FragmentedBlock { .. }))
+}
+
+fn upload_reread_idle_wait_window(
+    foreground_active: bool,
+    adaptive_penalty: Duration,
+    idle_grace: Duration,
+) -> Duration {
+    if !foreground_active || adaptive_penalty.is_zero() {
+        Duration::ZERO
+    } else {
+        adaptive_penalty.max(idle_grace)
+    }
+}
+
 trait CachedStorePort: Clone + Send + Sync + 'static {
     fn complete_upload(&self, op: &PendingUpload);
     fn requeue_upload(&self, op: PendingUpload) -> bool;
@@ -126,7 +143,12 @@ trait UploadLocalBlockPort: Clone + Send + Sync + 'static {
 trait UploadMetaPort: Clone + Send + Sync + 'static {
     async fn get_attr(&self, ino: Ino) -> VfsResult<Option<InodeAttr>>;
     async fn get_file_block(&self, ino: Ino, block_index: u32) -> VfsResult<Option<BlockRef>>;
-    async fn attr_matches_content_epoch(&self, ino: Ino, content_epoch: u64) -> bool;
+    async fn mark_regular_file_overlay_object_uploaded_if_matches(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_id: u64,
+    ) -> VfsResult<bool>;
     async fn mark_file_block_uploaded_if_matches(
         &self,
         ino: Ino,
@@ -376,11 +398,14 @@ where
             return Ok(SingleUploadOutcome::CancelledStale);
         }
 
-        if let Some(current) = self.meta.get_file_block(op.ino, block_index).await?
-            && current.object_id != op.object_id
-        {
-            self.cancel_stale_upload(op).await?;
-            return Ok(SingleUploadOutcome::CancelledStale);
+        match self.meta.get_file_block(op.ino, block_index).await {
+            Ok(Some(current)) if current.object_id != op.object_id => {
+                self.cancel_stale_upload(op).await?;
+                return Ok(SingleUploadOutcome::CancelledStale);
+            }
+            Ok(_) => {}
+            Err(error) if is_fragmented_block_lookup_error(&error) => {}
+            Err(error) => return Err(error),
         }
 
         let t0 = Instant::now();
@@ -482,19 +507,12 @@ where
             }
         }
 
-        let current = self.meta.get_file_block(op.ino, block_index).await?;
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or(0);
-        match current {
-            Some(ref block_ref)
-                if block_ref.object_id == op.object_id
-                    && self
-                        .meta
-                        .attr_matches_content_epoch(op.ino, op.content_epoch)
-                        .await =>
-            {
+        let keep_local_object = match self.meta.get_file_block(op.ino, block_index).await {
+            Ok(Some(ref block_ref)) if block_ref.object_id == op.object_id => {
                 let marked = self
                     .meta
                     .mark_file_block_uploaded_if_matches(
@@ -509,15 +527,33 @@ where
                         .add_pending_deletion(op.object_id, timestamp)
                         .await?;
                 }
-                self.coordinator.complete_upload(op);
+                marked
             }
-            _ => {
+            Ok(Some(_)) | Ok(None) => {
                 self.meta
                     .add_pending_deletion(op.object_id, timestamp)
                     .await?;
-                self.coordinator.complete_upload(op);
+                false
             }
-        }
+            Err(error) if is_fragmented_block_lookup_error(&error) => {
+                let marked = self
+                    .meta
+                    .mark_regular_file_overlay_object_uploaded_if_matches(
+                        op.ino,
+                        op.content_epoch,
+                        op.object_id,
+                    )
+                    .await?;
+                if !marked {
+                    self.meta
+                        .add_pending_deletion(op.object_id, timestamp)
+                        .await?;
+                }
+                marked
+            }
+            Err(error) => return Err(error),
+        };
+        self.coordinator.complete_upload(op);
 
         self.policy.refresh_incarnation_state(op.ino).await;
         self.policy.clear_upload_sticky_error(op.ino);
@@ -526,12 +562,10 @@ where
 
         if self.local_blocks.clear_pending_eviction(op.object_id) {
             self.local_blocks.remove(op.object_id).await?;
-        } else if let Some(current) = self.meta.get_file_block(op.ino, block_index).await?
-            && current.object_id != op.object_id
-        {
-            self.local_blocks.remove(op.object_id).await?;
-        } else {
+        } else if keep_local_object {
             self.local_blocks.mark_uploaded(op.object_id).await?;
+        } else {
+            self.local_blocks.remove(op.object_id).await?;
         }
 
         debug!(
@@ -620,12 +654,12 @@ impl UploadLocalBlockPort for VfsUploadLocalBlockPort {
     }
 
     async fn read_for_upload(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
-        let upload_io_cost = if self
+        let foreground_active = self
             .vfs
             .state
             .read
-            .foreground_read_active(now_unix_millis(), self.vfs.upload_user_idle_grace)
-        {
+            .foreground_read_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
+        let upload_io_cost = if foreground_active {
             self.vfs
                 .state
                 .upload
@@ -635,6 +669,33 @@ impl UploadLocalBlockPort for VfsUploadLocalBlockPort {
         } else {
             1
         };
+        let idle_wait = upload_reread_idle_wait_window(
+            foreground_active,
+            Duration::from_millis(self.vfs.upload_scheduler.adaptive_penalty_ms()),
+            self.vfs.upload_user_idle_grace,
+        );
+        if !idle_wait.is_zero() {
+            let wait_started = Instant::now();
+            let foreground_idle = self.vfs.wait_for_foreground_reads_idle(idle_wait).await;
+            let waited_ms = wait_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            if waited_ms > 0 {
+                // #region debug log
+                self.vfs.debug_write_probe(
+                    "H5",
+                    "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:682",
+                    "upload reread yielded to foreground reads",
+                    serde_json::json!({
+                        "object_id": object_id,
+                        "waited_ms": waited_ms,
+                        "foreground_idle": foreground_idle,
+                        "adaptive_penalty_ms": self.vfs.upload_scheduler.adaptive_penalty_ms(),
+                        "idle_grace_ms": self.vfs.upload_user_idle_grace.as_millis().min(u128::from(u64::MAX)) as u64,
+                        "foreground_reads_inflight": self.vfs.foreground_reads_inflight(),
+                    }),
+                );
+                // #endregion debug log
+            }
+        }
         let wait_started = Instant::now();
         let upload_io_permit = self
             .vfs
@@ -743,15 +804,21 @@ impl UploadMetaPort for VfsUploadMetaPort {
         .await
     }
 
-    async fn attr_matches_content_epoch(&self, ino: Ino, content_epoch: u64) -> bool {
+    async fn mark_regular_file_overlay_object_uploaded_if_matches(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_id: u64,
+    ) -> VfsResult<bool> {
         let meta = self.vfs.meta.clone();
         run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-            engine
-                .get_attr(ino)
-                .map(|attr| attr.content_epoch == content_epoch)
+            engine.mark_regular_file_overlay_object_uploaded_if_matches(
+                ino,
+                expected_epoch,
+                object_id,
+            )
         })
         .await
-        .unwrap_or(false)
     }
 
     async fn mark_file_block_uploaded_if_matches(
@@ -1371,13 +1438,17 @@ mod tests {
     }
 
     type UploadedBlockRecord = (Ino, u32, u64, u64);
+    type UploadedOverlayObjectRecord = (Ino, u64, u64);
 
     #[derive(Clone)]
     struct FakeMeta {
         attrs: Arc<Mutex<HashMap<Ino, Option<InodeAttr>>>>,
         blocks: Arc<Mutex<FakeBlockMap>>,
+        fragmented_blocks: Arc<Mutex<HashSet<(Ino, u32)>>>,
+        overlay_objects: Arc<Mutex<HashMap<Ino, HashSet<u64>>>>,
         pending_deletions: Arc<Mutex<Vec<u64>>>,
         uploaded_blocks: Arc<Mutex<Vec<UploadedBlockRecord>>>,
+        uploaded_overlay_objects: Arc<Mutex<Vec<UploadedOverlayObjectRecord>>>,
     }
 
     impl Default for FakeMeta {
@@ -1385,8 +1456,11 @@ mod tests {
             Self {
                 attrs: Arc::new(Mutex::new(HashMap::new())),
                 blocks: Arc::new(Mutex::new(HashMap::new())),
+                fragmented_blocks: Arc::new(Mutex::new(HashSet::new())),
+                overlay_objects: Arc::new(Mutex::new(HashMap::new())),
                 pending_deletions: Arc::new(Mutex::new(Vec::new())),
                 uploaded_blocks: Arc::new(Mutex::new(Vec::new())),
+                uploaded_overlay_objects: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -1397,6 +1471,12 @@ mod tests {
         }
 
         async fn get_file_block(&self, ino: Ino, block_index: u32) -> VfsResult<Option<BlockRef>> {
+            if self.fragmented_blocks.lock().contains(&(ino, block_index)) {
+                return Err(VfsError::Meta(MetaError::FragmentedBlock {
+                    ino,
+                    block_index,
+                }));
+            }
             Ok(self
                 .blocks
                 .lock()
@@ -1405,13 +1485,30 @@ mod tests {
                 .flatten())
         }
 
-        async fn attr_matches_content_epoch(&self, ino: Ino, content_epoch: u64) -> bool {
-            self.attrs
+        async fn mark_regular_file_overlay_object_uploaded_if_matches(
+            &self,
+            ino: Ino,
+            expected_epoch: u64,
+            object_id: u64,
+        ) -> VfsResult<bool> {
+            let matches = self
+                .attrs
                 .lock()
                 .get(&ino)
                 .and_then(|attr| attr.as_ref())
-                .map(|attr| attr.content_epoch == content_epoch)
+                .map(|attr| attr.content_epoch == expected_epoch)
                 .unwrap_or(false)
+                && self
+                    .overlay_objects
+                    .lock()
+                    .get(&ino)
+                    .is_some_and(|objects| objects.contains(&object_id));
+            if matches {
+                self.uploaded_overlay_objects
+                    .lock()
+                    .push((ino, expected_epoch, object_id));
+            }
+            Ok(matches)
         }
 
         async fn mark_file_block_uploaded_if_matches(
@@ -1762,6 +1859,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_upload_marks_fragmented_overlay_object_uploaded_before_local_cleanup() {
+        let (processor, coordinator, local_blocks, meta, _remote, _shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.fragmented_blocks.lock().insert((op.ino, 0));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+
+        let outcome = processor.process_upload(op).await;
+
+        assert_eq!(outcome, UploadOutcome::Completed);
+        assert!(
+            meta.uploaded_blocks.lock().is_empty(),
+            "fragmented overlays should not require a synthesized block manifest"
+        );
+        assert_eq!(
+            meta.uploaded_overlay_objects.lock().as_slice(),
+            &[(11, 3, 77)],
+            "fragmented overlay upload should persist progress against the referenced object id"
+        );
+        assert!(
+            meta.pending_deletions.lock().is_empty(),
+            "still-referenced fragmented objects must remain live"
+        );
+        assert_eq!(coordinator.completed.lock().as_slice(), &[77]);
+        assert_eq!(local_blocks.uploaded.lock().as_slice(), &[77]);
+        assert!(
+            local_blocks.removed.lock().is_empty(),
+            "current fragmented overlay object should stay in the local backend"
+        );
+        assert_eq!(policy.refreshed.lock().as_slice(), &[11]);
+    }
+
+    #[tokio::test]
     async fn delayed_retry_ops_wait_until_due_before_dispatch() {
         let mut ready = ReadyUploads::default();
         let mut delayed = DelayedUploads::default();
@@ -1782,6 +1918,46 @@ mod tests {
         };
         assert_eq!(ready_op.object_id, op.object_id);
         assert!(delayed.is_empty());
+    }
+
+    #[test]
+    fn upload_reread_idle_wait_window_requires_penalty_and_foreground_pressure() {
+        assert_eq!(
+            upload_reread_idle_wait_window(
+                false,
+                Duration::from_millis(200),
+                Duration::from_millis(50),
+            ),
+            Duration::ZERO
+        );
+        assert_eq!(
+            upload_reread_idle_wait_window(true, Duration::ZERO, Duration::from_millis(50)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn upload_reread_idle_wait_window_uses_idle_grace_as_floor() {
+        assert_eq!(
+            upload_reread_idle_wait_window(
+                true,
+                Duration::from_millis(20),
+                Duration::from_millis(50),
+            ),
+            Duration::from_millis(50)
+        );
+    }
+
+    #[test]
+    fn upload_reread_idle_wait_window_uses_penalty_when_larger() {
+        assert_eq!(
+            upload_reread_idle_wait_window(
+                true,
+                Duration::from_millis(240),
+                Duration::from_millis(50),
+            ),
+            Duration::from_millis(240)
+        );
     }
 
     #[test]

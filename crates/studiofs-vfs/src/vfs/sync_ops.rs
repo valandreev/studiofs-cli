@@ -37,6 +37,283 @@ impl StudioVfs {
         Ok(())
     }
 
+    fn suppress_deleted_inode_materialization_error(
+        &self,
+        ino: Ino,
+        error: &super::VfsError,
+    ) -> bool {
+        if !matches!(
+            error,
+            super::VfsError::Meta(studiofs_meta::MetaError::InodeNotFound(_))
+        ) {
+            return false;
+        }
+        if self.handle_table.open_count(ino) != 0 {
+            return false;
+        }
+        self.state.handle_writers.clear_inode(ino);
+        self.state.namespace.dirty_attrs.lock().remove(&ino);
+        true
+    }
+
+    fn should_continue_deferred_materialization(&self, ino: Ino) -> bool {
+        let per_inode_dirty = self.state.handle_writers.dirty_bytes_for_inode(ino);
+        if per_inode_dirty == 0 {
+            return false;
+        }
+        per_inode_dirty >= self.write_eager_flush_batch_bytes
+            || self.state.handle_writers.total_dirty_bytes()
+                >= super::aggressive_materialization_threshold_bytes(self.max_dirty_bytes())
+            || self.state.handle_writers.total_buffered_write_count()
+                >= super::AGGRESSIVE_MATERIALIZATION_BUFFERED_WRITE_THRESHOLD
+    }
+
+    pub(super) async fn wait_for_soft_dirty_budget_relief(self: &Arc<Self>, preferred_ino: Ino) {
+        if self.shutdown_requested() {
+            return;
+        }
+
+        let max_dirty = self.max_dirty_bytes();
+        loop {
+            let total_dirty_before = self.state.handle_writers.total_dirty_bytes();
+            if total_dirty_before <= max_dirty {
+                return;
+            }
+
+            let mut dirty_inodes = self.state.handle_writers.snapshot_dirty_inodes_by_bytes();
+            if dirty_inodes.is_empty() {
+                return;
+            }
+            dirty_inodes.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1));
+
+            let target_ino = dirty_inodes
+                .iter()
+                .find_map(|(ino, _)| (*ino == preferred_ino).then_some(*ino))
+                .unwrap_or(dirty_inodes[0].0);
+            let target_dirty_bytes = dirty_inodes
+                .iter()
+                .find_map(|(ino, dirty_bytes)| (*ino == target_ino).then_some(*dirty_bytes))
+                .unwrap_or_default();
+
+            let existing_task_lock = {
+                self.state
+                    .deferred_materialize_inflight
+                    .lock()
+                    .get(&target_ino)
+                    .cloned()
+            };
+            let task_lock = match existing_task_lock {
+                Some(lock) => lock,
+                None => {
+                    self.spawn_deferred_materialization_if_needed(target_ino)
+                        .await;
+                    let Some(lock) = self
+                        .state
+                        .deferred_materialize_inflight
+                        .lock()
+                        .get(&target_ino)
+                        .cloned()
+                    else {
+                        return;
+                    };
+                    lock
+                }
+            };
+
+            // #region debug log
+            self.debug_write_probe(
+                "H2",
+                "crates/studiofs-vfs/src/vfs/sync_ops.rs:107",
+                "soft dirty-budget wait for deferred materialization",
+                serde_json::json!({
+                    "preferred_ino": preferred_ino,
+                    "target_ino": target_ino,
+                    "target_dirty_bytes": target_dirty_bytes,
+                    "total_dirty_bytes": total_dirty_before,
+                    "max_dirty_bytes": max_dirty,
+                }),
+            );
+            // #endregion debug log
+
+            let wait_started = Instant::now();
+            let wait_guard = task_lock.lock().await;
+            let waited = wait_started.elapsed();
+            drop(wait_guard);
+
+            let total_dirty_after = self.state.handle_writers.total_dirty_bytes();
+            // #region debug log
+            self.debug_write_probe(
+                "H2",
+                "crates/studiofs-vfs/src/vfs/sync_ops.rs:128",
+                "soft dirty-budget wait finished",
+                serde_json::json!({
+                    "preferred_ino": preferred_ino,
+                    "target_ino": target_ino,
+                    "waited_ms": waited.as_millis().min(u128::from(u64::MAX)) as u64,
+                    "total_dirty_bytes_before": total_dirty_before,
+                    "total_dirty_bytes_after": total_dirty_after,
+                    "max_dirty_bytes": max_dirty,
+                }),
+            );
+            // #endregion debug log
+
+            if total_dirty_after <= max_dirty {
+                return;
+            }
+            if waited < std::time::Duration::from_millis(1)
+                && total_dirty_after >= total_dirty_before
+            {
+                return;
+            }
+        }
+    }
+
+    pub(super) async fn spawn_deferred_materialization_if_needed(self: &Arc<Self>, ino: Ino) {
+        if self.shutdown_requested() {
+            return;
+        }
+
+        let task_lock = {
+            let mut inflight = self.state.deferred_materialize_inflight.lock();
+            match inflight.entry(ino) {
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    // #region debug log
+                    self.debug_write_probe(
+                        "H2",
+                        "crates/studiofs-vfs/src/vfs/sync_ops.rs:48",
+                        "deferred materialization already inflight",
+                        serde_json::json!({
+                            "ino": ino,
+                            "per_inode_dirty_bytes": self.state.handle_writers.dirty_bytes_for_inode(ino),
+                            "total_dirty_bytes": self.state.handle_writers.total_dirty_bytes(),
+                            "open_count": self.handle_table.open_count(ino),
+                        }),
+                    );
+                    // #endregion debug log
+                    return;
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+                    entry.insert(Arc::clone(&task_lock));
+                    task_lock
+                }
+            }
+        };
+        // #region debug log
+        self.debug_write_probe(
+            "H2",
+            "crates/studiofs-vfs/src/vfs/sync_ops.rs:65",
+            "deferred materialization scheduled",
+            serde_json::json!({
+                "ino": ino,
+                "per_inode_dirty_bytes": self.state.handle_writers.dirty_bytes_for_inode(ino),
+                "total_dirty_bytes": self.state.handle_writers.total_dirty_bytes(),
+                "open_count": self.handle_table.open_count(ino),
+            }),
+        );
+        // #endregion debug log
+        let guard = task_lock.clone().lock_owned().await;
+        let vfs = Arc::clone(self);
+        self.track_background_task(tokio::spawn(async move {
+            loop {
+                let dirty_before = vfs.state.handle_writers.dirty_bytes_for_inode(ino);
+                let total_before = vfs.state.handle_writers.total_dirty_bytes();
+                if dirty_before == 0 {
+                    break;
+                }
+
+                let materialize_completed_started = Instant::now();
+                let completed_materialized = match vfs
+                    .materialize_completed_handle_writer_blocks_for_inode(
+                        ino,
+                        LocalSyncPolicy::Opportunistic,
+                    )
+                    .await
+                {
+                    Ok(materialized) => materialized,
+                    Err(e) => {
+                        if !vfs.suppress_deleted_inode_materialization_error(ino, &e) {
+                            warn!(
+                                ino,
+                                error = %e,
+                                "deferred materialization (completed blocks) failed; will retry at next strict barrier"
+                            );
+                            // #region debug log
+                            vfs.debug_write_probe(
+                                "H1",
+                                "crates/studiofs-vfs/src/vfs/sync_ops.rs:114",
+                                "deferred materialization completed-blocks failure",
+                                serde_json::json!({
+                                    "ino": ino,
+                                    "error": e.to_string(),
+                                    "meta_exists": vfs.sync_meta().get_attr(ino).is_ok(),
+                                    "deleted_marker": vfs.state.upload.deleted_inodes.lock().contains(&ino),
+                                    "open_count": vfs.handle_table.open_count(ino),
+                                    "per_inode_dirty_bytes": vfs.state.handle_writers.dirty_bytes_for_inode(ino),
+                                    "dirty_attr_present": vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
+                                }),
+                            );
+                            // #endregion debug log
+                        }
+                        break;
+                    }
+                };
+                vfs.record_vfs_write_materialize_completed(materialize_completed_started.elapsed());
+
+                let materialize_for_limits_started = Instant::now();
+                let limits_materialized = match vfs
+                    .materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
+                    .await
+                {
+                    Ok(materialized) => materialized,
+                    Err(e) => {
+                        if !vfs.suppress_deleted_inode_materialization_error(ino, &e) {
+                            warn!(
+                                ino,
+                                error = %e,
+                                "deferred materialization (budget enforcement) failed; will retry at next strict barrier"
+                            );
+                            // #region debug log
+                            vfs.debug_write_probe(
+                                "H1",
+                                "crates/studiofs-vfs/src/vfs/sync_ops.rs:144",
+                                "deferred materialization limit-pass failure",
+                                serde_json::json!({
+                                    "ino": ino,
+                                    "error": e.to_string(),
+                                    "meta_exists": vfs.sync_meta().get_attr(ino).is_ok(),
+                                    "deleted_marker": vfs.state.upload.deleted_inodes.lock().contains(&ino),
+                                    "open_count": vfs.handle_table.open_count(ino),
+                                    "per_inode_dirty_bytes": vfs.state.handle_writers.dirty_bytes_for_inode(ino),
+                                    "total_dirty_bytes": vfs.state.handle_writers.total_dirty_bytes(),
+                                }),
+                            );
+                            // #endregion debug log
+                        }
+                        break;
+                    }
+                };
+                vfs.record_vfs_write_materialize_for_limits(
+                    materialize_for_limits_started.elapsed(),
+                );
+
+                let dirty_after = vfs.state.handle_writers.dirty_bytes_for_inode(ino);
+                let total_after = vfs.state.handle_writers.total_dirty_bytes();
+                let made_progress = completed_materialized
+                    || limits_materialized
+                    || dirty_after < dirty_before
+                    || total_after < total_before;
+                if !made_progress || !vfs.should_continue_deferred_materialization(ino) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+
+            drop(guard);
+            vfs.state.deferred_materialize_inflight.lock().remove(&ino);
+        }));
+    }
+
     /// Release a file handle.
     ///
     /// If the inode was unlinked while this handle was open (orphan) and this
@@ -577,7 +854,7 @@ impl StudioVfs {
     /// * Duplicate materialization is safe: the block store uses last-writer-wins
     ///   for overlapping ranges, and orphaned objects are reclaimed by the janitor.
     /// * Budget enforcement runs in the background task: if dirty bytes exceed
-    ///   `3 × max_dirty_bytes` the *next* write will detect it synchronously via
+    ///   `2 × max_dirty_bytes` the next write will detect it synchronously via
     ///   the hard-backpressure guard at the top and block until drain catches up.
     pub async fn write_fh_with_deferred_materialize(
         self: &Arc<Self>,
@@ -587,12 +864,31 @@ impl StudioVfs {
         data: &[u8],
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<u32> {
+        if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+            self.wait_for_soft_dirty_budget_relief(ino).await;
+        }
+
         // ── Hard backpressure safety valve ───────────────────────────────
         // If background materialization falls behind and dirty memory is
         // dangerously high, fall back to the fully-synchronous path so we
         // exert real TCP-style backpressure on the caller and avoid OOM.
-        let hard_backpressure_threshold = self.max_dirty_bytes().saturating_mul(3);
+        let hard_backpressure_threshold =
+            super::hard_backpressure_threshold_bytes(self.max_dirty_bytes());
         if self.state.handle_writers.total_dirty_bytes() > hard_backpressure_threshold {
+            // #region debug log
+            self.debug_write_probe(
+                "H2",
+                "crates/studiofs-vfs/src/vfs/sync_ops.rs:688",
+                "hard backpressure fallback engaged",
+                serde_json::json!({
+                    "ino": ino,
+                    "per_inode_dirty_bytes": self.state.handle_writers.dirty_bytes_for_inode(ino),
+                    "total_dirty_bytes": self.state.handle_writers.total_dirty_bytes(),
+                    "hard_threshold_bytes": hard_backpressure_threshold,
+                    "max_dirty_bytes": self.max_dirty_bytes(),
+                }),
+            );
+            // #endregion debug log
             return self
                 .write_fh_with_local_sync_policy(fh, ino, offset, data, local_sync_policy)
                 .await;
@@ -651,71 +947,8 @@ impl StudioVfs {
         // ── Materialization phase ────────────────────────────────────────
         match (&result, local_sync_policy) {
             (Ok(_), LocalSyncPolicy::Opportunistic) => {
-                // Coalesced fire-and-forget: spawn at most ONE materialization
-                // task per inode.  If a task is already in-flight for this inode
-                // it will naturally drain all buffered data accumulated since it
-                // started — no need for another task.
-                let already_inflight = {
-                    let inflight = self.state.deferred_materialize_inflight.lock();
-                    inflight.contains_key(&ino)
-                };
-                if !already_inflight {
-                    // Create a tokio::sync::Mutex and pre-acquire it so the
-                    // spawned task holds the lock for its entire lifetime.
-                    // Flush/close will `.lock().await` on the same Mutex to
-                    // wait for completion — no TOCTOU race possible.
-                    let task_lock = Arc::new(tokio::sync::Mutex::new(()));
-                    let guard = task_lock.clone().lock_owned().await;
-                    self.state
-                        .deferred_materialize_inflight
-                        .lock()
-                        .insert(ino, Arc::clone(&task_lock));
-                    let vfs = Arc::clone(self);
-                    tokio::spawn(async move {
-                        let materialize_completed_started = Instant::now();
-                        if let Err(e) = vfs
-                            .materialize_completed_handle_writer_blocks_for_inode(
-                                ino,
-                                LocalSyncPolicy::Opportunistic,
-                            )
-                            .await
-                        {
-                            warn!(
-                                ino,
-                                error = %e,
-                                "deferred materialization (completed blocks) failed; \
-                                 will retry at next strict barrier"
-                            );
-                        }
-                        vfs.record_vfs_write_materialize_completed(
-                            materialize_completed_started.elapsed(),
-                        );
-
-                        let materialize_for_limits_started = Instant::now();
-                        if let Err(e) = vfs
-                            .materialize_handle_writers_for_limits(
-                                ino,
-                                LocalSyncPolicy::Opportunistic,
-                            )
-                            .await
-                        {
-                            warn!(
-                                ino,
-                                error = %e,
-                                "deferred materialization (budget enforcement) failed; \
-                                 will retry at next strict barrier"
-                            );
-                        }
-                        vfs.record_vfs_write_materialize_for_limits(
-                            materialize_for_limits_started.elapsed(),
-                        );
-
-                        // Release the lock so any waiting flush/close can proceed,
-                        // then remove the map entry.
-                        drop(guard);
-                        vfs.state.deferred_materialize_inflight.lock().remove(&ino);
-                    });
-                }
+                self.spawn_deferred_materialization_if_needed(ino).await;
+                self.wait_for_soft_dirty_budget_relief(ino).await;
             }
             (Ok(_), LocalSyncPolicy::Strict) => {
                 // Strict: await materialization inline (same as original).

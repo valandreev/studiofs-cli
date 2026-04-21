@@ -24,6 +24,7 @@
 
 mod acl;
 mod bootstrap;
+mod buffer_pool;
 #[path = "commit.rs"]
 mod commit;
 mod config;
@@ -78,6 +79,7 @@ pub use metrics::{
 pub use namespace::{KernelInvalidator, NamespaceParent, NamespacePathStyle, NamespaceResolver};
 
 use acl::AclState;
+use buffer_pool::BufferPool;
 use config::{
     CACHE_RUNTIME_HUGE_BUDGET_BYTES, CACHE_RUNTIME_LARGE_BUDGET_BYTES,
     CACHE_RUNTIME_MAX_DIRTY_BYTES_HUGE, CACHE_RUNTIME_MAX_DIRTY_BYTES_LARGE,
@@ -169,6 +171,12 @@ const ZEROIO_HEALTH_SIGNAL_LIMIT: usize = 16;
 const ZEROIO_REPLAY_EVENT_SAMPLE_LIMIT: usize = 16;
 pub(crate) const ZEROIO_RUNTIME_STATE_DIR: &str = "runtime";
 const ZEROIO_LAST_SHUTDOWN_SNAPSHOT_FILE: &str = "zeroio-last-shutdown.json";
+const HARD_BACKPRESSURE_DIRTY_MULTIPLIER: usize = 2;
+const AGGRESSIVE_MATERIALIZATION_DIRTY_DIVISOR: usize = 2;
+const AGGRESSIVE_MATERIALIZATION_BUFFERED_WRITE_THRESHOLD: usize = 64;
+const AGGRESSIVE_MATERIALIZATION_INTERVAL: Duration = Duration::from_millis(100);
+const WRITE_BUFFER_POOL_MIN_BUFFERS: usize = 4;
+const WRITE_BUFFER_POOL_BUFFER_MULTIPLIER: usize = 2;
 
 // =============================================================================
 // Error Types
@@ -1202,6 +1210,7 @@ struct ForegroundReadSample {
 struct ReadState {
     foreground_reads_inflight: AtomicUsize,
     last_foreground_read_ms: AtomicU64,
+    foreground_idle_notify: tokio::sync::Notify,
     foreground_read_latency_shards: Vec<Mutex<VecDeque<ForegroundReadSample>>>,
     foreground_read_shard_cursor: AtomicU64,
     /// Last observed foreground P90 (ns), used as sticky fallback.
@@ -1221,6 +1230,7 @@ impl ReadState {
         Self {
             foreground_reads_inflight: AtomicUsize::new(0),
             last_foreground_read_ms: AtomicU64::new(0),
+            foreground_idle_notify: tokio::sync::Notify::new(),
             foreground_read_latency_shards: (0..shard_count)
                 .map(|_| Mutex::new(VecDeque::new()))
                 .collect(),
@@ -1407,13 +1417,17 @@ impl ReadState {
     }
 
     fn unmark_foreground_read(&self, now_ms: u64) {
-        self.foreground_reads_inflight
+        let previous = self
+            .foreground_reads_inflight
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(1))
             })
-            .ok();
+            .unwrap_or(0);
         self.last_foreground_read_ms
             .store(now_ms, Ordering::Relaxed);
+        if previous == 1 {
+            self.foreground_idle_notify.notify_waiters();
+        }
     }
 
     fn foreground_read_active(&self, now_ms: u64, idle_grace: Duration) -> bool {
@@ -1999,6 +2013,16 @@ fn validate_volume_block_size(block_size: u32) -> VfsResult<()> {
     Ok(())
 }
 
+fn hard_backpressure_threshold_bytes(max_dirty_bytes: usize) -> usize {
+    max_dirty_bytes.saturating_mul(HARD_BACKPRESSURE_DIRTY_MULTIPLIER)
+}
+
+fn aggressive_materialization_threshold_bytes(max_dirty_bytes: usize) -> usize {
+    max_dirty_bytes
+        .saturating_div(AGGRESSIVE_MATERIALIZATION_DIRTY_DIVISOR)
+        .max(1)
+}
+
 fn warn_small_block_addressability(block_size: u32) {
     let block_size_nonzero = block_size.max(1) as u128;
     const MIN_PRACTICAL_ADDRESSABLE_BYTES: u128 = 64u128 * 1024 * 1024 * 1024 * 1024;
@@ -2185,6 +2209,9 @@ pub struct StudioVfs {
     /// Minimum dirty full-block batch size before `write()` pays the local
     /// persist boundary for eager block flushes.
     write_eager_flush_batch_bytes: usize,
+    /// Reuses hot-path block buffers to reduce allocator churn on repeated
+    /// materialize/stage cycles.
+    write_buffer_pool: BufferPool,
     /// Maximum bytes drained by one opportunistic eager-flush attempt.
     write_eager_flush_drain_chunk_bytes: usize,
     /// Bounded local payload-put concurrency for one eager drain.
@@ -2793,6 +2820,57 @@ struct PendingUploadTruthRebuildResult {
 }
 
 impl StudioVfs {
+    // #region debug log
+    fn debug_write_probe(
+        &self,
+        hypothesis_id: &'static str,
+        location: &'static str,
+        message: &'static str,
+        data: serde_json::Value,
+    ) {
+        const DEBUG_SESSION_ID: &str = "5ee5eb";
+        const DEBUG_LOG_PATH: &str =
+            r"C:\Users\valen\AppData\Local\Temp\debug-agent\debug-5ee5eb.log";
+        if std::env::var_os("STUDIOFS_WRITE_DEBUG").is_none() {
+            return;
+        }
+        let payload = serde_json::json!({
+            "sessionId": DEBUG_SESSION_ID,
+            "runId": std::env::var("STUDIOFS_DEBUG_RUN_ID").unwrap_or_else(|_| "run1".to_string()),
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": now_unix_millis(),
+        });
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(DEBUG_LOG_PATH)
+        {
+            let _ = writeln!(file, "{payload}");
+        }
+    }
+    // #endregion debug log
+
+    fn aggressive_materialization_should_run(&self) -> bool {
+        let total_dirty_bytes = self.state.handle_writers.total_dirty_bytes();
+        if total_dirty_bytes == 0 {
+            return false;
+        }
+        total_dirty_bytes >= aggressive_materialization_threshold_bytes(self.max_dirty_bytes())
+            || self.state.handle_writers.total_buffered_write_count()
+                >= AGGRESSIVE_MATERIALIZATION_BUFFERED_WRITE_THRESHOLD
+    }
+
+    fn clone_into_write_buffer(&self, data: &[u8]) -> BytesMut {
+        self.write_buffer_pool.acquire_with_bytes(data)
+    }
+
+    fn recycle_write_buffer(&self, buffer: BytesMut) {
+        self.write_buffer_pool.release(buffer);
+    }
+
     fn filter_runtime_pending_uploads_to_dirty_index(
         &self,
         runtime_pending_uploads: Vec<PendingUpload>,
@@ -2876,6 +2954,14 @@ impl StudioVfs {
             let inode_deleted = attr.nlink == 0;
             let blocks = match meta.get_file_blocks(ino) {
                 Ok(blocks) => blocks,
+                Err(studiofs_meta::MetaError::FragmentedBlock { block_index, .. }) => {
+                    debug!(
+                        ino,
+                        block_index,
+                        "pending upload truth rebuild falling back to overlay slices for fragmented regular-file block"
+                    );
+                    Vec::new()
+                }
                 Err(error) => {
                     warn!(
                         ino,
@@ -3976,6 +4062,7 @@ impl StudioVfs {
             upload_rx,
         }: StartupChannels,
     ) -> VfsResult<()> {
+        self.spawn_aggressive_materialization_worker();
         self.spawn_prefetch_worker(prefetch_rx);
         self.spawn_uploader_worker(upload_rx);
         self.spawn_epoch_finalizer_worker();
@@ -4001,6 +4088,13 @@ impl StudioVfs {
                 let panic_msg = panic_payload_message(&*panic_payload);
                 error!("prefetch worker panicked: {}", panic_msg);
             }
+        }));
+    }
+
+    fn spawn_aggressive_materialization_worker(self: &Arc<Self>) {
+        let vfs = self.clone();
+        self.track_background_task(tokio::spawn(async move {
+            vfs.background_aggressive_materialization().await;
         }));
     }
 
@@ -4195,6 +4289,26 @@ impl StudioVfs {
         } else {
             current_penalty_ms.saturating_sub(UPLOAD_SCHEDULER_PENALTY_DECAY_STEP_MS)
         };
+        // #region debug log
+        if current_penalty_ms != next_penalty_ms && (current_penalty_ms > 0 || next_penalty_ms > 0)
+        {
+            self.debug_write_probe(
+                "H5",
+                "crates/studiofs-vfs/src/vfs.rs:4255",
+                "upload scheduler adaptive penalty changed",
+                serde_json::json!({
+                    "current_penalty_ms": current_penalty_ms,
+                    "next_penalty_ms": next_penalty_ms,
+                    "foreground_active": foreground_active,
+                    "congested": congested,
+                    "p90_latency_ns": p90_latency_ns,
+                    "threshold_ns": threshold_ns,
+                    "io_cost": io_cost,
+                    "upload_pressure_boost": upload_pressure_boost,
+                }),
+            );
+        }
+        // #endregion debug log
         self.upload_scheduler
             .set_adaptive_penalty(Duration::from_millis(next_penalty_ms));
     }
@@ -5316,6 +5430,46 @@ impl StudioVfs {
             .read
             .foreground_reads_inflight
             .load(Ordering::Relaxed)
+    }
+
+    pub(crate) async fn wait_for_foreground_reads_idle(&self, timeout: Duration) -> bool {
+        let started = Instant::now();
+        loop {
+            let now_ms = now_unix_millis();
+            if !self
+                .state
+                .read
+                .foreground_read_active(now_ms, self.upload_user_idle_grace)
+            {
+                return true;
+            }
+
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return false;
+            }
+
+            let notified = self.state.read.foreground_idle_notify.notified();
+            let now_ms = now_unix_millis();
+            if !self
+                .state
+                .read
+                .foreground_read_active(now_ms, self.upload_user_idle_grace)
+            {
+                return true;
+            }
+
+            let wait_slice = if self.foreground_reads_inflight() > 0 {
+                remaining
+            } else {
+                remaining.min(self.upload_user_idle_grace)
+            };
+            if wait_slice.is_zero() {
+                return false;
+            }
+
+            let _ = tokio::time::timeout(wait_slice, notified).await;
+        }
     }
 
     /// Shared reference to the cached-store runtime.

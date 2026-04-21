@@ -297,6 +297,15 @@ impl HandleWriterRegistry {
         self.writers.lock().total_dirty_bytes
     }
 
+    pub(super) fn total_buffered_write_count(&self) -> usize {
+        let writers = self.writers.lock();
+        writers
+            .writers
+            .values()
+            .map(|writer| writer.writes.len())
+            .sum()
+    }
+
     pub(super) fn snapshot_dirty_inodes_by_bytes(&self) -> Vec<(Ino, usize)> {
         let writers = self.writers.lock();
         writers
@@ -322,6 +331,20 @@ impl HandleWriterRegistry {
             false
         };
         if remove {
+            Self::remove_writer(&mut writers, fh);
+        }
+    }
+
+    pub(super) fn clear_inode(&self, ino: Ino) {
+        let mut writers = self.writers.lock();
+        let inode_handles: Vec<u64> = writers
+            .writers_by_ino
+            .get(&ino)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        for fh in inode_handles {
             Self::remove_writer(&mut writers, fh);
         }
     }
@@ -626,7 +649,7 @@ impl StudioVfs {
                         },
                     }
                 };
-                entry.insert(BytesMut::from(existing_data.as_ref()));
+                entry.insert(self.clone_into_write_buffer(existing_data.as_ref()));
             }
 
             let offset_in_block = offset_within_block(write.offset, self.block_size) as usize;
@@ -648,10 +671,7 @@ impl StudioVfs {
                     data.truncate(logical_len);
                 }
                 if data.len() == self.block_size as usize {
-                    Some(DirtyWriteSnapshot {
-                        block_index,
-                        data: data.freeze(),
-                    })
+                    Some(DirtyWriteSnapshot { block_index, data })
                 } else {
                     None
                 }
@@ -716,36 +736,57 @@ impl StudioVfs {
         &self,
         ino: Ino,
         local_sync_policy: LocalSyncPolicy,
-    ) -> VfsResult<()> {
+    ) -> VfsResult<bool> {
         let per_inode_dirty = self.state.handle_writers.dirty_bytes_for_inode(ino);
         let total_dirty = self.state.handle_writers.total_dirty_bytes();
         let max_dirty = self.max_dirty_bytes();
         let budget_exceeded = total_dirty > max_dirty;
         if per_inode_dirty == 0 && !budget_exceeded {
-            return Ok(());
+            return Ok(false);
         }
         if per_inode_dirty > 0
             && per_inode_dirty < self.write_eager_flush_batch_bytes
             && !budget_exceeded
         {
-            return Ok(());
+            return Ok(false);
         }
 
+        let mut made_progress = false;
         if per_inode_dirty > 0 && !budget_exceeded {
-            self.materialize_completed_handle_writer_blocks_for_inode(ino, local_sync_policy)
+            made_progress |= self
+                .materialize_completed_handle_writer_blocks_for_inode(ino, local_sync_policy)
                 .await?;
             let per_inode_dirty_after = self.state.handle_writers.dirty_bytes_for_inode(ino);
             if per_inode_dirty_after == 0
                 || (per_inode_dirty_after < self.write_eager_flush_batch_bytes && !budget_exceeded)
             {
-                return Ok(());
+                return Ok(made_progress);
             }
         }
 
         if self.state.handle_writers.dirty_bytes_for_inode(ino) > 0 {
-            self.materialize_handle_writers_for_inode(ino, local_sync_policy)
+            made_progress |= self
+                .materialize_handle_writers_for_inode(ino, local_sync_policy)
                 .await?;
         }
+
+        // #region debug log
+        if budget_exceeded {
+            self.debug_write_probe(
+                "H1",
+                "crates/studiofs-vfs/src/vfs/handle_writer.rs:738",
+                "limit-drain pass started",
+                serde_json::json!({
+                    "ino": ino,
+                    "per_inode_dirty_bytes": per_inode_dirty,
+                    "total_dirty_bytes": total_dirty,
+                    "max_dirty_bytes": max_dirty,
+                    "dirty_inode_count": self.state.handle_writers.snapshot_dirty_inodes_by_bytes().len(),
+                    "buffered_write_count": self.state.handle_writers.total_buffered_write_count(),
+                }),
+            );
+        }
+        // #endregion debug log
 
         // Graduated backpressure: drain the dirtiest inodes until we are below the budget.
         // We yield between iterations so that other write tasks can make forward progress
@@ -760,21 +801,20 @@ impl StudioVfs {
             if dirty_inodes.is_empty() {
                 break;
             }
-            let mut made_progress = false;
+            let mut pass_made_progress = false;
             for (next_ino, _) in dirty_inodes {
                 if self.state.handle_writers.total_dirty_bytes() <= max_dirty {
                     break;
                 }
-                let total_before = self.state.handle_writers.total_dirty_bytes();
                 let materialized = self
                     .materialize_handle_writers_for_inode(next_ino, local_sync_policy)
                     .await?;
-                let total_after = self.state.handle_writers.total_dirty_bytes();
-                if materialized && total_after < total_before {
-                    made_progress = true;
+                if materialized {
+                    pass_made_progress = true;
                 }
             }
-            if !made_progress {
+            made_progress |= pass_made_progress;
+            if !pass_made_progress {
                 break;
             }
             stall_iterations = stall_iterations.saturating_add(1);
@@ -790,7 +830,27 @@ impl StudioVfs {
             }
         }
 
-        Ok(())
+        // #region debug log
+        if budget_exceeded || stall_iterations > 0 {
+            self.debug_write_probe(
+                "H1",
+                "crates/studiofs-vfs/src/vfs/handle_writer.rs:815",
+                "limit-drain pass completed",
+                serde_json::json!({
+                    "ino": ino,
+                    "made_progress": made_progress,
+                    "stall_iterations": stall_iterations,
+                    "per_inode_dirty_bytes_after": self.state.handle_writers.dirty_bytes_for_inode(ino),
+                    "total_dirty_bytes_after": self.state.handle_writers.total_dirty_bytes(),
+                    "max_dirty_bytes": max_dirty,
+                    "dirty_inode_count_after": self.state.handle_writers.snapshot_dirty_inodes_by_bytes().len(),
+                    "buffered_write_count_after": self.state.handle_writers.total_buffered_write_count(),
+                }),
+            );
+        }
+        // #endregion debug log
+
+        Ok(made_progress)
     }
 
     pub(super) async fn materialize_handle_writers_for_inode(
@@ -921,6 +981,28 @@ impl StudioVfs {
             || self.state.handle_writers.dirty_bytes_for_inode(ino)
                 >= self.write_eager_flush_batch_bytes;
         if !should_materialize_now {
+            // #region debug log
+            if self.state.handle_writers.dirty_bytes_for_inode(ino)
+                >= super::aggressive_materialization_threshold_bytes(self.max_dirty_bytes())
+            {
+                self.debug_write_probe(
+                    "H3",
+                    "crates/studiofs-vfs/src/vfs/handle_writer.rs:923",
+                    "completed-block materialization skipped",
+                    serde_json::json!({
+                        "ino": ino,
+                        "visible_size": visible_size,
+                        "completed_block_count": completed_block_indexes.len(),
+                        "current_write_full_block_count": current_write_full_block_indexes.len(),
+                        "current_write_crosses_boundary_with_partial_tail": current_write_crosses_boundary_with_partial_tail,
+                        "enough_completed_blocks": enough_completed_blocks,
+                        "budget_exceeded": budget_exceeded,
+                        "per_inode_dirty_bytes": self.state.handle_writers.dirty_bytes_for_inode(ino),
+                        "batch_threshold_bytes": self.write_eager_flush_batch_bytes,
+                    }),
+                );
+            }
+            // #endregion debug log
             return Ok(false);
         }
         let completed_blocks = self
@@ -1002,5 +1084,25 @@ mod tests {
         assert_eq!(spans.len(), 3);
         assert_eq!(spans[0].start, 2);
         assert_eq!(spans[0].data.as_ref(), b"XY");
+    }
+
+    #[test]
+    fn handle_writer_registry_clear_inode_drops_all_dirty_state() {
+        let registry = HandleWriterRegistry::new();
+        let ino = 11;
+
+        registry.open_writer_for_test(1, ino, 0);
+        registry.open_writer_for_test(2, ino, 0);
+        registry.write(1, ino, 0, 4096, 0, b"hello");
+        registry.write(2, ino, 5, 4096, 5, b"world");
+
+        assert!(registry.has_dirty_writers(ino));
+        assert_eq!(registry.dirty_bytes_for_inode(ino), 10);
+
+        registry.clear_inode(ino);
+
+        assert!(!registry.has_dirty_writers(ino));
+        assert_eq!(registry.dirty_bytes_for_inode(ino), 0);
+        assert_eq!(registry.total_dirty_bytes(), 0);
     }
 }

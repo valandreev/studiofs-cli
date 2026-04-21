@@ -1308,6 +1308,47 @@ fn foreground_read_active_respects_idle_grace_after_last_read() {
     );
 }
 
+#[tokio::test]
+async fn foreground_idle_notify_fires_when_last_read_finishes() {
+    let state = ReadState::new(1);
+    state.mark_foreground_read(100);
+    let notified = state.foreground_idle_notify.notified();
+    state.unmark_foreground_read(120);
+    tokio::time::timeout(Duration::from_millis(20), notified)
+        .await
+        .expect("dropping the last read should notify idle waiters");
+}
+
+#[test]
+fn wait_for_foreground_reads_idle_honors_idle_grace() {
+    let tmp = TempDir::new().expect("tempdir");
+    let mut cfg = VfsConfig::default();
+    cfg.upload_user_idle_grace_ms = 20;
+    let (rt, vfs, _meta) = make_test_vfs_with_config(&tmp, "foreground-read-idle-wait", cfg);
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        vfs.state.read.mark_foreground_read(now_unix_millis());
+        let waiter = {
+            let vfs = vfs.clone();
+            tokio::spawn(async move {
+                vfs.wait_for_foreground_reads_idle(Duration::from_millis(80))
+                    .await
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        vfs.state.read.unmark_foreground_read(now_unix_millis());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            !waiter.is_finished(),
+            "helper should keep upload rereads paused until the idle grace expires"
+        );
+
+        assert!(waiter.await.expect("join foreground idle waiter"));
+    });
+}
+
 #[test]
 fn foreground_read_scope_records_sample_and_clears_inflight() {
     let state = ReadState::new(1);
@@ -2042,6 +2083,62 @@ fn handle_writer_global_dirty_cap_drains_older_inodes_after_limit_drop() {
 }
 
 #[test]
+fn soft_dirty_budget_wait_observes_inflight_materialization() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-soft-dirty-budget-wait");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let ino = 42;
+        let fh = 7;
+        vfs.set_max_dirty_bytes(1024);
+        vfs.state.handle_writers.open_writer_for_test(fh, ino, 0);
+        let payload = vec![0xAB; 2048];
+        vfs.state
+            .handle_writers
+            .write(fh, ino, 0, vfs.block_size, 0, &payload);
+
+        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let task_guard = task_lock.clone().lock_owned().await;
+        vfs.state
+            .deferred_materialize_inflight
+            .lock()
+            .insert(ino, task_lock.clone());
+
+        let waiter_vfs = vfs.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waiter_vfs.state.handle_writers.clear_inode(ino);
+            waiter_vfs
+                .state
+                .deferred_materialize_inflight
+                .lock()
+                .remove(&ino);
+            drop(task_guard);
+        });
+
+        let started = Instant::now();
+        vfs.wait_for_soft_dirty_budget_relief(ino).await;
+        assert!(
+            started.elapsed() >= Duration::from_millis(15),
+            "soft dirty-budget wait should block until the inflight drain completes"
+        );
+        assert!(
+            vfs.state.handle_writers.total_dirty_bytes() <= vfs.max_dirty_bytes(),
+            "soft dirty-budget wait should return only after dirty bytes are back under budget"
+        );
+    });
+}
+
+#[test]
+fn aggressive_materialization_threshold_is_half_of_dirty_budget() {
+    assert_eq!(aggressive_materialization_threshold_bytes(0), 1);
+    assert_eq!(aggressive_materialization_threshold_bytes(1), 1);
+    assert_eq!(aggressive_materialization_threshold_bytes(8), 4);
+    assert_eq!(hard_backpressure_threshold_bytes(8), 16);
+}
+
+#[test]
 fn ingress_pressure_counts_buffered_handle_writer_bytes() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-ingress-pressure-handle-writers");
@@ -2558,6 +2655,41 @@ fn test_rename_over_existing_target_discards_pending_local_state() {
         assert!(
             !vfs.inode_has_local_dirty_state(displaced.ino),
             "rename overwrite should clear local dirty state for the displaced inode"
+        );
+    });
+}
+
+#[test]
+fn orphan_cleanup_clears_dirty_handle_writer_state_for_deleted_inode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "orphan-handle-writer-cleanup");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"orphan-handle-writer-cleanup.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.write_fh_with_local_sync_policy(fh, ino, 0, b"payload", LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        assert!(
+            vfs.inode_has_dirty_handle_writers(ino),
+            "orphan cleanup test requires buffered handle-writer state before unlink"
+        );
+
+        vfs.unlink(1, b"orphan-handle-writer-cleanup.txt").unwrap();
+        vfs.release_fh(fh).await.unwrap();
+
+        assert!(
+            !vfs.inode_has_dirty_handle_writers(ino),
+            "final orphan cleanup must clear stale handle-writer state for the deleted inode"
+        );
+        assert_eq!(
+            vfs.state.handle_writers.dirty_bytes_for_inode(ino),
+            0,
+            "deleted inode must not retain dirty handle-writer bytes after last-handle cleanup"
         );
     });
 }

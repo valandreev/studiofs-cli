@@ -3689,6 +3689,25 @@ impl MetaBlocks for PgMetaEngine {
         self.local.get_regular_file_overlay_object_ids(ino)
     }
 
+    fn mark_regular_file_overlay_object_uploaded_if_matches(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_id: u64,
+    ) -> MetaResult<bool> {
+        let result = self.mutate(|local| {
+            local.mark_regular_file_overlay_object_uploaded_if_matches(
+                ino,
+                expected_epoch,
+                object_id,
+            )
+        });
+        if matches!(result, Ok(true)) {
+            self.request_pending_flush();
+        }
+        result
+    }
+
     fn commit_uploaded_block(
         &self,
         ino: Ino,
