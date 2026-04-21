@@ -502,6 +502,40 @@ fn zeroio_uploaded_overlay_blocks_make_epoch_publish_ready_only_after_full_epoch
 }
 
 #[test]
+fn zeroio_zero_length_manifest_epoch_becomes_publish_ready_without_payload_upload() {
+    let engine = temp_engine();
+
+    let file = engine
+        .create_file(ROOT_INO, b"zeroio-zero-length-publish-ready.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+    let block = BlockRef::new_partial(1_111, 4096);
+    engine.set_file_block(file.ino, 0, &block).unwrap();
+    assert!(engine.publish_file_manifest(file.ino, 1).unwrap());
+
+    let mut truncated = engine.get_attr(file.ino).unwrap();
+    truncated.size = 0;
+    truncated.content_epoch = 2;
+    engine.set_attr(&truncated).unwrap();
+    engine.remove_file_blocks(file.ino).unwrap();
+
+    let lifecycle = engine.get_inode_lifecycle(file.ino).unwrap().unwrap();
+    assert_eq!(lifecycle.state, InodeLifecycleState::PublishReady);
+    assert_eq!(
+        lifecycle.retention,
+        PayloadRetentionClass::PublishReadyRetained
+    );
+    assert!(lifecycle.has_published_base);
+    assert_eq!(lifecycle.local_visible_size, 0);
+    assert_eq!(lifecycle.published_size, 4096);
+    assert_eq!(lifecycle.local_content_epoch, 2);
+    assert_eq!(lifecycle.published_content_epoch, 1);
+}
+
+#[test]
 fn fragmented_overlay_object_upload_marks_matching_slices_uploaded() {
     let engine = temp_engine();
 

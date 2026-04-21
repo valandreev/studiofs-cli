@@ -155,7 +155,7 @@ regressions:
   - `redb_partial_update_does_not_expose_new_blocks_before_publish`
   - `test_publish_regular_file_overlay_to_base_if_matches_promotes_base_rows`
   - `test_publish_regular_file_overlay_to_base_keeps_sparse_tail_committed_size_below_size`
-  - `background_epoch_finalizer_publishes_unpublished_epoch_without_pending_uploads` *(requires S3 env)*
+  - `background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart` *(requires S3 env)*
 
 - Recovery and replay
   - `test_pg_reopen_after_publish_before_local_persist_recovers_without_discover`
@@ -178,7 +178,7 @@ binary prefix where applicable.
 cargo test -p studiofs-meta test_resolve_chunk_slice_spans_overlay_over_base_with_hole -- --nocapture
 cargo test -p studiofs-meta redb_partial_update_does_not_expose_new_blocks_before_publish -- --nocapture
 cargo test -p studiofs-vfs --test vfs_test offline_s3_does_not_break_local_read_after_write -- --nocapture
-cargo test -p studiofs-vfs --test vfs_test background_epoch_finalizer_publishes_unpublished_epoch_without_pending_uploads -- --nocapture --test-threads=1
+cargo test -p studiofs-vfs --test vfs_test background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart -- --ignored --nocapture --test-threads=1
 ```
 
 ## Recommended Local Flow

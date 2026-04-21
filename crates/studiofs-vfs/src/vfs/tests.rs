@@ -774,10 +774,10 @@ fn epoch_finalizer_publishes_manifest_backed_zero_length_epoch() {
             unpublished_attr.committed_content_epoch, unpublished_attr.content_epoch,
             "regression setup should leave the zero-length epoch unpublished"
         );
-        assert_ne!(
+        assert_eq!(
             lifecycle.state,
             InodeLifecycleState::PublishReady,
-            "regression setup should continue exercising the legacy non-publish-ready path"
+            "blockless manifest-backed zero-length epochs should become publish-ready immediately"
         );
         assert_eq!(
             meta.get_file_blocks(attr.ino)
@@ -933,9 +933,18 @@ fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
             .expect("remove unpublished blocks for zero-length truncate");
 
         let unpublished_attr = meta.get_attr(attr.ino).expect("load unpublished attr");
+        let lifecycle = meta
+            .get_inode_lifecycle(attr.ino)
+            .expect("load lifecycle")
+            .expect("zero-length epoch should keep lifecycle state");
         assert!(
             !vfs.inode_has_unmaterialized_overlay_for_finalize(attr.ino),
             "setup should otherwise be ready to finalize once uploads are visible"
+        );
+        assert_eq!(
+            lifecycle.state,
+            InodeLifecycleState::PublishReady,
+            "once zero-length manifest state is durable, only publication should remain"
         );
 
         let task_lock = Arc::new(tokio::sync::Mutex::new(()));
