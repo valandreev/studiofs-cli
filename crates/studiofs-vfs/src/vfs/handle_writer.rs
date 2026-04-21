@@ -56,12 +56,11 @@ impl HandleSliceWriter {
         }
     }
 
-    fn upsert_write(&mut self, block_index: u32, seq: u64, offset: u64, data: &[u8]) {
-        if data.is_empty() {
+    fn upsert_write(&mut self, block_index: u32, seq: u64, offset: u64, payload: Bytes) {
+        if payload.is_empty() {
             return;
         }
 
-        let payload = Bytes::copy_from_slice(data);
         let end = offset.saturating_add(payload.len() as u64);
         let mut overlap_starts: Vec<u64> = self
             .writes
@@ -192,6 +191,30 @@ impl HandleWriterRegistry {
         offset: u64,
         data: &[u8],
     ) -> u32 {
+        self.write_bytes(
+            fh,
+            ino,
+            current_size,
+            block_size,
+            offset,
+            Bytes::copy_from_slice(data),
+        )
+    }
+
+    fn write_bytes(
+        &self,
+        fh: u64,
+        ino: Ino,
+        current_size: u64,
+        block_size: u32,
+        offset: u64,
+        data: Bytes,
+    ) -> u32 {
+        let data_len = data.len();
+        if data_len == 0 {
+            return 0;
+        }
+
         let mut writers = self.writers.lock();
         let previous_ino = writers.writers.get(&fh).map(|writer| writer.ino);
         let (old_dirty_bytes, new_dirty_bytes) = {
@@ -206,7 +229,7 @@ impl HandleWriterRegistry {
             assert!(block_size > 0, "block_size must be non-zero");
             let mut current_offset = offset;
             let mut data_offset = 0usize;
-            let mut remaining = data.len();
+            let mut remaining = data_len;
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
             while remaining > 0 {
                 let block_index = (current_offset / u64::from(block_size)) as u32;
@@ -217,7 +240,7 @@ impl HandleWriterRegistry {
                     block_index,
                     seq,
                     current_offset,
-                    &data[data_offset..data_offset + chunk_len],
+                    data.slice(data_offset..data_offset + chunk_len),
                 );
                 current_offset = current_offset.saturating_add(chunk_len as u64);
                 data_offset += chunk_len;
@@ -231,7 +254,7 @@ impl HandleWriterRegistry {
             new_dirty_bytes,
         );
         Self::reindex_writer(&mut writers, fh, previous_ino, ino);
-        data.len() as u32
+        data_len as u32
     }
 
     pub(super) fn snapshot_read_spans(
@@ -1166,5 +1189,26 @@ mod tests {
         assert!(!registry.has_dirty_writers(ino));
         assert_eq!(registry.dirty_bytes_for_inode(ino), 0);
         assert_eq!(registry.total_dirty_bytes(), 0);
+    }
+
+    #[test]
+    fn handle_writer_registry_splits_write_into_block_slices_without_extra_copying() {
+        let registry = HandleWriterRegistry::new();
+        let fh = 99;
+        let ino = 17;
+        let payload = Bytes::from_static(b"abcdefgh");
+
+        registry.write_bytes(fh, ino, 0, 4, 0, payload.clone());
+
+        let mut materialized = registry.snapshot_materialization_writes(ino);
+        materialized.sort_by_key(|write| write.offset);
+        assert_eq!(materialized.len(), 2);
+        assert_eq!(materialized[0].data.as_ref(), b"abcd");
+        assert_eq!(materialized[1].data.as_ref(), b"efgh");
+        assert_eq!(materialized[0].data.as_ptr(), payload.as_ptr());
+        assert_eq!(
+            materialized[1].data.as_ptr(),
+            payload.as_ptr().wrapping_add(4)
+        );
     }
 }
