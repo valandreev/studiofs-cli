@@ -5,7 +5,7 @@
 - Rust 2024 workspace
 - Metadata: local `redb` + PostgreSQL background sync (`PgMetaEngine`)
 - Data I/O: OpenDAL (S3-compatible)
-- Cache: RAM + disk + writeback queue
+- Cache: RAM + disk + runtime upload queue
 - Bridges: WinFSP (Windows), FUSE (Linux/macOS)
 
 ## Project Structure

@@ -26,7 +26,7 @@ Active invariants:
 | `meta` | `MetaExecutor<dyn VfsMeta>` | Typed metadata executor used by `run_meta(...)` |
 | `data_write` | `Arc<DataStore>` | S3 write/delete path |
 | `local_block_backend` | `Arc<dyn LocalBlockBackend>` | Current local cache backend for committed payloads and upload rereads |
-| `cached_store` | `Arc<CachedStore>` | Staged-writeback runtime, pending-upload pinning, and queue orchestration |
+| `cached_store` | `Arc<CachedStore>` | Local-durable payload runtime, pending-upload queue, upload-stage helpers, and pinning |
 | `fetch_scheduler` | `Arc<FetchScheduler>` | Adaptive S3 fetcher |
 | `readahead` | `Arc<ReadAheadTracker>` | Sequential prefetch |
 | `dir_prefetch` | `Arc<DirAccessTracker>` | Directory-level prefetch |
@@ -156,13 +156,13 @@ handle for the same inode.
 
 ## Background Upload Worker
 
-The upload worker consumes from the cached-store writeback queue:
+The upload worker consumes from the cached-store pending-upload queue:
 
 ```text
 persisted payload queued
   │
-  ├─ Acquire local-data I/O permits only for the local reread phase
-  ├─ Reread committed payload from `get_for_upload()` on the local backend
+  ├─ Acquire local-data I/O permits only for the local payload-read phase
+  ├─ Read payload from hot upload buffer, upload-stage hardlink, or local backend fallback
   ├─ Split each chunk into cloud blocks
   ├─ Upload block objects to S3
   ├─ Mark payloads uploaded only after remote success
@@ -170,7 +170,8 @@ persisted payload queued
 ```
 
 Upload is the payload data plane only. Publication of a new file version is a
-separate control-plane step.
+separate control-plane step gated by durable metadata lifecycle
+(`PublishReady`).
 
 ## Background Epoch Finalizer
 

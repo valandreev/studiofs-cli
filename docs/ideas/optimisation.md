@@ -4,6 +4,14 @@
 **Scope:** Understanding memory behavior when writing large files (~7GB) in StudioFS  
 **Key Finding:** NOT a true zero-copy application; multiple memory copies occur at each stage
 
+> Historical note (2026-04-21): the upload orchestration described below is
+> no longer the current production model. StudioFS now seeds the runtime upload
+> queue directly from local durable commit and from startup replay, and publish
+> is gated only by durable metadata lifecycle (`PublishReady`). The old
+> pending-upload truth/reconcile layer has been removed. Keep this document as
+> memory/copy-path investigation context, not as the source of truth for the
+> current uploader architecture.
+
 ---
 
 ## Table of Contents

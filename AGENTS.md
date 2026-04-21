@@ -16,7 +16,7 @@ studiofs-cli/
     ├── studiofs/           # CLI binary (main.rs)
     ├── studiofs-meta/      # Metadata engine (PostgreSQL + Redb)
     ├── studiofs-data/      # S3 object storage layer
-    ├── studiofs-cache/     # Local cache backend + staged writeback pipeline
+    ├── studiofs-cache/     # Local cache backend + upload runtime
     ├── studiofs-vfs/       # Virtual File System implementation
     ├── studiofs-fuse/      # Unix FUSE bridge
     └── studiofs-winfsp/    # Windows WinFSP bridge
@@ -246,7 +246,7 @@ AGENTS snapshot differ from that contract, the contract wins.
 
 - Cache-v2 storage code has been removed from the workspace.
 - The current on-disk local cache backend lives under the `v3` subtree; treat that as an implementation detail, not the product architecture name.
-- `CachedStore` owns staged writeback queue management and pending-upload pinning for production mounts.
+- `CachedStore` owns the runtime pending-upload queue, upload-stage helpers, and pending-upload pinning for production mounts.
 - `BenchmarkCache` owns the lightweight in-memory benchmark cache surface.
 
 ### Environment Variables

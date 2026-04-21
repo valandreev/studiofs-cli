@@ -485,7 +485,7 @@ Metadata cache observability is emitted through the existing `upload pipeline` /
 - VFS synchronous read fast-path counters (`vfs_read_sync_fast_path_hits`, `vfs_read_sync_fast_path_misses`)
 - queue depth/backpressure metrics (`upload_queue_depth`, `upload_queue_depth_peak`, `write_backpressure_wait_ms`, `write_backpressure_events`)
 - fast-mode backpressure metrics (`fast_backpressure_wait_ms`, `fast_backpressure_events`, `fast_backpressure_stall_max_ms`)
-- upload local reread metrics (`upload_fallback_deferrals`, `upload_fallback_rereads`, `upload_fallback_reread_bytes`, `upload_fallback_reread_cache_misses`, `upload_fallback_wait_ms`, `upload_fallback_wait_max_ms`, `upload_fallback_read_ms`, `upload_fallback_read_max_ms`)
+- upload local payload-read metrics (`upload_local_payload_reads`, `upload_local_payload_read_bytes`, `upload_fallback_deferrals`, `upload_fallback_rereads`, `upload_fallback_reread_bytes`, `upload_fallback_reread_cache_misses`, `upload_fallback_wait_ms`, `upload_fallback_wait_max_ms`, `upload_fallback_read_ms`, `upload_fallback_read_max_ms`)
 - transit-memory budget metrics (`transit_memory_budget_bytes`, `transit_memory_used_bytes`, `transit_memory_available_bytes`, `transit_memory_waiting_foreground`, `transit_memory_waiting_background`)
 - foreground access-policy metrics (`dominant_access_class`, `dominant_prefetch_enabled`, `dominant_cache_promotion_on_read`, `dominant_readahead_base_width`, `dominant_readahead_max_width`, `dominant_readahead_min_prefetch`, `dominant_upload_pressure_boost`, `active_sequential_media_reads`, `active_random_interactive_reads`, `active_sequential_writers`, `active_random_writers`)
 
@@ -493,9 +493,8 @@ Dentry/path shortcut logs also include negative-hit ratio. The summary `upload p
 Local backend read/write throughput metrics are lifetime averages since the current backend instance was opened (not short-window/EMA samples).
 
 Upload local-I/O tuning notes:
-- upload workers source payload bytes from persisted local blocks (`get_for_upload()` on the local backend) after dequeue; upload correctness does not depend on transient staged buffers.
-- upload local-cache I/O slots are held only around that persisted reread phase and then released before remote upload work continues.
-- upload workers do not short-circuit through L1/staged payload probes; the persisted-source path is kept uniform so live uploads and startup replay share the same correctness model.
+- upload workers source payload bytes from persisted local payload sources after dequeue: hot upload buffer, upload-stage helpers, or local backend fallback.
+- upload local-cache I/O slots are held only around the local payload-read phase and then released before remote upload work continues.
 - upload local rereads use `get_for_upload()` on the local backend, which issues a best-effort post-read `DONT_NEED` advisory over the full on-disk block span (header + payload, aligned to block start) on Linux and does not refresh LRU recency.
 - adaptive upload penalty is enforced before local-cache read permits are acquired, so throttling creates disk idle gaps before background L2 reads.
 - per-upload foreground cache cost is derived internally from cache budget; there is no separate user-tuned penalty knob.

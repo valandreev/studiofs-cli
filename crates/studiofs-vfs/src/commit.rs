@@ -1,6 +1,4 @@
 use super::*;
-use studiofs_cache::local::LocalBlockLifecycleState;
-use studiofs_data::object::format_object_fragment_keys;
 use studiofs_meta::InodeLifecycleState;
 
 pub(super) struct CommitCoordinator;
@@ -93,29 +91,13 @@ impl CommitCoordinator {
             return Ok(EpochFinalizeStatus::Skipped);
         }
         if lifecycle.state != InodeLifecycleState::PublishReady {
-            let legacy_publishable = Self::legacy_epoch_can_publish_without_publish_ready(
-                vfs,
+            tracing::debug!(
                 ino,
                 content_epoch,
-                &meta.extent_plan,
-            )
-            .await?;
-            if legacy_publishable {
-                tracing::debug!(
-                    ino,
-                    content_epoch,
-                    lifecycle_state = ?lifecycle.state,
-                    "finalizing legacy epoch without durable publish-ready marker"
-                );
-            } else {
-                tracing::debug!(
-                    ino,
-                    content_epoch,
-                    lifecycle_state = ?lifecycle.state,
-                    "deferring epoch publication until durable lifecycle reaches publish-ready"
-                );
-                return Ok(EpochFinalizeStatus::Deferred);
-            }
+                lifecycle_state = ?lifecycle.state,
+                "deferring epoch publication until durable lifecycle reaches publish-ready"
+            );
+            return Ok(EpochFinalizeStatus::Deferred);
         }
 
         let published = if let FinalizeExtentPlan::Overlay {
@@ -136,7 +118,17 @@ impl CommitCoordinator {
                         )
                     })
                     .collect();
-                Self::wait_until_remote_objects_visible(vfs, &extents_to_verify).await?;
+                if let Err(err) =
+                    Self::wait_until_remote_objects_visible(vfs, &extents_to_verify).await
+                {
+                    tracing::debug!(
+                        ino,
+                        content_epoch,
+                        error = %err,
+                        "deferring overlay publication until uploaded extents become remotely visible"
+                    );
+                    return Ok(EpochFinalizeStatus::Deferred);
+                }
             }
             run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
                 engine.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
@@ -163,9 +155,13 @@ impl CommitCoordinator {
                 if let Err(err) =
                     Self::wait_until_remote_objects_visible(vfs, &extents_to_verify).await
                 {
-                    requeue_missing_manifest_uploads(vfs, ino, content_epoch, &required_blocks)
-                        .await;
-                    return Err(err);
+                    tracing::debug!(
+                        ino,
+                        content_epoch,
+                        error = %err,
+                        "deferring manifest publication until uploaded extents become remotely visible"
+                    );
+                    return Ok(EpochFinalizeStatus::Deferred);
                 }
             }
 
@@ -303,84 +299,5 @@ impl CommitCoordinator {
 
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    }
-
-    async fn legacy_epoch_can_publish_without_publish_ready(
-        vfs: &StudioVfs,
-        ino: Ino,
-        content_epoch: u64,
-        extent_plan: &FinalizeExtentPlan,
-    ) -> VfsResult<bool> {
-        let pending_same_epoch = vfs
-            .cached_store()
-            .snapshot_pending_uploads()
-            .into_iter()
-            .any(|pending| pending.ino == ino && pending.content_epoch == content_epoch);
-        if pending_same_epoch {
-            return Ok(false);
-        }
-
-        let required_object_ids: Vec<u64> = match extent_plan {
-            FinalizeExtentPlan::Overlay { object_ids } => object_ids.clone(),
-            FinalizeExtentPlan::Manifest { blocks } => blocks
-                .iter()
-                .map(|(_, block_ref)| block_ref.object_id)
-                .collect(),
-        };
-
-        Ok(required_object_ids.into_iter().all(|object_id| {
-            !matches!(
-                vfs.local_block_backend().lifecycle_state(object_id),
-                LocalBlockLifecycleState::Dirty | LocalBlockLifecycleState::Uploading
-            )
-        }))
-    }
-}
-
-async fn requeue_missing_manifest_uploads(
-    vfs: &StudioVfs,
-    ino: Ino,
-    content_epoch: u64,
-    required_blocks: &[(u32, BlockRef)],
-) {
-    let pending = vfs.truth_pending_uploads_snapshot();
-    let pending_keys: std::collections::HashSet<(u64, u64)> = pending
-        .into_iter()
-        .filter(|op| op.ino == ino && op.content_epoch == content_epoch)
-        .map(|op| (op.offset, op.object_id))
-        .collect();
-
-    for (block_index, block_ref) in required_blocks {
-        let offset = u64::from(*block_index).saturating_mul(u64::from(vfs.block_size));
-        if pending_keys.contains(&(offset, block_ref.object_id)) {
-            continue;
-        }
-
-        let checks = format_object_fragment_keys(&vfs.data_prefix, block_ref.object_id)
-            .into_iter()
-            .map(|key| async move {
-                tokio::time::timeout(
-                    Duration::from_secs(3),
-                    vfs.fetch_scheduler.data_store().exists(&key),
-                )
-                .await
-            });
-        let visible = futures::future::join_all(checks)
-            .await
-            .into_iter()
-            .all(|result| matches!(result, Ok(Ok(true))));
-        if visible {
-            continue;
-        }
-
-        tracing::warn!(
-            ino,
-            block_index,
-            object_id = block_ref.object_id,
-            content_epoch,
-            "commit reconcile: requeueing missing manifest upload"
-        );
-        vfs.cached_store()
-            .submit_upload(ino, offset, block_ref.object_id, content_epoch);
     }
 }

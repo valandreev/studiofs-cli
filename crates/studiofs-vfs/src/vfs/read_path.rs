@@ -1742,6 +1742,13 @@ mod tests {
                 "newly written file should still expose a pending incarnation locally"
             );
 
+            let pending_object_ids: Vec<_> = vfs
+                .pending_uploads_for_inode(created.ino)
+                .into_iter()
+                .map(|(_, object_id, _)| object_id)
+                .collect();
+            vfs.upload_hot_remove_batch(pending_object_ids);
+
             counting_backend.reset_counters();
 
             let read = vfs

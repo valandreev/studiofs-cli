@@ -296,9 +296,9 @@ fn startup_replay_prefers_overlay_metadata_live_extent_over_base_for_same_epoch(
 }
 
 #[test]
-fn pending_upload_views_rebuild_from_persistent_state_without_runtime_queue() {
+fn pending_upload_views_follow_runtime_queue_after_startup_replay() {
     let tmp = TempDir::new().expect("tempdir");
-    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-views-persistent-state");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-views-runtime-queue");
 
     let created = vfs
         .create(1, b"persistent-pending.bin", 0, 0, 0o644)
@@ -327,11 +327,17 @@ fn pending_upload_views_rebuild_from_persistent_state_without_runtime_queue() {
         &BlockRef::new_partial(object_id, payload.len() as u32),
     )
     .expect("persist current file block");
+    assert!(
+        vfs.cached_store().snapshot_pending_uploads().is_empty(),
+        "test setup requires startup replay to seed the runtime queue"
+    );
+
+    vfs.replay_dirty_uploads_from_local_backend(&[], &[attr.clone()]);
 
     assert_eq!(
         vfs.pending_uploads_for_inode(ino),
         vec![(0, object_id, attr.content_epoch)],
-        "pending upload helpers must rebuild from persistent dirty/uploading state even when the runtime notification queue is empty"
+        "pending upload helpers must follow the runtime queue rebuilt during startup replay"
     );
 
     let pending_upload_index = vfs.snapshot_pending_upload_index();
@@ -341,7 +347,113 @@ fn pending_upload_views_rebuild_from_persistent_state_without_runtime_queue() {
             object_id,
             content_epoch: attr.content_epoch,
         }),
-        "pending upload catalog must derive live extents from persistent state instead of the runtime queue"
+        "pending upload catalog must derive live extents from the replayed runtime queue"
+    );
+}
+
+#[test]
+fn startup_replay_rebuilds_runtime_pending_upload_index_from_persisted_state() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-replay-runtime-uploads");
+
+    let created = vfs
+        .create(1, b"startup-replay.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = created.ino;
+    let object_id = 7_011;
+    let payload = vec![0xDA; 4096];
+
+    vfs.local_block_backend()
+        .put(object_id, &payload, false)
+        .expect("persist local block");
+    vfs.local_block_backend()
+        .sync_data()
+        .expect("sync local block");
+
+    let mut attr = meta.get_attr(ino).expect("load test attr");
+    attr.size = payload.len() as u64;
+    attr.committed_size = 0;
+    attr.content_epoch = 9;
+    attr.committed_content_epoch = 8;
+    attr.upload_state = MetaUploadState::Uploading;
+    meta.set_attr(&attr).expect("persist staged attr");
+    meta.set_file_block(
+        ino,
+        0,
+        &BlockRef::new_partial(object_id, payload.len() as u32),
+    )
+    .expect("persist current file block");
+
+    assert!(
+        vfs.cached_store().snapshot_pending_uploads().is_empty(),
+        "test setup requires the runtime queue to start empty"
+    );
+    vfs.replay_dirty_uploads_from_local_backend(&[], &[attr.clone()]);
+
+    let runtime_pending = vfs.cached_store().snapshot_pending_uploads();
+    assert_eq!(runtime_pending.len(), 1);
+    assert_eq!(runtime_pending[0].ino, ino);
+    assert_eq!(runtime_pending[0].object_id, object_id);
+    assert!(
+        vfs.cached_store().is_pinned(object_id),
+        "requeued runtime upload should repin the durable local block"
+    );
+}
+
+#[test]
+fn flush_queues_runtime_upload_immediately_after_local_durability() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "flush-queues-runtime-upload");
+    let _guard = rt.enter();
+
+    let created = vfs
+        .create(1, b"flush-truth.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = created.ino;
+    let payload = vec![0x5Au8; vfs.block_size as usize];
+
+    rt.block_on(async {
+        vfs.write(ino, 0, &payload)
+            .await
+            .expect("write test payload");
+        vfs.flush(ino).await.expect("flush durable local payload");
+    });
+
+    let pending_uploads = vfs.pending_uploads_for_inode(ino);
+    assert_eq!(
+        pending_uploads.len(),
+        1,
+        "local durability should enqueue the unpublished block into the runtime upload queue"
+    );
+
+    let runtime_pending = vfs.cached_store().snapshot_pending_uploads();
+    assert_eq!(runtime_pending.len(), 1);
+    assert_eq!(runtime_pending[0].ino, ino);
+    assert_eq!(runtime_pending[0].object_id, pending_uploads[0].1);
+}
+
+#[test]
+fn wait_for_uploads_idle_observes_runtime_upload_queue() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "wait-for-runtime-upload-idle");
+    let _guard = rt.enter();
+
+    let created = vfs
+        .create(1, b"wait-for-truth-idle.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = created.ino;
+    let payload = vec![0x33u8; vfs.block_size as usize];
+
+    rt.block_on(async {
+        vfs.write(ino, 0, &payload)
+            .await
+            .expect("write test payload");
+        vfs.flush(ino).await.expect("flush durable local payload");
+    });
+
+    assert!(
+        !rt.block_on(vfs.wait_for_uploads_idle(Duration::from_millis(25))),
+        "wait_for_uploads_idle must not report idle while runtime uploads are still queued"
     );
 }
 
@@ -389,64 +501,6 @@ fn pending_upload_truth_ignores_deleted_inode_local_blocks() {
         pending_upload_index.latest_extent_record(ino, 0, Some(attr.content_epoch)),
         None,
         "pending upload catalog must not expose deleted inode blocks as uploadable extents"
-    );
-}
-
-#[test]
-fn pending_upload_truth_candidate_filter_keeps_unpublished_lifecycle_states() {
-    for state in [
-        InodeLifecycleState::LocalOnly,
-        InodeLifecycleState::Uploading,
-        InodeLifecycleState::PublishReady,
-        InodeLifecycleState::DeletedBeforePublish,
-    ] {
-        let record = studiofs_meta::schema::InodeLifecycleRecord {
-            ino: 42,
-            state,
-            local_visible_size: 4096,
-            published_size: 0,
-            local_content_epoch: 7,
-            published_content_epoch: 0,
-            has_published_base: matches!(state, InodeLifecycleState::DeletedBeforePublish),
-            retention: if matches!(state, InodeLifecycleState::DeletedBeforePublish) {
-                PayloadRetentionClass::DeletedBeforePublish
-            } else {
-                PayloadRetentionClass::PinnedUnpublished
-            },
-            deferred_cleanup_object_ids: if matches!(
-                state,
-                InodeLifecycleState::DeletedBeforePublish
-            ) {
-                vec![7002]
-            } else {
-                Vec::new()
-            },
-        };
-        assert!(
-            StudioVfs::lifecycle_record_may_reference_pending_uploads(&record),
-            "state {state:?} should remain a pending-upload candidate"
-        );
-    }
-}
-
-#[test]
-fn pending_upload_truth_candidate_filter_excludes_non_uploadable_lifecycle_states() {
-    let state = InodeLifecycleState::Published;
-    let retention = PayloadRetentionClass::PublishedWarm;
-    let record = studiofs_meta::schema::InodeLifecycleRecord {
-        ino: 42,
-        state,
-        local_visible_size: 4096,
-        published_size: 4096,
-        local_content_epoch: 7,
-        published_content_epoch: 7,
-        has_published_base: true,
-        retention,
-        deferred_cleanup_object_ids: vec![7002],
-    };
-    assert!(
-        !StudioVfs::lifecycle_record_may_reference_pending_uploads(&record),
-        "state {state:?} should not remain a pending-upload candidate"
     );
 }
 
@@ -922,6 +976,54 @@ fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
 }
 
 #[test]
+fn manifest_finalizer_visibility_timeout_does_not_requeue_uploaded_blocks() {
+    let tmp = TempDir::new().expect("tempdir");
+    let cfg = VfsConfig {
+        publish_visibility_timeout_secs: 1,
+        ..VfsConfig::default()
+    };
+    let (rt, vfs, meta) = make_test_vfs_with_config(&tmp, "manifest-finalizer-no-requeue", cfg);
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"manifest-finalizer-no-requeue.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let payload = vec![0x5Au8; vfs.block_size as usize];
+        vfs.write(attr.ino, 0, &payload)
+            .await
+            .expect("write test payload");
+        vfs.flush(attr.ino)
+            .await
+            .expect("flush manifest-backed epoch");
+
+        let (content_epoch, _blocks) = mark_all_file_blocks_uploaded(&vfs, &meta, attr.ino);
+        for pending in vfs.pending_uploads_snapshot() {
+            if pending.ino == attr.ino && pending.content_epoch == content_epoch {
+                vfs.cached_store().complete_upload(&pending);
+            }
+        }
+        assert!(
+            vfs.pending_uploads_for_inode(attr.ino).is_empty(),
+            "setup should simulate uploaded blocks that are no longer pending locally"
+        );
+
+        let status =
+            super::commit::CommitCoordinator::finalize_inode_epoch(&vfs, attr.ino, content_epoch)
+                .await
+                .expect("visibility timeout should defer instead of failing");
+        assert!(
+            matches!(status, super::commit::EpochFinalizeStatus::Deferred),
+            "visibility lag should defer publish instead of requeueing uploaded blocks"
+        );
+        assert!(
+            vfs.pending_uploads_for_inode(attr.ino).is_empty(),
+            "uploaded blocks awaiting remote visibility should not be requeued into the upload backlog"
+        );
+    });
+}
+
+#[test]
 fn zeroio_snapshot_reports_repeated_restart_replay_as_health_signal() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "zeroio-repeated-replay");
@@ -1322,8 +1424,10 @@ async fn foreground_idle_notify_fires_when_last_read_finishes() {
 #[test]
 fn wait_for_foreground_reads_idle_honors_idle_grace() {
     let tmp = TempDir::new().expect("tempdir");
-    let mut cfg = VfsConfig::default();
-    cfg.upload_user_idle_grace_ms = 20;
+    let cfg = VfsConfig {
+        upload_user_idle_grace_ms: 20,
+        ..VfsConfig::default()
+    };
     let (rt, vfs, _meta) = make_test_vfs_with_config(&tmp, "foreground-read-idle-wait", cfg);
     let _guard = rt.enter();
 
@@ -4473,6 +4577,47 @@ fn local_cache_read_into_returns_none_for_missing_block() {
             .await
             .expect("read_into should not error on cache miss");
         assert_eq!(read, None);
+    });
+}
+
+#[test]
+fn block_store_get_prefers_hot_upload_buffer_before_disk() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "local-cache-get-hot-upload");
+    rt.block_on(async {
+        vfs.cache_upload_hot_batch(vec![studiofs_cache::local::LocalBlockPut {
+            object_id: 0xABCD,
+            data: Bytes::from_static(b"hot-payload"),
+            evictable: false,
+        }]);
+
+        let payload = vfs
+            .block_store_get_async(0xABCD)
+            .await
+            .expect("block store get from hot upload buffer")
+            .expect("hot upload payload");
+        assert_eq!(payload.as_ref(), b"hot-payload");
+    });
+}
+
+#[test]
+fn block_store_read_into_prefers_hot_upload_buffer_before_disk() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "local-cache-read-into-hot-upload");
+    rt.block_on(async {
+        vfs.cache_upload_hot_batch(vec![studiofs_cache::local::LocalBlockPut {
+            object_id: 0xBCDE,
+            data: Bytes::from_static(b"hot-payload"),
+            evictable: false,
+        }]);
+
+        let mut out = [0_u8; 7];
+        let read = vfs
+            .block_store_read_into_async(0xBCDE, 4, &mut out)
+            .await
+            .expect("block store read_into from hot upload buffer");
+        assert_eq!(read, Some(7));
+        assert_eq!(&out, b"payload");
     });
 }
 

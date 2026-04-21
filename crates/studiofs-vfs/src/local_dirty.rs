@@ -660,6 +660,10 @@ impl LocalBlockWriterPort for VfsLocalBlockWriter<'_> {
         let persisted_bytes: u64 = persisted_blocks.iter().map(|b| b.data.len() as u64).sum();
         let started = Instant::now();
         let result: VfsResult<()> = async {
+            let persisted_object_ids: Vec<u64> = persisted_blocks
+                .iter()
+                .map(|block| block.object_id)
+                .collect();
             for chunk in persisted_blocks.chunks(persist_config.put_concurrency.max(1)) {
                 let batch = chunk
                     .iter()
@@ -671,12 +675,35 @@ impl LocalBlockWriterPort for VfsLocalBlockWriter<'_> {
                     .collect();
                 self.vfs.block_store_put_batch_async(batch).await?;
             }
+            for chunk in persisted_blocks.chunks(persist_config.put_concurrency.max(1)) {
+                let batch = chunk
+                    .iter()
+                    .map(|block| studiofs_cache::local::LocalBlockPut {
+                        object_id: block.object_id,
+                        data: block.data.clone(),
+                        evictable: false,
+                    })
+                    .collect();
+                self.vfs.cache_upload_hot_batch(batch);
+            }
             self.vfs
                 .maybe_block_store_sync_data_async(
                     persisted_bytes,
                     persist_config.local_sync_policy,
                 )
                 .await?;
+            if !persisted_object_ids.is_empty()
+                && let Err(error) = self
+                    .vfs
+                    .upload_stage_link_batch_async(persisted_object_ids)
+                    .await
+            {
+                warn!(
+                    persisted_block_count = persisted_blocks.len(),
+                    error = %error,
+                    "failed to create zero-copy upload-stage links for durable payload blocks"
+                );
+            }
             Ok(())
         }
         .await;
@@ -715,6 +742,20 @@ impl LocalBlockWriterPort for VfsLocalBlockWriter<'_> {
                 "local-dirty cleanup of uncommitted block-store entries failed"
             );
         }
+        if let Err(error) = self
+            .vfs
+            .upload_stage_remove_batch_async(object_ids.clone())
+            .await
+        {
+            warn!(
+                ino,
+                stage,
+                object_count = object_ids.len(),
+                error = %error,
+                "local-dirty cleanup of uncommitted upload-stage entries failed"
+            );
+        }
+        self.vfs.upload_hot_remove_batch(object_ids);
     }
 }
 
@@ -746,35 +787,22 @@ impl UploadSubmissionPort for VfsUploadSubmitter<'_> {
         persisted_blocks: &[PersistedWriteBlock],
         content_epoch: u64,
     ) {
-        let upload_ops: Vec<(u64, u64, u64, u64)> = persisted_blocks
-            .iter()
-            .map(|block| {
-                (
-                    ino,
-                    (block.block_index as u64).saturating_mul(self.vfs.block_size as u64),
-                    block.object_id,
-                    content_epoch,
-                )
-            })
-            .collect();
-
-        self.vfs.cached_store.submit_uploads_batch(&upload_ops);
-        for (upload_ino, _, _, _) in &upload_ops {
+        let mut submit_ops = Vec::with_capacity(persisted_blocks.len());
+        let mut live_extents = Vec::with_capacity(persisted_blocks.len());
+        for block in persisted_blocks {
+            let offset = u64::from(block.block_index).saturating_mul(self.vfs.block_size as u64);
+            submit_ops.push((ino, offset, block.object_id, content_epoch));
+            live_extents.push((ino, block.block_index, block.object_id, content_epoch));
+        }
+        self.vfs.record_live_extents(&live_extents);
+        if !submit_ops.is_empty() {
+            self.vfs.cached_store.submit_uploads_batch(&submit_ops);
             self.vfs.state.file_session.note_background_transition(
-                *upload_ino,
+                ino,
                 FileSessionOperation::Upload,
                 "queued",
             );
         }
-        if !upload_ops.is_empty() {
-            self.vfs.cached_store.flush_upload_journal().await;
-        }
-
-        let mut live_extents = Vec::with_capacity(persisted_blocks.len());
-        for block in persisted_blocks {
-            live_extents.push((ino, block.block_index, block.object_id, content_epoch));
-        }
-        self.vfs.record_live_extents(&live_extents);
     }
 }
 

@@ -330,7 +330,7 @@ impl StudioVfs {
             if let Err(error) = self.block_store_run_pressure_maintenance_async().await {
                 warn!(error = %error, "background local backend pressure maintenance failed");
             }
-            let pending_uploads = self.truth_pending_uploads_snapshot();
+            let pending_uploads = self.pending_uploads_snapshot();
             let pending = pending_uploads.len();
             let pending_upload_bytes = pending_uploads
                 .iter()

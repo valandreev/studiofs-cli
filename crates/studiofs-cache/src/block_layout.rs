@@ -17,10 +17,14 @@ pub const LOCAL_BLOCK_LAYOUT_MARKER_FILE: &str = "LAYOUT_V1";
 pub const LOCAL_BLOCK_TMP_DIR: &str = "tmp";
 /// Root directory for on-disk payload data.
 pub const LOCAL_BLOCK_PAYLOAD_DIR: &str = "payload";
+/// Root directory for upload staging data used by writeback.
+pub const LOCAL_BLOCK_UPLOAD_STAGE_DIR: &str = "upload-stage";
 /// Nested tree under `payload/` holding block files.
 pub const LOCAL_BLOCK_PAYLOAD_BLOCKS_DIR: &str = "blocks";
 /// Extension used by committed payload files.
 pub const LOCAL_BLOCK_PAYLOAD_BLOCK_FILE_EXTENSION: &str = "block";
+/// Extension used by upload-stage files.
+pub const LOCAL_BLOCK_UPLOAD_STAGE_FILE_EXTENSION: &str = "stage";
 /// Number of shard directories in the payload block tree.
 pub const LOCAL_BLOCK_PAYLOAD_SHARD_COUNT: usize = 256 * 256;
 /// Root directory for metadata/index files.
@@ -37,6 +41,8 @@ pub struct LocalBlockLayout {
     pub tmp_dir: PathBuf,
     pub payload_root: PathBuf,
     pub payload_blocks_dir: PathBuf,
+    pub upload_stage_root: PathBuf,
+    pub upload_stage_blocks_dir: PathBuf,
     pub index_dir: PathBuf,
     pub redb_index_path: PathBuf,
 }
@@ -48,6 +54,8 @@ impl LocalBlockLayout {
         let runtime_root = cache_root.join(LOCAL_BLOCK_SUBTREE);
         let payload_root = runtime_root.join(LOCAL_BLOCK_PAYLOAD_DIR);
         let payload_blocks_dir = payload_root.join(LOCAL_BLOCK_PAYLOAD_BLOCKS_DIR);
+        let upload_stage_root = runtime_root.join(LOCAL_BLOCK_UPLOAD_STAGE_DIR);
+        let upload_stage_blocks_dir = upload_stage_root.join(LOCAL_BLOCK_PAYLOAD_BLOCKS_DIR);
         let index_dir = runtime_root.join(LOCAL_BLOCK_INDEX_DIR);
 
         Self {
@@ -57,6 +65,8 @@ impl LocalBlockLayout {
             tmp_dir: runtime_root.join(LOCAL_BLOCK_TMP_DIR),
             payload_root,
             payload_blocks_dir: payload_blocks_dir.clone(),
+            upload_stage_root,
+            upload_stage_blocks_dir: upload_stage_blocks_dir.clone(),
             index_dir: index_dir.clone(),
             redb_index_path: index_dir.join(LOCAL_BLOCK_REDB_INDEX_FILE),
         }
@@ -93,6 +103,27 @@ impl LocalBlockLayout {
         format!("{object_id:016x}.{LOCAL_BLOCK_PAYLOAD_BLOCK_FILE_EXTENSION}")
     }
 
+    /// Resolve the canonical upload-stage path for an object id.
+    pub fn upload_stage_block_path(&self, object_id: u64) -> PathBuf {
+        self.runtime_root
+            .join(self.upload_stage_block_relative_path(object_id))
+    }
+
+    /// Resolve the canonical upload-stage path relative to the runtime root.
+    pub fn upload_stage_block_relative_path(&self, object_id: u64) -> PathBuf {
+        let [shard_0, shard_1] = Self::payload_shard(object_id);
+        PathBuf::from(LOCAL_BLOCK_UPLOAD_STAGE_DIR)
+            .join(LOCAL_BLOCK_PAYLOAD_BLOCKS_DIR)
+            .join(format!("{shard_0:02x}"))
+            .join(format!("{shard_1:02x}"))
+            .join(Self::upload_stage_block_file_name(object_id))
+    }
+
+    /// Canonical upload-stage filename for an object id.
+    pub fn upload_stage_block_file_name(object_id: u64) -> String {
+        format!("{object_id:016x}.{LOCAL_BLOCK_UPLOAD_STAGE_FILE_EXTENSION}")
+    }
+
     /// Parse an object id from a canonical payload filename.
     pub fn parse_payload_block_file_name(file_name: &str) -> Option<u64> {
         let (hex, ext) = file_name.rsplit_once('.')?;
@@ -109,6 +140,7 @@ impl LocalBlockLayout {
     pub fn provision(&self) -> io::Result<()> {
         std::fs::create_dir_all(&self.tmp_dir)?;
         std::fs::create_dir_all(&self.payload_blocks_dir)?;
+        std::fs::create_dir_all(&self.upload_stage_blocks_dir)?;
         std::fs::create_dir_all(&self.index_dir)?;
         if !self.layout_marker.exists() {
             std::fs::write(&self.layout_marker, b"v1")?;
@@ -143,6 +175,10 @@ mod tests {
             layout.payload_blocks_dir,
             PathBuf::from("/cache/vol-a/v3/payload/blocks")
         );
+        assert_eq!(
+            layout.upload_stage_blocks_dir,
+            PathBuf::from("/cache/vol-a/v3/upload-stage/blocks")
+        );
         assert_eq!(layout.index_dir, PathBuf::from("/cache/vol-a/v3/index"));
         assert_eq!(
             layout.redb_index_path,
@@ -169,6 +205,12 @@ mod tests {
             layout.payload_block_relative_path(object_id),
             PathBuf::from(format!(
                 "payload/blocks/{shard_0:02x}/{shard_1:02x}/{hex}.block"
+            ))
+        );
+        assert_eq!(
+            layout.upload_stage_block_path(object_id),
+            PathBuf::from(format!(
+                "/cache/vol-a/v3/upload-stage/blocks/{shard_0:02x}/{shard_1:02x}/{hex}.stage"
             ))
         );
     }

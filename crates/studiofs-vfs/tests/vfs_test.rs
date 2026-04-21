@@ -11446,9 +11446,9 @@ fn foreground_read_baseline_during_and_post_upload_are_comparable() {
 }
 
 /// Force an upload backlog and verify the uploader progresses via persisted
-/// local-block rereads instead of depending on transient staged payload state.
+/// local payload sources instead of depending on transient in-memory state.
 #[test]
-fn upload_backlog_progresses_via_persisted_local_block_rereads() {
+fn upload_backlog_progresses_via_persisted_local_payload_reads() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = setup_offline_sfs121_env();
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
@@ -11491,20 +11491,20 @@ fn upload_backlog_progresses_via_persisted_local_block_rereads() {
         assert!(
             wait_until(Duration::from_secs(10), || {
                 let stats = vfs.foreground_read_protection_stats();
-                stats.upload_fallback_rereads > 0
+                stats.upload_local_payload_reads > 0
             })
             .await,
-            "expected uploader to reread persisted local blocks under backlog"
+            "expected uploader to consume persisted local payloads under backlog"
         );
 
         let stats = vfs.foreground_read_protection_stats();
         assert!(
-            stats.upload_fallback_rereads > 0,
-            "upload backlog should trigger persisted local-block rereads; stats={stats:?}"
+            stats.upload_local_payload_reads > 0,
+            "upload backlog should trigger persisted local payload reads; stats={stats:?}"
         );
         assert!(
-            stats.upload_fallback_reread_bytes > 0,
-            "reread path should account bytes from persisted local blocks; stats={stats:?}"
+            stats.upload_local_payload_read_bytes > 0,
+            "persisted local payload reads should account transferred bytes; stats={stats:?}"
         );
     });
     rt.shutdown_background();

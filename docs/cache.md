@@ -16,7 +16,7 @@ Current runtime components:
 |---|---|---|
 | Current local cache backend (`v3`) | `v3::layout`, `v3::cache_index`, `v3::file_payload_store`, `v3::reconcile` | Persistent local payloads + lifecycle/index state |
 | Local-backend contract | `local` | Backend-agnostic trait used by VFS read/write/upload paths |
-| Cached-store runtime | `cached_store`, `upload_queue` | Unified local cache handle, staged-writeback queue, pending-upload pinning, and runtime metrics |
+| Cached-store runtime | `cached_store`, `upload_queue`, `upload_stage` | Unified local cache handle, runtime pending-upload queue, upload-stage helpers, pending-upload pinning, and runtime metrics |
 | Benchmark-only cache surface | `benchmark_cache` | Lightweight in-memory cache used by `studiofs test-cache` |
 
 Legacy cache-v2 storage implementation code has been removed.
@@ -26,14 +26,15 @@ Legacy cache-v2 storage implementation code has been removed.
 ```text
                 ┌────────────────────────────┐
                 │        CachedStore         │
-                │ (cache + staged writeback) │
+                │ (cache + upload runtime)   │
                 └───────────┬────────────────┘
                             │
           ┌─────────────────┴──────────────────┐
           │                                    │
    ┌──────▼────────┐                  ┌────────▼─────────┐
    │ Pending-upload│                  │ Upload Queue     │
-   │ pin tracking  │                  │ (rebuilt on open)│
+   │ pin tracking  │                  │ (seeded on commit│
+   │               │                  │  + startup replay)│
    └───────────────┘                  └──────────────────┘
                             │
                             ▼
@@ -74,7 +75,8 @@ runtime. It is intentionally focused on:
 - local backend access for cache hits, range/full-block rereads, and persisted
   payload lifecycle
 - pending-upload pinning near upload boundaries
-- pending-upload queue bookkeeping
+- runtime pending-upload queue bookkeeping
+- upload-stage helpers used by the background uploader
 - runtime metrics used by `status`
 
 `BenchmarkCache` is separate and only backs `studiofs test-cache`; it is not
@@ -88,9 +90,9 @@ truth.
 
 - Runtime local payload durability and lifecycle state come from backend
   persistence + index state surfaced through `CachedStore`.
-- Upload intent is persisted through local-backend lifecycle flags; the
-  in-memory queue is rebuilt on startup from local backend + metadata mapping.
-- Upload workers reread committed payloads from the local backend
-  (`get_for_upload()` via `CachedStore`), not from transient staging buffers.
+- Upload intent is seeded directly from local durable commit and from startup
+  replay of durable local payloads.
+- Upload workers read committed payloads through `CachedStore` local payload
+  sources: hot upload buffer, upload-stage helpers, or local backend fallback.
 - `studiofs status` reports local cache layout/index/payload health without
   depending on retired storage formats or terminology.

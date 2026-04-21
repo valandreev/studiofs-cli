@@ -16,6 +16,7 @@ pub mod local;
 pub mod metrics;
 pub mod runtime;
 pub mod upload_queue;
+pub mod upload_stage;
 
 // --- Re-exports ---
 pub use benchmark_cache::{

@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 const UPLOAD_WORKER_YIELD_EVERY_OPS: u32 = super::super::UPLOAD_WORKER_YIELD_EVERY_OPS;
+const FOREGROUND_UPLOAD_REREAD_LIMIT_BYTES_PER_SEC: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 struct ReadyUploads {
@@ -90,6 +91,7 @@ enum SingleUploadOutcome {
     Completed,
     CancelledDeleted,
     CancelledStale,
+    DeferredLocalPriority(Duration),
     Shutdown,
 }
 
@@ -123,6 +125,39 @@ fn upload_reread_idle_wait_window(
     }
 }
 
+fn upload_disk_reread_defer_delay(
+    foreground_active: bool,
+    hot_payload_available: bool,
+    adaptive_penalty: Duration,
+    idle_grace: Duration,
+) -> Option<Duration> {
+    if hot_payload_available {
+        return None;
+    }
+    let wait = upload_reread_idle_wait_window(foreground_active, adaptive_penalty, idle_grace);
+    (!wait.is_zero()).then_some(wait)
+}
+
+fn foreground_upload_reread_slot_cost(foreground_active: bool, max_slots: u32) -> u32 {
+    if foreground_active {
+        max_slots.max(1)
+    } else {
+        1
+    }
+}
+
+fn foreground_upload_reread_pacing_delay(foreground_active: bool, reread_bytes: usize) -> Duration {
+    if !foreground_active || reread_bytes == 0 {
+        return Duration::ZERO;
+    }
+    let limit = FOREGROUND_UPLOAD_REREAD_LIMIT_BYTES_PER_SEC.max(1) as u128;
+    let nanos = (reread_bytes as u128)
+        .saturating_mul(1_000_000_000u128)
+        .div_ceil(limit)
+        .min(u64::MAX as u128) as u64;
+    Duration::from_nanos(nanos)
+}
+
 trait CachedStorePort: Clone + Send + Sync + 'static {
     fn complete_upload(&self, op: &PendingUpload);
     fn requeue_upload(&self, op: PendingUpload) -> bool;
@@ -132,9 +167,16 @@ trait CachedStorePort: Clone + Send + Sync + 'static {
 trait UploadLocalBlockPort: Clone + Send + Sync + 'static {
     fn mark_uploading(&self, object_id: u64);
     fn mark_upload_failed(&self, object_id: u64);
+    async fn local_priority_defer_delay(
+        &self,
+        object_id: u64,
+        adaptive_penalty: Duration,
+    ) -> VfsResult<Option<Duration>>;
     async fn read_for_upload(&self, object_id: u64) -> VfsResult<Option<Bytes>>;
     async fn remove(&self, object_id: u64) -> VfsResult<()>;
     async fn mark_uploaded(&self, object_id: u64) -> VfsResult<()>;
+    async fn remove_upload_hot(&self, object_id: u64) -> VfsResult<()>;
+    async fn remove_upload_stage(&self, object_id: u64) -> VfsResult<()>;
     fn open_handle_count(&self, ino: Ino) -> usize;
     fn record_deferred_deleted_local_block(&self, ino: Ino, object_id: u64);
     fn clear_pending_eviction(&self, object_id: u64) -> bool;
@@ -249,6 +291,31 @@ where
             Ok(SingleUploadOutcome::Completed) => UploadOutcome::Completed,
             Ok(SingleUploadOutcome::CancelledDeleted) => UploadOutcome::CancelledDeleted,
             Ok(SingleUploadOutcome::CancelledStale) => UploadOutcome::CancelledStale,
+            Ok(SingleUploadOutcome::DeferredLocalPriority(delay)) => {
+                let mut deferred_op = op;
+                deferred_op.not_before_unix_ms = now_unix_millis()
+                    .saturating_add(delay.as_millis().clamp(0, u64::MAX as u128) as u64);
+                self.shutdown.record_requeue();
+                debug!(
+                    object_id = deferred_op.object_id,
+                    ino = deferred_op.ino,
+                    delay_ms = delay.as_millis() as u64,
+                    not_before_unix_ms = deferred_op.not_before_unix_ms,
+                    "upload deferred to preserve local foreground priority"
+                );
+                self.policy
+                    .debug_pending_inode_state(deferred_op.ino, "upload_deferred_local_priority");
+                if !self.shutdown.uploader_shutdown_requested()
+                    && !self.coordinator.requeue_upload(deferred_op)
+                {
+                    error!("failed to requeue upload op after local-priority defer");
+                }
+                if !self.shutdown.uploader_shutdown_requested() {
+                    UploadOutcome::Requeued
+                } else {
+                    UploadOutcome::Shutdown
+                }
+            }
             Ok(SingleUploadOutcome::Shutdown) => UploadOutcome::Shutdown,
             Err(error) => {
                 if self.shutdown.uploader_shutdown_requested() {
@@ -406,6 +473,14 @@ where
             Ok(_) => {}
             Err(error) if is_fragmented_block_lookup_error(&error) => {}
             Err(error) => return Err(error),
+        }
+
+        if let Some(delay) = self
+            .local_blocks
+            .local_priority_defer_delay(op.object_id, Duration::from_millis(adaptive_penalty_ms))
+            .await?
+        {
+            return Ok(SingleUploadOutcome::DeferredLocalPriority(delay));
         }
 
         let t0 = Instant::now();
@@ -567,6 +642,8 @@ where
         } else {
             self.local_blocks.remove(op.object_id).await?;
         }
+        self.local_blocks.remove_upload_hot(op.object_id).await?;
+        self.local_blocks.remove_upload_stage(op.object_id).await?;
 
         debug!(
             object_id = op.object_id,
@@ -595,6 +672,8 @@ where
         } else {
             self.local_blocks.remove(op.object_id).await?;
         }
+        self.local_blocks.remove_upload_hot(op.object_id).await?;
+        self.local_blocks.remove_upload_stage(op.object_id).await?;
         self.local_blocks.clear_pending_eviction(op.object_id);
         Ok(())
     }
@@ -603,6 +682,8 @@ where
         self.shutdown.record_canceled_stale();
         self.coordinator.cancel_upload(op);
         self.local_blocks.remove(op.object_id).await?;
+        self.local_blocks.remove_upload_hot(op.object_id).await?;
+        self.local_blocks.remove_upload_stage(op.object_id).await?;
         self.local_blocks.clear_pending_eviction(op.object_id);
         Ok(())
     }
@@ -653,49 +734,99 @@ impl UploadLocalBlockPort for VfsUploadLocalBlockPort {
         self.vfs.local_block_backend.mark_upload_failed(object_id);
     }
 
-    async fn read_for_upload(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
+    async fn local_priority_defer_delay(
+        &self,
+        object_id: u64,
+        adaptive_penalty: Duration,
+    ) -> VfsResult<Option<Duration>> {
+        if self.vfs.upload_hot_get(object_id).is_some()
+            || self.vfs.upload_stage_contains_async(object_id).await?
+        {
+            return Ok(None);
+        }
         let foreground_active = self
             .vfs
             .state
             .read
             .foreground_read_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
-        let upload_io_cost = if foreground_active {
+        let defer_delay = upload_disk_reread_defer_delay(
+            foreground_active,
+            false,
+            adaptive_penalty,
+            self.vfs.upload_user_idle_grace,
+        );
+        if let Some(delay) = defer_delay {
+            // #region debug log
+            self.vfs.debug_write_probe(
+                "H5",
+                "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:682",
+                "upload disk reread deferred to preserve local foreground priority",
+                serde_json::json!({
+                    "object_id": object_id,
+                    "adaptive_penalty_ms": adaptive_penalty.as_millis().min(u128::from(u64::MAX)) as u64,
+                    "defer_delay_ms": delay.as_millis().min(u128::from(u64::MAX)) as u64,
+                    "foreground_reads_inflight": self.vfs.foreground_reads_inflight(),
+                }),
+            );
+            // #endregion debug log
+        }
+        Ok(defer_delay)
+    }
+
+    async fn read_for_upload(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
+        if let Some(hot_payload) = self.vfs.upload_hot_get(object_id) {
             self.vfs
                 .state
                 .upload
-                .upload_cache_io_foreground_cost
-                .load(Ordering::Relaxed)
-                .max(1)
-        } else {
-            1
-        };
-        let idle_wait = upload_reread_idle_wait_window(
-            foreground_active,
-            Duration::from_millis(self.vfs.upload_scheduler.adaptive_penalty_ms()),
-            self.vfs.upload_user_idle_grace,
-        );
-        if !idle_wait.is_zero() {
-            let wait_started = Instant::now();
-            let foreground_idle = self.vfs.wait_for_foreground_reads_idle(idle_wait).await;
-            let waited_ms = wait_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-            if waited_ms > 0 {
-                // #region debug log
-                self.vfs.debug_write_probe(
-                    "H5",
-                    "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:682",
-                    "upload reread yielded to foreground reads",
-                    serde_json::json!({
-                        "object_id": object_id,
-                        "waited_ms": waited_ms,
-                        "foreground_idle": foreground_idle,
-                        "adaptive_penalty_ms": self.vfs.upload_scheduler.adaptive_penalty_ms(),
-                        "idle_grace_ms": self.vfs.upload_user_idle_grace.as_millis().min(u128::from(u64::MAX)) as u64,
-                        "foreground_reads_inflight": self.vfs.foreground_reads_inflight(),
-                    }),
-                );
-                // #endregion debug log
-            }
+                .upload_local_payload_reads
+                .fetch_add(1, Ordering::Relaxed);
+            self.vfs
+                .state
+                .upload
+                .upload_local_payload_read_bytes
+                .fetch_add(hot_payload.len() as u64, Ordering::Relaxed);
+            self.vfs.debug_write_probe(
+                "H5",
+                "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:741",
+                "upload read served from hot upload buffer",
+                serde_json::json!({
+                    "object_id": object_id,
+                    "buffer_bytes": hot_payload.len(),
+                }),
+            );
+            return Ok(Some(hot_payload));
         }
+        if let Some(staged_payload) = self.vfs.upload_stage_get_async(object_id).await? {
+            self.vfs
+                .state
+                .upload
+                .upload_local_payload_reads
+                .fetch_add(1, Ordering::Relaxed);
+            self.vfs
+                .state
+                .upload
+                .upload_local_payload_read_bytes
+                .fetch_add(staged_payload.len() as u64, Ordering::Relaxed);
+            self.vfs.debug_write_probe(
+                "H5",
+                "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:752",
+                "upload read served from upload-stage hardlink",
+                serde_json::json!({
+                    "object_id": object_id,
+                    "buffer_bytes": staged_payload.len(),
+                }),
+            );
+            return Ok(Some(staged_payload));
+        }
+        let foreground_active = self
+            .vfs
+            .state
+            .read
+            .foreground_read_active(now_unix_millis(), self.vfs.upload_user_idle_grace);
+        let upload_io_cost = foreground_upload_reread_slot_cost(
+            foreground_active,
+            self.vfs.upload_cache_io_slots_max,
+        );
         let wait_started = Instant::now();
         let upload_io_permit = self
             .vfs
@@ -712,6 +843,24 @@ impl UploadLocalBlockPort for VfsUploadLocalBlockPort {
         let read_started = Instant::now();
         let read_result = self.vfs.block_store_get_for_upload_async(object_id).await?;
         let read_ns = read_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
+        let pacing_delay = read_result
+            .as_ref()
+            .map(|payload| foreground_upload_reread_pacing_delay(foreground_active, payload.len()))
+            .unwrap_or(Duration::ZERO);
+        if !pacing_delay.is_zero() {
+            self.vfs.debug_write_probe(
+                "H5",
+                "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:744",
+                "upload reread paced under foreground reads",
+                serde_json::json!({
+                    "object_id": object_id,
+                    "reread_bytes": read_result.as_ref().map(|payload| payload.len()).unwrap_or(0),
+                    "pacing_delay_ms": pacing_delay.as_millis().min(u128::from(u64::MAX)) as u64,
+                    "slot_cost": upload_io_cost,
+                }),
+            );
+            tokio::time::sleep(pacing_delay).await;
+        }
         drop(upload_io_permit);
 
         self.vfs
@@ -743,6 +892,16 @@ impl UploadLocalBlockPort for VfsUploadLocalBlockPort {
             self.vfs
                 .state
                 .upload
+                .upload_local_payload_reads
+                .fetch_add(1, Ordering::Relaxed);
+            self.vfs
+                .state
+                .upload
+                .upload_local_payload_read_bytes
+                .fetch_add(payload.len() as u64, Ordering::Relaxed);
+            self.vfs
+                .state
+                .upload
                 .upload_fallback_reread_bytes
                 .fetch_add(payload.len() as u64, Ordering::Relaxed);
         } else {
@@ -761,6 +920,15 @@ impl UploadLocalBlockPort for VfsUploadLocalBlockPort {
 
     async fn mark_uploaded(&self, object_id: u64) -> VfsResult<()> {
         self.vfs.block_store_mark_uploaded_async(object_id).await
+    }
+
+    async fn remove_upload_hot(&self, object_id: u64) -> VfsResult<()> {
+        self.vfs.upload_hot_remove(object_id);
+        Ok(())
+    }
+
+    async fn remove_upload_stage(&self, object_id: u64) -> VfsResult<()> {
+        self.vfs.upload_stage_remove_async(object_id).await
     }
 
     fn open_handle_count(&self, ino: Ino) -> usize {
@@ -1391,11 +1559,14 @@ mod tests {
     struct FakeLocalBlocks {
         upload_reads: Arc<Mutex<HashMap<u64, Option<Bytes>>>>,
         removed: Arc<Mutex<Vec<u64>>>,
+        upload_hot_removed: Arc<Mutex<Vec<u64>>>,
+        upload_stage_removed: Arc<Mutex<Vec<u64>>>,
         uploaded: Arc<Mutex<Vec<u64>>>,
         failed: Arc<Mutex<Vec<u64>>>,
         deferred: Arc<Mutex<Vec<(Ino, u64)>>>,
         pending_evictions: Arc<Mutex<HashSet<u64>>>,
         open_handles: Arc<Mutex<HashMap<Ino, usize>>>,
+        local_priority_delay: Arc<Mutex<Option<Duration>>>,
     }
 
     impl UploadLocalBlockPort for FakeLocalBlocks {
@@ -1403,6 +1574,14 @@ mod tests {
 
         fn mark_upload_failed(&self, object_id: u64) {
             self.failed.lock().push(object_id);
+        }
+
+        async fn local_priority_defer_delay(
+            &self,
+            _object_id: u64,
+            _adaptive_penalty: Duration,
+        ) -> VfsResult<Option<Duration>> {
+            Ok(*self.local_priority_delay.lock())
         }
 
         async fn read_for_upload(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
@@ -1421,6 +1600,16 @@ mod tests {
 
         async fn mark_uploaded(&self, object_id: u64) -> VfsResult<()> {
             self.uploaded.lock().push(object_id);
+            Ok(())
+        }
+
+        async fn remove_upload_hot(&self, object_id: u64) -> VfsResult<()> {
+            self.upload_hot_removed.lock().push(object_id);
+            Ok(())
+        }
+
+        async fn remove_upload_stage(&self, object_id: u64) -> VfsResult<()> {
+            self.upload_stage_removed.lock().push(object_id);
             Ok(())
         }
 
@@ -1855,6 +2044,8 @@ mod tests {
             "successful upload should durably mark epoch/block progress before publish"
         );
         assert_eq!(local_blocks.uploaded.lock().as_slice(), &[77]);
+        assert_eq!(local_blocks.upload_hot_removed.lock().as_slice(), &[77]);
+        assert_eq!(local_blocks.upload_stage_removed.lock().as_slice(), &[77]);
         assert_eq!(policy.refreshed.lock().as_slice(), &[11]);
     }
 
@@ -1890,6 +2081,8 @@ mod tests {
         );
         assert_eq!(coordinator.completed.lock().as_slice(), &[77]);
         assert_eq!(local_blocks.uploaded.lock().as_slice(), &[77]);
+        assert_eq!(local_blocks.upload_hot_removed.lock().as_slice(), &[77]);
+        assert_eq!(local_blocks.upload_stage_removed.lock().as_slice(), &[77]);
         assert!(
             local_blocks.removed.lock().is_empty(),
             "current fragmented overlay object should stay in the local backend"
@@ -1918,6 +2111,45 @@ mod tests {
         };
         assert_eq!(ready_op.object_id, op.object_id);
         assert!(delayed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_upload_requeues_without_failure_when_local_priority_stays_busy() {
+        let (processor, coordinator, local_blocks, meta, _remote, shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.blocks
+            .lock()
+            .insert((op.ino, 0), Some(BlockRef::new_partial(op.object_id, 4096)));
+        *local_blocks.local_priority_delay.lock() = Some(Duration::from_millis(40));
+
+        let before_requeue = now_unix_millis();
+        let outcome = processor.process_upload(op).await;
+
+        assert_eq!(outcome, UploadOutcome::Requeued);
+        assert!(
+            local_blocks.failed.lock().is_empty(),
+            "local-priority defer should not mark the upload as failed"
+        );
+        assert!(
+            policy.sticky_errors.lock().is_empty(),
+            "local-priority defer should not surface a sticky upload error"
+        );
+        assert_eq!(shutdown.requeues.load(Ordering::Relaxed), 1);
+        let requeued = coordinator.requeued.lock();
+        assert_eq!(requeued.len(), 1);
+        assert_eq!(
+            requeued[0].retry_count, 0,
+            "local-priority defers should preserve the retry budget"
+        );
+        assert!(
+            requeued[0].not_before_unix_ms >= before_requeue.saturating_add(30),
+            "requeued op should wait for the local-priority delay window"
+        );
     }
 
     #[test]
@@ -1957,6 +2189,59 @@ mod tests {
                 Duration::from_millis(50),
             ),
             Duration::from_millis(240)
+        );
+    }
+
+    #[test]
+    fn upload_disk_reread_defer_delay_skips_hot_payloads() {
+        assert_eq!(
+            upload_disk_reread_defer_delay(
+                true,
+                true,
+                Duration::from_millis(240),
+                Duration::from_millis(500),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn upload_disk_reread_defer_delay_uses_idle_window_for_disk_miss() {
+        assert_eq!(
+            upload_disk_reread_defer_delay(
+                true,
+                false,
+                Duration::from_millis(240),
+                Duration::from_millis(500),
+            ),
+            Some(Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn foreground_upload_reread_slot_cost_collapses_to_single_lane() {
+        assert_eq!(foreground_upload_reread_slot_cost(false, 32), 1);
+        assert_eq!(foreground_upload_reread_slot_cost(true, 32), 32);
+        assert_eq!(foreground_upload_reread_slot_cost(true, 1), 1);
+    }
+
+    #[test]
+    fn foreground_upload_reread_pacing_delay_tracks_payload_size() {
+        assert_eq!(
+            foreground_upload_reread_pacing_delay(false, 4096),
+            Duration::ZERO
+        );
+        assert_eq!(
+            foreground_upload_reread_pacing_delay(true, 0),
+            Duration::ZERO
+        );
+        assert_eq!(
+            foreground_upload_reread_pacing_delay(true, 1024usize * 1024 * 1024),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            foreground_upload_reread_pacing_delay(true, 4usize * 1024 * 1024),
+            Duration::from_nanos(3_906_250)
         );
     }
 
