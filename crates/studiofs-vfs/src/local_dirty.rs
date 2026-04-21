@@ -1683,9 +1683,21 @@ impl StudioVfs {
             return Ok(Some(data));
         }
 
-        let block_ref = match self.get_file_block_async(ino, block_index).await? {
-            Some(br) => br,
-            None => return Ok(None),
+        let visible_size = if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino) {
+            attr.size
+        } else {
+            self.getattr_async(ino).await?.size
+        };
+
+        let block_ref = match self.get_file_block_async(ino, block_index).await {
+            Ok(Some(br)) => br,
+            Ok(None) => return Ok(None),
+            Err(VfsError::Meta(studiofs_meta::MetaError::FragmentedBlock { .. })) => {
+                return self
+                    .read_metadata_block_from_slice_graph_async(ino, block_index, visible_size)
+                    .await;
+            }
+            Err(error) => return Err(error),
         };
 
         if let Some(cached) = self.block_store_get_async(block_ref.object_id).await? {

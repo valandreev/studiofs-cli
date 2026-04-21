@@ -633,8 +633,8 @@ impl StudioVfs {
                                 data
                             }
                         }
-                        None => match self.get_file_block_async(ino, write.block_index).await? {
-                            Some(block_ref) => {
+                        None => match self.get_file_block_async(ino, write.block_index).await {
+                            Ok(Some(block_ref)) => {
                                 if let Some(cached) =
                                     self.block_store_get_async(block_ref.object_id).await?
                                 {
@@ -645,7 +645,18 @@ impl StudioVfs {
                                         .map_err(|e| VfsError::Other(e.to_string()))?
                                 }
                             }
-                            None => Bytes::new(),
+                            Ok(None) => Bytes::new(),
+                            Err(VfsError::Meta(studiofs_meta::MetaError::FragmentedBlock {
+                                ..
+                            })) => self
+                                .read_metadata_block_from_slice_graph_async(
+                                    ino,
+                                    write.block_index,
+                                    visible_size,
+                                )
+                                .await?
+                                .unwrap_or_default(),
+                            Err(error) => return Err(error),
                         },
                     }
                 };

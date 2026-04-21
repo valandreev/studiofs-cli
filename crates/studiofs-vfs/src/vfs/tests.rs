@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use studiofs_meta::engine::MetadataAuthorityStatus;
 use studiofs_meta::engine::{MetaBlocks, MetaInodes};
 use studiofs_meta::schema::{
-    CURRENT_FORMAT_VERSION, FormatInfo, InodeLifecycleState, MetadataConfig, PayloadRetentionClass,
-    ROOT_INO,
+    CURRENT_FORMAT_VERSION, ChunkId, FormatInfo, InodeLifecycleState, MetadataConfig,
+    PayloadRetentionClass, ROOT_INO, SliceId, SliceOrder, SliceRange, SliceRecord,
 };
 use studiofs_meta::{
     FileLockLease, HardLockKind, MetaEngine, MetaFormat, MetaFsOps, RedbMetaEngine,
@@ -138,6 +138,62 @@ fn publish_current_manifest(
             .expect("publish current manifest"),
         "expected manifest publish to apply"
     );
+}
+
+fn install_fragmented_overlay_block(
+    vfs: &Arc<StudioVfs>,
+    meta: &Arc<RedbMetaEngine>,
+    ino: Ino,
+    block_size: usize,
+    left_fill: u8,
+    right_fill: u8,
+) -> Vec<u8> {
+    let half = block_size / 2;
+    let left = vec![left_fill; half];
+    let right = vec![right_fill; block_size - half];
+    let object_ids = meta
+        .next_block_ids(2)
+        .expect("allocate fragmented object ids");
+
+    vfs.local_block_backend()
+        .put(object_ids[0], &left, false)
+        .expect("persist left fragmented object");
+    vfs.local_block_backend()
+        .put(object_ids[1], &right, false)
+        .expect("persist right fragmented object");
+    vfs.local_block_backend()
+        .sync_data()
+        .expect("sync fragmented overlay objects");
+
+    meta.flush_regular_file_overlay_slices_with_attr(
+        ino,
+        &[(
+            ChunkId(0),
+            vec![
+                SliceRecord::new(
+                    SliceId(0),
+                    SliceOrder(0),
+                    SliceRange::new(0, half as u32).expect("left slice range"),
+                    BlockRef::new_partial(object_ids[0], half as u32),
+                ),
+                SliceRecord::new(
+                    SliceId(1),
+                    SliceOrder(1),
+                    SliceRange::new(half as u32, block_size as u32).expect("right slice range"),
+                    BlockRef::new_partial(object_ids[1], (block_size - half) as u32),
+                ),
+            ],
+        )],
+        None,
+    )
+    .expect("persist fragmented overlay slices");
+
+    vfs.remove_live_extents_for_inode(ino);
+    vfs.cancel_pending_uploads_for_inode(ino);
+
+    let mut expected = left;
+    expected.extend_from_slice(&right);
+    expected
 }
 
 #[test]
@@ -398,6 +454,10 @@ fn startup_replay_rebuilds_runtime_pending_upload_index_from_persisted_state() {
         vfs.cached_store().is_pinned(object_id),
         "requeued runtime upload should repin the durable local block"
     );
+    assert!(
+        vfs.cached_store().has_staged_upload(object_id),
+        "startup replay should restore upload-stage links so recovered uploads do not depend on cold rereads"
+    );
 }
 
 #[test]
@@ -430,6 +490,101 @@ fn flush_queues_runtime_upload_immediately_after_local_durability() {
     assert_eq!(runtime_pending.len(), 1);
     assert_eq!(runtime_pending[0].ino, ino);
     assert_eq!(runtime_pending[0].object_id, pending_uploads[0].1);
+}
+
+#[test]
+fn buffered_partial_write_uses_fragmented_overlay_slice_graph_as_base() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "fragmented-overlay-buffered-base");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let created = vfs
+            .create(1, b"fragmented-buffered-base.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = created.ino;
+        let block_size = vfs.block_size as usize;
+        let baseline = vec![0x33u8; block_size];
+
+        vfs.write(ino, 0, &baseline).await.expect("write baseline");
+        vfs.flush(ino).await.expect("flush baseline");
+
+        let mut expected =
+            install_fragmented_overlay_block(&vfs, &meta, ino, block_size, 0x11, 0x22);
+        let patch_offset = 128 * 1024usize;
+        let patch = vec![0x7Au8; 8192];
+        expected[patch_offset..patch_offset + patch.len()].copy_from_slice(&patch);
+
+        vfs.write(ino, patch_offset as u64, &patch)
+            .await
+            .expect("write patch over fragmented overlay");
+        vfs.flush(ino)
+            .await
+            .expect("flush patch over fragmented overlay");
+
+        let read = vfs
+            .read(ino, 0, block_size as u32)
+            .await
+            .expect("read patched block");
+        assert_eq!(
+            read.as_ref(),
+            expected.as_slice(),
+            "buffered write path should reuse fragmented overlay slice graph as its base block"
+        );
+    });
+}
+
+#[test]
+fn release_fh_materializes_fragmented_overlay_slice_graph_base() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "fragmented-overlay-handle-base");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let created = vfs
+            .create(1, b"fragmented-handle-base.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = created.ino;
+        let block_size = vfs.block_size as usize;
+        let baseline = vec![0x44u8; block_size];
+
+        vfs.write(ino, 0, &baseline).await.expect("write baseline");
+        vfs.flush(ino).await.expect("flush baseline");
+
+        let mut expected =
+            install_fragmented_overlay_block(&vfs, &meta, ino, block_size, 0x21, 0x42);
+        let patch_offset = 64 * 1024usize;
+        let patch = vec![0x6Bu8; 4096];
+        expected[patch_offset..patch_offset + patch.len()].copy_from_slice(&patch);
+
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open test handle");
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            patch_offset as u64,
+            &patch,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("write handle patch over fragmented overlay");
+
+        let outcome = vfs
+            .release_fh_with_outcome(fh)
+            .await
+            .expect("release should materialize fragmented overlay base");
+        assert!(outcome.closed_last_handle);
+        assert!(outcome.flushed_local_dirty_state);
+
+        let read = vfs
+            .read(ino, 0, block_size as u32)
+            .await
+            .expect("read released handle block");
+        assert_eq!(
+            read.as_ref(),
+            expected.as_slice(),
+            "handle-writer materialization should reuse fragmented overlay slice graph as its base block"
+        );
+    });
 }
 
 #[test]

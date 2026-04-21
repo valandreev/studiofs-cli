@@ -852,6 +852,152 @@ impl<'a> ReadMetadataResolver<'a> {
 }
 
 impl StudioVfs {
+    pub(super) async fn read_metadata_block_from_slice_graph_async(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        visible_size: u64,
+    ) -> VfsResult<Option<Bytes>> {
+        let logical_len = self.logical_block_len(visible_size, block_index);
+        if logical_len == 0 {
+            return Ok(None);
+        }
+
+        let block_start = (block_index as u64).saturating_mul(self.block_size as u64);
+        let block_end = block_start.saturating_add(logical_len as u64);
+        let meta = self.meta.clone();
+        let resolved = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            engine.lookup_regular_file_slices(ino, block_start, logical_len as u64)
+        })
+        .await?;
+        if resolved.is_empty() {
+            return Ok(None);
+        }
+
+        let requested = ReadRange {
+            start: block_start,
+            end: block_end,
+        };
+        let mut buffer = vec![0u8; logical_len];
+        for span in &resolved {
+            let Some(block) = span.block.as_ref() else {
+                continue;
+            };
+
+            let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
+            let span_range = ReadRange {
+                start: chunk_base.saturating_add(span.range.start as u64),
+                end: chunk_base.saturating_add(span.range.end as u64),
+            };
+            let Some(overlap) = span_range.intersection(requested) else {
+                continue;
+            };
+
+            let dst_start = usize::try_from(overlap.start.saturating_sub(block_start)).map_err(
+                |_| {
+                    VfsError::Other(format!(
+                        "metadata block read start does not fit usize: ino={}, block_index={}, start={}",
+                        ino, block_index, overlap.start
+                    ))
+                },
+            )?;
+            let dst_end =
+                usize::try_from(overlap.end.saturating_sub(block_start)).map_err(|_| {
+                    VfsError::Other(format!(
+                        "metadata block read end does not fit usize: ino={}, block_index={}, end={}",
+                        ino, block_index, overlap.end
+                    ))
+                })?;
+            let dst = &mut buffer[dst_start..dst_end];
+
+            let delta = overlap.start.saturating_sub(span_range.start);
+            let delta_u32 = u32::try_from(delta).map_err(|_| {
+                VfsError::Other(format!(
+                    "metadata block read delta does not fit u32: ino={}, block_index={}, delta={}",
+                    ino, block_index, delta
+                ))
+            })?;
+            let mut planned_block = block.clone();
+            planned_block.offset =
+                planned_block.offset.checked_add(delta_u32).ok_or_else(|| {
+                    VfsError::Other(format!(
+                        "metadata block read offset overflow: ino={}, block_index={}, object_id={}",
+                        ino, block_index, planned_block.object_id
+                    ))
+                })?;
+            planned_block.length =
+                u32::try_from(overlap.end.saturating_sub(overlap.start)).map_err(|_| {
+                    VfsError::Other(format!(
+                        "metadata block read span too large: ino={}, block_index={}, start={}, end={}",
+                        ino, block_index, overlap.start, overlap.end
+                    ))
+                })?;
+
+            let mut span_resolved = false;
+            let block_offset = usize::try_from(planned_block.offset).map_err(|_| {
+                VfsError::Other(format!(
+                    "metadata block offset does not fit usize: object_id={}, offset={}",
+                    planned_block.object_id, planned_block.offset
+                ))
+            })?;
+            if let Some(read) = self
+                .block_store_read_into_async(planned_block.object_id, block_offset, dst)
+                .await?
+            {
+                if read == dst.len() {
+                    span_resolved = true;
+                } else {
+                    error!(
+                        object_id = planned_block.object_id,
+                        ino,
+                        block_index,
+                        requested = dst.len(),
+                        read,
+                        "metadata slice-graph base read saw short local block read; evicting before refetch"
+                    );
+                    if let Err(evict_error) =
+                        self.block_store_remove_async(planned_block.object_id).await
+                    {
+                        warn!(
+                            object_id = planned_block.object_id,
+                            error = %evict_error,
+                            "metadata slice-graph base read failed to evict short-read local block"
+                        );
+                    }
+                }
+            }
+
+            if !span_resolved {
+                match self
+                    .fetch_block_for_ref_after_local_miss(&planned_block)
+                    .await
+                {
+                    Ok(data) => {
+                        self.copy_committed_block_payload_into_range(
+                            data.as_ref(),
+                            &planned_block,
+                            overlap.start,
+                            dst,
+                        )?;
+                    }
+                    Err(crate::fetch::FetchError::NotFound { key }) => {
+                        warn!(
+                            object_id = planned_block.object_id,
+                            ino,
+                            block_index,
+                            key,
+                            "metadata slice-graph base read missing remote fragment, zeroing span"
+                        );
+                        dst.fill(0);
+                    }
+                    Err(error) => return Err(VfsError::Fetch(error)),
+                }
+            }
+        }
+
+        Ok(Some(Bytes::from(buffer)))
+    }
+
     pub(super) fn getattr_unchecked(&self, ino: Ino) -> VfsResult<InodeAttr> {
         ReadMetadataResolver::new(self, ino).resolve_attr_sync()
     }

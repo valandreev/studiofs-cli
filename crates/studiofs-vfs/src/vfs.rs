@@ -2674,6 +2674,13 @@ impl<'a> StartupReplayCoordinator<'a> {
         self.discard_quarantined_dirty_objects();
         self.merge_pending_live_extents();
         let replayed_blocks = self.replay_ops.len() as u64;
+        let replayed_object_ids: Vec<_> = self
+            .replay_ops
+            .iter()
+            .map(|(_, _, object_id, _)| *object_id)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         let replayed_epochs: BTreeSet<_> = self
             .replay_ops
             .iter()
@@ -2698,6 +2705,18 @@ impl<'a> StartupReplayCoordinator<'a> {
             self.vfs.record_live_extents(&live_extents);
         }
         if !self.replay_ops.is_empty() {
+            if let Err(error) = self
+                .vfs
+                .cached_store
+                .link_upload_stage_batch(&replayed_object_ids)
+            {
+                warn!(
+                    replayed_dirty_blocks = self.replay_ops.len(),
+                    replayed_object_count = replayed_object_ids.len(),
+                    error = %error,
+                    "startup replay failed to restore upload-stage links for runtime pending uploads"
+                );
+            }
             self.vfs.cached_store.submit_uploads_batch(&self.replay_ops);
             for (ino, _) in replayed_epochs.iter().copied() {
                 self.vfs.state.file_session.note_background_transition(

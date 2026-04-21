@@ -739,10 +739,40 @@ impl UploadLocalBlockPort for VfsUploadLocalBlockPort {
         object_id: u64,
         adaptive_penalty: Duration,
     ) -> VfsResult<Option<Duration>> {
-        if self.vfs.upload_hot_get(object_id).is_some()
-            || self.vfs.upload_stage_contains_async(object_id).await?
-        {
+        if self.vfs.upload_hot_get(object_id).is_some() {
             return Ok(None);
+        }
+        if self.vfs.upload_stage_contains_async(object_id).await? {
+            return Ok(None);
+        }
+        match self
+            .vfs
+            .upload_stage_link_batch_async(vec![object_id])
+            .await
+        {
+            Ok(()) if self.vfs.upload_stage_contains_async(object_id).await? => {
+                self.vfs.debug_write_probe(
+                    "H5",
+                    "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:746",
+                    "upload stage hardlink restored before local-priority reread fallback",
+                    serde_json::json!({
+                        "object_id": object_id,
+                    }),
+                );
+                return Ok(None);
+            }
+            Ok(()) => {}
+            Err(error) => {
+                self.vfs.debug_write_probe(
+                    "H5",
+                    "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:754",
+                    "upload stage hardlink restore failed; falling back to bounded reread",
+                    serde_json::json!({
+                        "object_id": object_id,
+                        "error": error.to_string(),
+                    }),
+                );
+            }
         }
         let foreground_active = self
             .vfs
@@ -759,18 +789,18 @@ impl UploadLocalBlockPort for VfsUploadLocalBlockPort {
             // #region debug log
             self.vfs.debug_write_probe(
                 "H5",
-                "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:682",
-                "upload disk reread deferred to preserve local foreground priority",
+                "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:769",
+                "upload stage unavailable; skipping local-priority defer and using bounded reread",
                 serde_json::json!({
                     "object_id": object_id,
                     "adaptive_penalty_ms": adaptive_penalty.as_millis().min(u128::from(u64::MAX)) as u64,
-                    "defer_delay_ms": delay.as_millis().min(u128::from(u64::MAX)) as u64,
+                    "would_defer_delay_ms": delay.as_millis().min(u128::from(u64::MAX)) as u64,
                     "foreground_reads_inflight": self.vfs.foreground_reads_inflight(),
                 }),
             );
             // #endregion debug log
         }
-        Ok(defer_delay)
+        Ok(None)
     }
 
     async fn read_for_upload(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
