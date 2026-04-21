@@ -306,23 +306,23 @@ const DEFAULT_JANITOR_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_JANITOR_SKIP_NEWER_THAN: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_JANITOR_MAX_DELETES_PER_RUN: u64 = 500;
 const DEFAULT_JANITOR_LEASE_TTL: Duration = Duration::from_secs(45 * 60);
-// JuiceFS-like high-level read tuning default:
-// - buffer-size: 2048M
-const DEFAULT_READ_BUFFER_MB: u64 = 2_048;
+// JuiceFS-like high-level read/write buffering defaults:
+// - buffer-size: 300M
+const DEFAULT_READ_BUFFER_MB: u64 = 300;
 // Block-level derived defaults (used as fallback if conversion is unavailable).
-const DEFAULT_PREFETCH_CONCURRENCY: usize = 128;
-const DEFAULT_READAHEAD_WIDTH: u32 = 128;
-const DEFAULT_READAHEAD_MIN_PREFETCH: u32 = 16;
+const DEFAULT_PREFETCH_CONCURRENCY: usize = 1;
+const DEFAULT_READAHEAD_WIDTH: u32 = 18;
+const DEFAULT_READAHEAD_MIN_PREFETCH: u32 = 1;
 const DEFAULT_READAHEAD_SEQ_STEP: u8 = 4;
 const DEFAULT_READAHEAD_RANDOM_PENALTY: u8 = 2;
 const DEFAULT_PREFETCH_FOREGROUND_RESERVE: usize = 16;
 const DEFAULT_PREFETCH_MAX_PER_CYCLE: usize = 256;
 const DEFAULT_PREFETCH_PAUSE_ON_NETERR_MS: u64 = 250;
-const DEFAULT_PREFETCH_CONCURRENCY_MIN: usize = 16;
+const DEFAULT_PREFETCH_CONCURRENCY_MIN: usize = 1;
 const DEFAULT_DIR_PREFETCH_MAX_BATCH: usize = 0;
 const DEFAULT_READDIR_ATTR_BATCH_CHUNK: usize = 256;
 const DEFAULT_READDIR_ATTR_BATCH_MAX_INODES: usize = 4096;
-const DEFAULT_UPLOAD_DELAY_MS: u64 = 2000;
+const DEFAULT_UPLOAD_DELAY_MS: u64 = 0;
 // Keep failed uploads circulating quickly so a single transient error does not
 // strand the whole inode in pending-overlay mode until remount.
 const DEFAULT_UPLOAD_REQUEUE_BASE_MS: u64 = 500;
@@ -336,7 +336,7 @@ const DEFAULT_UPLOAD_USER_IDLE_GRACE_MS: u64 = 500;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS: u64 = 35;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS: u64 = 1_500;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS: u64 = 2;
-const DEFAULT_MAX_DIRTY_BYTES: usize = 1024 * 1024 * 1024;
+const DEFAULT_MAX_DIRTY_BYTES: usize = 300 * 1024 * 1024;
 const DEFAULT_WRITE_EAGER_FLUSH_BATCH_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_FETCH_INITIAL_WINDOW: f64 = 0.0;
 const DEFAULT_FETCH_MIN_WINDOW: f64 = 1.0;
@@ -344,14 +344,14 @@ const DEFAULT_FETCH_MAX_WINDOW: f64 = 0.0;
 const DEFAULT_FETCH_INCREASE_STEP: f64 = 0.0;
 const DEFAULT_FETCH_DECREASE_FACTOR: f64 = 0.85;
 const DEFAULT_FETCH_DECREASE_COOLDOWN_SECS: u64 = 3;
-const DEFAULT_UPLOAD_INITIAL_WINDOW: f64 = 4.0;
+const DEFAULT_UPLOAD_INITIAL_WINDOW: f64 = 20.0;
 const DEFAULT_UPLOAD_MIN_WINDOW: f64 = 1.0;
-const DEFAULT_UPLOAD_MAX_WINDOW: f64 = 16.0;
+const DEFAULT_UPLOAD_MAX_WINDOW: f64 = 20.0;
 const DEFAULT_UPLOAD_INCREASE_STEP: f64 = 1.0;
 const DEFAULT_UPLOAD_DECREASE_FACTOR: f64 = 0.85;
 const DEFAULT_UPLOAD_DECREASE_COOLDOWN_SECS: u64 = 3;
 const DEFAULT_SLAB_FLUSH_INTERVAL_MS: u64 = 10;
-const DEFAULT_UPLOAD_WORKER_COUNT: usize = 16;
+const DEFAULT_UPLOAD_WORKER_COUNT: usize = 20;
 const MIN_UPLOAD_WORKER_COUNT: usize = 1;
 const DEFAULT_UPLOAD_MAX_ATTEMPTS: u32 = 4;
 const DEFAULT_UPLOAD_REQUEST_TIMEOUT_SECS: u64 = 15;
@@ -368,7 +368,7 @@ const DEFAULT_PUBLISH_VISIBILITY_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_QOS_ACCEPT_SLOTS: usize = 64;
 const DEFAULT_QOS_MATERIALIZE_SLOTS: usize = 2;
 const DEFAULT_QOS_COMMIT_SLOTS: usize = 4;
-const DEFAULT_QOS_FETCH_SLOTS: usize = 128;
+const DEFAULT_QOS_FETCH_SLOTS: usize = 200;
 const UPLOAD_CACHE_IO_FOREGROUND_BASE_DIVISOR: u32 = 4;
 const UPLOAD_CACHE_IO_FOREGROUND_BASE_MAX: u32 = 8;
 const UPLOAD_CACHE_IO_FOREGROUND_STEP_DIVISOR: u32 = 8;
@@ -398,8 +398,8 @@ const DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS: u64 = 500;
 const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
-const CACHE_RUNTIME_MIN_DIRTY_BYTES: usize = 256 * 1024 * 1024;
-const CACHE_RUNTIME_MAX_DIRTY_BYTES_BASE: usize = 2 * 1024 * 1024 * 1024;
+const CACHE_RUNTIME_MIN_DIRTY_BYTES: usize = 300 * 1024 * 1024;
+const CACHE_RUNTIME_MAX_DIRTY_BYTES_BASE: usize = 300 * 1024 * 1024;
 const DEBUG_PENDING_PATH_SUFFIX_ENV: &str = "STUDIOFS_DEBUG_PENDING_PATH_SUFFIX";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TwoTierSegment {
@@ -2052,7 +2052,7 @@ fn derive_buffer_blocks_default(read_buffer_mb: u64, block_size: u32) -> u32 {
     let blocks = (bytes / block_size.max(1) as u128)
         .max(1)
         .min(u32::MAX as u128);
-    (blocks as u32).max(32)
+    blocks as u32
 }
 
 fn derive_readahead_max_width(
@@ -2060,21 +2060,19 @@ fn derive_readahead_max_width(
     block_size: u32,
     readahead_base_width: u32,
 ) -> u32 {
-    derive_buffer_blocks_default(read_buffer_mb, block_size)
-        .max(readahead_base_width.saturating_mul(8))
-        .max(256)
+    derive_buffer_blocks_default(read_buffer_mb, block_size).max(readahead_base_width.max(1))
 }
 
 fn build_fetch_aimd_config(
     readahead_max_width: u32,
     config: &VfsConfig,
 ) -> crate::aimd::AimdConfig {
-    let fetch_max_window_default = (readahead_max_width as f64).clamp(128.0, 4096.0);
-    let fetch_initial_window_default = (fetch_max_window_default / 8.0).clamp(16.0, 256.0);
-    let fetch_increase_default = if fetch_max_window_default >= 1024.0 {
-        4.0
-    } else {
+    let fetch_max_window_default = (readahead_max_width.max(1) as f64).clamp(1.0, 4096.0);
+    let fetch_initial_window_default = (fetch_max_window_default / 4.0).clamp(1.0, 64.0);
+    let fetch_increase_default = if fetch_max_window_default >= 64.0 {
         2.0
+    } else {
+        1.0
     };
     crate::aimd::AimdConfig {
         initial_window: if config.fetch_initial_window > 0.0 {

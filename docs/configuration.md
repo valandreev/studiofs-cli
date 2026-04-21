@@ -421,9 +421,9 @@ Operator stance for the rewrite:
 |---|---|---|
 | `--cache-dir` | `<meta-dir>/cache` | Local data-cache root |
 | `--cache-size` | `100GB` | Local data-cache budget |
-| `--read-buffer` | `2048MB` | Foreground read-buffer budget |
-| `--readahead` | `128` | Sequential readahead width in blocks |
-| `--prefetch` | `128` | Prefetch concurrency budget |
+| `--read-buffer` | `300MB` | Foreground read-buffer budget |
+| `--readahead` | `18` | Sequential readahead width in blocks |
+| `--prefetch` | `1` | Prefetch concurrency budget |
 | `--principal` / `STUDIOFS_PRINCIPAL` | `*` | Principal used for ACL checks |
 
 ### Transitional and expert overrides
@@ -507,8 +507,8 @@ Upload local-I/O tuning notes:
 
 Configuration validation notes:
 - StudioFS resolves user input through a raw/validated configuration pipeline before creating `StudioVfs`.
-- `STUDIOFS_PREFETCH_CONCURRENCY` is normalized to a minimum of `16` when an explicit lower value is supplied in raw config.
-- `STUDIOFS_UPLOAD_WORKER_COUNT=0` is treated as "use runtime default", which resolves to `4` workers.
+- `STUDIOFS_PREFETCH_CONCURRENCY` is normalized to a minimum of `1` when an explicit lower value is supplied in raw config.
+- `STUDIOFS_UPLOAD_WORKER_COUNT=0` is treated as "use runtime default", which resolves to `20` workers.
 
 ### Testing
 

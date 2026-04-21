@@ -36,8 +36,8 @@ use crate::vfs::{
 
 use super::{OpenFile, VfsError, VfsResult};
 
-pub(super) const CACHE_RUNTIME_MAX_DIRTY_BYTES_LARGE: usize = 4 * 1024 * 1024 * 1024;
-pub(super) const CACHE_RUNTIME_MAX_DIRTY_BYTES_HUGE: usize = 8 * 1024 * 1024 * 1024;
+pub(super) const CACHE_RUNTIME_MAX_DIRTY_BYTES_LARGE: usize = 300 * 1024 * 1024;
+pub(super) const CACHE_RUNTIME_MAX_DIRTY_BYTES_HUGE: usize = 300 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_MIN_WRITE_EAGER_BATCH_BYTES: usize = 16 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_MAX_WRITE_EAGER_BATCH_BYTES: usize = 128 * 1024 * 1024;
 pub(super) const WRITE_EAGER_DRAIN_CHUNK_MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -45,8 +45,8 @@ pub(super) const PAYLOAD_PUT_CONCURRENCY_TARGET_BYTES: usize = 32 * 1024 * 1024;
 pub(super) const PAYLOAD_PUT_CONCURRENCY_MAX: usize = 32;
 pub(super) const FAST_MODE_SYNC_GROUP_MIN_BYTES_FLOOR: u64 = 32 * 1024 * 1024;
 pub(super) const FAST_MODE_SYNC_GROUP_MIN_BYTES_CEIL: u64 = 256 * 1024 * 1024;
-pub(super) const CACHE_RUNTIME_MIN_TRANSIT_BUDGET_BYTES: usize = 512 * 1024 * 1024;
-pub(super) const CACHE_RUNTIME_MAX_TRANSIT_BUDGET_BYTES: usize = 4 * 1024 * 1024 * 1024;
+pub(super) const CACHE_RUNTIME_MIN_TRANSIT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+pub(super) const CACHE_RUNTIME_MAX_TRANSIT_BUDGET_BYTES: usize = 300 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_SMALL_BUDGET_BYTES: u64 = 128 * 1024 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_LARGE_BUDGET_BYTES: u64 = 512 * 1024 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_HUGE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
@@ -806,15 +806,15 @@ mod tests {
         );
         assert_eq!(validated.qos_fetch_slots, defaults.qos_fetch_slots);
         assert_eq!(
-            validated.upload_worker_count, 16,
+            validated.upload_worker_count, 20,
             "validation should materialize upload worker default"
         );
         assert_eq!(
-            validated.upload_initial_window, 4.0,
+            validated.upload_initial_window, 20.0,
             "validation should materialize the foreground-friendly upload initial window default"
         );
         assert_eq!(
-            validated.upload_max_window, 16.0,
+            validated.upload_max_window, 20.0,
             "validation should materialize the clamped upload max window default"
         );
         assert_eq!(

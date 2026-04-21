@@ -844,8 +844,8 @@ mod tests {
             "bootstrap plan should never under-provision local backend budget"
         );
         assert!(
-            missing_slash_plan.readahead_max_width >= 256,
-            "bootstrap plan should preserve the minimum readahead expansion floor"
+            missing_slash_plan.readahead_max_width >= missing_slash_plan.readahead_base_width,
+            "bootstrap plan should preserve at least the configured readahead width"
         );
     }
 

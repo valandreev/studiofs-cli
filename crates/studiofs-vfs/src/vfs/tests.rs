@@ -1372,6 +1372,31 @@ fn cache_runtime_tuning_enforces_bounds() {
 }
 
 #[test]
+fn cache_runtime_tuning_defaults_match_juicefs_sized_windows() {
+    let derived =
+        derive_cache_runtime_tuning(100 * 1024 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024);
+
+    assert_eq!(derived.max_dirty_bytes, DEFAULT_MAX_DIRTY_BYTES);
+    assert_eq!(derived.transit_memory_budget_bytes, 300 * 1024 * 1024);
+}
+
+#[test]
+fn default_readahead_tracks_the_juicefs_sized_buffer_budget() {
+    let buffer_blocks = derive_buffer_blocks_default(DEFAULT_READ_BUFFER_MB, 16 * 1024 * 1024);
+    let readahead_max_width = derive_readahead_max_width(
+        DEFAULT_READ_BUFFER_MB,
+        16 * 1024 * 1024,
+        DEFAULT_READAHEAD_WIDTH,
+    );
+    let fetch_aimd = build_fetch_aimd_config(readahead_max_width, &VfsConfig::default());
+
+    assert_eq!(buffer_blocks, 18);
+    assert_eq!(readahead_max_width, DEFAULT_READAHEAD_WIDTH);
+    assert_eq!(fetch_aimd.max_window, 18.0);
+    assert_eq!(fetch_aimd.initial_window, 4.5);
+}
+
+#[test]
 fn local_backend_budget_honors_runtime_dirty_window() {
     let runtime_tuning = CacheRuntimeTuning {
         max_dirty_bytes: 1024 * 1024,
@@ -1440,7 +1465,7 @@ fn cache_runtime_tuning_respects_explicit_default_values_from_raw_config() {
         validated.cache_runtime_overrides(),
     );
 
-    assert_ne!(derived.max_dirty_bytes, DEFAULT_MAX_DIRTY_BYTES);
+    assert_eq!(derived.max_dirty_bytes, DEFAULT_MAX_DIRTY_BYTES);
     assert_eq!(resolved.max_dirty_bytes, DEFAULT_MAX_DIRTY_BYTES);
     assert_eq!(
         resolved.write_eager_flush_batch_bytes,
@@ -1467,7 +1492,7 @@ fn vfs_config_raw_validate_clamps_and_normalizes() {
         DEFAULT_PREFETCH_CONCURRENCY_MIN
     );
     assert_eq!(validated.slab_flush_interval_ms, 1);
-    assert_eq!(validated.upload_worker_count, 16);
+    assert_eq!(validated.upload_worker_count, 20);
     assert_eq!(validated.principal, "*");
 }
 

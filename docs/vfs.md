@@ -64,8 +64,8 @@ inode toward root; no match defaults to `rw`.
 | `cache_size` | 100 GiB | Local cache size budget |
 | `block_size` | 16 MiB | Chunk size (cloud transfer currently uses 4x4 MiB blocks) |
 | `max_concurrent_uploads` | 4 | Transitional static upload knob |
-| `readahead_width` | 128 | Base prefetch depth |
-| `max_dirty_bytes` | 12 GiB | Local dirty-state memory limit before backpressure |
+| `readahead_width` | 18 | Base prefetch depth |
+| `max_dirty_bytes` | 300 MiB | Local dirty-state memory limit before backpressure |
 | `upload_stats_interval_secs` | 1 | Upload control-loop tick interval |
 | `upload_fg_read_latency_target_ms` | 35 | Foreground-read P90 target for upload throttling |
 | `upload_fg_read_latency_window_ms` | 1500 | Foreground-read speedometer sliding window |
