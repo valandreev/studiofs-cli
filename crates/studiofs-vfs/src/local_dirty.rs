@@ -329,13 +329,13 @@ where
         &self,
         pending: &mut std::collections::HashMap<(Ino, u32), PendingBlock>,
         ino: Ino,
-        blocks: &[DirtyWriteSnapshot],
+        blocks: Vec<DirtyWriteSnapshot>,
         fresh_object_ids: &mut std::collections::VecDeque<u64>,
-    ) -> Result<Vec<PersistedWriteBlock>, usize> {
-        let fresh_needed = Self::additional_object_id_count_needed(pending, ino, blocks);
+    ) -> Result<Vec<PersistedWriteBlock>, (Vec<DirtyWriteSnapshot>, usize)> {
+        let fresh_needed = Self::additional_object_id_count_needed(pending, ino, &blocks);
         let additional_needed = fresh_needed.saturating_sub(fresh_object_ids.len());
         if additional_needed > 0 {
-            return Err(additional_needed);
+            return Err((blocks, additional_needed));
         }
 
         let mut persisted_blocks = Vec::with_capacity(blocks.len());
@@ -356,7 +356,7 @@ where
                 persisted_blocks.push(PersistedWriteBlock {
                     block_index: block.block_index,
                     object_id,
-                    data: Bytes::copy_from_slice(block.data.as_ref()),
+                    data: block.data.freeze(),
                 });
                 continue;
             }
@@ -367,7 +367,7 @@ where
             persisted_blocks.push(PersistedWriteBlock {
                 block_index: block.block_index,
                 object_id,
-                data: Bytes::copy_from_slice(block.data.as_ref()),
+                data: block.data.freeze(),
             });
         }
 
@@ -819,7 +819,7 @@ impl DrainCommitObserverPort for VfsDrainCommitObserver<'_> {
 impl<'a> LocalDirtyFlushSession<'a> {
     async fn drain_snapshot(
         &self,
-        blocks: Vec<DirtyWriteSnapshot>,
+        mut blocks: Vec<DirtyWriteSnapshot>,
         dirty_chunk_slices: std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
         content_epoch: u64,
         attr_to_persist: Option<InodeAttr>,
@@ -832,13 +832,14 @@ impl<'a> LocalDirtyFlushSession<'a> {
                 self.drain.try_prepare_persisted_blocks(
                     &mut pending,
                     self.ino,
-                    &blocks,
+                    blocks,
                     &mut fresh_object_ids,
                 )
             };
             match prepare_result {
                 Ok(persisted_blocks) => break persisted_blocks,
-                Err(additional_needed) => {
+                Err((returned_blocks, additional_needed)) => {
+                    blocks = returned_blocks;
                     let additional_needed = u32::try_from(additional_needed).map_err(|_| {
                         VfsError::Io(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
@@ -2103,7 +2104,7 @@ mod tests {
         let (mut pending, blocks) = single_block_fixture(ino, 0, b"alpha", None);
         let mut fresh_object_ids = std::collections::VecDeque::from([111]);
         let persisted_blocks = drain
-            .try_prepare_persisted_blocks(&mut pending, ino, &blocks, &mut fresh_object_ids)
+            .try_prepare_persisted_blocks(&mut pending, ino, blocks, &mut fresh_object_ids)
             .expect("prepare persisted blocks");
 
         futures::executor::block_on(drain.execute_drain(
@@ -2158,7 +2159,7 @@ mod tests {
         let (mut pending, blocks) = single_block_fixture(ino, 1, b"beta", None);
         let mut fresh_object_ids = std::collections::VecDeque::from([222]);
         let persisted_blocks = drain
-            .try_prepare_persisted_blocks(&mut pending, ino, &blocks, &mut fresh_object_ids)
+            .try_prepare_persisted_blocks(&mut pending, ino, blocks, &mut fresh_object_ids)
             .expect("prepare persisted blocks");
 
         let error = futures::executor::block_on(drain.execute_drain(
@@ -2209,19 +2210,37 @@ mod tests {
             },
         );
 
-        assert!(matches!(
-            drain.try_prepare_persisted_blocks(&mut pending, ino, &blocks, &mut fresh_object_ids),
-            Err(1)
-        ));
+        let (blocks, additional_needed) = drain
+            .try_prepare_persisted_blocks(&mut pending, ino, blocks, &mut fresh_object_ids)
+            .expect_err("stale snapshot should request another object id");
+        assert_eq!(additional_needed, 1);
 
         fresh_object_ids.push_back(701);
         let persisted_blocks = drain
-            .try_prepare_persisted_blocks(&mut pending, ino, &blocks, &mut fresh_object_ids)
+            .try_prepare_persisted_blocks(&mut pending, ino, blocks, &mut fresh_object_ids)
             .expect("prepare stale snapshot");
         assert_eq!(persisted_blocks[0].object_id, 701);
         let pending_block = pending.get(&(ino, 0)).expect("pending block");
         assert_eq!(pending_block.data.as_ref(), b"newer");
         assert_eq!(pending_block.reserved_object_id, Some(700));
+    }
+
+    #[test]
+    fn prepare_persisted_blocks_freezes_snapshot_without_copying_payload() {
+        let ino = 22;
+        let events = EventLog::default();
+        let uploads = Arc::new(StdMutex::new(Vec::new()));
+        let observed_inodes = Arc::new(StdMutex::new(Vec::new()));
+        let drain = test_drain(events, false, false, None, uploads, observed_inodes);
+        let (mut pending, blocks) = single_block_fixture(ino, 0, b"alpha", None);
+        let mut fresh_object_ids = std::collections::VecDeque::from([702]);
+        let snapshot_ptr = blocks[0].data.as_ptr();
+
+        let persisted_blocks = drain
+            .try_prepare_persisted_blocks(&mut pending, ino, blocks, &mut fresh_object_ids)
+            .expect("prepare persisted blocks");
+
+        assert_eq!(persisted_blocks[0].data.as_ptr(), snapshot_ptr);
     }
 
     #[test]
