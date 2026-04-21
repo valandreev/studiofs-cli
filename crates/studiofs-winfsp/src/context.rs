@@ -840,37 +840,13 @@ impl LocalSyncBarrierPort for WinfspLocalSyncBarrierPort<'_> {
         request: HandleDrainRequest,
     ) -> studiofs_vfs::VfsResult<ExplicitFlushOutcome> {
         let vfs = self.context.vfs.clone();
-        let result = self.context.spawn_wait(async move {
+        self.context.spawn_wait(async move {
             if request.fh != 0 {
                 vfs.flush_fh_with_outcome(request.fh).await
             } else {
                 vfs.flush_with_outcome(request.ino).await
             }
-        });
-        if request.fh != 0 || result.is_err() {
-            // #region debug log
-            studiofs_vfs::emit_debug_agent_log(
-                "crates/studiofs-winfsp/src/context.rs:842",
-                "WinFSP explicit_flush completed",
-                "H4",
-                serde_json::json!({
-                    "ino": request.ino,
-                    "fh": request.fh,
-                    "result": match &result {
-                        Ok(outcome) => serde_json::json!({
-                            "ok": true,
-                            "flushed_local_dirty_state": outcome.flushed_local_dirty_state,
-                        }),
-                        Err(error) => serde_json::json!({
-                            "ok": false,
-                            "error": error.to_string(),
-                        }),
-                    },
-                }),
-            );
-            // #endregion
-        }
-        result
+        })
     }
 }
 
@@ -1331,14 +1307,6 @@ impl StudioFsContext {
         action: FileSizeCallbackAction,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        let action_label = match action {
-            FileSizeCallbackAction::KeepLogicalSize => "keep",
-            FileSizeCallbackAction::SetLogicalSize(_) => "set",
-        };
-        let requested_size = match action {
-            FileSizeCallbackAction::KeepLogicalSize => None,
-            FileSizeCallbackAction::SetLogicalSize(new_size) => Some(new_size),
-        };
         let attr = match action {
             FileSizeCallbackAction::KeepLogicalSize => {
                 self.vfs.getattr(ino).map_err(vfs_to_winfsp_err)?
@@ -1348,23 +1316,6 @@ impl StudioFsContext {
                 .setattr_with_handle(Some(fh), ino, SetattrArgs::size_only(new_size))
                 .map_err(vfs_to_winfsp_err)?,
         };
-        if requested_size.is_some() {
-            // #region debug log
-            studiofs_vfs::emit_debug_agent_log(
-                "crates/studiofs-winfsp/src/context.rs:1310",
-                "WinFSP file size callback committed attr",
-                "H5",
-                serde_json::json!({
-                    "ino": ino,
-                    "fh": fh,
-                    "action": action_label,
-                    "requested_size": requested_size,
-                    "attr_size": attr.size,
-                    "attr_committed_size": attr.committed_size,
-                }),
-            );
-            // #endregion
-        }
         Self::write_file_info(file_info, &attr);
         Ok(())
     }
@@ -1591,7 +1542,6 @@ impl FileSystemContext for StudioFsContext {
     ) -> winfsp::Result<u32> {
         self.vfs.note_winfsp_write_callback();
         let callback_started = Instant::now();
-        let requested_len = buffer.len();
         // Resolve actual write offset.  Prefer the in-memory dirty attr (free)
         // and fall back to the full getattr only when there is no dirty state.
         let actual_offset = if write_to_eof {
@@ -1664,43 +1614,6 @@ impl FileSystemContext for StudioFsContext {
             .map(Ok)
             .unwrap_or_else(|| self.vfs.getattr(context.ino))
             .map_err(vfs_to_winfsp_err)?;
-        let requested_end = actual_offset.saturating_add(requested_len as u64);
-        let written_end = actual_offset.saturating_add(written as u64);
-        let milestone_bytes = 512 * 1024 * 1024u64;
-        let crossed_milestone = if written > 0 {
-            (actual_offset / milestone_bytes) != (written_end.saturating_sub(1) / milestone_bytes)
-        } else {
-            false
-        };
-        let short_write = written as usize != buffer.len() || buffer.len() != requested_len;
-        let size_gap = attr.size < written_end;
-        if short_write || write_to_eof || constrained_io || crossed_milestone || size_gap {
-            // #region debug log
-            studiofs_vfs::emit_debug_agent_log(
-                "crates/studiofs-winfsp/src/context.rs:1660",
-                "WinFSP write callback observed size progress",
-                "H6",
-                serde_json::json!({
-                    "ino": context.ino,
-                    "fh": context.fh,
-                    "offset": offset,
-                    "actual_offset": actual_offset,
-                    "requested_len": requested_len,
-                    "dispatched_len": buffer.len(),
-                    "written": written,
-                    "requested_end": requested_end,
-                    "written_end": written_end,
-                    "attr_size": attr.size,
-                    "attr_committed_size": attr.committed_size,
-                    "write_to_eof": write_to_eof,
-                    "constrained_io": constrained_io,
-                    "crossed_milestone": crossed_milestone,
-                    "short_write": short_write,
-                    "size_gap": size_gap,
-                }),
-            );
-            // #endregion
-        }
         *file_info = attr_to_file_info(&attr);
         let post_write_getattr_elapsed = post_write_getattr_started.elapsed();
         self.vfs.record_winfsp_write_callback_observability(

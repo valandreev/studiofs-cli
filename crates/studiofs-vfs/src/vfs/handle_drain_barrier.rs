@@ -208,20 +208,6 @@ where
             .deferred_cleanup_hints
             .take_deferred_cleanup_hint(request.ino)
             || had_cleanup_deferred_hint;
-        // #region debug log
-        crate::emit_debug_agent_log(
-            "crates/studiofs-vfs/src/vfs/handle_drain_barrier.rs:207",
-            "handle_drain release error",
-            "H3",
-            serde_json::json!({
-                "ino": request.ino,
-                "fh": request.fh,
-                "had_cleanup_deferred_hint": had_cleanup_deferred_hint,
-                "hint_was_present_for_log": hint_was_present_for_log,
-                "error": error.to_string(),
-            }),
-        );
-        // #endregion
         self.observability
             .note_release_error(request, hint_was_present_for_log, error);
     }

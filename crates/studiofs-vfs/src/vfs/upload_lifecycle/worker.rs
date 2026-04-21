@@ -275,21 +275,6 @@ where
                 let delay = self.upload_requeue_delay(&retry_op);
                 retry_op.not_before_unix_ms = now_unix_millis()
                     .saturating_add(delay.as_millis().clamp(0, u64::MAX as u128) as u64);
-                // #region debug log
-                crate::emit_debug_agent_log(
-                    "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:270",
-                    "upload marked sticky and scheduled for requeue",
-                    "H2",
-                    serde_json::json!({
-                        "ino": retry_op.ino,
-                        "object_id": retry_op.object_id,
-                        "retry_count": retry_op.retry_count,
-                        "delay_ms": delay.as_millis() as u64,
-                        "not_before_unix_ms": retry_op.not_before_unix_ms,
-                        "error": error.to_string(),
-                    }),
-                );
-                // #endregion
                 self.shutdown.record_requeue();
                 warn!(
                     object_id = retry_op.object_id,

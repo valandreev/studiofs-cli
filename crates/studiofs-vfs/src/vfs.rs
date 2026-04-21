@@ -4575,17 +4575,6 @@ impl StudioVfs {
             .get(&ino)
             .cloned()
         {
-            // #region debug log
-            crate::emit_debug_agent_log(
-                "crates/studiofs-vfs/src/vfs.rs:4569",
-                "ensure_no_upload_sticky_error found sticky state",
-                "H1",
-                serde_json::json!({
-                    "ino": ino,
-                    "error": message,
-                }),
-            );
-            // #endregion
             return Err(VfsError::Other(format!(
                 "sticky upload error on inode {ino}: {message}"
             )));

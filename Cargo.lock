@@ -3624,7 +3624,6 @@ version = "0.1.1"
 dependencies = [
  "dotenvy",
  "parking_lot",
- "serde_json",
  "studiofs-data",
  "studiofs-meta",
  "studiofs-vfs",
