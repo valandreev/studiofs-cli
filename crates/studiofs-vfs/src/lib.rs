@@ -3,6 +3,48 @@
 //!
 //! Platform-agnostic virtual filesystem operations. Bridges metadata, data, and cache layers.
 
+// #region debug log
+pub fn emit_debug_agent_log(
+    location: &'static str,
+    message: &'static str,
+    hypothesis_id: &'static str,
+    data: serde_json::Value,
+) {
+    use std::io::Write as _;
+
+    let Ok(log_path) = std::env::var("STUDIOFS_DEBUG_AGENT_LOG_PATH") else {
+        return;
+    };
+    let session_id = std::env::var("STUDIOFS_DEBUG_AGENT_SESSION_ID").unwrap_or_default();
+    let run_id =
+        std::env::var("STUDIOFS_DEBUG_AGENT_RUN_ID").unwrap_or_else(|_| "run1".to_string());
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    let payload = serde_json::json!({
+        "sessionId": session_id,
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": timestamp,
+    });
+    let Ok(line) = serde_json::to_string(&payload) else {
+        return;
+    };
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "{line}");
+}
+// #endregion
+
 pub mod access;
 pub mod aimd;
 pub mod bridge;

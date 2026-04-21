@@ -181,6 +181,7 @@ impl StudioVfs {
             return Ok(ReleaseFhOutcome::default());
         };
         let ino = context.ino;
+        let open_flags = format!("{:?}", context.open_file.flags);
 
         let session = self
             .state
@@ -190,6 +191,29 @@ impl StudioVfs {
         let result = self.release_last_handle_with_outcome(context).await;
         drop(session);
         self.state.file_session.gc_if_idle(ino);
+        // #region debug log
+        crate::emit_debug_agent_log(
+            "crates/studiofs-vfs/src/vfs/sync_ops.rs:191",
+            "release_fh_with_outcome completed",
+            "H1",
+            serde_json::json!({
+                "fh": fh,
+                "ino": ino,
+                "open_flags": open_flags,
+                "result": match &result {
+                    Ok(outcome) => serde_json::json!({
+                        "ok": true,
+                        "closed_last_handle": outcome.closed_last_handle,
+                        "flushed_local_dirty_state": outcome.flushed_local_dirty_state,
+                    }),
+                    Err(error) => serde_json::json!({
+                        "ok": false,
+                        "error": error.to_string(),
+                    }),
+                },
+            }),
+        );
+        // #endregion
         result
     }
 
@@ -265,6 +289,31 @@ impl StudioVfs {
         } else {
             false
         };
+
+        let sticky_present = self
+            .state
+            .upload
+            .upload_sticky_errors
+            .lock()
+            .contains_key(&ino);
+        if sticky_present || matches!(sticky_error_policy, StickyErrorPolicy::Report) {
+            // #region debug log
+            crate::emit_debug_agent_log(
+                "crates/studiofs-vfs/src/vfs/sync_ops.rs:269",
+                "local_sync_barrier sticky evaluation",
+                "H1",
+                serde_json::json!({
+                    "ino": ino,
+                    "local_sync_policy": format!("{:?}", local_sync_policy),
+                    "sticky_error_policy": format!("{:?}", sticky_error_policy),
+                    "had_local_dirty_state": had_local_dirty_state,
+                    "flushed_file_data": flushed_file_data,
+                    "persisted_dirty_attrs": persisted_dirty_attrs,
+                    "sticky_present": sticky_present,
+                }),
+            );
+            // #endregion
+        }
 
         if matches!(sticky_error_policy, StickyErrorPolicy::Report) {
             self.ensure_no_upload_sticky_error(ino)?;

@@ -100,10 +100,34 @@ fn clamp_unix_nanos(nanos: i64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        panic,
+        sync::{Mutex, OnceLock},
+    };
+
     use super::{BridgeAttrTimes, BridgeVfsErrorKind, classify_vfs_error, normalize_attr_times};
     use studiofs_data::object::ObjectError;
     use studiofs_data::store::DataError;
     use studiofs_meta::{AccessLevel, InodeAttr, MetaError};
+
+    fn panic_hook_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn with_silenced_panic_hook<T>(f: impl FnOnce() -> T) -> T {
+        let _lock = panic_hook_lock()
+            .lock()
+            .expect("panic hook test lock should not be poisoned");
+        let previous_hook = panic::take_hook();
+        panic::set_hook(Box::new(|_| {}));
+        let result = panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        panic::set_hook(previous_hook);
+        match result {
+            Ok(value) => value,
+            Err(payload) => panic::resume_unwind(payload),
+        }
+    }
 
     #[test]
     fn classify_vfs_error_maps_meta_variants_to_bridge_categories() {
@@ -225,13 +249,15 @@ mod tests {
             BridgeVfsErrorKind::Retryable
         );
 
-        let join_err = tokio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(async {
-                tokio::spawn(async move { panic!("boom") })
-                    .await
-                    .expect_err("task should panic")
-            });
+        let join_err = with_silenced_panic_hook(|| {
+            tokio::runtime::Runtime::new()
+                .expect("runtime")
+                .block_on(async {
+                    tokio::spawn(async move { panic!("boom") })
+                        .await
+                        .expect_err("task should panic")
+                })
+        });
         let join = crate::VfsError::Join(join_err);
         assert_eq!(
             classify_vfs_error(&join),

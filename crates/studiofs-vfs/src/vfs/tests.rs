@@ -757,6 +757,171 @@ fn epoch_finalizer_publishes_manifest_backed_zero_length_epoch() {
 }
 
 #[test]
+fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "manifest-finalizer-buffered-tail");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"manifest-finalizer-buffered-tail.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open writable handle");
+        let block_size = vfs.block_size as usize;
+        let mut payload = vec![0x41u8; block_size];
+        payload.extend_from_slice(&vec![0x42u8; block_size / 8]);
+
+        vfs.write_fh_with_local_sync_policy(fh, ino, 0, &payload, LocalSyncPolicy::Opportunistic)
+            .await
+            .expect("buffer full block plus partial tail");
+
+        assert_eq!(
+            meta.get_file_blocks(ino)
+                .expect("load materialized file blocks")
+                .len(),
+            1,
+            "setup should materialize only the completed full block"
+        );
+        let unpublished_attr = meta.get_attr(ino).expect("load unpublished attr");
+        assert_eq!(
+            unpublished_attr.size,
+            block_size as u64,
+            "durable metadata should still reflect only the completed block prefix"
+        );
+        let dirty_attr = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .cloned()
+            .expect("dirty attr should preserve the buffered tail");
+        assert_eq!(
+            dirty_attr.size,
+            payload.len() as u64,
+            "dirty attr should keep the full visible EOF while the tail is still buffered"
+        );
+        assert!(
+            vfs.inode_has_dirty_handle_writers(ino),
+            "setup should retain the partial tail in handle-writer memory"
+        );
+        assert!(
+            !vfs.has_pending_local_dirty_blocks_for_inode(ino),
+            "setup should isolate the regression to handle-writer state, not local_dirty blocks"
+        );
+
+        let (content_epoch, _blocks) = mark_all_file_blocks_uploaded(&vfs, &meta, ino);
+        let status =
+            super::commit::CommitCoordinator::finalize_inode_epoch(&vfs, ino, content_epoch)
+                .await
+                .expect("finalize should defer while handle-writer tail is buffered");
+        assert!(
+            matches!(status, super::commit::EpochFinalizeStatus::Deferred),
+            "finalize must not publish or clear dirty attrs while a newer visible tail is still buffered"
+        );
+
+        let attr_after = meta.get_attr(ino).expect("load attr after deferred finalize");
+        assert_ne!(
+            attr_after.upload_state,
+            MetaUploadState::Ready,
+            "deferred finalize should leave the unpublished epoch unpublished"
+        );
+        let dirty_attr_after = vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .get(&ino)
+            .cloned()
+            .expect("dirty attr should survive deferred finalize");
+        assert_eq!(
+            dirty_attr_after.size,
+            payload.len() as u64,
+            "deferred finalize must preserve the larger visible EOF staged in dirty attrs"
+        );
+
+        vfs.release_fh(fh).await.expect("release handle");
+    });
+}
+
+#[test]
+fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "manifest-finalizer-inflight");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"manifest-finalizer-inflight.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let payload = b"manifest-backed-finalization";
+        vfs.write(attr.ino, 0, payload)
+            .await
+            .expect("write test payload");
+        vfs.flush(attr.ino)
+            .await
+            .expect("materialize unpublished blocks before publish setup");
+
+        let (published_epoch, published_blocks) =
+            mark_all_file_blocks_uploaded(&vfs, &meta, attr.ino);
+        publish_current_manifest(&meta, attr.ino, published_epoch, &published_blocks);
+
+        let mut truncated_attr = meta.get_attr(attr.ino).expect("load published attr");
+        truncated_attr.size = 0;
+        truncated_attr.content_epoch = truncated_attr.content_epoch.saturating_add(1);
+        truncated_attr.upload_state = MetaUploadState::Updating;
+        meta.set_attr(&truncated_attr)
+            .expect("stage manifest-backed zero-length epoch");
+        meta.remove_file_blocks(attr.ino)
+            .expect("remove unpublished blocks for zero-length truncate");
+
+        let unpublished_attr = meta.get_attr(attr.ino).expect("load unpublished attr");
+        assert!(
+            !vfs.inode_has_unmaterialized_overlay_for_finalize(attr.ino),
+            "setup should otherwise be ready to finalize once uploads are visible"
+        );
+
+        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+        vfs.state
+            .deferred_materialize_inflight
+            .lock()
+            .insert(attr.ino, Arc::clone(&task_lock));
+
+        let status = super::commit::CommitCoordinator::finalize_inode_epoch(
+            &vfs,
+            attr.ino,
+            unpublished_attr.content_epoch,
+        )
+        .await
+        .expect("finalize should defer while deferred materialization is in flight");
+        assert!(
+            matches!(status, super::commit::EpochFinalizeStatus::Deferred),
+            "finalize must not race ahead of an in-flight deferred materialization task"
+        );
+
+        vfs.state
+            .deferred_materialize_inflight
+            .lock()
+            .remove(&attr.ino);
+
+        let status = super::commit::CommitCoordinator::finalize_inode_epoch(
+            &vfs,
+            attr.ino,
+            unpublished_attr.content_epoch,
+        )
+        .await
+        .expect("finalize should publish once deferred materialization completes");
+        assert!(
+            matches!(status, super::commit::EpochFinalizeStatus::Published),
+            "once the in-flight task clears, finalize should publish the prepared epoch"
+        );
+    });
+}
+
+#[test]
 fn zeroio_snapshot_reports_repeated_restart_replay_as_health_signal() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "zeroio-repeated-replay");

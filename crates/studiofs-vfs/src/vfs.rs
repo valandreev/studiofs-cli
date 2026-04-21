@@ -4200,13 +4200,13 @@ impl StudioVfs {
     }
 
     fn inode_has_unmaterialized_overlay_for_finalize(&self, ino: Ino) -> bool {
-        if self
-            .state
-            .local_dirty
-            .pending_blocks
-            .lock()
-            .keys()
-            .any(|(candidate, _)| *candidate == ino)
+        if self.has_pending_local_dirty_blocks_for_inode(ino)
+            || self.inode_has_dirty_handle_writers(ino)
+            || self
+                .state
+                .deferred_materialize_inflight
+                .lock()
+                .contains_key(&ino)
         {
             return true;
         }
@@ -4575,6 +4575,17 @@ impl StudioVfs {
             .get(&ino)
             .cloned()
         {
+            // #region debug log
+            crate::emit_debug_agent_log(
+                "crates/studiofs-vfs/src/vfs.rs:4569",
+                "ensure_no_upload_sticky_error found sticky state",
+                "H1",
+                serde_json::json!({
+                    "ino": ino,
+                    "error": message,
+                }),
+            );
+            // #endregion
             return Err(VfsError::Other(format!(
                 "sticky upload error on inode {ino}: {message}"
             )));
