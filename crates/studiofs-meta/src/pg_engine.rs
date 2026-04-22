@@ -21,22 +21,30 @@ const LOCAL_PG_VERSION_COUNTER: &str = "pgLastAppliedBatchVersion";
 const LOCAL_PG_NAMESPACE_VERSION_COUNTER: &str = "pgLastAppliedNamespaceBatchVersion";
 const LOCAL_PG_CLIENT_SLOT_COUNTER: &str = "pgClientSlotPlusOne";
 const LOCAL_PG_FLUSHED_EVENT_SEQ_COUNTER: &str = "pgLastFlushedLocalEventSeq";
-const LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER: &str = "pgInodeActiveRangeStart";
-const LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER: &str = "pgInodeActiveRangeEnd";
-const LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER: &str = "pgInodeReservedRangeEnd";
+const LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER: &str = "pgInodeActiveRangeStart";
+const LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER: &str = "pgInodeActiveRangeEnd";
+const LEGACY_LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER: &str = "pgInodeReservedRangeEnd";
+const LOCAL_PG_INODE_CURRENT_WINDOW_START_COUNTER: &str = "pgInodeCurrentWindowStart";
+const LOCAL_PG_INODE_CURRENT_WINDOW_END_COUNTER: &str = "pgInodeCurrentWindowEnd";
+const LOCAL_PG_INODE_PREFETCHED_WINDOW_START_COUNTER: &str = "pgInodePrefetchedWindowStart";
+const LOCAL_PG_INODE_PREFETCHED_WINDOW_NEXT_COUNTER: &str = "pgInodePrefetchedWindowNext";
+const LOCAL_PG_INODE_PREFETCHED_WINDOW_END_COUNTER: &str = "pgInodePrefetchedWindowEnd";
 const LOCAL_PG_BLOCK_ACTIVE_RANGE_START_COUNTER: &str = "pgBlockActiveRangeStart";
 const LOCAL_PG_BLOCK_ACTIVE_RANGE_END_COUNTER: &str = "pgBlockActiveRangeEnd";
 const LOCAL_PG_BLOCK_RESERVED_RANGE_END_COUNTER: &str = "pgBlockReservedRangeEnd";
 const PG_NEXT_CLIENT_SLOT_COUNTER: &str = "next_client_slot";
+const PG_NEXT_INODE_COUNTER: &str = "next_inode";
 const DEFAULT_PG_FLUSH_INTERVAL_SECS: u64 = 60;
 const DEFAULT_PG_FLUSH_OPS_THRESHOLD: u32 = 500;
 const PG_EVENT_INSERT_CHUNK_SIZE: usize = 512;
 const DEFAULT_PG_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_PG_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const PG_JANITOR_LOCK_SALT: i64 = 0x5f53_4653_5f4a_414e;
-const PG_INODE_ID_STRIDE: u64 = 1_000_000_000;
+const LEGACY_PG_INODE_ID_STRIDE: u64 = 1_000_000_000;
 const PG_BLOCK_ID_STRIDE: u64 = 10_000_000_000;
-const PG_INODE_RANGE_WINDOW: u64 = 1_000_000;
+const LEGACY_PG_INODE_RANGE_WINDOW: u64 = 1_000_000;
+const PG_INODE_WINDOW_SIZE: u64 = 250_000;
+const PG_INODE_PREFETCH_LOW_WATERMARK: u64 = 50_000;
 const PG_BLOCK_RANGE_WINDOW: u64 = 10_000_000;
 const LOCAL_ID_LEASE_WINDOWS: u64 = 1;
 
@@ -67,7 +75,8 @@ pub struct PgMetaEngine {
     command_timeout: Duration,
     inflight_replication_ops: AtomicU32,
     pending_state: Mutex<PendingReplicationState>,
-    inode_id_cache: Mutex<LocalIdLeaseCache>,
+    inode_allocator_lock: Mutex<()>,
+    inode_window_reservation_lock: Mutex<()>,
     block_id_cache: Mutex<LocalIdLeaseCache>,
     inode_id_headroom_available: AtomicBool,
     block_id_headroom_available: AtomicBool,
@@ -137,6 +146,56 @@ struct RecentFlush {
     overlay: OverlayConflictSets,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct InodeWindow {
+    start: u64,
+    next: u64,
+    end: u64,
+}
+
+impl InodeWindow {
+    const fn is_empty(self) -> bool {
+        self.start == 0 && self.next == 0 && self.end == 0
+    }
+
+    const fn is_valid(self) -> bool {
+        self.is_empty()
+            || (self.start > ROOT_INO && self.start <= self.next && self.next <= self.end)
+    }
+
+    const fn has_headroom(self) -> bool {
+        self.next < self.end
+    }
+
+    const fn remaining(self) -> u64 {
+        self.end.saturating_sub(self.next)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct InodeAllocatorState {
+    current: InodeWindow,
+    prefetched: InodeWindow,
+}
+
+impl InodeAllocatorState {
+    const fn is_valid(self) -> bool {
+        self.current.is_valid()
+            && self.prefetched.is_valid()
+            && (!self.current.is_empty() || self.prefetched.is_empty())
+    }
+
+    const fn has_headroom(self) -> bool {
+        self.current.has_headroom() || self.prefetched.has_headroom()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InodeWindowReservationReason {
+    Current,
+    Prefetch,
+}
+
 #[derive(Clone, Copy)]
 struct LocalIdRangeSpec {
     kind_label: &'static str,
@@ -178,17 +237,6 @@ impl LocalIdLeaseCache {
     }
 }
 
-const INODE_ID_RANGE_SPEC: LocalIdRangeSpec = LocalIdRangeSpec {
-    kind_label: "inode",
-    next_counter: counters::NEXT_INODE,
-    active_start_counter: LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER,
-    active_end_counter: LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER,
-    reserved_end_counter: LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER,
-    min_value: ROOT_INO + 1,
-    slot_stride: PG_INODE_ID_STRIDE,
-    window_size: PG_INODE_RANGE_WINDOW,
-};
-
 const BLOCK_ID_RANGE_SPEC: LocalIdRangeSpec = LocalIdRangeSpec {
     kind_label: "block",
     next_counter: counters::NEXT_BLOCK_ID,
@@ -198,6 +246,17 @@ const BLOCK_ID_RANGE_SPEC: LocalIdRangeSpec = LocalIdRangeSpec {
     min_value: 1,
     slot_stride: PG_BLOCK_ID_STRIDE,
     window_size: PG_BLOCK_RANGE_WINDOW,
+};
+
+const LEGACY_INODE_RANGE_SPEC: LocalIdRangeSpec = LocalIdRangeSpec {
+    kind_label: "inode",
+    next_counter: counters::NEXT_INODE,
+    active_start_counter: LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER,
+    active_end_counter: LEGACY_LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER,
+    reserved_end_counter: LEGACY_LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER,
+    min_value: ROOT_INO + 1,
+    slot_stride: LEGACY_PG_INODE_ID_STRIDE,
+    window_size: LEGACY_PG_INODE_RANGE_WINDOW,
 };
 
 struct PgJanitorLock {
@@ -453,6 +512,388 @@ impl PgMetaEngine {
         Ok(true)
     }
 
+    fn load_persisted_inode_allocator_state(
+        local: &RedbMetaEngine,
+    ) -> MetaResult<InodeAllocatorState> {
+        Ok(InodeAllocatorState {
+            current: InodeWindow {
+                start: local.get_counter(LOCAL_PG_INODE_CURRENT_WINDOW_START_COUNTER)?,
+                next: local.get_counter(counters::NEXT_INODE)?,
+                end: local.get_counter(LOCAL_PG_INODE_CURRENT_WINDOW_END_COUNTER)?,
+            },
+            prefetched: InodeWindow {
+                start: local.get_counter(LOCAL_PG_INODE_PREFETCHED_WINDOW_START_COUNTER)?,
+                next: local.get_counter(LOCAL_PG_INODE_PREFETCHED_WINDOW_NEXT_COUNTER)?,
+                end: local.get_counter(LOCAL_PG_INODE_PREFETCHED_WINDOW_END_COUNTER)?,
+            },
+        })
+    }
+
+    fn load_valid_persisted_inode_allocator_state(
+        local: &RedbMetaEngine,
+    ) -> MetaResult<Option<InodeAllocatorState>> {
+        let state = Self::load_persisted_inode_allocator_state(local)?;
+        if state.is_valid() && !state.current.is_empty() {
+            Ok(Some(state))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn load_legacy_persisted_inode_allocator_state(
+        local: &RedbMetaEngine,
+        slot: u64,
+    ) -> MetaResult<Option<InodeAllocatorState>> {
+        let Some(state) =
+            Self::load_valid_persisted_local_id_range_state(local, slot, LEGACY_INODE_RANGE_SPEC)?
+        else {
+            return Ok(None);
+        };
+        if state.next > state.active_end {
+            return Ok(None);
+        }
+
+        let translated = InodeAllocatorState {
+            current: InodeWindow {
+                start: state.active_start,
+                next: state.next,
+                end: state.active_end,
+            },
+            prefetched: if state.reserved_end > state.active_end {
+                InodeWindow {
+                    start: state.active_end,
+                    next: state.active_end,
+                    end: state.reserved_end,
+                }
+            } else {
+                InodeWindow::default()
+            },
+        };
+        Ok(translated.is_valid().then_some(translated))
+    }
+
+    fn load_compatible_persisted_inode_allocator_state(
+        local: &RedbMetaEngine,
+        slot: Option<u64>,
+    ) -> MetaResult<Option<(InodeAllocatorState, bool)>> {
+        if let Some(state) = Self::load_valid_persisted_inode_allocator_state(local)? {
+            return Ok(Some((state, false)));
+        }
+        if let Some(slot) = slot {
+            if let Some(state) = Self::load_legacy_persisted_inode_allocator_state(local, slot)? {
+                return Ok(Some((state, true)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn has_persisted_inode_allocator_state(
+        local: &RedbMetaEngine,
+        slot: Option<u64>,
+    ) -> MetaResult<bool> {
+        Ok(Self::load_compatible_persisted_inode_allocator_state(local, slot)?.is_some())
+    }
+
+    fn persist_inode_allocator_state_locked(
+        counters: &crate::redb_engine::CounterWriteTransaction<'_>,
+        state: InodeAllocatorState,
+    ) -> MetaResult<()> {
+        counters.set(counters::NEXT_INODE, state.current.next)?;
+        counters.set(
+            LOCAL_PG_INODE_CURRENT_WINDOW_START_COUNTER,
+            state.current.start,
+        )?;
+        counters.set(LOCAL_PG_INODE_CURRENT_WINDOW_END_COUNTER, state.current.end)?;
+        counters.set(
+            LOCAL_PG_INODE_PREFETCHED_WINDOW_START_COUNTER,
+            state.prefetched.start,
+        )?;
+        counters.set(
+            LOCAL_PG_INODE_PREFETCHED_WINDOW_NEXT_COUNTER,
+            state.prefetched.next,
+        )?;
+        counters.set(
+            LOCAL_PG_INODE_PREFETCHED_WINDOW_END_COUNTER,
+            state.prefetched.end,
+        )?;
+        Ok(())
+    }
+
+    fn persist_inode_allocator_state(&self, state: InodeAllocatorState) -> MetaResult<()> {
+        self.local
+            .write_counters(|counters| Self::persist_inode_allocator_state_locked(counters, state))
+    }
+
+    fn update_inode_headroom_flag(&self, state: InodeAllocatorState) {
+        self.inode_id_headroom_available
+            .store(state.has_headroom(), Ordering::Release);
+    }
+
+    fn load_runtime_inode_allocator_state(&self, slot: u64) -> MetaResult<InodeAllocatorState> {
+        let Some((state, migrated_from_legacy)) =
+            Self::load_compatible_persisted_inode_allocator_state(&self.local, Some(slot))?
+        else {
+            return Ok(InodeAllocatorState::default());
+        };
+        if migrated_from_legacy {
+            self.persist_inode_allocator_state(state)?;
+        }
+        Ok(state)
+    }
+
+    fn reserve_inode_window_from_postgres(
+        &self,
+        initial_next_hint: u64,
+    ) -> MetaResult<InodeWindow> {
+        #[cfg(test)]
+        if let Some(override_result) = tests::pop_inode_window_reservation_override() {
+            return override_result.map_err(MetaError::Storage);
+        }
+
+        let postgres_url = self.postgres_url.clone();
+        let volume_id = self.volume_id;
+        let connect_timeout = self.connect_timeout;
+        let command_timeout = self.command_timeout;
+        let initial_next_hint = initial_next_hint.max(ROOT_INO + 1);
+        Self::run_async_once(async move {
+            Self::with_postgres_client_timeout(
+                postgres_url,
+                connect_timeout,
+                command_timeout,
+                "reserve inode window",
+                move |client| async move {
+                    let mut client = client;
+                    let tx = client.transaction().await.map_err(|e| {
+                        MetaError::Storage(format!(
+                            "postgres tx failed: {}",
+                            Self::format_pg_error(e)
+                        ))
+                    })?;
+                    tx.batch_execute(
+                        r#"
+                        CREATE TABLE IF NOT EXISTS counters (
+                            vol BIGINT NOT NULL REFERENCES volumes(vol) ON DELETE CASCADE,
+                            name TEXT NOT NULL,
+                            value BIGINT NOT NULL,
+                            PRIMARY KEY (vol, name)
+                        )
+                        "#,
+                    )
+                    .await
+                    .map_err(|e| {
+                        MetaError::Storage(format!(
+                            "postgres counters ensure failed: {}",
+                            Self::format_pg_error(e)
+                        ))
+                    })?;
+
+                    let initial_next_hint = i64::try_from(initial_next_hint).map_err(|_| {
+                        MetaError::Storage(format!(
+                            "invalid inode window seed hint: {initial_next_hint} exceeds PostgreSQL BIGINT max {}",
+                            i64::MAX
+                        ))
+                    })?;
+                    let window_size = i64::try_from(PG_INODE_WINDOW_SIZE).map_err(|_| {
+                        MetaError::Storage(format!(
+                            "invalid inode window size: {PG_INODE_WINDOW_SIZE} exceeds PostgreSQL BIGINT max {}",
+                            i64::MAX
+                        ))
+                    })?;
+
+                    tx.execute(
+                        r#"
+                        INSERT INTO counters (vol, name, value)
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT (vol, name) DO NOTHING
+                        "#,
+                        &[&volume_id, &PG_NEXT_INODE_COUNTER, &initial_next_hint],
+                    )
+                    .await
+                    .map_err(|e| {
+                        MetaError::Storage(format!(
+                            "postgres inode counter seed failed: {}",
+                            Self::format_pg_error(e)
+                        ))
+                    })?;
+
+                    let row = tx
+                        .query_one(
+                            r#"
+                            UPDATE counters
+                            SET value = GREATEST(value, $3) + $4
+                            WHERE vol = $1 AND name = $2
+                            RETURNING value - $4, value
+                            "#,
+                            &[
+                                &volume_id,
+                                &PG_NEXT_INODE_COUNTER,
+                                &initial_next_hint,
+                                &window_size,
+                            ],
+                        )
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres inode window reserve failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                    tx.commit().await.map_err(|e| {
+                        MetaError::Storage(format!(
+                            "postgres inode window commit failed: {}",
+                            Self::format_pg_error(e)
+                        ))
+                    })?;
+
+                    let start: i64 = row.get(0);
+                    let end: i64 = row.get(1);
+                    let start = u64::try_from(start).map_err(|_| {
+                        MetaError::Storage(format!("invalid negative inode window start: {start}"))
+                    })?;
+                    let end = u64::try_from(end).map_err(|_| {
+                        MetaError::Storage(format!("invalid negative inode window end: {end}"))
+                    })?;
+                    if start < ROOT_INO + 1 || end < start {
+                        return Err(MetaError::Storage(format!(
+                            "invalid inode window reservation: [{start}, {end})"
+                        )));
+                    }
+                    Ok(InodeWindow {
+                        start,
+                        next: start,
+                        end,
+                    })
+                },
+            )
+            .await
+        })
+    }
+
+    fn inode_window_reservation_needed(
+        state: InodeAllocatorState,
+        reason: InodeWindowReservationReason,
+    ) -> bool {
+        match reason {
+            InodeWindowReservationReason::Current => {
+                !state.current.has_headroom() && !state.prefetched.has_headroom()
+            }
+            InodeWindowReservationReason::Prefetch => {
+                state.current.has_headroom()
+                    && state.current.remaining() <= PG_INODE_PREFETCH_LOW_WATERMARK
+                    && !state.prefetched.has_headroom()
+            }
+        }
+    }
+
+    fn apply_reserved_inode_window(
+        state: &mut InodeAllocatorState,
+        reason: InodeWindowReservationReason,
+        window: InodeWindow,
+    ) -> bool {
+        match reason {
+            InodeWindowReservationReason::Current => {
+                if !state.current.has_headroom() && !state.prefetched.has_headroom() {
+                    state.current = window;
+                    state.prefetched = InodeWindow::default();
+                    true
+                } else if state.current.has_headroom() && !state.prefetched.has_headroom() {
+                    state.prefetched = window;
+                    true
+                } else {
+                    false
+                }
+            }
+            InodeWindowReservationReason::Prefetch => {
+                if state.prefetched.has_headroom() {
+                    false
+                } else if state.current.has_headroom() {
+                    state.prefetched = window;
+                    true
+                } else {
+                    state.current = window;
+                    state.prefetched = InodeWindow::default();
+                    true
+                }
+            }
+        }
+    }
+
+    fn inode_window_seed_hint(
+        &self,
+        state: InodeAllocatorState,
+        reason: InodeWindowReservationReason,
+    ) -> MetaResult<u64> {
+        match reason {
+            InodeWindowReservationReason::Current => {
+                if state.current.next > ROOT_INO {
+                    Ok(state.current.next.max(ROOT_INO + 1))
+                } else {
+                    Ok(self
+                        .local
+                        .get_counter(counters::NEXT_INODE)?
+                        .max(ROOT_INO + 1))
+                }
+            }
+            InodeWindowReservationReason::Prefetch => {
+                Ok(state.current.next.max(state.current.end).max(ROOT_INO + 1))
+            }
+        }
+    }
+
+    fn reserve_inode_window_if_needed(
+        &self,
+        slot: u64,
+        reason: InodeWindowReservationReason,
+    ) -> MetaResult<InodeAllocatorState> {
+        let _reservation_guard = self.inode_window_reservation_lock.lock().map_err(|_| {
+            MetaError::Storage("inode window reservation lock poisoned".to_string())
+        })?;
+        let seed_hint = {
+            let _allocator_guard = self
+                .inode_allocator_lock
+                .lock()
+                .map_err(|_| MetaError::Storage("inode allocator lock poisoned".to_string()))?;
+            let state = self.load_runtime_inode_allocator_state(slot)?;
+            self.update_inode_headroom_flag(state);
+            if !Self::inode_window_reservation_needed(state, reason) {
+                return Ok(state);
+            }
+            self.inode_window_seed_hint(state, reason)?
+        };
+
+        let window = self.reserve_inode_window_from_postgres(seed_hint)?;
+        let _allocator_guard = self
+            .inode_allocator_lock
+            .lock()
+            .map_err(|_| MetaError::Storage("inode allocator lock poisoned".to_string()))?;
+        let mut state = self.load_runtime_inode_allocator_state(slot)?;
+        let applied = Self::apply_reserved_inode_window(&mut state, reason, window);
+        if applied {
+            self.persist_inode_allocator_state(state)?;
+        }
+        self.update_inode_headroom_flag(state);
+        Ok(state)
+    }
+
+    fn format_inode_window_reservation_error(
+        &self,
+        state: InodeAllocatorState,
+        error: &MetaError,
+    ) -> String {
+        let has_local_headroom = state.current.has_headroom() || state.prefetched.has_headroom();
+        let error_text = error.to_string();
+        let lower_error_text = error_text.to_ascii_lowercase();
+        if has_local_headroom {
+            format!("failed to ensure current local inode window: {error_text}")
+        } else if lower_error_text.contains("exhaust") {
+            format!("pg local inode window exhausted: {error_text}")
+        } else {
+            format!(
+                "failed to reserve a new inode window from PostgreSQL after exhausting local inode windows: {error_text}"
+            )
+        }
+    }
+
     fn reserve_counter_range_base(slot: u64, stride: u64, min_value: u64) -> u64 {
         let base = slot.saturating_mul(stride);
         base.max(min_value)
@@ -602,15 +1043,9 @@ impl PgMetaEngine {
         Self::normalize_local_id_range_state(slot, spec, state)
     }
 
-    fn has_persisted_local_id_headroom(local: &RedbMetaEngine, slot: u64) -> MetaResult<bool> {
+    fn has_persisted_block_id_headroom(local: &RedbMetaEngine, slot: u64) -> MetaResult<bool> {
         Ok(
-            Self::load_valid_persisted_local_id_range_state(local, slot, INODE_ID_RANGE_SPEC)?
-                .is_some()
-                && Self::load_valid_persisted_local_id_range_state(
-                    local,
-                    slot,
-                    BLOCK_ID_RANGE_SPEC,
-                )?
+            Self::load_valid_persisted_local_id_range_state(local, slot, BLOCK_ID_RANGE_SPEC)?
                 .is_some(),
         )
     }
@@ -642,13 +1077,8 @@ impl PgMetaEngine {
         Ok(())
     }
 
-    fn ensure_local_id_headroom(&self, slot: u64) -> MetaResult<()> {
+    fn ensure_local_block_id_headroom(&self, slot: u64) -> MetaResult<()> {
         self.local.write_counters(|counters| {
-            let _ = Self::read_or_initialize_local_id_range_locked(
-                counters,
-                slot,
-                INODE_ID_RANGE_SPEC,
-            )?;
             let _ = Self::read_or_initialize_local_id_range_locked(
                 counters,
                 slot,
@@ -656,12 +1086,6 @@ impl PgMetaEngine {
             )?;
             Ok(())
         })?;
-        self.sync_local_id_lease_cache(
-            slot,
-            INODE_ID_RANGE_SPEC,
-            &self.inode_id_cache,
-            &self.inode_id_headroom_available,
-        )?;
         self.sync_local_id_lease_cache(
             slot,
             BLOCK_ID_RANGE_SPEC,
@@ -1535,24 +1959,39 @@ impl PgMetaEngine {
 
     fn prime_local_id_ranges(&self, slot: u64) -> MetaResult<()> {
         self.cache_client_slot(slot);
-        self.ensure_local_id_headroom(slot)?;
-        // If persisted state already has no headroom (next >= reserved_end from a
-        // previous session), extend it now so that `allows_new_mutations()` does not
-        // block every write on startup.  Without this, the engine stays read-only
-        // even when PG is healthy and the slot is not globally exhausted.
+        self.ensure_local_block_id_headroom(slot)?;
+
+        let inode_prime = (|| -> MetaResult<()> {
+            let state = {
+                let _guard = self
+                    .inode_allocator_lock
+                    .lock()
+                    .map_err(|_| MetaError::Storage("inode allocator lock poisoned".to_string()))?;
+                let state = self.load_runtime_inode_allocator_state(slot)?;
+                self.update_inode_headroom_flag(state);
+                state
+            };
+            if !Self::inode_window_reservation_needed(state, InodeWindowReservationReason::Current)
+            {
+                return Ok(());
+            }
+            let _ =
+                self.reserve_inode_window_if_needed(slot, InodeWindowReservationReason::Current)?;
+            Ok(())
+        })();
+        if inode_prime.is_err() {
+            self.inode_id_headroom_available
+                .store(false, Ordering::Release);
+        }
+
+        // If persisted state already has no headroom from a previous session,
+        // try to refill it now so ordinary writable opens do not get stuck in a
+        // stale read-only posture after PostgreSQL recovers.
         let pg_available = self.can_refresh_local_id_headroom().unwrap_or(false);
         if pg_available {
             if !self.inode_id_headroom_available.load(Ordering::Acquire) {
-                if let Ok(new_lease) =
-                    self.reserve_local_id_lease(slot, INODE_ID_RANGE_SPEC, 0, true)
-                {
-                    *self
-                        .inode_id_cache
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner()) = new_lease;
-                    self.inode_id_headroom_available
-                        .store(new_lease.has_headroom(), Ordering::Release);
-                }
+                let _ = self
+                    .reserve_inode_window_if_needed(slot, InodeWindowReservationReason::Current);
             }
             if !self.block_id_headroom_available.load(Ordering::Acquire) {
                 if let Ok(new_lease) =
@@ -1567,7 +2006,7 @@ impl PgMetaEngine {
                 }
             }
         }
-        Ok(())
+        inode_prime
     }
 
     pub fn open(path: impl AsRef<Path>) -> MetaResult<Arc<Self>> {
@@ -1627,14 +2066,15 @@ impl PgMetaEngine {
             Self::ensure_file_lock_lease_schema(&pg.url, connect_timeout, command_timeout)
         {
             let can_reopen_offline = persisted_client_slot
-                .map(|slot| Self::has_persisted_local_id_headroom(&local, slot))
+                .map(|slot| Self::has_persisted_block_id_headroom(&local, slot))
                 .transpose()?
                 .unwrap_or(false)
+                && Self::has_persisted_inode_allocator_state(&local, persisted_client_slot)?
                 && Self::is_transient_pg_schema_unavailability(&error);
             if can_reopen_offline {
                 warn!(
                     error = %error,
-                    "postgres lock schema unavailable during reopen; continuing from persisted client slot"
+                    "postgres lock schema unavailable during reopen; continuing from persisted local allocator state"
                 );
             } else {
                 return Err(error);
@@ -1673,11 +2113,12 @@ impl PgMetaEngine {
             command_timeout,
             inflight_replication_ops: AtomicU32::new(0),
             pending_state: Mutex::new(PendingReplicationState::default()),
-            inode_id_cache: Mutex::new(LocalIdLeaseCache::default()),
+            inode_allocator_lock: Mutex::new(()),
+            inode_window_reservation_lock: Mutex::new(()),
             block_id_cache: Mutex::new(LocalIdLeaseCache::default()),
             // Optimistic: assume headroom is available until proven exhausted.
-            // These flags are degraded to `false` by `allocate_local_ids` only
-            // when the reserved range is genuinely exhausted.  Starting at
+            // These flags are degraded to `false` only when the persisted
+            // local window/range state is genuinely exhausted.  Starting at
             // `false` caused `allows_new_mutations()` to block every write if
             // `prime_local_id_ranges` failed silently (via `let _ = ...`).
             inode_id_headroom_available: AtomicBool::new(true),
@@ -3477,13 +3918,94 @@ impl MetaInodes for PgMetaEngine {
 
     fn next_inode(&self) -> MetaResult<Ino> {
         let slot = self.client_slot()?;
-        self.allocate_local_ids(
-            slot,
-            INODE_ID_RANGE_SPEC,
-            &self.inode_id_cache,
-            &self.inode_id_headroom_available,
-            1,
-        )
+        loop {
+            let allocation = {
+                let _guard = self
+                    .inode_allocator_lock
+                    .lock()
+                    .map_err(|_| MetaError::Storage("inode allocator lock poisoned".to_string()))?;
+                let mut state = self.load_runtime_inode_allocator_state(slot)?;
+                if !state.current.has_headroom() && state.prefetched.has_headroom() {
+                    state.current = state.prefetched;
+                    state.prefetched = InodeWindow::default();
+                }
+                if !state.current.has_headroom() {
+                    self.update_inode_headroom_flag(state);
+                    None
+                } else {
+                    let ino = state.current.next;
+                    state.current.next = state.current.next.checked_add(1).ok_or_else(|| {
+                        MetaError::Storage("pg inode allocation overflow".to_string())
+                    })?;
+
+                    if state.current.next == state.current.end && state.prefetched.has_headroom() {
+                        state.current = state.prefetched;
+                        state.prefetched = InodeWindow::default();
+                    }
+
+                    let needs_current_refill = Self::inode_window_reservation_needed(
+                        state,
+                        InodeWindowReservationReason::Current,
+                    );
+                    let needs_prefetch = Self::inode_window_reservation_needed(
+                        state,
+                        InodeWindowReservationReason::Prefetch,
+                    );
+                    self.persist_inode_allocator_state(state)?;
+                    self.update_inode_headroom_flag(state);
+                    Some((ino, state, needs_current_refill, needs_prefetch))
+                }
+            };
+
+            let Some((ino, state, needs_current_refill, needs_prefetch)) = allocation else {
+                match self
+                    .reserve_inode_window_if_needed(slot, InodeWindowReservationReason::Current)
+                {
+                    Ok(_) => continue,
+                    Err(error) => {
+                        let state = {
+                            let _guard = self.inode_allocator_lock.lock().map_err(|_| {
+                                MetaError::Storage("inode allocator lock poisoned".to_string())
+                            })?;
+                            let state = self.load_runtime_inode_allocator_state(slot)?;
+                            self.update_inode_headroom_flag(state);
+                            state
+                        };
+                        return Err(MetaError::Storage(
+                            self.format_inode_window_reservation_error(state, &error),
+                        ));
+                    }
+                }
+            };
+
+            if needs_current_refill {
+                if let Err(error) =
+                    self.reserve_inode_window_if_needed(slot, InodeWindowReservationReason::Current)
+                {
+                    warn!(
+                        error = %error,
+                        volume_id = self.volume_id,
+                        exhausted_end = state.current.next,
+                        "postgres inode window refill unavailable after exhausting current window"
+                    );
+                }
+            } else if needs_prefetch {
+                if let Err(error) = self
+                    .reserve_inode_window_if_needed(slot, InodeWindowReservationReason::Prefetch)
+                {
+                    warn!(
+                        error = %error,
+                        volume_id = self.volume_id,
+                        current_start = state.current.start,
+                        current_next = state.current.next,
+                        current_end = state.current.end,
+                        "postgres inode window prefetch failed; continuing with current local window"
+                    );
+                }
+            }
+
+            return Ok(ino);
+        }
     }
 
     fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
@@ -4058,7 +4580,8 @@ impl crate::engine::MetaEngine for PgMetaEngine {
 mod tests {
     use super::*;
     use crate::pg_dsn::ensure_studiofs_database;
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
     use tempfile::tempdir;
     use uuid::Uuid;
 
@@ -4268,7 +4791,8 @@ mod tests {
 
     thread_local! {
         static TEST_SCHEMA_ENSURE_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
-        static TEST_HEADROOM_REFRESH_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+        static TEST_INODE_WINDOW_RESERVATION_OVERRIDE: RefCell<VecDeque<Result<InodeWindow, String>>> =
+            const { RefCell::new(VecDeque::new()) };
     }
 
     struct TestSchemaEnsureOverrideGuard {
@@ -4293,29 +4817,37 @@ mod tests {
         TEST_SCHEMA_ENSURE_OVERRIDE.with(|override_state| override_state.borrow().clone())
     }
 
-    struct TestHeadroomRefreshOverrideGuard {
-        previous: Option<bool>,
+    pub(super) fn headroom_refresh_test_override() -> Option<bool> {
+        None
     }
 
-    impl Drop for TestHeadroomRefreshOverrideGuard {
+    struct TestInodeWindowReservationOverrideGuard {
+        previous: VecDeque<Result<InodeWindow, String>>,
+    }
+
+    impl Drop for TestInodeWindowReservationOverrideGuard {
         fn drop(&mut self) {
-            TEST_HEADROOM_REFRESH_OVERRIDE.with(|override_state| {
-                override_state.set(self.previous.take());
+            TEST_INODE_WINDOW_RESERVATION_OVERRIDE.with(|override_state| {
+                *override_state.borrow_mut() = std::mem::take(&mut self.previous);
             });
         }
     }
 
-    fn set_headroom_refresh_test_override(value: bool) -> TestHeadroomRefreshOverrideGuard {
-        let previous = TEST_HEADROOM_REFRESH_OVERRIDE.with(|override_state| {
-            let previous = override_state.get();
-            override_state.set(Some(value));
-            previous
+    fn set_inode_window_reservation_override(
+        windows: impl IntoIterator<Item = Result<InodeWindow, String>>,
+    ) -> TestInodeWindowReservationOverrideGuard {
+        let previous = TEST_INODE_WINDOW_RESERVATION_OVERRIDE.with(|override_state| {
+            std::mem::replace(
+                &mut *override_state.borrow_mut(),
+                windows.into_iter().collect(),
+            )
         });
-        TestHeadroomRefreshOverrideGuard { previous }
+        TestInodeWindowReservationOverrideGuard { previous }
     }
 
-    pub(super) fn headroom_refresh_test_override() -> Option<bool> {
-        TEST_HEADROOM_REFRESH_OVERRIDE.with(Cell::get)
+    pub(super) fn pop_inode_window_reservation_override() -> Option<Result<InodeWindow, String>> {
+        TEST_INODE_WINDOW_RESERVATION_OVERRIDE
+            .with(|override_state| override_state.borrow_mut().pop_front())
     }
 
     struct TestEnvGuard {
@@ -4412,7 +4944,8 @@ mod tests {
             command_timeout: Duration::from_millis(50),
             inflight_replication_ops: AtomicU32::new(0),
             pending_state: Mutex::new(PendingReplicationState::default()),
-            inode_id_cache: Mutex::new(LocalIdLeaseCache::default()),
+            inode_allocator_lock: Mutex::new(()),
+            inode_window_reservation_lock: Mutex::new(()),
             block_id_cache: Mutex::new(LocalIdLeaseCache::default()),
             inode_id_headroom_available: AtomicBool::new(false),
             block_id_headroom_available: AtomicBool::new(false),
@@ -4431,8 +4964,20 @@ mod tests {
 
         PgMetaEngine::persist_client_slot(&engine.local, 0).expect("persist unit test client slot");
         engine
-            .prime_local_id_ranges(0)
-            .expect("prime unit test local id ranges");
+            .ensure_local_block_id_headroom(0)
+            .expect("prime unit test block ranges");
+        let inode_state = InodeAllocatorState {
+            current: InodeWindow {
+                start: ROOT_INO + 1,
+                next: ROOT_INO + 1,
+                end: ROOT_INO + 1 + PG_INODE_WINDOW_SIZE,
+            },
+            prefetched: InodeWindow::default(),
+        };
+        engine
+            .persist_inode_allocator_state(inode_state)
+            .expect("persist unit test inode window");
+        engine.update_inode_headroom_flag(inode_state);
 
         (dir, engine)
     }
@@ -4764,30 +5309,50 @@ mod tests {
         );
     }
 
+    fn persist_inode_state(local: &RedbMetaEngine, state: InodeAllocatorState) {
+        local
+            .write_counters(|counters| {
+                PgMetaEngine::persist_inode_allocator_state_locked(counters, state)
+            })
+            .expect("persist inode allocator state");
+    }
+
+    fn persist_legacy_inode_range_state(local: &RedbMetaEngine, state: LocalIdRangeState) {
+        local
+            .write_counters(|counters| {
+                PgMetaEngine::persist_local_id_range_state_locked(
+                    counters,
+                    LEGACY_INODE_RANGE_SPEC,
+                    state,
+                )
+            })
+            .expect("persist legacy inode range state");
+    }
+
+    fn load_inode_state(local: &RedbMetaEngine) -> InodeAllocatorState {
+        PgMetaEngine::load_persisted_inode_allocator_state(local)
+            .expect("load persisted inode allocator state")
+    }
+
     #[test]
-    fn prime_local_id_ranges_persists_reserved_headroom_boundaries() {
+    fn prime_local_id_ranges_persists_initial_inode_window_when_missing() {
         let (_dir, pg) = temp_pg_engine_for_unit();
+        let _inode_window_override = set_inode_window_reservation_override([Ok(InodeWindow {
+            start: 8_000,
+            next: 8_000,
+            end: 258_000,
+        })]);
 
         PgMetaEngine::persist_client_slot(&pg.local, 3).expect("persist client slot");
+        persist_inode_state(&pg.local, InodeAllocatorState::default());
         pg.prime_local_id_ranges(3)
-            .expect("prime local id headroom ranges");
+            .expect("prime local id allocator state");
 
-        let next_inode = pg
-            .local
-            .get_counter(counters::NEXT_INODE)
-            .expect("next inode counter");
         let next_block = pg
             .local
             .get_counter(counters::NEXT_BLOCK_ID)
             .expect("next block counter");
-        let inode_active_end = pg
-            .local
-            .get_counter("pgInodeActiveRangeEnd")
-            .expect("inode active range end");
-        let inode_reserved_end = pg
-            .local
-            .get_counter("pgInodeReservedRangeEnd")
-            .expect("inode reserved range end");
+        let inode_state = load_inode_state(&pg.local);
         let block_active_end = pg
             .local
             .get_counter("pgBlockActiveRangeEnd")
@@ -4798,13 +5363,15 @@ mod tests {
             .expect("block reserved range end");
 
         assert!(
-            inode_active_end > next_inode,
-            "inode active range must extend beyond the current cursor"
+            inode_state.current
+                == InodeWindow {
+                    start: 8_000,
+                    next: 8_000,
+                    end: 258_000,
+                },
+            "prime must persist the first inode window locally when none exists"
         );
-        assert!(
-            inode_reserved_end > inode_active_end,
-            "inode reserved headroom should include at least one future window"
-        );
+        assert!(inode_state.prefetched.is_empty());
         assert!(
             block_active_end > next_block,
             "block active range must extend beyond the current cursor"
@@ -4812,6 +5379,41 @@ mod tests {
         assert!(
             block_reserved_end > block_active_end,
             "block reserved headroom should include at least one future window"
+        );
+    }
+
+    #[test]
+    fn prime_local_id_ranges_migrates_legacy_inode_ranges_to_durable_windows() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        persist_inode_state(&pg.local, InodeAllocatorState::default());
+        persist_legacy_inode_range_state(
+            &pg.local,
+            LocalIdRangeState {
+                next: 1_203,
+                active_start: 1_000,
+                active_end: 2_000,
+                reserved_end: 3_000,
+            },
+        );
+
+        pg.prime_local_id_ranges(0)
+            .expect("prime must migrate legacy inode state");
+
+        assert_eq!(
+            load_inode_state(&pg.local),
+            InodeAllocatorState {
+                current: InodeWindow {
+                    start: 1_000,
+                    next: 1_203,
+                    end: 2_000,
+                },
+                prefetched: InodeWindow {
+                    start: 2_000,
+                    next: 2_000,
+                    end: 3_000,
+                },
+            },
+            "legacy inode ranges should be migrated into durable current/prefetched windows"
         );
     }
 
@@ -4831,24 +5433,21 @@ mod tests {
             .expect("set format info");
 
         PgMetaEngine::persist_client_slot(&local, 5).expect("persist client slot");
-        let inode_base =
-            PgMetaEngine::reserve_counter_range_base(5, PG_INODE_ID_STRIDE, ROOT_INO + 1);
         let block_base = PgMetaEngine::reserve_counter_range_base(5, PG_BLOCK_ID_STRIDE, 1);
-        local
-            .set_counter(counters::NEXT_INODE, inode_base + 2)
-            .expect("persist next inode");
         local
             .set_counter(counters::NEXT_BLOCK_ID, block_base + 2)
             .expect("persist next block");
-        local
-            .set_counter("pgInodeActiveRangeStart", inode_base)
-            .expect("persist inode active start");
-        local
-            .set_counter("pgInodeActiveRangeEnd", inode_base + 8)
-            .expect("persist inode active end");
-        local
-            .set_counter("pgInodeReservedRangeEnd", inode_base + 16)
-            .expect("persist inode reserved end");
+        persist_inode_state(
+            &local,
+            InodeAllocatorState {
+                current: InodeWindow {
+                    start: 4_000,
+                    next: 4_002,
+                    end: 4_008,
+                },
+                prefetched: InodeWindow::default(),
+            },
+        );
         local
             .set_counter("pgBlockActiveRangeStart", block_base)
             .expect("persist block active start");
@@ -4866,10 +5465,82 @@ mod tests {
                 background_poll: false,
             },
         );
-        let reopen_error = reopened.err().map(|err| err.to_string());
-        assert!(
-            reopen_error.is_none(),
-            "engine should reopen from persisted client slot + headroom even while PG is unavailable: {reopen_error:?}"
+        let reopened = reopened.expect("reopen from persisted allocator state");
+        assert_eq!(
+            load_inode_state(&reopened.local).current,
+            InodeWindow {
+                start: 4_000,
+                next: 4_002,
+                end: 4_008,
+            },
+            "reopen must reuse the persisted current inode window without reserving a fresh one"
+        );
+    }
+
+    #[test]
+    fn open_with_persisted_slot_and_legacy_inode_ranges_survives_pg_unavailable() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("meta.redb");
+        let local = RedbMetaEngine::open(&path).expect("open local redb");
+        local.init_root(0, 0).expect("init root");
+        local
+            .set_format_info(&format_info(
+                "offline-reopen-legacy-inodes",
+                "offline-reopen-legacy-inodes-uuid",
+                "postgres://127.0.0.1:1/studiofs",
+                1,
+            ))
+            .expect("set format info");
+
+        PgMetaEngine::persist_client_slot(&local, 5).expect("persist client slot");
+        let block_base = PgMetaEngine::reserve_counter_range_base(5, PG_BLOCK_ID_STRIDE, 1);
+        let legacy_inode_base =
+            PgMetaEngine::reserve_counter_range_base(5, LEGACY_PG_INODE_ID_STRIDE, ROOT_INO + 1);
+        local
+            .set_counter(counters::NEXT_BLOCK_ID, block_base + 2)
+            .expect("persist next block");
+        persist_legacy_inode_range_state(
+            &local,
+            LocalIdRangeState {
+                next: legacy_inode_base + 2,
+                active_start: legacy_inode_base,
+                active_end: legacy_inode_base + LEGACY_PG_INODE_RANGE_WINDOW,
+                reserved_end: legacy_inode_base + LEGACY_PG_INODE_RANGE_WINDOW * 2,
+            },
+        );
+        local
+            .set_counter("pgBlockActiveRangeStart", block_base)
+            .expect("persist block active start");
+        local
+            .set_counter("pgBlockActiveRangeEnd", block_base + 8)
+            .expect("persist block active end");
+        local
+            .set_counter("pgBlockReservedRangeEnd", block_base + 16)
+            .expect("persist block reserved end");
+        drop(local);
+
+        let reopened = PgMetaEngine::open_with_options(
+            &path,
+            PgOpenOptions {
+                background_poll: false,
+            },
+        );
+        let reopened = reopened.expect("reopen from persisted legacy inode state");
+        assert_eq!(
+            load_inode_state(&reopened.local),
+            InodeAllocatorState {
+                current: InodeWindow {
+                    start: legacy_inode_base,
+                    next: legacy_inode_base + 2,
+                    end: legacy_inode_base + LEGACY_PG_INODE_RANGE_WINDOW,
+                },
+                prefetched: InodeWindow {
+                    start: legacy_inode_base + LEGACY_PG_INODE_RANGE_WINDOW,
+                    next: legacy_inode_base + LEGACY_PG_INODE_RANGE_WINDOW,
+                    end: legacy_inode_base + LEGACY_PG_INODE_RANGE_WINDOW * 2,
+                },
+            },
+            "offline reopen must accept legacy inode ranges and migrate them into durable windows"
         );
     }
 
@@ -4921,24 +5592,21 @@ mod tests {
             .expect("set format info");
 
         PgMetaEngine::persist_client_slot(&local, 5).expect("persist client slot");
-        let inode_base =
-            PgMetaEngine::reserve_counter_range_base(5, PG_INODE_ID_STRIDE, ROOT_INO + 1);
         let block_base = PgMetaEngine::reserve_counter_range_base(5, PG_BLOCK_ID_STRIDE, 1);
-        local
-            .set_counter(counters::NEXT_INODE, inode_base + 2)
-            .expect("persist next inode");
         local
             .set_counter(counters::NEXT_BLOCK_ID, block_base + 2)
             .expect("persist next block");
-        local
-            .set_counter("pgInodeActiveRangeStart", inode_base)
-            .expect("persist inode active start");
-        local
-            .set_counter("pgInodeActiveRangeEnd", inode_base + 8)
-            .expect("persist inode active end");
-        local
-            .set_counter("pgInodeReservedRangeEnd", inode_base + 16)
-            .expect("persist inode reserved end");
+        persist_inode_state(
+            &local,
+            InodeAllocatorState {
+                current: InodeWindow {
+                    start: 7_000,
+                    next: 7_002,
+                    end: 7_008,
+                },
+                prefetched: InodeWindow::default(),
+            },
+        );
         local
             .set_counter("pgBlockActiveRangeStart", block_base)
             .expect("persist block active start");
@@ -4963,179 +5631,206 @@ mod tests {
     }
 
     #[test]
-    fn next_inode_advances_persisted_active_range_when_window_boundary_is_crossed() {
+    fn next_inode_switches_to_prefetched_window_without_pg_roundtrip() {
         let (_dir, pg) = temp_pg_engine_for_unit();
 
-        PgMetaEngine::persist_client_slot(&pg.local, 0).expect("persist client slot");
-        let base = PgMetaEngine::reserve_counter_range_base(0, PG_INODE_ID_STRIDE, ROOT_INO + 1);
-        pg.local
-            .set_counter(counters::NEXT_INODE, base + 1)
-            .expect("persist next inode");
-        pg.local
-            .set_counter(LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER, base)
-            .expect("persist inode active start");
-        pg.local
-            .set_counter(LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER, base + 2)
-            .expect("persist inode active end");
-        pg.local
-            .set_counter(LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER, base + 4)
-            .expect("persist inode reserved end");
+        persist_inode_state(
+            &pg.local,
+            InodeAllocatorState {
+                current: InodeWindow {
+                    start: 100,
+                    next: 101,
+                    end: 102,
+                },
+                prefetched: InodeWindow {
+                    start: 500,
+                    next: 500,
+                    end: 503,
+                },
+            },
+        );
 
         let allocated = pg.next_inode().expect("allocate boundary inode");
-        assert_eq!(allocated, base + 1);
+        assert_eq!(allocated, 101);
         assert_eq!(
-            pg.local
-                .get_counter(LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER)
-                .expect("inode active start"),
-            base + 2
-        );
-        assert_eq!(
-            pg.local
-                .get_counter(LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER)
-                .expect("inode active end"),
-            base + 4
-        );
-        assert_eq!(
-            pg.local
-                .get_counter(LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER)
-                .expect("inode reserved end"),
-            base + 4,
-            "advancing into the already-reserved window must not fabricate a new future reservation"
+            load_inode_state(&pg.local),
+            InodeAllocatorState {
+                current: InodeWindow {
+                    start: 500,
+                    next: 500,
+                    end: 503,
+                },
+                prefetched: InodeWindow::default(),
+            },
+            "exhausting the current window must switch to the prefetched window locally"
         );
     }
 
     #[test]
-    fn next_inode_stops_once_reserved_window_is_consumed() {
+    fn next_inode_prefetches_single_future_window_at_low_watermark() {
         let (_dir, pg) = temp_pg_engine_for_unit();
+        let _inode_window_override = set_inode_window_reservation_override([Ok(InodeWindow {
+            start: 9_000,
+            next: 9_000,
+            end: 59_500,
+        })]);
 
-        PgMetaEngine::persist_client_slot(&pg.local, 0).expect("persist client slot");
-        let base = PgMetaEngine::reserve_counter_range_base(0, PG_INODE_ID_STRIDE, ROOT_INO + 1);
-        pg.local
-            .set_counter(counters::NEXT_INODE, base + 3)
-            .expect("persist next inode");
-        pg.local
-            .set_counter(LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER, base + 2)
-            .expect("persist inode active start");
-        pg.local
-            .set_counter(LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER, base + 4)
-            .expect("persist inode active end");
-        pg.local
-            .set_counter(LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER, base + 4)
-            .expect("persist inode reserved end");
-
-        let last = pg.next_inode().expect("final inode in reserved window");
-        assert_eq!(last, base + 3);
-
-        let authority = MetaReplication::metadata_authority_status(&pg);
-        assert!(
-            !authority.allows_new_mutations(),
-            "consuming the final reserved inode should degrade the engine to read-only"
+        let start = 1_000;
+        let end = start + PG_INODE_PREFETCH_LOW_WATERMARK + 1;
+        persist_inode_state(
+            &pg.local,
+            InodeAllocatorState {
+                current: InodeWindow {
+                    start,
+                    next: start,
+                    end,
+                },
+                prefetched: InodeWindow::default(),
+            },
         );
-        let error = pg
+
+        let allocated = pg
             .next_inode()
-            .expect_err("allocator must stop once the reserved window is exhausted");
-        assert!(
-            matches!(error, MetaError::Storage(ref message) if message.contains("headroom exhausted")),
-            "unexpected exhaustion error: {error}"
+            .expect("allocate and trigger low-water prefetch");
+        assert_eq!(allocated, start);
+
+        let state = load_inode_state(&pg.local);
+        assert_eq!(state.current.next, start + 1);
+        assert_eq!(
+            state.prefetched,
+            InodeWindow {
+                start: 9_000,
+                next: 9_000,
+                end: 59_500,
+            },
+            "reaching the low-watermark should reserve exactly one prefetched inode window"
         );
     }
 
     #[test]
-    fn next_inode_refreshes_reserved_headroom_when_pg_is_available() {
-        let _pg_refresh = set_headroom_refresh_test_override(true);
+    fn next_inode_reserves_replacement_current_window_when_pg_is_available() {
         let (_dir, pg) = temp_pg_engine_for_unit();
+        let _inode_window_override = set_inode_window_reservation_override([Ok(InodeWindow {
+            start: 9_000,
+            next: 9_000,
+            end: 70_000,
+        })]);
 
-        PgMetaEngine::persist_client_slot(&pg.local, 0).expect("persist client slot");
-        let base = PgMetaEngine::reserve_counter_range_base(0, PG_INODE_ID_STRIDE, ROOT_INO + 1);
-        pg.local
-            .set_counter(counters::NEXT_INODE, base + 3)
-            .expect("persist next inode");
-        pg.local
-            .set_counter(LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER, base + 2)
-            .expect("persist inode active start");
-        pg.local
-            .set_counter(LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER, base + 4)
-            .expect("persist inode active end");
-        pg.local
-            .set_counter(LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER, base + 4)
-            .expect("persist inode reserved end");
+        persist_inode_state(
+            &pg.local,
+            InodeAllocatorState {
+                current: InodeWindow {
+                    start: 4_000,
+                    next: 4_000,
+                    end: 4_001,
+                },
+                prefetched: InodeWindow::default(),
+            },
+        );
 
         let first = pg
             .next_inode()
-            .expect("allocate final inode before refresh");
-        let second = pg
-            .next_inode()
-            .expect("pg-backed refresh should reserve more headroom before going read-only");
-        assert_eq!(first, base + 3);
-        assert_eq!(second, base + 4);
+            .expect("allocate final inode before current-window refill");
+        assert_eq!(first, 4_000);
         assert!(
-            pg.local
-                .get_counter(LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER)
-                .expect("inode reserved end")
-                > base + 4,
-            "online refresh should extend the persisted reserved headroom"
+            load_inode_state(&pg.local).current
+                == InodeWindow {
+                    start: 9_000,
+                    next: 9_000,
+                    end: 70_000,
+                },
+            "when PostgreSQL is available, exhausting the current window should refill it immediately"
         );
     }
 
     #[test]
     fn create_file_respects_inode_headroom_exhaustion() {
         let (_dir, pg) = temp_pg_engine_for_unit();
+        let _inode_window_override =
+            set_inode_window_reservation_override([Err("pg local inode window exhausted".into())]);
 
-        PgMetaEngine::persist_client_slot(&pg.local, 0).expect("persist client slot");
-        let limit = PgMetaEngine::counter_range_limit(0, INODE_ID_RANGE_SPEC);
-        pg.local
-            .set_counter(counters::NEXT_INODE, limit)
-            .expect("persist next inode");
-        pg.local
-            .set_counter(LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER, limit - 1)
-            .expect("persist inode active start");
-        pg.local
-            .set_counter(LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER, limit)
-            .expect("persist inode active end");
-        pg.local
-            .set_counter(LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER, limit)
-            .expect("persist inode reserved end");
+        persist_inode_state(
+            &pg.local,
+            InodeAllocatorState {
+                current: InodeWindow {
+                    start: 3_000,
+                    next: 3_001,
+                    end: 3_001,
+                },
+                prefetched: InodeWindow::default(),
+            },
+        );
+        pg.update_inode_headroom_flag(load_inode_state(&pg.local));
 
         let result = pg.create_file(ROOT_INO, b"exhausted.txt", 0, 0, 0o644);
         assert!(
-            matches!(result, Err(MetaError::Storage(ref message)) if message.contains("headroom exhausted")),
+            matches!(result, Err(MetaError::Storage(ref message)) if message.contains("inode window exhausted")),
             "create_file must honor inode headroom exhaustion instead of bypassing the PG allocator: {result:?}"
         );
     }
 
     #[test]
-    fn next_inode_reports_read_only_headroom_once_slot_limit_is_exhausted() {
+    fn next_inode_reports_read_only_headroom_once_windows_are_exhausted() {
         let (_dir, pg) = temp_pg_engine_for_unit();
+        let _inode_window_override = set_inode_window_reservation_override([
+            Err("pg local inode window exhausted".into()),
+            Err("pg local inode window exhausted".into()),
+        ]);
 
-        PgMetaEngine::persist_client_slot(&pg.local, 0).expect("persist client slot");
-        let limit = PgMetaEngine::counter_range_limit(0, INODE_ID_RANGE_SPEC);
-        pg.local
-            .set_counter(counters::NEXT_INODE, limit - 1)
-            .expect("persist next inode");
-        pg.local
-            .set_counter(LOCAL_PG_INODE_ACTIVE_RANGE_START_COUNTER, limit - 1)
-            .expect("persist inode active start");
-        pg.local
-            .set_counter(LOCAL_PG_INODE_ACTIVE_RANGE_END_COUNTER, limit)
-            .expect("persist inode active end");
-        pg.local
-            .set_counter(LOCAL_PG_INODE_RESERVED_RANGE_END_COUNTER, limit)
-            .expect("persist inode reserved end");
+        persist_inode_state(
+            &pg.local,
+            InodeAllocatorState {
+                current: InodeWindow {
+                    start: 5_000,
+                    next: 5_000,
+                    end: 5_001,
+                },
+                prefetched: InodeWindow::default(),
+            },
+        );
         let first = pg.next_inode().expect("final inode within local headroom");
-        assert_eq!(first, limit - 1);
+        assert_eq!(first, 5_000);
 
         let error = pg.next_inode().expect_err(
-            "headroom should hard-stop new inode allocation once the slot is exhausted",
+            "headroom should hard-stop new inode allocation once no local window remains",
         );
         assert!(
-            matches!(error, MetaError::Storage(ref message) if message.contains("headroom exhausted")),
+            matches!(error, MetaError::Storage(ref message) if message.contains("inode window exhausted")),
             "unexpected exhaustion error: {error}"
         );
 
         let authority = MetaReplication::metadata_authority_status(&pg);
         assert!(
             !authority.allows_new_mutations(),
-            "slot exhaustion should surface a read-only metadata authority status"
+            "inode window exhaustion should surface a read-only metadata authority status"
+        );
+    }
+
+    #[test]
+    fn next_inode_distinguishes_pg_reservation_failures_from_true_exhaustion() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let _inode_window_override =
+            set_inode_window_reservation_override([Err("connect timeout".into())]);
+
+        persist_inode_state(
+            &pg.local,
+            InodeAllocatorState {
+                current: InodeWindow {
+                    start: 6_000,
+                    next: 6_001,
+                    end: 6_001,
+                },
+                prefetched: InodeWindow::default(),
+            },
+        );
+        pg.update_inode_headroom_flag(load_inode_state(&pg.local));
+
+        let error = pg
+            .next_inode()
+            .expect_err("allocation must report the PostgreSQL reservation failure");
+        assert!(
+            matches!(error, MetaError::Storage(ref message) if message.contains("failed to reserve a new inode window from PostgreSQL after exhausting local inode windows")),
+            "unexpected PostgreSQL reservation error: {error}"
         );
     }
 
@@ -6122,6 +6817,50 @@ mod tests {
         assert_ne!(
             a_file.ino, b_file.ino,
             "new inode allocations must not collide"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
+    fn test_pg_inode_windows_are_scoped_per_volume() {
+        let Some(dsn) = pg_dsn() else {
+            return;
+        };
+
+        let dir_a = tempdir().expect("tempdir a");
+        let dir_b = tempdir().expect("tempdir b");
+        let db_a = dir_a.path().join("meta-a.redb");
+        let db_b = dir_b.path().join("meta-b.redb");
+        let volume_a = PgTestVolume::new(&dsn, "pg-inode-window-volume-a");
+        let volume_b = PgTestVolume::new(&dsn, "pg-inode-window-volume-b");
+        seed_local(&db_a, &volume_a.format_info());
+        seed_local(&db_b, &volume_b.format_info());
+
+        let a = PgMetaEngine::open(&db_a).expect("open a");
+        let b = PgMetaEngine::open(&db_b).expect("open b");
+
+        let a_window = load_inode_state(&a.local);
+        let b_window = load_inode_state(&b.local);
+        assert_eq!(
+            a_window.current.start,
+            ROOT_INO + 1,
+            "first inode window for a new volume should start at the root successor"
+        );
+        assert_eq!(
+            b_window.current.start,
+            ROOT_INO + 1,
+            "inode windows must be scoped per volume rather than globally across postgres"
+        );
+
+        let a_file = a
+            .create_file(ROOT_INO, b"a-volume.txt", 0, 0, 0o644)
+            .expect("a create file");
+        let b_file = b
+            .create_file(ROOT_INO, b"b-volume.txt", 0, 0, 0o644)
+            .expect("b create file");
+        assert_eq!(
+            a_file.ino, b_file.ino,
+            "different volumes may reuse inode values because each volume owns its own namespace"
         );
     }
 

@@ -3,7 +3,8 @@
 use clap::Args;
 use std::path::Path;
 use studiofs_meta::{
-    FormatInfo, MetaFormat, RedbMetaEngine, ensure_studiofs_database, redb_engine::RedbSnapshot,
+    FormatInfo, MetaFormat, MetaOpenOptions, RedbMetaEngine, ensure_studiofs_database,
+    open_meta_engine_with_options, redb_engine::RedbSnapshot,
 };
 use thiserror::Error;
 
@@ -202,6 +203,15 @@ fn create_local_snapshot(
         }
     };
     engine.init_root(uid, gid)?;
+    drop(engine);
+
+    let primed_engine = open_meta_engine_with_options(
+        &db_path,
+        MetaOpenOptions {
+            background_poll: false,
+        },
+    )?;
+    drop(primed_engine);
 
     Ok(db_path)
 }
