@@ -144,32 +144,27 @@ impl<'a> WinfspHandleDrainFacade<'a> {
         file_name: Option<&U16CStr>,
         flags: u32,
     ) -> CleanupCallbackAction {
-        if flags & 0x01 != 0 {
-            if let Some(file_name) = file_name {
-                return match resolve_parent(&self.context.vfs, file_name) {
-                    Ok((parent_ino, name)) => {
-                        CleanupCallbackAction::Delete(HandleDrainDeleteRequest {
-                            ino: context.ino,
-                            parent_ino,
-                            name,
-                            is_dir: context.is_dir,
-                        })
-                    }
-                    Err(_) => CleanupCallbackAction::SkipDeletePath {
-                        ino: context.ino,
-                        is_dir: context.is_dir,
-                    },
-                };
-            }
-            return CleanupCallbackAction::SkipDeletePath {
+        if flags & 0x01 == 0 {
+            return CleanupCallbackAction::NonDelete {
                 ino: context.ino,
-                is_dir: context.is_dir,
+                fh: context.fh,
             };
         }
 
-        CleanupCallbackAction::NonDelete {
+        if let Some(file_name) = file_name
+            && let Ok((parent_ino, name)) = resolve_parent(&self.context.vfs, file_name)
+        {
+            return CleanupCallbackAction::Delete(HandleDrainDeleteRequest {
+                ino: context.ino,
+                parent_ino,
+                name,
+                is_dir: context.is_dir,
+            });
+        }
+
+        CleanupCallbackAction::SkipDeletePath {
             ino: context.ino,
-            fh: context.fh,
+            is_dir: context.is_dir,
         }
     }
 
