@@ -96,6 +96,10 @@ impl LocalBlockRuntimeDetection {
             || self.index_dir_exists
     }
 
+    pub const fn has_complete_runtime_layout(&self) -> bool {
+        !self.needs_runtime_provisioning()
+    }
+
     pub const fn needs_runtime_provisioning(&self) -> bool {
         !self.payload_blocks_dir_exists
             || !self.upload_blocks_dir_exists
@@ -104,7 +108,7 @@ impl LocalBlockRuntimeDetection {
     }
 
     pub fn runtime_backend(&self) -> Option<LocalBlockBackendKind> {
-        if !self.has_runtime_layout() {
+        if !self.has_complete_runtime_layout() {
             None
         } else {
             Some(LocalBlockBackendKind::Current)
@@ -1351,6 +1355,19 @@ mod tests {
             detection.runtime_backend(),
             Some(LocalBlockBackendKind::Current)
         );
+    }
+
+    #[test]
+    fn partial_runtime_layout_is_not_reported_as_current_backend() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        std::fs::create_dir_all(&layout.index_dir).unwrap();
+
+        let detection = detect_cache_backends(temp.path()).unwrap();
+        assert!(detection.has_runtime_layout());
+        assert!(!detection.has_complete_runtime_layout());
+        assert!(detection.needs_runtime_provisioning());
+        assert_eq!(detection.runtime_backend(), None);
     }
 
     #[test]

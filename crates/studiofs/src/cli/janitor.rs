@@ -575,7 +575,7 @@ mod tests {
             detection
                 .as_ref()
                 .and_then(LocalBlockRuntimeDetection::runtime_backend),
-            Some(LocalBlockBackendKind::Current)
+            None
         );
         assert_eq!(local_cache_state, None);
         assert!(

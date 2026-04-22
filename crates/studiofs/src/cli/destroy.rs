@@ -80,7 +80,7 @@ impl DestroyArgs {
 
 fn describe_destroy_cache_scope(detection: Option<&LocalBlockRuntimeDetection>) -> &'static str {
     if let Some(detection) = detection {
-        if detection.has_runtime_layout() {
+        if detection.runtime_backend().is_some() {
             "local cleanup removes the entire metadata directory (`meta_dir`), including the default cache root and its active UUID-scoped local-cache runtime"
         } else {
             "local cleanup removes the entire metadata directory (`meta_dir`), including any default cache-root contents under it"
@@ -357,6 +357,19 @@ mod tests {
         }
     }
 
+    fn partial_detection() -> LocalBlockRuntimeDetection {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        LocalBlockRuntimeDetection {
+            layout,
+            index_exists: false,
+            payload_blocks_dir_exists: false,
+            upload_blocks_dir_exists: false,
+            tmp_dir_exists: false,
+            index_dir_exists: true,
+        }
+    }
+
     #[test]
     fn destroy_cache_layout_state_labels_cover_layouts() {
         assert_eq!(describe_cache_layout_state(None), "unknown");
@@ -368,6 +381,10 @@ mod tests {
             describe_cache_layout_state(Some(&detection(true))),
             "Local block runtime ready"
         );
+        assert_eq!(
+            describe_cache_layout_state(Some(&partial_detection())),
+            "Local block runtime incomplete"
+        );
     }
 
     #[test]
@@ -378,6 +395,10 @@ mod tests {
         );
         assert_eq!(
             describe_destroy_cache_scope(Some(&detection(false))),
+            "local cleanup removes the entire metadata directory (`meta_dir`), including any default cache-root contents under it"
+        );
+        assert_eq!(
+            describe_destroy_cache_scope(Some(&partial_detection())),
             "local cleanup removes the entire metadata directory (`meta_dir`), including any default cache-root contents under it"
         );
         assert_eq!(

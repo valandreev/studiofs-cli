@@ -1030,10 +1030,10 @@ impl StudioVfs {
                             object_id = planned_block.object_id,
                             ino,
                             block_index,
-                            key,
-                            "metadata slice-graph base read missing remote fragment, zeroing span"
+                            key = %key,
+                            "metadata slice-graph base read missing remote fragment"
                         );
-                        dst.fill(0);
+                        return Err(VfsError::Fetch(crate::fetch::FetchError::NotFound { key }));
                     }
                     Err(error) => return Err(VfsError::Fetch(error)),
                 }
