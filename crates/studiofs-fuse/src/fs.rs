@@ -1,5 +1,7 @@
 //! fuser::Filesystem implementation — bridges FUSE kernel calls to StudioVfs.
 
+mod handle_drain;
+
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
@@ -12,6 +14,7 @@ use fuser::{
     ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr,
     Request,
 };
+use handle_drain::FuseHandleDrainFacade;
 use studiofs_meta::FileType;
 #[cfg(not(target_os = "macos"))]
 use studiofs_meta::ROOT_INO;
@@ -22,12 +25,9 @@ use studiofs_meta::schema::DirEntry;
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
 #[cfg(not(target_os = "macos"))]
 use studiofs_vfs::is_hidden_non_macos_root_metadata_name;
-use studiofs_vfs::vfs::{ExplicitFlushOutcome, ReleaseFhOutcome};
 use studiofs_vfs::{
-    BarrierObservabilityPort, BridgeVfsErrorKind, DeferredCleanupHintPort, DeleteCleanupPort,
-    FlushGatePort, HandleDrainBarrier, HandleDrainDeleteRequest, HandleDrainRequest,
-    HandleReleasePort, KernelInvalidator, LocalSyncBarrierPort, LockKind, OpenFlags, StudioVfs,
-    VfsError, classify_vfs_error, normalize_attr_times,
+    BridgeVfsErrorKind, KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsError,
+    classify_vfs_error, normalize_attr_times,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, error, warn};
@@ -365,143 +365,9 @@ impl StudioFuseFs {
             mount_gid,
         }
     }
-}
 
-type FuseHandleDrainBarrier<'a> = HandleDrainBarrier<
-    FuseLocalSyncBarrierPort<'a>,
-    FuseHandleReleasePort<'a>,
-    FuseDeferredCleanupHintPort,
-    FuseFlushGatePort,
-    FuseDeleteCleanupPort,
-    FuseBarrierObservabilityPort,
->;
-
-#[derive(Clone, Copy)]
-struct FuseLocalSyncBarrierPort<'a> {
-    fs: &'a StudioFuseFs,
-}
-
-#[derive(Clone, Copy)]
-struct FuseHandleReleasePort<'a> {
-    fs: &'a StudioFuseFs,
-}
-
-#[derive(Clone, Copy)]
-struct FuseDeferredCleanupHintPort;
-
-#[derive(Clone, Copy)]
-struct FuseFlushGatePort;
-
-#[derive(Clone, Copy)]
-struct FuseDeleteCleanupPort;
-
-#[derive(Clone, Copy)]
-struct FuseBarrierObservabilityPort;
-
-impl LocalSyncBarrierPort for FuseLocalSyncBarrierPort<'_> {
-    fn inode_has_local_dirty_state(&self, ino: studiofs_meta::types::Ino) -> bool {
-        self.fs.vfs.inode_has_local_dirty_state(ino)
-    }
-
-    fn explicit_flush(
-        &self,
-        request: HandleDrainRequest,
-    ) -> studiofs_vfs::VfsResult<ExplicitFlushOutcome> {
-        if request.fh != 0 {
-            self.fs
-                .rt
-                .block_on(self.fs.vfs.flush_fh_with_outcome(request.fh))
-        } else {
-            self.fs
-                .rt
-                .block_on(self.fs.vfs.flush_with_outcome(request.ino))
-        }
-    }
-}
-
-impl HandleReleasePort for FuseHandleReleasePort<'_> {
-    fn release_handle(
-        &self,
-        request: HandleDrainRequest,
-    ) -> studiofs_vfs::VfsResult<ReleaseFhOutcome> {
-        self.fs
-            .rt
-            .block_on(self.fs.vfs.release_fh_with_outcome(request.fh))
-    }
-}
-
-impl DeferredCleanupHintPort for FuseDeferredCleanupHintPort {
-    // FUSE does not have the WinFSP-style non-delete cleanup callback split, so
-    // there is no deferred-hint state to preserve in this bridge.
-    fn set_deferred_cleanup_hint(&self, _ino: studiofs_meta::types::Ino) {}
-
-    fn clear_deferred_cleanup_hint(&self, _ino: studiofs_meta::types::Ino) {}
-
-    fn take_deferred_cleanup_hint(&self, _ino: studiofs_meta::types::Ino) -> bool {
-        false
-    }
-
-    fn has_deferred_cleanup_hint(&self, _ino: studiofs_meta::types::Ino) -> bool {
-        false
-    }
-}
-
-impl FlushGatePort for FuseFlushGatePort {
-    // FUSE calls into the barrier from a direct synchronous bridge path and
-    // does not need callback-side coalescing, so the flush gate is a no-op.
-    fn with_flush_gate<T, F>(
-        &self,
-        _ino: studiofs_meta::types::Ino,
-        op: F,
-    ) -> studiofs_vfs::VfsResult<T>
-    where
-        F: FnOnce() -> studiofs_vfs::VfsResult<T>,
-    {
-        op()
-    }
-}
-
-impl DeleteCleanupPort for FuseDeleteCleanupPort {
-    // FUSE delete handling is not routed through this barrier facade.
-    fn cleanup_delete(&self, _request: HandleDrainDeleteRequest) {}
-}
-
-impl BarrierObservabilityPort for FuseBarrierObservabilityPort {
-    fn note_cleanup_callback(&self) {}
-
-    fn note_flush_callback(&self) {}
-
-    fn note_flush_barrier_outcome(&self, _flushed_local_dirty_state: bool) {}
-
-    fn note_close_callback(&self) {}
-
-    fn note_release_success(
-        &self,
-        _request: HandleDrainRequest,
-        _hint_was_taken: bool,
-        _outcome: ReleaseFhOutcome,
-    ) {
-    }
-
-    fn note_release_error(
-        &self,
-        _request: HandleDrainRequest,
-        _cleanup_deferred_hint: bool,
-        _error: &studiofs_vfs::VfsError,
-    ) {
-    }
-}
-
-impl StudioFuseFs {
-    fn handle_drain_barrier(&self) -> FuseHandleDrainBarrier<'_> {
-        HandleDrainBarrier::new(
-            FuseLocalSyncBarrierPort { fs: self },
-            FuseHandleReleasePort { fs: self },
-            FuseDeferredCleanupHintPort,
-            FuseFlushGatePort,
-            FuseDeleteCleanupPort,
-            FuseBarrierObservabilityPort,
-        )
+    fn handle_drain(&self) -> FuseHandleDrainFacade<'_> {
+        FuseHandleDrainFacade::new(self)
     }
 }
 
@@ -1088,10 +954,7 @@ impl Filesystem for StudioFuseFs {
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
-        match self
-            .handle_drain_barrier()
-            .on_flush(HandleDrainRequest { ino, fh })
-        {
+        match self.handle_drain().flush(ino, fh) {
             Ok(()) => reply.ok(),
             Err(e) => {
                 if fh != 0 {
@@ -1114,10 +977,7 @@ impl Filesystem for StudioFuseFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        match self
-            .handle_drain_barrier()
-            .on_release(HandleDrainRequest { ino, fh })
-        {
+        match self.handle_drain().release(ino, fh) {
             Ok(()) => reply.ok(),
             Err(e) => {
                 error!("release({ino}, fh={fh}) -> {e}");
@@ -1771,7 +1631,7 @@ impl KernelInvalidator for FuseKernelInvalidator {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_FUSE_MAX_READAHEAD_BYTES, HandleDrainRequest, StudioFuseFs, is_missing_xattr_error,
+        DEFAULT_FUSE_MAX_READAHEAD_BYTES, StudioFuseFs, is_missing_xattr_error,
         missing_xattr_errno, normalize_unix_mode, posix_flags_to_open_flags,
         should_log_invalidation_error, to_fuse_attr, vfs_err_to_errno,
     };
@@ -1815,7 +1675,7 @@ mod tests {
         }
     }
 
-    fn make_test_fuse_fs(
+    pub(super) fn make_test_fuse_fs(
         volume_suffix: &str,
     ) -> (TempDir, Arc<Runtime>, Arc<StudioVfs>, StudioFuseFs) {
         let tmp = TempDir::new().expect("tempdir");
@@ -2175,67 +2035,5 @@ mod tests {
 
         assert_eq!(old_for_nfc_request, cyrillic_nfd.as_bytes());
         assert_eq!(new_for_nfd_request, cyrillic_nfc.as_bytes());
-    }
-
-    #[test]
-    fn fuse_handle_drain_flush_uses_handle_backed_path() {
-        let (_tmp, rt, vfs, fs) = make_test_fuse_fs("flush-fh");
-        let created = vfs
-            .create(ROOT_INO, b"flush-fh.txt", 0, 0, 0o644)
-            .expect("create file");
-        let ino = created.ino;
-        let fh = vfs
-            .open_file(ino, OpenFlags::RDWR, false)
-            .expect("open file handle");
-
-        rt.block_on(vfs.write_fh(fh, ino, 0, b"hello"))
-            .expect("write via handle");
-        fs.handle_drain_barrier()
-            .on_flush(HandleDrainRequest { ino, fh })
-            .expect("handle-backed flush should succeed");
-        rt.block_on(vfs.release_fh(fh))
-            .expect("release file handle");
-
-        let data = rt.block_on(vfs.read(ino, 0, 5)).expect("read data");
-        assert_eq!(data.as_ref(), b"hello");
-    }
-
-    #[test]
-    fn fuse_handle_drain_flush_uses_inode_path_when_handle_is_zero() {
-        let (_tmp, rt, vfs, fs) = make_test_fuse_fs("flush-ino");
-        let created = vfs
-            .create(ROOT_INO, b"flush-ino.txt", 0, 0, 0o644)
-            .expect("create file");
-        let ino = created.ino;
-
-        rt.block_on(vfs.write(ino, 0, b"world"))
-            .expect("write via inode path");
-        fs.handle_drain_barrier()
-            .on_flush(HandleDrainRequest { ino, fh: 0 })
-            .expect("inode-backed flush should succeed");
-
-        let data = rt.block_on(vfs.read(ino, 0, 5)).expect("read data");
-        assert_eq!(data.as_ref(), b"world");
-    }
-
-    #[test]
-    fn fuse_handle_drain_release_uses_shared_release_path() {
-        let (_tmp, rt, vfs, fs) = make_test_fuse_fs("release");
-        let created = vfs
-            .create(ROOT_INO, b"release.txt", 0, 0, 0o644)
-            .expect("create file");
-        let ino = created.ino;
-        let fh = vfs
-            .open_file(ino, OpenFlags::RDWR, false)
-            .expect("open file handle");
-
-        rt.block_on(vfs.write_fh(fh, ino, 0, b"release"))
-            .expect("write via handle");
-        fs.handle_drain_barrier()
-            .on_release(HandleDrainRequest { ino, fh })
-            .expect("release should succeed");
-
-        let data = rt.block_on(vfs.read(ino, 0, 7)).expect("read data");
-        assert_eq!(data.as_ref(), b"release");
     }
 }
