@@ -1773,7 +1773,8 @@ mod tests {
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, HandleDrainRequest, StudioFuseFs, is_missing_xattr_error,
         missing_xattr_errno, normalize_unix_mode, posix_flags_to_open_flags,
-        should_log_invalidation_error, to_fuse_attr, vfs_err_to_errno,
+        should_hide_non_macos_root_metadata_entry, should_log_invalidation_error, to_fuse_attr,
+        vfs_err_to_errno,
     };
     #[cfg(target_os = "macos")]
     use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};

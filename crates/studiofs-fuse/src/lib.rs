@@ -214,6 +214,15 @@ mod tests {
             }
             Self { key, previous }
         }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: test helpers serialize env updates with a process-global lock.
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, previous }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -251,6 +260,10 @@ mod tests {
 
     #[test]
     fn build_mount_options_sets_core_fuse_flags() {
+        #[cfg(target_os = "linux")]
+        let _env_lock = env_lock().lock().expect("env lock");
+        #[cfg(target_os = "linux")]
+        let _guard = EnvVarGuard::unset("STUDIOFS_FUSE_ALLOW_OTHER");
         let options = build_mount_options("studiofs", false, false).expect("options");
         assert!(
             options
