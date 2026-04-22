@@ -199,9 +199,15 @@ impl HandleSliceWriter {
             return;
         }
 
+        let block_start = u64::from(block_index).saturating_mul(u64::from(self.block_size));
+        let block_end = block_start.saturating_add(u64::from(self.block_size));
         let mut ranges = Vec::new();
-        for write in self.writes.values() {
-            if write.block_index != block_index || write.data.is_empty() {
+        for write in self
+            .writes
+            .range(block_start..block_end)
+            .map(|(_, write)| write)
+        {
+            if write.data.is_empty() {
                 continue;
             }
             let start = offset_within_block(write.offset, self.block_size) as usize;

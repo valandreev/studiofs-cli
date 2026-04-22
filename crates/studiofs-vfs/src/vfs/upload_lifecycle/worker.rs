@@ -91,7 +91,6 @@ enum SingleUploadOutcome {
     Completed,
     CancelledDeleted,
     CancelledStale,
-    DeferredLocalPriority(Duration),
     Shutdown,
 }
 
@@ -167,11 +166,11 @@ trait CachedStorePort: Clone + Send + Sync + 'static {
 trait UploadLocalBlockPort: Clone + Send + Sync + 'static {
     fn mark_uploading(&self, object_id: u64);
     fn mark_upload_failed(&self, object_id: u64);
-    async fn local_priority_defer_delay(
+    async fn prepare_local_priority_read(
         &self,
         object_id: u64,
         adaptive_penalty: Duration,
-    ) -> VfsResult<Option<Duration>>;
+    ) -> VfsResult<()>;
     async fn read_for_upload(&self, object_id: u64) -> VfsResult<Option<Bytes>>;
     async fn remove(&self, object_id: u64) -> VfsResult<()>;
     async fn mark_uploaded(&self, object_id: u64) -> VfsResult<()>;
@@ -291,31 +290,6 @@ where
             Ok(SingleUploadOutcome::Completed) => UploadOutcome::Completed,
             Ok(SingleUploadOutcome::CancelledDeleted) => UploadOutcome::CancelledDeleted,
             Ok(SingleUploadOutcome::CancelledStale) => UploadOutcome::CancelledStale,
-            Ok(SingleUploadOutcome::DeferredLocalPriority(delay)) => {
-                let mut deferred_op = op;
-                deferred_op.not_before_unix_ms = now_unix_millis()
-                    .saturating_add(delay.as_millis().clamp(0, u64::MAX as u128) as u64);
-                self.shutdown.record_requeue();
-                debug!(
-                    object_id = deferred_op.object_id,
-                    ino = deferred_op.ino,
-                    delay_ms = delay.as_millis() as u64,
-                    not_before_unix_ms = deferred_op.not_before_unix_ms,
-                    "upload deferred to preserve local foreground priority"
-                );
-                self.policy
-                    .debug_pending_inode_state(deferred_op.ino, "upload_deferred_local_priority");
-                if !self.shutdown.uploader_shutdown_requested()
-                    && !self.coordinator.requeue_upload(deferred_op)
-                {
-                    error!("failed to requeue upload op after local-priority defer");
-                }
-                if !self.shutdown.uploader_shutdown_requested() {
-                    UploadOutcome::Requeued
-                } else {
-                    UploadOutcome::Shutdown
-                }
-            }
             Ok(SingleUploadOutcome::Shutdown) => UploadOutcome::Shutdown,
             Err(error) => {
                 if self.shutdown.uploader_shutdown_requested() {
@@ -475,13 +449,9 @@ where
             Err(error) => return Err(error),
         }
 
-        if let Some(delay) = self
-            .local_blocks
-            .local_priority_defer_delay(op.object_id, Duration::from_millis(adaptive_penalty_ms))
-            .await?
-        {
-            return Ok(SingleUploadOutcome::DeferredLocalPriority(delay));
-        }
+        self.local_blocks
+            .prepare_local_priority_read(op.object_id, Duration::from_millis(adaptive_penalty_ms))
+            .await?;
 
         let t0 = Instant::now();
         self.local_blocks.mark_uploading(op.object_id);
@@ -734,16 +704,16 @@ impl UploadLocalBlockPort for VfsUploadLocalBlockPort {
         self.vfs.local_block_backend.mark_upload_failed(object_id);
     }
 
-    async fn local_priority_defer_delay(
+    async fn prepare_local_priority_read(
         &self,
         object_id: u64,
         adaptive_penalty: Duration,
-    ) -> VfsResult<Option<Duration>> {
+    ) -> VfsResult<()> {
         if self.vfs.upload_hot_get(object_id).is_some() {
-            return Ok(None);
+            return Ok(());
         }
         if self.vfs.upload_stage_contains_async(object_id).await? {
-            return Ok(None);
+            return Ok(());
         }
         match self
             .vfs
@@ -759,7 +729,7 @@ impl UploadLocalBlockPort for VfsUploadLocalBlockPort {
                         "object_id": object_id,
                     }),
                 );
-                return Ok(None);
+                return Ok(());
             }
             Ok(()) => {}
             Err(error) => {
@@ -800,7 +770,7 @@ impl UploadLocalBlockPort for VfsUploadLocalBlockPort {
             );
             // #endregion debug log
         }
-        Ok(None)
+        Ok(())
     }
 
     async fn read_for_upload(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
@@ -1596,7 +1566,6 @@ mod tests {
         deferred: Arc<Mutex<Vec<(Ino, u64)>>>,
         pending_evictions: Arc<Mutex<HashSet<u64>>>,
         open_handles: Arc<Mutex<HashMap<Ino, usize>>>,
-        local_priority_delay: Arc<Mutex<Option<Duration>>>,
     }
 
     impl UploadLocalBlockPort for FakeLocalBlocks {
@@ -1606,12 +1575,12 @@ mod tests {
             self.failed.lock().push(object_id);
         }
 
-        async fn local_priority_defer_delay(
+        async fn prepare_local_priority_read(
             &self,
             _object_id: u64,
             _adaptive_penalty: Duration,
-        ) -> VfsResult<Option<Duration>> {
-            Ok(*self.local_priority_delay.lock())
+        ) -> VfsResult<()> {
+            Ok(())
         }
 
         async fn read_for_upload(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
@@ -2141,45 +2110,6 @@ mod tests {
         };
         assert_eq!(ready_op.object_id, op.object_id);
         assert!(delayed.is_empty());
-    }
-
-    #[tokio::test]
-    async fn process_upload_requeues_without_failure_when_local_priority_stays_busy() {
-        let (processor, coordinator, local_blocks, meta, _remote, shutdown, policy) =
-            processor_fixture();
-        let op = make_pending_upload();
-        coordinator.pending_inodes.lock().insert(op.ino);
-        meta.attrs
-            .lock()
-            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
-        meta.blocks
-            .lock()
-            .insert((op.ino, 0), Some(BlockRef::new_partial(op.object_id, 4096)));
-        *local_blocks.local_priority_delay.lock() = Some(Duration::from_millis(40));
-
-        let before_requeue = now_unix_millis();
-        let outcome = processor.process_upload(op).await;
-
-        assert_eq!(outcome, UploadOutcome::Requeued);
-        assert!(
-            local_blocks.failed.lock().is_empty(),
-            "local-priority defer should not mark the upload as failed"
-        );
-        assert!(
-            policy.sticky_errors.lock().is_empty(),
-            "local-priority defer should not surface a sticky upload error"
-        );
-        assert_eq!(shutdown.requeues.load(Ordering::Relaxed), 1);
-        let requeued = coordinator.requeued.lock();
-        assert_eq!(requeued.len(), 1);
-        assert_eq!(
-            requeued[0].retry_count, 0,
-            "local-priority defers should preserve the retry budget"
-        );
-        assert!(
-            requeued[0].not_before_unix_ms >= before_requeue.saturating_add(30),
-            "requeued op should wait for the local-priority delay window"
-        );
     }
 
     #[test]

@@ -68,16 +68,16 @@ impl StudioVfs {
                 >= super::AGGRESSIVE_MATERIALIZATION_BUFFERED_WRITE_THRESHOLD
     }
 
-    pub(super) async fn apply_write_path_soft_pacing(self: &Arc<Self>, preferred_ino: Ino) {
+    pub(super) async fn apply_write_path_soft_pacing(self: &Arc<Self>, preferred_ino: Ino) -> bool {
         if self.shutdown_requested() {
-            return;
+            return false;
         }
 
         let max_dirty = self.max_dirty_bytes();
         let total_dirty_bytes = self.state.handle_writers.total_dirty_bytes();
         if total_dirty_bytes > max_dirty {
             self.wait_for_soft_dirty_budget_relief(preferred_ino).await;
-            return;
+            return true;
         }
 
         let buffered_write_count = self.state.handle_writers.total_buffered_write_count();
@@ -86,7 +86,7 @@ impl StudioVfs {
             max_dirty,
             buffered_write_count,
         ) else {
-            return;
+            return false;
         };
 
         self.spawn_deferred_materialization_if_needed(preferred_ino)
@@ -106,6 +106,7 @@ impl StudioVfs {
         );
 
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        true
     }
 
     pub(super) async fn wait_for_soft_dirty_budget_relief(self: &Arc<Self>, preferred_ino: Ino) {
@@ -904,9 +905,11 @@ impl StudioVfs {
         data: &[u8],
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<u32> {
-        if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
-            self.apply_write_path_soft_pacing(ino).await;
-        }
+        let pre_buffer_paced = if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+            self.apply_write_path_soft_pacing(ino).await
+        } else {
+            false
+        };
 
         // ── Hard backpressure safety valve ───────────────────────────────
         // If background materialization falls behind and dirty memory is
@@ -988,7 +991,9 @@ impl StudioVfs {
         match (&result, local_sync_policy) {
             (Ok(_), LocalSyncPolicy::Opportunistic) => {
                 self.spawn_deferred_materialization_if_needed(ino).await;
-                self.apply_write_path_soft_pacing(ino).await;
+                if !pre_buffer_paced {
+                    self.apply_write_path_soft_pacing(ino).await;
+                }
             }
             (Ok(_), LocalSyncPolicy::Strict) => {
                 // Strict: await materialization inline (same as original).

@@ -114,6 +114,7 @@ impl UploadHotState {
         if self.budget_bytes == 0 || data.is_empty() {
             return;
         }
+        let len = data.len();
         self.next_generation = self.next_generation.saturating_add(1);
         let generation = self.next_generation;
         if let Some(previous) = self
@@ -122,9 +123,7 @@ impl UploadHotState {
         {
             self.total_bytes = self.total_bytes.saturating_sub(previous.data.len());
         }
-        self.total_bytes = self
-            .total_bytes
-            .saturating_add(self.entries[&object_id].data.len());
+        self.total_bytes = self.total_bytes.saturating_add(len);
         self.order.push_back((object_id, generation));
         self.evict_over_budget();
     }
