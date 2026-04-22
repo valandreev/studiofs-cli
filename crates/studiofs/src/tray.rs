@@ -29,7 +29,7 @@ mod supported {
     const ANIMATION_TICK: Duration = Duration::from_millis(100);
     const DIAGNOSTICS_POLL_INTERVAL: Duration = Duration::from_millis(300);
     const DIAGNOSTICS_STARTUP_GRACE: Duration = Duration::from_secs(5);
-    const IDLE_CYCLE: Duration = Duration::from_millis(2200);
+    const IDLE_CYCLE: Duration = Duration::from_millis(4400);
     const ACTIVE_CYCLE: Duration = Duration::from_millis(1200);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +88,6 @@ mod supported {
         mode: TrayPulseMode,
         mode_started_at: Instant,
         last_color: Option<[u8; 3]>,
-        creation_failed: bool,
     }
 
     impl TrayApp {
@@ -100,7 +99,6 @@ mod supported {
                 mode: TrayPulseMode::Booting,
                 mode_started_at: Instant::now(),
                 last_color: None,
-                creation_failed: false,
             }
         }
 
@@ -109,7 +107,6 @@ mod supported {
                 Ok(icon) => icon,
                 Err(error) => {
                     tracing::warn!(error = %error, "failed to build boot tray icon");
-                    self.creation_failed = true;
                     event_loop.exit();
                     return;
                 }
@@ -129,7 +126,6 @@ mod supported {
                         error = %error,
                         "tray initialization failed; continuing without tray"
                     );
-                    self.creation_failed = true;
                     event_loop.exit();
                 }
             }
