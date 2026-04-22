@@ -438,8 +438,13 @@ mod supported {
     }
 
     fn activity_mode(snapshot: &DiagnosticsRuntimeSnapshot) -> TrayPulseMode {
+        let pending_metadata_ops = snapshot
+            .synchronization
+            .state
+            .pending_metadata_ops
+            .saturating_add(snapshot.synchronization.state.inflight_metadata_ops);
         if snapshot.upload.pending_uploads > 0
-            || snapshot.synchronization.state.pending_metadata_ops > 0
+            || (pending_metadata_ops != 0 && pending_metadata_ops >= 10)
         {
             TrayPulseMode::Active
         } else {
@@ -529,7 +534,22 @@ mod supported {
         #[test]
         fn activity_mode_is_active_for_pending_metadata_ops() {
             let mut snapshot = DiagnosticsRuntimeSnapshot::default();
-            snapshot.synchronization.state.pending_metadata_ops = 1;
+            snapshot.synchronization.state.pending_metadata_ops = 10;
+            assert_eq!(activity_mode(&snapshot), TrayPulseMode::Active);
+        }
+
+        #[test]
+        fn activity_mode_is_idle_for_small_metadata_backlog() {
+            let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+            snapshot.synchronization.state.pending_metadata_ops = 9;
+            assert_eq!(activity_mode(&snapshot), TrayPulseMode::Idle);
+        }
+
+        #[test]
+        fn activity_mode_is_active_for_inflight_metadata_ops() {
+            let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+            snapshot.synchronization.state.pending_metadata_ops = 4;
+            snapshot.synchronization.state.inflight_metadata_ops = 6;
             assert_eq!(activity_mode(&snapshot), TrayPulseMode::Active);
         }
 
