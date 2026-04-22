@@ -143,7 +143,7 @@ impl Commands {
         match self {
             Self::Init(args) => args.dispatch(),
             Self::Discover(args) => args.dispatch(),
-            Self::Mount(args) => args.dispatch(),
+            Self::Mount(args) => args.dispatch_with_auto_tray(),
             Self::Umount(args) => args.dispatch(),
             Self::Status(args) => args.dispatch(),
             Self::Settings(args) => args.dispatch(),
