@@ -46,7 +46,7 @@ impl MountCommand {
     }
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 #[command(about = "Mount a filesystem volume as a local drive")]
 #[command(long_about = "\
 Mount a previously initialized volume. On Windows, the mount point is a drive \
@@ -57,6 +57,10 @@ state through PostgreSQL. Same-mount reads observe accepted writes \
 immediately through the Local-First view. Other mounts converge after \
 background upload and metadata publish; close does not imply a global \
 close-to-open barrier.
+
+On Windows and macOS, StudioFS automatically attempts to show a tray / menu-bar \
+status indicator when GUI services are available. If tray initialization fails, \
+the mount continues normally in CLI mode.
 
 The process blocks while the filesystem is mounted. Press Ctrl+C to unmount.")]
 #[command(after_help = "\
@@ -157,6 +161,18 @@ pub(crate) struct MountArgs {
 }
 
 impl MountArgs {
+    pub(crate) fn should_detach(&self) -> bool {
+        self.detach
+    }
+
+    pub(crate) fn volume_name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn dispatch_with_auto_tray(self) -> anyhow::Result<()> {
+        crate::tray::dispatch_mount_with_auto_tray(self)
+    }
+
     pub(crate) fn dispatch(self) -> anyhow::Result<()> {
         #[cfg(windows)]
         super::winfsp_bootstrap::ensure_mountmgr_bootstrap()?;

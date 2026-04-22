@@ -49,6 +49,11 @@ fs2 = "0.4"
 studiofs-fuse.workspace = true
 pyroscope = { version = "2", default-features = false, features = ["backend-jemalloc", "backend-pprof-rs"] }
 
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+tray-icon = "0.22.0"
+winit = "0.30.12"
+
 [target.'cfg(windows)'.dependencies]
 studiofs-winfsp.workspace = true
 winreg = "0.55"
