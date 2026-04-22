@@ -175,6 +175,17 @@ const HARD_BACKPRESSURE_DIRTY_MULTIPLIER: usize = 2;
 const AGGRESSIVE_MATERIALIZATION_DIRTY_DIVISOR: usize = 2;
 const AGGRESSIVE_MATERIALIZATION_BUFFERED_WRITE_THRESHOLD: usize = 64;
 const AGGRESSIVE_MATERIALIZATION_INTERVAL: Duration = Duration::from_millis(100);
+const SOFT_DIRTY_PACING_START_NUMERATOR: usize = 3;
+const SOFT_DIRTY_PACING_START_DENOMINATOR: usize = 5;
+const SOFT_DIRTY_PACING_HIGH_NUMERATOR: usize = 4;
+const SOFT_DIRTY_PACING_HIGH_DENOMINATOR: usize = 5;
+const SOFT_DIRTY_PACING_NEAR_LIMIT_NUMERATOR: usize = 9;
+const SOFT_DIRTY_PACING_NEAR_LIMIT_DENOMINATOR: usize = 10;
+const SOFT_DIRTY_PACING_DELAY_LIGHT_MS: u64 = 1;
+const SOFT_DIRTY_PACING_DELAY_MEDIUM_MS: u64 = 4;
+const SOFT_DIRTY_PACING_DELAY_HEAVY_MS: u64 = 8;
+const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_LIGHT: usize = 512;
+const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_HIGH: usize = 1024;
 const WRITE_BUFFER_POOL_MIN_BUFFERS: usize = 4;
 const WRITE_BUFFER_POOL_BUFFER_MULTIPLIER: usize = 2;
 
@@ -336,7 +347,7 @@ const DEFAULT_UPLOAD_USER_IDLE_GRACE_MS: u64 = 500;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS: u64 = 35;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS: u64 = 1_500;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS: u64 = 2;
-const DEFAULT_MAX_DIRTY_BYTES: usize = 300 * 1024 * 1024;
+const DEFAULT_MAX_DIRTY_BYTES: usize = 800 * 1024 * 1024;
 const DEFAULT_WRITE_EAGER_FLUSH_BATCH_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_FETCH_INITIAL_WINDOW: f64 = 0.0;
 const DEFAULT_FETCH_MIN_WINDOW: f64 = 1.0;
@@ -398,8 +409,8 @@ const DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS: u64 = 500;
 const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
-const CACHE_RUNTIME_MIN_DIRTY_BYTES: usize = 300 * 1024 * 1024;
-const CACHE_RUNTIME_MAX_DIRTY_BYTES_BASE: usize = 300 * 1024 * 1024;
+const CACHE_RUNTIME_MIN_DIRTY_BYTES: usize = 800 * 1024 * 1024;
+const CACHE_RUNTIME_MAX_DIRTY_BYTES_BASE: usize = 800 * 1024 * 1024;
 const DEBUG_PENDING_PATH_SUFFIX_ENV: &str = "STUDIOFS_DEBUG_PENDING_PATH_SUFFIX";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TwoTierSegment {
@@ -2102,6 +2113,47 @@ fn aggressive_materialization_threshold_bytes(max_dirty_bytes: usize) -> usize {
         .max(1)
 }
 
+fn soft_dirty_budget_pacing_delay_ms(
+    total_dirty_bytes: usize,
+    max_dirty_bytes: usize,
+    buffered_write_count: usize,
+) -> Option<u64> {
+    if max_dirty_bytes == 0 {
+        return None;
+    }
+
+    let start_threshold = max_dirty_bytes
+        .saturating_mul(SOFT_DIRTY_PACING_START_NUMERATOR)
+        .saturating_div(SOFT_DIRTY_PACING_START_DENOMINATOR)
+        .max(1);
+    let high_threshold = max_dirty_bytes
+        .saturating_mul(SOFT_DIRTY_PACING_HIGH_NUMERATOR)
+        .saturating_div(SOFT_DIRTY_PACING_HIGH_DENOMINATOR)
+        .max(start_threshold);
+    let near_limit_threshold = max_dirty_bytes
+        .saturating_mul(SOFT_DIRTY_PACING_NEAR_LIMIT_NUMERATOR)
+        .saturating_div(SOFT_DIRTY_PACING_NEAR_LIMIT_DENOMINATOR)
+        .max(high_threshold);
+
+    let mut delay_ms = if total_dirty_bytes >= near_limit_threshold {
+        SOFT_DIRTY_PACING_DELAY_HEAVY_MS
+    } else if total_dirty_bytes >= high_threshold {
+        SOFT_DIRTY_PACING_DELAY_MEDIUM_MS
+    } else if total_dirty_bytes >= start_threshold {
+        SOFT_DIRTY_PACING_DELAY_LIGHT_MS
+    } else {
+        0
+    };
+
+    if buffered_write_count >= SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_HIGH {
+        delay_ms = delay_ms.max(SOFT_DIRTY_PACING_DELAY_MEDIUM_MS);
+    } else if buffered_write_count >= SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_LIGHT {
+        delay_ms = delay_ms.max(SOFT_DIRTY_PACING_DELAY_LIGHT_MS);
+    }
+
+    (delay_ms > 0).then_some(delay_ms)
+}
+
 fn warn_small_block_addressability(block_size: u32) {
     let block_size_nonzero = block_size.max(1) as u128;
     const MIN_PRACTICAL_ADDRESSABLE_BYTES: u128 = 64u128 * 1024 * 1024 * 1024 * 1024;
@@ -2787,7 +2839,7 @@ impl<'a> StartupReplayCoordinator<'a> {
                     replayed_dirty_blocks = self.replay_ops.len(),
                     replayed_object_count = replayed_object_ids.len(),
                     error = %error,
-                    "startup replay failed to restore upload-stage links for runtime pending uploads"
+                    "startup replay failed to restore upload links for runtime pending uploads"
                 );
             }
             self.vfs.cached_store.submit_uploads_batch(&self.replay_ops);

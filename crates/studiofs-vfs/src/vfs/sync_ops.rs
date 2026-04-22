@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 use crate::VfsMeta;
 use crate::runtime::run_meta;
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 impl StudioVfs {
     #[cfg(test)]
@@ -66,6 +66,46 @@ impl StudioVfs {
                 >= super::aggressive_materialization_threshold_bytes(self.max_dirty_bytes())
             || self.state.handle_writers.total_buffered_write_count()
                 >= super::AGGRESSIVE_MATERIALIZATION_BUFFERED_WRITE_THRESHOLD
+    }
+
+    pub(super) async fn apply_write_path_soft_pacing(self: &Arc<Self>, preferred_ino: Ino) {
+        if self.shutdown_requested() {
+            return;
+        }
+
+        let max_dirty = self.max_dirty_bytes();
+        let total_dirty_bytes = self.state.handle_writers.total_dirty_bytes();
+        if total_dirty_bytes > max_dirty {
+            self.wait_for_soft_dirty_budget_relief(preferred_ino).await;
+            return;
+        }
+
+        let buffered_write_count = self.state.handle_writers.total_buffered_write_count();
+        let Some(delay_ms) = super::soft_dirty_budget_pacing_delay_ms(
+            total_dirty_bytes,
+            max_dirty,
+            buffered_write_count,
+        ) else {
+            return;
+        };
+
+        self.spawn_deferred_materialization_if_needed(preferred_ino)
+            .await;
+
+        self.debug_write_probe(
+            "H2",
+            "crates/studiofs-vfs/src/vfs/sync_ops.rs:86",
+            "soft dirty-budget pacing applied",
+            serde_json::json!({
+                "preferred_ino": preferred_ino,
+                "total_dirty_bytes": total_dirty_bytes,
+                "max_dirty_bytes": max_dirty,
+                "buffered_write_count": buffered_write_count,
+                "delay_ms": delay_ms,
+            }),
+        );
+
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     }
 
     pub(super) async fn wait_for_soft_dirty_budget_relief(self: &Arc<Self>, preferred_ino: Ino) {
@@ -865,7 +905,7 @@ impl StudioVfs {
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<u32> {
         if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
-            self.wait_for_soft_dirty_budget_relief(ino).await;
+            self.apply_write_path_soft_pacing(ino).await;
         }
 
         // ── Hard backpressure safety valve ───────────────────────────────
@@ -948,7 +988,7 @@ impl StudioVfs {
         match (&result, local_sync_policy) {
             (Ok(_), LocalSyncPolicy::Opportunistic) => {
                 self.spawn_deferred_materialization_if_needed(ino).await;
-                self.wait_for_soft_dirty_budget_relief(ino).await;
+                self.apply_write_path_soft_pacing(ino).await;
             }
             (Ok(_), LocalSyncPolicy::Strict) => {
                 // Strict: await materialization inline (same as original).

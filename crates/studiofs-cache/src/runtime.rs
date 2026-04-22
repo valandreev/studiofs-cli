@@ -40,10 +40,7 @@ pub use cache_index::{
 };
 use eviction::{CacheBudgetGovernor, EVICTION_CANDIDATE_PAGE_SIZE, EVICTION_DELETE_BATCH_SIZE};
 pub use file_payload_store::{FilePayloadStore, FilePayloadStoreError, PayloadBatchEntry};
-pub use layout::{
-    LOCAL_BLOCK_LAYOUT_MARKER_FILE, LOCAL_BLOCK_LAYOUT_VERSION, LOCAL_BLOCK_PAYLOAD_SHARD_COUNT,
-    LOCAL_BLOCK_REDB_INDEX_FILE, LOCAL_BLOCK_SUBTREE, LocalBlockLayout,
-};
+pub use layout::{LOCAL_BLOCK_PAYLOAD_SHARD_COUNT, LOCAL_BLOCK_REDB_INDEX_FILE, LocalBlockLayout};
 pub use reconcile::{LocalBlockStartupReconcileError, LocalBlockStartupReconcileReport};
 use reconcile::{LocalBlockStartupReconcileMode, reconcile_startup_state};
 
@@ -83,21 +80,25 @@ impl fmt::Display for LocalBlockBackendKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalBlockRuntimeDetection {
     pub layout: LocalBlockLayout,
-    pub layout_marker_exists: bool,
     pub index_exists: bool,
     pub payload_blocks_dir_exists: bool,
+    pub upload_blocks_dir_exists: bool,
     pub tmp_dir_exists: bool,
     pub index_dir_exists: bool,
 }
 
 impl LocalBlockRuntimeDetection {
     pub fn has_runtime_layout(&self) -> bool {
-        self.layout_marker_exists
+        self.index_exists
+            || self.payload_blocks_dir_exists
+            || self.upload_blocks_dir_exists
+            || self.tmp_dir_exists
+            || self.index_dir_exists
     }
 
     pub const fn needs_runtime_provisioning(&self) -> bool {
-        !self.layout_marker_exists
-            || !self.payload_blocks_dir_exists
+        !self.payload_blocks_dir_exists
+            || !self.upload_blocks_dir_exists
             || !self.tmp_dir_exists
             || !self.index_dir_exists
     }
@@ -114,16 +115,16 @@ impl LocalBlockRuntimeDetection {
 /// Detect backend contracts for a per-volume cache root.
 pub fn detect_cache_backends(cache_root: &Path) -> io::Result<LocalBlockRuntimeDetection> {
     let layout = LocalBlockLayout::from_cache_root(cache_root);
-    let layout_marker_exists = layout.layout_marker.try_exists()?;
     let index_exists = layout.redb_index_path.try_exists()?;
     let payload_blocks_dir_exists = layout.payload_blocks_dir.try_exists()?;
+    let upload_blocks_dir_exists = layout.upload_stage_blocks_dir.try_exists()?;
     let tmp_dir_exists = layout.tmp_dir.try_exists()?;
     let index_dir_exists = layout.index_dir.try_exists()?;
     Ok(LocalBlockRuntimeDetection {
         layout,
-        layout_marker_exists,
         index_exists,
         payload_blocks_dir_exists,
+        upload_blocks_dir_exists,
         tmp_dir_exists,
         index_dir_exists,
     })
@@ -151,8 +152,8 @@ pub enum LocalBlockPayloadSyncMode {
 pub enum LocalBlockBackendOpenError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
-    #[error("local block layout marker is missing at '{path}'")]
-    MissingLayoutMarker { path: PathBuf },
+    #[error("local block runtime layout under '{cache_root}' is incomplete")]
+    IncompleteRuntimeLayout { cache_root: PathBuf },
     #[error("failed to open local block index at '{path}': {source}")]
     OpenCacheIndex {
         path: PathBuf,
@@ -240,9 +241,13 @@ impl LocalBlockBackendRuntime {
         payload_sync_mode: LocalBlockPayloadSyncMode,
     ) -> Result<Self, LocalBlockBackendOpenError> {
         let layout = LocalBlockLayout::from_cache_root(&config.cache_root);
-        if !layout.layout_marker.try_exists()? {
-            return Err(LocalBlockBackendOpenError::MissingLayoutMarker {
-                path: layout.layout_marker.clone(),
+        if !layout.payload_blocks_dir.try_exists()?
+            || !layout.upload_stage_blocks_dir.try_exists()?
+            || !layout.tmp_dir.try_exists()?
+            || !layout.index_dir.try_exists()?
+        {
+            return Err(LocalBlockBackendOpenError::IncompleteRuntimeLayout {
+                cache_root: layout.runtime_root.clone(),
             });
         }
 
@@ -1310,8 +1315,7 @@ mod tests {
     use crate::local::{LocalBlockOrigin, LocalBlockUploadState};
 
     fn create_v3_marker(layout: &LocalBlockLayout) {
-        std::fs::create_dir_all(&layout.runtime_root).unwrap();
-        std::fs::write(&layout.layout_marker, b"v1").unwrap();
+        layout.provision().unwrap();
     }
 
     #[test]
@@ -1322,6 +1326,7 @@ mod tests {
         assert!(!detection.has_runtime_layout());
         assert!(!detection.index_exists);
         assert!(!detection.payload_blocks_dir_exists);
+        assert!(!detection.upload_blocks_dir_exists);
         assert!(!detection.tmp_dir_exists);
         assert!(!detection.index_dir_exists);
         assert!(detection.needs_runtime_provisioning());
@@ -1337,10 +1342,11 @@ mod tests {
         let detection = detect_cache_backends(temp.path()).unwrap();
         assert!(detection.has_runtime_layout());
         assert!(!detection.index_exists);
-        assert!(!detection.payload_blocks_dir_exists);
-        assert!(!detection.tmp_dir_exists);
-        assert!(!detection.index_dir_exists);
-        assert!(detection.needs_runtime_provisioning());
+        assert!(detection.payload_blocks_dir_exists);
+        assert!(detection.upload_blocks_dir_exists);
+        assert!(detection.tmp_dir_exists);
+        assert!(detection.index_dir_exists);
+        assert!(!detection.needs_runtime_provisioning());
         assert_eq!(
             detection.runtime_backend(),
             Some(LocalBlockBackendKind::Current)
@@ -1348,7 +1354,7 @@ mod tests {
     }
 
     #[test]
-    fn local_block_backend_requires_layout_marker() {
+    fn local_block_backend_requires_runtime_dirs() {
         let temp = tempfile::tempdir().unwrap();
         let err = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
             cache_root: temp.path().to_path_buf(),
@@ -1357,7 +1363,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            LocalBlockBackendOpenError::MissingLayoutMarker { .. }
+            LocalBlockBackendOpenError::IncompleteRuntimeLayout { .. }
         ));
     }
 

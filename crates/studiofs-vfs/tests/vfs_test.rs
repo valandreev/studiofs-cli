@@ -91,10 +91,9 @@ fn make_format_info(volume_suffix: &str) -> FormatInfo {
     }
 }
 
-fn create_cache_v3_layout_marker(cache_root: &std::path::Path) {
+fn provision_cache_runtime_layout(cache_root: &std::path::Path) {
     let layout = LocalBlockLayout::from_cache_root(cache_root);
-    std::fs::create_dir_all(&layout.runtime_root).unwrap();
-    std::fs::write(&layout.layout_marker, b"v1").unwrap();
+    layout.provision().unwrap();
 }
 
 fn workspace_root() -> &'static std::path::Path {
@@ -6521,7 +6520,7 @@ fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
-    create_cache_v3_layout_marker(&cache_dir);
+    provision_cache_runtime_layout(&cache_dir);
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
     let mut format_info = make_format_info_with_endpoint(
         &format!("local-block-runtime-replay-{}", std::process::id()),

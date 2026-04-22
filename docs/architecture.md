@@ -18,8 +18,8 @@ Core principles:
 - File payloads live in immutable blocks addressed by chunk-relative slices.
 - Runtime visibility is split into `writer state`, local authority view, and
   asynchronously replicated shared state.
-- The current `v3` subtree is an implementation detail of the local cache
-  backend, not the architecture name of the product.
+- The UUID-scoped cache root itself is the runtime boundary of the current
+  local cache backend.
 - Remote visibility switches atomically at the file-version boundary after peer
   replay/apply, not on local `close()`.
 
@@ -91,9 +91,9 @@ foreground read path.
 
 - `studiofs-cache` provides the backend-agnostic local cache boundary plus the
   `CachedStore` runtime for local-durable payload handling, the runtime
-  pending-upload queue, upload-stage helpers, and pending-upload pinning.
-- The current disk layout lives under `<cache-root>/v3/**`; that versioned
-  subtree is an implementation detail, not a separate architecture.
+  pending-upload queue, upload helpers, and pending-upload pinning.
+- The current disk layout lives directly under `<cache-root>/**`; the
+  UUID-scoped cache root itself is the runtime boundary.
 - Upload is a background payload data plane seeded directly from local durable
   commit and startup replay. Publication is a separate control-plane step that
   flips remote visibility at file-version granularity once metadata lifecycle

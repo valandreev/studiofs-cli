@@ -119,7 +119,7 @@ mod tests {
         assert_eq!(
             payload_store.get(0x42).unwrap().as_ref(),
             b"payload",
-            "removing the upload-stage hardlink must keep the durable payload file intact"
+            "removing the upload hardlink must keep the durable payload file intact"
         );
     }
 }

@@ -73,8 +73,8 @@ impl VfsBootstrapPlan {
         if local_backend_budget_bytes > cache_size {
             warn!(
                 configured_cache_size_bytes = cache_size,
-                minimum_required_cache_v3_budget_bytes = minimum_local_backend_budget_bytes,
-                effective_cache_v3_budget_bytes = local_backend_budget_bytes,
+                minimum_required_local_backend_budget_bytes = minimum_local_backend_budget_bytes,
+                effective_local_backend_budget_bytes = local_backend_budget_bytes,
                 block_size,
                 max_dirty_bytes = cache_runtime_tuning.max_dirty_bytes,
                 write_eager_flush_batch_bytes = cache_runtime_tuning.write_eager_flush_batch_bytes,
@@ -286,9 +286,8 @@ impl VfsBootstrapResources {
         if opened_local_backend.detection.has_runtime_layout() {
             info!(
                 cache_root = %opened_local_backend.detection.layout.cache_root.display(),
-                layout_marker = %opened_local_backend.detection.layout.layout_marker.display(),
                 runtime_root = %opened_local_backend.detection.layout.runtime_root.display(),
-                "using current file-per-block local backend under the v3 subtree"
+                "using current file-per-block local backend under the volume cache root"
             );
         }
         let local_block_backend = opened_local_backend.backend;
@@ -631,7 +630,7 @@ mod tests {
     #[test]
     fn open_local_block_backend_provision_errors_surface_clear_runtime_message() {
         let source = OpenLocalBlockBackendError::ProvisionLocalBlockLayout {
-            cache_root: "E:\\cache-root\\v3".to_string(),
+            cache_root: "E:\\cache-root".to_string(),
             source: std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "simulated permission error",
@@ -641,14 +640,14 @@ mod tests {
         match mapped {
             VfsError::Other(message) => {
                 assert!(message.contains("failed to provision local block runtime layout"));
-                assert!(message.contains("E:\\cache-root\\v3"));
+                assert!(message.contains("E:\\cache-root"));
             }
             other => panic!("unexpected error variant: {other}"),
         }
     }
 
     #[test]
-    fn studio_vfs_new_selects_local_block_runtime_for_v3_only_layout() {
+    fn studio_vfs_new_selects_local_block_runtime_for_runtime_root_layout() {
         let tmp = TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("meta.redb");
         let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
@@ -659,8 +658,7 @@ mod tests {
         let data_config = DataStoreConfig::from(&format_info);
         let cache_dir = tmp.path().join("cache");
         let layout = studiofs_cache::runtime::LocalBlockLayout::from_cache_root(&cache_dir);
-        std::fs::create_dir_all(&layout.runtime_root).expect("create runtime root");
-        std::fs::write(&layout.layout_marker, b"v1").expect("create runtime marker");
+        layout.provision().expect("provision runtime layout");
 
         let rt = Runtime::new().expect("runtime");
         let _guard = rt.enter();

@@ -36,8 +36,8 @@ use crate::vfs::{
 
 use super::{OpenFile, VfsError, VfsResult};
 
-pub(super) const CACHE_RUNTIME_MAX_DIRTY_BYTES_LARGE: usize = 300 * 1024 * 1024;
-pub(super) const CACHE_RUNTIME_MAX_DIRTY_BYTES_HUGE: usize = 300 * 1024 * 1024;
+pub(super) const CACHE_RUNTIME_MAX_DIRTY_BYTES_LARGE: usize = 800 * 1024 * 1024;
+pub(super) const CACHE_RUNTIME_MAX_DIRTY_BYTES_HUGE: usize = 800 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_MIN_WRITE_EAGER_BATCH_BYTES: usize = 16 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_MAX_WRITE_EAGER_BATCH_BYTES: usize = 128 * 1024 * 1024;
 pub(super) const WRITE_EAGER_DRAIN_CHUNK_MAX_BYTES: usize = 32 * 1024 * 1024;

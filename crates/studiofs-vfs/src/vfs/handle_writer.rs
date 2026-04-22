@@ -742,6 +742,55 @@ impl StudioVfs {
             .collect()
     }
 
+    fn eager_materialization_block_cap(&self) -> usize {
+        self.write_eager_flush_drain_chunk_bytes
+            .div_ceil(self.block_size as usize)
+            .max(1)
+    }
+
+    fn select_completed_blocks_for_eager_materialization(
+        &self,
+        completed_block_indexes: &HashSet<u32>,
+        current_write_full_block_indexes: &HashSet<u32>,
+        local_sync_policy: LocalSyncPolicy,
+    ) -> HashSet<u32> {
+        if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
+            return completed_block_indexes.clone();
+        }
+
+        let block_cap = self.eager_materialization_block_cap();
+        if completed_block_indexes.len() <= block_cap {
+            return completed_block_indexes.clone();
+        }
+
+        let mut selected = BTreeSet::new();
+        for block_index in current_write_full_block_indexes
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+        {
+            if completed_block_indexes.contains(&block_index) {
+                selected.insert(block_index);
+                if selected.len() >= block_cap {
+                    return selected.into_iter().collect();
+                }
+            }
+        }
+
+        for block_index in completed_block_indexes
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+        {
+            selected.insert(block_index);
+            if selected.len() >= block_cap {
+                break;
+            }
+        }
+
+        selected.into_iter().collect()
+    }
+
     async fn build_dirty_write_snapshots_for_handle_writer_blocks(
         &self,
         ino: Ino,
@@ -1120,10 +1169,15 @@ impl StudioVfs {
         }
         let current_write_full_block_indexes = self
             .fully_overwritten_full_block_indexes_for_current_handle_write(&writes, visible_size);
+        let selected_block_indexes = self.select_completed_blocks_for_eager_materialization(
+            &completed_block_indexes,
+            &current_write_full_block_indexes,
+            local_sync_policy,
+        );
 
         let mut seqs_by_block = HashMap::<u32, u64>::new();
         for write in &writes {
-            if completed_block_indexes.contains(&write.block_index) {
+            if selected_block_indexes.contains(&write.block_index) {
                 seqs_by_block
                     .entry(write.block_index)
                     .and_modify(|seq| *seq = (*seq).max(write.seq))
@@ -1197,8 +1251,8 @@ impl StudioVfs {
                 ino,
                 &writes,
                 visible_size,
-                &completed_block_indexes,
-                &completed_block_indexes,
+                &selected_block_indexes,
+                &selected_block_indexes,
                 false,
             )
             .await?;

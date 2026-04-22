@@ -456,7 +456,7 @@ fn startup_replay_rebuilds_runtime_pending_upload_index_from_persisted_state() {
     );
     assert!(
         vfs.cached_store().has_staged_upload(object_id),
-        "startup replay should restore upload-stage links so recovered uploads do not depend on cold rereads"
+        "startup replay should restore upload links so recovered uploads do not depend on cold rereads"
     );
 }
 
@@ -1378,6 +1378,18 @@ fn cache_runtime_tuning_defaults_match_juicefs_sized_windows() {
 
     assert_eq!(derived.max_dirty_bytes, DEFAULT_MAX_DIRTY_BYTES);
     assert_eq!(derived.transit_memory_budget_bytes, 300 * 1024 * 1024);
+}
+
+#[test]
+fn soft_dirty_budget_pacing_starts_before_hard_limit() {
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 0), None);
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(59, 100, 0), None);
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(60, 100, 0), Some(1));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(80, 100, 0), Some(4));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(90, 100, 0), Some(8));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 512), Some(1));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 1024), Some(4));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(82, 100, 1024), Some(4));
 }
 
 #[test]
@@ -2647,6 +2659,59 @@ fn write_fh_full_block_callbacks_can_form_multi_block_payload_bursts() {
         snapshot.payload_burst.max_blocks_per_burst >= 2,
         "buffered handle-write full blocks should be able to persist as a multi-block burst instead of one block at a time"
     );
+}
+
+#[test]
+fn opportunistic_completed_handle_writer_materialization_caps_burst_to_drain_chunk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = VfsConfig {
+        write_eager_flush_batch_bytes: 16 * 1024 * 1024,
+        ..VfsConfig::default()
+    };
+    let (rt, vfs, meta) = make_test_vfs_with_config(&tmp, "sfs-257-write-fh-capped-burst", cfg);
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-257-write-fh-capped-burst.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let block_size = vfs.block_size as usize;
+        let first = vec![0x11; block_size];
+        let second = vec![0x22; block_size];
+        let third = vec![0x33; block_size];
+
+        vfs.record_handle_writer_state(fh, ino, 0, &first).await.unwrap();
+        vfs.record_handle_writer_state(fh, ino, block_size as u64, &second)
+            .await
+            .unwrap();
+        vfs.record_handle_writer_state(fh, ino, (block_size * 2) as u64, &third)
+            .await
+            .unwrap();
+
+        assert!(
+            vfs.materialize_completed_handle_writer_blocks_for_inode(
+                ino,
+                LocalSyncPolicy::Opportunistic
+            )
+            .await
+            .unwrap(),
+            "opportunistic materialization should persist at least one capped burst"
+        );
+        assert_eq!(
+            meta.get_file_blocks(ino).unwrap().len(),
+            2,
+            "one opportunistic pass should respect the eager drain chunk cap instead of draining every completed full block"
+        );
+        assert_eq!(
+            vfs.state.handle_writers.dirty_bytes_for_inode(ino),
+            block_size,
+            "the final completed block should stay buffered for the next opportunistic pass"
+        );
+
+        vfs.flush_fh(fh).await.unwrap();
+        vfs.release_fh(fh).await.unwrap();
+    });
 }
 
 #[test]

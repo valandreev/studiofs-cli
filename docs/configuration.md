@@ -426,6 +426,9 @@ Operator stance for the rewrite:
 | `--prefetch` | `1` | Prefetch concurrency budget |
 | `--principal` / `STUDIOFS_PRINCIPAL` | `*` | Principal used for ACL checks |
 
+The writeback dirty-buffer default is hardcoded to `800MB` (`max_dirty_bytes`) to stay
+closer to the smoother writeback window we want for long sequential writers.
+
 ### Transitional and expert overrides
 
 The current code still accepts additional `STUDIOFS_*` runtime overrides through
@@ -493,7 +496,7 @@ Dentry/path shortcut logs also include negative-hit ratio. The summary `upload p
 Local backend read/write throughput metrics are lifetime averages since the current backend instance was opened (not short-window/EMA samples).
 
 Upload local-I/O tuning notes:
-- upload workers source payload bytes from persisted local payload sources after dequeue: hot upload buffer, upload-stage helpers, or local backend fallback.
+- upload workers source payload bytes from persisted local payload sources after dequeue: hot upload buffer, upload helpers, or local backend fallback.
 - upload local-cache I/O slots are held only around the local payload-read phase and then released before remote upload work continues.
 - upload local rereads use `get_for_upload()` on the local backend, which issues a best-effort post-read `DONT_NEED` advisory over the full on-disk block span (header + payload, aligned to block start) on Linux and does not refresh LRU recency.
 - adaptive upload penalty is enforced before local-cache read permits are acquired, so throttling creates disk idle gaps before background L2 reads.

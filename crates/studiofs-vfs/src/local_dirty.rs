@@ -761,7 +761,7 @@ impl LocalBlockWriterPort for VfsLocalBlockWriter<'_> {
                 warn!(
                     persisted_block_count = persisted_blocks.len(),
                     error = %error,
-                    "failed to create zero-copy upload-stage links for durable payload blocks"
+                    "failed to create zero-copy upload links for durable payload blocks"
                 );
             }
             Ok(())
@@ -812,7 +812,7 @@ impl LocalBlockWriterPort for VfsLocalBlockWriter<'_> {
                 stage,
                 object_count = object_ids.len(),
                 error = %error,
-                "local-dirty cleanup of uncommitted upload-stage entries failed"
+                "local-dirty cleanup of uncommitted upload entries failed"
             );
         }
         self.vfs.upload_hot_remove_batch(object_ids);

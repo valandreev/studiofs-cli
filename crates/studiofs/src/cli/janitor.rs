@@ -564,8 +564,7 @@ mod tests {
 
         let cache_root = cache_base.join(volume_uuid);
         let layout = LocalBlockLayout::from_cache_root(&cache_root);
-        std::fs::create_dir_all(layout.runtime_root.as_path()).unwrap();
-        std::fs::write(&layout.layout_marker, b"v3\n").unwrap();
+        std::fs::create_dir_all(&layout.index_dir).unwrap();
 
         let (inspected_path, detection, local_cache_state) =
             inspect_local_cache_runtime(&meta_dir, Some(cache_base.as_path()), volume_uuid)
@@ -584,8 +583,12 @@ mod tests {
             "janitor inspection should not provision missing runtime directories"
         );
         assert!(
-            !layout.index_dir.exists(),
-            "janitor inspection should remain read-only for missing runtime directories"
+            layout.index_dir.exists(),
+            "the seeded partial runtime directory should stay intact"
+        );
+        assert!(
+            !layout.upload_stage_blocks_dir.exists(),
+            "janitor inspection should not provision the upload directory as a side effect"
         );
         assert!(
             !layout.tmp_dir.exists(),

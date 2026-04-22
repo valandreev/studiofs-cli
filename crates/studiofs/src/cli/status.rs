@@ -290,15 +290,6 @@ pub fn run(
     println!("  Cache layout state:  {}", contract_state);
     if let Some(detection) = cache_backend_detection.as_ref() {
         println!(
-            "  Local cache marker:  {} ({})",
-            detection.layout.layout_marker.display(),
-            if detection.has_runtime_layout() {
-                "present"
-            } else {
-                "absent"
-            }
-        );
-        println!(
             "  Local cache index:   {} ({})",
             detection.layout.redb_index_path.display(),
             if detection.index_exists {
@@ -317,7 +308,16 @@ pub fn run(
             }
         );
         println!(
-            "  Disk subtree:        {}",
+            "  Local cache upload:  {} ({})",
+            detection.layout.upload_stage_blocks_dir.display(),
+            if detection.upload_blocks_dir_exists {
+                "present"
+            } else {
+                "absent"
+            }
+        );
+        println!(
+            "  Runtime root:        {}",
             detection.layout.runtime_root.display()
         );
     }
@@ -543,8 +543,7 @@ mod tests {
     fn scan_pending_uploads_supports_current_local_block_runtime() {
         let tmp = tempfile::tempdir().unwrap();
         let layout = studiofs_cache::runtime::LocalBlockLayout::from_cache_root(tmp.path());
-        std::fs::create_dir_all(&layout.runtime_root).unwrap();
-        std::fs::write(&layout.layout_marker, b"v1").unwrap();
+        layout.provision().unwrap();
         let volume_uuid = Uuid::new_v4();
 
         let detection = detect_backends(tmp.path()).unwrap();

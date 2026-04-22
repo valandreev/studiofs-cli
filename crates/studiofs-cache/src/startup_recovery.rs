@@ -1,8 +1,7 @@
 //! Startup reconciliation for the current local block runtime.
 //!
-//! Startup reconciliation is intentionally scoped to the runtime's current
-//! `v3/` subtree implementation detail. It never mutates unrelated files under
-//! the cache root.
+//! Startup reconciliation is intentionally scoped to the runtime root. It never
+//! mutates unrelated files under the cache root.
 
 use std::io;
 use std::path::Path;
@@ -66,7 +65,7 @@ pub enum LocalBlockStartupReconcileError {
 /// Reconcile startup state for the current local block runtime.
 ///
 /// `Lightweight` mode:
-/// - delete orphan temp files under `v3/tmp/**`;
+/// - delete orphan temp files under `tmp/**`;
 /// - prune dirty/uploading index entries that reference missing payload files.
 ///
 /// `Full` mode additionally:
@@ -248,8 +247,7 @@ mod tests {
     use crate::local::{LocalBlockLifecycleState, LocalBlockOrigin, LocalBlockUploadState};
 
     fn create_v3_marker(layout: &LocalBlockLayout) {
-        std::fs::create_dir_all(&layout.runtime_root).unwrap();
-        std::fs::write(&layout.layout_marker, b"v1").unwrap();
+        layout.provision().unwrap();
     }
 
     fn payload_key(layout: &LocalBlockLayout, object_id: u64) -> Vec<u8> {

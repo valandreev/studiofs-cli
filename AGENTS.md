@@ -245,8 +245,8 @@ AGENTS snapshot differ from that contract, the contract wins.
 ### Cache Note
 
 - Cache-v2 storage code has been removed from the workspace.
-- The current on-disk local cache backend lives under the `v3` subtree; treat that as an implementation detail, not the product architecture name.
-- `CachedStore` owns the runtime pending-upload queue, upload-stage helpers, and pending-upload pinning for production mounts.
+- The current on-disk local cache backend lives directly under the UUID-scoped cache root.
+- `CachedStore` owns the runtime pending-upload queue, upload helpers, and pending-upload pinning for production mounts.
 - `BenchmarkCache` owns the lightweight in-memory benchmark cache surface.
 
 ### Environment Variables

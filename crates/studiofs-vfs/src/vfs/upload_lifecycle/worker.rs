@@ -840,7 +840,7 @@ impl UploadLocalBlockPort for VfsUploadLocalBlockPort {
             self.vfs.debug_write_probe(
                 "H5",
                 "crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs:752",
-                "upload read served from upload-stage hardlink",
+                "upload read served from upload hardlink",
                 serde_json::json!({
                     "object_id": object_id,
                     "buffer_bytes": staged_payload.len(),
