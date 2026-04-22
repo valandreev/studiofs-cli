@@ -212,10 +212,10 @@ mod supported {
             self.mode = mode;
             self.mode_started_at = Instant::now();
             self.last_color = None;
-            if let Some(tray_icon) = self.tray_icon.as_ref()
-                && let Err(error) = tray_icon.set_tooltip(Some(&self.tooltip_for(mode)))
-            {
-                tracing::debug!(error = %error, "failed to update tray tooltip");
+            if let Some(tray_icon) = self.tray_icon.as_ref() {
+                if let Err(error) = tray_icon.set_tooltip(Some(&self.tooltip_for(mode))) {
+                    tracing::debug!(error = %error, "failed to update tray tooltip");
+                }
             }
         }
 
@@ -401,14 +401,6 @@ mod supported {
                         }
                     }
 
-                    if matches!(
-                        next_mode,
-                        TrayPulseMode::Booting | TrayPulseMode::Unavailable
-                    ) && discovery.is_none()
-                    {
-                        discovery = find_local_mount_session(process_id, &volume_name);
-                    }
-
                     std::thread::sleep(DIAGNOSTICS_POLL_INTERVAL);
                 }
             })
@@ -420,10 +412,10 @@ mod supported {
     }
 
     fn join_optional_thread(name: &str, handle: Option<JoinHandle<()>>) {
-        if let Some(handle) = handle
-            && handle.join().is_err()
-        {
-            tracing::warn!(thread = name, "background tray helper thread panicked");
+        if let Some(handle) = handle {
+            if handle.join().is_err() {
+                tracing::warn!(thread = name, "background tray helper thread panicked");
+            }
         }
     }
 
