@@ -429,8 +429,8 @@ impl<'a> DiagnosticsSessionService<'a> {
             store,
             self.deps.source,
             self.deps.profiling,
-            workflow_run_id.to_string(),
-            step_id.to_string(),
+            workflow_run_id,
+            step_id,
         )
     }
 
@@ -465,9 +465,9 @@ impl<'a> DiagnosticsSessionService<'a> {
                 format!("workflow step '{}' is not waiting for operator", step_id),
             ));
         }
-        if let Some(marker_title) = workflow.steps[step_index].on_exit_marker.clone()
+        if let Some(marker_title) = workflow.steps[step_index].on_exit_marker.as_deref()
             && let Err(error) =
-                append_workflow_marker(store, &workflow.run_id, &marker_title, self.deps.source)
+                append_workflow_marker(store, &workflow.run_id, marker_title, self.deps.source)
         {
             return Err(DiagnosticsServiceError::InvestigationStore(error));
         }
@@ -512,8 +512,8 @@ impl<'a> DiagnosticsSessionService<'a> {
         let mut workflow = store
             .load_workflow_run(workflow_run_id)
             .map_err(DiagnosticsServiceError::InvestigationStore)?;
-        if let Some(current_step_id) = workflow.current_step_id.clone()
-            && let Ok(step_index) = workflow_step_index(&workflow, &current_step_id)
+        if let Some(current_step_id) = workflow.current_step_id.as_deref()
+            && let Ok(step_index) = workflow_step_index(&workflow, current_step_id)
             && !workflow_step_is_terminal(workflow.steps[step_index].status)
         {
             workflow.steps[step_index].status = InvestigationWorkflowStepStatus::Aborted;
@@ -1059,11 +1059,11 @@ fn advance_workflow_step_operation(
     store: &InvestigationStore,
     source: &dyn DiagnosticsDataSource,
     profiling: Option<&DiagnosticsProfilingCoordinator>,
-    workflow_run_id: String,
-    step_id: String,
+    workflow_run_id: &str,
+    step_id: &str,
 ) -> DiagnosticsServiceResult<InvestigationWorkflowRun> {
     let mut workflow = store
-        .load_workflow_run(&workflow_run_id)
+        .load_workflow_run(workflow_run_id)
         .map_err(DiagnosticsServiceError::InvestigationStore)?;
     if matches!(
         workflow.status,
@@ -1079,7 +1079,7 @@ fn advance_workflow_step_operation(
             ),
         ));
     }
-    if workflow.current_step_id.as_deref() != Some(step_id.as_str()) {
+    if workflow.current_step_id.as_deref() != Some(step_id) {
         return Err(DiagnosticsServiceError::workflow(
             "workflow_invalid_step",
             format!(
@@ -1088,7 +1088,7 @@ fn advance_workflow_step_operation(
             ),
         ));
     }
-    let step_index = workflow_step_index(&workflow, &step_id).map_err(|error| {
+    let step_index = workflow_step_index(&workflow, step_id).map_err(|error| {
         DiagnosticsServiceError::workflow("workflow_invalid_step", error.to_string())
     })?;
     if !workflow_dependencies_satisfied(&workflow, &workflow.steps[step_index]) {
@@ -1114,9 +1114,9 @@ fn advance_workflow_step_operation(
         workflow.steps[step_index].started_unix_ms = Some(now_unix_millis());
         workflow.updated_unix_ms = now_unix_millis();
         workflow.status = InvestigationWorkflowStatus::WaitingForOperator;
-        if let Some(marker_title) = workflow.steps[step_index].on_enter_marker.clone()
+        if let Some(marker_title) = workflow.steps[step_index].on_enter_marker.as_deref()
             && let Err(error) =
-                append_workflow_marker(store, &workflow.run_id, &marker_title, source)
+                append_workflow_marker(store, &workflow.run_id, marker_title, source)
         {
             return Err(DiagnosticsServiceError::InvestigationStore(error));
         }
