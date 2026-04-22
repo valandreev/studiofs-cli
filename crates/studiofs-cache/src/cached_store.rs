@@ -135,6 +135,8 @@ impl UploadHotState {
     fn remove(&mut self, object_id: ObjectId) {
         if let Some(previous) = self.entries.remove(&object_id) {
             self.total_bytes = self.total_bytes.saturating_sub(previous.data.len());
+            self.order
+                .retain(|(queued_object_id, _)| *queued_object_id != object_id);
         }
     }
 
@@ -573,6 +575,25 @@ mod tests {
         assert_eq!(
             cached_store.get_hot_upload(3).as_deref(),
             Some(&b"cccc"[..])
+        );
+    }
+
+    #[test]
+    fn hot_upload_buffer_remove_cleans_lru_queue_entries() {
+        let mut state = UploadHotState::new(64);
+
+        state.insert(1, Bytes::from_static(b"aaaa"));
+        state.insert(1, Bytes::from_static(b"bbbb"));
+        state.insert(2, Bytes::from_static(b"cccc"));
+        assert_eq!(state.order.len(), 3);
+
+        state.remove(1);
+
+        assert!(state.get(1).is_none());
+        assert_eq!(state.order.len(), 1);
+        assert_eq!(
+            state.order.front().map(|(object_id, _)| *object_id),
+            Some(2)
         );
     }
 
