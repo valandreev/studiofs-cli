@@ -159,7 +159,7 @@ impl BarrierObservabilityPort for FuseBarrierObservabilityPort {
 
 #[cfg(test)]
 mod tests {
-    use super::super::make_test_fuse_fs;
+    use super::super::tests::make_test_fuse_fs;
     use super::FuseHandleDrainFacade;
     use studiofs_meta::ROOT_INO;
     use studiofs_vfs::OpenFlags;
