@@ -1827,17 +1827,19 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let meta_dir = temp.path().join("meta");
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
-        let cli_mount_point = startup_mount_point(&temp);
-        let mut command = mount_command("projectfs", &meta_dir, Some(cli_mount_point), None, None);
+        let mount_point = startup_mount_point(&temp);
+        let mut command = mount_command(
+            "projectfs",
+            &meta_dir,
+            Some(mount_point.clone()),
+            None,
+            None,
+        );
         command.endpoint = Some("ftp://127.0.0.1:9000".to_string());
 
         let err = MountPlan::resolve(MountRequest {
             command,
-            settings_config: startup_settings_config(
-                startup_mount_point(&temp),
-                None,
-                Some("64GB"),
-            ),
+            settings_config: startup_settings_config(mount_point, None, Some("64GB")),
         })
         .expect_err("invalid endpoint should fail");
 
@@ -1849,10 +1851,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let meta_dir = temp.path().join("meta");
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
+        let mount_point = startup_mount_point(&temp);
         let mut command = mount_command(
             "projectfs",
             &meta_dir,
-            Some(startup_mount_point(&temp)),
+            Some(mount_point.clone()),
             None,
             Some("64GB"),
         );
@@ -1860,11 +1863,7 @@ mod tests {
 
         let plan = MountPlan::resolve(MountRequest {
             command,
-            settings_config: startup_settings_config(
-                startup_mount_point(&temp),
-                None,
-                Some("64GB"),
-            ),
+            settings_config: startup_settings_config(mount_point, None, Some("64GB")),
         })
         .expect("mount plan resolved");
 
@@ -1943,10 +1942,11 @@ mod tests {
         let snapshot = engine.create_snapshot(ROOT_INO).expect("create snapshot");
         drop(engine);
         let events = Arc::new(Mutex::new(Vec::new()));
+        let mount_point = startup_mount_point(&temp);
         let mut command = mount_command(
             "demo",
             &meta_dir,
-            Some(startup_mount_point(&temp)),
+            Some(mount_point.clone()),
             Some(temp.path().join("cache")),
             Some("64GB"),
         );
@@ -1954,11 +1954,7 @@ mod tests {
 
         let prepared = MountPlan::resolve(MountRequest {
             command,
-            settings_config: startup_settings_config(
-                startup_mount_point(&temp),
-                None,
-                Some("64GB"),
-            ),
+            settings_config: startup_settings_config(mount_point, None, Some("64GB")),
         })
         .expect("mount plan resolved")
         .prepare(|| {
@@ -1997,10 +1993,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let meta_dir = temp.path().join("meta");
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
+        let mount_point = startup_mount_point(&temp);
         let mut command = mount_command(
             "demo",
             &meta_dir,
-            Some(startup_mount_point(&temp)),
+            Some(mount_point.clone()),
             None,
             Some("64GB"),
         );
@@ -2008,11 +2005,7 @@ mod tests {
 
         let prepared = MountPlan::resolve(MountRequest {
             command,
-            settings_config: startup_settings_config(
-                startup_mount_point(&temp),
-                None,
-                Some("64GB"),
-            ),
+            settings_config: startup_settings_config(mount_point, None, Some("64GB")),
         })
         .expect("mount plan resolved")
         .prepare(|| {
