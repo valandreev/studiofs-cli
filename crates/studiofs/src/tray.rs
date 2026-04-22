@@ -28,12 +28,14 @@ mod supported {
     const COLOR_WHITE: [u8; 3] = [0xF7, 0xF7, 0xF3];
     const ANIMATION_TICK: Duration = Duration::from_millis(100);
     const DIAGNOSTICS_POLL_INTERVAL: Duration = Duration::from_millis(300);
+    const DIAGNOSTICS_STARTUP_GRACE: Duration = Duration::from_secs(5);
     const IDLE_CYCLE: Duration = Duration::from_millis(2200);
     const ACTIVE_CYCLE: Duration = Duration::from_millis(1200);
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum TrayPulseMode {
         Booting,
+        Unavailable,
         Idle,
         Active,
     }
@@ -137,6 +139,12 @@ mod supported {
             match mode {
                 TrayPulseMode::Booting => {
                     format!("StudioFS {}: starting mount", self.volume_name)
+                }
+                TrayPulseMode::Unavailable => {
+                    format!(
+                        "StudioFS {}: mounted; live status unavailable",
+                        self.volume_name
+                    )
                 }
                 TrayPulseMode::Idle => {
                     format!("StudioFS {}: safe to shut down", self.volume_name)
@@ -259,10 +267,15 @@ mod supported {
                 let proxy = proxy.clone();
                 let stop = stop.clone();
                 move || {
-                    let result = mount_args.dispatch();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        mount_args.dispatch()
+                    }));
                     stop.store(true, Ordering::Release);
                     let _ = proxy.send_event(TrayUserEvent::MountFinished);
-                    result
+                    match result {
+                        Ok(result) => result,
+                        Err(payload) => std::panic::resume_unwind(payload),
+                    }
                 }
             })
             .map_err(|error| anyhow::anyhow!("failed to spawn mount thread: {error}"))?;
@@ -320,6 +333,7 @@ mod supported {
             .spawn(move || {
                 let mut last_mode = TrayPulseMode::Booting;
                 let mut discovery: Option<LocalDiagnosticsDiscovery> = None;
+                let monitor_started_at = Instant::now();
 
                 while !stop.load(Ordering::Acquire) {
                     if discovery.is_none() {
@@ -329,7 +343,7 @@ mod supported {
                     let next_mode = discovery
                         .as_ref()
                         .and_then(current_activity_mode)
-                        .unwrap_or(TrayPulseMode::Booting);
+                        .unwrap_or_else(|| fallback_mode(monitor_started_at));
 
                     if next_mode != last_mode {
                         last_mode = next_mode;
@@ -341,7 +355,11 @@ mod supported {
                         }
                     }
 
-                    if next_mode == TrayPulseMode::Booting {
+                    if matches!(
+                        next_mode,
+                        TrayPulseMode::Booting | TrayPulseMode::Unavailable
+                    ) && discovery.is_none()
+                    {
                         discovery = find_local_mount_session(process_id, &volume_name);
                     }
 
@@ -391,9 +409,18 @@ mod supported {
         }
     }
 
+    fn fallback_mode(monitor_started_at: Instant) -> TrayPulseMode {
+        if monitor_started_at.elapsed() < DIAGNOSTICS_STARTUP_GRACE {
+            TrayPulseMode::Booting
+        } else {
+            TrayPulseMode::Unavailable
+        }
+    }
+
     fn pulse_color(mode: TrayPulseMode, elapsed: Duration) -> [u8; 3] {
         match mode {
             TrayPulseMode::Booting => COLOR_BLACK,
+            TrayPulseMode::Unavailable => COLOR_WHITE,
             TrayPulseMode::Idle => {
                 blend_color(COLOR_WHITE, COLOR_BLUE, breathe_factor(elapsed, IDLE_CYCLE))
             }
@@ -449,6 +476,17 @@ mod supported {
         fn activity_mode_is_idle_when_synchronized() {
             let snapshot = DiagnosticsRuntimeSnapshot::default();
             assert_eq!(activity_mode(&snapshot), TrayPulseMode::Idle);
+        }
+
+        #[test]
+        fn fallback_mode_starts_as_booting() {
+            assert_eq!(fallback_mode(Instant::now()), TrayPulseMode::Booting);
+        }
+
+        #[test]
+        fn fallback_mode_becomes_unavailable_after_grace_period() {
+            let started_at = Instant::now() - DIAGNOSTICS_STARTUP_GRACE - Duration::from_millis(1);
+            assert_eq!(fallback_mode(started_at), TrayPulseMode::Unavailable);
         }
 
         #[test]
