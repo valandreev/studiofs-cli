@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>StudioFS Logo Final</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #f4f1e8;
+      --panel: rgba(255, 255, 255, 0.88);
+      --ink: #111317;
+      --muted: #6d737d;
+      --line: rgba(17, 19, 23, 0.12);
+      --shadow: 0 18px 56px rgba(17, 24, 39, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "Inter", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top right, rgba(17, 19, 23, 0.06), transparent 28%),
+        radial-gradient(circle at bottom left, rgba(36, 55, 87, 0.08), transparent 24%),
+        var(--bg);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 400 400' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.82' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+    }
+
+    .page {
+      width: min(1040px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 56px 0 84px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .mono {
+      font-family: "JetBrains Mono", monospace;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+    }
+
+    .hero {
+      display: grid;
+      gap: 14px;
+      margin-bottom: 34px;
+    }
+
+    .eyebrow {
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(40px, 8vw, 88px);
+      font-weight: 300;
+      line-height: 0.95;
+      letter-spacing: -0.045em;
+    }
+
+    .lede {
+      max-width: 700px;
+      font-size: 18px;
+      line-height: 1.7;
+      color: #2d333d;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1.2fr 0.8fr;
+      gap: 20px;
+    }
+
+    .card {
+      border-radius: 28px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+      padding: 24px;
+    }
+
+    .preview-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .stage {
+      min-height: 240px;
+      border-radius: 24px;
+      display: grid;
+      place-items: center;
+      border: 1px solid rgba(17, 19, 23, 0.08);
+    }
+
+    .stage.light {
+      background: linear-gradient(145deg, rgba(255,255,255,0.97), rgba(248,246,241,0.93));
+      color: #111317;
+    }
+
+    .stage.dark {
+      background: linear-gradient(145deg, #17191d, #222733);
+      color: #ffffff;
+    }
+
+    .stage.small {
+      min-height: 180px;
+    }
+
+    .stage img {
+      width: 156px;
+      height: 156px;
+    }
+
+    .stage.dark img {
+      filter: brightness(0) invert(1);
+    }
+
+    .stage.small img {
+      width: 72px;
+      height: 72px;
+    }
+
+    h2 {
+      margin: 0 0 12px;
+      font-size: 22px;
+      font-weight: 500;
+      letter-spacing: -0.03em;
+    }
+
+    p {
+      margin: 0;
+      color: #2d333d;
+      line-height: 1.7;
+    }
+
+    ul {
+      margin: 14px 0 0;
+      padding-left: 18px;
+      color: #2d333d;
+      line-height: 1.8;
+    }
+
+    code {
+      font-family: "JetBrains Mono", monospace;
+      font-size: 0.95em;
+    }
+
+    @media (max-width: 860px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      .preview-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <div class="eyebrow mono">StudioFS / final selected logo</div>
+      <h1>Block Cache, original</h1>
+      <p class="lede">
+        Finalized from the original exploration mark. The chosen version keeps the
+        asymmetry and the anchor dot below the hot block, which gave the symbol its
+        distinct personality.
+      </p>
+      <p class="lede">
+        Extended brand exploration: <a href="./brand-system.html">wordmark, color variants, and font study</a>.
+      </p>
+    </section>
+
+    <section class="grid">
+      <div class="card">
+        <h2>Preview</h2>
+        <div class="preview-grid">
+          <div class="stage light">
+            <img src="./studiofs-logo.svg" alt="StudioFS logo on light background" />
+          </div>
+          <div class="stage dark">
+            <img src="./studiofs-logo.svg" alt="StudioFS logo on dark background" />
+          </div>
+          <div class="stage light small">
+            <img src="./studiofs-logo.svg" alt="StudioFS logo small on light background" />
+          </div>
+          <div class="stage dark small">
+            <img src="./studiofs-logo.svg" alt="StudioFS logo small on dark background" />
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Assets</h2>
+        <p>
+          Canonical vector asset: <code>studiofs-logo.svg</code>
+        </p>
+        <ul>
+          <li>Transparent PNG exports live in <code>./png/</code></li>
+          <li>Raster sizes: <code>1024</code>, <code>512</code>, <code>256</code>, <code>128</code>, <code>64</code>, <code>32</code>, <code>16</code></li>
+          <li>The SVG stays color-flexible via <code>currentColor</code></li>
+        </ul>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

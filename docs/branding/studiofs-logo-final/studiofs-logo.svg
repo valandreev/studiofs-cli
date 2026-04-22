@@ -1,0 +1,33 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 100 100"
+  role="img"
+  aria-labelledby="title desc"
+>
+  <title id="title">StudioFS logo</title>
+  <desc id="desc">
+    StudioFS Block Cache logo with rounded volume frame, cache dots, and an
+    asymmetric anchor dot below the hot block.
+  </desc>
+  <rect
+    x="22"
+    y="22"
+    width="56"
+    height="56"
+    rx="18"
+    fill="none"
+    stroke="currentColor"
+    stroke-linejoin="round"
+    stroke-width="3.5"
+  />
+  <g fill="currentColor">
+    <circle cx="34" cy="36" r="3" />
+    <circle cx="48" cy="36" r="3" />
+    <circle cx="34" cy="50" r="3" />
+    <circle cx="48" cy="50" r="3" />
+    <circle cx="34" cy="64" r="3" />
+    <circle cx="48" cy="64" r="3" />
+    <circle cx="62" cy="64" r="3" />
+    <rect x="58" y="32" width="12" height="24" rx="6" />
+  </g>
+</svg>
