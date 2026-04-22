@@ -7,7 +7,8 @@ mod supported {
         DiagnosticsRuntimeSnapshot, LocalDiagnosticsClient, LocalDiagnosticsDiscovery,
         discover_local_sessions,
     };
-    use image::ImageFormat;
+    use image::imageops::FilterType;
+    use image::{GrayImage, ImageFormat};
     use std::f32::consts::PI;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,8 +21,9 @@ mod supported {
 
     const TRAY_ICON_PNG: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../docs/branding/studiofs-logo-final/png/studiofs-logo-32.png"
+        "/../../docs/branding/studiofs-logo-final/png/studiofs-logo-64.png"
     ));
+    const ICON_PADDING_DIVISOR: u32 = 16;
     const COLOR_BLACK: [u8; 3] = [0x11, 0x13, 0x17];
     const COLOR_BLUE: [u8; 3] = [0x23, 0x4A, 0x78];
     const COLOR_ORANGE: [u8; 3] = [0xA8, 0x57, 0x2A];
@@ -60,16 +62,64 @@ mod supported {
                 .map_err(|error| anyhow::anyhow!("failed to decode tray icon PNG: {error}"))?
                 .into_rgba8();
             let (width, height) = image.dimensions();
-            let alpha = image
-                .into_raw()
-                .chunks_exact(4)
-                .map(|pixel| pixel[3])
-                .collect::<Vec<_>>();
+            let alpha = Self::normalize_alpha_mask(&image);
             Ok(Self {
                 width,
                 height,
                 alpha: Arc::new(alpha),
             })
+        }
+
+        fn normalize_alpha_mask(image: &image::RgbaImage) -> Vec<u8> {
+            let (width, height) = image.dimensions();
+            let source_alpha = image
+                .as_raw()
+                .chunks_exact(4)
+                .map(|pixel| pixel[3])
+                .collect::<Vec<_>>();
+            let Some((min_x, min_y, max_x, max_y)) =
+                alpha_bounds(width, height, source_alpha.as_slice())
+            else {
+                return source_alpha;
+            };
+
+            let cropped_width = max_x - min_x + 1;
+            let cropped_height = max_y - min_y + 1;
+            let padding_x = (width / ICON_PADDING_DIVISOR)
+                .max(1)
+                .min(width.saturating_sub(1) / 2);
+            let padding_y = (height / ICON_PADDING_DIVISOR)
+                .max(1)
+                .min(height.saturating_sub(1) / 2);
+            let target_width = width.saturating_sub(padding_x * 2).max(1);
+            let target_height = height.saturating_sub(padding_y * 2).max(1);
+
+            let alpha_image = GrayImage::from_vec(width, height, source_alpha)
+                .expect("alpha mask dimensions should match source image");
+            let cropped = image::imageops::crop_imm(
+                &alpha_image,
+                min_x,
+                min_y,
+                cropped_width,
+                cropped_height,
+            )
+            .to_image();
+            let resized = image::imageops::resize(
+                &cropped,
+                target_width,
+                target_height,
+                FilterType::CatmullRom,
+            );
+
+            let mut normalized = vec![0u8; (width * height) as usize];
+            for y in 0..target_height {
+                for x in 0..target_width {
+                    let dst_x = x + padding_x;
+                    let dst_y = y + padding_y;
+                    normalized[(dst_y * width + dst_x) as usize] = resized.get_pixel(x, y).0[0];
+                }
+            }
+            normalized
         }
 
         fn tinted_icon(&self, color: [u8; 3]) -> Result<Icon, tray_icon::BadIcon> {
@@ -405,6 +455,29 @@ mod supported {
         }
     }
 
+    fn alpha_bounds(width: u32, height: u32, alpha: &[u8]) -> Option<(u32, u32, u32, u32)> {
+        let mut min_x = width;
+        let mut min_y = height;
+        let mut max_x = 0;
+        let mut max_y = 0;
+        let mut found = false;
+
+        for y in 0..height {
+            for x in 0..width {
+                if alpha[(y * width + x) as usize] == 0 {
+                    continue;
+                }
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+                found = true;
+            }
+        }
+
+        found.then_some((min_x, min_y, max_x, max_y))
+    }
+
     fn fallback_mode(monitor_started_at: Instant) -> TrayPulseMode {
         if monitor_started_at.elapsed() < DIAGNOSTICS_STARTUP_GRACE {
             TrayPulseMode::Booting
@@ -483,6 +556,22 @@ mod supported {
         fn fallback_mode_becomes_unavailable_after_grace_period() {
             let started_at = Instant::now() - DIAGNOSTICS_STARTUP_GRACE - Duration::from_millis(1);
             assert_eq!(fallback_mode(started_at), TrayPulseMode::Unavailable);
+        }
+
+        #[test]
+        fn normalize_alpha_mask_expands_visible_bounds() {
+            let mut image = image::RgbaImage::new(8, 8);
+            for y in 3..=4 {
+                for x in 3..=4 {
+                    image.put_pixel(x, y, image::Rgba([0, 0, 0, 255]));
+                }
+            }
+
+            let normalized = IconMask::normalize_alpha_mask(&image);
+            assert_eq!(
+                alpha_bounds(8, 8, normalized.as_slice()),
+                Some((1, 1, 6, 6))
+            );
         }
 
         #[test]
