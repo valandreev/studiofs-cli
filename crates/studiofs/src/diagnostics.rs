@@ -49,6 +49,12 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tracing::warn;
 use uuid::Uuid;
 
+mod session_service;
+
+#[cfg(test)]
+use session_service::DiagnosticsServiceError;
+use session_service::{DiagnosticsSessionDeps, DiagnosticsSessionService, dispatch_protocol};
+
 #[cfg(windows)]
 use std::{ffi::c_void, mem::size_of};
 #[cfg(windows)]
@@ -5045,203 +5051,6 @@ where
     Ok(Some(String::from_utf8(buffer)?))
 }
 
-fn advance_workflow_step_response(
-    store: &InvestigationStore,
-    source: &dyn DiagnosticsDataSource,
-    profiling: Option<&DiagnosticsProfilingCoordinator>,
-    workflow_run_id: String,
-    step_id: String,
-) -> DiagnosticsResponse {
-    let mut workflow = match store.load_workflow_run(&workflow_run_id) {
-        Ok(workflow) => workflow,
-        Err(error) => return store_error_response(error),
-    };
-    if matches!(
-        workflow.status,
-        InvestigationWorkflowStatus::Completed
-            | InvestigationWorkflowStatus::Failed
-            | InvestigationWorkflowStatus::Aborted
-    ) {
-        return workflow_error_response(
-            "workflow_invalid",
-            format!(
-                "workflow run '{}' is already in terminal state {:?}",
-                workflow.id, workflow.status
-            ),
-        );
-    }
-    if workflow.current_step_id.as_deref() != Some(step_id.as_str()) {
-        return workflow_error_response(
-            "workflow_invalid_step",
-            format!(
-                "workflow step '{}' is not current for workflow run '{}'",
-                step_id, workflow.id
-            ),
-        );
-    }
-    let step_index = match workflow_step_index(&workflow, &step_id) {
-        Ok(index) => index,
-        Err(error) => return workflow_error_response("workflow_invalid_step", error.to_string()),
-    };
-    if !workflow_dependencies_satisfied(&workflow, &workflow.steps[step_index]) {
-        return workflow_error_response(
-            "workflow_dependencies_unmet",
-            format!("workflow step '{}' dependencies are not satisfied", step_id),
-        );
-    }
-
-    let step_kind = workflow.steps[step_index].kind;
-    let step_failure_policy = workflow.steps[step_index].failure_policy;
-    if step_kind == InvestigationWorkflowStepKind::ManualStep {
-        if workflow.steps[step_index].status != InvestigationWorkflowStepStatus::Pending {
-            return workflow_error_response(
-                "workflow_invalid_step",
-                format!(
-                    "manual workflow step '{}' is not pending",
-                    workflow.steps[step_index].step_id
-                ),
-            );
-        }
-        workflow.steps[step_index].status = InvestigationWorkflowStepStatus::WaitingForOperator;
-        workflow.steps[step_index].started_unix_ms = Some(now_unix_millis());
-        workflow.updated_unix_ms = now_unix_millis();
-        workflow.status = InvestigationWorkflowStatus::WaitingForOperator;
-        if let Some(marker_title) = workflow.steps[step_index].on_enter_marker.clone()
-            && let Err(error) =
-                append_workflow_marker(store, &workflow.run_id, &marker_title, source)
-        {
-            return store_error_response(error);
-        }
-        if let Err(error) = store.save_workflow_run(&workflow) {
-            return store_error_response(error);
-        }
-        return DiagnosticsResponse::WorkflowRun {
-            workflow: Box::new(workflow),
-        };
-    }
-
-    workflow.steps[step_index].status = InvestigationWorkflowStepStatus::InProgress;
-    workflow.steps[step_index]
-        .started_unix_ms
-        .get_or_insert_with(now_unix_millis);
-    workflow.updated_unix_ms = now_unix_millis();
-    if let Err(error) = store.save_workflow_run(&workflow) {
-        return store_error_response(error);
-    }
-
-    let result = match step_kind {
-        InvestigationWorkflowStepKind::Marker => append_workflow_marker(
-            store,
-            &workflow.run_id,
-            &workflow.steps[step_index].title,
-            source,
-        )
-        .map(|_| {
-            (
-                serde_json::json!({ "marker": workflow.steps[step_index].title }),
-                Vec::new(),
-                None,
-            )
-        }),
-        InvestigationWorkflowStepKind::Note => store
-            .append_timeline_entry(
-                &workflow.run_id,
-                NewTimelineEntry {
-                    source: TimelineEntrySource::Mcp,
-                    kind: TimelineEntryKind::Note,
-                    title: workflow.steps[step_index].title.clone(),
-                    body: Some(workflow.steps[step_index].instructions.clone()),
-                    actor: Some("workflow".to_string()),
-                    reason: None,
-                },
-            )
-            .map(|_| {
-                (
-                    serde_json::json!({ "note": workflow.steps[step_index].title }),
-                    Vec::new(),
-                    None,
-                )
-            }),
-        InvestigationWorkflowStepKind::ToolStep
-        | InvestigationWorkflowStepKind::ProfilingWindow
-        | InvestigationWorkflowStepKind::SafeAction
-        | InvestigationWorkflowStepKind::ReportStep => {
-            execute_workflow_tool_like_step(&workflow, step_index, source, store, profiling)
-        }
-        InvestigationWorkflowStepKind::ManualStep => unreachable!(),
-    };
-
-    match result {
-        Ok((summary, artifacts, invocation)) => {
-            workflow.steps[step_index].status = InvestigationWorkflowStepStatus::Completed;
-            workflow.steps[step_index].completed_unix_ms = Some(now_unix_millis());
-            workflow.steps[step_index].last_error = None;
-            workflow.steps[step_index].output_summary = Some(summary);
-            workflow.steps[step_index].artifacts = artifacts;
-            workflow.steps[step_index].tool_invocation = invocation;
-            complete_workflow_progress(&mut workflow);
-            if let Err(error) = store.save_workflow_run(&workflow) {
-                return store_error_response(error);
-            }
-            if let Err(error) = append_workflow_timeline_event(
-                store,
-                &workflow.run_id,
-                "workflow_step_completed",
-                serde_json::json!({
-                    "workflow_run_id": workflow.id,
-                    "step_id": workflow.steps[step_index].step_id,
-                    "status": workflow.steps[step_index].status,
-                }),
-            ) {
-                warn!(
-                    workflow_run_id = %workflow.id,
-                    step_id = %workflow.steps[step_index].step_id,
-                    error = %error,
-                    "failed to append workflow completion timeline event"
-                );
-            }
-            DiagnosticsResponse::WorkflowRun {
-                workflow: Box::new(workflow),
-            }
-        }
-        Err(error) => {
-            workflow.steps[step_index].last_error = Some(error.to_string());
-            match step_failure_policy {
-                InvestigationWorkflowFailurePolicy::FailOpen => {
-                    workflow.steps[step_index].status = InvestigationWorkflowStepStatus::Failed;
-                    workflow.steps[step_index].completed_unix_ms = Some(now_unix_millis());
-                    complete_workflow_progress(&mut workflow);
-                    if let Err(save_error) = store.save_workflow_run(&workflow) {
-                        return store_error_response(save_error);
-                    }
-                    DiagnosticsResponse::WorkflowRun {
-                        workflow: Box::new(workflow),
-                    }
-                }
-                InvestigationWorkflowFailurePolicy::Retryable => {
-                    workflow.steps[step_index].status = InvestigationWorkflowStepStatus::Pending;
-                    workflow.status = InvestigationWorkflowStatus::InProgress;
-                    workflow.current_step_id = Some(workflow.steps[step_index].step_id.clone());
-                    if let Err(save_error) = store.save_workflow_run(&workflow) {
-                        return store_error_response(save_error);
-                    }
-                    workflow_error_response("workflow_step_failed", error.to_string())
-                }
-                InvestigationWorkflowFailurePolicy::AbortWorkflow => {
-                    workflow.steps[step_index].status = InvestigationWorkflowStepStatus::Failed;
-                    workflow.steps[step_index].completed_unix_ms = Some(now_unix_millis());
-                    workflow.status = InvestigationWorkflowStatus::Failed;
-                    workflow.current_step_id = Some(workflow.steps[step_index].step_id.clone());
-                    if let Err(save_error) = store.save_workflow_run(&workflow) {
-                        return store_error_response(save_error);
-                    }
-                    workflow_error_response("workflow_failed", error.to_string())
-                }
-            }
-        }
-    }
-}
-
 fn execute_request(
     request: DiagnosticsRequest,
     auth_token: &str,
@@ -5250,950 +5059,13 @@ fn execute_request(
     investigation_store: Option<&InvestigationStore>,
     profiling: Option<&DiagnosticsProfilingCoordinator>,
 ) -> DiagnosticsResponse {
-    fn unauthorized() -> DiagnosticsResponse {
-        DiagnosticsResponse::Error {
-            code: "unauthorized".to_string(),
-            message: "diagnostics auth token did not match".to_string(),
-        }
-    }
-
-    fn investigation_unavailable() -> DiagnosticsResponse {
-        DiagnosticsResponse::Error {
-            code: "investigation_unavailable".to_string(),
-            message: "investigation persistence is unavailable for this session".to_string(),
-        }
-    }
-
-    fn store_error(error: anyhow::Error) -> DiagnosticsResponse {
-        DiagnosticsResponse::Error {
-            code: "investigation_store_error".to_string(),
-            message: error.to_string(),
-        }
-    }
-
-    fn lease_error(error: anyhow::Error) -> DiagnosticsResponse {
-        DiagnosticsResponse::Error {
-            code: "lease_invalid".to_string(),
-            message: error.to_string(),
-        }
-    }
-
-    fn profiling_unavailable() -> DiagnosticsResponse {
-        DiagnosticsResponse::Error {
-            code: "profiling_unavailable".to_string(),
-            message: "profiling control is unavailable for this session".to_string(),
-        }
-    }
-
-    fn workflow_error(code: &str, message: impl Into<String>) -> DiagnosticsResponse {
-        DiagnosticsResponse::Error {
-            code: code.to_string(),
-            message: message.into(),
-        }
-    }
-
-    fn profiling_start_error(error: ProfilingWindowStartError) -> DiagnosticsResponse {
-        match error {
-            ProfilingWindowStartError::Budget(error) => DiagnosticsResponse::Error {
-                code: "profiling_budget_invalid".to_string(),
-                message: error.to_string(),
-            },
-            ProfilingWindowStartError::Busy => DiagnosticsResponse::Error {
-                code: "profiling_start_failed".to_string(),
-                message: error.to_string(),
-            },
-            ProfilingWindowStartError::Store(error) => store_error(error),
-        }
-    }
-
-    enum MutatingRequestPrereqError {
-        Unauthorized,
-        InvalidLease(anyhow::Error),
-        InvestigationUnavailable,
-    }
-
-    fn mutating_request_store<'a>(
-        provided_token: &str,
-        auth_token: &str,
-        lease_id: &str,
-        lease_manager: &ControllerLeaseManager,
-        investigation_store: Option<&'a InvestigationStore>,
-    ) -> std::result::Result<&'a InvestigationStore, MutatingRequestPrereqError> {
-        if provided_token != auth_token {
-            return Err(MutatingRequestPrereqError::Unauthorized);
-        }
-        if let Err(error) = lease_manager.require_current(lease_id) {
-            return Err(MutatingRequestPrereqError::InvalidLease(error));
-        }
-        investigation_store.ok_or(MutatingRequestPrereqError::InvestigationUnavailable)
-    }
-
-    fn require_mutating_store<'a>(
-        provided_token: &str,
-        auth_token: &str,
-        lease_id: &str,
-        lease_manager: &ControllerLeaseManager,
-        investigation_store: Option<&'a InvestigationStore>,
-    ) -> std::result::Result<&'a InvestigationStore, MutatingRequestPrereqError> {
-        mutating_request_store(
-            provided_token,
-            auth_token,
-            lease_id,
-            lease_manager,
-            investigation_store,
-        )
-    }
-
-    fn mutating_request_error_response(error: MutatingRequestPrereqError) -> DiagnosticsResponse {
-        match error {
-            MutatingRequestPrereqError::Unauthorized => unauthorized(),
-            MutatingRequestPrereqError::InvalidLease(error) => lease_error(error),
-            MutatingRequestPrereqError::InvestigationUnavailable => investigation_unavailable(),
-        }
-    }
-
-    match request {
-        DiagnosticsRequest::SessionInfo {
-            auth_token: provided,
-        } => {
-            if provided != auth_token {
-                return unauthorized();
-            }
-            let mut session = source.session_info();
-            session.controller = lease_manager.snapshot();
-            DiagnosticsResponse::SessionInfo { session }
-        }
-        DiagnosticsRequest::ListWorkflows {
-            auth_token: provided,
-        } => {
-            if provided != auth_token {
-                return unauthorized();
-            }
-            DiagnosticsResponse::WorkflowPresets {
-                workflows: built_in_workflow_presets(),
-            }
-        }
-        DiagnosticsRequest::Health {
-            auth_token: provided,
-        } => {
-            if provided != auth_token {
-                return unauthorized();
-            }
-            DiagnosticsResponse::Health {
-                health: Box::new(source.health_snapshot()),
-            }
-        }
-        DiagnosticsRequest::RuntimeSnapshot {
-            auth_token: provided,
-        } => {
-            if provided != auth_token {
-                return unauthorized();
-            }
-            DiagnosticsResponse::RuntimeSnapshot {
-                snapshot: Box::new(source.runtime_snapshot()),
-            }
-        }
-        DiagnosticsRequest::RecentEvents {
-            auth_token: provided,
-            limit,
-        } => {
-            if provided != auth_token {
-                return unauthorized();
-            }
-            let limit = limit
-                .unwrap_or(DEFAULT_RECENT_EVENTS_LIMIT)
-                .clamp(1, MAX_RECENT_EVENTS_LIMIT);
-            DiagnosticsResponse::RecentEvents {
-                events: source.recent_events(limit),
-            }
-        }
-        DiagnosticsRequest::EvidenceView {
-            auth_token: provided,
-            lease_id,
-            run_id,
-            request,
-        } => {
-            let store = match require_mutating_store(
-                &provided,
-                auth_token,
-                &lease_id,
-                lease_manager,
-                investigation_store,
-            ) {
-                Ok(store) => store,
-                Err(error) => return mutating_request_error_response(error),
-            };
-            match build_evidence_view(&run_id, request, source, store) {
-                Ok(view) => DiagnosticsResponse::EvidenceView {
-                    view: Box::new(view),
-                },
-                Err(error) => store_error(error),
-            }
-        }
-        DiagnosticsRequest::MaterializeReport {
-            auth_token: provided,
-            lease_id,
-            run_id,
-        } => {
-            let store = match require_mutating_store(
-                &provided,
-                auth_token,
-                &lease_id,
-                lease_manager,
-                investigation_store,
-            ) {
-                Ok(store) => store,
-                Err(error) => return mutating_request_error_response(error),
-            };
-            match materialize_report(&run_id, source, store) {
-                Ok(report) => DiagnosticsResponse::InvestigationReport {
-                    report: Box::new(report),
-                },
-                Err(error) => store_error(error),
-            }
-        }
-        DiagnosticsRequest::CompareRunSpan {
-            auth_token: provided,
-            lease_id,
-            request,
-        } => {
-            let store = match require_mutating_store(
-                &provided,
-                auth_token,
-                &lease_id,
-                lease_manager,
-                investigation_store,
-            ) {
-                Ok(store) => store,
-                Err(error) => return mutating_request_error_response(error),
-            };
-            match materialize_run_span_comparison(request, store) {
-                Ok(comparison) => DiagnosticsResponse::InvestigationSpanComparison {
-                    comparison: Box::new(comparison),
-                },
-                Err(error) => store_error(error),
-            }
-        }
-        DiagnosticsRequest::ProfilingStatus {
-            auth_token: provided,
-        } => {
-            if provided != auth_token {
-                return unauthorized();
-            }
-            let Some(profiling) = profiling else {
-                return profiling_unavailable();
-            };
-            DiagnosticsResponse::ProfilingStatus {
-                status: Box::new(profiling.status()),
-            }
-        }
-        DiagnosticsRequest::InvokeSafeAction {
-            auth_token: provided,
-            lease_id,
-            run_id,
-            action,
-        } => {
-            let store = match require_mutating_store(
-                &provided,
-                auth_token,
-                &lease_id,
-                lease_manager,
-                investigation_store,
-            ) {
-                Ok(store) => store,
-                Err(error) => return mutating_request_error_response(error),
-            };
-            if let Err(error) = store.load_run(&run_id) {
-                return store_error(error);
-            }
-            let actor = action.actor().map(str::to_string);
-            let reason = action.reason().map(str::to_string);
-            let mut outcome = match action {
-                SafeDebugActionRequest::SetLogVerbosity { level } => {
-                    match crate::set_diagnostics_log_verbosity(level) {
-                        Ok(()) => SafeDebugActionOutcome {
-                            action: SafeDebugActionKind::SetLogVerbosity,
-                            loud: false,
-                            status: SafeDebugActionStatus::Succeeded,
-                            summary: serde_json::json!({
-                                "level": level.as_directive(),
-                            }),
-                            artifact: None,
-                            error: None,
-                            audit_error: None,
-                        },
-                        Err(error) => SafeDebugActionOutcome {
-                            action: SafeDebugActionKind::SetLogVerbosity,
-                            loud: false,
-                            status: SafeDebugActionStatus::Failed,
-                            summary: serde_json::json!({
-                                "level": level.as_directive(),
-                            }),
-                            artifact: None,
-                            error: Some(error.to_string()),
-                            audit_error: None,
-                        },
-                    }
-                }
-                SafeDebugActionRequest::CaptureBundle {
-                    recent_events_limit,
-                    ..
-                } => {
-                    let session = source.session_info();
-                    let snapshot = source.runtime_snapshot();
-                    let events = source.recent_events(
-                        recent_events_limit
-                            .unwrap_or(DEFAULT_RECENT_EVENTS_LIMIT)
-                            .clamp(1, MAX_RECENT_EVENTS_LIMIT),
-                    );
-                    match capture_bundle_artifact(&session, &snapshot, &events) {
-                        Ok(artifact) => SafeDebugActionOutcome {
-                            action: SafeDebugActionKind::CaptureBundle,
-                            loud: true,
-                            status: SafeDebugActionStatus::Succeeded,
-                            summary: serde_json::json!({
-                                "recent_events": events.len(),
-                                "path": artifact.path.clone(),
-                            }),
-                            artifact: Some(artifact),
-                            error: None,
-                            audit_error: None,
-                        },
-                        Err(error) => SafeDebugActionOutcome {
-                            action: SafeDebugActionKind::CaptureBundle,
-                            loud: true,
-                            status: SafeDebugActionStatus::Failed,
-                            summary: serde_json::json!({
-                                "recent_events": events.len(),
-                            }),
-                            artifact: None,
-                            error: Some(error.to_string()),
-                            audit_error: None,
-                        },
-                    }
-                }
-                SafeDebugActionRequest::ResetObservabilityCounters { .. } => {
-                    match source.reset_observability_counters() {
-                        Ok(()) => SafeDebugActionOutcome {
-                            action: SafeDebugActionKind::ResetObservabilityCounters,
-                            loud: true,
-                            status: SafeDebugActionStatus::Succeeded,
-                            summary: serde_json::json!({
-                                "status": "reset",
-                            }),
-                            artifact: None,
-                            error: None,
-                            audit_error: None,
-                        },
-                        Err(error) => SafeDebugActionOutcome {
-                            action: SafeDebugActionKind::ResetObservabilityCounters,
-                            loud: true,
-                            status: SafeDebugActionStatus::Failed,
-                            summary: serde_json::json!({}),
-                            artifact: None,
-                            error: Some(error.to_string()),
-                            audit_error: None,
-                        },
-                    }
-                }
-                SafeDebugActionRequest::LightweightSelfCheck { .. } => {
-                    let snapshot = source.runtime_snapshot();
-                    let events = source.recent_events(DEFAULT_RECENT_EVENTS_LIMIT.min(8));
-                    SafeDebugActionOutcome {
-                        action: SafeDebugActionKind::LightweightSelfCheck,
-                        loud: true,
-                        status: SafeDebugActionStatus::Succeeded,
-                        summary: serde_json::json!({
-                            "status": "ok",
-                            "pending_uploads": snapshot.upload.pending_uploads,
-                            "recent_events": events.len(),
-                        }),
-                        artifact: None,
-                        error: None,
-                        audit_error: None,
-                    }
-                }
-            };
-            if outcome.loud
-                && let Err(error) = append_safe_action_audit(
-                    store,
-                    &run_id,
-                    outcome.action,
-                    actor.as_deref(),
-                    reason.as_deref(),
-                    &outcome,
-                )
-            {
-                warn!(
-                    run_id,
-                    action = ?outcome.action,
-                    error = %error,
-                    "failed to persist safe action audit entry"
-                );
-                outcome.audit_error = Some(error.to_string());
-            }
-            DiagnosticsResponse::SafeDebugAction {
-                outcome: Box::new(outcome),
-            }
-        }
-        DiagnosticsRequest::AcquireController {
-            auth_token: provided,
-            client_name,
-            ttl_ms,
-        } => {
-            if provided != auth_token {
-                return unauthorized();
-            }
-            match lease_manager.acquire(client_name, ttl_ms) {
-                Ok(lease) => DiagnosticsResponse::ControllerLease { lease },
-                Err(error) => DiagnosticsResponse::Error {
-                    code: "controller_busy".to_string(),
-                    message: error.to_string(),
-                },
-            }
-        }
-        DiagnosticsRequest::RenewController {
-            auth_token: provided,
-            lease_id,
-            ttl_ms,
-        } => {
-            if provided != auth_token {
-                return unauthorized();
-            }
-            match lease_manager.renew(&lease_id, ttl_ms) {
-                Ok(lease) => DiagnosticsResponse::ControllerLease { lease },
-                Err(error) => DiagnosticsResponse::Error {
-                    code: "lease_invalid".to_string(),
-                    message: error.to_string(),
-                },
-            }
-        }
-        DiagnosticsRequest::CreateCase {
-            auth_token: provided,
-            lease_id,
-            title,
-            problem_statement,
-            workload_identity,
-            target_environment,
-        } => {
-            let store = match require_mutating_store(
-                &provided,
-                auth_token,
-                &lease_id,
-                lease_manager,
-                investigation_store,
-            ) {
-                Ok(store) => store,
-                Err(error) => return mutating_request_error_response(error),
-            };
-            match store.create_case(NewInvestigationCase {
-                title,
-                problem_statement,
-                workload_identity,
-                target_environment,
-            }) {
-                Ok(case) => DiagnosticsResponse::InvestigationCase {
-                    case: Box::new(case),
-                },
-                Err(error) => store_error(error),
-            }
-        }
-        DiagnosticsRequest::CreateRun {
-            auth_token: provided,
-            lease_id,
-            case_id,
-            run_workload_identity,
-        } => {
-            let store = match require_mutating_store(
-                &provided,
-                auth_token,
-                &lease_id,
-                lease_manager,
-                investigation_store,
-            ) {
-                Ok(store) => store,
-                Err(error) => return mutating_request_error_response(error),
-            };
-            let case = match store.load_case(&case_id) {
-                Ok(case) => case,
-                Err(error) => return store_error(error),
-            };
-            let fingerprint = source.environment_fingerprint(
-                case.workload_identity.as_deref(),
-                run_workload_identity.as_deref(),
-            );
-            match store.create_run(NewInvestigationRun {
-                case_id,
-                session_id: source.session_info().session_id,
-                fingerprint,
-            }) {
-                Ok(run) => DiagnosticsResponse::InvestigationRun { run: Box::new(run) },
-                Err(error) => store_error(error),
-            }
-        }
-        DiagnosticsRequest::StartWorkflow {
-            auth_token: provided,
-            lease_id,
-            run_id,
-            workflow_id,
-        } => {
-            let store = match require_mutating_store(
-                &provided,
-                auth_token,
-                &lease_id,
-                lease_manager,
-                investigation_store,
-            ) {
-                Ok(store) => store,
-                Err(error) => return mutating_request_error_response(error),
-            };
-            if let Err(error) = store.load_run(&run_id) {
-                return store_error(error);
-            }
-            let Some(workflow) = built_in_workflow_by_id(&workflow_id) else {
-                return workflow_error(
-                    "workflow_unknown",
-                    format!("workflow preset '{}' is not registered", workflow_id),
-                );
-            };
-            match store.create_workflow_run(&run_id, NewInvestigationWorkflowRun { workflow }) {
-                Ok(mut workflow_run) => {
-                    if workflow_run.current_step_id.is_some() {
-                        workflow_run.status = InvestigationWorkflowStatus::InProgress;
-                        workflow_run.updated_unix_ms = now_unix_millis();
-                        if let Err(error) = store.save_workflow_run(&workflow_run) {
-                            return store_error(error);
-                        }
-                    }
-                    if let Err(error) = append_workflow_timeline_event(
-                        store,
-                        &run_id,
-                        "workflow_started",
-                        serde_json::json!({
-                            "workflow_run_id": workflow_run.id,
-                            "workflow_id": workflow_run.workflow_id,
-                        }),
-                    ) {
-                        warn!(
-                            run_id = %run_id,
-                            workflow_id = %workflow_run.workflow_id,
-                            error = %error,
-                            "failed to append workflow start timeline event"
-                        );
-                    }
-                    DiagnosticsResponse::WorkflowRun {
-                        workflow: Box::new(workflow_run),
-                    }
-                }
-                Err(error) => store_error(error),
-            }
-        }
-        DiagnosticsRequest::GetWorkflowRun {
-            auth_token: provided,
-            lease_id,
-            workflow_run_id,
-        } => {
-            let store = match require_mutating_store(
-                &provided,
-                auth_token,
-                &lease_id,
-                lease_manager,
-                investigation_store,
-            ) {
-                Ok(store) => store,
-                Err(error) => return mutating_request_error_response(error),
-            };
-            match store.load_workflow_run(&workflow_run_id) {
-                Ok(workflow) => DiagnosticsResponse::WorkflowRun {
-                    workflow: Box::new(workflow),
-                },
-                Err(error) => store_error(error),
-            }
-        }
-        DiagnosticsRequest::AdvanceWorkflowStep {
-            auth_token: provided,
-            lease_id,
-            workflow_run_id,
-            step_id,
-        } => {
-            let store = match require_mutating_store(
-                &provided,
-                auth_token,
-                &lease_id,
-                lease_manager,
-                investigation_store,
-            ) {
-                Ok(store) => store,
-                Err(error) => return mutating_request_error_response(error),
-            };
-            advance_workflow_step_response(store, source, profiling, workflow_run_id, step_id)
-        }
-        DiagnosticsRequest::AcknowledgeManualStep {
-            auth_token: provided,
-            lease_id,
-            workflow_run_id,
-            step_id,
-            actor,
-            note,
-        } => {
-            let store = match require_mutating_store(
-                &provided,
-                auth_token,
-                &lease_id,
-                lease_manager,
-                investigation_store,
-            ) {
-                Ok(store) => store,
-                Err(error) => return mutating_request_error_response(error),
-            };
-            let mut workflow = match store.load_workflow_run(&workflow_run_id) {
-                Ok(workflow) => workflow,
-                Err(error) => return store_error(error),
-            };
-            if workflow.current_step_id.as_deref() != Some(step_id.as_str()) {
-                return workflow_error(
-                    "workflow_invalid_step",
-                    format!(
-                        "workflow step '{}' is not current for workflow run '{}'",
-                        step_id, workflow.id
-                    ),
-                );
-            }
-            let step_index = match workflow_step_index(&workflow, &step_id) {
-                Ok(index) => index,
-                Err(error) => return workflow_error("workflow_invalid_step", error.to_string()),
-            };
-            if workflow.steps[step_index].status
-                != InvestigationWorkflowStepStatus::WaitingForOperator
-            {
-                return workflow_error(
-                    "workflow_invalid_step",
-                    format!("workflow step '{}' is not waiting for operator", step_id),
-                );
-            }
-            if let Some(marker_title) = workflow.steps[step_index].on_exit_marker.clone()
-                && let Err(error) =
-                    append_workflow_marker(store, &workflow.run_id, &marker_title, source)
-            {
-                return store_error(error);
-            }
-            workflow.steps[step_index].status = InvestigationWorkflowStepStatus::Completed;
-            workflow.steps[step_index].completed_unix_ms = Some(now_unix_millis());
-            workflow.steps[step_index].operator_acknowledged_by = actor.clone();
-            workflow.steps[step_index].operator_acknowledgement_note = note.clone();
-            workflow.steps[step_index].output_summary = Some(serde_json::json!({
-                "acknowledged_by": actor,
-                "note": note,
-            }));
-            complete_workflow_progress(&mut workflow);
-            if let Err(error) = store.save_workflow_run(&workflow) {
-                return store_error(error);
-            }
-            if let Err(error) = append_workflow_timeline_event(
-                store,
-                &workflow.run_id,
-                "workflow_manual_acknowledged",
-                serde_json::json!({
-                    "workflow_run_id": workflow.id,
-                    "step_id": step_id,
-                }),
-            ) {
-                warn!(
-                    workflow_run_id = %workflow.id,
-                    step_id = %step_id,
-                    error = %error,
-                    "failed to append manual acknowledgement timeline event"
-                );
-            }
-            DiagnosticsResponse::WorkflowRun {
-                workflow: Box::new(workflow),
-            }
-        }
-        DiagnosticsRequest::AbortWorkflow {
-            auth_token: provided,
-            lease_id,
-            workflow_run_id,
-            reason,
-        } => {
-            let store = match require_mutating_store(
-                &provided,
-                auth_token,
-                &lease_id,
-                lease_manager,
-                investigation_store,
-            ) {
-                Ok(store) => store,
-                Err(error) => return mutating_request_error_response(error),
-            };
-            let mut workflow = match store.load_workflow_run(&workflow_run_id) {
-                Ok(workflow) => workflow,
-                Err(error) => return store_error(error),
-            };
-            if let Some(current_step_id) = workflow.current_step_id.clone()
-                && let Ok(step_index) = workflow_step_index(&workflow, &current_step_id)
-                && !workflow_step_is_terminal(workflow.steps[step_index].status)
-            {
-                workflow.steps[step_index].status = InvestigationWorkflowStepStatus::Aborted;
-                workflow.steps[step_index].completed_unix_ms = Some(now_unix_millis());
-                workflow.steps[step_index].last_error = reason.clone();
-            }
-            workflow.status = InvestigationWorkflowStatus::Aborted;
-            workflow.current_step_id = None;
-            workflow.updated_unix_ms = now_unix_millis();
-            if let Err(error) = store.save_workflow_run(&workflow) {
-                return store_error(error);
-            }
-            if let Err(error) = append_workflow_timeline_event(
-                store,
-                &workflow.run_id,
-                "workflow_aborted",
-                serde_json::json!({
-                    "workflow_run_id": workflow.id,
-                    "reason": reason,
-                }),
-            ) {
-                warn!(
-                    workflow_run_id = %workflow.id,
-                    error = %error,
-                    "failed to append workflow abort timeline event"
-                );
-            }
-            DiagnosticsResponse::WorkflowRun {
-                workflow: Box::new(workflow),
-            }
-        }
-        DiagnosticsRequest::CompleteWorkflow {
-            auth_token: provided,
-            lease_id,
-            workflow_run_id,
-        } => {
-            let store = match require_mutating_store(
-                &provided,
-                auth_token,
-                &lease_id,
-                lease_manager,
-                investigation_store,
-            ) {
-                Ok(store) => store,
-                Err(error) => return mutating_request_error_response(error),
-            };
-            let mut workflow = match store.load_workflow_run(&workflow_run_id) {
-                Ok(workflow) => workflow,
-                Err(error) => return store_error(error),
-            };
-            if workflow
-                .steps
-                .iter()
-                .any(|step| !workflow_step_is_terminal(step.status))
-            {
-                return workflow_error(
-                    "workflow_incomplete",
-                    format!("workflow run '{}' still has unfinished steps", workflow.id),
-                );
-            }
-            workflow.status = InvestigationWorkflowStatus::Completed;
-            workflow.current_step_id = None;
-            workflow.updated_unix_ms = now_unix_millis();
-            if let Err(error) = store.save_workflow_run(&workflow) {
-                return store_error(error);
-            }
-            if let Err(error) = append_workflow_timeline_event(
-                store,
-                &workflow.run_id,
-                "workflow_completed",
-                serde_json::json!({
-                    "workflow_run_id": workflow.id,
-                    "workflow_id": workflow.workflow_id,
-                }),
-            ) {
-                warn!(
-                    workflow_run_id = %workflow.id,
-                    error = %error,
-                    "failed to append workflow completion timeline event"
-                );
-            }
-            DiagnosticsResponse::WorkflowRun {
-                workflow: Box::new(workflow),
-            }
-        }
-        DiagnosticsRequest::CreateHypothesis {
-            auth_token: provided,
-            lease_id,
-            case_id,
-            statement,
-            expected_signal,
-            supporting_evidence,
-        } => {
-            let store = match require_mutating_store(
-                &provided,
-                auth_token,
-                &lease_id,
-                lease_manager,
-                investigation_store,
-            ) {
-                Ok(store) => store,
-                Err(error) => return mutating_request_error_response(error),
-            };
-            match store.create_hypothesis(
-                &case_id,
-                NewInvestigationHypothesis {
-                    statement,
-                    expected_signal,
-                    supporting_evidence,
-                },
-            ) {
-                Ok(hypothesis) => DiagnosticsResponse::InvestigationHypothesis {
-                    hypothesis: Box::new(hypothesis),
-                },
-                Err(error) => store_error(error),
-            }
-        }
-        DiagnosticsRequest::UpdateHypothesisStatus {
-            auth_token: provided,
-            lease_id,
-            hypothesis_id,
-            status,
-            actor,
-            reason,
-            supporting_evidence,
-        } => {
-            let store = match require_mutating_store(
-                &provided,
-                auth_token,
-                &lease_id,
-                lease_manager,
-                investigation_store,
-            ) {
-                Ok(store) => store,
-                Err(error) => return mutating_request_error_response(error),
-            };
-            match store.update_hypothesis_status(
-                &hypothesis_id,
-                UpdateInvestigationHypothesisStatus {
-                    status,
-                    actor,
-                    reason,
-                    supporting_evidence,
-                },
-            ) {
-                Ok(hypothesis) => DiagnosticsResponse::InvestigationHypothesis {
-                    hypothesis: Box::new(hypothesis),
-                },
-                Err(error) => store_error(error),
-            }
-        }
-        DiagnosticsRequest::StartProfilingWindow {
-            auth_token: provided,
-            lease_id,
-            run_id,
-            request,
-        } => {
-            let store = match require_mutating_store(
-                &provided,
-                auth_token,
-                &lease_id,
-                lease_manager,
-                investigation_store,
-            ) {
-                Ok(store) => store,
-                Err(error) => return mutating_request_error_response(error),
-            };
-            let Some(profiling) = profiling else {
-                return profiling_unavailable();
-            };
-            match profiling.start_window(&run_id, request, Some(store)) {
-                Ok(window) => DiagnosticsResponse::ProfilingWindow {
-                    window: Box::new(window),
-                },
-                Err(error) => profiling_start_error(error),
-            }
-        }
-        DiagnosticsRequest::StopProfilingWindow {
-            auth_token: provided,
-            lease_id,
-            window_id,
-        } => {
-            let store = match require_mutating_store(
-                &provided,
-                auth_token,
-                &lease_id,
-                lease_manager,
-                investigation_store,
-            ) {
-                Ok(store) => store,
-                Err(error) => return mutating_request_error_response(error),
-            };
-            let Some(profiling) = profiling else {
-                return profiling_unavailable();
-            };
-            match profiling.stop_window(&window_id, Some(store)) {
-                Ok(window) => DiagnosticsResponse::ProfilingWindow {
-                    window: Box::new(window),
-                },
-                Err(error) => DiagnosticsResponse::Error {
-                    code: "profiling_stop_failed".to_string(),
-                    message: error.to_string(),
-                },
-            }
-        }
-        DiagnosticsRequest::AppendTimelineEntry {
-            auth_token: provided,
-            lease_id,
-            run_id,
-            source: entry_source,
-            kind,
-            title,
-            body,
-            actor,
-            reason,
-        } => {
-            let store = match require_mutating_store(
-                &provided,
-                auth_token,
-                &lease_id,
-                lease_manager,
-                investigation_store,
-            ) {
-                Ok(store) => store,
-                Err(error) => return mutating_request_error_response(error),
-            };
-            match store.append_timeline_entry(
-                &run_id,
-                NewTimelineEntry {
-                    source: entry_source,
-                    kind,
-                    title,
-                    body,
-                    actor,
-                    reason,
-                },
-            ) {
-                Ok(entry) => {
-                    let marker_runtime_snapshot = (entry.kind == TimelineEntryKind::Marker)
-                        .then(|| source.runtime_snapshot());
-                    if let Some(runtime_snapshot) = marker_runtime_snapshot
-                        && let Err(error) = store.append_marker_snapshot(
-                            &run_id,
-                            NewInvestigationMarkerSnapshot {
-                                marker_sequence: entry.sequence,
-                                marker_title: entry.title.clone(),
-                                runtime_snapshot,
-                            },
-                        )
-                    {
-                        warn!(
-                            run_id = %run_id,
-                            marker_sequence = entry.sequence,
-                            error = %error,
-                            "failed to persist marker snapshot after timeline marker append"
-                        );
-                    }
-                    DiagnosticsResponse::TimelineEntry { entry }
-                }
-                Err(error) => store_error(error),
-            }
-        }
-    }
+    let service = DiagnosticsSessionService::new(DiagnosticsSessionDeps {
+        source,
+        leases: lease_manager,
+        store: investigation_store,
+        profiling,
+    });
+    dispatch_protocol(&service, auth_token, request)
 }
 
 async fn send_request<S>(stream: S, request: DiagnosticsRequest) -> Result<DiagnosticsResponse>
@@ -6599,6 +5471,20 @@ mod tests {
         (case, run)
     }
 
+    fn test_session_service<'a>(
+        source: &'a dyn DiagnosticsDataSource,
+        lease_manager: &'a ControllerLeaseManager,
+        store: Option<&'a InvestigationStore>,
+        profiling: Option<&'a DiagnosticsProfilingCoordinator>,
+    ) -> DiagnosticsSessionService<'a> {
+        DiagnosticsSessionService::new(DiagnosticsSessionDeps {
+            source,
+            leases: lease_manager,
+            store,
+            profiling,
+        })
+    }
+
     fn write_wall_blocking_artifact_fixture(
         dir: &TempDir,
         file_name: &str,
@@ -6760,26 +5646,19 @@ mod tests {
         let lease_manager = ControllerLeaseManager::default();
         let temp = mounts_dir_temp();
         let store = InvestigationStore::new(temp.path().join("investigations"));
+        let service = test_session_service(&source, &lease_manager, Some(&store), None);
 
-        let response = execute_request(
-            DiagnosticsRequest::CreateCase {
-                auth_token: "secret".to_string(),
-                lease_id: "lease-1".to_string(),
-                title: "AJA slowdown".to_string(),
-                problem_statement: None,
-                workload_identity: Some("aja".to_string()),
-                target_environment: None,
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
+        let response = service.create_case(
+            "lease-1",
+            "AJA slowdown".to_string(),
+            None,
+            Some("aja".to_string()),
             None,
         );
 
         assert!(matches!(
             response,
-            DiagnosticsResponse::Error { code, .. } if code == "lease_invalid"
+            Err(DiagnosticsServiceError::LeaseInvalid(_))
         ));
     }
 
@@ -6789,48 +5668,29 @@ mod tests {
         let lease_manager = ControllerLeaseManager::default();
         let temp = mounts_dir_temp();
         let store = InvestigationStore::new(temp.path().join("investigations"));
+        let service = test_session_service(&source, &lease_manager, Some(&store), None);
 
-        let response = execute_request(
-            DiagnosticsRequest::InvokeSafeAction {
-                auth_token: "secret".to_string(),
-                lease_id: "lease-1".to_string(),
-                run_id: "run-1".to_string(),
-                action: SafeDebugActionRequest::ResetObservabilityCounters {
-                    actor: Some("studiofs-dev-mcp".to_string()),
-                    reason: Some("baseline".to_string()),
-                },
+        let response = service.invoke_safe_action(
+            "lease-1",
+            "run-1",
+            SafeDebugActionRequest::ResetObservabilityCounters {
+                actor: Some("studiofs-dev-mcp".to_string()),
+                reason: Some("baseline".to_string()),
             },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            None,
         );
 
         assert!(matches!(
             response,
-            DiagnosticsResponse::Error { code, .. } if code == "lease_invalid"
+            Err(DiagnosticsServiceError::LeaseInvalid(_))
         ));
     }
 
     #[test]
     fn runtime_snapshot_request_returns_structured_sections() {
         let source = static_source();
-
-        let response = execute_request(
-            DiagnosticsRequest::RuntimeSnapshot {
-                auth_token: "secret".to_string(),
-            },
-            "secret",
-            &source,
-            &ControllerLeaseManager::default(),
-            None,
-            None,
-        );
-
-        let DiagnosticsResponse::RuntimeSnapshot { snapshot } = response else {
-            panic!("expected runtime snapshot response");
-        };
+        let lease_manager = ControllerLeaseManager::default();
+        let service = test_session_service(&source, &lease_manager, None, None);
+        let snapshot = service.runtime_snapshot().expect("runtime snapshot");
 
         assert_eq!(snapshot.schema_version, 2);
         assert_eq!(
@@ -6944,13 +5804,12 @@ mod tests {
         let lease = lease_manager
             .acquire("tester".to_string(), Some(500))
             .expect("acquire lease");
-
-        let response = execute_request(
-            DiagnosticsRequest::EvidenceView {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id,
-                run_id: run.id.clone(),
-                request: DiagnosticsEvidenceRequest {
+        let service = test_session_service(&source, &lease_manager, Some(&store), None);
+        let view = service
+            .evidence_view(
+                &lease.lease_id,
+                &run.id,
+                DiagnosticsEvidenceRequest {
                     scope: DiagnosticsEvidenceScope {
                         subsystem: Some(SUBSYSTEM_UPLOAD_PIPELINE.to_string()),
                         operation_type: None,
@@ -6970,17 +5829,8 @@ mod tests {
                         max_derived_items_per_kind: 4,
                     },
                 },
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            None,
-        );
-
-        let DiagnosticsResponse::EvidenceView { view } = response else {
-            panic!("expected evidence view response");
-        };
+            )
+            .expect("evidence view");
 
         assert_eq!(
             view.raw
@@ -7032,13 +5882,12 @@ mod tests {
         let lease = lease_manager
             .acquire("tester".to_string(), Some(500))
             .expect("acquire lease");
-
-        let response = execute_request(
-            DiagnosticsRequest::EvidenceView {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id,
-                run_id: run.id,
-                request: DiagnosticsEvidenceRequest {
+        let service = test_session_service(&source, &lease_manager, Some(&store), None);
+        let view = service
+            .evidence_view(
+                &lease.lease_id,
+                &run.id,
+                DiagnosticsEvidenceRequest {
                     scope: DiagnosticsEvidenceScope::default(),
                     budget: DiagnosticsEvidenceBudget {
                         max_recent_events: 10_000,
@@ -7047,17 +5896,8 @@ mod tests {
                         max_derived_items_per_kind: 10_000,
                     },
                 },
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            None,
-        );
-
-        let DiagnosticsResponse::EvidenceView { view } = response else {
-            panic!("expected evidence view response");
-        };
+            )
+            .expect("evidence view");
 
         assert_eq!(
             view.budget.applied.max_recent_events,
@@ -7145,13 +5985,13 @@ mod tests {
         let lease = lease_manager
             .acquire("tester".to_string(), Some(500))
             .expect("acquire lease");
-
-        let response = execute_request(
-            DiagnosticsRequest::EvidenceView {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id,
-                run_id: run.id,
-                request: DiagnosticsEvidenceRequest {
+        let source = static_source();
+        let service = test_session_service(&source, &lease_manager, Some(&store), None);
+        let view = service
+            .evidence_view(
+                &lease.lease_id,
+                &run.id,
+                DiagnosticsEvidenceRequest {
                     scope: DiagnosticsEvidenceScope {
                         subsystem: Some("write_path".to_string()),
                         ..DiagnosticsEvidenceScope::default()
@@ -7163,17 +6003,8 @@ mod tests {
                         max_derived_items_per_kind: 4,
                     },
                 },
-            },
-            "secret",
-            &static_source(),
-            &lease_manager,
-            Some(&store),
-            None,
-        );
-
-        let DiagnosticsResponse::EvidenceView { view } = response else {
-            panic!("expected evidence view response");
-        };
+            )
+            .expect("evidence view");
 
         assert_eq!(view.raw.profiling_windows.len(), 1);
         assert!(view.raw.profiling_windows[0].summary.is_some());
@@ -7205,13 +6036,13 @@ mod tests {
         let lease = lease_manager
             .acquire("tester".to_string(), Some(500))
             .expect("acquire lease");
-
-        let response = execute_request(
-            DiagnosticsRequest::EvidenceView {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id,
-                run_id: run.id,
-                request: DiagnosticsEvidenceRequest {
+        let source = static_source();
+        let service = test_session_service(&source, &lease_manager, Some(&store), None);
+        let view = service
+            .evidence_view(
+                &lease.lease_id,
+                &run.id,
+                DiagnosticsEvidenceRequest {
                     scope: DiagnosticsEvidenceScope {
                         subsystem: Some(SUBSYSTEM_UPLOAD_PIPELINE.to_string()),
                         object_identity: Some(DiagnosticsObjectIdentity {
@@ -7227,17 +6058,8 @@ mod tests {
                         max_derived_items_per_kind: 4,
                     },
                 },
-            },
-            "secret",
-            &static_source(),
-            &lease_manager,
-            Some(&store),
-            None,
-        );
-
-        let DiagnosticsResponse::EvidenceView { view } = response else {
-            panic!("expected evidence view response");
-        };
+            )
+            .expect("evidence view");
 
         assert!(view.raw.recent_events.is_empty());
         assert!(view.raw.timeline_entries.is_empty());
@@ -7290,13 +6112,13 @@ mod tests {
         let lease = lease_manager
             .acquire("tester".to_string(), Some(500))
             .expect("acquire lease");
-
-        let response = execute_request(
-            DiagnosticsRequest::EvidenceView {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id,
-                run_id: run.id,
-                request: DiagnosticsEvidenceRequest {
+        let source = static_source();
+        let service = test_session_service(&source, &lease_manager, Some(&store), None);
+        let view = service
+            .evidence_view(
+                &lease.lease_id,
+                &run.id,
+                DiagnosticsEvidenceRequest {
                     scope: DiagnosticsEvidenceScope::default(),
                     budget: DiagnosticsEvidenceBudget {
                         max_recent_events: 8,
@@ -7305,17 +6127,8 @@ mod tests {
                         max_derived_items_per_kind: 4,
                     },
                 },
-            },
-            "secret",
-            &static_source(),
-            &lease_manager,
-            Some(&store),
-            None,
-        );
-
-        let DiagnosticsResponse::EvidenceView { view } = response else {
-            panic!("expected evidence view response");
-        };
+            )
+            .expect("evidence view");
 
         assert_eq!(view.raw.profiling_windows.len(), 1);
         assert!(view.raw.profiling_windows[0].summary.is_none());
@@ -7412,23 +6225,10 @@ mod tests {
         let lease = lease_manager
             .acquire("tester".to_string(), Some(500))
             .expect("acquire lease");
-
-        let response = execute_request(
-            DiagnosticsRequest::MaterializeReport {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id,
-                run_id: run.id.clone(),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            None,
-        );
-
-        let DiagnosticsResponse::InvestigationReport { report } = response else {
-            panic!("expected investigation report response");
-        };
+        let service = test_session_service(&source, &lease_manager, Some(&store), None);
+        let report = service
+            .materialize_report(&lease.lease_id, &run.id)
+            .expect("materialize report");
 
         assert_eq!(report.run_id, run.id);
         assert_eq!(report.marker_timeline.len(), 1);
@@ -7533,23 +6333,10 @@ mod tests {
         let lease = lease_manager
             .acquire("tester".to_string(), Some(500))
             .expect("acquire lease");
-
-        let response = execute_request(
-            DiagnosticsRequest::MaterializeReport {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id,
-                run_id: run.id.clone(),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            None,
-        );
-
-        let DiagnosticsResponse::InvestigationReport { report } = response else {
-            panic!("expected investigation report response");
-        };
+        let service = test_session_service(&source, &lease_manager, Some(&store), None);
+        let report = service
+            .materialize_report(&lease.lease_id, &run.id)
+            .expect("materialize report");
 
         assert_eq!(
             report.truncation.anomalies.included_count,
@@ -7680,23 +6467,10 @@ mod tests {
         let lease = lease_manager
             .acquire("tester".to_string(), Some(500))
             .expect("acquire lease");
-
-        let response = execute_request(
-            DiagnosticsRequest::MaterializeReport {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id,
-                run_id: run.id,
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            None,
-        );
-
-        let DiagnosticsResponse::InvestigationReport { report } = response else {
-            panic!("expected investigation report response");
-        };
+        let service = test_session_service(&source, &lease_manager, Some(&store), None);
+        let report = service
+            .materialize_report(&lease.lease_id, &run.id)
+            .expect("materialize report");
 
         let upload_pending_in_view = report.references.derived_view.raw.snapshot_sections["upload"]
             ["pending_uploads"]
@@ -8254,20 +7028,8 @@ mod tests {
     fn list_workflows_includes_aja_hybrid_preset() {
         let source = static_source();
         let lease_manager = ControllerLeaseManager::default();
-        let response = execute_request(
-            DiagnosticsRequest::ListWorkflows {
-                auth_token: "secret".to_string(),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            None,
-            None,
-        );
-
-        let DiagnosticsResponse::WorkflowPresets { workflows } = response else {
-            panic!("expected workflow preset response");
-        };
+        let service = test_session_service(&source, &lease_manager, None, None);
+        let workflows = service.list_workflows().expect("list workflows");
         assert_eq!(workflows.len(), 1);
         assert_eq!(workflows[0].workflow_id, "aja_hybrid_v1");
         assert_eq!(workflows[0].steps[0].step_id, "capture_attach_snapshot");
@@ -8279,95 +7041,56 @@ mod tests {
         let lease_manager = ControllerLeaseManager::default();
         let temp = mounts_dir_temp();
         let store = InvestigationStore::new(temp.path().join("investigations"));
+        let service = test_session_service(&source, &lease_manager, Some(&store), None);
 
-        let lease = match execute_request(
-            DiagnosticsRequest::AcquireController {
-                auth_token: "secret".to_string(),
-                client_name: "tester".to_string(),
-                ttl_ms: Some(250),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            None,
-        ) {
-            DiagnosticsResponse::ControllerLease { lease } => lease,
-            other => panic!("unexpected lease response: {other:?}"),
-        };
+        let lease = service
+            .acquire_controller("tester".to_string(), Some(250))
+            .expect("acquire controller");
+        let case = service
+            .create_case(
+                &lease.lease_id,
+                "AJA slowdown".to_string(),
+                Some("Copy stalls after warmup".to_string()),
+                Some("aja".to_string()),
+                Some("artist workstation".to_string()),
+            )
+            .expect("create case");
+        let run = service
+            .create_run(
+                &lease.lease_id,
+                case.id.clone(),
+                Some("copy-pass-1".to_string()),
+            )
+            .expect("create run");
 
-        let case = match execute_request(
-            DiagnosticsRequest::CreateCase {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id.clone(),
-                title: "AJA slowdown".to_string(),
-                problem_statement: Some("Copy stalls after warmup".to_string()),
-                workload_identity: Some("aja".to_string()),
-                target_environment: Some("artist workstation".to_string()),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            None,
-        ) {
-            DiagnosticsResponse::InvestigationCase { case } => *case,
-            other => panic!("unexpected case response: {other:?}"),
-        };
-
-        let run = match execute_request(
-            DiagnosticsRequest::CreateRun {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id.clone(),
-                case_id: case.id.clone(),
-                run_workload_identity: Some("copy-pass-1".to_string()),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            None,
-        ) {
-            DiagnosticsResponse::InvestigationRun { run } => *run,
-            other => panic!("unexpected run response: {other:?}"),
-        };
-
-        let _ = execute_request(
-            DiagnosticsRequest::AppendTimelineEntry {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id.clone(),
-                run_id: run.id.clone(),
-                source: TimelineEntrySource::Cli,
-                kind: TimelineEntryKind::Marker,
-                title: "start copy".to_string(),
-                body: Some("Started the manual copy workload".to_string()),
-                actor: Some("developer".to_string()),
-                reason: Some("begin workload".to_string()),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            None,
-        );
-        let _ = execute_request(
-            DiagnosticsRequest::AppendTimelineEntry {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id,
-                run_id: run.id.clone(),
-                source: TimelineEntrySource::Mcp,
-                kind: TimelineEntryKind::Anomaly,
-                title: "cache miss burst".to_string(),
-                body: Some("MCP adapter observed a foreground read spike".to_string()),
-                actor: Some("studiofs-dev-mcp".to_string()),
-                reason: Some("operator observation".to_string()),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            None,
-        );
+        service
+            .append_timeline_entry(
+                &lease.lease_id,
+                &run.id,
+                NewTimelineEntry {
+                    source: TimelineEntrySource::Cli,
+                    kind: TimelineEntryKind::Marker,
+                    title: "start copy".to_string(),
+                    body: Some("Started the manual copy workload".to_string()),
+                    actor: Some("developer".to_string()),
+                    reason: Some("begin workload".to_string()),
+                },
+            )
+            .expect("append marker timeline entry");
+        service
+            .append_timeline_entry(
+                &lease.lease_id,
+                &run.id,
+                NewTimelineEntry {
+                    source: TimelineEntrySource::Mcp,
+                    kind: TimelineEntryKind::Anomaly,
+                    title: "cache miss burst".to_string(),
+                    body: Some("MCP adapter observed a foreground read spike".to_string()),
+                    actor: Some("studiofs-dev-mcp".to_string()),
+                    reason: Some("operator observation".to_string()),
+                },
+            )
+            .expect("append anomaly timeline entry");
 
         let persisted_run = store.load_run(&run.id).expect("load run");
 
@@ -8411,94 +7134,35 @@ mod tests {
         let lease_manager = ControllerLeaseManager::default();
         let store = InvestigationStore::new(temp.path().join("investigations"));
         let profiling = DiagnosticsProfilingCoordinator::new(Arc::new(SuccessfulProfilingBackend));
+        let service = test_session_service(&source, &lease_manager, Some(&store), Some(&profiling));
 
-        let lease = match execute_request(
-            DiagnosticsRequest::AcquireController {
-                auth_token: "secret".to_string(),
-                client_name: "tester".to_string(),
-                ttl_ms: Some(250),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            Some(&profiling),
-        ) {
-            DiagnosticsResponse::ControllerLease { lease } => lease,
-            other => panic!("unexpected lease response: {other:?}"),
-        };
-        let case = match execute_request(
-            DiagnosticsRequest::CreateCase {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id.clone(),
-                title: "AJA workflow".to_string(),
-                problem_statement: None,
-                workload_identity: Some("aja".to_string()),
-                target_environment: None,
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            Some(&profiling),
-        ) {
-            DiagnosticsResponse::InvestigationCase { case } => *case,
-            other => panic!("unexpected case response: {other:?}"),
-        };
-        let run = match execute_request(
-            DiagnosticsRequest::CreateRun {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id.clone(),
-                case_id: case.id,
-                run_workload_identity: Some("aja-pass-1".to_string()),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            Some(&profiling),
-        ) {
-            DiagnosticsResponse::InvestigationRun { run } => *run,
-            other => panic!("unexpected run response: {other:?}"),
-        };
+        let lease = service
+            .acquire_controller("tester".to_string(), Some(250))
+            .expect("acquire controller");
+        let case = service
+            .create_case(
+                &lease.lease_id,
+                "AJA workflow".to_string(),
+                None,
+                Some("aja".to_string()),
+                None,
+            )
+            .expect("create case");
+        let run = service
+            .create_run(&lease.lease_id, case.id, Some("aja-pass-1".to_string()))
+            .expect("create run");
 
-        let mut workflow = match execute_request(
-            DiagnosticsRequest::StartWorkflow {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id.clone(),
-                run_id: run.id.clone(),
-                workflow_id: "aja_hybrid_v1".to_string(),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            Some(&profiling),
-        ) {
-            DiagnosticsResponse::WorkflowRun { workflow } => *workflow,
-            other => panic!("unexpected workflow response: {other:?}"),
-        };
+        let mut workflow = service
+            .start_workflow(&lease.lease_id, &run.id, "aja_hybrid_v1".to_string())
+            .expect("start workflow");
         assert_eq!(
             workflow.current_step_id.as_deref(),
             Some("capture_attach_snapshot")
         );
 
-        workflow = match execute_request(
-            DiagnosticsRequest::AdvanceWorkflowStep {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id.clone(),
-                workflow_run_id: workflow.id.clone(),
-                step_id: "capture_attach_snapshot".to_string(),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            Some(&profiling),
-        ) {
-            DiagnosticsResponse::WorkflowRun { workflow } => *workflow,
-            other => panic!("unexpected workflow step response: {other:?}"),
-        };
+        workflow = service
+            .advance_workflow_step(&lease.lease_id, &workflow.id, "capture_attach_snapshot")
+            .expect("advance capture snapshot");
         assert_eq!(
             workflow.steps[0].status,
             InvestigationWorkflowStepStatus::Completed
@@ -8517,22 +7181,9 @@ mod tests {
             Some("start_balanced_profiling")
         );
 
-        workflow = match execute_request(
-            DiagnosticsRequest::AdvanceWorkflowStep {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id.clone(),
-                workflow_run_id: workflow.id.clone(),
-                step_id: "start_balanced_profiling".to_string(),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            Some(&profiling),
-        ) {
-            DiagnosticsResponse::WorkflowRun { workflow } => *workflow,
-            other => panic!("unexpected workflow profiling response: {other:?}"),
-        };
+        workflow = service
+            .advance_workflow_step(&lease.lease_id, &workflow.id, "start_balanced_profiling")
+            .expect("advance profiling step");
         assert_eq!(
             workflow.steps[1].status,
             InvestigationWorkflowStepStatus::Completed
@@ -8542,22 +7193,9 @@ mod tests {
             Some("run_manual_aja_phase")
         );
 
-        workflow = match execute_request(
-            DiagnosticsRequest::AdvanceWorkflowStep {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id.clone(),
-                workflow_run_id: workflow.id.clone(),
-                step_id: "run_manual_aja_phase".to_string(),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            Some(&profiling),
-        ) {
-            DiagnosticsResponse::WorkflowRun { workflow } => *workflow,
-            other => panic!("unexpected manual workflow response: {other:?}"),
-        };
+        workflow = service
+            .advance_workflow_step(&lease.lease_id, &workflow.id, "run_manual_aja_phase")
+            .expect("advance manual step");
         assert_eq!(
             workflow.status,
             InvestigationWorkflowStatus::WaitingForOperator
@@ -8567,24 +7205,15 @@ mod tests {
             InvestigationWorkflowStepStatus::WaitingForOperator
         );
 
-        workflow = match execute_request(
-            DiagnosticsRequest::AcknowledgeManualStep {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id.clone(),
-                workflow_run_id: workflow.id.clone(),
-                step_id: "run_manual_aja_phase".to_string(),
-                actor: Some("operator".to_string()),
-                note: Some("AJA phase complete".to_string()),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            Some(&profiling),
-        ) {
-            DiagnosticsResponse::WorkflowRun { workflow } => *workflow,
-            other => panic!("unexpected manual ack response: {other:?}"),
-        };
+        workflow = service
+            .acknowledge_manual_step(
+                &lease.lease_id,
+                &workflow.id,
+                "run_manual_aja_phase",
+                Some("operator".to_string()),
+                Some("AJA phase complete".to_string()),
+            )
+            .expect("acknowledge manual step");
         assert_eq!(
             workflow.steps[2].status,
             InvestigationWorkflowStepStatus::Completed
@@ -8594,22 +7223,9 @@ mod tests {
             Some("stop_active_profiling")
         );
 
-        workflow = match execute_request(
-            DiagnosticsRequest::AdvanceWorkflowStep {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id.clone(),
-                workflow_run_id: workflow.id.clone(),
-                step_id: "stop_active_profiling".to_string(),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            Some(&profiling),
-        ) {
-            DiagnosticsResponse::WorkflowRun { workflow } => *workflow,
-            other => panic!("unexpected profiling stop response: {other:?}"),
-        };
+        workflow = service
+            .advance_workflow_step(&lease.lease_id, &workflow.id, "stop_active_profiling")
+            .expect("advance stop profiling");
         assert_eq!(
             workflow.steps[3].status,
             InvestigationWorkflowStepStatus::Completed
@@ -8620,22 +7236,9 @@ mod tests {
             Some("materialize_report")
         );
 
-        workflow = match execute_request(
-            DiagnosticsRequest::AdvanceWorkflowStep {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id,
-                workflow_run_id: workflow.id.clone(),
-                step_id: "materialize_report".to_string(),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            Some(&profiling),
-        ) {
-            DiagnosticsResponse::WorkflowRun { workflow } => *workflow,
-            other => panic!("unexpected report step response: {other:?}"),
-        };
+        workflow = service
+            .advance_workflow_step(&lease.lease_id, &workflow.id, "materialize_report")
+            .expect("advance report step");
         assert_eq!(workflow.status, InvestigationWorkflowStatus::Completed);
         assert!(workflow.current_step_id.is_none());
 
@@ -8761,65 +7364,33 @@ mod tests {
         let temp = mounts_dir_temp();
         let store = InvestigationStore::new(temp.path().join("investigations"));
         let profiling = DiagnosticsProfilingCoordinator::new(Arc::new(SuccessfulProfilingBackend));
+        let service = test_session_service(&source, &lease_manager, Some(&store), Some(&profiling));
 
-        let lease = match execute_request(
-            DiagnosticsRequest::AcquireController {
-                auth_token: "secret".to_string(),
-                client_name: "tester".to_string(),
-                ttl_ms: Some(250),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            Some(&profiling),
-        ) {
-            DiagnosticsResponse::ControllerLease { lease } => lease,
-            other => panic!("unexpected lease response: {other:?}"),
-        };
+        let lease = service
+            .acquire_controller("tester".to_string(), Some(250))
+            .expect("acquire controller");
+        let case = service
+            .create_case(
+                &lease.lease_id,
+                "AJA slowdown".to_string(),
+                Some("Copy stalls after warmup".to_string()),
+                Some("aja".to_string()),
+                Some("artist workstation".to_string()),
+            )
+            .expect("create case");
+        let run = service
+            .create_run(
+                &lease.lease_id,
+                case.id.clone(),
+                Some("copy-pass-1".to_string()),
+            )
+            .expect("create run");
 
-        let case = match execute_request(
-            DiagnosticsRequest::CreateCase {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id.clone(),
-                title: "AJA slowdown".to_string(),
-                problem_statement: Some("Copy stalls after warmup".to_string()),
-                workload_identity: Some("aja".to_string()),
-                target_environment: Some("artist workstation".to_string()),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            Some(&profiling),
-        ) {
-            DiagnosticsResponse::InvestigationCase { case } => *case,
-            other => panic!("unexpected case response: {other:?}"),
-        };
-
-        let run = match execute_request(
-            DiagnosticsRequest::CreateRun {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id.clone(),
-                case_id: case.id.clone(),
-                run_workload_identity: Some("copy-pass-1".to_string()),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            Some(&profiling),
-        ) {
-            DiagnosticsResponse::InvestigationRun { run } => *run,
-            other => panic!("unexpected run response: {other:?}"),
-        };
-
-        let started = match execute_request(
-            DiagnosticsRequest::StartProfilingWindow {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id.clone(),
-                run_id: run.id.clone(),
-                request: StartProfilingWindowRequest {
+        let started = service
+            .start_profiling_window(
+                &lease.lease_id,
+                &run.id,
+                StartProfilingWindowRequest {
                     capture_mode: ProfilingCaptureMode::WallBlocking,
                     preset: DiagnosticsPreset::Balanced,
                     budget: ProfilingBudget {
@@ -8827,34 +7398,14 @@ mod tests {
                         sample_rate_hz: Some(99),
                     },
                 },
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            Some(&profiling),
-        ) {
-            DiagnosticsResponse::ProfilingWindow { window } => *window,
-            other => panic!("unexpected profiling start response: {other:?}"),
-        };
+            )
+            .expect("start profiling window");
 
         assert_eq!(started.status, ProfilingWindowStatus::Running);
 
-        let stopped = match execute_request(
-            DiagnosticsRequest::StopProfilingWindow {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id.clone(),
-                window_id: started.window_id.clone(),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            Some(&profiling),
-        ) {
-            DiagnosticsResponse::ProfilingWindow { window } => *window,
-            other => panic!("unexpected profiling stop response: {other:?}"),
-        };
+        let stopped = service
+            .stop_profiling_window(&lease.lease_id, &started.window_id)
+            .expect("stop profiling window");
 
         assert_eq!(stopped.status, ProfilingWindowStatus::Completed);
         assert_eq!(stopped.sample_rate_hz, Some(99));
@@ -8878,47 +7429,30 @@ mod tests {
         let temp = mounts_dir_temp();
         let store = InvestigationStore::new(temp.path().join("investigations"));
         let profiling = DiagnosticsProfilingCoordinator::new(Arc::new(SuccessfulProfilingBackend));
+        let service = test_session_service(&source, &lease_manager, Some(&store), Some(&profiling));
 
-        let lease = match execute_request(
-            DiagnosticsRequest::AcquireController {
-                auth_token: "secret".to_string(),
-                client_name: "tester".to_string(),
-                ttl_ms: Some(250),
-            },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            Some(&profiling),
-        ) {
-            DiagnosticsResponse::ControllerLease { lease } => lease,
-            other => panic!("unexpected lease response: {other:?}"),
-        };
+        let lease = service
+            .acquire_controller("tester".to_string(), Some(250))
+            .expect("acquire controller");
 
-        let response = execute_request(
-            DiagnosticsRequest::StartProfilingWindow {
-                auth_token: "secret".to_string(),
-                lease_id: lease.lease_id,
-                run_id: "run-1".to_string(),
-                request: StartProfilingWindowRequest {
-                    capture_mode: ProfilingCaptureMode::Cpu,
-                    preset: DiagnosticsPreset::Minimal,
-                    budget: ProfilingBudget {
-                        duration_ms: MAX_PROFILE_WINDOW_DURATION_MS + 1,
-                        sample_rate_hz: Some(100),
-                    },
+        let response = service.start_profiling_window(
+            &lease.lease_id,
+            "run-1",
+            StartProfilingWindowRequest {
+                capture_mode: ProfilingCaptureMode::Cpu,
+                preset: DiagnosticsPreset::Minimal,
+                budget: ProfilingBudget {
+                    duration_ms: MAX_PROFILE_WINDOW_DURATION_MS + 1,
+                    sample_rate_hz: Some(100),
                 },
             },
-            "secret",
-            &source,
-            &lease_manager,
-            Some(&store),
-            Some(&profiling),
         );
 
         assert!(matches!(
             response,
-            DiagnosticsResponse::Error { code, .. } if code == "profiling_budget_invalid"
+            Err(DiagnosticsServiceError::ProfilingStart(
+                ProfilingWindowStartError::Budget(_)
+            ))
         ));
     }
 
