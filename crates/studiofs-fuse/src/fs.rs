@@ -1633,8 +1633,7 @@ mod tests {
     use super::{
         DEFAULT_FUSE_MAX_READAHEAD_BYTES, StudioFuseFs, is_missing_xattr_error,
         missing_xattr_errno, normalize_unix_mode, posix_flags_to_open_flags,
-        should_hide_non_macos_root_metadata_entry, should_log_invalidation_error, to_fuse_attr,
-        vfs_err_to_errno,
+        should_log_invalidation_error, to_fuse_attr, vfs_err_to_errno,
     };
     #[cfg(target_os = "macos")]
     use studiofs_meta::engine::{XATTR_CREATE_FLAG, XATTR_REPLACE_FLAG};
@@ -1652,7 +1651,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     use studiofs_meta::schema::DirEntry;
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
-    use studiofs_meta::{MetaFormat, ROOT_INO, RedbMetaEngine};
+    use studiofs_meta::{MetaFormat, RedbMetaEngine};
     use studiofs_vfs::{OpenFlags, StudioVfs, VfsConfig, VfsError};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
@@ -1859,19 +1858,21 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn hidden_non_macos_root_metadata_entry_matches_trashes_only() {
-        assert!(should_hide_non_macos_root_metadata_entry(
-            ROOT_INO,
+        assert!(super::should_hide_non_macos_root_metadata_entry(
+            studiofs_meta::ROOT_INO,
             b".Trashes"
         ));
-        assert!(!should_hide_non_macos_root_metadata_entry(
-            ROOT_INO, b".Trash"
+        assert!(!super::should_hide_non_macos_root_metadata_entry(
+            studiofs_meta::ROOT_INO,
+            b".Trash"
         ));
-        assert!(!should_hide_non_macos_root_metadata_entry(
-            ROOT_INO + 1,
+        assert!(!super::should_hide_non_macos_root_metadata_entry(
+            studiofs_meta::ROOT_INO + 1,
             b".Trashes"
         ));
-        assert!(!should_hide_non_macos_root_metadata_entry(
-            ROOT_INO, b"visible"
+        assert!(!super::should_hide_non_macos_root_metadata_entry(
+            studiofs_meta::ROOT_INO,
+            b"visible"
         ));
     }
 
