@@ -91,15 +91,18 @@ Invariants:
   to read/write against the version/path binding it opened with until close,
   while new opens resolve against the latest applied shared state plus the
   opening client's own private overlay.
-- Each discovered client owns disjoint inode and block-ID ranges before local
-  foreground allocation so concurrent clients do not collide on
-  foreground-created keys.
-- The initial client slot plus initial ID ranges are reserved during
-  bootstrap/discover and persisted locally for later mounts of that client.
-- If the active range is nearing exhaustion, StudioFS reserves the next
-  disjoint range from available space and persists that extension locally
-  before foreground allocation crosses the current range boundary.
-- The disjoint-range rule is part of the contract, not a disposable
+- Each volume owns one shared inode allocator for files, directories, and
+  symlinks. Clients reserve durable local inode windows from a per-volume
+  PostgreSQL `next_inode` counter and allocate foreground inode values from the
+  persisted local window state.
+- The initial inode window is reserved during bootstrap/discover when local
+  allocator state is missing and then reused across later mounts of the same
+  client instead of minting a fresh lease-like range on reconnect.
+- If the current inode window is nearing exhaustion, StudioFS reserves and
+  persists one prefetched inode window so the foreground create path can switch
+  locally when the current window is consumed.
+- Block IDs still use a persistent PG client slot plus disjoint local block
+  ranges; that rule remains part of the contract, not a disposable
   implementation trick.
 
 ## 3. Primary Observation Model
@@ -307,13 +310,14 @@ Rules:
   foreground IO locally.
 - Foreign changes are applied into local `redb` asynchronously and become
   visible through local invalidation/apply.
-- Per-client inode/block preallocation remains mandatory. A discovered client
-  obtains a persistent PG client slot, derives disjoint ID ranges from it,
-  persists that slot and the active ranges locally, and allocates foreground
-  inode/block IDs without further PG round-trips while the current range still
-  has headroom.
-- When the active range is nearing exhaustion, the client reserves and persists
-  the next disjoint range before switching local allocation to it.
+- Per-volume inode window persistence remains mandatory. A discovered client
+  reuses its local `current`/`prefetched` inode windows across restarts and
+  reserves a new per-volume window from PostgreSQL only when no local inode
+  window remains available.
+- Per-client block preallocation also remains mandatory. A discovered client
+  obtains a persistent PG client slot, derives disjoint local block-ID ranges
+  from it, and allocates foreground block IDs without further PG round-trips
+  while the current block range still has headroom.
 
 ## 11. Mutation Visibility And Invalidation Matrix
 
@@ -386,7 +390,8 @@ Review guardrails:
 
 - Reject code that drags PostgreSQL into ordinary mounted read/write hot paths.
 - Reject APIs that make per-inode or per-block foreground allocation depend on
-  a PG round-trip once the client slot and ID ranges are reserved.
+  a PG round-trip once the local inode windows or local block ranges are
+  already reserved.
 - Reject designs that require remote readers to reason about another mount's
   private overlay.
 - Reject generic `anyhow`-style library errors where callers need domain
@@ -426,7 +431,7 @@ contract.
 | `Local-First` | Retained StudioFS semantic | The writing mount observes accepted changes immediately through the merged local view. |
 | `eventual consistency` | Retained StudioFS semantic | Other mounts converge later through upload plus replication/apply, not synchronously on each write. |
 | `cached-store pipeline` | Borrowed JuiceFS concept | Unified cache, staging, download, upload, and eviction pipeline. |
-| `client slot` | StudioFS target semantic | Persistent PG-assigned client identity, established during bootstrap/discover, used to derive disjoint local inode/block ID ranges across later mounts of the same client. |
+| `client slot` | StudioFS target semantic | Persistent PG-assigned client identity used for client-scoped block-ID ranges and other per-client coordination surfaces; inode allocation is no longer derived from the client slot. |
 | `lock lease` | StudioFS target semantic | PG-coordinated hard lock with TTL/renewal semantics and pub/sub notifications. |
 | `orphaned payload` | StudioFS target semantic | Uploaded payload that is not referenced by any published version and can later be removed by janitor. |
 | `Fast Local Authority` | StudioFS target semantic | The single target mount contract: local foreground authority, PG for replication/bootstrap/locks, S3 for payload replication. |

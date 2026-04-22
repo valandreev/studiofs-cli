@@ -10,8 +10,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use studiofs_data::{DataStore, DataStoreConfig};
 use studiofs_meta::{
-    CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, FormatInfo, MetaFormat, MetadataBackend,
-    MetadataConfig, PostgresConfig, RedbMetaEngine, ensure_studiofs_database,
+    CURRENT_FORMAT_VERSION, DEFAULT_BLOCK_SIZE, FormatInfo, MetaFormat, MetaOpenOptions,
+    MetadataBackend, MetadataConfig, PostgresConfig, RedbMetaEngine, ensure_studiofs_database,
+    open_meta_engine_with_options,
 };
 use tracing::info;
 use uuid::Uuid;
@@ -549,6 +550,14 @@ fn run(request: InitRunRequest) -> anyhow::Result<()> {
     let snapshot_json = serde_json::to_vec(&snapshot)?;
     seed_pg_metadata_state(&rt, &postgres_dsn, postgres_volume_id, &snapshot_json)?;
     drop(engine);
+
+    let primed_engine = open_meta_engine_with_options(
+        &db_path,
+        MetaOpenOptions {
+            background_poll: false,
+        },
+    )?;
+    drop(primed_engine);
 
     // ── 7. Report success ─────────────────────────────────────────────────────
     info!("volume {name:?} initialized successfully");
