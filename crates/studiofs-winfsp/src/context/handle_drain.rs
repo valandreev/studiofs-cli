@@ -219,9 +219,12 @@ impl FlushGateRegistry {
 
     fn maybe_release(&self, ino: Ino, gate: &Arc<Mutex<()>>) {
         let mut gates = self.gates.lock();
-        let should_remove = gates
-            .get(&ino)
-            .is_some_and(|current| Arc::ptr_eq(current, gate) && Arc::strong_count(current) == 2);
+        let should_remove = gates.get(&ino).is_some_and(|current| {
+            // During `FlushGateRelease::drop`, the map entry, the caller's local
+            // `gate`, and `self.gate` are the only remaining strong refs when no
+            // other callbacks are waiting on this inode gate.
+            Arc::ptr_eq(current, gate) && Arc::strong_count(current) == 3
+        });
         if should_remove {
             gates.remove(&ino);
         }
@@ -770,6 +773,42 @@ mod tests {
             0,
             "close should still release the last handle after the explicit flush path"
         );
+    }
+
+    #[test]
+    fn dirty_flush_callback_releases_inode_flush_gate_after_completion() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("flush-gate-release");
+        let attr = vfs
+            .create(ROOT_INO, b"flush-gate-release.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+        let facade = WinfspHandleDrainFacade::new(&ctx);
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.write(attr.ino, 0, b"dirty").await }
+        })
+        .expect("dirty write");
+
+        assert_eq!(
+            ctx.flush_gate_count(),
+            0,
+            "test setup should start gate-free"
+        );
+        facade.flush(attr.ino, fh).expect("explicit flush callback");
+        assert_eq!(
+            ctx.flush_gate_count(),
+            0,
+            "flush callback should release the per-inode gate after the barrier completes"
+        );
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh).await }
+        })
+        .expect("release_fh");
     }
 
     #[test]
