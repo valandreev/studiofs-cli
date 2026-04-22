@@ -55,14 +55,21 @@ struct ResolvedMountConfig {
     vfs_config: VfsConfigValidated,
 }
 
+struct MountRequest {
+    command: MountCommand,
+    settings_config: settings::StudioFsConfig,
+}
+
 #[derive(Debug)]
-struct ResolvedMountStartup {
+struct MountPlan {
+    command: MountCommand,
     actual_mount_path: String,
     base_cache_path: PathBuf,
     cache_size: String,
     vfs_config: VfsConfigValidated,
     run_in_foreground: bool,
     launch_mode: MountLaunchMode,
+    read_only_mount: bool,
 }
 
 #[derive(Debug)]
@@ -72,20 +79,18 @@ struct PreparedVolumeCacheRuntime {
     cache_runtime: PreparedLocalBlockRuntime,
 }
 
-pub(crate) struct MountSession {
-    command: MountCommand,
-    actual_mount_path: String,
-    cache_size: String,
-    #[cfg(unix)]
-    run_in_foreground: bool,
-    launch_mode: MountLaunchMode,
+struct PreparedMount {
+    plan: MountPlan,
     format_info: Option<FormatInfo>,
-    read_only_mount: bool,
     snapshot_mount_db_path: Option<PathBuf>,
-    prepared_foreground: Option<PreparedForegroundSession>,
+    foreground: Option<PreparedForegroundRuntime>,
 }
 
-struct PreparedForegroundSession {
+pub(crate) struct MountSession {
+    prepared: PreparedMount,
+}
+
+struct PreparedForegroundRuntime {
     cache_path: PathBuf,
     cache_path_str: String,
     backend: Box<dyn MountBackend>,
@@ -449,36 +454,41 @@ fn resolve_mount_runtime_settings(
     })
 }
 
-fn resolve_mount_startup(
-    command: &MountCommand,
-    settings_config: settings::StudioFsConfig,
-) -> anyhow::Result<ResolvedMountStartup> {
-    let resolved_settings = resolve_mount_runtime_settings(
-        &settings_config,
-        command.mount_point.as_deref(),
-        command.cache_dir.as_deref(),
-        command.cache_size.as_deref(),
-    )?;
-    let ResolvedMountConfig { vfs_config } = build_mount_config_from_raw(
-        settings_config.vfs,
-        command.principal.as_deref(),
-        &command.runtime_tuning,
-    )?;
+impl MountPlan {
+    fn resolve(request: MountRequest) -> anyhow::Result<Self> {
+        let MountRequest {
+            command,
+            settings_config,
+        } = request;
+        let resolved_settings = resolve_mount_runtime_settings(
+            &settings_config,
+            command.mount_point.as_deref(),
+            command.cache_dir.as_deref(),
+            command.cache_size.as_deref(),
+        )?;
+        let ResolvedMountConfig { vfs_config } = build_mount_config_from_raw(
+            settings_config.vfs,
+            command.principal.as_deref(),
+            &command.runtime_tuning,
+        )?;
 
-    validate_endpoint_override(command.endpoint.as_deref())?;
-    let mount_point = resolve_runtime_mount_point(resolved_settings.mount_point);
-    let actual_mount_path = prepare_mount_path(&command.name, &mount_point)?;
+        validate_endpoint_override(command.endpoint.as_deref())?;
+        let mount_point = resolve_runtime_mount_point(resolved_settings.mount_point);
+        let actual_mount_path = prepare_mount_path(&command.name, &mount_point)?;
 
-    Ok(ResolvedMountStartup {
-        actual_mount_path,
-        base_cache_path: resolved_settings
-            .cache_dir
-            .unwrap_or_else(|| command.meta_dir.join("cache")),
-        cache_size: resolved_settings.cache_size,
-        vfs_config,
-        run_in_foreground: resolve_run_in_foreground(command.foreground, command.detach),
-        launch_mode: resolve_mount_launch_mode(command.detach),
-    })
+        Ok(Self {
+            actual_mount_path,
+            base_cache_path: resolved_settings
+                .cache_dir
+                .unwrap_or_else(|| command.meta_dir.join("cache")),
+            cache_size: resolved_settings.cache_size,
+            vfs_config,
+            run_in_foreground: resolve_run_in_foreground(command.foreground, command.detach),
+            launch_mode: resolve_mount_launch_mode(command.detach),
+            read_only_mount: command.snapshot_id.is_some(),
+            command,
+        })
+    }
 }
 
 fn resolve_run_in_foreground(foreground: bool, detach: bool) -> bool {
@@ -894,32 +904,34 @@ impl MountSession {
     where
         Factory: FnOnce() -> Box<dyn MountBackend>,
     {
-        let startup = resolve_mount_startup(&command, settings_config)?;
-        let ResolvedMountStartup {
-            actual_mount_path,
-            base_cache_path,
-            cache_size,
-            vfs_config,
-            run_in_foreground,
-            launch_mode,
-        } = startup;
+        let plan = MountPlan::resolve(MountRequest {
+            command,
+            settings_config,
+        })?;
+        let prepared = plan.prepare(backend_factory)?;
+        Ok(Self { prepared })
+    }
 
-        if matches!(launch_mode, MountLaunchMode::Daemon) {
-            return Ok(Self {
-                command,
-                actual_mount_path,
-                cache_size,
-                #[cfg(unix)]
-                run_in_foreground,
-                launch_mode,
+    pub(crate) fn launch(self) -> anyhow::Result<()> {
+        self.prepared.launch()
+    }
+}
+
+impl MountPlan {
+    fn prepare<Factory>(self, backend_factory: Factory) -> anyhow::Result<PreparedMount>
+    where
+        Factory: FnOnce() -> Box<dyn MountBackend>,
+    {
+        if matches!(self.launch_mode, MountLaunchMode::Daemon) {
+            return Ok(PreparedMount {
+                plan: self,
                 format_info: None,
-                read_only_mount: false,
                 snapshot_mount_db_path: None,
-                prepared_foreground: None,
+                foreground: None,
             });
         }
 
-        guard_mount_pid_file(&actual_mount_path)?;
+        guard_mount_pid_file(&self.actual_mount_path)?;
 
         let MountMetaSession {
             meta,
@@ -927,38 +939,43 @@ impl MountSession {
             read_only_mount,
             snapshot_db_path,
         } = resolve_mount_meta_session(
-            &command.name,
-            &command.meta_dir,
-            command.snapshot_id.as_deref(),
-            command.endpoint.as_deref(),
+            &self.command.name,
+            &self.command.meta_dir,
+            self.command.snapshot_id.as_deref(),
+            self.command.endpoint.as_deref(),
         )?;
-        let prepared_foreground = (|| -> anyhow::Result<PreparedForegroundSession> {
+        debug_assert_eq!(self.read_only_mount, read_only_mount);
+
+        let prepared_foreground = (|| -> anyhow::Result<PreparedForegroundRuntime> {
             let data_config = DataStoreConfig::from(&format_info);
             let memory_cache_budget_bytes = initial_cache_bytes();
             let PreparedVolumeCacheRuntime {
                 cache_path,
                 cache_path_str,
                 cache_runtime,
-            } = prepare_volume_cache_runtime(&base_cache_path, &format_info.uuid)?;
-            let cache_size_bytes = parse_positive_size_arg(&cache_size)?;
+            } = prepare_volume_cache_runtime(&self.base_cache_path, &format_info.uuid)?;
+            let cache_size_bytes = parse_positive_size_arg(&self.cache_size)?;
             let profiling = build_mount_profile_finish(
-                command.profile,
-                &command.name,
+                self.command.profile,
+                &self.command.name,
                 &cache_path,
-                run_in_foreground,
+                self.run_in_foreground,
             );
-            let profiling_backend =
-                build_runtime_profiling_backend(&command.name, &cache_path, run_in_foreground);
+            let profiling_backend = build_runtime_profiling_backend(
+                &self.command.name,
+                &cache_path,
+                self.run_in_foreground,
+            );
             let runtime = Runtime::new()
                 .map_err(|error| anyhow::anyhow!("failed to create tokio runtime: {error}"))?;
             let _guard = runtime.enter();
             let backend = backend_factory();
             let diagnostics_runtime_fingerprint = LiveMountRuntimeFingerprint {
                 bridge: backend.name().to_string(),
-                cache_size: command.cache_size.clone(),
-                endpoint_override: command.endpoint.clone(),
-                snapshot_id: command.snapshot_id.clone(),
-                vfs_config: serde_json::to_value(vfs_config.as_ref())
+                cache_size: self.command.cache_size.clone(),
+                endpoint_override: self.command.endpoint.clone(),
+                snapshot_id: self.command.snapshot_id.clone(),
+                vfs_config: serde_json::to_value(self.vfs_config.as_ref())
                     .map_err(|error| anyhow::anyhow!("failed to serialize vfs config: {error}"))?,
             };
             let vfs = StudioVfs::new_with_prepared_cache_runtime(
@@ -967,7 +984,7 @@ impl MountSession {
                 &cache_path_str,
                 cache_size_bytes,
                 memory_cache_budget_bytes,
-                vfs_config,
+                self.vfs_config.clone(),
                 cache_runtime,
             )
             .map_err(|error| anyhow::anyhow!("failed to init vfs: {error}"))?;
@@ -981,15 +998,15 @@ impl MountSession {
             let diagnostics_source: Arc<dyn DiagnosticsDataSource> =
                 Arc::new(LiveMountDiagnosticsSource::new(
                     &format_info,
-                    &actual_mount_path,
+                    &self.actual_mount_path,
                     &cache_path,
                     std::process::id(),
-                    read_only_mount,
+                    self.read_only_mount,
                     diagnostics_runtime_fingerprint,
                     vfs.clone(),
                 ));
 
-            Ok(PreparedForegroundSession {
+            Ok(PreparedForegroundRuntime {
                 cache_path,
                 cache_path_str,
                 backend,
@@ -1003,17 +1020,11 @@ impl MountSession {
         })();
 
         match prepared_foreground {
-            Ok(prepared_foreground) => Ok(Self {
-                command,
-                actual_mount_path,
-                cache_size,
-                #[cfg(unix)]
-                run_in_foreground,
-                launch_mode,
+            Ok(foreground) => Ok(PreparedMount {
+                plan: self,
                 format_info: Some(format_info),
-                read_only_mount,
                 snapshot_mount_db_path: snapshot_db_path,
-                prepared_foreground: Some(prepared_foreground),
+                foreground: Some(foreground),
             }),
             Err(error) => {
                 cleanup_snapshot_mount_db(snapshot_db_path.as_deref());
@@ -1021,13 +1032,15 @@ impl MountSession {
             }
         }
     }
+}
 
-    pub(crate) fn launch(self) -> anyhow::Result<()> {
-        if matches!(self.launch_mode, MountLaunchMode::Daemon) {
+impl PreparedMount {
+    fn launch(self) -> anyhow::Result<()> {
+        if matches!(self.plan.launch_mode, MountLaunchMode::Daemon) {
             return spawn_daemon(
-                &self.command.name,
-                &self.actual_mount_path,
-                &self.command.meta_dir,
+                &self.plan.command.name,
+                &self.plan.actual_mount_path,
+                &self.plan.command.meta_dir,
             );
         }
 
@@ -1042,17 +1055,17 @@ impl MountSession {
             .as_ref()
             .expect("foreground mount sessions must resolve format info");
         let cache_path_str = &self
-            .prepared_foreground
+            .foreground
             .as_ref()
             .expect("foreground mount sessions must prepare runtime")
             .cache_path_str;
         for line in build_ready_banner_lines(
-            &self.command.name,
-            &self.actual_mount_path,
-            &self.cache_size,
+            &self.plan.command.name,
+            &self.plan.actual_mount_path,
+            &self.plan.cache_size,
             cache_path_str,
             format_info,
-            self.command.snapshot_id.as_deref(),
+            self.plan.command.snapshot_id.as_deref(),
         ) {
             println!("{line}");
         }
@@ -1060,12 +1073,12 @@ impl MountSession {
 
     fn write_pid_file(&self) {
         let prepared = self
-            .prepared_foreground
+            .foreground
             .as_ref()
             .expect("foreground mount sessions must prepare runtime");
         persist_mount_pid_file_best_effort_with(
-            &self.actual_mount_path,
-            &self.command.name,
+            &self.plan.actual_mount_path,
+            &self.plan.command.name,
             std::process::id(),
             Some(&prepared.cache_path),
             utils::write_pid_file_with_cache,
@@ -1078,10 +1091,10 @@ impl MountSession {
             .as_ref()
             .expect("foreground mount sessions must resolve format info");
         let prepared = self
-            .prepared_foreground
+            .foreground
             .take()
             .expect("foreground mount sessions must prepare runtime");
-        let PreparedForegroundSession {
+        let PreparedForegroundRuntime {
             cache_path: _,
             cache_path_str: _,
             backend,
@@ -1095,23 +1108,23 @@ impl MountSession {
         let backend_name = backend.name();
         info!(
             backend = backend_name,
-            mount_point = %self.actual_mount_path,
+            mount_point = %self.plan.actual_mount_path,
             "starting mount backend"
         );
         let diagnostics_host = LocalDiagnosticsHost::start_best_effort(
             runtime.handle(),
-            &self.actual_mount_path,
+            &self.plan.actual_mount_path,
             diagnostics_source,
             profiling_backend,
         );
         let serve_result = backend.serve(BackendLaunch {
             vfs: vfs.clone(),
             runtime_handle: runtime.handle().clone(),
-            mount_point: self.actual_mount_path.clone(),
+            mount_point: self.plan.actual_mount_path.clone(),
             volume_name: format_info.name.clone(),
-            read_only: self.read_only_mount,
+            read_only: self.plan.read_only_mount,
             #[cfg(unix)]
-            run_in_foreground: self.run_in_foreground,
+            run_in_foreground: self.plan.run_in_foreground,
         });
         write_path_observability_publisher.stop_and_join();
         runtime.block_on(vfs.shutdown(shutdown_upload_drain_timeout()));
@@ -1122,7 +1135,7 @@ impl MountSession {
             finish_profiling();
         }
         drop(vfs);
-        let _ = utils::remove_pid_file(&self.actual_mount_path);
+        let _ = utils::remove_pid_file(&self.plan.actual_mount_path);
         cleanup_snapshot_mount_db(self.snapshot_mount_db_path.take().as_deref());
         runtime.shutdown_timeout(runtime_shutdown_timeout());
 
@@ -1689,7 +1702,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_mount_startup_defaults_to_meta_cache_and_foreground_launch() {
+    fn mount_plan_defaults_to_meta_cache_and_foreground_launch() {
         let temp = tempfile::tempdir().expect("tempdir");
         let meta_dir = temp.path().join("meta");
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
@@ -1699,17 +1712,22 @@ mod tests {
         command.principal = Some("alice".to_string());
         command.endpoint = Some("127.0.0.1:9000".to_string());
 
-        let startup = resolve_mount_startup(&command, settings_config).expect("startup resolved");
+        let plan = MountPlan::resolve(MountRequest {
+            command,
+            settings_config,
+        })
+        .expect("mount plan resolved");
 
-        assert_eq!(startup.base_cache_path, meta_dir.join("cache"));
-        assert_eq!(startup.cache_size, "64GB");
-        assert_eq!(startup.launch_mode, MountLaunchMode::Foreground);
-        assert!(startup.run_in_foreground);
-        assert_eq!(startup.vfs_config.principal, "alice");
+        assert_eq!(plan.base_cache_path, meta_dir.join("cache"));
+        assert_eq!(plan.cache_size, "64GB");
+        assert_eq!(plan.launch_mode, MountLaunchMode::Foreground);
+        assert!(plan.run_in_foreground);
+        assert!(!plan.read_only_mount);
+        assert_eq!(plan.vfs_config.principal, "alice");
     }
 
     #[test]
-    fn resolve_mount_startup_prefers_cli_runtime_settings_over_defaults() {
+    fn mount_plan_prefers_cli_runtime_settings_over_defaults() {
         let temp = tempfile::tempdir().expect("tempdir");
         let meta_dir = temp.path().join("meta");
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
@@ -1721,26 +1739,26 @@ mod tests {
         #[cfg(windows)]
         let cli_mount_point = reserve_windows_test_mount_point(&[settings_mount_point.as_str()]);
 
-        let startup = resolve_mount_startup(
-            &mount_command(
+        let plan = MountPlan::resolve(MountRequest {
+            command: mount_command(
                 "projectfs",
                 &meta_dir,
                 Some(cli_mount_point),
                 Some(cli_cache_dir.clone()),
                 Some("96GB"),
             ),
-            startup_settings_config(
+            settings_config: startup_settings_config(
                 settings_mount_point,
                 Some(configured_cache_dir),
                 Some("32GB"),
             ),
-        )
-        .expect("startup resolved");
+        })
+        .expect("mount plan resolved");
 
-        assert_eq!(startup.base_cache_path, cli_cache_dir);
-        assert_eq!(startup.cache_size, "96GB");
-        assert_eq!(startup.launch_mode, MountLaunchMode::Foreground);
-        assert!(startup.run_in_foreground);
+        assert_eq!(plan.base_cache_path, cli_cache_dir);
+        assert_eq!(plan.cache_size, "96GB");
+        assert_eq!(plan.launch_mode, MountLaunchMode::Foreground);
+        assert!(plan.run_in_foreground);
     }
 
     #[test]
@@ -1805,21 +1823,51 @@ mod tests {
     }
 
     #[test]
-    fn resolve_mount_startup_rejects_invalid_endpoint() {
+    fn mount_plan_rejects_invalid_endpoint() {
         let temp = tempfile::tempdir().expect("tempdir");
         let meta_dir = temp.path().join("meta");
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
-        let cli_mount_point = startup_mount_point(&temp);
-        let mut command = mount_command("projectfs", &meta_dir, Some(cli_mount_point), None, None);
+        let mount_point = startup_mount_point(&temp);
+        let mut command = mount_command(
+            "projectfs",
+            &meta_dir,
+            Some(mount_point.clone()),
+            None,
+            None,
+        );
         command.endpoint = Some("ftp://127.0.0.1:9000".to_string());
 
-        let err = resolve_mount_startup(
-            &command,
-            startup_settings_config(startup_mount_point(&temp), None, Some("64GB")),
-        )
+        let err = MountPlan::resolve(MountRequest {
+            command,
+            settings_config: startup_settings_config(mount_point, None, Some("64GB")),
+        })
         .expect_err("invalid endpoint should fail");
 
         assert!(err.to_string().contains("invalid S3 endpoint"));
+    }
+
+    #[test]
+    fn mount_plan_marks_snapshot_mount_read_only() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let meta_dir = temp.path().join("meta");
+        std::fs::create_dir_all(&meta_dir).expect("create meta dir");
+        let mount_point = startup_mount_point(&temp);
+        let mut command = mount_command(
+            "projectfs",
+            &meta_dir,
+            Some(mount_point.clone()),
+            None,
+            Some("64GB"),
+        );
+        command.snapshot_id = Some("snapshot-123".to_string());
+
+        let plan = MountPlan::resolve(MountRequest {
+            command,
+            settings_config: startup_settings_config(mount_point, None, Some("64GB")),
+        })
+        .expect("mount plan resolved");
+
+        assert!(plan.read_only_mount);
     }
 
     #[test]
@@ -1888,37 +1936,39 @@ mod tests {
     }
 
     #[test]
-    fn mount_session_prepare_marks_snapshot_mount_read_only_and_uses_fake_backend() {
+    fn mount_plan_prepare_marks_snapshot_mount_read_only_and_uses_fake_backend() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
         let snapshot = engine.create_snapshot(ROOT_INO).expect("create snapshot");
         drop(engine);
         let events = Arc::new(Mutex::new(Vec::new()));
+        let mount_point = startup_mount_point(&temp);
         let mut command = mount_command(
             "demo",
             &meta_dir,
-            Some(startup_mount_point(&temp)),
+            Some(mount_point.clone()),
             Some(temp.path().join("cache")),
             Some("64GB"),
         );
         command.snapshot_id = Some(snapshot.id.clone());
 
-        let session = MountSession::prepare_with_backend_factory(
+        let prepared = MountPlan::resolve(MountRequest {
             command,
-            startup_settings_config(startup_mount_point(&temp), None, Some("64GB")),
-            || {
-                Box::new(FakeBackend {
-                    events: events.clone(),
-                    fail: false,
-                    inspect: None,
-                })
-            },
-        )
-        .expect("prepare session");
+            settings_config: startup_settings_config(mount_point, None, Some("64GB")),
+        })
+        .expect("mount plan resolved")
+        .prepare(|| {
+            Box::new(FakeBackend {
+                events: events.clone(),
+                fail: false,
+                inspect: None,
+            })
+        })
+        .expect("prepare mount");
 
-        assert!(session.read_only_mount);
+        assert!(prepared.plan.read_only_mount);
         assert_eq!(
-            session
+            prepared
                 .format_info
                 .as_ref()
                 .expect("format info")
@@ -1927,51 +1977,53 @@ mod tests {
             MetadataBackend::RedbLocal
         );
         assert_eq!(
-            session
-                .prepared_foreground
+            prepared
+                .foreground
                 .as_ref()
                 .expect("prepared runtime")
                 .backend
                 .name(),
             "FakeBackend"
         );
-        assert!(session.snapshot_mount_db_path.is_some());
+        assert!(prepared.snapshot_mount_db_path.is_some());
     }
 
     #[test]
-    fn mount_session_prepare_daemon_skips_foreground_runtime() {
+    fn mount_plan_prepare_daemon_skips_foreground_runtime() {
         let temp = tempfile::tempdir().expect("tempdir");
         let meta_dir = temp.path().join("meta");
         std::fs::create_dir_all(&meta_dir).expect("create meta dir");
+        let mount_point = startup_mount_point(&temp);
         let mut command = mount_command(
             "demo",
             &meta_dir,
-            Some(startup_mount_point(&temp)),
+            Some(mount_point.clone()),
             None,
             Some("64GB"),
         );
         command.detach = true;
 
-        let session = MountSession::prepare_with_backend_factory(
+        let prepared = MountPlan::resolve(MountRequest {
             command,
-            startup_settings_config(startup_mount_point(&temp), None, Some("64GB")),
-            || {
-                Box::new(FakeBackend {
-                    events: Arc::new(Mutex::new(Vec::new())),
-                    fail: false,
-                    inspect: None,
-                })
-            },
-        )
-        .expect("prepare daemon session");
+            settings_config: startup_settings_config(mount_point, None, Some("64GB")),
+        })
+        .expect("mount plan resolved")
+        .prepare(|| {
+            Box::new(FakeBackend {
+                events: Arc::new(Mutex::new(Vec::new())),
+                fail: false,
+                inspect: None,
+            })
+        })
+        .expect("prepare daemon mount");
 
-        assert!(matches!(session.launch_mode, MountLaunchMode::Daemon));
-        assert!(session.prepared_foreground.is_none());
-        assert!(session.format_info.is_none());
+        assert!(matches!(prepared.plan.launch_mode, MountLaunchMode::Daemon));
+        assert!(prepared.foreground.is_none());
+        assert!(prepared.format_info.is_none());
     }
 
     #[test]
-    fn mount_session_launch_success_invokes_backend_and_removes_pid_file() {
+    fn prepared_mount_launch_success_invokes_backend_and_removes_pid_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
         drop(engine);
@@ -1984,21 +2036,22 @@ mod tests {
             Some(temp.path().join("cache")),
             Some("64GB"),
         );
-        let session = MountSession::prepare_with_backend_factory(
+        let prepared = MountPlan::resolve(MountRequest {
             command,
-            startup_settings_config(mount_point.clone(), None, Some("64GB")),
-            || {
-                Box::new(FakeBackend {
-                    events: events.clone(),
-                    fail: false,
-                    inspect: None,
-                })
-            },
-        )
-        .expect("prepare session");
-        let actual_mount_path = session.actual_mount_path.clone();
+            settings_config: startup_settings_config(mount_point.clone(), None, Some("64GB")),
+        })
+        .expect("mount plan resolved")
+        .prepare(|| {
+            Box::new(FakeBackend {
+                events: events.clone(),
+                fail: false,
+                inspect: None,
+            })
+        })
+        .expect("prepare mount");
+        let actual_mount_path = prepared.plan.actual_mount_path.clone();
 
-        session.launch().expect("launch session");
+        prepared.launch().expect("launch mount");
 
         let observed = events.lock().expect("lock events").clone();
         assert_eq!(observed.len(), 1);
@@ -2010,33 +2063,34 @@ mod tests {
     }
 
     #[test]
-    fn mount_session_launch_failure_removes_pid_file() {
+    fn prepared_mount_launch_failure_removes_pid_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
         drop(engine);
         let events = Arc::new(Mutex::new(Vec::new()));
         let mount_point = startup_mount_point(&temp);
-        let session = MountSession::prepare_with_backend_factory(
-            mount_command(
+        let prepared = MountPlan::resolve(MountRequest {
+            command: mount_command(
                 "demo",
                 &meta_dir,
                 Some(mount_point.clone()),
                 Some(temp.path().join("cache")),
                 Some("64GB"),
             ),
-            startup_settings_config(mount_point.clone(), None, Some("64GB")),
-            || {
-                Box::new(FakeBackend {
-                    events: events.clone(),
-                    fail: true,
-                    inspect: None,
-                })
-            },
-        )
-        .expect("prepare session");
-        let actual_mount_path = session.actual_mount_path.clone();
+            settings_config: startup_settings_config(mount_point.clone(), None, Some("64GB")),
+        })
+        .expect("mount plan resolved")
+        .prepare(|| {
+            Box::new(FakeBackend {
+                events: events.clone(),
+                fail: true,
+                inspect: None,
+            })
+        })
+        .expect("prepare mount");
+        let actual_mount_path = prepared.plan.actual_mount_path.clone();
 
-        let err = session.launch().expect_err("backend error should surface");
+        let err = prepared.launch().expect_err("backend error should surface");
 
         assert!(err.to_string().contains("FakeBackend error: boom"));
         assert_eq!(events.lock().expect("lock events").len(), 1);
@@ -2071,7 +2125,7 @@ mod tests {
     }
 
     #[test]
-    fn mount_session_launch_cleans_up_snapshot_mount_db_on_backend_failure() {
+    fn prepared_mount_launch_cleans_up_snapshot_mount_db_on_backend_failure() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
         let snapshot = engine.create_snapshot(ROOT_INO).expect("create snapshot");
@@ -2087,19 +2141,20 @@ mod tests {
         );
         command.snapshot_id = Some(snapshot.id.clone());
 
-        let session = MountSession::prepare_with_backend_factory(
+        let prepared = MountPlan::resolve(MountRequest {
             command,
-            startup_settings_config(mount_point.clone(), None, Some("64GB")),
-            || {
-                Box::new(FakeBackend {
-                    events: events.clone(),
-                    fail: true,
-                    inspect: None,
-                })
-            },
-        )
-        .expect("prepare session");
-        let snapshot_db_path = session
+            settings_config: startup_settings_config(mount_point.clone(), None, Some("64GB")),
+        })
+        .expect("mount plan resolved")
+        .prepare(|| {
+            Box::new(FakeBackend {
+                events: events.clone(),
+                fail: true,
+                inspect: None,
+            })
+        })
+        .expect("prepare mount");
+        let snapshot_db_path = prepared
             .snapshot_mount_db_path
             .clone()
             .expect("snapshot db path");
@@ -2108,7 +2163,7 @@ mod tests {
             "prepare should materialize snapshot db"
         );
 
-        let err = session.launch().expect_err("backend error should surface");
+        let err = prepared.launch().expect_err("backend error should surface");
 
         assert!(err.to_string().contains("FakeBackend error: boom"));
         assert!(
@@ -2118,7 +2173,7 @@ mod tests {
     }
 
     #[test]
-    fn mount_session_launch_publishes_live_diagnostics_and_supports_attach() {
+    fn prepared_mount_launch_publishes_live_diagnostics_and_supports_attach() {
         let _guard = diagnostics::lock_diagnostics_test_mutex();
         let _investigation_guard = lock_investigation_test_mutex();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2357,27 +2412,28 @@ mod tests {
             Ok(())
         });
 
-        let session = MountSession::prepare_with_backend_factory(
-            mount_command(
+        let prepared = MountPlan::resolve(MountRequest {
+            command: mount_command(
                 "demo",
                 &meta_dir,
                 Some(mount_point.clone()),
                 Some(temp.path().join("cache")),
                 Some("64GB"),
             ),
-            startup_settings_config(mount_point.clone(), None, Some("64GB")),
-            || {
-                Box::new(FakeBackend {
-                    events: events.clone(),
-                    fail: false,
-                    inspect: Some(inspect.clone()),
-                })
-            },
-        )
-        .expect("prepare session");
-        let actual_mount_path = session.actual_mount_path.clone();
+            settings_config: startup_settings_config(mount_point.clone(), None, Some("64GB")),
+        })
+        .expect("mount plan resolved")
+        .prepare(|| {
+            Box::new(FakeBackend {
+                events: events.clone(),
+                fail: false,
+                inspect: Some(inspect.clone()),
+            })
+        })
+        .expect("prepare mount");
+        let actual_mount_path = prepared.plan.actual_mount_path.clone();
 
-        session.launch().expect("launch session");
+        prepared.launch().expect("launch mount");
         assert_eq!(events.lock().expect("lock events").len(), 1);
 
         let run_id = persisted_run_id
@@ -2414,7 +2470,7 @@ mod tests {
     }
 
     #[test]
-    fn mount_session_launch_fails_open_when_diagnostics_start_fails() {
+    fn prepared_mount_launch_fails_open_when_diagnostics_start_fails() {
         let _guard = diagnostics::lock_diagnostics_test_mutex();
         diagnostics::set_test_start_failure(Some("synthetic diagnostics startup failure"));
         struct ResetDiagnosticsFailure;
@@ -2437,26 +2493,27 @@ mod tests {
             .join("diag-fail-open")
             .to_string_lossy()
             .into_owned();
-        let session = MountSession::prepare_with_backend_factory(
-            mount_command(
+        let prepared = MountPlan::resolve(MountRequest {
+            command: mount_command(
                 "demo",
                 &meta_dir,
                 Some(mount_point.clone()),
                 Some(temp.path().join("cache")),
                 Some("64GB"),
             ),
-            startup_settings_config(mount_point.clone(), None, Some("64GB")),
-            || {
-                Box::new(FakeBackend {
-                    events: events.clone(),
-                    fail: false,
-                    inspect: None,
-                })
-            },
-        )
-        .expect("prepare session");
+            settings_config: startup_settings_config(mount_point.clone(), None, Some("64GB")),
+        })
+        .expect("mount plan resolved")
+        .prepare(|| {
+            Box::new(FakeBackend {
+                events: events.clone(),
+                fail: false,
+                inspect: None,
+            })
+        })
+        .expect("prepare mount");
 
-        session
+        prepared
             .launch()
             .expect("mount launch should survive diagnostics startup failure");
         assert_eq!(events.lock().expect("lock events").len(), 1);
