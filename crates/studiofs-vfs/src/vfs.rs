@@ -1211,6 +1211,42 @@ struct ForegroundReadSample {
     policy: AccessPolicy,
 }
 
+const PUBLISHED_READ_PLAN_CACHE_MAX_ENTRIES: usize = 1_024;
+const PUBLISHED_READ_PLAN_CACHE_WINDOW_BLOCKS: u64 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PublishedReadPlanCacheKey {
+    size: u64,
+    committed_size: u64,
+    content_epoch: u64,
+    committed_content_epoch: u64,
+    upload_state: MetaUploadState,
+}
+
+impl PublishedReadPlanCacheKey {
+    fn from_attr(attr: &InodeAttr) -> Option<Self> {
+        (attr.kind == FileType::RegularFile
+            && attr.upload_state == MetaUploadState::Ready
+            && attr.content_epoch == attr.committed_content_epoch
+            && attr.size == attr.committed_size)
+            .then_some(Self {
+                size: attr.size,
+                committed_size: attr.committed_size,
+                content_epoch: attr.content_epoch,
+                committed_content_epoch: attr.committed_content_epoch,
+                upload_state: attr.upload_state,
+            })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PublishedReadPlanCacheEntry {
+    key: PublishedReadPlanCacheKey,
+    start: u64,
+    end: u64,
+    resolved_slices: Arc<[studiofs_meta::schema::ResolvedSliceSpan]>,
+}
+
 struct ReadState {
     foreground_reads_inflight: AtomicUsize,
     last_foreground_read_ms: AtomicU64,
@@ -1225,6 +1261,7 @@ struct ReadState {
     prefetch_last_hint: Mutex<HashMap<(Ino, u64), (u32, u32)>>,
     read_access_fallback: Mutex<HashMap<Ino, Arc<Mutex<HandleAccessState>>>>,
     write_access_fallback: Mutex<HashMap<Ino, Arc<Mutex<HandleAccessState>>>>,
+    published_read_plan_cache: Mutex<HashMap<Ino, PublishedReadPlanCacheEntry>>,
     active_access_classes: [AtomicU64; AccessClass::COUNT],
     access_class_transitions: [AtomicU64; AccessClass::COUNT],
 }
@@ -1244,9 +1281,47 @@ impl ReadState {
             prefetch_last_hint: Mutex::new(HashMap::new()),
             read_access_fallback: Mutex::new(HashMap::new()),
             write_access_fallback: Mutex::new(HashMap::new()),
+            published_read_plan_cache: Mutex::new(HashMap::new()),
             active_access_classes: std::array::from_fn(|_| AtomicU64::new(0)),
             access_class_transitions: std::array::from_fn(|_| AtomicU64::new(0)),
         }
+    }
+
+    fn published_read_plan_cache_get(
+        &self,
+        ino: Ino,
+        key: PublishedReadPlanCacheKey,
+        start: u64,
+        end: u64,
+    ) -> Option<Arc<[studiofs_meta::schema::ResolvedSliceSpan]>> {
+        self.published_read_plan_cache
+            .lock()
+            .get(&ino)
+            .filter(|entry| entry.key == key && start >= entry.start && end <= entry.end)
+            .map(|entry| entry.resolved_slices.clone())
+    }
+
+    fn published_read_plan_cache_put(
+        &self,
+        ino: Ino,
+        key: PublishedReadPlanCacheKey,
+        start: u64,
+        end: u64,
+        resolved_slices: Arc<[studiofs_meta::schema::ResolvedSliceSpan]>,
+    ) {
+        let mut cache = self.published_read_plan_cache.lock();
+        if cache.len() >= PUBLISHED_READ_PLAN_CACHE_MAX_ENTRIES && !cache.contains_key(&ino) {
+            cache.clear();
+        }
+        cache.insert(
+            ino,
+            PublishedReadPlanCacheEntry {
+                key,
+                start,
+                end,
+                resolved_slices,
+            },
+        );
     }
 
     fn fallback_access_state(&self, ino: Ino, is_write: bool) -> Arc<Mutex<HandleAccessState>> {

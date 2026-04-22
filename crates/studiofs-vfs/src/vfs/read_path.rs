@@ -1,7 +1,8 @@
 use super::overlay::PendingOverlayBlockSource;
 use super::{
-    ATTR_CACHE_TTL, AccessLevel, ForegroundReadScope, PrefetchBatch, PrefetchReadContext,
-    ReadRequestContext, StudioVfs, VfsError, VfsResult,
+    ATTR_CACHE_TTL, AccessLevel, ForegroundReadScope, PUBLISHED_READ_PLAN_CACHE_WINDOW_BLOCKS,
+    PrefetchBatch, PrefetchReadContext, PublishedReadPlanCacheKey, ReadRequestContext, StudioVfs,
+    VfsError, VfsResult,
 };
 use crate::VfsMeta;
 use crate::runtime::run_meta;
@@ -263,8 +264,11 @@ impl<'a> DataReader<'a> {
                 ) else {
                     continue;
                 };
-                if matches!(&source, PendingOverlayBlockSource::Extent(object_id) if !vfs.local_block_backend.contains(*object_id))
-                {
+                if matches!(
+                    &source,
+                    PendingOverlayBlockSource::Extent(object_id)
+                        if !vfs.local_block_backend.contains(*object_id)
+                ) {
                     continue;
                 }
                 let block_start = (block_index as u64).saturating_mul(vfs.block_size as u64);
@@ -445,19 +449,14 @@ impl<'a> DataReader<'a> {
         segments: &[ReadSegment],
         prefetch: bool,
     ) -> VfsResult<()> {
-        let mut cached = BTreeSet::new();
-        let mut missing = BTreeMap::new();
+        let mut remote_blocks = BTreeMap::new();
         let mut local_pending = BTreeSet::new();
         for segment in segments {
             match &segment.source {
                 ReadSegmentSource::Overlay { block } | ReadSegmentSource::Base { block } => {
-                    if vfs.local_block_backend.contains(block.object_id) {
-                        cached.insert(block.object_id);
-                    } else {
-                        missing
-                            .entry(block.object_id)
-                            .or_insert_with(|| block.clone());
-                    }
+                    remote_blocks
+                        .entry(block.object_id)
+                        .or_insert_with(|| block.clone());
                 }
                 ReadSegmentSource::PendingExtent { object_id, .. } => {
                     local_pending.insert(*object_id);
@@ -467,16 +466,13 @@ impl<'a> DataReader<'a> {
                 | ReadSegmentSource::Zero => {}
             }
         }
-        for object_id in cached {
-            vfs.local_block_backend.advise_will_need(object_id);
-        }
         for object_id in local_pending {
             vfs.local_block_backend.advise_will_need(object_id);
         }
-        if missing.is_empty() {
+        if remote_blocks.is_empty() {
             return Ok(());
         }
-        let fetches = missing.into_iter().map(|(object_id, block)| async move {
+        let fetches = remote_blocks.into_iter().map(|(object_id, block)| async move {
             match vfs.fetch_block_for_ref(&block, prefetch).await {
                 Ok(_) => Ok::<(), VfsError>(()),
                 Err(crate::fetch::FetchError::NotFound { ref key }) => {
@@ -637,12 +633,12 @@ impl<'a> DataReader<'a> {
 
 struct ReadMetadata {
     attr: InodeAttr,
-    resolved_slices: Vec<ResolvedSliceSpan>,
+    resolved_slices: Arc<[ResolvedSliceSpan]>,
 }
 
 pub(super) struct PreparedForegroundRead {
     pub(super) context: ReadRequestContext,
-    pub(super) resolved_slices: Vec<ResolvedSliceSpan>,
+    pub(super) resolved_slices: Arc<[ResolvedSliceSpan]>,
     pub(super) read_len: usize,
 }
 
@@ -686,7 +682,7 @@ impl<'a> ReadMetadataResolver<'a> {
         if let Some(attr) = self.ignored_attr() {
             return Ok(ReadMetadata {
                 attr,
-                resolved_slices: Vec::new(),
+                resolved_slices: Arc::from(Vec::<ResolvedSliceSpan>::new()),
             });
         }
         if let Some(attr) = self.dirty_attr() {
@@ -775,10 +771,75 @@ impl<'a> ReadMetadataResolver<'a> {
         attr: &InodeAttr,
         offset: u64,
         buffer_len: u64,
-    ) -> VfsResult<Vec<ResolvedSliceSpan>> {
+    ) -> VfsResult<Arc<[ResolvedSliceSpan]>> {
         let read_len = self.read_len_for_attr(attr, offset, buffer_len);
         if read_len == 0 {
-            return Ok(Vec::new());
+            return Ok(Arc::from(Vec::<ResolvedSliceSpan>::new()));
+        }
+        if self
+            .vfs
+            .state
+            .namespace
+            .dirty_attrs
+            .lock()
+            .contains_key(&self.ino)
+        {
+            let ino = self.ino;
+            let meta = self.vfs.meta.clone();
+            let resolved = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                engine.lookup_regular_file_slices(ino, offset, read_len)
+            })
+            .await
+            {
+                Ok(resolved) => resolved,
+                Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
+                    return Err(self.stale_inode_not_found());
+                }
+                Err(err) => return Err(err),
+            };
+            return Ok(Arc::from(resolved));
+        }
+
+        if let Some(key) = PublishedReadPlanCacheKey::from_attr(attr) {
+            let requested_end = offset.saturating_add(read_len);
+            if let Some(cached) = self.vfs.state.read.published_read_plan_cache_get(
+                self.ino,
+                key,
+                offset,
+                requested_end,
+            ) {
+                return Ok(cached);
+            }
+
+            let cache_window_len = read_len.max(
+                (self.vfs.block_size as u64)
+                    .saturating_mul(PUBLISHED_READ_PLAN_CACHE_WINDOW_BLOCKS),
+            );
+            let cache_end =
+                offset.saturating_add(attr.size.saturating_sub(offset).min(cache_window_len));
+            let cache_read_len = cache_end.saturating_sub(offset);
+            let ino = self.ino;
+            let meta = self.vfs.meta.clone();
+            let resolved = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                engine.lookup_regular_file_slices(ino, offset, cache_read_len)
+            })
+            .await
+            {
+                Ok(resolved) => resolved,
+                Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
+                    return Err(self.stale_inode_not_found());
+                }
+                Err(err) => return Err(err),
+            };
+            let resolved = Arc::<[ResolvedSliceSpan]>::from(resolved);
+            self.vfs.state.read.published_read_plan_cache_put(
+                self.ino,
+                key,
+                offset,
+                cache_end,
+                resolved.clone(),
+            );
+            return Ok(resolved);
         }
         let ino = self.ino;
         let meta = self.vfs.meta.clone();
@@ -787,7 +848,7 @@ impl<'a> ReadMetadataResolver<'a> {
         })
         .await
         {
-            Ok(resolved) => Ok(resolved),
+            Ok(resolved) => Ok(Arc::from(resolved)),
             Err(VfsError::Meta(MetaError::InodeNotFound(_))) => Err(self.stale_inode_not_found()),
             Err(err) => Err(err),
         }
@@ -823,26 +884,10 @@ impl<'a> ReadMetadataResolver<'a> {
         offset: u64,
         buffer_len: u64,
     ) -> VfsResult<ReadMetadata> {
-        let ino = self.ino;
-        let meta = self.vfs.meta.clone();
-        let (attr, resolved_slices) = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-            let attr = engine.get_attr(ino)?;
-            let read_len = attr.size.saturating_sub(offset).min(buffer_len);
-            let resolved_slices = if read_len == 0 {
-                Vec::new()
-            } else {
-                engine.lookup_regular_file_slices(ino, offset, read_len)?
-            };
-            Ok((attr, resolved_slices))
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
-                return Err(self.stale_inode_not_found());
-            }
-            Err(err) => return Err(err),
-        };
+        let attr = self.load_attr_from_meta().await?;
+        let resolved_slices = self
+            .resolve_slices_for_attr(&attr, offset, buffer_len)
+            .await?;
         self.cache_attr(&attr);
         Ok(ReadMetadata {
             attr,
@@ -1011,7 +1056,7 @@ impl StudioVfs {
         ino: Ino,
         offset: u64,
         buffer_len: u64,
-    ) -> VfsResult<(InodeAttr, Vec<ResolvedSliceSpan>)> {
+    ) -> VfsResult<(InodeAttr, Arc<[ResolvedSliceSpan]>)> {
         let resolved = ReadMetadataResolver::new(self, ino)
             .resolve_for_read(offset, buffer_len)
             .await?;
@@ -1087,7 +1132,7 @@ impl StudioVfs {
             offset,
             prepared.read_len as u64,
             prepared.context.pending_content_epoch,
-            Some(prepared.resolved_slices.as_slice()),
+            Some(prepared.resolved_slices.as_ref()),
         );
         let written = data_reader.read_into(buffer).await?;
 
@@ -1420,6 +1465,42 @@ mod tests {
         (rt, vfs, meta)
     }
 
+    fn mark_all_file_blocks_uploaded(
+        vfs: &Arc<StudioVfs>,
+        meta: &Arc<RedbMetaEngine>,
+        ino: Ino,
+    ) -> (u64, Vec<(u32, BlockRef)>) {
+        let attr = meta.get_attr(ino).expect("load inode attrs");
+        let blocks = meta.get_file_blocks(ino).expect("load file blocks");
+        for (block_index, block) in &blocks {
+            vfs.local_block_backend().mark_uploaded(block.object_id);
+            assert!(
+                meta.mark_file_block_uploaded_if_matches(
+                    ino,
+                    *block_index,
+                    attr.content_epoch,
+                    block
+                )
+                .expect("mark block uploaded"),
+                "expected metadata upload mark to apply for every block"
+            );
+        }
+        (attr.content_epoch, blocks)
+    }
+
+    fn publish_current_manifest(
+        meta: &Arc<RedbMetaEngine>,
+        ino: Ino,
+        content_epoch: u64,
+        blocks: &[(u32, BlockRef)],
+    ) {
+        assert!(
+            meta.publish_file_manifest_if_matches(ino, content_epoch, blocks)
+                .expect("publish current manifest"),
+            "expected manifest publish to apply"
+        );
+    }
+
     #[test]
     fn collect_data_block_refs_deduplicates_by_object_id() {
         let first = BlockRef {
@@ -1493,6 +1574,42 @@ mod tests {
 
             assert_eq!(resolved_attr.size, 5);
             assert!(resolved_slices.is_empty());
+        });
+    }
+
+    #[test]
+    fn resolve_read_metadata_async_reuses_published_read_plan_cache_for_hot_window() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "read-metadata-plan-cache");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(ROOT_INO, b"published-read-plan-cache.txt", 1000, 1000, 0o644)
+                .expect("create file");
+            let ino = created.ino;
+            let payload = vec![0x4A_u8; 512 * 1024];
+
+            vfs.write(ino, 0, &payload).await.expect("write payload");
+            vfs.flush(ino).await.expect("flush durable local payload");
+
+            let (content_epoch, blocks) = mark_all_file_blocks_uploaded(&vfs, &meta, ino);
+            publish_current_manifest(&meta, ino, content_epoch, &blocks);
+            vfs.state.namespace.dirty_attrs.lock().remove(&ino);
+            vfs.state.namespace.attr_read_cache.lock().remove(ino);
+
+            let (_, first_slices) = vfs
+                .resolve_read_metadata_async(ino, 0, 64 * 1024)
+                .await
+                .expect("resolve first read");
+            let (_, second_slices) = vfs
+                .resolve_read_metadata_async(ino, 64 * 1024, 64 * 1024)
+                .await
+                .expect("resolve second read");
+
+            assert!(
+                Arc::ptr_eq(&first_slices, &second_slices),
+                "sequential reads inside the widened published window should reuse the cached slice plan"
+            );
         });
     }
 
@@ -1747,7 +1864,7 @@ mod tests {
                 0,
                 8,
                 read_context.pending_content_epoch,
-                Some(resolved_slices.as_slice()),
+                Some(resolved_slices.as_ref()),
             )
             .read_into(&mut buffer)
             .await
@@ -1784,7 +1901,7 @@ mod tests {
                 0,
                 6,
                 read_context.pending_content_epoch,
-                Some(resolved_slices.as_slice()),
+                Some(resolved_slices.as_ref()),
             )
             .read_into(&mut buffer)
             .await
@@ -1845,6 +1962,53 @@ mod tests {
                     && segment.range.start < 4
                     && segment.range.end > 2
             }));
+        });
+    }
+
+    #[test]
+    fn data_reader_missing_pending_extent_falls_back_to_committed_base() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "missing-pending-extent-fallback");
+        rt.block_on(async {
+            let attr = vfs
+                .create(ROOT_INO, b"pending-extent-fallback.bin", 0, 0, 0o644)
+                .expect("create test file");
+            let ino = attr.ino;
+            let committed_object_id = 0xC0FFEE;
+            let missing_pending_object_id = 0xDEADBEEF;
+
+            vfs.block_store_put_async(
+                committed_object_id,
+                Bytes::from_static(b"abcdefgh"),
+                false,
+            )
+            .await
+            .expect("seed committed block");
+
+            let mut staged_attr = meta.get_attr(ino).expect("load staged attr");
+            staged_attr.size = 8;
+            staged_attr.committed_size = 8;
+            staged_attr.upload_state = MetaUploadState::Updating;
+            staged_attr.committed_content_epoch = 1;
+            staged_attr.content_epoch = 2;
+            meta.set_attr(&staged_attr).expect("persist staged attr");
+            meta.set_file_block(ino, 0, &BlockRef::new_partial(committed_object_id, 8))
+                .expect("persist committed block");
+
+            vfs.state.incarnation.live_extent_records.lock().insert(
+                (ino, 0),
+                crate::vfs::overlay::ExtentRecordId {
+                    object_id: missing_pending_object_id,
+                    content_epoch: staged_attr.content_epoch,
+                },
+            );
+
+            let read = vfs.read(ino, 0, 8).await.expect("read committed fallback");
+            assert_eq!(
+                read.as_ref(),
+                b"abcdefgh",
+                "a missing local pending extent on another mount must not shadow the committed base view"
+            );
         });
     }
 
