@@ -92,7 +92,7 @@ impl StudioVfs {
         if self.handle_table.open_count(ino) > 0 {
             return;
         }
-        if self.cached_store.has_pending_uploads_for_ino(ino) {
+        if self.inode_has_pending_uploads(ino) {
             return;
         }
         // Only clear after inode metadata is actually gone. This keeps the
@@ -105,7 +105,7 @@ impl StudioVfs {
 
     pub(super) fn maybe_release_upload_cancel_token(&self, ino: Ino) {
         let mut tokens = self.state.upload.upload_cancel_tokens.lock();
-        if self.cached_store.has_pending_uploads_for_ino(ino) {
+        if self.inode_has_pending_uploads(ino) {
             return;
         }
         tokens.remove(&ino);
@@ -299,19 +299,19 @@ impl StudioVfs {
         let dirty_before = self.total_pending_local_dirty_bytes();
         info!(
             dirty_bytes = dirty_before,
-            pending_uploads = self.truth_pending_uploads_snapshot().len(),
+            pending_uploads = self.pending_uploads_snapshot().len(),
             "VFS shutdown: flushing pending local dirty state"
         );
         self.flush_pending_blocks_for_shutdown().await;
         info!(
-            pending_uploads = self.truth_pending_uploads_snapshot().len(),
+            pending_uploads = self.pending_uploads_snapshot().len(),
             elapsed_ms = t0.elapsed().as_millis() as u64,
             "VFS shutdown: local dirty drain complete"
         );
 
         // Phase 2: attempt graceful upload drain (bounded by user timeout),
         // then cancel uploader work so network-blocked requests are aborted.
-        let pending = self.truth_pending_uploads_snapshot().len();
+        let pending = self.pending_uploads_snapshot().len();
         let mut drained = pending == 0;
         if pending > 0 {
             if upload_drain_timeout.is_zero() {
@@ -326,8 +326,7 @@ impl StudioVfs {
                     "VFS shutdown: waiting for uploads to drain before forced cancellation"
                 );
                 drained = self
-                    .cached_store
-                    .wait_for_uploads_idle(upload_drain_timeout)
+                    .wait_for_pending_uploads_idle(upload_drain_timeout)
                     .await;
             }
         }
@@ -335,7 +334,7 @@ impl StudioVfs {
         self.request_uploader_shutdown();
 
         if !drained {
-            let pending_ops = self.truth_pending_uploads_snapshot();
+            let pending_ops = self.pending_uploads_snapshot();
             let sample_object_ids: Vec<u64> =
                 pending_ops.iter().take(8).map(|op| op.object_id).collect();
             info!(
@@ -377,7 +376,7 @@ impl StudioVfs {
         self.sync_meta().prepare_for_close();
         let local_payload_sync_ok = self.persist_cache().await;
         let dirty_after = self.total_pending_local_dirty_bytes();
-        let pending_uploads_after = self.truth_pending_uploads_snapshot().len();
+        let pending_uploads_after = self.pending_uploads_snapshot().len();
         let recoverable_on_restart = dirty_after == 0 && local_payload_sync_ok;
         let shutdown_snapshot = VfsZeroIoShutdownSnapshot {
             generated_unix_ms: now_unix_millis(),

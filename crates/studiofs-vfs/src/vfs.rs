@@ -24,6 +24,7 @@
 
 mod acl;
 mod bootstrap;
+mod buffer_pool;
 #[path = "commit.rs"]
 mod commit;
 mod config;
@@ -78,6 +79,7 @@ pub use metrics::{
 pub use namespace::{KernelInvalidator, NamespaceParent, NamespacePathStyle, NamespaceResolver};
 
 use acl::AclState;
+use buffer_pool::BufferPool;
 use config::{
     CACHE_RUNTIME_HUGE_BUDGET_BYTES, CACHE_RUNTIME_LARGE_BUDGET_BYTES,
     CACHE_RUNTIME_MAX_DIRTY_BYTES_HUGE, CACHE_RUNTIME_MAX_DIRTY_BYTES_LARGE,
@@ -169,6 +171,23 @@ const ZEROIO_HEALTH_SIGNAL_LIMIT: usize = 16;
 const ZEROIO_REPLAY_EVENT_SAMPLE_LIMIT: usize = 16;
 pub(crate) const ZEROIO_RUNTIME_STATE_DIR: &str = "runtime";
 const ZEROIO_LAST_SHUTDOWN_SNAPSHOT_FILE: &str = "zeroio-last-shutdown.json";
+const HARD_BACKPRESSURE_DIRTY_MULTIPLIER: usize = 2;
+const AGGRESSIVE_MATERIALIZATION_DIRTY_DIVISOR: usize = 2;
+const AGGRESSIVE_MATERIALIZATION_BUFFERED_WRITE_THRESHOLD: usize = 64;
+const AGGRESSIVE_MATERIALIZATION_INTERVAL: Duration = Duration::from_millis(100);
+const SOFT_DIRTY_PACING_START_NUMERATOR: usize = 3;
+const SOFT_DIRTY_PACING_START_DENOMINATOR: usize = 5;
+const SOFT_DIRTY_PACING_HIGH_NUMERATOR: usize = 4;
+const SOFT_DIRTY_PACING_HIGH_DENOMINATOR: usize = 5;
+const SOFT_DIRTY_PACING_NEAR_LIMIT_NUMERATOR: usize = 9;
+const SOFT_DIRTY_PACING_NEAR_LIMIT_DENOMINATOR: usize = 10;
+const SOFT_DIRTY_PACING_DELAY_LIGHT_MS: u64 = 1;
+const SOFT_DIRTY_PACING_DELAY_MEDIUM_MS: u64 = 4;
+const SOFT_DIRTY_PACING_DELAY_HEAVY_MS: u64 = 8;
+const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_LIGHT: usize = 512;
+const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_HIGH: usize = 1024;
+const WRITE_BUFFER_POOL_MIN_BUFFERS: usize = 4;
+const WRITE_BUFFER_POOL_BUFFER_MULTIPLIER: usize = 2;
 
 // =============================================================================
 // Error Types
@@ -298,23 +317,23 @@ const DEFAULT_JANITOR_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_JANITOR_SKIP_NEWER_THAN: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_JANITOR_MAX_DELETES_PER_RUN: u64 = 500;
 const DEFAULT_JANITOR_LEASE_TTL: Duration = Duration::from_secs(45 * 60);
-// JuiceFS-like high-level read tuning default:
-// - buffer-size: 2048M
-const DEFAULT_READ_BUFFER_MB: u64 = 2_048;
+// JuiceFS-like high-level read/write buffering defaults:
+// - buffer-size: 300M
+const DEFAULT_READ_BUFFER_MB: u64 = 300;
 // Block-level derived defaults (used as fallback if conversion is unavailable).
-const DEFAULT_PREFETCH_CONCURRENCY: usize = 128;
-const DEFAULT_READAHEAD_WIDTH: u32 = 128;
-const DEFAULT_READAHEAD_MIN_PREFETCH: u32 = 16;
+const DEFAULT_PREFETCH_CONCURRENCY: usize = 1;
+const DEFAULT_READAHEAD_WIDTH: u32 = 18;
+const DEFAULT_READAHEAD_MIN_PREFETCH: u32 = 1;
 const DEFAULT_READAHEAD_SEQ_STEP: u8 = 4;
 const DEFAULT_READAHEAD_RANDOM_PENALTY: u8 = 2;
 const DEFAULT_PREFETCH_FOREGROUND_RESERVE: usize = 16;
 const DEFAULT_PREFETCH_MAX_PER_CYCLE: usize = 256;
 const DEFAULT_PREFETCH_PAUSE_ON_NETERR_MS: u64 = 250;
-const DEFAULT_PREFETCH_CONCURRENCY_MIN: usize = 16;
+const DEFAULT_PREFETCH_CONCURRENCY_MIN: usize = 1;
 const DEFAULT_DIR_PREFETCH_MAX_BATCH: usize = 0;
 const DEFAULT_READDIR_ATTR_BATCH_CHUNK: usize = 256;
 const DEFAULT_READDIR_ATTR_BATCH_MAX_INODES: usize = 4096;
-const DEFAULT_UPLOAD_DELAY_MS: u64 = 2000;
+const DEFAULT_UPLOAD_DELAY_MS: u64 = 0;
 // Keep failed uploads circulating quickly so a single transient error does not
 // strand the whole inode in pending-overlay mode until remount.
 const DEFAULT_UPLOAD_REQUEUE_BASE_MS: u64 = 500;
@@ -328,7 +347,7 @@ const DEFAULT_UPLOAD_USER_IDLE_GRACE_MS: u64 = 500;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS: u64 = 35;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS: u64 = 1_500;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS: u64 = 2;
-const DEFAULT_MAX_DIRTY_BYTES: usize = 1024 * 1024 * 1024;
+const DEFAULT_MAX_DIRTY_BYTES: usize = 800 * 1024 * 1024;
 const DEFAULT_WRITE_EAGER_FLUSH_BATCH_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_FETCH_INITIAL_WINDOW: f64 = 0.0;
 const DEFAULT_FETCH_MIN_WINDOW: f64 = 1.0;
@@ -336,14 +355,14 @@ const DEFAULT_FETCH_MAX_WINDOW: f64 = 0.0;
 const DEFAULT_FETCH_INCREASE_STEP: f64 = 0.0;
 const DEFAULT_FETCH_DECREASE_FACTOR: f64 = 0.85;
 const DEFAULT_FETCH_DECREASE_COOLDOWN_SECS: u64 = 3;
-const DEFAULT_UPLOAD_INITIAL_WINDOW: f64 = 4.0;
+const DEFAULT_UPLOAD_INITIAL_WINDOW: f64 = 20.0;
 const DEFAULT_UPLOAD_MIN_WINDOW: f64 = 1.0;
-const DEFAULT_UPLOAD_MAX_WINDOW: f64 = 16.0;
+const DEFAULT_UPLOAD_MAX_WINDOW: f64 = 20.0;
 const DEFAULT_UPLOAD_INCREASE_STEP: f64 = 1.0;
 const DEFAULT_UPLOAD_DECREASE_FACTOR: f64 = 0.85;
 const DEFAULT_UPLOAD_DECREASE_COOLDOWN_SECS: u64 = 3;
 const DEFAULT_SLAB_FLUSH_INTERVAL_MS: u64 = 10;
-const DEFAULT_UPLOAD_WORKER_COUNT: usize = 16;
+const DEFAULT_UPLOAD_WORKER_COUNT: usize = 20;
 const MIN_UPLOAD_WORKER_COUNT: usize = 1;
 const DEFAULT_UPLOAD_MAX_ATTEMPTS: u32 = 4;
 const DEFAULT_UPLOAD_REQUEST_TIMEOUT_SECS: u64 = 15;
@@ -360,7 +379,7 @@ const DEFAULT_PUBLISH_VISIBILITY_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_QOS_ACCEPT_SLOTS: usize = 64;
 const DEFAULT_QOS_MATERIALIZE_SLOTS: usize = 2;
 const DEFAULT_QOS_COMMIT_SLOTS: usize = 4;
-const DEFAULT_QOS_FETCH_SLOTS: usize = 128;
+const DEFAULT_QOS_FETCH_SLOTS: usize = 200;
 const UPLOAD_CACHE_IO_FOREGROUND_BASE_DIVISOR: u32 = 4;
 const UPLOAD_CACHE_IO_FOREGROUND_BASE_MAX: u32 = 8;
 const UPLOAD_CACHE_IO_FOREGROUND_STEP_DIVISOR: u32 = 8;
@@ -390,8 +409,8 @@ const DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS: u64 = 500;
 const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
-const CACHE_RUNTIME_MIN_DIRTY_BYTES: usize = 256 * 1024 * 1024;
-const CACHE_RUNTIME_MAX_DIRTY_BYTES_BASE: usize = 2 * 1024 * 1024 * 1024;
+const CACHE_RUNTIME_MIN_DIRTY_BYTES: usize = 800 * 1024 * 1024;
+const CACHE_RUNTIME_MAX_DIRTY_BYTES_BASE: usize = 800 * 1024 * 1024;
 const DEBUG_PENDING_PATH_SUFFIX_ENV: &str = "STUDIOFS_DEBUG_PENDING_PATH_SUFFIX";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TwoTierSegment {
@@ -963,6 +982,8 @@ struct UploadState {
     upload_requeues: AtomicU64,
     upload_canceled_deleted: AtomicU64,
     upload_canceled_stale: AtomicU64,
+    upload_local_payload_reads: AtomicU64,
+    upload_local_payload_read_bytes: AtomicU64,
     upload_fallback_deferrals: AtomicU64,
     upload_fallback_rereads: AtomicU64,
     upload_fallback_reread_bytes: AtomicU64,
@@ -1163,6 +1184,8 @@ impl UploadState {
             upload_requeues: AtomicU64::new(0),
             upload_canceled_deleted: AtomicU64::new(0),
             upload_canceled_stale: AtomicU64::new(0),
+            upload_local_payload_reads: AtomicU64::new(0),
+            upload_local_payload_read_bytes: AtomicU64::new(0),
             upload_fallback_deferrals: AtomicU64::new(0),
             upload_fallback_rereads: AtomicU64::new(0),
             upload_fallback_reread_bytes: AtomicU64::new(0),
@@ -1199,9 +1222,46 @@ struct ForegroundReadSample {
     policy: AccessPolicy,
 }
 
+const PUBLISHED_READ_PLAN_CACHE_MAX_ENTRIES: usize = 1_024;
+const PUBLISHED_READ_PLAN_CACHE_WINDOW_BLOCKS: u64 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PublishedReadPlanCacheKey {
+    size: u64,
+    committed_size: u64,
+    content_epoch: u64,
+    committed_content_epoch: u64,
+    upload_state: MetaUploadState,
+}
+
+impl PublishedReadPlanCacheKey {
+    fn from_attr(attr: &InodeAttr) -> Option<Self> {
+        (attr.kind == FileType::RegularFile
+            && attr.upload_state == MetaUploadState::Ready
+            && attr.content_epoch == attr.committed_content_epoch
+            && attr.size == attr.committed_size)
+            .then_some(Self {
+                size: attr.size,
+                committed_size: attr.committed_size,
+                content_epoch: attr.content_epoch,
+                committed_content_epoch: attr.committed_content_epoch,
+                upload_state: attr.upload_state,
+            })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PublishedReadPlanCacheEntry {
+    key: PublishedReadPlanCacheKey,
+    start: u64,
+    end: u64,
+    resolved_slices: Arc<[studiofs_meta::schema::ResolvedSliceSpan]>,
+}
+
 struct ReadState {
     foreground_reads_inflight: AtomicUsize,
     last_foreground_read_ms: AtomicU64,
+    foreground_idle_notify: tokio::sync::Notify,
     foreground_read_latency_shards: Vec<Mutex<VecDeque<ForegroundReadSample>>>,
     foreground_read_shard_cursor: AtomicU64,
     /// Last observed foreground P90 (ns), used as sticky fallback.
@@ -1212,6 +1272,7 @@ struct ReadState {
     prefetch_last_hint: Mutex<HashMap<(Ino, u64), (u32, u32)>>,
     read_access_fallback: Mutex<HashMap<Ino, Arc<Mutex<HandleAccessState>>>>,
     write_access_fallback: Mutex<HashMap<Ino, Arc<Mutex<HandleAccessState>>>>,
+    published_read_plan_cache: Mutex<HashMap<Ino, PublishedReadPlanCacheEntry>>,
     active_access_classes: [AtomicU64; AccessClass::COUNT],
     access_class_transitions: [AtomicU64; AccessClass::COUNT],
 }
@@ -1221,6 +1282,7 @@ impl ReadState {
         Self {
             foreground_reads_inflight: AtomicUsize::new(0),
             last_foreground_read_ms: AtomicU64::new(0),
+            foreground_idle_notify: tokio::sync::Notify::new(),
             foreground_read_latency_shards: (0..shard_count)
                 .map(|_| Mutex::new(VecDeque::new()))
                 .collect(),
@@ -1230,9 +1292,47 @@ impl ReadState {
             prefetch_last_hint: Mutex::new(HashMap::new()),
             read_access_fallback: Mutex::new(HashMap::new()),
             write_access_fallback: Mutex::new(HashMap::new()),
+            published_read_plan_cache: Mutex::new(HashMap::new()),
             active_access_classes: std::array::from_fn(|_| AtomicU64::new(0)),
             access_class_transitions: std::array::from_fn(|_| AtomicU64::new(0)),
         }
+    }
+
+    fn published_read_plan_cache_get(
+        &self,
+        ino: Ino,
+        key: PublishedReadPlanCacheKey,
+        start: u64,
+        end: u64,
+    ) -> Option<Arc<[studiofs_meta::schema::ResolvedSliceSpan]>> {
+        self.published_read_plan_cache
+            .lock()
+            .get(&ino)
+            .filter(|entry| entry.key == key && start >= entry.start && end <= entry.end)
+            .map(|entry| entry.resolved_slices.clone())
+    }
+
+    fn published_read_plan_cache_put(
+        &self,
+        ino: Ino,
+        key: PublishedReadPlanCacheKey,
+        start: u64,
+        end: u64,
+        resolved_slices: Arc<[studiofs_meta::schema::ResolvedSliceSpan]>,
+    ) {
+        let mut cache = self.published_read_plan_cache.lock();
+        if cache.len() >= PUBLISHED_READ_PLAN_CACHE_MAX_ENTRIES && !cache.contains_key(&ino) {
+            cache.clear();
+        }
+        cache.insert(
+            ino,
+            PublishedReadPlanCacheEntry {
+                key,
+                start,
+                end,
+                resolved_slices,
+            },
+        );
     }
 
     fn fallback_access_state(&self, ino: Ino, is_write: bool) -> Arc<Mutex<HandleAccessState>> {
@@ -1407,13 +1507,17 @@ impl ReadState {
     }
 
     fn unmark_foreground_read(&self, now_ms: u64) {
-        self.foreground_reads_inflight
+        let previous = self
+            .foreground_reads_inflight
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_sub(1))
             })
-            .ok();
+            .unwrap_or(0);
         self.last_foreground_read_ms
             .store(now_ms, Ordering::Relaxed);
+        if previous == 1 {
+            self.foreground_idle_notify.notify_waiters();
+        }
     }
 
     fn foreground_read_active(&self, now_ms: u64, idle_grace: Duration) -> bool {
@@ -1999,6 +2103,57 @@ fn validate_volume_block_size(block_size: u32) -> VfsResult<()> {
     Ok(())
 }
 
+fn hard_backpressure_threshold_bytes(max_dirty_bytes: usize) -> usize {
+    max_dirty_bytes.saturating_mul(HARD_BACKPRESSURE_DIRTY_MULTIPLIER)
+}
+
+fn aggressive_materialization_threshold_bytes(max_dirty_bytes: usize) -> usize {
+    max_dirty_bytes
+        .saturating_div(AGGRESSIVE_MATERIALIZATION_DIRTY_DIVISOR)
+        .max(1)
+}
+
+fn soft_dirty_budget_pacing_delay_ms(
+    total_dirty_bytes: usize,
+    max_dirty_bytes: usize,
+    buffered_write_count: usize,
+) -> Option<u64> {
+    if max_dirty_bytes == 0 {
+        return None;
+    }
+
+    let start_threshold = max_dirty_bytes
+        .saturating_mul(SOFT_DIRTY_PACING_START_NUMERATOR)
+        .saturating_div(SOFT_DIRTY_PACING_START_DENOMINATOR)
+        .max(1);
+    let high_threshold = max_dirty_bytes
+        .saturating_mul(SOFT_DIRTY_PACING_HIGH_NUMERATOR)
+        .saturating_div(SOFT_DIRTY_PACING_HIGH_DENOMINATOR)
+        .max(start_threshold);
+    let near_limit_threshold = max_dirty_bytes
+        .saturating_mul(SOFT_DIRTY_PACING_NEAR_LIMIT_NUMERATOR)
+        .saturating_div(SOFT_DIRTY_PACING_NEAR_LIMIT_DENOMINATOR)
+        .max(high_threshold);
+
+    let mut delay_ms = if total_dirty_bytes >= near_limit_threshold {
+        SOFT_DIRTY_PACING_DELAY_HEAVY_MS
+    } else if total_dirty_bytes >= high_threshold {
+        SOFT_DIRTY_PACING_DELAY_MEDIUM_MS
+    } else if total_dirty_bytes >= start_threshold {
+        SOFT_DIRTY_PACING_DELAY_LIGHT_MS
+    } else {
+        0
+    };
+
+    if buffered_write_count >= SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_HIGH {
+        delay_ms = delay_ms.max(SOFT_DIRTY_PACING_DELAY_MEDIUM_MS);
+    } else if buffered_write_count >= SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_LIGHT {
+        delay_ms = delay_ms.max(SOFT_DIRTY_PACING_DELAY_LIGHT_MS);
+    }
+
+    (delay_ms > 0).then_some(delay_ms)
+}
+
 fn warn_small_block_addressability(block_size: u32) {
     let block_size_nonzero = block_size.max(1) as u128;
     const MIN_PRACTICAL_ADDRESSABLE_BYTES: u128 = 64u128 * 1024 * 1024 * 1024 * 1024;
@@ -2024,7 +2179,7 @@ fn derive_buffer_blocks_default(read_buffer_mb: u64, block_size: u32) -> u32 {
     let blocks = (bytes / block_size.max(1) as u128)
         .max(1)
         .min(u32::MAX as u128);
-    (blocks as u32).max(32)
+    blocks as u32
 }
 
 fn derive_readahead_max_width(
@@ -2032,21 +2187,19 @@ fn derive_readahead_max_width(
     block_size: u32,
     readahead_base_width: u32,
 ) -> u32 {
-    derive_buffer_blocks_default(read_buffer_mb, block_size)
-        .max(readahead_base_width.saturating_mul(8))
-        .max(256)
+    derive_buffer_blocks_default(read_buffer_mb, block_size).max(readahead_base_width.max(1))
 }
 
 fn build_fetch_aimd_config(
     readahead_max_width: u32,
     config: &VfsConfig,
 ) -> crate::aimd::AimdConfig {
-    let fetch_max_window_default = (readahead_max_width as f64).clamp(128.0, 4096.0);
-    let fetch_initial_window_default = (fetch_max_window_default / 8.0).clamp(16.0, 256.0);
-    let fetch_increase_default = if fetch_max_window_default >= 1024.0 {
-        4.0
-    } else {
+    let fetch_max_window_default = (readahead_max_width.max(1) as f64).clamp(1.0, 4096.0);
+    let fetch_initial_window_default = (fetch_max_window_default / 4.0).clamp(1.0, 64.0);
+    let fetch_increase_default = if fetch_max_window_default >= 64.0 {
         2.0
+    } else {
+        1.0
     };
     crate::aimd::AimdConfig {
         initial_window: if config.fetch_initial_window > 0.0 {
@@ -2185,6 +2338,9 @@ pub struct StudioVfs {
     /// Minimum dirty full-block batch size before `write()` pays the local
     /// persist boundary for eager block flushes.
     write_eager_flush_batch_bytes: usize,
+    /// Reuses hot-path block buffers to reduce allocator churn on repeated
+    /// materialize/stage cycles.
+    write_buffer_pool: BufferPool,
     /// Maximum bytes drained by one opportunistic eager-flush attempt.
     write_eager_flush_drain_chunk_bytes: usize,
     /// Bounded local payload-put concurrency for one eager drain.
@@ -2643,6 +2799,13 @@ impl<'a> StartupReplayCoordinator<'a> {
         self.discard_quarantined_dirty_objects();
         self.merge_pending_live_extents();
         let replayed_blocks = self.replay_ops.len() as u64;
+        let replayed_object_ids: Vec<_> = self
+            .replay_ops
+            .iter()
+            .map(|(_, _, object_id, _)| *object_id)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         let replayed_epochs: BTreeSet<_> = self
             .replay_ops
             .iter()
@@ -2655,17 +2818,38 @@ impl<'a> StartupReplayCoordinator<'a> {
             .fetch_add(self.replay_failures, Ordering::Relaxed);
 
         if !self.replay_ops.is_empty() {
-            self.vfs.cached_store.submit_uploads_batch(&self.replay_ops);
             info!(
                 replayed_dirty_blocks = self.replay_ops.len(),
                 restored_live_extents = self.restored_live_extents,
-                "replayed dirty local backend blocks into upload queue"
+                "startup replay restored runtime pending uploads from local backend"
             );
         }
 
         let live_extents = self.live_extents_batch();
         if !live_extents.is_empty() {
             self.vfs.record_live_extents(&live_extents);
+        }
+        if !self.replay_ops.is_empty() {
+            if let Err(error) = self
+                .vfs
+                .cached_store
+                .link_upload_stage_batch(&replayed_object_ids)
+            {
+                warn!(
+                    replayed_dirty_blocks = self.replay_ops.len(),
+                    replayed_object_count = replayed_object_ids.len(),
+                    error = %error,
+                    "startup replay failed to restore upload links for runtime pending uploads"
+                );
+            }
+            self.vfs.cached_store.submit_uploads_batch(&self.replay_ops);
+            for (ino, _) in replayed_epochs.iter().copied() {
+                self.vfs.state.file_session.note_background_transition(
+                    ino,
+                    FileSessionOperation::Upload,
+                    "queued",
+                );
+            }
         }
 
         for (ino, content_epoch) in &self.pending_epoch_finalizations {
@@ -2753,407 +2937,64 @@ fn map_open_local_block_backend_error(
     }
 }
 
-struct PendingUploadTruthRebuildState<'a> {
-    runtime_pending_by_object: &'a HashMap<u64, PendingUpload>,
-    dirty_objects: &'a mut HashSet<u64>,
-    pending: &'a mut Vec<PendingUpload>,
-    pending_count: usize,
-    collect_pending_ops: bool,
-    scanned_inodes: &'a mut HashSet<Ino>,
-    now_ms: u64,
-}
-
-impl PendingUploadTruthRebuildState<'_> {
-    fn record_pending_upload(
-        &mut self,
-        vfs: &StudioVfs,
-        ino: Ino,
-        offset: u64,
-        object_id: u64,
-        content_epoch: u64,
+impl StudioVfs {
+    // #region debug log
+    fn debug_write_probe(
+        &self,
+        hypothesis_id: &'static str,
+        location: &'static str,
+        message: &'static str,
+        data: serde_json::Value,
     ) {
-        self.pending_count += 1;
-        if !self.collect_pending_ops {
+        const DEBUG_SESSION_ID: &str = "5ee5eb";
+        const DEBUG_LOG_PATH: &str =
+            r"C:\Users\valen\AppData\Local\Temp\debug-agent\debug-5ee5eb.log";
+        if std::env::var_os("STUDIOFS_WRITE_DEBUG").is_none() {
             return;
         }
-        self.pending.push(vfs.pending_upload_from_persistent_state(
-            ino,
-            offset,
-            object_id,
-            content_epoch,
-            self.runtime_pending_by_object.get(&object_id),
-            self.now_ms,
-        ));
-    }
-}
-
-struct PendingUploadTruthRebuildResult {
-    pending: Vec<PendingUpload>,
-    count: usize,
-}
-
-impl StudioVfs {
-    fn filter_runtime_pending_uploads_to_dirty_index(
-        &self,
-        runtime_pending_uploads: Vec<PendingUpload>,
-    ) -> Vec<PendingUpload> {
-        let mut seen_object_ids = HashSet::with_capacity(runtime_pending_uploads.len());
-        runtime_pending_uploads
-            .into_iter()
-            .filter(|op| {
-                seen_object_ids.insert(op.object_id)
-                    && matches!(
-                        self.local_block_backend.lifecycle_state(op.object_id),
-                        LocalBlockLifecycleState::Dirty | LocalBlockLifecycleState::Uploading
-                    )
-            })
-            .collect()
-    }
-
-    fn runtime_pending_uploads_aligned_with_dirty_index(
-        &self,
-        runtime_pending_uploads: Vec<PendingUpload>,
-        dirty_count: usize,
-    ) -> Option<Vec<PendingUpload>> {
-        let filtered = self.filter_runtime_pending_uploads_to_dirty_index(runtime_pending_uploads);
-        (filtered.len() == dirty_count).then_some(filtered)
-    }
-
-    fn lifecycle_record_may_reference_pending_uploads(
-        record: &studiofs_meta::schema::InodeLifecycleRecord,
-    ) -> bool {
-        matches!(
-            record.state,
-            InodeLifecycleState::LocalOnly
-                | InodeLifecycleState::Uploading
-                | InodeLifecycleState::PublishReady
-                | InodeLifecycleState::DeletedBeforePublish
-        )
-    }
-
-    fn pending_upload_from_persistent_state(
-        &self,
-        ino: Ino,
-        offset: u64,
-        object_id: u64,
-        content_epoch: u64,
-        runtime_pending: Option<&PendingUpload>,
-        now_ms: u64,
-    ) -> PendingUpload {
-        let fallback_created_ms = self
-            .local_block_backend
-            .object_stats(object_id)
-            .map(|stats| stats.last_access_unix_millis)
-            .filter(|created| *created > 0)
-            .unwrap_or(now_ms);
-        PendingUpload {
-            ino,
-            offset,
-            object_id,
-            content_epoch,
-            created_unix_ms: runtime_pending
-                .map(|op| op.created_unix_ms)
-                .filter(|created| *created > 0)
-                .unwrap_or(fallback_created_ms),
-            not_before_unix_ms: runtime_pending.map(|op| op.not_before_unix_ms).unwrap_or(0),
-            retry_count: runtime_pending.map(|op| op.retry_count).unwrap_or(0),
-        }
-    }
-
-    fn collect_pending_uploads_from_attrs<I>(
-        &self,
-        meta: &Arc<dyn VfsMeta>,
-        attrs: I,
-        state: &mut PendingUploadTruthRebuildState<'_>,
-    ) where
-        I: IntoIterator<Item = InodeAttr>,
-    {
-        for attr in attrs {
-            let ino = attr.ino;
-            if !state.scanned_inodes.insert(ino) {
-                continue;
-            }
-            let inode_deleted = attr.nlink == 0;
-            let blocks = match meta.get_file_blocks(ino) {
-                Ok(blocks) => blocks,
-                Err(error) => {
-                    warn!(
-                        ino,
-                        error = %error,
-                        "failed to enumerate file blocks while rebuilding pending upload truth view"
-                    );
-                    continue;
-                }
-            };
-
-            for (block_index, block_ref) in &blocks {
-                if state.dirty_objects.remove(&block_ref.object_id) {
-                    if inode_deleted {
-                        continue;
-                    }
-                    let offset = (*block_index as u64).saturating_mul(self.block_size as u64);
-                    state.record_pending_upload(
-                        self,
-                        ino,
-                        offset,
-                        block_ref.object_id,
-                        attr.content_epoch,
-                    );
-                }
-            }
-
-            if state.dirty_objects.is_empty() {
-                break;
-            }
-
-            if inode_deleted || attr.size == 0 {
-                continue;
-            }
-
-            match meta.lookup_regular_file_slices(ino, 0, attr.size) {
-                Ok(spans) => {
-                    for span in spans {
-                        let Some(block) = span.block else {
-                            continue;
-                        };
-                        if !state.dirty_objects.remove(&block.object_id) {
-                            continue;
-                        }
-                        let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
-                        let absolute_start = chunk_base.saturating_add(u64::from(span.range.start));
-                        let block_index = block_index_from_offset(absolute_start, self.block_size);
-                        let offset = u64::from(block_index).saturating_mul(self.block_size as u64);
-                        state.record_pending_upload(
-                            self,
-                            ino,
-                            offset,
-                            block.object_id,
-                            attr.content_epoch,
-                        );
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        ino,
-                        error = %error,
-                        "failed to enumerate overlay slices while rebuilding pending upload truth view"
-                    );
-                }
-            }
-
-            if state.dirty_objects.is_empty() {
-                break;
-            }
-        }
-    }
-
-    fn rebuild_pending_upload_truth(
-        &self,
-        runtime_pending_by_object: &HashMap<u64, PendingUpload>,
-        collect_pending_ops: bool,
-    ) -> PendingUploadTruthRebuildResult {
-        let mut dirty_objects: HashSet<u64> = self
-            .local_block_backend
-            .dirty_object_ids()
-            .into_iter()
-            .collect();
-        if dirty_objects.is_empty() {
-            return PendingUploadTruthRebuildResult {
-                pending: Vec::new(),
-                count: 0,
-            };
-        }
-
-        let now_ms = now_unix_millis();
-        let meta = self.sync_meta();
-        let mut pending = if collect_pending_ops {
-            Vec::with_capacity(dirty_objects.len())
-        } else {
-            Vec::new()
-        };
-        let mut scanned_inodes = HashSet::new();
-        let pending_count = {
-            let mut state = PendingUploadTruthRebuildState {
-                runtime_pending_by_object,
-                dirty_objects: &mut dirty_objects,
-                pending: &mut pending,
-                pending_count: 0,
-                collect_pending_ops,
-                scanned_inodes: &mut scanned_inodes,
-                now_ms,
-            };
-
-            match meta.list_inode_lifecycles() {
-                Ok(records) => {
-                    let candidate_inos: Vec<_> = records
-                        .iter()
-                        .filter(|record| {
-                            Self::lifecycle_record_may_reference_pending_uploads(record)
-                        })
-                        .map(|record| record.ino)
-                        .collect();
-                    if !candidate_inos.is_empty() {
-                        match meta.get_attrs_batch(&candidate_inos) {
-                            Ok(attrs) => {
-                                self.collect_pending_uploads_from_attrs(&meta, attrs, &mut state);
-                            }
-                            Err(error) => {
-                                warn!(
-                                    error = %error,
-                                    candidate_inodes = candidate_inos.len(),
-                                    "failed to batch-fetch lifecycle-selected inode attrs while rebuilding pending upload truth view"
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "failed to enumerate inode lifecycles while rebuilding pending upload truth view"
-                    );
-                }
-            }
-
-            if !state.dirty_objects.is_empty() {
-                debug!(
-                    unresolved_dirty_objects = state.dirty_objects.len(),
-                    candidate_inodes_scanned = state.scanned_inodes.len(),
-                    "pending upload truth view skipped unresolved dirty objects without hot-path full inode scan"
-                );
-            }
-
-            state.pending_count
-        };
-
-        if collect_pending_ops {
-            pending.sort_by_key(|op| (op.created_unix_ms, op.object_id));
-        }
-
-        PendingUploadTruthRebuildResult {
-            pending,
-            count: pending_count,
-        }
-    }
-
-    fn persistent_pending_uploads_snapshot(
-        &self,
-        runtime_pending_by_object: &HashMap<u64, PendingUpload>,
-    ) -> Vec<PendingUpload> {
-        self.rebuild_pending_upload_truth(runtime_pending_by_object, true)
-            .pending
-    }
-
-    fn persistent_pending_upload_count(
-        &self,
-        runtime_pending_by_object: &HashMap<u64, PendingUpload>,
-    ) -> usize {
-        self.rebuild_pending_upload_truth(runtime_pending_by_object, false)
-            .count
-    }
-
-    fn stable_runtime_pending_uploads_snapshot(&self) -> Option<Vec<PendingUpload>> {
-        let runtime_pending_uploads = self.cached_store.snapshot_pending_uploads();
-        let dirty_count = self.local_block_backend.dirty_object_count();
-        if dirty_count == 0 {
-            return Some(Vec::new());
-        }
-        if let Some(runtime_pending_uploads) = self
-            .runtime_pending_uploads_aligned_with_dirty_index(runtime_pending_uploads, dirty_count)
+        let payload = serde_json::json!({
+            "sessionId": DEBUG_SESSION_ID,
+            "runId": std::env::var("STUDIOFS_DEBUG_RUN_ID").unwrap_or_else(|_| "run1".to_string()),
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": now_unix_millis(),
+        });
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(DEBUG_LOG_PATH)
         {
-            return Some(runtime_pending_uploads);
+            let _ = writeln!(file, "{payload}");
         }
+    }
+    // #endregion debug log
 
-        let retry_runtime_pending_uploads = self.cached_store.snapshot_pending_uploads();
-        let retry_runtime_pending_count = retry_runtime_pending_uploads.len();
-        let retry_dirty_count = self.local_block_backend.dirty_object_count();
-        if retry_dirty_count == 0 {
-            return Some(Vec::new());
+    fn aggressive_materialization_should_run(&self) -> bool {
+        let total_dirty_bytes = self.state.handle_writers.total_dirty_bytes();
+        if total_dirty_bytes == 0 {
+            return false;
         }
-        if let Some(retry_runtime_pending_uploads) = self
-            .runtime_pending_uploads_aligned_with_dirty_index(
-                retry_runtime_pending_uploads,
-                retry_dirty_count,
-            )
-        {
-            return Some(retry_runtime_pending_uploads);
-        }
-
-        debug!(
-            runtime_pending_count = retry_runtime_pending_count,
-            dirty_count = retry_dirty_count,
-            "pending upload truth view falling back to persistent rebuild after runtime mismatch"
-        );
-        None
+        total_dirty_bytes >= aggressive_materialization_threshold_bytes(self.max_dirty_bytes())
+            || self.state.handle_writers.total_buffered_write_count()
+                >= AGGRESSIVE_MATERIALIZATION_BUFFERED_WRITE_THRESHOLD
     }
 
-    fn stable_runtime_pending_upload_count(&self) -> Option<usize> {
-        const MAX_RUNTIME_PENDING_COUNT_DELTA: usize = 1;
-
-        let runtime_pending_uploads = self.cached_store.snapshot_pending_uploads();
-        let dirty_count = self.local_block_backend.dirty_object_count();
-        if dirty_count == 0 {
-            return Some(0);
-        }
-
-        let runtime_pending_count = self
-            .filter_runtime_pending_uploads_to_dirty_index(runtime_pending_uploads)
-            .len();
-        if runtime_pending_count == dirty_count {
-            return Some(dirty_count);
-        }
-
-        let retry_runtime_pending_uploads = self.cached_store.snapshot_pending_uploads();
-        let retry_dirty_count = self.local_block_backend.dirty_object_count();
-        if retry_dirty_count == 0 {
-            return Some(0);
-        }
-
-        let retry_runtime_pending_count = self
-            .filter_runtime_pending_uploads_to_dirty_index(retry_runtime_pending_uploads)
-            .len();
-        if retry_runtime_pending_count == retry_dirty_count {
-            return Some(retry_dirty_count);
-        }
-        if retry_runtime_pending_count > 0
-            && retry_runtime_pending_count < retry_dirty_count
-            && retry_dirty_count.saturating_sub(retry_runtime_pending_count)
-                <= MAX_RUNTIME_PENDING_COUNT_DELTA
-            && (retry_runtime_pending_count != runtime_pending_count
-                || retry_dirty_count != dirty_count)
-        {
-            return Some(retry_dirty_count);
-        }
-
-        None
+    fn clone_into_write_buffer(&self, data: &[u8]) -> BytesMut {
+        self.write_buffer_pool.acquire_with_bytes(data)
     }
 
-    fn truth_pending_upload_count(&self) -> usize {
-        if let Some(runtime_pending_count) = self.stable_runtime_pending_upload_count() {
-            return runtime_pending_count;
-        }
-
-        let runtime_pending_by_object: HashMap<u64, PendingUpload> = self
-            .cached_store
-            .snapshot_pending_uploads()
-            .into_iter()
-            .map(|op| (op.object_id, op))
-            .collect();
-        self.persistent_pending_upload_count(&runtime_pending_by_object)
+    fn recycle_write_buffer(&self, buffer: BytesMut) {
+        self.write_buffer_pool.release(buffer);
     }
 
-    pub(crate) fn truth_pending_uploads_snapshot(&self) -> Vec<PendingUpload> {
-        if let Some(runtime_pending_uploads) = self.stable_runtime_pending_uploads_snapshot() {
-            return runtime_pending_uploads;
-        }
+    fn pending_upload_count(&self) -> usize {
+        self.cached_store.pending_upload_count()
+    }
 
-        let runtime_pending_by_object: HashMap<u64, PendingUpload> = self
-            .cached_store
-            .snapshot_pending_uploads()
-            .into_iter()
-            .map(|op| (op.object_id, op))
-            .collect();
-        self.persistent_pending_uploads_snapshot(&runtime_pending_by_object)
+    pub(crate) fn pending_uploads_snapshot(&self) -> Vec<PendingUpload> {
+        self.cached_store.snapshot_pending_uploads()
     }
 
     fn attr_read_cache_snapshot(metrics: AttrReadCacheMetrics) -> VfsAttrReadCacheSnapshot {
@@ -3453,7 +3294,7 @@ impl StudioVfs {
         let backend_non_evictable_bytes = storage_stats
             .current_bytes
             .saturating_sub(storage_stats.evictable_bytes);
-        let pending_uploads = self.truth_pending_uploads_snapshot();
+        let pending_uploads = self.pending_uploads_snapshot();
         let mut pending_uploads_by_inode: HashMap<Ino, Vec<PendingUpload>> = HashMap::new();
         for op in pending_uploads {
             pending_uploads_by_inode.entry(op.ino).or_default().push(op);
@@ -3738,8 +3579,8 @@ impl StudioVfs {
             {
                 health_signals.push(VfsZeroIoHealthSignal {
                     severity: "warn".to_string(),
-                    code: "upload_queue_missing".to_string(),
-                    summary: "inode is marked uploading but has no pending upload queue entries"
+                    code: "upload_truth_missing".to_string(),
+                    summary: "inode is marked uploading but the runtime upload queue is empty"
                         .to_string(),
                     ino: Some(ino),
                     content_epoch: Some(lifecycle.local_content_epoch),
@@ -3976,6 +3817,7 @@ impl StudioVfs {
             upload_rx,
         }: StartupChannels,
     ) -> VfsResult<()> {
+        self.spawn_aggressive_materialization_worker();
         self.spawn_prefetch_worker(prefetch_rx);
         self.spawn_uploader_worker(upload_rx);
         self.spawn_epoch_finalizer_worker();
@@ -4001,6 +3843,13 @@ impl StudioVfs {
                 let panic_msg = panic_payload_message(&*panic_payload);
                 error!("prefetch worker panicked: {}", panic_msg);
             }
+        }));
+    }
+
+    fn spawn_aggressive_materialization_worker(self: &Arc<Self>) {
+        let vfs = self.clone();
+        self.track_background_task(tokio::spawn(async move {
+            vfs.background_aggressive_materialization().await;
         }));
     }
 
@@ -4195,6 +4044,26 @@ impl StudioVfs {
         } else {
             current_penalty_ms.saturating_sub(UPLOAD_SCHEDULER_PENALTY_DECAY_STEP_MS)
         };
+        // #region debug log
+        if current_penalty_ms != next_penalty_ms && (current_penalty_ms > 0 || next_penalty_ms > 0)
+        {
+            self.debug_write_probe(
+                "H5",
+                "crates/studiofs-vfs/src/vfs.rs:4255",
+                "upload scheduler adaptive penalty changed",
+                serde_json::json!({
+                    "current_penalty_ms": current_penalty_ms,
+                    "next_penalty_ms": next_penalty_ms,
+                    "foreground_active": foreground_active,
+                    "congested": congested,
+                    "p90_latency_ns": p90_latency_ns,
+                    "threshold_ns": threshold_ns,
+                    "io_cost": io_cost,
+                    "upload_pressure_boost": upload_pressure_boost,
+                }),
+            );
+        }
+        // #endregion debug log
         self.upload_scheduler
             .set_adaptive_penalty(Duration::from_millis(next_penalty_ms));
     }
@@ -4227,6 +4096,11 @@ impl StudioVfs {
 
     fn inode_has_pending_uploads(&self, ino: Ino) -> bool {
         self.cached_store.has_pending_uploads_for_ino(ino)
+    }
+
+    async fn wait_for_pending_uploads_idle(&self, timeout: Duration) -> bool {
+        self.cached_store.wait_for_uploads_idle(timeout).await
+            && self.upload_scheduler.in_flight() == 0
     }
 
     fn derive_committed_incarnation_from_attr(
@@ -4637,7 +4511,7 @@ impl StudioVfs {
         }
 
         let pending_uploads: Vec<_> = self
-            .truth_pending_uploads_snapshot()
+            .pending_uploads_snapshot()
             .into_iter()
             .filter(|op| inos.contains(&op.ino))
             .collect();
@@ -4797,7 +4671,7 @@ impl StudioVfs {
 
     pub fn pending_uploads_for_inode(&self, ino: Ino) -> Vec<(u64, u64, u64)> {
         let mut out: Vec<_> = self
-            .truth_pending_uploads_snapshot()
+            .pending_uploads_snapshot()
             .into_iter()
             .filter(|op| op.ino == ino)
             .map(|op| (op.offset, op.object_id, op.content_epoch))
@@ -4813,6 +4687,9 @@ impl StudioVfs {
     }
 
     async fn block_store_get_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
+        if let Some(payload) = self.upload_hot_get(object_id) {
+            return Ok(Some(payload));
+        }
         let (result, timing) = run_local_cache_io(|| self.local_block_backend.get(object_id));
         self.record_local_cache_io_timing(timing);
         Ok(result)
@@ -4824,6 +4701,15 @@ impl StudioVfs {
         data_offset: usize,
         out: &mut [u8],
     ) -> VfsResult<Option<usize>> {
+        if let Some(payload) = self.upload_hot_get(object_id) {
+            if data_offset >= payload.len() {
+                return Ok(Some(0));
+            }
+            let available = payload.len() - data_offset;
+            let read = available.min(out.len());
+            out[..read].copy_from_slice(&payload[data_offset..data_offset + read]);
+            return Ok(Some(read));
+        }
         let (result, timing) = run_local_cache_io(|| {
             self.local_block_backend
                 .read_into(object_id, data_offset, out)
@@ -4848,6 +4734,44 @@ impl StudioVfs {
             run_local_cache_io_blocking(move || Ok(block_store.get_for_upload(object_id))).await?;
         self.record_local_cache_io_timing(timing);
         Ok(result)
+    }
+
+    fn upload_hot_get(&self, object_id: u64) -> Option<Bytes> {
+        self.cached_store.get_hot_upload(object_id)
+    }
+
+    async fn upload_stage_contains_async(&self, object_id: u64) -> VfsResult<bool> {
+        let cached_store = self.cached_store.clone();
+        let (result, timing) =
+            run_local_cache_io_blocking(move || Ok(cached_store.has_staged_upload(object_id)))
+                .await?;
+        self.record_local_cache_io_timing(timing);
+        Ok(result)
+    }
+
+    async fn upload_stage_get_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
+        let cached_store = self.cached_store.clone();
+        let (result, timing) =
+            run_local_cache_io_blocking(move || Ok(cached_store.get_staged_for_upload(object_id)))
+                .await?;
+        self.record_local_cache_io_timing(timing);
+        Ok(result)
+    }
+
+    async fn upload_stage_link_batch_async(&self, object_ids: Vec<u64>) -> VfsResult<()> {
+        if object_ids.is_empty() {
+            return Ok(());
+        }
+        let cached_store = self.cached_store.clone();
+        let ((), timing) = run_local_cache_io_blocking(move || {
+            cached_store
+                .link_upload_stage_batch(&object_ids)
+                .map_err(std::io::Error::other)?;
+            Ok(())
+        })
+        .await?;
+        self.record_local_cache_io_timing(timing);
+        Ok(())
     }
 
     async fn block_store_run_pressure_maintenance_async(&self) -> VfsResult<()> {
@@ -4893,6 +4817,13 @@ impl StudioVfs {
         .await?;
         self.record_local_cache_io_timing(timing);
         Ok(())
+    }
+
+    fn cache_upload_hot_batch(&self, entries: Vec<LocalBlockPut>) {
+        if entries.is_empty() {
+            return;
+        }
+        self.cached_store.cache_hot_upload_batch(&entries);
     }
 
     async fn maybe_block_store_sync_data_async(
@@ -5031,9 +4962,45 @@ impl StudioVfs {
         Ok(())
     }
 
+    async fn upload_stage_remove_async(&self, object_id: u64) -> VfsResult<()> {
+        let cached_store = self.cached_store.clone();
+        let ((), timing) = run_local_cache_io_blocking(move || {
+            cached_store.remove_staged_upload(object_id);
+            Ok(())
+        })
+        .await?;
+        self.record_local_cache_io_timing(timing);
+        Ok(())
+    }
+
+    fn upload_hot_remove(&self, object_id: u64) {
+        self.cached_store.remove_hot_upload(object_id);
+    }
+
+    async fn upload_stage_remove_batch_async(&self, object_ids: Vec<u64>) -> VfsResult<()> {
+        if object_ids.is_empty() {
+            return Ok(());
+        }
+        let cached_store = self.cached_store.clone();
+        let ((), timing) = run_local_cache_io_blocking(move || {
+            cached_store.remove_staged_upload_batch(&object_ids);
+            Ok(())
+        })
+        .await?;
+        self.record_local_cache_io_timing(timing);
+        Ok(())
+    }
+
+    fn upload_hot_remove_batch(&self, object_ids: Vec<u64>) {
+        if object_ids.is_empty() {
+            return;
+        }
+        self.cached_store.remove_hot_upload_batch(&object_ids);
+    }
+
     pub fn upload_stats(&self) -> VfsUploadStats {
         VfsUploadStats {
-            pending_uploads: self.truth_pending_upload_count(),
+            pending_uploads: self.pending_upload_count(),
             upload_requeues: self.state.upload.upload_requeues.load(Ordering::Relaxed),
             canceled_deleted: self
                 .state
@@ -5091,6 +5058,16 @@ impl StudioVfs {
                 [AccessClass::RandomInteractiveRead.index()],
             active_sequential_writers: active_counts[AccessClass::SequentialWriter.index()],
             active_random_writers: active_counts[AccessClass::RandomWriter.index()],
+            upload_local_payload_reads: self
+                .state
+                .upload
+                .upload_local_payload_reads
+                .load(Ordering::Relaxed),
+            upload_local_payload_read_bytes: self
+                .state
+                .upload
+                .upload_local_payload_read_bytes
+                .load(Ordering::Relaxed),
             upload_fallback_deferrals: self
                 .state
                 .upload
@@ -5318,6 +5295,47 @@ impl StudioVfs {
             .load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn wait_for_foreground_reads_idle(&self, timeout: Duration) -> bool {
+        let started = Instant::now();
+        loop {
+            let now_ms = now_unix_millis();
+            if !self
+                .state
+                .read
+                .foreground_read_active(now_ms, self.upload_user_idle_grace)
+            {
+                return true;
+            }
+
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return false;
+            }
+
+            let notified = self.state.read.foreground_idle_notify.notified();
+            let now_ms = now_unix_millis();
+            if !self
+                .state
+                .read
+                .foreground_read_active(now_ms, self.upload_user_idle_grace)
+            {
+                return true;
+            }
+
+            let wait_slice = if self.foreground_reads_inflight() > 0 {
+                remaining
+            } else {
+                remaining.min(self.upload_user_idle_grace)
+            };
+            if wait_slice.is_zero() {
+                return false;
+            }
+
+            let _ = tokio::time::timeout(wait_slice, notified).await;
+        }
+    }
+
     /// Shared reference to the cached-store runtime.
     pub fn cached_store(&self) -> &Arc<CachedStore> {
         &self.cached_store
@@ -5344,7 +5362,7 @@ impl StudioVfs {
     /// Useful in tests to ensure block data is available on S3 before
     /// cross-client reads.
     pub async fn wait_for_uploads_idle(&self, timeout: Duration) -> bool {
-        self.cached_store.wait_for_uploads_idle(timeout).await
+        self.wait_for_pending_uploads_idle(timeout).await
     }
 
     /// Snapshot accepted local-ingress state for diagnostics and backpressure
@@ -6155,7 +6173,7 @@ impl StudioVfs {
             publisher_pid: std::process::id(),
             generated_unix_ms: now_unix_millis(),
             uptime_secs: elapsed.as_secs_f64(),
-            pending_uploads: self.truth_pending_upload_count(),
+            pending_uploads: self.pending_upload_count(),
             backend_tag: self.write_path_backend_tag.clone(),
             flush_barrier_calls,
             flush_barrier_calls_per_sec: Self::per_second(flush_barrier_calls, elapsed),

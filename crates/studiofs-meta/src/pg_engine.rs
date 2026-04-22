@@ -3689,6 +3689,25 @@ impl MetaBlocks for PgMetaEngine {
         self.local.get_regular_file_overlay_object_ids(ino)
     }
 
+    fn mark_regular_file_overlay_object_uploaded_if_matches(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_id: u64,
+    ) -> MetaResult<bool> {
+        let result = self.mutate(|local| {
+            local.mark_regular_file_overlay_object_uploaded_if_matches(
+                ino,
+                expected_epoch,
+                object_id,
+            )
+        });
+        if matches!(result, Ok(true)) {
+            self.request_pending_flush();
+        }
+        result
+    }
+
     fn commit_uploaded_block(
         &self,
         ino: Ino,
@@ -4138,6 +4157,15 @@ mod tests {
             Ok::<(), MetaError>(())
         })
         .expect("drop file_lock_leases");
+    }
+
+    static FILE_LOCK_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn file_lock_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        FILE_LOCK_TEST_SERIAL
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("file lock test serial guard")
     }
 
     fn reopen_pg_engine_with_retry(path: &std::path::Path) -> Arc<PgMetaEngine> {
@@ -5133,6 +5161,7 @@ mod tests {
     #[test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
     fn test_pg_file_lock_lease_blocks_peer_until_release() {
+        let _guard = file_lock_test_guard();
         let Some(dsn) = pg_dsn() else {
             return;
         };
@@ -5200,6 +5229,7 @@ mod tests {
     #[test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
     fn test_pg_file_lock_first_acquire_serializes_concurrent_racers() {
+        let _guard = file_lock_test_guard();
         let Some(dsn) = pg_dsn() else {
             return;
         };
@@ -5273,6 +5303,7 @@ mod tests {
     #[test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
     fn test_pg_open_recreates_missing_file_lock_lease_table() {
+        let _guard = file_lock_test_guard();
         let Some(dsn) = pg_dsn() else {
             return;
         };
@@ -5304,6 +5335,7 @@ mod tests {
     #[test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
     fn test_pg_file_lock_lease_expires_for_peer() {
+        let _guard = file_lock_test_guard();
         let Some(dsn) = pg_dsn() else {
             return;
         };
@@ -5360,6 +5392,7 @@ mod tests {
     #[test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
     fn test_pg_file_lock_lease_renew_keeps_peer_blocked() {
+        let _guard = file_lock_test_guard();
         let Some(dsn) = pg_dsn() else {
             return;
         };
@@ -5433,6 +5466,7 @@ mod tests {
     #[test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
     fn test_pg_file_lock_known_state_refreshes_from_notify() {
+        let _guard = file_lock_test_guard();
         let Some(dsn) = pg_dsn() else {
             return;
         };
@@ -5486,6 +5520,7 @@ mod tests {
     #[test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
     fn test_pg_passive_lock_monitoring_starts_notify_listener_but_defers_renew_worker() {
+        let _guard = file_lock_test_guard();
         let Some(dsn) = pg_dsn() else {
             return;
         };

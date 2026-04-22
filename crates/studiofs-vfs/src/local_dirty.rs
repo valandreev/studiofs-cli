@@ -26,9 +26,69 @@ pub(super) struct PendingDirtyReadSpan {
 }
 
 #[derive(Debug, Clone)]
+pub(super) enum DirtyWriteData {
+    Mutable(BytesMut),
+    Shared(Bytes),
+}
+
+impl DirtyWriteData {
+    fn len(&self) -> usize {
+        match self {
+            Self::Mutable(data) => data.len(),
+            Self::Shared(data) => data.len(),
+        }
+    }
+
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Mutable(data) => data.as_ref(),
+            Self::Shared(data) => data.as_ref(),
+        }
+    }
+
+    fn freeze(self) -> Bytes {
+        match self {
+            Self::Mutable(data) => data.freeze(),
+            Self::Shared(data) => data,
+        }
+    }
+
+    fn into_pending_block_data(self, vfs: &StudioVfs) -> BytesMut {
+        match self {
+            Self::Mutable(data) => data,
+            Self::Shared(data) => vfs.clone_into_write_buffer(data.as_ref()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct DirtyWriteSnapshot {
     pub(super) block_index: u32,
-    pub(super) data: Bytes,
+    pub(super) data: DirtyWriteData,
+}
+
+impl DirtyWriteSnapshot {
+    pub(super) fn from_mutable(block_index: u32, data: BytesMut) -> Self {
+        Self {
+            block_index,
+            data: DirtyWriteData::Mutable(data),
+        }
+    }
+
+    pub(super) fn from_shared(block_index: u32, data: Bytes) -> Self {
+        Self {
+            block_index,
+            data: DirtyWriteData::Shared(data),
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub(super) fn as_ref(&self) -> &[u8] {
+        self.data.as_ref()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -270,9 +330,10 @@ fn commit_persisted_block_state(
     pending: &mut std::collections::HashMap<(Ino, u32), PendingBlock>,
     ino: Ino,
     blocks: &[PersistedWriteBlock],
-) -> (usize, Vec<u32>) {
+) -> (usize, Vec<u32>, Vec<BytesMut>) {
     let mut removed_bytes = 0usize;
     let mut removed_block_indexes = Vec::new();
+    let mut removed_buffers = Vec::new();
     for block in blocks {
         let key = (ino, block.block_index);
         let mut should_remove = false;
@@ -285,9 +346,10 @@ fn commit_persisted_block_state(
         if should_remove && let Some(removed) = pending.remove(&key) {
             removed_bytes += removed.data.len();
             removed_block_indexes.push(block.block_index);
+            removed_buffers.push(removed.data);
         }
     }
-    (removed_bytes, removed_block_indexes)
+    (removed_bytes, removed_block_indexes, removed_buffers)
 }
 
 impl<L, C, B, U, O> LocalDirtyDrainCore<L, C, B, U, O>
@@ -316,7 +378,7 @@ where
             .filter(|block| {
                 pending
                     .get(&(ino, block.block_index))
-                    .filter(|current| current.data.as_ref() == block.data.as_ref())
+                    .filter(|current| current.data.as_ref() == block.as_ref())
                     .and_then(|current| current.reserved_object_id)
                     .is_none()
             })
@@ -327,20 +389,20 @@ where
         &self,
         pending: &mut std::collections::HashMap<(Ino, u32), PendingBlock>,
         ino: Ino,
-        blocks: &[DirtyWriteSnapshot],
+        blocks: Vec<DirtyWriteSnapshot>,
         fresh_object_ids: &mut std::collections::VecDeque<u64>,
-    ) -> Result<Vec<PersistedWriteBlock>, usize> {
-        let fresh_needed = Self::additional_object_id_count_needed(pending, ino, blocks);
+    ) -> Result<Vec<PersistedWriteBlock>, (Vec<DirtyWriteSnapshot>, usize)> {
+        let fresh_needed = Self::additional_object_id_count_needed(pending, ino, &blocks);
         let additional_needed = fresh_needed.saturating_sub(fresh_object_ids.len());
         if additional_needed > 0 {
-            return Err(additional_needed);
+            return Err((blocks, additional_needed));
         }
 
         let mut persisted_blocks = Vec::with_capacity(blocks.len());
         for block in blocks {
             let key = (ino, block.block_index);
             if let Some(current) = pending.get_mut(&key)
-                && current.data.as_ref() == block.data.as_ref()
+                && current.data.as_ref() == block.as_ref()
             {
                 let object_id = if let Some(object_id) = current.reserved_object_id {
                     object_id
@@ -354,7 +416,7 @@ where
                 persisted_blocks.push(PersistedWriteBlock {
                     block_index: block.block_index,
                     object_id,
-                    data: block.data.clone(),
+                    data: block.data.freeze(),
                 });
                 continue;
             }
@@ -365,7 +427,7 @@ where
             persisted_blocks.push(PersistedWriteBlock {
                 block_index: block.block_index,
                 object_id,
-                data: block.data.clone(),
+                data: block.data.freeze(),
             });
         }
 
@@ -658,6 +720,10 @@ impl LocalBlockWriterPort for VfsLocalBlockWriter<'_> {
         let persisted_bytes: u64 = persisted_blocks.iter().map(|b| b.data.len() as u64).sum();
         let started = Instant::now();
         let result: VfsResult<()> = async {
+            let persisted_object_ids: Vec<u64> = persisted_blocks
+                .iter()
+                .map(|block| block.object_id)
+                .collect();
             for chunk in persisted_blocks.chunks(persist_config.put_concurrency.max(1)) {
                 let batch = chunk
                     .iter()
@@ -669,12 +735,35 @@ impl LocalBlockWriterPort for VfsLocalBlockWriter<'_> {
                     .collect();
                 self.vfs.block_store_put_batch_async(batch).await?;
             }
+            for chunk in persisted_blocks.chunks(persist_config.put_concurrency.max(1)) {
+                let batch = chunk
+                    .iter()
+                    .map(|block| studiofs_cache::local::LocalBlockPut {
+                        object_id: block.object_id,
+                        data: block.data.clone(),
+                        evictable: false,
+                    })
+                    .collect();
+                self.vfs.cache_upload_hot_batch(batch);
+            }
             self.vfs
                 .maybe_block_store_sync_data_async(
                     persisted_bytes,
                     persist_config.local_sync_policy,
                 )
                 .await?;
+            if !persisted_object_ids.is_empty()
+                && let Err(error) = self
+                    .vfs
+                    .upload_stage_link_batch_async(persisted_object_ids)
+                    .await
+            {
+                warn!(
+                    persisted_block_count = persisted_blocks.len(),
+                    error = %error,
+                    "failed to create zero-copy upload links for durable payload blocks"
+                );
+            }
             Ok(())
         }
         .await;
@@ -713,6 +802,20 @@ impl LocalBlockWriterPort for VfsLocalBlockWriter<'_> {
                 "local-dirty cleanup of uncommitted block-store entries failed"
             );
         }
+        if let Err(error) = self
+            .vfs
+            .upload_stage_remove_batch_async(object_ids.clone())
+            .await
+        {
+            warn!(
+                ino,
+                stage,
+                object_count = object_ids.len(),
+                error = %error,
+                "local-dirty cleanup of uncommitted upload entries failed"
+            );
+        }
+        self.vfs.upload_hot_remove_batch(object_ids);
     }
 }
 
@@ -744,35 +847,22 @@ impl UploadSubmissionPort for VfsUploadSubmitter<'_> {
         persisted_blocks: &[PersistedWriteBlock],
         content_epoch: u64,
     ) {
-        let upload_ops: Vec<(u64, u64, u64, u64)> = persisted_blocks
-            .iter()
-            .map(|block| {
-                (
-                    ino,
-                    (block.block_index as u64).saturating_mul(self.vfs.block_size as u64),
-                    block.object_id,
-                    content_epoch,
-                )
-            })
-            .collect();
-
-        self.vfs.cached_store.submit_uploads_batch(&upload_ops);
-        for (upload_ino, _, _, _) in &upload_ops {
+        let mut submit_ops = Vec::with_capacity(persisted_blocks.len());
+        let mut live_extents = Vec::with_capacity(persisted_blocks.len());
+        for block in persisted_blocks {
+            let offset = u64::from(block.block_index).saturating_mul(self.vfs.block_size as u64);
+            submit_ops.push((ino, offset, block.object_id, content_epoch));
+            live_extents.push((ino, block.block_index, block.object_id, content_epoch));
+        }
+        self.vfs.record_live_extents(&live_extents);
+        if !submit_ops.is_empty() {
+            self.vfs.cached_store.submit_uploads_batch(&submit_ops);
             self.vfs.state.file_session.note_background_transition(
-                *upload_ino,
+                ino,
                 FileSessionOperation::Upload,
                 "queued",
             );
         }
-        if !upload_ops.is_empty() {
-            self.vfs.cached_store.flush_upload_journal().await;
-        }
-
-        let mut live_extents = Vec::with_capacity(persisted_blocks.len());
-        for block in persisted_blocks {
-            live_extents.push((ino, block.block_index, block.object_id, content_epoch));
-        }
-        self.vfs.record_live_extents(&live_extents);
     }
 }
 
@@ -789,7 +879,7 @@ impl DrainCommitObserverPort for VfsDrainCommitObserver<'_> {
 impl<'a> LocalDirtyFlushSession<'a> {
     async fn drain_snapshot(
         &self,
-        blocks: Vec<DirtyWriteSnapshot>,
+        mut blocks: Vec<DirtyWriteSnapshot>,
         dirty_chunk_slices: std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
         content_epoch: u64,
         attr_to_persist: Option<InodeAttr>,
@@ -802,13 +892,14 @@ impl<'a> LocalDirtyFlushSession<'a> {
                 self.drain.try_prepare_persisted_blocks(
                     &mut pending,
                     self.ino,
-                    &blocks,
+                    blocks,
                     &mut fresh_object_ids,
                 )
             };
             match prepare_result {
                 Ok(persisted_blocks) => break persisted_blocks,
-                Err(additional_needed) => {
+                Err((returned_blocks, additional_needed)) => {
+                    blocks = returned_blocks;
                     let additional_needed = u32::try_from(additional_needed).map_err(|_| {
                         VfsError::Io(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
@@ -890,6 +981,53 @@ impl<'a> LocalDirtyFlushSession<'a> {
 }
 
 impl StudioVfs {
+    fn direct_full_block_snapshots_for_buffered_writes(
+        &self,
+        writes: &[(u64, Bytes)],
+        visible_size: u64,
+        fully_overwritten_blocks: &std::collections::HashSet<u32>,
+    ) -> std::collections::BTreeMap<u32, DirtyWriteSnapshot> {
+        let mut counts = std::collections::HashMap::<u32, usize>::new();
+        let mut candidates = std::collections::BTreeMap::<u32, DirtyWriteSnapshot>::new();
+
+        for (offset, data) in writes {
+            if data.is_empty() {
+                continue;
+            }
+
+            let mut remaining = data.len();
+            let mut current_offset = *offset;
+            let mut data_offset = 0usize;
+            while remaining > 0 {
+                let block_index = block_index_from_offset(current_offset, self.block_size);
+                let offset_in_block = offset_within_block(current_offset, self.block_size) as usize;
+                let space_in_block = self.block_size as usize - offset_in_block;
+                let to_write = remaining.min(space_in_block);
+                *counts.entry(block_index).or_default() += 1;
+                if fully_overwritten_blocks.contains(&block_index) {
+                    let logical_len = self.logical_block_len(visible_size, block_index);
+                    if offset_in_block == 0 && to_write == logical_len {
+                        candidates.insert(
+                            block_index,
+                            DirtyWriteSnapshot::from_shared(
+                                block_index,
+                                data.slice(data_offset..data_offset + to_write),
+                            ),
+                        );
+                    } else {
+                        candidates.remove(&block_index);
+                    }
+                }
+                remaining -= to_write;
+                current_offset += to_write as u64;
+                data_offset += to_write;
+            }
+        }
+
+        candidates.retain(|block_index, _| counts.get(block_index) == Some(&1));
+        candidates
+    }
+
     pub(super) async fn build_dirty_write_snapshots_from_buffered_writes(
         &self,
         ino: Ino,
@@ -899,6 +1037,11 @@ impl StudioVfs {
         let pending_upload_index = self.snapshot_pending_upload_index();
         let fully_overwritten_blocks =
             self.fully_overwritten_block_indexes_for_buffered_writes(writes, visible_size);
+        let direct_snapshots = self.direct_full_block_snapshots_for_buffered_writes(
+            writes,
+            visible_size,
+            &fully_overwritten_blocks,
+        );
         let mut blocks = std::collections::BTreeMap::<u32, BytesMut>::new();
 
         for (offset, data) in writes {
@@ -914,6 +1057,12 @@ impl StudioVfs {
                 let offset_in_block = offset_within_block(current_offset, self.block_size) as usize;
                 let space_in_block = self.block_size as usize - offset_in_block;
                 let to_write = remaining.min(space_in_block);
+                if direct_snapshots.contains_key(&block_index) {
+                    remaining -= to_write;
+                    current_offset += to_write as u64;
+                    data_offset += to_write;
+                    continue;
+                }
 
                 if let std::collections::btree_map::Entry::Vacant(entry) = blocks.entry(block_index)
                 {
@@ -935,7 +1084,7 @@ impl StudioVfs {
                             None => Bytes::new(),
                         }
                     };
-                    entry.insert(BytesMut::from(existing_data.as_ref()));
+                    entry.insert(self.clone_into_write_buffer(existing_data.as_ref()));
                 }
 
                 let block = blocks
@@ -954,23 +1103,19 @@ impl StudioVfs {
             }
         }
 
-        Ok(blocks
-            .into_iter()
-            .filter_map(|(block_index, mut data)| {
-                let logical_len = self.logical_block_len(visible_size, block_index);
-                if data.len() > logical_len {
-                    data.truncate(logical_len);
-                }
-                if data.is_empty() {
-                    None
-                } else {
-                    Some(DirtyWriteSnapshot {
-                        block_index,
-                        data: data.freeze(),
-                    })
-                }
-            })
-            .collect())
+        let mut snapshots: Vec<DirtyWriteSnapshot> = direct_snapshots.into_values().collect();
+        snapshots.extend(blocks.into_iter().filter_map(|(block_index, mut data)| {
+            let logical_len = self.logical_block_len(visible_size, block_index);
+            if data.len() > logical_len {
+                data.truncate(logical_len);
+            }
+            if data.is_empty() {
+                None
+            } else {
+                Some(DirtyWriteSnapshot::from_mutable(block_index, data))
+            }
+        }));
+        Ok(snapshots)
     }
 
     fn fully_overwritten_block_indexes_for_buffered_writes(
@@ -1056,7 +1201,7 @@ impl StudioVfs {
         if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
             let (completed_blocks, buffered_blocks): (Vec<_>, Vec<_>) = blocks
                 .into_iter()
-                .partition(|block| block.data.len() == self.block_size as usize);
+                .partition(|block| block.len() == self.block_size as usize);
 
             if !completed_blocks.is_empty() {
                 let attr_to_persist = if buffered_blocks.is_empty() {
@@ -1152,7 +1297,7 @@ impl StudioVfs {
             .map(|(block, object_id)| PersistedWriteBlock {
                 block_index: block.block_index,
                 object_id,
-                data: block.data,
+                data: block.data.freeze(),
             })
             .collect();
 
@@ -1197,7 +1342,7 @@ impl StudioVfs {
                 ino,
                 block.block_index,
                 PendingBlock {
-                    data: BytesMut::from(block.data.as_ref()),
+                    data: block.data.into_pending_block_data(self),
                     dirty: true,
                     reserved_object_id,
                 },
@@ -1275,10 +1420,8 @@ impl StudioVfs {
         let mut pending = self.state.local_dirty.pending_blocks.lock();
         let mut indexes = self.state.local_dirty.pending_block_indexes.lock();
         let new_len = block.data.len();
-        let old_len = pending
-            .insert((ino, block_index), block)
-            .map(|old| old.data.len())
-            .unwrap_or(0);
+        let replaced = pending.insert((ino, block_index), block);
+        let old_len = replaced.as_ref().map(|old| old.data.len()).unwrap_or(0);
         indexes.entry(ino).or_default().insert(block_index);
         drop(indexes);
         drop(pending);
@@ -1286,6 +1429,9 @@ impl StudioVfs {
             std::cmp::Ordering::Greater => self.add_pending_local_dirty_bytes(new_len - old_len),
             std::cmp::Ordering::Less => self.subtract_pending_local_dirty_bytes(old_len - new_len),
             std::cmp::Ordering::Equal => {}
+        }
+        if let Some(old) = replaced {
+            self.recycle_write_buffer(old.data);
         }
     }
 
@@ -1366,19 +1512,27 @@ impl StudioVfs {
 
     pub(super) fn clear_pending_blocks_for_inode(&self, ino: Ino) {
         let mut removed_bytes = 0usize;
+        let mut removed_buffers = Vec::new();
         let mut pending = self.state.local_dirty.pending_blocks.lock();
         let mut indexes = self.state.local_dirty.pending_block_indexes.lock();
-        pending.retain(|(candidate, _), block| {
-            if *candidate == ino {
-                removed_bytes += block.data.len();
-                return false;
+        let block_indexes: Vec<u32> = indexes
+            .get(&ino)
+            .into_iter()
+            .flat_map(|inode_indexes| inode_indexes.iter().copied())
+            .collect();
+        for block_index in block_indexes {
+            if let Some(removed) = pending.remove(&(ino, block_index)) {
+                removed_bytes += removed.data.len();
+                removed_buffers.push(removed.data);
             }
-            true
-        });
+        }
         indexes.remove(&ino);
         drop(indexes);
         drop(pending);
         self.subtract_pending_local_dirty_bytes(removed_bytes);
+        for buffer in removed_buffers {
+            self.recycle_write_buffer(buffer);
+        }
         self.clear_pending_dirty_slices_for_inode(ino);
     }
 
@@ -1395,6 +1549,7 @@ impl StudioVfs {
             drop(indexes);
             drop(pending);
             self.subtract_pending_local_dirty_bytes(removed.data.len());
+            self.recycle_write_buffer(removed.data);
             self.clear_pending_dirty_slices_for_block(ino, block_index);
         }
     }
@@ -1413,9 +1568,11 @@ impl StudioVfs {
                 pending
                     .get(&(ino, *block_index))
                     .filter(|pending| pending.dirty)
-                    .map(|pending| DirtyWriteSnapshot {
-                        block_index: *block_index,
-                        data: pending.data.clone().freeze(),
+                    .map(|pending| {
+                        DirtyWriteSnapshot::from_mutable(
+                            *block_index,
+                            self.clone_into_write_buffer(pending.data.as_ref()),
+                        )
                     })
             })
             .collect()
@@ -1430,7 +1587,7 @@ impl StudioVfs {
             blocks.iter().map(|block| block.block_index).collect();
         let block_lengths: std::collections::HashMap<u32, usize> = blocks
             .iter()
-            .map(|block| (block.block_index, block.data.len()))
+            .map(|block| (block.block_index, block.len()))
             .collect();
         if selected_block_indexes.is_empty() {
             return std::collections::BTreeMap::new();
@@ -1536,7 +1693,7 @@ impl StudioVfs {
 
         let mut pending = self.state.local_dirty.pending_blocks.lock();
         let mut indexes = self.state.local_dirty.pending_block_indexes.lock();
-        let (removed_bytes, removed_block_indexes) =
+        let (removed_bytes, removed_block_indexes, removed_buffers) =
             commit_persisted_block_state(&mut pending, ino, blocks);
         if let Some(inode_indexes) = indexes.get_mut(&ino) {
             for block_index in &removed_block_indexes {
@@ -1549,6 +1706,9 @@ impl StudioVfs {
         drop(indexes);
         drop(pending);
         self.subtract_pending_local_dirty_bytes(removed_bytes);
+        for buffer in removed_buffers {
+            self.recycle_write_buffer(buffer);
+        }
         self.clear_pending_dirty_slices_for_blocks(ino, &removed_block_indexes);
     }
 
@@ -1616,7 +1776,7 @@ impl StudioVfs {
             ino,
             block_index,
             PendingBlock {
-                data: BytesMut::from(&data[..new_len]),
+                data: self.clone_into_write_buffer(&data[..new_len]),
                 dirty: true,
                 reserved_object_id,
             },
@@ -1643,9 +1803,21 @@ impl StudioVfs {
             return Ok(Some(data));
         }
 
-        let block_ref = match self.get_file_block_async(ino, block_index).await? {
-            Some(br) => br,
-            None => return Ok(None),
+        let visible_size = if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino) {
+            attr.size
+        } else {
+            self.getattr_async(ino).await?.size
+        };
+
+        let block_ref = match self.get_file_block_async(ino, block_index).await {
+            Ok(Some(br)) => br,
+            Ok(None) => return Ok(None),
+            Err(VfsError::Meta(studiofs_meta::MetaError::FragmentedBlock { .. })) => {
+                return self
+                    .read_metadata_block_from_slice_graph_async(ino, block_index, visible_size)
+                    .await;
+            }
+            Err(error) => return Err(error),
         };
 
         if let Some(cached) = self.block_store_get_async(block_ref.object_id).await? {
@@ -1775,10 +1947,10 @@ mod tests {
                     reserved_object_id,
                 },
             )]),
-            vec![DirtyWriteSnapshot {
+            vec![DirtyWriteSnapshot::from_mutable(
                 block_index,
-                data: Bytes::from_static(data),
-            }],
+                BytesMut::from(data),
+            )],
         )
     }
 
@@ -1865,11 +2037,12 @@ mod tests {
             data: Bytes::from_static(b"older"),
         }];
 
-        let (removed_bytes, removed_block_indexes) =
+        let (removed_bytes, removed_block_indexes, removed_buffers) =
             commit_persisted_block_state(&mut pending, ino, &blocks);
 
         assert_eq!(removed_bytes, 0);
         assert!(removed_block_indexes.is_empty());
+        assert!(removed_buffers.is_empty());
         let pending_block = pending.get(&(ino, 3)).unwrap();
         assert_eq!(pending_block.data.as_ref(), b"newer");
         assert_eq!(pending_block.reserved_object_id, None);
@@ -2050,7 +2223,7 @@ mod tests {
         let (mut pending, blocks) = single_block_fixture(ino, 0, b"alpha", None);
         let mut fresh_object_ids = std::collections::VecDeque::from([111]);
         let persisted_blocks = drain
-            .try_prepare_persisted_blocks(&mut pending, ino, &blocks, &mut fresh_object_ids)
+            .try_prepare_persisted_blocks(&mut pending, ino, blocks, &mut fresh_object_ids)
             .expect("prepare persisted blocks");
 
         futures::executor::block_on(drain.execute_drain(
@@ -2105,7 +2278,7 @@ mod tests {
         let (mut pending, blocks) = single_block_fixture(ino, 1, b"beta", None);
         let mut fresh_object_ids = std::collections::VecDeque::from([222]);
         let persisted_blocks = drain
-            .try_prepare_persisted_blocks(&mut pending, ino, &blocks, &mut fresh_object_ids)
+            .try_prepare_persisted_blocks(&mut pending, ino, blocks, &mut fresh_object_ids)
             .expect("prepare persisted blocks");
 
         let error = futures::executor::block_on(drain.execute_drain(
@@ -2156,19 +2329,37 @@ mod tests {
             },
         );
 
-        assert!(matches!(
-            drain.try_prepare_persisted_blocks(&mut pending, ino, &blocks, &mut fresh_object_ids),
-            Err(1)
-        ));
+        let (blocks, additional_needed) = drain
+            .try_prepare_persisted_blocks(&mut pending, ino, blocks, &mut fresh_object_ids)
+            .expect_err("stale snapshot should request another object id");
+        assert_eq!(additional_needed, 1);
 
         fresh_object_ids.push_back(701);
         let persisted_blocks = drain
-            .try_prepare_persisted_blocks(&mut pending, ino, &blocks, &mut fresh_object_ids)
+            .try_prepare_persisted_blocks(&mut pending, ino, blocks, &mut fresh_object_ids)
             .expect("prepare stale snapshot");
         assert_eq!(persisted_blocks[0].object_id, 701);
         let pending_block = pending.get(&(ino, 0)).expect("pending block");
         assert_eq!(pending_block.data.as_ref(), b"newer");
         assert_eq!(pending_block.reserved_object_id, Some(700));
+    }
+
+    #[test]
+    fn prepare_persisted_blocks_freezes_snapshot_without_copying_payload() {
+        let ino = 22;
+        let events = EventLog::default();
+        let uploads = Arc::new(StdMutex::new(Vec::new()));
+        let observed_inodes = Arc::new(StdMutex::new(Vec::new()));
+        let drain = test_drain(events, false, false, None, uploads, observed_inodes);
+        let (mut pending, blocks) = single_block_fixture(ino, 0, b"alpha", None);
+        let mut fresh_object_ids = std::collections::VecDeque::from([702]);
+        let snapshot_ptr = blocks[0].as_ref().as_ptr();
+
+        let persisted_blocks = drain
+            .try_prepare_persisted_blocks(&mut pending, ino, blocks, &mut fresh_object_ids)
+            .expect("prepare persisted blocks");
+
+        assert_eq!(persisted_blocks[0].data.as_ptr(), snapshot_ptr);
     }
 
     #[test]

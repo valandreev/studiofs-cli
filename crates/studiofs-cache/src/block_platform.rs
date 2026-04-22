@@ -127,15 +127,11 @@ fn open_read_only_impl(path: &Path) -> io::Result<File> {
 
 #[cfg(windows)]
 fn open_read_only_impl(path: &Path) -> io::Result<File> {
-    use std::fs::OpenOptions;
-    use std::os::windows::fs::OpenOptionsExt;
-
-    const FILE_FLAG_RANDOM_ACCESS: u32 = 0x1000_0000;
-
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_RANDOM_ACCESS)
-        .open(path)
+    // Let Windows apply its default cache and readahead policy here.
+    // JuiceFS uses plain read-only opens for cache/staging files, and forcing
+    // FILE_FLAG_RANDOM_ACCESS made our large sequential read/writeback mix much
+    // less cooperative with the OS page cache.
+    std::fs::OpenOptions::new().read(true).open(path)
 }
 
 #[cfg(unix)]

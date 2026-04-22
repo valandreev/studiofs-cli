@@ -267,38 +267,33 @@ impl RedbMetaEngine {
         txn: &redb::WriteTransaction,
         attr: &InodeAttr,
     ) -> MetaResult<InodeLifecycleRecord> {
-        let existing: Option<InodeLifecycleRecord> = txn
-            .open_table(INODE_LIFECYCLE_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-            .get(attr.ino)
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-            .map(|value| decode(value.value()))
-            .transpose()?;
         let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
             txn,
             REGULAR_FILE_OVERLAY_TABLE,
             attr.ino,
         )?;
         let overlay_state = Self::overlay_lifecycle_state(overlay_chunks.values());
-        let has_published_base = existing
-            .as_ref()
-            .map(|record| record.has_published_base)
-            .unwrap_or(attr.committed_size > 0 || attr.committed_content_epoch > 0);
-        let state = match overlay_state {
-            Some(InodeLifecycleState::Uploading) => InodeLifecycleState::Uploading,
-            Some(InodeLifecycleState::PublishReady) => InodeLifecycleState::PublishReady,
-            _ => InodeLifecycleState::LocalOnly,
+        let base_manifest = Self::base_manifest_from_graph_rows_in_txn(txn, attr.ino)?;
+        let has_published_base = !base_manifest.is_empty()
+            || attr.committed_size > 0
+            || attr.committed_content_epoch > 0;
+        let (local_matches_published, blockless_manifest_ready) = if overlay_state.is_some() {
+            (false, false)
+        } else {
+            let current_manifest = Self::current_manifest_in_txn(txn, attr.ino)?;
+            (
+                attr.size == attr.committed_size
+                    && attr.content_epoch == attr.committed_content_epoch
+                    && current_manifest == base_manifest,
+                current_manifest.is_empty(),
+            )
         };
-        let retention = match state {
-            InodeLifecycleState::PublishReady => PayloadRetentionClass::PublishReadyRetained,
-            InodeLifecycleState::LocalOnly | InodeLifecycleState::Uploading => {
-                PayloadRetentionClass::PinnedUnpublished
-            }
-            InodeLifecycleState::Published => PayloadRetentionClass::PublishedWarm,
-            InodeLifecycleState::DeletedBeforePublish => {
-                PayloadRetentionClass::DeletedBeforePublish
-            }
-        };
+        let (state, retention) = Self::derive_inode_lifecycle_state_and_retention(
+            has_published_base,
+            local_matches_published,
+            overlay_state,
+            blockless_manifest_ready,
+        );
         let record = InodeLifecycleRecord {
             ino: attr.ino,
             state,
@@ -308,7 +303,13 @@ impl RedbMetaEngine {
             published_content_epoch: attr.committed_content_epoch,
             has_published_base,
             retention,
-            deferred_cleanup_object_ids: existing
+            deferred_cleanup_object_ids: txn
+                .open_table(INODE_LIFECYCLE_TABLE)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .get(attr.ino)
+                .map_err(|e| MetaError::Storage(e.to_string()))?
+                .map(|value| decode::<InodeLifecycleRecord>(value.value()))
+                .transpose()?
                 .map(|record| record.deferred_cleanup_object_ids)
                 .unwrap_or_default(),
         };
@@ -325,21 +326,56 @@ impl RedbMetaEngine {
             REGULAR_FILE_OVERLAY_TABLE,
             attr.ino,
         )?;
-        let has_published_base = !Self::base_manifest_from_graph_rows_in_txn(txn, attr.ino)?
-            .is_empty()
+        let base_manifest = Self::base_manifest_from_graph_rows_in_txn(txn, attr.ino)?;
+        let has_published_base = !base_manifest.is_empty()
             || attr.committed_size > 0
             || attr.committed_content_epoch > 0;
-        let local_matches_published = attr.size == attr.committed_size
-            && attr.content_epoch == attr.committed_content_epoch
-            && Self::manifest_matches_committed_in_txn(txn, attr.ino)?;
-
         let overlay_state = Self::overlay_lifecycle_state(overlay_chunks.values());
+        let (local_matches_published, blockless_manifest_ready) = if overlay_state.is_some() {
+            (false, false)
+        } else {
+            let current_manifest = Self::current_manifest_in_txn(txn, attr.ino)?;
+            (
+                attr.size == attr.committed_size
+                    && attr.content_epoch == attr.committed_content_epoch
+                    && current_manifest == base_manifest,
+                current_manifest.is_empty(),
+            )
+        };
+        let (state, retention) = Self::derive_inode_lifecycle_state_and_retention(
+            has_published_base,
+            local_matches_published,
+            overlay_state,
+            blockless_manifest_ready,
+        );
+
+        Ok(InodeLifecycleRecord {
+            ino: attr.ino,
+            state,
+            local_visible_size: attr.size,
+            published_size: attr.committed_size,
+            local_content_epoch: attr.content_epoch,
+            published_content_epoch: attr.committed_content_epoch,
+            has_published_base,
+            retention,
+            deferred_cleanup_object_ids: Vec::new(),
+        })
+    }
+
+    fn derive_inode_lifecycle_state_and_retention(
+        has_published_base: bool,
+        local_matches_published: bool,
+        overlay_state: Option<InodeLifecycleState>,
+        blockless_manifest_ready: bool,
+    ) -> (InodeLifecycleState, PayloadRetentionClass) {
         let state = if local_matches_published {
             if has_published_base {
                 InodeLifecycleState::Published
             } else {
                 InodeLifecycleState::LocalOnly
             }
+        } else if blockless_manifest_ready {
+            InodeLifecycleState::PublishReady
         } else {
             match overlay_state {
                 Some(InodeLifecycleState::Uploading) => InodeLifecycleState::Uploading,
@@ -368,18 +404,7 @@ impl RedbMetaEngine {
                 PayloadRetentionClass::DeletedBeforePublish
             }
         };
-
-        Ok(InodeLifecycleRecord {
-            ino: attr.ino,
-            state,
-            local_visible_size: attr.size,
-            published_size: attr.committed_size,
-            local_content_epoch: attr.content_epoch,
-            published_content_epoch: attr.committed_content_epoch,
-            has_published_base,
-            retention,
-            deferred_cleanup_object_ids: Vec::new(),
-        })
+        (state, retention)
     }
 
     fn overlay_lifecycle_state<'a>(

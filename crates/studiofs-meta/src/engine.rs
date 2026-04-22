@@ -525,6 +525,24 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
         Ok(ids.into_iter().collect())
     }
 
+    /// Mark a still-referenced overlay object as remote-visible for the current
+    /// unpublished epoch, even when its logical block is represented by
+    /// multiple slice records and cannot be synthesized into a single
+    /// [`BlockRef`].
+    ///
+    /// Returns `Ok(true)` when `object_id` is still referenced by the inode's
+    /// local regular-file overlay for `expected_epoch`. Returns `Ok(false)`
+    /// when the inode/epoch/object no longer matches the caller's view.
+    fn mark_regular_file_overlay_object_uploaded_if_matches(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_id: u64,
+    ) -> MetaResult<bool> {
+        let _ = (ino, expected_epoch, object_id);
+        Ok(false)
+    }
+
     /// Mark a block as remote-visible after its object upload has completed.
     ///
     /// Remote-backed engines can use this to publish block visibility and

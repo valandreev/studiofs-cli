@@ -80,8 +80,8 @@ impl DestroyArgs {
 
 fn describe_destroy_cache_scope(detection: Option<&LocalBlockRuntimeDetection>) -> &'static str {
     if let Some(detection) = detection {
-        if detection.has_runtime_layout() {
-            "local cleanup removes the entire metadata directory (`meta_dir`), including the default cache root and its active local-cache subtree"
+        if detection.runtime_backend().is_some() {
+            "local cleanup removes the entire metadata directory (`meta_dir`), including the default cache root and its active UUID-scoped local-cache runtime"
         } else {
             "local cleanup removes the entire metadata directory (`meta_dir`), including any default cache-root contents under it"
         }
@@ -179,18 +179,18 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
     );
     if let Some(detection) = cache_backend_detection.as_ref() {
         println!(
-            "  Local cache marker: {} ({})",
-            detection.layout.layout_marker.display(),
-            if detection.has_runtime_layout() {
+            "  Local cache index: {} ({})",
+            detection.layout.redb_index_path.display(),
+            if detection.index_exists {
                 "present"
             } else {
                 "absent"
             }
         );
         println!(
-            "  Local cache index: {} ({})",
-            detection.layout.redb_index_path.display(),
-            if detection.index_exists {
+            "  Local cache upload: {} ({})",
+            detection.layout.upload_stage_blocks_dir.display(),
+            if detection.upload_blocks_dir_exists {
                 "present"
             } else {
                 "absent"
@@ -344,16 +344,29 @@ mod tests {
     use super::*;
     use studiofs_cache::runtime::LocalBlockLayout;
 
-    fn detection(marker: bool) -> LocalBlockRuntimeDetection {
+    fn detection(has_layout: bool) -> LocalBlockRuntimeDetection {
         let temp = tempfile::tempdir().unwrap();
         let layout = LocalBlockLayout::from_cache_root(temp.path());
         LocalBlockRuntimeDetection {
             layout,
-            layout_marker_exists: marker,
+            index_exists: false,
+            payload_blocks_dir_exists: has_layout,
+            upload_blocks_dir_exists: has_layout,
+            tmp_dir_exists: has_layout,
+            index_dir_exists: has_layout,
+        }
+    }
+
+    fn partial_detection() -> LocalBlockRuntimeDetection {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        LocalBlockRuntimeDetection {
+            layout,
             index_exists: false,
             payload_blocks_dir_exists: false,
+            upload_blocks_dir_exists: false,
             tmp_dir_exists: false,
-            index_dir_exists: false,
+            index_dir_exists: true,
         }
     }
 
@@ -368,16 +381,24 @@ mod tests {
             describe_cache_layout_state(Some(&detection(true))),
             "Local block runtime ready"
         );
+        assert_eq!(
+            describe_cache_layout_state(Some(&partial_detection())),
+            "Local block runtime incomplete"
+        );
     }
 
     #[test]
     fn destroy_cleanup_scope_is_layout_aware() {
         assert_eq!(
             describe_destroy_cache_scope(Some(&detection(true))),
-            "local cleanup removes the entire metadata directory (`meta_dir`), including the default cache root and its active local-cache subtree"
+            "local cleanup removes the entire metadata directory (`meta_dir`), including the default cache root and its active UUID-scoped local-cache runtime"
         );
         assert_eq!(
             describe_destroy_cache_scope(Some(&detection(false))),
+            "local cleanup removes the entire metadata directory (`meta_dir`), including any default cache-root contents under it"
+        );
+        assert_eq!(
+            describe_destroy_cache_scope(Some(&partial_detection())),
             "local cleanup removes the entire metadata directory (`meta_dir`), including any default cache-root contents under it"
         );
         assert_eq!(

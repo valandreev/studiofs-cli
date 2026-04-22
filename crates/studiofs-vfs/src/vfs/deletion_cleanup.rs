@@ -99,11 +99,28 @@ impl StudioVfs {
         removed_ids: Vec<u64>,
     ) -> usize {
         let removed_ids_len = removed_ids.len();
+        // #region debug log
+        self.debug_write_probe(
+            "H1",
+            "crates/studiofs-vfs/src/vfs/deletion_cleanup.rs:101",
+            "finalizing deleted inode runtime cleanup",
+            serde_json::json!({
+                "ino": ino,
+                "removed_ids_len": removed_ids_len,
+                "open_count": self.handle_table.open_count(ino),
+                "deleted_marker": self.state.upload.deleted_inodes.lock().contains(&ino),
+                "dirty_handle_bytes": self.state.handle_writers.dirty_bytes_for_inode(ino),
+                "has_pending_local_dirty_blocks": self.has_pending_local_dirty_blocks_for_inode(ino),
+                "has_inflight_materialization": self.state.deferred_materialize_inflight.lock().contains_key(&ino),
+            }),
+        );
+        // #endregion debug log
 
         // Deleted inodes should never retain staged writes, even if no committed
         // block refs existed yet. Preserve the old immediate-unlink contract by
         // also clearing live extent identities and read-side runtime state even
         // when no object IDs remain to evict.
+        self.state.handle_writers.clear_inode(ino);
         self.clear_pending_blocks_for_inode(ino);
         self.remove_live_extents_for_inode(ino);
         self.readahead.evict(ino);

@@ -356,7 +356,7 @@ Rules:
 | `UploadCoordinator` as the canonical upload architecture | Simplify/delete as a top-level design concept. Replace with one cached-store-style staging/upload pipeline. |
 | `published` / `local unpublished` as separate architecture authorities | Simplify. They may remain as internal lifecycle labels inside local metadata, but they must not imply PG as a foreground authority. |
 | `cache_safety_mode=fast|durable` as a product-level mount contract | Deleted from the product contract and implementation. A single Fast Local Authority mount model is the target. |
-| Versioned local runtime subtree as product architecture vocabulary | Rename/simplify. The current `v3/` subtree may remain as an implementation detail for the local backend, but not as the rewrite's conceptual model. |
+| Versioned local runtime subtree as product architecture vocabulary | Resolved. The UUID-scoped cache root is now the runtime boundary; no nested versioned subtree is part of the product model. |
 | File-version atomic visibility | Retain. Peers must not observe half-published file versions. |
 | `STUDIOFS_*` tuning sprawl | Simplify into a JuiceFS-inspired CLI/config surface with only transitional env vars where necessary. |
 

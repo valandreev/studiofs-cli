@@ -91,10 +91,9 @@ fn make_format_info(volume_suffix: &str) -> FormatInfo {
     }
 }
 
-fn create_cache_v3_layout_marker(cache_root: &std::path::Path) {
+fn provision_cache_runtime_layout(cache_root: &std::path::Path) {
     let layout = LocalBlockLayout::from_cache_root(cache_root);
-    std::fs::create_dir_all(&layout.runtime_root).unwrap();
-    std::fs::write(&layout.layout_marker, b"v1").unwrap();
+    layout.provision().unwrap();
 }
 
 fn workspace_root() -> &'static std::path::Path {
@@ -6130,7 +6129,7 @@ fn published_file_remains_readable_after_cache_wipe_and_restart() {
 
 #[test]
 #[ignore = "requires live S3 backend; run with --ignored and valid .env"]
-fn background_epoch_finalizer_publishes_legacy_epoch_without_publish_ready_marker() {
+fn background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_bucket = ScopedEnvVar::capture("STUDIOFS_S3_BUCKET");
     let _restore_access_key = ScopedEnvVar::capture("STUDIOFS_S3_ACCESS_KEY");
@@ -6158,6 +6157,7 @@ fn background_epoch_finalizer_publishes_legacy_epoch_without_publish_ready_marke
     let baseline_payload = vec![0x21u8; 512 * 1024];
     let replacement_payload = vec![0x91u8; 512 * 1024];
     let mut ino = 0u64;
+    let mut committed_block = BlockRef::new_partial(0, 0);
     let mut replacement_object_id = 0u64;
 
     {
@@ -6166,7 +6166,7 @@ fn background_epoch_finalizer_publishes_legacy_epoch_without_publish_ready_marke
             .build()
             .unwrap();
         rt.block_on(async {
-            let (seeded_ino, _) = seed_committed_file(
+            let (seeded_ino, seeded_blocks) = seed_committed_file(
                 &meta,
                 &format_info,
                 b"restart-finalizer-no-pending.bin",
@@ -6174,6 +6174,7 @@ fn background_epoch_finalizer_publishes_legacy_epoch_without_publish_ready_marke
             )
             .await;
             ino = seeded_ino;
+            committed_block = seeded_blocks[0].1.clone();
 
             let mut staged_attr = meta.get_attr(ino).unwrap();
             staged_attr.size = replacement_payload.len() as u64;
@@ -6231,31 +6232,62 @@ fn background_epoch_finalizer_publishes_legacy_epoch_without_publish_ready_marke
 
         assert!(
             vfs.pending_uploads_for_inode(ino).is_empty(),
-            "recovery setup should rely on metadata-only finalization with an empty upload journal"
+            "recovery setup should keep the restart path free of upload journal entries"
         );
 
-        assert!(
-            wait_until(Duration::from_secs(20), || {
-                meta.get_attr(ino)
-                    .map(|attr| {
-                        attr.upload_state == UploadState::Ready
-                            && attr.committed_content_epoch == attr.content_epoch
-                    })
-                    .unwrap_or(false)
-            })
-            .await,
-            "background epoch finalizer should preserve legacy metadata-only publish after restart"
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let attr_after = meta.get_attr(ino).unwrap();
+        assert_eq!(
+            attr_after.upload_state,
+            UploadState::Updating,
+            "background finalizer must not publish epochs that never reached PublishReady"
+        );
+        assert_ne!(
+            attr_after.committed_content_epoch,
+            attr_after.content_epoch,
+            "the staged epoch should remain unpublished after restart"
+        );
+        let lifecycle = meta.get_inode_lifecycle(ino).unwrap().unwrap();
+        assert_eq!(
+            lifecycle.state,
+            InodeLifecycleState::LocalOnly,
+            "without a durable PublishReady marker the restart path should keep the epoch local-only"
         );
 
-        let published_blocks = meta.get_file_blocks(ino).unwrap();
-        assert_eq!(published_blocks.len(), 1);
-        assert_eq!(published_blocks[0].1.object_id, replacement_object_id);
-
-        let data = vfs
+        let local_data = vfs
             .read(ino, 0, replacement_payload.len() as u32)
             .await
             .unwrap();
-        assert_eq!(data.as_ref(), replacement_payload.as_slice());
+        assert_eq!(
+            local_data.as_ref(),
+            replacement_payload.as_slice(),
+            "the local mount should still recover and read its unpublished replacement payload"
+        );
+
+        let remote_db_path = tmp.path().join("remote-meta.redb");
+        let remote_meta = RedbMetaEngine::open(&remote_db_path).unwrap();
+        remote_meta.init_root(0, 0).unwrap();
+        import_remote_snapshot(meta.as_ref(), &remote_meta, &format_info);
+
+        let remote_attr = remote_meta.get_attr(ino).unwrap();
+        assert_eq!(
+            remote_attr.committed_content_epoch,
+            attr_after.committed_content_epoch,
+            "remote-visible state must remain on the last committed epoch"
+        );
+        assert_eq!(remote_attr.upload_state, UploadState::Updating);
+        let remote_block = remote_meta.get_file_block(ino, 0).unwrap().unwrap();
+        assert_eq!(
+            remote_block.object_id,
+            committed_block.object_id,
+            "remote-visible payload should stay on the previous committed block"
+        );
+        assert_ne!(
+            remote_block.object_id,
+            replacement_object_id,
+            "the unpublished replacement block must not leak into published state"
+        );
     });
     rt.shutdown_background();
 }
@@ -6488,7 +6520,7 @@ fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
-    create_cache_v3_layout_marker(&cache_dir);
+    provision_cache_runtime_layout(&cache_dir);
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
     let mut format_info = make_format_info_with_endpoint(
         &format!("local-block-runtime-replay-{}", std::process::id()),
@@ -11446,9 +11478,9 @@ fn foreground_read_baseline_during_and_post_upload_are_comparable() {
 }
 
 /// Force an upload backlog and verify the uploader progresses via persisted
-/// local-block rereads instead of depending on transient staged payload state.
+/// local payload sources instead of depending on transient in-memory state.
 #[test]
-fn upload_backlog_progresses_via_persisted_local_block_rereads() {
+fn upload_backlog_progresses_via_persisted_local_payload_reads() {
     let tmp = tempfile::tempdir().unwrap();
     let _env = setup_offline_sfs121_env();
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
@@ -11491,20 +11523,20 @@ fn upload_backlog_progresses_via_persisted_local_block_rereads() {
         assert!(
             wait_until(Duration::from_secs(10), || {
                 let stats = vfs.foreground_read_protection_stats();
-                stats.upload_fallback_rereads > 0
+                stats.upload_local_payload_reads > 0
             })
             .await,
-            "expected uploader to reread persisted local blocks under backlog"
+            "expected uploader to consume persisted local payloads under backlog"
         );
 
         let stats = vfs.foreground_read_protection_stats();
         assert!(
-            stats.upload_fallback_rereads > 0,
-            "upload backlog should trigger persisted local-block rereads; stats={stats:?}"
+            stats.upload_local_payload_reads > 0,
+            "upload backlog should trigger persisted local payload reads; stats={stats:?}"
         );
         assert!(
-            stats.upload_fallback_reread_bytes > 0,
-            "reread path should account bytes from persisted local blocks; stats={stats:?}"
+            stats.upload_local_payload_read_bytes > 0,
+            "persisted local payload reads should account transferred bytes; stats={stats:?}"
         );
     });
     rt.shutdown_background();

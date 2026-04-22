@@ -26,10 +26,12 @@ pub(super) struct BufferedHandleWrite {
 #[derive(Debug, Clone)]
 struct HandleSliceWriter {
     ino: Ino,
+    block_size: u32,
     logical_size: u64,
     open: bool,
     dirty_bytes: usize,
     writes: BTreeMap<u64, BufferedHandleWrite>,
+    ready_full_block_indexes: HashSet<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -46,22 +48,23 @@ pub(super) struct HandleWriterRegistry {
 }
 
 impl HandleSliceWriter {
-    fn new(ino: Ino, current_size: u64) -> Self {
+    fn new(ino: Ino, current_size: u64, block_size: u32) -> Self {
         Self {
             ino,
+            block_size,
             logical_size: current_size,
             open: true,
             dirty_bytes: 0,
             writes: BTreeMap::new(),
+            ready_full_block_indexes: HashSet::new(),
         }
     }
 
-    fn upsert_write(&mut self, block_index: u32, seq: u64, offset: u64, data: &[u8]) {
-        if data.is_empty() {
+    fn upsert_write(&mut self, block_index: u32, seq: u64, offset: u64, payload: Bytes) {
+        if payload.is_empty() {
             return;
         }
 
-        let payload = Bytes::copy_from_slice(data);
         let end = offset.saturating_add(payload.len() as u64);
         let mut overlap_starts: Vec<u64> = self
             .writes
@@ -105,6 +108,7 @@ impl HandleSliceWriter {
 
         self.insert_slice(block_index, offset, seq, payload);
         self.logical_size = self.logical_size.max(end);
+        self.recompute_ready_full_block(block_index);
     }
 
     fn insert_slice(&mut self, block_index: u32, offset: u64, seq: u64, data: Bytes) {
@@ -145,33 +149,96 @@ impl HandleSliceWriter {
         out.extend(self.writes.values().cloned());
     }
 
+    fn snapshot_ready_full_block_indexes(&self, out: &mut HashSet<u32>) {
+        out.extend(self.ready_full_block_indexes.iter().copied());
+    }
+
     fn mark_materialized(&mut self, seq: u64) {
         let mut removed_bytes = 0usize;
+        let mut affected_blocks = HashSet::new();
         self.writes.retain(|_, write| {
             if write.seq <= seq {
                 removed_bytes = removed_bytes.saturating_add(write.data.len());
+                affected_blocks.insert(write.block_index);
                 false
             } else {
                 true
             }
         });
         self.dirty_bytes = self.dirty_bytes.saturating_sub(removed_bytes);
+        for block_index in affected_blocks {
+            self.recompute_ready_full_block(block_index);
+        }
     }
 
     fn mark_blocks_materialized(&mut self, seqs_by_block: &HashMap<u32, u64>) {
         let mut removed_bytes = 0usize;
+        let mut affected_blocks = HashSet::new();
         self.writes.retain(|_, write| {
             let should_remove = seqs_by_block
                 .get(&write.block_index)
                 .is_some_and(|cutoff| write.seq <= *cutoff);
             if should_remove {
                 removed_bytes = removed_bytes.saturating_add(write.data.len());
+                affected_blocks.insert(write.block_index);
                 false
             } else {
                 true
             }
         });
         self.dirty_bytes = self.dirty_bytes.saturating_sub(removed_bytes);
+        for block_index in affected_blocks {
+            self.recompute_ready_full_block(block_index);
+        }
+    }
+
+    fn recompute_ready_full_block(&mut self, block_index: u32) {
+        self.ready_full_block_indexes.remove(&block_index);
+        let logical_len = self.logical_block_len(block_index);
+        if logical_len != self.block_size as usize {
+            return;
+        }
+
+        let block_start = u64::from(block_index).saturating_mul(u64::from(self.block_size));
+        let block_end = block_start.saturating_add(u64::from(self.block_size));
+        let mut ranges = Vec::new();
+        for write in self
+            .writes
+            .range(block_start..block_end)
+            .map(|(_, write)| write)
+        {
+            if write.data.is_empty() {
+                continue;
+            }
+            let start = offset_within_block(write.offset, self.block_size) as usize;
+            let end = start.saturating_add(write.data.len());
+            ranges.push((start, end));
+        }
+        if ranges.is_empty() {
+            return;
+        }
+        ranges.sort_unstable_by_key(|(start, _)| *start);
+        let mut covered_until = 0usize;
+        for (start, end) in ranges {
+            if start > covered_until {
+                return;
+            }
+            covered_until = covered_until.max(end);
+            if covered_until >= logical_len {
+                self.ready_full_block_indexes.insert(block_index);
+                return;
+            }
+        }
+    }
+
+    fn logical_block_len(&self, block_index: u32) -> usize {
+        let block_start = block_index as u64 * self.block_size as u64;
+        if block_start >= self.logical_size {
+            return 0;
+        }
+        self.logical_size
+            .saturating_sub(block_start)
+            .min(self.block_size as u64) as usize
     }
 }
 
@@ -192,21 +259,46 @@ impl HandleWriterRegistry {
         offset: u64,
         data: &[u8],
     ) -> u32 {
+        self.write_bytes(
+            fh,
+            ino,
+            current_size,
+            block_size,
+            offset,
+            Bytes::copy_from_slice(data),
+        )
+    }
+
+    fn write_bytes(
+        &self,
+        fh: u64,
+        ino: Ino,
+        current_size: u64,
+        block_size: u32,
+        offset: u64,
+        data: Bytes,
+    ) -> u32 {
+        let data_len = data.len();
+        if data_len == 0 {
+            return 0;
+        }
+
         let mut writers = self.writers.lock();
         let previous_ino = writers.writers.get(&fh).map(|writer| writer.ino);
         let (old_dirty_bytes, new_dirty_bytes) = {
             let writer = writers
                 .writers
                 .entry(fh)
-                .or_insert_with(|| HandleSliceWriter::new(ino, current_size));
+                .or_insert_with(|| HandleSliceWriter::new(ino, current_size, block_size));
             let old_dirty_bytes = writer.dirty_bytes;
             writer.ino = ino;
+            writer.block_size = block_size;
             writer.open = true;
             writer.logical_size = writer.logical_size.max(current_size);
             assert!(block_size > 0, "block_size must be non-zero");
             let mut current_offset = offset;
             let mut data_offset = 0usize;
-            let mut remaining = data.len();
+            let mut remaining = data_len;
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
             while remaining > 0 {
                 let block_index = (current_offset / u64::from(block_size)) as u32;
@@ -217,7 +309,7 @@ impl HandleWriterRegistry {
                     block_index,
                     seq,
                     current_offset,
-                    &data[data_offset..data_offset + chunk_len],
+                    data.slice(data_offset..data_offset + chunk_len),
                 );
                 current_offset = current_offset.saturating_add(chunk_len as u64);
                 data_offset += chunk_len;
@@ -231,7 +323,7 @@ impl HandleWriterRegistry {
             new_dirty_bytes,
         );
         Self::reindex_writer(&mut writers, fh, previous_ino, ino);
-        data.len() as u32
+        data_len as u32
     }
 
     pub(super) fn snapshot_read_spans(
@@ -297,6 +389,15 @@ impl HandleWriterRegistry {
         self.writers.lock().total_dirty_bytes
     }
 
+    pub(super) fn total_buffered_write_count(&self) -> usize {
+        let writers = self.writers.lock();
+        writers
+            .writers
+            .values()
+            .map(|writer| writer.writes.len())
+            .sum()
+    }
+
     pub(super) fn snapshot_dirty_inodes_by_bytes(&self) -> Vec<(Ino, usize)> {
         let writers = self.writers.lock();
         writers
@@ -326,6 +427,20 @@ impl HandleWriterRegistry {
         }
     }
 
+    pub(super) fn clear_inode(&self, ino: Ino) {
+        let mut writers = self.writers.lock();
+        let inode_handles: Vec<u64> = writers
+            .writers_by_ino
+            .get(&ino)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        for fh in inode_handles {
+            Self::remove_writer(&mut writers, fh);
+        }
+    }
+
     pub(super) fn snapshot_materialization_writes(&self, ino: Ino) -> Vec<BufferedHandleWrite> {
         let writers = self.writers.lock();
         let mut writes = Vec::new();
@@ -338,6 +453,19 @@ impl HandleWriterRegistry {
         }
         writes.sort_by_key(|write| write.seq);
         writes
+    }
+
+    pub(super) fn snapshot_ready_full_block_indexes(&self, ino: Ino) -> HashSet<u32> {
+        let writers = self.writers.lock();
+        let mut ready = HashSet::new();
+        if let Some(handles) = writers.writers_by_ino.get(&ino) {
+            for fh in handles {
+                if let Some(writer) = writers.writers.get(fh) {
+                    writer.snapshot_ready_full_block_indexes(&mut ready);
+                }
+            }
+        }
+        ready
     }
 
     pub(super) fn mark_materialized(&self, ino: Ino, seq: u64) {
@@ -426,7 +554,7 @@ impl HandleWriterRegistry {
     pub(super) fn open_writer_for_test(&self, fh: u64, ino: Ino, current_size: u64) {
         let mut writers = self.writers.lock();
         if let std::collections::hash_map::Entry::Vacant(entry) = writers.writers.entry(fh) {
-            entry.insert(HandleSliceWriter::new(ino, current_size));
+            entry.insert(HandleSliceWriter::new(ino, current_size, 4096));
             writers.writers_by_ino.entry(ino).or_default().insert(fh);
         }
     }
@@ -478,6 +606,48 @@ impl HandleWriterRegistry {
 }
 
 impl StudioVfs {
+    fn fully_overwritten_block_indexes_for_handle_writes(
+        &self,
+        writes: &[BufferedHandleWrite],
+        visible_size: u64,
+    ) -> std::collections::HashSet<u32> {
+        let mut ranges_by_block = std::collections::BTreeMap::<u32, Vec<(usize, usize)>>::new();
+
+        for write in writes {
+            if write.data.is_empty() {
+                continue;
+            }
+            let start = offset_within_block(write.offset, self.block_size) as usize;
+            let end = start.saturating_add(write.data.len());
+            ranges_by_block
+                .entry(write.block_index)
+                .or_default()
+                .push((start, end));
+        }
+
+        ranges_by_block
+            .into_iter()
+            .filter_map(|(block_index, mut ranges)| {
+                let logical_len = self.logical_block_len(visible_size, block_index);
+                if logical_len == 0 {
+                    return None;
+                }
+                ranges.sort_unstable_by_key(|(start, _)| *start);
+                let mut covered_until = 0usize;
+                for (start, end) in ranges {
+                    if start > covered_until {
+                        return None;
+                    }
+                    covered_until = covered_until.max(end);
+                    if covered_until >= logical_len {
+                        return Some(block_index);
+                    }
+                }
+                None
+            })
+            .collect()
+    }
+
     fn fully_overwritten_full_block_indexes_for_handle_writes(
         &self,
         writes: &[BufferedHandleWrite],
@@ -520,49 +690,111 @@ impl StudioVfs {
             .collect()
     }
 
+    fn direct_full_block_snapshots_for_handle_writes(
+        &self,
+        writes: &[BufferedHandleWrite],
+        visible_size: u64,
+        selected_block_indexes: &HashSet<u32>,
+        fully_overwritten_blocks: &HashSet<u32>,
+    ) -> std::collections::BTreeMap<u32, DirtyWriteSnapshot> {
+        let mut counts = HashMap::<u32, usize>::new();
+        let mut candidates = std::collections::BTreeMap::<u32, DirtyWriteSnapshot>::new();
+
+        for write in writes {
+            if write.data.is_empty() || !selected_block_indexes.contains(&write.block_index) {
+                continue;
+            }
+            *counts.entry(write.block_index).or_default() += 1;
+            if !fully_overwritten_blocks.contains(&write.block_index) {
+                candidates.remove(&write.block_index);
+                continue;
+            }
+            let logical_len = self.logical_block_len(visible_size, write.block_index);
+            let offset_in_block = offset_within_block(write.offset, self.block_size) as usize;
+            if offset_in_block == 0 && write.data.len() == logical_len {
+                candidates.insert(
+                    write.block_index,
+                    DirtyWriteSnapshot::from_shared(write.block_index, write.data.clone()),
+                );
+            } else {
+                candidates.remove(&write.block_index);
+            }
+        }
+
+        candidates.retain(|block_index, _| counts.get(block_index) == Some(&1));
+        candidates
+    }
+
     fn fully_overwritten_full_block_indexes_for_current_handle_write(
         &self,
         writes: &[BufferedHandleWrite],
         visible_size: u64,
-    ) -> std::collections::HashSet<u32> {
+    ) -> HashSet<u32> {
         let Some(current_seq) = writes.last().map(|write| write.seq) else {
             return HashSet::new();
         };
 
-        let mut ranges_by_block = std::collections::BTreeMap::<u32, Vec<(usize, usize)>>::new();
-        for write in writes.iter().filter(|write| write.seq == current_seq) {
-            if write.data.is_empty() {
-                continue;
-            }
-            let start = offset_within_block(write.offset, self.block_size) as usize;
-            let end = start.saturating_add(write.data.len());
-            ranges_by_block
-                .entry(write.block_index)
-                .or_default()
-                .push((start, end));
-        }
-
-        ranges_by_block
-            .into_iter()
-            .filter_map(|(block_index, mut ranges)| {
-                let logical_len = self.logical_block_len(visible_size, block_index);
-                if logical_len != self.block_size as usize {
-                    return None;
-                }
-                ranges.sort_unstable_by_key(|(start, _)| *start);
-                let mut covered_until = 0usize;
-                for (start, end) in ranges {
-                    if start > covered_until {
-                        return None;
-                    }
-                    covered_until = covered_until.max(end);
-                    if covered_until >= logical_len {
-                        return Some(block_index);
-                    }
-                }
-                None
+        writes
+            .iter()
+            .filter(|write| write.seq == current_seq)
+            .filter_map(|write| {
+                let logical_len = self.logical_block_len(visible_size, write.block_index);
+                let offset_in_block = offset_within_block(write.offset, self.block_size) as usize;
+                (logical_len == self.block_size as usize
+                    && offset_in_block == 0
+                    && write.data.len() == logical_len)
+                    .then_some(write.block_index)
             })
             .collect()
+    }
+
+    fn eager_materialization_block_cap(&self) -> usize {
+        self.write_eager_flush_drain_chunk_bytes
+            .div_ceil(self.block_size as usize)
+            .max(1)
+    }
+
+    fn select_completed_blocks_for_eager_materialization(
+        &self,
+        completed_block_indexes: &HashSet<u32>,
+        current_write_full_block_indexes: &HashSet<u32>,
+        local_sync_policy: LocalSyncPolicy,
+    ) -> HashSet<u32> {
+        if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
+            return completed_block_indexes.clone();
+        }
+
+        let block_cap = self.eager_materialization_block_cap();
+        if completed_block_indexes.len() <= block_cap {
+            return completed_block_indexes.clone();
+        }
+
+        let mut selected = BTreeSet::new();
+        for block_index in current_write_full_block_indexes
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+        {
+            if completed_block_indexes.contains(&block_index) {
+                selected.insert(block_index);
+                if selected.len() >= block_cap {
+                    return selected.into_iter().collect();
+                }
+            }
+        }
+
+        for block_index in completed_block_indexes
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+        {
+            selected.insert(block_index);
+            if selected.len() >= block_cap {
+                break;
+            }
+        }
+
+        selected.into_iter().collect()
     }
 
     async fn build_dirty_write_snapshots_for_handle_writer_blocks(
@@ -572,16 +804,26 @@ impl StudioVfs {
         visible_size: u64,
         selected_block_indexes: &HashSet<u32>,
         fully_overwritten_blocks: &HashSet<u32>,
+        include_partial_blocks: bool,
     ) -> VfsResult<Vec<DirtyWriteSnapshot>> {
         if selected_block_indexes.is_empty() {
             return Ok(Vec::new());
         }
 
         let pending_upload_index = self.snapshot_pending_upload_index();
+        let direct_snapshots = self.direct_full_block_snapshots_for_handle_writes(
+            writes,
+            visible_size,
+            selected_block_indexes,
+            fully_overwritten_blocks,
+        );
         let mut blocks = std::collections::BTreeMap::<u32, BytesMut>::new();
 
         for write in writes {
             if write.data.is_empty() || !selected_block_indexes.contains(&write.block_index) {
+                continue;
+            }
+            if direct_snapshots.contains_key(&write.block_index) {
                 continue;
             }
 
@@ -610,8 +852,8 @@ impl StudioVfs {
                                 data
                             }
                         }
-                        None => match self.get_file_block_async(ino, write.block_index).await? {
-                            Some(block_ref) => {
+                        None => match self.get_file_block_async(ino, write.block_index).await {
+                            Ok(Some(block_ref)) => {
                                 if let Some(cached) =
                                     self.block_store_get_async(block_ref.object_id).await?
                                 {
@@ -622,11 +864,22 @@ impl StudioVfs {
                                         .map_err(|e| VfsError::Other(e.to_string()))?
                                 }
                             }
-                            None => Bytes::new(),
+                            Ok(None) => Bytes::new(),
+                            Err(VfsError::Meta(studiofs_meta::MetaError::FragmentedBlock {
+                                ..
+                            })) => self
+                                .read_metadata_block_from_slice_graph_async(
+                                    ino,
+                                    write.block_index,
+                                    visible_size,
+                                )
+                                .await?
+                                .unwrap_or_default(),
+                            Err(error) => return Err(error),
                         },
                     }
                 };
-                entry.insert(BytesMut::from(existing_data.as_ref()));
+                entry.insert(self.clone_into_write_buffer(existing_data.as_ref()));
             }
 
             let offset_in_block = offset_within_block(write.offset, self.block_size) as usize;
@@ -640,23 +893,19 @@ impl StudioVfs {
             block[offset_in_block..end_pos].copy_from_slice(write.data.as_ref());
         }
 
-        Ok(blocks
-            .into_iter()
-            .filter_map(|(block_index, mut data)| {
-                let logical_len = self.logical_block_len(visible_size, block_index);
-                if data.len() > logical_len {
-                    data.truncate(logical_len);
-                }
-                if data.len() == self.block_size as usize {
-                    Some(DirtyWriteSnapshot {
-                        block_index,
-                        data: data.freeze(),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect())
+        let mut snapshots: Vec<DirtyWriteSnapshot> = direct_snapshots.into_values().collect();
+        snapshots.extend(blocks.into_iter().filter_map(|(block_index, mut data)| {
+            let logical_len = self.logical_block_len(visible_size, block_index);
+            if data.len() > logical_len {
+                data.truncate(logical_len);
+            }
+            if include_partial_blocks || data.len() == self.block_size as usize {
+                Some(DirtyWriteSnapshot::from_mutable(block_index, data))
+            } else {
+                None
+            }
+        }));
+        Ok(snapshots)
     }
 
     pub(super) fn snapshot_handle_writer_read_spans(
@@ -716,36 +965,57 @@ impl StudioVfs {
         &self,
         ino: Ino,
         local_sync_policy: LocalSyncPolicy,
-    ) -> VfsResult<()> {
+    ) -> VfsResult<bool> {
         let per_inode_dirty = self.state.handle_writers.dirty_bytes_for_inode(ino);
         let total_dirty = self.state.handle_writers.total_dirty_bytes();
         let max_dirty = self.max_dirty_bytes();
         let budget_exceeded = total_dirty > max_dirty;
         if per_inode_dirty == 0 && !budget_exceeded {
-            return Ok(());
+            return Ok(false);
         }
         if per_inode_dirty > 0
             && per_inode_dirty < self.write_eager_flush_batch_bytes
             && !budget_exceeded
         {
-            return Ok(());
+            return Ok(false);
         }
 
+        let mut made_progress = false;
         if per_inode_dirty > 0 && !budget_exceeded {
-            self.materialize_completed_handle_writer_blocks_for_inode(ino, local_sync_policy)
+            made_progress |= self
+                .materialize_completed_handle_writer_blocks_for_inode(ino, local_sync_policy)
                 .await?;
             let per_inode_dirty_after = self.state.handle_writers.dirty_bytes_for_inode(ino);
             if per_inode_dirty_after == 0
                 || (per_inode_dirty_after < self.write_eager_flush_batch_bytes && !budget_exceeded)
             {
-                return Ok(());
+                return Ok(made_progress);
             }
         }
 
         if self.state.handle_writers.dirty_bytes_for_inode(ino) > 0 {
-            self.materialize_handle_writers_for_inode(ino, local_sync_policy)
+            made_progress |= self
+                .materialize_handle_writers_for_inode(ino, local_sync_policy)
                 .await?;
         }
+
+        // #region debug log
+        if budget_exceeded {
+            self.debug_write_probe(
+                "H1",
+                "crates/studiofs-vfs/src/vfs/handle_writer.rs:738",
+                "limit-drain pass started",
+                serde_json::json!({
+                    "ino": ino,
+                    "per_inode_dirty_bytes": per_inode_dirty,
+                    "total_dirty_bytes": total_dirty,
+                    "max_dirty_bytes": max_dirty,
+                    "dirty_inode_count": self.state.handle_writers.snapshot_dirty_inodes_by_bytes().len(),
+                    "buffered_write_count": self.state.handle_writers.total_buffered_write_count(),
+                }),
+            );
+        }
+        // #endregion debug log
 
         // Graduated backpressure: drain the dirtiest inodes until we are below the budget.
         // We yield between iterations so that other write tasks can make forward progress
@@ -760,21 +1030,20 @@ impl StudioVfs {
             if dirty_inodes.is_empty() {
                 break;
             }
-            let mut made_progress = false;
+            let mut pass_made_progress = false;
             for (next_ino, _) in dirty_inodes {
                 if self.state.handle_writers.total_dirty_bytes() <= max_dirty {
                     break;
                 }
-                let total_before = self.state.handle_writers.total_dirty_bytes();
                 let materialized = self
                     .materialize_handle_writers_for_inode(next_ino, local_sync_policy)
                     .await?;
-                let total_after = self.state.handle_writers.total_dirty_bytes();
-                if materialized && total_after < total_before {
-                    made_progress = true;
+                if materialized {
+                    pass_made_progress = true;
                 }
             }
-            if !made_progress {
+            made_progress |= pass_made_progress;
+            if !pass_made_progress {
                 break;
             }
             stall_iterations = stall_iterations.saturating_add(1);
@@ -790,7 +1059,27 @@ impl StudioVfs {
             }
         }
 
-        Ok(())
+        // #region debug log
+        if budget_exceeded || stall_iterations > 0 {
+            self.debug_write_probe(
+                "H1",
+                "crates/studiofs-vfs/src/vfs/handle_writer.rs:815",
+                "limit-drain pass completed",
+                serde_json::json!({
+                    "ino": ino,
+                    "made_progress": made_progress,
+                    "stall_iterations": stall_iterations,
+                    "per_inode_dirty_bytes_after": self.state.handle_writers.dirty_bytes_for_inode(ino),
+                    "total_dirty_bytes_after": self.state.handle_writers.total_dirty_bytes(),
+                    "max_dirty_bytes": max_dirty,
+                    "dirty_inode_count_after": self.state.handle_writers.snapshot_dirty_inodes_by_bytes().len(),
+                    "buffered_write_count_after": self.state.handle_writers.total_buffered_write_count(),
+                }),
+            );
+        }
+        // #endregion debug log
+
+        Ok(made_progress)
     }
 
     pub(super) async fn materialize_handle_writers_for_inode(
@@ -820,12 +1109,19 @@ impl StudioVfs {
             .last()
             .map(|write| write.seq)
             .expect("non-empty writes have a max seq");
-        let buffered_writes: Vec<(u64, Bytes)> = writes
-            .iter()
-            .map(|write| (write.offset, write.data.clone()))
-            .collect();
+        let selected_block_indexes: HashSet<u32> =
+            writes.iter().map(|write| write.block_index).collect();
+        let fully_overwritten_blocks =
+            self.fully_overwritten_block_indexes_for_handle_writes(&writes, visible_size);
         let blocks = self
-            .build_dirty_write_snapshots_from_buffered_writes(ino, &buffered_writes, visible_size)
+            .build_dirty_write_snapshots_for_handle_writer_blocks(
+                ino,
+                &writes,
+                visible_size,
+                &selected_block_indexes,
+                &fully_overwritten_blocks,
+                true,
+            )
             .await?;
         if blocks.is_empty() {
             return Ok(false);
@@ -866,17 +1162,28 @@ impl StudioVfs {
         } else {
             self.current_content_epoch_async(ino).await?
         };
-        let completed_block_indexes =
-            self.fully_overwritten_full_block_indexes_for_handle_writes(&writes, visible_size);
+        let mut completed_block_indexes = self
+            .state
+            .handle_writers
+            .snapshot_ready_full_block_indexes(ino);
+        if completed_block_indexes.is_empty() {
+            completed_block_indexes =
+                self.fully_overwritten_full_block_indexes_for_handle_writes(&writes, visible_size);
+        }
         if completed_block_indexes.is_empty() {
             return Ok(false);
         }
         let current_write_full_block_indexes = self
             .fully_overwritten_full_block_indexes_for_current_handle_write(&writes, visible_size);
+        let selected_block_indexes = self.select_completed_blocks_for_eager_materialization(
+            &completed_block_indexes,
+            &current_write_full_block_indexes,
+            local_sync_policy,
+        );
 
         let mut seqs_by_block = HashMap::<u32, u64>::new();
         for write in &writes {
-            if completed_block_indexes.contains(&write.block_index) {
+            if selected_block_indexes.contains(&write.block_index) {
                 seqs_by_block
                     .entry(write.block_index)
                     .and_modify(|seq| *seq = (*seq).max(write.seq))
@@ -921,6 +1228,28 @@ impl StudioVfs {
             || self.state.handle_writers.dirty_bytes_for_inode(ino)
                 >= self.write_eager_flush_batch_bytes;
         if !should_materialize_now {
+            // #region debug log
+            if self.state.handle_writers.dirty_bytes_for_inode(ino)
+                >= super::aggressive_materialization_threshold_bytes(self.max_dirty_bytes())
+            {
+                self.debug_write_probe(
+                    "H3",
+                    "crates/studiofs-vfs/src/vfs/handle_writer.rs:923",
+                    "completed-block materialization skipped",
+                    serde_json::json!({
+                        "ino": ino,
+                        "visible_size": visible_size,
+                        "completed_block_count": completed_block_indexes.len(),
+                        "current_write_full_block_count": current_write_full_block_indexes.len(),
+                        "current_write_crosses_boundary_with_partial_tail": current_write_crosses_boundary_with_partial_tail,
+                        "enough_completed_blocks": enough_completed_blocks,
+                        "budget_exceeded": budget_exceeded,
+                        "per_inode_dirty_bytes": self.state.handle_writers.dirty_bytes_for_inode(ino),
+                        "batch_threshold_bytes": self.write_eager_flush_batch_bytes,
+                    }),
+                );
+            }
+            // #endregion debug log
             return Ok(false);
         }
         let completed_blocks = self
@@ -928,8 +1257,9 @@ impl StudioVfs {
                 ino,
                 &writes,
                 visible_size,
-                &completed_block_indexes,
-                &completed_block_indexes,
+                &selected_block_indexes,
+                &selected_block_indexes,
+                false,
             )
             .await?;
         if completed_blocks.is_empty() {
@@ -1002,5 +1332,81 @@ mod tests {
         assert_eq!(spans.len(), 3);
         assert_eq!(spans[0].start, 2);
         assert_eq!(spans[0].data.as_ref(), b"XY");
+    }
+
+    #[test]
+    fn handle_writer_registry_tracks_ready_full_blocks_incrementally() {
+        let registry = HandleWriterRegistry::new();
+        let fh = 11;
+        let ino = 13;
+        let first_half = vec![0x11_u8; 2048];
+        let second_half = vec![0x22_u8; 2048];
+
+        registry.open_writer_for_test(fh, ino, 4096);
+        registry.write(fh, ino, 0, 4096, 0, &first_half);
+        assert!(
+            registry.snapshot_ready_full_block_indexes(ino).is_empty(),
+            "partial coverage should not advertise a ready full block"
+        );
+
+        registry.write(fh, ino, 2048, 4096, 2048, &second_half);
+        assert_eq!(
+            registry.snapshot_ready_full_block_indexes(ino),
+            HashSet::from([0]),
+            "once the logical block is fully covered it should be marked ready"
+        );
+
+        let cutoff = registry
+            .snapshot_materialization_writes(ino)
+            .into_iter()
+            .map(|write| write.seq)
+            .max()
+            .expect("materialized writes");
+        registry.mark_blocks_materialized(ino, &HashMap::from([(0, cutoff)]));
+        assert!(
+            registry.snapshot_ready_full_block_indexes(ino).is_empty(),
+            "marking the block materialized should clear the ready-full-block index"
+        );
+    }
+
+    #[test]
+    fn handle_writer_registry_clear_inode_drops_all_dirty_state() {
+        let registry = HandleWriterRegistry::new();
+        let ino = 11;
+
+        registry.open_writer_for_test(1, ino, 0);
+        registry.open_writer_for_test(2, ino, 0);
+        registry.write(1, ino, 0, 4096, 0, b"hello");
+        registry.write(2, ino, 5, 4096, 5, b"world");
+
+        assert!(registry.has_dirty_writers(ino));
+        assert_eq!(registry.dirty_bytes_for_inode(ino), 10);
+
+        registry.clear_inode(ino);
+
+        assert!(!registry.has_dirty_writers(ino));
+        assert_eq!(registry.dirty_bytes_for_inode(ino), 0);
+        assert_eq!(registry.total_dirty_bytes(), 0);
+    }
+
+    #[test]
+    fn handle_writer_registry_splits_write_into_block_slices_without_extra_copying() {
+        let registry = HandleWriterRegistry::new();
+        let fh = 99;
+        let ino = 17;
+        let payload = Bytes::from_static(b"abcdefgh");
+
+        registry.write_bytes(fh, ino, 0, 4, 0, payload.clone());
+
+        let mut materialized = registry.snapshot_materialization_writes(ino);
+        materialized.sort_by_key(|write| write.offset);
+        assert_eq!(materialized.len(), 2);
+        assert_eq!(materialized[0].data.as_ref(), b"abcd");
+        assert_eq!(materialized[1].data.as_ref(), b"efgh");
+        assert_eq!(materialized[0].data.as_ptr(), payload.as_ptr());
+        assert_eq!(
+            materialized[1].data.as_ptr(),
+            payload.as_ptr().wrapping_add(4)
+        );
     }
 }

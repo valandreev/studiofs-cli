@@ -352,6 +352,14 @@ impl<M: ?Sized + MetaBlocks> MetaBlocks for RuntimeMetaHandle<M> {
         fn get_regular_file_overlay_object_ids(&self, ino: Ino) -> MetaResult<Vec<u64>>
     );
     forward_method!(
+        fn mark_regular_file_overlay_object_uploaded_if_matches(
+            &self,
+            ino: Ino,
+            expected_epoch: u64,
+            object_id: u64,
+        ) -> MetaResult<bool>
+    );
+    forward_method!(
         fn commit_uploaded_block(
             &self,
             ino: Ino,

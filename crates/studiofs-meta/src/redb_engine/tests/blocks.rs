@@ -502,6 +502,125 @@ fn zeroio_uploaded_overlay_blocks_make_epoch_publish_ready_only_after_full_epoch
 }
 
 #[test]
+fn zeroio_zero_length_manifest_epoch_becomes_publish_ready_without_payload_upload() {
+    let engine = temp_engine();
+
+    let file = engine
+        .create_file(ROOT_INO, b"zeroio-zero-length-publish-ready.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 4096;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+    let block = BlockRef::new_partial(1_111, 4096);
+    engine.set_file_block(file.ino, 0, &block).unwrap();
+    assert!(engine.publish_file_manifest(file.ino, 1).unwrap());
+
+    let mut truncated = engine.get_attr(file.ino).unwrap();
+    truncated.size = 0;
+    truncated.content_epoch = 2;
+    engine.set_attr(&truncated).unwrap();
+    engine.remove_file_blocks(file.ino).unwrap();
+
+    let lifecycle = engine.get_inode_lifecycle(file.ino).unwrap().unwrap();
+    assert_eq!(lifecycle.state, InodeLifecycleState::PublishReady);
+    assert_eq!(
+        lifecycle.retention,
+        PayloadRetentionClass::PublishReadyRetained
+    );
+    assert!(lifecycle.has_published_base);
+    assert_eq!(lifecycle.local_visible_size, 0);
+    assert_eq!(lifecycle.published_size, 4096);
+    assert_eq!(lifecycle.local_content_epoch, 2);
+    assert_eq!(lifecycle.published_content_epoch, 1);
+}
+
+#[test]
+fn fragmented_overlay_object_upload_marks_matching_slices_uploaded() {
+    let engine = temp_engine();
+
+    let file = engine
+        .create_file(ROOT_INO, b"fragmented-overlay-upload.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = 8192;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+
+    let chunk_id = ChunkId(0);
+    let incoming = vec![
+        SliceRecord {
+            slice_id: SliceId::default(),
+            order: SliceOrder::default(),
+            range: SliceRange::new(0, 4096).unwrap(),
+            block: Some(BlockRef::new_partial(2_001, 4096)),
+            block_state: BlockRefState::LocalOnly,
+        },
+        SliceRecord {
+            slice_id: SliceId::default(),
+            order: SliceOrder::default(),
+            range: SliceRange::new(4096, 8192).unwrap(),
+            block: Some(BlockRef::new_partial(2_002, 4096)),
+            block_state: BlockRefState::LocalOnly,
+        },
+    ];
+    engine
+        .flush_regular_file_overlay_slices(file.ino, &[(chunk_id, incoming)])
+        .unwrap();
+
+    assert!(matches!(
+        engine.get_file_block(file.ino, 0),
+        Err(MetaError::FragmentedBlock { ino, block_index })
+            if ino == file.ino && block_index == 0
+    ));
+
+    assert!(
+        engine
+            .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 1, 2_001)
+            .unwrap()
+    );
+
+    let txn = engine.db.begin_write().unwrap();
+    let overlay_chunks = RedbMetaEngine::regular_file_chunk_states_for_inode_in_write_txn(
+        &txn,
+        REGULAR_FILE_OVERLAY_TABLE,
+        file.ino,
+    )
+    .unwrap();
+    txn.abort().unwrap();
+    let chunk = overlay_chunks.get(&chunk_id).unwrap();
+    assert_eq!(chunk.slices.len(), 2);
+    let uploaded_state = chunk
+        .slices
+        .values()
+        .find(|slice| slice.block.as_ref().is_some_and(|block| block.object_id == 2_001))
+        .unwrap()
+        .block_state;
+    let pending_state = chunk
+        .slices
+        .values()
+        .find(|slice| slice.block.as_ref().is_some_and(|block| block.object_id == 2_002))
+        .unwrap()
+        .block_state;
+    assert_eq!(uploaded_state, BlockRefState::Uploaded);
+    assert_eq!(pending_state, BlockRefState::LocalOnly);
+    assert_eq!(
+        engine.get_inode_lifecycle(file.ino).unwrap().unwrap().state,
+        InodeLifecycleState::LocalOnly
+    );
+
+    assert!(
+        engine
+            .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 1, 2_002)
+            .unwrap()
+    );
+    assert_eq!(
+        engine.get_inode_lifecycle(file.ino).unwrap().unwrap().state,
+        InodeLifecycleState::PublishReady
+    );
+}
+
+#[test]
 fn redb_upload_state_transitions_follow_inode_fields() {
     let engine = temp_engine();
 

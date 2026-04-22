@@ -42,7 +42,7 @@ Legacy `DataStore::put_block/get_block/...` APIs still use the historical:
 These are retained for compatibility/tests; VFS read/write path uses `<volume>/objects/.../<block_index>`.
 
 In the active Local-First runtime, `CachedStore` owns local cache hits,
-staged writeback, upload rereads, and background queueing. `DataStore` is the
+local-durable payload handling, upload rereads, and runtime queueing. `DataStore` is the
 remote object-store edge that `CachedStore`/VFS call for block download,
 range reads, and eventual upload.
 

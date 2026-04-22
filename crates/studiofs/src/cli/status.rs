@@ -270,8 +270,10 @@ pub fn run(
         == Some(LocalBlockBackendKind::Current);
     let contract_state = describe_cache_layout_state(cache_backend_detection.as_ref());
     let remediation = if let Some(detection) = cache_backend_detection.as_ref() {
-        if detection.has_runtime_layout() {
+        if detection.runtime_backend() == Some(LocalBlockBackendKind::Current) {
             "none"
+        } else if detection.has_runtime_layout() {
+            "runtime layout is incomplete; mount will reprovision missing runtime directories on first use"
         } else {
             "mount will provision the local cache layout on first use"
         }
@@ -289,15 +291,6 @@ pub fn run(
     );
     println!("  Cache layout state:  {}", contract_state);
     if let Some(detection) = cache_backend_detection.as_ref() {
-        println!(
-            "  Local cache marker:  {} ({})",
-            detection.layout.layout_marker.display(),
-            if detection.has_runtime_layout() {
-                "present"
-            } else {
-                "absent"
-            }
-        );
         println!(
             "  Local cache index:   {} ({})",
             detection.layout.redb_index_path.display(),
@@ -317,7 +310,16 @@ pub fn run(
             }
         );
         println!(
-            "  Disk subtree:        {}",
+            "  Local cache upload:  {} ({})",
+            detection.layout.upload_stage_blocks_dir.display(),
+            if detection.upload_blocks_dir_exists {
+                "present"
+            } else {
+                "absent"
+            }
+        );
+        println!(
+            "  Runtime root:        {}",
             detection.layout.runtime_root.display()
         );
     }
@@ -543,8 +545,7 @@ mod tests {
     fn scan_pending_uploads_supports_current_local_block_runtime() {
         let tmp = tempfile::tempdir().unwrap();
         let layout = studiofs_cache::runtime::LocalBlockLayout::from_cache_root(tmp.path());
-        std::fs::create_dir_all(&layout.runtime_root).unwrap();
-        std::fs::write(&layout.layout_marker, b"v1").unwrap();
+        layout.provision().unwrap();
         let volume_uuid = Uuid::new_v4();
 
         let detection = detect_backends(tmp.path()).unwrap();
@@ -579,6 +580,25 @@ mod tests {
         assert_eq!(usage.usage_bytes, 11);
         assert_eq!(usage.dirty_bytes, 5);
         assert_eq!(usage.evictable_bytes, 6);
+    }
+
+    #[test]
+    fn scan_cache_usage_skips_incomplete_runtime_without_creating_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = studiofs_cache::runtime::LocalBlockLayout::from_cache_root(tmp.path());
+        std::fs::create_dir_all(&layout.index_dir).unwrap();
+
+        let detection = detect_backends(tmp.path()).unwrap();
+        assert!(detection.has_runtime_layout());
+        assert_eq!(detection.runtime_backend(), None);
+        assert!(!layout.redb_index_path.exists());
+
+        let usage = scan_cache_usage(Some(&detection)).expect("scan cache usage");
+        assert!(usage.is_none(), "incomplete runtimes should be skipped");
+        assert!(
+            !layout.redb_index_path.exists(),
+            "status inspection must not create a cache index for partial runtimes"
+        );
     }
 
     #[test]

@@ -112,7 +112,7 @@ impl StudioVfs {
     }
 
     pub(super) fn snapshot_pending_upload_index(&self) -> PendingUploadCatalog {
-        PendingUploadCatalog::from_ops(self.truth_pending_uploads_snapshot())
+        PendingUploadCatalog::from_ops(self.pending_uploads_snapshot())
     }
 
     pub(super) fn pending_live_extent_record(

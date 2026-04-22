@@ -18,8 +18,8 @@ Core principles:
 - File payloads live in immutable blocks addressed by chunk-relative slices.
 - Runtime visibility is split into `writer state`, local authority view, and
   asynchronously replicated shared state.
-- The current `v3` subtree is an implementation detail of the local cache
-  backend, not the architecture name of the product.
+- The UUID-scoped cache root itself is the runtime boundary of the current
+  local cache backend.
 - Remote visibility switches atomically at the file-version boundary after peer
   replay/apply, not on local `close()`.
 
@@ -29,7 +29,7 @@ Core principles:
 studiofs (CLI)
   ├── studiofs-meta       local metadata + PostgreSQL delta sync
   ├── studiofs-data       S3 object I/O + object format
-  ├── studiofs-cache      local cache backend + staged writeback pipeline
+  ├── studiofs-cache      local cache backend + upload runtime
   ├── studiofs-vfs        filesystem core
   ├── studiofs-fuse       Linux/macOS bridge
   └── studiofs-winfsp     Windows bridge
@@ -66,7 +66,7 @@ Core invariants:
    readable on the writing mount.
 4. `flush(ino)` / `close(ino)` / last-handle release materialize accepted bytes
    into the local authority view through local backend + metadata commit.
-5. `CachedStore` queues persisted payloads for background upload.
+5. `CachedStore` queues committed payloads into the runtime upload queue.
 6. Background workers upload immutable blocks to object storage.
 7. `fsync(ino)` is the explicit strict request for a crash-safe local sync
    boundary.
@@ -90,12 +90,14 @@ foreground read path.
 ## Cache and Upload Runtime
 
 - `studiofs-cache` provides the backend-agnostic local cache boundary plus the
-  `CachedStore` runtime for staged writeback, queue rebuild, and pending-upload
-  pinning.
-- The current disk layout lives under `<cache-root>/v3/**`; that versioned
-  subtree is an implementation detail, not a separate architecture.
-- Upload is a background payload data plane. Publication is a separate
-  control-plane step that flips remote visibility at file-version granularity.
+  `CachedStore` runtime for local-durable payload handling, the runtime
+  pending-upload queue, upload helpers, and pending-upload pinning.
+- The current disk layout lives directly under `<cache-root>/**`; the
+  UUID-scoped cache root itself is the runtime boundary.
+- Upload is a background payload data plane seeded directly from local durable
+  commit and startup replay. Publication is a separate control-plane step that
+  flips remote visibility at file-version granularity once metadata lifecycle
+  reaches `PublishReady`.
 
 ## Concurrency Model
 

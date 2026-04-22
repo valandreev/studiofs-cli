@@ -1,7 +1,6 @@
 //! File-per-block payload storage for the current local block runtime.
 //!
-//! The runtime still persists payloads under the `v3/` subtree as an on-disk
-//! implementation detail.
+//! The runtime persists payloads directly under the UUID-scoped cache root.
 
 use std::array;
 use std::collections::HashSet;

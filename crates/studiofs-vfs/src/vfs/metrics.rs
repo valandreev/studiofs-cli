@@ -411,6 +411,8 @@ pub struct VfsForegroundReadProtectionStats {
     pub active_random_interactive_reads: u64,
     pub active_sequential_writers: u64,
     pub active_random_writers: u64,
+    pub upload_local_payload_reads: u64,
+    pub upload_local_payload_read_bytes: u64,
     pub upload_fallback_deferrals: u64,
     pub upload_fallback_rereads: u64,
     pub upload_fallback_reread_bytes: u64,

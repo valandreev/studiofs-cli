@@ -16,6 +16,7 @@ pub mod local;
 pub mod metrics;
 pub mod runtime;
 pub mod upload_queue;
+pub mod upload_stage;
 
 // --- Re-exports ---
 pub use benchmark_cache::{
@@ -33,6 +34,31 @@ pub use upload_queue::PendingUpload;
 
 const LOCAL_BLOCK_OPEN_LOCK_RETRY_ATTEMPTS: usize = 40;
 const LOCAL_BLOCK_OPEN_LOCK_RETRY_DELAY: Duration = Duration::from_millis(25);
+const RETIRED_LOCAL_BLOCK_SUBTREE: &str = "v3";
+const RETIRED_LOCAL_BLOCK_LEGACY_UPLOAD_DIR: &str = "upload-stage";
+
+fn is_recognized_retired_runtime_root(path: &Path, metadata: &std::fs::Metadata) -> bool {
+    let file_type = metadata.file_type();
+    if !file_type.is_dir() || file_type.is_symlink() {
+        return false;
+    }
+
+    let layout = runtime::LocalBlockLayout::from_cache_root(path);
+    let legacy_upload_dir = path.join(RETIRED_LOCAL_BLOCK_LEGACY_UPLOAD_DIR);
+    let recognized_entries = [
+        layout.tmp_dir.as_path(),
+        layout.payload_root.as_path(),
+        layout.upload_stage_root.as_path(),
+        legacy_upload_dir.as_path(),
+        layout.index_dir.as_path(),
+    ];
+    let recognized_count = recognized_entries
+        .into_iter()
+        .filter(|entry| entry.exists())
+        .count();
+
+    recognized_count >= 2 || layout.redb_index_path.exists()
+}
 
 /// Open result for the selected local backend implementation.
 pub struct OpenedLocalBlockBackend {
@@ -94,6 +120,18 @@ pub fn prepare_local_block_runtime(
 ) -> Result<PreparedLocalBlockRuntime, PrepareLocalBlockRuntimeError> {
     let cache_root = cache_root.as_ref();
     let cache_root_display = cache_root.display().to_string();
+    let retired_runtime_root = cache_root.join(RETIRED_LOCAL_BLOCK_SUBTREE);
+
+    if let Ok(metadata) = std::fs::symlink_metadata(&retired_runtime_root) {
+        if is_recognized_retired_runtime_root(&retired_runtime_root, &metadata) {
+            std::fs::remove_dir_all(&retired_runtime_root).map_err(|source| {
+                PrepareLocalBlockRuntimeError::ProvisionLocalBlockLayout {
+                    cache_root: cache_root_display.clone(),
+                    source,
+                }
+            })?;
+        }
+    }
 
     let mut detection = runtime::detect_cache_backends(cache_root).map_err(|source| {
         PrepareLocalBlockRuntimeError::DetectCacheBackend {
@@ -317,9 +355,9 @@ mod tests {
             LocalBlockLayout::from_cache_root(temp.path())
         );
         assert!(prepared.detection.has_runtime_layout());
-        assert!(prepared.layout.layout_marker.exists());
         assert!(prepared.layout.tmp_dir.exists());
         assert!(prepared.layout.payload_blocks_dir.exists());
+        assert!(prepared.layout.upload_stage_blocks_dir.exists());
         assert!(prepared.layout.index_dir.exists());
     }
 
@@ -333,6 +371,40 @@ mod tests {
         assert_eq!(first.layout, second.layout);
         assert_eq!(first.detection, second.detection);
         assert!(second.detection.has_runtime_layout());
+    }
+
+    #[test]
+    fn prepare_local_block_runtime_removes_retired_v3_subtree() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let retired_root = temp.path().join(RETIRED_LOCAL_BLOCK_SUBTREE);
+        std::fs::create_dir_all(retired_root.join("payload")).expect("create retired payload");
+        std::fs::create_dir_all(retired_root.join("index")).expect("create retired index");
+        std::fs::write(retired_root.join("stale.txt"), b"stale").expect("write stale file");
+
+        let prepared =
+            prepare_local_block_runtime(temp.path()).expect("prepare local block runtime");
+
+        assert!(prepared.detection.has_runtime_layout());
+        assert!(!retired_root.exists());
+        assert!(prepared.layout.upload_stage_blocks_dir.exists());
+    }
+
+    #[test]
+    fn prepare_local_block_runtime_keeps_unrecognized_v3_entry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let retired_root = temp.path().join(RETIRED_LOCAL_BLOCK_SUBTREE);
+        std::fs::create_dir_all(&retired_root).expect("create unrelated v3 dir");
+        std::fs::write(retired_root.join("notes.txt"), b"user data").expect("write unrelated file");
+
+        let prepared =
+            prepare_local_block_runtime(temp.path()).expect("prepare local block runtime");
+
+        assert!(prepared.detection.has_runtime_layout());
+        assert!(
+            retired_root.exists(),
+            "non-runtime v3 entries should be preserved"
+        );
+        assert!(retired_root.join("notes.txt").exists());
     }
 
     #[test]
@@ -374,8 +446,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let cache_root = temp.path();
         let layout = LocalBlockLayout::from_cache_root(cache_root);
-        std::fs::create_dir_all(&layout.runtime_root).expect("create v3 root");
-        std::fs::write(&layout.layout_marker, b"v1").expect("create marker");
+        layout.provision().expect("provision runtime layout");
 
         let opened = open_local_block_backend(cache_root, "00000000-0000-0000-0000-000000000001")
             .expect("open local block backend");

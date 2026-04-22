@@ -4,8 +4,9 @@
 //! object pinning, and cache-pipeline diagnostics used by the mount runtime.
 //! Benchmark-only cache helpers live in `benchmark_cache`.
 
+use bytes::Bytes;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,20 +18,29 @@ use crate::local::{
     LocalBlockStorageStats,
 };
 use crate::metrics::{CachePipelineMetrics, CachePipelineMetricsSnapshot};
+use crate::runtime::LocalBlockLayout;
 use crate::upload_queue::{PendingUpload, UploadQueue};
+use crate::upload_stage::{UploadStageStore, UploadStageStoreError};
 
 pub type ObjectId = u64;
 
 #[derive(Debug, Clone)]
 pub struct CachedStoreConfig {
     pub cache_dir: PathBuf,
+    pub upload_hot_bytes: usize,
 }
 
 impl CachedStoreConfig {
     pub fn new(cache_dir: impl Into<PathBuf>) -> Self {
         Self {
             cache_dir: cache_dir.into(),
+            upload_hot_bytes: 0,
         }
+    }
+
+    pub fn with_upload_hot_bytes(mut self, upload_hot_bytes: usize) -> Self {
+        self.upload_hot_bytes = upload_hot_bytes;
+        self
     }
 }
 
@@ -77,9 +87,80 @@ impl PinnedState {
     }
 }
 
+#[derive(Debug, Clone)]
+struct UploadHotEntry {
+    data: Bytes,
+    generation: u64,
+}
+
+#[derive(Debug, Default)]
+struct UploadHotState {
+    budget_bytes: usize,
+    total_bytes: usize,
+    next_generation: u64,
+    order: VecDeque<(ObjectId, u64)>,
+    entries: HashMap<ObjectId, UploadHotEntry>,
+}
+
+impl UploadHotState {
+    fn new(budget_bytes: usize) -> Self {
+        Self {
+            budget_bytes,
+            ..Self::default()
+        }
+    }
+
+    fn insert(&mut self, object_id: ObjectId, data: Bytes) {
+        if self.budget_bytes == 0 || data.is_empty() {
+            return;
+        }
+        let len = data.len();
+        self.next_generation = self.next_generation.saturating_add(1);
+        let generation = self.next_generation;
+        if let Some(previous) = self
+            .entries
+            .insert(object_id, UploadHotEntry { data, generation })
+        {
+            self.total_bytes = self.total_bytes.saturating_sub(previous.data.len());
+        }
+        self.total_bytes = self.total_bytes.saturating_add(len);
+        self.order.push_back((object_id, generation));
+        self.evict_over_budget();
+    }
+
+    fn get(&self, object_id: ObjectId) -> Option<Bytes> {
+        self.entries.get(&object_id).map(|entry| entry.data.clone())
+    }
+
+    fn remove(&mut self, object_id: ObjectId) {
+        if let Some(previous) = self.entries.remove(&object_id) {
+            self.total_bytes = self.total_bytes.saturating_sub(previous.data.len());
+            self.order
+                .retain(|(queued_object_id, _)| *queued_object_id != object_id);
+        }
+    }
+
+    fn evict_over_budget(&mut self) {
+        while self.total_bytes > self.budget_bytes {
+            let Some((object_id, generation)) = self.order.pop_front() else {
+                break;
+            };
+            let should_evict = self
+                .entries
+                .get(&object_id)
+                .is_some_and(|entry| entry.generation == generation);
+            if should_evict {
+                self.remove(object_id);
+            }
+        }
+    }
+}
+
 pub struct CachedStore {
     config: CachedStoreConfig,
     local_block_backend: Arc<dyn LocalBlockBackend>,
+    upload_stage_store: UploadStageStore,
+    upload_hot: Mutex<UploadHotState>,
     pinned: Mutex<PinnedState>,
     upload_queue: Arc<UploadQueue>,
     metrics: CachePipelineMetrics,
@@ -91,10 +172,16 @@ impl CachedStore {
         local_block_backend: Arc<dyn LocalBlockBackend>,
     ) -> io::Result<(Arc<Self>, mpsc::UnboundedReceiver<PendingUpload>)> {
         std::fs::create_dir_all(&config.cache_dir)?;
+        let upload_hot_bytes = config.upload_hot_bytes;
+        let upload_stage_store =
+            UploadStageStore::open(LocalBlockLayout::from_cache_root(&config.cache_dir))
+                .map_err(io::Error::other)?;
         let (upload_queue, upload_rx) = UploadQueue::new(&config.cache_dir);
         let cached_store = Arc::new(Self {
             config,
             local_block_backend,
+            upload_stage_store,
+            upload_hot: Mutex::new(UploadHotState::new(upload_hot_bytes)),
             pinned: Mutex::new(PinnedState::default()),
             upload_queue,
             metrics: CachePipelineMetrics::default(),
@@ -122,6 +209,18 @@ impl CachedStore {
 
     pub fn get_for_upload(&self, object_id: ObjectId) -> Option<bytes::Bytes> {
         self.local_block_backend.get_for_upload(object_id)
+    }
+
+    pub fn get_staged_for_upload(&self, object_id: ObjectId) -> Option<bytes::Bytes> {
+        self.upload_stage_store.get(object_id)
+    }
+
+    pub fn has_staged_upload(&self, object_id: ObjectId) -> bool {
+        self.upload_stage_store.contains(object_id)
+    }
+
+    pub fn get_hot_upload(&self, object_id: ObjectId) -> Option<Bytes> {
+        self.upload_hot.lock().get(object_id)
     }
 
     pub fn contains(&self, object_id: ObjectId) -> bool {
@@ -176,6 +275,39 @@ impl CachedStore {
         self.local_block_backend.remove_batch(object_ids);
     }
 
+    pub fn link_upload_stage_batch(
+        &self,
+        object_ids: &[ObjectId],
+    ) -> Result<(), UploadStageStoreError> {
+        self.upload_stage_store.link_payload_batch(object_ids)
+    }
+
+    pub fn cache_hot_upload_batch(&self, entries: &[LocalBlockPut]) {
+        let mut upload_hot = self.upload_hot.lock();
+        for entry in entries {
+            upload_hot.insert(entry.object_id, entry.data.clone());
+        }
+    }
+
+    pub fn remove_staged_upload(&self, object_id: ObjectId) {
+        self.upload_stage_store.remove(object_id);
+    }
+
+    pub fn remove_staged_upload_batch(&self, object_ids: &[ObjectId]) {
+        self.upload_stage_store.remove_batch(object_ids);
+    }
+
+    pub fn remove_hot_upload(&self, object_id: ObjectId) {
+        self.upload_hot.lock().remove(object_id);
+    }
+
+    pub fn remove_hot_upload_batch(&self, object_ids: &[ObjectId]) {
+        let mut upload_hot = self.upload_hot.lock();
+        for &object_id in object_ids {
+            upload_hot.remove(object_id);
+        }
+    }
+
     pub fn dirty_object_ids(&self) -> Vec<ObjectId> {
         self.local_block_backend.dirty_object_ids()
     }
@@ -212,7 +344,7 @@ impl CachedStore {
     }
 
     pub fn is_pinned(&self, object_id: ObjectId) -> bool {
-        self.pinned.lock().contains(object_id) || self.upload_queue.has_pending_object(object_id)
+        self.pinned.lock().contains(object_id)
     }
 
     pub fn unpin(&self, object_id: ObjectId) {
@@ -376,6 +508,93 @@ mod tests {
         assert_eq!(requeued.object_id, 303);
         assert_eq!(cached_store.pending_upload_count(), 1);
         assert!(cached_store.is_pinned(303));
+    }
+
+    #[test]
+    fn upload_stage_roundtrip_through_cached_store_api() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        let put = LocalBlockPut {
+            object_id: 404,
+            data: bytes::Bytes::from_static(b"staged-payload"),
+            evictable: false,
+        };
+        cached_store
+            .put_batch(std::slice::from_ref(&put))
+            .expect("persist payload batch");
+
+        cached_store
+            .link_upload_stage_batch(&[put.object_id])
+            .expect("link upload stage batch");
+
+        assert_eq!(
+            cached_store.get_staged_for_upload(put.object_id).as_deref(),
+            Some(&b"staged-payload"[..])
+        );
+
+        cached_store.remove_staged_upload(put.object_id);
+
+        assert!(cached_store.get_staged_for_upload(put.object_id).is_none());
+    }
+
+    #[test]
+    fn hot_upload_buffer_evicts_oldest_entries_over_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend = open_local_block_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
+            .expect("open backend")
+            .backend;
+        let (cached_store, _rx) = CachedStore::open(
+            CachedStoreConfig::new(dir.path()).with_upload_hot_bytes(8),
+            backend,
+        )
+        .expect("open cached store");
+
+        cached_store.cache_hot_upload_batch(&[
+            LocalBlockPut {
+                object_id: 1,
+                data: Bytes::from_static(b"aaaa"),
+                evictable: false,
+            },
+            LocalBlockPut {
+                object_id: 2,
+                data: Bytes::from_static(b"bbbb"),
+                evictable: false,
+            },
+            LocalBlockPut {
+                object_id: 3,
+                data: Bytes::from_static(b"cccc"),
+                evictable: false,
+            },
+        ]);
+
+        assert!(cached_store.get_hot_upload(1).is_none());
+        assert_eq!(
+            cached_store.get_hot_upload(2).as_deref(),
+            Some(&b"bbbb"[..])
+        );
+        assert_eq!(
+            cached_store.get_hot_upload(3).as_deref(),
+            Some(&b"cccc"[..])
+        );
+    }
+
+    #[test]
+    fn hot_upload_buffer_remove_cleans_lru_queue_entries() {
+        let mut state = UploadHotState::new(64);
+
+        state.insert(1, Bytes::from_static(b"aaaa"));
+        state.insert(1, Bytes::from_static(b"bbbb"));
+        state.insert(2, Bytes::from_static(b"cccc"));
+        assert_eq!(state.order.len(), 3);
+
+        state.remove(1);
+
+        assert!(state.get(1).is_none());
+        assert_eq!(state.order.len(), 1);
+        assert_eq!(
+            state.order.front().map(|(object_id, _)| *object_id),
+            Some(2)
+        );
     }
 
     #[test]

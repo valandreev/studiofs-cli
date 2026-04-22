@@ -1,5 +1,8 @@
 //! StudioFS CLI — FUSE mount tool for S3-backed virtual filesystems.
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use chrono::{Duration, NaiveDate, Utc};
 #[cfg(test)]
 use parking_lot::Mutex;
