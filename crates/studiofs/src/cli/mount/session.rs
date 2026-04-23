@@ -9,6 +9,7 @@ use crate::diagnostics::{
     DiagnosticsDataSource, LiveMountDiagnosticsSource, LiveMountRuntimeFingerprint,
     LocalDiagnosticsHost, RuntimeProfilingBackend,
 };
+use anyhow::Context;
 use chrono::Utc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1052,20 +1053,20 @@ impl PreparedMount {
             return result;
         }
 
-        self.print_ready();
-        self.write_pid_file();
+        self.write_pid_file()?;
+        self.print_ready()?;
         self.launch_foreground()
     }
 
-    fn print_ready(&self) {
+    fn print_ready(&self) -> anyhow::Result<()> {
         let format_info = self
             .format_info
             .as_ref()
-            .expect("foreground mount sessions must resolve format info");
+            .context("foreground mount session is missing format metadata before launch")?;
         let cache_path_str = &self
             .foreground
             .as_ref()
-            .expect("foreground mount sessions must prepare runtime")
+            .context("foreground mount session is missing prepared runtime before launch")?
             .cache_path_str;
         for line in build_ready_banner_lines(
             &self.plan.command.name,
@@ -1077,32 +1078,38 @@ impl PreparedMount {
         ) {
             println!("{line}");
         }
+        Ok(())
     }
 
-    fn write_pid_file(&self) {
-        let prepared = self
-            .foreground
-            .as_ref()
-            .expect("foreground mount sessions must prepare runtime");
+    fn write_pid_file(&self) -> anyhow::Result<()> {
+        let prepared = self.foreground.as_ref().context(
+            "foreground mount session is missing prepared runtime before persisting the pid file",
+        )?;
         if let Some(mount_lock) = self.mount_lock.as_ref() {
-            let _ = mount_lock.persist_record(
-                &self.plan.actual_mount_path,
-                &self.plan.command.name,
-                std::process::id(),
-                Some(&prepared.cache_path),
-            );
+            mount_lock
+                .persist_record(
+                    &self.plan.actual_mount_path,
+                    &self.plan.command.name,
+                    std::process::id(),
+                    Some(&prepared.cache_path),
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to persist mount record for '{}'",
+                        self.plan.actual_mount_path
+                    )
+                })?;
         }
+        Ok(())
     }
 
     fn launch_foreground(mut self) -> anyhow::Result<()> {
-        let format_info = self
-            .format_info
-            .as_ref()
-            .expect("foreground mount sessions must resolve format info");
-        let prepared = self
-            .foreground
-            .take()
-            .expect("foreground mount sessions must prepare runtime");
+        let format_info = self.format_info.as_ref().context(
+            "foreground mount session is missing format metadata before foreground launch",
+        )?;
+        let prepared = self.foreground.take().context(
+            "foreground mount session is missing prepared runtime before foreground launch",
+        )?;
         let PreparedForegroundRuntime {
             cache_path: _,
             cache_path_str: _,

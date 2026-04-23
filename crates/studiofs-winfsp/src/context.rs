@@ -7,6 +7,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Instant;
 
+use futures::FutureExt;
 use handle_drain::{CallbackBarrierState, WinfspHandleDrainFacade};
 use parking_lot::Mutex;
 use studiofs_meta::types::{SetattrArgs, TimeSpec};
@@ -28,7 +29,7 @@ use winfsp::filesystem::*;
 use winfsp::notify::{Notifier, NotifyInfo, NotifyingFileSystemContext};
 use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
 
-use crate::ensure_winfsp_runtime_loaded_or_panic;
+use crate::{ensure_winfsp_runtime_loaded, ensure_winfsp_runtime_loaded_or_panic};
 
 // Windows reparse point constants
 const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
@@ -147,6 +148,34 @@ struct SendConstBuffer {
 // SAFETY: The wrapper only marks transport capability across threads.
 // Call sites must guarantee pointer validity and lifetime.
 unsafe impl Send for SendConstBuffer {}
+
+trait SpawnWaitFallback {
+    fn task_panic_fallback() -> Self;
+}
+
+impl<T> SpawnWaitFallback for studiofs_vfs::VfsResult<T> {
+    fn task_panic_fallback() -> Self {
+        Err(studiofs_vfs::VfsError::Other(
+            "WinFSP callback task panicked".to_string(),
+        ))
+    }
+}
+
+impl<T> SpawnWaitFallback for winfsp::Result<T> {
+    fn task_panic_fallback() -> Self {
+        Err(winfsp::FspError::from(STATUS_UNSUCCESSFUL))
+    }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
 
 impl SendConstBuffer {
     fn from_slice(slice: &[u8]) -> Self {
@@ -515,7 +544,7 @@ fn filetime_to_timespec(ft: u64) -> TimeSpec {
 ///   - Full Access for SYSTEM
 ///   - Full Access for BUILTIN\Administrators
 ///   - Full Access for Everyone
-fn create_default_security_descriptor() -> Vec<u8> {
+fn create_default_security_descriptor() -> std::io::Result<Vec<u8>> {
     let sddl = windows::core::w!("O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)");
     let mut psd = PSECURITY_DESCRIPTOR::default();
     unsafe {
@@ -523,14 +552,18 @@ fn create_default_security_descriptor() -> Vec<u8> {
             sddl, 1, // SDDL_REVISION_1
             &mut psd, None,
         )
-        .expect("Failed to create security descriptor from SDDL");
+        .map_err(|err| {
+            std::io::Error::other(format!(
+                "failed to create default WinFSP security descriptor from SDDL: {err}"
+            ))
+        })?;
         let len = GetSecurityDescriptorLength(psd) as usize;
         let bytes = std::slice::from_raw_parts(psd.0 as *const u8, len).to_vec();
         // Free the LocalAlloc'd descriptor
         windows::Win32::Foundation::LocalFree(Some(windows::Win32::Foundation::HLOCAL(
             psd.0 as *mut _,
         )));
-        bytes
+        Ok(bytes)
     }
 }
 
@@ -655,10 +688,14 @@ pub struct StudioFsContext {
 }
 
 impl StudioFsContext {
-    pub fn new(vfs: Arc<StudioVfs>, rt: Handle, invalidation_queue: Arc<Mutex<Vec<Ino>>>) -> Self {
-        ensure_winfsp_runtime_loaded_or_panic();
-        let default_sd = create_default_security_descriptor();
-        Self {
+    pub fn new(
+        vfs: Arc<StudioVfs>,
+        rt: Handle,
+        invalidation_queue: Arc<Mutex<Vec<Ino>>>,
+    ) -> std::io::Result<Self> {
+        ensure_winfsp_runtime_loaded()?;
+        let default_sd = create_default_security_descriptor()?;
+        Ok(Self {
             vfs,
             rt,
             default_sd,
@@ -666,7 +703,7 @@ impl StudioFsContext {
             callback_barrier_state: CallbackBarrierState::new(),
             #[cfg(test)]
             _test_runtime: None,
-        }
+        })
     }
 
     #[cfg(test)]
@@ -676,7 +713,8 @@ impl StudioFsContext {
         invalidation_queue: Arc<Mutex<Vec<Ino>>>,
     ) -> Self {
         ensure_winfsp_runtime_loaded_or_panic();
-        let default_sd = create_default_security_descriptor();
+        let default_sd =
+            create_default_security_descriptor().expect("default WinFSP security descriptor");
         Self {
             vfs,
             rt: rt.handle().clone(),
@@ -932,17 +970,30 @@ impl StudioFsContext {
     fn spawn_wait<F, T>(&self, f: F) -> T
     where
         F: std::future::Future<Output = T> + Send + 'static,
-        T: Send + 'static,
+        T: SpawnWaitFallback + Send + 'static,
     {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<T>(1);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<std::thread::Result<T>>(1);
         self.rt.spawn(async move {
-            let result = f.await;
+            let result = std::panic::AssertUnwindSafe(f).catch_unwind().await;
             let _ = tx.send(result);
         });
         // Park the WinFSP thread until the runtime worker finishes.
-        // unwrap: the channel can only fail if the spawned task panics,
-        // which results in an immediate WinFSP error.
-        rx.recv().expect("tokio task panicked")
+        match rx.recv() {
+            Ok(Ok(result)) => result,
+            Ok(Err(payload)) => {
+                error!(
+                    panic = %panic_payload_message(payload.as_ref()),
+                    "WinFSP callback task panicked"
+                );
+                crate::request_shutdown();
+                T::task_panic_fallback()
+            }
+            Err(_) => {
+                error!("WinFSP callback task terminated before returning a result");
+                crate::request_shutdown();
+                T::task_panic_fallback()
+            }
+        }
     }
 }
 
@@ -1518,7 +1569,13 @@ fn notify_filter_for_kind(kind: FileType) -> u32 {
 }
 
 fn build_notify_info(path: &str, kind: FileType) -> Option<NotifyInfo<512>> {
-    ensure_winfsp_runtime_loaded_or_panic();
+    if let Err(error) = ensure_winfsp_runtime_loaded() {
+        warn!(
+            error = %error,
+            "WinFSP runtime unavailable while building notify info; skipping notification"
+        );
+        return None;
+    }
     let mut info = NotifyInfo::<512>::new();
     info.filter = notify_filter_for_kind(kind);
     info.action = FILE_ACTION_MODIFIED;

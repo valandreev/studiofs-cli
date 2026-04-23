@@ -9,6 +9,7 @@ studiofs-vfs.workspace = true
 studiofs-meta.workspace = true
 studiofs-data.workspace = true
 tokio.workspace = true
+futures.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 parking_lot.workspace = true

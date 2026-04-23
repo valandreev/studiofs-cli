@@ -71,9 +71,13 @@ fn winfsp_dll_stem_for_arch(target_arch: &str) -> Option<&'static str> {
     }
 }
 
-fn winfsp_dll_name() -> &'static str {
-    winfsp_dll_stem_for_arch(std::env::consts::ARCH)
-        .expect("unsupported Windows architecture for WinFSP runtime")
+fn winfsp_dll_name() -> Result<&'static str, String> {
+    winfsp_dll_stem_for_arch(std::env::consts::ARCH).ok_or_else(|| {
+        format!(
+            "unsupported Windows architecture '{}' for WinFSP runtime",
+            std::env::consts::ARCH
+        )
+    })
 }
 
 fn push_candidate_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
@@ -82,14 +86,13 @@ fn push_candidate_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
     }
 }
 
-fn winfsp_dll_candidate_paths() -> Vec<PathBuf> {
-    let dll_name = format!("{}.dll", winfsp_dll_name());
+fn winfsp_dll_candidate_paths(dll_name: &str) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
     if let Ok(current_exe) = std::env::current_exe()
         && let Some(parent) = current_exe.parent()
     {
-        push_candidate_path(&mut candidates, parent.join(&dll_name));
+        push_candidate_path(&mut candidates, parent.join(dll_name));
     }
 
     if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)") {
@@ -98,7 +101,7 @@ fn winfsp_dll_candidate_paths() -> Vec<PathBuf> {
             PathBuf::from(program_files_x86)
                 .join("WinFsp")
                 .join("bin")
-                .join(&dll_name),
+                .join(dll_name),
         );
     }
 
@@ -108,7 +111,7 @@ fn winfsp_dll_candidate_paths() -> Vec<PathBuf> {
             PathBuf::from(program_files)
                 .join("WinFsp")
                 .join("bin")
-                .join(&dll_name),
+                .join(dll_name),
         );
     }
 
@@ -116,8 +119,8 @@ fn winfsp_dll_candidate_paths() -> Vec<PathBuf> {
 }
 
 fn load_winfsp_runtime_dll() -> Result<(), String> {
-    let dll_name = format!("{}.dll", winfsp_dll_name());
-    let candidates = winfsp_dll_candidate_paths();
+    let dll_name = format!("{}.dll", winfsp_dll_name()?);
+    let candidates = winfsp_dll_candidate_paths(&dll_name);
     let mut last_error = None;
 
     for candidate in &candidates {
@@ -472,7 +475,8 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
         vfs.clone(),
         runtime_handle.clone(),
         invalidation_queue.clone(),
-    );
+    )
+    .map_err(|err| std::io::Error::other(format!("failed to initialize WinFSP context: {err}")))?;
 
     // Use `new_with_timer` so the WinFSP threadpool timer periodically calls
     // our `NotifyingFileSystemContext` impl, which sends `FspFileSystemNotify`
