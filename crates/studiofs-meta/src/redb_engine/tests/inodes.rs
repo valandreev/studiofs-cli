@@ -146,6 +146,47 @@ fn test_detect_overlay_attr_against_imported_base() {
 }
 
 #[test]
+fn test_set_attr_accepts_fragmented_regular_file_base_graph() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"fragmented-base-attr.txt", 1000, 1000, 0o644)
+        .unwrap();
+
+    let mut base_chunk = RegularFileChunkState::default();
+    base_chunk.slices.insert(
+        SliceId(0),
+        SliceRecord {
+            slice_id: SliceId(0),
+            order: SliceOrder(0),
+            range: SliceRange::new(0, 4096).unwrap(),
+            block: Some(BlockRef::new_partial(41, 4096)),
+            block_state: BlockRefState::Published,
+        },
+    );
+    base_chunk.slices.insert(
+        SliceId(1),
+        SliceRecord {
+            slice_id: SliceId(1),
+            order: SliceOrder(1),
+            range: SliceRange::new(4096, 8192).unwrap(),
+            block: Some(BlockRef::new_partial(42, 4096)),
+            block_state: BlockRefState::Published,
+        },
+    );
+    base_chunk.refresh_fragmentation_metrics();
+    set_regular_file_chunk_rows(&engine, file.ino, &[], &[(ChunkId(0), base_chunk)]);
+
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.mode = 0o600;
+    engine
+        .set_attr(&attr)
+        .expect("set_attr should not synthesize a flat manifest for fragmented base rows");
+
+    let loaded = engine.get_attr(file.ino).unwrap();
+    assert_eq!(loaded.mode, 0o600);
+}
+
+#[test]
 fn test_getattr_falls_back_to_base_when_no_local_overlay() {
     let engine = temp_engine();
 

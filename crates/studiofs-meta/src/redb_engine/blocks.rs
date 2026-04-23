@@ -1157,8 +1157,11 @@ impl RedbMetaEngine {
         let normalized_attr = if let Some(attr) = attr {
             let mut normalized = attr.clone();
             if normalized.kind == FileType::RegularFile {
-                let has_committed_manifest =
-                    !Self::base_manifest_from_graph_rows_in_txn(&txn, normalized.ino)?.is_empty();
+                let has_committed_manifest = Self::has_regular_file_chunk_rows_in_write_txn(
+                    &txn,
+                    REGULAR_FILE_BASE_TABLE,
+                    normalized.ino,
+                )?;
                 Self::transition_upload_state_for_local_mutation(
                     &mut normalized,
                     has_committed_manifest,
@@ -1315,8 +1318,11 @@ impl RedbMetaEngine {
         let normalized_attr = if let Some(attr) = attr {
             let mut normalized = attr.clone();
             if normalized.kind == FileType::RegularFile {
-                let has_committed_manifest =
-                    !Self::base_manifest_from_graph_rows_in_txn(&txn, normalized.ino)?.is_empty();
+                let has_committed_manifest = Self::has_regular_file_chunk_rows_in_write_txn(
+                    &txn,
+                    REGULAR_FILE_BASE_TABLE,
+                    normalized.ino,
+                )?;
                 Self::transition_upload_state_for_local_mutation(
                     &mut normalized,
                     has_committed_manifest,
@@ -1401,7 +1407,11 @@ impl RedbMetaEngine {
                     if let Some(attr_bytes) = attr_bytes {
                         let mut current_attr: InodeAttr = decode(&attr_bytes)?;
                         let has_committed_manifest =
-                            !Self::base_manifest_from_graph_rows_in_txn(&txn, ino)?.is_empty();
+                            Self::has_regular_file_chunk_rows_in_write_txn(
+                                &txn,
+                                REGULAR_FILE_BASE_TABLE,
+                                ino,
+                            )?;
                         Self::transition_upload_state_for_local_mutation(
                             &mut current_attr,
                             has_committed_manifest,

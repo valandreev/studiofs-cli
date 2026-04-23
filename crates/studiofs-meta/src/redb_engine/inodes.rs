@@ -654,8 +654,11 @@ impl MetaInodes for RedbMetaEngine {
         {
             let mut normalized = attr.clone();
             if normalized.kind == FileType::RegularFile {
-                let has_committed_manifest =
-                    !Self::base_manifest_from_graph_rows_in_txn(&txn, normalized.ino)?.is_empty();
+                let has_committed_manifest = Self::has_regular_file_chunk_rows_in_write_txn(
+                    &txn,
+                    REGULAR_FILE_BASE_TABLE,
+                    normalized.ino,
+                )?;
                 Self::transition_upload_state_for_local_mutation(
                     &mut normalized,
                     has_committed_manifest,
