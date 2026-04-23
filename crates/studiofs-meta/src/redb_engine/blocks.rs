@@ -419,6 +419,57 @@ impl MetaBlocks for RedbMetaEngine {
         Ok(ids.into_iter().collect())
     }
 
+    fn has_regular_file_overlay_object_if_matches(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_id: u64,
+    ) -> MetaResult<bool> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let inodes = txn
+            .open_table(INODES_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let attr_bytes = match inodes
+            .get(ino)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            Some(g) => g.value().to_vec(),
+            None => return Ok(false),
+        };
+        let attr: InodeAttr = decode(&attr_bytes)?;
+        if attr.content_epoch != expected_epoch {
+            return Ok(false);
+        }
+        drop(inodes);
+
+        let table = txn
+            .open_table(REGULAR_FILE_OVERLAY_TABLE)
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let prefix = regular_file_chunk_prefix(ino);
+        for row in table
+            .range(prefix.as_ref()..)
+            .map_err(|e| MetaError::Storage(e.to_string()))?
+        {
+            let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
+            if !key.value().starts_with(prefix.as_ref()) {
+                break;
+            }
+            let chunk: RegularFileChunkState = decode(value.value())?;
+            if chunk
+                .slices
+                .values()
+                .filter_map(|slice| slice.block.as_ref())
+                .any(|block| block.object_id == object_id)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn mark_regular_file_overlay_object_uploaded_if_matches(
         &self,
         ino: Ino,
@@ -727,41 +778,68 @@ impl MetaBlocks for RedbMetaEngine {
                 return Ok(false);
             }
 
-            let previous_base_manifest = Self::base_manifest_from_graph_rows_in_txn(&txn, ino)?;
             let publish_regular_graph = Self::has_regular_file_chunk_rows_in_write_txn(
                 &txn,
                 REGULAR_FILE_OVERLAY_TABLE,
                 ino,
             )?;
-            let (regular_graph_committed_size, removed_object_ids) = if publish_regular_graph {
-                let (committed_size, removed_object_ids) =
-                    Self::publish_regular_file_overlay_to_base_in_txn(&txn, ino)?;
-                (Some(committed_size), removed_object_ids)
-            } else {
-                Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
-                    &txn,
-                    REGULAR_FILE_BASE_TABLE,
-                    ino,
-                    published_blocks.as_slice(),
-                    block_size,
-                    true,
-                    false,
-                )?;
-                let previous_ids: std::collections::HashSet<_> = previous_base_manifest
-                    .iter()
-                    .map(|(_, block)| block.object_id)
-                    .collect();
-                let next_ids: std::collections::HashSet<_> = published_blocks
-                    .iter()
-                    .map(|(_, block)| block.object_id)
-                    .collect();
-                (
-                    Some(Self::legacy_committed_size_from_blocks(
+            let (regular_graph_committed_size, removed_object_ids, publish_event) =
+                if publish_regular_graph {
+                    let (committed_size, removed_object_ids) =
+                        Self::publish_regular_file_overlay_to_base_in_txn(&txn, ino)?;
+                    let published_base_chunks =
+                        Self::regular_file_chunk_states_for_inode_in_write_txn(
+                            &txn,
+                            REGULAR_FILE_BASE_TABLE,
+                            ino,
+                        )?
+                        .into_iter()
+                        .map(|(chunk_id, chunk_state)| {
+                            (
+                                chunk_id,
+                                chunk_state.slices.values().cloned().collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    (
+                        Some(committed_size),
+                        removed_object_ids,
+                        crate::events::MetaEvent::PublishRegularFileBaseSlices {
+                            ino,
+                            chunk_slices: published_base_chunks,
+                        },
+                    )
+                } else {
+                    let previous_base_manifest =
+                        Self::base_manifest_from_graph_rows_in_txn(&txn, ino)?;
+                    Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+                        &txn,
+                        REGULAR_FILE_BASE_TABLE,
+                        ino,
                         published_blocks.as_slice(),
-                    )),
-                    previous_ids.difference(&next_ids).copied().collect(),
-                )
-            };
+                        block_size,
+                        true,
+                        false,
+                    )?;
+                    let previous_ids: std::collections::HashSet<_> = previous_base_manifest
+                        .iter()
+                        .map(|(_, block)| block.object_id)
+                        .collect();
+                    let next_ids: std::collections::HashSet<_> = published_blocks
+                        .iter()
+                        .map(|(_, block)| block.object_id)
+                        .collect();
+                    (
+                        Some(Self::legacy_committed_size_from_blocks(
+                            published_blocks.as_slice(),
+                        )),
+                        previous_ids.difference(&next_ids).copied().collect(),
+                        crate::events::MetaEvent::PublishFileManifest {
+                            ino,
+                            blocks: published_blocks.clone(),
+                        },
+                    )
+                };
 
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -792,13 +870,7 @@ impl MetaBlocks for RedbMetaEngine {
             Self::set_inode_overlay_in_txn(&txn, &attr)?;
             Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
 
-            Self::append_event_in_txn(
-                &txn,
-                &crate::events::MetaEvent::PublishFileManifest {
-                    ino,
-                    blocks: published_blocks.clone(),
-                },
-            )?;
+            Self::append_event_in_txn(&txn, &publish_event)?;
             Self::append_event_in_txn(
                 &txn,
                 &crate::events::MetaEvent::SetAttr { attr: attr.clone() },
@@ -838,7 +910,19 @@ impl MetaBlocks for RedbMetaEngine {
 
             let (committed_size, removed_object_ids) =
                 Self::publish_regular_file_overlay_to_base_in_txn(&txn, ino)?;
-            let published_blocks = Self::base_manifest_from_graph_rows_in_txn(&txn, ino)?;
+            let published_base_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
+                &txn,
+                REGULAR_FILE_BASE_TABLE,
+                ino,
+            )?
+            .into_iter()
+            .map(|(chunk_id, chunk_state)| {
+                (
+                    chunk_id,
+                    chunk_state.slices.values().cloned().collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
             if !removed_object_ids.is_empty() {
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -869,9 +953,9 @@ impl MetaBlocks for RedbMetaEngine {
 
             Self::append_event_in_txn(
                 &txn,
-                &crate::events::MetaEvent::PublishFileManifest {
+                &crate::events::MetaEvent::PublishRegularFileBaseSlices {
                     ino,
-                    blocks: published_blocks,
+                    chunk_slices: published_base_chunks,
                 },
             )?;
             Self::append_event_in_txn(

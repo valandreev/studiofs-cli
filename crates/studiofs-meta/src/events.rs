@@ -123,6 +123,19 @@ pub enum MetaEvent {
         chunk_slices: Vec<(crate::schema::ChunkId, Vec<crate::schema::SliceRecord>)>,
     },
 
+    /// Atomically publish the remote-visible regular-file base graph.
+    ///
+    /// The payload carries the full published base rows for the inode after the
+    /// publish barrier completes. This is the slice-native publish event used
+    /// by regular-file graphs that can no longer be losslessly expressed as a
+    /// flat `(block_index, BlockRef)` manifest.
+    PublishRegularFileBaseSlices {
+        /// File inode whose published base chunks are being replaced.
+        ino: u64,
+        /// Final published base rows as `(chunk_id, slices)` pairs.
+        chunk_slices: Vec<(crate::schema::ChunkId, Vec<crate::schema::SliceRecord>)>,
+    },
+
     // ─── Target & Extended Attributes ────────────────────────────────────────
     /// Set a symlink target.
     SetSymlinkTarget {
@@ -217,6 +230,7 @@ impl MetaEvent {
             Self::CommitFileBlock { .. } => "commit_file_block",
             Self::PublishFileManifest { .. } => "publish_file_manifest",
             Self::SetRegularFileOverlaySlices { .. } => "set_regular_file_overlay_slices",
+            Self::PublishRegularFileBaseSlices { .. } => "publish_regular_file_base_slices",
             Self::SetSymlinkTarget { .. } => "set_symlink_target",
             Self::SetXattr { .. } => "set_xattr",
             Self::RemoveXattr { .. } => "remove_xattr",
@@ -253,6 +267,7 @@ impl MetaEvent {
             Self::CommitFileBlock { ino, .. } => Some(*ino),
             Self::PublishFileManifest { ino, .. } => Some(*ino),
             Self::SetRegularFileOverlaySlices { ino, .. } => Some(*ino),
+            Self::PublishRegularFileBaseSlices { ino, .. } => Some(*ino),
             Self::SetSymlinkTarget { ino, .. } => Some(*ino),
             Self::SetXattr { ino, .. } => Some(*ino),
             Self::RemoveXattr { ino, .. } => Some(*ino),

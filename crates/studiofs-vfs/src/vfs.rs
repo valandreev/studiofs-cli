@@ -175,6 +175,7 @@ const HARD_BACKPRESSURE_DIRTY_MULTIPLIER: usize = 2;
 const AGGRESSIVE_MATERIALIZATION_DIRTY_DIVISOR: usize = 2;
 const AGGRESSIVE_MATERIALIZATION_BUFFERED_WRITE_THRESHOLD: usize = 64;
 const AGGRESSIVE_MATERIALIZATION_INTERVAL: Duration = Duration::from_millis(25);
+const LOCAL_DIRTY_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
 const DEFERRED_MATERIALIZATION_LINGER_WAIT_MS: u64 = 5;
 const DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES: usize = 6;
 const SOFT_DIRTY_PACING_START_NUMERATOR: usize = 9;
@@ -3832,6 +3833,7 @@ impl StudioVfs {
         }: StartupChannels,
     ) -> VfsResult<()> {
         self.spawn_aggressive_materialization_worker();
+        self.spawn_local_dirty_flush_worker();
         self.spawn_prefetch_worker(prefetch_rx);
         self.spawn_uploader_worker(upload_rx);
         self.spawn_epoch_finalizer_worker();
@@ -3864,6 +3866,13 @@ impl StudioVfs {
         let vfs = self.clone();
         self.track_background_task(tokio::spawn(async move {
             vfs.background_aggressive_materialization().await;
+        }));
+    }
+
+    fn spawn_local_dirty_flush_worker(self: &Arc<Self>) {
+        let vfs = self.clone();
+        self.track_background_task(tokio::spawn(async move {
+            vfs.background_local_dirty_flush().await;
         }));
     }
 

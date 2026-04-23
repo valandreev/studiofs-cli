@@ -110,6 +110,7 @@ impl StudioVfs {
                 .insert(ino, attr.clone());
             self.state.namespace.attr_read_cache.lock().remove(ino);
             self.sync_meta().set_attr(&attr)?;
+            self.clear_matching_dirty_attr_if_committed(ino, &attr);
             self.refresh_inode_incarnation_state_from_attr(ino, &attr);
         }
 

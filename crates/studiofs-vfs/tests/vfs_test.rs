@@ -2429,7 +2429,7 @@ fn writer_reads_full_file_before_any_remote_commit() {
 }
 
 #[test]
-fn eager_full_block_write_recovers_pending_upload_after_restart() {
+fn full_block_write_flush_recovers_pending_upload_after_restart() {
     type EnvRestore = ScopedEnvVar;
 
     let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
@@ -2484,21 +2484,37 @@ fn eager_full_block_write_recovers_pending_upload_after_restart() {
             assert_eq!(
                 attr_after.size,
                 payload.len() as u64,
-                "eager full-block commit must advance inode size together with block refs"
+                "stage-first full-block write must advance the live inode size immediately"
             );
             assert_eq!(
                 vfs.meta().get_file_blocks(inode).unwrap().len(),
-                1,
-                "eager full-block write should commit one block ref without flush()"
+                0,
+                "stage-first full-block write should not commit block refs before an explicit flush"
+            );
+            assert!(
+                vfs.inode_has_local_dirty_state(inode),
+                "stage-first full-block write must retain local dirty state until flush commits metadata"
             );
             assert_eq!(
                 vfs.pending_uploads_for_inode(inode).len(),
-                1,
-                "eager full-block write must persist a pending upload intent before restart"
+                0,
+                "upload intent should not be queued until the staged write crosses the flush barrier"
             );
 
             let read = vfs.read(inode, 0, payload.len() as u32).await.unwrap();
             assert_eq!(read.as_ref(), payload.as_slice());
+
+            vfs.flush(inode).await.unwrap();
+            assert_eq!(
+                vfs.meta().get_file_blocks(inode).unwrap().len(),
+                1,
+                "flush should materialize the staged full block into unpublished metadata"
+            );
+            assert_eq!(
+                vfs.pending_uploads_for_inode(inode).len(),
+                1,
+                "flush should queue the upload intent for the materialized block"
+            );
         });
         rt.shutdown_background();
     }
@@ -2524,7 +2540,7 @@ fn eager_full_block_write_recovers_pending_upload_after_restart() {
             assert_eq!(
                 vfs.pending_uploads_for_inode(inode).len(),
                 1,
-                "restart should recover the eager-path upload journal entry"
+                "restart should recover the flushed upload journal entry"
             );
             let attr_after = vfs.getattr(inode).unwrap();
             assert_eq!(attr_after.size, payload.len() as u64);
@@ -5118,13 +5134,15 @@ fn large_file_unlink_cancels_pending_uploads() {
         let attr = vfs.create(1, b"unlink-cancel.bin", 0, 0, 0o644).unwrap();
         vfs.write(attr.ino, 0, &payload).await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
+        let canceled_before = vfs.upload_stats().canceled_deleted;
 
         assert!(
             wait_until(Duration::from_secs(10), || {
-                vfs.pending_uploads_for_inode(attr.ino).len() == 2
+                !vfs.pending_uploads_for_inode(attr.ino).is_empty()
+                    || !vfs.live_extent_records_for_inode(attr.ino).is_empty()
             })
             .await,
-            "two full-block uploads should be pending before unlink"
+            "flush should leave upload or live-extent work for unlink to cancel"
         );
 
         vfs.unlink(1, b"unlink-cancel.bin").unwrap();
@@ -5132,7 +5150,7 @@ fn large_file_unlink_cancels_pending_uploads() {
         assert!(
             wait_until(Duration::from_secs(10), || {
                 vfs.pending_uploads_for_inode(attr.ino).is_empty()
-                    && vfs.upload_stats().canceled_deleted >= 2
+                    && vfs.upload_stats().canceled_deleted > canceled_before
             })
             .await,
             "unlink must cancel the whole pending incarnation and stop useful upload work"
@@ -5202,13 +5220,15 @@ fn open_unlink_keeps_data_readable_while_canceling_pending_uploads() {
             .expect("open handle before unlink");
         vfs.write(attr.ino, 0, &payload).await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
+        let canceled_before = vfs.upload_stats().canceled_deleted;
 
         assert!(
             wait_until(Duration::from_secs(10), || {
-                vfs.pending_uploads_for_inode(attr.ino).len() == 2
+                !vfs.pending_uploads_for_inode(attr.ino).is_empty()
+                    || !vfs.live_extent_records_for_inode(attr.ino).is_empty()
             })
             .await,
-            "two full-block uploads should be pending before open-unlink"
+            "flush should leave upload or live-extent work for open-unlink to cancel"
         );
 
         vfs.unlink(1, b"open-unlink-cancel.bin").unwrap();
@@ -5216,7 +5236,7 @@ fn open_unlink_keeps_data_readable_while_canceling_pending_uploads() {
         assert!(
             wait_until(Duration::from_secs(10), || {
                 vfs.pending_uploads_for_inode(attr.ino).is_empty()
-                    && vfs.upload_stats().canceled_deleted >= 2
+                    && vfs.upload_stats().canceled_deleted > canceled_before
             })
             .await,
             "open-unlink must cancel pending uploads without waiting for close"
@@ -9758,14 +9778,16 @@ fn truncate_after_create_is_locally_durable_without_flush() {
 }
 
 #[test]
-fn eager_full_block_write_with_offline_s3_keeps_data_locally_committed_and_queued() {
+fn full_block_write_with_offline_s3_stays_local_until_flush_then_queues_upload() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_eager = ScopedEnvVar::capture("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES");
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     unsafe {
         std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1048576");
         std::env::set_var("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES", "512KB");
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
     }
 
     let tmp = tempfile::tempdir().unwrap();
@@ -9810,25 +9832,45 @@ fn eager_full_block_write_with_offline_s3_keeps_data_locally_committed_and_queue
         assert_eq!(
             read.as_ref(),
             payload.as_slice(),
-            "eager local persistence must keep data readable while S3 is offline"
+            "stage-first local acceptance must keep data readable while S3 is offline"
         );
         assert!(
+            vfs.inode_has_local_dirty_state(attr.ino),
+            "stage-first local acceptance must keep local dirty state until flush materializes metadata"
+        );
+        assert!(
+            vfs.live_extent_records_for_inode(attr.ino).is_empty(),
+            "live extents should only appear after flush commits unpublished metadata"
+        );
+        assert!(
+            vfs.pending_uploads_for_inode(attr.ino).is_empty(),
+            "remote upload work should stay deferred until flush commits metadata"
+        );
+        assert_eq!(
+            vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
+            0,
+            "stage-first writes should not commit block refs before flush"
+        );
+
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert!(
             !vfs.live_extent_records_for_inode(attr.ino).is_empty(),
-            "eager local persistence should materialize live extents immediately"
+            "flush should materialize live extents once the staged block is committed"
         );
         assert!(
             !vfs.pending_uploads_for_inode(attr.ino).is_empty(),
-            "eager local persistence should still queue remote upload work"
+            "flush should queue remote upload work even when S3 is offline"
         );
         assert_eq!(vfs.meta().get_file_blocks(attr.ino).unwrap().len(), 1);
         let state = vfs.inode_incarnation_state(attr.ino).await.unwrap();
         assert_eq!(state.upload_state, VfsUploadState::Updating);
         let committed = state.committed_incarnation.expect(
-            "eager local persistence should retain the zero-size committed base incarnation",
+            "flush should retain the zero-size committed base incarnation while upload is pending",
         );
         assert_eq!(committed.size, 0);
         let pending = state.pending_incarnation.expect(
-            "eager local persistence must retain a pending incarnation until upload completes",
+            "flush must retain a pending incarnation until upload completes",
         );
         assert_eq!(pending.size, payload.len() as u64);
         assert_eq!(pending.base_size, 0);
@@ -9837,7 +9879,11 @@ fn eager_full_block_write_with_offline_s3_keeps_data_locally_committed_and_queue
 }
 
 #[test]
-fn write_persists_successive_full_blocks_without_waiting_for_threshold() {
+fn write_stages_successive_full_blocks_without_waiting_for_threshold() {
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    unsafe {
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -9887,18 +9933,22 @@ fn write_persists_successive_full_blocks_without_waiting_for_threshold() {
 
         vfs.write(attr.ino, 0, &first).await.unwrap();
         assert!(
-            vfs.meta().get_file_blocks(attr.ino).unwrap().len() == 1,
-            "foreground write should durably persist the first full block immediately"
+            vfs.meta().get_file_blocks(attr.ino).unwrap().is_empty(),
+            "stage-first write should keep the first full block in local staging until flush"
         );
         assert!(
-            vfs.pending_uploads_for_inode(attr.ino).len() == 1,
-            "foreground write should queue upload work after the local block is durable"
+            vfs.pending_uploads_for_inode(attr.ino).is_empty(),
+            "upload work should stay deferred until the staged blocks are flushed"
+        );
+        assert!(
+            vfs.inode_has_local_dirty_state(attr.ino),
+            "stage-first write should retain local dirty state for the staged full block"
         );
         let first_read = vfs.read(attr.ino, 0, block_size as u32).await.unwrap();
         assert_eq!(
             first_read.as_ref(),
             first.as_slice(),
-            "buffered full blocks must remain readable before eager persistence"
+            "staged full blocks must remain readable before metadata materialization"
         );
 
         vfs.write(attr.ino, block_size as u64, &second)
@@ -9911,10 +9961,9 @@ fn write_persists_successive_full_blocks_without_waiting_for_threshold() {
             .await
             .unwrap();
         let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
-        assert_eq!(
-            blocks.len(),
-            4,
-            "each successful write should leave all written full blocks durably visible in local metadata"
+        assert!(
+            blocks.len() < 4,
+            "foreground writes should not need to fully materialize every staged block before the explicit flush barrier"
         );
 
         let combined = vfs
@@ -9925,17 +9974,38 @@ fn write_persists_successive_full_blocks_without_waiting_for_threshold() {
         assert_eq!(&combined[block_size..(block_size * 2)], second.as_slice());
         assert_eq!(&combined[(block_size * 2)..(block_size * 3)], third.as_slice());
         assert_eq!(&combined[(block_size * 3)..], fourth.as_slice());
+        assert!(
+            vfs.pending_uploads_for_inode(attr.ino).len() < 4,
+            "upload queue may grow opportunistically, but it should not require fully materializing every staged block before flush"
+        );
+        assert_eq!(
+            vfs.ingress_stats().dirty_mem_bytes,
+            0,
+            "full-block staging should spill payload out of dirty RAM even before flush"
+        );
+
+        vfs.flush(attr.ino).await.unwrap();
+        let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
+        assert_eq!(
+            blocks.len(),
+            4,
+            "flush should materialize all staged full blocks in local metadata"
+        );
         assert_eq!(
             vfs.pending_uploads_for_inode(attr.ino).len(),
             4,
-            "each durably persisted block should be queued for upload"
+            "flush should queue uploads for every materialized full block"
         );
     });
     rt.shutdown_background();
 }
 
 #[test]
-fn write_persists_full_blocks_without_explicit_flush() {
+fn write_stages_full_blocks_without_explicit_flush() {
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    unsafe {
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -9984,17 +10054,33 @@ fn write_persists_full_blocks_without_explicit_flush() {
         let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
-            1,
-            "write() must persist a full block before returning even below the old eager threshold"
+            0,
+            "stage-first write should not commit a full block to metadata before flush"
+        );
+        assert!(
+            vfs.inode_has_local_dirty_state(attr.ino),
+            "stage-first write should retain local dirty state for the staged full block"
         );
         let read = vfs.read(attr.ino, 0, block_size as u32).await.unwrap();
         assert_eq!(read.as_ref(), payload.as_slice());
+
+        vfs.flush(attr.ino).await.unwrap();
+        let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
+        assert_eq!(
+            blocks.len(),
+            1,
+            "flush should materialize the staged full block"
+        );
     });
     rt.shutdown_background();
 }
 
 #[test]
-fn write_buffers_partial_tail_until_flush() {
+fn write_stages_full_block_prefix_and_buffers_tail_until_flush() {
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    unsafe {
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -10052,8 +10138,8 @@ fn write_buffers_partial_tail_until_flush() {
 
         assert_eq!(
             vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
-            1,
-            "write() should eagerly accept the completed full block but keep the partial tail buffered until flush"
+            0,
+            "stage-first write should keep the completed full-block prefix in local staging until flush"
         );
         assert!(
             vfs.ingress_stats().dirty_mem_bytes > 0,
@@ -10062,8 +10148,8 @@ fn write_buffers_partial_tail_until_flush() {
         let persisted_attr = vfs.meta().get_attr(attr.ino).unwrap();
         assert_eq!(
             persisted_attr.size,
-            block_size as u64,
-            "durable local metadata should advance to the accepted full-block prefix before the buffered tail is flushed"
+            0,
+            "durable metadata should remain unchanged until flush materializes the staged prefix and tail"
         );
 
         let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
@@ -10088,7 +10174,11 @@ fn write_buffers_partial_tail_until_flush() {
 }
 
 #[test]
-fn read_from_start_does_not_depend_on_draining_dirty_tail() {
+fn read_from_start_does_not_depend_on_metadata_materialization() {
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    unsafe {
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -10134,8 +10224,8 @@ fn read_from_start_does_not_depend_on_draining_dirty_tail() {
         let ingress_before = vfs.ingress_stats();
         assert_eq!(
             persisted_before,
-            burst_blocks,
-            "a large write burst should already be durably materialized before the first read"
+            0,
+            "stage-first writes should not need metadata materialization before the first read"
         );
         assert_eq!(
             ingress_before.dirty_mem_bytes,
@@ -10149,25 +10239,30 @@ fn read_from_start_does_not_depend_on_draining_dirty_tail() {
         let ingress_after = vfs.ingress_stats();
         assert_eq!(
             ingress_after.dirty_mem_blocks,
-            0,
-            "the first read from offset 0 should not introduce dirty buffered state"
+            ingress_before.dirty_mem_blocks,
+            "the first read from offset 0 should not change how many locally staged blocks are pending"
         );
         assert_eq!(
             ingress_after.dirty_mem_bytes,
             0,
             "the first read from offset 0 should not need to clear buffered full-block dirty bytes"
         );
+        vfs.flush(attr.ino).await.unwrap();
         assert_eq!(
             vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
             burst_blocks,
-            "all full blocks should already be present in local metadata before the sequential read starts"
+            "flush should materialize every staged full block after the read succeeds"
         );
     });
     rt.shutdown_background();
 }
 
 #[test]
-fn write_persists_full_blocks_and_buffers_tail_without_buffered_relief() {
+fn write_stages_full_blocks_and_buffers_tail_without_buffered_relief() {
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    unsafe {
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -10216,16 +10311,16 @@ fn write_persists_full_blocks_and_buffers_tail_without_buffered_relief() {
 
         vfs.write(attr.ino, 0, &first).await.unwrap();
         assert!(
-            vfs.meta().get_file_blocks(attr.ino).unwrap().len() == 1,
-            "the initial full block should be durably visible immediately"
+            vfs.meta().get_file_blocks(attr.ino).unwrap().is_empty(),
+            "stage-first writes should keep the initial full block in local staging until flush"
         );
 
         vfs.write(attr.ino, block_size as u64, &tail).await.unwrap();
 
         assert_eq!(
             vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
-            1,
-            "the tail block should remain buffered while the initial full block stays durably persisted"
+            0,
+            "the tail block should remain buffered while the initial full block stays locally staged"
         );
         assert_eq!(
             vfs.ingress_stats().dirty_mem_bytes,
@@ -10242,8 +10337,8 @@ fn write_persists_full_blocks_and_buffers_tail_without_buffered_relief() {
         let persisted_attr = vfs.meta().get_attr(attr.ino).unwrap();
         assert_eq!(
             persisted_attr.size,
-            block_size as u64,
-            "durable local metadata should stay at the full-block prefix until the buffered tail is flushed"
+            0,
+            "durable metadata should remain unchanged until flush commits the staged prefix and tail"
         );
 
         let read = vfs

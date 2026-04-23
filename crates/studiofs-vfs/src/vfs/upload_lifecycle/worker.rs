@@ -184,6 +184,12 @@ trait UploadLocalBlockPort: Clone + Send + Sync + 'static {
 trait UploadMetaPort: Clone + Send + Sync + 'static {
     async fn get_attr(&self, ino: Ino) -> VfsResult<Option<InodeAttr>>;
     async fn get_file_block(&self, ino: Ino, block_index: u32) -> VfsResult<Option<BlockRef>>;
+    async fn has_regular_file_overlay_object_if_matches(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_id: u64,
+    ) -> VfsResult<bool>;
     async fn mark_regular_file_overlay_object_uploaded_if_matches(
         &self,
         ino: Ino,
@@ -439,14 +445,24 @@ where
             return Ok(SingleUploadOutcome::CancelledStale);
         }
 
-        match self.meta.get_file_block(op.ino, block_index).await {
-            Ok(Some(current)) if current.object_id != op.object_id => {
-                self.cancel_stale_upload(op).await?;
-                return Ok(SingleUploadOutcome::CancelledStale);
+        let overlay_object_current = self
+            .meta
+            .has_regular_file_overlay_object_if_matches(op.ino, op.content_epoch, op.object_id)
+            .await?;
+
+        if !overlay_object_current {
+            match self.meta.get_file_block(op.ino, block_index).await {
+                Ok(Some(current)) if current.object_id != op.object_id => {
+                    self.cancel_stale_upload(op).await?;
+                    return Ok(SingleUploadOutcome::CancelledStale);
+                }
+                Ok(_) => {}
+                Err(error) if is_fragmented_block_lookup_error(&error) => {
+                    self.cancel_stale_upload(op).await?;
+                    return Ok(SingleUploadOutcome::CancelledStale);
+                }
+                Err(error) => return Err(error),
             }
-            Ok(_) => {}
-            Err(error) if is_fragmented_block_lookup_error(&error) => {}
-            Err(error) => return Err(error),
         }
 
         self.local_blocks
@@ -556,47 +572,54 @@ where
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or(0);
-        let keep_local_object = match self.meta.get_file_block(op.ino, block_index).await {
-            Ok(Some(ref block_ref)) if block_ref.object_id == op.object_id => {
-                let marked = self
-                    .meta
-                    .mark_file_block_uploaded_if_matches(
-                        op.ino,
-                        block_index,
-                        op.content_epoch,
-                        block_ref,
-                    )
-                    .await?;
-                if !marked {
-                    self.meta
-                        .add_pending_deletion(op.object_id, timestamp)
-                        .await?;
-                }
-                marked
-            }
-            Ok(Some(_)) | Ok(None) => {
+        let keep_local_object = if overlay_object_current {
+            let marked = self
+                .meta
+                .mark_regular_file_overlay_object_uploaded_if_matches(
+                    op.ino,
+                    op.content_epoch,
+                    op.object_id,
+                )
+                .await?;
+            if !marked {
                 self.meta
                     .add_pending_deletion(op.object_id, timestamp)
                     .await?;
-                false
             }
-            Err(error) if is_fragmented_block_lookup_error(&error) => {
-                let marked = self
-                    .meta
-                    .mark_regular_file_overlay_object_uploaded_if_matches(
-                        op.ino,
-                        op.content_epoch,
-                        op.object_id,
-                    )
-                    .await?;
-                if !marked {
+            marked
+        } else {
+            match self.meta.get_file_block(op.ino, block_index).await {
+                Ok(Some(ref block_ref)) if block_ref.object_id == op.object_id => {
+                    let marked = self
+                        .meta
+                        .mark_file_block_uploaded_if_matches(
+                            op.ino,
+                            block_index,
+                            op.content_epoch,
+                            block_ref,
+                        )
+                        .await?;
+                    if !marked {
+                        self.meta
+                            .add_pending_deletion(op.object_id, timestamp)
+                            .await?;
+                    }
+                    marked
+                }
+                Ok(Some(_)) | Ok(None) => {
                     self.meta
                         .add_pending_deletion(op.object_id, timestamp)
                         .await?;
+                    false
                 }
-                marked
+                Err(error) if is_fragmented_block_lookup_error(&error) => {
+                    self.meta
+                        .add_pending_deletion(op.object_id, timestamp)
+                        .await?;
+                    false
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         };
         self.coordinator.complete_upload(op);
 
@@ -968,6 +991,19 @@ impl UploadMetaPort for VfsUploadMetaPort {
         let meta = self.vfs.meta.clone();
         run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
             engine.get_file_block(ino, block_index)
+        })
+        .await
+    }
+
+    async fn has_regular_file_overlay_object_if_matches(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_id: u64,
+    ) -> VfsResult<bool> {
+        let meta = self.vfs.meta.clone();
+        run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+            engine.has_regular_file_overlay_object_if_matches(ino, expected_epoch, object_id)
         })
         .await
     }
@@ -1673,6 +1709,29 @@ mod tests {
                 .flatten())
         }
 
+        async fn has_regular_file_overlay_object_if_matches(
+            &self,
+            ino: Ino,
+            expected_epoch: u64,
+            object_id: u64,
+        ) -> VfsResult<bool> {
+            let epoch_matches = self
+                .attrs
+                .lock()
+                .get(&ino)
+                .and_then(|attr| attr.as_ref())
+                .map(|attr| attr.content_epoch == expected_epoch)
+                .unwrap_or(false);
+            if !epoch_matches {
+                return Ok(false);
+            }
+            Ok(self
+                .overlay_objects
+                .lock()
+                .get(&ino)
+                .is_some_and(|objects| objects.contains(&object_id)))
+        }
+
         async fn mark_regular_file_overlay_object_uploaded_if_matches(
             &self,
             ino: Ino,
@@ -2087,6 +2146,29 @@ mod tests {
             "current fragmented overlay object should stay in the local backend"
         );
         assert_eq!(policy.refreshed.lock().as_slice(), &[11]);
+    }
+
+    #[tokio::test]
+    async fn process_upload_cancels_stale_fragmented_overlay_without_quarantine() {
+        let (processor, coordinator, local_blocks, meta, _remote, shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.fragmented_blocks.lock().insert((op.ino, 0));
+
+        let outcome = processor.process_upload(op).await;
+
+        assert_eq!(outcome, UploadOutcome::CancelledStale);
+        assert_eq!(coordinator.cancelled.lock().as_slice(), &[77]);
+        assert_eq!(local_blocks.removed.lock().as_slice(), &[77]);
+        assert!(
+            policy.quarantines.lock().is_empty(),
+            "stale fragmented uploads should cancel cleanly instead of quarantining the inode"
+        );
+        assert_eq!(shutdown.canceled_stale.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

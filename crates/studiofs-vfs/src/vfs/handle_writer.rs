@@ -1,10 +1,15 @@
-use super::local_dirty::DirtyWriteSnapshot;
+use super::local_dirty::{DirtyWriteSnapshot, PersistedPendingLocalDirtySliceSpec};
 use super::{Bytes, FileType, Ino, LocalSyncPolicy, StudioVfs, VfsError, VfsResult};
+use crate::VfsMeta;
+use crate::runtime::run_meta;
 use bytes::BytesMut;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use studiofs_meta::schema::offset_within_block;
+
+const JUICEFS_LIKE_SLICE_FLUSH_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub(super) struct HandleWriterReadSpan {
@@ -21,6 +26,18 @@ pub(super) struct BufferedHandleWrite {
     pub(super) offset: u64,
     pub(super) seq: u64,
     pub(super) data: Bytes,
+}
+
+#[derive(Debug, Clone)]
+struct SpillBatchSegment {
+    write: BufferedHandleWrite,
+    object_offset: u32,
+}
+
+#[derive(Debug, Clone)]
+struct HandleWriterSpillBatch {
+    payload: Bytes,
+    segments: Vec<SpillBatchSegment>,
 }
 
 #[derive(Debug, Clone)]
@@ -754,6 +771,194 @@ impl StudioVfs {
             .max(1)
     }
 
+    fn handle_writer_slice_flush_bytes(&self) -> usize {
+        JUICEFS_LIKE_SLICE_FLUSH_BYTES
+            .min(self.block_size as usize)
+            .max(1)
+    }
+
+    fn handle_writer_slice_spill_budget_bytes(&self) -> usize {
+        self.write_eager_flush_drain_chunk_bytes
+            .max(self.handle_writer_slice_flush_bytes())
+    }
+
+    fn select_handle_writer_slices_for_spill(
+        &self,
+        writes: &[BufferedHandleWrite],
+    ) -> Vec<BufferedHandleWrite> {
+        let Some(latest_seq) = writes.iter().map(|write| write.seq).max() else {
+            return Vec::new();
+        };
+        let mut ordered = writes.to_vec();
+        ordered.sort_by_key(|write| (write.seq, write.offset));
+        let spill_bytes_cap = self.handle_writer_slice_spill_budget_bytes();
+        let mut selected = Vec::new();
+        let mut selected_bytes = 0usize;
+        for write in ordered {
+            if write.seq == latest_seq {
+                continue;
+            }
+            if selected_bytes > 0
+                && selected_bytes.saturating_add(write.data.len()) > spill_bytes_cap
+            {
+                break;
+            }
+            selected_bytes = selected_bytes.saturating_add(write.data.len());
+            selected.push(write);
+            if selected_bytes >= spill_bytes_cap {
+                break;
+            }
+        }
+        selected
+    }
+
+    fn should_spill_selected_handle_writer_slices(
+        &self,
+        selected: &[BufferedHandleWrite],
+        budget_exceeded: bool,
+    ) -> bool {
+        if selected.is_empty() {
+            return false;
+        }
+        if budget_exceeded {
+            return true;
+        }
+        let selected_bytes: usize = selected.iter().map(|write| write.data.len()).sum();
+        selected_bytes >= self.handle_writer_slice_flush_bytes()
+    }
+
+    fn build_handle_writer_slice_spill_batches(
+        &self,
+        selected: Vec<BufferedHandleWrite>,
+    ) -> Vec<HandleWriterSpillBatch> {
+        if selected.is_empty() {
+            return Vec::new();
+        }
+
+        let spill_bytes_cap = self.handle_writer_slice_flush_bytes();
+        let mut batches = Vec::new();
+        let mut current_payload = BytesMut::new();
+        let mut current_segments = Vec::new();
+        let mut current_end: Option<u64> = None;
+
+        let flush_current_batch =
+            |payload: &mut BytesMut,
+             segments: &mut Vec<SpillBatchSegment>,
+             out: &mut Vec<HandleWriterSpillBatch>| {
+                if segments.is_empty() {
+                    payload.clear();
+                    return;
+                }
+                out.push(HandleWriterSpillBatch {
+                    payload: payload.split().freeze(),
+                    segments: std::mem::take(segments),
+                });
+            };
+
+        for write in selected {
+            let contiguous = current_end.is_none_or(|end| end == write.offset);
+            let fits_current_batch = current_payload.is_empty()
+                || current_payload.len().saturating_add(write.data.len()) <= spill_bytes_cap;
+            if !current_segments.is_empty() && (!contiguous || !fits_current_batch) {
+                flush_current_batch(&mut current_payload, &mut current_segments, &mut batches);
+            }
+
+            let object_offset = u32::try_from(current_payload.len())
+                .expect("spill batch payload offset must fit in u32");
+            current_payload.extend_from_slice(write.data.as_ref());
+            current_end = Some(write.offset.saturating_add(write.data.len() as u64));
+            current_segments.push(SpillBatchSegment {
+                write,
+                object_offset,
+            });
+        }
+
+        flush_current_batch(&mut current_payload, &mut current_segments, &mut batches);
+        batches
+    }
+
+    pub(super) async fn spill_handle_writer_slices_for_inode(
+        &self,
+        ino: Ino,
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<bool> {
+        if !matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+            return Ok(false);
+        }
+        let writes = self
+            .state
+            .handle_writers
+            .snapshot_materialization_writes(ino);
+        let selected = self.select_handle_writer_slices_for_spill(&writes);
+        let budget_exceeded = self.total_pending_write_buffer_bytes() > self.max_dirty_bytes();
+        if !self.should_spill_selected_handle_writer_slices(&selected, budget_exceeded) {
+            return Ok(false);
+        }
+        let spill_batches = self.build_handle_writer_slice_spill_batches(selected);
+        if spill_batches.is_empty() {
+            return Ok(false);
+        }
+
+        let object_count = u32::try_from(spill_batches.len()).map_err(|_| {
+            VfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "requested slice spill batch count {} exceeds u32::MAX",
+                    spill_batches.len()
+                ),
+            ))
+        })?;
+        let object_ids = run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            engine.next_block_ids(object_count)
+        })
+        .await?;
+        let payloads: Vec<(u64, Bytes)> = spill_batches
+            .iter()
+            .zip(object_ids.iter().copied())
+            .map(|(batch, object_id)| (object_id, batch.payload.clone()))
+            .collect();
+        let logical_block_count = spill_batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .segments
+                    .iter()
+                    .map(|segment| segment.write.block_index)
+            })
+            .collect::<HashSet<_>>()
+            .len();
+        self.persist_local_object_payloads(payloads, logical_block_count, local_sync_policy)
+            .await?;
+        for (batch, object_id) in spill_batches.iter().zip(object_ids.iter().copied()) {
+            for segment in &batch.segments {
+                self.install_persisted_pending_local_dirty_slice(
+                    ino,
+                    PersistedPendingLocalDirtySliceSpec {
+                        block_index: segment.write.block_index,
+                        file_offset: segment.write.offset,
+                        len: segment.write.data.len(),
+                        seq: segment.write.seq,
+                        object_id,
+                        initial_object_offset: segment.object_offset,
+                    },
+                );
+            }
+        }
+        let mut seqs_by_block = HashMap::<u32, u64>::new();
+        for batch in &spill_batches {
+            for segment in &batch.segments {
+                seqs_by_block
+                    .entry(segment.write.block_index)
+                    .and_modify(|seq| *seq = (*seq).max(segment.write.seq))
+                    .or_insert(segment.write.seq);
+            }
+        }
+        self.state
+            .handle_writers
+            .mark_blocks_materialized(ino, &seqs_by_block);
+        Ok(true)
+    }
+
     fn select_completed_blocks_for_eager_materialization(
         &self,
         completed_block_indexes: &HashSet<u32>,
@@ -966,21 +1171,32 @@ impl StudioVfs {
         ino: Ino,
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<bool> {
-        let per_inode_dirty = self.state.handle_writers.dirty_bytes_for_inode(ino);
-        let total_dirty = self.state.handle_writers.total_dirty_bytes();
+        let mut per_inode_dirty = self.state.handle_writers.dirty_bytes_for_inode(ino);
+        let mut total_dirty = self.total_pending_write_buffer_bytes();
         let max_dirty = self.max_dirty_bytes();
-        let budget_exceeded = total_dirty > max_dirty;
+        let mut budget_exceeded = total_dirty > max_dirty;
         if per_inode_dirty == 0 && !budget_exceeded {
             return Ok(false);
+        }
+
+        let mut made_progress = false;
+        if per_inode_dirty > 0 && matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+            made_progress |= self
+                .spill_handle_writer_slices_for_inode(ino, local_sync_policy)
+                .await?;
+            per_inode_dirty = self.state.handle_writers.dirty_bytes_for_inode(ino);
+            total_dirty = self.total_pending_write_buffer_bytes();
+            budget_exceeded = total_dirty > max_dirty;
+            if per_inode_dirty == 0 && !budget_exceeded {
+                return Ok(made_progress);
+            }
         }
         if per_inode_dirty > 0
             && per_inode_dirty < self.write_eager_flush_batch_bytes
             && !budget_exceeded
         {
-            return Ok(false);
+            return Ok(made_progress);
         }
-
-        let mut made_progress = false;
         if per_inode_dirty > 0 && !budget_exceeded {
             made_progress |= self
                 .materialize_completed_handle_writer_blocks_for_inode(ino, local_sync_policy)
@@ -1024,7 +1240,7 @@ impl StudioVfs {
         // burst-then-stall pattern where a single write blocks on materializing every other
         // inode sequentially.
         let mut stall_iterations: u32 = 0;
-        while self.state.handle_writers.total_dirty_bytes() > max_dirty {
+        while self.total_pending_write_buffer_bytes() > max_dirty {
             let mut dirty_inodes = self.state.handle_writers.snapshot_dirty_inodes_by_bytes();
             dirty_inodes.sort_by_key(|(_, dirty_bytes)| std::cmp::Reverse(*dirty_bytes));
             if dirty_inodes.is_empty() {
@@ -1032,7 +1248,7 @@ impl StudioVfs {
             }
             let mut pass_made_progress = false;
             for (next_ino, _) in dirty_inodes {
-                if self.state.handle_writers.total_dirty_bytes() <= max_dirty {
+                if self.total_pending_write_buffer_bytes() <= max_dirty {
                     break;
                 }
                 let materialized = self
@@ -1070,7 +1286,7 @@ impl StudioVfs {
                     "made_progress": made_progress,
                     "stall_iterations": stall_iterations,
                     "per_inode_dirty_bytes_after": self.state.handle_writers.dirty_bytes_for_inode(ino),
-                    "total_dirty_bytes_after": self.state.handle_writers.total_dirty_bytes(),
+                    "total_dirty_bytes_after": self.total_pending_write_buffer_bytes(),
                     "max_dirty_bytes": max_dirty,
                     "dirty_inode_count_after": self.state.handle_writers.snapshot_dirty_inodes_by_bytes().len(),
                     "buffered_write_count_after": self.state.handle_writers.total_buffered_write_count(),
@@ -1100,11 +1316,6 @@ impl StudioVfs {
         } else {
             self.getattr_async(ino).await?.size
         };
-        let content_epoch = if let Some(attr) = dirty_attr.as_ref() {
-            attr.content_epoch
-        } else {
-            self.current_content_epoch_async(ino).await?
-        };
         let max_seq = writes
             .last()
             .map(|write| write.seq)
@@ -1126,6 +1337,24 @@ impl StudioVfs {
         if blocks.is_empty() {
             return Ok(false);
         }
+        if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+            let selected_block_indexes: std::collections::HashSet<u32> =
+                blocks.iter().map(|block| block.block_index).collect();
+            self.stage_dirty_write_snapshots(ino, blocks);
+            self.persist_staged_pending_local_blocks_to_local_extents(
+                ino,
+                &selected_block_indexes,
+                local_sync_policy,
+            )
+            .await?;
+            self.state.handle_writers.mark_materialized(ino, max_seq);
+            return Ok(true);
+        }
+        let content_epoch = if let Some(attr) = dirty_attr.as_ref() {
+            attr.content_epoch
+        } else {
+            self.current_content_epoch_async(ino).await?
+        };
         self.persist_dirty_write_snapshots_direct(
             ino,
             blocks,
@@ -1156,11 +1385,6 @@ impl StudioVfs {
             attr.size
         } else {
             self.getattr_async(ino).await?.size
-        };
-        let content_epoch = if let Some(attr) = dirty_attr.as_ref() {
-            attr.content_epoch
-        } else {
-            self.current_content_epoch_async(ino).await?
         };
         let mut completed_block_indexes = self
             .state
@@ -1216,8 +1440,7 @@ impl StudioVfs {
             .unwrap_or(false);
         let enough_completed_blocks =
             completed_block_indexes.len() >= self.payload_put_concurrency.max(2);
-        let budget_exceeded =
-            self.state.handle_writers.total_dirty_bytes() > self.max_dirty_bytes();
+        let budget_exceeded = self.total_pending_write_buffer_bytes() > self.max_dirty_bytes();
         let eager_single_full_block_accept = !current_write_full_block_indexes.is_empty()
             && visible_size <= u64::from(self.block_size);
         let should_materialize_now = matches!(local_sync_policy, LocalSyncPolicy::Strict)
@@ -1265,6 +1488,31 @@ impl StudioVfs {
         if completed_blocks.is_empty() {
             return Ok(false);
         }
+        if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+            let completed_block_indexes: std::collections::HashSet<u32> = completed_blocks
+                .iter()
+                .map(|block| block.block_index)
+                .collect();
+            self.stage_dirty_write_snapshots(ino, completed_blocks);
+            let should_persist_staged_now = enough_completed_blocks || budget_exceeded;
+            if should_persist_staged_now {
+                self.persist_staged_pending_local_blocks_to_local_extents(
+                    ino,
+                    &completed_block_indexes,
+                    local_sync_policy,
+                )
+                .await?;
+            }
+            self.state
+                .handle_writers
+                .mark_blocks_materialized(ino, &seqs_by_block);
+            return Ok(true);
+        }
+        let content_epoch = if let Some(attr) = dirty_attr.as_ref() {
+            attr.content_epoch
+        } else {
+            self.current_content_epoch_async(ino).await?
+        };
         let attr_to_persist = self
             .derive_opportunistic_prefix_attr(ino, dirty_attr.as_ref(), &completed_blocks)
             .await?;

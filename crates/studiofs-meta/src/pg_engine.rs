@@ -2353,7 +2353,9 @@ impl PgMetaEngine {
                 }
                 overlay.block_inodes.contains(ino)
             }
-            MetaEvent::CommitFileBlock { ino, .. } | MetaEvent::PublishFileManifest { ino, .. } => {
+            MetaEvent::CommitFileBlock { ino, .. }
+            | MetaEvent::PublishFileManifest { ino, .. }
+            | MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
                 overlay.block_inodes.contains(ino)
             }
             MetaEvent::SetSymlinkTarget { ino, .. } => {
@@ -2393,6 +2395,7 @@ impl PgMetaEngine {
             | MetaEvent::RemoveFileBlocks { .. }
             | MetaEvent::CommitFileBlock { .. }
             | MetaEvent::PublishFileManifest { .. }
+            | MetaEvent::PublishRegularFileBaseSlices { .. }
             | MetaEvent::SetSymlinkTarget { .. }
             | MetaEvent::SetXattr { .. }
             | MetaEvent::RemoveXattr { .. }
@@ -2498,6 +2501,7 @@ impl PgMetaEngine {
                 }
                 MetaEvent::SetFileBlock { ino, .. }
                 | MetaEvent::SetRegularFileOverlaySlices { ino, .. }
+                | MetaEvent::PublishRegularFileBaseSlices { ino, .. }
                 | MetaEvent::RemoveFileBlock { ino, .. }
                 | MetaEvent::RemoveFileBlocks { ino }
                 | MetaEvent::CommitFileBlock { ino, .. }
@@ -2604,6 +2608,7 @@ impl PgMetaEngine {
             }
             MetaEvent::SetFileBlock { .. }
             | MetaEvent::SetRegularFileOverlaySlices { .. }
+            | MetaEvent::PublishRegularFileBaseSlices { .. }
             | MetaEvent::RemoveFileBlock { .. }
             | MetaEvent::RemoveFileBlocks { .. }
             | MetaEvent::SetFileBlocksBatch { .. }
@@ -4216,6 +4221,16 @@ impl MetaBlocks for PgMetaEngine {
 
     fn get_regular_file_overlay_object_ids(&self, ino: Ino) -> MetaResult<Vec<u64>> {
         self.local.get_regular_file_overlay_object_ids(ino)
+    }
+
+    fn has_regular_file_overlay_object_if_matches(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_id: u64,
+    ) -> MetaResult<bool> {
+        self.local
+            .has_regular_file_overlay_object_if_matches(ino, expected_epoch, object_id)
     }
 
     fn mark_regular_file_overlay_object_uploaded_if_matches(

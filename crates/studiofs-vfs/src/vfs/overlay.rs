@@ -163,6 +163,9 @@ impl StudioVfs {
             .lock()
             .get(&(ino, block_index))
         {
+            if let Some(object_id) = pending_block.local_extent_id() {
+                return Some(PendingOverlayBlockSource::Extent(object_id));
+            }
             return Some(PendingOverlayBlockSource::Pending(
                 pending_block.data.clone().freeze(),
             ));

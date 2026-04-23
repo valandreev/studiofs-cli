@@ -47,6 +47,43 @@ impl StudioVfs {
         }
     }
 
+    pub(super) async fn background_local_dirty_flush(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(LOCAL_DIRTY_FLUSH_INTERVAL);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = self.state.shutdown.shutdown_notify.notified() => break,
+                _ = interval.tick() => {}
+            }
+            if self.shutdown_requested() {
+                break;
+            }
+            let dirty_inodes = self.snapshot_pending_local_dirty_inodes();
+            if dirty_inodes.is_empty() {
+                continue;
+            }
+            for ino in dirty_inodes {
+                if self.shutdown_requested() {
+                    break;
+                }
+                if !self.should_background_flush_pending_local_dirty_inode(ino) {
+                    continue;
+                }
+                if let Err(error) = self
+                    .flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
+                    .await
+                {
+                    warn!(
+                        ino,
+                        error = %error,
+                        "background local-dirty flush failed; will retry"
+                    );
+                }
+            }
+        }
+    }
+
     pub(super) async fn background_epoch_finalizer(self: Arc<Self>) {
         loop {
             let Some((ino, content_epoch)) = self.pop_epoch_finalization() else {

@@ -277,19 +277,17 @@ impl RedbMetaEngine {
             attr.ino,
         )?;
         let overlay_state = Self::overlay_lifecycle_state(overlay_chunks.values());
-        let base_manifest = Self::base_manifest_from_graph_rows_in_txn(txn, attr.ino)?;
-        let has_published_base = !base_manifest.is_empty()
-            || attr.committed_size > 0
-            || attr.committed_content_epoch > 0;
+        let has_published_base =
+            Self::has_regular_file_chunk_rows_in_write_txn(txn, REGULAR_FILE_BASE_TABLE, attr.ino)?
+                || attr.committed_size > 0
+                || attr.committed_content_epoch > 0;
         let (local_matches_published, blockless_manifest_ready) = if overlay_state.is_some() {
             (false, false)
         } else {
-            let current_manifest = Self::current_manifest_in_txn(txn, attr.ino)?;
             (
                 attr.size == attr.committed_size
-                    && attr.content_epoch == attr.committed_content_epoch
-                    && current_manifest == base_manifest,
-                current_manifest.is_empty(),
+                    && attr.content_epoch == attr.committed_content_epoch,
+                attr.size == 0 && attr.content_epoch != attr.committed_content_epoch,
             )
         };
         let (state, retention) = Self::derive_inode_lifecycle_state_and_retention(
@@ -330,20 +328,18 @@ impl RedbMetaEngine {
             REGULAR_FILE_OVERLAY_TABLE,
             attr.ino,
         )?;
-        let base_manifest = Self::base_manifest_from_graph_rows_in_txn(txn, attr.ino)?;
-        let has_published_base = !base_manifest.is_empty()
-            || attr.committed_size > 0
-            || attr.committed_content_epoch > 0;
+        let has_published_base =
+            Self::has_regular_file_chunk_rows_in_write_txn(txn, REGULAR_FILE_BASE_TABLE, attr.ino)?
+                || attr.committed_size > 0
+                || attr.committed_content_epoch > 0;
         let overlay_state = Self::overlay_lifecycle_state(overlay_chunks.values());
         let (local_matches_published, blockless_manifest_ready) = if overlay_state.is_some() {
             (false, false)
         } else {
-            let current_manifest = Self::current_manifest_in_txn(txn, attr.ino)?;
             (
                 attr.size == attr.committed_size
-                    && attr.content_epoch == attr.committed_content_epoch
-                    && current_manifest == base_manifest,
-                current_manifest.is_empty(),
+                    && attr.content_epoch == attr.committed_content_epoch,
+                attr.size == 0 && attr.content_epoch != attr.committed_content_epoch,
             )
         };
         let (state, retention) = Self::derive_inode_lifecycle_state_and_retention(

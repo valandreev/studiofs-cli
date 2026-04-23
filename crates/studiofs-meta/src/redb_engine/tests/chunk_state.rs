@@ -1115,6 +1115,49 @@ fn test_publish_regular_file_overlay_to_base_keeps_sparse_tail_committed_size_be
 }
 
 #[test]
+fn test_publish_regular_file_overlay_to_base_accepts_fragmented_block_graph() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"publish-fragmented-slices.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.content_epoch = 9;
+    attr.size = 8192;
+    engine.set_attr(&attr).unwrap();
+
+    let chunk_id = ChunkId(0);
+    let incoming = vec![
+        SliceRecord::new(
+            SliceId(1),
+            SliceOrder(1),
+            SliceRange::new(0, 4096).unwrap(),
+            BlockRef::new_partial(4_201, 4096),
+        ),
+        SliceRecord::new(
+            SliceId(2),
+            SliceOrder(2),
+            SliceRange::new(4096, 8192).unwrap(),
+            BlockRef::new_partial(4_202, 4096),
+        ),
+    ];
+    engine
+        .flush_regular_file_overlay_slices(file.ino, &[(chunk_id, incoming)])
+        .unwrap();
+
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 9)
+            .unwrap(),
+        "slice-native publish should not require block-manifest synthesis"
+    );
+
+    let published_attr = engine.get_attr(file.ino).unwrap();
+    assert_eq!(published_attr.upload_state, UploadState::Ready);
+    assert_eq!(published_attr.committed_content_epoch, 9);
+    assert_eq!(published_attr.committed_size, 8192);
+}
+
+#[test]
 fn test_compute_committed_size_prefers_regular_file_base_rows() {
     let engine = temp_engine();
 

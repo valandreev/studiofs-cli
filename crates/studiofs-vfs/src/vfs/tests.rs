@@ -879,7 +879,7 @@ fn zeroio_snapshot_reports_delete_before_publish_cleanup_visibility() {
 #[test]
 fn epoch_finalizer_publishes_manifest_backed_zero_length_epoch() {
     let tmp = TempDir::new().expect("tempdir");
-    let (rt, vfs, meta) = make_test_vfs(&tmp, "manifest-finalizer-zero-length");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "manifest-finalizer-zero-length");
     let _guard = rt.enter();
 
     rt.block_on(async {
@@ -968,7 +968,7 @@ fn epoch_finalizer_publishes_manifest_backed_zero_length_epoch() {
 #[test]
 fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
     let tmp = TempDir::new().expect("tempdir");
-    let (rt, vfs, meta) = make_test_vfs(&tmp, "manifest-finalizer-buffered-tail");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "manifest-finalizer-buffered-tail");
     let _guard = rt.enter();
 
     rt.block_on(async {
@@ -980,25 +980,54 @@ fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
             .open_file(ino, OpenFlags::RDWR, false)
             .expect("open writable handle");
         let block_size = vfs.block_size as usize;
-        let mut payload = vec![0x41u8; block_size];
-        payload.extend_from_slice(&vec![0x42u8; block_size / 8]);
+        let full_block = vec![0x41u8; block_size];
+        let tail = vec![0x42u8; block_size / 8];
 
-        vfs.write_fh_with_local_sync_policy(fh, ino, 0, &payload, LocalSyncPolicy::Opportunistic)
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            0,
+            &full_block,
+            LocalSyncPolicy::Opportunistic,
+        )
             .await
-            .expect("buffer full block plus partial tail");
+            .expect("stage the initial full-block epoch");
+        vfs.flush_fh(fh)
+            .await
+            .expect("flush the initial full block into durable unpublished metadata");
 
         assert_eq!(
             meta.get_file_blocks(ino)
-                .expect("load materialized file blocks")
+                .expect("load flushed file blocks")
                 .len(),
             1,
-            "setup should materialize only the completed full block"
+            "setup should create a publishable durable prefix before buffering a newer tail"
+        );
+
+        let (content_epoch, _blocks) = mark_all_file_blocks_uploaded(&vfs, &meta, ino);
+
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            block_size as u64,
+            &tail,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("buffer a newer partial tail without flushing it");
+
+        assert_eq!(
+            meta.get_file_blocks(ino)
+                .expect("load durable file blocks")
+                .len(),
+            1,
+            "the newer tail should remain buffered and must not rewrite the durable prefix yet"
         );
         let unpublished_attr = meta.get_attr(ino).expect("load unpublished attr");
         assert_eq!(
             unpublished_attr.size,
             block_size as u64,
-            "durable metadata should still reflect only the completed block prefix"
+            "durable metadata should still reflect only the older flushed epoch while the newer tail is buffered"
         );
         let dirty_attr = vfs
             .state
@@ -1010,7 +1039,7 @@ fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
             .expect("dirty attr should preserve the buffered tail");
         assert_eq!(
             dirty_attr.size,
-            payload.len() as u64,
+            (block_size + tail.len()) as u64,
             "dirty attr should keep the full visible EOF while the tail is still buffered"
         );
         assert!(
@@ -1019,10 +1048,9 @@ fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
         );
         assert!(
             !vfs.has_pending_local_dirty_blocks_for_inode(ino),
-            "setup should isolate the regression to handle-writer state, not local_dirty blocks"
+            "setup should isolate the regression to a buffered handle-writer tail, not staged local_dirty blocks"
         );
 
-        let (content_epoch, _blocks) = mark_all_file_blocks_uploaded(&vfs, &meta, ino);
         let status =
             super::commit::CommitCoordinator::finalize_inode_epoch(&vfs, ino, content_epoch)
                 .await
@@ -1048,7 +1076,7 @@ fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
             .expect("dirty attr should survive deferred finalize");
         assert_eq!(
             dirty_attr_after.size,
-            payload.len() as u64,
+            (block_size + tail.len()) as u64,
             "deferred finalize must preserve the larger visible EOF staged in dirty attrs"
         );
 
@@ -1059,7 +1087,7 @@ fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
 #[test]
 fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
     let tmp = TempDir::new().expect("tempdir");
-    let (rt, vfs, meta) = make_test_vfs(&tmp, "manifest-finalizer-inflight");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "manifest-finalizer-inflight");
     let _guard = rt.enter();
 
     rt.block_on(async {
@@ -1146,7 +1174,8 @@ fn manifest_finalizer_visibility_timeout_does_not_requeue_uploaded_blocks() {
         publish_visibility_timeout_secs: 1,
         ..VfsConfig::default()
     };
-    let (rt, vfs, meta) = make_test_vfs_with_config(&tmp, "manifest-finalizer-no-requeue", cfg);
+    let (rt, vfs, meta) =
+        make_unstarted_test_vfs_with_config(&tmp, "manifest-finalizer-no-requeue", cfg);
     let _guard = rt.enter();
 
     rt.block_on(async {
@@ -2581,7 +2610,7 @@ fn write_fh_default_buffers_partial_state_until_flush() {
 #[test]
 fn write_fh_buffers_partial_tail_after_full_block_boundary_until_flush() {
     let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-257-write-fh-full-block-plus-tail");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-257-write-fh-full-block-plus-tail");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
@@ -2597,19 +2626,21 @@ fn write_fh_buffers_partial_tail_after_full_block_boundary_until_flush() {
 
         assert_eq!(
             meta.get_file_blocks(ino).unwrap().len(),
-            1,
-            "buffered handle writes should eagerly accept the completed full block but keep the tail buffered until flush"
+            0,
+            "stage-first opportunistic writes should keep the completed full block in local staging until a background or explicit flush commits metadata"
         );
         assert!(
             vfs.inode_has_dirty_handle_writers(ino) || vfs.has_pending_local_dirty_blocks_for_inode(ino),
             "the partial tail should remain buffered after the full-block prefix is accepted"
         );
-        let persisted_attr = meta.get_attr(ino).unwrap();
+        let visible_attr = vfs.getattr_unchecked(ino).unwrap();
         assert_eq!(
-            persisted_attr.size,
-            block_size as u64,
-            "durable local metadata should advance to the accepted full-block prefix before flush drains the buffered tail"
+            visible_attr.size,
+            payload.len() as u64,
+            "read-visible inode size should advance immediately even when the full-block prefix is only staged locally"
         );
+        let buffered = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(buffered.as_ref(), payload.as_slice());
 
         vfs.flush_fh(fh).await.unwrap();
 
@@ -2659,7 +2690,8 @@ fn write_fh_full_block_callbacks_can_form_multi_block_payload_bursts() {
     let snapshot = vfs.write_path_observability_snapshot();
     assert!(
         snapshot.payload_burst.max_blocks_per_burst >= 2,
-        "buffered handle-write full blocks should be able to persist as a multi-block burst instead of one block at a time"
+        "buffered handle-write full blocks should be able to persist as a multi-block burst instead of one block at a time: {:?}",
+        snapshot.payload_burst
     );
 }
 
@@ -2670,7 +2702,8 @@ fn opportunistic_completed_handle_writer_materialization_caps_burst_to_drain_chu
         write_eager_flush_batch_bytes: 16 * 1024 * 1024,
         ..VfsConfig::default()
     };
-    let (rt, vfs, meta) = make_test_vfs_with_config(&tmp, "sfs-257-write-fh-capped-burst", cfg);
+    let (rt, vfs, meta) =
+        make_unstarted_test_vfs_with_config(&tmp, "sfs-257-write-fh-capped-burst", cfg);
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
@@ -2683,7 +2716,9 @@ fn opportunistic_completed_handle_writer_materialization_caps_burst_to_drain_chu
         let second = vec![0x22; block_size];
         let third = vec![0x33; block_size];
 
-        vfs.record_handle_writer_state(fh, ino, 0, &first).await.unwrap();
+        vfs.record_handle_writer_state(fh, ino, 0, &first)
+            .await
+            .unwrap();
         vfs.record_handle_writer_state(fh, ino, block_size as u64, &second)
             .await
             .unwrap();
@@ -2698,17 +2733,188 @@ fn opportunistic_completed_handle_writer_materialization_caps_burst_to_drain_chu
             )
             .await
             .unwrap(),
-            "opportunistic materialization should persist at least one capped burst"
+            "opportunistic materialization should stage at least one capped burst"
         );
         assert_eq!(
             meta.get_file_blocks(ino).unwrap().len(),
-            2,
-            "one opportunistic pass should respect the eager drain chunk cap instead of draining every completed full block"
+            0,
+            "completed blocks should stay in local staging until a later flush commits metadata"
+        );
+        assert_eq!(
+            vfs.total_pending_local_dirty_bytes(),
+            0,
+            "completed full blocks should be spilled out of hot RAM once their payload is durably staged locally"
+        );
+        assert!(
+            vfs.has_pending_local_dirty_blocks_for_inode(ino),
+            "payload-staged blocks should remain visible as pending local extents until metadata commit catches up"
         );
         assert_eq!(
             vfs.state.handle_writers.dirty_bytes_for_inode(ino),
             block_size,
             "the final completed block should stay buffered for the next opportunistic pass"
+        );
+        let read = vfs.read(ino, 0, (block_size * 3) as u32).await.unwrap();
+        assert_eq!(&read[..block_size], first.as_slice());
+        assert_eq!(&read[block_size..block_size * 2], second.as_slice());
+        assert_eq!(&read[block_size * 2..], third.as_slice());
+
+        vfs.flush_fh(fh).await.unwrap();
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn opportunistic_handle_writer_slice_spill_batches_adjacent_callbacks_into_single_object() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-257-write-fh-slice-batch");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-257-write-fh-slice-batch.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let slice_bytes = 2 * 1024 * 1024usize;
+
+        let first = vec![0x11; slice_bytes];
+        let second = vec![0x22; slice_bytes];
+        let third = vec![0x33; slice_bytes];
+
+        vfs.record_handle_writer_state(fh, ino, 0, &first)
+            .await
+            .unwrap();
+        vfs.record_handle_writer_state(fh, ino, slice_bytes as u64, &second)
+            .await
+            .unwrap();
+        vfs.record_handle_writer_state(fh, ino, (slice_bytes * 2) as u64, &third)
+            .await
+            .unwrap();
+
+        assert!(
+            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
+                .await
+                .unwrap(),
+            "three sequential 2 MiB callbacks should spill the first 4 MiB as one staged slice object"
+        );
+
+        let dirty_object_ids = vfs.local_block_backend().dirty_object_ids();
+        assert_eq!(
+            dirty_object_ids.len(),
+            1,
+            "adjacent slice spill should batch the first two callbacks into one staged object"
+        );
+        let staged = vfs
+            .local_block_backend()
+            .get(dirty_object_ids[0])
+            .expect("staged slice payload should be readable locally");
+        assert_eq!(
+            staged.len(),
+            slice_bytes * 2,
+            "the staged slice object should carry a full 4 MiB batch instead of a single callback"
+        );
+        assert_eq!(
+            vfs.state.handle_writers.dirty_bytes_for_inode(ino),
+            slice_bytes,
+            "the newest callback should remain buffered as the active tail slice"
+        );
+
+        let read = vfs.read(ino, 0, (slice_bytes * 3) as u32).await.unwrap();
+        assert_eq!(&read[..slice_bytes], first.as_slice());
+        assert_eq!(&read[slice_bytes..slice_bytes * 2], second.as_slice());
+        assert_eq!(&read[slice_bytes * 2..], third.as_slice());
+
+        vfs.flush_fh(fh).await.unwrap();
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn opportunistic_handle_writer_slice_spill_drains_multiple_4mib_batches_per_pass() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-257-write-fh-slice-multi-batch");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-257-write-fh-slice-multi-batch.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let slice_bytes = 2 * 1024 * 1024usize;
+
+        for index in 0..9u64 {
+            let payload = vec![0x40u8.saturating_add(index as u8); slice_bytes];
+            vfs.record_handle_writer_state(fh, ino, index * slice_bytes as u64, &payload)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
+                .await
+                .unwrap(),
+            "a single opportunistic drain pass should spill multiple 4 MiB batches when enough old callbacks are queued"
+        );
+
+        let dirty_object_ids = vfs.local_block_backend().dirty_object_ids();
+        assert_eq!(
+            dirty_object_ids.len(),
+            4,
+            "eight older 2 MiB callbacks should become four staged 4 MiB slice objects in one pass"
+        );
+        for object_id in dirty_object_ids {
+            let staged = vfs
+                .local_block_backend()
+                .get(object_id)
+                .expect("staged slice payload should be readable locally");
+            assert_eq!(staged.len(), 4 * 1024 * 1024);
+        }
+        assert_eq!(
+            vfs.state.handle_writers.dirty_bytes_for_inode(ino),
+            slice_bytes,
+            "the newest callback should remain buffered as the active tail slice"
+        );
+
+        vfs.flush_fh(fh).await.unwrap();
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn background_flush_defers_active_persisted_slice_batches_until_commit_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-257-background-flush-defers-slices");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-257-background-flush-defers-slices.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let slice_bytes = 2 * 1024 * 1024usize;
+
+        for index in 0..3u64 {
+            let payload = vec![0x70u8.saturating_add(index as u8); slice_bytes];
+            vfs.record_handle_writer_state(fh, ino, index * slice_bytes as u64, &payload)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
+                .await
+                .unwrap(),
+            "first opportunistic spill should stage the older 4 MiB batch"
+        );
+
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            4 * 1024 * 1024,
+            "the first spilled slice batch should remain locally staged"
+        );
+        assert!(
+            !vfs.should_background_flush_pending_local_dirty_inode(ino),
+            "background local-dirty flush should not immediately commit staged slices while the file still has an active dirty tail"
         );
 
         vfs.flush_fh(fh).await.unwrap();
@@ -2719,7 +2925,7 @@ fn opportunistic_completed_handle_writer_materialization_caps_burst_to_drain_chu
 #[test]
 fn write_fh_aligned_full_block_callback_is_accepted_immediately() {
     let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-257-write-fh-aligned-full-block");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-257-write-fh-aligned-full-block");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
@@ -2734,15 +2940,28 @@ fn write_fh_aligned_full_block_callback_is_accepted_immediately() {
 
         assert_eq!(
             meta.get_file_blocks(ino).unwrap().len(),
-            1,
-            "aligned full-block callbacks should be durably accepted immediately instead of waiting for a large burst threshold"
+            0,
+            "aligned full-block callbacks should be staged immediately instead of forcing inline metadata commits"
         );
 
-        let persisted_attr = meta.get_attr(ino).unwrap();
+        assert!(
+            vfs.has_pending_local_dirty_blocks_for_inode(ino),
+            "aligned full-block callbacks should land in local dirty staging right away"
+        );
+        let visible_attr = vfs.getattr_unchecked(ino).unwrap();
         assert_eq!(
-            persisted_attr.size,
+            visible_attr.size,
             block_size as u64,
-            "durable local metadata should advance with the aligned full-block accept"
+            "read-visible size should advance with the staged full-block accept"
+        );
+        let read = vfs.read(ino, 0, block_size as u32).await.unwrap();
+        assert_eq!(read.as_ref(), payload.as_slice());
+
+        vfs.flush_fh(fh).await.unwrap();
+        assert_eq!(
+            meta.get_file_blocks(ino).unwrap().len(),
+            1,
+            "flush should durably materialize the staged full block"
         );
 
         vfs.release_fh(fh).await.unwrap();
@@ -2806,7 +3025,8 @@ fn write_fh_sub_block_callbacks_batch_completed_blocks_until_flush() {
     let snapshot = vfs.write_path_observability_snapshot();
     assert!(
         snapshot.payload_burst.max_blocks_per_burst >= 2,
-        "sub-block sequential callbacks should be able to flush as a multi-block payload burst"
+        "sub-block sequential callbacks should be able to flush as a multi-block payload burst: {:?}",
+        snapshot.payload_burst
     );
 }
 

@@ -58,8 +58,17 @@ impl UploadStageStore {
         match fs::hard_link(&payload_path, &stage_path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if stage_path.try_exists().unwrap_or(false) {
+                    return Ok(());
+                }
                 let _ = fs::remove_file(&stage_path);
-                fs::hard_link(&payload_path, &stage_path).map_err(UploadStageStoreError::Io)
+                match fs::hard_link(&payload_path, &stage_path) {
+                    Ok(()) => Ok(()),
+                    Err(retry_error) if retry_error.kind() == io::ErrorKind::AlreadyExists => {
+                        Ok(())
+                    }
+                    Err(retry_error) => Err(UploadStageStoreError::Io(retry_error)),
+                }
             }
             Err(error) => Err(UploadStageStoreError::Io(error)),
         }
@@ -121,5 +130,23 @@ mod tests {
             b"payload",
             "removing the upload hardlink must keep the durable payload file intact"
         );
+    }
+
+    #[test]
+    fn upload_stage_link_payload_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let layout = LocalBlockLayout::from_cache_root(tmp.path());
+        layout.provision().expect("provision");
+        let payload_store = FilePayloadStore::open(layout.clone()).expect("payload store");
+        let store = UploadStageStore::open(layout).expect("open");
+
+        payload_store.put(0x99, b"payload").expect("put payload");
+        store.link_payload(0x99).expect("first link");
+        store
+            .link_payload(0x99)
+            .expect("second link should be a no-op");
+
+        assert!(store.contains(0x99));
+        assert_eq!(store.get(0x99).unwrap().as_ref(), b"payload");
     }
 }

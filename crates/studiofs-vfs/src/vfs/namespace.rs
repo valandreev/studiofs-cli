@@ -1448,6 +1448,7 @@ mod tests {
                 data: BytesMut::from(&b"local"[..]),
                 dirty: true,
                 reserved_object_id: None,
+                persisted_len: None,
             },
         );
 

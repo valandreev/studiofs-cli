@@ -242,6 +242,36 @@ impl<'a> DataReader<'a> {
             }
         }
 
+        let pending_block_spans =
+            vfs.snapshot_pending_local_dirty_block_read_spans(ino, offset, length);
+        for dirty in pending_block_spans {
+            if unresolved.is_empty() {
+                break;
+            }
+            let dirty_range = ReadRange {
+                start: dirty.start,
+                end: dirty.end,
+            };
+            let (next_unresolved, claimed) = Self::claim_unresolved_ranges(unresolved, dirty_range);
+            unresolved = next_unresolved;
+            for overlap in claimed {
+                let delta = overlap.start.saturating_sub(dirty.start);
+                let Some(delta_u32) = u32::try_from(delta).ok() else {
+                    continue;
+                };
+                let Some(block_offset) = dirty.block_offset.checked_add(delta_u32) else {
+                    continue;
+                };
+                segments.push(ReadSegment {
+                    range: overlap,
+                    source: ReadSegmentSource::Dirty {
+                        data: dirty.data.clone(),
+                        block_offset: u64::from(block_offset),
+                    },
+                });
+            }
+        }
+
         if !unresolved.is_empty() {
             let mut candidate_blocks = BTreeSet::new();
             for range in &unresolved {
@@ -1658,6 +1688,7 @@ mod tests {
                     data: BytesMut::from(&b"stale"[..]),
                     dirty: true,
                     reserved_object_id: None,
+                    persisted_len: None,
                 },
             );
             vfs.state
@@ -1716,6 +1747,7 @@ mod tests {
                 data: BytesMut::from(&b"stale"[..]),
                 dirty: true,
                 reserved_object_id: None,
+                persisted_len: None,
             },
         );
         vfs.state

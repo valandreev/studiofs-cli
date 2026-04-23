@@ -622,6 +622,23 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
         Ok(ids.into_iter().collect())
     }
 
+    /// Return `true` when `object_id` is still referenced by the inode's local
+    /// regular-file overlay for `expected_epoch`.
+    ///
+    /// Slice-native regular-file writes can keep multiple immutable objects for
+    /// one logical block. Upload workers use this check to decide whether an
+    /// uploaded object still belongs to the current unpublished epoch without
+    /// forcing the overlay graph through legacy single-`BlockRef` synthesis.
+    fn has_regular_file_overlay_object_if_matches(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_id: u64,
+    ) -> MetaResult<bool> {
+        let _ = (ino, expected_epoch, object_id);
+        Ok(false)
+    }
+
     /// Mark a still-referenced overlay object as remote-visible for the current
     /// unpublished epoch, even when its logical block is represented by
     /// multiple slice records and cannot be synthesized into a single
