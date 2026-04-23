@@ -224,6 +224,56 @@ fn test_file_block_overwrite_returns_old() {
 }
 
 #[test]
+fn test_set_file_block_overwrites_fragmented_block_without_error() {
+    let engine = temp_engine();
+
+    let attr = engine
+        .create_file(ROOT_INO, b"set-over-fragmented.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let ino = attr.ino;
+
+    engine
+        .flush_regular_file_overlay_slices(
+            ino,
+            &[(
+                ChunkId(0),
+                vec![
+                    SliceRecord {
+                        slice_id: SliceId(0),
+                        order: SliceOrder(0),
+                        range: SliceRange::new(0, 4096).unwrap(),
+                        block: Some(BlockRef::new_partial(101, 4096)),
+                        block_state: BlockRefState::LocalOnly,
+                    },
+                    SliceRecord {
+                        slice_id: SliceId(0),
+                        order: SliceOrder(0),
+                        range: SliceRange::new(4096, 8192).unwrap(),
+                        block: Some(BlockRef::new_partial(102, 4096)),
+                        block_state: BlockRefState::LocalOnly,
+                    },
+                ],
+            )],
+        )
+        .unwrap();
+    assert!(matches!(
+        engine.get_file_block(ino, 0),
+        Err(MetaError::FragmentedBlock { .. })
+    ));
+
+    let replacement = BlockRef::new_full(103, DEFAULT_BLOCK_SIZE);
+    let old = engine.set_file_block(ino, 0, &replacement).unwrap();
+    assert!(
+        old.is_none(),
+        "fragmented old data cannot be represented as a legacy BlockRef"
+    );
+    assert_eq!(
+        engine.get_file_block(ino, 0).unwrap().unwrap().object_id,
+        replacement.object_id
+    );
+}
+
+#[test]
 fn test_partial_block_overwrite_hides_old_tail() {
     let engine = temp_engine();
 
@@ -509,6 +559,52 @@ fn test_remove_file_block_updates_regular_file_graph() {
         engine.get_file_block(ino, 1).unwrap().unwrap().object_id,
         32
     );
+}
+
+#[test]
+fn test_remove_file_block_tombstones_fragmented_block_without_error() {
+    let engine = temp_engine();
+
+    let attr = engine
+        .create_file(ROOT_INO, b"remove-fragmented.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let ino = attr.ino;
+
+    engine
+        .flush_regular_file_overlay_slices(
+            ino,
+            &[(
+                ChunkId(0),
+                vec![
+                    SliceRecord {
+                        slice_id: SliceId(0),
+                        order: SliceOrder(0),
+                        range: SliceRange::new(0, 4096).unwrap(),
+                        block: Some(BlockRef::new_partial(201, 4096)),
+                        block_state: BlockRefState::LocalOnly,
+                    },
+                    SliceRecord {
+                        slice_id: SliceId(0),
+                        order: SliceOrder(0),
+                        range: SliceRange::new(4096, 8192).unwrap(),
+                        block: Some(BlockRef::new_partial(202, 4096)),
+                        block_state: BlockRefState::LocalOnly,
+                    },
+                ],
+            )],
+        )
+        .unwrap();
+    assert!(matches!(
+        engine.get_file_block(ino, 0),
+        Err(MetaError::FragmentedBlock { .. })
+    ));
+
+    let removed = engine.remove_file_block(ino, 0).unwrap();
+    assert!(
+        removed.is_none(),
+        "fragmented removed data cannot be represented as a single legacy object id"
+    );
+    assert!(engine.get_file_block(ino, 0).unwrap().is_none());
 }
 
 #[test]

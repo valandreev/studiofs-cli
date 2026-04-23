@@ -51,7 +51,11 @@ impl MetaBlocks for RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         let old_block;
         {
-            old_block = Self::current_block_in_txn(&txn, ino, block_index, block_size)?;
+            old_block = match Self::current_block_in_txn(&txn, ino, block_index, block_size) {
+                Ok(old_block) => old_block,
+                Err(MetaError::FragmentedBlock { .. }) => None,
+                Err(err) => return Err(err),
+            };
             let chunk_slices = Self::chunk_slices_for_block(
                 block_index,
                 block_size,
@@ -259,14 +263,51 @@ impl MetaBlocks for RedbMetaEngine {
         let removed_id;
         let mut updated_attr: Option<InodeAttr> = None;
         {
-            let current_block = Self::current_block_in_txn(&txn, ino, block_index, block_size)?;
-            let base_block = Self::base_block_in_txn(&txn, ino, block_index, block_size)?;
+            let block_start = u64::from(block_index).saturating_mul(u64::from(block_size));
+            let current_spans = Self::lookup_regular_file_slices_in_write_txn(
+                &txn,
+                ino,
+                block_start,
+                u64::from(block_size),
+                true,
+                true,
+            )?;
+            let base_spans = Self::lookup_regular_file_slices_in_write_txn(
+                &txn,
+                ino,
+                block_start,
+                u64::from(block_size),
+                false,
+                true,
+            )?;
+            let current_has_data = current_spans.iter().any(|span| span.block.is_some());
+            let base_has_data = base_spans.iter().any(|span| span.block.is_some());
+            let current_block = match Self::synthesize_block_ref_from_resolved_spans(
+                ino,
+                current_spans.as_slice(),
+                block_index,
+                block_size,
+            ) {
+                Ok(current_block) => current_block,
+                Err(MetaError::FragmentedBlock { .. }) => None,
+                Err(err) => return Err(err),
+            };
+            let base_block = match Self::synthesize_block_ref_from_resolved_spans(
+                ino,
+                base_spans.as_slice(),
+                block_index,
+                block_size,
+            ) {
+                Ok(base_block) => base_block,
+                Err(MetaError::FragmentedBlock { .. }) => None,
+                Err(err) => return Err(err),
+            };
             removed_id = current_block
                 .as_ref()
                 .map(|block| block.object_id)
                 .or(base_block.as_ref().map(|block| block.object_id));
 
-            if current_block.is_some() || base_block.is_some() {
+            if current_has_data {
                 let overlay_tombstones = Self::chunk_slices_for_block(
                     block_index,
                     block_size,
@@ -281,7 +322,7 @@ impl MetaBlocks for RedbMetaEngine {
                     true,
                 )?;
             }
-            if base_block.is_some() {
+            if base_has_data {
                 let base_tombstones = Self::chunk_slices_for_block(
                     block_index,
                     block_size,
@@ -297,7 +338,7 @@ impl MetaBlocks for RedbMetaEngine {
                 )?;
             }
 
-            if removed_id.is_some() {
+            if current_has_data || base_has_data {
                 let new_committed_size =
                     Self::regular_file_committed_size_in_txn(&txn, ino)?.unwrap_or(0);
                 let inodes = txn
