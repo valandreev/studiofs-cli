@@ -44,18 +44,18 @@ fn cleanup_stale_mounts() -> Result<()> {
     let mounts_dir = super::super::utils::get_mounts_dir()?;
     cleanup_stale_mounts_in(
         &mounts_dir,
-        super::super::utils::is_process_running,
+        super::super::utils::mount_is_active,
         super::super::utils::remove_pid_file,
     )
 }
 
 fn cleanup_stale_mounts_in<F, R>(
     mounts_dir: &Path,
-    is_process_running: F,
+    is_mount_active: F,
     mut remove_pid_file: R,
 ) -> Result<()>
 where
-    F: Fn(u32) -> bool,
+    F: Fn(&str) -> Result<bool>,
     R: FnMut(&str) -> Result<()>,
 {
     for entry in std::fs::read_dir(mounts_dir)
@@ -70,7 +70,7 @@ where
             std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let parsed: serde_json::Value =
             serde_json::from_str(&content).with_context(|| format!("parse {}", path.display()))?;
-        let Some(pid) = parsed.get("pid").and_then(serde_json::Value::as_u64) else {
+        let Some(_pid) = parsed.get("pid").and_then(serde_json::Value::as_u64) else {
             continue;
         };
         let Some(mount_point) = parsed
@@ -79,7 +79,7 @@ where
         else {
             continue;
         };
-        if !is_process_running(pid as u32) {
+        if !is_mount_active(mount_point)? {
             let _ = remove_pid_file(mount_point);
         }
     }
@@ -101,12 +101,12 @@ fn is_path_under_mount(target: &Path, mount_point: &Path) -> bool {
 
 fn active_mounts() -> Result<Vec<ActiveMount>> {
     let mounts_dir = super::super::utils::get_mounts_dir()?;
-    active_mounts_in(&mounts_dir, super::super::utils::is_process_running)
+    active_mounts_in(&mounts_dir, super::super::utils::mount_is_active)
 }
 
-fn active_mounts_in<F>(mounts_dir: &Path, is_process_running: F) -> Result<Vec<ActiveMount>>
+fn active_mounts_in<F>(mounts_dir: &Path, is_mount_active: F) -> Result<Vec<ActiveMount>>
 where
-    F: Fn(u32) -> bool,
+    F: Fn(&str) -> Result<bool>,
 {
     let mut mounts = Vec::new();
     for entry in std::fs::read_dir(mounts_dir)
@@ -138,7 +138,7 @@ where
             .get("cache_path")
             .and_then(serde_json::Value::as_str)
             .map(PathBuf::from);
-        if !is_process_running(pid as u32) {
+        if !is_mount_active(mount_point)? {
             continue;
         }
         mounts.push(ActiveMount {
@@ -263,7 +263,7 @@ mod tests {
         let removed = std::cell::RefCell::new(Vec::new());
         cleanup_stale_mounts_in(
             temp.path(),
-            |pid| pid == 42,
+            |mount_point| Ok(mount_point == "/mnt/live"),
             |mount_point| {
                 removed.borrow_mut().push(mount_point.to_string());
                 Ok(())
@@ -294,7 +294,8 @@ mod tests {
             Some("/cache/dead"),
         );
 
-        let mounts = active_mounts_in(temp.path(), |pid| pid == 77).unwrap();
+        let mounts =
+            active_mounts_in(temp.path(), |mount_point| Ok(mount_point == "/mnt/live")).unwrap();
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].pid, 77);
         assert_eq!(mounts[0].mount_point, PathBuf::from("/mnt/live"));

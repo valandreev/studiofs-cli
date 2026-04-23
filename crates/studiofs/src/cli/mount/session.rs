@@ -35,6 +35,8 @@ use tokio::runtime::Runtime;
 use tracing::{debug, info, warn};
 
 const WRITE_PATH_OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(1);
+const DAEMON_RECORD_PUBLISH_TIMEOUT: Duration = Duration::from_secs(15);
+const DAEMON_RECORD_PUBLISH_POLL_INTERVAL: Duration = Duration::from_millis(50);
 type MountProfileFinish = Box<dyn FnMut()>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +86,7 @@ struct PreparedMount {
     format_info: Option<FormatInfo>,
     snapshot_mount_db_path: Option<PathBuf>,
     foreground: Option<PreparedForegroundRuntime>,
+    mount_lock: Option<utils::MountLockGuard>,
 }
 
 pub(crate) struct MountSession {
@@ -923,15 +926,17 @@ impl MountPlan {
         Factory: FnOnce() -> Box<dyn MountBackend>,
     {
         if matches!(self.launch_mode, MountLaunchMode::Daemon) {
+            guard_mount_pid_file(&self.actual_mount_path)?;
             return Ok(PreparedMount {
                 plan: self,
                 format_info: None,
                 snapshot_mount_db_path: None,
                 foreground: None,
+                mount_lock: None,
             });
         }
 
-        guard_mount_pid_file(&self.actual_mount_path)?;
+        let mount_lock = acquire_mount_lock(&self.actual_mount_path)?;
 
         let MountMetaSession {
             meta,
@@ -1025,6 +1030,7 @@ impl MountPlan {
                 format_info: Some(format_info),
                 snapshot_mount_db_path: snapshot_db_path,
                 foreground: Some(foreground),
+                mount_lock: Some(mount_lock),
             }),
             Err(error) => {
                 cleanup_snapshot_mount_db(snapshot_db_path.as_deref());
@@ -1035,13 +1041,15 @@ impl MountPlan {
 }
 
 impl PreparedMount {
-    fn launch(self) -> anyhow::Result<()> {
+    fn launch(mut self) -> anyhow::Result<()> {
         if matches!(self.plan.launch_mode, MountLaunchMode::Daemon) {
-            return spawn_daemon(
+            let result = spawn_daemon(
                 &self.plan.command.name,
                 &self.plan.actual_mount_path,
                 &self.plan.command.meta_dir,
             );
+            drop(self.mount_lock.take());
+            return result;
         }
 
         self.print_ready();
@@ -1076,13 +1084,14 @@ impl PreparedMount {
             .foreground
             .as_ref()
             .expect("foreground mount sessions must prepare runtime");
-        persist_mount_pid_file_best_effort_with(
-            &self.plan.actual_mount_path,
-            &self.plan.command.name,
-            std::process::id(),
-            Some(&prepared.cache_path),
-            utils::write_pid_file_with_cache,
-        );
+        if let Some(mount_lock) = self.mount_lock.as_ref() {
+            let _ = mount_lock.persist_record(
+                &self.plan.actual_mount_path,
+                &self.plan.command.name,
+                std::process::id(),
+                Some(&prepared.cache_path),
+            );
+        }
     }
 
     fn launch_foreground(mut self) -> anyhow::Result<()> {
@@ -1136,6 +1145,7 @@ impl PreparedMount {
         }
         drop(vfs);
         let _ = utils::remove_pid_file(&self.plan.actual_mount_path);
+        drop(self.mount_lock.take());
         cleanup_snapshot_mount_db(self.snapshot_mount_db_path.take().as_deref());
         runtime.shutdown_timeout(runtime_shutdown_timeout());
 
@@ -1166,27 +1176,27 @@ fn guard_mount_pid_file(actual_mount_path: &str) -> anyhow::Result<()> {
         std::process::id(),
         utils::read_pid_file,
         utils::remove_pid_file,
-        utils::is_process_running,
+        utils::mount_is_active,
     )
 }
 
-fn guard_mount_pid_file_with<ReadPid, RemovePid, IsRunning>(
+fn guard_mount_pid_file_with<ReadPid, RemovePid, IsMountActive>(
     actual_mount_path: &str,
     current_pid: u32,
     read_pid_file: ReadPid,
     remove_pid_file: RemovePid,
-    is_process_running: IsRunning,
+    is_mount_active: IsMountActive,
 ) -> anyhow::Result<()>
 where
     ReadPid: Fn(&str) -> anyhow::Result<(u32, String, String)>,
     RemovePid: Fn(&str) -> anyhow::Result<()>,
-    IsRunning: Fn(u32) -> bool,
+    IsMountActive: Fn(&str) -> anyhow::Result<bool>,
 {
     if let Ok((pid, _, _)) = read_pid_file(actual_mount_path) {
         if pid == current_pid {
             return Ok(());
         }
-        if is_process_running(pid) {
+        if is_mount_active(actual_mount_path)? {
             anyhow::bail!(
                 "Already mounted at '{}' (PID {}). Run `studiofs umount \"{}\"` first.",
                 actual_mount_path,
@@ -1194,7 +1204,7 @@ where
                 actual_mount_path
             );
         }
-        // Stale PID file — clean up before the session writes its own entry.
+        // The record exists but no process holds the lifecycle lock anymore.
         let _ = remove_pid_file(actual_mount_path);
     }
     Ok(())
@@ -1227,16 +1237,27 @@ fn build_ready_banner_lines(
     lines
 }
 
-fn persist_mount_pid_file_best_effort_with<WritePid>(
-    actual_mount_path: &str,
-    requested_name: &str,
-    pid: u32,
-    cache_path: Option<&Path>,
-    write_pid_file: WritePid,
-) where
-    WritePid: FnOnce(&str, &str, u32, Option<&Path>) -> anyhow::Result<()>,
-{
-    let _ = write_pid_file(actual_mount_path, requested_name, pid, cache_path);
+fn acquire_mount_lock(actual_mount_path: &str) -> anyhow::Result<utils::MountLockGuard> {
+    guard_mount_pid_file(actual_mount_path)?;
+
+    let Some(mount_lock) = utils::try_acquire_mount_lock(actual_mount_path)? else {
+        match utils::read_pid_file(actual_mount_path) {
+            Ok((pid, _, _)) => anyhow::bail!(
+                "Already mounted at '{}' (PID {}). Run `studiofs umount \"{}\"` first.",
+                actual_mount_path,
+                pid,
+                actual_mount_path
+            ),
+            Err(_) => anyhow::bail!(
+                "Already mounted at '{}'. Run `studiofs umount \"{}\"` first.",
+                actual_mount_path,
+                actual_mount_path
+            ),
+        }
+    };
+
+    let _ = utils::remove_pid_file(actual_mount_path);
+    Ok(mount_lock)
 }
 
 fn read_live_mount_format_info<M: ?Sized + MountOpenMeta>(
@@ -1411,13 +1432,18 @@ fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Resul
         }
     }
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn background mount process: {e}"))?;
     let pid = child.id();
 
-    // Write PID file (the child will overwrite with identical data once it starts)
-    utils::write_pid_file(mount_point, name, pid)?;
+    wait_for_daemon_mount_record(
+        mount_point,
+        pid,
+        &mut child,
+        DAEMON_RECORD_PUBLISH_TIMEOUT,
+        DAEMON_RECORD_PUBLISH_POLL_INTERVAL,
+    )?;
 
     println!(
         "✓ Volume '{}' mounting at '{}' in background (PID: {})",
@@ -1427,6 +1453,63 @@ fn spawn_daemon(name: &str, mount_point: &str, meta_dir: &Path) -> anyhow::Resul
     println!("  To unmount: studiofs umount \"{}\"", mount_point);
 
     Ok(())
+}
+
+fn wait_for_daemon_mount_record(
+    mount_point: &str,
+    expected_pid: u32,
+    child: &mut std::process::Child,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> anyhow::Result<()> {
+    wait_for_daemon_mount_record_with(
+        mount_point,
+        expected_pid,
+        timeout,
+        poll_interval,
+        utils::read_pid_file,
+        || Ok(child.try_wait()?.is_none()),
+    )
+}
+
+fn wait_for_daemon_mount_record_with<ReadPid, IsChildAlive>(
+    mount_point: &str,
+    expected_pid: u32,
+    timeout: Duration,
+    poll_interval: Duration,
+    read_pid_file: ReadPid,
+    mut is_child_alive: IsChildAlive,
+) -> anyhow::Result<()>
+where
+    ReadPid: Fn(&str) -> anyhow::Result<(u32, String, String)>,
+    IsChildAlive: FnMut() -> anyhow::Result<bool>,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if matches!(
+            read_pid_file(mount_point),
+            Ok((pid, _, _)) if pid == expected_pid
+        ) {
+            return Ok(());
+        }
+
+        if !is_child_alive()? {
+            anyhow::bail!(
+                "background mount process exited before publishing mount state for '{}'",
+                mount_point
+            );
+        }
+
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "background mount process did not publish mount state for '{}' within {}s",
+                mount_point,
+                timeout.as_secs()
+            );
+        }
+
+        std::thread::sleep(poll_interval);
+    }
 }
 
 fn build_daemon_spawn_plan<I>(
@@ -1612,11 +1695,7 @@ mod tests {
         if Path::new(&drive_root).exists() {
             return false;
         }
-
-        !matches!(
-            utils::read_pid_file(mount_point),
-            Ok((pid, _, _)) if pid != std::process::id() && utils::is_process_running(pid)
-        )
+        !utils::mount_is_active(mount_point).unwrap_or(false)
     }
 
     #[cfg(windows)]
@@ -2023,6 +2102,50 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_daemon_mount_record_accepts_child_record_once_published() {
+        let attempts = Arc::new(Mutex::new(0usize));
+        wait_for_daemon_mount_record_with(
+            "/tmp/demo",
+            4242,
+            Duration::from_secs(1),
+            Duration::ZERO,
+            {
+                let attempts = attempts.clone();
+                move |_| {
+                    let mut attempts = attempts.lock().expect("lock attempts");
+                    *attempts += 1;
+                    if *attempts >= 2 {
+                        Ok((4242, "/tmp/demo".to_string(), "demo".to_string()))
+                    } else {
+                        Err(anyhow::anyhow!("record not ready"))
+                    }
+                }
+            },
+            || Ok(true),
+        )
+        .expect("daemon record should eventually appear");
+    }
+
+    #[test]
+    fn wait_for_daemon_mount_record_errors_when_child_exits_early() {
+        let err = wait_for_daemon_mount_record_with(
+            "/tmp/demo",
+            4242,
+            Duration::from_secs(1),
+            Duration::ZERO,
+            |_| Err(anyhow::anyhow!("record not ready")),
+            || Ok(false),
+        )
+        .expect_err("exited child should fail readiness wait");
+
+        assert!(
+            err.to_string()
+                .contains("exited before publishing mount state"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn prepared_mount_launch_success_invokes_backend_and_removes_pid_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (meta_dir, engine, _) = seed_mount_meta_db(&temp, "demo");
@@ -2114,13 +2237,37 @@ mod tests {
                     Ok(())
                 }
             },
-            |_| true,
+            |_| Ok(true),
         )
         .expect("current pid should be accepted");
 
         assert!(
             removed.lock().expect("lock removed").is_empty(),
             "current pid entry should not be removed"
+        );
+    }
+
+    #[test]
+    fn guard_mount_pid_file_with_cleans_stale_record_when_lock_is_not_held() {
+        let removed = Arc::new(Mutex::new(Vec::new()));
+        guard_mount_pid_file_with(
+            "/tmp/demo",
+            7777,
+            |_| Ok((4242, "demo".to_string(), String::new())),
+            {
+                let removed = removed.clone();
+                move |path| {
+                    removed.lock().expect("lock removed").push(path.to_string());
+                    Ok(())
+                }
+            },
+            |_| Ok(false),
+        )
+        .expect("stale record should be cleaned up");
+
+        assert_eq!(
+            removed.lock().expect("lock removed").clone(),
+            vec!["/tmp/demo".to_string()]
         );
     }
 

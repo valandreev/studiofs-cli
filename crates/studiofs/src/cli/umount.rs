@@ -9,6 +9,7 @@ use anyhow::anyhow;
 type ReadPidFn = fn(&str) -> Result<(u32, String, String)>;
 type RemovePidFn = fn(&str) -> Result<()>;
 type IsRunningFn = fn(u32) -> bool;
+type IsMountActiveFn = fn(&str) -> Result<bool>;
 
 #[derive(Debug, Args)]
 #[command(about = "Unmount a previously mounted filesystem volume")]
@@ -33,18 +34,25 @@ fn run_with(
     read_pid_file: ReadPidFn,
     remove_pid_file: RemovePidFn,
     is_process_running: IsRunningFn,
+    is_mount_active: IsMountActiveFn,
 ) -> Result<()> {
     let (pid, mp, volume) = read_pid_file(mount_point)?;
 
-    // Check the process is actually alive
-    if !is_process_running(pid) {
-        // Stale PID file — just clean up
+    if !is_mount_active(mount_point)? {
         let _ = remove_pid_file(mount_point);
         println!(
-            "Mount for '{}' (PID {}) is no longer running. Cleaned up stale state.",
+            "Mount for '{}' has no active lifecycle lock. Cleaned up stale state (recorded PID {}).",
             mp, pid
         );
         return Ok(());
+    }
+
+    if !is_process_running(pid) {
+        anyhow::bail!(
+            "Mount for '{}' is still lock-held, but the recorded PID {} is not running. Refusing to terminate an unrelated process.",
+            mp,
+            pid
+        );
     }
 
     println!(
@@ -58,7 +66,7 @@ fn run_with(
     #[cfg(unix)]
     unmount_unix(pid)?;
 
-    // Clean up PID file
+    // Clean up the persisted mount record.
     let _ = remove_pid_file(mount_point);
 
     println!("✓ Successfully unmounted '{}'", mount_point);
@@ -72,6 +80,7 @@ pub fn run(mount_point: &str) -> Result<()> {
         super::utils::read_pid_file,
         super::utils::remove_pid_file,
         super::utils::is_process_running,
+        super::utils::mount_is_active,
     )
 }
 
@@ -211,11 +220,15 @@ mod tests {
         Ok(())
     }
 
-    fn test_process_not_running(_pid: u32) -> bool {
-        false
+    fn test_process_running(_pid: u32) -> bool {
+        true
     }
 
-    /// `umount` on a mount point with no PID file should return an error.
+    fn test_mount_not_active(_mount_point: &str) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// `umount` on a mount point with no persisted mount record should return an error.
     #[test]
     fn umount_no_pid_file() {
         // Use a mount point that is almost certainly not mounted.
@@ -256,7 +269,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// If a PID file exists but the process is dead, `umount` should clean it up.
+    /// If a mount record exists but no process still holds the lifecycle lock, `umount` should
+    /// clean it up without trusting the recorded PID.
     #[test]
     fn umount_stale_pid_file_cleanup() {
         let mp = "__test_stale_umount__";
@@ -271,7 +285,8 @@ mod tests {
             mp,
             test_read_pid_file,
             test_remove_pid_file,
-            test_process_not_running,
+            test_process_running,
+            test_mount_not_active,
         );
         assert!(
             result.is_ok(),

@@ -1,6 +1,9 @@
 use anyhow::{Result, anyhow};
-use std::convert::TryFrom;
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 pub fn get_default_meta_dir(volume_name: &str) -> Result<PathBuf> {
     let home = home::home_dir().ok_or_else(|| anyhow!("Could not find home directory"))?;
@@ -50,54 +53,151 @@ pub fn get_logs_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Full path to the PID file for a given mount point.
+const MOUNT_RECORD_VERSION: u32 = 2;
+
+fn default_mount_record_version() -> u32 {
+    MOUNT_RECORD_VERSION
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct MountRecordInfo {
+    #[serde(default = "default_mount_record_version")]
+    pub record_version: u32,
+    pub pid: u32,
+    #[serde(default)]
+    pub mount_point: String,
+    #[serde(default)]
+    pub volume: String,
+    #[serde(default)]
+    pub cache_path: Option<String>,
+    #[serde(default)]
+    pub instance_id: Option<String>,
+}
+
+pub(crate) struct MountLockGuard {
+    lock_file: File,
+    instance_id: String,
+}
+
+impl MountLockGuard {
+    pub(crate) fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub(crate) fn persist_record(
+        &self,
+        mount_point: &str,
+        volume: &str,
+        pid: u32,
+        cache_path: Option<&Path>,
+    ) -> Result<()> {
+        write_mount_record_with_cache_and_instance(
+            mount_point,
+            volume,
+            pid,
+            cache_path,
+            Some(self.instance_id()),
+        )
+    }
+}
+
+impl Drop for MountLockGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.lock_file);
+    }
+}
+
+/// Full path to the JSON mount record for a given mount point.
 pub fn pid_file_path(mount_point: &str) -> Result<PathBuf> {
     let dir = get_mounts_dir()?;
     let sanitized = sanitize_mount_point(&normalize_mount_point(mount_point));
     Ok(dir.join(format!("{sanitized}.json")))
 }
 
-/// Write a JSON PID file for a mount.
-pub fn write_pid_file(mount_point: &str, volume: &str, pid: u32) -> Result<()> {
-    write_pid_file_with_cache(mount_point, volume, pid, None)
+/// Full path to the lifecycle lock file for a given mount point.
+pub(crate) fn mount_lock_file_path(mount_point: &str) -> Result<PathBuf> {
+    let dir = get_mounts_dir()?;
+    let sanitized = sanitize_mount_point(&normalize_mount_point(mount_point));
+    Ok(dir.join(format!("{sanitized}.lock")))
 }
 
-/// Write a JSON PID file for a mount, optionally including the resolved cache path.
-pub fn write_pid_file_with_cache(
+fn open_mount_lock_file(mount_point: &str) -> Result<File> {
+    let path = mount_lock_file_path(mount_point)?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(Into::into)
+}
+
+fn try_acquire_mount_lock_file(lock_file: File) -> Result<Option<File>> {
+    match lock_file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(lock_file)),
+        Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn try_acquire_mount_lock(mount_point: &str) -> Result<Option<MountLockGuard>> {
+    let lock_file = open_mount_lock_file(mount_point)?;
+    Ok(
+        try_acquire_mount_lock_file(lock_file)?.map(|lock_file| MountLockGuard {
+            lock_file,
+            instance_id: Uuid::new_v4().to_string(),
+        }),
+    )
+}
+
+pub(crate) fn mount_is_active(mount_point: &str) -> Result<bool> {
+    let Some(lock_guard) = try_acquire_mount_lock(mount_point)? else {
+        return Ok(true);
+    };
+    drop(lock_guard);
+    Ok(false)
+}
+
+fn write_mount_record_with_cache_and_instance(
     mount_point: &str,
     volume: &str,
     pid: u32,
     cache_path: Option<&Path>,
+    instance_id: Option<&str>,
 ) -> Result<()> {
     let path = pid_file_path(mount_point)?;
-    let mut info = serde_json::json!({
-        "pid": pid,
-        "mount_point": mount_point,
-        "volume": volume,
-    });
-    if let Some(cache_path) = cache_path {
-        info["cache_path"] = serde_json::Value::String(cache_path.to_string_lossy().into_owned());
-    }
-    std::fs::write(&path, serde_json::to_string_pretty(&info)?)?;
+    let record = MountRecordInfo {
+        record_version: MOUNT_RECORD_VERSION,
+        pid,
+        mount_point: mount_point.to_string(),
+        volume: volume.to_string(),
+        cache_path: cache_path.map(|path| path.to_string_lossy().into_owned()),
+        instance_id: instance_id.map(str::to_string),
+    };
+    std::fs::write(&path, serde_json::to_string_pretty(&record)?)?;
     Ok(())
 }
 
 /// Read PID file → `(pid, mount_point, volume)`.
 pub fn read_pid_file(mount_point: &str) -> Result<(u32, String, String)> {
+    let record = read_mount_record(mount_point)?;
+    Ok((record.pid, record.mount_point, record.volume))
+}
+
+pub(crate) fn read_mount_record(mount_point: &str) -> Result<MountRecordInfo> {
     let normalized = normalize_mount_point(mount_point);
     let path = pid_file_path(&normalized)?;
     let data = std::fs::read_to_string(&path)
         .map_err(|_| anyhow!("No mount found for '{mount_point}'. Is it mounted?"))?;
-    let v: serde_json::Value = serde_json::from_str(&data)?;
-    let pid = u32::try_from(
-        v["pid"]
-            .as_u64()
-            .ok_or_else(|| anyhow!("corrupt PID file"))?,
-    )
-    .map_err(|_| anyhow!("corrupt PID file"))?;
-    let mp = v["mount_point"].as_str().unwrap_or(&normalized).to_string();
-    let vol = v["volume"].as_str().unwrap_or("unknown").to_string();
-    Ok((pid, mp, vol))
+    let mut record: MountRecordInfo =
+        serde_json::from_str(&data).map_err(|_| anyhow!("corrupt PID file"))?;
+    if record.mount_point.is_empty() {
+        record.mount_point = normalized;
+    }
+    if record.volume.is_empty() {
+        record.volume = "unknown".to_string();
+    }
+    Ok(record)
 }
 
 /// Remove PID file if it exists.
@@ -182,12 +282,15 @@ pub fn write_pid_file_in(
 ) -> Result<()> {
     let sanitized = sanitize_mount_point(mount_point);
     let path = dir.join(format!("{sanitized}.json"));
-    let info = serde_json::json!({
-        "pid": pid,
-        "mount_point": mount_point,
-        "volume": volume,
-    });
-    std::fs::write(&path, serde_json::to_string_pretty(&info)?)?;
+    let record = MountRecordInfo {
+        record_version: MOUNT_RECORD_VERSION,
+        pid,
+        mount_point: mount_point.to_string(),
+        volume: volume.to_string(),
+        cache_path: None,
+        instance_id: None,
+    };
+    std::fs::write(&path, serde_json::to_string_pretty(&record)?)?;
     Ok(())
 }
 
@@ -384,6 +487,47 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // Should not error even though no file exists
         remove_pid_file_in(tmp.path(), "Q:").unwrap();
+    }
+
+    #[test]
+    fn try_acquire_mount_lock_file_reports_contention() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("mount.lock");
+        let first = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        let second = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+
+        let guard = try_acquire_mount_lock_file(first)
+            .unwrap()
+            .expect("first lock acquisition");
+        assert!(
+            try_acquire_mount_lock_file(second).unwrap().is_none(),
+            "second handle should observe the lock as contended"
+        );
+        drop(guard);
+
+        let third = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        assert!(
+            try_acquire_mount_lock_file(third).unwrap().is_some(),
+            "lock should be acquirable again after release"
+        );
     }
 
     // ── is_process_running ───────────────────────────────────────────────

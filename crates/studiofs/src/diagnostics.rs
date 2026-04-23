@@ -25,6 +25,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -4575,12 +4576,12 @@ impl LocalDiagnosticsClient {
 }
 
 pub(crate) fn discover_local_sessions() -> Result<Vec<LocalDiagnosticsDiscovery>> {
-    discover_sessions_in(&utils::get_mounts_dir()?, utils::is_process_running)
+    discover_sessions_in(&utils::get_mounts_dir()?, utils::mount_is_active)
 }
 
 fn discover_sessions_in(
     dir: &Path,
-    is_process_running: impl Fn(u32) -> bool,
+    is_mount_active: impl Fn(&str) -> Result<bool>,
 ) -> Result<Vec<LocalDiagnosticsDiscovery>> {
     let mut sessions = Vec::new();
     for entry in fs::read_dir(dir)? {
@@ -4609,7 +4610,7 @@ fn discover_sessions_in(
         let Some(discovery) = record.diagnostics else {
             continue;
         };
-        if is_process_running(discovery.pid) {
+        if is_mount_active(&record.mount_point)? {
             sessions.push(discovery);
         }
     }
@@ -4619,13 +4620,19 @@ fn discover_sessions_in(
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct MountRecord {
+    #[serde(default)]
+    record_version: u32,
     pid: u32,
     mount_point: String,
     volume: String,
     #[serde(default)]
     cache_path: Option<String>,
     #[serde(default)]
+    instance_id: Option<String>,
+    #[serde(default)]
     diagnostics: Option<LocalDiagnosticsDiscovery>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 fn publish_discovery(mount_point: &str, discovery: &LocalDiagnosticsDiscovery) -> Result<()> {
@@ -5572,11 +5579,14 @@ mod tests {
     ) {
         let path = dir.join(format!("{}.json", utils::sanitize_mount_point(mount_point)));
         let record = MountRecord {
+            record_version: 2,
             pid,
             mount_point: mount_point.to_string(),
             volume: "demo".to_string(),
             cache_path: Some("cache".to_string()),
+            instance_id: Some(format!("instance-{pid}")),
             diagnostics: discovery,
+            extra: BTreeMap::new(),
         };
         fs::write(
             path,
@@ -5605,7 +5615,8 @@ mod tests {
         write_mount_record(dir.path(), "X:", Some(discovery.clone()), 123);
         write_mount_record(dir.path(), "Y:", None, 456);
 
-        let sessions = discover_sessions_in(dir.path(), |pid| pid == 123).expect("discover");
+        let sessions = discover_sessions_in(dir.path(), |mount_point| Ok(mount_point == "X:"))
+            .expect("discover");
 
         assert_eq!(sessions, vec![discovery]);
     }
@@ -5616,7 +5627,7 @@ mod tests {
         fs::write(dir.path().join("broken.json"), b"{not-json").expect("write malformed record");
         write_mount_record(dir.path(), "X:", None, 123);
 
-        let sessions = discover_sessions_in(dir.path(), |_| true).expect("discover");
+        let sessions = discover_sessions_in(dir.path(), |_| Ok(true)).expect("discover");
 
         assert!(sessions.is_empty());
     }
