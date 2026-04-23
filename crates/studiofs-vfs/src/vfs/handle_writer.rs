@@ -170,6 +170,7 @@ impl HandleSliceWriter {
         out.extend(self.ready_full_block_indexes.iter().copied());
     }
 
+    #[cfg(test)]
     fn mark_materialized(&mut self, seq: u64) {
         let mut removed_bytes = 0usize;
         let mut affected_blocks = HashSet::new();
@@ -485,6 +486,7 @@ impl HandleWriterRegistry {
         ready
     }
 
+    #[cfg(test)]
     pub(super) fn mark_materialized(&self, ino: Ino, seq: u64) {
         let mut writers = self.writers.lock();
         let mut empty_closed = Vec::new();
@@ -623,48 +625,6 @@ impl HandleWriterRegistry {
 }
 
 impl StudioVfs {
-    fn fully_overwritten_block_indexes_for_handle_writes(
-        &self,
-        writes: &[BufferedHandleWrite],
-        visible_size: u64,
-    ) -> std::collections::HashSet<u32> {
-        let mut ranges_by_block = std::collections::BTreeMap::<u32, Vec<(usize, usize)>>::new();
-
-        for write in writes {
-            if write.data.is_empty() {
-                continue;
-            }
-            let start = offset_within_block(write.offset, self.block_size) as usize;
-            let end = start.saturating_add(write.data.len());
-            ranges_by_block
-                .entry(write.block_index)
-                .or_default()
-                .push((start, end));
-        }
-
-        ranges_by_block
-            .into_iter()
-            .filter_map(|(block_index, mut ranges)| {
-                let logical_len = self.logical_block_len(visible_size, block_index);
-                if logical_len == 0 {
-                    return None;
-                }
-                ranges.sort_unstable_by_key(|(start, _)| *start);
-                let mut covered_until = 0usize;
-                for (start, end) in ranges {
-                    if start > covered_until {
-                        return None;
-                    }
-                    covered_until = covered_until.max(end);
-                    if covered_until >= logical_len {
-                        return Some(block_index);
-                    }
-                }
-                None
-            })
-            .collect()
-    }
-
     fn fully_overwritten_full_block_indexes_for_handle_writes(
         &self,
         writes: &[BufferedHandleWrite],
@@ -907,24 +867,12 @@ impl StudioVfs {
         batches
     }
 
-    pub(super) async fn spill_handle_writer_slices_for_inode(
+    async fn persist_handle_writer_spill_batches(
         &self,
         ino: Ino,
+        spill_batches: Vec<HandleWriterSpillBatch>,
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<bool> {
-        if !matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
-            return Ok(false);
-        }
-        let writes = self
-            .state
-            .handle_writers
-            .snapshot_materialization_writes(ino);
-        let selected = self.select_handle_writer_slices_for_spill(&writes);
-        let budget_exceeded = self.total_pending_write_buffer_bytes() > self.max_dirty_bytes();
-        if !self.should_spill_selected_handle_writer_slices(&selected, budget_exceeded) {
-            return Ok(false);
-        }
-        let spill_batches = self.build_handle_writer_slice_spill_batches(selected);
         if spill_batches.is_empty() {
             return Ok(false);
         }
@@ -987,6 +935,28 @@ impl StudioVfs {
             .handle_writers
             .mark_blocks_materialized(ino, &seqs_by_block);
         Ok(true)
+    }
+
+    pub(super) async fn spill_handle_writer_slices_for_inode(
+        &self,
+        ino: Ino,
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<bool> {
+        if !matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+            return Ok(false);
+        }
+        let writes = self
+            .state
+            .handle_writers
+            .snapshot_materialization_writes(ino);
+        let selected = self.select_handle_writer_slices_for_spill(&writes);
+        let budget_exceeded = self.total_pending_write_buffer_bytes() > self.max_dirty_bytes();
+        if !self.should_spill_selected_handle_writer_slices(&selected, budget_exceeded) {
+            return Ok(false);
+        }
+        let spill_batches = self.build_handle_writer_slice_spill_batches(selected);
+        self.persist_handle_writer_spill_batches(ino, spill_batches, local_sync_policy)
+            .await
     }
 
     fn select_completed_blocks_for_eager_materialization(
@@ -1340,61 +1310,9 @@ impl StudioVfs {
         if writes.is_empty() {
             return Ok(false);
         }
-        let dirty_attr = { self.state.namespace.dirty_attrs.lock().get(&ino).cloned() };
-        let visible_size = if let Some(attr) = dirty_attr.as_ref() {
-            attr.size
-        } else {
-            self.getattr_async(ino).await?.size
-        };
-        let max_seq = writes
-            .last()
-            .map(|write| write.seq)
-            .expect("non-empty writes have a max seq");
-        let selected_block_indexes: HashSet<u32> =
-            writes.iter().map(|write| write.block_index).collect();
-        let fully_overwritten_blocks =
-            self.fully_overwritten_block_indexes_for_handle_writes(&writes, visible_size);
-        let blocks = self
-            .build_dirty_write_snapshots_for_handle_writer_blocks(
-                ino,
-                &writes,
-                visible_size,
-                &selected_block_indexes,
-                &fully_overwritten_blocks,
-                true,
-            )
-            .await?;
-        if blocks.is_empty() {
-            return Ok(false);
-        }
-        if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
-            let selected_block_indexes: std::collections::HashSet<u32> =
-                blocks.iter().map(|block| block.block_index).collect();
-            self.stage_dirty_write_snapshots(ino, blocks);
-            self.persist_staged_pending_local_blocks_to_local_extents(
-                ino,
-                &selected_block_indexes,
-                local_sync_policy,
-            )
-            .await?;
-            self.state.handle_writers.mark_materialized(ino, max_seq);
-            return Ok(true);
-        }
-        let content_epoch = if let Some(attr) = dirty_attr.as_ref() {
-            attr.content_epoch
-        } else {
-            self.current_content_epoch_async(ino).await?
-        };
-        self.persist_dirty_write_snapshots_direct(
-            ino,
-            blocks,
-            content_epoch,
-            dirty_attr,
-            local_sync_policy,
-        )
-        .await?;
-        self.state.handle_writers.mark_materialized(ino, max_seq);
-        Ok(true)
+        let spill_batches = self.build_handle_writer_slice_spill_batches(writes);
+        self.persist_handle_writer_spill_batches(ino, spill_batches, local_sync_policy)
+            .await
     }
 
     pub(super) async fn materialize_completed_handle_writer_blocks_for_inode(
@@ -1521,24 +1439,14 @@ impl StudioVfs {
             return Ok(false);
         }
         if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
-            let completed_block_indexes: std::collections::HashSet<u32> = completed_blocks
-                .iter()
-                .map(|block| block.block_index)
+            let selected_writes: Vec<_> = writes
+                .into_iter()
+                .filter(|write| selected_block_indexes.contains(&write.block_index))
                 .collect();
-            self.stage_dirty_write_snapshots(ino, completed_blocks);
-            let should_persist_staged_now = true;
-            if should_persist_staged_now {
-                self.persist_staged_pending_local_blocks_to_local_extents(
-                    ino,
-                    &completed_block_indexes,
-                    local_sync_policy,
-                )
-                .await?;
-            }
-            self.state
-                .handle_writers
-                .mark_blocks_materialized(ino, &seqs_by_block);
-            return Ok(true);
+            let spill_batches = self.build_handle_writer_slice_spill_batches(selected_writes);
+            return self
+                .persist_handle_writer_spill_batches(ino, spill_batches, local_sync_policy)
+                .await;
         }
         let content_epoch = if let Some(attr) = dirty_attr.as_ref() {
             attr.content_epoch

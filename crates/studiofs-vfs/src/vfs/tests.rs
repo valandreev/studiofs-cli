@@ -2747,7 +2747,7 @@ fn opportunistic_completed_handle_writer_materialization_caps_burst_to_drain_chu
         );
         assert!(
             vfs.has_pending_local_dirty_blocks_for_inode(ino),
-            "payload-staged blocks should remain visible as pending local extents until metadata commit catches up"
+            "payload-staged slices should remain locally visible until metadata commit catches up"
         );
         assert_eq!(
             vfs.state.handle_writers.dirty_bytes_for_inode(ino),
@@ -4468,7 +4468,7 @@ fn flush_fh_materializes_opportunistic_handle_writer_state_into_overlay_slices()
 }
 
 #[test]
-fn flush_fh_materializes_handle_writer_state_without_legacy_ordered_flush() {
+fn flush_fh_materializes_handle_writer_state_through_strict_local_barrier() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-flush-without-ordered-flush");
     let _guard = rt.enter();
@@ -4503,8 +4503,9 @@ fn flush_fh_materializes_handle_writer_state_without_legacy_ordered_flush() {
             .flush_barrier_calls
             .load(Ordering::Relaxed);
         assert_eq!(
-            ordered_flushes_after, ordered_flushes_before,
-            "handle writer flush should materialize directly without routing through the flush barrier path"
+            ordered_flushes_after,
+            ordered_flushes_before + 1,
+            "slice-first handle-writer flush should route through one strict local barrier to commit staged slices"
         );
 
         vfs.release_fh(fh).await.unwrap();
