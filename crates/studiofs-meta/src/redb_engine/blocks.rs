@@ -696,7 +696,11 @@ impl MetaBlocks for RedbMetaEngine {
                 return Ok(false);
             }
 
-            let old_committed = Self::base_block_in_txn(&txn, ino, block_index, block_size)?;
+            let old_committed = match Self::base_block_in_txn(&txn, ino, block_index, block_size) {
+                Ok(old_committed) => old_committed,
+                Err(MetaError::FragmentedBlock { .. }) => None,
+                Err(err) => return Err(err),
+            };
             let committed_slices = Self::chunk_slices_for_block(
                 block_index,
                 block_size,
@@ -716,7 +720,12 @@ impl MetaBlocks for RedbMetaEngine {
             let previous_committed_size = attr.committed_size;
             let previous_committed_epoch = attr.committed_content_epoch;
             let previous_upload_state = attr.upload_state;
-            let manifest_matches_committed = Self::manifest_matches_committed_in_txn(&txn, ino)?;
+            let manifest_matches_committed =
+                match Self::manifest_matches_committed_in_txn(&txn, ino) {
+                    Ok(matches) => matches,
+                    Err(MetaError::FragmentedBlock { .. }) => false,
+                    Err(err) => return Err(err),
+                };
             attr.committed_size = new_committed_size;
             if manifest_matches_committed {
                 attr.committed_content_epoch = attr.content_epoch;

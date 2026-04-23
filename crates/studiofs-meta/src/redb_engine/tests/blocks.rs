@@ -696,6 +696,69 @@ fn commit_uploaded_block_rejects_fragmented_overlay_without_error() {
 }
 
 #[test]
+fn commit_uploaded_block_accepts_flat_overlay_over_fragmented_base_without_error() {
+    let engine = temp_engine();
+
+    let file = engine
+        .create_file(
+            ROOT_INO,
+            b"flat-upload-over-fragmented-base.bin",
+            1000,
+            1000,
+            0o644,
+        )
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = DEFAULT_BLOCK_SIZE as u64;
+    attr.content_epoch = 1;
+    attr.committed_size = DEFAULT_BLOCK_SIZE as u64;
+    attr.committed_content_epoch = 0;
+    attr.upload_state = UploadState::Updating;
+    engine.set_attr(&attr).unwrap();
+
+    let midpoint = DEFAULT_BLOCK_SIZE / 2;
+    let mut fragmented_base = RegularFileChunkState::default();
+    fragmented_base.slices.insert(
+        SliceId(0),
+        SliceRecord {
+            slice_id: SliceId(0),
+            order: SliceOrder(0),
+            range: SliceRange::new(0, midpoint).unwrap(),
+            block: Some(BlockRef::new_partial(601, midpoint)),
+            block_state: BlockRefState::Published,
+        },
+    );
+    fragmented_base.slices.insert(
+        SliceId(1),
+        SliceRecord {
+            slice_id: SliceId(1),
+            order: SliceOrder(1),
+            range: SliceRange::new(midpoint, DEFAULT_BLOCK_SIZE).unwrap(),
+            block: Some(BlockRef::new_partial(602, DEFAULT_BLOCK_SIZE - midpoint)),
+            block_state: BlockRefState::Published,
+        },
+    );
+    fragmented_base.refresh_fragmentation_metrics();
+    set_regular_file_chunk_rows(&engine, file.ino, &[], &[(ChunkId(0), fragmented_base)]);
+
+    assert!(matches!(
+        engine.get_file_blocks(file.ino),
+        Err(MetaError::FragmentedBlock { .. })
+    ));
+
+    let uploaded = BlockRef::new_full(701, DEFAULT_BLOCK_SIZE);
+    engine.set_file_block(file.ino, 0, &uploaded).unwrap();
+
+    assert!(
+        engine
+            .commit_uploaded_block(file.ino, 0, 1, &uploaded)
+            .unwrap(),
+        "legacy single-block commit should replace a fragmented base when the current overlay is flat"
+    );
+    assert_eq!(engine.get_file_block(file.ino, 0).unwrap(), Some(uploaded));
+}
+
+#[test]
 fn zeroio_uploaded_overlay_blocks_make_epoch_publish_ready_only_after_full_epoch_upload() {
     let engine = temp_engine();
 
