@@ -213,9 +213,9 @@ impl CommitCoordinator {
         // subsequent flush_local_dirty_state finds this dirty_attr and the local dirty state is
         // empty it will call engine.set_attr with committed_epoch=0, reverting
         // INODES_TABLE back to {Uploading}. That triggers a second spurious
-        // finalize_inode_epoch which (a) emits a garbage
-        // PublishFileManifest{blocks:[]} event to PG — corrupting remote nodes'
-        // COMMITTED_FILE_BLOCKS_TABLE — and (b) fires invalidate_kernel_inodes a
+        // finalize_inode_epoch which (a) emits a garbage published-base event to
+        // PG — corrupting remote nodes' regular-file base graph — and (b) fires
+        // invalidate_kernel_inodes a
         // second time, sending a file-change notification that can cause readers
         // (e.g. media players) to abort an in-progress read.
         //

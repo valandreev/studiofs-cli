@@ -788,19 +788,11 @@ impl MetaBlocks for RedbMetaEngine {
                     let (committed_size, removed_object_ids) =
                         Self::publish_regular_file_overlay_to_base_in_txn(&txn, ino)?;
                     let published_base_chunks =
-                        Self::regular_file_chunk_states_for_inode_in_write_txn(
+                        Self::regular_file_chunk_rows_for_inode_in_write_txn(
                             &txn,
                             REGULAR_FILE_BASE_TABLE,
                             ino,
-                        )?
-                        .into_iter()
-                        .map(|(chunk_id, chunk_state)| {
-                            (
-                                chunk_id,
-                                chunk_state.slices.values().cloned().collect::<Vec<_>>(),
-                            )
-                        })
-                        .collect::<Vec<_>>();
+                        )?;
                     (
                         Some(committed_size),
                         removed_object_ids,
@@ -829,14 +821,20 @@ impl MetaBlocks for RedbMetaEngine {
                         .iter()
                         .map(|(_, block)| block.object_id)
                         .collect();
+                    let published_base_chunks =
+                        Self::regular_file_chunk_rows_for_inode_in_write_txn(
+                            &txn,
+                            REGULAR_FILE_BASE_TABLE,
+                            ino,
+                        )?;
                     (
                         Some(Self::legacy_committed_size_from_blocks(
                             published_blocks.as_slice(),
                         )),
                         previous_ids.difference(&next_ids).copied().collect(),
-                        crate::events::MetaEvent::PublishFileManifest {
+                        crate::events::MetaEvent::PublishRegularFileBaseSlices {
                             ino,
-                            blocks: published_blocks.clone(),
+                            chunk_slices: published_base_chunks,
                         },
                     )
                 };
@@ -910,19 +908,11 @@ impl MetaBlocks for RedbMetaEngine {
 
             let (committed_size, removed_object_ids) =
                 Self::publish_regular_file_overlay_to_base_in_txn(&txn, ino)?;
-            let published_base_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
+            let published_base_chunks = Self::regular_file_chunk_rows_for_inode_in_write_txn(
                 &txn,
                 REGULAR_FILE_BASE_TABLE,
                 ino,
-            )?
-            .into_iter()
-            .map(|(chunk_id, chunk_state)| {
-                (
-                    chunk_id,
-                    chunk_state.slices.values().cloned().collect::<Vec<_>>(),
-                )
-            })
-            .collect::<Vec<_>>();
+            )?;
             if !removed_object_ids.is_empty() {
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)

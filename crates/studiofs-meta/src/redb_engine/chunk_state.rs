@@ -47,6 +47,24 @@ impl RedbMetaEngine {
         Ok(chunks)
     }
 
+    pub(super) fn regular_file_chunk_rows_for_inode_in_write_txn(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<&[u8], &[u8]>,
+        ino: Ino,
+    ) -> MetaResult<Vec<(ChunkId, Vec<SliceRecord>)>> {
+        Ok(
+            Self::regular_file_chunk_states_for_inode_in_write_txn(txn, table_def, ino)?
+                .into_iter()
+                .map(|(chunk_id, chunk_state)| {
+                    (
+                        chunk_id,
+                        chunk_state.slices.values().cloned().collect::<Vec<_>>(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
     pub(super) fn regular_file_chunk_states_for_inode_in_read_txn(
         txn: &redb::ReadTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
@@ -395,6 +413,30 @@ impl RedbMetaEngine {
                     .insert(key.as_slice(), 1)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
             }
+        }
+        Ok(())
+    }
+
+    pub(super) fn replace_regular_file_chunk_rows_from_chunk_slices_in_txn(
+        txn: &redb::WriteTransaction,
+        table_def: TableDefinition<&[u8], &[u8]>,
+        ino: Ino,
+        chunk_slices: &[(ChunkId, Vec<SliceRecord>)],
+        track_pending_compaction: bool,
+    ) -> MetaResult<()> {
+        if track_pending_compaction {
+            Self::clear_regular_file_pending_compaction_rows_in_txn(txn, ino)?;
+        }
+        Self::clear_regular_file_chunk_rows_in_txn(txn, table_def, ino)?;
+        for (chunk_id, slices) in chunk_slices {
+            Self::set_regular_file_chunk_state_in_txn(
+                txn,
+                table_def,
+                track_pending_compaction,
+                ino,
+                *chunk_id,
+                slices,
+            )?;
         }
         Ok(())
     }

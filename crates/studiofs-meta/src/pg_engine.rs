@@ -6371,6 +6371,81 @@ mod tests {
     }
 
     #[test]
+    fn unit_remote_projection_manifest_publish_replaces_base_graph_on_shrink() {
+        let (_writer_dir, writer) = temp_pg_engine_for_unit();
+        let (_remote_dir, remote) = temp_pg_engine_for_unit();
+        let block_size = DEFAULT_BLOCK_SIZE as u64;
+
+        let batch1_start = writer
+            .local
+            .get_counter("nextEventSeq")
+            .expect("batch1 start");
+        let file = writer
+            .create_file(ROOT_INO, b"shrink.bin", 0, 0, 0o644)
+            .expect("create file");
+        set_file_state(&writer, file.ino, block_size + 4096, 1);
+        let first = BlockRef::new_full(1001, DEFAULT_BLOCK_SIZE);
+        let second = BlockRef::new_partial(block_size + 2, 4096);
+        writer
+            .set_file_block(file.ino, 0, &first)
+            .expect("set first block");
+        writer
+            .set_file_block(file.ino, 1, &second)
+            .expect("set second block");
+        assert!(
+            writer
+                .publish_file_manifest(file.ino, 1)
+                .expect("publish initial manifest"),
+            "initial manifest publish must succeed"
+        );
+        let batch1_end = writer
+            .local
+            .get_counter("nextEventSeq")
+            .expect("batch1 end");
+        apply_projected_remote_range(&writer, &remote, batch1_start, batch1_end);
+
+        let remote_initial = remote
+            .get_file_blocks(file.ino)
+            .expect("remote initial blocks");
+        assert_eq!(remote_initial, vec![(0, first), (1, second)]);
+
+        let batch2_start = batch1_end;
+        set_file_state(&writer, file.ino, 4096, 2);
+        writer
+            .remove_file_block(file.ino, 1)
+            .expect("remove second block for shrink");
+        let replacement = BlockRef::new_partial(block_size + 3, 4096);
+        writer
+            .set_file_block(file.ino, 0, &replacement)
+            .expect("set replacement block");
+        assert!(
+            writer
+                .publish_file_manifest(file.ino, 2)
+                .expect("publish shrink manifest"),
+            "shrink manifest publish must succeed"
+        );
+        let batch2_end = writer
+            .local
+            .get_counter("nextEventSeq")
+            .expect("batch2 end");
+        apply_projected_remote_range(&writer, &remote, batch2_start, batch2_end);
+
+        let remote_attr = remote.get_attr(file.ino).expect("remote attr after shrink");
+        assert_eq!(remote_attr.size, 4096);
+        assert_eq!(remote_attr.committed_size, 4096);
+        assert_eq!(remote_attr.committed_content_epoch, 2);
+        assert_eq!(remote_attr.upload_state, UploadState::Ready);
+        let remote_blocks = remote
+            .get_file_blocks(file.ino)
+            .expect("remote blocks after shrink");
+        assert_eq!(
+            remote_blocks,
+            vec![(0, replacement)],
+            "manifest publish must replace the full remote base graph and drop stale trailing blocks"
+        );
+    }
+
+    #[test]
     fn unit_remote_projection_updates_nested_file_after_temp_rename_then_publish() {
         let (_writer_dir, writer) = temp_pg_engine_for_unit();
         let (_remote_dir, remote) = temp_pg_engine_for_unit();

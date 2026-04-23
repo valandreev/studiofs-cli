@@ -386,19 +386,6 @@ impl RedbMetaEngine {
                         )?;
                     }
                 }
-                crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
-                    for (chunk_id, slices) in chunk_slices {
-                        Self::set_regular_file_chunk_state_in_txn(
-                            &txn,
-                            REGULAR_FILE_BASE_TABLE,
-                            false,
-                            *ino,
-                            *chunk_id,
-                            slices,
-                        )?;
-                    }
-                }
-
                 crate::events::MetaEvent::RemoveFileBlock { ino, block_index } => {
                     let mut committed_manifest =
                         Self::base_manifest_from_graph_rows_in_txn(&txn, *ino)?;
@@ -454,6 +441,15 @@ impl RedbMetaEngine {
                         blocks.as_slice(),
                         block_size,
                         true,
+                        false,
+                    )?;
+                }
+                crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
+                    Self::replace_regular_file_chunk_rows_from_chunk_slices_in_txn(
+                        &txn,
+                        REGULAR_FILE_BASE_TABLE,
+                        *ino,
+                        chunk_slices.as_slice(),
                         false,
                     )?;
                 }
@@ -780,16 +776,13 @@ impl RedbMetaEngine {
                     }
                 }
                 crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
-                    for (chunk_id, slices) in chunk_slices {
-                        Self::set_regular_file_chunk_state_in_txn(
-                            &txn,
-                            REGULAR_FILE_BASE_TABLE,
-                            false,
-                            *ino,
-                            *chunk_id,
-                            slices,
-                        )?;
-                    }
+                    Self::replace_regular_file_chunk_rows_from_chunk_slices_in_txn(
+                        &txn,
+                        REGULAR_FILE_BASE_TABLE,
+                        *ino,
+                        chunk_slices.as_slice(),
+                        false,
+                    )?;
                 }
                 crate::events::MetaEvent::SetFileBlock { .. }
                 | crate::events::MetaEvent::RemoveFileBlock { .. }
