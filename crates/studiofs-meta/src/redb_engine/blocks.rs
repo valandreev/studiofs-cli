@@ -25,6 +25,20 @@ fn regular_file_chunk_states_usage_bytes(
     usage.values().copied().sum()
 }
 
+fn regular_file_chunk_states_object_ids(
+    chunks: &std::collections::BTreeMap<ChunkId, RegularFileChunkState>,
+) -> std::collections::BTreeSet<u64> {
+    let mut object_ids = std::collections::BTreeSet::new();
+    for chunk_state in chunks.values() {
+        for slice in chunk_state.slices.values() {
+            if let Some(block) = slice.block.as_ref() {
+                object_ids.insert(block.object_id);
+            }
+        }
+    }
+    object_ids
+}
+
 impl MetaBlocks for RedbMetaEngine {
     fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
         let block_size = self.regular_file_graph_block_size()?;
@@ -927,8 +941,13 @@ impl MetaBlocks for RedbMetaEngine {
                         },
                     )
                 } else {
-                    let previous_base_manifest =
-                        Self::base_manifest_from_graph_rows_in_txn(&txn, ino)?;
+                    let previous_base_chunks =
+                        Self::regular_file_chunk_states_for_inode_in_write_txn(
+                            &txn,
+                            REGULAR_FILE_BASE_TABLE,
+                            ino,
+                        )?;
+                    let previous_ids = regular_file_chunk_states_object_ids(&previous_base_chunks);
                     Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
                         &txn,
                         REGULAR_FILE_BASE_TABLE,
@@ -938,11 +957,7 @@ impl MetaBlocks for RedbMetaEngine {
                         true,
                         false,
                     )?;
-                    let previous_ids: std::collections::HashSet<_> = previous_base_manifest
-                        .iter()
-                        .map(|(_, block)| block.object_id)
-                        .collect();
-                    let next_ids: std::collections::HashSet<_> = published_blocks
+                    let next_ids: std::collections::BTreeSet<_> = published_blocks
                         .iter()
                         .map(|(_, block)| block.object_id)
                         .collect();

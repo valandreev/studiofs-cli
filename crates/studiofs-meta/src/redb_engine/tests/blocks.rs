@@ -548,9 +548,9 @@ fn test_remove_file_block_updates_regular_file_graph() {
     assert_eq!(base_chunks.get(&ChunkId(0)).unwrap().slices.len(), 1);
     let txn = engine.db.begin_write().unwrap();
     assert_eq!(
-        RedbMetaEngine::base_manifest_from_graph_rows_in_txn(&txn, ino)
+        RedbMetaEngine::regular_file_committed_size_in_txn(&txn, ino)
             .unwrap()
-            .len(),
+            .unwrap_or(0),
         0
     );
     txn.abort().unwrap();

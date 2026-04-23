@@ -1372,19 +1372,6 @@ impl RedbMetaEngine {
         Ok(chunks.into_iter().collect())
     }
 
-    pub(super) fn base_manifest_from_graph_rows_in_txn(
-        txn: &redb::WriteTransaction,
-        ino: Ino,
-    ) -> MetaResult<Vec<(u32, BlockRef)>> {
-        let base_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
-            txn,
-            REGULAR_FILE_BASE_TABLE,
-            ino,
-        )?;
-        let block_size = Self::regular_file_graph_block_size_from_write_txn(txn)?;
-        Self::manifest_from_chunk_states(ino, None, Some(&base_chunks), block_size)
-    }
-
     pub(super) fn regular_file_graph_block_size_from_write_txn(
         txn: &redb::WriteTransaction,
     ) -> MetaResult<u32> {
@@ -1419,7 +1406,28 @@ impl RedbMetaEngine {
         txn: &redb::WriteTransaction,
         ino: Ino,
     ) -> MetaResult<bool> {
-        let current = Self::current_manifest_in_txn(txn, ino)?;
-        Ok(current == Self::base_manifest_from_graph_rows_in_txn(txn, ino)?)
+        let attr = Self::get_attr_from_write_table(txn, INODES_TABLE, ino)?
+            .or_else(|| {
+                Self::get_attr_from_write_table(txn, BASE_INODES_TABLE, ino)
+                    .ok()
+                    .flatten()
+            })
+            .ok_or(MetaError::InodeNotFound(ino))?;
+        if attr.size == 0 {
+            return Ok(true);
+        }
+
+        let current =
+            Self::lookup_regular_file_slices_in_write_txn(txn, ino, 0, attr.size, true, true)?;
+        let committed =
+            Self::lookup_regular_file_slices_in_write_txn(txn, ino, 0, attr.size, false, true)?;
+
+        let normalize = |spans: Vec<ResolvedSliceSpan>| {
+            spans
+                .into_iter()
+                .map(|span| (span.chunk_id, span.range, span.block))
+                .collect::<Vec<_>>()
+        };
+        Ok(normalize(current) == normalize(committed))
     }
 }
