@@ -1209,7 +1209,7 @@ fn redb_base_graph_publish_sets_committed_head() {
     engine.stage_block_projection(file.ino, 0, &block0).unwrap();
     engine.stage_block_projection(file.ino, 1, &block1).unwrap();
 
-    assert!(engine.publish_block_projection_graph(file.ino, 1).unwrap());
+    assert!(engine.publish_regular_file_overlay_to_base_if_matches(file.ino, 1).unwrap());
 
     let published_attr = engine.get_attr(file.ino).unwrap();
     assert_eq!(published_attr.committed_size, block_size + 4096);

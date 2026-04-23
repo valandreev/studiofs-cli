@@ -100,7 +100,12 @@ fn test_detect_local_overlay_state() {
 
     assert!(
         engine
-            .publish_uploaded_block_projection(file.ino, 0, 0, &BlockRef::new_partial(11, 4096))
+            .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 0, 11)
+            .unwrap()
+    );
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 0)
             .unwrap()
     );
     assert!(engine.has_local_overlay_state().unwrap());

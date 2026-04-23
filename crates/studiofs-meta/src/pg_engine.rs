@@ -4567,15 +4567,6 @@ mod tests {
             ino: Ino,
             block_index: u32,
         ) -> MetaResult<Option<u64>>;
-        fn mark_block_projection_uploaded_if_matches(
-            &self,
-            ino: Ino,
-            block_index: u32,
-            expected_epoch: u64,
-            block: &BlockRef,
-        ) -> MetaResult<bool>;
-        fn publish_block_projection_graph(&self, ino: Ino, expected_epoch: u64)
-        -> MetaResult<bool>;
     }
 
     fn block_projection_slices(
@@ -4749,28 +4740,6 @@ mod tests {
                 block_projection_slices(block_index, None, BlockRefState::LocalOnly)?.as_slice(),
             )?;
             Ok(old.map(|block| block.object_id))
-        }
-
-        fn mark_block_projection_uploaded_if_matches(
-            &self,
-            ino: Ino,
-            _block_index: u32,
-            expected_epoch: u64,
-            block: &BlockRef,
-        ) -> MetaResult<bool> {
-            self.mark_regular_file_overlay_object_uploaded_if_matches(
-                ino,
-                expected_epoch,
-                block.object_id,
-            )
-        }
-
-        fn publish_block_projection_graph(
-            &self,
-            ino: Ino,
-            expected_epoch: u64,
-        ) -> MetaResult<bool> {
-            self.publish_regular_file_overlay_to_base_if_matches(ino, expected_epoch)
         }
     }
 
@@ -5085,7 +5054,7 @@ mod tests {
             .expect("set published file block");
         assert!(
             engine
-                .publish_block_projection_graph(file.ino, 1)
+                .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
                 .expect("publish small file"),
             "small file publish must succeed"
         );
@@ -6508,7 +6477,7 @@ mod tests {
             .expect("set block");
         assert!(
             writer
-                .publish_block_projection_graph(file.ino, 1)
+                .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
                 .expect("publish base graph"),
             "publish must succeed"
         );
@@ -6556,7 +6525,7 @@ mod tests {
             .expect("set second block");
         assert!(
             writer
-                .publish_block_projection_graph(file.ino, 1)
+                .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
                 .expect("publish initial base graph"),
             "initial base graph publish must succeed"
         );
@@ -6582,7 +6551,7 @@ mod tests {
             .expect("set replacement block");
         assert!(
             writer
-                .publish_block_projection_graph(file.ino, 2)
+                .publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
                 .expect("publish shrink base graph"),
             "shrink base graph publish must succeed"
         );
@@ -6653,7 +6622,7 @@ mod tests {
             .expect("set block 1");
         assert!(
             writer
-                .publish_block_projection_graph(file.ino, 1)
+                .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
                 .expect("publish renamed base graph"),
             "publish after rename must succeed"
         );
@@ -6703,7 +6672,7 @@ mod tests {
             .expect("set old block");
         assert!(
             writer
-                .publish_block_projection_graph(old.ino, 1)
+                .publish_regular_file_overlay_to_base_if_matches(old.ino, 1)
                 .expect("publish old base graph"),
             "old base graph publish must succeed"
         );
@@ -6732,7 +6701,7 @@ mod tests {
             .expect("set replacement block 1");
         assert!(
             writer
-                .publish_block_projection_graph(temp.ino, 2)
+                .publish_regular_file_overlay_to_base_if_matches(temp.ino, 2)
                 .expect("publish replacement temp"),
             "replacement temp publish must succeed"
         );
@@ -6789,7 +6758,7 @@ mod tests {
             .expect("set published block");
         assert!(
             writer
-                .publish_block_projection_graph(file.ino, 1)
+                .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
                 .expect("publish seed base graph"),
             "seed publish must succeed"
         );
@@ -6811,7 +6780,11 @@ mod tests {
             .expect("set unpublished overlay");
         assert!(
             writer
-                .mark_block_projection_uploaded_if_matches(file.ino, 0, 2, &uploaded_overlay)
+                .mark_regular_file_overlay_object_uploaded_if_matches(
+                    file.ino,
+                    2,
+                    uploaded_overlay.object_id,
+                )
                 .expect("mark overlay uploaded"),
             "overlay upload marker must succeed"
         );
@@ -6888,7 +6861,7 @@ mod tests {
             .expect("set overlay block");
         assert!(
             writer
-                .mark_block_projection_uploaded_if_matches(file.ino, 0, 1, &block)
+                .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 1, block.object_id)
                 .expect("mark overlay uploaded"),
             "uploaded marker must succeed"
         );
@@ -7181,7 +7154,7 @@ mod tests {
         a.stage_block_projection(file.ino, 0, &block)
             .expect("set staged block");
         assert!(
-            a.publish_block_projection_graph(file.ino, 2)
+            a.publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
                 .expect("publish committed base graph")
         );
         a.flush_metadata().expect("flush a");
@@ -7281,7 +7254,7 @@ mod tests {
         a.stage_block_projection(file.ino, 0, &block)
             .expect("set nested block");
         assert!(
-            a.publish_block_projection_graph(file.ino, 1)
+            a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
                 .expect("publish nested base graph")
         );
         a.flush_metadata().expect("flush nested publish");
@@ -7371,7 +7344,7 @@ mod tests {
         a.stage_block_projection(file.ino, 1, &block1)
             .expect("set block 1");
         assert!(
-            a.publish_block_projection_graph(file.ino, 1)
+            a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
                 .expect("publish renamed nested base graph")
         );
         a.flush_metadata().expect("flush renamed nested base graph");
@@ -7429,7 +7402,7 @@ mod tests {
         a.stage_block_projection(file.ino, 0, &baseline)
             .expect("set baseline block");
         assert!(
-            a.publish_block_projection_graph(file.ino, 1)
+            a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
                 .expect("publish baseline base graph")
         );
         a.flush_metadata().expect("flush baseline");
@@ -7507,7 +7480,7 @@ mod tests {
         a.stage_block_projection(file.ino, 1, &baseline1)
             .expect("set baseline block 1");
         assert!(
-            a.publish_block_projection_graph(file.ino, 1)
+            a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
                 .expect("publish baseline base graph")
         );
         a.flush_metadata().expect("flush baseline base graph");
@@ -7541,7 +7514,7 @@ mod tests {
         }));
 
         assert!(
-            a.publish_block_projection_graph(file.ino, 2)
+            a.publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
                 .expect("publish replacement base graph")
         );
         a.flush_metadata().expect("flush replacement base graph");
@@ -7707,7 +7680,7 @@ mod tests {
         a.stage_block_projection(file.ino, 0, &BlockRef::new_partial(87, 4096))
             .expect("set baseline remote block");
         assert!(
-            a.publish_block_projection_graph(file.ino, 1)
+            a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
                 .expect("publish baseline base graph")
         );
         a.flush_metadata().expect("flush create");
@@ -7728,7 +7701,7 @@ mod tests {
         a.stage_block_projection(file.ino, 0, &block)
             .expect("set staged remote block");
         assert!(
-            a.publish_block_projection_graph(file.ino, 2)
+            a.publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
                 .expect("publish remote block graph")
         );
         a.flush_metadata().expect("flush remote block");
@@ -7957,7 +7930,7 @@ mod tests {
         a.stage_block_projection(file.ino, 0, &BlockRef::new_partial(776, 4096))
             .expect("set baseline uploading block");
         assert!(
-            a.publish_block_projection_graph(file.ino, 1)
+            a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
                 .expect("publish baseline base graph")
         );
         a.flush_metadata().expect("flush baseline");
@@ -8622,7 +8595,7 @@ mod tests {
                 a.stage_block_projection(entry.ino, 0, &BlockRef::new_partial(50_320, 64))
                     .expect("set winner block on a");
                 assert!(
-                    a.publish_block_projection_graph(entry.ino, 1)
+                    a.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
                         .expect("publish winner on a")
                 );
                 a.flush_metadata().expect("flush winner on a");
@@ -8633,7 +8606,7 @@ mod tests {
                 b.stage_block_projection(entry.ino, 0, &BlockRef::new_partial(50_321, 64))
                     .expect("set winner block on b");
                 assert!(
-                    b.publish_block_projection_graph(entry.ino, 1)
+                    b.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
                         .expect("publish winner on b")
                 );
                 b.flush_metadata().expect("flush winner on b");
@@ -8713,7 +8686,7 @@ mod tests {
                 a.stage_block_projection(entry.ino, 0, &BlockRef::new_partial(50_322, 64))
                     .expect("set winner block on a");
                 assert!(
-                    a.publish_block_projection_graph(entry.ino, 1)
+                    a.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
                         .expect("publish winner on a")
                 );
                 a.flush_metadata().expect("flush winner on a");
@@ -8724,7 +8697,7 @@ mod tests {
                 b.stage_block_projection(entry.ino, 0, &BlockRef::new_partial(50_323, 64))
                     .expect("set winner block on b");
                 assert!(
-                    b.publish_block_projection_graph(entry.ino, 1)
+                    b.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
                         .expect("publish winner on b")
                 );
                 b.flush_metadata().expect("flush winner on b");

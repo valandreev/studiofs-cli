@@ -135,7 +135,7 @@ fn zeroio_delete_before_publish_persists_tombstone_lifecycle() {
     engine.stage_block_projection(file.ino, 1, &uploaded).unwrap();
     assert!(
         engine
-            .mark_block_projection_uploaded_if_matches(file.ino, 1, 1, &uploaded)
+            .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 1, uploaded.object_id)
             .unwrap()
     );
 
@@ -180,7 +180,7 @@ fn zeroio_unlink_open_handle_marks_unpublished_epoch_deleted_before_publish() {
     engine.set_attr(&published_attr).unwrap();
     let published = BlockRef::new_partial(960, 4096);
     engine.stage_block_projection(file.ino, 0, &published).unwrap();
-    assert!(engine.publish_block_projection_graph(file.ino, 1).unwrap());
+    assert!(engine.publish_regular_file_overlay_to_base_if_matches(file.ino, 1).unwrap());
 
     let mut overwrite_attr = engine.get_attr(file.ino).unwrap();
     overwrite_attr.content_epoch = 2;
@@ -189,7 +189,11 @@ fn zeroio_unlink_open_handle_marks_unpublished_epoch_deleted_before_publish() {
     engine.stage_block_projection(file.ino, 0, &uploaded_overlay).unwrap();
     assert!(
         engine
-            .mark_block_projection_uploaded_if_matches(file.ino, 0, 2, &uploaded_overlay)
+            .mark_regular_file_overlay_object_uploaded_if_matches(
+                file.ino,
+                2,
+                uploaded_overlay.object_id,
+            )
             .unwrap()
     );
 
@@ -500,7 +504,7 @@ fn redb_rename_keeps_same_inode_and_incarnation_ids() {
     engine
         .stage_block_projection(file.ino, 0, &BlockRef::new_partial(401, 4096))
         .unwrap();
-    assert!(engine.publish_block_projection_graph(file.ino, 7).unwrap());
+    assert!(engine.publish_regular_file_overlay_to_base_if_matches(file.ino, 7).unwrap());
 
     engine
         .rename_atomic(

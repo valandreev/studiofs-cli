@@ -93,9 +93,16 @@ fn test_referenced_object_ids_include_committed_blocks() {
     engine
         .stage_block_projection(ino, 0, &BlockRef::new_partial(21, 4096))
         .unwrap();
-    engine
-        .publish_uploaded_block_projection(ino, 0, 0, &BlockRef::new_partial(21, 4096))
-        .unwrap();
+    assert!(
+        engine
+            .mark_regular_file_overlay_object_uploaded_if_matches(ino, 0, 21)
+            .unwrap()
+    );
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(ino, 0)
+            .unwrap()
+    );
     engine
         .stage_block_projection(ino, 1, &BlockRef::new_partial(22, 4096))
         .unwrap();

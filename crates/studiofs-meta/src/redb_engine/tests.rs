@@ -13,21 +13,6 @@ trait BlockProjectionFixture {
     ) -> MetaResult<Option<BlockRef>>;
     fn lookup_block_projection(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>>;
     fn lookup_block_projections(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>>;
-    fn publish_uploaded_block_projection(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        expected_epoch: u64,
-        block: &BlockRef,
-    ) -> MetaResult<bool>;
-    fn mark_block_projection_uploaded_if_matches(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        expected_epoch: u64,
-        block: &BlockRef,
-    ) -> MetaResult<bool>;
-    fn publish_block_projection_graph(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool>;
 }
 
 fn block_projection_slices(
@@ -182,39 +167,6 @@ impl BlockProjectionFixture for RedbMetaEngine {
             }
         }
         Ok(out)
-    }
-
-    fn publish_uploaded_block_projection(
-        &self,
-        ino: Ino,
-        _block_index: u32,
-        expected_epoch: u64,
-        block: &BlockRef,
-    ) -> MetaResult<bool> {
-        self.mark_regular_file_overlay_object_uploaded_if_matches(
-            ino,
-            expected_epoch,
-            block.object_id,
-        )?;
-        self.publish_regular_file_overlay_to_base_if_matches(ino, expected_epoch)
-    }
-
-    fn mark_block_projection_uploaded_if_matches(
-        &self,
-        ino: Ino,
-        _block_index: u32,
-        expected_epoch: u64,
-        block: &BlockRef,
-    ) -> MetaResult<bool> {
-        self.mark_regular_file_overlay_object_uploaded_if_matches(
-            ino,
-            expected_epoch,
-            block.object_id,
-        )
-    }
-
-    fn publish_block_projection_graph(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool> {
-        self.publish_regular_file_overlay_to_base_if_matches(ino, expected_epoch)
     }
 }
 
