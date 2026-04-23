@@ -613,11 +613,26 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
     /// Collect object ids currently referenced by local regular-file overlay.
     ///
     /// Backends with a dedicated overlay graph should override this to read from
-    /// overlay metadata directly. The default falls back to the merged manifest.
+    /// overlay metadata directly. The default falls back to the merged manifest
+    /// and then to resolved slice spans when the file can no longer be
+    /// represented by legacy flat blocks.
     fn get_regular_file_overlay_object_ids(&self, ino: Ino) -> MetaResult<Vec<u64>> {
         let mut ids = HashSet::new();
-        for (_, block) in self.get_file_blocks(ino)? {
-            ids.insert(block.object_id);
+        match self.get_file_blocks(ino) {
+            Ok(blocks) => {
+                for (_, block) in blocks {
+                    ids.insert(block.object_id);
+                }
+            }
+            Err(MetaError::FragmentedBlock { .. }) => {
+                let attr = self.get_attr(ino)?;
+                for span in self.lookup_regular_file_slices(ino, 0, attr.size)? {
+                    if let Some(block) = span.block {
+                        ids.insert(block.object_id);
+                    }
+                }
+            }
+            Err(err) => return Err(err),
         }
         Ok(ids.into_iter().collect())
     }
@@ -631,12 +646,31 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
     /// counted once.
     fn get_regular_file_graph_object_usage(&self, ino: Ino) -> MetaResult<Vec<(u64, u64)>> {
         let mut usage: HashMap<u64, u64> = HashMap::new();
-        for (_, block) in self.get_file_blocks(ino)? {
-            let object_bytes = u64::from(block.offset).saturating_add(u64::from(block.length));
-            usage
-                .entry(block.object_id)
-                .and_modify(|existing| *existing = (*existing).max(object_bytes))
-                .or_insert(object_bytes);
+        match self.get_file_blocks(ino) {
+            Ok(blocks) => {
+                for (_, block) in blocks {
+                    let object_bytes =
+                        u64::from(block.offset).saturating_add(u64::from(block.length));
+                    usage
+                        .entry(block.object_id)
+                        .and_modify(|existing| *existing = (*existing).max(object_bytes))
+                        .or_insert(object_bytes);
+                }
+            }
+            Err(MetaError::FragmentedBlock { .. }) => {
+                let attr = self.get_attr(ino)?;
+                for span in self.lookup_regular_file_slices(ino, 0, attr.size)? {
+                    if let Some(block) = span.block {
+                        let object_bytes =
+                            u64::from(block.offset).saturating_add(u64::from(block.length));
+                        usage
+                            .entry(block.object_id)
+                            .and_modify(|existing| *existing = (*existing).max(object_bytes))
+                            .or_insert(object_bytes);
+                    }
+                }
+            }
+            Err(err) => return Err(err),
         }
         Ok(usage.into_iter().collect())
     }
@@ -715,7 +749,9 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
     fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool> {
         let expected_manifest = match self.get_file_blocks(ino) {
             Ok(expected_manifest) => expected_manifest,
-            Err(MetaError::FragmentedBlock { .. }) => return Ok(false),
+            Err(MetaError::FragmentedBlock { .. }) => {
+                return self.publish_regular_file_overlay_to_base_if_matches(ino, expected_epoch);
+            }
             Err(err) => return Err(err),
         };
         self.publish_file_manifest_if_matches(ino, expected_epoch, &expected_manifest)

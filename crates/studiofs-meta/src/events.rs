@@ -64,7 +64,10 @@ pub enum MetaEvent {
     },
 
     // ─── File Block Operations ───────────────────────────────────────────────
-    /// Set a block reference for a file.
+    /// Legacy flat-block event: set one block reference for a file.
+    ///
+    /// Kept for compatibility with old journals/tests. New regular-file write
+    /// paths should prefer slice-native regular-file graph events.
     SetFileBlock {
         /// File inode being updated.
         ino: u64,
@@ -74,7 +77,10 @@ pub enum MetaEvent {
         block: BlockRef,
     },
 
-    /// Remove a specific file block (e.g., truncate).
+    /// Legacy flat-block event: remove one logical file block.
+    ///
+    /// Kept for compatibility with old journals/tests. New regular-file write
+    /// paths should prefer slice-native regular-file graph events.
     RemoveFileBlock {
         /// File inode being updated.
         ino: u64,
@@ -82,19 +88,25 @@ pub enum MetaEvent {
         block_index: u32,
     },
 
-    /// Remove all blocks for a file (e.g., unlink).
+    /// Remove all regular-file graph rows for a file (e.g., unlink).
     RemoveFileBlocks {
         /// File inode whose block mapping should be removed.
         ino: u64,
     },
 
-    /// Set multiple block references in one batch (used by drain_dirty_mem).
+    /// Legacy flat-block event: set multiple block references in one batch.
+    ///
+    /// Kept for compatibility with old journals/tests. New regular-file write
+    /// paths should prefer slice-native regular-file graph events.
     SetFileBlocksBatch {
         /// Batch of `(ino, block_index, block)` updates to apply atomically.
         blocks: Vec<(u64, u32, BlockRef)>,
     },
 
-    /// Publish a block that has finished uploading and is now remote-visible.
+    /// Legacy flat-block event: publish one uploaded block as remote-visible.
+    ///
+    /// Kept for compatibility with old journals/tests. New regular-file upload
+    /// paths should prefer object/slice-native publication.
     CommitFileBlock {
         /// File inode being updated.
         ino: u64,
@@ -104,7 +116,11 @@ pub enum MetaEvent {
         block: BlockRef,
     },
 
-    /// Atomically publish the committed manifest head for a file.
+    /// Legacy flat-manifest event: publish a full `(block_index, BlockRef)`
+    /// manifest for a file.
+    ///
+    /// Kept for compatibility with old journals/tests. New regular-file
+    /// publish paths should prefer `PublishRegularFileBaseSlices`.
     PublishFileManifest {
         /// File inode whose published manifest is being replaced.
         ino: u64,

@@ -1025,7 +1025,7 @@ fn redb_upload_state_transitions_follow_inode_fields() {
 }
 
 #[test]
-fn publish_file_manifest_rejects_fragmented_graph_without_error() {
+fn publish_file_manifest_promotes_fragmented_graph_slice_natively() {
     let engine = temp_engine();
 
     let file = engine
@@ -1066,14 +1066,19 @@ fn publish_file_manifest_rejects_fragmented_graph_without_error() {
     ));
 
     assert!(
-        !engine.publish_file_manifest(file.ino, 1).unwrap(),
-        "legacy flat manifest publish should decline fragmented graphs"
+        engine.publish_file_manifest(file.ino, 1).unwrap(),
+        "default publish should promote fragmented regular-file graphs through the slice-native path"
     );
+    let attr = engine.get_attr(file.ino).unwrap();
+    assert_eq!(attr.upload_state, UploadState::Ready);
+    assert_eq!(attr.committed_content_epoch, 1);
+    assert_eq!(attr.committed_size, 8192);
+    assert!(!engine.has_local_regular_file_overlay(file.ino).unwrap());
     assert!(
         !engine
             .publish_file_manifest_if_matches(file.ino, 1, &[])
             .unwrap(),
-        "race-checked legacy publish should also decline fragmented graphs"
+        "race-checked legacy flat publish should still decline mismatched manifests"
     );
 }
 
