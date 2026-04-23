@@ -103,7 +103,7 @@ impl MetaBlocks for RedbMetaEngine {
         Ok(merge_adjacent_spans(spans))
     }
 
-    fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>> {
+    fn remove_regular_file_graph(&self, ino: Ino) -> MetaResult<Vec<u64>> {
         let txn = self
             .db
             .begin_write()
@@ -637,14 +637,14 @@ impl RedbMetaEngine {
         let normalized_attr = if let Some(attr) = attr {
             let mut normalized = attr.clone();
             if normalized.kind == FileType::RegularFile {
-                let has_committed_manifest = Self::has_regular_file_chunk_rows_in_write_txn(
+                let has_committed_graph = Self::has_regular_file_chunk_rows_in_write_txn(
                     &txn,
                     REGULAR_FILE_BASE_TABLE,
                     normalized.ino,
                 )?;
                 Self::transition_upload_state_for_local_mutation(
                     &mut normalized,
-                    has_committed_manifest,
+                    has_committed_graph,
                 );
             }
             Some(normalized)

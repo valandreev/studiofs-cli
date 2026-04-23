@@ -106,7 +106,7 @@ fn test_recover_undo_logs_replays_deferred_delete_with_fragmented_graph() {
 
     assert!(matches!(
         engine.lookup_file_graph_blocks(attr.ino),
-        Err(MetaError::FragmentedBlock { .. })
+        Err(MetaError::NonContiguousRegularFileGraph { .. })
     ));
     let unlinked = engine.unlink_open_handle(parent, name).unwrap();
     assert_eq!(unlinked.ino, attr.ino);

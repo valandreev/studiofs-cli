@@ -182,7 +182,7 @@ fn fixture_block_from_spans(
             if current.object_id != part.object_id
                 || current.offset.saturating_add(current.length) != part.offset
             {
-                return Err(MetaError::FragmentedBlock {
+                return Err(MetaError::NonContiguousRegularFileGraph {
                     ino: 0,
                     block_index,
                 });
@@ -2019,10 +2019,10 @@ async fn test_background_janitor_cleans_simulated_crash_orphan() {
     );
 
     // 2) Simulate crash window by "losing" metadata refs while object remains in S3.
-    let removed_ids = vfs.meta().remove_file_blocks(ino).unwrap();
+    let removed_ids = vfs.meta().remove_regular_file_graph(ino).unwrap();
     assert!(
         removed_ids.contains(&object_id),
-        "remove_file_blocks should drop the uploaded object reference"
+        "remove_regular_file_graph should drop the uploaded object reference"
     );
 
     // 3) Janitor should eventually detect object as orphan and delete it.
@@ -5937,7 +5937,7 @@ async fn rename_into_trashes_evicts_local_block_payloads() {
 
 #[test]
 #[ignore = "requires live S3 backend; run with --ignored and valid .env"]
-fn update_manifest_reuses_untouched_committed_extents() {
+fn update_base_graph_reuses_untouched_committed_extents() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
@@ -5960,7 +5960,7 @@ fn update_manifest_reuses_untouched_committed_extents() {
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
-    let volume_suffix = format!("pr06-manifest-reuse-{}", std::process::id());
+    let volume_suffix = format!("pr06-base-graph-reuse-{}", std::process::id());
     let online_info = make_format_info(&volume_suffix);
     let offline_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
     let data_config_offline = DataStoreConfig::from(&offline_info);
@@ -5983,7 +5983,7 @@ fn update_manifest_reuses_untouched_committed_extents() {
             let (seeded_ino, seeded_blocks) = seed_committed_file(
                 &meta,
                 &online_info,
-                b"manifest-reuse.bin",
+                b"base-graph-reuse.bin",
                 &baseline_payload,
             )
             .await;
@@ -6042,7 +6042,7 @@ fn update_manifest_reuses_untouched_committed_extents() {
         assert_eq!(
             read.as_ref(),
             patch.as_slice(),
-            "pending update manifest must expose the touched extent while preserving untouched committed refs"
+            "pending update graph must expose the touched extent while preserving untouched committed refs"
         );
     });
     rt.shutdown_background();

@@ -141,7 +141,7 @@ fn test_replica_aux_block_events_accept_fragmented_base_graph() {
     set_regular_file_chunk_rows(&engine, file.ino, &[], &[(ChunkId(0), base_chunk)]);
     assert!(matches!(
         engine.lookup_file_graph_block(file.ino, 0),
-        Err(MetaError::FragmentedBlock { .. })
+        Err(MetaError::NonContiguousRegularFileGraph { .. })
     ));
 
     let replacement = BlockRef::new_full(73, DEFAULT_BLOCK_SIZE);

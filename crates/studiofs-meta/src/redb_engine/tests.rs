@@ -129,7 +129,7 @@ fn fixture_block_from_spans(
             if current.object_id != part.object_id
                 || current.offset.saturating_add(current.length) != part.offset
             {
-                return Err(MetaError::FragmentedBlock {
+                return Err(MetaError::NonContiguousRegularFileGraph {
                     ino: 0,
                     block_index,
                 });

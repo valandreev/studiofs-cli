@@ -440,7 +440,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         } else if attr.nlink == 0 {
             RedbMetaEngine::remove_inode_overlay_in_txn(self.txn, entry.ino)?;
             RedbMetaEngine::clear_inode_overlay_aux_in_txn(self.txn, entry.ino)?;
-            self.remove_file_blocks_for_inode(entry.ino)?;
+            self.remove_regular_file_graph_for_inode(entry.ino)?;
             if deleted_before_publish.is_none() {
                 RedbMetaEngine::remove_inode_lifecycle_in_txn(self.txn, entry.ino)?;
             }
@@ -499,7 +499,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         Ok(NamespaceDeleteResult::Directory)
     }
 
-    pub(super) fn remove_file_blocks_for_inode(&self, ino: Ino) -> MetaResult<()> {
+    pub(super) fn remove_regular_file_graph_for_inode(&self, ino: Ino) -> MetaResult<()> {
         RedbMetaEngine::clear_regular_file_graph_in_txn(self.txn, ino)
     }
 

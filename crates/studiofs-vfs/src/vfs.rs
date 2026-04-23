@@ -4460,7 +4460,10 @@ impl StudioVfs {
     }
 
     fn is_invalid_regular_file_graph_error(error: &VfsError) -> bool {
-        matches!(error, VfsError::Meta(MetaError::FragmentedBlock { .. }))
+        matches!(
+            error,
+            VfsError::Meta(MetaError::NonContiguousRegularFileGraph { .. })
+        )
     }
 
     fn needs_epoch_finalization(attr: &InodeAttr) -> bool {

@@ -391,7 +391,7 @@ impl RedbMetaEngine {
             return Ok(());
         }
 
-        let graph = Self::convert_blocks_to_chunk_state(blocks, block_size)?;
+        let graph = Self::block_projection_to_chunk_state(blocks, block_size)?;
         let mut table = txn
             .open_table(table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -631,9 +631,9 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    /// Convert flat block list to chunk/slice state using the provided block size.
+    /// Convert a block-shaped test projection to chunk/slice state using the provided block size.
     #[cfg(test)]
-    pub(super) fn convert_blocks_to_chunk_state(
+    pub(super) fn block_projection_to_chunk_state(
         blocks: &[(u32, BlockRef)],
         block_size: u32,
     ) -> MetaResult<RegularFileOverlayState> {
@@ -728,7 +728,7 @@ impl RedbMetaEngine {
 
     #[cfg(test)]
     #[allow(dead_code)]
-    pub(super) fn manifest_from_chunk_states(
+    pub(super) fn block_projection_from_chunk_states(
         ino: Ino,
         overlay_chunks: Option<&BTreeMap<ChunkId, RegularFileChunkState>>,
         base_chunks: Option<&BTreeMap<ChunkId, RegularFileChunkState>>,
@@ -776,7 +776,9 @@ impl RedbMetaEngine {
                 (cursor - chunk_start) as u32,
                 (query_end - chunk_start) as u32,
             )
-            .ok_or_else(|| MetaError::Storage("invalid chunk-local manifest range".to_string()))?;
+            .ok_or_else(|| {
+                MetaError::Storage("invalid chunk-local block projection range".to_string())
+            })?;
             spans.extend(resolve_chunk_slice_spans(
                 chunk_id,
                 query,
@@ -788,7 +790,7 @@ impl RedbMetaEngine {
         let spans = merge_adjacent_spans(spans);
         if block_size == 0 {
             return Err(MetaError::Storage(
-                "invalid zero block size in manifest synthesis".to_string(),
+                "invalid zero block size in block projection synthesis".to_string(),
             ));
         }
         let block_count = ((size.saturating_sub(1)) / block_size as u64).saturating_add(1);
@@ -1107,7 +1109,7 @@ impl RedbMetaEngine {
                 if existing.object_id != part.object_id
                     || existing.offset.saturating_add(existing.length) != part.offset
                 {
-                    return Err(MetaError::FragmentedBlock { ino, block_index });
+                    return Err(MetaError::NonContiguousRegularFileGraph { ino, block_index });
                 }
                 existing.length = existing.length.saturating_add(part.length);
                 existing.flags |= part.flags;
@@ -1174,7 +1176,7 @@ impl RedbMetaEngine {
 
     #[cfg(test)]
     #[allow(dead_code)]
-    pub(super) fn current_manifest_in_txn(
+    pub(super) fn current_block_projection_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
     ) -> MetaResult<Vec<(u32, BlockRef)>> {
@@ -1199,7 +1201,12 @@ impl RedbMetaEngine {
             ino,
         )?;
         let block_size = Self::regular_file_graph_block_size_from_write_txn(txn)?;
-        Self::manifest_from_chunk_states(ino, Some(&overlay_chunks), Some(&base_chunks), block_size)
+        Self::block_projection_from_chunk_states(
+            ino,
+            Some(&overlay_chunks),
+            Some(&base_chunks),
+            block_size,
+        )
     }
 
     #[cfg(test)]
@@ -1408,7 +1415,7 @@ impl RedbMetaEngine {
 
     pub(super) fn transition_upload_state_for_local_mutation(
         attr: &mut InodeAttr,
-        has_committed_manifest: bool,
+        has_committed_graph: bool,
     ) {
         if attr.kind != FileType::RegularFile {
             attr.upload_state = UploadState::Ready;
@@ -1416,9 +1423,7 @@ impl RedbMetaEngine {
         }
         if attr.content_epoch == attr.committed_content_epoch && attr.size == attr.committed_size {
             attr.upload_state = UploadState::Ready;
-        } else if has_committed_manifest
-            || attr.committed_size > 0
-            || attr.committed_content_epoch > 0
+        } else if has_committed_graph || attr.committed_size > 0 || attr.committed_content_epoch > 0
         {
             attr.upload_state = UploadState::Updating;
         } else {
@@ -1428,7 +1433,7 @@ impl RedbMetaEngine {
 
     #[cfg(test)]
     #[allow(dead_code)]
-    pub(super) fn manifest_matches_committed_in_txn(
+    pub(super) fn block_projection_matches_committed_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
     ) -> MetaResult<bool> {

@@ -16,13 +16,14 @@ pub enum MetaError {
     #[error("inode not found: {0}")]
     InodeNotFound(Ino),
 
-    /// The caller asked for a flat block view of a file that is represented by
-    /// fragmented chunk/slice metadata instead of one block per slot.
-    #[error("fragmented regular-file block: ino={ino}, block_index={block_index}")]
-    FragmentedBlock {
-        /// Inode whose block view is fragmented.
+    /// The caller asked for a contiguous block-shaped projection of a file range that is represented by multiple slice spans.
+    #[error(
+        "non-contiguous regular-file graph cannot be represented as one block: ino={ino}, block_index={block_index}"
+    )]
+    NonContiguousRegularFileGraph {
+        /// Inode whose graph projection is non-contiguous.
         ino: Ino,
-        /// Logical block index that could not be synthesized.
+        /// Logical block slot that could not be projected as a single object.
         block_index: u32,
     },
 
@@ -462,7 +463,7 @@ pub trait MetaFsOps: Send + Sync + MetaInodes {
     ) -> MetaResult<InodeAttr>;
 }
 
-/// Capability trait for block ids, manifests, and regular-file overlay graphs.
+/// Capability trait for object ids and regular-file overlay/base graphs.
 pub trait MetaBlocks: Send + Sync + MetaInodes {
     /// Resolve merged regular-file slice coverage for one chunk-local range.
     ///
@@ -488,9 +489,9 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
         length: u64,
     ) -> MetaResult<Vec<ResolvedSliceSpan>>;
 
-    /// Remove all blocks for a file (used when deleting).
-    /// Returns the list of removed block IDs for GC.
-    fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>>;
+    /// Remove the regular-file graph for an inode (used when deleting).
+    /// Returns the list of removed object IDs for GC.
+    fn remove_regular_file_graph(&self, ino: Ino) -> MetaResult<Vec<u64>>;
 
     /// Allocate a new sequential block ID.
     fn next_block_id(&self) -> MetaResult<u64>;
@@ -640,8 +641,7 @@ pub trait MetaGc: Send + Sync {
 
     /// Get currently referenced object IDs from the full reachability graph.
     ///
-    /// Backends should include flat block tables, chunk/slice overlay/base
-    /// rows, and snapshot pins so cleanup can reason about publication races
+    /// Backends should include regular-file graph overlay/base rows and snapshot pins so cleanup can reason about publication races
     /// and shadow refs directly from metadata reachability.
     ///
     /// Prefer streaming the underlying rows into a shared accumulator instead
@@ -805,7 +805,7 @@ pub trait MetaEngine:
     /// returned value (rather than the input) for any post-commit in-memory
     /// state updates, because backends are permitted to normalise fields such
     /// as `upload_state` inside the commit transaction using information only
-    /// they can observe (e.g. whether a committed S3 manifest already exists).
+    /// they can observe (e.g. whether a committed remote base graph already exists).
     ///
     /// Backends should override this to make the operation atomic if possible.
     fn flush_regular_file_overlay_slices_with_attr(
@@ -817,7 +817,7 @@ pub trait MetaEngine:
         self.flush_regular_file_overlay_slices(ino, chunk_slices)?;
         if let Some(attr) = attr {
             // `set_attr` normalises `upload_state` (including the
-            // `has_committed_manifest` check) before writing, so we must
+            // `has_committed_graph` check) before writing, so we must
             // re-read the stored value to return the accurate committed form.
             self.set_attr(attr)?;
             return Ok(Some(self.get_attr(ino)?));

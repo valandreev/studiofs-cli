@@ -289,7 +289,7 @@ impl MetaRecovery for RedbMetaEngine {
                     Err(err) => return Err(err),
                 };
                 let total_bytes: u64 = graph_usage.iter().map(|(_, bytes)| *bytes).sum();
-                let removed_ids = match self.remove_file_blocks(record.ino) {
+                let removed_ids = match self.remove_regular_file_graph(record.ino) {
                     Ok(ids) => ids,
                     Err(MetaError::InodeNotFound(_)) => Vec::new(),
                     Err(err) => return Err(err),

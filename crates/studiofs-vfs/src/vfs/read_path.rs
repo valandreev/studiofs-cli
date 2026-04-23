@@ -1570,7 +1570,7 @@ mod tests {
         (rt, vfs, meta)
     }
 
-    fn mark_all_file_blocks_uploaded(
+    fn mark_all_overlay_objects_uploaded(
         vfs: &Arc<StudioVfs>,
         meta: &Arc<RedbMetaEngine>,
         ino: Ino,
@@ -1587,14 +1587,14 @@ mod tests {
                     attr.content_epoch,
                     *object_id
                 )
-                .expect("mark block uploaded"),
+                .expect("mark overlay object uploaded"),
                 "expected metadata upload mark to apply for every overlay object"
             );
         }
         (attr.content_epoch, object_ids)
     }
 
-    fn publish_current_manifest(
+    fn publish_current_file_graph(
         meta: &Arc<RedbMetaEngine>,
         ino: Ino,
         content_epoch: u64,
@@ -1602,8 +1602,8 @@ mod tests {
     ) {
         assert!(
             meta.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
-                .expect("publish current manifest"),
-            "expected manifest publish to apply"
+                .expect("publish current file graph"),
+            "expected file graph publish to apply"
         );
     }
 
@@ -1698,8 +1698,8 @@ mod tests {
             vfs.write(ino, 0, &payload).await.expect("write payload");
             vfs.flush(ino).await.expect("flush durable local payload");
 
-            let (content_epoch, blocks) = mark_all_file_blocks_uploaded(&vfs, &meta, ino);
-            publish_current_manifest(&meta, ino, content_epoch, &blocks);
+            let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+            publish_current_file_graph(&meta, ino, content_epoch, &blocks);
             vfs.state.namespace.dirty_attrs.lock().remove(&ino);
             vfs.state.namespace.attr_read_cache.lock().remove(ino);
 

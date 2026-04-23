@@ -349,8 +349,6 @@ fn test_redb_snapshot_defaults_missing_regular_file_fields() {
         "counters": [],
         "inodes": [],
         "dentries": [],
-        "file_blocks": [],
-        "committed_file_blocks": [],
         "pending_deletions": [],
         "symlinks": [],
         "xattrs": [],

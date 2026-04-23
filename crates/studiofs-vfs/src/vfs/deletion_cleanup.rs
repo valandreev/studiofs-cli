@@ -58,7 +58,7 @@ impl StudioVfs {
         self.mark_inode_deleted_for_uploads(ino);
 
         let graph_usage = self.regular_file_graph_usage(meta, ino)?;
-        let removed_ids = meta.remove_file_blocks(ino)?;
+        let removed_ids = meta.remove_regular_file_graph(ino)?;
         let deletion_ids = if graph_usage.object_ids.is_empty() {
             removed_ids.as_slice()
         } else {
@@ -107,7 +107,7 @@ impl StudioVfs {
                 .iter()
                 .fold(0_u64, |acc, (_, bytes)| acc.saturating_add(*bytes));
 
-            let removed_ids = match engine.remove_file_blocks(ino) {
+            let removed_ids = match engine.remove_regular_file_graph(ino) {
                 Ok(ids) => ids,
                 Err(MetaError::InodeNotFound(_)) => Vec::new(),
                 Err(err) => return Err(err),

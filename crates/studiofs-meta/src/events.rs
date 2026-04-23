@@ -86,7 +86,7 @@ pub enum MetaEvent {
     /// The payload carries the full published base rows for the inode after the
     /// publish barrier completes. This is the slice-native publish event used
     /// by regular-file graphs that can no longer be losslessly expressed as a
-    /// flat `(block_index, BlockRef)` manifest.
+    /// lossless `(block_index, BlockRef)` projection.
     PublishRegularFileBaseSlices {
         /// File inode whose published base chunks are being replaced.
         ino: u64,

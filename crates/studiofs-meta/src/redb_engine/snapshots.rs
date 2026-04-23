@@ -479,7 +479,7 @@ impl RedbMetaEngine {
             match attr.kind {
                 FileType::RegularFile => {
                     // Snapshots pin the visible file contents, so resolve the
-                    // overlay/base view instead of reading legacy flat blocks.
+                    // overlay/base graph instead of synthesizing block-shaped rows.
                     for span in self.lookup_regular_file_slices(ino, 0, attr.size)? {
                         if let Some(block) = span.block {
                             pinned.insert(block.object_id);

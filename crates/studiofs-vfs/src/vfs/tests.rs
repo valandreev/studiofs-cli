@@ -209,7 +209,7 @@ fn reopen_existing_test_vfs(tmp: &TempDir) -> (Arc<Runtime>, Arc<StudioVfs>, Arc
     (rt, vfs, meta)
 }
 
-fn mark_all_file_blocks_uploaded(
+fn mark_all_overlay_objects_uploaded(
     vfs: &Arc<StudioVfs>,
     meta: &Arc<RedbMetaEngine>,
     ino: Ino,
@@ -226,14 +226,14 @@ fn mark_all_file_blocks_uploaded(
                 attr.content_epoch,
                 *object_id
             )
-            .expect("mark block uploaded"),
+            .expect("mark overlay object uploaded"),
             "expected metadata upload mark to apply for every overlay object"
         );
     }
     (attr.content_epoch, object_ids)
 }
 
-fn publish_current_manifest(
+fn publish_current_file_graph(
     meta: &Arc<RedbMetaEngine>,
     ino: Ino,
     content_epoch: u64,
@@ -241,8 +241,8 @@ fn publish_current_manifest(
 ) {
     assert!(
         meta.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
-            .expect("publish current manifest"),
-        "expected manifest publish to apply"
+            .expect("publish current file graph"),
+        "expected file graph publish to apply"
     );
 }
 
@@ -856,10 +856,10 @@ fn zeroio_snapshot_distinguishes_single_store_payload_classes_and_publish_backlo
             .expect("materialize published warm payload");
 
         let (publish_ready_epoch, publish_ready_blocks) =
-            mark_all_file_blocks_uploaded(&vfs, &meta, publish_ready.ino);
+            mark_all_overlay_objects_uploaded(&vfs, &meta, publish_ready.ino);
         let (published_epoch, published_blocks) =
-            mark_all_file_blocks_uploaded(&vfs, &meta, published.ino);
-        publish_current_manifest(&meta, published.ino, published_epoch, &published_blocks);
+            mark_all_overlay_objects_uploaded(&vfs, &meta, published.ino);
+        publish_current_file_graph(&meta, published.ino, published_epoch, &published_blocks);
 
         let snapshot = vfs.zeroio_runtime_snapshot();
 
@@ -983,16 +983,16 @@ fn zeroio_snapshot_reports_delete_before_publish_cleanup_visibility() {
 }
 
 #[test]
-fn epoch_finalizer_publishes_manifest_backed_zero_length_epoch() {
+fn epoch_finalizer_publishes_graph_backed_zero_length_epoch() {
     let tmp = TempDir::new().expect("tempdir");
-    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "manifest-finalizer-zero-length");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-zero-length");
     let _guard = rt.enter();
 
     rt.block_on(async {
         let attr = vfs
-            .create(1, b"manifest-finalizer-zero-length.bin", 0, 0, 0o644)
+            .create(1, b"graph-finalizer-zero-length.bin", 0, 0, 0o644)
             .expect("create test file");
-        let payload = b"manifest-backed-finalization";
+        let payload = b"graph-backed-finalization";
         vfs.write(attr.ino, 0, payload)
             .await
             .expect("write test payload");
@@ -1001,30 +1001,30 @@ fn epoch_finalizer_publishes_manifest_backed_zero_length_epoch() {
             .expect("materialize unpublished blocks before publish setup");
 
         let (published_epoch, published_blocks) =
-            mark_all_file_blocks_uploaded(&vfs, &meta, attr.ino);
-        publish_current_manifest(&meta, attr.ino, published_epoch, &published_blocks);
+            mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
+        publish_current_file_graph(&meta, attr.ino, published_epoch, &published_blocks);
 
         let mut truncated_attr = meta.get_attr(attr.ino).expect("load published attr");
         truncated_attr.size = 0;
         truncated_attr.content_epoch = truncated_attr.content_epoch.saturating_add(1);
         truncated_attr.upload_state = MetaUploadState::Updating;
         meta.set_attr(&truncated_attr)
-            .expect("stage manifest-backed zero-length epoch");
-        meta.remove_file_blocks(attr.ino)
+            .expect("stage graph-backed zero-length epoch");
+        meta.remove_regular_file_graph(attr.ino)
             .expect("remove unpublished blocks for zero-length truncate");
 
         assert!(
             !meta
                 .has_local_regular_file_overlay(attr.ino)
                 .expect("query overlay state"),
-            "regression setup should exercise the legacy manifest-backed path"
+            "regression setup should exercise the legacy graph-backed path"
         );
 
         let unpublished_attr = meta.get_attr(attr.ino).expect("load unpublished attr");
         let lifecycle = meta
             .get_inode_lifecycle(attr.ino)
             .expect("load lifecycle")
-            .expect("manifest-backed epoch should keep lifecycle state");
+            .expect("graph-backed epoch should keep lifecycle state");
         assert_eq!(unpublished_attr.size, 0);
         assert_ne!(
             unpublished_attr.upload_state,
@@ -1038,11 +1038,11 @@ fn epoch_finalizer_publishes_manifest_backed_zero_length_epoch() {
         assert_eq!(
             lifecycle.state,
             InodeLifecycleState::PublishReady,
-            "blockless manifest-backed zero-length epochs should become publish-ready immediately"
+            "blockless graph-backed zero-length epochs should become publish-ready immediately"
         );
         assert_eq!(
             meta.lookup_file_graph_blocks(attr.ino)
-                .expect("load unpublished manifest")
+                .expect("load unpublished graph")
                 .len(),
             0,
             "regression setup should not require remote object visibility checks"
@@ -1054,10 +1054,10 @@ fn epoch_finalizer_publishes_manifest_backed_zero_length_epoch() {
             unpublished_attr.content_epoch,
         )
         .await
-        .expect("finalize zero-length manifest-backed epoch");
+        .expect("finalize zero-length graph-backed epoch");
         assert!(
             matches!(status, super::commit::EpochFinalizeStatus::Published),
-            "manifest-backed zero-length epoch should still publish"
+            "graph-backed zero-length epoch should still publish"
         );
 
         let published_attr = meta.get_attr(attr.ino).expect("load published attr");
@@ -1074,12 +1074,12 @@ fn epoch_finalizer_publishes_manifest_backed_zero_length_epoch() {
 #[test]
 fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
     let tmp = TempDir::new().expect("tempdir");
-    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "manifest-finalizer-buffered-tail");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-buffered-tail");
     let _guard = rt.enter();
 
     rt.block_on(async {
         let attr = vfs
-            .create(1, b"manifest-finalizer-buffered-tail.bin", 0, 0, 0o644)
+            .create(1, b"graph-finalizer-buffered-tail.bin", 0, 0, 0o644)
             .expect("create test file");
         let ino = attr.ino;
         let fh = vfs
@@ -1110,7 +1110,7 @@ fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
             "setup should create a publishable durable prefix before buffering a newer tail"
         );
 
-        let (content_epoch, _blocks) = mark_all_file_blocks_uploaded(&vfs, &meta, ino);
+        let (content_epoch, _blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
 
         vfs.write_fh_with_local_sync_policy(
             fh,
@@ -1193,14 +1193,14 @@ fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
 #[test]
 fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
     let tmp = TempDir::new().expect("tempdir");
-    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "manifest-finalizer-inflight");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-inflight");
     let _guard = rt.enter();
 
     rt.block_on(async {
         let attr = vfs
-            .create(1, b"manifest-finalizer-inflight.bin", 0, 0, 0o644)
+            .create(1, b"graph-finalizer-inflight.bin", 0, 0, 0o644)
             .expect("create test file");
-        let payload = b"manifest-backed-finalization";
+        let payload = b"graph-backed-finalization";
         vfs.write(attr.ino, 0, payload)
             .await
             .expect("write test payload");
@@ -1209,16 +1209,16 @@ fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
             .expect("materialize unpublished blocks before publish setup");
 
         let (published_epoch, published_blocks) =
-            mark_all_file_blocks_uploaded(&vfs, &meta, attr.ino);
-        publish_current_manifest(&meta, attr.ino, published_epoch, &published_blocks);
+            mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
+        publish_current_file_graph(&meta, attr.ino, published_epoch, &published_blocks);
 
         let mut truncated_attr = meta.get_attr(attr.ino).expect("load published attr");
         truncated_attr.size = 0;
         truncated_attr.content_epoch = truncated_attr.content_epoch.saturating_add(1);
         truncated_attr.upload_state = MetaUploadState::Updating;
         meta.set_attr(&truncated_attr)
-            .expect("stage manifest-backed zero-length epoch");
-        meta.remove_file_blocks(attr.ino)
+            .expect("stage graph-backed zero-length epoch");
+        meta.remove_regular_file_graph(attr.ino)
             .expect("remove unpublished blocks for zero-length truncate");
 
         let unpublished_attr = meta.get_attr(attr.ino).expect("load unpublished attr");
@@ -1233,7 +1233,7 @@ fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
         assert_eq!(
             lifecycle.state,
             InodeLifecycleState::PublishReady,
-            "once zero-length manifest state is durable, only publication should remain"
+            "once zero-length graph state is durable, only publication should remain"
         );
 
         let task_lock = Arc::new(tokio::sync::Mutex::new(()));
@@ -1274,19 +1274,19 @@ fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
 }
 
 #[test]
-fn manifest_finalizer_visibility_timeout_does_not_requeue_uploaded_blocks() {
+fn graph_finalizer_visibility_timeout_does_not_requeue_uploaded_blocks() {
     let tmp = TempDir::new().expect("tempdir");
     let cfg = VfsConfig {
         publish_visibility_timeout_secs: 1,
         ..VfsConfig::default()
     };
     let (rt, vfs, meta) =
-        make_unstarted_test_vfs_with_config(&tmp, "manifest-finalizer-no-requeue", cfg);
+        make_unstarted_test_vfs_with_config(&tmp, "graph-finalizer-no-requeue", cfg);
     let _guard = rt.enter();
 
     rt.block_on(async {
         let attr = vfs
-            .create(1, b"manifest-finalizer-no-requeue.bin", 0, 0, 0o644)
+            .create(1, b"graph-finalizer-no-requeue.bin", 0, 0, 0o644)
             .expect("create test file");
         let payload = vec![0x5Au8; vfs.block_size as usize];
         vfs.write(attr.ino, 0, &payload)
@@ -1294,9 +1294,9 @@ fn manifest_finalizer_visibility_timeout_does_not_requeue_uploaded_blocks() {
             .expect("write test payload");
         vfs.flush(attr.ino)
             .await
-            .expect("flush manifest-backed epoch");
+            .expect("flush graph-backed epoch");
 
-        let (content_epoch, _blocks) = mark_all_file_blocks_uploaded(&vfs, &meta, attr.ino);
+        let (content_epoch, _blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
         for pending in vfs.pending_uploads_snapshot() {
             if pending.ino == attr.ino && pending.content_epoch == content_epoch {
                 vfs.cached_store().complete_upload(&pending);
@@ -3318,8 +3318,8 @@ fn inode_write_overwrite_updates_current_block_graph_over_published_base() {
 
         vfs.write(ino, 0, baseline).await.unwrap();
         vfs.flush(ino).await.unwrap();
-        let (published_epoch, published_blocks) = mark_all_file_blocks_uploaded(&vfs, &meta, ino);
-        publish_current_manifest(&meta, ino, published_epoch, &published_blocks);
+        let (published_epoch, published_blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, published_epoch, &published_blocks);
 
         vfs.write(ino, 0, replacement).await.unwrap();
         vfs.flush(ino).await.unwrap();

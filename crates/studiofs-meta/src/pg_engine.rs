@@ -4129,8 +4129,8 @@ impl MetaBlocks for PgMetaEngine {
         self.local.lookup_regular_file_slices(ino, offset, length)
     }
 
-    fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>> {
-        self.mutate(|local| local.remove_file_blocks(ino))
+    fn remove_regular_file_graph(&self, ino: Ino) -> MetaResult<Vec<u64>> {
+        self.mutate(|local| local.remove_regular_file_graph(ino))
     }
 
     fn next_block_id(&self) -> MetaResult<u64> {
@@ -4677,7 +4677,7 @@ mod tests {
                 if current.object_id != part.object_id
                     || current.offset.saturating_add(current.length) != part.offset
                 {
-                    return Err(MetaError::FragmentedBlock {
+                    return Err(MetaError::NonContiguousRegularFileGraph {
                         ino: 0,
                         block_index,
                     });
@@ -6485,7 +6485,7 @@ mod tests {
     }
 
     #[test]
-    fn unit_remote_projection_preserves_nested_manifest_publish() {
+    fn unit_remote_projection_preserves_nested_base_graph_publish() {
         let (_writer_dir, writer) = temp_pg_engine_for_unit();
         let (_remote_dir, remote) = temp_pg_engine_for_unit();
 
@@ -6504,7 +6504,7 @@ mod tests {
         assert!(
             writer
                 .publish_overlay_graph(file.ino, 1)
-                .expect("publish manifest"),
+                .expect("publish base graph"),
             "publish must succeed"
         );
         let end = writer.local.get_counter("nextEventSeq").expect("end seq");
@@ -6528,7 +6528,7 @@ mod tests {
     }
 
     #[test]
-    fn unit_remote_projection_manifest_publish_replaces_base_graph_on_shrink() {
+    fn unit_remote_projection_base_graph_publish_replaces_base_graph_on_shrink() {
         let (_writer_dir, writer) = temp_pg_engine_for_unit();
         let (_remote_dir, remote) = temp_pg_engine_for_unit();
         let block_size = DEFAULT_BLOCK_SIZE as u64;
@@ -6552,8 +6552,8 @@ mod tests {
         assert!(
             writer
                 .publish_overlay_graph(file.ino, 1)
-                .expect("publish initial manifest"),
-            "initial manifest publish must succeed"
+                .expect("publish initial base graph"),
+            "initial base graph publish must succeed"
         );
         let batch1_end = writer
             .local
@@ -6578,8 +6578,8 @@ mod tests {
         assert!(
             writer
                 .publish_overlay_graph(file.ino, 2)
-                .expect("publish shrink manifest"),
-            "shrink manifest publish must succeed"
+                .expect("publish shrink base graph"),
+            "shrink base graph publish must succeed"
         );
         let batch2_end = writer
             .local
@@ -6598,7 +6598,7 @@ mod tests {
         assert_eq!(
             remote_blocks,
             vec![(0, replacement)],
-            "manifest publish must replace the full remote base graph and drop stale trailing blocks"
+            "base graph publish must replace the full remote base graph and drop stale trailing blocks"
         );
     }
 
@@ -6649,7 +6649,7 @@ mod tests {
         assert!(
             writer
                 .publish_overlay_graph(file.ino, 1)
-                .expect("publish renamed manifest"),
+                .expect("publish renamed base graph"),
             "publish after rename must succeed"
         );
         let batch2_end = writer
@@ -6699,8 +6699,8 @@ mod tests {
         assert!(
             writer
                 .publish_overlay_graph(old.ino, 1)
-                .expect("publish old manifest"),
-            "old manifest publish must succeed"
+                .expect("publish old base graph"),
+            "old base graph publish must succeed"
         );
         let seed_end = writer.local.get_counter("nextEventSeq").expect("seed end");
 
@@ -6785,7 +6785,7 @@ mod tests {
         assert!(
             writer
                 .publish_overlay_graph(file.ino, 1)
-                .expect("publish seed manifest"),
+                .expect("publish seed base graph"),
             "seed publish must succeed"
         );
         let seed_end = writer.local.get_counter("nextEventSeq").expect("seed end");
@@ -7177,7 +7177,7 @@ mod tests {
             .expect("set staged block");
         assert!(
             a.publish_overlay_graph(file.ino, 2)
-                .expect("publish committed manifest")
+                .expect("publish committed base graph")
         );
         a.flush_metadata().expect("flush a");
 
@@ -7240,7 +7240,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
-    fn test_pg_nested_manifest_publish_visible_on_remote_peer() {
+    fn test_pg_nested_base_graph_publish_visible_on_remote_peer() {
         let Some(dsn) = pg_dsn() else {
             return;
         };
@@ -7249,7 +7249,7 @@ mod tests {
         let dir_b = tempdir().expect("tempdir b");
         let db_a = dir_a.path().join("meta-a.redb");
         let db_b = dir_b.path().join("meta-b.redb");
-        let volume = PgTestVolume::new(&dsn, "pg-nested-manifest-publish");
+        let volume = PgTestVolume::new(&dsn, "pg-nested-base-graph-publish");
         let info = volume.format_info();
         seed_local(&db_a, &info);
         seed_local(&db_b, &info);
@@ -7277,7 +7277,7 @@ mod tests {
             .expect("set nested block");
         assert!(
             a.publish_overlay_graph(file.ino, 1)
-                .expect("publish nested manifest")
+                .expect("publish nested base graph")
         );
         a.flush_metadata().expect("flush nested publish");
 
@@ -7367,9 +7367,9 @@ mod tests {
             .expect("set block 1");
         assert!(
             a.publish_overlay_graph(file.ino, 1)
-                .expect("publish renamed nested manifest")
+                .expect("publish renamed nested base graph")
         );
-        a.flush_metadata().expect("flush renamed nested manifest");
+        a.flush_metadata().expect("flush renamed nested base graph");
 
         assert!(wait_until(Duration::from_secs(12), || {
             let _ = b.sync_metadata();
@@ -7425,7 +7425,7 @@ mod tests {
             .expect("set baseline block");
         assert!(
             a.publish_overlay_graph(file.ino, 1)
-                .expect("publish baseline manifest")
+                .expect("publish baseline base graph")
         );
         a.flush_metadata().expect("flush baseline");
 
@@ -7503,9 +7503,9 @@ mod tests {
             .expect("set baseline block 1");
         assert!(
             a.publish_overlay_graph(file.ino, 1)
-                .expect("publish baseline manifest")
+                .expect("publish baseline base graph")
         );
-        a.flush_metadata().expect("flush baseline manifest");
+        a.flush_metadata().expect("flush baseline base graph");
 
         assert!(wait_visible(
             &b,
@@ -7537,9 +7537,9 @@ mod tests {
 
         assert!(
             a.publish_overlay_graph(file.ino, 2)
-                .expect("publish replacement manifest")
+                .expect("publish replacement base graph")
         );
-        a.flush_metadata().expect("flush replacement manifest");
+        a.flush_metadata().expect("flush replacement base graph");
 
         assert!(wait_until(Duration::from_secs(10), || {
             let _ = b.sync_metadata();
@@ -7703,7 +7703,7 @@ mod tests {
             .expect("set baseline remote block");
         assert!(
             a.publish_overlay_graph(file.ino, 1)
-                .expect("publish baseline manifest")
+                .expect("publish baseline base graph")
         );
         a.flush_metadata().expect("flush create");
         assert!(wait_visible(
@@ -7724,7 +7724,7 @@ mod tests {
             .expect("set staged remote block");
         assert!(
             a.publish_overlay_graph(file.ino, 2)
-                .expect("publish remote block manifest")
+                .expect("publish remote block graph")
         );
         a.flush_metadata().expect("flush remote block");
 
@@ -7953,7 +7953,7 @@ mod tests {
             .expect("set baseline uploading block");
         assert!(
             a.publish_overlay_graph(file.ino, 1)
-                .expect("publish baseline manifest")
+                .expect("publish baseline base graph")
         );
         a.flush_metadata().expect("flush baseline");
         assert!(wait_visible(

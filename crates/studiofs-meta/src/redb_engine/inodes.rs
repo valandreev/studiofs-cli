@@ -281,7 +281,7 @@ impl RedbMetaEngine {
             Self::has_regular_file_chunk_rows_in_write_txn(txn, REGULAR_FILE_BASE_TABLE, attr.ino)?
                 || attr.committed_size > 0
                 || attr.committed_content_epoch > 0;
-        let (local_matches_published, blockless_manifest_ready) = if overlay_state.is_some() {
+        let (local_matches_published, blockless_graph_ready) = if overlay_state.is_some() {
             (false, false)
         } else {
             (
@@ -294,7 +294,7 @@ impl RedbMetaEngine {
             has_published_base,
             local_matches_published,
             overlay_state,
-            blockless_manifest_ready,
+            blockless_graph_ready,
         );
         let record = InodeLifecycleRecord {
             ino: attr.ino,
@@ -333,7 +333,7 @@ impl RedbMetaEngine {
                 || attr.committed_size > 0
                 || attr.committed_content_epoch > 0;
         let overlay_state = Self::overlay_lifecycle_state(overlay_chunks.values());
-        let (local_matches_published, blockless_manifest_ready) = if overlay_state.is_some() {
+        let (local_matches_published, blockless_graph_ready) = if overlay_state.is_some() {
             (false, false)
         } else {
             (
@@ -346,7 +346,7 @@ impl RedbMetaEngine {
             has_published_base,
             local_matches_published,
             overlay_state,
-            blockless_manifest_ready,
+            blockless_graph_ready,
         );
 
         Ok(InodeLifecycleRecord {
@@ -366,7 +366,7 @@ impl RedbMetaEngine {
         has_published_base: bool,
         local_matches_published: bool,
         overlay_state: Option<InodeLifecycleState>,
-        blockless_manifest_ready: bool,
+        blockless_graph_ready: bool,
     ) -> (InodeLifecycleState, PayloadRetentionClass) {
         let state = if local_matches_published {
             if has_published_base {
@@ -374,7 +374,7 @@ impl RedbMetaEngine {
             } else {
                 InodeLifecycleState::LocalOnly
             }
-        } else if blockless_manifest_ready {
+        } else if blockless_graph_ready {
             InodeLifecycleState::PublishReady
         } else {
             match overlay_state {
@@ -654,14 +654,14 @@ impl MetaInodes for RedbMetaEngine {
         {
             let mut normalized = attr.clone();
             if normalized.kind == FileType::RegularFile {
-                let has_committed_manifest = Self::has_regular_file_chunk_rows_in_write_txn(
+                let has_committed_graph = Self::has_regular_file_chunk_rows_in_write_txn(
                     &txn,
                     REGULAR_FILE_BASE_TABLE,
                     normalized.ino,
                 )?;
                 Self::transition_upload_state_for_local_mutation(
                     &mut normalized,
-                    has_committed_manifest,
+                    has_committed_graph,
                 );
             }
             Self::set_inode_overlay_in_txn(&txn, &normalized)?;

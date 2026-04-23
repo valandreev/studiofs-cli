@@ -179,7 +179,7 @@ Serving rules are:
 6. Periodically refresh the remote-visible checkpoint in `metadata_state`.
 
 Events that stay local-only are not published as remote-visible deltas:
-- staged `SetFileBlock` / `SetFileBlocksBatch`
+- local regular-file overlay graph staging (`StageRegularFileOverlaySlices` and upload-state marks)
 - pending deletion churn
 - local regular-file `size` ahead of `committed_size`
 
