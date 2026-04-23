@@ -387,17 +387,18 @@ impl RedbMetaEngine {
                     }
                 }
                 crate::events::MetaEvent::RemoveFileBlock { ino, block_index } => {
-                    let mut committed_manifest =
-                        Self::base_manifest_from_graph_rows_in_txn(&txn, *ino)?;
-                    committed_manifest.retain(|(current_index, _)| current_index != block_index);
                     let block_size = Self::regular_file_graph_block_size_from_write_txn(&txn)?;
-                    Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+                    let tombstones = Self::chunk_slices_for_block(
+                        *block_index,
+                        block_size,
+                        None,
+                        BlockRefState::Published,
+                    )?;
+                    Self::apply_regular_file_chunk_slices_in_txn(
                         &txn,
                         REGULAR_FILE_BASE_TABLE,
                         *ino,
-                        committed_manifest.as_slice(),
-                        block_size,
-                        true,
+                        tombstones.as_slice(),
                         false,
                     )?;
                 }
@@ -410,25 +411,18 @@ impl RedbMetaEngine {
                     block_index,
                     block,
                 } => {
-                    let mut committed_manifest =
-                        Self::base_manifest_from_graph_rows_in_txn(&txn, *ino)?;
-                    if let Some((_, existing_block)) = committed_manifest
-                        .iter_mut()
-                        .find(|(current_index, _)| current_index == block_index)
-                    {
-                        *existing_block = block.clone();
-                    } else {
-                        committed_manifest.push((*block_index, block.clone()));
-                        committed_manifest.sort_by_key(|(current_index, _)| *current_index);
-                    }
                     let block_size = Self::regular_file_graph_block_size_from_write_txn(&txn)?;
-                    Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+                    let committed_slices = Self::chunk_slices_for_block(
+                        *block_index,
+                        block_size,
+                        Some(block),
+                        BlockRefState::Published,
+                    )?;
+                    Self::apply_regular_file_chunk_slices_in_txn(
                         &txn,
                         REGULAR_FILE_BASE_TABLE,
                         *ino,
-                        committed_manifest.as_slice(),
-                        block_size,
-                        true,
+                        committed_slices.as_slice(),
                         false,
                     )?;
                 }

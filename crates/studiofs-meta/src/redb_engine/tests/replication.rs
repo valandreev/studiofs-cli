@@ -108,3 +108,64 @@ fn test_replica_apply_keeps_symlink_and_xattr_in_base_only() {
         before_xattr_overlay
     );
 }
+
+#[test]
+fn test_replica_aux_block_events_accept_fragmented_base_graph() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"replica-fragmented-base.bin", 1000, 1000, 0o644)
+        .unwrap();
+
+    let mut base_chunk = RegularFileChunkState::default();
+    base_chunk.slices.insert(
+        SliceId(0),
+        SliceRecord {
+            slice_id: SliceId(0),
+            order: SliceOrder(0),
+            range: SliceRange::new(0, 4096).unwrap(),
+            block: Some(BlockRef::new_partial(71, 4096)),
+            block_state: BlockRefState::Published,
+        },
+    );
+    base_chunk.slices.insert(
+        SliceId(1),
+        SliceRecord {
+            slice_id: SliceId(1),
+            order: SliceOrder(1),
+            range: SliceRange::new(4096, 8192).unwrap(),
+            block: Some(BlockRef::new_partial(72, 4096)),
+            block_state: BlockRefState::Published,
+        },
+    );
+    base_chunk.refresh_fragmentation_metrics();
+    set_regular_file_chunk_rows(&engine, file.ino, &[], &[(ChunkId(0), base_chunk)]);
+    assert!(matches!(
+        engine.get_file_block(file.ino, 0),
+        Err(MetaError::FragmentedBlock { .. })
+    ));
+
+    let replacement = BlockRef::new_full(73, DEFAULT_BLOCK_SIZE);
+    engine
+        .apply_replica_aux_state(&[crate::events::MetaEvent::CommitFileBlock {
+            ino: file.ino,
+            block_index: 0,
+            block: replacement.clone(),
+        }])
+        .expect("CommitFileBlock replay should update fragmented base graph slice-natively");
+    assert_eq!(
+        engine
+            .get_file_block(file.ino, 0)
+            .unwrap()
+            .expect("replacement block")
+            .object_id,
+        replacement.object_id
+    );
+
+    engine
+        .apply_replica_aux_state(&[crate::events::MetaEvent::RemoveFileBlock {
+            ino: file.ino,
+            block_index: 0,
+        }])
+        .expect("RemoveFileBlock replay should tombstone fragmented base graph slice-natively");
+    assert!(engine.get_file_block(file.ino, 0).unwrap().is_none());
+}
