@@ -170,6 +170,9 @@ impl StudioVfs {
                 pending_block.data.clone().freeze(),
             ));
         }
+        if self.has_pending_dirty_slices_for_block(ino, block_index) {
+            return None;
+        }
         // Stage 2 — committed local cache state for the pending epoch.
         self.pending_live_extent_record(
             ino,

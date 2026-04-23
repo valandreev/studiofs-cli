@@ -1439,11 +1439,19 @@ impl StudioVfs {
             return Ok(false);
         }
         if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
-            let selected_writes: Vec<_> = writes
-                .into_iter()
-                .filter(|write| selected_block_indexes.contains(&write.block_index))
+            let snapshot_writes: Vec<_> = completed_blocks
+                .iter()
+                .map(|block| BufferedHandleWrite {
+                    block_index: block.block_index,
+                    offset: u64::from(block.block_index).saturating_mul(u64::from(self.block_size)),
+                    seq: seqs_by_block
+                        .get(&block.block_index)
+                        .copied()
+                        .unwrap_or_default(),
+                    data: Bytes::copy_from_slice(block.as_ref()),
+                })
                 .collect();
-            let spill_batches = self.build_handle_writer_slice_spill_batches(selected_writes);
+            let spill_batches = self.build_handle_writer_slice_spill_batches(snapshot_writes);
             return self
                 .persist_handle_writer_spill_batches(ino, spill_batches, local_sync_policy)
                 .await;
