@@ -150,12 +150,12 @@ use studiofs_data::store::{DataError, DataStore, DataStoreConfig, IoProfile};
 
 use studiofs_meta::engine::MetadataAuthorityStatus;
 use studiofs_meta::schema::{
-    DEFAULT_CHUNK_SIZE, DirEntry, FormatInfo, InodeLifecycleState, PayloadRetentionClass, ROOT_INO,
-    SetattrArgs, UploadState as MetaUploadState, chunk_start_offset,
+    ChunkId, DEFAULT_CHUNK_SIZE, DirEntry, FormatInfo, InodeLifecycleState, PayloadRetentionClass,
+    ROOT_INO, ResolvedSliceSource, SetattrArgs, SliceId, SliceOrder, SliceRange, SliceRecord,
+    UploadState as MetaUploadState, chunk_id_from_offset, chunk_start_offset,
 };
 use studiofs_meta::types::{
-    AccessLevel, BlockFlags as MetaBlockFlags, BlockRef, FileType, Ino, InodeAttr,
-    block_index_from_offset, offset_within_block,
+    AccessLevel, BlockRef, FileType, Ino, InodeAttr, block_index_from_offset, offset_within_block,
 };
 use studiofs_meta::{FileLockLease, HardLockKind, MetaError, MetaResult};
 use tempfile::NamedTempFile;

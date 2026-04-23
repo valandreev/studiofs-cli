@@ -183,27 +183,6 @@ impl StudioVfs {
         .map(|extent| PendingOverlayBlockSource::Extent(extent.object_id))
     }
 
-    pub(super) fn read_pending_overlay_block_sync(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        pending_content_epoch: Option<u64>,
-        pending_upload_index: Option<&PendingUploadCatalog>,
-    ) -> VfsResult<Option<Bytes>> {
-        let Some(source) = self.pending_overlay_block_source(
-            ino,
-            block_index,
-            pending_content_epoch,
-            pending_upload_index,
-        ) else {
-            return Ok(None);
-        };
-        Ok(match source {
-            PendingOverlayBlockSource::Pending(data) => Some(data),
-            PendingOverlayBlockSource::Extent(object_id) => self.local_block_backend.get(object_id),
-        })
-    }
-
     pub(super) async fn read_pending_overlay_block_async(
         &self,
         ino: Ino,

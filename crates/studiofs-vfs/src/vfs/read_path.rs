@@ -1301,6 +1301,7 @@ mod tests {
         LocalBlockStorageStats,
     };
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig, ROOT_INO};
+    use studiofs_meta::types::BlockFlags as MetaBlockFlags;
     use studiofs_meta::{MetaBlocks, MetaFormat, MetaInodes, RedbMetaEngine};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;

@@ -2762,50 +2762,6 @@ impl StudioVfs {
         Ok(changed)
     }
 
-    pub(super) fn load_local_block_bytes_sync(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        object_id: u64,
-        pending_upload_index: Option<&PendingUploadCatalog>,
-    ) -> VfsResult<Option<Bytes>> {
-        let pending_content_epoch = self.pending_content_epoch_for_inode(ino);
-        if let Some(data) = self.read_pending_overlay_block_sync(
-            ino,
-            block_index,
-            pending_content_epoch,
-            pending_upload_index,
-        )? {
-            return Ok(Some(data));
-        }
-        Ok(self.local_block_backend.get(object_id))
-    }
-
-    pub(super) fn install_truncated_pending_block(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        data: Bytes,
-        new_len: usize,
-    ) {
-        let reserved_object_id = self
-            .state
-            .local_dirty
-            .pending_blocks
-            .lock()
-            .get(&(ino, block_index))
-            .and_then(|block| block.reusable_reserved_object_id());
-        self.replace_pending_local_dirty_block(
-            ino,
-            block_index,
-            PendingBlock::buffered(
-                self.clone_into_write_buffer(&data[..new_len]),
-                reserved_object_id,
-            ),
-        );
-        self.clear_pending_dirty_slices_exceeding_len(ino, block_index, new_len);
-    }
-
     pub(super) async fn read_block_if_exists(
         &self,
         ino: Ino,

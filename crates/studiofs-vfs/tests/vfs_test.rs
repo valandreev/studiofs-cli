@@ -31,9 +31,9 @@ use studiofs_meta::engine::{MetaFsOps, PendingCreateRecord, UndoLogKind};
 use studiofs_meta::types::SetattrArgs;
 use studiofs_meta::types::TimeSpec;
 use studiofs_meta::{
-    CURRENT_FORMAT_VERSION, FormatInfo, MetaBlocks, MetaEngine, MetaError, MetaFormat, MetaInodes,
-    MetaReplication, MetadataBackend, MetadataConfig, PgMetaEngine, PgOpenOptions, PostgresConfig,
-    ROOT_INO, RedbMetaEngine, ensure_studiofs_database,
+    CURRENT_FORMAT_VERSION, FormatInfo, MetaBlocks, MetaEngine, MetaError, MetaFormat, MetaGc,
+    MetaInodes, MetaReplication, MetadataBackend, MetadataConfig, PgMetaEngine, PgOpenOptions,
+    PostgresConfig, ROOT_INO, RedbMetaEngine, ensure_studiofs_database,
     schema::InodeLifecycleState,
     schema::{ChunkId, SliceId, SliceOrder, SliceRange, SliceRecord},
     types::{AccessLevel, BlockFlags, BlockRef, UploadState},
@@ -9608,6 +9608,12 @@ fn truncate_of_published_file_keeps_committed_size_and_pending_incarnation() {
         let published_before = meta.get_attr(ino).unwrap();
         let published_epoch = published_before.committed_content_epoch;
         let published_size = published_before.committed_size;
+        let published_objects = meta
+            .get_file_blocks(ino)
+            .unwrap()
+            .into_iter()
+            .map(|(_, block)| block.object_id)
+            .collect::<Vec<_>>();
 
         vfs.setattr(ino, SetattrArgs::size_only(truncated_size))
             .unwrap();
@@ -9645,6 +9651,16 @@ fn truncate_of_published_file_keeps_committed_size_and_pending_incarnation() {
             persisted_after.committed_size, published_size,
             "foreground truncate must keep the last published size intact"
         );
+
+        let pending_deletions = meta.get_pending_deletions().unwrap();
+        for object_id in published_objects {
+            assert!(
+                !pending_deletions
+                    .iter()
+                    .any(|(pending_object_id, _)| *pending_object_id == object_id),
+                "local truncate must not GC a still-published base object"
+            );
+        }
     });
     rt.shutdown_background();
 }
