@@ -906,7 +906,7 @@ impl MetaBlocks for RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?
         {
             let (key, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let (ino, chunk_id) = decode_regular_file_chunk_key(key.value());
+            let (ino, chunk_id) = decode_regular_file_chunk_key(key.value())?;
             candidates.push((ino, chunk_id));
             if candidates.len() >= max_chunks {
                 break;

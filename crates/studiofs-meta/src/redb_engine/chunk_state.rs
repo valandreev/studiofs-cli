@@ -14,7 +14,7 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?
         {
             let (key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let (ino, chunk_id) = decode_regular_file_chunk_key(key.value());
+            let (ino, chunk_id) = decode_regular_file_chunk_key(key.value())?;
             let chunk_state: RegularFileChunkState = decode(value.value())?;
             states.entry(ino).or_default().insert(chunk_id, chunk_state);
         }
@@ -39,7 +39,7 @@ impl RedbMetaEngine {
             if !key.value().starts_with(prefix.as_ref()) {
                 break;
             }
-            let (decoded_ino, chunk_id) = decode_regular_file_chunk_key(key.value());
+            let (decoded_ino, chunk_id) = decode_regular_file_chunk_key(key.value())?;
             debug_assert_eq!(decoded_ino, ino);
             let chunk_state: RegularFileChunkState = decode(value.value())?;
             chunks.insert(chunk_id, chunk_state);
@@ -65,7 +65,7 @@ impl RedbMetaEngine {
             if !key.value().starts_with(prefix.as_ref()) {
                 break;
             }
-            let (_decoded_ino, chunk_id) = decode_regular_file_chunk_key(key.value());
+            let (_decoded_ino, chunk_id) = decode_regular_file_chunk_key(key.value())?;
             chunks.insert(chunk_id, decode(value.value())?);
         }
         Ok(chunks)
@@ -1080,7 +1080,7 @@ impl RedbMetaEngine {
             if !key.value().starts_with(prefix.as_ref()) {
                 break;
             }
-            let (decoded_ino, chunk_id) = decode_regular_file_chunk_key(key.value());
+            let (decoded_ino, chunk_id) = decode_regular_file_chunk_key(key.value())?;
             debug_assert_eq!(decoded_ino, ino);
             saw_row = true;
             let chunk: RegularFileChunkState = decode(value.value())?;

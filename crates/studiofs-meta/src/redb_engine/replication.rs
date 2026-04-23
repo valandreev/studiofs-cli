@@ -178,11 +178,10 @@ impl RedbMetaEngine {
     }
 
     pub fn local_overlay_xattr_inodes(&self) -> MetaResult<HashSet<Ino>> {
-        Ok(self
-            .local_overlay_xattr_keys()?
+        self.local_overlay_xattr_keys()?
             .into_iter()
-            .map(|key| u64::from_le_bytes(key[..8].try_into().unwrap()))
-            .collect())
+            .map(|key| decode_inode_prefix(&key, "xattr"))
+            .collect()
     }
 
     pub fn local_overlay_acl_keys(&self) -> MetaResult<HashSet<Vec<u8>>> {

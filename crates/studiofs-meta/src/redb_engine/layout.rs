@@ -132,11 +132,28 @@ pub(super) fn encode_dentry_key(parent: Ino, name: &[u8]) -> Vec<u8> {
     key
 }
 
+fn invalid_redb_key_len(key_kind: &str, expected: &str, actual: usize) -> MetaError {
+    MetaError::Storage(format!(
+        "invalid redb {key_kind} key length: expected {expected}, got {actual}"
+    ))
+}
+
+pub(super) fn decode_inode_prefix(key: &[u8], key_kind: &str) -> MetaResult<Ino> {
+    let prefix = key
+        .get(..8)
+        .ok_or_else(|| invalid_redb_key_len(key_kind, "at least 8 bytes", key.len()))?;
+    let mut ino_bytes = [0_u8; 8];
+    ino_bytes.copy_from_slice(prefix);
+    Ok(u64::from_le_bytes(ino_bytes))
+}
+
 /// Decode a dentry key back to (parent_ino, name).
-pub(super) fn decode_dentry_key(key: &[u8]) -> (Ino, &[u8]) {
-    let parent = u64::from_le_bytes(key[..8].try_into().unwrap());
-    let name = &key[8..];
-    (parent, name)
+pub(super) fn decode_dentry_key(key: &[u8]) -> MetaResult<(Ino, &[u8])> {
+    let parent = decode_inode_prefix(key, "dentry")?;
+    let name = key
+        .get(8..)
+        .ok_or_else(|| invalid_redb_key_len("dentry", "at least 8 bytes", key.len()))?;
+    Ok((parent, name))
 }
 
 /// The prefix for scanning all dentries of a parent inode.
@@ -153,10 +170,19 @@ pub(super) fn encode_regular_file_chunk_key(ino: Ino, chunk_id: ChunkId) -> [u8;
 }
 
 /// Decode a regular-file chunk key back to (ino, chunk_id).
-pub(super) fn decode_regular_file_chunk_key(key: &[u8]) -> (Ino, ChunkId) {
-    let ino = u64::from_le_bytes(key[..8].try_into().unwrap());
-    let chunk_id = u64::from_le_bytes(key[8..16].try_into().unwrap());
-    (ino, ChunkId(chunk_id))
+pub(super) fn decode_regular_file_chunk_key(key: &[u8]) -> MetaResult<(Ino, ChunkId)> {
+    if key.len() != 16 {
+        return Err(invalid_redb_key_len(
+            "regular-file chunk",
+            "exactly 16 bytes",
+            key.len(),
+        ));
+    }
+
+    let ino = decode_inode_prefix(key, "regular-file chunk")?;
+    let mut chunk_bytes = [0_u8; 8];
+    chunk_bytes.copy_from_slice(&key[8..16]);
+    Ok((ino, ChunkId(u64::from_le_bytes(chunk_bytes))))
 }
 
 /// The prefix for scanning all chunk rows of an inode.
@@ -358,4 +384,29 @@ pub(super) fn encode<T: serde::Serialize>(val: &T) -> MetaResult<Vec<u8>> {
 
 pub(super) fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> MetaResult<T> {
     postcard::from_bytes(bytes).map_err(|e| MetaError::Serialization(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_dentry_key_rejects_short_key() {
+        let err = decode_dentry_key(&[1, 2, 3, 4]).expect_err("short key must fail");
+        assert!(matches!(
+            err,
+            MetaError::Storage(message)
+                if message.contains("invalid redb dentry key length")
+        ));
+    }
+
+    #[test]
+    fn decode_regular_file_chunk_key_rejects_invalid_length() {
+        let err = decode_regular_file_chunk_key(&[0_u8; 15]).expect_err("short key must fail");
+        assert!(matches!(
+            err,
+            MetaError::Storage(message)
+                if message.contains("invalid redb regular-file chunk key length")
+        ));
+    }
 }

@@ -2150,7 +2150,7 @@ impl PgMetaEngine {
                 Arc::downgrade(&engine),
                 engine.poll_interval,
                 poll_shutdown,
-            );
+            )?;
             *engine.poll_handle.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
         }
         Ok(engine)
@@ -2201,7 +2201,7 @@ impl PgMetaEngine {
         engine: std::sync::Weak<Self>,
         interval: Duration,
         shutdown: Arc<AtomicBool>,
-    ) -> std::thread::JoinHandle<()> {
+    ) -> MetaResult<std::thread::JoinHandle<()>> {
         std::thread::Builder::new()
             .name("pg-meta-poll".into())
             .spawn(move || {
@@ -2228,7 +2228,9 @@ impl PgMetaEngine {
                     let _ = engine.sync_metadata();
                 }
             })
-            .expect("spawn pg-meta-poll thread")
+            .map_err(|error| {
+                MetaError::Storage(format!("failed to spawn pg-meta-poll thread: {error}"))
+            })
     }
 
     fn run_async<T, F>(&self, fut: F) -> MetaResult<T>

@@ -105,7 +105,7 @@ impl RedbMetaEngine {
         for result in iter {
             let (k, v) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
             let key_bytes = k.value();
-            let (decoded_parent, stored_name) = decode_dentry_key(key_bytes);
+            let (decoded_parent, stored_name) = decode_dentry_key(key_bytes)?;
             if decoded_parent != parent {
                 break;
             }
@@ -137,7 +137,7 @@ impl RedbMetaEngine {
         for result in iter {
             let (key, value) = result.map_err(|e| MetaError::Storage(e.to_string()))?;
             let key_bytes = key.value();
-            let (decoded_parent, name) = decode_dentry_key(key_bytes);
+            let (decoded_parent, name) = decode_dentry_key(key_bytes)?;
             if decoded_parent != parent {
                 break;
             }
@@ -330,7 +330,7 @@ impl RedbMetaEngine {
             .map_err(|e| MetaError::Storage(e.to_string()))?
         {
             let (key, _value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
-            let (decoded_parent, name) = decode_dentry_key(key.value());
+            let (decoded_parent, name) = decode_dentry_key(key.value())?;
             if decoded_parent != parent {
                 break;
             }
@@ -350,7 +350,7 @@ impl RedbMetaEngine {
                 .map(|entry| entry.name)
                 .collect();
         for key in overlay_dentries {
-            let (overlay_parent, overlay_name) = decode_dentry_key(key);
+            let (overlay_parent, overlay_name) = decode_dentry_key(key)?;
             if overlay_parent != parent {
                 continue;
             }
