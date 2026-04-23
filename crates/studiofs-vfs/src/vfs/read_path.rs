@@ -1500,33 +1500,34 @@ mod tests {
         vfs: &Arc<StudioVfs>,
         meta: &Arc<RedbMetaEngine>,
         ino: Ino,
-    ) -> (u64, Vec<(u32, BlockRef)>) {
+    ) -> (u64, Vec<u64>) {
         let attr = meta.get_attr(ino).expect("load inode attrs");
-        let blocks = meta.get_file_blocks(ino).expect("load file blocks");
-        for (block_index, block) in &blocks {
-            vfs.local_block_backend().mark_uploaded(block.object_id);
+        let object_ids = meta
+            .get_regular_file_overlay_object_ids(ino)
+            .expect("load overlay object ids");
+        for object_id in &object_ids {
+            vfs.local_block_backend().mark_uploaded(*object_id);
             assert!(
-                meta.mark_file_block_uploaded_if_matches(
+                meta.mark_regular_file_overlay_object_uploaded_if_matches(
                     ino,
-                    *block_index,
                     attr.content_epoch,
-                    block
+                    *object_id
                 )
                 .expect("mark block uploaded"),
-                "expected metadata upload mark to apply for every block"
+                "expected metadata upload mark to apply for every overlay object"
             );
         }
-        (attr.content_epoch, blocks)
+        (attr.content_epoch, object_ids)
     }
 
     fn publish_current_manifest(
         meta: &Arc<RedbMetaEngine>,
         ino: Ino,
         content_epoch: u64,
-        blocks: &[(u32, BlockRef)],
+        _object_ids: &[u64],
     ) {
         assert!(
-            meta.publish_file_manifest_if_matches(ino, content_epoch, blocks)
+            meta.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
                 .expect("publish current manifest"),
             "expected manifest publish to apply"
         );

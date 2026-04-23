@@ -113,28 +113,34 @@ fn mark_all_file_blocks_uploaded(
     vfs: &Arc<StudioVfs>,
     meta: &Arc<RedbMetaEngine>,
     ino: Ino,
-) -> (u64, Vec<(u32, BlockRef)>) {
+) -> (u64, Vec<u64>) {
     let attr = meta.get_attr(ino).expect("load inode attrs");
-    let blocks = meta.get_file_blocks(ino).expect("load file blocks");
-    for (block_index, block) in &blocks {
-        vfs.local_block_backend().mark_uploaded(block.object_id);
+    let object_ids = meta
+        .get_regular_file_overlay_object_ids(ino)
+        .expect("load overlay object ids");
+    for object_id in &object_ids {
+        vfs.local_block_backend().mark_uploaded(*object_id);
         assert!(
-            meta.mark_file_block_uploaded_if_matches(ino, *block_index, attr.content_epoch, block)
-                .expect("mark block uploaded"),
-            "expected metadata upload mark to apply for every block"
+            meta.mark_regular_file_overlay_object_uploaded_if_matches(
+                ino,
+                attr.content_epoch,
+                *object_id
+            )
+            .expect("mark block uploaded"),
+            "expected metadata upload mark to apply for every overlay object"
         );
     }
-    (attr.content_epoch, blocks)
+    (attr.content_epoch, object_ids)
 }
 
 fn publish_current_manifest(
     meta: &Arc<RedbMetaEngine>,
     ino: Ino,
     content_epoch: u64,
-    blocks: &[(u32, BlockRef)],
+    _object_ids: &[u64],
 ) {
     assert!(
-        meta.publish_file_manifest_if_matches(ino, content_epoch, blocks)
+        meta.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
             .expect("publish current manifest"),
         "expected manifest publish to apply"
     );
@@ -838,9 +844,9 @@ fn zeroio_snapshot_reports_delete_before_publish_cleanup_visibility() {
     meta.set_file_block(attr.ino, 1, &uploaded)
         .expect("persist uploaded block");
     assert!(
-        meta.mark_file_block_uploaded_if_matches(attr.ino, 1, 1, &uploaded)
-            .expect("mark uploaded block"),
-        "expected uploaded block transition to apply"
+        meta.mark_regular_file_overlay_object_uploaded_if_matches(attr.ino, 1, uploaded.object_id)
+            .expect("mark uploaded object"),
+        "expected uploaded object transition to apply"
     );
 
     meta.unlink(ROOT_INO, b"delete-before-publish.bin")
@@ -3222,7 +3228,7 @@ fn inode_write_overwrite_updates_current_block_graph_over_published_base() {
         assert_eq!(current_blocks.len(), 1, "overwrite test should stay single-block");
         assert_ne!(
             current_blocks[0].1.object_id,
-            published_blocks[0].1.object_id,
+            published_blocks[0],
             "current file graph must advance to the replacement block instead of reusing the published base"
         );
 
