@@ -1057,31 +1057,14 @@ impl StudioVfs {
                                 data
                             }
                         }
-                        None => match self.get_file_block_async(ino, write.block_index).await {
-                            Ok(Some(block_ref)) => {
-                                if let Some(cached) =
-                                    self.block_store_get_async(block_ref.object_id).await?
-                                {
-                                    cached
-                                } else {
-                                    self.fetch_block_for_ref(&block_ref, false)
-                                        .await
-                                        .map_err(|e| VfsError::Other(e.to_string()))?
-                                }
-                            }
-                            Ok(None) => Bytes::new(),
-                            Err(VfsError::Meta(studiofs_meta::MetaError::FragmentedBlock {
-                                ..
-                            })) => self
-                                .read_metadata_block_from_slice_graph_async(
-                                    ino,
-                                    write.block_index,
-                                    visible_size,
-                                )
-                                .await?
-                                .unwrap_or_default(),
-                            Err(error) => return Err(error),
-                        },
+                        None => self
+                            .read_block_if_exists(
+                                ino,
+                                write.block_index,
+                                Some(&pending_upload_index),
+                            )
+                            .await?
+                            .unwrap_or_default(),
                     }
                 };
                 entry.insert(self.clone_into_write_buffer(existing_data.as_ref()));

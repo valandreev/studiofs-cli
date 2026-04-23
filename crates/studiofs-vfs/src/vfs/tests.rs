@@ -4470,7 +4470,7 @@ fn flush_fh_materializes_opportunistic_handle_writer_state_into_overlay_slices()
 #[test]
 fn flush_fh_materializes_handle_writer_state_through_strict_local_barrier() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-flush-without-ordered-flush");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-245-flush-without-ordered-flush");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs

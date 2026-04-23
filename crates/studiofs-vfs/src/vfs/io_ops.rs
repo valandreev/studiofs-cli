@@ -1,9 +1,8 @@
 use super::{
     AccessLevel, BlockRef, Bytes, ExplicitFlushOutcome, FileSessionOperation, Ino, LocalSyncPolicy,
-    StickyErrorPolicy, StudioVfs, VfsError, VfsMeta, VfsResult, block_index_from_offset, debug,
-    error, format_object_fragment_keys, offset_within_block, run_meta, warn,
+    StickyErrorPolicy, StudioVfs, VfsError, VfsResult, block_index_from_offset, debug, error,
+    format_object_fragment_keys, offset_within_block, warn,
 };
-use std::sync::Arc;
 
 impl StudioVfs {
     /// Read file data at the given offset.
@@ -253,18 +252,6 @@ impl StudioVfs {
         }
         dst.copy_from_slice(&data[src_start..src_end]);
         Ok(())
-    }
-
-    pub(super) async fn get_file_block_async(
-        &self,
-        ino: Ino,
-        block_index: u32,
-    ) -> VfsResult<Option<BlockRef>> {
-        let meta = self.meta.clone();
-        run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-            engine.get_file_block(ino, block_index)
-        })
-        .await
     }
 
     /// Write data to a file at the given offset.

@@ -259,6 +259,7 @@ impl PersistedWriteBlock {
         }
     }
 
+    #[cfg(test)]
     fn from_local_extent(block_index: u32, object_id: u64, len: usize) -> Self {
         Self {
             block_index,
@@ -1100,43 +1101,6 @@ impl DrainCommitObserverPort for VfsDrainCommitObserver<'_> {
 }
 
 impl<'a> LocalDirtyFlushSession<'a> {
-    async fn commit_local_extent_snapshot(
-        &self,
-        persisted_blocks: Vec<PersistedWriteBlock>,
-        content_epoch: u64,
-        attr_to_persist: Option<InodeAttr>,
-    ) -> VfsResult<Vec<PersistedWriteBlock>> {
-        if persisted_blocks.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let chunk_slices = self.drain.build_overlay_slice_records(
-            self.ino,
-            &persisted_blocks,
-            Default::default(),
-        )?;
-        let attr_to_clear = attr_to_persist.clone();
-        let committed_attr = self
-            .drain
-            .commit_meta
-            .commit_overlay(self.ino, chunk_slices, attr_to_persist)
-            .await?;
-        self.drain
-            .observer
-            .on_metadata_committed(self.ino, committed_attr.as_ref());
-        self.drain
-            .uploads
-            .submit_uploads(self.ino, &persisted_blocks, content_epoch)
-            .await;
-        self.vfs
-            .commit_persisted_local_dirty_blocks(self.ino, &persisted_blocks);
-        if let Some(attr) = attr_to_clear.as_ref() {
-            self.vfs
-                .clear_matching_dirty_attr_if_committed(self.ino, attr);
-        }
-        Ok(persisted_blocks)
-    }
-
     async fn commit_pending_slice_snapshot(
         &self,
         pending_slices: std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
@@ -1364,28 +1328,7 @@ impl<'a> LocalDirtyFlushSession<'a> {
                 .cloned();
         }
 
-        let staged_local_extents = if matches!(local_sync_policy, LocalSyncPolicy::Strict)
-            || self.vfs.handle_table.open_count(self.ino) == 0
-            || self
-                .vfs
-                .state
-                .handle_writers
-                .dirty_bytes_for_inode(self.ino)
-                == 0
-        {
-            self.vfs.snapshot_pending_local_extent_blocks(self.ino)
-        } else {
-            Vec::new()
-        };
-        if !staged_local_extents.is_empty() {
-            let content_epoch = if let Some(attr) = dirty_attr.as_ref() {
-                attr.content_epoch
-            } else {
-                self.vfs.current_content_epoch_async(self.ino).await?
-            };
-            self.commit_local_extent_snapshot(staged_local_extents, content_epoch, dirty_attr)
-                .await?;
-        } else if let Some(attr) = dirty_attr
+        if let Some(attr) = dirty_attr
             && (!matches!(local_sync_policy, LocalSyncPolicy::Opportunistic)
                 || !self.vfs.has_pending_local_dirty_blocks_for_inode(self.ino))
         {
@@ -2764,25 +2707,6 @@ impl StudioVfs {
             })
     }
 
-    fn snapshot_pending_local_extent_blocks(&self, ino: Ino) -> Vec<PersistedWriteBlock> {
-        let pending = self.state.local_dirty.pending_blocks.lock();
-        let indexes = self.state.local_dirty.pending_block_indexes.lock();
-        indexes
-            .get(&ino)
-            .into_iter()
-            .flat_map(|inode_indexes| inode_indexes.iter())
-            .filter_map(|block_index| {
-                let block = pending.get(&(ino, *block_index))?;
-                let object_id = block.local_extent_id()?;
-                Some(PersistedWriteBlock::from_local_extent(
-                    *block_index,
-                    object_id,
-                    block.logical_len(),
-                ))
-            })
-            .collect()
-    }
-
     fn commit_persisted_local_dirty_blocks(&self, ino: Ino, blocks: &[PersistedWriteBlock]) {
         if blocks.is_empty() {
             return;
@@ -2882,7 +2806,7 @@ impl StudioVfs {
         self.clear_pending_dirty_slices_exceeding_len(ino, block_index, new_len);
     }
 
-    async fn read_block_if_exists(
+    pub(super) async fn read_block_if_exists(
         &self,
         ino: Ino,
         block_index: u32,
@@ -2906,28 +2830,8 @@ impl StudioVfs {
         } else {
             self.getattr_async(ino).await?.size
         };
-
-        let block_ref = match self.get_file_block_async(ino, block_index).await {
-            Ok(Some(br)) => br,
-            Ok(None) => return Ok(None),
-            Err(VfsError::Meta(studiofs_meta::MetaError::FragmentedBlock { .. })) => {
-                return self
-                    .read_metadata_block_from_slice_graph_async(ino, block_index, visible_size)
-                    .await;
-            }
-            Err(error) => return Err(error),
-        };
-
-        if let Some(cached) = self.block_store_get_async(block_ref.object_id).await? {
-            return Ok(Some(cached));
-        }
-
-        let data = self
-            .fetch_block_for_ref(&block_ref, false)
+        self.read_metadata_block_from_slice_graph_async(ino, block_index, visible_size)
             .await
-            .map_err(|e| VfsError::Other(e.to_string()))?;
-
-        Ok(Some(data))
     }
 
     pub(super) async fn flush_local_dirty_state(
@@ -2941,10 +2845,10 @@ impl StudioVfs {
     }
 
     pub(super) async fn flush_pending_blocks_for_shutdown(&self) {
-        let mut inos: BTreeSet<Ino> = {
-            let pending = self.state.local_dirty.pending_blocks.lock();
-            pending.keys().map(|(ino, _)| *ino).collect()
-        };
+        let mut inos: BTreeSet<Ino> = self
+            .snapshot_pending_local_dirty_inodes()
+            .into_iter()
+            .collect();
         {
             let dirty_attrs = self.state.namespace.dirty_attrs.lock();
             inos.extend(dirty_attrs.keys().copied());
@@ -2955,7 +2859,7 @@ impl StudioVfs {
 
         info!(
             inode_count = inos.len(),
-            "VFS shutdown: flushing buffered inodes"
+            "VFS shutdown: flushing dirty inodes"
         );
         for ino in inos {
             if let Err(e) = self.flush(ino).await {
