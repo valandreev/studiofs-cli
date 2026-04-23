@@ -64,108 +64,6 @@ fn test_file_block_operations() {
 }
 
 #[test]
-fn test_flush_blocks_batch_updates_regular_file_overlay() {
-    let engine = temp_engine();
-
-    let attr = engine
-        .create_file(ROOT_INO, b"batch_blocks.txt", 1000, 1000, 0o644)
-        .unwrap();
-
-    let results = engine
-        .flush_blocks_batch(&[
-            BatchFlushEntry {
-                ino: attr.ino,
-                block_index: 0,
-                object_id: 11,
-                length: 4 * 1024 * 1024,
-                flags: BlockFlags::empty(),
-            },
-            BatchFlushEntry {
-                ino: attr.ino,
-                block_index: 1,
-                object_id: 12,
-                length: 1000,
-                flags: BlockFlags::PARTIAL_BLOCK,
-            },
-        ])
-        .unwrap();
-
-    assert_eq!(results.len(), 2);
-    assert_eq!(engine.get_file_blocks(attr.ino).unwrap().len(), 2);
-
-    let txn = engine.db.begin_write().unwrap();
-    let overlay_chunks = RedbMetaEngine::regular_file_chunk_states_for_inode_in_write_txn(
-        &txn,
-        REGULAR_FILE_OVERLAY_TABLE,
-        attr.ino,
-    )
-    .unwrap();
-    txn.abort().unwrap();
-
-    assert_eq!(overlay_chunks.len(), 1);
-    assert_eq!(overlay_chunks.get(&ChunkId(0)).unwrap().slices.len(), 2);
-}
-
-#[test]
-fn test_flush_blocks_batch_accepts_fragmented_overlay_base() {
-    let engine = temp_engine();
-
-    let attr = engine
-        .create_file(ROOT_INO, b"batch_fragmented_overlay.txt", 1000, 1000, 0o644)
-        .unwrap();
-    let mut sized_attr = attr.clone();
-    sized_attr.size = DEFAULT_BLOCK_SIZE as u64;
-    engine.set_attr(&sized_attr).unwrap();
-
-    engine
-        .flush_regular_file_overlay_slices(
-            attr.ino,
-            &[(ChunkId(0), {
-                vec![
-                    SliceRecord {
-                        slice_id: SliceId(0),
-                        order: SliceOrder(0),
-                        range: SliceRange::new(0, 4096).unwrap(),
-                        block: Some(BlockRef::new_partial(31, 4096)),
-                        block_state: BlockRefState::LocalOnly,
-                    },
-                    SliceRecord {
-                        slice_id: SliceId(0),
-                        order: SliceOrder(0),
-                        range: SliceRange::new(4096, 8192).unwrap(),
-                        block: Some(BlockRef::new_partial(32, 4096)),
-                        block_state: BlockRefState::LocalOnly,
-                    },
-                ]
-            })],
-        )
-        .unwrap();
-    assert!(matches!(
-        engine.get_file_block(attr.ino, 0),
-        Err(MetaError::FragmentedBlock { .. })
-    ));
-
-    let results = engine
-        .flush_blocks_batch(&[BatchFlushEntry {
-            ino: attr.ino,
-            block_index: 0,
-            object_id: 33,
-            length: DEFAULT_BLOCK_SIZE,
-            flags: BlockFlags::empty(),
-        }])
-        .unwrap();
-
-    assert_eq!(results.len(), 1);
-    assert!(
-        results[0].old_block.is_none(),
-        "fragmented old block cannot be represented as a legacy BlockRef"
-    );
-    let block = engine.get_file_block(attr.ino, 0).unwrap().unwrap();
-    assert_eq!(block.object_id, 33);
-    assert_eq!(block.length, DEFAULT_BLOCK_SIZE);
-}
-
-#[test]
 fn test_block_runtime_paths_use_graph_tables_only() {
     let engine = temp_engine();
 
@@ -323,11 +221,17 @@ fn test_get_file_block_reads_base_graph_rows() {
             attr: remote_attr.clone(),
         }])
         .unwrap();
+    let chunk_slices = RedbMetaEngine::chunk_slices_for_block(
+        0,
+        DEFAULT_BLOCK_SIZE,
+        Some(&block),
+        BlockRefState::Published,
+    )
+    .unwrap();
     engine
-        .apply_replica_aux_state(&[crate::events::MetaEvent::CommitFileBlock {
+        .apply_replica_aux_state(&[crate::events::MetaEvent::PublishRegularFileBaseSlices {
             ino,
-            block_index: 0,
-            block: block.clone(),
+            chunk_slices,
         }])
         .unwrap();
 

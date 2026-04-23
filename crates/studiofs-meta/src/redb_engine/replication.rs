@@ -373,7 +373,6 @@ impl RedbMetaEngine {
                 crate::events::MetaEvent::AddEntry { .. } => {}
                 crate::events::MetaEvent::RemoveEntry { .. } => {}
                 crate::events::MetaEvent::RenameEntry { .. } => {}
-                crate::events::MetaEvent::SetFileBlock { .. } => {}
                 crate::events::MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
                     for (chunk_id, slices) in chunk_slices {
                         Self::set_regular_file_chunk_state_in_txn(
@@ -386,57 +385,8 @@ impl RedbMetaEngine {
                         )?;
                     }
                 }
-                crate::events::MetaEvent::RemoveFileBlock { ino, block_index } => {
-                    let block_size = Self::regular_file_graph_block_size_from_write_txn(&txn)?;
-                    let tombstones = Self::chunk_slices_for_block(
-                        *block_index,
-                        block_size,
-                        None,
-                        BlockRefState::Published,
-                    )?;
-                    Self::apply_regular_file_chunk_slices_in_txn(
-                        &txn,
-                        REGULAR_FILE_BASE_TABLE,
-                        *ino,
-                        tombstones.as_slice(),
-                        false,
-                    )?;
-                }
                 crate::events::MetaEvent::RemoveFileBlocks { ino } => {
                     Self::clear_regular_file_graph_in_txn(&txn, *ino)?;
-                }
-                crate::events::MetaEvent::SetFileBlocksBatch { .. } => {}
-                crate::events::MetaEvent::CommitFileBlock {
-                    ino,
-                    block_index,
-                    block,
-                } => {
-                    let block_size = Self::regular_file_graph_block_size_from_write_txn(&txn)?;
-                    let committed_slices = Self::chunk_slices_for_block(
-                        *block_index,
-                        block_size,
-                        Some(block),
-                        BlockRefState::Published,
-                    )?;
-                    Self::apply_regular_file_chunk_slices_in_txn(
-                        &txn,
-                        REGULAR_FILE_BASE_TABLE,
-                        *ino,
-                        committed_slices.as_slice(),
-                        false,
-                    )?;
-                }
-                crate::events::MetaEvent::PublishFileManifest { ino, blocks } => {
-                    let block_size = Self::regular_file_graph_block_size_from_write_txn(&txn)?;
-                    Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
-                        &txn,
-                        REGULAR_FILE_BASE_TABLE,
-                        *ino,
-                        blocks.as_slice(),
-                        block_size,
-                        true,
-                        false,
-                    )?;
                 }
                 crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
                     Self::replace_regular_file_chunk_rows_from_chunk_slices_in_txn(
@@ -778,12 +728,7 @@ impl RedbMetaEngine {
                         false,
                     )?;
                 }
-                crate::events::MetaEvent::SetFileBlock { .. }
-                | crate::events::MetaEvent::RemoveFileBlock { .. }
-                | crate::events::MetaEvent::RemoveFileBlocks { .. }
-                | crate::events::MetaEvent::SetFileBlocksBatch { .. }
-                | crate::events::MetaEvent::CommitFileBlock { .. }
-                | crate::events::MetaEvent::PublishFileManifest { .. }
+                crate::events::MetaEvent::RemoveFileBlocks { .. }
                 | crate::events::MetaEvent::AddPendingDeletion { .. }
                 | crate::events::MetaEvent::RemovePendingDeletion { .. }
                 | crate::events::MetaEvent::CreateSnapshot { .. }
@@ -964,12 +909,7 @@ impl RedbMetaEngine {
                     }
                 }
                 crate::events::MetaEvent::PublishRegularFileBaseSlices { .. } => {}
-                crate::events::MetaEvent::SetFileBlock { .. }
-                | crate::events::MetaEvent::RemoveFileBlock { .. }
-                | crate::events::MetaEvent::RemoveFileBlocks { .. }
-                | crate::events::MetaEvent::SetFileBlocksBatch { .. }
-                | crate::events::MetaEvent::CommitFileBlock { .. }
-                | crate::events::MetaEvent::PublishFileManifest { .. }
+                crate::events::MetaEvent::RemoveFileBlocks { .. }
                 | crate::events::MetaEvent::AddPendingDeletion { .. }
                 | crate::events::MetaEvent::RemovePendingDeletion { .. }
                 | crate::events::MetaEvent::CreateSnapshot { .. }

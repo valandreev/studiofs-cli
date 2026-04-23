@@ -1,4 +1,4 @@
-use crate::types::{BlockRef, DirEntryValue, InodeAttr, MetadataSnapshot, SnapshotState};
+use crate::types::{DirEntryValue, InodeAttr, MetadataSnapshot, SnapshotState};
 use serde::{Deserialize, Serialize};
 
 /// Represents a single mutation to the metadata state.
@@ -63,69 +63,11 @@ pub enum MetaEvent {
         new_parent_attr: Box<Option<InodeAttr>>,
     },
 
-    // ─── File Block Operations ───────────────────────────────────────────────
-    /// Legacy flat-block event: set one block reference for a file.
-    ///
-    /// Kept for compatibility with old journals/tests. New regular-file write
-    /// paths should prefer slice-native regular-file graph events.
-    SetFileBlock {
-        /// File inode being updated.
-        ino: u64,
-        /// Logical block slot inside the file.
-        block_index: u32,
-        /// Block payload reference to persist.
-        block: BlockRef,
-    },
-
-    /// Legacy flat-block event: remove one logical file block.
-    ///
-    /// Kept for compatibility with old journals/tests. New regular-file write
-    /// paths should prefer slice-native regular-file graph events.
-    RemoveFileBlock {
-        /// File inode being updated.
-        ino: u64,
-        /// Logical block slot to clear.
-        block_index: u32,
-    },
-
+    // ─── Regular File Graph Operations ──────────────────────────────────────
     /// Remove all regular-file graph rows for a file (e.g., unlink).
     RemoveFileBlocks {
         /// File inode whose block mapping should be removed.
         ino: u64,
-    },
-
-    /// Legacy flat-block event: set multiple block references in one batch.
-    ///
-    /// Kept for compatibility with old journals/tests. New regular-file write
-    /// paths should prefer slice-native regular-file graph events.
-    SetFileBlocksBatch {
-        /// Batch of `(ino, block_index, block)` updates to apply atomically.
-        blocks: Vec<(u64, u32, BlockRef)>,
-    },
-
-    /// Legacy flat-block event: publish one uploaded block as remote-visible.
-    ///
-    /// Kept for compatibility with old journals/tests. New regular-file upload
-    /// paths should prefer object/slice-native publication.
-    CommitFileBlock {
-        /// File inode being updated.
-        ino: u64,
-        /// Logical block slot inside the file.
-        block_index: u32,
-        /// Remote-visible block reference for the slot.
-        block: BlockRef,
-    },
-
-    /// Legacy flat-manifest event: publish a full `(block_index, BlockRef)`
-    /// manifest for a file.
-    ///
-    /// Kept for compatibility with old journals/tests. New regular-file
-    /// publish paths should prefer `PublishRegularFileBaseSlices`.
-    PublishFileManifest {
-        /// File inode whose published manifest is being replaced.
-        ino: u64,
-        /// Full published manifest as `(block_index, block)` rows.
-        blocks: Vec<(u32, BlockRef)>,
     },
 
     /// Replace the local overlay slices for a regular file chunk batch.
@@ -239,12 +181,7 @@ impl MetaEvent {
             Self::AddEntry { .. } => "add_entry",
             Self::RemoveEntry { .. } => "remove_entry",
             Self::RenameEntry { .. } => "rename_entry",
-            Self::SetFileBlock { .. } => "set_file_block",
-            Self::RemoveFileBlock { .. } => "remove_file_block",
             Self::RemoveFileBlocks { .. } => "remove_file_blocks",
-            Self::SetFileBlocksBatch { .. } => "set_file_blocks_batch",
-            Self::CommitFileBlock { .. } => "commit_file_block",
-            Self::PublishFileManifest { .. } => "publish_file_manifest",
             Self::SetRegularFileOverlaySlices { .. } => "set_regular_file_overlay_slices",
             Self::PublishRegularFileBaseSlices { .. } => "publish_regular_file_base_slices",
             Self::SetSymlinkTarget { .. } => "set_symlink_target",
@@ -276,12 +213,7 @@ impl MetaEvent {
             Self::AddEntry { parent, .. } => Some(*parent),
             Self::RemoveEntry { parent, .. } => Some(*parent),
             Self::RenameEntry { parent, .. } => Some(*parent),
-            Self::SetFileBlock { ino, .. } => Some(*ino),
-            Self::RemoveFileBlock { ino, .. } => Some(*ino),
             Self::RemoveFileBlocks { ino } => Some(*ino),
-            Self::SetFileBlocksBatch { blocks } => blocks.first().map(|(ino, _, _)| *ino),
-            Self::CommitFileBlock { ino, .. } => Some(*ino),
-            Self::PublishFileManifest { ino, .. } => Some(*ino),
             Self::SetRegularFileOverlaySlices { ino, .. } => Some(*ino),
             Self::PublishRegularFileBaseSlices { ino, .. } => Some(*ino),
             Self::SetSymlinkTarget { ino, .. } => Some(*ino),

@@ -1,8 +1,8 @@
 use crate::engine::{
-    BatchFlushEntry, BatchFlushResult, DeferredDeleteRecord, MetaAcl, MetaBlocks, MetaEngineCore,
-    MetaError, MetaFormat, MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaRecovery,
-    MetaReplication, MetaResult, MetaSnapshots, MetaSymlink, MetaXattr, MetadataAuthorityStatus,
-    PendingCreateRecord, UndoLogKind, UndoLogRecord,
+    DeferredDeleteRecord, MetaAcl, MetaBlocks, MetaEngineCore, MetaError, MetaFormat, MetaFsOps,
+    MetaGc, MetaInodes, MetaNamespace, MetaRecovery, MetaReplication, MetaResult, MetaSnapshots,
+    MetaSymlink, MetaXattr, MetadataAuthorityStatus, PendingCreateRecord, UndoLogKind,
+    UndoLogRecord,
 };
 use crate::events::MetaEvent;
 use crate::redb_engine::{RedbMetaEngine, RedbSnapshot};
@@ -2308,12 +2308,8 @@ impl PgMetaEngine {
         let mut out = Vec::with_capacity(events.len());
         for event in events {
             match event {
-                MetaEvent::SetFileBlock { .. }
-                | MetaEvent::SetRegularFileOverlaySlices { .. }
-                | MetaEvent::RemoveFileBlock { .. }
-                | MetaEvent::RemoveFileBlocks { .. }
-                | MetaEvent::SetFileBlocksBatch { .. }
-                | MetaEvent::CommitFileBlock { .. } => {}
+                MetaEvent::SetRegularFileOverlaySlices { .. }
+                | MetaEvent::RemoveFileBlocks { .. } => {}
                 MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => {}
                 MetaEvent::CreateSnapshot { snapshot } => {
                     let mut synced = snapshot.clone();
@@ -2347,16 +2343,14 @@ impl PgMetaEngine {
                     || overlay.symlink_inodes.contains(ino)
                     || overlay.xattr_inodes.contains(ino)
             }
-            MetaEvent::SetFileBlock { .. } | MetaEvent::SetRegularFileOverlaySlices { .. } => false,
-            MetaEvent::RemoveFileBlock { ino, .. } | MetaEvent::RemoveFileBlocks { ino } => {
+            MetaEvent::SetRegularFileOverlaySlices { .. } => false,
+            MetaEvent::RemoveFileBlocks { ino } => {
                 if removed_inodes.contains(ino) {
                     return Ok(false);
                 }
                 overlay.block_inodes.contains(ino)
             }
-            MetaEvent::CommitFileBlock { ino, .. }
-            | MetaEvent::PublishFileManifest { ino, .. }
-            | MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
+            MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
                 overlay.block_inodes.contains(ino)
             }
             MetaEvent::SetSymlinkTarget { ino, .. } => {
@@ -2374,9 +2368,6 @@ impl PgMetaEngine {
                 overlay.attr_inodes.contains(ino)
                     || overlay.acl_keys.contains(&Self::acl_key(*ino, principal))
             }
-            MetaEvent::SetFileBlocksBatch { blocks } => blocks
-                .iter()
-                .any(|(ino, _, _)| overlay.block_inodes.contains(ino)),
             MetaEvent::SetAttr { .. }
             | MetaEvent::AddEntry { .. }
             | MetaEvent::RemoveEntry { .. }
@@ -2392,10 +2383,7 @@ impl PgMetaEngine {
     fn event_has_aux_apply_effect(event: &MetaEvent) -> bool {
         match event {
             MetaEvent::RemoveAttr { .. }
-            | MetaEvent::RemoveFileBlock { .. }
             | MetaEvent::RemoveFileBlocks { .. }
-            | MetaEvent::CommitFileBlock { .. }
-            | MetaEvent::PublishFileManifest { .. }
             | MetaEvent::PublishRegularFileBaseSlices { .. }
             | MetaEvent::SetSymlinkTarget { .. }
             | MetaEvent::SetXattr { .. }
@@ -2407,9 +2395,7 @@ impl PgMetaEngine {
             | MetaEvent::CreateSnapshot { .. }
             | MetaEvent::UpdateSnapshotState { .. } => true,
             MetaEvent::SetAttr { .. }
-            | MetaEvent::SetFileBlock { .. }
             | MetaEvent::SetRegularFileOverlaySlices { .. }
-            | MetaEvent::SetFileBlocksBatch { .. }
             | MetaEvent::AddEntry { .. }
             | MetaEvent::RemoveEntry { .. }
             | MetaEvent::RenameEntry { .. } => false,
@@ -2500,19 +2486,10 @@ impl PgMetaEngine {
                         overlay.attr_inodes.insert(attr.ino);
                     }
                 }
-                MetaEvent::SetFileBlock { ino, .. }
-                | MetaEvent::SetRegularFileOverlaySlices { ino, .. }
+                MetaEvent::SetRegularFileOverlaySlices { ino, .. }
                 | MetaEvent::PublishRegularFileBaseSlices { ino, .. }
-                | MetaEvent::RemoveFileBlock { ino, .. }
-                | MetaEvent::RemoveFileBlocks { ino }
-                | MetaEvent::CommitFileBlock { ino, .. }
-                | MetaEvent::PublishFileManifest { ino, .. } => {
+                | MetaEvent::RemoveFileBlocks { ino } => {
                     overlay.block_inodes.insert(*ino);
-                }
-                MetaEvent::SetFileBlocksBatch { blocks } => {
-                    for (ino, _, _) in blocks {
-                        overlay.block_inodes.insert(*ino);
-                    }
                 }
                 MetaEvent::SetSymlinkTarget { ino, .. } => {
                     overlay.symlink_inodes.insert(*ino);
@@ -2607,14 +2584,9 @@ impl PgMetaEngine {
                 overlay.attr_inodes.contains(ino)
                     || overlay.acl_keys.contains(&Self::acl_key(*ino, principal))
             }
-            MetaEvent::SetFileBlock { .. }
-            | MetaEvent::SetRegularFileOverlaySlices { .. }
+            MetaEvent::SetRegularFileOverlaySlices { .. }
             | MetaEvent::PublishRegularFileBaseSlices { .. }
-            | MetaEvent::RemoveFileBlock { .. }
             | MetaEvent::RemoveFileBlocks { .. }
-            | MetaEvent::SetFileBlocksBatch { .. }
-            | MetaEvent::CommitFileBlock { .. }
-            | MetaEvent::PublishFileManifest { .. }
             | MetaEvent::AddPendingDeletion { .. }
             | MetaEvent::RemovePendingDeletion { .. }
             | MetaEvent::CreateSnapshot { .. }
@@ -4138,23 +4110,6 @@ impl MetaFsOps for PgMetaEngine {
     }
 }
 impl MetaBlocks for PgMetaEngine {
-    fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
-        self.local.get_file_block(ino, block_index)
-    }
-
-    fn set_file_block(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        block: &BlockRef,
-    ) -> MetaResult<Option<BlockRef>> {
-        self.mutate(|local| local.set_file_block(ino, block_index, block))
-    }
-
-    fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
-        self.local.get_file_blocks(ino)
-    }
-
     fn lookup_regular_file_chunk_slices(
         &self,
         ino: Ino,
@@ -4178,10 +4133,6 @@ impl MetaBlocks for PgMetaEngine {
         self.mutate(|local| local.remove_file_blocks(ino))
     }
 
-    fn remove_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<u64>> {
-        self.mutate(|local| local.remove_file_block(ino, block_index))
-    }
-
     fn next_block_id(&self) -> MetaResult<u64> {
         self.next_block_ids(1)?
             .into_iter()
@@ -4202,10 +4153,6 @@ impl MetaBlocks for PgMetaEngine {
             count as u64,
         )?;
         Ok((first..first + count as u64).collect())
-    }
-
-    fn flush_blocks_batch(&self, entries: &[BatchFlushEntry]) -> MetaResult<Vec<BatchFlushResult>> {
-        self.mutate(|local| local.flush_blocks_batch(entries))
     }
 
     fn flush_regular_file_overlay_slices(
@@ -4250,52 +4197,6 @@ impl MetaBlocks for PgMetaEngine {
                 expected_epoch,
                 object_id,
             )
-        });
-        if matches!(result, Ok(true)) {
-            self.request_pending_flush();
-        }
-        result
-    }
-
-    fn commit_uploaded_block(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        expected_epoch: u64,
-        block: &BlockRef,
-    ) -> MetaResult<bool> {
-        let result = self
-            .mutate(|local| local.commit_uploaded_block(ino, block_index, expected_epoch, block));
-        if matches!(result, Ok(true)) {
-            self.request_pending_flush();
-        }
-        result
-    }
-
-    fn mark_file_block_uploaded_if_matches(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        expected_epoch: u64,
-        block: &BlockRef,
-    ) -> MetaResult<bool> {
-        let result = self.mutate(|local| {
-            local.mark_file_block_uploaded_if_matches(ino, block_index, expected_epoch, block)
-        });
-        if matches!(result, Ok(true)) {
-            self.request_pending_flush();
-        }
-        result
-    }
-
-    fn publish_file_manifest_if_matches(
-        &self,
-        ino: Ino,
-        expected_epoch: u64,
-        expected_manifest: &[(u32, BlockRef)],
-    ) -> MetaResult<bool> {
-        let result = self.mutate(|local| {
-            local.publish_file_manifest_if_matches(ino, expected_epoch, expected_manifest)
         });
         if matches!(result, Ok(true)) {
             self.request_pending_flush();
@@ -4583,14 +4484,6 @@ impl MetaReplication for PgMetaEngine {
     }
 }
 impl crate::engine::MetaEngine for PgMetaEngine {
-    fn flush_blocks_batch_with_attr(
-        &self,
-        entries: &[BatchFlushEntry],
-        attr: Option<&InodeAttr>,
-    ) -> MetaResult<Vec<BatchFlushResult>> {
-        self.mutate(|local| local.flush_blocks_batch_with_attr(entries, attr))
-    }
-
     fn flush_regular_file_overlay_slices_with_attr(
         &self,
         ino: Ino,

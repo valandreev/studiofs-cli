@@ -145,13 +145,19 @@ fn test_replica_aux_block_events_accept_fragmented_base_graph() {
     ));
 
     let replacement = BlockRef::new_full(73, DEFAULT_BLOCK_SIZE);
+    let replacement_slices = RedbMetaEngine::chunk_slices_for_block(
+        0,
+        DEFAULT_BLOCK_SIZE,
+        Some(&replacement),
+        BlockRefState::Published,
+    )
+    .unwrap();
     engine
-        .apply_replica_aux_state(&[crate::events::MetaEvent::CommitFileBlock {
+        .apply_replica_aux_state(&[crate::events::MetaEvent::PublishRegularFileBaseSlices {
             ino: file.ino,
-            block_index: 0,
-            block: replacement.clone(),
+            chunk_slices: replacement_slices,
         }])
-        .expect("CommitFileBlock replay should update fragmented base graph slice-natively");
+        .expect("slice-native base replay should update fragmented base graph");
     assert_eq!(
         engine
             .get_file_block(file.ino, 0)
@@ -162,10 +168,10 @@ fn test_replica_aux_block_events_accept_fragmented_base_graph() {
     );
 
     engine
-        .apply_replica_aux_state(&[crate::events::MetaEvent::RemoveFileBlock {
+        .apply_replica_aux_state(&[crate::events::MetaEvent::PublishRegularFileBaseSlices {
             ino: file.ino,
-            block_index: 0,
+            chunk_slices: Vec::new(),
         }])
-        .expect("RemoveFileBlock replay should tombstone fragmented base graph slice-natively");
+        .expect("slice-native empty base replay should clear fragmented base graph");
     assert!(engine.get_file_block(file.ino, 0).unwrap().is_none());
 }

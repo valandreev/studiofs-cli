@@ -7,35 +7,6 @@ use crate::types::*;
 use std::collections::{HashMap, HashSet};
 
 // =============================================================================
-// Batch flush types
-// =============================================================================
-
-/// Input for one block in a batched flush operation.
-///
-/// The caller pre-allocates `object_id` via [`MetaBlocks::next_block_ids`]
-/// before calling [`MetaBlocks::flush_blocks_batch`].
-#[derive(Debug, Clone)]
-pub struct BatchFlushEntry {
-    /// Inode whose block slot is being updated.
-    pub ino: Ino,
-    /// Logical block index inside the file.
-    pub block_index: u32,
-    /// Pre-allocated immutable object id that stores the payload.
-    pub object_id: u64,
-    /// Payload length in bytes.
-    pub length: u32,
-    /// Block flags associated with the stored payload.
-    pub flags: BlockFlags,
-}
-
-/// Result for one block in a batched flush operation.
-#[derive(Debug, Clone)]
-pub struct BatchFlushResult {
-    /// The old block reference if the slot was occupied (caller should GC it).
-    pub old_block: Option<BlockRef>,
-}
-
-// =============================================================================
 // Errors
 // =============================================================================
 #[derive(Debug, thiserror::Error)]
@@ -493,22 +464,6 @@ pub trait MetaFsOps: Send + Sync + MetaInodes {
 
 /// Capability trait for block ids, manifests, and regular-file overlay graphs.
 pub trait MetaBlocks: Send + Sync + MetaInodes {
-    /// Get a specific block reference for a file.
-    /// Key: (inode, block_index)
-    fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>>;
-
-    /// Set a block reference for a file.
-    /// Returns the old block reference if it existed (for GC marking).
-    fn set_file_block(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        block: &BlockRef,
-    ) -> MetaResult<Option<BlockRef>>;
-
-    /// Get all block references for a file.
-    fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>>;
-
     /// Resolve merged regular-file slice coverage for one chunk-local range.
     ///
     /// Implementations must apply deterministic precedence:
@@ -537,10 +492,6 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
     /// Returns the list of removed block IDs for GC.
     fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>>;
 
-    /// Remove a single block for a file (used in truncate).
-    /// Returns the removed block ID if it existed.
-    fn remove_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<u64>>;
-
     /// Allocate a new sequential block ID.
     fn next_block_id(&self) -> MetaResult<u64>;
 
@@ -559,36 +510,6 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
             ids.push(self.next_block_id()?);
         }
         Ok(ids)
-    }
-
-    /// Flush a batch of block writes in a single transaction.
-    ///
-    /// For each entry:
-    /// - Sets the new `BlockRef` in `FILE_BLOCKS`
-    /// - If an old block existed at `(ino, block_index)`, returns it to the
-    ///   caller so remote-visible replacement/GC can be decided later
-    /// - Increments `USED_SPACE` by the new block's length
-    ///
-    /// Returns one [`BatchFlushResult`] per entry (same order).
-    ///
-    /// Default implementation calls individual methods sequentially.
-    fn flush_blocks_batch(&self, entries: &[BatchFlushEntry]) -> MetaResult<Vec<BatchFlushResult>> {
-        let mut results = Vec::with_capacity(entries.len());
-        for e in entries {
-            let block_ref = BlockRef {
-                object_id: e.object_id,
-                offset: 0,
-                length: e.length,
-                flags: e.flags,
-            };
-            let old = self.set_file_block(e.ino, e.block_index, &block_ref)?;
-            if let Some(ref old_block) = old {
-                self.decr_counter(counters::USED_SPACE, u64::from(old_block.length))?;
-            }
-            self.incr_counter(counters::USED_SPACE, u64::from(e.length))?;
-            results.push(BatchFlushResult { old_block: old });
-        }
-        Ok(results)
     }
 
     /// Flush new local overlay slices for a regular file.
@@ -613,26 +534,15 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
     /// Collect object ids currently referenced by local regular-file overlay.
     ///
     /// Backends with a dedicated overlay graph should override this to read from
-    /// overlay metadata directly. The default falls back to the merged manifest
-    /// and then to resolved slice spans when the file can no longer be
-    /// represented by legacy flat blocks.
+    /// overlay metadata directly. The default resolves the current regular-file
+    /// slice graph and deduplicates referenced objects.
     fn get_regular_file_overlay_object_ids(&self, ino: Ino) -> MetaResult<Vec<u64>> {
         let mut ids = HashSet::new();
-        match self.get_file_blocks(ino) {
-            Ok(blocks) => {
-                for (_, block) in blocks {
-                    ids.insert(block.object_id);
-                }
+        let attr = self.get_attr(ino)?;
+        for span in self.lookup_regular_file_slices(ino, 0, attr.size)? {
+            if let Some(block) = span.block {
+                ids.insert(block.object_id);
             }
-            Err(MetaError::FragmentedBlock { .. }) => {
-                let attr = self.get_attr(ino)?;
-                for span in self.lookup_regular_file_slices(ino, 0, attr.size)? {
-                    if let Some(block) = span.block {
-                        ids.insert(block.object_id);
-                    }
-                }
-            }
-            Err(err) => return Err(err),
         }
         Ok(ids.into_iter().collect())
     }
@@ -646,31 +556,15 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
     /// counted once.
     fn get_regular_file_graph_object_usage(&self, ino: Ino) -> MetaResult<Vec<(u64, u64)>> {
         let mut usage: HashMap<u64, u64> = HashMap::new();
-        match self.get_file_blocks(ino) {
-            Ok(blocks) => {
-                for (_, block) in blocks {
-                    let object_bytes =
-                        u64::from(block.offset).saturating_add(u64::from(block.length));
-                    usage
-                        .entry(block.object_id)
-                        .and_modify(|existing| *existing = (*existing).max(object_bytes))
-                        .or_insert(object_bytes);
-                }
+        let attr = self.get_attr(ino)?;
+        for span in self.lookup_regular_file_slices(ino, 0, attr.size)? {
+            if let Some(block) = span.block {
+                let object_bytes = u64::from(block.offset).saturating_add(u64::from(block.length));
+                usage
+                    .entry(block.object_id)
+                    .and_modify(|existing| *existing = (*existing).max(object_bytes))
+                    .or_insert(object_bytes);
             }
-            Err(MetaError::FragmentedBlock { .. }) => {
-                let attr = self.get_attr(ino)?;
-                for span in self.lookup_regular_file_slices(ino, 0, attr.size)? {
-                    if let Some(block) = span.block {
-                        let object_bytes =
-                            u64::from(block.offset).saturating_add(u64::from(block.length));
-                        usage
-                            .entry(block.object_id)
-                            .and_modify(|existing| *existing = (*existing).max(object_bytes))
-                            .or_insert(object_bytes);
-                    }
-                }
-            }
-            Err(err) => return Err(err),
         }
         Ok(usage.into_iter().collect())
     }
@@ -709,62 +603,6 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
         let _ = (ino, expected_epoch, object_id);
         Ok(false)
     }
-
-    /// Mark a block as remote-visible after its object upload has completed.
-    ///
-    /// Remote-backed engines can use this to publish block visibility and
-    /// advance remote-visible file size independently from the local write view.
-    fn commit_uploaded_block(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        expected_epoch: u64,
-        block: &BlockRef,
-    ) -> MetaResult<bool>;
-
-    /// Mark the current unpublished overlay block as fully uploaded without
-    /// publishing the inode's remote-visible manifest yet.
-    ///
-    /// Returns `Ok(true)` when the active overlay block for the current epoch
-    /// still matches `block` and its local lifecycle can advance to
-    /// `BlockRefState::Uploaded`. Returns `Ok(false)` when the inode/epoch/block
-    /// no longer matches the caller's view.
-    fn mark_file_block_uploaded_if_matches(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        expected_epoch: u64,
-        block: &BlockRef,
-    ) -> MetaResult<bool>;
-
-    /// Atomically publish the current file manifest as the new committed head.
-    ///
-    /// This switches the committed manifest at file granularity and updates the
-    /// inode's coarse remote upload state to `ready` when successful.
-    ///
-    /// The default implementation snapshots the current manifest before
-    /// entering the backend transaction and delegates to
-    /// [`MetaBlocks::publish_file_manifest_if_matches`]. Callers that need an
-    /// in-transaction race check should prefer that lower-level API directly.
-    fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool> {
-        let expected_manifest = match self.get_file_blocks(ino) {
-            Ok(expected_manifest) => expected_manifest,
-            Err(MetaError::FragmentedBlock { .. }) => {
-                return self.publish_regular_file_overlay_to_base_if_matches(ino, expected_epoch);
-            }
-            Err(err) => return Err(err),
-        };
-        self.publish_file_manifest_if_matches(ino, expected_epoch, &expected_manifest)
-    }
-
-    /// Publish only if the current manifest still matches the verified block
-    /// list observed by the caller.
-    fn publish_file_manifest_if_matches(
-        &self,
-        ino: Ino,
-        expected_epoch: u64,
-        expected_manifest: &[(u32, BlockRef)],
-    ) -> MetaResult<bool>;
 
     /// Promote the local regular-file overlay graph to the remote-visible base
     /// graph for a specific inode/content epoch.
@@ -959,24 +797,6 @@ pub trait MetaEngine:
     + MetaSnapshots
     + MetaReplication
 {
-    /// Flush block refs and, optionally, inode attrs in one logical
-    /// foreground persist step.
-    ///
-    /// Backends should override this to make the operation atomic. The default
-    /// implementation preserves behavior but is not crash-atomic across the
-    /// two metadata updates.
-    fn flush_blocks_batch_with_attr(
-        &self,
-        entries: &[BatchFlushEntry],
-        attr: Option<&InodeAttr>,
-    ) -> MetaResult<Vec<BatchFlushResult>> {
-        let results = self.flush_blocks_batch(entries)?;
-        if let Some(attr) = attr {
-            self.set_attr(attr)?;
-        }
-        Ok(results)
-    }
-
     /// Flush local regular-file overlay slices and optionally inode attributes
     /// in one logical foreground persist step.
     ///
