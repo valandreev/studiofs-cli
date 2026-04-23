@@ -696,11 +696,19 @@ impl MetaBlocks for RedbMetaEngine {
                 return Ok(false);
             }
 
-            let old_committed = match Self::base_block_in_txn(&txn, ino, block_index, block_size) {
-                Ok(old_committed) => old_committed,
-                Err(MetaError::FragmentedBlock { .. }) => None,
-                Err(err) => return Err(err),
-            };
+            let block_start = u64::from(block_index).saturating_mul(u64::from(block_size));
+            let previous_committed_object_ids: std::collections::BTreeSet<_> =
+                Self::lookup_regular_file_slices_in_write_txn(
+                    &txn,
+                    ino,
+                    block_start,
+                    u64::from(block_size),
+                    false,
+                    true,
+                )?
+                .into_iter()
+                .filter_map(|span| span.block.map(|block| block.object_id))
+                .collect();
             let committed_slices = Self::chunk_slices_for_block(
                 block_index,
                 block_size,
@@ -754,9 +762,11 @@ impl MetaBlocks for RedbMetaEngine {
                 )?;
             }
 
-            if let Some(old) = old_committed
-                && old.object_id != block.object_id
-            {
+            let removed_object_ids: Vec<_> = previous_committed_object_ids
+                .into_iter()
+                .filter(|object_id| *object_id != block.object_id)
+                .collect();
+            if !removed_object_ids.is_empty() {
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::SystemTime::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
@@ -764,17 +774,19 @@ impl MetaBlocks for RedbMetaEngine {
                 let mut pending_del_table = txn
                     .open_table(PENDING_DELETIONS_TABLE)
                     .map_err(|e| MetaError::Storage(e.to_string()))?;
-                pending_del_table
-                    .insert(old.object_id, timestamp)
-                    .map_err(|e| MetaError::Storage(e.to_string()))?;
+                for object_id in removed_object_ids {
+                    pending_del_table
+                        .insert(object_id, timestamp)
+                        .map_err(|e| MetaError::Storage(e.to_string()))?;
+                    Self::append_event_in_txn(
+                        &txn,
+                        &crate::events::MetaEvent::AddPendingDeletion {
+                            object_id,
+                            timestamp,
+                        },
+                    )?;
+                }
                 drop(pending_del_table);
-                Self::append_event_in_txn(
-                    &txn,
-                    &crate::events::MetaEvent::AddPendingDeletion {
-                        object_id: old.object_id,
-                        timestamp,
-                    },
-                )?;
             }
         }
 

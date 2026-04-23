@@ -756,6 +756,16 @@ fn commit_uploaded_block_accepts_flat_overlay_over_fragmented_base_without_error
         "legacy single-block commit should replace a fragmented base when the current overlay is flat"
     );
     assert_eq!(engine.get_file_block(file.ino, 0).unwrap(), Some(uploaded));
+    let pending_deletions: std::collections::BTreeSet<_> = engine
+        .get_pending_deletions()
+        .unwrap()
+        .into_iter()
+        .map(|(object_id, _)| object_id)
+        .collect();
+    assert_eq!(
+        pending_deletions,
+        std::collections::BTreeSet::from([601, 602])
+    );
 }
 
 #[test]

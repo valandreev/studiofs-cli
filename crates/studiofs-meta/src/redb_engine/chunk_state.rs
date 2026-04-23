@@ -1281,29 +1281,6 @@ impl RedbMetaEngine {
         )
     }
 
-    pub(super) fn base_block_in_txn(
-        txn: &redb::WriteTransaction,
-        ino: Ino,
-        block_index: u32,
-        block_size: u32,
-    ) -> MetaResult<Option<BlockRef>> {
-        let block_start = u64::from(block_index).saturating_mul(u64::from(block_size));
-        let spans = Self::lookup_regular_file_slices_in_write_txn(
-            txn,
-            ino,
-            block_start,
-            u64::from(block_size),
-            false,
-            true,
-        )?;
-        Self::synthesize_block_ref_from_resolved_spans(
-            ino,
-            spans.as_slice(),
-            block_index,
-            block_size,
-        )
-    }
-
     pub(super) fn chunk_slices_for_block(
         block_index: u32,
         block_size: u32,
