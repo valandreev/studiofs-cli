@@ -637,7 +637,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         } else {
             RedbMetaEngine::append_event_in_txn(
                 self.txn,
-                &crate::events::MetaEvent::RemoveFileBlocks { ino: attr.ino },
+                &crate::events::MetaEvent::RemoveRegularFileGraph { ino: attr.ino },
             )?;
             RedbMetaEngine::append_event_in_txn(
                 self.txn,

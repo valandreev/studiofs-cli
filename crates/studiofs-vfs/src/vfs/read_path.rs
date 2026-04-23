@@ -1300,11 +1300,85 @@ mod tests {
         LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState, LocalBlockObjectStats,
         LocalBlockStorageStats,
     };
-    use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig, ROOT_INO};
+    use studiofs_meta::schema::{
+        BlockRefState, CURRENT_FORMAT_VERSION, ChunkId, DEFAULT_BLOCK_SIZE, FormatInfo,
+        MetadataConfig, ROOT_INO, SliceId, SliceOrder, SliceRange, SliceRecord,
+    };
     use studiofs_meta::types::BlockFlags as MetaBlockFlags;
     use studiofs_meta::{MetaBlocks, MetaFormat, MetaInodes, RedbMetaEngine};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
+
+    trait SliceNativeMetaFixture {
+        fn set_file_block(
+            &self,
+            ino: Ino,
+            block_index: u32,
+            block: &BlockRef,
+        ) -> MetaResult<Option<BlockRef>>;
+    }
+
+    fn fixture_block_slices(
+        block_index: u32,
+        block: &BlockRef,
+    ) -> MetaResult<Vec<(ChunkId, Vec<SliceRecord>)>> {
+        let block_start = u64::from(block_index)
+            .checked_mul(u64::from(DEFAULT_BLOCK_SIZE))
+            .ok_or_else(|| MetaError::Storage("fixture block offset overflow".to_string()))?;
+        let data_end = block_start
+            .checked_add(u64::from(block.length))
+            .ok_or_else(|| MetaError::Storage("fixture data range overflow".to_string()))?;
+        let mut chunks = std::collections::BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
+        let mut cursor = block_start;
+        while cursor < data_end {
+            let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);
+            let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
+            let piece_end = data_end.min(chunk_start.saturating_add(DEFAULT_CHUNK_SIZE as u64));
+            let range = SliceRange::new(
+                (cursor - chunk_start) as u32,
+                (piece_end - chunk_start) as u32,
+            )
+            .ok_or_else(|| MetaError::Storage("fixture invalid slice range".to_string()))?;
+            let delta = u32::try_from(cursor.saturating_sub(block_start))
+                .map_err(|_| MetaError::Storage("fixture slice delta overflow".to_string()))?;
+            let mut slice = SliceRecord::new(
+                SliceId(0),
+                SliceOrder(0),
+                range,
+                BlockRef {
+                    object_id: block.object_id,
+                    offset: block.offset.saturating_add(delta),
+                    length: u32::try_from(piece_end.saturating_sub(cursor)).map_err(|_| {
+                        MetaError::Storage("fixture slice length overflow".to_string())
+                    })?,
+                    flags: block.flags,
+                },
+            );
+            slice.block_state = BlockRefState::Published;
+            chunks.entry(chunk_id).or_default().push(slice);
+            cursor = piece_end;
+        }
+        Ok(chunks.into_iter().collect())
+    }
+
+    impl SliceNativeMetaFixture for Arc<RedbMetaEngine> {
+        fn set_file_block(
+            &self,
+            ino: Ino,
+            block_index: u32,
+            block: &BlockRef,
+        ) -> MetaResult<Option<BlockRef>> {
+            self.flush_regular_file_overlay_slices(
+                ino,
+                fixture_block_slices(block_index, block)?.as_slice(),
+            )?;
+            self.publish_regular_file_overlay_to_base_if_matches(
+                ino,
+                self.get_attr(ino)?.content_epoch,
+            )?;
+            Ok(None)
+        }
+    }
 
     struct CountingLocalBlockBackend {
         inner: Arc<dyn LocalBlockBackend>,

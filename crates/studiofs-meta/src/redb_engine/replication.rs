@@ -385,7 +385,7 @@ impl RedbMetaEngine {
                         )?;
                     }
                 }
-                crate::events::MetaEvent::RemoveFileBlocks { ino } => {
+                crate::events::MetaEvent::RemoveRegularFileGraph { ino } => {
                     Self::clear_regular_file_graph_in_txn(&txn, *ino)?;
                 }
                 crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
@@ -728,7 +728,7 @@ impl RedbMetaEngine {
                         false,
                     )?;
                 }
-                crate::events::MetaEvent::RemoveFileBlocks { .. }
+                crate::events::MetaEvent::RemoveRegularFileGraph { .. }
                 | crate::events::MetaEvent::AddPendingDeletion { .. }
                 | crate::events::MetaEvent::RemovePendingDeletion { .. }
                 | crate::events::MetaEvent::CreateSnapshot { .. }
@@ -909,7 +909,7 @@ impl RedbMetaEngine {
                     }
                 }
                 crate::events::MetaEvent::PublishRegularFileBaseSlices { .. } => {}
-                crate::events::MetaEvent::RemoveFileBlocks { .. }
+                crate::events::MetaEvent::RemoveRegularFileGraph { .. }
                 | crate::events::MetaEvent::AddPendingDeletion { .. }
                 | crate::events::MetaEvent::RemovePendingDeletion { .. }
                 | crate::events::MetaEvent::CreateSnapshot { .. }

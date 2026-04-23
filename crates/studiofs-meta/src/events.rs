@@ -65,7 +65,7 @@ pub enum MetaEvent {
 
     // ─── Regular File Graph Operations ──────────────────────────────────────
     /// Remove all regular-file graph rows for a file (e.g., unlink).
-    RemoveFileBlocks {
+    RemoveRegularFileGraph {
         /// File inode whose block mapping should be removed.
         ino: u64,
     },
@@ -181,7 +181,7 @@ impl MetaEvent {
             Self::AddEntry { .. } => "add_entry",
             Self::RemoveEntry { .. } => "remove_entry",
             Self::RenameEntry { .. } => "rename_entry",
-            Self::RemoveFileBlocks { .. } => "remove_file_blocks",
+            Self::RemoveRegularFileGraph { .. } => "remove_regular_file_graph",
             Self::SetRegularFileOverlaySlices { .. } => "set_regular_file_overlay_slices",
             Self::PublishRegularFileBaseSlices { .. } => "publish_regular_file_base_slices",
             Self::SetSymlinkTarget { .. } => "set_symlink_target",
@@ -213,7 +213,7 @@ impl MetaEvent {
             Self::AddEntry { parent, .. } => Some(*parent),
             Self::RemoveEntry { parent, .. } => Some(*parent),
             Self::RenameEntry { parent, .. } => Some(*parent),
-            Self::RemoveFileBlocks { ino } => Some(*ino),
+            Self::RemoveRegularFileGraph { ino } => Some(*ino),
             Self::SetRegularFileOverlaySlices { ino, .. } => Some(*ino),
             Self::PublishRegularFileBaseSlices { ino, .. } => Some(*ino),
             Self::SetSymlinkTarget { ino, .. } => Some(*ino),

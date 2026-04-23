@@ -29,6 +29,8 @@ impl RedbMetaEngine {
         serde_json::from_slice(entry.value()).map_err(|e| MetaError::Serialization(e.to_string()))
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn format_info_from_write_txn(
         txn: &redb::WriteTransaction,
     ) -> MetaResult<FormatInfo> {

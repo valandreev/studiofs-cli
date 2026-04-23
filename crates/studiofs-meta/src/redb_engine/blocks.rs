@@ -11,20 +11,6 @@ fn record_regular_file_object_usage(
         .or_insert(object_bytes);
 }
 
-fn regular_file_chunk_states_object_ids(
-    chunks: &std::collections::BTreeMap<ChunkId, RegularFileChunkState>,
-) -> std::collections::BTreeSet<u64> {
-    let mut object_ids = std::collections::BTreeSet::new();
-    for chunk_state in chunks.values() {
-        for slice in chunk_state.slices.values() {
-            if let Some(block) = slice.block.as_ref() {
-                object_ids.insert(block.object_id);
-            }
-        }
-    }
-    object_ids
-}
-
 impl MetaBlocks for RedbMetaEngine {
     fn lookup_regular_file_chunk_slices(
         &self,
@@ -147,7 +133,10 @@ impl MetaBlocks for RedbMetaEngine {
             Self::clear_regular_file_graph_in_txn(&txn, ino)?;
             Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
 
-            Self::append_event_in_txn(&txn, &crate::events::MetaEvent::RemoveFileBlocks { ino })?;
+            Self::append_event_in_txn(
+                &txn,
+                &crate::events::MetaEvent::RemoveRegularFileGraph { ino },
+            )?;
         }
         txn.commit()
             .map_err(|e| MetaError::Storage(e.to_string()))?;

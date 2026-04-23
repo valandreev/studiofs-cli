@@ -775,7 +775,19 @@ mod tests {
             attr.content_epoch = 1;
             engine.set_attr(&attr).unwrap();
             engine
-                .set_file_block(file.ino, 0, &BlockRef::new_partial(777, 4096))
+                .flush_regular_file_overlay_slices(
+                    file.ino,
+                    &[(ChunkId(0), {
+                        let mut slice = SliceRecord::new(
+                            SliceId(0),
+                            SliceOrder(0),
+                            SliceRange::new(0, 4096).unwrap(),
+                            BlockRef::new_partial(777, 4096),
+                        );
+                        slice.block_state = BlockRefState::LocalOnly;
+                        vec![slice]
+                    })],
+                )
                 .unwrap();
             file.ino
         };

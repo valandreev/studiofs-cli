@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use studiofs_meta::engine::MetadataAuthorityStatus;
 use studiofs_meta::engine::{MetaBlocks, MetaInodes};
 use studiofs_meta::schema::{
-    CURRENT_FORMAT_VERSION, ChunkId, FormatInfo, InodeLifecycleState, MetadataConfig,
-    PayloadRetentionClass, ROOT_INO, SliceId, SliceOrder, SliceRange, SliceRecord,
+    BlockRefState, CURRENT_FORMAT_VERSION, ChunkId, DEFAULT_BLOCK_SIZE, FormatInfo,
+    InodeLifecycleState, MetadataConfig, PayloadRetentionClass, ROOT_INO, SliceId, SliceOrder,
+    SliceRange, SliceRecord,
 };
 use studiofs_meta::{
     FileLockLease, HardLockKind, MetaEngine, MetaFormat, MetaFsOps, RedbMetaEngine,
@@ -85,6 +86,105 @@ fn make_test_vfs_with_config(
     let _guard = rt.enter();
     vfs.start().expect("start vfs background workers");
     (rt, vfs, meta)
+}
+
+trait SliceNativeMetaFixture {
+    fn set_file_block(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        block: &BlockRef,
+    ) -> MetaResult<Option<BlockRef>>;
+    fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>>;
+}
+
+fn fixture_block_slices(
+    block_index: u32,
+    block: Option<&BlockRef>,
+) -> MetaResult<Vec<(ChunkId, Vec<SliceRecord>)>> {
+    let block_start = u64::from(block_index)
+        .checked_mul(u64::from(DEFAULT_BLOCK_SIZE))
+        .ok_or_else(|| MetaError::Storage("fixture block offset overflow".to_string()))?;
+    let data_end = block_start
+        .checked_add(u64::from(block.map_or(0, |block| block.length)))
+        .ok_or_else(|| MetaError::Storage("fixture block data overflow".to_string()))?;
+    let block_end = block_start
+        .checked_add(u64::from(DEFAULT_BLOCK_SIZE))
+        .ok_or_else(|| MetaError::Storage("fixture block range overflow".to_string()))?;
+    let mut chunks = std::collections::BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
+    let mut push = |start: u64, end: u64, source: Option<&BlockRef>| -> MetaResult<()> {
+        let mut cursor = start;
+        while cursor < end {
+            let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);
+            let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
+            let piece_end = end.min(chunk_start.saturating_add(DEFAULT_CHUNK_SIZE as u64));
+            let range = SliceRange::new(
+                (cursor - chunk_start) as u32,
+                (piece_end - chunk_start) as u32,
+            )
+            .ok_or_else(|| MetaError::Storage("fixture invalid slice range".to_string()))?;
+            let mut slice = if let Some(source) = source {
+                let delta = u32::try_from(cursor.saturating_sub(block_start))
+                    .map_err(|_| MetaError::Storage("fixture slice delta overflow".to_string()))?;
+                SliceRecord::new(
+                    SliceId(0),
+                    SliceOrder(0),
+                    range,
+                    BlockRef {
+                        object_id: source.object_id,
+                        offset: source.offset.saturating_add(delta),
+                        length: u32::try_from(piece_end.saturating_sub(cursor)).map_err(|_| {
+                            MetaError::Storage("fixture slice length overflow".to_string())
+                        })?,
+                        flags: source.flags,
+                    },
+                )
+            } else {
+                SliceRecord::tombstone(SliceId(0), SliceOrder(0), range)
+            };
+            slice.block_state = BlockRefState::LocalOnly;
+            chunks.entry(chunk_id).or_default().push(slice);
+            cursor = piece_end;
+        }
+        Ok(())
+    };
+    push(block_start, data_end, block)?;
+    if data_end < block_end {
+        push(data_end, block_end, None)?;
+    }
+    Ok(chunks.into_iter().collect())
+}
+
+impl SliceNativeMetaFixture for Arc<RedbMetaEngine> {
+    fn set_file_block(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        block: &BlockRef,
+    ) -> MetaResult<Option<BlockRef>> {
+        self.flush_regular_file_overlay_slices(
+            ino,
+            fixture_block_slices(block_index, Some(block))?.as_slice(),
+        )?;
+        Ok(None)
+    }
+
+    fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
+        let attr = self.get_attr(ino)?;
+        self.lookup_regular_file_slices(ino, 0, attr.size)
+            .map(|spans| {
+                spans
+                    .into_iter()
+                    .filter_map(|span| {
+                        span.block.map(|block| {
+                            let offset = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE)
+                                + u64::from(span.range.start);
+                            ((offset / u64::from(DEFAULT_BLOCK_SIZE)) as u32, block)
+                        })
+                    })
+                    .collect()
+            })
+    }
 }
 
 fn reopen_existing_test_vfs(tmp: &TempDir) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {

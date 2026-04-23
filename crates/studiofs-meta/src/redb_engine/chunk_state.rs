@@ -373,6 +373,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn replace_regular_file_chunk_rows_from_blocks_in_txn(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
@@ -441,6 +442,8 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn apply_regular_file_chunk_slices_in_txn(
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
@@ -629,6 +632,7 @@ impl RedbMetaEngine {
     }
 
     /// Convert flat block list to chunk/slice state using the provided block size.
+    #[cfg(test)]
     pub(super) fn convert_blocks_to_chunk_state(
         blocks: &[(u32, BlockRef)],
         block_size: u32,
@@ -722,6 +726,8 @@ impl RedbMetaEngine {
         size
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn manifest_from_chunk_states(
         ino: Ino,
         overlay_chunks: Option<&BTreeMap<ChunkId, RegularFileChunkState>>,
@@ -801,6 +807,8 @@ impl RedbMetaEngine {
         Ok(synthesized)
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn legacy_committed_size_from_blocks(blocks: &[(u32, BlockRef)]) -> u64 {
         let mut size = 0u64;
         let mut expected = 0u32;
@@ -986,6 +994,8 @@ impl RedbMetaEngine {
         ))
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn regular_file_graph_block_size(&self) -> MetaResult<u32> {
         match self.get_format_info() {
             Ok(info) => Ok(info.block_size),
@@ -994,6 +1004,8 @@ impl RedbMetaEngine {
         }
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn synthesize_block_ref_from_resolved_spans(
         ino: Ino,
         spans: &[ResolvedSliceSpan],
@@ -1107,6 +1119,7 @@ impl RedbMetaEngine {
         Ok(chosen.filter(|block| block.length > 0))
     }
 
+    #[cfg(test)]
     fn regular_file_committed_size_from_base_table(
         table: &redb::Table<'_, &[u8], &[u8]>,
         ino: Ino,
@@ -1147,6 +1160,8 @@ impl RedbMetaEngine {
         Ok(Self::regular_file_committed_size_from_base_table(committed, ino)?.unwrap_or(0))
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn regular_file_committed_size_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
@@ -1157,6 +1172,8 @@ impl RedbMetaEngine {
         Self::regular_file_committed_size_from_base_table(&table, ino)
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn current_manifest_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
@@ -1185,6 +1202,8 @@ impl RedbMetaEngine {
         Self::manifest_from_chunk_states(ino, Some(&overlay_chunks), Some(&base_chunks), block_size)
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn lookup_regular_file_slices_in_write_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
@@ -1258,6 +1277,8 @@ impl RedbMetaEngine {
         Ok(merge_adjacent_spans(spans))
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn current_block_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
@@ -1281,6 +1302,7 @@ impl RedbMetaEngine {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn chunk_slices_for_block(
         block_index: u32,
         block_size: u32,
@@ -1372,6 +1394,8 @@ impl RedbMetaEngine {
         Ok(chunks.into_iter().collect())
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn regular_file_graph_block_size_from_write_txn(
         txn: &redb::WriteTransaction,
     ) -> MetaResult<u32> {
@@ -1402,6 +1426,8 @@ impl RedbMetaEngine {
         }
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn manifest_matches_committed_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
