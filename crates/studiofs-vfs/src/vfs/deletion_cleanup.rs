@@ -4,7 +4,30 @@ use tracing::{debug, info, warn};
 
 use crate::runtime::run_meta;
 
+struct RegularFileGraphUsage {
+    object_ids: Vec<u64>,
+    total_bytes: u64,
+}
+
 impl StudioVfs {
+    fn regular_file_graph_usage(
+        &self,
+        meta: &Arc<dyn VfsMeta>,
+        ino: Ino,
+    ) -> VfsResult<RegularFileGraphUsage> {
+        let usage = match meta.get_regular_file_graph_object_usage(ino) {
+            Ok(usage) => usage,
+            Err(MetaError::InodeNotFound(_)) => Vec::new(),
+            Err(err) => return Err(err.into()),
+        };
+        Ok(RegularFileGraphUsage {
+            total_bytes: usage
+                .iter()
+                .fold(0_u64, |acc, (_, bytes)| acc.saturating_add(*bytes)),
+            object_ids: usage.into_iter().map(|(object_id, _)| object_id).collect(),
+        })
+    }
+
     pub(super) fn queue_pending_deletions_for_object_ids(
         &self,
         meta: &Arc<dyn VfsMeta>,
@@ -34,16 +57,28 @@ impl StudioVfs {
     ) -> VfsResult<DeletedInodeCleanup> {
         self.mark_inode_deleted_for_uploads(ino);
 
+        let graph_usage = self.regular_file_graph_usage(meta, ino)?;
         let removed_ids = meta.remove_file_blocks(ino)?;
-        self.queue_pending_deletions_for_object_ids(meta, &removed_ids, gc_reason)?;
+        let deletion_ids = if graph_usage.object_ids.is_empty() {
+            removed_ids.as_slice()
+        } else {
+            graph_usage.object_ids.as_slice()
+        };
+        self.queue_pending_deletions_for_object_ids(meta, deletion_ids, gc_reason)?;
 
-        if used_space_bytes > 0 {
-            meta.decr_counter(studiofs_meta::types::counters::USED_SPACE, used_space_bytes)?;
+        let freed_bytes = if graph_usage.total_bytes > 0 {
+            graph_usage.total_bytes
+        } else {
+            used_space_bytes
+        };
+
+        if freed_bytes > 0 {
+            meta.decr_counter(studiofs_meta::types::counters::USED_SPACE, freed_bytes)?;
         }
 
         Ok(DeletedInodeCleanup {
             removed_ids,
-            freed_bytes: used_space_bytes,
+            freed_bytes,
         })
     }
 
@@ -59,19 +94,30 @@ impl StudioVfs {
             .unwrap_or(0);
         let meta = self.meta.clone();
         run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-            let blocks = match engine.get_file_blocks(ino) {
-                Ok(blocks) => blocks,
+            let graph_usage = match engine.get_regular_file_graph_object_usage(ino) {
+                Ok(usage) => usage,
                 Err(MetaError::InodeNotFound(_)) => Vec::new(),
                 Err(err) => return Err(err),
             };
-            let freed_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
+            let graph_object_ids: Vec<u64> = graph_usage
+                .iter()
+                .map(|(object_id, _)| *object_id)
+                .collect();
+            let freed_bytes = graph_usage
+                .iter()
+                .fold(0_u64, |acc, (_, bytes)| acc.saturating_add(*bytes));
 
             let removed_ids = match engine.remove_file_blocks(ino) {
                 Ok(ids) => ids,
                 Err(MetaError::InodeNotFound(_)) => Vec::new(),
                 Err(err) => return Err(err),
             };
-            for &object_id in &removed_ids {
+            let deletion_ids = if graph_object_ids.is_empty() {
+                removed_ids.as_slice()
+            } else {
+                graph_object_ids.as_slice()
+            };
+            for &object_id in deletion_ids {
                 engine.add_pending_deletion(object_id, timestamp)?;
             }
 
@@ -212,12 +258,9 @@ impl StudioVfs {
     }
 
     pub(super) async fn evict_file_cache_only(&self, ino: Ino) -> VfsResult<()> {
-        let object_ids: Vec<u64> = self
-            .sync_meta()
-            .get_file_blocks(ino)?
-            .into_iter()
-            .map(|(_, block_ref)| block_ref.object_id)
-            .collect();
+        let object_ids = self
+            .regular_file_graph_usage(&self.sync_meta(), ino)?
+            .object_ids;
         let mut evicted = Vec::new();
         let mut deferred_pinned = 0;
         let mut pending_evictions_to_add = Vec::new();

@@ -1,5 +1,16 @@
 use super::*;
 
+fn record_regular_file_object_usage(
+    usage: &mut std::collections::BTreeMap<u64, u64>,
+    block: &BlockRef,
+) {
+    let object_bytes = u64::from(block.offset).saturating_add(u64::from(block.length));
+    usage
+        .entry(block.object_id)
+        .and_modify(|existing| *existing = (*existing).max(object_bytes))
+        .or_insert(object_bytes);
+}
+
 impl MetaBlocks for RedbMetaEngine {
     fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
         let block_size = self.regular_file_graph_block_size()?;
@@ -417,6 +428,32 @@ impl MetaBlocks for RedbMetaEngine {
             }
         }
         Ok(ids.into_iter().collect())
+    }
+
+    fn get_regular_file_graph_object_usage(&self, ino: Ino) -> MetaResult<Vec<(u64, u64)>> {
+        let txn = self
+            .db
+            .begin_read()
+            .map_err(|e| MetaError::Storage(e.to_string()))?;
+        let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_read_txn(
+            &txn,
+            REGULAR_FILE_OVERLAY_TABLE,
+            ino,
+        )?;
+        let base_chunks = Self::regular_file_chunk_states_for_inode_in_read_txn(
+            &txn,
+            REGULAR_FILE_BASE_TABLE,
+            ino,
+        )?;
+        let mut usage = std::collections::BTreeMap::new();
+        for chunk_state in overlay_chunks.values().chain(base_chunks.values()) {
+            for slice in chunk_state.slices.values() {
+                if let Some(block) = &slice.block {
+                    record_regular_file_object_usage(&mut usage, block);
+                }
+            }
+        }
+        Ok(usage.into_iter().collect())
     }
 
     fn has_regular_file_overlay_object_if_matches(

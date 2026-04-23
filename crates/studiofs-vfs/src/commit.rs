@@ -10,8 +10,13 @@ pub(super) enum EpochFinalizeStatus {
 }
 
 enum FinalizeExtentPlan {
-    Overlay { object_ids: Vec<u64> },
-    Manifest { blocks: Vec<(u32, BlockRef)> },
+    Overlay {
+        object_ids: Vec<u64>,
+    },
+    Manifest {
+        expected_manifest: Vec<(u32, BlockRef)>,
+        object_ids: Vec<u64>,
+    },
 }
 
 struct FinalizeMetaSnapshot {
@@ -62,8 +67,17 @@ impl CommitCoordinator {
                     object_ids: engine.get_regular_file_overlay_object_ids(ino)?,
                 }
             } else {
-                FinalizeExtentPlan::Manifest {
-                    blocks: engine.get_file_blocks(ino)?,
+                let expected_manifest = engine.get_file_blocks(ino)?;
+                if expected_manifest.is_empty() {
+                    FinalizeExtentPlan::Overlay {
+                        object_ids: Vec::new(),
+                    }
+                } else {
+                    let object_ids = Self::dedupe_manifest_object_ids(&expected_manifest);
+                    FinalizeExtentPlan::Manifest {
+                        expected_manifest,
+                        object_ids,
+                    }
                 }
             };
             Ok(FinalizeMetaSnapshot {
@@ -104,68 +118,37 @@ impl CommitCoordinator {
             object_ids: overlay_object_ids,
         } = &meta.extent_plan
         {
-            if !overlay_object_ids.is_empty() {
-                let extents_to_verify: Vec<(u32, ExtentRecordId)> = overlay_object_ids
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, object_id)| {
-                        (
-                            u32::try_from(idx).unwrap_or(u32::MAX),
-                            ExtentRecordId {
-                                object_id: *object_id,
-                                content_epoch,
-                            },
-                        )
-                    })
-                    .collect();
-                if let Err(err) =
-                    Self::wait_until_remote_objects_visible(vfs, &extents_to_verify).await
-                {
-                    tracing::debug!(
-                        ino,
-                        content_epoch,
-                        error = %err,
-                        "deferring overlay publication until uploaded extents become remotely visible"
-                    );
-                    return Ok(EpochFinalizeStatus::Deferred);
-                }
+            if let Err(err) = Self::wait_until_remote_objects_visible(vfs, overlay_object_ids).await
+            {
+                tracing::debug!(
+                    ino,
+                    content_epoch,
+                    error = %err,
+                    "deferring overlay publication until uploaded objects become remotely visible"
+                );
+                return Ok(EpochFinalizeStatus::Deferred);
             }
             run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
                 engine.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
             })
             .await?
         } else {
-            let required_blocks = match &meta.extent_plan {
-                FinalizeExtentPlan::Manifest { blocks } => blocks.clone(),
+            let (expected_manifest, object_ids) = match &meta.extent_plan {
+                FinalizeExtentPlan::Manifest {
+                    expected_manifest,
+                    object_ids,
+                } => (expected_manifest.clone(), object_ids.clone()),
                 FinalizeExtentPlan::Overlay { .. } => unreachable!("overlay path handled above"),
             };
-            if !required_blocks.is_empty() {
-                let extents_to_verify: Vec<(u32, ExtentRecordId)> = required_blocks
-                    .iter()
-                    .map(|(block_index, block_ref)| {
-                        (
-                            *block_index,
-                            ExtentRecordId {
-                                object_id: block_ref.object_id,
-                                content_epoch,
-                            },
-                        )
-                    })
-                    .collect();
-                if let Err(err) =
-                    Self::wait_until_remote_objects_visible(vfs, &extents_to_verify).await
-                {
-                    tracing::debug!(
-                        ino,
-                        content_epoch,
-                        error = %err,
-                        "deferring manifest publication until uploaded extents become remotely visible"
-                    );
-                    return Ok(EpochFinalizeStatus::Deferred);
-                }
+            if let Err(err) = Self::wait_until_remote_objects_visible(vfs, &object_ids).await {
+                tracing::debug!(
+                    ino,
+                    content_epoch,
+                    error = %err,
+                    "deferring manifest publication until uploaded objects become remotely visible"
+                );
+                return Ok(EpochFinalizeStatus::Deferred);
             }
-
-            let expected_manifest = required_blocks.clone();
             run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
                 engine.publish_file_manifest_if_matches(
                     ino,
@@ -247,16 +230,27 @@ impl CommitCoordinator {
         Ok(EpochFinalizeStatus::Published)
     }
 
+    fn dedupe_manifest_object_ids(blocks: &[(u32, BlockRef)]) -> Vec<u64> {
+        let mut object_ids = std::collections::BTreeSet::new();
+        for (_, block_ref) in blocks {
+            object_ids.insert(block_ref.object_id);
+        }
+        object_ids.into_iter().collect()
+    }
+
     async fn wait_until_remote_objects_visible(
         vfs: &StudioVfs,
-        live_extents: &[(u32, ExtentRecordId)],
+        object_ids: &[u64],
     ) -> VfsResult<()> {
+        if object_ids.is_empty() {
+            return Ok(());
+        }
         let visibility_timeout = vfs.publish_visibility_timeout;
         let deadline = tokio::time::Instant::now() + visibility_timeout;
         loop {
             let mut all_visible = true;
-            for (_, extent) in live_extents {
-                let checks = format_object_fragment_keys(&vfs.data_prefix, extent.object_id)
+            for object_id in object_ids {
+                let checks = format_object_fragment_keys(&vfs.data_prefix, *object_id)
                     .into_iter()
                     .map(|key| async {
                         let result = vfs.fetch_scheduler.data_store().exists(&key).await;
@@ -273,7 +267,7 @@ impl CommitCoordinator {
                         Err(err) => {
                             all_visible = false;
                             tracing::debug!(
-                                object_id = extent.object_id,
+                                object_id = *object_id,
                                 key,
                                 error = %err,
                                 "publish visibility check failed, will retry"

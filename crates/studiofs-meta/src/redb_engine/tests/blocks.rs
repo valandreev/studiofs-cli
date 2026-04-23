@@ -240,6 +240,46 @@ fn test_get_file_block_reads_base_graph_rows() {
 }
 
 #[test]
+fn test_regular_file_graph_object_usage_includes_hidden_base_and_overlay_objects() {
+    let engine = temp_engine();
+
+    let file = engine
+        .create_file(ROOT_INO, b"graph-object-usage.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let ino = file.ino;
+
+    let mut attr = engine.get_attr(ino).unwrap();
+    attr.size = DEFAULT_BLOCK_SIZE as u64;
+    attr.committed_size = DEFAULT_BLOCK_SIZE as u64;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+
+    let committed = BlockRef::new_full(8_001, DEFAULT_BLOCK_SIZE);
+    engine.set_file_block(ino, 0, &committed).unwrap();
+    assert!(engine.commit_uploaded_block(ino, 0, 1, &committed).unwrap());
+
+    let overlay = BlockRef::new_partial(8_002, 4096);
+    engine.set_file_block(ino, 0, &overlay).unwrap();
+
+    let usage = engine
+        .get_regular_file_graph_object_usage(ino)
+        .unwrap()
+        .into_iter()
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    assert_eq!(
+        usage.get(&8_001),
+        Some(&(DEFAULT_BLOCK_SIZE as u64)),
+        "helper should still report the hidden committed base object"
+    );
+    assert_eq!(
+        usage.get(&8_002),
+        Some(&4096_u64),
+        "helper should report the active overlay object as well"
+    );
+}
+
+#[test]
 fn test_synthesize_block_ref_rejects_fragmented_block() {
     let spans = vec![
         ResolvedSliceSpan {

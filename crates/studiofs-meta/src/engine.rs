@@ -4,7 +4,7 @@
 //! but the design supports swapping to PostgreSQL/Redis for multi-user mode.
 
 use crate::types::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 // =============================================================================
 // Batch flush types
@@ -620,6 +620,25 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
             ids.insert(block.object_id);
         }
         Ok(ids.into_iter().collect())
+    }
+
+    /// Collect all object ids currently referenced anywhere in the inode's
+    /// regular-file graph, together with their deduplicated physical byte
+    /// usage.
+    ///
+    /// The returned byte count is the maximum observed `offset + length` for
+    /// each `object_id`, so a staged object referenced by multiple slices is
+    /// counted once.
+    fn get_regular_file_graph_object_usage(&self, ino: Ino) -> MetaResult<Vec<(u64, u64)>> {
+        let mut usage: HashMap<u64, u64> = HashMap::new();
+        for (_, block) in self.get_file_blocks(ino)? {
+            let object_bytes = u64::from(block.offset).saturating_add(u64::from(block.length));
+            usage
+                .entry(block.object_id)
+                .and_modify(|existing| *existing = (*existing).max(object_bytes))
+                .or_insert(object_bytes);
+        }
+        Ok(usage.into_iter().collect())
     }
 
     /// Return `true` when `object_id` is still referenced by the inode's local

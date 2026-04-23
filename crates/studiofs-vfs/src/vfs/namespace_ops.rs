@@ -1057,8 +1057,10 @@ impl StudioVfs {
             && self.directory_has_probable_trash_ancestor(new_parent)?;
 
         if let Some(ino) = rename_result.displaced_ino {
-            let blocks = meta.get_file_blocks(ino)?;
-            let total_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
+            let total_bytes = meta
+                .get_regular_file_graph_object_usage(ino)?
+                .into_iter()
+                .fold(0_u64, |acc, (_, bytes)| acc.saturating_add(bytes));
 
             self.cleanup_deleted_inode_storage(&meta, ino, total_bytes, "rename overwrite")
                 .await?;

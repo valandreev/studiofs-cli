@@ -3255,8 +3255,8 @@ impl StudioVfs {
             }
         }
 
-        if let Ok(blocks) = meta.get_file_blocks(ino) {
-            object_ids.extend(blocks.into_iter().map(|(_, block)| block.object_id));
+        if let Ok(usage) = meta.get_regular_file_graph_object_usage(ino) {
+            object_ids.extend(usage.into_iter().map(|(object_id, _)| object_id));
         }
 
         ZeroIoObjectView {

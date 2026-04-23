@@ -4223,6 +4223,10 @@ impl MetaBlocks for PgMetaEngine {
         self.local.get_regular_file_overlay_object_ids(ino)
     }
 
+    fn get_regular_file_graph_object_usage(&self, ino: Ino) -> MetaResult<Vec<(u64, u64)>> {
+        self.local.get_regular_file_graph_object_usage(ino)
+    }
+
     fn has_regular_file_overlay_object_if_matches(
         &self,
         ino: Ino,

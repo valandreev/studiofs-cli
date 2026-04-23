@@ -352,6 +352,9 @@ impl<M: ?Sized + MetaBlocks> MetaBlocks for RuntimeMetaHandle<M> {
         fn get_regular_file_overlay_object_ids(&self, ino: Ino) -> MetaResult<Vec<u64>>
     );
     forward_method!(
+        fn get_regular_file_graph_object_usage(&self, ino: Ino) -> MetaResult<Vec<(u64, u64)>>
+    );
+    forward_method!(
         fn has_regular_file_overlay_object_if_matches(
             &self,
             ino: Ino,
