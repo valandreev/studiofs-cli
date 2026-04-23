@@ -2469,6 +2469,13 @@ struct StartupReplayCoordinator<'a> {
     orphan_dirty_blocks_removed: u64,
 }
 
+#[derive(Clone)]
+struct StartupGraphObject {
+    block_index: u32,
+    object_id: u64,
+    absolute_offset: u64,
+}
+
 struct ZeroIoDrilldownStatusInput<'a> {
     lifecycle: &'a studiofs_meta::schema::InodeLifecycleRecord,
     pending_upload_count: usize,
@@ -2520,93 +2527,60 @@ impl<'a> StartupReplayCoordinator<'a> {
             return;
         }
 
-        let blocks = match self.vfs.sync_meta().get_file_blocks(ino) {
-            Ok(blocks) => blocks,
+        let graph_objects = match self.regular_file_graph_objects(attr) {
+            Ok(graph_objects) => graph_objects,
             Err(error) => {
-                let error = VfsError::Meta(error);
-                if StudioVfs::is_invalid_regular_file_graph_error(&error) {
-                    self.handle_quarantine(ino, attr.size, &error);
-                } else {
-                    self.replay_failures = self.replay_failures.saturating_add(1);
-                    warn!(
-                        ino,
-                        error = %error,
-                        "failed to enumerate file blocks during startup recovery"
-                    );
-                }
+                self.replay_failures = self.replay_failures.saturating_add(1);
+                warn!(
+                    ino,
+                    error = %error,
+                    "failed to enumerate regular-file graph during startup recovery"
+                );
                 return;
             }
         };
 
         if self.has_dirty_objects() {
-            for (block_index, block_ref) in &blocks {
-                if !self.take_dirty_object(block_ref.object_id) {
+            for graph_object in &graph_objects {
+                if !self.take_dirty_object(graph_object.object_id) {
                     continue;
                 }
 
-                self.record_replayed_block(
-                    ino,
-                    *block_index,
-                    block_ref.object_id,
-                    attr.content_epoch,
-                    self.vfs.block_size,
-                );
-            }
-
-            if self.has_dirty_objects() && attr.size > 0 {
-                match self
-                    .vfs
-                    .sync_meta()
-                    .lookup_regular_file_slices(ino, 0, attr.size)
-                {
-                    Ok(spans) => {
-                        for span in spans {
-                            let Some(block) = span.block else {
-                                continue;
-                            };
-                            if !self.take_dirty_object(block.object_id) {
-                                continue;
-                            }
-                            let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
-                            let absolute_start = chunk_base.saturating_add(span.range.start as u64);
-                            let block_index =
-                                block_index_from_offset(absolute_start, self.vfs.block_size);
-                            self.record_replayed_block(
-                                ino,
-                                block_index,
-                                block.object_id,
-                                attr.content_epoch,
-                                self.vfs.block_size,
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        self.replay_failures = self.replay_failures.saturating_add(1);
-                        warn!(
-                            ino,
-                            error = %error,
-                            "failed to enumerate regular-file slices during startup recovery"
-                        );
-                    }
-                }
+                self.record_replayed_graph_object(ino, graph_object, attr.content_epoch);
             }
         }
 
         if needs_finalization {
-            self.record_epoch_finalization(ino, attr.content_epoch, blocks.as_slice());
+            self.record_epoch_finalization(ino, attr.content_epoch, graph_objects.as_slice());
         }
     }
 
-    fn handle_quarantine(&mut self, ino: Ino, size: u64, error: &VfsError) {
-        warn!(
-            ino,
-            error = %error,
-            "quarantining invalid regular-file graph during startup recovery"
-        );
-        let protected = self
+    fn regular_file_graph_objects(&self, attr: &InodeAttr) -> VfsResult<Vec<StartupGraphObject>> {
+        if attr.size == 0 {
+            return Ok(Vec::new());
+        }
+        let spans = self
             .vfs
-            .quarantine_invalid_regular_file_graph_for_startup_recovery(ino, size, error);
-        self.record_quarantine(ino, protected);
+            .sync_meta()
+            .lookup_regular_file_slices(attr.ino, 0, attr.size)?;
+        let mut seen = HashSet::new();
+        let mut objects = Vec::new();
+        for span in spans {
+            let Some(block) = span.block else {
+                continue;
+            };
+            if !seen.insert(block.object_id) {
+                continue;
+            }
+            let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
+            let absolute_offset = chunk_base.saturating_add(span.range.start as u64);
+            objects.push(StartupGraphObject {
+                block_index: block_index_from_offset(absolute_offset, self.vfs.block_size),
+                object_id: block.object_id,
+                absolute_offset,
+            });
+        }
+        Ok(objects)
     }
 
     fn needs_scan(&self, attr: &InodeAttr) -> bool {
@@ -2621,11 +2595,6 @@ impl<'a> StartupReplayCoordinator<'a> {
         self.dirty_set.remove(&object_id)
     }
 
-    fn record_quarantine(&mut self, ino: Ino, protected_object_ids: HashSet<u64>) {
-        self.quarantined_inodes.insert(ino);
-        self.quarantined_object_ids.extend(protected_object_ids);
-    }
-
     fn discard_quarantined_dirty_objects(&mut self) {
         if self.quarantined_object_ids.is_empty() {
             return;
@@ -2634,18 +2603,24 @@ impl<'a> StartupReplayCoordinator<'a> {
             .retain(|object_id| !self.quarantined_object_ids.contains(object_id));
     }
 
-    fn record_replayed_block(
+    fn record_replayed_graph_object(
         &mut self,
         ino: Ino,
-        block_index: u32,
-        object_id: u64,
+        graph_object: &StartupGraphObject,
         content_epoch: u64,
-        block_size: u32,
     ) {
-        let offset = (block_index as u64).saturating_mul(block_size as u64);
-        self.replay_ops
-            .push((ino, offset, object_id, content_epoch));
-        self.record_live_extent(ino, block_index, object_id, content_epoch);
+        self.replay_ops.push((
+            ino,
+            graph_object.absolute_offset,
+            graph_object.object_id,
+            content_epoch,
+        ));
+        self.record_live_extent(
+            ino,
+            graph_object.block_index,
+            graph_object.object_id,
+            content_epoch,
+        );
         self.restored_live_extents = self.restored_live_extents.saturating_add(1);
     }
 
@@ -2653,10 +2628,15 @@ impl<'a> StartupReplayCoordinator<'a> {
         &mut self,
         ino: Ino,
         content_epoch: u64,
-        blocks: &[(u32, BlockRef)],
+        graph_objects: &[StartupGraphObject],
     ) {
-        for (block_index, block_ref) in blocks {
-            self.record_live_extent(ino, *block_index, block_ref.object_id, content_epoch);
+        for graph_object in graph_objects {
+            self.record_live_extent(
+                ino,
+                graph_object.block_index,
+                graph_object.object_id,
+                content_epoch,
+            );
         }
         self.pending_epoch_finalizations.push((ino, content_epoch));
     }
@@ -4614,15 +4594,6 @@ impl StudioVfs {
         error: &VfsError,
     ) -> HashSet<u64> {
         self.quarantine_invalid_regular_file_graph_impl(ino, size, error, true)
-    }
-
-    fn quarantine_invalid_regular_file_graph_for_startup_recovery(
-        &self,
-        ino: Ino,
-        size: u64,
-        error: &VfsError,
-    ) -> HashSet<u64> {
-        self.quarantine_invalid_regular_file_graph_impl(ino, size, error, false)
     }
 
     fn quarantine_invalid_regular_file_graph_impl(

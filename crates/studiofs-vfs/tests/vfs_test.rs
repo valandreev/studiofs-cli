@@ -6314,7 +6314,7 @@ fn background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart(
 }
 
 #[test]
-fn startup_recovery_quarantines_fragmented_regular_file_graph_and_preserves_dirty_blocks() {
+fn startup_recovery_replays_fragmented_regular_file_graph_without_quarantine() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
@@ -6328,7 +6328,7 @@ fn startup_recovery_quarantines_fragmented_regular_file_graph_and_preserves_dirt
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
-    let volume_suffix = format!("restart-quarantine-{}", std::process::id());
+    let volume_suffix = format!("restart-slice-replay-{}", std::process::id());
     let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
     let data_config = DataStoreConfig::from(&format_info);
     let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
@@ -6361,7 +6361,7 @@ fn startup_recovery_quarantines_fragmented_regular_file_graph_and_preserves_dirt
                 .expect("failed to start StudioVfs background workers");
 
             let attr = vfs
-                .create(1, b"startup-quarantine.bin", 0, 0, 0o644)
+                .create(1, b"startup-slice-replay.bin", 0, 0, 0o644)
                 .unwrap();
             ino = attr.ino;
 
@@ -6378,20 +6378,24 @@ fn startup_recovery_quarantines_fragmented_regular_file_graph_and_preserves_dirt
 
             dirty_object_id = vfs.pending_uploads_for_inode(ino)[0].1;
 
-            let object_ids = meta.next_block_ids(2).unwrap();
             let half = (block_size_u32 / 2) as u32;
             let slices = vec![
                 SliceRecord::new(
                     SliceId(0),
                     SliceOrder(0),
                     SliceRange::new(0, half).unwrap(),
-                    BlockRef::new_partial(object_ids[0], half),
+                    BlockRef::new_partial(dirty_object_id, half),
                 ),
                 SliceRecord::new(
                     SliceId(1),
                     SliceOrder(1),
                     SliceRange::new(half, block_size_u32).unwrap(),
-                    BlockRef::new_partial(object_ids[1], half),
+                    BlockRef {
+                        object_id: dirty_object_id,
+                        offset: half,
+                        length: half,
+                        flags: BlockFlags::PARTIAL_BLOCK,
+                    },
                 ),
             ];
             let _ = meta
@@ -6420,25 +6424,24 @@ fn startup_recovery_quarantines_fragmented_regular_file_graph_and_preserves_dirt
             .expect("failed to start StudioVfs background workers");
 
         assert!(
-            vfs.pending_uploads_for_inode(ino).is_empty(),
-            "startup quarantine should clear the invalid inode's upload queue"
+            wait_until(Duration::from_secs(10), || {
+                !vfs.pending_uploads_for_inode(ino).is_empty()
+            })
+            .await,
+            "startup replay should restore upload queue entries for fragmented slice graphs"
         );
         assert!(
-            vfs.live_extent_records_for_inode(ino).is_empty(),
-            "startup quarantine should clear live extents for the invalid inode"
+            !vfs.live_extent_records_for_inode(ino).is_empty(),
+            "startup replay should keep live extents for fragmented slice graphs"
         );
         assert!(
             vfs.local_block_backend()
                 .dirty_object_ids()
                 .contains(&dirty_object_id),
-            "startup quarantine must preserve the original dirty block"
+            "startup replay must preserve the dirty local object while upload is pending"
         );
 
-        let fsync_err = vfs.fsync(ino, false).await.unwrap_err();
-        assert!(
-            fsync_err.to_string().contains("sticky upload error"),
-            "quarantined inode should surface a sticky upload error"
-        );
+        vfs.fsync(ino, false).await.unwrap();
     });
     rt.shutdown_background();
 }
