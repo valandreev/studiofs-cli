@@ -283,12 +283,12 @@ impl MetaRecovery for RedbMetaEngine {
                     UndoLogPhase::Replaying,
                 )?;
 
-                let blocks = match self.get_file_blocks(record.ino) {
-                    Ok(blocks) => blocks,
+                let graph_usage = match self.get_regular_file_graph_object_usage(record.ino) {
+                    Ok(usage) => usage,
                     Err(MetaError::InodeNotFound(_)) => Vec::new(),
                     Err(err) => return Err(err),
                 };
-                let total_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
+                let total_bytes: u64 = graph_usage.iter().map(|(_, bytes)| *bytes).sum();
                 let removed_ids = match self.remove_file_blocks(record.ino) {
                     Ok(ids) => ids,
                     Err(MetaError::InodeNotFound(_)) => Vec::new(),
