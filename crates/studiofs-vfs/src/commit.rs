@@ -9,19 +9,9 @@ pub(super) enum EpochFinalizeStatus {
     Skipped,
 }
 
-enum FinalizeExtentPlan {
-    Overlay {
-        object_ids: Vec<u64>,
-    },
-    Manifest {
-        expected_manifest: Vec<(u32, BlockRef)>,
-        object_ids: Vec<u64>,
-    },
-}
-
 struct FinalizeMetaSnapshot {
     lifecycle: Option<studiofs_meta::InodeLifecycleRecord>,
-    extent_plan: FinalizeExtentPlan,
+    object_ids: Vec<u64>,
 }
 
 impl CommitCoordinator {
@@ -62,27 +52,14 @@ impl CommitCoordinator {
         let meta = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
             let has_persisted_overlay = engine.has_local_regular_file_overlay(ino)?;
             let lifecycle = engine.get_inode_lifecycle(ino)?;
-            let extent_plan = if has_persisted_overlay {
-                FinalizeExtentPlan::Overlay {
-                    object_ids: engine.get_regular_file_overlay_object_ids(ino)?,
-                }
+            let object_ids = if has_persisted_overlay {
+                engine.get_regular_file_overlay_object_ids(ino)?
             } else {
-                let expected_manifest = engine.get_file_blocks(ino)?;
-                if expected_manifest.is_empty() {
-                    FinalizeExtentPlan::Overlay {
-                        object_ids: Vec::new(),
-                    }
-                } else {
-                    let object_ids = Self::dedupe_manifest_object_ids(&expected_manifest);
-                    FinalizeExtentPlan::Manifest {
-                        expected_manifest,
-                        object_ids,
-                    }
-                }
+                Vec::new()
             };
             Ok(FinalizeMetaSnapshot {
                 lifecycle,
-                extent_plan,
+                object_ids,
             })
         })
         .await?;
@@ -114,50 +91,19 @@ impl CommitCoordinator {
             return Ok(EpochFinalizeStatus::Deferred);
         }
 
-        let published = if let FinalizeExtentPlan::Overlay {
-            object_ids: overlay_object_ids,
-        } = &meta.extent_plan
-        {
-            if let Err(err) = Self::wait_until_remote_objects_visible(vfs, overlay_object_ids).await
-            {
-                tracing::debug!(
-                    ino,
-                    content_epoch,
-                    error = %err,
-                    "deferring overlay publication until uploaded objects become remotely visible"
-                );
-                return Ok(EpochFinalizeStatus::Deferred);
-            }
-            run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-                engine.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
-            })
-            .await?
-        } else {
-            let (expected_manifest, object_ids) = match &meta.extent_plan {
-                FinalizeExtentPlan::Manifest {
-                    expected_manifest,
-                    object_ids,
-                } => (expected_manifest.clone(), object_ids.clone()),
-                FinalizeExtentPlan::Overlay { .. } => unreachable!("overlay path handled above"),
-            };
-            if let Err(err) = Self::wait_until_remote_objects_visible(vfs, &object_ids).await {
-                tracing::debug!(
-                    ino,
-                    content_epoch,
-                    error = %err,
-                    "deferring manifest publication until uploaded objects become remotely visible"
-                );
-                return Ok(EpochFinalizeStatus::Deferred);
-            }
-            run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-                engine.publish_file_manifest_if_matches(
-                    ino,
-                    content_epoch,
-                    expected_manifest.as_slice(),
-                )
-            })
-            .await?
-        };
+        if let Err(err) = Self::wait_until_remote_objects_visible(vfs, &meta.object_ids).await {
+            tracing::debug!(
+                ino,
+                content_epoch,
+                error = %err,
+                "deferring overlay publication until uploaded objects become remotely visible"
+            );
+            return Ok(EpochFinalizeStatus::Deferred);
+        }
+        let published = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            engine.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
+        })
+        .await?;
         if !published {
             let latest_attr = match run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
                 engine.get_attr(ino)
@@ -228,14 +174,6 @@ impl CommitCoordinator {
         vfs.invalidate_kernel_inodes([ino]);
 
         Ok(EpochFinalizeStatus::Published)
-    }
-
-    fn dedupe_manifest_object_ids(blocks: &[(u32, BlockRef)]) -> Vec<u64> {
-        let mut object_ids = std::collections::BTreeSet::new();
-        for (_, block_ref) in blocks {
-            object_ids.insert(block_ref.object_id);
-        }
-        object_ids.into_iter().collect()
     }
 
     async fn wait_until_remote_objects_visible(
