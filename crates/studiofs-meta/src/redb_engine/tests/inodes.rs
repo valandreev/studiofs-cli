@@ -94,13 +94,13 @@ fn test_detect_local_overlay_state() {
     attr.size = 4096;
     engine.set_attr(&attr).unwrap();
     engine
-        .stage_file_overlay_block(file.ino, 0, &BlockRef::new_partial(11, 4096))
+        .stage_block_projection(file.ino, 0, &BlockRef::new_partial(11, 4096))
         .unwrap();
     assert!(engine.has_local_overlay_state().unwrap());
 
     assert!(
         engine
-            .publish_uploaded_overlay_block(file.ino, 0, 0, &BlockRef::new_partial(11, 4096))
+            .publish_uploaded_block_projection(file.ino, 0, 0, &BlockRef::new_partial(11, 4096))
             .unwrap()
     );
     assert!(engine.has_local_overlay_state().unwrap());

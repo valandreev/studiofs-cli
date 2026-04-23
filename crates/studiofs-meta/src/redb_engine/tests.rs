@@ -4,33 +4,33 @@ use super::test_support::*;
 use super::*;
 use crate::events::MetaEvent;
 
-trait SliceNativeBlockFixture {
-    fn stage_file_overlay_block(
+trait BlockProjectionFixture {
+    fn stage_block_projection(
         &self,
         ino: Ino,
         block_index: u32,
         block: &BlockRef,
     ) -> MetaResult<Option<BlockRef>>;
-    fn lookup_file_graph_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>>;
-    fn lookup_file_graph_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>>;
-    fn publish_uploaded_overlay_block(
+    fn lookup_block_projection(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>>;
+    fn lookup_block_projections(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>>;
+    fn publish_uploaded_block_projection(
         &self,
         ino: Ino,
         block_index: u32,
         expected_epoch: u64,
         block: &BlockRef,
     ) -> MetaResult<bool>;
-    fn mark_overlay_block_uploaded_if_matches(
+    fn mark_block_projection_uploaded_if_matches(
         &self,
         ino: Ino,
         block_index: u32,
         expected_epoch: u64,
         block: &BlockRef,
     ) -> MetaResult<bool>;
-    fn publish_overlay_graph(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool>;
+    fn publish_block_projection_graph(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool>;
 }
 
-fn fixture_block_slices(
+fn block_projection_slices(
     block_index: u32,
     block: Option<&BlockRef>,
     state: BlockRefState,
@@ -90,7 +90,7 @@ fn fixture_block_slices(
     Ok(chunks.into_iter().collect())
 }
 
-fn fixture_block_from_spans(
+fn block_projection_from_spans(
     spans: Vec<ResolvedSliceSpan>,
     block_index: u32,
 ) -> MetaResult<Option<BlockRef>> {
@@ -143,48 +143,48 @@ fn fixture_block_from_spans(
     Ok(merged)
 }
 
-impl SliceNativeBlockFixture for RedbMetaEngine {
-    fn stage_file_overlay_block(
+impl BlockProjectionFixture for RedbMetaEngine {
+    fn stage_block_projection(
         &self,
         ino: Ino,
         block_index: u32,
         block: &BlockRef,
     ) -> MetaResult<Option<BlockRef>> {
         let old = self
-            .lookup_file_graph_block(ino, block_index)
+            .lookup_block_projection(ino, block_index)
             .ok()
             .flatten();
         self.flush_regular_file_overlay_slices(
             ino,
-            fixture_block_slices(block_index, Some(block), BlockRefState::LocalOnly)?.as_slice(),
+            block_projection_slices(block_index, Some(block), BlockRefState::LocalOnly)?.as_slice(),
         )?;
         Ok(old)
     }
 
-    fn lookup_file_graph_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
+    fn lookup_block_projection(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
         self.lookup_regular_file_slices(
             ino,
             u64::from(block_index) * u64::from(DEFAULT_BLOCK_SIZE),
             u64::from(DEFAULT_BLOCK_SIZE),
         )
-        .and_then(|spans| fixture_block_from_spans(spans, block_index))
+        .and_then(|spans| block_projection_from_spans(spans, block_index))
     }
 
-    fn lookup_file_graph_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
+    fn lookup_block_projections(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
         let attr = self.get_attr(ino)?;
         let blocks = attr.size.div_ceil(u64::from(DEFAULT_BLOCK_SIZE));
         let mut out = Vec::new();
         for idx in 0..blocks {
             let idx = u32::try_from(idx)
                 .map_err(|_| MetaError::Storage("fixture block index overflow".to_string()))?;
-            if let Some(block) = self.lookup_file_graph_block(ino, idx)? {
+            if let Some(block) = self.lookup_block_projection(ino, idx)? {
                 out.push((idx, block));
             }
         }
         Ok(out)
     }
 
-    fn publish_uploaded_overlay_block(
+    fn publish_uploaded_block_projection(
         &self,
         ino: Ino,
         _block_index: u32,
@@ -199,7 +199,7 @@ impl SliceNativeBlockFixture for RedbMetaEngine {
         self.publish_regular_file_overlay_to_base_if_matches(ino, expected_epoch)
     }
 
-    fn mark_overlay_block_uploaded_if_matches(
+    fn mark_block_projection_uploaded_if_matches(
         &self,
         ino: Ino,
         _block_index: u32,
@@ -213,7 +213,7 @@ impl SliceNativeBlockFixture for RedbMetaEngine {
         )
     }
 
-    fn publish_overlay_graph(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool> {
+    fn publish_block_projection_graph(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool> {
         self.publish_regular_file_overlay_to_base_if_matches(ino, expected_epoch)
     }
 }

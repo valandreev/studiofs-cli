@@ -91,13 +91,13 @@ fn test_referenced_object_ids_include_committed_blocks() {
     let ino = attr.ino;
 
     engine
-        .stage_file_overlay_block(ino, 0, &BlockRef::new_partial(21, 4096))
+        .stage_block_projection(ino, 0, &BlockRef::new_partial(21, 4096))
         .unwrap();
     engine
-        .publish_uploaded_overlay_block(ino, 0, 0, &BlockRef::new_partial(21, 4096))
+        .publish_uploaded_block_projection(ino, 0, 0, &BlockRef::new_partial(21, 4096))
         .unwrap();
     engine
-        .stage_file_overlay_block(ino, 1, &BlockRef::new_partial(22, 4096))
+        .stage_block_projection(ino, 1, &BlockRef::new_partial(22, 4096))
         .unwrap();
 
     let refs = engine.get_referenced_object_ids().unwrap();
@@ -326,7 +326,7 @@ fn test_import_snapshot_keeps_unpublished_regular_file_visible() {
     attr.content_epoch = 1;
     source.set_attr(&attr).unwrap();
     let block = BlockRef::new_partial(40_001, 4096);
-    source.stage_file_overlay_block(file.ino, 0, &block).unwrap();
+    source.stage_block_projection(file.ino, 0, &block).unwrap();
 
     let snapshot = source.export_snapshot().unwrap();
     let imported = temp_engine();
@@ -338,7 +338,7 @@ fn test_import_snapshot_keeps_unpublished_regular_file_visible() {
     assert_eq!(imported_attr.size, 4096);
     assert_eq!(imported_attr.committed_size, 0);
     assert_eq!(imported_attr.upload_state, UploadState::Uploading);
-    let imported_block = imported.lookup_file_graph_block(imported_file.ino, 0).unwrap().unwrap();
+    let imported_block = imported.lookup_block_projection(imported_file.ino, 0).unwrap().unwrap();
     assert_eq!(imported_block.object_id, block.object_id);
 }
 
