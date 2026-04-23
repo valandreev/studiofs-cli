@@ -11,6 +11,20 @@ fn record_regular_file_object_usage(
         .or_insert(object_bytes);
 }
 
+fn regular_file_chunk_states_usage_bytes(
+    chunks: &std::collections::BTreeMap<ChunkId, RegularFileChunkState>,
+) -> u64 {
+    let mut usage = std::collections::BTreeMap::new();
+    for chunk_state in chunks.values() {
+        for slice in chunk_state.slices.values() {
+            if let Some(block) = slice.block.as_ref() {
+                record_regular_file_object_usage(&mut usage, block);
+            }
+        }
+    }
+    usage.values().copied().sum()
+}
+
 impl MetaBlocks for RedbMetaEngine {
     fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
         let block_size = self.regular_file_graph_block_size()?;
@@ -1315,11 +1329,20 @@ impl RedbMetaEngine {
 
         {
             let mut touched_inodes = std::collections::BTreeSet::new();
+            let mut overlay_usage_before = std::collections::BTreeMap::<Ino, u64>::new();
             if !entries.is_empty() {
-                let mut manifests = std::collections::BTreeMap::<
-                    Ino,
-                    std::collections::BTreeMap<u32, BlockRef>,
-                >::new();
+                for entry in entries {
+                    touched_inodes.insert(entry.ino);
+                }
+                for &ino in &touched_inodes {
+                    let chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
+                        &txn,
+                        REGULAR_FILE_OVERLAY_TABLE,
+                        ino,
+                    )?;
+                    overlay_usage_before
+                        .insert(ino, regular_file_chunk_states_usage_bytes(&chunks));
+                }
 
                 for e in entries {
                     let block_ref = BlockRef {
@@ -1328,37 +1351,37 @@ impl RedbMetaEngine {
                         length: e.length,
                         flags: e.flags,
                     };
-                    let manifest = manifests.entry(e.ino).or_insert_with(|| {
-                        Self::current_manifest_in_txn(&txn, e.ino)
-                            .unwrap_or_default()
-                            .into_iter()
-                            .collect()
-                    });
-                    let old_block = manifest.insert(e.block_index, block_ref.clone());
-
-                    if let Some(ref old) = old_block {
-                        used_space_delta -= old.length as i64;
-                    }
-
-                    used_space_delta += e.length as i64;
+                    let old_block =
+                        match Self::current_block_in_txn(&txn, e.ino, e.block_index, block_size) {
+                            Ok(old_block) => old_block,
+                            Err(MetaError::FragmentedBlock { .. }) => None,
+                            Err(err) => return Err(err),
+                        };
+                    let chunk_slices = Self::chunk_slices_for_block(
+                        e.block_index,
+                        block_size,
+                        Some(&block_ref),
+                        BlockRefState::LocalOnly,
+                    )?;
+                    Self::apply_regular_file_chunk_slices_in_txn(
+                        &txn,
+                        REGULAR_FILE_OVERLAY_TABLE,
+                        e.ino,
+                        chunk_slices.as_slice(),
+                        true,
+                    )?;
                     results.push(BatchFlushResult { old_block });
-                    touched_inodes.insert(e.ino);
                 }
 
-                for (&ino, manifest) in &manifests {
-                    let updated_manifest: Vec<_> = manifest
-                        .iter()
-                        .map(|(block_index, block_ref)| (*block_index, block_ref.clone()))
-                        .collect();
-                    Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+                for &ino in &touched_inodes {
+                    let chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
                         &txn,
                         REGULAR_FILE_OVERLAY_TABLE,
                         ino,
-                        updated_manifest.as_slice(),
-                        block_size,
-                        false,
-                        true,
                     )?;
+                    let before = overlay_usage_before.get(&ino).copied().unwrap_or(0);
+                    let after = regular_file_chunk_states_usage_bytes(&chunks);
+                    used_space_delta += after as i64 - before as i64;
                 }
             }
 

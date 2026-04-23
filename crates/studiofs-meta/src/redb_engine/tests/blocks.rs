@@ -107,6 +107,65 @@ fn test_flush_blocks_batch_updates_regular_file_overlay() {
 }
 
 #[test]
+fn test_flush_blocks_batch_accepts_fragmented_overlay_base() {
+    let engine = temp_engine();
+
+    let attr = engine
+        .create_file(ROOT_INO, b"batch_fragmented_overlay.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let mut sized_attr = attr.clone();
+    sized_attr.size = DEFAULT_BLOCK_SIZE as u64;
+    engine.set_attr(&sized_attr).unwrap();
+
+    engine
+        .flush_regular_file_overlay_slices(
+            attr.ino,
+            &[(ChunkId(0), {
+                vec![
+                    SliceRecord {
+                        slice_id: SliceId(0),
+                        order: SliceOrder(0),
+                        range: SliceRange::new(0, 4096).unwrap(),
+                        block: Some(BlockRef::new_partial(31, 4096)),
+                        block_state: BlockRefState::LocalOnly,
+                    },
+                    SliceRecord {
+                        slice_id: SliceId(0),
+                        order: SliceOrder(0),
+                        range: SliceRange::new(4096, 8192).unwrap(),
+                        block: Some(BlockRef::new_partial(32, 4096)),
+                        block_state: BlockRefState::LocalOnly,
+                    },
+                ]
+            })],
+        )
+        .unwrap();
+    assert!(matches!(
+        engine.get_file_block(attr.ino, 0),
+        Err(MetaError::FragmentedBlock { .. })
+    ));
+
+    let results = engine
+        .flush_blocks_batch(&[BatchFlushEntry {
+            ino: attr.ino,
+            block_index: 0,
+            object_id: 33,
+            length: DEFAULT_BLOCK_SIZE,
+            flags: BlockFlags::empty(),
+        }])
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0].old_block.is_none(),
+        "fragmented old block cannot be represented as a legacy BlockRef"
+    );
+    let block = engine.get_file_block(attr.ino, 0).unwrap().unwrap();
+    assert_eq!(block.object_id, 33);
+    assert_eq!(block.length, DEFAULT_BLOCK_SIZE);
+}
+
+#[test]
 fn test_block_runtime_paths_use_graph_tables_only() {
     let engine = temp_engine();
 
