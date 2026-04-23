@@ -160,6 +160,7 @@ Checks:
 
 ```bash
 cargo fmt --all
+cargo clippy -p studiofs-meta --all-targets -- -W missing-docs
 cargo clippy --workspace --all-targets -- -D warnings
 cargo check --workspace
 ```

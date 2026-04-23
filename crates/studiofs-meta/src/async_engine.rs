@@ -18,10 +18,12 @@ impl<M: ?Sized> Clone for SyncMetaEngineAdapter<M> {
 }
 
 impl<M: ?Sized> SyncMetaEngineAdapter<M> {
+    /// Wrap a synchronous metadata capability in an async-friendly adapter.
     pub fn new(engine: Arc<M>) -> Self {
         Self { inner: engine }
     }
 
+    /// Return the underlying synchronous capability principal.
     pub fn sync_engine(&self) -> Arc<M> {
         self.inner.clone()
     }

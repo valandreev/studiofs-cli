@@ -1,6 +1,7 @@
 use super::*;
 
 impl RedbMetaEngine {
+    /// Read persisted format metadata from a redb file without opening the full engine.
     pub fn read_format_info_readonly(path: impl AsRef<Path>) -> MetaResult<FormatInfo> {
         let db = match ReadOnlyDatabase::open(path.as_ref()) {
             Ok(db) => db,

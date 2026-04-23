@@ -16,10 +16,15 @@ use std::collections::HashSet;
 /// before calling [`MetaBlocks::flush_blocks_batch`].
 #[derive(Debug, Clone)]
 pub struct BatchFlushEntry {
+    /// Inode whose block slot is being updated.
     pub ino: Ino,
+    /// Logical block index inside the file.
     pub block_index: u32,
+    /// Pre-allocated immutable object id that stores the payload.
     pub object_id: u64,
+    /// Payload length in bytes.
     pub length: u32,
+    /// Block flags associated with the stored payload.
     pub flags: BlockFlags,
 }
 
@@ -34,57 +39,108 @@ pub struct BatchFlushResult {
 // Errors
 // =============================================================================
 #[derive(Debug, thiserror::Error)]
+/// Common metadata-layer error surface shared by all engine backends.
 pub enum MetaError {
+    /// The requested inode does not exist in metadata.
     #[error("inode not found: {0}")]
     InodeNotFound(Ino),
 
+    /// The caller asked for a flat block view of a file that is represented by
+    /// fragmented chunk/slice metadata instead of one block per slot.
     #[error("fragmented regular-file block: ino={ino}, block_index={block_index}")]
-    FragmentedBlock { ino: Ino, block_index: u32 },
+    FragmentedBlock {
+        /// Inode whose block view is fragmented.
+        ino: Ino,
+        /// Logical block index that could not be synthesized.
+        block_index: u32,
+    },
 
+    /// The requested directory entry does not exist under its parent.
     #[error("entry not found: {name:?} in parent {parent}")]
-    EntryNotFound { parent: Ino, name: String },
+    EntryNotFound {
+        /// Parent directory inode.
+        parent: Ino,
+        /// Entry name that was requested.
+        name: String,
+    },
 
+    /// A conflicting directory entry already exists under the parent.
     #[error("entry already exists: {name:?} in parent {parent}")]
-    EntryExists { parent: Ino, name: String },
+    EntryExists {
+        /// Parent directory inode.
+        parent: Ino,
+        /// Entry name that already exists.
+        name: String,
+    },
 
+    /// The target inode is not a directory.
     #[error("not a directory: inode {0}")]
     NotADirectory(Ino),
 
+    /// The target directory still has children and cannot be removed.
     #[error("directory not empty: inode {0}")]
     DirNotEmpty(Ino),
 
+    /// The target inode is a directory where a non-directory was required.
     #[error("is a directory: inode {0}")]
     IsADirectory(Ino),
 
+    /// Backend-specific storage or transport failure.
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// Serialization or deserialization failure for persisted metadata.
     #[error("serialization error: {0}")]
     Serialization(String),
 
+    /// The metadata store has not been initialized yet.
     #[error("format info not found — run `studiofs init` first")]
     NotFormatted,
 
+    /// The on-disk metadata format version is unsupported by this binary.
     #[error("unsupported format version: found {found}, expected {expected}")]
-    UnsupportedFormatVersion { found: u16, expected: u16 },
+    UnsupportedFormatVersion {
+        /// Version stored in metadata.
+        found: u16,
+        /// Version expected by the running binary.
+        expected: u16,
+    },
 
+    /// An xattr write exceeded the backend-supported value size limit.
     #[error("xattr value too large: actual={actual} bytes, limit={limit} bytes")]
-    XattrValueTooLarge { actual: usize, limit: usize },
+    XattrValueTooLarge {
+        /// Actual xattr value size in bytes.
+        actual: usize,
+        /// Maximum allowed xattr value size in bytes.
+        limit: usize,
+    },
 
+    /// The local metadata store belongs to a different remote volume UUID.
     #[error("disk UUID mismatch: local={local}, remote={remote}")]
-    UuidMismatch { local: String, remote: String },
+    UuidMismatch {
+        /// UUID stored in the local metadata database.
+        local: String,
+        /// UUID observed from the authoritative remote metadata source.
+        remote: String,
+    },
 
+    /// ACL evaluation rejected the requested access for the principal.
     #[error(
         "access denied: ino={ino}, principal={principal}, required={required:?}, actual={actual:?}"
     )]
     AccessDenied {
+        /// Inode that denied access.
         ino: Ino,
+        /// Principal being authorized.
         principal: String,
+        /// Minimum access required for the attempted operation.
         required: AccessLevel,
+        /// Effective access currently granted to the principal.
         actual: AccessLevel,
     },
 }
 
+/// Standard result type returned by metadata APIs.
 pub type MetaResult<T> = Result<T, MetaError>;
 
 impl MetaError {
@@ -110,18 +166,25 @@ pub const XATTR_CREATE_FLAG: u32 = 1;
 pub const XATTR_REPLACE_FLAG: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Best-effort counts of local metadata work that still needs remote flush.
 pub struct MetadataReplicationBacklog {
+    /// Number of queued local operations not yet flushed.
     pub pending_ops: u32,
+    /// Number of operations currently being flushed in the background.
     pub inflight_ops: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Whether this engine instance is still allowed to accept new mutations.
 pub struct MetadataAuthorityStatus {
+    /// `true` when inode id allocation still has local headroom.
     pub inode_id_headroom: bool,
+    /// `true` when block id allocation still has local headroom.
     pub block_id_headroom: bool,
 }
 
 impl MetadataAuthorityStatus {
+    /// Return a status that permits new mutations.
     pub const fn writable() -> Self {
         Self {
             inode_id_headroom: true,
@@ -129,6 +192,7 @@ impl MetadataAuthorityStatus {
         }
     }
 
+    /// Return a status that blocks new mutations.
     pub const fn read_only() -> Self {
         Self {
             inode_id_headroom: false,
@@ -136,6 +200,7 @@ impl MetadataAuthorityStatus {
         }
     }
 
+    /// Return `true` when both inode and block allocators still have headroom.
     pub const fn allows_new_mutations(self) -> bool {
         self.inode_id_headroom && self.block_id_headroom
     }
@@ -148,49 +213,76 @@ impl Default for MetadataAuthorityStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Open-unlink orphan that still needs final cleanup after the last handle closes.
 pub struct DeferredDeleteRecord {
+    /// Orphaned inode awaiting deferred cleanup.
     pub ino: Ino,
+    /// Parent directory from which the entry was removed.
     pub parent: Ino,
+    /// Original dentry name removed from the parent.
     pub name: Vec<u8>,
+    /// Unix timestamp when the record was created.
     pub created_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Crash-recovery record for a namespace create that may need replay or cleanup.
 pub struct PendingCreateRecord {
+    /// Newly allocated inode for the pending create.
     pub ino: Ino,
+    /// Parent directory that should contain the entry.
     pub parent: Ino,
+    /// Entry name that is being created.
     pub name: Vec<u8>,
+    /// File type of the pending inode.
     pub kind: FileType,
+    /// Unix timestamp when the record was created.
     pub created_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Logical kind of undo-log record persisted for recovery.
 pub enum UndoLogKind {
+    /// Undo-log entry for a pending create record.
     PendingCreate,
+    /// Undo-log entry for a deferred delete record.
     DeferredDelete,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Replay phase of a persisted undo-log record.
 pub enum UndoLogPhase {
     #[default]
+    /// The operation has been recorded but replay has not started yet.
     Started,
+    /// Recovery is actively replaying this record.
     Replaying,
+    /// Replay completed and the record can be ignored/cleaned up.
     Completed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Generic undo-log entry used to recover namespace mutations after crashes.
 pub struct UndoLogRecord {
+    /// Monotonic undo-log operation id.
     pub op_id: u64,
+    /// Logical kind of record being replayed.
     pub kind: UndoLogKind,
     #[serde(default)]
+    /// Replay phase currently persisted for the record.
     pub phase: UndoLogPhase,
+    /// Inode associated with the operation.
     pub ino: Ino,
+    /// Parent directory involved in the operation.
     pub parent: Ino,
+    /// Entry name involved in the operation.
     pub name: Vec<u8>,
+    /// Unix timestamp when the record was created.
     pub created_at: i64,
 }
 
 impl MetadataReplicationBacklog {
+    /// Return the sum of queued and in-flight replication operations.
     pub fn total_ops(self) -> u32 {
         self.pending_ops.saturating_add(self.inflight_ops)
     }
@@ -248,6 +340,7 @@ pub trait MetaEngineCore: Send + Sync + MetaInodes {
     fn known_file_lock_lease(&self, ino: Ino) -> Option<FileLockLease>;
 }
 
+/// Capability trait for reading and writing persisted format metadata.
 pub trait MetaFormat: Send + Sync {
     /// Store format info (called during `studiofs init`).
     fn set_format_info(&self, info: &FormatInfo) -> MetaResult<()>;
@@ -256,6 +349,7 @@ pub trait MetaFormat: Send + Sync {
     fn get_format_info(&self) -> MetaResult<FormatInfo>;
 }
 
+/// Capability trait for inode attributes, counters, and lifecycle metadata.
 pub trait MetaInodes: Send + Sync {
     /// Get a counter value, returns 0 if not set.
     fn get_counter(&self, name: &str) -> MetaResult<u64>;
@@ -313,6 +407,7 @@ pub trait MetaInodes: Send + Sync {
     }
 }
 
+/// Capability trait for dentry lookup and directory namespace mutations.
 pub trait MetaNamespace: Send + Sync {
     /// Look up a child entry by name in a parent directory.
     fn lookup(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue>;
@@ -327,6 +422,7 @@ pub trait MetaNamespace: Send + Sync {
     fn remove_entry(&self, parent: Ino, name: &[u8]) -> MetaResult<DirEntryValue>;
 }
 
+/// High-level filesystem operations built on top of namespace and inode primitives.
 pub trait MetaFsOps: Send + Sync + MetaInodes {
     /// Create a new file: allocate inode, set attrs, add dentry.
     fn create_file(
@@ -395,6 +491,7 @@ pub trait MetaFsOps: Send + Sync + MetaInodes {
     ) -> MetaResult<InodeAttr>;
 }
 
+/// Capability trait for block ids, manifests, and regular-file overlay graphs.
 pub trait MetaBlocks: Send + Sync + MetaInodes {
     /// Get a specific block reference for a file.
     /// Key: (inode, block_index)
@@ -615,6 +712,7 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
     }
 }
 
+/// Capability trait for garbage-collection bookkeeping and reachability scans.
 pub trait MetaGc: Send + Sync {
     /// Add a block to pending deletions (mark for GC).
     /// The timestamp is used for grace period.
@@ -637,6 +735,7 @@ pub trait MetaGc: Send + Sync {
     fn get_referenced_object_ids(&self) -> MetaResult<HashSet<u64>>;
 }
 
+/// Capability trait for crash recovery and replay of pending local operations.
 pub trait MetaRecovery: Send + Sync {
     /// Replay pending create intents and heal dangling namespace entries.
     /// Returns parent inode ids whose directory namespace was mutated during replay.
@@ -674,6 +773,7 @@ pub trait MetaRecovery: Send + Sync {
     fn list_deferred_deletes(&self) -> MetaResult<Vec<DeferredDeleteRecord>>;
 }
 
+/// Capability trait for symlink target storage.
 pub trait MetaSymlink: Send + Sync {
     /// Store a symlink target for the given inode.
     fn set_symlink_target(&self, ino: Ino, target: &[u8]) -> MetaResult<()>;
@@ -682,6 +782,7 @@ pub trait MetaSymlink: Send + Sync {
     fn get_symlink_target(&self, ino: Ino) -> MetaResult<Vec<u8>>;
 }
 
+/// Capability trait for extended attribute storage.
 pub trait MetaXattr: Send + Sync {
     /// Get an extended attribute value.
     fn get_xattr(&self, ino: Ino, name: &[u8]) -> MetaResult<Option<Vec<u8>>>;
@@ -699,6 +800,7 @@ pub trait MetaXattr: Send + Sync {
     fn list_xattrs(&self, ino: Ino) -> MetaResult<Vec<Vec<u8>>>;
 }
 
+/// Capability trait for ACL rule storage and lookup.
 pub trait MetaAcl: Send + Sync {
     /// Set (create/update) explicit ACL rule for `(ino, principal)`.
     fn set_acl_rule(&self, ino: Ino, principal: &str, access_level: AccessLevel) -> MetaResult<()>;
@@ -710,6 +812,7 @@ pub trait MetaAcl: Send + Sync {
     fn get_acl_rule(&self, ino: Ino, principal: &str) -> MetaResult<Option<AccessLevel>>;
 }
 
+/// Capability trait for immutable metadata snapshots.
 pub trait MetaSnapshots: Send + Sync {
     /// Create an immutable snapshot rooted at `root_ino`.
     fn create_snapshot(&self, root_ino: Ino) -> MetaResult<MetadataSnapshot>;
@@ -721,6 +824,7 @@ pub trait MetaSnapshots: Send + Sync {
     fn get_snapshot(&self, snapshot_id: &str) -> MetaResult<Option<MetadataSnapshot>>;
 }
 
+/// Capability trait for replication, flushing, and remote consistency hooks.
 pub trait MetaReplication: Send + Sync {
     /// Verify that the local metadata matches the remote state (e.g. UUID check).
     fn check_consistency(&self) -> MetaResult<()>;

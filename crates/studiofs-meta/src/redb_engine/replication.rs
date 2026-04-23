@@ -1,6 +1,7 @@
 use super::*;
 
 impl RedbMetaEngine {
+    /// Export a snapshot projected to the remote-visible published namespace.
     pub fn export_remote_snapshot(&self) -> MetaResult<RedbSnapshot> {
         let mut snapshot = self.export_snapshot()?;
         let mut published_regular_inodes = HashSet::new();
@@ -92,6 +93,7 @@ impl RedbMetaEngine {
         Ok(snapshot)
     }
 
+    /// Return symlink inode ids whose local state differs from the imported base view.
     pub fn local_overlay_symlink_inodes(&self) -> MetaResult<HashSet<Ino>> {
         let txn = self
             .db
@@ -134,6 +136,7 @@ impl RedbMetaEngine {
         Ok(overlay)
     }
 
+    /// Return encoded xattr keys whose local state differs from the imported base view.
     pub fn local_overlay_xattr_keys(&self) -> MetaResult<HashSet<Vec<u8>>> {
         let txn = self
             .db
@@ -177,6 +180,7 @@ impl RedbMetaEngine {
         Ok(overlay)
     }
 
+    /// Return inode ids that currently have locally divergent xattr state.
     pub fn local_overlay_xattr_inodes(&self) -> MetaResult<HashSet<Ino>> {
         self.local_overlay_xattr_keys()?
             .into_iter()
@@ -184,6 +188,7 @@ impl RedbMetaEngine {
             .collect()
     }
 
+    /// Return encoded ACL keys whose local state differs from the imported base view.
     pub fn local_overlay_acl_keys(&self) -> MetaResult<HashSet<Vec<u8>>> {
         let txn = self
             .db
@@ -965,6 +970,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    /// Reconcile a rename in the serving overlay using the authoritative base namespace.
     pub fn reconcile_serving_rename_from_base(
         &self,
         parent: Ino,

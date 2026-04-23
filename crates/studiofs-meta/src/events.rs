@@ -8,64 +8,107 @@ use serde::{Deserialize, Serialize};
 pub enum MetaEvent {
     // ─── Core Inode Operations ───────────────────────────────────────────────
     /// Create or update an inode.
-    SetAttr { attr: InodeAttr },
+    SetAttr {
+        /// Full inode attributes that should become authoritative.
+        attr: InodeAttr,
+    },
 
     /// Remove an inode entirely.
-    RemoveAttr { ino: u64 },
+    RemoveAttr {
+        /// Inode to remove from metadata.
+        ino: u64,
+    },
 
     // ─── Directory Operations ────────────────────────────────────────────────
     /// Add a directory entry.
     AddEntry {
+        /// Parent directory that should contain the entry.
         parent: u64,
+        /// Entry name encoded as raw bytes.
         name: Vec<u8>,
+        /// Dentry payload to store for the child.
         entry: DirEntryValue,
     },
 
     /// Remove a directory entry.
-    RemoveEntry { parent: u64, name: Vec<u8> },
+    RemoveEntry {
+        /// Parent directory that currently contains the entry.
+        parent: u64,
+        /// Entry name encoded as raw bytes.
+        name: Vec<u8>,
+    },
 
     /// Atomically rename a directory entry. Replicas apply this only if the
     /// source dentry still points at the expected inode.
     RenameEntry {
+        /// Source parent directory.
         parent: u64,
+        /// Source entry name encoded as raw bytes.
         name: Vec<u8>,
+        /// Destination parent directory.
         new_parent: u64,
+        /// Destination entry name encoded as raw bytes.
         new_name: Vec<u8>,
+        /// Entry payload that should appear at the destination.
         entry: DirEntryValue,
+        /// Replacement attrs for an inode displaced at the destination, if any.
         displaced_set_attr: Box<Option<InodeAttr>>,
+        /// Displaced inode that should be removed outright, if any.
         displaced_remove_attr_ino: Option<u64>,
+        /// Updated attrs for a moved directory inode after the rename.
         moved_dir_attr: Box<Option<InodeAttr>>,
+        /// Updated attrs for the source parent after the rename.
         old_parent_attr: Box<Option<InodeAttr>>,
+        /// Updated attrs for the destination parent after the rename.
         new_parent_attr: Box<Option<InodeAttr>>,
     },
 
     // ─── File Block Operations ───────────────────────────────────────────────
     /// Set a block reference for a file.
     SetFileBlock {
+        /// File inode being updated.
         ino: u64,
+        /// Logical block slot inside the file.
         block_index: u32,
+        /// Block payload reference to persist.
         block: BlockRef,
     },
 
     /// Remove a specific file block (e.g., truncate).
-    RemoveFileBlock { ino: u64, block_index: u32 },
+    RemoveFileBlock {
+        /// File inode being updated.
+        ino: u64,
+        /// Logical block slot to clear.
+        block_index: u32,
+    },
 
     /// Remove all blocks for a file (e.g., unlink).
-    RemoveFileBlocks { ino: u64 },
+    RemoveFileBlocks {
+        /// File inode whose block mapping should be removed.
+        ino: u64,
+    },
 
     /// Set multiple block references in one batch (used by drain_dirty_mem).
-    SetFileBlocksBatch { blocks: Vec<(u64, u32, BlockRef)> },
+    SetFileBlocksBatch {
+        /// Batch of `(ino, block_index, block)` updates to apply atomically.
+        blocks: Vec<(u64, u32, BlockRef)>,
+    },
 
     /// Publish a block that has finished uploading and is now remote-visible.
     CommitFileBlock {
+        /// File inode being updated.
         ino: u64,
+        /// Logical block slot inside the file.
         block_index: u32,
+        /// Remote-visible block reference for the slot.
         block: BlockRef,
     },
 
     /// Atomically publish the committed manifest head for a file.
     PublishFileManifest {
+        /// File inode whose published manifest is being replaced.
         ino: u64,
+        /// Full published manifest as `(block_index, block)` rows.
         blocks: Vec<(u32, BlockRef)>,
     },
 
@@ -74,51 +117,92 @@ pub enum MetaEvent {
     /// The payload carries the final row state for each chunk. An empty slice
     /// vector means the chunk row should be removed.
     SetRegularFileOverlaySlices {
+        /// File inode whose overlay chunks are being rewritten.
         ino: u64,
+        /// Final chunk rows as `(chunk_id, slices)` pairs.
         chunk_slices: Vec<(crate::schema::ChunkId, Vec<crate::schema::SliceRecord>)>,
     },
 
     // ─── Target & Extended Attributes ────────────────────────────────────────
     /// Set a symlink target.
-    SetSymlinkTarget { ino: u64, target: Vec<u8> },
+    SetSymlinkTarget {
+        /// Symlink inode being updated.
+        ino: u64,
+        /// Raw target bytes to persist.
+        target: Vec<u8>,
+    },
 
     /// Set an extended attribute.
     SetXattr {
+        /// Inode that owns the xattr.
         ino: u64,
+        /// Raw xattr name bytes.
         name: Vec<u8>,
+        /// Raw xattr value bytes.
         value: Vec<u8>,
+        /// POSIX-style create/replace flags for the mutation.
         flags: u32, // XATTR_CREATE (1) or XATTR_REPLACE (2)
     },
 
     /// Remove an extended attribute.
-    RemoveXattr { ino: u64, name: Vec<u8> },
+    RemoveXattr {
+        /// Inode that owns the xattr.
+        ino: u64,
+        /// Raw xattr name bytes.
+        name: Vec<u8>,
+    },
 
     /// Set ACL rule for `(ino, principal)`.
     SetAclRule {
+        /// Inode protected by the ACL rule.
         ino: u64,
+        /// Principal receiving the rule.
         principal: String,
+        /// Effective access level to persist.
         access_level: crate::types::AccessLevel,
     },
 
     /// Remove ACL rule for `(ino, principal)`.
-    RemoveAclRule { ino: u64, principal: String },
+    RemoveAclRule {
+        /// Inode protected by the ACL rule.
+        ino: u64,
+        /// Principal whose explicit rule should be removed.
+        principal: String,
+    },
 
     // ─── Garbage Collection ──────────────────────────────────────────────────
     /// Mark an object for garbage collection.
-    AddPendingDeletion { object_id: u64, timestamp: i64 },
+    AddPendingDeletion {
+        /// Object id scheduled for deferred deletion.
+        object_id: u64,
+        /// Unix timestamp when the object became pending deletion.
+        timestamp: i64,
+    },
 
     /// Remove an object from pending deletions (GC complete).
-    RemovePendingDeletion { object_id: u64 },
+    RemovePendingDeletion {
+        /// Object id that finished deferred deletion.
+        object_id: u64,
+    },
 
     // ─── Snapshots ───────────────────────────────────────────────────────────
     /// Create or update snapshot definition.
-    CreateSnapshot { snapshot: MetadataSnapshot },
+    CreateSnapshot {
+        /// Snapshot descriptor to persist.
+        snapshot: MetadataSnapshot,
+    },
 
     /// Update snapshot replication state.
-    UpdateSnapshotState { id: String, state: SnapshotState },
+    UpdateSnapshotState {
+        /// Snapshot id to update.
+        id: String,
+        /// New replication state for the snapshot.
+        state: SnapshotState,
+    },
 }
 
 impl MetaEvent {
+    /// Return a stable lowercase identifier for this event kind.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::SetAttr { .. } => "set_attr",
@@ -145,6 +229,7 @@ impl MetaEvent {
         }
     }
 
+    /// Return `true` when this event mutates the directory namespace.
     pub fn is_namespace_mutation(&self) -> bool {
         matches!(
             self,

@@ -1,6 +1,7 @@
 use super::*;
 
 impl RedbMetaEngine {
+    /// Returns dentry keys whose local state differs from the last imported base view.
     pub fn local_overlay_dentries(&self) -> MetaResult<HashSet<Vec<u8>>> {
         let txn = self
             .db

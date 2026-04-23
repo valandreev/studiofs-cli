@@ -41,8 +41,11 @@ pub type Ino = u64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum FileType {
+    /// A regular data file.
     RegularFile = 1,
+    /// A directory containing dentries.
     Directory = 2,
+    /// A symbolic link.
     Symlink = 3,
 }
 
@@ -62,9 +65,12 @@ impl FileType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[repr(u8)]
 pub enum UploadState {
+    /// Payload upload is still in progress.
     Uploading = 1,
+    /// Metadata is being updated after upload completion.
     Updating = 2,
     #[default]
+    /// The local and committed views are settled.
     Ready = 3,
 }
 
@@ -123,45 +129,60 @@ pub enum AccessLevel {
 #[repr(u8)]
 #[serde(rename_all = "snake_case")]
 pub enum HardLockKind {
+    /// Multiple readers may hold the lease concurrently.
     Shared = 1,
+    /// Exactly one writer holds the lease.
     Exclusive = 2,
 }
 
 /// Authoritative or known snapshot of one inode hard-lock lease.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileLockLease {
+    /// Inode protected by this lease.
     pub ino: Ino,
+    /// Shared or exclusive lease mode.
     pub kind: HardLockKind,
+    /// Monotonic generation assigned by PostgreSQL.
     pub generation: u64,
+    /// Unix-millis deadline after which the lease expires.
     pub lease_expires_at_unix_ms: i64,
     #[serde(default)]
+    /// Client id holding the exclusive lease, when present.
     pub exclusive_owner: Option<String>,
     #[serde(default)]
+    /// Client ids currently holding the shared lease.
     pub shared_owners: BTreeSet<String>,
 }
 
 /// Outcome when trying to acquire a hard-lock lease.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileLockLeaseAcquireOutcome {
+    /// Lease acquisition succeeded and returned the current authoritative lease.
     Acquired(FileLockLease),
+    /// Lease acquisition was blocked by an existing incompatible holder.
     Blocked(FileLockLease),
 }
 
 /// Outcome when releasing a hard-lock lease for the current client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileLockLeaseReleaseOutcome {
+    /// The current client released the lease; remaining authoritative state is returned.
     Released(Option<FileLockLease>),
+    /// The current client did not hold the lease; current authoritative state is returned.
     NotHeld(Option<FileLockLease>),
 }
 
 /// Outcome when renewing a hard-lock lease for the current client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileLockLeaseRenewOutcome {
+    /// Lease renewal succeeded and returned the refreshed lease.
     Renewed(FileLockLease),
+    /// Lease ownership was lost; remaining authoritative state is returned.
     Lost(Option<FileLockLease>),
 }
 
 impl AccessLevel {
+    /// Convert a serialized ACL access level into its enum form.
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::NoAccess),
@@ -175,8 +196,11 @@ impl AccessLevel {
 /// ACL rule persisted in metadata and replicated through the event log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AclRule {
+    /// Inode protected by this ACL rule.
     pub ino: Ino,
+    /// Principal that receives the access level.
     pub principal: String,
+    /// Effective access granted to the principal.
     pub access_level: AccessLevel,
 }
 
@@ -234,7 +258,9 @@ pub struct InodeAttr {
 /// Durable lifecycle metadata for a regular file's locally visible epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InodeLifecycleRecord {
+    /// Regular-file inode described by this lifecycle row.
     pub ino: Ino,
+    /// Current lifecycle state for the locally visible epoch.
     pub state: InodeLifecycleState,
     /// Size visible on the local mount for the current epoch.
     pub local_visible_size: u64,
@@ -257,6 +283,7 @@ pub struct InodeLifecycleRecord {
 }
 
 impl InodeLifecycleRecord {
+    /// Return `true` when the local file view has diverged from the published one.
     pub fn local_view_differs_from_published(&self) -> bool {
         self.local_visible_size != self.published_size
             || self.local_content_epoch != self.published_content_epoch
@@ -405,11 +432,17 @@ impl TimeSpec {
 /// Arguments for `setattr`. All `None`/`Omit` fields are left unchanged.
 #[derive(Debug, Clone)]
 pub struct SetattrArgs {
+    /// New file size, if the caller wants to truncate or extend the inode.
     pub size: Option<u64>,
+    /// New permission mode, if any.
     pub mode: Option<u16>,
+    /// New owner uid, if any.
     pub uid: Option<u32>,
+    /// New owner gid, if any.
     pub gid: Option<u32>,
+    /// Requested access-time update behavior.
     pub atime: TimeSpec,
+    /// Requested modification-time update behavior.
     pub mtime: TimeSpec,
     /// Creation/birth time.
     pub crtime: TimeSpec,
@@ -567,7 +600,9 @@ pub struct SliceOrder(pub u64);
 /// Ranges are half-open: `[start, end)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SliceRange {
+    /// Inclusive chunk-relative start offset.
     pub start: u32,
+    /// Exclusive chunk-relative end offset.
     pub end: u32,
 }
 
@@ -625,6 +660,7 @@ pub enum BlockRefState {
 }
 
 impl BlockRefState {
+    /// Return the cache-retention policy implied by this block lifecycle state.
     pub fn retention_class(self) -> PayloadRetentionClass {
         match self {
             Self::LocalOnly | Self::Uploading | Self::Recovering => {
@@ -635,6 +671,7 @@ impl BlockRefState {
         }
     }
 
+    /// Return `true` when payload in this state must stay pinned locally.
     pub fn is_pinned_unpublished(self) -> bool {
         matches!(
             self.retention_class(),
@@ -667,8 +704,11 @@ pub struct ChunkFragmentationCounters {
 /// - at least one shadowing overlap or tombstone,
 /// - or at least one MiB of shadowed bytes.
 pub const DEFAULT_CHUNK_COMPACTION_MIN_LIVE_SLICES: u32 = 2;
+/// Minimum overlapping-slice count that triggers chunk compaction.
 pub const DEFAULT_CHUNK_COMPACTION_MIN_OVERLAPPING_SLICES: u32 = 1;
+/// Minimum tombstone count that triggers chunk compaction.
 pub const DEFAULT_CHUNK_COMPACTION_MIN_TOMBSTONE_SLICES: u32 = 1;
+/// Minimum fragmented-byte estimate that triggers chunk compaction.
 pub const DEFAULT_CHUNK_COMPACTION_MIN_FRAGMENTED_BYTES: u64 = 1024 * 1024;
 
 impl ChunkFragmentationCounters {
@@ -874,8 +914,10 @@ impl RegularFileChunkState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RegularFileState {
     #[serde(default)]
+    /// Locally durable overlay chunks that shadow the published base.
     pub overlay: RegularFileOverlayState,
     #[serde(default)]
+    /// Remote-visible published chunk graph.
     pub base: RegularFileBaseState,
 }
 
@@ -883,10 +925,15 @@ pub struct RegularFileState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResolvedSliceSource {
+    /// Bytes were provided by the local overlay.
     Overlay,
+    /// Bytes were provided by the published base.
     Base,
+    /// Coverage was masked by an overlay tombstone.
     OverlayTombstone,
+    /// Coverage was masked by a base tombstone.
     BaseTombstone,
+    /// No slice covered this range.
     Hole,
 }
 
@@ -1113,12 +1160,18 @@ pub struct FormatInfo {
     pub block_size: u32,
 }
 
+/// S3-style data-store settings used when constructing new [`FormatInfo`] values.
 #[derive(Clone, PartialEq, Eq)]
 pub struct FormatInfoDataStore {
+    /// Object-store endpoint URL.
     pub endpoint: String,
+    /// Object-store bucket/container name.
     pub bucket: String,
+    /// Access key or equivalent client id.
     pub access_key: String,
+    /// Secret key or equivalent client secret.
     pub secret_key: String,
+    /// Cloud region used for requests.
     pub region: String,
 }
 
@@ -1139,7 +1192,9 @@ impl std::fmt::Debug for FormatInfoDataStore {
 #[serde(rename_all = "snake_case")]
 pub enum MetadataBackend {
     #[default]
+    /// Use the embedded redb-only metadata backend.
     RedbLocal,
+    /// Use PostgreSQL as the authoritative shared metadata backend.
     Postgres,
 }
 
@@ -1147,12 +1202,18 @@ pub enum MetadataBackend {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteStoreConfig {
+    /// Metadata object-store endpoint URL.
     pub endpoint: String,
+    /// Metadata object-store bucket/container name.
     pub bucket: String,
+    /// Access key or equivalent client id.
     pub access_key: String,
+    /// Secret key or equivalent client secret.
     pub secret_key: String,
+    /// Cloud region used for requests.
     pub region: String,
     #[serde(default = "default_metadata_prefix")]
+    /// Prefix under which metadata objects are stored.
     pub prefix: String,
 }
 
@@ -1161,10 +1222,13 @@ pub struct RemoteStoreConfig {
 #[serde(deny_unknown_fields)]
 pub struct MetadataConfig {
     #[serde(default)]
+    /// Selected metadata backend implementation.
     pub backend: MetadataBackend,
     #[serde(default)]
+    /// Optional remote object-store config for shared metadata artifacts.
     pub remote: Option<RemoteStoreConfig>,
     #[serde(default)]
+    /// Optional PostgreSQL authority configuration.
     pub postgres: Option<PostgresConfig>,
 }
 

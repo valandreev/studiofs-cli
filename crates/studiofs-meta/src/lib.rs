@@ -3,13 +3,23 @@
 //! Provides metadata storage for the virtual filesystem using redb as the embedded KV store.
 //! All filesystem structure (inodes, directory entries, chunk/slice mappings) is managed here.
 
+#![warn(missing_docs)]
+
+/// Async adapters for invoking synchronous metadata capabilities from Tokio.
 pub mod async_engine;
+/// Backend-agnostic metadata contracts shared by all metadata engines.
 pub mod engine;
+/// Internal metadata event-log payloads used for replication and recovery.
 pub mod events;
+/// PostgreSQL DSN helpers for StudioFS metadata databases.
 pub mod pg_dsn;
+/// PostgreSQL-backed metadata engine implementation.
 pub mod pg_engine;
+/// redb-backed metadata engine implementation.
 pub mod redb_engine;
+/// Internal on-disk metadata schema and replication model types.
 pub mod schema;
+/// Public metadata model types shared across engines and callers.
 pub mod types;
 
 use std::path::Path;
@@ -30,7 +40,9 @@ pub use redb_engine::RedbMetaEngine;
 pub use types::*;
 
 #[derive(Debug, Clone, Copy)]
+/// Runtime knobs that influence how a metadata engine instance is opened.
 pub struct MetaOpenOptions {
+    /// Whether remote-backed engines may start background polling workers.
     pub background_poll: bool,
 }
 

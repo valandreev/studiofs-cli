@@ -4,6 +4,7 @@ const INODE_LIFECYCLE_SCHEMA_VERSION_KEY: &str = "inode_lifecycle_schema_version
 const CURRENT_INODE_LIFECYCLE_SCHEMA_VERSION: u64 = 1;
 
 impl RedbMetaEngine {
+    /// Ensure the inode lifecycle table exists and matches the current schema version.
     pub fn ensure_inode_lifecycle_table(&self) -> MetaResult<()> {
         let txn = self
             .db
@@ -41,6 +42,7 @@ impl RedbMetaEngine {
         Ok(())
     }
 
+    /// Return the lifecycle record for one inode, if the table contains it.
     pub fn get_inode_lifecycle(&self, ino: Ino) -> MetaResult<Option<InodeLifecycleRecord>> {
         let txn = self
             .db
@@ -56,6 +58,7 @@ impl RedbMetaEngine {
             .transpose()
     }
 
+    /// Return all persisted inode lifecycle rows.
     pub fn list_inode_lifecycles(&self) -> MetaResult<Vec<InodeLifecycleRecord>> {
         let txn = self
             .db
@@ -75,6 +78,7 @@ impl RedbMetaEngine {
         Ok(records)
     }
 
+    /// Rebuild inode lifecycle rows from the current foreground metadata state.
     pub fn rebuild_inode_lifecycle_table(&self) -> MetaResult<()> {
         let txn = self
             .db
@@ -498,6 +502,7 @@ impl RedbMetaEngine {
         Self::resolve_attr_from_opened_tables(&base, &current, &tombstones, ino, prefer_current)
     }
 
+    /// Returns inode ids whose local state differs from the last imported base view.
     pub fn local_overlay_inodes(&self) -> MetaResult<HashSet<Ino>> {
         let txn = self
             .db

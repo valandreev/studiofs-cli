@@ -1,15 +1,20 @@
 use crate::{MetaError, MetaResult};
 use std::str::FromStr;
 
+/// Canonical PostgreSQL database name used for StudioFS metadata.
 pub const STUDIOFS_METADATA_DB: &str = "studiofs";
 const PG_ADMIN_DB: &str = "postgres";
 
 #[derive(Debug, Clone)]
+/// Pair of DSNs used to provision and then connect to the StudioFS metadata DB.
 pub struct StudioPgDsns {
+    /// DSN that targets an administrative database such as `postgres`.
     pub admin_dsn: String,
+    /// DSN that targets the `studiofs` metadata database itself.
     pub metadata_dsn: String,
 }
 
+/// Resolve an input PostgreSQL DSN into admin and StudioFS metadata DSNs.
 pub fn resolve_studiofs_pg_dsns(input: &str) -> MetaResult<StudioPgDsns> {
     let input = input.trim();
     if input.is_empty() {
@@ -36,6 +41,7 @@ pub fn resolve_studiofs_pg_dsns(input: &str) -> MetaResult<StudioPgDsns> {
     })
 }
 
+/// Ensure the `studiofs` PostgreSQL database exists and return both DSNs.
 pub async fn ensure_studiofs_database(input: &str) -> MetaResult<StudioPgDsns> {
     let dsns = resolve_studiofs_pg_dsns(input)?;
     let (client, connection) = tokio_postgres::connect(&dsns.admin_dsn, tokio_postgres::NoTls)

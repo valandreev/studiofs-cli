@@ -109,19 +109,31 @@ pub(super) const REMOTE_NAMESPACE_VISIBILITY_FILTER_SETTING: &str =
 /// Serializable full snapshot of redb metadata state.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct RedbSnapshot {
+    /// Settings table rows as `(key, raw_value)` pairs.
     pub settings: Vec<(String, Vec<u8>)>,
+    /// Counter rows as `(name, value)` pairs.
     pub counters: Vec<(String, u64)>,
+    /// Inode rows as `(ino, encoded_attr)` pairs.
     pub inodes: Vec<(u64, Vec<u8>)>,
+    /// Dentry rows as `(encoded_key, encoded_value)` pairs.
     pub dentries: Vec<(Vec<u8>, Vec<u8>)>,
     #[serde(default)]
+    /// Overlay regular-file chunk rows as `(ino, encoded_state)` pairs.
     pub regular_file_overlay: Vec<(u64, Vec<u8>)>,
     #[serde(default)]
+    /// Base regular-file chunk rows as `(ino, encoded_state)` pairs.
     pub regular_file_base: Vec<(u64, Vec<u8>)>,
+    /// Pending deletion rows as `(object_id, timestamp)` pairs.
     pub pending_deletions: Vec<(u64, i64)>,
+    /// Symlink rows as `(ino, target_bytes)` pairs.
     pub symlinks: Vec<(u64, Vec<u8>)>,
+    /// Xattr rows as `(encoded_key, decoded_value)` pairs.
     pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// ACL rows as `(encoded_key, access_level)` pairs.
     pub acl_rules: Vec<(Vec<u8>, u8)>,
+    /// Local event-log rows as `(sequence, encoded_event)` pairs.
     pub event_log: Vec<(u64, Vec<u8>)>,
+    /// Snapshot-definition rows as `(snapshot_id, encoded_snapshot)` pairs.
     pub snapshots: Vec<(String, Vec<u8>)>,
 }
 

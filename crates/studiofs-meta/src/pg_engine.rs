@@ -98,7 +98,9 @@ pub struct PgMetaEngine {
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Options that control how a [`PgMetaEngine`] instance is opened.
 pub struct PgOpenOptions {
+    /// Whether to start background polling and lock-worker threads immediately.
     pub background_poll: bool,
 }
 
@@ -2009,10 +2011,12 @@ impl PgMetaEngine {
         inode_prime
     }
 
+    /// Open the PostgreSQL-backed metadata engine using default startup options.
     pub fn open(path: impl AsRef<Path>) -> MetaResult<Arc<Self>> {
         Self::open_with_options(path, PgOpenOptions::default())
     }
 
+    /// Open the PostgreSQL-backed metadata engine with explicit startup options.
     pub fn open_with_options(
         path: impl AsRef<Path>,
         options: PgOpenOptions,
@@ -2156,6 +2160,7 @@ impl PgMetaEngine {
         Ok(engine)
     }
 
+    /// Return the configured PostgreSQL DSN for this engine instance.
     pub fn postgres_url(&self) -> &str {
         &self.postgres_url
     }

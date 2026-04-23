@@ -1,10 +1,12 @@
 use super::*;
 
 impl RedbMetaEngine {
+    /// Encode a [`RedbSnapshot`] into the canonical persisted snapshot payload format.
     pub fn encode_snapshot_payload(snapshot: &RedbSnapshot) -> MetaResult<Vec<u8>> {
         encode(snapshot)
     }
 
+    /// Decode a persisted snapshot payload, including legacy JSON-encoded snapshots.
     pub fn decode_snapshot_payload(payload: &[u8]) -> MetaResult<RedbSnapshot> {
         match decode(payload) {
             Ok(snapshot) => Ok(snapshot),
@@ -14,6 +16,7 @@ impl RedbMetaEngine {
         }
     }
 
+    /// Export the current merged redb state into a serializable snapshot.
     pub fn export_snapshot(&self) -> MetaResult<RedbSnapshot> {
         let txn = self
             .db
@@ -226,10 +229,12 @@ impl RedbMetaEngine {
         Ok(snapshot)
     }
 
+    /// Replace local redb state with a snapshot that should remain fully visible locally.
     pub fn import_snapshot(&self, snapshot: &RedbSnapshot) -> MetaResult<()> {
         self.import_snapshot_with_namespace_mode(snapshot, false)
     }
 
+    /// Replace local redb state with a snapshot imported from the remote authority.
     pub fn import_remote_snapshot(&self, snapshot: &RedbSnapshot) -> MetaResult<()> {
         self.import_snapshot_with_namespace_mode(snapshot, true)
     }

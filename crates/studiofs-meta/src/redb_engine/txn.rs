@@ -1,6 +1,7 @@
 use super::*;
 
 impl RedbMetaEngine {
+    /// Enable or disable filtering that hides remote-only namespace rows locally.
     pub fn set_remote_namespace_visibility_filter(&self, enabled: bool) -> MetaResult<()> {
         let txn = self
             .db
