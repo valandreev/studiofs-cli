@@ -68,6 +68,16 @@ impl StudioVfs {
                 >= super::AGGRESSIVE_MATERIALIZATION_BUFFERED_WRITE_THRESHOLD
     }
 
+    fn should_linger_deferred_materialization(&self, ino: Ino) -> bool {
+        if self.shutdown_requested() {
+            return false;
+        }
+        if self.handle_table.open_count(ino) == 0 {
+            return false;
+        }
+        self.state.handle_writers.dirty_bytes_for_inode(ino) > 0
+    }
+
     pub(super) async fn apply_write_path_soft_pacing(self: &Arc<Self>, preferred_ino: Ino) -> bool {
         if self.shutdown_requested() {
             return false;
@@ -256,6 +266,7 @@ impl StudioVfs {
         let guard = task_lock.clone().lock_owned().await;
         let vfs = Arc::clone(self);
         self.track_background_task(tokio::spawn(async move {
+            let mut no_progress_retries = 0usize;
             loop {
                 let dirty_before = vfs.state.handle_writers.dirty_bytes_for_inode(ino);
                 let total_before = vfs.state.handle_writers.total_dirty_bytes();
@@ -344,6 +355,18 @@ impl StudioVfs {
                     || limits_materialized
                     || dirty_after < dirty_before
                     || total_after < total_before;
+                if made_progress {
+                    no_progress_retries = 0;
+                } else if no_progress_retries < super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES
+                    && vfs.should_linger_deferred_materialization(ino)
+                {
+                    no_progress_retries += 1;
+                    tokio::time::sleep(Duration::from_millis(
+                        super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS,
+                    ))
+                    .await;
+                    continue;
+                }
                 if !made_progress || !vfs.should_continue_deferred_materialization(ino) {
                     break;
                 }

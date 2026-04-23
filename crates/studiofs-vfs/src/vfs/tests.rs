@@ -1383,13 +1383,15 @@ fn cache_runtime_tuning_defaults_match_juicefs_sized_windows() {
 #[test]
 fn soft_dirty_budget_pacing_starts_before_hard_limit() {
     assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 0), None);
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(59, 100, 0), None);
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(60, 100, 0), Some(1));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(80, 100, 0), Some(4));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(90, 100, 0), Some(8));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 512), Some(1));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 1024), Some(4));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(82, 100, 1024), Some(4));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(44, 100, 0), None);
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(45, 100, 0), Some(1));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(60, 100, 0), Some(3));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(75, 100, 0), Some(6));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(85, 100, 0), Some(10));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 256), Some(1));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 512), Some(3));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 1024), Some(6));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(62, 100, 1024), Some(6));
 }
 
 #[test]

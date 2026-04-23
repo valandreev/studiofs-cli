@@ -426,8 +426,8 @@ Operator stance for the rewrite:
 | `--prefetch` | `1` | Prefetch concurrency budget |
 | `--principal` / `STUDIOFS_PRINCIPAL` | `*` | Principal used for ACL checks |
 
-The writeback dirty-buffer default is hardcoded to `800MB` (`max_dirty_bytes`) to stay
-closer to the smoother writeback window we want for long sequential writers.
+The writeback dirty-buffer default is hardcoded to `1200MB` (`max_dirty_bytes`) to give
+long sequential writers a slightly wider smoothing window before hard backpressure.
 
 ### Transitional and expert overrides
 
