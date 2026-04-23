@@ -1,5 +1,8 @@
 use super::*;
 use futures::stream::{FuturesUnordered, StreamExt};
+use std::time::{Duration, Instant};
+
+const PENDING_SLICE_COMMIT_MAX_AGE: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub(super) struct PendingBlock {
@@ -69,6 +72,7 @@ struct PendingDirtySlice {
     seq: u64,
     object_id: Option<u64>,
     object_offset: u32,
+    created_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -109,11 +113,27 @@ impl PendingDirtySlice {
             seq,
             object_id: Some(object_id),
             object_offset,
+            created_at: Instant::now(),
         }
     }
 
     fn is_persisted(self) -> bool {
         self.object_id.is_some()
+    }
+
+    fn len(self) -> usize {
+        self.range.len() as usize
+    }
+
+    fn age(self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.created_at)
+    }
+
+    fn prefix(self, len: usize) -> Option<Self> {
+        let len = len.min(self.len());
+        let range_end = self.range.start.checked_add(u32::try_from(len).ok()?)?;
+        let range = studiofs_meta::schema::SliceRange::new(self.range.start, range_end)?;
+        Some(Self { range, ..self })
     }
 
     fn commit_key(self, chunk_id: u64) -> PendingDirtySliceCommitKey {
@@ -1272,6 +1292,13 @@ impl<'a> LocalDirtyFlushSession<'a> {
         let pending_slices = self
             .vfs
             .snapshot_pending_persisted_local_dirty_slices(self.ino);
+        let pending_slices = self
+            .vfs
+            .select_pending_persisted_local_dirty_slice_commit_wave(
+                self.ino,
+                pending_slices,
+                local_sync_policy,
+            );
         if !pending_slices.is_empty() {
             let content_epoch = if let Some(attr) = dirty_attr.as_ref() {
                 attr.content_epoch
@@ -1290,7 +1317,19 @@ impl<'a> LocalDirtyFlushSession<'a> {
                 .cloned();
         }
 
-        let staged_local_extents = self.vfs.snapshot_pending_local_extent_blocks(self.ino);
+        let staged_local_extents = if matches!(local_sync_policy, LocalSyncPolicy::Strict)
+            || self.vfs.handle_table.open_count(self.ino) == 0
+            || self
+                .vfs
+                .state
+                .handle_writers
+                .dirty_bytes_for_inode(self.ino)
+                == 0
+        {
+            self.vfs.snapshot_pending_local_extent_blocks(self.ino)
+        } else {
+            Vec::new()
+        };
         if !staged_local_extents.is_empty() {
             let content_epoch = if let Some(attr) = dirty_attr.as_ref() {
                 attr.content_epoch
@@ -1299,7 +1338,10 @@ impl<'a> LocalDirtyFlushSession<'a> {
             };
             self.commit_local_extent_snapshot(staged_local_extents, content_epoch, dirty_attr)
                 .await?;
-        } else if let Some(attr) = dirty_attr {
+        } else if let Some(attr) = dirty_attr
+            && (!matches!(local_sync_policy, LocalSyncPolicy::Opportunistic)
+                || !self.vfs.has_pending_local_dirty_blocks_for_inode(self.ino))
+        {
             let _ = self
                 .drain
                 .execute_drain(
@@ -1750,6 +1792,7 @@ impl StudioVfs {
         inos_with_bytes.into_iter().map(|(ino, _)| ino).collect()
     }
 
+    #[cfg(test)]
     pub(super) fn pending_persisted_local_dirty_slice_bytes_for_inode(&self, ino: Ino) -> usize {
         self.state
             .local_dirty
@@ -1765,6 +1808,136 @@ impl StudioVfs {
                     .sum()
             })
             .unwrap_or(0)
+    }
+
+    fn pending_slice_commit_wave_bytes(&self) -> usize {
+        self.handle_writer_slice_flush_bytes()
+            .saturating_mul(2)
+            .min(self.write_eager_flush_drain_chunk_bytes)
+            .max(self.handle_writer_slice_flush_bytes())
+    }
+
+    fn pending_slice_commit_hot_tail_bytes(&self) -> usize {
+        self.handle_writer_slice_flush_bytes()
+    }
+
+    fn oldest_pending_persisted_local_dirty_slice_age(
+        &self,
+        pending_slices: &std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
+    ) -> Option<Duration> {
+        let now = Instant::now();
+        pending_slices
+            .values()
+            .flat_map(|slices| slices.iter().copied())
+            .map(|slice| slice.age(now))
+            .max()
+    }
+
+    fn select_pending_persisted_local_dirty_slice_commit_wave(
+        &self,
+        ino: Ino,
+        pending_slices: std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
+        local_sync_policy: LocalSyncPolicy,
+    ) -> std::collections::BTreeMap<u64, Vec<PendingDirtySlice>> {
+        if pending_slices.is_empty() {
+            return pending_slices;
+        }
+        if !matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+            return pending_slices;
+        }
+        if self.handle_table.open_count(ino) == 0 {
+            return pending_slices;
+        }
+
+        let has_dirty_tail = self.state.handle_writers.dirty_bytes_for_inode(ino) > 0;
+        if !has_dirty_tail {
+            return pending_slices;
+        }
+
+        let total_bytes: usize = pending_slices
+            .values()
+            .flat_map(|slices| slices.iter().copied())
+            .map(PendingDirtySlice::len)
+            .sum();
+        let oldest_age = self.oldest_pending_persisted_local_dirty_slice_age(&pending_slices);
+        let commit_wave_bytes = self.pending_slice_commit_wave_bytes();
+        if total_bytes < commit_wave_bytes
+            && oldest_age.is_none_or(|age| age < PENDING_SLICE_COMMIT_MAX_AGE)
+        {
+            return std::collections::BTreeMap::new();
+        }
+
+        let mut ordered_slices = Vec::<(u64, PendingDirtySlice)>::new();
+        for (chunk_id, slices) in &pending_slices {
+            for slice in slices {
+                ordered_slices.push((*chunk_id, *slice));
+            }
+        }
+        ordered_slices.sort_by_key(|(chunk_id, slice)| {
+            (
+                slice.seq,
+                studiofs_meta::schema::chunk_start_offset(
+                    studiofs_meta::schema::ChunkId(*chunk_id),
+                    studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
+                )
+                .saturating_add(slice.range.start as u64),
+                slice.block_offset,
+                slice.object_offset,
+            )
+        });
+
+        let mut retain_tail_bytes = self.pending_slice_commit_hot_tail_bytes();
+        let mut commit_candidates = Vec::<(u64, PendingDirtySlice)>::new();
+        for (chunk_id, slice) in ordered_slices.iter().rev().copied() {
+            let slice_len = slice.len();
+            if retain_tail_bytes == 0 {
+                commit_candidates.push((chunk_id, slice));
+                continue;
+            }
+            if slice_len <= retain_tail_bytes {
+                retain_tail_bytes = retain_tail_bytes.saturating_sub(slice_len);
+                continue;
+            }
+
+            let commit_len = slice_len.saturating_sub(retain_tail_bytes);
+            retain_tail_bytes = 0;
+            if let Some(prefix) = slice.prefix(commit_len) {
+                commit_candidates.push((chunk_id, prefix));
+            }
+        }
+        commit_candidates.reverse();
+
+        let mut selected = std::collections::BTreeMap::<u64, Vec<PendingDirtySlice>>::new();
+        let mut selected_bytes = 0usize;
+        for (chunk_id, slice) in commit_candidates.iter().copied() {
+            let remaining = commit_wave_bytes.saturating_sub(selected_bytes);
+            if remaining == 0 {
+                break;
+            }
+            let commit_len = remaining.min(slice.len());
+            let Some(prefix) = slice.prefix(commit_len) else {
+                continue;
+            };
+            selected.entry(chunk_id).or_default().push(prefix);
+            selected_bytes = selected_bytes.saturating_add(prefix.len());
+            if commit_len < slice.len() {
+                break;
+            }
+        }
+        if selected.is_empty()
+            && oldest_age.is_some_and(|age| age >= PENDING_SLICE_COMMIT_MAX_AGE)
+            && let Some((chunk_id, slice)) = ordered_slices.first().copied()
+        {
+            let commit_len = commit_wave_bytes.min(slice.len());
+            if let Some(prefix) = slice.prefix(commit_len) {
+                selected.entry(chunk_id).or_default().push(prefix);
+            }
+        }
+
+        for slices in selected.values_mut() {
+            slices.sort_by_key(|slice| (slice.seq, slice.range.start, slice.block_offset));
+        }
+        selected
     }
 
     fn pending_buffered_local_dirty_bytes_for_inode(&self, ino: Ino) -> usize {
@@ -1783,7 +1956,12 @@ impl StudioVfs {
             return false;
         }
 
-        let pending_slice_bytes = self.pending_persisted_local_dirty_slice_bytes_for_inode(ino);
+        let pending_slices = self.snapshot_pending_persisted_local_dirty_slices(ino);
+        let pending_slice_bytes: usize = pending_slices
+            .values()
+            .flat_map(|slices| slices.iter().copied())
+            .map(PendingDirtySlice::len)
+            .sum();
         if pending_slice_bytes == 0 {
             if self.handle_table.open_count(ino) == 0 {
                 return true;
@@ -1802,7 +1980,10 @@ impl StudioVfs {
             return true;
         }
 
-        pending_slice_bytes >= self.local_sync_group_min_bytes as usize
+        pending_slice_bytes >= self.pending_slice_commit_wave_bytes()
+            || self
+                .oldest_pending_persisted_local_dirty_slice_age(&pending_slices)
+                .is_some_and(|age| age >= PENDING_SLICE_COMMIT_MAX_AGE)
     }
 
     fn snapshot_selected_buffered_pending_blocks(

@@ -771,10 +771,14 @@ impl StudioVfs {
             .max(1)
     }
 
-    fn handle_writer_slice_flush_bytes(&self) -> usize {
+    pub(super) fn handle_writer_slice_flush_bytes(&self) -> usize {
         JUICEFS_LIKE_SLICE_FLUSH_BYTES
             .min(self.block_size as usize)
             .max(1)
+    }
+
+    pub(super) fn handle_writer_active_tail_bytes(&self) -> usize {
+        (self.handle_writer_slice_flush_bytes() / 2).max(1)
     }
 
     fn handle_writer_slice_spill_budget_bytes(&self) -> usize {
@@ -786,25 +790,51 @@ impl StudioVfs {
         &self,
         writes: &[BufferedHandleWrite],
     ) -> Vec<BufferedHandleWrite> {
-        let Some(latest_seq) = writes.iter().map(|write| write.seq).max() else {
-            return Vec::new();
-        };
         let mut ordered = writes.to_vec();
         ordered.sort_by_key(|write| (write.seq, write.offset));
+        let mut retain_tail_bytes = self.handle_writer_active_tail_bytes();
+        let mut spillable = Vec::new();
+        for write in ordered.into_iter().rev() {
+            let write_len = write.data.len();
+            if retain_tail_bytes == 0 {
+                spillable.push(write);
+                continue;
+            }
+            if write_len <= retain_tail_bytes {
+                retain_tail_bytes = retain_tail_bytes.saturating_sub(write_len);
+                continue;
+            }
+
+            let spill_len = write_len.saturating_sub(retain_tail_bytes);
+            retain_tail_bytes = 0;
+            spillable.push(BufferedHandleWrite {
+                block_index: write.block_index,
+                offset: write.offset,
+                seq: write.seq,
+                data: write.data.slice(..spill_len),
+            });
+        }
+        spillable.reverse();
+
         let spill_bytes_cap = self.handle_writer_slice_spill_budget_bytes();
         let mut selected = Vec::new();
         let mut selected_bytes = 0usize;
-        for write in ordered {
-            if write.seq == latest_seq {
-                continue;
-            }
-            if selected_bytes > 0
-                && selected_bytes.saturating_add(write.data.len()) > spill_bytes_cap
-            {
+        for write in spillable {
+            let remaining = spill_bytes_cap.saturating_sub(selected_bytes);
+            if remaining == 0 {
                 break;
             }
-            selected_bytes = selected_bytes.saturating_add(write.data.len());
-            selected.push(write);
+            let take_len = remaining.min(write.data.len());
+            if take_len == 0 {
+                break;
+            }
+            selected.push(BufferedHandleWrite {
+                block_index: write.block_index,
+                offset: write.offset,
+                seq: write.seq,
+                data: write.data.slice(..take_len),
+            });
+            selected_bytes = selected_bytes.saturating_add(take_len);
             if selected_bytes >= spill_bytes_cap {
                 break;
             }
@@ -1443,8 +1473,10 @@ impl StudioVfs {
         let budget_exceeded = self.total_pending_write_buffer_bytes() > self.max_dirty_bytes();
         let eager_single_full_block_accept = !current_write_full_block_indexes.is_empty()
             && visible_size <= u64::from(self.block_size);
+        let current_write_completed_full_block = !current_write_full_block_indexes.is_empty();
         let should_materialize_now = matches!(local_sync_policy, LocalSyncPolicy::Strict)
             || eager_single_full_block_accept
+            || current_write_completed_full_block
             || current_write_crosses_boundary_with_partial_tail
             || enough_completed_blocks
             || budget_exceeded
@@ -1494,7 +1526,7 @@ impl StudioVfs {
                 .map(|block| block.block_index)
                 .collect();
             self.stage_dirty_write_snapshots(ino, completed_blocks);
-            let should_persist_staged_now = enough_completed_blocks || budget_exceeded;
+            let should_persist_staged_now = true;
             if should_persist_staged_now {
                 self.persist_staged_pending_local_blocks_to_local_extents(
                     ino,

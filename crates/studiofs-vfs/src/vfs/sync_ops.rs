@@ -61,7 +61,8 @@ impl StudioVfs {
         if per_inode_dirty == 0 {
             return false;
         }
-        per_inode_dirty >= self.write_eager_flush_batch_bytes
+        per_inode_dirty > self.handle_writer_active_tail_bytes()
+            || per_inode_dirty >= self.write_eager_flush_batch_bytes
             || self.state.handle_writers.total_dirty_bytes()
                 >= super::aggressive_materialization_threshold_bytes(self.max_dirty_bytes())
             || self.state.handle_writers.total_buffered_write_count()

@@ -5084,6 +5084,7 @@ fn single_inode_never_has_two_pending_incarnations() {
 
 #[test]
 fn large_file_unlink_cancels_pending_uploads() {
+    let _test_env = ScopedTestEnv::new();
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
@@ -9719,6 +9720,7 @@ fn append_after_create_stays_buffered_until_flush() {
 
 #[test]
 fn truncate_after_create_is_locally_durable_without_flush() {
+    let _test_env = ScopedTestEnv::new();
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     unsafe {
         std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
@@ -9748,8 +9750,6 @@ fn truncate_after_create_is_locally_durable_without_flush() {
                 .validate()
                 .expect("default VFS config should validate"),
         );
-        vfs.start()
-            .expect("failed to start StudioVfs background workers");
 
         let attr = vfs.create(1, b"zeroio-truncate.bin", 0, 0, 0o644).unwrap();
         let payload = b"truncate-me-down";
@@ -10259,6 +10259,7 @@ fn read_from_start_does_not_depend_on_metadata_materialization() {
 
 #[test]
 fn write_stages_full_blocks_and_buffers_tail_without_buffered_relief() {
+    let _test_env = ScopedTestEnv::new();
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     unsafe {
         std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
@@ -10300,8 +10301,6 @@ fn write_stages_full_blocks_and_buffers_tail_without_buffered_relief() {
                 .expect("test VFS config should validate"),
         )
         .unwrap();
-        vfs.start()
-            .expect("failed to start StudioVfs background workers");
 
         let attr = vfs
             .create(1, b"write-backpressure-full-first.bin", 0, 0, 0o644)

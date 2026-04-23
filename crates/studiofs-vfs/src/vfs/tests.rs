@@ -2654,7 +2654,7 @@ fn write_fh_buffers_partial_tail_after_full_block_boundary_until_flush() {
 }
 
 #[test]
-fn write_fh_full_block_callbacks_can_form_multi_block_payload_bursts() {
+fn write_fh_full_block_callbacks_persist_in_small_foreground_waves() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-write-fh-multi-block-burst");
     let _guard = rt.enter();
@@ -2689,8 +2689,8 @@ fn write_fh_full_block_callbacks_can_form_multi_block_payload_bursts() {
 
     let snapshot = vfs.write_path_observability_snapshot();
     assert!(
-        snapshot.payload_burst.max_blocks_per_burst >= 2,
-        "buffered handle-write full blocks should be able to persist as a multi-block burst instead of one block at a time: {:?}",
+        snapshot.payload_burst.max_blocks_per_burst <= 1,
+        "slice-first foreground persistence should avoid multi-block payload bursts for full-block callbacks: {:?}",
         snapshot.payload_burst
     );
 }
@@ -2881,6 +2881,65 @@ fn opportunistic_handle_writer_slice_spill_drains_multiple_4mib_batches_per_pass
 }
 
 #[test]
+fn opportunistic_handle_writer_slice_spill_splits_large_current_callback_into_batched_slices() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) =
+        make_unstarted_test_vfs(&tmp, "sfs-257-write-fh-slice-large-current-callback");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                1,
+                b"sfs-257-write-fh-slice-large-current-callback.txt",
+                0,
+                0,
+                0o644,
+            )
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let slice_bytes = 2 * 1024 * 1024usize;
+        let payload = vec![0x5Au8; slice_bytes * 5];
+
+        vfs.record_handle_writer_state(fh, ino, 0, &payload)
+            .await
+            .unwrap();
+
+        assert!(
+            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
+                .await
+                .unwrap(),
+            "a single large callback should spill all but the active hot tail into staged 4 MiB slice batches"
+        );
+
+        let dirty_object_ids = vfs.local_block_backend().dirty_object_ids();
+        assert_eq!(
+            dirty_object_ids.len(),
+            2,
+            "an opportunistic spill should split a 10 MiB callback into two staged 4 MiB slice objects"
+        );
+        for object_id in dirty_object_ids {
+            let staged = vfs
+                .local_block_backend()
+                .get(object_id)
+                .expect("staged slice payload should be readable locally");
+            assert_eq!(staged.len(), 4 * 1024 * 1024);
+        }
+        assert_eq!(
+            vfs.state.handle_writers.dirty_bytes_for_inode(ino),
+            slice_bytes,
+            "the newest 2 MiB hot tail should remain buffered after the spill"
+        );
+
+        let read = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(read.as_ref(), payload.as_slice());
+
+        vfs.flush_fh(fh).await.unwrap();
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn background_flush_defers_active_persisted_slice_batches_until_commit_window() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-257-background-flush-defers-slices");
@@ -2915,6 +2974,114 @@ fn background_flush_defers_active_persisted_slice_batches_until_commit_window() 
         assert!(
             !vfs.should_background_flush_pending_local_dirty_inode(ino),
             "background local-dirty flush should not immediately commit staged slices while the file still has an active dirty tail"
+        );
+
+        vfs.flush_fh(fh).await.unwrap();
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn background_flush_commits_persisted_slice_waves_and_keeps_latest_hot_tail_staged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-257-background-flush-slice-waves");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-257-background-flush-slice-waves.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let slice_bytes = 2 * 1024 * 1024usize;
+
+        for index in 0..17u64 {
+            let payload = vec![0x20u8.saturating_add(index as u8); slice_bytes];
+            vfs.record_handle_writer_state(fh, ino, index * slice_bytes as u64, &payload)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
+                .await
+                .unwrap(),
+            "first opportunistic pass should spill the oldest staged slice wave while retaining a small active hot tail"
+        );
+        assert!(
+            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
+                .await
+                .unwrap(),
+            "second opportunistic pass should spill the next staged slice wave"
+        );
+
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            32 * 1024 * 1024,
+            "two opportunistic spill passes should stage 32 MiB of persisted slice payloads"
+        );
+        assert_eq!(
+            vfs.state.handle_writers.dirty_bytes_for_inode(ino),
+            slice_bytes,
+            "the newest callback should remain buffered as the active dirty tail"
+        );
+
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            24 * 1024 * 1024,
+            "background flush should commit only a small oldest slice wave first"
+        );
+
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            16 * 1024 * 1024,
+            "subsequent background waves should continue draining old staged slices without touching the hot tail"
+        );
+
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            8 * 1024 * 1024,
+            "background flush should keep shrinking the staged backlog in small waves"
+        );
+
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            4 * 1024 * 1024,
+            "the newest persisted slice should remain staged as the hot tail"
+        );
+
+        tokio::time::sleep(Duration::from_millis(125)).await;
+        assert!(
+            vfs.should_background_flush_pending_local_dirty_inode(ino),
+            "once the hot staged slice ages out, the next background wave should be allowed"
+        );
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            2 * 1024 * 1024,
+            "an aged-out wave should shrink to the final staged 2 MiB tail first"
+        );
+
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            0,
+            "repeated aged-out waves should eventually drain the final staged slice"
         );
 
         vfs.flush_fh(fh).await.unwrap();
