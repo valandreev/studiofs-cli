@@ -873,7 +873,11 @@ impl MetaBlocks for RedbMetaEngine {
             }
             drop(inodes);
 
-            published_blocks = Self::current_manifest_in_txn(&txn, ino)?;
+            published_blocks = match Self::current_manifest_in_txn(&txn, ino) {
+                Ok(published_blocks) => published_blocks,
+                Err(MetaError::FragmentedBlock { .. }) => return Ok(false),
+                Err(err) => return Err(err),
+            };
             if published_blocks.as_slice() != expected_manifest {
                 return Ok(false);
             }

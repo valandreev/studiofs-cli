@@ -713,7 +713,11 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
     /// [`MetaBlocks::publish_file_manifest_if_matches`]. Callers that need an
     /// in-transaction race check should prefer that lower-level API directly.
     fn publish_file_manifest(&self, ino: Ino, expected_epoch: u64) -> MetaResult<bool> {
-        let expected_manifest = self.get_file_blocks(ino)?;
+        let expected_manifest = match self.get_file_blocks(ino) {
+            Ok(expected_manifest) => expected_manifest,
+            Err(MetaError::FragmentedBlock { .. }) => return Ok(false),
+            Err(err) => return Err(err),
+        };
         self.publish_file_manifest_if_matches(ino, expected_epoch, &expected_manifest)
     }
 

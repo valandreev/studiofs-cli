@@ -952,6 +952,59 @@ fn redb_upload_state_transitions_follow_inode_fields() {
 }
 
 #[test]
+fn publish_file_manifest_rejects_fragmented_graph_without_error() {
+    let engine = temp_engine();
+
+    let file = engine
+        .create_file(ROOT_INO, b"fragmented-manifest-publish.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = DEFAULT_BLOCK_SIZE as u64;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+
+    engine
+        .flush_regular_file_overlay_slices(
+            file.ino,
+            &[(
+                ChunkId(0),
+                vec![
+                    SliceRecord {
+                        slice_id: SliceId(0),
+                        order: SliceOrder(0),
+                        range: SliceRange::new(0, 4096).unwrap(),
+                        block: Some(BlockRef::new_partial(501, 4096)),
+                        block_state: BlockRefState::Uploaded,
+                    },
+                    SliceRecord {
+                        slice_id: SliceId(0),
+                        order: SliceOrder(0),
+                        range: SliceRange::new(4096, 8192).unwrap(),
+                        block: Some(BlockRef::new_partial(502, 4096)),
+                        block_state: BlockRefState::Uploaded,
+                    },
+                ],
+            )],
+        )
+        .unwrap();
+    assert!(matches!(
+        engine.get_file_blocks(file.ino),
+        Err(MetaError::FragmentedBlock { .. })
+    ));
+
+    assert!(
+        !engine.publish_file_manifest(file.ino, 1).unwrap(),
+        "legacy flat manifest publish should decline fragmented graphs"
+    );
+    assert!(
+        !engine
+            .publish_file_manifest_if_matches(file.ino, 1, &[])
+            .unwrap(),
+        "race-checked legacy publish should also decline fragmented graphs"
+    );
+}
+
+#[test]
 fn redb_partial_update_does_not_expose_new_blocks_before_publish() {
     let engine = temp_engine();
     let format_info = FormatInfo {
