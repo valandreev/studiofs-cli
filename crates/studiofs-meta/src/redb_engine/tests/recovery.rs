@@ -105,7 +105,7 @@ fn test_recover_undo_logs_replays_deferred_delete_with_fragmented_graph() {
     set_regular_file_chunk_rows(&engine, attr.ino, &[(ChunkId(0), overlay_chunk)], &[]);
 
     assert!(matches!(
-        engine.get_file_blocks(attr.ino),
+        engine.lookup_file_graph_blocks(attr.ino),
         Err(MetaError::FragmentedBlock { .. })
     ));
     let unlinked = engine.unlink_open_handle(parent, name).unwrap();

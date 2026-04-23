@@ -140,7 +140,7 @@ fn test_replica_aux_block_events_accept_fragmented_base_graph() {
     base_chunk.refresh_fragmentation_metrics();
     set_regular_file_chunk_rows(&engine, file.ino, &[], &[(ChunkId(0), base_chunk)]);
     assert!(matches!(
-        engine.get_file_block(file.ino, 0),
+        engine.lookup_file_graph_block(file.ino, 0),
         Err(MetaError::FragmentedBlock { .. })
     ));
 
@@ -160,7 +160,7 @@ fn test_replica_aux_block_events_accept_fragmented_base_graph() {
         .expect("slice-native base replay should update fragmented base graph");
     assert_eq!(
         engine
-            .get_file_block(file.ino, 0)
+            .lookup_file_graph_block(file.ino, 0)
             .unwrap()
             .expect("replacement block")
             .object_id,
@@ -173,5 +173,5 @@ fn test_replica_aux_block_events_accept_fragmented_base_graph() {
             chunk_slices: Vec::new(),
         }])
         .expect("slice-native empty base replay should clear fragmented base graph");
-    assert!(engine.get_file_block(file.ino, 0).unwrap().is_none());
+    assert!(engine.lookup_file_graph_block(file.ino, 0).unwrap().is_none());
 }

@@ -1310,7 +1310,7 @@ mod tests {
     use tokio::runtime::Runtime;
 
     trait SliceNativeMetaFixture {
-        fn set_file_block(
+        fn stage_file_overlay_block(
             &self,
             ino: Ino,
             block_index: u32,
@@ -1362,7 +1362,7 @@ mod tests {
     }
 
     impl SliceNativeMetaFixture for Arc<RedbMetaEngine> {
-        fn set_file_block(
+        fn stage_file_overlay_block(
             &self,
             ino: Ino,
             block_index: u32,
@@ -1954,7 +1954,7 @@ mod tests {
             staged_attr.committed_size = 8;
             staged_attr.upload_state = MetaUploadState::Ready;
             meta.set_attr(&staged_attr).expect("persist committed attr");
-            meta.set_file_block(ino, 0, &BlockRef::new_partial(object_id, 8))
+            meta.stage_file_overlay_block(ino, 0, &BlockRef::new_partial(object_id, 8))
                 .expect("persist committed block");
 
             vfs.write(ino, 2, b"XY").await.expect("stage dirty patch");
@@ -2039,7 +2039,7 @@ mod tests {
             staged_attr.committed_size = 8;
             staged_attr.upload_state = MetaUploadState::Ready;
             meta.set_attr(&staged_attr).expect("persist committed attr");
-            meta.set_file_block(ino, 0, &BlockRef::new_partial(object_id, 8))
+            meta.stage_file_overlay_block(ino, 0, &BlockRef::new_partial(object_id, 8))
                 .expect("persist committed block");
 
             vfs.write(ino, 2, b"XY").await.expect("stage dirty patch");
@@ -2100,7 +2100,7 @@ mod tests {
             staged_attr.committed_content_epoch = 1;
             staged_attr.content_epoch = 2;
             meta.set_attr(&staged_attr).expect("persist staged attr");
-            meta.set_file_block(ino, 0, &BlockRef::new_partial(committed_object_id, 8))
+            meta.stage_file_overlay_block(ino, 0, &BlockRef::new_partial(committed_object_id, 8))
                 .expect("persist committed block");
 
             vfs.state.incarnation.live_extent_records.lock().insert(

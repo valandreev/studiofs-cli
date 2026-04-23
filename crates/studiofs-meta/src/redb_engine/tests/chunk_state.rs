@@ -1206,10 +1206,10 @@ fn redb_manifest_publish_sets_committed_head() {
 
     let block0 = BlockRef::new_full(101, DEFAULT_BLOCK_SIZE);
     let block1 = BlockRef::new_partial(102, 4096);
-    engine.set_file_block(file.ino, 0, &block0).unwrap();
-    engine.set_file_block(file.ino, 1, &block1).unwrap();
+    engine.stage_file_overlay_block(file.ino, 0, &block0).unwrap();
+    engine.stage_file_overlay_block(file.ino, 1, &block1).unwrap();
 
-    assert!(engine.publish_file_manifest(file.ino, 1).unwrap());
+    assert!(engine.publish_overlay_graph(file.ino, 1).unwrap());
 
     let published_attr = engine.get_attr(file.ino).unwrap();
     assert_eq!(published_attr.committed_size, block_size + 4096);
@@ -1225,6 +1225,6 @@ fn redb_manifest_publish_sets_committed_head() {
     assert_eq!(remote_attr.committed_content_epoch, 1);
     assert_eq!(remote_attr.upload_state, UploadState::Ready);
 
-    let remote_blocks = remote.get_file_blocks(file.ino).unwrap();
+    let remote_blocks = remote.lookup_file_graph_blocks(file.ino).unwrap();
     assert_eq!(remote_blocks, vec![(0, block0), (1, block1)]);
 }

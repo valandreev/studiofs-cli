@@ -61,15 +61,19 @@ use uuid::Uuid;
 // =============================================================================
 
 trait SliceNativeMetaFixture {
-    fn set_file_block(
+    fn stage_file_overlay_block(
         &self,
         ino: Ino,
         block_index: u32,
         block: &BlockRef,
     ) -> Result<Option<BlockRef>, MetaError>;
-    fn get_file_block(&self, ino: Ino, block_index: u32) -> Result<Option<BlockRef>, MetaError>;
-    fn get_file_blocks(&self, ino: Ino) -> Result<Vec<(u32, BlockRef)>, MetaError>;
-    fn commit_uploaded_block(
+    fn lookup_file_graph_block(
+        &self,
+        ino: Ino,
+        block_index: u32,
+    ) -> Result<Option<BlockRef>, MetaError>;
+    fn lookup_file_graph_blocks(&self, ino: Ino) -> Result<Vec<(u32, BlockRef)>, MetaError>;
+    fn publish_uploaded_overlay_block(
         &self,
         ino: Ino,
         block_index: u32,
@@ -196,13 +200,16 @@ impl<T> SliceNativeMetaFixture for Arc<T>
 where
     T: ?Sized + MetaBlocks + MetaInodes,
 {
-    fn set_file_block(
+    fn stage_file_overlay_block(
         &self,
         ino: Ino,
         block_index: u32,
         block: &BlockRef,
     ) -> Result<Option<BlockRef>, MetaError> {
-        let old = self.get_file_block(ino, block_index).ok().flatten();
+        let old = self
+            .lookup_file_graph_block(ino, block_index)
+            .ok()
+            .flatten();
         self.flush_regular_file_overlay_slices(
             ino,
             fixture_block_slices(block_index, Some(block))?.as_slice(),
@@ -210,7 +217,11 @@ where
         Ok(old)
     }
 
-    fn get_file_block(&self, ino: Ino, block_index: u32) -> Result<Option<BlockRef>, MetaError> {
+    fn lookup_file_graph_block(
+        &self,
+        ino: Ino,
+        block_index: u32,
+    ) -> Result<Option<BlockRef>, MetaError> {
         self.lookup_regular_file_slices(
             ino,
             u64::from(block_index) * u64::from(DEFAULT_BLOCK_SIZE),
@@ -219,21 +230,21 @@ where
         .and_then(|spans| fixture_block_from_spans(spans, block_index))
     }
 
-    fn get_file_blocks(&self, ino: Ino) -> Result<Vec<(u32, BlockRef)>, MetaError> {
+    fn lookup_file_graph_blocks(&self, ino: Ino) -> Result<Vec<(u32, BlockRef)>, MetaError> {
         let attr = self.get_attr(ino)?;
         let blocks = attr.size.div_ceil(u64::from(DEFAULT_BLOCK_SIZE));
         let mut out = Vec::new();
         for idx in 0..blocks {
             let idx = u32::try_from(idx)
                 .map_err(|_| MetaError::Storage("fixture block index overflow".to_string()))?;
-            if let Some(block) = self.get_file_block(ino, idx)? {
+            if let Some(block) = self.lookup_file_graph_block(ino, idx)? {
                 out.push((idx, block));
             }
         }
         Ok(out)
     }
 
-    fn commit_uploaded_block(
+    fn publish_uploaded_overlay_block(
         &self,
         ino: Ino,
         _block_index: u32,
@@ -250,13 +261,16 @@ where
 }
 
 impl SliceNativeMetaFixture for RedbMetaEngine {
-    fn set_file_block(
+    fn stage_file_overlay_block(
         &self,
         ino: Ino,
         block_index: u32,
         block: &BlockRef,
     ) -> Result<Option<BlockRef>, MetaError> {
-        let old = self.get_file_block(ino, block_index).ok().flatten();
+        let old = self
+            .lookup_file_graph_block(ino, block_index)
+            .ok()
+            .flatten();
         self.flush_regular_file_overlay_slices(
             ino,
             fixture_block_slices(block_index, Some(block))?.as_slice(),
@@ -264,7 +278,11 @@ impl SliceNativeMetaFixture for RedbMetaEngine {
         Ok(old)
     }
 
-    fn get_file_block(&self, ino: Ino, block_index: u32) -> Result<Option<BlockRef>, MetaError> {
+    fn lookup_file_graph_block(
+        &self,
+        ino: Ino,
+        block_index: u32,
+    ) -> Result<Option<BlockRef>, MetaError> {
         self.lookup_regular_file_slices(
             ino,
             u64::from(block_index) * u64::from(DEFAULT_BLOCK_SIZE),
@@ -273,21 +291,21 @@ impl SliceNativeMetaFixture for RedbMetaEngine {
         .and_then(|spans| fixture_block_from_spans(spans, block_index))
     }
 
-    fn get_file_blocks(&self, ino: Ino) -> Result<Vec<(u32, BlockRef)>, MetaError> {
+    fn lookup_file_graph_blocks(&self, ino: Ino) -> Result<Vec<(u32, BlockRef)>, MetaError> {
         let attr = self.get_attr(ino)?;
         let blocks = attr.size.div_ceil(u64::from(DEFAULT_BLOCK_SIZE));
         let mut out = Vec::new();
         for idx in 0..blocks {
             let idx = u32::try_from(idx)
                 .map_err(|_| MetaError::Storage("fixture block index overflow".to_string()))?;
-            if let Some(block) = self.get_file_block(ino, idx)? {
+            if let Some(block) = self.lookup_file_graph_block(ino, idx)? {
                 out.push((idx, block));
             }
         }
         Ok(out)
     }
 
-    fn commit_uploaded_block(
+    fn publish_uploaded_overlay_block(
         &self,
         ino: Ino,
         _block_index: u32,
@@ -1444,10 +1462,10 @@ async fn seed_committed_file(
         } else {
             BlockRef::new_partial(object_id, chunk.len() as u32)
         };
-        meta.set_file_block(ino, block_index as u32, &block_ref)
+        meta.stage_file_overlay_block(ino, block_index as u32, &block_ref)
             .unwrap();
         assert!(
-            meta.commit_uploaded_block(
+            meta.publish_uploaded_overlay_block(
                 ino,
                 block_index as u32,
                 file_attr.content_epoch,
@@ -1458,7 +1476,7 @@ async fn seed_committed_file(
         );
     }
 
-    (ino, meta.get_file_blocks(ino).unwrap())
+    (ino, meta.lookup_file_graph_blocks(ino).unwrap())
 }
 
 fn wait_until_blocks(
@@ -1468,7 +1486,7 @@ fn wait_until_blocks(
 ) -> Option<Vec<(u32, BlockRef)>> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(blocks) = vfs.meta().get_file_blocks(ino)
+        if let Ok(blocks) = vfs.meta().lookup_file_graph_blocks(ino)
             && !blocks.is_empty()
         {
             return Some(blocks);
@@ -1493,7 +1511,7 @@ fn wait_until_n_blocks(
 ) -> Option<Vec<(u32, BlockRef)>> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(blocks) = vfs.meta().get_file_blocks(ino)
+        if let Ok(blocks) = vfs.meta().lookup_file_graph_blocks(ino)
             && blocks.len() >= expected
         {
             return Some(blocks);
@@ -1794,7 +1812,7 @@ async fn test_truncate_file() {
     vfs.setattr(ino, SetattrArgs::size_only(new_size)).unwrap();
 
     // Verify 2 blocks now (truncation is synchronous — no wait needed)
-    let blocks = vfs.meta().get_file_blocks(ino).unwrap();
+    let blocks = vfs.meta().lookup_file_graph_blocks(ino).unwrap();
     assert_eq!(blocks.len(), 2);
 
     // Verify file size
@@ -1867,7 +1885,7 @@ async fn test_pending_deletions_gc() {
                 && attr.committed_content_epoch == attr.content_epoch
                 && vfs
                     .meta()
-                    .get_file_blocks(ino)
+                    .lookup_file_graph_blocks(ino)
                     .unwrap()
                     .first()
                     .is_some_and(|(_, block)| block.object_id != old_block_id)
@@ -1886,7 +1904,7 @@ async fn test_pending_deletions_gc() {
     );
 
     // Verify new block is different
-    let blocks_after = vfs.meta().get_file_blocks(ino).unwrap();
+    let blocks_after = vfs.meta().lookup_file_graph_blocks(ino).unwrap();
     assert_ne!(blocks_after[0].1.object_id, old_block_id);
 }
 
@@ -2335,7 +2353,7 @@ fn test_crash_recovery_replays_pending_journal() {
             // and no journal files exist yet.
             let deadline = Instant::now() + Duration::from_secs(15);
             loop {
-                if let Ok(blocks) = vfs.meta().get_file_blocks(attr.ino)
+                if let Ok(blocks) = vfs.meta().lookup_file_graph_blocks(attr.ino)
                     && !blocks.is_empty()
                 {
                     break;
@@ -2385,7 +2403,7 @@ fn test_crash_recovery_replays_pending_journal() {
         vfs.start()
             .expect("failed to start StudioVfs background workers");
 
-        let blocks = meta.get_file_blocks(crash_file_ino).unwrap();
+        let blocks = meta.lookup_file_graph_blocks(crash_file_ino).unwrap();
         assert!(!blocks.is_empty(), "file blocks must exist in metadata");
         let object_id = blocks[0].1.object_id;
         let check_store = DataStore::new(&DataStoreConfig::from(&online_info)).unwrap();
@@ -2525,7 +2543,7 @@ fn test_crash_recovery_replays_local_committed_block_before_metadata_flush() {
             vfs.start()
                 .expect("failed to start StudioVfs background workers");
 
-            let before = meta.get_file_blocks(ino).unwrap();
+            let before = meta.lookup_file_graph_blocks(ino).unwrap();
             assert_eq!(
                 before.len(),
                 1,
@@ -2539,7 +2557,7 @@ fn test_crash_recovery_replays_local_committed_block_before_metadata_flush() {
             vfs.write(ino, 0, &replacement_payload).await.unwrap();
             vfs.flush(ino).await.unwrap();
 
-            let after = meta.get_file_blocks(ino).unwrap();
+            let after = meta.lookup_file_graph_blocks(ino).unwrap();
             assert_eq!(
                 after.len(),
                 1,
@@ -2556,7 +2574,7 @@ fn test_crash_recovery_replays_local_committed_block_before_metadata_flush() {
         });
         rt.shutdown_background();
     }
-    let blocks_after_crash = meta.get_file_blocks(ino).unwrap();
+    let blocks_after_crash = meta.lookup_file_graph_blocks(ino).unwrap();
     assert_ne!(
         blocks_after_crash[0].1.object_id, baseline_object_id,
         "metadata should still point at the locally committed replacement after crash"
@@ -2584,7 +2602,7 @@ fn test_crash_recovery_replays_local_committed_block_before_metadata_flush() {
             vfs.start()
                 .expect("failed to start StudioVfs background workers");
 
-            let blocks = meta.get_file_blocks(ino).unwrap();
+            let blocks = meta.lookup_file_graph_blocks(ino).unwrap();
             assert_eq!(blocks.len(), 1);
             assert_ne!(blocks[0].1.object_id, baseline_object_id);
 
@@ -2655,7 +2673,7 @@ fn writer_reads_full_file_before_any_remote_commit() {
         vfs.write(attr.ino, 0, &payload).await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
 
-        let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
+        let blocks = vfs.meta().lookup_file_graph_blocks(attr.ino).unwrap();
         assert!(
             !blocks.is_empty(),
             "local flush should commit metadata even before any remote upload succeeds"
@@ -2730,7 +2748,7 @@ fn full_block_write_flush_recovers_pending_upload_after_restart() {
                 "stage-first full-block write must advance the live inode size immediately"
             );
             assert_eq!(
-                vfs.meta().get_file_blocks(inode).unwrap().len(),
+                vfs.meta().lookup_file_graph_blocks(inode).unwrap().len(),
                 0,
                 "stage-first full-block write should not commit block refs before an explicit flush"
             );
@@ -2749,7 +2767,7 @@ fn full_block_write_flush_recovers_pending_upload_after_restart() {
 
             vfs.flush(inode).await.unwrap();
             assert_eq!(
-                vfs.meta().get_file_blocks(inode).unwrap().len(),
+                vfs.meta().lookup_file_graph_blocks(inode).unwrap().len(),
                 1,
                 "flush should materialize the staged full block into unpublished metadata"
             );
@@ -2787,7 +2805,7 @@ fn full_block_write_flush_recovers_pending_upload_after_restart() {
             );
             let attr_after = vfs.getattr(inode).unwrap();
             assert_eq!(attr_after.size, payload.len() as u64);
-            assert_eq!(vfs.meta().get_file_blocks(inode).unwrap().len(), 1);
+            assert_eq!(vfs.meta().lookup_file_graph_blocks(inode).unwrap().len(), 1);
 
             let read = vfs.read(inode, 0, payload.len() as u32).await.unwrap();
             assert_eq!(
@@ -3676,7 +3694,7 @@ fn atomic_switch_to_new_incarnation_after_full_commit() {
             );
             let remote_attr = remote_vfs.lookup(1, b"atomic-switch.bin").unwrap();
             assert_eq!(remote_attr.upload_state, UploadState::Updating);
-            let remote_blocks_before = remote_meta.get_file_blocks(ino).unwrap();
+            let remote_blocks_before = remote_meta.lookup_file_graph_blocks(ino).unwrap();
             assert_eq!(remote_blocks_before, baseline_blocks);
             let read_before = remote_vfs
                 .read(ino, 0, baseline_payload.len() as u32)
@@ -3706,7 +3724,7 @@ fn atomic_switch_to_new_incarnation_after_full_commit() {
                 &remote_cache_str,
             );
             let remote_attr_after = remote_vfs.lookup(1, b"atomic-switch.bin").unwrap();
-            let remote_blocks_after = remote_meta.get_file_blocks(ino).unwrap();
+            let remote_blocks_after = remote_meta.lookup_file_graph_blocks(ino).unwrap();
             let read_after = remote_vfs
                 .read(ino, 0, replacement_payload.len() as u32)
                 .await
@@ -4280,7 +4298,7 @@ fn test_crash_recovery_replays_local_committed_block_before_remote_fetch() {
                 .expect("failed to start StudioVfs background workers");
             vfs.write(ino, 0, &replacement_payload).await.unwrap();
             vfs.flush(ino).await.unwrap();
-            let blocks = vfs.meta().get_file_blocks(ino).unwrap();
+            let blocks = vfs.meta().lookup_file_graph_blocks(ino).unwrap();
             assert_eq!(blocks.len(), 1);
             replacement_object_id = blocks[0].1.object_id;
             assert_ne!(replacement_object_id, baseline_object_id);
@@ -4321,7 +4339,7 @@ fn test_crash_recovery_replays_local_committed_block_before_remote_fetch() {
             )
             .unwrap();
             vfs.start().expect("failed to start StudioVfs background workers");
-            let blocks = vfs.meta().get_file_blocks(ino).unwrap();
+            let blocks = vfs.meta().lookup_file_graph_blocks(ino).unwrap();
             assert_eq!(blocks.len(), 1);
             assert_eq!(blocks[0].1.object_id, replacement_object_id);
             let read = tokio::time::timeout(
@@ -4336,7 +4354,7 @@ fn test_crash_recovery_replays_local_committed_block_before_remote_fetch() {
                 replacement_payload.as_slice(),
                 "read after restart with offline endpoint should use committed block-store state; ingress_stats={:?} meta_blocks={:?}",
                 vfs.ingress_stats(),
-                vfs.meta().get_file_blocks(ino).ok(),
+                vfs.meta().lookup_file_graph_blocks(ino).ok(),
             );
         });
         rt.shutdown_background();
@@ -5604,7 +5622,7 @@ fn large_file_partial_overwrite_reuploads_only_touched_extents() {
             assert_eq!(live_extents[0].0, 0);
             assert_eq!(live_extents[1].0, 2);
 
-            let after_blocks = meta.get_file_blocks(ino).unwrap();
+            let after_blocks = meta.lookup_file_graph_blocks(ino).unwrap();
             assert_eq!(after_blocks.len(), 3);
             assert_ne!(after_blocks[0].1.object_id, baseline_blocks[0].1.object_id);
             assert_eq!(after_blocks[1].1.object_id, baseline_blocks[1].1.object_id);
@@ -5767,7 +5785,7 @@ fn stale_upload_completion_is_ignored_after_extent_invalidate() {
                 .await,
                 "stale superseded upload must be canceled instead of committing"
             );
-            let blocks = meta.get_file_blocks(ino).unwrap();
+            let blocks = meta.lookup_file_graph_blocks(ino).unwrap();
             assert_eq!(blocks.len(), 1);
             assert_eq!(blocks[0].1.object_id, second_extent_object_id);
             let read = vfs.read(ino, 0, block_size as u32).await.unwrap();
@@ -6011,7 +6029,7 @@ fn update_manifest_reuses_untouched_committed_extents() {
             "single-block update should materialize exactly one live pending extent"
         );
 
-        let visible_blocks = meta.get_file_blocks(ino).unwrap();
+        let visible_blocks = meta.lookup_file_graph_blocks(ino).unwrap();
         assert_eq!(visible_blocks.len(), 3);
         assert_eq!(visible_blocks[0].1.object_id, baseline_blocks[0].1.object_id);
         assert_ne!(visible_blocks[1].1.object_id, baseline_blocks[1].1.object_id);
@@ -6458,7 +6476,8 @@ fn background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart(
 
             let replacement_block =
                 BlockRef::new_partial(replacement_object_id, replacement_payload.len() as u32);
-            meta.set_file_block(ino, 0, &replacement_block).unwrap();
+            meta.stage_file_overlay_block(ino, 0, &replacement_block)
+                .unwrap();
 
             let unpublished_attr = meta.get_attr(ino).unwrap();
             assert_eq!(unpublished_attr.upload_state, UploadState::Updating);
@@ -6541,7 +6560,7 @@ fn background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart(
             "remote-visible state must remain on the last committed epoch"
         );
         assert_eq!(remote_attr.upload_state, UploadState::Updating);
-        let remote_block = remote_meta.get_file_block(ino, 0).unwrap().unwrap();
+        let remote_block = remote_meta.lookup_file_graph_block(ino, 0).unwrap().unwrap();
         assert_eq!(
             remote_block.object_id,
             committed_block.object_id,
@@ -7092,7 +7111,7 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
                     vfs.pending_uploads_for_inode(ino),
                     vfs.upload_stats(),
                     std::env::var("STUDIOFS_S3_ENDPOINT").ok(),
-                    vfs.meta().get_file_blocks(ino).ok(),
+                    vfs.meta().lookup_file_graph_blocks(ino).ok(),
                     vfs.live_extent_records_for_inode(ino),
                 );
                 tokio::time::sleep(Duration::from_millis(75)).await;
@@ -7823,7 +7842,10 @@ fn test_single_mode_ingress_write_path_materializes_local_blocks() {
         vfs.write(attr.ino, 0, &payload).await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
         let _stats = vfs.ingress_stats();
-        assert_eq!(vfs.meta().get_file_blocks(attr.ino).unwrap().len(), 1);
+        assert_eq!(
+            vfs.meta().lookup_file_graph_blocks(attr.ino).unwrap().len(),
+            1
+        );
     });
     rt.shutdown_background();
 }
@@ -7906,7 +7928,7 @@ fn test_write_fast_mode_no_spill_artifacts() {
                 object_id = Some(id);
                 break;
             }
-            if let Ok(blocks) = vfs.meta().get_file_blocks(attr.ino)
+            if let Ok(blocks) = vfs.meta().lookup_file_graph_blocks(attr.ino)
                 && let Some((_, block_ref)) = blocks.first()
             {
                 object_id = Some(block_ref.object_id);
@@ -9417,7 +9439,7 @@ async fn test_truncate_to_exact_block_boundary() {
     // Truncate to exactly 1 block boundary = block_size bytes.
     vfs.setattr(attr.ino, SetattrArgs::size_only(block_size as u64))
         .unwrap();
-    let after = vfs.meta().get_file_blocks(attr.ino).unwrap();
+    let after = vfs.meta().lookup_file_graph_blocks(attr.ino).unwrap();
     assert_eq!(after.len(), 1, "Only 1 block should remain");
 
     let (idx, blk) = &after[0];
@@ -9607,7 +9629,10 @@ fn flush_with_offline_s3_keeps_data_locally_committed_and_queued() {
             !vfs.pending_uploads_for_inode(attr.ino).is_empty(),
             "offline S3 should leave the flush queued for later upload replay"
         );
-        assert_eq!(vfs.meta().get_file_blocks(attr.ino).unwrap().len(), 1);
+        assert_eq!(
+            vfs.meta().lookup_file_graph_blocks(attr.ino).unwrap().len(),
+            1
+        );
         let state = vfs.inode_incarnation_state(attr.ino).await.unwrap();
         assert_eq!(state.upload_state, VfsUploadState::Updating);
         let committed = state
@@ -9695,7 +9720,7 @@ fn write_returns_after_small_new_file_is_locally_readable_until_flush() {
             persisted_attr.size, 0,
             "small partial writes should leave durable metadata at the pre-barrier size"
         );
-        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        let blocks = meta.lookup_file_graph_blocks(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             0,
@@ -9706,7 +9731,7 @@ fn write_returns_after_small_new_file_is_locally_readable_until_flush() {
 
         let persisted_attr = meta.get_attr(attr.ino).unwrap();
         assert_eq!(persisted_attr.size, payload.len() as u64);
-        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        let blocks = meta.lookup_file_graph_blocks(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             1,
@@ -9852,7 +9877,7 @@ fn truncate_of_published_file_keeps_committed_size_and_pending_incarnation() {
         let published_epoch = published_before.committed_content_epoch;
         let published_size = published_before.committed_size;
         let published_objects = meta
-            .get_file_blocks(ino)
+            .lookup_file_graph_blocks(ino)
             .unwrap()
             .into_iter()
             .map(|(_, block)| block.object_id)
@@ -9958,7 +9983,7 @@ fn append_after_create_stays_buffered_until_flush() {
             persisted_attr.size, 0,
             "ordinary append-before-flush should keep the durable local metadata at the pre-barrier size"
         );
-        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        let blocks = meta.lookup_file_graph_blocks(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             0,
@@ -9969,7 +9994,7 @@ fn append_after_create_stays_buffered_until_flush() {
 
         let persisted_attr = meta.get_attr(attr.ino).unwrap();
         assert_eq!(persisted_attr.size, expected.len() as u64);
-        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        let blocks = meta.lookup_file_graph_blocks(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             1,
@@ -10024,7 +10049,7 @@ fn truncate_after_create_is_locally_durable_without_flush() {
 
         let persisted_attr = meta.get_attr(attr.ino).unwrap();
         assert_eq!(persisted_attr.size, 8);
-        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        let blocks = meta.lookup_file_graph_blocks(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             1,
@@ -10109,7 +10134,7 @@ fn full_block_write_with_offline_s3_stays_local_until_flush_then_queues_upload()
             "remote upload work should stay deferred until flush commits metadata"
         );
         assert_eq!(
-            vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
+            vfs.meta().lookup_file_graph_blocks(attr.ino).unwrap().len(),
             0,
             "stage-first writes should not commit block refs before flush"
         );
@@ -10124,7 +10149,7 @@ fn full_block_write_with_offline_s3_stays_local_until_flush_then_queues_upload()
             !vfs.pending_uploads_for_inode(attr.ino).is_empty(),
             "flush should queue remote upload work even when S3 is offline"
         );
-        assert_eq!(vfs.meta().get_file_blocks(attr.ino).unwrap().len(), 1);
+        assert_eq!(vfs.meta().lookup_file_graph_blocks(attr.ino).unwrap().len(), 1);
         let state = vfs.inode_incarnation_state(attr.ino).await.unwrap();
         assert_eq!(state.upload_state, VfsUploadState::Updating);
         let committed = state.committed_incarnation.expect(
@@ -10195,7 +10220,7 @@ fn write_stages_successive_full_blocks_without_waiting_for_threshold() {
 
         vfs.write(attr.ino, 0, &first).await.unwrap();
         assert!(
-            vfs.meta().get_file_blocks(attr.ino).unwrap().is_empty(),
+            vfs.meta().lookup_file_graph_blocks(attr.ino).unwrap().is_empty(),
             "stage-first write should keep the first full block in local staging until flush"
         );
         assert!(
@@ -10222,7 +10247,7 @@ fn write_stages_successive_full_blocks_without_waiting_for_threshold() {
         vfs.write(attr.ino, (block_size * 3) as u64, &fourth)
             .await
             .unwrap();
-        let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
+        let blocks = vfs.meta().lookup_file_graph_blocks(attr.ino).unwrap();
         assert!(
             blocks.len() < 4,
             "foreground writes should not need to fully materialize every staged block before the explicit flush barrier"
@@ -10247,7 +10272,7 @@ fn write_stages_successive_full_blocks_without_waiting_for_threshold() {
         );
 
         vfs.flush(attr.ino).await.unwrap();
-        let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
+        let blocks = vfs.meta().lookup_file_graph_blocks(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             4,
@@ -10313,7 +10338,7 @@ fn write_stages_full_blocks_without_explicit_flush() {
         let payload = vec![0x33u8; block_size];
 
         vfs.write(attr.ino, 0, &payload).await.unwrap();
-        let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
+        let blocks = vfs.meta().lookup_file_graph_blocks(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             0,
@@ -10327,7 +10352,7 @@ fn write_stages_full_blocks_without_explicit_flush() {
         assert_eq!(read.as_ref(), payload.as_slice());
 
         vfs.flush(attr.ino).await.unwrap();
-        let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
+        let blocks = vfs.meta().lookup_file_graph_blocks(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             1,
@@ -10399,7 +10424,7 @@ fn write_stages_full_block_prefix_and_buffers_tail_until_flush() {
         );
 
         assert_eq!(
-            vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
+            vfs.meta().lookup_file_graph_blocks(attr.ino).unwrap().len(),
             0,
             "stage-first write should keep the completed full-block prefix in local staging until flush"
         );
@@ -10426,7 +10451,7 @@ fn write_stages_full_block_prefix_and_buffers_tail_until_flush() {
             "flush should advance the durable local metadata to include the tail bytes"
         );
         assert_eq!(
-            vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
+            vfs.meta().lookup_file_graph_blocks(attr.ino).unwrap().len(),
             2,
             "flush should materialize the buffered partial tail block"
         );
@@ -10482,7 +10507,7 @@ fn read_from_start_does_not_depend_on_metadata_materialization() {
 
         vfs.write(attr.ino, 0, &payload).await.unwrap();
 
-        let persisted_before = vfs.meta().get_file_blocks(attr.ino).unwrap().len();
+        let persisted_before = vfs.meta().lookup_file_graph_blocks(attr.ino).unwrap().len();
         let ingress_before = vfs.ingress_stats();
         assert_eq!(
             persisted_before,
@@ -10511,7 +10536,7 @@ fn read_from_start_does_not_depend_on_metadata_materialization() {
         );
         vfs.flush(attr.ino).await.unwrap();
         assert_eq!(
-            vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
+            vfs.meta().lookup_file_graph_blocks(attr.ino).unwrap().len(),
             burst_blocks,
             "flush should materialize every staged full block after the read succeeds"
         );
@@ -10572,14 +10597,14 @@ fn write_stages_full_blocks_and_buffers_tail_without_buffered_relief() {
 
         vfs.write(attr.ino, 0, &first).await.unwrap();
         assert!(
-            vfs.meta().get_file_blocks(attr.ino).unwrap().is_empty(),
+            vfs.meta().lookup_file_graph_blocks(attr.ino).unwrap().is_empty(),
             "stage-first writes should keep the initial full block in local staging until flush"
         );
 
         vfs.write(attr.ino, block_size as u64, &tail).await.unwrap();
 
         assert_eq!(
-            vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
+            vfs.meta().lookup_file_graph_blocks(attr.ino).unwrap().len(),
             0,
             "the tail block should remain buffered while the initial full block stays locally staged"
         );
@@ -10612,7 +10637,7 @@ fn write_stages_full_blocks_and_buffers_tail_without_buffered_relief() {
         vfs.flush(attr.ino).await.unwrap();
 
         assert_eq!(
-            vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
+            vfs.meta().lookup_file_graph_blocks(attr.ino).unwrap().len(),
             2,
             "flush should durably persist the buffered tail block alongside the initial full block"
         );
@@ -10649,7 +10674,7 @@ async fn test_truncate_to_zero_then_rewrite() {
     let _ = wait_until_n_blocks(&vfs, ino, 2, Duration::from_secs(15));
 
     // Get old block IDs.
-    let old_blocks = vfs.meta().get_file_blocks(ino).unwrap();
+    let old_blocks = vfs.meta().lookup_file_graph_blocks(ino).unwrap();
     let old_ids: Vec<u64> = old_blocks.iter().map(|(_, b)| b.object_id).collect();
     assert!(!old_ids.is_empty());
 
@@ -10658,7 +10683,7 @@ async fn test_truncate_to_zero_then_rewrite() {
     assert_eq!(vfs.getattr(ino).unwrap().size, 0);
 
     // All blocks should be removed when truncating to zero.
-    let remaining = vfs.meta().get_file_blocks(ino).unwrap();
+    let remaining = vfs.meta().lookup_file_graph_blocks(ino).unwrap();
     assert!(
         remaining.is_empty(),
         "all blocks should be removed after truncate-to-zero, got {}",
@@ -10755,7 +10780,12 @@ async fn test_flush_empty_file_is_noop() {
     // Flush without writing anything — should not panic or allocate blocks.
     vfs.flush(attr.ino).await.unwrap();
     assert_eq!(vfs.getattr(attr.ino).unwrap().size, 0);
-    assert!(vfs.meta().get_file_blocks(attr.ino).unwrap().is_empty());
+    assert!(
+        vfs.meta()
+            .lookup_file_graph_blocks(attr.ino)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// Read zero bytes from a file — should return empty immediately.
@@ -11068,7 +11098,7 @@ async fn test_rename_overwrite_existing_file() {
     vfs.flush(target.ino).await.unwrap();
     let _ = wait_until_n_blocks(&vfs, target.ino, 1, Duration::from_secs(15));
 
-    let target_blocks = vfs.meta().get_file_blocks(target.ino).unwrap();
+    let target_blocks = vfs.meta().lookup_file_graph_blocks(target.ino).unwrap();
     let target_block_id = target_blocks[0].1.object_id;
 
     // Create source file with data.
@@ -11124,7 +11154,7 @@ async fn test_unlink_with_open_handle_deferred_cleanup() {
     assert_eq!(&data[..], b"orphan data");
 
     // Blocks should still exist (not yet GC'd).
-    let blocks = vfs.meta().get_file_blocks(ino).unwrap();
+    let blocks = vfs.meta().lookup_file_graph_blocks(ino).unwrap();
     assert!(
         !blocks.is_empty(),
         "blocks should survive until last handle closes"
@@ -11135,7 +11165,7 @@ async fn test_unlink_with_open_handle_deferred_cleanup() {
     vfs.release_fh(fh).await.unwrap();
 
     // Now blocks should be removed and pending deletion.
-    let blocks_after = vfs.meta().get_file_blocks(ino).unwrap();
+    let blocks_after = vfs.meta().lookup_file_graph_blocks(ino).unwrap();
     assert!(
         blocks_after.is_empty(),
         "blocks should be removed after release_fh"
@@ -11340,7 +11370,7 @@ async fn test_multiple_handles_orphan_cleanup_after_last_close() {
     // Close first two — blocks should still exist (orphan still alive).
     vfs.release_fh(fh1).await.unwrap();
     vfs.release_fh(fh2).await.unwrap();
-    let blocks_mid = vfs.meta().get_file_blocks(ino).unwrap();
+    let blocks_mid = vfs.meta().lookup_file_graph_blocks(ino).unwrap();
     assert!(
         !blocks_mid.is_empty(),
         "blocks should survive with 1 handle remaining"
@@ -11348,7 +11378,7 @@ async fn test_multiple_handles_orphan_cleanup_after_last_close() {
 
     // Close the last handle — orphan cleanup triggers.
     vfs.release_fh(fh3).await.unwrap();
-    let blocks_final = vfs.meta().get_file_blocks(ino).unwrap();
+    let blocks_final = vfs.meta().lookup_file_graph_blocks(ino).unwrap();
     assert!(
         blocks_final.is_empty(),
         "blocks should be cleaned up after last handle closes"
@@ -12423,7 +12453,7 @@ async fn test_hardlink_unlink_one_keeps_other() {
     assert_eq!(a.ino, attr.ino);
 
     // Blocks should NOT be removed (nlink still > 0).
-    let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
+    let blocks = vfs.meta().lookup_file_graph_blocks(attr.ino).unwrap();
     assert!(
         !blocks.is_empty(),
         "blocks should survive when hardlink remains"
@@ -12972,7 +13002,7 @@ async fn test_shutdown_drains_dirty_buffers() {
     vfs.shutdown(Duration::from_secs(30)).await;
 
     // After shutdown, all 3 blocks should exist in metadata.
-    let blocks = vfs.meta().get_file_blocks(ino).unwrap();
+    let blocks = vfs.meta().lookup_file_graph_blocks(ino).unwrap();
     assert_eq!(
         blocks.len(),
         3,

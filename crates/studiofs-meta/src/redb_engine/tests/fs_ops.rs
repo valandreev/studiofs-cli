@@ -129,13 +129,13 @@ fn zeroio_delete_before_publish_persists_tombstone_lifecycle() {
     attr.content_epoch = 1;
     engine.set_attr(&attr).unwrap();
     engine
-        .set_file_block(file.ino, 0, &BlockRef::new_partial(950, 4096))
+        .stage_file_overlay_block(file.ino, 0, &BlockRef::new_partial(950, 4096))
         .unwrap();
     let uploaded = BlockRef::new_partial(951, 4096);
-    engine.set_file_block(file.ino, 1, &uploaded).unwrap();
+    engine.stage_file_overlay_block(file.ino, 1, &uploaded).unwrap();
     assert!(
         engine
-            .mark_file_block_uploaded_if_matches(file.ino, 1, 1, &uploaded)
+            .mark_overlay_block_uploaded_if_matches(file.ino, 1, 1, &uploaded)
             .unwrap()
     );
 
@@ -179,17 +179,17 @@ fn zeroio_unlink_open_handle_marks_unpublished_epoch_deleted_before_publish() {
     published_attr.content_epoch = 1;
     engine.set_attr(&published_attr).unwrap();
     let published = BlockRef::new_partial(960, 4096);
-    engine.set_file_block(file.ino, 0, &published).unwrap();
-    assert!(engine.publish_file_manifest(file.ino, 1).unwrap());
+    engine.stage_file_overlay_block(file.ino, 0, &published).unwrap();
+    assert!(engine.publish_overlay_graph(file.ino, 1).unwrap());
 
     let mut overwrite_attr = engine.get_attr(file.ino).unwrap();
     overwrite_attr.content_epoch = 2;
     engine.set_attr(&overwrite_attr).unwrap();
     let uploaded_overlay = BlockRef::new_partial(961, 4096);
-    engine.set_file_block(file.ino, 0, &uploaded_overlay).unwrap();
+    engine.stage_file_overlay_block(file.ino, 0, &uploaded_overlay).unwrap();
     assert!(
         engine
-            .mark_file_block_uploaded_if_matches(file.ino, 0, 2, &uploaded_overlay)
+            .mark_overlay_block_uploaded_if_matches(file.ino, 0, 2, &uploaded_overlay)
             .unwrap()
     );
 
@@ -498,9 +498,9 @@ fn redb_rename_keeps_same_inode_and_incarnation_ids() {
     attr.content_epoch = 7;
     engine.set_attr(&attr).unwrap();
     engine
-        .set_file_block(file.ino, 0, &BlockRef::new_partial(401, 4096))
+        .stage_file_overlay_block(file.ino, 0, &BlockRef::new_partial(401, 4096))
         .unwrap();
-    assert!(engine.publish_file_manifest(file.ino, 7).unwrap());
+    assert!(engine.publish_overlay_graph(file.ino, 7).unwrap());
 
     engine
         .rename_atomic(
@@ -608,13 +608,13 @@ fn test_unlink_last_link_cleans_blocks_for_inode_with_0xff_suffix() {
     persisted.size = 4096;
     engine.set_attr(&persisted).unwrap();
     engine
-        .set_file_block(attr.ino, 0, &BlockRef::new_partial(4_255, 4096))
+        .stage_file_overlay_block(attr.ino, 0, &BlockRef::new_partial(4_255, 4096))
         .unwrap();
 
     let removed = engine.unlink(ROOT_INO, b"ff-suffix.bin").unwrap();
     assert_eq!(removed.nlink, 0);
     assert!(engine.get_attr(attr.ino).is_err());
-    assert!(engine.get_file_blocks(attr.ino).unwrap().is_empty());
+    assert!(engine.lookup_file_graph_blocks(attr.ino).unwrap().is_empty());
 }
 
 // === xattr Tests ===
