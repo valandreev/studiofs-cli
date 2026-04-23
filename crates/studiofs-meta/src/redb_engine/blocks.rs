@@ -684,7 +684,11 @@ impl MetaBlocks for RedbMetaEngine {
             }
             drop(inodes);
 
-            let current = Self::current_block_in_txn(&txn, ino, block_index, block_size)?;
+            let current = match Self::current_block_in_txn(&txn, ino, block_index, block_size) {
+                Ok(current) => current,
+                Err(MetaError::FragmentedBlock { .. }) => return Ok(false),
+                Err(err) => return Err(err),
+            };
             let Some(current) = current else {
                 return Ok(false);
             };
@@ -799,7 +803,11 @@ impl MetaBlocks for RedbMetaEngine {
             }
             drop(inodes);
 
-            let current = Self::current_block_in_txn(&txn, ino, block_index, block_size)?;
+            let current = match Self::current_block_in_txn(&txn, ino, block_index, block_size) {
+                Ok(current) => current,
+                Err(MetaError::FragmentedBlock { .. }) => return Ok(false),
+                Err(err) => return Err(err),
+            };
             let Some(current) = current else {
                 return Ok(false);
             };

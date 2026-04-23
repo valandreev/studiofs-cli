@@ -651,6 +651,51 @@ fn test_commit_uploaded_block_rejects_replaced_block() {
 }
 
 #[test]
+fn commit_uploaded_block_rejects_fragmented_overlay_without_error() {
+    let engine = temp_engine();
+
+    let file = engine
+        .create_file(ROOT_INO, b"fragmented-commit-block.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = DEFAULT_BLOCK_SIZE as u64;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+
+    engine
+        .flush_regular_file_overlay_slices(
+            file.ino,
+            &[(
+                ChunkId(0),
+                vec![
+                    SliceRecord {
+                        slice_id: SliceId(0),
+                        order: SliceOrder(0),
+                        range: SliceRange::new(0, 4096).unwrap(),
+                        block: Some(BlockRef::new_partial(401, 4096)),
+                        block_state: BlockRefState::Uploaded,
+                    },
+                    SliceRecord {
+                        slice_id: SliceId(0),
+                        order: SliceOrder(0),
+                        range: SliceRange::new(4096, 8192).unwrap(),
+                        block: Some(BlockRef::new_partial(402, 4096)),
+                        block_state: BlockRefState::Uploaded,
+                    },
+                ],
+            )],
+        )
+        .unwrap();
+
+    assert!(
+        !engine
+            .commit_uploaded_block(file.ino, 0, 1, &BlockRef::new_partial(401, 4096))
+            .unwrap(),
+        "legacy single-block commit should decline fragmented blocks"
+    );
+}
+
+#[test]
 fn zeroio_uploaded_overlay_blocks_make_epoch_publish_ready_only_after_full_epoch_upload() {
     let engine = temp_engine();
 
@@ -694,6 +739,60 @@ fn zeroio_uploaded_overlay_blocks_make_epoch_publish_ready_only_after_full_epoch
     assert_eq!(publish_ready.published_size, 0);
     assert_eq!(publish_ready.local_content_epoch, 1);
     assert_eq!(publish_ready.published_content_epoch, 0);
+}
+
+#[test]
+fn mark_file_block_uploaded_if_matches_rejects_fragmented_overlay_without_error() {
+    let engine = temp_engine();
+
+    let file = engine
+        .create_file(ROOT_INO, b"fragmented-upload-mark.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.size = DEFAULT_BLOCK_SIZE as u64;
+    attr.content_epoch = 1;
+    engine.set_attr(&attr).unwrap();
+
+    engine
+        .flush_regular_file_overlay_slices(
+            file.ino,
+            &[(
+                ChunkId(0),
+                vec![
+                    SliceRecord {
+                        slice_id: SliceId(0),
+                        order: SliceOrder(0),
+                        range: SliceRange::new(0, 4096).unwrap(),
+                        block: Some(BlockRef::new_partial(301, 4096)),
+                        block_state: BlockRefState::LocalOnly,
+                    },
+                    SliceRecord {
+                        slice_id: SliceId(0),
+                        order: SliceOrder(0),
+                        range: SliceRange::new(4096, 8192).unwrap(),
+                        block: Some(BlockRef::new_partial(302, 4096)),
+                        block_state: BlockRefState::LocalOnly,
+                    },
+                ],
+            )],
+        )
+        .unwrap();
+    assert!(matches!(
+        engine.get_file_block(file.ino, 0),
+        Err(MetaError::FragmentedBlock { .. })
+    ));
+
+    assert!(
+        !engine
+            .mark_file_block_uploaded_if_matches(
+                file.ino,
+                0,
+                1,
+                &BlockRef::new_partial(301, 4096),
+            )
+            .unwrap(),
+        "legacy single-block upload mark should decline fragmented blocks"
+    );
 }
 
 #[test]
