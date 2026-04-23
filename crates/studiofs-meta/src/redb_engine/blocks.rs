@@ -376,10 +376,21 @@ impl MetaBlocks for RedbMetaEngine {
                     updated_attr = Some(attr);
                 }
 
-                Self::append_event_in_txn(
-                    &txn,
-                    &crate::events::MetaEvent::RemoveFileBlock { ino, block_index },
-                )?;
+                if base_has_data {
+                    let published_base_chunks =
+                        Self::regular_file_chunk_rows_for_inode_in_write_txn(
+                            &txn,
+                            REGULAR_FILE_BASE_TABLE,
+                            ino,
+                        )?;
+                    Self::append_event_in_txn(
+                        &txn,
+                        &crate::events::MetaEvent::PublishRegularFileBaseSlices {
+                            ino,
+                            chunk_slices: published_base_chunks,
+                        },
+                    )?;
+                }
                 if let Some(attr) = &updated_attr {
                     Self::append_event_in_txn(
                         &txn,
@@ -761,12 +772,16 @@ impl MetaBlocks for RedbMetaEngine {
             Self::set_inode_overlay_in_txn(&txn, &attr)?;
             Self::sync_inode_lifecycle_in_txn(&txn, ino)?;
 
+            let published_base_chunks = Self::regular_file_chunk_rows_for_inode_in_write_txn(
+                &txn,
+                REGULAR_FILE_BASE_TABLE,
+                ino,
+            )?;
             Self::append_event_in_txn(
                 &txn,
-                &crate::events::MetaEvent::CommitFileBlock {
+                &crate::events::MetaEvent::PublishRegularFileBaseSlices {
                     ino,
-                    block_index,
-                    block: block.clone(),
+                    chunk_slices: published_base_chunks,
                 },
             )?;
             if committed_changed {

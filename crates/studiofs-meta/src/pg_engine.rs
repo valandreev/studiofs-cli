@@ -2309,6 +2309,7 @@ impl PgMetaEngine {
         for event in events {
             match event {
                 MetaEvent::SetFileBlock { .. }
+                | MetaEvent::SetRegularFileOverlaySlices { .. }
                 | MetaEvent::RemoveFileBlock { .. }
                 | MetaEvent::RemoveFileBlocks { .. }
                 | MetaEvent::SetFileBlocksBatch { .. }
@@ -4901,6 +4902,45 @@ mod tests {
             std::env::set_var(key, value);
         }
         TestEnvGuard { key, previous }
+    }
+
+    #[test]
+    fn project_remote_events_filters_unpublished_overlay_slices() {
+        let events = vec![
+            MetaEvent::SetRegularFileOverlaySlices {
+                ino: 42,
+                chunk_slices: vec![(
+                    ChunkId(0),
+                    vec![SliceRecord {
+                        slice_id: SliceId(0),
+                        order: SliceOrder(0),
+                        range: SliceRange::new(0, 4096).unwrap(),
+                        block: Some(BlockRef::new_partial(9001, 4096)),
+                        block_state: BlockRefState::LocalOnly,
+                    }],
+                )],
+            },
+            MetaEvent::PublishRegularFileBaseSlices {
+                ino: 42,
+                chunk_slices: vec![(
+                    ChunkId(0),
+                    vec![SliceRecord {
+                        slice_id: SliceId(1),
+                        order: SliceOrder(0),
+                        range: SliceRange::new(0, 4096).unwrap(),
+                        block: Some(BlockRef::new_partial(9002, 4096)),
+                        block_state: BlockRefState::Published,
+                    }],
+                )],
+            },
+        ];
+
+        let projected = PgMetaEngine::project_remote_events(&events);
+        assert_eq!(projected.len(), 1);
+        assert!(matches!(
+            projected.first(),
+            Some(MetaEvent::PublishRegularFileBaseSlices { ino: 42, .. })
+        ));
     }
 
     fn set_file_state(engine: &PgMetaEngine, ino: Ino, size: u64, content_epoch: u64) {
