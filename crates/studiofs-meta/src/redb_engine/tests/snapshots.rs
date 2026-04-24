@@ -91,7 +91,7 @@ fn test_referenced_object_ids_include_committed_blocks() {
     let ino = attr.ino;
 
     engine
-        .stage_block_slices(ino, 0, &BlockRef::new_partial(21, 4096))
+        .stage_logical_payload_slice(ino, 0, &BlockRef::new_partial(21, 4096))
         .unwrap();
     assert!(
         engine
@@ -104,7 +104,7 @@ fn test_referenced_object_ids_include_committed_blocks() {
             .unwrap()
     );
     engine
-        .stage_block_slices(ino, 1, &BlockRef::new_partial(22, 4096))
+        .stage_logical_payload_slice(ino, 1, &BlockRef::new_partial(22, 4096))
         .unwrap();
 
     let refs = engine.get_referenced_object_ids().unwrap();
@@ -333,7 +333,9 @@ fn test_import_snapshot_keeps_unpublished_regular_file_visible() {
     attr.content_epoch = 1;
     source.set_attr(&attr).unwrap();
     let block = BlockRef::new_partial(40_001, 4096);
-    source.stage_block_slices(file.ino, 0, &block).unwrap();
+    source
+        .stage_logical_payload_slice(file.ino, 0, &block)
+        .unwrap();
 
     let snapshot = source.export_snapshot().unwrap();
     let imported = temp_engine();

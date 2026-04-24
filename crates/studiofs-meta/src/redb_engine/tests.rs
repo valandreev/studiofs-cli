@@ -4,12 +4,22 @@ use super::test_support::*;
 use super::*;
 use crate::events::MetaEvent;
 
-trait BlockSliceFixture {
-    fn stage_block_slices(&self, ino: Ino, block_index: u32, block: &BlockRef) -> MetaResult<()>;
+trait FileGraphFixture {
+    fn stage_logical_payload_slice(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        block: &BlockRef,
+    ) -> MetaResult<()>;
 }
 
-impl BlockSliceFixture for RedbMetaEngine {
-    fn stage_block_slices(&self, ino: Ino, block_index: u32, block: &BlockRef) -> MetaResult<()> {
+impl FileGraphFixture for RedbMetaEngine {
+    fn stage_logical_payload_slice(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        block: &BlockRef,
+    ) -> MetaResult<()> {
         let chunk_slices = Self::chunk_slices_for_block(
             block_index,
             DEFAULT_BLOCK_SIZE,
