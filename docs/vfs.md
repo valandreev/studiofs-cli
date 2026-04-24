@@ -25,14 +25,14 @@ Active invariants:
 |-------|------|---------|
 | `meta` | `MetaExecutor<dyn VfsMeta>` | Typed metadata executor used by `run_meta(...)` |
 | `data_write` | `Arc<DataStore>` | S3 write/delete path |
-| `local_block_backend` | `Arc<dyn LocalBlockBackend>` | Current local cache backend for committed payloads and upload rereads |
+| `local_payload_backend` | `Arc<dyn LocalPayloadBackend>` | Current local cache backend for committed payloads and upload rereads |
 | `cached_store` | `Arc<CachedStore>` | Local-durable payload runtime, pending-upload queue, upload helpers, and pinning |
 | `fetch_scheduler` | `Arc<FetchScheduler>` | Adaptive S3 fetcher |
 | `readahead` | `Arc<ReadAheadTracker>` | Sequential prefetch |
 | `dir_prefetch` | `Arc<DirAccessTracker>` | Directory-level prefetch |
 | `state` | `Arc<VfsState>` | Local dirty state, namespace caches, file sessions, and backpressure |
 
-`local_block_backend()` remains the accessor used by helper modules that need
+`local_payload_backend()` remains the accessor used by helper modules that need
 the backend boundary without reaching through backend-specific internals.
 
 ## Lifecycle
@@ -62,10 +62,10 @@ inode toward root; no match defaults to `rw`.
 | `meta_path` | — | Path to redb database |
 | `cache_dir` | — | Root for the local cache backend and runtime state |
 | `cache_size` | 100 GiB | Local cache size budget |
-| `block_size` | 16 MiB | Chunk size (cloud transfer currently uses 4x4 MiB blocks) |
+| `block_size` | 16 MiB | Chunk size (cloud transfer currently uses 4x4 MiB fragments) |
 | `max_concurrent_uploads` | 4 | Transitional static upload knob |
 | `readahead_width` | 18 | Base prefetch depth |
-| `max_dirty_bytes` | 800 MiB | Local dirty-state memory limit before backpressure |
+| `max_dirty_bytes` | 1200 MiB | Local dirty-state memory limit before backpressure |
 | `upload_stats_interval_secs` | 1 | Upload control-loop tick interval |
 | `upload_fg_read_latency_target_ms` | 35 | Foreground-read P90 target for upload throttling |
 | `upload_fg_read_latency_window_ms` | 1500 | Foreground-read speedometer sliding window |
@@ -75,7 +75,7 @@ Local data-path QoS:
 - foreground reads/writes use the foreground local-data semaphore
 - upload rereads and cache eviction use the background local-data semaphore
 - cache-only delete/rename cleanup stays synchronous at the API boundary, while
-  internal block eviction is batched through the background pool
+  internal payload-object eviction is batched through the background pool
 
 ## Write Path
 
@@ -110,7 +110,7 @@ Handle-aware write path:
 dirty local state for this inode
   │
   ├─ Take a point-in-time snapshot of accepted bytes
-  ├─ Reserve/reuse per-block object IDs
+  ├─ Reserve/reuse per-payload object IDs
   ├─ local backend `put(...)` committed payloads locally
   ├─ local backend `sync_data()` for explicit `flush()`, `fsync()`, or last-handle `close()` / `release()` when dirty unpublished state remains
   ├─ Persist local unpublished slices + attrs in metadata
@@ -124,7 +124,7 @@ Local durability notes:
   boundary directly, but explicit `flush()` and last-handle
   `close()` / `release()` also reach that boundary when dirty unpublished
   state still exists.
-- Reserved object IDs make retrying the same dirty block idempotent across
+- Reserved object IDs make retrying the same dirty object IDempotent across
   metadata failures.
 - Historical `ingress_spill` directories are outside the active Local-First
   contract and are deleted during startup cleanup.
@@ -163,8 +163,8 @@ persisted payload queued
   │
   ├─ Acquire local-data I/O permits only for the local payload-read phase
   ├─ Read payload from hot upload buffer, upload hardlink, or local backend fallback
-  ├─ Split each chunk into cloud blocks
-  ├─ Upload block objects to S3
+  ├─ Split each chunk into cloud fragments
+  ├─ Upload payload objects to S3
   ├─ Mark payloads uploaded only after remote success
   └─ Requeue with backoff on failure
 ```
@@ -181,9 +181,9 @@ The epoch finalizer publishes file versions after upload completion:
 queued (ino, content_epoch)
   │
   ├─ Skip/requeue if the inode still has newer local dirty state
-  ├─ Read the current block list for that epoch from metadata
+  ├─ Read the current payload-object list for that epoch from metadata
   ├─ Wait until every referenced object is remote-visible
-  └─ Publish only if metadata still matches the verified block list
+  └─ Publish only if metadata still matches the verified payload-object list
 ```
 
 Why this split exists:

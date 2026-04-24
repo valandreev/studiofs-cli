@@ -9,14 +9,9 @@ pub(super) enum EpochFinalizeStatus {
     Skipped,
 }
 
-enum FinalizeExtentPlan {
-    Overlay { object_ids: Vec<u64> },
-    Manifest { blocks: Vec<(u32, BlockRef)> },
-}
-
 struct FinalizeMetaSnapshot {
     lifecycle: Option<studiofs_meta::InodeLifecycleRecord>,
-    extent_plan: FinalizeExtentPlan,
+    object_ids: Vec<u64>,
 }
 
 impl CommitCoordinator {
@@ -57,18 +52,14 @@ impl CommitCoordinator {
         let meta = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
             let has_persisted_overlay = engine.has_local_regular_file_overlay(ino)?;
             let lifecycle = engine.get_inode_lifecycle(ino)?;
-            let extent_plan = if has_persisted_overlay {
-                FinalizeExtentPlan::Overlay {
-                    object_ids: engine.get_regular_file_overlay_object_ids(ino)?,
-                }
+            let object_ids = if has_persisted_overlay {
+                engine.get_regular_file_overlay_object_ids(ino)?
             } else {
-                FinalizeExtentPlan::Manifest {
-                    blocks: engine.get_file_blocks(ino)?,
-                }
+                Vec::new()
             };
             Ok(FinalizeMetaSnapshot {
                 lifecycle,
-                extent_plan,
+                object_ids,
             })
         })
         .await?;
@@ -100,81 +91,19 @@ impl CommitCoordinator {
             return Ok(EpochFinalizeStatus::Deferred);
         }
 
-        let published = if let FinalizeExtentPlan::Overlay {
-            object_ids: overlay_object_ids,
-        } = &meta.extent_plan
-        {
-            if !overlay_object_ids.is_empty() {
-                let extents_to_verify: Vec<(u32, ExtentRecordId)> = overlay_object_ids
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, object_id)| {
-                        (
-                            u32::try_from(idx).unwrap_or(u32::MAX),
-                            ExtentRecordId {
-                                object_id: *object_id,
-                                content_epoch,
-                            },
-                        )
-                    })
-                    .collect();
-                if let Err(err) =
-                    Self::wait_until_remote_objects_visible(vfs, &extents_to_verify).await
-                {
-                    tracing::debug!(
-                        ino,
-                        content_epoch,
-                        error = %err,
-                        "deferring overlay publication until uploaded extents become remotely visible"
-                    );
-                    return Ok(EpochFinalizeStatus::Deferred);
-                }
-            }
-            run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-                engine.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
-            })
-            .await?
-        } else {
-            let required_blocks = match &meta.extent_plan {
-                FinalizeExtentPlan::Manifest { blocks } => blocks.clone(),
-                FinalizeExtentPlan::Overlay { .. } => unreachable!("overlay path handled above"),
-            };
-            if !required_blocks.is_empty() {
-                let extents_to_verify: Vec<(u32, ExtentRecordId)> = required_blocks
-                    .iter()
-                    .map(|(block_index, block_ref)| {
-                        (
-                            *block_index,
-                            ExtentRecordId {
-                                object_id: block_ref.object_id,
-                                content_epoch,
-                            },
-                        )
-                    })
-                    .collect();
-                if let Err(err) =
-                    Self::wait_until_remote_objects_visible(vfs, &extents_to_verify).await
-                {
-                    tracing::debug!(
-                        ino,
-                        content_epoch,
-                        error = %err,
-                        "deferring manifest publication until uploaded extents become remotely visible"
-                    );
-                    return Ok(EpochFinalizeStatus::Deferred);
-                }
-            }
-
-            let expected_manifest = required_blocks.clone();
-            run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-                engine.publish_file_manifest_if_matches(
-                    ino,
-                    content_epoch,
-                    expected_manifest.as_slice(),
-                )
-            })
-            .await?
-        };
+        if let Err(err) = Self::wait_until_remote_objects_visible(vfs, &meta.object_ids).await {
+            tracing::debug!(
+                ino,
+                content_epoch,
+                error = %err,
+                "deferring overlay publication until uploaded objects become remotely visible"
+            );
+            return Ok(EpochFinalizeStatus::Deferred);
+        }
+        let published = run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
+            engine.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
+        })
+        .await?;
         if !published {
             let latest_attr = match run_meta(vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
                 engine.get_attr(ino)
@@ -213,9 +142,9 @@ impl CommitCoordinator {
         // subsequent flush_local_dirty_state finds this dirty_attr and the local dirty state is
         // empty it will call engine.set_attr with committed_epoch=0, reverting
         // INODES_TABLE back to {Uploading}. That triggers a second spurious
-        // finalize_inode_epoch which (a) emits a garbage
-        // PublishFileManifest{blocks:[]} event to PG — corrupting remote nodes'
-        // COMMITTED_FILE_BLOCKS_TABLE — and (b) fires invalidate_kernel_inodes a
+        // finalize_inode_epoch which (a) emits a garbage published-base event to
+        // PG — corrupting remote nodes' regular-file base graph — and (b) fires
+        // invalidate_kernel_inodes a
         // second time, sending a file-change notification that can cause readers
         // (e.g. media players) to abort an in-progress read.
         //
@@ -249,14 +178,17 @@ impl CommitCoordinator {
 
     async fn wait_until_remote_objects_visible(
         vfs: &StudioVfs,
-        live_extents: &[(u32, ExtentRecordId)],
+        object_ids: &[u64],
     ) -> VfsResult<()> {
+        if object_ids.is_empty() {
+            return Ok(());
+        }
         let visibility_timeout = vfs.publish_visibility_timeout;
         let deadline = tokio::time::Instant::now() + visibility_timeout;
         loop {
             let mut all_visible = true;
-            for (_, extent) in live_extents {
-                let checks = format_object_fragment_keys(&vfs.data_prefix, extent.object_id)
+            for object_id in object_ids {
+                let checks = format_object_fragment_keys(&vfs.data_prefix, *object_id)
                     .into_iter()
                     .map(|key| async {
                         let result = vfs.fetch_scheduler.data_store().exists(&key).await;
@@ -273,7 +205,7 @@ impl CommitCoordinator {
                         Err(err) => {
                             all_visible = false;
                             tracing::debug!(
-                                object_id = extent.object_id,
+                                object_id = *object_id,
                                 key,
                                 error = %err,
                                 "publish visibility check failed, will retry"

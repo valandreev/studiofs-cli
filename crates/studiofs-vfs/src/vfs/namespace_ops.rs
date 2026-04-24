@@ -1,16 +1,21 @@
 use super::{
-    ATTR_CACHE_TTL, AccessLevel, Arc, BlockRef, DirEntry, FileSessionOperation, FileType, Ino,
-    InodeAttr, InodeIncarnationState, Instant, LocalSyncPolicy, MetaBlockFlags, MetaError,
-    NamespacePathStyle, PendingIncarnation, SetattrArgs, StudioVfs, UnlinkTarget, VfsError,
-    VfsMeta, VfsResult, VfsState, VfsUploadState, block_index_from_offset, debug, info,
+    ATTR_CACHE_TTL, AccessLevel, Arc, ChunkId, DEFAULT_CHUNK_SIZE, DirEntry, FileSessionOperation,
+    FileType, Ino, InodeAttr, InodeIncarnationState, Instant, LocalSyncPolicy, MetaError,
+    NamespacePathStyle, PendingIncarnation, ResolvedSliceSource, SetattrArgs, SliceId, SliceOrder,
+    SliceRange, SliceRecord, StudioVfs, UnlinkTarget, VfsError, VfsMeta, VfsResult, VfsState,
+    VfsUploadState, block_index_from_offset, chunk_id_from_offset, chunk_start_offset, debug, info,
     offset_within_block, validate_name, warn,
 };
+use studiofs_meta::schema::PayloadRefState;
 
 struct TruncateMutation {
-    removed_blocks: Vec<(u32, BlockRef)>,
-    modified_tail_block: Option<(u32, BlockRef)>,
+    removed_objects: Vec<(u32, u64)>,
+    restore_slices: ChunkSliceBatch,
     installed_pending_tail_block: Option<u32>,
 }
+
+type ChunkSliceBatch = Vec<(ChunkId, Vec<SliceRecord>)>;
+type RemovedObjectList = Vec<(u32, u64)>;
 
 impl StudioVfs {
     pub fn setattr(&self, ino: Ino, args: SetattrArgs) -> VfsResult<InodeAttr> {
@@ -110,6 +115,7 @@ impl StudioVfs {
                 .insert(ino, attr.clone());
             self.state.namespace.attr_read_cache.lock().remove(ino);
             self.sync_meta().set_attr(&attr)?;
+            self.clear_matching_dirty_attr_if_committed(ino, &attr);
             self.refresh_inode_incarnation_state_from_attr(ino, &attr);
         }
 
@@ -216,7 +222,7 @@ impl StudioVfs {
         old_attr: &InodeAttr,
         truncate_mutation: Option<&TruncateMutation>,
     ) -> VfsResult<()> {
-        self.clear_pending_blocks_for_inode(ino);
+        self.clear_pending_payloads_for_inode(ino);
         self.state.namespace.dirty_attrs.lock().remove(&ino);
         self.state.namespace.attr_read_cache.lock().remove(ino);
 
@@ -238,31 +244,25 @@ impl StudioVfs {
         };
 
         if let Some(block_index) = mutation.installed_pending_tail_block {
-            self.clear_pending_block(ino, block_index);
+            self.clear_pending_payload(ino, block_index);
         }
 
-        let mut live_extents = Vec::with_capacity(
-            mutation.removed_blocks.len() + usize::from(mutation.modified_tail_block.is_some()),
-        );
-        for (block_index, block_ref) in &mutation.removed_blocks {
+        if !mutation.restore_slices.is_empty() {
             self.sync_meta()
-                .set_file_block(ino, *block_index, block_ref)?;
-            live_extents.push((
-                ino,
-                *block_index,
-                block_ref.object_id,
-                restore_content_epoch,
-            ));
+                .flush_regular_file_overlay_slices_with_attr(ino, &mutation.restore_slices, None)?;
         }
-        if let Some((block_index, block_ref)) = &mutation.modified_tail_block {
-            self.sync_meta()
-                .set_file_block(ino, *block_index, block_ref)?;
-            live_extents.push((
-                ino,
-                *block_index,
-                block_ref.object_id,
-                restore_content_epoch,
-            ));
+
+        let mut live_extents = Vec::new();
+        for (chunk_id, slices) in &mutation.restore_slices {
+            let chunk_base = chunk_start_offset(*chunk_id, DEFAULT_CHUNK_SIZE);
+            for slice in slices {
+                let Some(block) = slice.payload.as_ref() else {
+                    continue;
+                };
+                let absolute_offset = chunk_base.saturating_add(slice.range.start as u64);
+                let block_index = block_index_from_offset(absolute_offset, self.block_size);
+                live_extents.push((ino, block_index, block.object_id, restore_content_epoch));
+            }
         }
         if !live_extents.is_empty() {
             self.record_live_extents(&live_extents);
@@ -281,21 +281,110 @@ impl StudioVfs {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
         let mut scheduled_for_gc = std::collections::HashSet::new();
-        for (block_index, block_ref) in &mutation.removed_blocks {
-            if scheduled_for_gc.insert(block_ref.object_id)
-                && let Err(error) = self
-                    .sync_meta()
-                    .add_pending_deletion(block_ref.object_id, timestamp)
+        for (block_index, object_id) in &mutation.removed_objects {
+            if scheduled_for_gc.insert(*object_id)
+                && let Err(error) = self.sync_meta().add_pending_deletion(*object_id, timestamp)
             {
                 warn!(
                     ino,
-                    object_id = block_ref.object_id,
+                    object_id = *object_id,
                     error = %error,
                     "failed to schedule truncated object for deferred deletion"
                 );
             }
-            self.evict_block_from_caches(ino, *block_index, block_ref.object_id);
+            self.evict_block_from_caches(ino, *block_index, *object_id);
         }
+    }
+
+    fn truncate_tombstone_slices(
+        &self,
+        start_offset: u64,
+        end_offset: u64,
+    ) -> VfsResult<ChunkSliceBatch> {
+        let mut chunks = std::collections::BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
+        let mut cursor = start_offset;
+        while cursor < end_offset {
+            let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);
+            let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
+            let chunk_end = chunk_start.saturating_add(DEFAULT_CHUNK_SIZE as u64);
+            let piece_end = end_offset.min(chunk_end);
+            let range = SliceRange::new(
+                (cursor - chunk_start) as u32,
+                (piece_end - chunk_start) as u32,
+            )
+            .ok_or_else(|| VfsError::Other("invalid truncate tombstone range".to_string()))?;
+            chunks
+                .entry(chunk_id)
+                .or_default()
+                .push(SliceRecord::tombstone(SliceId(0), SliceOrder(0), range));
+            cursor = piece_end;
+        }
+        Ok(chunks.into_iter().collect())
+    }
+
+    fn truncate_restore_slices_and_removed_objects(
+        &self,
+        ino: Ino,
+        new_size: u64,
+        old_size: u64,
+    ) -> VfsResult<(ChunkSliceBatch, RemovedObjectList)> {
+        let mut kept_object_ids = std::collections::HashSet::new();
+        if new_size > 0 {
+            for span in self
+                .sync_meta()
+                .lookup_regular_file_slices(ino, 0, new_size)?
+            {
+                if let Some(block) = span.payload {
+                    kept_object_ids.insert(block.object_id);
+                }
+            }
+        }
+
+        let mut restore_chunks = std::collections::BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
+        let mut removed_objects = Vec::new();
+        let mut removed_seen = std::collections::HashSet::new();
+        for span in self.sync_meta().lookup_regular_file_slices(
+            ino,
+            new_size,
+            old_size.saturating_sub(new_size),
+        )? {
+            let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
+            let absolute_offset = chunk_base.saturating_add(span.range.start as u64);
+            let block_index = block_index_from_offset(absolute_offset, self.block_size);
+            match span.payload {
+                Some(block) => {
+                    if matches!(span.source, ResolvedSliceSource::Overlay)
+                        && !kept_object_ids.contains(&block.object_id)
+                        && removed_seen.insert(block.object_id)
+                    {
+                        removed_objects.push((block_index, block.object_id));
+                    }
+                    let mut slice = SliceRecord::new(SliceId(0), SliceOrder(0), span.range, block);
+                    slice.payload_state = match span.source {
+                        ResolvedSliceSource::Base => PayloadRefState::Published,
+                        _ => PayloadRefState::LocalOnly,
+                    };
+                    restore_chunks.entry(span.chunk_id).or_default().push(slice);
+                }
+                None if matches!(
+                    span.source,
+                    ResolvedSliceSource::OverlayTombstone | ResolvedSliceSource::BaseTombstone
+                ) =>
+                {
+                    restore_chunks
+                        .entry(span.chunk_id)
+                        .or_default()
+                        .push(SliceRecord::tombstone(
+                            SliceId(0),
+                            SliceOrder(0),
+                            span.range,
+                        ));
+                }
+                None => {}
+            }
+        }
+
+        Ok((restore_chunks.into_iter().collect(), removed_objects))
     }
 
     fn truncate_blocks(
@@ -310,41 +399,29 @@ impl StudioVfs {
         } else {
             block_index_from_offset(new_size - 1, self.block_size) + 1
         };
-        let mut old_blocks = self.sync_meta().get_file_blocks(ino)?;
-        old_blocks.sort_unstable_by_key(|(block_index, _)| *block_index);
-        let mut mutation = TruncateMutation {
-            removed_blocks: Vec::new(),
-            modified_tail_block: None,
+        let (restore_slices, removed_objects) =
+            self.truncate_restore_slices_and_removed_objects(ino, new_size, old_size)?;
+        let mutation = TruncateMutation {
+            removed_objects,
+            restore_slices,
             installed_pending_tail_block: None,
         };
 
-        if new_size == 0 && old_size > 0 {
-            mutation.removed_blocks = old_blocks;
-            self.sync_meta().remove_file_blocks(ino)?;
-
-            for (block_idx, _) in &mutation.removed_blocks {
-                self.clear_pending_block(ino, *block_idx);
-                self.remove_live_extent(ino, *block_idx);
-            }
-            return Ok(mutation);
+        let tombstones = self.truncate_tombstone_slices(new_size, old_size)?;
+        if let Err(error) = self
+            .sync_meta()
+            .flush_regular_file_overlay_slices_with_attr(ino, &tombstones, None)
+        {
+            return Err(error.into());
         }
 
-        for (block_idx, block_ref) in old_blocks
-            .iter()
-            .filter(|(block_idx, _)| *block_idx >= first_block_to_remove)
+        for object_idx in
+            first_block_to_remove..=block_index_from_offset(old_size - 1, self.block_size)
         {
-            let removal_result = self.sync_meta().remove_file_block(ino, *block_idx);
-            if let Err(error) = removal_result {
-                self.rollback_truncate_mutation(ino, restore_content_epoch, Some(&mutation))?;
-                return Err(error.into());
-            }
-            self.clear_pending_block(ino, *block_idx);
-            self.remove_live_extent(ino, *block_idx);
-            mutation
-                .removed_blocks
-                .push((*block_idx, block_ref.clone()));
+            self.clear_pending_payload(ino, object_idx);
+            self.remove_live_extent(ino, object_idx);
             if let Err(error) = self.fail_size_change_truncate_after_first_removed_block_for_test(
-                mutation.removed_blocks.len(),
+                mutation.removed_objects.len(),
             ) {
                 self.rollback_truncate_mutation(ino, restore_content_epoch, Some(&mutation))?;
                 return Err(error);
@@ -355,8 +432,9 @@ impl StudioVfs {
             let new_last_block = block_index_from_offset(new_size - 1, self.block_size);
             let last_block_offset = offset_within_block(new_size - 1, self.block_size);
             let new_last_len = last_block_offset as usize + 1;
+            self.remove_live_extent(ino, new_last_block);
             let trimmed_local =
-                match self.trim_local_block_staging(ino, new_last_block, new_last_len) {
+                match self.trim_local_payload_staging(ino, new_last_block, new_last_len) {
                     Ok(trimmed_local) => trimmed_local,
                     Err(error) => {
                         self.rollback_truncate_mutation(
@@ -367,64 +445,9 @@ impl StudioVfs {
                         return Err(error);
                     }
                 };
-            if let Ok(pos) =
-                old_blocks.binary_search_by_key(&new_last_block, |(block_idx, _)| *block_idx)
-            {
-                let original_tail_block = old_blocks[pos].1.clone();
-                let mut truncated_pending_bytes = None;
-                if !trimmed_local {
-                    let pending_upload_index = self.snapshot_pending_upload_index();
-                    let bytes = match self.load_local_block_bytes_sync(
-                        ino,
-                        new_last_block,
-                        original_tail_block.object_id,
-                        Some(&pending_upload_index),
-                    ) {
-                        Ok(bytes) => bytes,
-                        Err(error) => {
-                            self.rollback_truncate_mutation(
-                                ino,
-                                restore_content_epoch,
-                                Some(&mutation),
-                            )?;
-                            return Err(error);
-                        }
-                    };
-                    if let Some(bytes) = bytes
-                        && bytes.len() > new_last_len
-                    {
-                        truncated_pending_bytes = Some(bytes);
-                    }
-                }
-
-                if original_tail_block.length as usize > new_last_len {
-                    let mut shortened_tail_block = original_tail_block.clone();
-                    shortened_tail_block.length = last_block_offset + 1;
-                    if shortened_tail_block.length < self.block_size {
-                        shortened_tail_block.flags |= MetaBlockFlags::PARTIAL_BLOCK;
-                    } else {
-                        shortened_tail_block
-                            .flags
-                            .remove(MetaBlockFlags::PARTIAL_BLOCK);
-                    }
-                    if let Err(error) =
-                        self.sync_meta()
-                            .set_file_block(ino, new_last_block, &shortened_tail_block)
-                    {
-                        self.rollback_truncate_mutation(
-                            ino,
-                            restore_content_epoch,
-                            Some(&mutation),
-                        )?;
-                        return Err(error.into());
-                    }
-                    mutation.modified_tail_block = Some((new_last_block, original_tail_block));
-                }
-
-                if let Some(bytes) = truncated_pending_bytes {
-                    self.install_truncated_pending_block(ino, new_last_block, bytes, new_last_len);
-                    mutation.installed_pending_tail_block = Some(new_last_block);
-                }
+            if !trimmed_local {
+                let _ = new_last_block;
+                let _ = new_last_len;
             }
         }
 
@@ -511,7 +534,7 @@ impl StudioVfs {
         }
 
         if let Some(ino) = ino_hint {
-            self.clear_pending_blocks_for_inode(ino);
+            self.clear_pending_payloads_for_inode(ino);
             self.clear_inode_incarnation(ino);
             self.state.namespace.dirty_attrs.lock().remove(&ino);
             self.state.namespace.attr_read_cache.lock().remove(ino);
@@ -1056,8 +1079,10 @@ impl StudioVfs {
             && self.directory_has_probable_trash_ancestor(new_parent)?;
 
         if let Some(ino) = rename_result.displaced_ino {
-            let blocks = meta.get_file_blocks(ino)?;
-            let total_bytes: u64 = blocks.iter().map(|(_, b)| b.length as u64).sum();
+            let total_bytes = meta
+                .get_regular_file_graph_object_usage(ino)?
+                .into_iter()
+                .fold(0_u64, |acc, (_, bytes)| acc.saturating_add(bytes));
 
             self.cleanup_deleted_inode_storage(&meta, ino, total_bytes, "rename overwrite")
                 .await?;

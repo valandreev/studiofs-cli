@@ -58,7 +58,7 @@ pub(crate) struct TestCacheArgs {
     /// and treats this path as cache directory.
     path: PathBuf,
 
-    /// Block payload size (e.g. 1MB, 4MB, 16MB, 32MB). Defaults to 16MB.
+    /// Payload object size (e.g. 1MB, 4MB, 16MB, 32MB). Defaults to 16MB.
     #[arg(long)]
     block_size: Option<String>,
 

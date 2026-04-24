@@ -14,7 +14,7 @@ Current runtime components:
 
 | Component | Modules | Role |
 |---|---|---|
-| Current local cache backend | `block_layout`, `block_index`, `block_store`, `startup_recovery` | Persistent local payloads + lifecycle/index state |
+| Current local cache backend | `payload_layout`, `payload_index`, `payload_store`, `startup_recovery` | Persistent local payloads + lifecycle/index state |
 | Local-backend contract | `local` | Backend-agnostic trait used by VFS read/write/upload paths |
 | Cached-store runtime | `cached_store`, `upload_queue`, `upload_stage` | Unified local cache handle, runtime pending-upload queue, upload helpers, pending-upload pinning, and runtime metrics |
 | Benchmark-only cache surface | `benchmark_cache` | Lightweight in-memory cache used by `studiofs test-cache` |
@@ -46,7 +46,7 @@ Legacy cache-v2 storage implementation code has been removed.
 
 ## Metadata Lookup Caches
 
-In addition to block caching, VFS keeps bounded metadata lookup caches:
+In addition to payload-object caching, VFS keeps bounded metadata lookup caches:
 
 - `DentryCache` for `(parent ino, name) -> child ino | negative`
 - `PathShortcutCache` for full-path shortcut resolution
@@ -72,7 +72,7 @@ files under `<cache-root>`.
 `CachedStore` is the canonical cache/object-store pipeline owner for the mount
 runtime. It is intentionally focused on:
 
-- local backend access for cache hits, range/full-block rereads, and persisted
+- local backend access for cache hits, range/full-payload rereads, and persisted
   payload lifecycle
 - pending-upload pinning near upload boundaries
 - runtime pending-upload queue bookkeeping

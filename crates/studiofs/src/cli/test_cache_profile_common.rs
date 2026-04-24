@@ -168,7 +168,7 @@ pub(crate) fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
     ));
     out.push_str(&format!(
         "sync_data_calls_per_gib: {:.2}\n",
-        snapshot.block_store_sync_data.calls_per_gib
+        snapshot.payload_store_sync_data.calls_per_gib
     ));
     out.push_str(&format!(
         "winfsp_callbacks: write={} overwrite={} cleanup={} cleanup_flush_fh={} flush={} close={}\n",
@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn render_write_path_summary_includes_winfsp_callback_breakdown() {
         let snapshot = VfsWritePathObservabilitySnapshot {
-            backend_tag: "local-block-runtime".to_string(),
+            backend_tag: "local-payload-runtime".to_string(),
             winfsp_callbacks: VfsWritePathWinfspCallbackStats {
                 write: 11,
                 overwrite: 2,
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn render_write_path_summary_emits_follow_up_for_cleanup_barrier_regressions() {
         let snapshot = VfsWritePathObservabilitySnapshot {
-            backend_tag: "local-block-runtime".to_string(),
+            backend_tag: "local-payload-runtime".to_string(),
             winfsp_callbacks: VfsWritePathWinfspCallbackStats {
                 cleanup: 5,
                 ..Default::default()
@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn render_write_path_summary_emits_follow_up_for_cleanup_skipped_clean_regressions() {
         let snapshot = VfsWritePathObservabilitySnapshot {
-            backend_tag: "local-block-runtime".to_string(),
+            backend_tag: "local-payload-runtime".to_string(),
             winfsp_callbacks: VfsWritePathWinfspCallbackStats {
                 cleanup: 6,
                 ..Default::default()
@@ -309,7 +309,7 @@ mod tests {
     #[test]
     fn render_write_path_summary_emits_follow_up_for_cleanup_flush_fh_callbacks() {
         let snapshot = VfsWritePathObservabilitySnapshot {
-            backend_tag: "local-block-runtime".to_string(),
+            backend_tag: "local-payload-runtime".to_string(),
             winfsp_callbacks: VfsWritePathWinfspCallbackStats {
                 cleanup: 4,
                 cleanup_flush_fh: 2,
@@ -327,7 +327,7 @@ mod tests {
     #[test]
     fn collect_write_path_artifacts_writes_json_and_summary_artifacts() {
         let snapshot = VfsWritePathObservabilitySnapshot {
-            backend_tag: "local-block-runtime".to_string(),
+            backend_tag: "local-payload-runtime".to_string(),
             winfsp_callbacks: VfsWritePathWinfspCallbackStats {
                 cleanup: 3,
                 close: 1,

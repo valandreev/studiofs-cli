@@ -61,11 +61,22 @@ impl StudioVfs {
         if per_inode_dirty == 0 {
             return false;
         }
-        per_inode_dirty >= self.write_eager_flush_batch_bytes
+        per_inode_dirty > self.handle_writer_active_tail_bytes()
+            || per_inode_dirty >= self.write_eager_flush_batch_bytes
             || self.state.handle_writers.total_dirty_bytes()
                 >= super::aggressive_materialization_threshold_bytes(self.max_dirty_bytes())
             || self.state.handle_writers.total_buffered_write_count()
                 >= super::AGGRESSIVE_MATERIALIZATION_BUFFERED_WRITE_THRESHOLD
+    }
+
+    fn should_linger_deferred_materialization(&self, ino: Ino) -> bool {
+        if self.shutdown_requested() {
+            return false;
+        }
+        if self.handle_table.open_count(ino) == 0 {
+            return false;
+        }
+        self.state.handle_writers.dirty_bytes_for_inode(ino) > 0
     }
 
     pub(super) async fn apply_write_path_soft_pacing(self: &Arc<Self>, preferred_ino: Ino) -> bool {
@@ -74,7 +85,7 @@ impl StudioVfs {
         }
 
         let max_dirty = self.max_dirty_bytes();
-        let total_dirty_bytes = self.state.handle_writers.total_dirty_bytes();
+        let total_dirty_bytes = self.total_pending_write_buffer_bytes();
         if total_dirty_bytes > max_dirty {
             self.wait_for_soft_dirty_budget_relief(preferred_ino).await;
             return true;
@@ -116,14 +127,15 @@ impl StudioVfs {
 
         let max_dirty = self.max_dirty_bytes();
         loop {
-            let total_dirty_before = self.state.handle_writers.total_dirty_bytes();
+            let total_dirty_before = self.total_pending_write_buffer_bytes();
             if total_dirty_before <= max_dirty {
                 return;
             }
 
             let mut dirty_inodes = self.state.handle_writers.snapshot_dirty_inodes_by_bytes();
             if dirty_inodes.is_empty() {
-                return;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                continue;
             }
             dirty_inodes.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1));
 
@@ -181,7 +193,7 @@ impl StudioVfs {
             let waited = wait_started.elapsed();
             drop(wait_guard);
 
-            let total_dirty_after = self.state.handle_writers.total_dirty_bytes();
+            let total_dirty_after = self.total_pending_write_buffer_bytes();
             // #region debug log
             self.debug_write_probe(
                 "H2",
@@ -256,6 +268,7 @@ impl StudioVfs {
         let guard = task_lock.clone().lock_owned().await;
         let vfs = Arc::clone(self);
         self.track_background_task(tokio::spawn(async move {
+            let mut no_progress_retries = 0usize;
             loop {
                 let dirty_before = vfs.state.handle_writers.dirty_bytes_for_inode(ino);
                 let total_before = vfs.state.handle_writers.total_dirty_bytes();
@@ -344,6 +357,18 @@ impl StudioVfs {
                     || limits_materialized
                     || dirty_after < dirty_before
                     || total_after < total_before;
+                if made_progress {
+                    no_progress_retries = 0;
+                } else if no_progress_retries < super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES
+                    && vfs.should_linger_deferred_materialization(ino)
+                {
+                    no_progress_retries += 1;
+                    tokio::time::sleep(Duration::from_millis(
+                        super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS,
+                    ))
+                    .await;
+                    continue;
+                }
                 if !made_progress || !vfs.should_continue_deferred_materialization(ino) {
                     break;
                 }
@@ -361,7 +386,7 @@ impl StudioVfs {
     /// was the last open handle, perform the deferred deletion now.
     ///
     /// This is also the last-handle local-state drain point. If a writable
-    /// handle reaches release with dirty blocks or attrs still pending,
+    /// handle reaches release with dirty payloads or attrs still pending,
     /// `release_fh` must push that state through the current local
     /// payload/metadata pipeline before the handle disappears so later opens,
     /// open-unlink cleanup, and sticky-error reporting all see a coherent
@@ -409,12 +434,12 @@ impl StudioVfs {
         let cleanup = self.collect_orphan_deleted_inode_cleanup(ino).await?;
         let removed_blocks = cleanup.removed_ids.len();
         let freed_bytes = cleanup.freed_bytes;
-        let deferred_local_blocks = self
+        let deferred_local_payloads = self
             .finalize_deleted_inode_runtime_cleanup(ino, cleanup.removed_ids)
             .await;
         debug!(
-            "orphan cleanup complete: ino={} removed_blocks={} deferred_local_blocks={} freed_bytes={}",
-            ino, removed_blocks, deferred_local_blocks, freed_bytes
+            "orphan cleanup complete: ino={} removed_blocks={} deferred_local_payloads={} freed_bytes={}",
+            ino, removed_blocks, deferred_local_payloads, freed_bytes
         );
         Ok(ReleaseFhOutcome {
             closed_last_handle: true,
@@ -469,7 +494,7 @@ impl StudioVfs {
                         ino,
                         self.local_sync_policy_for_barrier(ino),
                         sticky_error_policy,
-                        DirtyAttrPersistPolicy::Ignore,
+                        DirtyAttrPersistPolicy::PersistIfPresent,
                     )
                     .await?;
                 Ok(ReleaseFhOutcome {
@@ -541,24 +566,24 @@ impl StudioVfs {
             .materialize_handle_writers_for_inode(ino, local_sync_policy)
             .await?;
         let flushed_file_data =
-            materialized_handle_writers || self.has_pending_local_dirty_blocks_for_inode(ino);
-        let residual_pending_local_blocks = self.has_pending_local_dirty_blocks_for_inode(ino);
+            materialized_handle_writers || self.has_pending_local_dirty_payloads_for_inode(ino);
+        let residual_pending_local_payloads = self.has_pending_local_dirty_payloads_for_inode(ino);
         let dirty_attr_present = self.state.namespace.dirty_attrs.lock().contains_key(&ino);
-        let persist_dirty_attr_inline = !residual_pending_local_blocks
+        let persist_dirty_attr_inline = !residual_pending_local_payloads
             && dirty_attr_present
             && matches!(
                 dirty_attr_persist_policy,
                 DirtyAttrPersistPolicy::PersistIfPresent
             );
         let residual_local_dirty_state =
-            residual_pending_local_blocks || (dirty_attr_present && !persist_dirty_attr_inline);
+            residual_pending_local_payloads || (dirty_attr_present && !persist_dirty_attr_inline);
         let had_local_dirty_state =
             materialized_handle_writers || residual_local_dirty_state || persist_dirty_attr_inline;
         if residual_local_dirty_state {
             self.flush_local_dirty_state(ino, local_sync_policy).await?;
         }
         if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
-            self.maybe_block_store_sync_data_async(0, LocalSyncPolicy::Strict)
+            self.maybe_payload_store_sync_data_async(0, LocalSyncPolicy::Strict)
                 .await?;
         }
 
@@ -835,7 +860,7 @@ impl StudioVfs {
             // opportunistic writes. This lets concurrent writes to the same inode proceed
             // through buffering while this write's materialization is in-flight.
             //
-            // Duplicate materialization is safe: the local block store uses last-writer-wins
+            // Duplicate materialization is safe: the local payload store uses last-writer-wins
             // for overlapping block ranges, and orphaned objects are reclaimed by the
             // background janitor. Strict writes keep the gate to serialize flush/fsync
             // callers with any concurrent materialization on the same inode.
@@ -860,12 +885,24 @@ impl StudioVfs {
                 );
                 completed_result?;
             }
-            let materialize_for_limits_started = Instant::now();
-            let limits_result = self
-                .materialize_handle_writers_for_limits(ino, local_sync_policy)
-                .await;
-            self.record_vfs_write_materialize_for_limits(materialize_for_limits_started.elapsed());
-            limits_result?;
+            let should_materialize_for_limits =
+                matches!(local_sync_policy, LocalSyncPolicy::Strict)
+                    || self.total_pending_write_buffer_bytes() > self.max_dirty_bytes()
+                    || self.state.handle_writers.dirty_bytes_for_inode(ino)
+                        >= self.write_eager_flush_batch_bytes;
+            if should_materialize_for_limits {
+                let materialize_for_limits_started = Instant::now();
+                let limits_result = self
+                    .materialize_handle_writers_for_limits(ino, local_sync_policy)
+                    .await;
+                self.record_vfs_write_materialize_for_limits(
+                    materialize_for_limits_started.elapsed(),
+                );
+                limits_result?;
+            }
+            if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
+                self.flush_local_dirty_state(ino, local_sync_policy).await?;
+            }
             Ok(written)
         }
         .await;
@@ -892,7 +929,7 @@ impl StudioVfs {
     /// * Any materialization error will surface at the next `Strict` barrier
     ///   (flush / fsync / close) because those paths call
     ///   `materialize_handle_writers_for_inode` synchronously.
-    /// * Duplicate materialization is safe: the block store uses last-writer-wins
+    /// * Duplicate materialization is safe: the payload store uses last-writer-wins
     ///   for overlapping ranges, and orphaned objects are reclaimed by the janitor.
     /// * Budget enforcement runs in the background task: if dirty bytes exceed
     ///   `2 × max_dirty_bytes` the next write will detect it synchronously via
@@ -917,7 +954,7 @@ impl StudioVfs {
         // exert real TCP-style backpressure on the caller and avoid OOM.
         let hard_backpressure_threshold =
             super::hard_backpressure_threshold_bytes(self.max_dirty_bytes());
-        if self.state.handle_writers.total_dirty_bytes() > hard_backpressure_threshold {
+        if self.total_pending_write_buffer_bytes() > hard_backpressure_threshold {
             // #region debug log
             self.debug_write_probe(
                 "H2",
@@ -926,7 +963,7 @@ impl StudioVfs {
                 serde_json::json!({
                     "ino": ino,
                     "per_inode_dirty_bytes": self.state.handle_writers.dirty_bytes_for_inode(ino),
-                    "total_dirty_bytes": self.state.handle_writers.total_dirty_bytes(),
+                    "total_dirty_bytes": self.total_pending_write_buffer_bytes(),
                     "hard_threshold_bytes": hard_backpressure_threshold,
                     "max_dirty_bytes": self.max_dirty_bytes(),
                 }),
@@ -1020,6 +1057,11 @@ impl StudioVfs {
                 self.record_vfs_write_materialize_for_limits(
                     materialize_for_limits_started.elapsed(),
                 );
+                if let Err(e) = self.flush_local_dirty_state(ino, local_sync_policy).await {
+                    drop(session);
+                    self.state.file_session.gc_if_idle(ino);
+                    return Err(e);
+                }
             }
             _ => {
                 // Write failed or unknown policy — nothing to materialize.

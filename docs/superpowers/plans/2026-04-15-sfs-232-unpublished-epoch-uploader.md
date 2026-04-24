@@ -4,7 +4,7 @@
 
 **Goal:** Redesign the background uploader so unpublished epochs are uploaded from local durable state, transition to explicit `PublishReady`, and publish exactly once only after the full epoch is complete.
 
-**Architecture:** Keep the current parallel block upload worker pool, but move epoch completion truth into durable metadata instead of inferring readiness from pending queue emptiness. Upload success will advance overlay block lifecycle state for the active epoch; a separate finalizer will publish only when the inode lifecycle says the current epoch is `PublishReady` and still current.
+**Architecture:** Keep the current parallel payload-object upload worker pool, but move epoch completion truth into durable metadata instead of inferring readiness from pending queue emptiness. Upload success will advance overlay payload lifecycle state for the active epoch; a separate finalizer will publish only when the inode lifecycle says the current epoch is `PublishReady` and still current.
 
 **Tech Stack:** Rust 2024, Tokio, StudioFS VFS, Redb/PG metadata engines, focused Rust tests.
 
@@ -14,19 +14,19 @@
 
 **Files:**
 - Modify: `crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs`
-- Modify: `crates/studiofs-meta/src/redb_engine/tests/blocks.rs`
+- Modify: `crates/studiofs-meta/src/redb_engine/tests/payload_objects.rs`
 
 - [ ] Add a metadata test that proves uploaded overlay slices transition inode lifecycle to `PublishReady` without publishing the inode yet.
 - [ ] Run only the new metadata test and verify it fails for the expected reason.
 - [ ] Add an uploader worker test that proves successful upload records durable epoch progress instead of only clearing queue state.
 - [ ] Run only the new uploader worker test and verify it fails for the expected reason.
 
-### Task 2: Add durable per-block uploaded bookkeeping
+### Task 2: Add durable per-payload uploaded bookkeeping
 
 **Files:**
 - Modify: `crates/studiofs-meta/src/engine.rs`
 - Modify: `crates/studiofs-vfs/src/runtime.rs`
-- Modify: `crates/studiofs-meta/src/redb_engine/blocks.rs`
+- Modify: `crates/studiofs-meta/src/redb_engine/payload_objects.rs`
 - Modify: `crates/studiofs-meta/src/pg_engine.rs`
 
 - [ ] Add a metadata API that marks the current overlay block for `(ino, block_index, expected_epoch, expected_block)` as uploaded without publishing base visibility.
@@ -39,7 +39,7 @@
 **Files:**
 - Modify: `crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs`
 
-- [ ] Update the upload worker success path to mark metadata block state as uploaded before local post-upload cleanup.
+- [ ] Update the upload worker success path to mark metadata payload-object state as uploaded before local post-upload cleanup.
 - [ ] Keep retry, delete-cancel, and stale-epoch short-circuit behavior unchanged for local readability.
 - [ ] Refresh VFS incarnation state after durable upload-state transition.
 - [ ] Run focused uploader worker tests to verify success, retry, and stale suppression behavior.

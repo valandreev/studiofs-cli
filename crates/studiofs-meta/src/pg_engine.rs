@@ -1,8 +1,8 @@
 use crate::engine::{
-    BatchFlushEntry, BatchFlushResult, DeferredDeleteRecord, MetaAcl, MetaBlocks, MetaEngineCore,
-    MetaError, MetaFormat, MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaRecovery,
-    MetaReplication, MetaResult, MetaSnapshots, MetaSymlink, MetaXattr, MetadataAuthorityStatus,
-    PendingCreateRecord, UndoLogKind, UndoLogRecord,
+    DeferredDeleteRecord, MetaAcl, MetaEngineCore, MetaError, MetaFormat, MetaFsOps, MetaGc,
+    MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery, MetaReplication, MetaResult,
+    MetaSnapshots, MetaSymlink, MetaXattr, MetadataAuthorityStatus, PendingCreateRecord,
+    UndoLogKind, UndoLogRecord,
 };
 use crate::events::MetaEvent;
 use crate::redb_engine::{RedbMetaEngine, RedbSnapshot};
@@ -29,9 +29,9 @@ const LOCAL_PG_INODE_CURRENT_WINDOW_END_COUNTER: &str = "pgInodeCurrentWindowEnd
 const LOCAL_PG_INODE_PREFETCHED_WINDOW_START_COUNTER: &str = "pgInodePrefetchedWindowStart";
 const LOCAL_PG_INODE_PREFETCHED_WINDOW_NEXT_COUNTER: &str = "pgInodePrefetchedWindowNext";
 const LOCAL_PG_INODE_PREFETCHED_WINDOW_END_COUNTER: &str = "pgInodePrefetchedWindowEnd";
-const LOCAL_PG_BLOCK_ACTIVE_RANGE_START_COUNTER: &str = "pgBlockActiveRangeStart";
-const LOCAL_PG_BLOCK_ACTIVE_RANGE_END_COUNTER: &str = "pgBlockActiveRangeEnd";
-const LOCAL_PG_BLOCK_RESERVED_RANGE_END_COUNTER: &str = "pgBlockReservedRangeEnd";
+const LOCAL_PG_OBJECT_ACTIVE_RANGE_START_COUNTER: &str = "pgObjectActiveRangeStart";
+const LOCAL_PG_OBJECT_ACTIVE_RANGE_END_COUNTER: &str = "pgObjectActiveRangeEnd";
+const LOCAL_PG_OBJECT_RESERVED_RANGE_END_COUNTER: &str = "pgObjectReservedRangeEnd";
 const PG_NEXT_CLIENT_SLOT_COUNTER: &str = "next_client_slot";
 const PG_NEXT_INODE_COUNTER: &str = "next_inode";
 const DEFAULT_PG_FLUSH_INTERVAL_SECS: u64 = 60;
@@ -41,11 +41,11 @@ const DEFAULT_PG_CONNECT_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_PG_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const PG_JANITOR_LOCK_SALT: i64 = 0x5f53_4653_5f4a_414e;
 const LEGACY_PG_INODE_ID_STRIDE: u64 = 1_000_000_000;
-const PG_BLOCK_ID_STRIDE: u64 = 10_000_000_000;
+const PG_OBJECT_ID_STRIDE: u64 = 10_000_000_000;
 const LEGACY_PG_INODE_RANGE_WINDOW: u64 = 1_000_000;
 const PG_INODE_WINDOW_SIZE: u64 = 250_000;
 const PG_INODE_PREFETCH_LOW_WATERMARK: u64 = 50_000;
-const PG_BLOCK_RANGE_WINDOW: u64 = 10_000_000;
+const PG_OBJECT_RANGE_WINDOW: u64 = 10_000_000;
 const LOCAL_ID_LEASE_WINDOWS: u64 = 1;
 
 /// PostgreSQL-backed metadata engine.
@@ -77,9 +77,9 @@ pub struct PgMetaEngine {
     pending_state: Mutex<PendingReplicationState>,
     inode_allocator_lock: Mutex<()>,
     inode_window_reservation_lock: Mutex<()>,
-    block_id_cache: Mutex<LocalIdLeaseCache>,
+    object_id_cache: Mutex<LocalIdLeaseCache>,
     inode_id_headroom_available: AtomicBool,
-    block_id_headroom_available: AtomicBool,
+    object_id_headroom_available: AtomicBool,
     janitor_lock: Mutex<Option<PgJanitorLock>>,
     file_lock_cache: Mutex<HashMap<Ino, FileLockLease>>,
     held_file_locks: Mutex<HashMap<Ino, HeldFileLockLease>>,
@@ -239,15 +239,15 @@ impl LocalIdLeaseCache {
     }
 }
 
-const BLOCK_ID_RANGE_SPEC: LocalIdRangeSpec = LocalIdRangeSpec {
-    kind_label: "block",
-    next_counter: counters::NEXT_BLOCK_ID,
-    active_start_counter: LOCAL_PG_BLOCK_ACTIVE_RANGE_START_COUNTER,
-    active_end_counter: LOCAL_PG_BLOCK_ACTIVE_RANGE_END_COUNTER,
-    reserved_end_counter: LOCAL_PG_BLOCK_RESERVED_RANGE_END_COUNTER,
+const OBJECT_ID_RANGE_SPEC: LocalIdRangeSpec = LocalIdRangeSpec {
+    kind_label: "object",
+    next_counter: counters::NEXT_OBJECT_ID,
+    active_start_counter: LOCAL_PG_OBJECT_ACTIVE_RANGE_START_COUNTER,
+    active_end_counter: LOCAL_PG_OBJECT_ACTIVE_RANGE_END_COUNTER,
+    reserved_end_counter: LOCAL_PG_OBJECT_RESERVED_RANGE_END_COUNTER,
     min_value: 1,
-    slot_stride: PG_BLOCK_ID_STRIDE,
-    window_size: PG_BLOCK_RANGE_WINDOW,
+    slot_stride: PG_OBJECT_ID_STRIDE,
+    window_size: PG_OBJECT_RANGE_WINDOW,
 };
 
 const LEGACY_INODE_RANGE_SPEC: LocalIdRangeSpec = LocalIdRangeSpec {
@@ -1045,9 +1045,9 @@ impl PgMetaEngine {
         Self::normalize_local_id_range_state(slot, spec, state)
     }
 
-    fn has_persisted_block_id_headroom(local: &RedbMetaEngine, slot: u64) -> MetaResult<bool> {
+    fn has_persisted_object_id_headroom(local: &RedbMetaEngine, slot: u64) -> MetaResult<bool> {
         Ok(
-            Self::load_valid_persisted_local_id_range_state(local, slot, BLOCK_ID_RANGE_SPEC)?
+            Self::load_valid_persisted_local_id_range_state(local, slot, OBJECT_ID_RANGE_SPEC)?
                 .is_some(),
         )
     }
@@ -1079,20 +1079,20 @@ impl PgMetaEngine {
         Ok(())
     }
 
-    fn ensure_local_block_id_headroom(&self, slot: u64) -> MetaResult<()> {
+    fn ensure_local_object_id_headroom(&self, slot: u64) -> MetaResult<()> {
         self.local.write_counters(|counters| {
             let _ = Self::read_or_initialize_local_id_range_locked(
                 counters,
                 slot,
-                BLOCK_ID_RANGE_SPEC,
+                OBJECT_ID_RANGE_SPEC,
             )?;
             Ok(())
         })?;
         self.sync_local_id_lease_cache(
             slot,
-            BLOCK_ID_RANGE_SPEC,
-            &self.block_id_cache,
-            &self.block_id_headroom_available,
+            OBJECT_ID_RANGE_SPEC,
+            &self.object_id_cache,
+            &self.object_id_headroom_available,
         )
     }
 
@@ -1961,7 +1961,7 @@ impl PgMetaEngine {
 
     fn prime_local_id_ranges(&self, slot: u64) -> MetaResult<()> {
         self.cache_client_slot(slot);
-        self.ensure_local_block_id_headroom(slot)?;
+        self.ensure_local_object_id_headroom(slot)?;
 
         let inode_prime = (|| -> MetaResult<()> {
             let state = {
@@ -1995,15 +1995,15 @@ impl PgMetaEngine {
                 let _ = self
                     .reserve_inode_window_if_needed(slot, InodeWindowReservationReason::Current);
             }
-            if !self.block_id_headroom_available.load(Ordering::Acquire) {
+            if !self.object_id_headroom_available.load(Ordering::Acquire) {
                 if let Ok(new_lease) =
-                    self.reserve_local_id_lease(slot, BLOCK_ID_RANGE_SPEC, 0, true)
+                    self.reserve_local_id_lease(slot, OBJECT_ID_RANGE_SPEC, 0, true)
                 {
                     *self
-                        .block_id_cache
+                        .object_id_cache
                         .lock()
                         .unwrap_or_else(|p| p.into_inner()) = new_lease;
-                    self.block_id_headroom_available
+                    self.object_id_headroom_available
                         .store(new_lease.has_headroom(), Ordering::Release);
                 }
             }
@@ -2070,7 +2070,7 @@ impl PgMetaEngine {
             Self::ensure_file_lock_lease_schema(&pg.url, connect_timeout, command_timeout)
         {
             let can_reopen_offline = persisted_client_slot
-                .map(|slot| Self::has_persisted_block_id_headroom(&local, slot))
+                .map(|slot| Self::has_persisted_object_id_headroom(&local, slot))
                 .transpose()?
                 .unwrap_or(false)
                 && Self::has_persisted_inode_allocator_state(&local, persisted_client_slot)?
@@ -2119,14 +2119,14 @@ impl PgMetaEngine {
             pending_state: Mutex::new(PendingReplicationState::default()),
             inode_allocator_lock: Mutex::new(()),
             inode_window_reservation_lock: Mutex::new(()),
-            block_id_cache: Mutex::new(LocalIdLeaseCache::default()),
+            object_id_cache: Mutex::new(LocalIdLeaseCache::default()),
             // Optimistic: assume headroom is available until proven exhausted.
             // These flags are degraded to `false` only when the persisted
             // local window/range state is genuinely exhausted.  Starting at
             // `false` caused `allows_new_mutations()` to block every write if
             // `prime_local_id_ranges` failed silently (via `let _ = ...`).
             inode_id_headroom_available: AtomicBool::new(true),
-            block_id_headroom_available: AtomicBool::new(true),
+            object_id_headroom_available: AtomicBool::new(true),
             janitor_lock: Mutex::new(None),
             file_lock_cache: Mutex::new(HashMap::new()),
             held_file_locks: Mutex::new(HashMap::new()),
@@ -2308,11 +2308,8 @@ impl PgMetaEngine {
         let mut out = Vec::with_capacity(events.len());
         for event in events {
             match event {
-                MetaEvent::SetFileBlock { .. }
-                | MetaEvent::RemoveFileBlock { .. }
-                | MetaEvent::RemoveFileBlocks { .. }
-                | MetaEvent::SetFileBlocksBatch { .. }
-                | MetaEvent::CommitFileBlock { .. } => {}
+                MetaEvent::SetRegularFileOverlaySlices { .. }
+                | MetaEvent::RemoveRegularFileGraph { .. } => {}
                 MetaEvent::AddPendingDeletion { .. } | MetaEvent::RemovePendingDeletion { .. } => {}
                 MetaEvent::CreateSnapshot { snapshot } => {
                     let mut synced = snapshot.clone();
@@ -2346,14 +2343,14 @@ impl PgMetaEngine {
                     || overlay.symlink_inodes.contains(ino)
                     || overlay.xattr_inodes.contains(ino)
             }
-            MetaEvent::SetFileBlock { .. } | MetaEvent::SetRegularFileOverlaySlices { .. } => false,
-            MetaEvent::RemoveFileBlock { ino, .. } | MetaEvent::RemoveFileBlocks { ino } => {
+            MetaEvent::SetRegularFileOverlaySlices { .. } => false,
+            MetaEvent::RemoveRegularFileGraph { ino } => {
                 if removed_inodes.contains(ino) {
                     return Ok(false);
                 }
                 overlay.block_inodes.contains(ino)
             }
-            MetaEvent::CommitFileBlock { ino, .. } | MetaEvent::PublishFileManifest { ino, .. } => {
+            MetaEvent::PublishRegularFileBaseSlices { ino, .. } => {
                 overlay.block_inodes.contains(ino)
             }
             MetaEvent::SetSymlinkTarget { ino, .. } => {
@@ -2371,9 +2368,6 @@ impl PgMetaEngine {
                 overlay.attr_inodes.contains(ino)
                     || overlay.acl_keys.contains(&Self::acl_key(*ino, principal))
             }
-            MetaEvent::SetFileBlocksBatch { blocks } => blocks
-                .iter()
-                .any(|(ino, _, _)| overlay.block_inodes.contains(ino)),
             MetaEvent::SetAttr { .. }
             | MetaEvent::AddEntry { .. }
             | MetaEvent::RemoveEntry { .. }
@@ -2389,10 +2383,8 @@ impl PgMetaEngine {
     fn event_has_aux_apply_effect(event: &MetaEvent) -> bool {
         match event {
             MetaEvent::RemoveAttr { .. }
-            | MetaEvent::RemoveFileBlock { .. }
-            | MetaEvent::RemoveFileBlocks { .. }
-            | MetaEvent::CommitFileBlock { .. }
-            | MetaEvent::PublishFileManifest { .. }
+            | MetaEvent::RemoveRegularFileGraph { .. }
+            | MetaEvent::PublishRegularFileBaseSlices { .. }
             | MetaEvent::SetSymlinkTarget { .. }
             | MetaEvent::SetXattr { .. }
             | MetaEvent::RemoveXattr { .. }
@@ -2403,9 +2395,7 @@ impl PgMetaEngine {
             | MetaEvent::CreateSnapshot { .. }
             | MetaEvent::UpdateSnapshotState { .. } => true,
             MetaEvent::SetAttr { .. }
-            | MetaEvent::SetFileBlock { .. }
             | MetaEvent::SetRegularFileOverlaySlices { .. }
-            | MetaEvent::SetFileBlocksBatch { .. }
             | MetaEvent::AddEntry { .. }
             | MetaEvent::RemoveEntry { .. }
             | MetaEvent::RenameEntry { .. } => false,
@@ -2496,18 +2486,10 @@ impl PgMetaEngine {
                         overlay.attr_inodes.insert(attr.ino);
                     }
                 }
-                MetaEvent::SetFileBlock { ino, .. }
-                | MetaEvent::SetRegularFileOverlaySlices { ino, .. }
-                | MetaEvent::RemoveFileBlock { ino, .. }
-                | MetaEvent::RemoveFileBlocks { ino }
-                | MetaEvent::CommitFileBlock { ino, .. }
-                | MetaEvent::PublishFileManifest { ino, .. } => {
+                MetaEvent::SetRegularFileOverlaySlices { ino, .. }
+                | MetaEvent::PublishRegularFileBaseSlices { ino, .. }
+                | MetaEvent::RemoveRegularFileGraph { ino } => {
                     overlay.block_inodes.insert(*ino);
-                }
-                MetaEvent::SetFileBlocksBatch { blocks } => {
-                    for (ino, _, _) in blocks {
-                        overlay.block_inodes.insert(*ino);
-                    }
                 }
                 MetaEvent::SetSymlinkTarget { ino, .. } => {
                     overlay.symlink_inodes.insert(*ino);
@@ -2602,13 +2584,9 @@ impl PgMetaEngine {
                 overlay.attr_inodes.contains(ino)
                     || overlay.acl_keys.contains(&Self::acl_key(*ino, principal))
             }
-            MetaEvent::SetFileBlock { .. }
-            | MetaEvent::SetRegularFileOverlaySlices { .. }
-            | MetaEvent::RemoveFileBlock { .. }
-            | MetaEvent::RemoveFileBlocks { .. }
-            | MetaEvent::SetFileBlocksBatch { .. }
-            | MetaEvent::CommitFileBlock { .. }
-            | MetaEvent::PublishFileManifest { .. }
+            MetaEvent::SetRegularFileOverlaySlices { .. }
+            | MetaEvent::PublishRegularFileBaseSlices { .. }
+            | MetaEvent::RemoveRegularFileGraph { .. }
             | MetaEvent::AddPendingDeletion { .. }
             | MetaEvent::RemovePendingDeletion { .. }
             | MetaEvent::CreateSnapshot { .. }
@@ -4131,24 +4109,7 @@ impl MetaFsOps for PgMetaEngine {
         self.mutate(|local| local.create_symlink_with_ino(ino, parent, name, target, uid, gid))
     }
 }
-impl MetaBlocks for PgMetaEngine {
-    fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>> {
-        self.local.get_file_block(ino, block_index)
-    }
-
-    fn set_file_block(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        block: &BlockRef,
-    ) -> MetaResult<Option<BlockRef>> {
-        self.mutate(|local| local.set_file_block(ino, block_index, block))
-    }
-
-    fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
-        self.local.get_file_blocks(ino)
-    }
-
+impl MetaPayloadObjects for PgMetaEngine {
     fn lookup_regular_file_chunk_slices(
         &self,
         ino: Ino,
@@ -4168,38 +4129,30 @@ impl MetaBlocks for PgMetaEngine {
         self.local.lookup_regular_file_slices(ino, offset, length)
     }
 
-    fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>> {
-        self.mutate(|local| local.remove_file_blocks(ino))
+    fn remove_regular_file_graph(&self, ino: Ino) -> MetaResult<Vec<u64>> {
+        self.mutate(|local| local.remove_regular_file_graph(ino))
     }
 
-    fn remove_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<u64>> {
-        self.mutate(|local| local.remove_file_block(ino, block_index))
-    }
-
-    fn next_block_id(&self) -> MetaResult<u64> {
-        self.next_block_ids(1)?
+    fn next_object_id(&self) -> MetaResult<u64> {
+        self.next_object_ids(1)?
             .into_iter()
             .next()
-            .ok_or_else(|| MetaError::Storage("missing allocated block id".to_string()))
+            .ok_or_else(|| MetaError::Storage("missing allocated object ID".to_string()))
     }
 
-    fn next_block_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
+    fn next_object_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
         if count == 0 {
             return Ok(Vec::new());
         }
         let slot = self.client_slot()?;
         let first = self.allocate_local_ids(
             slot,
-            BLOCK_ID_RANGE_SPEC,
-            &self.block_id_cache,
-            &self.block_id_headroom_available,
+            OBJECT_ID_RANGE_SPEC,
+            &self.object_id_cache,
+            &self.object_id_headroom_available,
             count as u64,
         )?;
         Ok((first..first + count as u64).collect())
-    }
-
-    fn flush_blocks_batch(&self, entries: &[BatchFlushEntry]) -> MetaResult<Vec<BatchFlushResult>> {
-        self.mutate(|local| local.flush_blocks_batch(entries))
     }
 
     fn flush_regular_file_overlay_slices(
@@ -4218,6 +4171,20 @@ impl MetaBlocks for PgMetaEngine {
         self.local.get_regular_file_overlay_object_ids(ino)
     }
 
+    fn get_regular_file_graph_object_usage(&self, ino: Ino) -> MetaResult<Vec<(u64, u64)>> {
+        self.local.get_regular_file_graph_object_usage(ino)
+    }
+
+    fn has_regular_file_overlay_object_if_matches(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_id: u64,
+    ) -> MetaResult<bool> {
+        self.local
+            .has_regular_file_overlay_object_if_matches(ino, expected_epoch, object_id)
+    }
+
     fn mark_regular_file_overlay_object_uploaded_if_matches(
         &self,
         ino: Ino,
@@ -4230,52 +4197,6 @@ impl MetaBlocks for PgMetaEngine {
                 expected_epoch,
                 object_id,
             )
-        });
-        if matches!(result, Ok(true)) {
-            self.request_pending_flush();
-        }
-        result
-    }
-
-    fn commit_uploaded_block(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        expected_epoch: u64,
-        block: &BlockRef,
-    ) -> MetaResult<bool> {
-        let result = self
-            .mutate(|local| local.commit_uploaded_block(ino, block_index, expected_epoch, block));
-        if matches!(result, Ok(true)) {
-            self.request_pending_flush();
-        }
-        result
-    }
-
-    fn mark_file_block_uploaded_if_matches(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        expected_epoch: u64,
-        block: &BlockRef,
-    ) -> MetaResult<bool> {
-        let result = self.mutate(|local| {
-            local.mark_file_block_uploaded_if_matches(ino, block_index, expected_epoch, block)
-        });
-        if matches!(result, Ok(true)) {
-            self.request_pending_flush();
-        }
-        result
-    }
-
-    fn publish_file_manifest_if_matches(
-        &self,
-        ino: Ino,
-        expected_epoch: u64,
-        expected_manifest: &[(u32, BlockRef)],
-    ) -> MetaResult<bool> {
-        let result = self.mutate(|local| {
-            local.publish_file_manifest_if_matches(ino, expected_epoch, expected_manifest)
         });
         if matches!(result, Ok(true)) {
             self.request_pending_flush();
@@ -4478,7 +4399,7 @@ impl MetaReplication for PgMetaEngine {
     fn metadata_authority_status(&self) -> MetadataAuthorityStatus {
         MetadataAuthorityStatus {
             inode_id_headroom: self.inode_id_headroom_available.load(Ordering::Acquire),
-            block_id_headroom: self.block_id_headroom_available.load(Ordering::Acquire),
+            object_id_headroom: self.object_id_headroom_available.load(Ordering::Acquire),
         }
     }
 
@@ -4563,14 +4484,6 @@ impl MetaReplication for PgMetaEngine {
     }
 }
 impl crate::engine::MetaEngine for PgMetaEngine {
-    fn flush_blocks_batch_with_attr(
-        &self,
-        entries: &[BatchFlushEntry],
-        attr: Option<&InodeAttr>,
-    ) -> MetaResult<Vec<BatchFlushResult>> {
-        self.mutate(|local| local.flush_blocks_batch_with_attr(entries, attr))
-    }
-
     fn flush_regular_file_overlay_slices_with_attr(
         &self,
         ino: Ino,
@@ -4634,6 +4547,115 @@ mod tests {
             .build()
             .map_err(|e| MetaError::Storage(format!("failed to build tokio runtime: {e}")))?;
         rt.block_on(fut)
+    }
+
+    trait PgFileGraphFixture {
+        fn stage_payload_slice(
+            &self,
+            ino: Ino,
+            block_index: u32,
+            payload: &PayloadRef,
+        ) -> MetaResult<()>;
+        fn stage_payload_tombstone(&self, ino: Ino, block_index: u32) -> MetaResult<()>;
+    }
+
+    fn fixture_payload_slices(
+        block_index: u32,
+        payload: Option<&PayloadRef>,
+        state: PayloadRefState,
+    ) -> MetaResult<Vec<(ChunkId, Vec<SliceRecord>)>> {
+        let block_start = u64::from(block_index)
+            .checked_mul(u64::from(DEFAULT_BLOCK_SIZE))
+            .ok_or_else(|| MetaError::Storage("fixture block offset overflow".to_string()))?;
+        let data_end = block_start
+            .checked_add(u64::from(payload.map_or(0, |payload| payload.length)))
+            .ok_or_else(|| MetaError::Storage("fixture data range overflow".to_string()))?;
+        let block_end = block_start
+            .checked_add(u64::from(DEFAULT_BLOCK_SIZE))
+            .ok_or_else(|| MetaError::Storage("fixture block range overflow".to_string()))?;
+        let mut chunks = std::collections::BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
+        let mut push = |start: u64, end: u64, source: Option<&PayloadRef>| -> MetaResult<()> {
+            let mut cursor = start;
+            while cursor < end {
+                let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);
+                let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
+                let piece_end = end.min(chunk_start.saturating_add(DEFAULT_CHUNK_SIZE as u64));
+                let range = SliceRange::new(
+                    (cursor - chunk_start) as u32,
+                    (piece_end - chunk_start) as u32,
+                )
+                .ok_or_else(|| MetaError::Storage("fixture invalid slice range".to_string()))?;
+                let mut slice = if let Some(source) = source {
+                    let delta =
+                        u32::try_from(cursor.saturating_sub(block_start)).map_err(|_| {
+                            MetaError::Storage("fixture slice delta overflow".to_string())
+                        })?;
+                    SliceRecord::new(
+                        SliceId(0),
+                        SliceOrder(0),
+                        range,
+                        PayloadRef {
+                            object_id: source.object_id,
+                            offset: source.offset.saturating_add(delta),
+                            length: u32::try_from(piece_end.saturating_sub(cursor)).map_err(
+                                |_| MetaError::Storage("fixture slice length overflow".to_string()),
+                            )?,
+                            flags: source.flags,
+                        },
+                    )
+                } else {
+                    SliceRecord::tombstone(SliceId(0), SliceOrder(0), range)
+                };
+                slice.payload_state = state;
+                chunks.entry(chunk_id).or_default().push(slice);
+                cursor = piece_end;
+            }
+            Ok(())
+        };
+        push(block_start, data_end, payload)?;
+        if data_end < block_end {
+            push(data_end, block_end, None)?;
+        }
+        Ok(chunks.into_iter().collect())
+    }
+
+    fn lookup_first_object_id(engine: &PgMetaEngine, ino: Ino) -> MetaResult<Option<u64>> {
+        Ok(engine
+            .lookup_regular_file_slices(ino, 0, u64::from(DEFAULT_BLOCK_SIZE))?
+            .into_iter()
+            .find_map(|span| span.payload.map(|block| block.object_id)))
+    }
+
+    fn lookup_object_ids(engine: &PgMetaEngine, ino: Ino, length: u64) -> MetaResult<Vec<u64>> {
+        Ok(engine
+            .lookup_regular_file_slices(ino, 0, length)?
+            .into_iter()
+            .filter_map(|span| span.payload.map(|block| block.object_id))
+            .collect())
+    }
+
+    impl PgFileGraphFixture for PgMetaEngine {
+        fn stage_payload_slice(
+            &self,
+            ino: Ino,
+            block_index: u32,
+            payload: &PayloadRef,
+        ) -> MetaResult<()> {
+            self.flush_regular_file_overlay_slices(
+                ino,
+                fixture_payload_slices(block_index, Some(payload), PayloadRefState::LocalOnly)?
+                    .as_slice(),
+            )?;
+            Ok(())
+        }
+
+        fn stage_payload_tombstone(&self, ino: Ino, block_index: u32) -> MetaResult<()> {
+            self.flush_regular_file_overlay_slices(
+                ino,
+                fixture_payload_slices(block_index, None, PayloadRefState::LocalOnly)?.as_slice(),
+            )?;
+            Ok(())
+        }
     }
 
     fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
@@ -4884,6 +4906,45 @@ mod tests {
         TestEnvGuard { key, previous }
     }
 
+    #[test]
+    fn project_remote_events_filters_unpublished_overlay_slices() {
+        let events = vec![
+            MetaEvent::SetRegularFileOverlaySlices {
+                ino: 42,
+                chunk_slices: vec![(
+                    ChunkId(0),
+                    vec![SliceRecord {
+                        slice_id: SliceId(0),
+                        order: SliceOrder(0),
+                        range: SliceRange::new(0, 4096).unwrap(),
+                        payload: Some(PayloadRef::new_partial(9001, 4096)),
+                        payload_state: PayloadRefState::LocalOnly,
+                    }],
+                )],
+            },
+            MetaEvent::PublishRegularFileBaseSlices {
+                ino: 42,
+                chunk_slices: vec![(
+                    ChunkId(0),
+                    vec![SliceRecord {
+                        slice_id: SliceId(1),
+                        order: SliceOrder(0),
+                        range: SliceRange::new(0, 4096).unwrap(),
+                        payload: Some(PayloadRef::new_partial(9002, 4096)),
+                        payload_state: PayloadRefState::Published,
+                    }],
+                )],
+            },
+        ];
+
+        let projected = PgMetaEngine::project_remote_events(&events);
+        assert_eq!(projected.len(), 1);
+        assert!(matches!(
+            projected.first(),
+            Some(MetaEvent::PublishRegularFileBaseSlices { ino: 42, .. })
+        ));
+    }
+
     fn set_file_state(engine: &PgMetaEngine, ino: Ino, size: u64, content_epoch: u64) {
         let mut attr = engine.get_attr(ino).expect("get file attr");
         attr.size = size;
@@ -4904,11 +4965,11 @@ mod tests {
             .expect("create published file");
         set_file_state(engine, file.ino, 64, 1);
         engine
-            .set_file_block(file.ino, 0, &BlockRef::new_partial(object_id, 64))
-            .expect("set published file block");
+            .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(object_id, 64))
+            .expect("set published payload slice");
         assert!(
             engine
-                .publish_file_manifest(file.ino, 1)
+                .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
                 .expect("publish small file"),
             "small file publish must succeed"
         );
@@ -4953,9 +5014,9 @@ mod tests {
             pending_state: Mutex::new(PendingReplicationState::default()),
             inode_allocator_lock: Mutex::new(()),
             inode_window_reservation_lock: Mutex::new(()),
-            block_id_cache: Mutex::new(LocalIdLeaseCache::default()),
+            object_id_cache: Mutex::new(LocalIdLeaseCache::default()),
             inode_id_headroom_available: AtomicBool::new(false),
-            block_id_headroom_available: AtomicBool::new(false),
+            object_id_headroom_available: AtomicBool::new(false),
             janitor_lock: Mutex::new(None),
             file_lock_cache: Mutex::new(HashMap::new()),
             held_file_locks: Mutex::new(HashMap::new()),
@@ -4971,7 +5032,7 @@ mod tests {
 
         PgMetaEngine::persist_client_slot(&engine.local, 0).expect("persist unit test client slot");
         engine
-            .ensure_local_block_id_headroom(0)
+            .ensure_local_object_id_headroom(0)
             .expect("prime unit test block ranges");
         let inode_state = InodeAllocatorState {
             current: InodeWindow {
@@ -5355,18 +5416,18 @@ mod tests {
         pg.prime_local_id_ranges(3)
             .expect("prime local id allocator state");
 
-        let next_block = pg
+        let next_object = pg
             .local
-            .get_counter(counters::NEXT_BLOCK_ID)
+            .get_counter(counters::NEXT_OBJECT_ID)
             .expect("next block counter");
         let inode_state = load_inode_state(&pg.local);
         let block_active_end = pg
             .local
-            .get_counter("pgBlockActiveRangeEnd")
+            .get_counter("pgObjectActiveRangeEnd")
             .expect("block active range end");
         let block_reserved_end = pg
             .local
-            .get_counter("pgBlockReservedRangeEnd")
+            .get_counter("pgObjectReservedRangeEnd")
             .expect("block reserved range end");
 
         assert!(
@@ -5380,7 +5441,7 @@ mod tests {
         );
         assert!(inode_state.prefetched.is_empty());
         assert!(
-            block_active_end > next_block,
+            block_active_end > next_object,
             "block active range must extend beyond the current cursor"
         );
         assert!(
@@ -5440,9 +5501,9 @@ mod tests {
             .expect("set format info");
 
         PgMetaEngine::persist_client_slot(&local, 5).expect("persist client slot");
-        let block_base = PgMetaEngine::reserve_counter_range_base(5, PG_BLOCK_ID_STRIDE, 1);
+        let object_base = PgMetaEngine::reserve_counter_range_base(5, PG_OBJECT_ID_STRIDE, 1);
         local
-            .set_counter(counters::NEXT_BLOCK_ID, block_base + 2)
+            .set_counter(counters::NEXT_OBJECT_ID, object_base + 2)
             .expect("persist next block");
         persist_inode_state(
             &local,
@@ -5456,13 +5517,13 @@ mod tests {
             },
         );
         local
-            .set_counter("pgBlockActiveRangeStart", block_base)
+            .set_counter("pgObjectActiveRangeStart", object_base)
             .expect("persist block active start");
         local
-            .set_counter("pgBlockActiveRangeEnd", block_base + 8)
+            .set_counter("pgObjectActiveRangeEnd", object_base + 8)
             .expect("persist block active end");
         local
-            .set_counter("pgBlockReservedRangeEnd", block_base + 16)
+            .set_counter("pgObjectReservedRangeEnd", object_base + 16)
             .expect("persist block reserved end");
         drop(local);
 
@@ -5500,11 +5561,11 @@ mod tests {
             .expect("set format info");
 
         PgMetaEngine::persist_client_slot(&local, 5).expect("persist client slot");
-        let block_base = PgMetaEngine::reserve_counter_range_base(5, PG_BLOCK_ID_STRIDE, 1);
+        let object_base = PgMetaEngine::reserve_counter_range_base(5, PG_OBJECT_ID_STRIDE, 1);
         let legacy_inode_base =
             PgMetaEngine::reserve_counter_range_base(5, LEGACY_PG_INODE_ID_STRIDE, ROOT_INO + 1);
         local
-            .set_counter(counters::NEXT_BLOCK_ID, block_base + 2)
+            .set_counter(counters::NEXT_OBJECT_ID, object_base + 2)
             .expect("persist next block");
         persist_legacy_inode_range_state(
             &local,
@@ -5516,13 +5577,13 @@ mod tests {
             },
         );
         local
-            .set_counter("pgBlockActiveRangeStart", block_base)
+            .set_counter("pgObjectActiveRangeStart", object_base)
             .expect("persist block active start");
         local
-            .set_counter("pgBlockActiveRangeEnd", block_base + 8)
+            .set_counter("pgObjectActiveRangeEnd", object_base + 8)
             .expect("persist block active end");
         local
-            .set_counter("pgBlockReservedRangeEnd", block_base + 16)
+            .set_counter("pgObjectReservedRangeEnd", object_base + 16)
             .expect("persist block reserved end");
         drop(local);
 
@@ -5599,9 +5660,9 @@ mod tests {
             .expect("set format info");
 
         PgMetaEngine::persist_client_slot(&local, 5).expect("persist client slot");
-        let block_base = PgMetaEngine::reserve_counter_range_base(5, PG_BLOCK_ID_STRIDE, 1);
+        let object_base = PgMetaEngine::reserve_counter_range_base(5, PG_OBJECT_ID_STRIDE, 1);
         local
-            .set_counter(counters::NEXT_BLOCK_ID, block_base + 2)
+            .set_counter(counters::NEXT_OBJECT_ID, object_base + 2)
             .expect("persist next block");
         persist_inode_state(
             &local,
@@ -5615,13 +5676,13 @@ mod tests {
             },
         );
         local
-            .set_counter("pgBlockActiveRangeStart", block_base)
+            .set_counter("pgObjectActiveRangeStart", object_base)
             .expect("persist block active start");
         local
-            .set_counter("pgBlockActiveRangeEnd", block_base + 8)
+            .set_counter("pgObjectActiveRangeEnd", object_base + 8)
             .expect("persist block active end");
         local
-            .set_counter("pgBlockReservedRangeEnd", block_base + 16)
+            .set_counter("pgObjectReservedRangeEnd", object_base + 16)
             .expect("persist block reserved end");
         drop(local);
 
@@ -6313,7 +6374,7 @@ mod tests {
     }
 
     #[test]
-    fn unit_remote_projection_preserves_nested_manifest_publish() {
+    fn unit_remote_projection_preserves_nested_base_graph_publish() {
         let (_writer_dir, writer) = temp_pg_engine_for_unit();
         let (_remote_dir, remote) = temp_pg_engine_for_unit();
 
@@ -6325,14 +6386,14 @@ mod tests {
             .create_file(dir.ino, b"leaf.bin", 0, 0, 0o644)
             .expect("create file");
         set_file_state(&writer, file.ino, 4096, 1);
-        let block = BlockRef::new_partial(701, 4096);
+        let block = PayloadRef::new_partial(701, 4096);
         writer
-            .set_file_block(file.ino, 0, &block)
-            .expect("set block");
+            .stage_payload_slice(file.ino, 0, &block)
+            .expect("set payload slice");
         assert!(
             writer
-                .publish_file_manifest(file.ino, 1)
-                .expect("publish manifest"),
+                .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+                .expect("publish base graph"),
             "publish must succeed"
         );
         let end = writer.local.get_counter("nextEventSeq").expect("end seq");
@@ -6349,10 +6410,85 @@ mod tests {
         assert_eq!(remote_attr.committed_size, 4096);
         assert_eq!(remote_attr.committed_content_epoch, 1);
         assert_eq!(remote_attr.upload_state, UploadState::Ready);
-        let remote_blocks = remote
-            .get_file_blocks(remote_file.ino)
-            .expect("remote blocks");
-        assert_eq!(remote_blocks, vec![(0, block)]);
+        assert_eq!(
+            lookup_object_ids(&remote, remote_file.ino, remote_attr.size)
+                .expect("remote object ids"),
+            vec![block.object_id]
+        );
+    }
+
+    #[test]
+    fn unit_remote_projection_base_graph_publish_replaces_base_graph_on_shrink() {
+        let (_writer_dir, writer) = temp_pg_engine_for_unit();
+        let (_remote_dir, remote) = temp_pg_engine_for_unit();
+        let block_size = DEFAULT_BLOCK_SIZE as u64;
+
+        let batch1_start = writer
+            .local
+            .get_counter("nextEventSeq")
+            .expect("batch1 start");
+        let file = writer
+            .create_file(ROOT_INO, b"shrink.bin", 0, 0, 0o644)
+            .expect("create file");
+        set_file_state(&writer, file.ino, block_size + 4096, 1);
+        let first = PayloadRef::new_full(1001, DEFAULT_BLOCK_SIZE);
+        let second = PayloadRef::new_partial(block_size + 2, 4096);
+        writer
+            .stage_payload_slice(file.ino, 0, &first)
+            .expect("set first block");
+        writer
+            .stage_payload_slice(file.ino, 1, &second)
+            .expect("set second block");
+        assert!(
+            writer
+                .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+                .expect("publish initial base graph"),
+            "initial base graph publish must succeed"
+        );
+        let batch1_end = writer
+            .local
+            .get_counter("nextEventSeq")
+            .expect("batch1 end");
+        apply_projected_remote_range(&writer, &remote, batch1_start, batch1_end);
+
+        assert_eq!(
+            lookup_object_ids(&remote, file.ino, block_size + 4096)
+                .expect("remote initial object ids"),
+            vec![first.object_id, second.object_id]
+        );
+
+        let batch2_start = batch1_end;
+        set_file_state(&writer, file.ino, 4096, 2);
+        writer
+            .stage_payload_tombstone(file.ino, 1)
+            .expect("remove second block for shrink");
+        let replacement = PayloadRef::new_partial(block_size + 3, 4096);
+        writer
+            .stage_payload_slice(file.ino, 0, &replacement)
+            .expect("set replacement payload slice");
+        assert!(
+            writer
+                .publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
+                .expect("publish shrink base graph"),
+            "shrink base graph publish must succeed"
+        );
+        let batch2_end = writer
+            .local
+            .get_counter("nextEventSeq")
+            .expect("batch2 end");
+        apply_projected_remote_range(&writer, &remote, batch2_start, batch2_end);
+
+        let remote_attr = remote.get_attr(file.ino).expect("remote attr after shrink");
+        assert_eq!(remote_attr.size, 4096);
+        assert_eq!(remote_attr.committed_size, 4096);
+        assert_eq!(remote_attr.committed_content_epoch, 2);
+        assert_eq!(remote_attr.upload_state, UploadState::Ready);
+        assert_eq!(
+            lookup_object_ids(&remote, file.ino, remote_attr.size)
+                .expect("remote object ids after shrink"),
+            vec![replacement.object_id],
+            "base graph publish must replace the full remote base graph and drop stale trailing blocks"
+        );
     }
 
     #[test]
@@ -6391,18 +6527,18 @@ mod tests {
 
         let batch2_start = batch1_end;
         set_file_state(&writer, file.ino, block_size + 4096, 1);
-        let block0 = BlockRef::new_full(801, DEFAULT_BLOCK_SIZE);
-        let block1 = BlockRef::new_partial(802, 4096);
+        let block0 = PayloadRef::new_full(801, DEFAULT_BLOCK_SIZE);
+        let block1 = PayloadRef::new_partial(802, 4096);
         writer
-            .set_file_block(file.ino, 0, &block0)
-            .expect("set block 0");
+            .stage_payload_slice(file.ino, 0, &block0)
+            .expect("set payload slice 0");
         writer
-            .set_file_block(file.ino, 1, &block1)
-            .expect("set block 1");
+            .stage_payload_slice(file.ino, 1, &block1)
+            .expect("set payload slice 1");
         assert!(
             writer
-                .publish_file_manifest(file.ino, 1)
-                .expect("publish renamed manifest"),
+                .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+                .expect("publish renamed base graph"),
             "publish after rename must succeed"
         );
         let batch2_end = writer
@@ -6422,10 +6558,11 @@ mod tests {
         assert_eq!(remote_attr_after.size, block_size + 4096);
         assert_eq!(remote_attr_after.committed_size, block_size + 4096);
         assert_eq!(remote_attr_after.upload_state, UploadState::Ready);
-        let remote_blocks = remote
-            .get_file_blocks(remote_file_after.ino)
-            .expect("remote blocks after publish");
-        assert_eq!(remote_blocks, vec![(0, block0), (1, block1)]);
+        assert_eq!(
+            lookup_object_ids(&remote, remote_file_after.ino, remote_attr_after.size)
+                .expect("remote object ids after publish"),
+            vec![block0.object_id, block1.object_id]
+        );
     }
 
     #[test]
@@ -6445,15 +6582,15 @@ mod tests {
             .create_file(dir.ino, b"final.bin", 0, 0, 0o644)
             .expect("create old final");
         set_file_state(&writer, old.ino, 4096, 1);
-        let old_block = BlockRef::new_partial(901, 4096);
+        let old_block = PayloadRef::new_partial(901, 4096);
         writer
-            .set_file_block(old.ino, 0, &old_block)
+            .stage_payload_slice(old.ino, 0, &old_block)
             .expect("set old block");
         assert!(
             writer
-                .publish_file_manifest(old.ino, 1)
-                .expect("publish old manifest"),
-            "old manifest publish must succeed"
+                .publish_regular_file_overlay_to_base_if_matches(old.ino, 1)
+                .expect("publish old base graph"),
+            "old base graph publish must succeed"
         );
         let seed_end = writer.local.get_counter("nextEventSeq").expect("seed end");
 
@@ -6470,17 +6607,17 @@ mod tests {
             .create_file(dir.ino, b"temp.bin", 0, 0, 0o644)
             .expect("create replacement temp");
         set_file_state(&writer, temp.ino, block_size + 4096, 2);
-        let new_block0 = BlockRef::new_full(902, DEFAULT_BLOCK_SIZE);
-        let new_block1 = BlockRef::new_partial(903, 4096);
+        let new_block0 = PayloadRef::new_full(902, DEFAULT_BLOCK_SIZE);
+        let new_block1 = PayloadRef::new_partial(903, 4096);
         writer
-            .set_file_block(temp.ino, 0, &new_block0)
-            .expect("set replacement block 0");
+            .stage_payload_slice(temp.ino, 0, &new_block0)
+            .expect("set replacement payload slice 0");
         writer
-            .set_file_block(temp.ino, 1, &new_block1)
-            .expect("set replacement block 1");
+            .stage_payload_slice(temp.ino, 1, &new_block1)
+            .expect("set replacement payload slice 1");
         assert!(
             writer
-                .publish_file_manifest(temp.ino, 2)
+                .publish_regular_file_overlay_to_base_if_matches(temp.ino, 2)
                 .expect("publish replacement temp"),
             "replacement temp publish must succeed"
         );
@@ -6509,10 +6646,11 @@ mod tests {
         assert_eq!(remote_attr.committed_size, block_size + 4096);
         assert_eq!(remote_attr.committed_content_epoch, 2);
         assert_eq!(remote_attr.upload_state, UploadState::Ready);
-        let remote_blocks = remote
-            .get_file_blocks(remote_final.ino)
-            .expect("replacement blocks");
-        assert_eq!(remote_blocks, vec![(0, new_block0), (1, new_block1)]);
+        assert_eq!(
+            lookup_object_ids(&remote, remote_final.ino, remote_attr.size)
+                .expect("replacement object ids"),
+            vec![new_block0.object_id, new_block1.object_id]
+        );
     }
 
     #[test]
@@ -6531,14 +6669,14 @@ mod tests {
             .create_file(dir.ino, b"final.bin", 0, 0, 0o644)
             .expect("create final");
         set_file_state(&writer, file.ino, 4096, 1);
-        let published = BlockRef::new_partial(904, 4096);
+        let published = PayloadRef::new_partial(904, 4096);
         writer
-            .set_file_block(file.ino, 0, &published)
-            .expect("set published block");
+            .stage_payload_slice(file.ino, 0, &published)
+            .expect("set published payload slice");
         assert!(
             writer
-                .publish_file_manifest(file.ino, 1)
-                .expect("publish seed manifest"),
+                .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+                .expect("publish seed base graph"),
             "seed publish must succeed"
         );
         let seed_end = writer.local.get_counter("nextEventSeq").expect("seed end");
@@ -6553,13 +6691,17 @@ mod tests {
 
         let upload_start = seed_end;
         set_file_state(&writer, file.ino, 4096, 2);
-        let uploaded_overlay = BlockRef::new_partial(905, 4096);
+        let uploaded_overlay = PayloadRef::new_partial(905, 4096);
         writer
-            .set_file_block(file.ino, 0, &uploaded_overlay)
+            .stage_payload_slice(file.ino, 0, &uploaded_overlay)
             .expect("set unpublished overlay");
         assert!(
             writer
-                .mark_file_block_uploaded_if_matches(file.ino, 0, 2, &uploaded_overlay)
+                .mark_regular_file_overlay_object_uploaded_if_matches(
+                    file.ino,
+                    2,
+                    uploaded_overlay.object_id,
+                )
                 .expect("mark overlay uploaded"),
             "overlay upload marker must succeed"
         );
@@ -6589,8 +6731,10 @@ mod tests {
         assert_eq!(remote_attr.committed_size, 4096);
         assert_eq!(remote_attr.content_epoch, 1);
         assert_eq!(remote_attr.committed_content_epoch, 1);
-        let remote_blocks = remote.get_file_blocks(file.ino).expect("remote blocks");
-        assert_eq!(remote_blocks, vec![(0, published)]);
+        assert_eq!(
+            lookup_object_ids(&remote, file.ino, remote_attr.size).expect("remote object ids"),
+            vec![published.object_id]
+        );
 
         assert!(
             writer.get_attr(file.ino).is_err(),
@@ -6628,13 +6772,13 @@ mod tests {
             .create_file(ROOT_INO, b"overlay.bin", 0, 0, 0o644)
             .expect("create overlay file");
         set_file_state(&writer, file.ino, 4096, 1);
-        let block = BlockRef::new_partial(906, 4096);
+        let block = PayloadRef::new_partial(906, 4096);
         writer
-            .set_file_block(file.ino, 0, &block)
+            .stage_payload_slice(file.ino, 0, &block)
             .expect("set overlay block");
         assert!(
             writer
-                .mark_file_block_uploaded_if_matches(file.ino, 0, 1, &block)
+                .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 1, block.object_id)
                 .expect("mark overlay uploaded"),
             "uploaded marker must succeed"
         );
@@ -6656,10 +6800,11 @@ mod tests {
         assert_eq!(remote_attr.committed_size, 4096);
         assert_eq!(remote_attr.committed_content_epoch, 1);
         assert_eq!(remote_attr.upload_state, UploadState::Ready);
-        let remote_blocks = remote
-            .get_file_blocks(remote_file.ino)
-            .expect("remote overlay blocks");
-        assert_eq!(remote_blocks, vec![(0, block)]);
+        assert_eq!(
+            lookup_object_ids(&remote, remote_file.ino, remote_attr.size)
+                .expect("remote overlay object ids"),
+            vec![block.object_id]
+        );
     }
 
     #[test]
@@ -6803,17 +6948,17 @@ mod tests {
             .local
             .get_counter(counters::NEXT_INODE)
             .expect("b next inode");
-        let a_next_block = a
+        let a_next_object = a
             .local
-            .get_counter(counters::NEXT_BLOCK_ID)
+            .get_counter(counters::NEXT_OBJECT_ID)
             .expect("a next block");
-        let b_next_block = b
+        let b_next_object = b
             .local
-            .get_counter(counters::NEXT_BLOCK_ID)
+            .get_counter(counters::NEXT_OBJECT_ID)
             .expect("b next block");
 
         assert_ne!(a_next_inode, b_next_inode);
-        assert_ne!(a_next_block, b_next_block);
+        assert_ne!(a_next_object, b_next_object);
 
         let a_file = a
             .create_file(ROOT_INO, b"a.txt", 0, 0, 0o644)
@@ -6923,12 +7068,12 @@ mod tests {
 
         let file = create_published_small_file(&a, ROOT_INO, b"remote.bin", 50_301);
         set_file_state(&a, file.ino, 4096, 2);
-        let block = BlockRef::new_partial(77, 4096);
-        a.set_file_block(file.ino, 0, &block)
-            .expect("set staged block");
+        let block = PayloadRef::new_partial(77, 4096);
+        a.stage_payload_slice(file.ino, 0, &block)
+            .expect("set staged payload slice");
         assert!(
-            a.publish_file_manifest(file.ino, 2)
-                .expect("publish committed manifest")
+            a.publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
+                .expect("publish committed base graph")
         );
         a.flush_metadata().expect("flush a");
 
@@ -6939,16 +7084,17 @@ mod tests {
             Duration::from_secs(10)
         ));
         let remote = b.lookup(ROOT_INO, b"remote.bin").expect("lookup remote");
-        let remote_block = b
-            .get_file_block(remote.ino, 0)
-            .expect("get remote block")
-            .expect("remote committed block");
-        assert_eq!(remote_block.object_id, 77);
+        assert_eq!(
+            lookup_first_object_id(&b, remote.ino)
+                .expect("get remote payload slice")
+                .expect("remote committed payload slice"),
+            77
+        );
 
-        let remote_blocks = b.get_file_blocks(remote.ino).expect("get remote blocks");
-        assert_eq!(remote_blocks.len(), 1);
-        assert_eq!(remote_blocks[0].0, 0);
-        assert_eq!(remote_blocks[0].1.object_id, 77);
+        assert_eq!(
+            lookup_object_ids(&b, remote.ino, 4096).expect("get remote object ids"),
+            vec![77]
+        );
     }
 
     #[test]
@@ -6974,8 +7120,8 @@ mod tests {
             .create_file(ROOT_INO, b"uploading.bin", 0, 0, 0o644)
             .expect("create file");
         set_file_state(&a, file.ino, 4096, 1);
-        a.set_file_block(file.ino, 0, &BlockRef::new_partial(501, 4096))
-            .expect("set staged block");
+        a.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(501, 4096))
+            .expect("set staged payload slice");
         a.flush_metadata().expect("flush uploading marker");
 
         assert!(wait_until(Duration::from_secs(10), || {
@@ -6989,7 +7135,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
-    fn test_pg_nested_manifest_publish_visible_on_remote_peer() {
+    fn test_pg_nested_base_graph_publish_visible_on_remote_peer() {
         let Some(dsn) = pg_dsn() else {
             return;
         };
@@ -6998,7 +7144,7 @@ mod tests {
         let dir_b = tempdir().expect("tempdir b");
         let db_a = dir_a.path().join("meta-a.redb");
         let db_b = dir_b.path().join("meta-b.redb");
-        let volume = PgTestVolume::new(&dsn, "pg-nested-manifest-publish");
+        let volume = PgTestVolume::new(&dsn, "pg-nested-base-graph-publish");
         let info = volume.format_info();
         seed_local(&db_a, &info);
         seed_local(&db_b, &info);
@@ -7021,12 +7167,12 @@ mod tests {
             .create_file(dir.ino, b"leaf.bin", 0, 0, 0o644)
             .expect("create nested file");
         set_file_state(&a, file.ino, 4096, 1);
-        let block = BlockRef::new_partial(511, 4096);
-        a.set_file_block(file.ino, 0, &block)
+        let block = PayloadRef::new_partial(511, 4096);
+        a.stage_payload_slice(file.ino, 0, &block)
             .expect("set nested block");
         assert!(
-            a.publish_file_manifest(file.ino, 1)
-                .expect("publish nested manifest")
+            a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+                .expect("publish nested base graph")
         );
         a.flush_metadata().expect("flush nested publish");
 
@@ -7052,10 +7198,10 @@ mod tests {
         let remote_file = b
             .lookup(remote_dir.ino, b"leaf.bin")
             .expect("lookup remote nested file");
-        let remote_blocks = b
-            .get_file_blocks(remote_file.ino)
-            .expect("get remote nested blocks");
-        assert_eq!(remote_blocks, vec![(0, block)]);
+        assert_eq!(
+            lookup_object_ids(&b, remote_file.ino, 4096).expect("get remote nested object ids"),
+            vec![block.object_id]
+        );
     }
 
     #[test]
@@ -7108,15 +7254,17 @@ mod tests {
 
         let block_size = DEFAULT_BLOCK_SIZE as u64;
         set_file_state(&a, file.ino, block_size + 4096, 1);
-        let block0 = BlockRef::new_full(611, DEFAULT_BLOCK_SIZE);
-        let block1 = BlockRef::new_partial(612, 4096);
-        a.set_file_block(file.ino, 0, &block0).expect("set block 0");
-        a.set_file_block(file.ino, 1, &block1).expect("set block 1");
+        let block0 = PayloadRef::new_full(611, DEFAULT_BLOCK_SIZE);
+        let block1 = PayloadRef::new_partial(612, 4096);
+        a.stage_payload_slice(file.ino, 0, &block0)
+            .expect("set payload slice 0");
+        a.stage_payload_slice(file.ino, 1, &block1)
+            .expect("set payload slice 1");
         assert!(
-            a.publish_file_manifest(file.ino, 1)
-                .expect("publish renamed nested manifest")
+            a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+                .expect("publish renamed nested base graph")
         );
-        a.flush_metadata().expect("flush renamed nested manifest");
+        a.flush_metadata().expect("flush renamed nested base graph");
 
         assert!(wait_until(Duration::from_secs(12), || {
             let _ = b.sync_metadata();
@@ -7131,10 +7279,12 @@ mod tests {
                                     && attr.upload_state == UploadState::Ready
                             })
                             .unwrap_or(false);
-                        let blocks_ready = b
-                            .get_file_blocks(remote_file.ino)
-                            .map(|blocks| blocks == vec![(0, block0.clone()), (1, block1.clone())])
-                            .unwrap_or(false);
+                        let blocks_ready =
+                            lookup_object_ids(&b, remote_file.ino, block_size + 4096)
+                                .map(|object_ids| {
+                                    object_ids == vec![block0.object_id, block1.object_id]
+                                })
+                                .unwrap_or(false);
                         attr_ready && blocks_ready
                     }
                     Err(_) => false,
@@ -7167,12 +7317,12 @@ mod tests {
             .create_file(ROOT_INO, b"committed.bin", 0, 0, 0o644)
             .expect("create file");
         set_file_state(&a, file.ino, 4096, 1);
-        let baseline = BlockRef::new_partial(701, 4096);
-        a.set_file_block(file.ino, 0, &baseline)
+        let baseline = PayloadRef::new_partial(701, 4096);
+        a.stage_payload_slice(file.ino, 0, &baseline)
             .expect("set baseline block");
         assert!(
-            a.publish_file_manifest(file.ino, 1)
-                .expect("publish baseline manifest")
+            a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+                .expect("publish baseline base graph")
         );
         a.flush_metadata().expect("flush baseline");
 
@@ -7184,17 +7334,16 @@ mod tests {
         ));
         let remote = b.lookup(ROOT_INO, b"committed.bin").expect("lookup remote");
         assert_eq!(
-            b.get_file_block(remote.ino, 0)
+            lookup_first_object_id(&b, remote.ino)
                 .expect("get baseline remote block")
-                .expect("baseline remote block")
-                .object_id,
+                .expect("baseline remote block"),
             701
         );
 
         set_file_state(&a, file.ino, 4096, 2);
-        let replacement = BlockRef::new_partial(702, 4096);
-        a.set_file_block(file.ino, 0, &replacement)
-            .expect("set replacement block");
+        let replacement = PayloadRef::new_partial(702, 4096);
+        a.stage_payload_slice(file.ino, 0, &replacement)
+            .expect("set replacement payload slice");
         a.flush_metadata().expect("flush updating marker");
 
         assert!(wait_until(Duration::from_secs(10), || {
@@ -7208,12 +7357,11 @@ mod tests {
             .get_attr(remote.ino)
             .expect("get remote attr after update");
         assert_eq!(remote_attr.upload_state, UploadState::Updating);
-        let remote_block = b
-            .get_file_block(remote.ino, 0)
-            .expect("get remote block after update")
-            .expect("remote block after update");
         assert_eq!(
-            remote_block.object_id, 701,
+            lookup_first_object_id(&b, remote.ino)
+                .expect("get remote block after update")
+                .expect("remote block after update"),
+            701,
             "remote peer must keep serving the previous committed version until publish"
         );
     }
@@ -7242,17 +7390,17 @@ mod tests {
             .expect("create file");
         let block_size = DEFAULT_BLOCK_SIZE as u64;
         set_file_state(&a, file.ino, block_size + 4096, 1);
-        let baseline0 = BlockRef::new_full(801, DEFAULT_BLOCK_SIZE);
-        let baseline1 = BlockRef::new_partial(802, 4096);
-        a.set_file_block(file.ino, 0, &baseline0)
+        let baseline0 = PayloadRef::new_full(801, DEFAULT_BLOCK_SIZE);
+        let baseline1 = PayloadRef::new_partial(802, 4096);
+        a.stage_payload_slice(file.ino, 0, &baseline0)
             .expect("set baseline block 0");
-        a.set_file_block(file.ino, 1, &baseline1)
+        a.stage_payload_slice(file.ino, 1, &baseline1)
             .expect("set baseline block 1");
         assert!(
-            a.publish_file_manifest(file.ino, 1)
-                .expect("publish baseline manifest")
+            a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+                .expect("publish baseline base graph")
         );
-        a.flush_metadata().expect("flush baseline manifest");
+        a.flush_metadata().expect("flush baseline base graph");
 
         assert!(wait_visible(
             &b,
@@ -7263,46 +7411,44 @@ mod tests {
         let remote = b.lookup(ROOT_INO, b"atomic.bin").expect("lookup remote");
 
         set_file_state(&a, file.ino, block_size + 4096, 2);
-        let replacement0 = BlockRef::new_full(901, DEFAULT_BLOCK_SIZE);
-        let replacement1 = BlockRef::new_partial(902, 4096);
-        a.set_file_block(file.ino, 0, &replacement0)
-            .expect("set replacement block 0");
-        a.set_file_block(file.ino, 1, &replacement1)
-            .expect("set replacement block 1");
+        let replacement0 = PayloadRef::new_full(901, DEFAULT_BLOCK_SIZE);
+        let replacement1 = PayloadRef::new_partial(902, 4096);
+        a.stage_payload_slice(file.ino, 0, &replacement0)
+            .expect("set replacement payload slice 0");
+        a.stage_payload_slice(file.ino, 1, &replacement1)
+            .expect("set replacement payload slice 1");
         a.flush_metadata().expect("flush updating state");
 
         assert!(wait_until(Duration::from_secs(10), || {
             let _ = b.sync_metadata();
-            let blocks = b.get_file_blocks(remote.ino).unwrap_or_default();
-            blocks.len() == 2
-                && blocks[0].1.object_id == 801
-                && blocks[1].1.object_id == 802
+            let object_ids =
+                lookup_object_ids(&b, remote.ino, block_size + 4096).unwrap_or_default();
+            object_ids == vec![801, 802]
                 && b.get_attr(remote.ino)
                     .map(|attr| attr.upload_state == UploadState::Updating)
                     .unwrap_or(false)
         }));
 
         assert!(
-            a.publish_file_manifest(file.ino, 2)
-                .expect("publish replacement manifest")
+            a.publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
+                .expect("publish replacement base graph")
         );
-        a.flush_metadata().expect("flush replacement manifest");
+        a.flush_metadata().expect("flush replacement base graph");
 
         assert!(wait_until(Duration::from_secs(10), || {
             let _ = b.sync_metadata();
-            let blocks = b.get_file_blocks(remote.ino).unwrap_or_default();
-            blocks.len() == 2
-                && blocks[0].1.object_id == 901
-                && blocks[1].1.object_id == 902
+            let object_ids =
+                lookup_object_ids(&b, remote.ino, block_size + 4096).unwrap_or_default();
+            object_ids == vec![901, 902]
                 && b.get_attr(remote.ino)
                     .map(|attr| attr.upload_state == UploadState::Ready)
                     .unwrap_or(false)
         }));
 
-        let remote_blocks = b.get_file_blocks(remote.ino).expect("get remote blocks");
-        assert_eq!(remote_blocks.len(), 2);
-        assert_eq!(remote_blocks[0].1.object_id, 901);
-        assert_eq!(remote_blocks[1].1.object_id, 902);
+        assert_eq!(
+            lookup_object_ids(&b, remote.ino, block_size + 4096).expect("get remote object ids"),
+            vec![901, 902]
+        );
     }
 
     #[test]
@@ -7332,7 +7478,7 @@ mod tests {
             .create_file(ROOT_INO, b"draft.bin", 0, 0, 0o644)
             .expect("create local draft");
         set_file_state(&b, draft.ino, 4096, 1);
-        b.set_file_block(draft.ino, 0, &BlockRef::new_partial(1001, 4096))
+        b.stage_payload_slice(draft.ino, 0, &PayloadRef::new_partial(1001, 4096))
             .expect("set local draft block");
 
         a.create_dir(ROOT_INO, b"foreign", 0, 0, 0o755)
@@ -7352,11 +7498,12 @@ mod tests {
         assert_eq!(local_attr.size, 4096);
         assert_eq!(local_attr.committed_size, 0);
         assert_eq!(local_attr.upload_state, UploadState::Uploading);
-        let local_block = b
-            .get_file_block(draft.ino, 0)
-            .expect("get local draft block")
-            .expect("local draft block");
-        assert_eq!(local_block.object_id, 1001);
+        assert_eq!(
+            lookup_first_object_id(&b, draft.ino)
+                .expect("get local draft block")
+                .expect("local draft block"),
+            1001
+        );
 
         if let Ok(mut state) = b.pending_state.lock() {
             state.force_flush = false;
@@ -7398,8 +7545,8 @@ mod tests {
         let mut draft_attr = a.get_attr(draft.ino).expect("get draft attr");
         draft_attr.size = 4096;
         a.set_attr(&draft_attr).expect("set draft size");
-        a.set_file_block(draft.ino, 0, &BlockRef::new_partial(501, 4096))
-            .expect("set draft staged block");
+        a.stage_payload_slice(draft.ino, 0, &PayloadRef::new_partial(501, 4096))
+            .expect("set draft staged payload slice");
         a.flush_metadata().expect("flush draft namespace");
 
         b.create_dir(ROOT_INO, b"foreign.txt", 0, 0, 0o755)
@@ -7414,11 +7561,12 @@ mod tests {
         let draft_after = a.get_attr(draft.ino).expect("get local draft");
         assert_eq!(draft_after.size, 4096);
         assert_eq!(draft_after.committed_size, 0);
-        let local_block = a
-            .get_file_block(draft.ino, 0)
-            .expect("get staged draft block")
-            .expect("staged draft block exists");
-        assert_eq!(local_block.object_id, 501);
+        assert_eq!(
+            lookup_first_object_id(&a, draft.ino)
+                .expect("get staged draft block")
+                .expect("staged draft block exists"),
+            501
+        );
     }
 
     #[test]
@@ -7444,11 +7592,11 @@ mod tests {
             .create_file(ROOT_INO, b"remote.bin", 0, 0, 0o644)
             .expect("create file");
         set_file_state(&a, file.ino, 4096, 1);
-        a.set_file_block(file.ino, 0, &BlockRef::new_partial(87, 4096))
+        a.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(87, 4096))
             .expect("set baseline remote block");
         assert!(
-            a.publish_file_manifest(file.ino, 1)
-                .expect("publish baseline manifest")
+            a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+                .expect("publish baseline base graph")
         );
         a.flush_metadata().expect("flush create");
         assert!(wait_visible(
@@ -7464,27 +7612,28 @@ mod tests {
         b.set_attr(&local_attr).expect("set local attr overlay");
 
         set_file_state(&a, file.ino, 4096, 2);
-        let block = BlockRef::new_partial(88, 4096);
-        a.set_file_block(file.ino, 0, &block)
-            .expect("set staged remote block");
+        let block = PayloadRef::new_partial(88, 4096);
+        a.stage_payload_slice(file.ino, 0, &block)
+            .expect("set staged remote slice");
         assert!(
-            a.publish_file_manifest(file.ino, 2)
-                .expect("publish remote block manifest")
+            a.publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
+                .expect("publish remote slice graph")
         );
-        a.flush_metadata().expect("flush remote block");
+        a.flush_metadata().expect("flush remote slice graph");
 
         assert!(wait_until(Duration::from_secs(12), || {
             let _ = b.sync_metadata();
-            b.get_file_block(b_file.ino, 0)
-                .map(|block| block.map(|value| value.object_id == 88).unwrap_or(false))
+            lookup_first_object_id(&b, b_file.ino)
+                .map(|object_id| object_id == Some(88))
                 .unwrap_or(false)
         }));
 
-        let committed = b
-            .get_file_block(b_file.ino, 0)
-            .expect("get committed block on b")
-            .expect("committed block visible on b");
-        assert_eq!(committed.object_id, 88);
+        assert_eq!(
+            lookup_first_object_id(&b, b_file.ino)
+                .expect("get committed payload slice on b")
+                .expect("committed payload slice visible on b"),
+            88
+        );
 
         let attr_after = b.get_attr(b_file.ino).expect("get local attr after sync");
         assert_eq!(
@@ -7513,7 +7662,7 @@ mod tests {
         let mut draft_attr = pg.get_attr(draft.ino).expect("get draft attr");
         draft_attr.size = 4096;
         pg.set_attr(&draft_attr).expect("set staged size");
-        pg.set_file_block(draft.ino, 0, &BlockRef::new_partial(601, 4096))
+        pg.stage_payload_slice(draft.ino, 0, &PayloadRef::new_partial(601, 4096))
             .expect("set draft block");
 
         let mut conflicted_attr = draft_attr.clone();
@@ -7597,7 +7746,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
-    fn test_pg_checkpoint_excludes_uncommitted_local_blocks() {
+    fn test_pg_checkpoint_excludes_uncommitted_local_payloads() {
         let Some(dsn) = pg_dsn() else {
             return;
         };
@@ -7621,8 +7770,8 @@ mod tests {
         attr.mtime = InodeAttr::now_nanos();
         attr.ctime = attr.mtime;
         a.set_attr(&attr).expect("set staged size");
-        a.set_file_block(file.ino, 0, &BlockRef::new_partial(42, 4096))
-            .expect("set staged block");
+        a.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(42, 4096))
+            .expect("set staged payload slice");
         a.flush_metadata().expect("flush a");
 
         let b = PgMetaEngine::open(&db_b).expect("open b");
@@ -7694,11 +7843,11 @@ mod tests {
             .create_file(ROOT_INO, b"uploading.bin", 0, 0, 0o644)
             .expect("create uploading file");
         set_file_state(&a, file.ino, 4096, 1);
-        a.set_file_block(file.ino, 0, &BlockRef::new_partial(776, 4096))
+        a.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(776, 4096))
             .expect("set baseline uploading block");
         assert!(
-            a.publish_file_manifest(file.ino, 1)
-                .expect("publish baseline manifest")
+            a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+                .expect("publish baseline base graph")
         );
         a.flush_metadata().expect("flush baseline");
         assert!(wait_visible(
@@ -7709,7 +7858,7 @@ mod tests {
         ));
 
         set_file_state(&a, file.ino, 4096, 2);
-        a.set_file_block(file.ino, 0, &BlockRef::new_partial(777, 4096))
+        a.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(777, 4096))
             .expect("set local uploading block");
         a.flush_metadata().expect("flush uploading namespace");
 
@@ -7738,22 +7887,21 @@ mod tests {
             .get_attr(file.ino)
             .expect("get local attr after peer unlink");
         assert_eq!(local_attr.upload_state, UploadState::Ready);
-        let local_block = a
-            .get_file_block(file.ino, 0)
-            .expect("get local block after peer unlink")
-            .expect("writer keeps local pending block after peer unlink");
-        assert_eq!(local_block.object_id, 777);
+        assert_eq!(
+            lookup_first_object_id(&a, file.ino)
+                .expect("get local payload after peer unlink")
+                .expect("writer keeps local pending payload after peer unlink"),
+            777
+        );
 
         drop(a);
         let reopened = reopen_pg_engine_with_retry(&db_a);
         reopened.sync_metadata().expect("sync reopened a");
         assert!(reopened.lookup(ROOT_INO, b"uploading.bin").is_ok());
         assert_eq!(
-            reopened
-                .get_file_block(file.ino, 0)
-                .expect("get reopened local block")
-                .expect("reopened local block")
-                .object_id,
+            lookup_first_object_id(&reopened, file.ino)
+                .expect("get reopened local payload")
+                .expect("reopened local payload"),
             777
         );
     }
@@ -8359,10 +8507,10 @@ mod tests {
         if let Ok(entry) = a.lookup(ROOT_INO, b"victim") {
             if a.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
                 set_file_state(&a, entry.ino, 64, 1);
-                a.set_file_block(entry.ino, 0, &BlockRef::new_partial(50_320, 64))
+                a.stage_payload_slice(entry.ino, 0, &PayloadRef::new_partial(50_320, 64))
                     .expect("set winner block on a");
                 assert!(
-                    a.publish_file_manifest(entry.ino, 1)
+                    a.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
                         .expect("publish winner on a")
                 );
                 a.flush_metadata().expect("flush winner on a");
@@ -8370,10 +8518,10 @@ mod tests {
         } else if let Ok(entry) = b.lookup(ROOT_INO, b"victim") {
             if b.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
                 set_file_state(&b, entry.ino, 64, 1);
-                b.set_file_block(entry.ino, 0, &BlockRef::new_partial(50_321, 64))
+                b.stage_payload_slice(entry.ino, 0, &PayloadRef::new_partial(50_321, 64))
                     .expect("set winner block on b");
                 assert!(
-                    b.publish_file_manifest(entry.ino, 1)
+                    b.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
                         .expect("publish winner on b")
                 );
                 b.flush_metadata().expect("flush winner on b");
@@ -8450,10 +8598,10 @@ mod tests {
         if let Ok(entry) = a.lookup(ROOT_INO, b"victim") {
             if a.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
                 set_file_state(&a, entry.ino, 64, 1);
-                a.set_file_block(entry.ino, 0, &BlockRef::new_partial(50_322, 64))
+                a.stage_payload_slice(entry.ino, 0, &PayloadRef::new_partial(50_322, 64))
                     .expect("set winner block on a");
                 assert!(
-                    a.publish_file_manifest(entry.ino, 1)
+                    a.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
                         .expect("publish winner on a")
                 );
                 a.flush_metadata().expect("flush winner on a");
@@ -8461,10 +8609,10 @@ mod tests {
         } else if let Ok(entry) = b.lookup(ROOT_INO, b"victim") {
             if b.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
                 set_file_state(&b, entry.ino, 64, 1);
-                b.set_file_block(entry.ino, 0, &BlockRef::new_partial(50_323, 64))
+                b.stage_payload_slice(entry.ino, 0, &PayloadRef::new_partial(50_323, 64))
                     .expect("set winner block on b");
                 assert!(
-                    b.publish_file_manifest(entry.ino, 1)
+                    b.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
                         .expect("publish winner on b")
                 );
                 b.flush_metadata().expect("flush winner on b");
@@ -9329,8 +9477,8 @@ mod tests {
             .create_file(ROOT_INO, b"snap-peer.txt", 0, 0, 0o644)
             .expect("create file on a");
         set_file_state(&a, file.ino, 64, 1);
-        a.set_file_block(file.ino, 0, &BlockRef::new_partial(44_001, 64))
-            .expect("set block");
+        a.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(44_001, 64))
+            .expect("set payload slice");
 
         let created = a.create_snapshot(ROOT_INO).expect("create snapshot");
         a.flush_metadata().expect("flush snapshot");
@@ -9433,8 +9581,8 @@ mod tests {
             .create_file(ROOT_INO, b"snap-gc.txt", 0, 0, 0o644)
             .expect("create file");
         set_file_state(&a, file.ino, 64, 1);
-        a.set_file_block(file.ino, 0, &BlockRef::new_partial(55_001, 64))
-            .expect("set block");
+        a.stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(55_001, 64))
+            .expect("set payload slice");
         let _snapshot = a.create_snapshot(ROOT_INO).expect("create snapshot");
         a.flush_metadata().expect("flush snapshot");
 

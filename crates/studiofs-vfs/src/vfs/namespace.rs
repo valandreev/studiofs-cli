@@ -1037,7 +1037,7 @@ impl StudioVfs {
 
 #[cfg(test)]
 mod tests {
-    use super::super::local_dirty::PendingBlock;
+    use super::super::local_dirty::PendingPayload;
     use super::*;
     use bytes::BytesMut;
     use std::sync::Arc;
@@ -1442,12 +1442,13 @@ mod tests {
             "remote namespace should stay hidden until the first published version exists"
         );
 
-        vfs.state.local_dirty.pending_blocks.lock().insert(
+        vfs.state.local_dirty.pending_payloads.lock().insert(
             (ino, 0),
-            PendingBlock {
+            PendingPayload {
                 data: BytesMut::from(&b"local"[..]),
                 dirty: true,
                 reserved_object_id: None,
+                persisted_len: None,
             },
         );
 

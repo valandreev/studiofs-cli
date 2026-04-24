@@ -125,7 +125,7 @@ This change is deliberately narrow:
 - A temp-file-plus-rename flow must keep the final path hidden on the peer
   until the first publish lands.
 - Once the first publish lands, the file must appear atomically with the final
-  committed attr/block state.
+  committed attr/payload-object state.
 - Snapshot export/import must not surface an unpublished new regular file on a
   fresh peer.
 

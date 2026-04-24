@@ -13,9 +13,9 @@ fn test_snapshot_pins_objects_and_is_listed() {
         SliceId(1),
         SliceOrder(1),
         SliceRange::new(0, DEFAULT_CHUNK_SIZE).expect("valid overlay slice"),
-        BlockRef::new_partial(9_001, DEFAULT_CHUNK_SIZE),
+        PayloadRef::new_partial(9_001, DEFAULT_CHUNK_SIZE),
     );
-    overlay_slice.block_state = BlockRefState::Uploaded;
+    overlay_slice.payload_state = PayloadRefState::Uploaded;
     overlay_chunk.insert_slice(overlay_slice);
 
     let mut base_chunk = RegularFileChunkState::default();
@@ -23,9 +23,9 @@ fn test_snapshot_pins_objects_and_is_listed() {
         SliceId(2),
         SliceOrder(2),
         SliceRange::new(0, DEFAULT_CHUNK_SIZE).expect("valid base slice"),
-        BlockRef::new_partial(9_002, DEFAULT_CHUNK_SIZE),
+        PayloadRef::new_partial(9_002, DEFAULT_CHUNK_SIZE),
     );
-    base_slice.block_state = BlockRefState::Published;
+    base_slice.payload_state = PayloadRefState::Published;
     base_chunk.insert_slice(base_slice);
 
     set_regular_file_chunk_rows(
@@ -91,13 +91,20 @@ fn test_referenced_object_ids_include_committed_blocks() {
     let ino = attr.ino;
 
     engine
-        .set_file_block(ino, 0, &BlockRef::new_partial(21, 4096))
+        .stage_payload_slice(ino, 0, &PayloadRef::new_partial(21, 4096))
         .unwrap();
+    assert!(
+        engine
+            .mark_regular_file_overlay_object_uploaded_if_matches(ino, 0, 21)
+            .unwrap()
+    );
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(ino, 0)
+            .unwrap()
+    );
     engine
-        .commit_uploaded_block(ino, 0, 0, &BlockRef::new_partial(21, 4096))
-        .unwrap();
-    engine
-        .set_file_block(ino, 1, &BlockRef::new_partial(22, 4096))
+        .stage_payload_slice(ino, 1, &PayloadRef::new_partial(22, 4096))
         .unwrap();
 
     let refs = engine.get_referenced_object_ids().unwrap();
@@ -122,7 +129,7 @@ fn test_regular_file_graph_tables_roundtrip_and_project_remote_overlay() {
             SliceId(1),
             SliceOrder(1),
             SliceRange::new(0, 4096).expect("valid overlay slice"),
-            BlockRef::new_partial(301, 4096),
+            PayloadRef::new_partial(301, 4096),
         ),
     );
     let overlay_chunk = RegularFileChunkState {
@@ -147,9 +154,9 @@ fn test_regular_file_graph_tables_roundtrip_and_project_remote_overlay() {
         SliceId(3),
         SliceOrder(3),
         SliceRange::new(0, 4096).expect("valid base slice"),
-        BlockRef::new_partial(401, 4096),
+        PayloadRef::new_partial(401, 4096),
     );
-    base_slice.block_state = BlockRefState::Published;
+    base_slice.payload_state = PayloadRefState::Published;
     base_slices.insert(SliceId(3), base_slice);
     let base_chunk = RegularFileChunkState {
         next_slice_id: SliceId(4),
@@ -253,7 +260,7 @@ fn test_import_snapshot_rebuilds_pending_compaction_rows() {
             SliceId(1),
             SliceOrder(1),
             SliceRange::new(0, 4096).expect("first slice"),
-            BlockRef::new_partial(1001, 4096),
+            PayloadRef::new_partial(1001, 4096),
         ),
     );
     chunk_slices.insert(
@@ -262,7 +269,7 @@ fn test_import_snapshot_rebuilds_pending_compaction_rows() {
             SliceId(2),
             SliceOrder(2),
             SliceRange::new(0, 4096).expect("shadowed slice"),
-            BlockRef::new_partial(1002, 4096),
+            PayloadRef::new_partial(1002, 4096),
         ),
     );
     let mut overlay_state = RegularFileOverlayState::default();
@@ -325,8 +332,10 @@ fn test_import_snapshot_keeps_unpublished_regular_file_visible() {
     attr.size = 4096;
     attr.content_epoch = 1;
     source.set_attr(&attr).unwrap();
-    let block = BlockRef::new_partial(40_001, 4096);
-    source.set_file_block(file.ino, 0, &block).unwrap();
+    let block = PayloadRef::new_partial(40_001, 4096);
+    source
+        .stage_payload_slice(file.ino, 0, &block)
+        .unwrap();
 
     let snapshot = source.export_snapshot().unwrap();
     let imported = temp_engine();
@@ -338,8 +347,18 @@ fn test_import_snapshot_keeps_unpublished_regular_file_visible() {
     assert_eq!(imported_attr.size, 4096);
     assert_eq!(imported_attr.committed_size, 0);
     assert_eq!(imported_attr.upload_state, UploadState::Uploading);
-    let imported_block = imported.get_file_block(imported_file.ino, 0).unwrap().unwrap();
-    assert_eq!(imported_block.object_id, block.object_id);
+    let imported_spans = imported
+        .lookup_regular_file_slices(imported_file.ino, 0, imported_attr.size)
+        .unwrap();
+    assert_eq!(imported_spans.len(), 1);
+    assert_eq!(
+        imported_spans[0]
+            .payload
+            .as_ref()
+            .expect("imported local-only slice")
+            .object_id,
+        block.object_id
+    );
 }
 
 #[test]
@@ -349,8 +368,6 @@ fn test_redb_snapshot_defaults_missing_regular_file_fields() {
         "counters": [],
         "inodes": [],
         "dentries": [],
-        "file_blocks": [],
-        "committed_file_blocks": [],
         "pending_deletions": [],
         "symlinks": [],
         "xattrs": [],
@@ -377,7 +394,7 @@ fn test_regular_file_graph_rows_removed_on_unlink() {
         SliceId(1),
         SliceOrder(1),
         SliceRange::new(0, 4096).expect("valid slice"),
-        BlockRef::new_partial(777, 4096),
+        PayloadRef::new_partial(777, 4096),
     ));
     let chunk_key = encode_regular_file_chunk_key(ino, ChunkId(0));
     let chunk_bytes = encode(&chunk).expect("encode chunk state");

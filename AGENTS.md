@@ -232,7 +232,7 @@ AGENTS snapshot differ from that contract, the contract wins.
             ┌──────────────────────────────┐
             │  Data Store (S3)             │
             │  - Object storage layer      │
-            │  - Block caching             │
+            │  - Payload-object caching    │
             └──────────────────────────────┘
 ```
 
@@ -253,7 +253,7 @@ AGENTS snapshot differ from that contract, the contract wins.
 
 Tunable at runtime (see `crates/studiofs/src/cli/mount.rs` for full list):
 
-- `STUDIOFS_MAX_DIRTY_BYTES`: Memory budget for dirty blocks
+- `STUDIOFS_MAX_DIRTY_BYTES`: Memory budget for dirty payload objects
 - `STUDIOFS_S3_ENDPOINT`: S3 endpoint URL
 - `STUDIOFS_S3_BUCKET`: S3 bucket name
 - `STUDIOFS_PRINCIPAL`: ACL principal for access control
@@ -369,7 +369,7 @@ fn new(
 ### Key Patterns
 
 1. **State access**: Use `self.state.subsystem.field` instead of direct fields on `VfsState`
-2. **Lock release before IO**: Always release mutex locks before performing local block backend writes, metadata flushes, file deletions, or ingress artifact cleanup
-3. **Batch operations**: Prefer batch local block backend / metadata operations when draining local dirty state; avoid per-block IO while holding hot locks
+2. **Lock release before IO**: Always release mutex locks before performing local payload backend writes, metadata flushes, file deletions, or ingress artifact cleanup
+3. **Batch operations**: Prefer batch local payload backend / metadata operations when draining local dirty state; avoid per-block IO while holding hot locks
 4. **Atomic ordering**: Use `Release`/`Acquire` for critical data (throttling metrics), `Relaxed` for non-critical counters
 5. **notify_waiters outside lock**: Always call `notify_waiters()` after releasing the mutex to avoid lock contention

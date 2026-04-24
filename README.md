@@ -38,7 +38,7 @@ It is built around a local-first runtime model:
 studiofs (CLI)
   ├── studiofs-meta       local metadata + PostgreSQL delta sync
   ├── studiofs-data       S3 object I/O + object format
-  ├── studiofs-cache      local block backend + upload queue
+  ├── studiofs-cache      local payload backend + upload queue
   ├── studiofs-vfs        filesystem core
   ├── studiofs-fuse       Linux/macOS bridge
   └── studiofs-winfsp     Windows bridge
@@ -54,7 +54,7 @@ Key points:
 
 - S3-compatible data path via OpenDAL
 - Local-first metadata path with eventual multi-client convergence
-- Local block backend + upload queue
+- Local payload backend + upload queue
 - Append-only ingress and crash recovery for accepted local writes
 - Cross-platform mounts: WinFSP on Windows, FUSE on Linux/macOS
 - Background upload, janitor, and metadata sync workers

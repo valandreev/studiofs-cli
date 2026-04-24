@@ -1,8 +1,8 @@
 //! Metadata index for the current `v3` local cache backend, backed by redb.
 //!
-//! The index is the source of truth for block lifecycle state, replay ordering,
-//! and space accounting. Accounting counters are updated atomically with row
-//! mutations so budget checks never require payload scans.
+//! The index is the source of truth for payload-object lifecycle state, replay
+//! ordering, and space accounting. Accounting counters are updated atomically
+//! with row mutations so budget checks never require payload scans.
 
 use std::array;
 use std::collections::HashSet;
@@ -18,7 +18,7 @@ use redb::{
     TableDefinition,
 };
 
-use crate::local::{LocalBlockLifecycleState, LocalBlockOrigin, LocalBlockUploadState};
+use crate::local::{LocalPayloadLifecycleState, LocalPayloadOrigin, LocalPayloadUploadState};
 
 const LEGACY_INDEX_FORMAT_VERSION: u64 = 1;
 const INDEX_FORMAT_VERSION: u64 = 2;
@@ -26,7 +26,7 @@ const LEGACY_ENTRY_ENCODING_VERSION: u8 = 1;
 const ENTRY_ENCODING_VERSION: u8 = 2;
 const NO_DIRTY_ORDER: u64 = u64::MAX;
 
-const BLOCKS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("blocks");
+const PAYLOAD_OBJECTS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("payload_objects");
 const DIRTY_ORDER_TABLE: TableDefinition<u64, u64> = TableDefinition::new("dirty_order");
 const ACCESS_ORDER_TABLE: TableDefinition<u64, u64> = TableDefinition::new("access_order");
 const COUNTERS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("counters");
@@ -93,9 +93,9 @@ pub struct CacheIndexEntry {
     pub object_id: u64,
     pub payload_key: Vec<u8>,
     pub payload_len: u64,
-    pub lifecycle: LocalBlockLifecycleState,
-    pub origin: LocalBlockOrigin,
-    pub upload_state: LocalBlockUploadState,
+    pub lifecycle: LocalPayloadLifecycleState,
+    pub origin: LocalPayloadOrigin,
+    pub upload_state: LocalPayloadUploadState,
     pub last_access_unix_millis: u64,
     pub evictable: bool,
     pub dirty_order: Option<u64>,
@@ -107,9 +107,9 @@ pub struct CacheIndexUpsert {
     pub object_id: u64,
     pub payload_key: Vec<u8>,
     pub payload_len: u64,
-    pub lifecycle: LocalBlockLifecycleState,
-    pub origin: LocalBlockOrigin,
-    pub upload_state: LocalBlockUploadState,
+    pub lifecycle: LocalPayloadLifecycleState,
+    pub origin: LocalPayloadOrigin,
+    pub upload_state: LocalPayloadUploadState,
     pub evictable: bool,
 }
 
@@ -118,9 +118,9 @@ pub struct DirtyReplayEntry {
     pub object_id: u64,
     pub payload_key: Vec<u8>,
     pub payload_len: u64,
-    pub lifecycle: LocalBlockLifecycleState,
-    pub origin: LocalBlockOrigin,
-    pub upload_state: LocalBlockUploadState,
+    pub lifecycle: LocalPayloadLifecycleState,
+    pub origin: LocalPayloadOrigin,
+    pub upload_state: LocalPayloadUploadState,
     pub dirty_order: u64,
 }
 
@@ -148,16 +148,16 @@ pub struct CacheIndex {
 fn normalize_upsert(mut update: CacheIndexUpsert) -> CacheIndexUpsert {
     if matches!(
         update.lifecycle,
-        LocalBlockLifecycleState::Dirty | LocalBlockLifecycleState::Uploading
+        LocalPayloadLifecycleState::Dirty | LocalPayloadLifecycleState::Uploading
     ) {
         update.evictable = false;
     }
-    if matches!(update.upload_state, LocalBlockUploadState::Uploading) {
-        update.lifecycle = LocalBlockLifecycleState::Uploading;
-    } else if matches!(update.upload_state, LocalBlockUploadState::Pending) {
-        update.lifecycle = LocalBlockLifecycleState::Dirty;
-    } else if update.origin == LocalBlockOrigin::Downloaded {
-        update.lifecycle = LocalBlockLifecycleState::Uploaded;
+    if matches!(update.upload_state, LocalPayloadUploadState::Uploading) {
+        update.lifecycle = LocalPayloadLifecycleState::Uploading;
+    } else if matches!(update.upload_state, LocalPayloadUploadState::Pending) {
+        update.lifecycle = LocalPayloadLifecycleState::Dirty;
+    } else if update.origin == LocalPayloadOrigin::Downloaded {
+        update.lifecycle = LocalPayloadLifecycleState::Uploaded;
     }
     update
 }
@@ -207,8 +207,11 @@ impl CacheIndex {
 
     pub fn get_entry(&self, object_id: u64) -> Result<Option<CacheIndexEntry>, CacheIndexError> {
         let txn = self.db.begin_read().map_err(storage_error)?;
-        let blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
-        Ok(read_entry_from_blocks(&blocks, object_id)?.map(|entry| entry.into_public(object_id)))
+        let payloads = txn
+            .open_table(PAYLOAD_OBJECTS_TABLE)
+            .map_err(storage_error)?;
+        Ok(read_entry_from_payloads(&payloads, object_id)?
+            .map(|entry| entry.into_public(object_id)))
     }
 
     pub fn upsert(&self, mut update: CacheIndexUpsert) -> Result<(), CacheIndexError> {
@@ -216,12 +219,14 @@ impl CacheIndex {
 
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
-            let mut blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+            let mut payloads = txn
+                .open_table(PAYLOAD_OBJECTS_TABLE)
+                .map_err(storage_error)?;
             let mut dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
-            let old = read_entry_write(&blocks, update.object_id)?;
+            let old = read_entry_write(&payloads, update.object_id)?;
             let mut new = StoredEntry {
                 payload_key: update.payload_key,
                 payload_len: update.payload_len,
@@ -241,7 +246,7 @@ impl CacheIndex {
                 update.object_id,
                 old.as_ref(),
                 Some(&new),
-                &mut blocks,
+                &mut payloads,
                 &mut dirty_order,
                 &mut access_order,
                 &mut counters,
@@ -259,13 +264,15 @@ impl CacheIndex {
 
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
-            let mut blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+            let mut payloads = txn
+                .open_table(PAYLOAD_OBJECTS_TABLE)
+                .map_err(storage_error)?;
             let mut dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
             for update in updates.iter().cloned().map(normalize_upsert) {
-                let old = read_entry_write(&blocks, update.object_id)?;
+                let old = read_entry_write(&payloads, update.object_id)?;
                 let mut new = StoredEntry {
                     payload_key: update.payload_key,
                     payload_len: update.payload_len,
@@ -286,7 +293,7 @@ impl CacheIndex {
                     update.object_id,
                     old.as_ref(),
                     Some(&new),
-                    &mut blocks,
+                    &mut payloads,
                     &mut dirty_order,
                     &mut access_order,
                     &mut counters,
@@ -375,13 +382,15 @@ impl CacheIndex {
 
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
-            let mut blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+            let mut payloads = txn
+                .open_table(PAYLOAD_OBJECTS_TABLE)
+                .map_err(storage_error)?;
             let mut dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
             for object_id in object_ids {
-                let Some(old) = read_entry_write(&blocks, *object_id)? else {
+                let Some(old) = read_entry_write(&payloads, *object_id)? else {
                     continue;
                 };
                 let mut new = old.clone();
@@ -392,7 +401,7 @@ impl CacheIndex {
                     *object_id,
                     Some(&old),
                     Some(&new),
-                    &mut blocks,
+                    &mut payloads,
                     &mut dirty_order,
                     &mut access_order,
                     &mut counters,
@@ -407,21 +416,23 @@ impl CacheIndex {
     pub fn mark_uploading(&self, object_id: u64) -> Result<(), CacheIndexError> {
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
-            let mut blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+            let mut payloads = txn
+                .open_table(PAYLOAD_OBJECTS_TABLE)
+                .map_err(storage_error)?;
             let mut dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
-            let Some(old) = read_entry_write(&blocks, object_id)? else {
+            let Some(old) = read_entry_write(&payloads, object_id)? else {
                 return Ok(());
             };
-            if old.lifecycle != LocalBlockLifecycleState::Dirty {
+            if old.lifecycle != LocalPayloadLifecycleState::Dirty {
                 return Ok(());
             }
 
             let mut new = old.clone();
-            new.lifecycle = LocalBlockLifecycleState::Uploading;
-            new.upload_state = LocalBlockUploadState::Uploading;
+            new.lifecycle = LocalPayloadLifecycleState::Uploading;
+            new.upload_state = LocalPayloadUploadState::Uploading;
             new.evictable = false;
             if new.dirty_order.is_none() {
                 new.dirty_order = Some(allocate_sequence(&mut counters, COUNTER_NEXT_DIRTY_SEQ)?);
@@ -431,7 +442,7 @@ impl CacheIndex {
                 object_id,
                 Some(&old),
                 Some(&new),
-                &mut blocks,
+                &mut payloads,
                 &mut dirty_order,
                 &mut access_order,
                 &mut counters,
@@ -445,21 +456,23 @@ impl CacheIndex {
     pub fn mark_upload_failed(&self, object_id: u64) -> Result<(), CacheIndexError> {
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
-            let mut blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+            let mut payloads = txn
+                .open_table(PAYLOAD_OBJECTS_TABLE)
+                .map_err(storage_error)?;
             let mut dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
-            let Some(old) = read_entry_write(&blocks, object_id)? else {
+            let Some(old) = read_entry_write(&payloads, object_id)? else {
                 return Ok(());
             };
-            if old.lifecycle != LocalBlockLifecycleState::Uploading {
+            if old.lifecycle != LocalPayloadLifecycleState::Uploading {
                 return Ok(());
             }
 
             let mut new = old.clone();
-            new.lifecycle = LocalBlockLifecycleState::Dirty;
-            new.upload_state = LocalBlockUploadState::Pending;
+            new.lifecycle = LocalPayloadLifecycleState::Dirty;
+            new.upload_state = LocalPayloadUploadState::Pending;
             new.evictable = false;
             new.dirty_order = Some(allocate_sequence(&mut counters, COUNTER_NEXT_DIRTY_SEQ)?);
 
@@ -467,7 +480,7 @@ impl CacheIndex {
                 object_id,
                 Some(&old),
                 Some(&new),
-                &mut blocks,
+                &mut payloads,
                 &mut dirty_order,
                 &mut access_order,
                 &mut counters,
@@ -481,17 +494,19 @@ impl CacheIndex {
     pub fn mark_uploaded(&self, object_id: u64) -> Result<(), CacheIndexError> {
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
-            let mut blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+            let mut payloads = txn
+                .open_table(PAYLOAD_OBJECTS_TABLE)
+                .map_err(storage_error)?;
             let mut dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
-            let Some(old) = read_entry_write(&blocks, object_id)? else {
+            let Some(old) = read_entry_write(&payloads, object_id)? else {
                 return Ok(());
             };
             let mut new = old.clone();
-            new.lifecycle = LocalBlockLifecycleState::Uploaded;
-            new.upload_state = LocalBlockUploadState::None;
+            new.lifecycle = LocalPayloadLifecycleState::Uploaded;
+            new.upload_state = LocalPayloadUploadState::None;
             new.evictable = true;
             new.dirty_order = None;
 
@@ -499,7 +514,7 @@ impl CacheIndex {
                 object_id,
                 Some(&old),
                 Some(&new),
-                &mut blocks,
+                &mut payloads,
                 &mut dirty_order,
                 &mut access_order,
                 &mut counters,
@@ -513,12 +528,14 @@ impl CacheIndex {
     pub fn remove(&self, object_id: u64) -> Result<(), CacheIndexError> {
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
-            let mut blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+            let mut payloads = txn
+                .open_table(PAYLOAD_OBJECTS_TABLE)
+                .map_err(storage_error)?;
             let mut dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
-            let Some(old) = read_entry_write(&blocks, object_id)? else {
+            let Some(old) = read_entry_write(&payloads, object_id)? else {
                 return Ok(());
             };
 
@@ -526,7 +543,7 @@ impl CacheIndex {
                 object_id,
                 Some(&old),
                 None,
-                &mut blocks,
+                &mut payloads,
                 &mut dirty_order,
                 &mut access_order,
                 &mut counters,
@@ -546,14 +563,16 @@ impl CacheIndex {
 
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
-            let mut blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+            let mut payloads = txn
+                .open_table(PAYLOAD_OBJECTS_TABLE)
+                .map_err(storage_error)?;
             let mut dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
             let mut batch_delta = AccountingDelta::default();
 
             for object_id in object_ids {
-                let Some(old) = read_entry_write(&blocks, *object_id)? else {
+                let Some(old) = read_entry_write(&payloads, *object_id)? else {
                     continue;
                 };
                 remove_order_link(&mut dirty_order, old.dirty_order, *object_id, "dirty")?;
@@ -563,7 +582,7 @@ impl CacheIndex {
                     *object_id,
                     "access",
                 )?;
-                let _ = blocks.remove(object_id).map_err(storage_error)?;
+                let _ = payloads.remove(object_id).map_err(storage_error)?;
                 batch_delta.subtract_entry(&old)?;
             }
 
@@ -601,7 +620,9 @@ impl CacheIndex {
             return Ok(Vec::new());
         }
         let txn = self.db.begin_read().map_err(storage_error)?;
-        let blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+        let payloads = txn
+            .open_table(PAYLOAD_OBJECTS_TABLE)
+            .map_err(storage_error)?;
         let dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
 
         let start = match start_after {
@@ -622,9 +643,9 @@ impl CacheIndex {
             let order = order.value();
             let object_id = object_id.value();
 
-            let Some(entry) = read_entry_from_blocks(&blocks, object_id)? else {
+            let Some(entry) = read_entry_from_payloads(&payloads, object_id)? else {
                 return Err(CacheIndexError::Corruption(format!(
-                    "dirty order references missing block object_id={object_id}"
+                    "dirty order references missing payload object_id={object_id}"
                 )));
             };
             if entry.dirty_order != Some(order) {
@@ -678,7 +699,9 @@ impl CacheIndex {
             return Ok(Vec::new());
         }
         let txn = self.db.begin_read().map_err(storage_error)?;
-        let blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+        let payloads = txn
+            .open_table(PAYLOAD_OBJECTS_TABLE)
+            .map_err(storage_error)?;
         let access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
 
         let start = match start_after {
@@ -698,7 +721,7 @@ impl CacheIndex {
             let (order, object_id) = pair.map_err(storage_error)?;
             let order = order.value();
             let object_id = object_id.value();
-            if read_entry_from_blocks(&blocks, object_id)?.is_some() {
+            if read_entry_from_payloads(&payloads, object_id)?.is_some() {
                 ordered.push((object_id, order));
             }
         }
@@ -734,7 +757,9 @@ impl CacheIndex {
             return Ok(EvictionCandidatePage::default());
         }
         let txn = self.db.begin_read().map_err(storage_error)?;
-        let blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+        let payloads = txn
+            .open_table(PAYLOAD_OBJECTS_TABLE)
+            .map_err(storage_error)?;
         let access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
 
         let start = match start_after {
@@ -758,7 +783,7 @@ impl CacheIndex {
             let object_id = object_id.value();
             scanned_rows = scanned_rows.saturating_add(1);
 
-            let Some(entry) = read_entry_from_blocks(&blocks, object_id)? else {
+            let Some(entry) = read_entry_from_payloads(&payloads, object_id)? else {
                 continue;
             };
             if entry.access_order != order {
@@ -767,7 +792,7 @@ impl CacheIndex {
                     entry.access_order
                 )));
             }
-            if entry.lifecycle == LocalBlockLifecycleState::Uploaded && entry.evictable {
+            if entry.lifecycle == LocalPayloadLifecycleState::Uploaded && entry.evictable {
                 ordered.push(EvictionCandidateEntry {
                     object_id,
                     payload_len: entry.payload_len,
@@ -788,9 +813,11 @@ impl CacheIndex {
     fn initialize_schema(&self) -> Result<(), CacheIndexError> {
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
-            let blocks_exist = {
-                let blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
-                blocks.first().map_err(storage_error)?.is_some()
+            let payloads_exist = {
+                let payloads = txn
+                    .open_table(PAYLOAD_OBJECTS_TABLE)
+                    .map_err(storage_error)?;
+                payloads.first().map_err(storage_error)?.is_some()
             };
             let _ = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
             let _ = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
@@ -812,7 +839,7 @@ impl CacheIndex {
                         found,
                     });
                 }
-            } else if blocks_exist {
+            } else if payloads_exist {
                 return Err(CacheIndexError::Corruption(format!(
                     "missing '{COUNTER_INDEX_FORMAT}' counter in non-empty index"
                 )));
@@ -830,7 +857,7 @@ impl CacheIndex {
                 (COUNTER_NEXT_ACCESS_SEQ, 0_u64),
             ] {
                 if counters.get(name).map_err(storage_error)?.is_none() {
-                    if blocks_exist {
+                    if payloads_exist {
                         return Err(CacheIndexError::Corruption(format!(
                             "missing '{name}' counter in non-empty index"
                         )));
@@ -878,9 +905,9 @@ impl CacheIndex {
 struct StoredEntry {
     payload_key: Vec<u8>,
     payload_len: u64,
-    lifecycle: LocalBlockLifecycleState,
-    origin: LocalBlockOrigin,
-    upload_state: LocalBlockUploadState,
+    lifecycle: LocalPayloadLifecycleState,
+    origin: LocalPayloadOrigin,
+    upload_state: LocalPayloadUploadState,
     last_access_unix_millis: u64,
     evictable: bool,
     dirty_order: Option<u64>,
@@ -904,11 +931,11 @@ impl StoredEntry {
     }
 }
 
-fn read_entry_from_blocks(
-    blocks: &redb::ReadOnlyTable<u64, &[u8]>,
+fn read_entry_from_payloads(
+    payloads: &redb::ReadOnlyTable<u64, &[u8]>,
     object_id: u64,
 ) -> Result<Option<StoredEntry>, CacheIndexError> {
-    blocks
+    payloads
         .get(&object_id)
         .map_err(storage_error)?
         .map(|value| decode_entry(value.value(), object_id))
@@ -916,10 +943,10 @@ fn read_entry_from_blocks(
 }
 
 fn read_entry_write(
-    blocks: &redb::Table<'_, u64, &[u8]>,
+    payloads: &redb::Table<'_, u64, &[u8]>,
     object_id: u64,
 ) -> Result<Option<StoredEntry>, CacheIndexError> {
-    blocks
+    payloads
         .get(&object_id)
         .map_err(storage_error)?
         .map(|value| decode_entry(value.value(), object_id))
@@ -930,7 +957,7 @@ fn apply_entry_change(
     object_id: u64,
     old: Option<&StoredEntry>,
     new: Option<&StoredEntry>,
-    blocks: &mut redb::Table<'_, u64, &[u8]>,
+    payloads: &mut redb::Table<'_, u64, &[u8]>,
     dirty_order: &mut redb::Table<'_, u64, u64>,
     access_order: &mut redb::Table<'_, u64, u64>,
     counters: &mut redb::Table<'_, &str, u64>,
@@ -966,12 +993,12 @@ fn apply_entry_change(
     match new {
         Some(new_entry) => {
             let encoded = encode_entry(new_entry)?;
-            blocks
+            payloads
                 .insert(&object_id, encoded.as_slice())
                 .map_err(storage_error)?;
         }
         None => {
-            let _ = blocks.remove(&object_id).map_err(storage_error)?;
+            let _ = payloads.remove(&object_id).map_err(storage_error)?;
         }
     }
 
@@ -1140,10 +1167,10 @@ fn allocate_sequence(
     Ok(current)
 }
 
-fn is_dirty_like(lifecycle: LocalBlockLifecycleState) -> bool {
+fn is_dirty_like(lifecycle: LocalPayloadLifecycleState) -> bool {
     matches!(
         lifecycle,
-        LocalBlockLifecycleState::Dirty | LocalBlockLifecycleState::Uploading
+        LocalPayloadLifecycleState::Dirty | LocalPayloadLifecycleState::Uploading
     )
 }
 
@@ -1366,75 +1393,78 @@ fn read_u32_field(
     Ok(u32::from_le_bytes(array))
 }
 
-fn encode_lifecycle(lifecycle: LocalBlockLifecycleState) -> u8 {
+fn encode_lifecycle(lifecycle: LocalPayloadLifecycleState) -> u8 {
     match lifecycle {
-        LocalBlockLifecycleState::Missing => 0,
-        LocalBlockLifecycleState::Dirty => 1,
-        LocalBlockLifecycleState::Uploading => 2,
-        LocalBlockLifecycleState::Uploaded => 3,
+        LocalPayloadLifecycleState::Missing => 0,
+        LocalPayloadLifecycleState::Dirty => 1,
+        LocalPayloadLifecycleState::Uploading => 2,
+        LocalPayloadLifecycleState::Uploaded => 3,
     }
 }
 
-fn decode_lifecycle(raw: u8) -> Option<LocalBlockLifecycleState> {
+fn decode_lifecycle(raw: u8) -> Option<LocalPayloadLifecycleState> {
     match raw {
-        0 => Some(LocalBlockLifecycleState::Missing),
-        1 => Some(LocalBlockLifecycleState::Dirty),
-        2 => Some(LocalBlockLifecycleState::Uploading),
-        3 => Some(LocalBlockLifecycleState::Uploaded),
+        0 => Some(LocalPayloadLifecycleState::Missing),
+        1 => Some(LocalPayloadLifecycleState::Dirty),
+        2 => Some(LocalPayloadLifecycleState::Uploading),
+        3 => Some(LocalPayloadLifecycleState::Uploaded),
         _ => None,
     }
 }
 
-fn encode_origin(origin: LocalBlockOrigin) -> u8 {
+fn encode_origin(origin: LocalPayloadOrigin) -> u8 {
     match origin {
-        LocalBlockOrigin::Local => 1,
-        LocalBlockOrigin::Downloaded => 2,
+        LocalPayloadOrigin::Local => 1,
+        LocalPayloadOrigin::Downloaded => 2,
     }
 }
 
-fn decode_origin(raw: u8) -> Option<LocalBlockOrigin> {
+fn decode_origin(raw: u8) -> Option<LocalPayloadOrigin> {
     match raw {
-        1 => Some(LocalBlockOrigin::Local),
-        2 => Some(LocalBlockOrigin::Downloaded),
+        1 => Some(LocalPayloadOrigin::Local),
+        2 => Some(LocalPayloadOrigin::Downloaded),
         _ => None,
     }
 }
 
-fn encode_upload_state(upload_state: LocalBlockUploadState) -> u8 {
+fn encode_upload_state(upload_state: LocalPayloadUploadState) -> u8 {
     match upload_state {
-        LocalBlockUploadState::None => 0,
-        LocalBlockUploadState::Pending => 1,
-        LocalBlockUploadState::Uploading => 2,
+        LocalPayloadUploadState::None => 0,
+        LocalPayloadUploadState::Pending => 1,
+        LocalPayloadUploadState::Uploading => 2,
     }
 }
 
-fn decode_upload_state(raw: u8) -> Option<LocalBlockUploadState> {
+fn decode_upload_state(raw: u8) -> Option<LocalPayloadUploadState> {
     match raw {
-        0 => Some(LocalBlockUploadState::None),
-        1 => Some(LocalBlockUploadState::Pending),
-        2 => Some(LocalBlockUploadState::Uploading),
+        0 => Some(LocalPayloadUploadState::None),
+        1 => Some(LocalPayloadUploadState::Pending),
+        2 => Some(LocalPayloadUploadState::Uploading),
         _ => None,
     }
 }
 
-fn infer_legacy_origin(lifecycle: LocalBlockLifecycleState, evictable: bool) -> LocalBlockOrigin {
+fn infer_legacy_origin(
+    lifecycle: LocalPayloadLifecycleState,
+    evictable: bool,
+) -> LocalPayloadOrigin {
     if matches!(
         lifecycle,
-        LocalBlockLifecycleState::Dirty | LocalBlockLifecycleState::Uploading
+        LocalPayloadLifecycleState::Dirty | LocalPayloadLifecycleState::Uploading
     ) || !evictable
     {
-        LocalBlockOrigin::Local
+        LocalPayloadOrigin::Local
     } else {
-        LocalBlockOrigin::Downloaded
+        LocalPayloadOrigin::Downloaded
     }
 }
 
-fn infer_legacy_upload_state(lifecycle: LocalBlockLifecycleState) -> LocalBlockUploadState {
+fn infer_legacy_upload_state(lifecycle: LocalPayloadLifecycleState) -> LocalPayloadUploadState {
     match lifecycle {
-        LocalBlockLifecycleState::Missing => LocalBlockUploadState::None,
-        LocalBlockLifecycleState::Dirty => LocalBlockUploadState::Pending,
-        LocalBlockLifecycleState::Uploading => LocalBlockUploadState::Uploading,
-        LocalBlockLifecycleState::Uploaded => LocalBlockUploadState::None,
+        LocalPayloadLifecycleState::Missing => LocalPayloadUploadState::None,
+        LocalPayloadLifecycleState::Dirty => LocalPayloadUploadState::Pending,
+        LocalPayloadLifecycleState::Uploading => LocalPayloadUploadState::Uploading,
+        LocalPayloadLifecycleState::Uploaded => LocalPayloadUploadState::None,
     }
 }
 
@@ -1466,7 +1496,7 @@ fn touch_access_lru_shard(object_id: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::local::{LocalBlockOrigin, LocalBlockUploadState};
+    use crate::local::{LocalPayloadOrigin, LocalPayloadUploadState};
     use std::time::Duration;
 
     fn open_index(path: &Path) -> CacheIndex {
@@ -1486,28 +1516,28 @@ mod tests {
         index
             .upsert(CacheIndexUpsert {
                 object_id,
-                payload_key: format!("payload/{object_id}.block").into_bytes(),
+                payload_key: format!("payload/{object_id}.object").into_bytes(),
                 payload_len,
-                lifecycle: LocalBlockLifecycleState::Dirty,
-                origin: LocalBlockOrigin::Local,
-                upload_state: LocalBlockUploadState::Pending,
+                lifecycle: LocalPayloadLifecycleState::Dirty,
+                origin: LocalPayloadOrigin::Local,
+                upload_state: LocalPayloadUploadState::Pending,
                 evictable: false,
             })
-            .expect("upsert dirty block");
+            .expect("upsert dirty payload object");
     }
 
     fn upsert_uploaded(index: &CacheIndex, object_id: u64, payload_len: u64) {
         index
             .upsert(CacheIndexUpsert {
                 object_id,
-                payload_key: format!("payload/{object_id}.block").into_bytes(),
+                payload_key: format!("payload/{object_id}.object").into_bytes(),
                 payload_len,
-                lifecycle: LocalBlockLifecycleState::Uploaded,
-                origin: LocalBlockOrigin::Downloaded,
-                upload_state: LocalBlockUploadState::None,
+                lifecycle: LocalPayloadLifecycleState::Uploaded,
+                origin: LocalPayloadOrigin::Downloaded,
+                upload_state: LocalPayloadUploadState::None,
                 evictable: true,
             })
-            .expect("upsert uploaded block");
+            .expect("upsert uploaded payload object");
     }
 
     #[test]
@@ -1557,20 +1587,20 @@ mod tests {
             .upsert_many(&[
                 CacheIndexUpsert {
                     object_id: 21,
-                    payload_key: b"payload/21.block".to_vec(),
+                    payload_key: b"payload/21.object".to_vec(),
                     payload_len: 64,
-                    lifecycle: LocalBlockLifecycleState::Dirty,
-                    origin: LocalBlockOrigin::Local,
-                    upload_state: LocalBlockUploadState::Pending,
+                    lifecycle: LocalPayloadLifecycleState::Dirty,
+                    origin: LocalPayloadOrigin::Local,
+                    upload_state: LocalPayloadUploadState::Pending,
                     evictable: false,
                 },
                 CacheIndexUpsert {
                     object_id: 22,
-                    payload_key: b"payload/22.block".to_vec(),
+                    payload_key: b"payload/22.object".to_vec(),
                     payload_len: 32,
-                    lifecycle: LocalBlockLifecycleState::Uploaded,
-                    origin: LocalBlockOrigin::Downloaded,
-                    upload_state: LocalBlockUploadState::None,
+                    lifecycle: LocalPayloadLifecycleState::Uploaded,
+                    origin: LocalPayloadOrigin::Downloaded,
+                    upload_state: LocalPayloadUploadState::None,
                     evictable: true,
                 },
             ])
@@ -1588,7 +1618,7 @@ mod tests {
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].object_id, 21);
         assert_eq!(dirty[0].payload_len, 64);
-        assert_eq!(dirty[0].lifecycle, LocalBlockLifecycleState::Dirty);
+        assert_eq!(dirty[0].lifecycle, LocalPayloadLifecycleState::Dirty);
     }
 
     #[test]
@@ -1609,10 +1639,13 @@ mod tests {
             assert_eq!(before_restart[0].object_id, 2);
             assert_eq!(
                 before_restart[0].lifecycle,
-                LocalBlockLifecycleState::Uploading
+                LocalPayloadLifecycleState::Uploading
             );
             assert_eq!(before_restart[1].object_id, 1);
-            assert_eq!(before_restart[1].lifecycle, LocalBlockLifecycleState::Dirty);
+            assert_eq!(
+                before_restart[1].lifecycle,
+                LocalPayloadLifecycleState::Dirty
+            );
         }
 
         let reopened = open_index(&db_path);
@@ -1621,10 +1654,13 @@ mod tests {
         assert_eq!(after_restart[0].object_id, 2);
         assert_eq!(
             after_restart[0].lifecycle,
-            LocalBlockLifecycleState::Uploading
+            LocalPayloadLifecycleState::Uploading
         );
         assert_eq!(after_restart[1].object_id, 1);
-        assert_eq!(after_restart[1].lifecycle, LocalBlockLifecycleState::Dirty);
+        assert_eq!(
+            after_restart[1].lifecycle,
+            LocalPayloadLifecycleState::Dirty
+        );
 
         let stats = reopened.stats().unwrap();
         assert_eq!(stats.current_bytes, 30);
@@ -1669,9 +1705,9 @@ mod tests {
         let dirty = index.dirty_uploading_entries().unwrap();
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].object_id, 2);
-        assert_eq!(dirty[0].payload_key, b"payload/2.block".to_vec());
+        assert_eq!(dirty[0].payload_key, b"payload/2.object".to_vec());
         assert_eq!(dirty[0].payload_len, 20);
-        assert_eq!(dirty[0].lifecycle, LocalBlockLifecycleState::Uploading);
+        assert_eq!(dirty[0].lifecycle, LocalPayloadLifecycleState::Uploading);
     }
 
     #[test]
@@ -1692,8 +1728,8 @@ mod tests {
                 .map(|entry| (entry.object_id, entry.lifecycle))
                 .collect::<Vec<_>>(),
             vec![
-                (2, LocalBlockLifecycleState::Dirty),
-                (1, LocalBlockLifecycleState::Dirty)
+                (2, LocalPayloadLifecycleState::Dirty),
+                (1, LocalPayloadLifecycleState::Dirty)
             ]
         );
 
@@ -1705,8 +1741,8 @@ mod tests {
                 .map(|entry| (entry.object_id, entry.lifecycle))
                 .collect::<Vec<_>>(),
             vec![
-                (2, LocalBlockLifecycleState::Uploading),
-                (1, LocalBlockLifecycleState::Dirty)
+                (2, LocalPayloadLifecycleState::Uploading),
+                (1, LocalPayloadLifecycleState::Dirty)
             ]
         );
 
@@ -1717,7 +1753,7 @@ mod tests {
                 .iter()
                 .map(|entry| (entry.object_id, entry.lifecycle))
                 .collect::<Vec<_>>(),
-            vec![(1, LocalBlockLifecycleState::Dirty)]
+            vec![(1, LocalPayloadLifecycleState::Dirty)]
         );
 
         let stats = index.stats().unwrap();
@@ -1825,17 +1861,17 @@ mod tests {
         index
             .upsert(CacheIndexUpsert {
                 object_id: 99,
-                payload_key: b"payload/99.block".to_vec(),
+                payload_key: b"payload/99.object".to_vec(),
                 payload_len: 9,
-                lifecycle: LocalBlockLifecycleState::Dirty,
-                origin: LocalBlockOrigin::Local,
-                upload_state: LocalBlockUploadState::Pending,
+                lifecycle: LocalPayloadLifecycleState::Dirty,
+                origin: LocalPayloadOrigin::Local,
+                upload_state: LocalPayloadUploadState::Pending,
                 evictable: false,
             })
             .unwrap();
         let before_touch = index.get_entry(99).unwrap().unwrap();
-        assert_eq!(before_touch.origin, LocalBlockOrigin::Local);
-        assert_eq!(before_touch.upload_state, LocalBlockUploadState::Pending);
+        assert_eq!(before_touch.origin, LocalPayloadOrigin::Local);
+        assert_eq!(before_touch.upload_state, LocalPayloadUploadState::Pending);
         assert!(before_touch.last_access_unix_millis > 0);
 
         std::thread::sleep(Duration::from_millis(1));
@@ -1847,8 +1883,11 @@ mod tests {
 
         let reopened = open_index(&db_path);
         let reopened_entry = reopened.get_entry(99).unwrap().unwrap();
-        assert_eq!(reopened_entry.origin, LocalBlockOrigin::Local);
-        assert_eq!(reopened_entry.upload_state, LocalBlockUploadState::Pending);
+        assert_eq!(reopened_entry.origin, LocalPayloadOrigin::Local);
+        assert_eq!(
+            reopened_entry.upload_state,
+            LocalPayloadUploadState::Pending
+        );
         assert_eq!(
             reopened_entry.last_access_unix_millis,
             after_touch.last_access_unix_millis

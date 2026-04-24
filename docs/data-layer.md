@@ -2,9 +2,9 @@
 
 `studiofs-data` handles object I/O against S3-compatible storage and object encoding/decoding.
 
-This document follows the frozen chunk/slice/block vocabulary. Historical helper
-APIs still use the older `chunks/...` compatibility keys for tests, but the
-active data-path descriptions below use the final model.
+This document follows the frozen chunk/slice/payload-object vocabulary. Historical
+helper APIs still use the older `chunks/...` compatibility keys for tests, but
+the active data-path descriptions below use the final model.
 
 ## Responsibilities
 
@@ -13,7 +13,7 @@ active data-path descriptions below use the final model.
 - Object payload validation (xxh64 checksums).
 - Read/write connection profile separation (`IoProfile`).
 - Serve as the remote object-store boundary behind the VFS `CachedStore` pipeline.
-- Hybrid cloud layout for chunks: one 16 MiB chunk is stored as four 4 MiB block objects.
+- Hybrid cloud layout for chunks: one 16 MiB chunk is stored as four 4 MiB payload objects.
 
 ## S3 Key Layout
 
@@ -27,23 +27,17 @@ Remote storage uses a 4x4 hybrid scheme:
 ```
 - `<ab>/<cd>`: First 4 hex characters of object ID for S3 partition distribution.
 
-### Block Keys (4 blocks per chunk)
+### Fragment Keys (4 fragments per payload object)
 ```
 <volume>/objects/<ab>/<cd>/<object_id>/<block_index>
 ```
 - `block_index`: `0..3`
-- Each block stores an independent STFS object payload (typically up to 4 MiB raw payload + 30-byte header).
-- Block writes/retries are independent, so network failures only retry the affected piece.
-
-Legacy `DataStore::put_block/get_block/...` APIs still use the historical:
-```
-<volume>/data/chunks/<hash>/<slice_id>_<block_index>_<block_size>
-```
-These are retained for compatibility/tests; VFS read/write path uses `<volume>/objects/.../<block_index>`.
+- Each fragment stores an independent STFS object payload (typically up to 4 MiB raw payload + 30-byte header).
+- Fragment writes/retries are independent, so network failures only retry the affected piece.
 
 In the active Local-First runtime, `CachedStore` owns local cache hits,
 local-durable payload handling, upload rereads, and runtime queueing. `DataStore` is the
-remote object-store edge that `CachedStore`/VFS call for block download,
+remote object-store edge that `CachedStore`/VFS call for object download,
 range reads, and eventual upload.
 
 ## Object Format (Version 2)
@@ -75,8 +69,8 @@ Little-endian encoding is used for all multi-byte fields.
 ```
 
 On write, object upload paths use `create_object_buffer` / `create_object_buffer_with_flags`
-and an `opendal::Buffer` (`header` + payload chunks) to avoid copying full block payload
-buffers when prepending the fixed header.
+and an `opendal::Buffer` (`header` + payload chunks) to avoid copying full
+payload-object buffers when prepending the fixed header.
 
 On read, object decode accepts `opendal::Buffer` directly, parses the fixed header from a small stack buffer, and validates checksum incrementally across buffer chunks. Payload is returned as zero-copy `Bytes` when the payload is a single contiguous chunk, with contiguous materialization only as a fallback for fragmented payloads.
 
@@ -88,7 +82,7 @@ On read, object decode accepts `opendal::Buffer` directly, parses the fixed head
 | `HAS_FOOTER` | `0x0002` | Object contains footer checksums (future use). |
 | `ENCRYPTED` | `0x0004` | Object is encrypted (future use). |
 
-The current build enforces that new objects are raw (uncompressed) data blocks to minimize CPU overhead. Legacy LZ4 compressed objects will return a `LegacyCompressionUnsupported` error if read.
+The current build enforces that new objects are raw (uncompressed) payload objects to minimize CPU overhead. Legacy LZ4 compressed objects will return a `LegacyCompressionUnsupported` error if read.
 
 ## Storage I/O Profiles
 

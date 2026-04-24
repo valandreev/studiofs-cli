@@ -6,8 +6,8 @@
 >
   <title id="title">StudioFS logo</title>
   <desc id="desc">
-    StudioFS Block Cache logo with rounded volume frame, cache dots, and an
-    asymmetric anchor dot below the hot block.
+    StudioFS Payload Cache logo with rounded volume frame, cache dots, and an
+    asymmetric anchor dot below the hot payload object.
   </desc>
   <rect
     x="22"

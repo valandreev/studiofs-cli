@@ -1756,7 +1756,7 @@ mod tests {
 
     fn sync_data_calls(vfs: &StudioVfs) -> u64 {
         vfs.write_path_observability_snapshot()
-            .block_store_sync_data
+            .payload_store_sync_data
             .calls
     }
 
@@ -1893,7 +1893,7 @@ mod tests {
         let status = vfs_to_winfsp_err(denied).to_ntstatus();
         assert_eq!(status, STATUS_ACCESS_DENIED.0);
 
-        let fragmented = VfsError::Meta(MetaError::FragmentedBlock {
+        let fragmented = VfsError::Meta(MetaError::NonContiguousRegularFileGraph {
             ino: 7,
             block_index: 3,
         });
@@ -2441,8 +2441,9 @@ mod tests {
             "explicit flush callback should force the local payload sync barrier after buffered writes"
         );
         assert_eq!(
-            flush_calls_after, flush_calls_before,
-            "explicit flush should materialize dirty buffered handle state directly without routing through the legacy ordered flush path"
+            flush_calls_after,
+            flush_calls_before + 1,
+            "explicit flush should commit materialized dirty handle state through the strict local metadata barrier"
         );
         assert!(
             !vfs.inode_has_local_dirty_state(attr.ino),
@@ -2522,10 +2523,9 @@ mod tests {
             sync_data_calls(&vfs) > sync_calls_before,
             "strict WinFSP write policy should still force the local payload sync barrier in write()"
         );
-        assert_eq!(
-            flush_barrier_calls(&vfs),
-            flush_calls_before,
-            "strict handle-writer writes now materialize directly without routing through the legacy ordered flush path"
+        assert!(
+            flush_barrier_calls(&vfs) > flush_calls_before,
+            "strict handle-writer writes should commit materialized slices through the strict local metadata barrier"
         );
 
         ctx.spawn_wait({

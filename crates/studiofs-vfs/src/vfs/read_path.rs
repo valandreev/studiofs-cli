@@ -15,7 +15,7 @@ use studiofs_meta::MetaError;
 use studiofs_meta::schema::{
     DEFAULT_CHUNK_SIZE, ResolvedSliceSource, ResolvedSliceSpan, chunk_start_offset,
 };
-use studiofs_meta::types::{BlockRef, Ino, InodeAttr, block_index_from_offset};
+use studiofs_meta::types::{Ino, InodeAttr, PayloadRef, block_index_from_offset};
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, Copy)]
@@ -37,8 +37,8 @@ enum ReadSegmentSource {
     Dirty { data: Bytes, block_offset: u64 },
     PendingOverlay { data: Bytes, block_offset: u32 },
     PendingExtent { object_id: u64, block_offset: u32 },
-    Overlay { block: BlockRef },
-    Base { block: BlockRef },
+    Overlay { payload: PayloadRef },
+    Base { payload: PayloadRef },
     Zero,
 }
 
@@ -134,21 +134,23 @@ impl<'a> DataReader<'a> {
     }
 
     #[cfg(test)]
-    fn collect_data_block_refs(segments: &[ReadSegment]) -> BTreeMap<u64, BlockRef> {
-        let mut block_refs = BTreeMap::new();
+    fn collect_data_payload_refs(segments: &[ReadSegment]) -> BTreeMap<u64, PayloadRef> {
+        let mut payload_refs = BTreeMap::new();
         for segment in segments {
-            let block = match &segment.source {
-                ReadSegmentSource::Overlay { block } | ReadSegmentSource::Base { block } => block,
+            let payload = match &segment.source {
+                ReadSegmentSource::Overlay { payload } | ReadSegmentSource::Base { payload } => {
+                    payload
+                }
                 ReadSegmentSource::Dirty { .. }
                 | ReadSegmentSource::PendingOverlay { .. }
                 | ReadSegmentSource::PendingExtent { .. }
                 | ReadSegmentSource::Zero => continue,
             };
-            block_refs
-                .entry(block.object_id)
-                .or_insert_with(|| block.clone());
+            payload_refs
+                .entry(payload.object_id)
+                .or_insert_with(|| payload.clone());
         }
-        block_refs
+        payload_refs
     }
 
     async fn build_segments(&self) -> VfsResult<Vec<ReadSegment>> {
@@ -242,6 +244,36 @@ impl<'a> DataReader<'a> {
             }
         }
 
+        let pending_payload_spans =
+            vfs.snapshot_pending_local_dirty_block_read_spans(ino, offset, length);
+        for dirty in pending_payload_spans {
+            if unresolved.is_empty() {
+                break;
+            }
+            let dirty_range = ReadRange {
+                start: dirty.start,
+                end: dirty.end,
+            };
+            let (next_unresolved, claimed) = Self::claim_unresolved_ranges(unresolved, dirty_range);
+            unresolved = next_unresolved;
+            for overlap in claimed {
+                let delta = overlap.start.saturating_sub(dirty.start);
+                let Some(delta_u32) = u32::try_from(delta).ok() else {
+                    continue;
+                };
+                let Some(block_offset) = dirty.block_offset.checked_add(delta_u32) else {
+                    continue;
+                };
+                segments.push(ReadSegment {
+                    range: overlap,
+                    source: ReadSegmentSource::Dirty {
+                        data: dirty.data.clone(),
+                        block_offset: u64::from(block_offset),
+                    },
+                });
+            }
+        }
+
         if !unresolved.is_empty() {
             let mut candidate_blocks = BTreeSet::new();
             for range in &unresolved {
@@ -267,7 +299,7 @@ impl<'a> DataReader<'a> {
                 if matches!(
                     &source,
                     PendingOverlayBlockSource::Extent(object_id)
-                        if !vfs.local_block_backend.contains(*object_id)
+                        if !vfs.local_payload_backend.contains(*object_id)
                 ) {
                     continue;
                 }
@@ -315,7 +347,7 @@ impl<'a> DataReader<'a> {
                     &mut segments,
                     requested,
                     ResolvedSliceSource::Overlay,
-                    |block| ReadSegmentSource::Overlay { block },
+                    |payload| ReadSegmentSource::Overlay { payload },
                 );
                 unresolved = Self::claim_meta_spans_into_segments(
                     resolved.iter(),
@@ -323,7 +355,7 @@ impl<'a> DataReader<'a> {
                     &mut segments,
                     requested,
                     ResolvedSliceSource::Base,
-                    |block| ReadSegmentSource::Base { block },
+                    |payload| ReadSegmentSource::Base { payload },
                 );
             } else {
                 let meta = vfs.meta.clone();
@@ -337,7 +369,7 @@ impl<'a> DataReader<'a> {
                     &mut segments,
                     requested,
                     ResolvedSliceSource::Overlay,
-                    |block| ReadSegmentSource::Overlay { block },
+                    |payload| ReadSegmentSource::Overlay { payload },
                 );
                 unresolved = Self::claim_meta_spans_into_segments(
                     resolved.iter(),
@@ -345,7 +377,7 @@ impl<'a> DataReader<'a> {
                     &mut segments,
                     requested,
                     ResolvedSliceSource::Base,
-                    |block| ReadSegmentSource::Base { block },
+                    |payload| ReadSegmentSource::Base { payload },
                 );
             }
         }
@@ -397,7 +429,7 @@ impl<'a> DataReader<'a> {
     ) -> Vec<ReadRange>
     where
         I: Iterator<Item = &'b ResolvedSliceSpan>,
-        F: Fn(BlockRef) -> ReadSegmentSource + Copy,
+        F: Fn(PayloadRef) -> ReadSegmentSource + Copy,
     {
         let mut unresolved = unresolved;
         for span in resolved {
@@ -407,7 +439,7 @@ impl<'a> DataReader<'a> {
             if span.source != source_filter {
                 continue;
             }
-            let Some(block) = span.block.as_ref() else {
+            let Some(block) = span.payload.as_ref() else {
                 continue;
             };
             let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
@@ -453,10 +485,10 @@ impl<'a> DataReader<'a> {
         let mut local_pending = BTreeSet::new();
         for segment in segments {
             match &segment.source {
-                ReadSegmentSource::Overlay { block } | ReadSegmentSource::Base { block } => {
+                ReadSegmentSource::Overlay { payload } | ReadSegmentSource::Base { payload } => {
                     remote_blocks
-                        .entry(block.object_id)
-                        .or_insert_with(|| block.clone());
+                        .entry(payload.object_id)
+                        .or_insert_with(|| payload.clone());
                 }
                 ReadSegmentSource::PendingExtent { object_id, .. } => {
                     local_pending.insert(*object_id);
@@ -467,7 +499,7 @@ impl<'a> DataReader<'a> {
             }
         }
         for object_id in local_pending {
-            vfs.local_block_backend.advise_will_need(object_id);
+            vfs.local_payload_backend.advise_will_need(object_id);
         }
         if remote_blocks.is_empty() {
             return Ok(());
@@ -517,10 +549,10 @@ impl<'a> DataReader<'a> {
             let dst = &mut buffer[dst_start..dst_end];
             match &segment.source {
                 ReadSegmentSource::Dirty { data, block_offset } => {
-                    vfs.copy_block_payload_into_range(data.as_ref(), *block_offset, dst);
+                    vfs.copy_payload_into_range(data.as_ref(), *block_offset, dst);
                 }
                 ReadSegmentSource::PendingOverlay { data, block_offset } => {
-                    vfs.copy_block_payload_into_range(data.as_ref(), u64::from(*block_offset), dst);
+                    vfs.copy_payload_into_range(data.as_ref(), u64::from(*block_offset), dst);
                 }
                 ReadSegmentSource::PendingExtent {
                     object_id,
@@ -533,7 +565,7 @@ impl<'a> DataReader<'a> {
                         ))
                     })?;
                     let read = vfs
-                        .block_store_read_into_async(*object_id, block_offset, dst)
+                        .payload_store_read_into_async(*object_id, block_offset, dst)
                         .await?;
                     match read {
                         Some(read) if read == dst.len() => {}
@@ -560,16 +592,16 @@ impl<'a> DataReader<'a> {
                         }
                     }
                 }
-                ReadSegmentSource::Overlay { block } | ReadSegmentSource::Base { block } => {
-                    let block_offset = usize::try_from(block.offset).map_err(|_| {
+                ReadSegmentSource::Overlay { payload } | ReadSegmentSource::Base { payload } => {
+                    let block_offset = usize::try_from(payload.offset).map_err(|_| {
                         VfsError::Other(format!(
                             "block offset does not fit usize: object_id={}, offset={}",
-                            block.object_id, block.offset
+                            payload.object_id, payload.offset
                         ))
                     })?;
                     let mut span_resolved = false;
                     if let Some(read) = vfs
-                        .block_store_read_into_async(block.object_id, block_offset, dst)
+                        .payload_store_read_into_async(payload.object_id, block_offset, dst)
                         .await?
                     {
                         if read == dst.len() {
@@ -577,42 +609,42 @@ impl<'a> DataReader<'a> {
                         }
                         if !span_resolved {
                             error!(
-                                object_id = block.object_id,
+                                object_id = payload.object_id,
                                 file_offset = segment.range.start,
-                                block_offset = block.offset,
+                                block_offset = payload.offset,
                                 requested = dst.len(),
                                 read,
-                                "data_reader: short local backend read for committed block; evicting and refetching"
+                                "data_reader: short local backend read for committed payload object; evicting and refetching"
                             );
                             if let Err(evict_error) =
-                                vfs.block_store_remove_async(block.object_id).await
+                                vfs.payload_store_remove_async(payload.object_id).await
                             {
                                 warn!(
-                                    object_id = block.object_id,
+                                    object_id = payload.object_id,
                                     error = %evict_error,
-                                    "data_reader: failed to evict short-read local block before refetch"
+                                    "data_reader: failed to evict short-read local payload before refetch"
                                 );
                             }
                         }
                     }
 
                     if !span_resolved {
-                        match vfs.fetch_block_for_ref_after_local_miss(block).await {
+                        match vfs.fetch_block_for_ref_after_local_miss(payload).await {
                             Ok(data) => {
-                                vfs.copy_committed_block_payload_into_range(
+                                vfs.copy_committed_payload_into_range(
                                     data.as_ref(),
-                                    block,
+                                    payload,
                                     segment.range.start,
                                     dst,
                                 )?;
                             }
                             Err(crate::fetch::FetchError::NotFound { key }) => {
                                 warn!(
-                                    object_id = block.object_id,
+                                    object_id = payload.object_id,
                                     key,
                                     file_offset = segment.range.start,
-                                    block_offset = block.offset,
-                                    block_length = block.length,
+                                    block_offset = payload.offset,
+                                    block_length = payload.length,
                                     "data_reader: S3 object not found during foreground read, zeroing range (upload incomplete or evicted before upload?)"
                                 );
                                 dst.fill(0);
@@ -740,7 +772,7 @@ impl<'a> ReadMetadataResolver<'a> {
     }
 
     fn clear_stale_state(&self) {
-        self.vfs.clear_pending_blocks_for_inode(self.ino);
+        self.vfs.clear_pending_payloads_for_inode(self.ino);
         self.vfs.clear_inode_incarnation(self.ino);
         self.vfs
             .state
@@ -925,7 +957,7 @@ impl StudioVfs {
         };
         let mut buffer = vec![0u8; logical_len];
         for span in &resolved {
-            let Some(block) = span.block.as_ref() else {
+            let Some(block) = span.payload.as_ref() else {
                 continue;
             };
 
@@ -941,7 +973,7 @@ impl StudioVfs {
             let dst_start = usize::try_from(overlap.start.saturating_sub(block_start)).map_err(
                 |_| {
                     VfsError::Other(format!(
-                        "metadata block read start does not fit usize: ino={}, block_index={}, start={}",
+                        "metadata payload read start does not fit usize: ino={}, block_index={}, start={}",
                         ino, block_index, overlap.start
                     ))
                 },
@@ -949,7 +981,7 @@ impl StudioVfs {
             let dst_end =
                 usize::try_from(overlap.end.saturating_sub(block_start)).map_err(|_| {
                     VfsError::Other(format!(
-                        "metadata block read end does not fit usize: ino={}, block_index={}, end={}",
+                        "metadata payload read end does not fit usize: ino={}, block_index={}, end={}",
                         ino, block_index, overlap.end
                     ))
                 })?;
@@ -958,7 +990,7 @@ impl StudioVfs {
             let delta = overlap.start.saturating_sub(span_range.start);
             let delta_u32 = u32::try_from(delta).map_err(|_| {
                 VfsError::Other(format!(
-                    "metadata block read delta does not fit u32: ino={}, block_index={}, delta={}",
+                    "metadata payload read delta does not fit u32: ino={}, block_index={}, delta={}",
                     ino, block_index, delta
                 ))
             })?;
@@ -966,14 +998,14 @@ impl StudioVfs {
             planned_block.offset =
                 planned_block.offset.checked_add(delta_u32).ok_or_else(|| {
                     VfsError::Other(format!(
-                        "metadata block read offset overflow: ino={}, block_index={}, object_id={}",
+                        "metadata payload read offset overflow: ino={}, block_index={}, object_id={}",
                         ino, block_index, planned_block.object_id
                     ))
                 })?;
             planned_block.length =
                 u32::try_from(overlap.end.saturating_sub(overlap.start)).map_err(|_| {
                     VfsError::Other(format!(
-                        "metadata block read span too large: ino={}, block_index={}, start={}, end={}",
+                        "metadata payload read span too large: ino={}, block_index={}, start={}, end={}",
                         ino, block_index, overlap.start, overlap.end
                     ))
                 })?;
@@ -981,12 +1013,12 @@ impl StudioVfs {
             let mut span_resolved = false;
             let block_offset = usize::try_from(planned_block.offset).map_err(|_| {
                 VfsError::Other(format!(
-                    "metadata block offset does not fit usize: object_id={}, offset={}",
+                    "metadata payload offset does not fit usize: object_id={}, offset={}",
                     planned_block.object_id, planned_block.offset
                 ))
             })?;
             if let Some(read) = self
-                .block_store_read_into_async(planned_block.object_id, block_offset, dst)
+                .payload_store_read_into_async(planned_block.object_id, block_offset, dst)
                 .await?
             {
                 if read == dst.len() {
@@ -998,15 +1030,16 @@ impl StudioVfs {
                         block_index,
                         requested = dst.len(),
                         read,
-                        "metadata slice-graph base read saw short local block read; evicting before refetch"
+                        "metadata slice-graph base read saw short local payload read; evicting before refetch"
                     );
-                    if let Err(evict_error) =
-                        self.block_store_remove_async(planned_block.object_id).await
+                    if let Err(evict_error) = self
+                        .payload_store_remove_async(planned_block.object_id)
+                        .await
                     {
                         warn!(
                             object_id = planned_block.object_id,
                             error = %evict_error,
-                            "metadata slice-graph base read failed to evict short-read local block"
+                            "metadata slice-graph base read failed to evict short-read local payload"
                         );
                     }
                 }
@@ -1018,7 +1051,7 @@ impl StudioVfs {
                     .await
                 {
                     Ok(data) => {
-                        self.copy_committed_block_payload_into_range(
+                        self.copy_committed_payload_into_range(
                             data.as_ref(),
                             &planned_block,
                             overlap.start,
@@ -1169,7 +1202,8 @@ impl StudioVfs {
         }
 
         let result = async {
-            block_indices.retain(|block_idx| self.readahead.is_prefetch_relevant(ino, *block_idx));
+            block_indices
+                .retain(|object_idx| self.readahead.is_prefetch_relevant(ino, *object_idx));
             if block_indices.is_empty() {
                 return Ok(());
             }
@@ -1186,7 +1220,7 @@ impl StudioVfs {
             let Some(eof_block) = context.eof_block(self.block_size) else {
                 return Ok(());
             };
-            block_indices.retain(|block_idx| *block_idx <= eof_block);
+            block_indices.retain(|object_idx| *object_idx <= eof_block);
             if block_indices.is_empty() {
                 return Ok(());
             }
@@ -1258,7 +1292,7 @@ impl StudioVfs {
 
 #[cfg(test)]
 mod tests {
-    use super::super::local_dirty::PendingBlock;
+    use super::super::local_dirty::PendingPayload;
     use super::super::*;
     use super::{DataReader, ReadRange, ReadSegment, ReadSegmentSource};
     use bytes::{Bytes, BytesMut};
@@ -1267,22 +1301,97 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::time::Instant;
     use studiofs_cache::local::{
-        LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState, LocalBlockObjectStats,
-        LocalBlockStorageStats,
+        LocalPayloadBackend, LocalPayloadBackendError, LocalPayloadLifecycleState,
+        LocalPayloadObjectStats, LocalPayloadStorageStats,
     };
-    use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig, ROOT_INO};
-    use studiofs_meta::{MetaBlocks, MetaFormat, MetaInodes, RedbMetaEngine};
+    use studiofs_meta::schema::{
+        CURRENT_FORMAT_VERSION, ChunkId, DEFAULT_BLOCK_SIZE, FormatInfo, MetadataConfig,
+        PayloadRefState, ROOT_INO, SliceId, SliceOrder, SliceRange, SliceRecord,
+    };
+    use studiofs_meta::types::BlockFlags as MetaBlockFlags;
+    use studiofs_meta::{MetaFormat, MetaInodes, MetaPayloadObjects, RedbMetaEngine};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
-    struct CountingLocalBlockBackend {
-        inner: Arc<dyn LocalBlockBackend>,
+    trait FileGraphMetaFixture {
+        fn stage_payload_slice(
+            &self,
+            ino: Ino,
+            block_index: u32,
+            payload: &PayloadRef,
+        ) -> MetaResult<Option<PayloadRef>>;
+    }
+
+    fn fixture_payload_slices(
+        block_index: u32,
+        payload: &PayloadRef,
+    ) -> MetaResult<Vec<(ChunkId, Vec<SliceRecord>)>> {
+        let block_start = u64::from(block_index)
+            .checked_mul(u64::from(DEFAULT_BLOCK_SIZE))
+            .ok_or_else(|| MetaError::Storage("fixture block offset overflow".to_string()))?;
+        let data_end = block_start
+            .checked_add(u64::from(payload.length))
+            .ok_or_else(|| MetaError::Storage("fixture data range overflow".to_string()))?;
+        let mut chunks = std::collections::BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
+        let mut cursor = block_start;
+        while cursor < data_end {
+            let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);
+            let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
+            let piece_end = data_end.min(chunk_start.saturating_add(DEFAULT_CHUNK_SIZE as u64));
+            let range = SliceRange::new(
+                (cursor - chunk_start) as u32,
+                (piece_end - chunk_start) as u32,
+            )
+            .ok_or_else(|| MetaError::Storage("fixture invalid slice range".to_string()))?;
+            let delta = u32::try_from(cursor.saturating_sub(block_start))
+                .map_err(|_| MetaError::Storage("fixture slice delta overflow".to_string()))?;
+            let mut slice = SliceRecord::new(
+                SliceId(0),
+                SliceOrder(0),
+                range,
+                PayloadRef {
+                    object_id: payload.object_id,
+                    offset: payload.offset.saturating_add(delta),
+                    length: u32::try_from(piece_end.saturating_sub(cursor)).map_err(|_| {
+                        MetaError::Storage("fixture slice length overflow".to_string())
+                    })?,
+                    flags: payload.flags,
+                },
+            );
+            slice.payload_state = PayloadRefState::Published;
+            chunks.entry(chunk_id).or_default().push(slice);
+            cursor = piece_end;
+        }
+        Ok(chunks.into_iter().collect())
+    }
+
+    impl FileGraphMetaFixture for Arc<RedbMetaEngine> {
+        fn stage_payload_slice(
+            &self,
+            ino: Ino,
+            block_index: u32,
+            payload: &PayloadRef,
+        ) -> MetaResult<Option<PayloadRef>> {
+            self.flush_regular_file_overlay_slices(
+                ino,
+                fixture_payload_slices(block_index, payload)?.as_slice(),
+            )?;
+            self.publish_regular_file_overlay_to_base_if_matches(
+                ino,
+                self.get_attr(ino)?.content_epoch,
+            )?;
+            Ok(None)
+        }
+    }
+
+    struct CountingLocalPayloadBackend {
+        inner: Arc<dyn LocalPayloadBackend>,
         get_calls: AtomicU64,
         read_into_calls: AtomicU64,
     }
 
-    impl CountingLocalBlockBackend {
-        fn new(inner: Arc<dyn LocalBlockBackend>) -> Self {
+    impl CountingLocalPayloadBackend {
+        fn new(inner: Arc<dyn LocalPayloadBackend>) -> Self {
             Self {
                 inner,
                 get_calls: AtomicU64::new(0),
@@ -1304,7 +1413,7 @@ mod tests {
         }
     }
 
-    impl LocalBlockBackend for CountingLocalBlockBackend {
+    impl LocalPayloadBackend for CountingLocalPayloadBackend {
         fn as_any(&self) -> &dyn Any {
             self
         }
@@ -1336,15 +1445,15 @@ mod tests {
             object_id: u64,
             data: &[u8],
             evictable: bool,
-        ) -> Result<(), LocalBlockBackendError> {
+        ) -> Result<(), LocalPayloadBackendError> {
             self.inner.put(object_id, data, evictable)
         }
 
-        fn sync_data(&self) -> Result<(), LocalBlockBackendError> {
+        fn sync_data(&self) -> Result<(), LocalPayloadBackendError> {
             self.inner.sync_data()
         }
 
-        fn run_pressure_maintenance(&self) -> Result<(), LocalBlockBackendError> {
+        fn run_pressure_maintenance(&self) -> Result<(), LocalPayloadBackendError> {
             self.inner.run_pressure_maintenance()
         }
 
@@ -1388,7 +1497,7 @@ mod tests {
             self.inner.dirty_object_ids()
         }
 
-        fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState {
+        fn lifecycle_state(&self, object_id: u64) -> LocalPayloadLifecycleState {
             self.inner.lifecycle_state(object_id)
         }
 
@@ -1396,11 +1505,11 @@ mod tests {
             self.inner.is_evictable(object_id)
         }
 
-        fn storage_stats(&self) -> LocalBlockStorageStats {
+        fn storage_stats(&self) -> LocalPayloadStorageStats {
             self.inner.storage_stats()
         }
 
-        fn object_stats(&self, object_id: u64) -> Option<LocalBlockObjectStats> {
+        fn object_stats(&self, object_id: u64) -> Option<LocalPayloadObjectStats> {
             self.inner.object_stats(object_id)
         }
 
@@ -1465,51 +1574,52 @@ mod tests {
         (rt, vfs, meta)
     }
 
-    fn mark_all_file_blocks_uploaded(
+    fn mark_all_overlay_objects_uploaded(
         vfs: &Arc<StudioVfs>,
         meta: &Arc<RedbMetaEngine>,
         ino: Ino,
-    ) -> (u64, Vec<(u32, BlockRef)>) {
+    ) -> (u64, Vec<u64>) {
         let attr = meta.get_attr(ino).expect("load inode attrs");
-        let blocks = meta.get_file_blocks(ino).expect("load file blocks");
-        for (block_index, block) in &blocks {
-            vfs.local_block_backend().mark_uploaded(block.object_id);
+        let object_ids = meta
+            .get_regular_file_overlay_object_ids(ino)
+            .expect("load overlay object ids");
+        for object_id in &object_ids {
+            vfs.local_payload_backend().mark_uploaded(*object_id);
             assert!(
-                meta.mark_file_block_uploaded_if_matches(
+                meta.mark_regular_file_overlay_object_uploaded_if_matches(
                     ino,
-                    *block_index,
                     attr.content_epoch,
-                    block
+                    *object_id
                 )
-                .expect("mark block uploaded"),
-                "expected metadata upload mark to apply for every block"
+                .expect("mark overlay object uploaded"),
+                "expected metadata upload mark to apply for every overlay object"
             );
         }
-        (attr.content_epoch, blocks)
+        (attr.content_epoch, object_ids)
     }
 
-    fn publish_current_manifest(
+    fn publish_current_file_graph(
         meta: &Arc<RedbMetaEngine>,
         ino: Ino,
         content_epoch: u64,
-        blocks: &[(u32, BlockRef)],
+        _object_ids: &[u64],
     ) {
         assert!(
-            meta.publish_file_manifest_if_matches(ino, content_epoch, blocks)
-                .expect("publish current manifest"),
-            "expected manifest publish to apply"
+            meta.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
+                .expect("publish current file graph"),
+            "expected file graph publish to apply"
         );
     }
 
     #[test]
-    fn collect_data_block_refs_deduplicates_by_object_id() {
-        let first = BlockRef {
+    fn collect_data_payload_refs_deduplicates_by_object_id() {
+        let first = PayloadRef {
             object_id: 42,
             offset: 0,
             length: 16,
             flags: MetaBlockFlags::empty(),
         };
-        let second = BlockRef {
+        let second = PayloadRef {
             object_id: 42,
             offset: 8,
             length: 8,
@@ -1519,13 +1629,13 @@ mod tests {
             ReadSegment {
                 range: ReadRange { start: 0, end: 16 },
                 source: ReadSegmentSource::Base {
-                    block: first.clone(),
+                    payload: first.clone(),
                 },
             },
             ReadSegment {
                 range: ReadRange { start: 16, end: 24 },
                 source: ReadSegmentSource::Overlay {
-                    block: second.clone(),
+                    payload: second.clone(),
                 },
             },
             ReadSegment {
@@ -1534,7 +1644,7 @@ mod tests {
             },
         ];
 
-        let refs = DataReader::collect_data_block_refs(&segments);
+        let refs = DataReader::collect_data_payload_refs(&segments);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs.get(&42), Some(&first));
     }
@@ -1592,8 +1702,8 @@ mod tests {
             vfs.write(ino, 0, &payload).await.expect("write payload");
             vfs.flush(ino).await.expect("flush durable local payload");
 
-            let (content_epoch, blocks) = mark_all_file_blocks_uploaded(&vfs, &meta, ino);
-            publish_current_manifest(&meta, ino, content_epoch, &blocks);
+            let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+            publish_current_file_graph(&meta, ino, content_epoch, &blocks);
             vfs.state.namespace.dirty_attrs.lock().remove(&ino);
             vfs.state.namespace.attr_read_cache.lock().remove(ino);
 
@@ -1652,17 +1762,18 @@ mod tests {
             let ino = 9_001;
             let mut cached_attr = InodeAttr::new_file(ino, ROOT_INO, 1000, 1000, 0o644);
             cached_attr.size = 5;
-            vfs.state.local_dirty.pending_blocks.lock().insert(
+            vfs.state.local_dirty.pending_payloads.lock().insert(
                 (ino, 0),
-                PendingBlock {
+                PendingPayload {
                     data: BytesMut::from(&b"stale"[..]),
                     dirty: true,
                     reserved_object_id: None,
+                    persisted_len: None,
                 },
             );
             vfs.state
                 .local_dirty
-                .pending_block_indexes
+                .pending_payload_indexes
                 .lock()
                 .entry(ino)
                 .or_default()
@@ -1688,7 +1799,7 @@ mod tests {
             assert!(
                 !vfs.state
                     .local_dirty
-                    .pending_blocks
+                    .pending_payloads
                     .lock()
                     .contains_key(&(ino, 0))
             );
@@ -1710,17 +1821,18 @@ mod tests {
         let ino = 9_101;
         let mut cached_attr = InodeAttr::new_file(ino, ROOT_INO, 1000, 1000, 0o644);
         cached_attr.size = 5;
-        vfs.state.local_dirty.pending_blocks.lock().insert(
+        vfs.state.local_dirty.pending_payloads.lock().insert(
             (ino, 0),
-            PendingBlock {
+            PendingPayload {
                 data: BytesMut::from(&b"stale"[..]),
                 dirty: true,
                 reserved_object_id: None,
+                persisted_len: None,
             },
         );
         vfs.state
             .local_dirty
-            .pending_block_indexes
+            .pending_payload_indexes
             .lock()
             .entry(ino)
             .or_default()
@@ -1745,7 +1857,7 @@ mod tests {
         assert!(
             !vfs.state
                 .local_dirty
-                .pending_blocks
+                .pending_payloads
                 .lock()
                 .contains_key(&(ino, 0))
         );
@@ -1790,23 +1902,23 @@ mod tests {
     fn committed_local_cache_hit_uses_direct_backend_read_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, "assemble-read-plan-written");
-        let inner = vfs.local_block_backend.clone();
-        let counting_backend = Arc::new(CountingLocalBlockBackend::new(inner));
+        let inner = vfs.local_payload_backend.clone();
+        let counting_backend = Arc::new(CountingLocalPayloadBackend::new(inner));
         Arc::get_mut(&mut vfs)
             .expect("unstarted test VFS should be uniquely owned")
-            .local_block_backend = counting_backend.clone();
+            .local_payload_backend = counting_backend.clone();
         rt.block_on(async {
             let object_id = 0xCC77;
-            vfs.block_store_put_async(object_id, Bytes::from_static(b"0123456789"), false)
+            vfs.payload_store_put_async(object_id, Bytes::from_static(b"0123456789"), false)
                 .await
-                .expect("block store put");
+                .expect("payload store put");
 
-            let mut block = BlockRef::new_full(object_id, 10);
-            block.offset = 2;
-            block.length = 4;
+            let mut payload = PayloadRef::new_full(object_id, 10);
+            payload.offset = 2;
+            payload.length = 4;
             let segments = vec![ReadSegment {
                 range: ReadRange { start: 0, end: 4 },
-                source: ReadSegmentSource::Base { block },
+                source: ReadSegmentSource::Base { payload },
             }];
             let mut buffer = [0_u8; 4];
             counting_backend.reset_counters();
@@ -1837,17 +1949,17 @@ mod tests {
                 .expect("create test file");
             let ino = attr.ino;
             let object_id = 0xDADA;
-            vfs.block_store_put_async(object_id, Bytes::from_static(b"abcdefgh"), false)
+            vfs.payload_store_put_async(object_id, Bytes::from_static(b"abcdefgh"), false)
                 .await
-                .expect("seed committed block");
+                .expect("seed committed payload object");
 
             let mut staged_attr = meta.get_attr(ino).expect("load staged attr");
             staged_attr.size = 8;
             staged_attr.committed_size = 8;
             staged_attr.upload_state = MetaUploadState::Ready;
             meta.set_attr(&staged_attr).expect("persist committed attr");
-            meta.set_file_block(ino, 0, &BlockRef::new_partial(object_id, 8))
-                .expect("persist committed block");
+            meta.stage_payload_slice(ino, 0, &PayloadRef::new_partial(object_id, 8))
+                .expect("persist committed payload slice");
 
             vfs.write(ino, 2, b"XY").await.expect("stage dirty patch");
 
@@ -1922,17 +2034,17 @@ mod tests {
                 .expect("create test file");
             let ino = attr.ino;
             let object_id = 0xA11CE;
-            vfs.block_store_put_async(object_id, Bytes::from_static(b"abcdefgh"), false)
+            vfs.payload_store_put_async(object_id, Bytes::from_static(b"abcdefgh"), false)
                 .await
-                .expect("seed committed block");
+                .expect("seed committed payload object");
 
             let mut staged_attr = meta.get_attr(ino).expect("load staged attr");
             staged_attr.size = 8;
             staged_attr.committed_size = 8;
             staged_attr.upload_state = MetaUploadState::Ready;
             meta.set_attr(&staged_attr).expect("persist committed attr");
-            meta.set_file_block(ino, 0, &BlockRef::new_partial(object_id, 8))
-                .expect("persist committed block");
+            meta.stage_payload_slice(ino, 0, &PayloadRef::new_partial(object_id, 8))
+                .expect("persist committed payload slice");
 
             vfs.write(ino, 2, b"XY").await.expect("stage dirty patch");
 
@@ -1977,13 +2089,13 @@ mod tests {
             let committed_object_id = 0xC0FFEE;
             let missing_pending_object_id = 0xDEADBEEF;
 
-            vfs.block_store_put_async(
+            vfs.payload_store_put_async(
                 committed_object_id,
                 Bytes::from_static(b"abcdefgh"),
                 false,
             )
             .await
-            .expect("seed committed block");
+            .expect("seed committed payload object");
 
             let mut staged_attr = meta.get_attr(ino).expect("load staged attr");
             staged_attr.size = 8;
@@ -1992,8 +2104,8 @@ mod tests {
             staged_attr.committed_content_epoch = 1;
             staged_attr.content_epoch = 2;
             meta.set_attr(&staged_attr).expect("persist staged attr");
-            meta.set_file_block(ino, 0, &BlockRef::new_partial(committed_object_id, 8))
-                .expect("persist committed block");
+            meta.stage_payload_slice(ino, 0, &PayloadRef::new_partial(committed_object_id, 8))
+                .expect("persist committed payload slice");
 
             vfs.state.incarnation.live_extent_records.lock().insert(
                 (ino, 0),
@@ -2016,11 +2128,11 @@ mod tests {
     fn materialized_pending_local_read_uses_direct_backend_read_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-local-read-fast-path");
-        let inner = vfs.local_block_backend.clone();
-        let counting_backend = Arc::new(CountingLocalBlockBackend::new(inner));
+        let inner = vfs.local_payload_backend.clone();
+        let counting_backend = Arc::new(CountingLocalPayloadBackend::new(inner));
         Arc::get_mut(&mut vfs)
             .expect("unstarted test VFS should be uniquely owned")
-            .local_block_backend = counting_backend.clone();
+            .local_payload_backend = counting_backend.clone();
 
         rt.block_on(async {
             let created = vfs
@@ -2036,7 +2148,7 @@ mod tests {
                 .expect("materialize pending local state");
 
             assert!(
-                !vfs.has_pending_local_dirty_blocks_for_inode(created.ino),
+                !vfs.has_pending_local_dirty_payloads_for_inode(created.ino),
                 "explicit flush should materialize local pending extents before read"
             );
             assert!(

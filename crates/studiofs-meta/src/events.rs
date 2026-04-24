@@ -1,4 +1,4 @@
-use crate::types::{BlockRef, DirEntryValue, InodeAttr, MetadataSnapshot, SnapshotState};
+use crate::types::{DirEntryValue, InodeAttr, MetadataSnapshot, SnapshotState};
 use serde::{Deserialize, Serialize};
 
 /// Represents a single mutation to the metadata state.
@@ -63,53 +63,11 @@ pub enum MetaEvent {
         new_parent_attr: Box<Option<InodeAttr>>,
     },
 
-    // ─── File Block Operations ───────────────────────────────────────────────
-    /// Set a block reference for a file.
-    SetFileBlock {
-        /// File inode being updated.
+    // ─── Regular File Graph Operations ──────────────────────────────────────
+    /// Remove all regular-file graph rows for a file (e.g., unlink).
+    RemoveRegularFileGraph {
+        /// File inode whose slice graph should be removed.
         ino: u64,
-        /// Logical block slot inside the file.
-        block_index: u32,
-        /// Block payload reference to persist.
-        block: BlockRef,
-    },
-
-    /// Remove a specific file block (e.g., truncate).
-    RemoveFileBlock {
-        /// File inode being updated.
-        ino: u64,
-        /// Logical block slot to clear.
-        block_index: u32,
-    },
-
-    /// Remove all blocks for a file (e.g., unlink).
-    RemoveFileBlocks {
-        /// File inode whose block mapping should be removed.
-        ino: u64,
-    },
-
-    /// Set multiple block references in one batch (used by drain_dirty_mem).
-    SetFileBlocksBatch {
-        /// Batch of `(ino, block_index, block)` updates to apply atomically.
-        blocks: Vec<(u64, u32, BlockRef)>,
-    },
-
-    /// Publish a block that has finished uploading and is now remote-visible.
-    CommitFileBlock {
-        /// File inode being updated.
-        ino: u64,
-        /// Logical block slot inside the file.
-        block_index: u32,
-        /// Remote-visible block reference for the slot.
-        block: BlockRef,
-    },
-
-    /// Atomically publish the committed manifest head for a file.
-    PublishFileManifest {
-        /// File inode whose published manifest is being replaced.
-        ino: u64,
-        /// Full published manifest as `(block_index, block)` rows.
-        blocks: Vec<(u32, BlockRef)>,
     },
 
     /// Replace the local overlay slices for a regular file chunk batch.
@@ -120,6 +78,19 @@ pub enum MetaEvent {
         /// File inode whose overlay chunks are being rewritten.
         ino: u64,
         /// Final chunk rows as `(chunk_id, slices)` pairs.
+        chunk_slices: Vec<(crate::schema::ChunkId, Vec<crate::schema::SliceRecord>)>,
+    },
+
+    /// Atomically publish the remote-visible regular-file base graph.
+    ///
+    /// The payload carries the full published base rows for the inode after the
+    /// publish barrier completes. This is the slice-native publish event used
+    /// by regular-file graphs that can no longer be expressed as a contiguous
+    /// `(logical_index, payload_ref)` projection.
+    PublishRegularFileBaseSlices {
+        /// File inode whose published base chunks are being replaced.
+        ino: u64,
+        /// Final published base rows as `(chunk_id, slices)` pairs.
         chunk_slices: Vec<(crate::schema::ChunkId, Vec<crate::schema::SliceRecord>)>,
     },
 
@@ -210,13 +181,9 @@ impl MetaEvent {
             Self::AddEntry { .. } => "add_entry",
             Self::RemoveEntry { .. } => "remove_entry",
             Self::RenameEntry { .. } => "rename_entry",
-            Self::SetFileBlock { .. } => "set_file_block",
-            Self::RemoveFileBlock { .. } => "remove_file_block",
-            Self::RemoveFileBlocks { .. } => "remove_file_blocks",
-            Self::SetFileBlocksBatch { .. } => "set_file_blocks_batch",
-            Self::CommitFileBlock { .. } => "commit_file_block",
-            Self::PublishFileManifest { .. } => "publish_file_manifest",
+            Self::RemoveRegularFileGraph { .. } => "remove_regular_file_graph",
             Self::SetRegularFileOverlaySlices { .. } => "set_regular_file_overlay_slices",
+            Self::PublishRegularFileBaseSlices { .. } => "publish_regular_file_base_slices",
             Self::SetSymlinkTarget { .. } => "set_symlink_target",
             Self::SetXattr { .. } => "set_xattr",
             Self::RemoveXattr { .. } => "remove_xattr",
@@ -246,13 +213,9 @@ impl MetaEvent {
             Self::AddEntry { parent, .. } => Some(*parent),
             Self::RemoveEntry { parent, .. } => Some(*parent),
             Self::RenameEntry { parent, .. } => Some(*parent),
-            Self::SetFileBlock { ino, .. } => Some(*ino),
-            Self::RemoveFileBlock { ino, .. } => Some(*ino),
-            Self::RemoveFileBlocks { ino } => Some(*ino),
-            Self::SetFileBlocksBatch { blocks } => blocks.first().map(|(ino, _, _)| *ino),
-            Self::CommitFileBlock { ino, .. } => Some(*ino),
-            Self::PublishFileManifest { ino, .. } => Some(*ino),
+            Self::RemoveRegularFileGraph { ino } => Some(*ino),
             Self::SetRegularFileOverlaySlices { ino, .. } => Some(*ino),
+            Self::PublishRegularFileBaseSlices { ino, .. } => Some(*ino),
             Self::SetSymlinkTarget { ino, .. } => Some(*ino),
             Self::SetXattr { ino, .. } => Some(*ino),
             Self::RemoveXattr { ino, .. } => Some(*ino),

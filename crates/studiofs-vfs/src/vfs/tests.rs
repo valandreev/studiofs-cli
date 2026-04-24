@@ -1,12 +1,13 @@
 use super::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use studiofs_meta::engine::MetadataAuthorityStatus;
-use studiofs_meta::engine::{MetaBlocks, MetaInodes};
+use studiofs_meta::engine::{MetaInodes, MetaPayloadObjects};
 use studiofs_meta::schema::{
-    CURRENT_FORMAT_VERSION, ChunkId, FormatInfo, InodeLifecycleState, MetadataConfig,
-    PayloadRetentionClass, ROOT_INO, SliceId, SliceOrder, SliceRange, SliceRecord,
+    CURRENT_FORMAT_VERSION, ChunkId, DEFAULT_BLOCK_SIZE, FormatInfo, InodeLifecycleState,
+    MetadataConfig, PayloadRefState, PayloadRetentionClass, ROOT_INO, SliceId, SliceOrder,
+    SliceRange, SliceRecord,
 };
 use studiofs_meta::{
     FileLockLease, HardLockKind, MetaEngine, MetaFormat, MetaFsOps, RedbMetaEngine,
@@ -87,6 +88,127 @@ fn make_test_vfs_with_config(
     (rt, vfs, meta)
 }
 
+trait FileGraphMetaFixture {
+    fn stage_payload_slice(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        payload: &PayloadRef,
+    ) -> MetaResult<Option<PayloadRef>>;
+    fn lookup_payload_slices(&self, ino: Ino) -> MetaResult<Vec<(u32, PayloadRef)>>;
+}
+
+fn fixture_payload_slices(
+    block_index: u32,
+    payload: Option<&PayloadRef>,
+) -> MetaResult<Vec<(ChunkId, Vec<SliceRecord>)>> {
+    let block_start = u64::from(block_index)
+        .checked_mul(u64::from(DEFAULT_BLOCK_SIZE))
+        .ok_or_else(|| MetaError::Storage("fixture block offset overflow".to_string()))?;
+    let data_end = block_start
+        .checked_add(u64::from(payload.map_or(0, |payload| payload.length)))
+        .ok_or_else(|| MetaError::Storage("fixture block data overflow".to_string()))?;
+    let block_end = block_start
+        .checked_add(u64::from(DEFAULT_BLOCK_SIZE))
+        .ok_or_else(|| MetaError::Storage("fixture block range overflow".to_string()))?;
+    let mut chunks = std::collections::BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
+    let mut push = |start: u64, end: u64, source: Option<&PayloadRef>| -> MetaResult<()> {
+        let mut cursor = start;
+        while cursor < end {
+            let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);
+            let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
+            let piece_end = end.min(chunk_start.saturating_add(DEFAULT_CHUNK_SIZE as u64));
+            let range = SliceRange::new(
+                (cursor - chunk_start) as u32,
+                (piece_end - chunk_start) as u32,
+            )
+            .ok_or_else(|| MetaError::Storage("fixture invalid slice range".to_string()))?;
+            let mut slice = if let Some(source) = source {
+                let delta = u32::try_from(cursor.saturating_sub(block_start))
+                    .map_err(|_| MetaError::Storage("fixture slice delta overflow".to_string()))?;
+                SliceRecord::new(
+                    SliceId(0),
+                    SliceOrder(0),
+                    range,
+                    PayloadRef {
+                        object_id: source.object_id,
+                        offset: source.offset.saturating_add(delta),
+                        length: u32::try_from(piece_end.saturating_sub(cursor)).map_err(|_| {
+                            MetaError::Storage("fixture slice length overflow".to_string())
+                        })?,
+                        flags: source.flags,
+                    },
+                )
+            } else {
+                SliceRecord::tombstone(SliceId(0), SliceOrder(0), range)
+            };
+            slice.payload_state = PayloadRefState::LocalOnly;
+            chunks.entry(chunk_id).or_default().push(slice);
+            cursor = piece_end;
+        }
+        Ok(())
+    };
+    push(block_start, data_end, payload)?;
+    if data_end < block_end {
+        push(data_end, block_end, None)?;
+    }
+    Ok(chunks.into_iter().collect())
+}
+
+impl FileGraphMetaFixture for Arc<RedbMetaEngine> {
+    fn stage_payload_slice(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        payload: &PayloadRef,
+    ) -> MetaResult<Option<PayloadRef>> {
+        self.flush_regular_file_overlay_slices(
+            ino,
+            fixture_payload_slices(block_index, Some(payload))?.as_slice(),
+        )?;
+        Ok(None)
+    }
+
+    fn lookup_payload_slices(&self, ino: Ino) -> MetaResult<Vec<(u32, PayloadRef)>> {
+        let attr = self.get_attr(ino)?;
+        let mut blocks = BTreeMap::<u32, PayloadRef>::new();
+        for span in self.lookup_regular_file_slices(ino, 0, attr.size)? {
+            let Some(block) = span.payload else {
+                continue;
+            };
+            let chunk_start = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
+            let span_start = chunk_start.saturating_add(u64::from(span.range.start));
+            let span_end = chunk_start.saturating_add(u64::from(span.range.end));
+            let mut cursor = span_start;
+            while cursor < span_end {
+                let block_index = u32::try_from(cursor / u64::from(DEFAULT_BLOCK_SIZE))
+                    .map_err(|_| MetaError::Storage("fixture block index overflow".to_string()))?;
+                let logical_block_end =
+                    (u64::from(block_index) + 1).saturating_mul(u64::from(DEFAULT_BLOCK_SIZE));
+                let piece_end = span_end.min(logical_block_end);
+                let piece_len = u32::try_from(piece_end.saturating_sub(cursor))
+                    .map_err(|_| MetaError::Storage("fixture block length overflow".to_string()))?;
+                let delta = u32::try_from(cursor.saturating_sub(span_start))
+                    .map_err(|_| MetaError::Storage("fixture block offset overflow".to_string()))?;
+                blocks
+                    .entry(block_index)
+                    .and_modify(|existing| {
+                        existing.length = existing.length.saturating_add(piece_len);
+                        existing.flags |= block.flags;
+                    })
+                    .or_insert_with(|| PayloadRef {
+                        object_id: block.object_id,
+                        offset: block.offset.saturating_add(delta),
+                        length: piece_len,
+                        flags: block.flags,
+                    });
+                cursor = piece_end;
+            }
+        }
+        Ok(blocks.into_iter().collect())
+    }
+}
+
 fn reopen_existing_test_vfs(tmp: &TempDir) -> (Arc<Runtime>, Arc<StudioVfs>, Arc<RedbMetaEngine>) {
     let db_path = tmp.path().join("meta.redb");
     let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("reopen RedbMetaEngine"));
@@ -109,34 +231,40 @@ fn reopen_existing_test_vfs(tmp: &TempDir) -> (Arc<Runtime>, Arc<StudioVfs>, Arc
     (rt, vfs, meta)
 }
 
-fn mark_all_file_blocks_uploaded(
+fn mark_all_overlay_objects_uploaded(
     vfs: &Arc<StudioVfs>,
     meta: &Arc<RedbMetaEngine>,
     ino: Ino,
-) -> (u64, Vec<(u32, BlockRef)>) {
+) -> (u64, Vec<u64>) {
     let attr = meta.get_attr(ino).expect("load inode attrs");
-    let blocks = meta.get_file_blocks(ino).expect("load file blocks");
-    for (block_index, block) in &blocks {
-        vfs.local_block_backend().mark_uploaded(block.object_id);
+    let object_ids = meta
+        .get_regular_file_overlay_object_ids(ino)
+        .expect("load overlay object ids");
+    for object_id in &object_ids {
+        vfs.local_payload_backend().mark_uploaded(*object_id);
         assert!(
-            meta.mark_file_block_uploaded_if_matches(ino, *block_index, attr.content_epoch, block)
-                .expect("mark block uploaded"),
-            "expected metadata upload mark to apply for every block"
+            meta.mark_regular_file_overlay_object_uploaded_if_matches(
+                ino,
+                attr.content_epoch,
+                *object_id
+            )
+            .expect("mark overlay object uploaded"),
+            "expected metadata upload mark to apply for every overlay object"
         );
     }
-    (attr.content_epoch, blocks)
+    (attr.content_epoch, object_ids)
 }
 
-fn publish_current_manifest(
+fn publish_current_file_graph(
     meta: &Arc<RedbMetaEngine>,
     ino: Ino,
     content_epoch: u64,
-    blocks: &[(u32, BlockRef)],
+    _object_ids: &[u64],
 ) {
     assert!(
-        meta.publish_file_manifest_if_matches(ino, content_epoch, blocks)
-            .expect("publish current manifest"),
-        "expected manifest publish to apply"
+        meta.publish_regular_file_overlay_to_base_if_matches(ino, content_epoch)
+            .expect("publish current file graph"),
+        "expected file graph publish to apply"
     );
 }
 
@@ -152,16 +280,16 @@ fn install_fragmented_overlay_block(
     let left = vec![left_fill; half];
     let right = vec![right_fill; block_size - half];
     let object_ids = meta
-        .next_block_ids(2)
+        .next_object_ids(2)
         .expect("allocate fragmented object ids");
 
-    vfs.local_block_backend()
+    vfs.local_payload_backend()
         .put(object_ids[0], &left, false)
         .expect("persist left fragmented object");
-    vfs.local_block_backend()
+    vfs.local_payload_backend()
         .put(object_ids[1], &right, false)
         .expect("persist right fragmented object");
-    vfs.local_block_backend()
+    vfs.local_payload_backend()
         .sync_data()
         .expect("sync fragmented overlay objects");
 
@@ -174,13 +302,13 @@ fn install_fragmented_overlay_block(
                     SliceId(0),
                     SliceOrder(0),
                     SliceRange::new(0, half as u32).expect("left slice range"),
-                    BlockRef::new_partial(object_ids[0], half as u32),
+                    PayloadRef::new_partial(object_ids[0], half as u32),
                 ),
                 SliceRecord::new(
                     SliceId(1),
                     SliceOrder(1),
                     SliceRange::new(half as u32, block_size as u32).expect("right slice range"),
-                    BlockRef::new_partial(object_ids[1], (block_size - half) as u32),
+                    PayloadRef::new_partial(object_ids[1], (block_size - half) as u32),
                 ),
             ],
         )],
@@ -212,8 +340,8 @@ fn startup_replay_does_not_override_current_epoch_live_extent_with_stale_pending
     attr.committed_content_epoch = 4;
     attr.upload_state = MetaUploadState::Uploading;
     meta.set_attr(&attr).expect("persist staged attr");
-    meta.set_file_block(ino, 0, &BlockRef::new_partial(9001, 4096))
-        .expect("persist current file block");
+    meta.stage_payload_slice(ino, 0, &PayloadRef::new_partial(9001, 4096))
+        .expect("persist current payload slice");
 
     let pending_uploads = vec![PendingUpload {
         ino,
@@ -270,8 +398,8 @@ fn startup_replay_keeps_metadata_live_extent_when_pending_upload_has_same_epoch(
     attr.committed_content_epoch = 4;
     attr.upload_state = MetaUploadState::Uploading;
     meta.set_attr(&attr).expect("persist staged attr");
-    meta.set_file_block(ino, 0, &BlockRef::new_partial(9001, 4096))
-        .expect("persist current file block");
+    meta.stage_payload_slice(ino, 0, &PayloadRef::new_partial(9001, 4096))
+        .expect("persist current payload slice");
 
     let pending_uploads = vec![PendingUpload {
         ino,
@@ -308,8 +436,8 @@ fn startup_replay_prefers_overlay_metadata_live_extent_over_base_for_same_epoch(
     attr.committed_content_epoch = 4;
     attr.upload_state = MetaUploadState::Updating;
     meta.set_attr(&attr).expect("persist staged attr");
-    meta.set_file_block(ino, 0, &BlockRef::new_partial(9001, 4096))
-        .expect("persist base file block");
+    meta.stage_payload_slice(ino, 0, &PayloadRef::new_partial(9001, 4096))
+        .expect("persist base payload slice");
     meta.flush_regular_file_overlay_slices_with_attr(
         ino,
         &[(
@@ -319,13 +447,13 @@ fn startup_replay_prefers_overlay_metadata_live_extent_over_base_for_same_epoch(
                 order: studiofs_meta::schema::SliceOrder::default(),
                 range: studiofs_meta::schema::SliceRange::new(0, 4096)
                     .expect("overlay slice range"),
-                block: Some(studiofs_meta::schema::BlockRef {
+                payload: Some(studiofs_meta::schema::PayloadRef {
                     object_id: 9002,
                     offset: 0,
                     length: 4096,
                     flags: studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK,
                 }),
-                block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
+                payload_state: studiofs_meta::schema::PayloadRefState::LocalOnly,
             }],
         )],
         Some(&attr),
@@ -363,12 +491,12 @@ fn pending_upload_views_follow_runtime_queue_after_startup_replay() {
     let object_id = 7_001;
     let payload = vec![0xAB; 4096];
 
-    vfs.local_block_backend()
+    vfs.local_payload_backend()
         .put(object_id, &payload, false)
-        .expect("persist local block");
-    vfs.local_block_backend()
+        .expect("persist local payload");
+    vfs.local_payload_backend()
         .sync_data()
-        .expect("sync local block");
+        .expect("sync local payload");
 
     let mut attr = meta.get_attr(ino).expect("load test attr");
     attr.size = payload.len() as u64;
@@ -377,12 +505,12 @@ fn pending_upload_views_follow_runtime_queue_after_startup_replay() {
     attr.committed_content_epoch = 4;
     attr.upload_state = MetaUploadState::Uploading;
     meta.set_attr(&attr).expect("persist staged attr");
-    meta.set_file_block(
+    meta.stage_payload_slice(
         ino,
         0,
-        &BlockRef::new_partial(object_id, payload.len() as u32),
+        &PayloadRef::new_partial(object_id, payload.len() as u32),
     )
-    .expect("persist current file block");
+    .expect("persist current payload slice");
     assert!(
         vfs.cached_store().snapshot_pending_uploads().is_empty(),
         "test setup requires startup replay to seed the runtime queue"
@@ -419,12 +547,12 @@ fn startup_replay_rebuilds_runtime_pending_upload_index_from_persisted_state() {
     let object_id = 7_011;
     let payload = vec![0xDA; 4096];
 
-    vfs.local_block_backend()
+    vfs.local_payload_backend()
         .put(object_id, &payload, false)
-        .expect("persist local block");
-    vfs.local_block_backend()
+        .expect("persist local payload");
+    vfs.local_payload_backend()
         .sync_data()
-        .expect("sync local block");
+        .expect("sync local payload");
 
     let mut attr = meta.get_attr(ino).expect("load test attr");
     attr.size = payload.len() as u64;
@@ -433,12 +561,12 @@ fn startup_replay_rebuilds_runtime_pending_upload_index_from_persisted_state() {
     attr.committed_content_epoch = 8;
     attr.upload_state = MetaUploadState::Uploading;
     meta.set_attr(&attr).expect("persist staged attr");
-    meta.set_file_block(
+    meta.stage_payload_slice(
         ino,
         0,
-        &BlockRef::new_partial(object_id, payload.len() as u32),
+        &PayloadRef::new_partial(object_id, payload.len() as u32),
     )
-    .expect("persist current file block");
+    .expect("persist current payload slice");
 
     assert!(
         vfs.cached_store().snapshot_pending_uploads().is_empty(),
@@ -452,7 +580,7 @@ fn startup_replay_rebuilds_runtime_pending_upload_index_from_persisted_state() {
     assert_eq!(runtime_pending[0].object_id, object_id);
     assert!(
         vfs.cached_store().is_pinned(object_id),
-        "requeued runtime upload should repin the durable local block"
+        "requeued runtime upload should repin the durable local payload"
     );
     assert!(
         vfs.cached_store().has_staged_upload(object_id),
@@ -483,7 +611,7 @@ fn flush_queues_runtime_upload_immediately_after_local_durability() {
     assert_eq!(
         pending_uploads.len(),
         1,
-        "local durability should enqueue the unpublished block into the runtime upload queue"
+        "local durability should enqueue the unpublished payload object into the runtime upload queue"
     );
 
     let runtime_pending = vfs.cached_store().snapshot_pending_uploads();
@@ -528,7 +656,7 @@ fn buffered_partial_write_uses_fragmented_overlay_slice_graph_as_base() {
         assert_eq!(
             read.as_ref(),
             expected.as_slice(),
-            "buffered write path should reuse fragmented overlay slice graph as its base block"
+            "buffered write path should reuse fragmented overlay slice graph as its base payload"
         );
     });
 }
@@ -582,7 +710,7 @@ fn release_fh_materializes_fragmented_overlay_slice_graph_base() {
         assert_eq!(
             read.as_ref(),
             expected.as_slice(),
-            "handle-writer materialization should reuse fragmented overlay slice graph as its base block"
+            "handle-writer materialization should reuse fragmented overlay slice graph as its base payload"
         );
     });
 }
@@ -613,7 +741,7 @@ fn wait_for_uploads_idle_observes_runtime_upload_queue() {
 }
 
 #[test]
-fn pending_upload_truth_ignores_deleted_inode_local_blocks() {
+fn pending_upload_truth_ignores_deleted_inode_local_payloads() {
     let tmp = TempDir::new().expect("tempdir");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-views-deleted-inode");
 
@@ -624,12 +752,12 @@ fn pending_upload_truth_ignores_deleted_inode_local_blocks() {
     let object_id = 7_002;
     let payload = vec![0xCD; 4096];
 
-    vfs.local_block_backend()
+    vfs.local_payload_backend()
         .put(object_id, &payload, false)
-        .expect("persist local block");
-    vfs.local_block_backend()
+        .expect("persist local payload");
+    vfs.local_payload_backend()
         .sync_data()
-        .expect("sync local block");
+        .expect("sync local payload");
 
     let mut attr = meta.get_attr(ino).expect("load test attr");
     attr.size = payload.len() as u64;
@@ -639,16 +767,16 @@ fn pending_upload_truth_ignores_deleted_inode_local_blocks() {
     attr.nlink = 0;
     attr.upload_state = MetaUploadState::Uploading;
     meta.set_attr(&attr).expect("persist deleted attr");
-    meta.set_file_block(
+    meta.stage_payload_slice(
         ino,
         0,
-        &BlockRef::new_partial(object_id, payload.len() as u32),
+        &PayloadRef::new_partial(object_id, payload.len() as u32),
     )
-    .expect("persist deleted file block");
+    .expect("persist deleted payload slice");
 
     assert!(
         vfs.pending_uploads_for_inode(ino).is_empty(),
-        "deleted inodes must keep local blocks readable without advertising them as pending uploads"
+        "deleted inodes must keep local payloads readable without advertising them as pending uploads"
     );
 
     let pending_upload_index = vfs.snapshot_pending_upload_index();
@@ -660,21 +788,21 @@ fn pending_upload_truth_ignores_deleted_inode_local_blocks() {
 }
 
 #[test]
-fn startup_replay_removes_orphan_dirty_blocks_and_clears_pending_evictions() {
+fn startup_replay_removes_orphan_dirty_payloads_and_clears_pending_evictions() {
     let tmp = TempDir::new().expect("tempdir");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "startup-replay-orphan-cleanup");
     let object_id = 991_337;
 
-    vfs.local_block_backend()
-        .put(object_id, b"orphan-dirty-block", false)
-        .expect("persist orphan dirty block");
-    vfs.local_block_backend()
+    vfs.local_payload_backend()
+        .put(object_id, b"orphan-dirty-payload", false)
+        .expect("persist orphan dirty payload");
+    vfs.local_payload_backend()
         .sync_data()
-        .expect("sync orphan dirty block");
+        .expect("sync orphan dirty payload");
     vfs.state.upload.pending_evictions.lock().insert(object_id);
 
     assert!(
-        vfs.local_block_backend()
+        vfs.local_payload_backend()
             .dirty_object_ids()
             .contains(&object_id),
         "test setup should expose orphan as dirty before replay"
@@ -691,14 +819,14 @@ fn startup_replay_removes_orphan_dirty_blocks_and_clears_pending_evictions() {
     vfs.replay_dirty_uploads_from_local_backend(&[], &[]);
 
     assert!(
-        !vfs.local_block_backend().contains(object_id),
-        "startup replay should remove orphan dirty block without metadata reference"
+        !vfs.local_payload_backend().contains(object_id),
+        "startup replay should remove orphan dirty payload without metadata reference"
     );
     assert!(
-        !vfs.local_block_backend()
+        !vfs.local_payload_backend()
             .dirty_object_ids()
             .contains(&object_id),
-        "startup replay should clear orphan dirty block from dirty index"
+        "startup replay should clear orphan dirty payload from dirty index"
     );
     assert!(
         !vfs.state
@@ -750,10 +878,10 @@ fn zeroio_snapshot_distinguishes_single_store_payload_classes_and_publish_backlo
             .expect("materialize published warm payload");
 
         let (publish_ready_epoch, publish_ready_blocks) =
-            mark_all_file_blocks_uploaded(&vfs, &meta, publish_ready.ino);
+            mark_all_overlay_objects_uploaded(&vfs, &meta, publish_ready.ino);
         let (published_epoch, published_blocks) =
-            mark_all_file_blocks_uploaded(&vfs, &meta, published.ino);
-        publish_current_manifest(&meta, published.ino, published_epoch, &published_blocks);
+            mark_all_overlay_objects_uploaded(&vfs, &meta, published.ino);
+        publish_current_file_graph(&meta, published.ino, published_epoch, &published_blocks);
 
         let snapshot = vfs.zeroio_runtime_snapshot();
 
@@ -805,7 +933,7 @@ fn zeroio_snapshot_distinguishes_single_store_payload_classes_and_publish_backlo
 
         assert!(
             !publish_ready_blocks.is_empty(),
-            "test setup should persist current unpublished blocks"
+            "test setup should persist current unpublished slice payloads"
         );
     });
 }
@@ -825,22 +953,22 @@ fn zeroio_snapshot_reports_delete_before_publish_cleanup_visibility() {
     staged_attr.size = 8192;
     staged_attr.content_epoch = 1;
     meta.set_attr(&staged_attr).expect("persist staged attr");
-    vfs.local_block_backend()
+    vfs.local_payload_backend()
         .put(950, b"local-only", false)
         .expect("persist local-only object");
-    vfs.local_block_backend()
+    vfs.local_payload_backend()
         .put(951, b"uploaded", true)
         .expect("persist uploaded object");
-    vfs.local_block_backend().mark_uploaded(951);
-    meta.set_file_block(attr.ino, 0, &BlockRef::new_partial(950, 4096))
+    vfs.local_payload_backend().mark_uploaded(951);
+    meta.stage_payload_slice(attr.ino, 0, &PayloadRef::new_partial(950, 4096))
         .expect("persist local-only block");
-    let uploaded = BlockRef::new_partial(951, 4096);
-    meta.set_file_block(attr.ino, 1, &uploaded)
-        .expect("persist uploaded block");
+    let uploaded = PayloadRef::new_partial(951, 4096);
+    meta.stage_payload_slice(attr.ino, 1, &uploaded)
+        .expect("persist uploaded payload object");
     assert!(
-        meta.mark_file_block_uploaded_if_matches(attr.ino, 1, 1, &uploaded)
-            .expect("mark uploaded block"),
-        "expected uploaded block transition to apply"
+        meta.mark_regular_file_overlay_object_uploaded_if_matches(attr.ino, 1, uploaded.object_id)
+            .expect("mark uploaded object"),
+        "expected uploaded object transition to apply"
     );
 
     meta.unlink(ROOT_INO, b"delete-before-publish.bin")
@@ -877,48 +1005,48 @@ fn zeroio_snapshot_reports_delete_before_publish_cleanup_visibility() {
 }
 
 #[test]
-fn epoch_finalizer_publishes_manifest_backed_zero_length_epoch() {
+fn epoch_finalizer_publishes_slice_graph_zero_length_epoch() {
     let tmp = TempDir::new().expect("tempdir");
-    let (rt, vfs, meta) = make_test_vfs(&tmp, "manifest-finalizer-zero-length");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-zero-length");
     let _guard = rt.enter();
 
     rt.block_on(async {
         let attr = vfs
-            .create(1, b"manifest-finalizer-zero-length.bin", 0, 0, 0o644)
+            .create(1, b"slice-graph-finalizer-zero-length.bin", 0, 0, 0o644)
             .expect("create test file");
-        let payload = b"manifest-backed-finalization";
+        let payload = b"slice-graph-finalization";
         vfs.write(attr.ino, 0, payload)
             .await
             .expect("write test payload");
         vfs.flush(attr.ino)
             .await
-            .expect("materialize unpublished blocks before publish setup");
+            .expect("materialize unpublished slice payloads before publish setup");
 
         let (published_epoch, published_blocks) =
-            mark_all_file_blocks_uploaded(&vfs, &meta, attr.ino);
-        publish_current_manifest(&meta, attr.ino, published_epoch, &published_blocks);
+            mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
+        publish_current_file_graph(&meta, attr.ino, published_epoch, &published_blocks);
 
         let mut truncated_attr = meta.get_attr(attr.ino).expect("load published attr");
         truncated_attr.size = 0;
         truncated_attr.content_epoch = truncated_attr.content_epoch.saturating_add(1);
         truncated_attr.upload_state = MetaUploadState::Updating;
         meta.set_attr(&truncated_attr)
-            .expect("stage manifest-backed zero-length epoch");
-        meta.remove_file_blocks(attr.ino)
-            .expect("remove unpublished blocks for zero-length truncate");
+            .expect("stage slice-graph zero-length epoch");
+        meta.remove_regular_file_graph(attr.ino)
+            .expect("remove unpublished slice graph for zero-length truncate");
 
         assert!(
             !meta
                 .has_local_regular_file_overlay(attr.ino)
                 .expect("query overlay state"),
-            "regression setup should exercise the legacy manifest-backed path"
+            "regression setup should exercise a payload-free slice-graph epoch"
         );
 
         let unpublished_attr = meta.get_attr(attr.ino).expect("load unpublished attr");
         let lifecycle = meta
             .get_inode_lifecycle(attr.ino)
             .expect("load lifecycle")
-            .expect("manifest-backed epoch should keep lifecycle state");
+            .expect("slice-graph epoch should keep lifecycle state");
         assert_eq!(unpublished_attr.size, 0);
         assert_ne!(
             unpublished_attr.upload_state,
@@ -932,11 +1060,11 @@ fn epoch_finalizer_publishes_manifest_backed_zero_length_epoch() {
         assert_eq!(
             lifecycle.state,
             InodeLifecycleState::PublishReady,
-            "blockless manifest-backed zero-length epochs should become publish-ready immediately"
+            "payload-free slice-graph zero-length epochs should become publish-ready immediately"
         );
         assert_eq!(
-            meta.get_file_blocks(attr.ino)
-                .expect("load unpublished manifest")
+            meta.lookup_payload_slices(attr.ino)
+                .expect("load unpublished graph")
                 .len(),
             0,
             "regression setup should not require remote object visibility checks"
@@ -948,10 +1076,10 @@ fn epoch_finalizer_publishes_manifest_backed_zero_length_epoch() {
             unpublished_attr.content_epoch,
         )
         .await
-        .expect("finalize zero-length manifest-backed epoch");
+        .expect("finalize zero-length slice-graph epoch");
         assert!(
             matches!(status, super::commit::EpochFinalizeStatus::Published),
-            "manifest-backed zero-length epoch should still publish"
+            "slice-graph zero-length epoch should still publish"
         );
 
         let published_attr = meta.get_attr(attr.ino).expect("load published attr");
@@ -968,37 +1096,66 @@ fn epoch_finalizer_publishes_manifest_backed_zero_length_epoch() {
 #[test]
 fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
     let tmp = TempDir::new().expect("tempdir");
-    let (rt, vfs, meta) = make_test_vfs(&tmp, "manifest-finalizer-buffered-tail");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-buffered-tail");
     let _guard = rt.enter();
 
     rt.block_on(async {
         let attr = vfs
-            .create(1, b"manifest-finalizer-buffered-tail.bin", 0, 0, 0o644)
+            .create(1, b"graph-finalizer-buffered-tail.bin", 0, 0, 0o644)
             .expect("create test file");
         let ino = attr.ino;
         let fh = vfs
             .open_file(ino, OpenFlags::RDWR, false)
             .expect("open writable handle");
         let block_size = vfs.block_size as usize;
-        let mut payload = vec![0x41u8; block_size];
-        payload.extend_from_slice(&vec![0x42u8; block_size / 8]);
+        let full_block = vec![0x41u8; block_size];
+        let tail = vec![0x42u8; block_size / 8];
 
-        vfs.write_fh_with_local_sync_policy(fh, ino, 0, &payload, LocalSyncPolicy::Opportunistic)
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            0,
+            &full_block,
+            LocalSyncPolicy::Opportunistic,
+        )
             .await
-            .expect("buffer full block plus partial tail");
+            .expect("stage the initial full-block epoch");
+        vfs.flush_fh(fh)
+            .await
+            .expect("flush the initial full block into durable unpublished metadata");
 
         assert_eq!(
-            meta.get_file_blocks(ino)
-                .expect("load materialized file blocks")
+            meta.lookup_payload_slices(ino)
+                .expect("load flushed payload slices")
                 .len(),
             1,
-            "setup should materialize only the completed full block"
+            "setup should create a publishable durable prefix before buffering a newer tail"
+        );
+
+        let (content_epoch, _blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+
+        vfs.write_fh_with_local_sync_policy(
+            fh,
+            ino,
+            block_size as u64,
+            &tail,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("buffer a newer partial tail without flushing it");
+
+        assert_eq!(
+            meta.lookup_payload_slices(ino)
+                .expect("load durable payload slices")
+                .len(),
+            1,
+            "the newer tail should remain buffered and must not rewrite the durable prefix yet"
         );
         let unpublished_attr = meta.get_attr(ino).expect("load unpublished attr");
         assert_eq!(
             unpublished_attr.size,
             block_size as u64,
-            "durable metadata should still reflect only the completed block prefix"
+            "durable metadata should still reflect only the older flushed epoch while the newer tail is buffered"
         );
         let dirty_attr = vfs
             .state
@@ -1010,7 +1167,7 @@ fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
             .expect("dirty attr should preserve the buffered tail");
         assert_eq!(
             dirty_attr.size,
-            payload.len() as u64,
+            (block_size + tail.len()) as u64,
             "dirty attr should keep the full visible EOF while the tail is still buffered"
         );
         assert!(
@@ -1018,11 +1175,10 @@ fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
             "setup should retain the partial tail in handle-writer memory"
         );
         assert!(
-            !vfs.has_pending_local_dirty_blocks_for_inode(ino),
-            "setup should isolate the regression to handle-writer state, not local_dirty blocks"
+            !vfs.has_pending_local_dirty_payloads_for_inode(ino),
+            "setup should isolate the regression to a buffered handle-writer tail, not staged local_dirty payloads"
         );
 
-        let (content_epoch, _blocks) = mark_all_file_blocks_uploaded(&vfs, &meta, ino);
         let status =
             super::commit::CommitCoordinator::finalize_inode_epoch(&vfs, ino, content_epoch)
                 .await
@@ -1048,7 +1204,7 @@ fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
             .expect("dirty attr should survive deferred finalize");
         assert_eq!(
             dirty_attr_after.size,
-            payload.len() as u64,
+            (block_size + tail.len()) as u64,
             "deferred finalize must preserve the larger visible EOF staged in dirty attrs"
         );
 
@@ -1059,33 +1215,33 @@ fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
 #[test]
 fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
     let tmp = TempDir::new().expect("tempdir");
-    let (rt, vfs, meta) = make_test_vfs(&tmp, "manifest-finalizer-inflight");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-inflight");
     let _guard = rt.enter();
 
     rt.block_on(async {
         let attr = vfs
-            .create(1, b"manifest-finalizer-inflight.bin", 0, 0, 0o644)
+            .create(1, b"graph-finalizer-inflight.bin", 0, 0, 0o644)
             .expect("create test file");
-        let payload = b"manifest-backed-finalization";
+        let payload = b"slice-graph-finalization";
         vfs.write(attr.ino, 0, payload)
             .await
             .expect("write test payload");
         vfs.flush(attr.ino)
             .await
-            .expect("materialize unpublished blocks before publish setup");
+            .expect("materialize unpublished slice payloads before publish setup");
 
         let (published_epoch, published_blocks) =
-            mark_all_file_blocks_uploaded(&vfs, &meta, attr.ino);
-        publish_current_manifest(&meta, attr.ino, published_epoch, &published_blocks);
+            mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
+        publish_current_file_graph(&meta, attr.ino, published_epoch, &published_blocks);
 
         let mut truncated_attr = meta.get_attr(attr.ino).expect("load published attr");
         truncated_attr.size = 0;
         truncated_attr.content_epoch = truncated_attr.content_epoch.saturating_add(1);
         truncated_attr.upload_state = MetaUploadState::Updating;
         meta.set_attr(&truncated_attr)
-            .expect("stage manifest-backed zero-length epoch");
-        meta.remove_file_blocks(attr.ino)
-            .expect("remove unpublished blocks for zero-length truncate");
+            .expect("stage slice-graph zero-length epoch");
+        meta.remove_regular_file_graph(attr.ino)
+            .expect("remove unpublished slice graph for zero-length truncate");
 
         let unpublished_attr = meta.get_attr(attr.ino).expect("load unpublished attr");
         let lifecycle = meta
@@ -1099,7 +1255,7 @@ fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
         assert_eq!(
             lifecycle.state,
             InodeLifecycleState::PublishReady,
-            "once zero-length manifest state is durable, only publication should remain"
+            "once zero-length slice-graph state is durable, only publication should remain"
         );
 
         let task_lock = Arc::new(tokio::sync::Mutex::new(()));
@@ -1140,18 +1296,19 @@ fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
 }
 
 #[test]
-fn manifest_finalizer_visibility_timeout_does_not_requeue_uploaded_blocks() {
+fn graph_finalizer_visibility_timeout_does_not_requeue_uploaded_blocks() {
     let tmp = TempDir::new().expect("tempdir");
     let cfg = VfsConfig {
         publish_visibility_timeout_secs: 1,
         ..VfsConfig::default()
     };
-    let (rt, vfs, meta) = make_test_vfs_with_config(&tmp, "manifest-finalizer-no-requeue", cfg);
+    let (rt, vfs, meta) =
+        make_unstarted_test_vfs_with_config(&tmp, "graph-finalizer-no-requeue", cfg);
     let _guard = rt.enter();
 
     rt.block_on(async {
         let attr = vfs
-            .create(1, b"manifest-finalizer-no-requeue.bin", 0, 0, 0o644)
+            .create(1, b"graph-finalizer-no-requeue.bin", 0, 0, 0o644)
             .expect("create test file");
         let payload = vec![0x5Au8; vfs.block_size as usize];
         vfs.write(attr.ino, 0, &payload)
@@ -1159,9 +1316,9 @@ fn manifest_finalizer_visibility_timeout_does_not_requeue_uploaded_blocks() {
             .expect("write test payload");
         vfs.flush(attr.ino)
             .await
-            .expect("flush manifest-backed epoch");
+            .expect("flush slice-graph epoch");
 
-        let (content_epoch, _blocks) = mark_all_file_blocks_uploaded(&vfs, &meta, attr.ino);
+        let (content_epoch, _blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
         for pending in vfs.pending_uploads_snapshot() {
             if pending.ino == attr.ino && pending.content_epoch == content_epoch {
                 vfs.cached_store().complete_upload(&pending);
@@ -1169,7 +1326,7 @@ fn manifest_finalizer_visibility_timeout_does_not_requeue_uploaded_blocks() {
         }
         assert!(
             vfs.pending_uploads_for_inode(attr.ino).is_empty(),
-            "setup should simulate uploaded blocks that are no longer pending locally"
+            "setup should simulate uploaded payload objects that are no longer pending locally"
         );
 
         let status =
@@ -1178,11 +1335,11 @@ fn manifest_finalizer_visibility_timeout_does_not_requeue_uploaded_blocks() {
                 .expect("visibility timeout should defer instead of failing");
         assert!(
             matches!(status, super::commit::EpochFinalizeStatus::Deferred),
-            "visibility lag should defer publish instead of requeueing uploaded blocks"
+            "visibility lag should defer publish instead of requeueing uploaded payload objects"
         );
         assert!(
             vfs.pending_uploads_for_inode(attr.ino).is_empty(),
-            "uploaded blocks awaiting remote visibility should not be requeued into the upload backlog"
+            "uploaded payload objects awaiting remote visibility should not be requeued into the upload backlog"
         );
     });
 }
@@ -1205,7 +1362,7 @@ fn zeroio_snapshot_reports_repeated_restart_replay_as_health_signal() {
     });
     let attr = meta.get_attr(ino).expect("load replay attr");
     let block = meta
-        .get_file_blocks(ino)
+        .lookup_payload_slices(ino)
         .expect("load replay blocks")
         .into_iter()
         .next()
@@ -1335,7 +1492,7 @@ fn cache_backend_detection_errors_are_structured() {
     );
     let mapped = map_cache_backend_detection_error("E:\\cache-root", error);
     match mapped {
-        VfsError::LocalBlockRuntimeDetection { cache_root, source } => {
+        VfsError::LocalPayloadRuntimeDetection { cache_root, source } => {
             assert_eq!(cache_root, "E:\\cache-root");
             assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
         }
@@ -1383,13 +1540,15 @@ fn cache_runtime_tuning_defaults_match_juicefs_sized_windows() {
 #[test]
 fn soft_dirty_budget_pacing_starts_before_hard_limit() {
     assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 0), None);
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(59, 100, 0), None);
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(60, 100, 0), Some(1));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(80, 100, 0), Some(4));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(90, 100, 0), Some(8));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 512), Some(1));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 1024), Some(4));
-    assert_eq!(soft_dirty_budget_pacing_delay_ms(82, 100, 1024), Some(4));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(44, 100, 0), None);
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(45, 100, 0), Some(1));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(60, 100, 0), Some(3));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(75, 100, 0), Some(6));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(85, 100, 0), Some(10));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 256), Some(1));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 512), Some(3));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 1024), Some(6));
+    assert_eq!(soft_dirty_budget_pacing_delay_ms(62, 100, 1024), Some(6));
 }
 
 #[test]
@@ -2288,11 +2447,11 @@ fn same_mount_read_keeps_opportunistic_handle_write_visible_after_local_dirty_cl
             .lookup_regular_file_slices(ino, 0, payload.len() as u64)
             .unwrap();
         assert!(
-            overlay_spans.iter().all(|span| span.block.is_none()),
+            overlay_spans.iter().all(|span| span.payload.is_none()),
             "opportunistic handle writes should not materialize block-backed metadata before a barrier: {overlay_spans:?}"
         );
 
-        vfs.clear_pending_blocks_for_inode(ino);
+        vfs.clear_pending_payloads_for_inode(ino);
 
         let bytes = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
         assert_eq!(bytes.as_ref(), payload);
@@ -2321,7 +2480,7 @@ fn same_mount_read_prefers_newer_opportunistic_handle_writer_spans() {
             .await
             .unwrap();
 
-        vfs.clear_pending_blocks_for_inode(ino);
+        vfs.clear_pending_payloads_for_inode(ino);
 
         let bytes = vfs.read(ino, 0, 5).await.unwrap();
         assert_eq!(bytes.as_ref(), b"hXYZo");
@@ -2509,14 +2668,14 @@ fn inode_write_keeps_partial_state_buffered_until_flush() {
             .unwrap();
 
         assert!(
-            vfs.has_pending_local_dirty_blocks_for_inode(ino),
+            vfs.has_pending_local_dirty_payloads_for_inode(ino),
             "ordinary opportunistic inode writes should keep partial state buffered until the flush barrier"
         );
         let spans = meta
             .lookup_regular_file_slices(ino, 0, payload.len() as u64)
             .unwrap();
         assert!(
-            spans.iter().all(|span| span.block.is_none()),
+            spans.iter().all(|span| span.payload.is_none()),
             "ordinary opportunistic inode writes should not materialize block-backed unpublished slices before flush: {spans:?}"
         );
 
@@ -2529,7 +2688,7 @@ fn inode_write_keeps_partial_state_buffered_until_flush() {
             .lookup_regular_file_slices(ino, 0, payload.len() as u64)
             .unwrap();
         assert!(
-            spans.iter().any(|span| span.block.is_some()),
+            spans.iter().any(|span| span.payload.is_some()),
             "flush should materialize block-backed unpublished slices for the buffered inode write: {spans:?}"
         );
     });
@@ -2558,7 +2717,7 @@ fn write_fh_default_buffers_partial_state_until_flush() {
             .lookup_regular_file_slices(ino, 0, payload.len() as u64)
             .unwrap();
         assert!(
-            spans.iter().all(|span| span.block.is_none()),
+            spans.iter().all(|span| span.payload.is_none()),
             "default buffered handle writes should not materialize block-backed unpublished slices before flush: {spans:?}"
         );
 
@@ -2568,7 +2727,7 @@ fn write_fh_default_buffers_partial_state_until_flush() {
             .lookup_regular_file_slices(ino, 0, payload.len() as u64)
             .unwrap();
         assert!(
-            spans.iter().any(|span| span.block.is_some()),
+            spans.iter().any(|span| span.payload.is_some()),
             "flush_fh should materialize block-backed unpublished slices for the buffered handle write: {spans:?}"
         );
 
@@ -2579,7 +2738,7 @@ fn write_fh_default_buffers_partial_state_until_flush() {
 #[test]
 fn write_fh_buffers_partial_tail_after_full_block_boundary_until_flush() {
     let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-257-write-fh-full-block-plus-tail");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-257-write-fh-full-block-plus-tail");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
@@ -2594,25 +2753,27 @@ fn write_fh_buffers_partial_tail_after_full_block_boundary_until_flush() {
         vfs.write_fh(fh, ino, 0, &payload).await.unwrap();
 
         assert_eq!(
-            meta.get_file_blocks(ino).unwrap().len(),
-            1,
-            "buffered handle writes should eagerly accept the completed full block but keep the tail buffered until flush"
+            meta.lookup_payload_slices(ino).unwrap().len(),
+            0,
+            "stage-first opportunistic writes should keep the completed full block in local staging until a background or explicit flush commits metadata"
         );
         assert!(
-            vfs.inode_has_dirty_handle_writers(ino) || vfs.has_pending_local_dirty_blocks_for_inode(ino),
+            vfs.inode_has_dirty_handle_writers(ino) || vfs.has_pending_local_dirty_payloads_for_inode(ino),
             "the partial tail should remain buffered after the full-block prefix is accepted"
         );
-        let persisted_attr = meta.get_attr(ino).unwrap();
+        let visible_attr = vfs.getattr_unchecked(ino).unwrap();
         assert_eq!(
-            persisted_attr.size,
-            block_size as u64,
-            "durable local metadata should advance to the accepted full-block prefix before flush drains the buffered tail"
+            visible_attr.size,
+            payload.len() as u64,
+            "read-visible inode size should advance immediately even when the full-block prefix is only staged locally"
         );
+        let buffered = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(buffered.as_ref(), payload.as_slice());
 
         vfs.flush_fh(fh).await.unwrap();
 
         assert_eq!(
-            meta.get_file_blocks(ino).unwrap().len(),
+            meta.lookup_payload_slices(ino).unwrap().len(),
             2,
             "flush should materialize the buffered tail block"
         );
@@ -2621,7 +2782,7 @@ fn write_fh_buffers_partial_tail_after_full_block_boundary_until_flush() {
 }
 
 #[test]
-fn write_fh_full_block_callbacks_can_form_multi_block_payload_bursts() {
+fn write_fh_full_block_callbacks_persist_in_small_foreground_waves() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-write-fh-multi-block-burst");
     let _guard = rt.enter();
@@ -2656,8 +2817,9 @@ fn write_fh_full_block_callbacks_can_form_multi_block_payload_bursts() {
 
     let snapshot = vfs.write_path_observability_snapshot();
     assert!(
-        snapshot.payload_burst.max_blocks_per_burst >= 2,
-        "buffered handle-write full blocks should be able to persist as a multi-block burst instead of one block at a time"
+        snapshot.payload_burst.max_payloads_per_burst <= 1,
+        "slice-first foreground persistence should avoid multi-payload bursts for full-block callbacks: {:?}",
+        snapshot.payload_burst
     );
 }
 
@@ -2668,7 +2830,8 @@ fn opportunistic_completed_handle_writer_materialization_caps_burst_to_drain_chu
         write_eager_flush_batch_bytes: 16 * 1024 * 1024,
         ..VfsConfig::default()
     };
-    let (rt, vfs, meta) = make_test_vfs_with_config(&tmp, "sfs-257-write-fh-capped-burst", cfg);
+    let (rt, vfs, meta) =
+        make_unstarted_test_vfs_with_config(&tmp, "sfs-257-write-fh-capped-burst", cfg);
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
@@ -2681,7 +2844,9 @@ fn opportunistic_completed_handle_writer_materialization_caps_burst_to_drain_chu
         let second = vec![0x22; block_size];
         let third = vec![0x33; block_size];
 
-        vfs.record_handle_writer_state(fh, ino, 0, &first).await.unwrap();
+        vfs.record_handle_writer_state(fh, ino, 0, &first)
+            .await
+            .unwrap();
         vfs.record_handle_writer_state(fh, ino, block_size as u64, &second)
             .await
             .unwrap();
@@ -2696,17 +2861,355 @@ fn opportunistic_completed_handle_writer_materialization_caps_burst_to_drain_chu
             )
             .await
             .unwrap(),
-            "opportunistic materialization should persist at least one capped burst"
+            "opportunistic materialization should stage at least one capped burst"
         );
         assert_eq!(
-            meta.get_file_blocks(ino).unwrap().len(),
-            2,
-            "one opportunistic pass should respect the eager drain chunk cap instead of draining every completed full block"
+            meta.lookup_payload_slices(ino).unwrap().len(),
+            0,
+            "completed payload should stay in local staging until a later flush commits metadata"
+        );
+        assert_eq!(
+            vfs.total_pending_local_dirty_bytes(),
+            0,
+            "completed full logical block should be spilled out of hot RAM once durably staged locally"
+        );
+        assert!(
+            vfs.has_pending_local_dirty_payloads_for_inode(ino),
+            "payload-staged slices should remain locally visible until metadata commit catches up"
         );
         assert_eq!(
             vfs.state.handle_writers.dirty_bytes_for_inode(ino),
             block_size,
             "the final completed block should stay buffered for the next opportunistic pass"
+        );
+        let read = vfs.read(ino, 0, (block_size * 3) as u32).await.unwrap();
+        assert_eq!(&read[..block_size], first.as_slice());
+        assert_eq!(&read[block_size..block_size * 2], second.as_slice());
+        assert_eq!(&read[block_size * 2..], third.as_slice());
+
+        vfs.flush_fh(fh).await.unwrap();
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn opportunistic_handle_writer_slice_spill_batches_adjacent_callbacks_into_single_object() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-257-write-fh-slice-batch");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-257-write-fh-slice-batch.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let slice_bytes = 2 * 1024 * 1024usize;
+
+        let first = vec![0x11; slice_bytes];
+        let second = vec![0x22; slice_bytes];
+        let third = vec![0x33; slice_bytes];
+
+        vfs.record_handle_writer_state(fh, ino, 0, &first)
+            .await
+            .unwrap();
+        vfs.record_handle_writer_state(fh, ino, slice_bytes as u64, &second)
+            .await
+            .unwrap();
+        vfs.record_handle_writer_state(fh, ino, (slice_bytes * 2) as u64, &third)
+            .await
+            .unwrap();
+
+        assert!(
+            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
+                .await
+                .unwrap(),
+            "three sequential 2 MiB callbacks should spill the first 4 MiB as one staged slice object"
+        );
+
+        let dirty_object_ids = vfs.local_payload_backend().dirty_object_ids();
+        assert_eq!(
+            dirty_object_ids.len(),
+            1,
+            "adjacent slice spill should batch the first two callbacks into one staged object"
+        );
+        let staged = vfs
+            .local_payload_backend()
+            .get(dirty_object_ids[0])
+            .expect("staged slice payload should be readable locally");
+        assert_eq!(
+            staged.len(),
+            slice_bytes * 2,
+            "the staged slice object should carry a full 4 MiB batch instead of a single callback"
+        );
+        assert_eq!(
+            vfs.state.handle_writers.dirty_bytes_for_inode(ino),
+            slice_bytes,
+            "the newest callback should remain buffered as the active tail slice"
+        );
+
+        let read = vfs.read(ino, 0, (slice_bytes * 3) as u32).await.unwrap();
+        assert_eq!(&read[..slice_bytes], first.as_slice());
+        assert_eq!(&read[slice_bytes..slice_bytes * 2], second.as_slice());
+        assert_eq!(&read[slice_bytes * 2..], third.as_slice());
+
+        vfs.flush_fh(fh).await.unwrap();
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn opportunistic_handle_writer_slice_spill_drains_multiple_4mib_batches_per_pass() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-257-write-fh-slice-multi-batch");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-257-write-fh-slice-multi-batch.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let slice_bytes = 2 * 1024 * 1024usize;
+
+        for index in 0..9u64 {
+            let payload = vec![0x40u8.saturating_add(index as u8); slice_bytes];
+            vfs.record_handle_writer_state(fh, ino, index * slice_bytes as u64, &payload)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
+                .await
+                .unwrap(),
+            "a single opportunistic drain pass should spill multiple 4 MiB batches when enough old callbacks are queued"
+        );
+
+        let dirty_object_ids = vfs.local_payload_backend().dirty_object_ids();
+        assert_eq!(
+            dirty_object_ids.len(),
+            4,
+            "eight older 2 MiB callbacks should become four staged 4 MiB slice objects in one pass"
+        );
+        for object_id in dirty_object_ids {
+            let staged = vfs
+                .local_payload_backend()
+                .get(object_id)
+                .expect("staged slice payload should be readable locally");
+            assert_eq!(staged.len(), 4 * 1024 * 1024);
+        }
+        assert_eq!(
+            vfs.state.handle_writers.dirty_bytes_for_inode(ino),
+            slice_bytes,
+            "the newest callback should remain buffered as the active tail slice"
+        );
+
+        vfs.flush_fh(fh).await.unwrap();
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn opportunistic_handle_writer_slice_spill_splits_large_current_callback_into_batched_slices() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) =
+        make_unstarted_test_vfs(&tmp, "sfs-257-write-fh-slice-large-current-callback");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(
+                1,
+                b"sfs-257-write-fh-slice-large-current-callback.txt",
+                0,
+                0,
+                0o644,
+            )
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let slice_bytes = 2 * 1024 * 1024usize;
+        let payload = vec![0x5Au8; slice_bytes * 5];
+
+        vfs.record_handle_writer_state(fh, ino, 0, &payload)
+            .await
+            .unwrap();
+
+        assert!(
+            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
+                .await
+                .unwrap(),
+            "a single large callback should spill all but the active hot tail into staged 4 MiB slice batches"
+        );
+
+        let dirty_object_ids = vfs.local_payload_backend().dirty_object_ids();
+        assert_eq!(
+            dirty_object_ids.len(),
+            2,
+            "an opportunistic spill should split a 10 MiB callback into two staged 4 MiB slice objects"
+        );
+        for object_id in dirty_object_ids {
+            let staged = vfs
+                .local_payload_backend()
+                .get(object_id)
+                .expect("staged slice payload should be readable locally");
+            assert_eq!(staged.len(), 4 * 1024 * 1024);
+        }
+        assert_eq!(
+            vfs.state.handle_writers.dirty_bytes_for_inode(ino),
+            slice_bytes,
+            "the newest 2 MiB hot tail should remain buffered after the spill"
+        );
+
+        let read = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(read.as_ref(), payload.as_slice());
+
+        vfs.flush_fh(fh).await.unwrap();
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn background_flush_defers_active_persisted_slice_batches_until_commit_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-257-background-flush-defers-slices");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-257-background-flush-defers-slices.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let slice_bytes = 2 * 1024 * 1024usize;
+
+        for index in 0..3u64 {
+            let payload = vec![0x70u8.saturating_add(index as u8); slice_bytes];
+            vfs.record_handle_writer_state(fh, ino, index * slice_bytes as u64, &payload)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
+                .await
+                .unwrap(),
+            "first opportunistic spill should stage the older 4 MiB batch"
+        );
+
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            4 * 1024 * 1024,
+            "the first spilled slice batch should remain locally staged"
+        );
+        assert!(
+            !vfs.should_background_flush_pending_local_dirty_inode(ino),
+            "background local-dirty flush should not immediately commit staged slices while the file still has an active dirty tail"
+        );
+
+        vfs.flush_fh(fh).await.unwrap();
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn background_flush_commits_persisted_slice_waves_and_keeps_latest_hot_tail_staged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-257-background-flush-slice-waves");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-257-background-flush-slice-waves.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let slice_bytes = 2 * 1024 * 1024usize;
+
+        for index in 0..17u64 {
+            let payload = vec![0x20u8.saturating_add(index as u8); slice_bytes];
+            vfs.record_handle_writer_state(fh, ino, index * slice_bytes as u64, &payload)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
+                .await
+                .unwrap(),
+            "first opportunistic pass should spill the oldest staged slice wave while retaining a small active hot tail"
+        );
+        assert!(
+            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
+                .await
+                .unwrap(),
+            "second opportunistic pass should spill the next staged slice wave"
+        );
+
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            32 * 1024 * 1024,
+            "two opportunistic spill passes should stage 32 MiB of persisted slice payloads"
+        );
+        assert_eq!(
+            vfs.state.handle_writers.dirty_bytes_for_inode(ino),
+            slice_bytes,
+            "the newest callback should remain buffered as the active dirty tail"
+        );
+
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            24 * 1024 * 1024,
+            "background flush should commit only a small oldest slice wave first"
+        );
+
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            16 * 1024 * 1024,
+            "subsequent background waves should continue draining old staged slices without touching the hot tail"
+        );
+
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            8 * 1024 * 1024,
+            "background flush should keep shrinking the staged backlog in small waves"
+        );
+
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            4 * 1024 * 1024,
+            "the newest persisted slice should remain staged as the hot tail"
+        );
+
+        tokio::time::sleep(Duration::from_millis(125)).await;
+        assert!(
+            vfs.should_background_flush_pending_local_dirty_inode(ino),
+            "once the hot staged slice ages out, the next background wave should be allowed"
+        );
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            2 * 1024 * 1024,
+            "an aged-out wave should shrink to the final staged 2 MiB tail first"
+        );
+
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            0,
+            "repeated aged-out waves should eventually drain the final staged slice"
         );
 
         vfs.flush_fh(fh).await.unwrap();
@@ -2717,7 +3220,7 @@ fn opportunistic_completed_handle_writer_materialization_caps_burst_to_drain_chu
 #[test]
 fn write_fh_aligned_full_block_callback_is_accepted_immediately() {
     let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-257-write-fh-aligned-full-block");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-257-write-fh-aligned-full-block");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
@@ -2731,16 +3234,29 @@ fn write_fh_aligned_full_block_callback_is_accepted_immediately() {
         vfs.write_fh(fh, ino, 0, &payload).await.unwrap();
 
         assert_eq!(
-            meta.get_file_blocks(ino).unwrap().len(),
-            1,
-            "aligned full-block callbacks should be durably accepted immediately instead of waiting for a large burst threshold"
+            meta.lookup_payload_slices(ino).unwrap().len(),
+            0,
+            "aligned full-block callbacks should be staged immediately instead of forcing inline metadata commits"
         );
 
-        let persisted_attr = meta.get_attr(ino).unwrap();
+        assert!(
+            vfs.has_pending_local_dirty_payloads_for_inode(ino),
+            "aligned full-block callbacks should land in local dirty staging right away"
+        );
+        let visible_attr = vfs.getattr_unchecked(ino).unwrap();
         assert_eq!(
-            persisted_attr.size,
+            visible_attr.size,
             block_size as u64,
-            "durable local metadata should advance with the aligned full-block accept"
+            "read-visible size should advance with the staged full-block accept"
+        );
+        let read = vfs.read(ino, 0, block_size as u32).await.unwrap();
+        assert_eq!(read.as_ref(), payload.as_slice());
+
+        vfs.flush_fh(fh).await.unwrap();
+        assert_eq!(
+            meta.lookup_payload_slices(ino).unwrap().len(),
+            1,
+            "flush should durably materialize the staged full block"
         );
 
         vfs.release_fh(fh).await.unwrap();
@@ -2787,29 +3303,30 @@ fn write_fh_sub_block_callbacks_batch_completed_blocks_until_flush() {
         }
 
         assert_eq!(
-            meta.get_file_blocks(ino).unwrap().len(),
+            meta.lookup_payload_slices(ino).unwrap().len(),
             0,
             "sub-block sequential callbacks should keep completed blocks buffered until flush can drain a larger burst"
         );
 
         vfs.flush_fh(fh).await.unwrap();
         assert_eq!(
-            meta.get_file_blocks(ino).unwrap().len(),
+            meta.lookup_payload_slices(ino).unwrap().len(),
             3,
-            "flush should materialize all completed sequential blocks"
+            "flush should materialize all completed sequential logical blocks"
         );
         vfs.release_fh(fh).await.unwrap();
     });
 
     let snapshot = vfs.write_path_observability_snapshot();
     assert!(
-        snapshot.payload_burst.max_blocks_per_burst >= 2,
-        "sub-block sequential callbacks should be able to flush as a multi-block payload burst"
+        snapshot.payload_burst.max_payloads_per_burst >= 2,
+        "sub-block sequential callbacks should be able to flush as a multi-payload burst: {:?}",
+        snapshot.payload_burst
     );
 }
 
 #[test]
-fn inode_write_overwrite_updates_current_block_graph_over_published_base() {
+fn inode_write_overwrite_updates_current_slice_graph_over_published_base() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-inode-write-overwrite");
     let _guard = rt.enter();
@@ -2823,37 +3340,39 @@ fn inode_write_overwrite_updates_current_block_graph_over_published_base() {
 
         vfs.write(ino, 0, baseline).await.unwrap();
         vfs.flush(ino).await.unwrap();
-        let (published_epoch, published_blocks) = mark_all_file_blocks_uploaded(&vfs, &meta, ino);
-        publish_current_manifest(&meta, ino, published_epoch, &published_blocks);
+        let (published_epoch, published_blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, published_epoch, &published_blocks);
 
         vfs.write(ino, 0, replacement).await.unwrap();
         vfs.flush(ino).await.unwrap();
 
-        let current_blocks = meta.get_file_blocks(ino).expect("load current file graph");
+        let current_blocks = meta
+            .lookup_payload_slices(ino)
+            .expect("load current file graph");
         assert_eq!(current_blocks.len(), 1, "overwrite test should stay single-block");
         assert_ne!(
             current_blocks[0].1.object_id,
-            published_blocks[0].1.object_id,
-            "current file graph must advance to the replacement block instead of reusing the published base"
+            published_blocks[0],
+            "current file graph must advance to the replacement payload slice instead of reusing the published base"
         );
 
         let spans = meta
             .lookup_regular_file_slices(ino, 0, replacement.len() as u64)
             .expect("load current regular-file slices");
         assert_eq!(
-            spans.iter().filter_map(|span| span.block.as_ref()).count(),
+            spans.iter().filter_map(|span| span.payload.as_ref()).count(),
             1,
             "overwrite should resolve to one block-backed span"
         );
         assert_eq!(
             spans
                 .iter()
-                .filter_map(|span| span.block.as_ref())
+                .filter_map(|span| span.payload.as_ref())
                 .next()
                 .expect("block-backed overwrite span")
                 .object_id,
             current_blocks[0].1.object_id,
-            "lookup_regular_file_slices and get_file_blocks must agree on the current unpublished block"
+            "regular-file slice lookup and payload helper must agree on the current unpublished payload"
         );
     });
 }
@@ -3447,11 +3966,11 @@ fn test_size_changing_setattr_rollback_restores_old_local_state_on_failure() {
             "failed size-changing setattr must preserve the last durable local contents"
         );
 
-        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        let blocks = meta.lookup_payload_slices(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             1,
-            "failed rollback should restore the original block map"
+            "failed rollback should restore the original logical block summary"
         );
         assert_eq!(
             blocks[0].1.length as usize,
@@ -3496,11 +4015,11 @@ fn test_size_changing_setattr_rolls_back_partial_truncate_mutation_failure() {
             "failed truncate mutation must not leave dirty local state behind"
         );
 
-        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        let blocks = meta.lookup_payload_slices(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             2,
-            "rollback should restore both originally committed blocks"
+            "rollback should restore both originally committed payload slices"
         );
         let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
         assert_eq!(
@@ -3800,16 +4319,16 @@ fn strict_local_sync_flushes_pending_group_commit_bytes() {
     let calls_before = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let synced_before = vfs
         .state
         .metrics
-        .block_store_sync_data_synced_bytes
+        .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
 
     rt.block_on(async {
-        vfs.maybe_block_store_sync_data_async(0, LocalSyncPolicy::Strict)
+        vfs.maybe_payload_store_sync_data_async(0, LocalSyncPolicy::Strict)
             .await
             .expect("strict local sync");
     });
@@ -3817,12 +4336,12 @@ fn strict_local_sync_flushes_pending_group_commit_bytes() {
     let calls_after = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let synced_after = vfs
         .state
         .metrics
-        .block_store_sync_data_synced_bytes
+        .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
     assert!(
         calls_after > calls_before,
@@ -3851,16 +4370,16 @@ fn opportunistic_local_sync_defers_when_threshold_not_reached() {
     let calls_before = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let deferred_before = vfs
         .state
         .metrics
-        .block_store_sync_data_deferred_calls
+        .payload_store_sync_data_deferred_calls
         .load(Ordering::Relaxed);
 
     rt.block_on(async {
-        vfs.maybe_block_store_sync_data_async(0, LocalSyncPolicy::Opportunistic)
+        vfs.maybe_payload_store_sync_data_async(0, LocalSyncPolicy::Opportunistic)
             .await
             .expect("opportunistic local sync");
     });
@@ -3868,12 +4387,12 @@ fn opportunistic_local_sync_defers_when_threshold_not_reached() {
     let calls_after = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let deferred_after = vfs
         .state
         .metrics
-        .block_store_sync_data_deferred_calls
+        .payload_store_sync_data_deferred_calls
         .load(Ordering::Relaxed);
     assert_eq!(
         calls_after, calls_before,
@@ -3916,12 +4435,12 @@ fn flush_fh_enforces_strict_local_durability_in_single_mode() {
     let calls_before = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let synced_before = vfs
         .state
         .metrics
-        .block_store_sync_data_synced_bytes
+        .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
 
     rt.block_on(async {
@@ -3931,12 +4450,12 @@ fn flush_fh_enforces_strict_local_durability_in_single_mode() {
     let calls_after = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let synced_after = vfs
         .state
         .metrics
-        .block_store_sync_data_synced_bytes
+        .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
     assert!(
         calls_after > calls_before,
@@ -3995,12 +4514,12 @@ fn flush_fh_default_config_enforces_strict_local_durability() {
     let calls_before = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let synced_before = vfs
         .state
         .metrics
-        .block_store_sync_data_synced_bytes
+        .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
 
     rt.block_on(async {
@@ -4010,12 +4529,12 @@ fn flush_fh_default_config_enforces_strict_local_durability() {
     let calls_after = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let synced_after = vfs
         .state
         .metrics
-        .block_store_sync_data_synced_bytes
+        .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
     assert!(
         calls_after > calls_before,
@@ -4066,7 +4585,7 @@ fn flush_fh_materializes_opportunistic_handle_writer_state_into_overlay_slices()
             .lookup_regular_file_slices(ino, 0, payload.len() as u64)
             .unwrap();
         assert!(
-            spans.iter().any(|span| span.block.is_some()),
+            spans.iter().any(|span| span.payload.is_some()),
             "flush_fh should materialize block-backed local unpublished slices: {spans:?}"
         );
         assert!(
@@ -4079,9 +4598,9 @@ fn flush_fh_materializes_opportunistic_handle_writer_state_into_overlay_slices()
 }
 
 #[test]
-fn flush_fh_materializes_handle_writer_state_without_legacy_ordered_flush() {
+fn flush_fh_materializes_handle_writer_state_through_strict_local_barrier() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-flush-without-ordered-flush");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-245-flush-without-ordered-flush");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
@@ -4114,8 +4633,9 @@ fn flush_fh_materializes_handle_writer_state_without_legacy_ordered_flush() {
             .flush_barrier_calls
             .load(Ordering::Relaxed);
         assert_eq!(
-            ordered_flushes_after, ordered_flushes_before,
-            "handle writer flush should materialize directly without routing through the flush barrier path"
+            ordered_flushes_after,
+            ordered_flushes_before + 1,
+            "slice-first handle-writer flush should route through one strict local barrier to commit staged slices"
         );
 
         vfs.release_fh(fh).await.unwrap();
@@ -4236,12 +4756,12 @@ fn release_fh_enforces_strict_local_durability_on_last_handle() {
     let calls_before = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let synced_before = vfs
         .state
         .metrics
-        .block_store_sync_data_synced_bytes
+        .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
 
     rt.block_on(async {
@@ -4262,12 +4782,12 @@ fn release_fh_enforces_strict_local_durability_on_last_handle() {
     let calls_after = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let synced_after = vfs
         .state
         .metrics
-        .block_store_sync_data_synced_bytes
+        .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
     assert!(
         calls_after > calls_before,
@@ -4322,12 +4842,12 @@ fn release_fh_default_config_enforces_strict_local_durability() {
     let calls_before = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let synced_before = vfs
         .state
         .metrics
-        .block_store_sync_data_synced_bytes
+        .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
 
     rt.block_on(async {
@@ -4348,12 +4868,12 @@ fn release_fh_default_config_enforces_strict_local_durability() {
     let calls_after = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let synced_after = vfs
         .state
         .metrics
-        .block_store_sync_data_synced_bytes
+        .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
     assert!(
         calls_after > calls_before,
@@ -4408,7 +4928,7 @@ fn release_fh_materializes_opportunistic_handle_writer_state() {
             .lookup_regular_file_slices(ino, 0, payload.len() as u64)
             .unwrap();
         assert!(
-            spans.iter().any(|span| span.block.is_some()),
+            spans.iter().any(|span| span.payload.is_some()),
             "last-handle release should materialize block-backed local unpublished slices: {spans:?}"
         );
         assert!(
@@ -4451,7 +4971,7 @@ fn write_path_observability_tracks_burst_shape_and_metadata_commit_stalls() {
         "two write+flush rounds should yield at least two payload bursts"
     );
     assert!(
-        snapshot.payload_burst.total_blocks >= 2,
+        snapshot.payload_burst.total_payloads >= 2,
         "burst accounting should include persisted full blocks"
     );
     assert!(
@@ -4486,7 +5006,7 @@ fn write_path_observability_tracks_burst_shape_and_metadata_commit_stalls() {
         "metadata commit cadence should expose a positive interval after multiple commits"
     );
     assert!(
-        snapshot.block_store_sync_data.calls >= 1,
+        snapshot.payload_store_sync_data.calls >= 1,
         "sync barrier calls should be surfaced in write-path observability"
     );
     assert_eq!(
@@ -4666,8 +5186,8 @@ fn failed_payload_persist_attempts_do_not_count_as_completed_bursts() {
         "failed payload persists must not count as completed bursts"
     );
     assert_eq!(
-        snapshot.payload_burst.total_blocks, 0,
-        "failed payload persists must not add completed burst block counts"
+        snapshot.payload_burst.total_payloads, 0,
+        "failed payload persists must not add completed burst payload counts"
     );
     assert_eq!(
         snapshot.payload_burst.total_bytes, 0,
@@ -4696,13 +5216,13 @@ fn local_cache_io_stats_track_handoff_and_backend_time_separately() {
         .load(Ordering::Relaxed);
 
     rt.block_on(async {
-        vfs.block_store_put_async(0xAA55, Bytes::from_static(b"payload"), false)
+        vfs.payload_store_put_async(0xAA55, Bytes::from_static(b"payload"), false)
             .await
-            .expect("block store put");
+            .expect("payload store put");
         let payload = vfs
-            .block_store_get_async(0xAA55)
+            .payload_store_get_async(0xAA55)
             .await
-            .expect("block store get")
+            .expect("payload store get")
             .expect("cached payload");
         assert_eq!(payload.as_ref(), b"payload");
     });
@@ -4764,9 +5284,9 @@ fn local_cache_io_stats_track_direct_partial_read_into() {
         .load(Ordering::Relaxed);
 
     rt.block_on(async {
-        vfs.block_store_put_async(0xBB66, Bytes::from_static(b"payload"), false)
+        vfs.payload_store_put_async(0xBB66, Bytes::from_static(b"payload"), false)
             .await
-            .expect("block store put");
+            .expect("payload store put");
         let handoff_before_read = vfs
             .state
             .metrics
@@ -4774,9 +5294,9 @@ fn local_cache_io_stats_track_direct_partial_read_into() {
             .load(Ordering::Relaxed);
         let mut out = [0_u8; 3];
         let read = vfs
-            .block_store_read_into_async(0xBB66, 2, &mut out)
+            .payload_store_read_into_async(0xBB66, 2, &mut out)
             .await
-            .expect("block store read_into");
+            .expect("payload store read_into");
         assert_eq!(read, Some(3));
         assert_eq!(&out, b"ylo");
         let handoff_after_read = vfs
@@ -4827,7 +5347,7 @@ fn local_cache_read_into_returns_none_for_missing_block() {
     rt.block_on(async {
         let mut out = [0_u8; 8];
         let read = vfs
-            .block_store_read_into_async(0xDEADBEEF, 0, &mut out)
+            .payload_store_read_into_async(0xDEADBEEF, 0, &mut out)
             .await
             .expect("read_into should not error on cache miss");
         assert_eq!(read, None);
@@ -4835,31 +5355,31 @@ fn local_cache_read_into_returns_none_for_missing_block() {
 }
 
 #[test]
-fn block_store_get_prefers_hot_upload_buffer_before_disk() {
+fn payload_store_get_prefers_hot_upload_buffer_before_disk() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "local-cache-get-hot-upload");
     rt.block_on(async {
-        vfs.cache_upload_hot_batch(vec![studiofs_cache::local::LocalBlockPut {
+        vfs.cache_upload_hot_batch(vec![studiofs_cache::local::LocalPayloadPut {
             object_id: 0xABCD,
             data: Bytes::from_static(b"hot-payload"),
             evictable: false,
         }]);
 
         let payload = vfs
-            .block_store_get_async(0xABCD)
+            .payload_store_get_async(0xABCD)
             .await
-            .expect("block store get from hot upload buffer")
+            .expect("payload store get from hot upload buffer")
             .expect("hot upload payload");
         assert_eq!(payload.as_ref(), b"hot-payload");
     });
 }
 
 #[test]
-fn block_store_read_into_prefers_hot_upload_buffer_before_disk() {
+fn payload_store_read_into_prefers_hot_upload_buffer_before_disk() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "local-cache-read-into-hot-upload");
     rt.block_on(async {
-        vfs.cache_upload_hot_batch(vec![studiofs_cache::local::LocalBlockPut {
+        vfs.cache_upload_hot_batch(vec![studiofs_cache::local::LocalPayloadPut {
             object_id: 0xBCDE,
             data: Bytes::from_static(b"hot-payload"),
             evictable: false,
@@ -4867,9 +5387,9 @@ fn block_store_read_into_prefers_hot_upload_buffer_before_disk() {
 
         let mut out = [0_u8; 7];
         let read = vfs
-            .block_store_read_into_async(0xBCDE, 4, &mut out)
+            .payload_store_read_into_async(0xBCDE, 4, &mut out)
             .await
-            .expect("block store read_into from hot upload buffer");
+            .expect("payload store read_into from hot upload buffer");
         assert_eq!(read, Some(7));
         assert_eq!(&out, b"payload");
     });
@@ -4879,17 +5399,17 @@ fn block_store_read_into_prefers_hot_upload_buffer_before_disk() {
 fn committed_copy_rejects_short_payload() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "committed-copy-short-payload");
-    let block = BlockRef::new_full(42, vfs.block_size);
+    let block = PayloadRef::new_full(42, vfs.block_size);
     let mut dst = [0_u8; 8];
     let err = vfs
-        .copy_committed_block_payload_into_range(b"abcd", &block, 0, &mut dst)
+        .copy_committed_payload_into_range(b"abcd", &block, 0, &mut dst)
         .expect_err("short committed payload should error");
     let message = match err {
         VfsError::Other(message) => message,
         other => panic!("expected VfsError::Other, got {other}"),
     };
     assert!(
-        message.contains("committed block payload too short"),
+        message.contains("committed payload object too short"),
         "error message should highlight short committed payload"
     );
 }

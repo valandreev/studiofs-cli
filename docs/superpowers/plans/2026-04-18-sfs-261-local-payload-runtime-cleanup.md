@@ -1,10 +1,10 @@
-# SFS-261 Local Block Runtime Cleanup Implementation Plan
+# SFS-261 Local Payload Runtime Cleanup Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Remove superseded `cache-v3` runtime surface and duplicate module tree so the repository exposes one canonical local-block runtime while preserving the current `v3/` disk layout as an implementation detail.
+**Goal:** Remove superseded `legacy runtime tag` runtime surface and duplicate module tree so the repository exposes one canonical local payload runtime while preserving the current `v3/` disk layout as an implementation detail.
 
-**Architecture:** Keep `crates/studiofs-cache/src/runtime.rs` plus `block_*` and `startup_recovery.rs` as the only active runtime implementation. Rename public/runtime-facing `CacheV3*` surface to `LocalBlock*`, migrate CLI and VFS callers to the neutral runtime vocabulary, then delete `crates/studiofs-cache/src/v3/**` and rewrite active docs/tests to match.
+**Architecture:** Keep `crates/studiofs-cache/src/runtime.rs` plus `payload_*` and `startup_recovery.rs` as the only active runtime implementation. Rename public/runtime-facing `legacy runtime symbols` surface to `LocalPayload*`, migrate CLI and VFS callers to the neutral runtime vocabulary, then delete `crates/studiofs-cache/src/v3/**` and rewrite active docs/tests to match.
 
 **Tech Stack:** Rust 2024 workspace, `cargo test`, `cargo fmt`, `studiofs-cache`, `studiofs`, `studiofs-vfs`, Markdown docs.
 
@@ -15,8 +15,8 @@
 **Files:**
 - Modify: `crates/studiofs-cache/src/lib.rs`
 - Modify: `crates/studiofs-cache/src/runtime.rs`
-- Modify: `crates/studiofs-cache/src/block_layout.rs`
-- Modify: `crates/studiofs-cache/src/block_store.rs`
+- Modify: `crates/studiofs-cache/src/payload_layout.rs`
+- Modify: `crates/studiofs-cache/src/payload_store.rs`
 - Modify: `crates/studiofs-cache/src/startup_recovery.rs`
 - Test: `crates/studiofs-cache/src/lib.rs`
 - Test: `crates/studiofs-cache/src/runtime.rs`
@@ -25,62 +25,62 @@
 
 ```rust
 #[test]
-fn prepare_local_block_runtime_creates_contract_paths() {
+fn prepare_local_payload_runtime_creates_contract_paths() {
     let temp = tempfile::tempdir().unwrap();
 
-    let prepared = prepare_local_block_runtime(temp.path()).expect("prepare local block runtime");
+    let prepared = prepare_local_payload_runtime(temp.path()).expect("prepare local payload runtime");
 
-    assert_eq!(prepared.layout, LocalBlockLayout::from_cache_root(temp.path()));
+    assert_eq!(prepared.layout, LocalPayloadLayout::from_cache_root(temp.path()));
     assert!(prepared.detection.has_runtime_layout());
 }
 
 #[test]
-fn local_block_runtime_root_opens_local_block_backend() {
+fn local_payload_runtime_root_opens_local_payload_backend() {
     let temp = tempfile::tempdir().unwrap();
     let prepared =
-        prepare_local_block_runtime(temp.path()).expect("prepare local block runtime");
+        prepare_local_payload_runtime(temp.path()).expect("prepare local payload runtime");
 
-    let opened = open_prepared_local_block_backend_with_budget_and_sync_mode(
+    let opened = open_prepared_local_payload_backend_with_budget_and_sync_mode(
         prepared,
         "volume-uuid",
         64 * 1024 * 1024,
-        LocalBlockPayloadSyncMode::Durable,
+        LocalPayloadSyncMode::Durable,
     )
-    .expect("open local block backend");
+    .expect("open local payload backend");
 
-    assert_eq!(opened.backend_kind, LocalBlockBackendKind::Current);
+    assert_eq!(opened.backend_kind, LocalPayloadBackendKind::Current);
     assert!(opened.detection.has_runtime_layout());
 }
 ```
 
 - [ ] **Step 2: Run the focused cache tests to verify they fail for the expected symbol/name mismatch**
 
-Run: `cargo test -p studiofs-cache prepare_local_block_runtime_creates_contract_paths local_block_runtime_root_opens_local_block_backend`
+Run: `cargo test -p studiofs-cache prepare_local_payload_runtime_creates_contract_paths local_payload_runtime_root_opens_local_payload_backend`
 
-Expected: FAIL because the new `LocalBlock*` names and neutral detection helpers do not exist yet.
+Expected: FAIL because the new `LocalPayload*` names and neutral detection helpers do not exist yet.
 
 - [ ] **Step 3: Rename the canonical runtime types, helpers, and detection predicates**
 
 ```rust
 pub use runtime::{
-    CacheBackendDetection as LocalBlockRuntimeDetection,
-    LocalBlockBackendKind,
-    LocalBlockBackendConfig,
-    LocalBlockBackendOpenError,
-    LocalBlockBackendRuntime as PersistentLocalBlockBackend,
-    LocalBlockLayout,
-    LocalBlockPayloadSyncMode,
+    CacheBackendDetection as LocalPayloadRuntimeDetection,
+    LocalPayloadBackendKind,
+    LocalPayloadBackendConfig,
+    LocalPayloadBackendOpenError,
+    LocalPayloadBackendRuntime as PersistentLocalPayloadBackend,
+    LocalPayloadLayout,
+    LocalPayloadSyncMode,
 };
 
 #[derive(Debug, Clone)]
-pub struct PreparedLocalBlockRuntime {
-    pub layout: runtime::LocalBlockLayout,
-    pub detection: runtime::LocalBlockRuntimeDetection,
+pub struct PreparedLocalPayloadRuntime {
+    pub layout: runtime::LocalPayloadLayout,
+    pub detection: runtime::LocalPayloadRuntimeDetection,
 }
 
-pub fn prepare_local_block_runtime(
+pub fn prepare_local_payload_runtime(
     cache_root: impl AsRef<Path>,
-) -> Result<PreparedLocalBlockRuntime, PrepareLocalBlockRuntimeError> {
+) -> Result<PreparedLocalPayloadRuntime, PrepareLocalPayloadRuntimeError> {
     // existing provisioning logic, but using neutral names
 }
 ```
@@ -88,31 +88,31 @@ pub fn prepare_local_block_runtime(
 - [ ] **Step 4: Keep the on-disk `v3/` layout constants as implementation-detail aliases, not the primary vocabulary**
 
 ```rust
-pub const LOCAL_BLOCK_SUBTREE: &str = "v3";
-pub const LOCAL_BLOCK_LAYOUT_MARKER_FILE: &str = "LAYOUT_V1";
+pub const LOCAL_PAYLOAD_SUBTREE: &str = "v3";
+pub const LOCAL_PAYLOAD_LAYOUT_MARKER_FILE: &str = "LAYOUT_V1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LocalBlockLayout {
+pub struct LocalPayloadLayout {
     pub cache_root: PathBuf,
     pub v3_root: PathBuf,
     pub layout_marker: PathBuf,
     // ...
 }
 
-pub type CacheV3Layout = LocalBlockLayout;
+pub type LegacyRuntimeLayout = LocalPayloadLayout;
 ```
 
 - [ ] **Step 5: Run the focused cache tests to verify the renamed API passes**
 
-Run: `cargo test -p studiofs-cache prepare_local_block_runtime_creates_contract_paths local_block_runtime_root_opens_local_block_backend`
+Run: `cargo test -p studiofs-cache prepare_local_payload_runtime_creates_contract_paths local_payload_runtime_root_opens_local_payload_backend`
 
 Expected: PASS
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/studiofs-cache/src/lib.rs crates/studiofs-cache/src/runtime.rs crates/studiofs-cache/src/block_layout.rs crates/studiofs-cache/src/block_store.rs crates/studiofs-cache/src/startup_recovery.rs
-git commit -m "refactor: rename canonical local block runtime surface (SFS-261)"
+git add crates/studiofs-cache/src/lib.rs crates/studiofs-cache/src/runtime.rs crates/studiofs-cache/src/payload_layout.rs crates/studiofs-cache/src/payload_store.rs crates/studiofs-cache/src/startup_recovery.rs
+git commit -m "refactor: rename canonical local payload runtime surface (SFS-261)"
 ```
 
 ### Task 2: Migrate CLI and VFS callers to the neutral runtime vocabulary
@@ -134,14 +134,14 @@ git commit -m "refactor: rename canonical local block runtime surface (SFS-261)"
 
 ```rust
 #[test]
-fn scan_pending_uploads_supports_current_local_block_runtime() {
+fn scan_pending_uploads_supports_current_local_payload_runtime() {
     let tmp = tempfile::tempdir().unwrap();
-    let layout = studiofs_cache::runtime::LocalBlockLayout::from_cache_root(tmp.path());
+    let layout = studiofs_cache::runtime::LocalPayloadLayout::from_cache_root(tmp.path());
     std::fs::create_dir_all(&layout.v3_root).unwrap();
     std::fs::write(&layout.layout_marker, b"v1").unwrap();
 
     let detection = detect_backends(tmp.path()).unwrap();
-    assert_eq!(detection.runtime_backend(), Some(LocalBlockBackendKind::Current));
+    assert_eq!(detection.runtime_backend(), Some(LocalPayloadBackendKind::Current));
 }
 
 #[test]
@@ -151,46 +151,46 @@ fn prepare_volume_cache_runtime_scopes_layout_by_volume_uuid() {
 
     assert_eq!(
         prepared.cache_runtime.layout,
-        LocalBlockLayout::from_cache_root(&prepared.cache_path)
+        LocalPayloadLayout::from_cache_root(&prepared.cache_path)
     );
     assert!(prepared.cache_runtime.detection.has_runtime_layout());
 }
 ```
 
-- [ ] **Step 2: Run the narrow CLI/VFS tests to verify they fail on old `CacheV3*` names**
+- [ ] **Step 2: Run the narrow CLI/VFS tests to verify they fail on old `legacy runtime symbols` names**
 
-Run: `cargo test -p studiofs scan_pending_uploads_supports_current_local_block_runtime prepare_volume_cache_runtime_scopes_layout_by_volume_uuid`
+Run: `cargo test -p studiofs scan_pending_uploads_supports_current_local_payload_runtime prepare_volume_cache_runtime_scopes_layout_by_volume_uuid`
 
-Expected: FAIL because the code still imports `CacheV3*` names and old detection helpers.
+Expected: FAIL because the code still imports `legacy runtime symbols` names and old detection helpers.
 
 - [ ] **Step 3: Update status, janitor, mount, and bootstrap code to use the neutral API and wording**
 
 ```rust
 match cache_backend_detection {
-    Some(detection) if detection.runtime_backend() == Some(LocalBlockBackendKind::Current) => {
+    Some(detection) if detection.runtime_backend() == Some(LocalPayloadBackendKind::Current) => {
         scan_runtime_cache(detection).map(Some)
     }
     _ => Ok(None),
 }
 
-println!("  Runtime:             current local block runtime");
+println!("  Runtime:             current local payload runtime");
 println!("  Disk subtree:        {}", detection.layout.v3_root.display());
 ```
 
-- [ ] **Step 4: Rename observability tags and test fixture strings away from `cache-v3`**
+- [ ] **Step 4: Rename observability tags and test fixture strings away from `legacy runtime tag`**
 
 ```rust
 let snapshot = VfsWritePathObservabilitySnapshot {
-    backend_tag: "local-block-runtime".to_string(),
+    backend_tag: "local-payload-runtime".to_string(),
     // ...
 };
 
-assert_eq!(loaded.1.backend_tag, "local-block-runtime");
+assert_eq!(loaded.1.backend_tag, "local-payload-runtime");
 ```
 
 - [ ] **Step 5: Run the narrow CLI/VFS tests to verify the caller migration passes**
 
-Run: `cargo test -p studiofs scan_pending_uploads_supports_current_local_block_runtime prepare_volume_cache_runtime_scopes_layout_by_volume_uuid`
+Run: `cargo test -p studiofs scan_pending_uploads_supports_current_local_payload_runtime prepare_volume_cache_runtime_scopes_layout_by_volume_uuid`
 
 Expected: PASS
 
@@ -198,7 +198,7 @@ Expected: PASS
 
 ```bash
 git add crates/studiofs/src/cli/status.rs crates/studiofs/src/cli/janitor.rs crates/studiofs/src/cli/destroy.rs crates/studiofs/src/cli/cache_layout.rs crates/studiofs/src/cli/mount/session.rs crates/studiofs-vfs/src/vfs/bootstrap.rs crates/studiofs-vfs/src/vfs.rs
-git commit -m "refactor: move cli and vfs onto local block runtime naming (SFS-261)"
+git commit -m "refactor: move cli and vfs onto local payload runtime naming (SFS-261)"
 ```
 
 ### Task 3: Remove the duplicated `src/v3/**` module tree
@@ -219,22 +219,22 @@ git commit -m "refactor: move cli and vfs onto local block runtime naming (SFS-2
 
 ```rust
 #[test]
-fn studio_vfs_new_selects_current_local_block_runtime_for_layout_only_root() {
-    let layout = studiofs_cache::runtime::LocalBlockLayout::from_cache_root(&cache_dir);
+fn studio_vfs_new_selects_current_local_payload_runtime_for_layout_only_root() {
+    let layout = studiofs_cache::runtime::LocalPayloadLayout::from_cache_root(&cache_dir);
     std::fs::create_dir_all(&layout.v3_root).unwrap();
     std::fs::write(&layout.layout_marker, b"v1").unwrap();
 
     assert!(
-        vfs.local_block_backend()
+        vfs.local_payload_backend()
             .as_any()
-            .is::<studiofs_cache::runtime::LocalBlockBackendRuntime>()
+            .is::<studiofs_cache::runtime::LocalPayloadBackendRuntime>()
     );
 }
 ```
 
 - [ ] **Step 2: Run the targeted VFS/cache tests to verify the stale `studiofs_cache::v3` imports fail**
 
-Run: `cargo test -p studiofs-vfs studio_vfs_new_selects_current_local_block_runtime_for_layout_only_root`
+Run: `cargo test -p studiofs-vfs studio_vfs_new_selects_current_local_payload_runtime_for_layout_only_root`
 
 Expected: FAIL until all `studiofs_cache::v3` references are removed.
 
@@ -249,11 +249,11 @@ pub mod runtime;
 pub mod upload_queue;
 
 pub use runtime::{
-    LocalBlockBackendConfig,
-    LocalBlockBackendKind,
-    LocalBlockBackendRuntime,
-    LocalBlockLayout,
-    LocalBlockPayloadSyncMode,
+    LocalPayloadBackendConfig,
+    LocalPayloadBackendKind,
+    LocalPayloadBackendRuntime,
+    LocalPayloadLayout,
+    LocalPayloadSyncMode,
 };
 ```
 
@@ -263,7 +263,7 @@ Run: `cargo test -p studiofs-cache`
 
 Expected: PASS for the touched `studiofs-cache` runtime tests
 
-Run: `cargo test -p studiofs-vfs studio_vfs_new_selects_current_local_block_runtime_for_layout_only_root`
+Run: `cargo test -p studiofs-vfs studio_vfs_new_selects_current_local_payload_runtime_for_layout_only_root`
 
 Expected: PASS
 
@@ -279,7 +279,7 @@ git commit -m "refactor: delete duplicated cache v3 module tree (SFS-261)"
 
 **Files:**
 - Modify: `docs/architecture.md`
-- Modify or replace: `docs/local-block-runtime-layout.md`
+- Modify or replace: `docs/local-payload-runtime-layout.md`
 - Modify: `docs/juicefs-local-first-rust-contract.md`
 - Modify: `crates/studiofs/tests/architecture_vocabulary_test.rs`
 - Modify: `crates/studiofs/src/cli/test_cache_profile_common.rs`
@@ -291,15 +291,15 @@ git commit -m "refactor: delete duplicated cache v3 module tree (SFS-261)"
 ```rust
 #[test]
 fn active_docs_drop_superseded_runtime_identity_wording() {
-    let forbidden_terms = ["Cache 3.0", "cache-v3 runtime", "cache-v3 backend"];
+    let forbidden_terms = ["legacy cache runtime", "superseded runtime", "superseded backend"];
     // same helper pattern, but allow implementation-detail mentions for `v3/` layout
 }
 
 #[test]
-fn observability_surface_uses_local_block_runtime_tag() {
+fn observability_surface_uses_local_payload_runtime_tag() {
     let hits = collect_term_hits(
         "crates/studiofs/src/cli/test_cache_profile_common.rs",
-        &["cache-v3"],
+        &["legacy runtime tag"],
     );
     assert!(hits.is_empty());
 }
@@ -311,12 +311,12 @@ Run: `cargo test -p studiofs --test architecture_vocabulary_test`
 
 Expected: FAIL because docs and fixtures still encode the superseded runtime identity.
 
-- [ ] **Step 3: Rewrite the active docs so they describe one local-block runtime with a retained `v3/` disk-layout detail**
+- [ ] **Step 3: Rewrite the active docs so they describe one local payload runtime with a retained `v3/` disk-layout detail**
 
 ```md
 ## Local Cache Runtime
 
-- StudioFS uses one current local block runtime for mounted operation.
+- StudioFS uses one current local payload runtime for mounted operation.
 - The present on-disk layout still lives under `<cache-root>/v3/**`.
 - The `v3/` subtree is an implementation detail, not a separate product/runtime generation.
 ```
@@ -325,7 +325,7 @@ Expected: FAIL because docs and fixtures still encode the superseded runtime ide
 
 ```rust
 let snapshot = VfsWritePathObservabilitySnapshot {
-    backend_tag: "local-block-runtime".to_string(),
+    backend_tag: "local-payload-runtime".to_string(),
     // ...
 };
 ```
@@ -339,8 +339,8 @@ Expected: PASS
 - [ ] **Step 6: Commit**
 
 ```bash
-git add docs/architecture.md docs/local-block-runtime-layout.md docs/juicefs-local-first-rust-contract.md crates/studiofs/tests/architecture_vocabulary_test.rs crates/studiofs/src/cli/test_cache_profile_common.rs crates/studiofs/src/cli/test_cache_profile_stub.rs
-git commit -m "docs: describe one canonical local block runtime (SFS-261)"
+git add docs/architecture.md docs/local-payload-runtime-layout.md docs/juicefs-local-first-rust-contract.md crates/studiofs/tests/architecture_vocabulary_test.rs crates/studiofs/src/cli/test_cache_profile_common.rs crates/studiofs/src/cli/test_cache_profile_stub.rs
+git commit -m "docs: describe one canonical local payload runtime (SFS-261)"
 ```
 
 ### Task 5: Final verification and finish
@@ -369,19 +369,19 @@ Run: `cargo test -p studiofs --test architecture_vocabulary_test`
 
 Expected: PASS
 
-Run: `cargo test -p studiofs scan_pending_uploads_supports_current_local_block_runtime prepare_volume_cache_runtime_scopes_layout_by_volume_uuid`
+Run: `cargo test -p studiofs scan_pending_uploads_supports_current_local_payload_runtime prepare_volume_cache_runtime_scopes_layout_by_volume_uuid`
 
 Expected: PASS
 
 - [ ] **Step 4: Run targeted VFS verification**
 
-Run: `cargo test -p studiofs-vfs studio_vfs_new_selects_current_local_block_runtime_for_layout_only_root`
+Run: `cargo test -p studiofs-vfs studio_vfs_new_selects_current_local_payload_runtime_for_layout_only_root`
 
 Expected: PASS
 
-- [ ] **Step 5: Inspect the remaining `cache-v3` hits and confirm they are only the retained disk-layout details**
+- [ ] **Step 5: Inspect the remaining `legacy runtime tag` hits and confirm they are only the retained disk-layout details**
 
-Run: `rg -n "cache-v3|CacheV3" crates docs`
+Run: `rg -n "legacy runtime tag|LegacyRuntime" crates docs`
 
 Expected: only implementation-detail aliases or compatibility remnants that are intentionally retained.
 
@@ -389,5 +389,5 @@ Expected: only implementation-detail aliases or compatibility remnants that are 
 
 ```bash
 git add .
-git commit -m "refactor: finish local block runtime cleanup (SFS-261)"
+git commit -m "refactor: finish local payload runtime cleanup (SFS-261)"
 ```

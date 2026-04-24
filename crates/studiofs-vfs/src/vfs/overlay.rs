@@ -1,4 +1,4 @@
-use super::{StudioVfs, VfsResult};
+use super::{ResolvedSliceSource, StudioVfs, VfsResult};
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -156,46 +156,78 @@ impl StudioVfs {
     ) -> Option<PendingOverlayBlockSource> {
         // Stage 1 — local dirty state: newest local bytes not yet represented
         // by committed local-backend metadata.
-        if let Some(pending_block) = self
+        if let Some(pending_payload) = self
             .state
             .local_dirty
-            .pending_blocks
+            .pending_payloads
             .lock()
             .get(&(ino, block_index))
         {
+            if let Some(object_id) = pending_payload.local_extent_id() {
+                return Some(PendingOverlayBlockSource::Extent(object_id));
+            }
             return Some(PendingOverlayBlockSource::Pending(
-                pending_block.data.clone().freeze(),
+                pending_payload.data.clone().freeze(),
             ));
         }
+        if self.has_pending_dirty_slices_for_block(ino, block_index) {
+            return None;
+        }
         // Stage 2 — committed local cache state for the pending epoch.
-        self.pending_live_extent_record(
+        let extent = self.pending_live_extent_record(
             ino,
             block_index,
             pending_content_epoch,
             pending_upload_index,
-        )
-        .map(|extent| PendingOverlayBlockSource::Extent(extent.object_id))
+        )?;
+        if !self.pending_live_extent_matches_current_slice_graph(ino, block_index, extent) {
+            return None;
+        }
+        Some(PendingOverlayBlockSource::Extent(extent.object_id))
     }
 
-    pub(super) fn read_pending_overlay_block_sync(
+    fn pending_live_extent_matches_current_slice_graph(
         &self,
         ino: Ino,
         block_index: u32,
-        pending_content_epoch: Option<u64>,
-        pending_upload_index: Option<&PendingUploadCatalog>,
-    ) -> VfsResult<Option<Bytes>> {
-        let Some(source) = self.pending_overlay_block_source(
-            ino,
-            block_index,
-            pending_content_epoch,
-            pending_upload_index,
-        ) else {
-            return Ok(None);
+        extent: ExtentRecordId,
+    ) -> bool {
+        let visible_size = if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino) {
+            attr.size
+        } else {
+            match self.sync_meta().get_attr(ino) {
+                Ok(attr) => attr.size,
+                Err(_) => return false,
+            }
         };
-        Ok(match source {
-            PendingOverlayBlockSource::Pending(data) => Some(data),
-            PendingOverlayBlockSource::Extent(object_id) => self.local_block_backend.get(object_id),
-        })
+        let logical_len = self.logical_block_len(visible_size, block_index);
+        if logical_len == 0 {
+            return false;
+        }
+
+        let block_start = u64::from(block_index).saturating_mul(u64::from(self.block_size));
+        let Ok(spans) =
+            self.sync_meta()
+                .lookup_regular_file_slices(ino, block_start, logical_len as u64)
+        else {
+            return false;
+        };
+        if spans.len() != 1 {
+            return false;
+        }
+        let span = &spans[0];
+        if !matches!(
+            span.source,
+            ResolvedSliceSource::Overlay | ResolvedSliceSource::Base
+        ) {
+            return false;
+        }
+        let Some(block) = span.payload.as_ref() else {
+            return false;
+        };
+        block.object_id == extent.object_id
+            && block.offset == 0
+            && block.length as usize == logical_len
     }
 
     pub(super) async fn read_pending_overlay_block_async(
@@ -216,7 +248,7 @@ impl StudioVfs {
         match source {
             PendingOverlayBlockSource::Pending(data) => Ok(Some(data)),
             PendingOverlayBlockSource::Extent(object_id) => {
-                self.block_store_get_async(object_id).await
+                self.payload_store_get_async(object_id).await
             }
         }
     }
@@ -225,7 +257,7 @@ impl StudioVfs {
         if self
             .state
             .local_dirty
-            .pending_blocks
+            .pending_payloads
             .lock()
             .keys()
             .any(|(candidate, _)| *candidate == ino)

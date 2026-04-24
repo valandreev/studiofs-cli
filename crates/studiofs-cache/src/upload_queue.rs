@@ -19,11 +19,11 @@ pub type Ino = u64;
 /// A pending upload operation.
 #[derive(Debug, Clone)]
 pub struct PendingUpload {
-    /// Inode that owns this block.
+    /// Inode that owns this payload object.
     pub ino: Ino,
-    /// File offset this block corresponds to.
+    /// File offset this payload object corresponds to.
     pub offset: u64,
-    /// Object ID (block ID).
+    /// Object ID (object ID).
     pub object_id: u64,
     /// Monotonic content generation captured when the upload was queued.
     pub content_epoch: u64,
@@ -48,7 +48,7 @@ pub struct UploadQueue {
 /// Atomically-consistent index of in-flight uploads.
 ///
 /// Both maps are guarded by the same mutex so that `has_pending_for_ino`
-/// never observes an inconsistent state where a block exists in the
+/// never observes an inconsistent state where a payload object exists in the
 /// object-id index but the per-inode counter has not yet been bumped.
 struct PendingState {
     by_object: BTreeMap<u64, PendingUpload>,
@@ -338,7 +338,7 @@ mod tests {
         assert!(!queue.has_pending_for_ino(1));
         assert!(!queue.has_pending_for_ino(2));
 
-        // Submit two blocks for ino 1 and one for ino 2.
+        // Submit two payload objects for ino 1 and one for ino 2.
         queue.submit(1, 0, 100, 1);
         queue.submit(1, 4096, 101, 1);
         queue.submit(2, 0, 200, 1);
@@ -347,12 +347,12 @@ mod tests {
         assert!(queue.has_pending_for_ino(2));
         assert!(!queue.has_pending_for_ino(3));
 
-        // Complete one of the two blocks for ino 1.
+        // Complete one of the two payload objects for ino 1.
         let op = rx.recv().await.unwrap();
         assert_eq!(op.ino, 1);
         queue.complete(&op);
 
-        // ino 1 still has the second block pending.
+        // ino 1 still has the second payload object pending.
         assert!(queue.has_pending_for_ino(1));
 
         // Drain remaining ops.

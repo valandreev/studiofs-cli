@@ -1,6 +1,6 @@
 //! Lightweight in-memory cache surface used by `studiofs test-cache`.
 //!
-//! The production VFS path uses the local block backend directly. This module
+//! The production VFS path uses the local payload backend directly. This module
 //! retains the small L1 helper surface needed by direct benchmark workflows.
 
 use bytes::Bytes;

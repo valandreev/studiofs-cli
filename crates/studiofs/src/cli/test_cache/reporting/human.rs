@@ -397,9 +397,9 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
         );
         let _ = writeln!(
             &mut out,
-            "Materialize: {} batches, {} blocks, {}, inflight {} (peak {})",
+            "Materialize: {} batches, {} payloads, {}, inflight {} (peak {})",
             pipeline.materialize_batches.batches,
-            pipeline.materialize_batches.blocks,
+            pipeline.materialize_batches.payloads,
             format_bytes(pipeline.materialize_batches.bytes),
             pipeline.materialize_batches.inflight_batches,
             pipeline.materialize_batches.inflight_batches_peak,

@@ -7,11 +7,11 @@ use studiofs_meta::engine::{
     UndoLogKind, UndoLogRecord,
 };
 use studiofs_meta::{
-    AccessLevel, BatchFlushEntry, BatchFlushResult, BlockRef, ChunkId, DirEntry, DirEntryValue,
-    FormatInfo, Ino, InodeAttr, InodeLifecycleRecord, MetaAcl, MetaBlocks, MetaEngine,
-    MetaEngineCore, MetaFormat, MetaFsOps, MetaGc, MetaInodes, MetaNamespace, MetaRecovery,
-    MetaReplication, MetaResult, MetaSymlink, MetaXattr, RenameAtomicResult, ResolvedSliceSpan,
-    SliceRange, SliceRecord, SyncMetaEngineAdapter, execute_sync_meta,
+    AccessLevel, ChunkId, DirEntry, DirEntryValue, FormatInfo, Ino, InodeAttr,
+    InodeLifecycleRecord, MetaAcl, MetaEngine, MetaEngineCore, MetaFormat, MetaFsOps, MetaGc,
+    MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery, MetaReplication, MetaResult,
+    MetaSymlink, MetaXattr, RenameAtomicResult, ResolvedSliceSpan, SliceRange, SliceRecord,
+    SyncMetaEngineAdapter, execute_sync_meta,
 };
 use tokio::task;
 use tokio_util::sync::CancellationToken;
@@ -19,12 +19,6 @@ use tokio_util::sync::CancellationToken;
 use super::{VfsError, VfsResult};
 
 pub trait VfsCommitMeta: Send + Sync {
-    fn flush_blocks_batch_with_attr(
-        &self,
-        entries: &[BatchFlushEntry],
-        attr: Option<&InodeAttr>,
-    ) -> MetaResult<Vec<BatchFlushResult>>;
-
     fn flush_regular_file_overlay_slices_with_attr(
         &self,
         ino: Ino,
@@ -37,14 +31,6 @@ impl<T> VfsCommitMeta for T
 where
     T: ?Sized + MetaEngine,
 {
-    fn flush_blocks_batch_with_attr(
-        &self,
-        entries: &[BatchFlushEntry],
-        attr: Option<&InodeAttr>,
-    ) -> MetaResult<Vec<BatchFlushResult>> {
-        <T as MetaEngine>::flush_blocks_batch_with_attr(self, entries, attr)
-    }
-
     fn flush_regular_file_overlay_slices_with_attr(
         &self,
         ino: Ino,
@@ -69,7 +55,7 @@ pub trait VfsMeta:
     + MetaInodes
     + MetaNamespace
     + MetaFsOps
-    + MetaBlocks
+    + MetaPayloadObjects
     + MetaGc
     + MetaRecovery
     + MetaSymlink
@@ -89,7 +75,7 @@ impl<T> VfsMeta for T where
         + MetaInodes
         + MetaNamespace
         + MetaFsOps
-        + MetaBlocks
+        + MetaPayloadObjects
         + MetaGc
         + MetaRecovery
         + MetaSymlink
@@ -99,14 +85,14 @@ impl<T> VfsMeta for T where
 {
 }
 
-pub trait ReadPathMeta: Send + Sync + MetaInodes + MetaBlocks {}
-impl<T> ReadPathMeta for T where T: ?Sized + Send + Sync + MetaInodes + MetaBlocks {}
+pub trait ReadPathMeta: Send + Sync + MetaInodes + MetaPayloadObjects {}
+impl<T> ReadPathMeta for T where T: ?Sized + Send + Sync + MetaInodes + MetaPayloadObjects {}
 
 pub trait AclMeta: Send + Sync + MetaInodes + MetaAcl {}
 impl<T> AclMeta for T where T: ?Sized + Send + Sync + MetaInodes + MetaAcl {}
 
-pub trait UploadMeta: Send + Sync + MetaInodes + MetaBlocks + MetaGc {}
-impl<T> UploadMeta for T where T: ?Sized + Send + Sync + MetaInodes + MetaBlocks + MetaGc {}
+pub trait UploadMeta: Send + Sync + MetaInodes + MetaPayloadObjects + MetaGc {}
+impl<T> UploadMeta for T where T: ?Sized + Send + Sync + MetaInodes + MetaPayloadObjects + MetaGc {}
 
 pub trait JanitorMeta:
     Send
@@ -114,7 +100,7 @@ pub trait JanitorMeta:
     + MetaEngineCore
     + MetaInodes
     + MetaNamespace
-    + MetaBlocks
+    + MetaPayloadObjects
     + MetaGc
     + MetaRecovery
     + MetaReplication
@@ -127,7 +113,7 @@ impl<T> JanitorMeta for T where
         + MetaEngineCore
         + MetaInodes
         + MetaNamespace
-        + MetaBlocks
+        + MetaPayloadObjects
         + MetaGc
         + MetaRecovery
         + MetaReplication
@@ -158,13 +144,6 @@ impl<M: ?Sized> RuntimeMetaHandle<M> {
 }
 
 impl<M: ?Sized + VfsCommitMeta> VfsCommitMeta for RuntimeMetaHandle<M> {
-    forward_method!(
-        fn flush_blocks_batch_with_attr(
-            &self,
-            entries: &[BatchFlushEntry],
-            attr: Option<&InodeAttr>,
-        ) -> MetaResult<Vec<BatchFlushResult>>
-    );
     forward_method!(
         fn flush_regular_file_overlay_slices_with_attr(
             &self,
@@ -299,19 +278,7 @@ impl<M: ?Sized + MetaFsOps> MetaFsOps for RuntimeMetaHandle<M> {
     );
 }
 
-impl<M: ?Sized + MetaBlocks> MetaBlocks for RuntimeMetaHandle<M> {
-    forward_method!(
-        fn get_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<BlockRef>>
-    );
-    forward_method!(
-        fn set_file_block(
-            &self,
-            ino: Ino,
-            block_index: u32,
-            block: &BlockRef,
-        ) -> MetaResult<Option<BlockRef>>
-    );
-    forward_method!(fn get_file_blocks(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>>);
+impl<M: ?Sized + MetaPayloadObjects> MetaPayloadObjects for RuntimeMetaHandle<M> {
     forward_method!(
         fn lookup_regular_file_chunk_slices(
             &self,
@@ -328,18 +295,9 @@ impl<M: ?Sized + MetaBlocks> MetaBlocks for RuntimeMetaHandle<M> {
             length: u64,
         ) -> MetaResult<Vec<ResolvedSliceSpan>>
     );
-    forward_method!(fn remove_file_blocks(&self, ino: Ino) -> MetaResult<Vec<u64>>);
-    forward_method!(
-        fn remove_file_block(&self, ino: Ino, block_index: u32) -> MetaResult<Option<u64>>
-    );
-    forward_method!(fn next_block_id(&self) -> MetaResult<u64>);
-    forward_method!(fn next_block_ids(&self, count: u32) -> MetaResult<Vec<u64>>);
-    forward_method!(
-        fn flush_blocks_batch(
-            &self,
-            entries: &[BatchFlushEntry],
-        ) -> MetaResult<Vec<BatchFlushResult>>
-    );
+    forward_method!(fn remove_regular_file_graph(&self, ino: Ino) -> MetaResult<Vec<u64>>);
+    forward_method!(fn next_object_id(&self) -> MetaResult<u64>);
+    forward_method!(fn next_object_ids(&self, count: u32) -> MetaResult<Vec<u64>>);
     forward_method!(
         fn flush_regular_file_overlay_slices(
             &self,
@@ -352,7 +310,10 @@ impl<M: ?Sized + MetaBlocks> MetaBlocks for RuntimeMetaHandle<M> {
         fn get_regular_file_overlay_object_ids(&self, ino: Ino) -> MetaResult<Vec<u64>>
     );
     forward_method!(
-        fn mark_regular_file_overlay_object_uploaded_if_matches(
+        fn get_regular_file_graph_object_usage(&self, ino: Ino) -> MetaResult<Vec<(u64, u64)>>
+    );
+    forward_method!(
+        fn has_regular_file_overlay_object_if_matches(
             &self,
             ino: Ino,
             expected_epoch: u64,
@@ -360,29 +321,11 @@ impl<M: ?Sized + MetaBlocks> MetaBlocks for RuntimeMetaHandle<M> {
         ) -> MetaResult<bool>
     );
     forward_method!(
-        fn commit_uploaded_block(
-            &self,
-            ino: Ino,
-            block_index: u32,
-            expected_epoch: u64,
-            block: &BlockRef,
-        ) -> MetaResult<bool>
-    );
-    forward_method!(
-        fn mark_file_block_uploaded_if_matches(
-            &self,
-            ino: Ino,
-            block_index: u32,
-            expected_epoch: u64,
-            block: &BlockRef,
-        ) -> MetaResult<bool>
-    );
-    forward_method!(
-        fn publish_file_manifest_if_matches(
+        fn mark_regular_file_overlay_object_uploaded_if_matches(
             &self,
             ino: Ino,
             expected_epoch: u64,
-            expected_manifest: &[(u32, BlockRef)],
+            object_id: u64,
         ) -> MetaResult<bool>
     );
     forward_method!(

@@ -1,12 +1,12 @@
 //! StudioFS Metadata Types
 //!
-//! Core types for the virtual filesystem metadata and the chunk/slice/block model.
+//! Core types for the virtual filesystem metadata and the chunk/slice object model.
 //!
 //! Architecture Key Changes:
-//! - Regular files can be represented as chunk/slice/block graphs
-//! - Blocks are immutable - never modified, only created/deleted
+//! - Regular files are represented as chunk/slice object graphs
+//! - Payload objects are immutable - never modified, only created/deleted
 //! - Local overlay and remote-visible base views are modeled explicitly
-//! - All metadata in redb, S3 stores only raw data blocks
+//! - All metadata lives in redb, S3 stores only raw payload objects
 
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -17,9 +17,9 @@ use std::time::SystemTime;
 // Constants
 // =============================================================================
 
-/// Fixed block size: 4 MiB.
+/// Default logical block size: 4 MiB.
 pub const DEFAULT_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
-/// Default chunk size for the chunk/slice/block graph: 64 MiB.
+/// Default chunk size for the chunk/slice object graph: 64 MiB.
 ///
 /// Follow-up: promote this into persisted `FormatInfo` once chunk-size
 /// migration/versioning is introduced.
@@ -222,7 +222,7 @@ pub struct InodeAttr {
     pub gid: u32,
     /// File size in bytes.
     pub size: u64,
-    /// Size visible to remote clients after committed block uploads.
+    /// Size visible to remote clients after committed payload uploads.
     #[serde(default)]
     pub committed_size: u64,
     /// Number of hard links.
@@ -492,16 +492,16 @@ pub struct DirEntryValue {
 }
 
 // =============================================================================
-// Block Reference Types
+// Payload Object Reference Types
 // =============================================================================
 
 bitflags::bitflags! {
-    /// Block flags indicating block properties.
+    /// Payload object flags retained for compatibility with existing slice records.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub struct BlockFlags: u8 {
         /// Legacy flag from earlier builds that used LZ4 compression.
         const COMPRESSED_LZ4 = 0x01;
-        /// Block is partial (not a full block, typically the last block of a file).
+        /// Payload object represents less than one logical block's worth of data.
         const PARTIAL_BLOCK = 0x02;
     }
 }
@@ -512,29 +512,27 @@ impl Default for BlockFlags {
     }
 }
 
-/// Block reference - stored in FILE_BLOCKS table.
+/// Payload object reference embedded in regular-file slice records.
 ///
-/// Points to an immutable S3 object containing block payload data.
-/// Key: (inode, block_index) - each block has a single owner.
+/// Points to an immutable S3/local object containing payload bytes for a slice.
 ///
 /// Design decisions:
 /// - Sequential object_id (not content hash) - simpler and faster
-/// - No reference counting - block belongs to exactly one file position
 /// - Immutable objects - never modified, only created/deleted
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BlockRef {
-    /// Sequential block ID (unique across the volume).
+pub struct PayloadRef {
+    /// Sequential payload object ID (unique across the volume).
     pub object_id: u64,
-    /// Offset within the block (for partial blocks, typically 0).
+    /// Offset within the payload object.
     pub offset: u32,
-    /// Length of valid data in this block.
+    /// Length of valid data in this slice view.
     pub length: u32,
     /// Compression and other flags.
     pub flags: BlockFlags,
 }
 
-impl BlockRef {
-    /// Create a new block reference for a full block.
+impl PayloadRef {
+    /// Create a new payload reference that covers a full logical block.
     pub fn new_full(object_id: u64, length: u32) -> Self {
         Self {
             object_id,
@@ -544,7 +542,7 @@ impl BlockRef {
         }
     }
 
-    /// Create a new block reference for a partial block (last block of file).
+    /// Create a new payload reference that covers less than one logical block.
     pub fn new_partial(object_id: u64, length: u32) -> Self {
         Self {
             object_id,
@@ -554,12 +552,12 @@ impl BlockRef {
         }
     }
 
-    /// Check if this is a partial block.
+    /// Check if this reference is marked as partial.
     pub fn is_partial(&self) -> bool {
         self.flags.contains(BlockFlags::PARTIAL_BLOCK)
     }
 
-    /// Check if this block is compressed.
+    /// Check if this payload object is marked as compressed.
     pub fn is_compressed(&self) -> bool {
         self.flags.contains(BlockFlags::COMPRESSED_LZ4)
     }
@@ -639,13 +637,13 @@ impl SliceRange {
     }
 }
 
-/// Lifecycle state attached to a slice's block reference.
+/// Lifecycle state attached to a slice's payload object reference.
 ///
 /// The separate state makes the upload/publication/recovery lifecycle explicit
-/// without changing the immutable block payload itself.
+/// without changing the immutable payload object itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum BlockRefState {
+pub enum PayloadRefState {
     /// Accepted locally but not yet uploaded.
     #[default]
     LocalOnly,
@@ -659,8 +657,8 @@ pub enum BlockRefState {
     Recovering,
 }
 
-impl BlockRefState {
-    /// Return the cache-retention policy implied by this block lifecycle state.
+impl PayloadRefState {
+    /// Return the cache-retention policy implied by this payload lifecycle state.
     pub fn retention_class(self) -> PayloadRetentionClass {
         match self {
             Self::LocalOnly | Self::Uploading | Self::Recovering => {
@@ -731,23 +729,28 @@ pub struct SliceRecord {
     pub order: SliceOrder,
     /// Chunk-relative byte range for the slice.
     pub range: SliceRange,
-    /// Block payload reference; `None` represents a tombstone.
+    /// Payload object reference; `None` represents a tombstone.
     #[serde(default)]
-    pub block: Option<BlockRef>,
-    /// Upload/publication/recovery lifecycle for the referenced block.
+    pub payload: Option<PayloadRef>,
+    /// Upload/publication/recovery lifecycle for the referenced payload.
     #[serde(default)]
-    pub block_state: BlockRefState,
+    pub payload_state: PayloadRefState,
 }
 
 impl SliceRecord {
     /// Create a data-bearing slice record.
-    pub fn new(slice_id: SliceId, order: SliceOrder, range: SliceRange, block: BlockRef) -> Self {
+    pub fn new(
+        slice_id: SliceId,
+        order: SliceOrder,
+        range: SliceRange,
+        payload: PayloadRef,
+    ) -> Self {
         Self {
             slice_id,
             order,
             range,
-            block: Some(block),
-            block_state: BlockRefState::LocalOnly,
+            payload: Some(payload),
+            payload_state: PayloadRefState::LocalOnly,
         }
     }
 
@@ -757,14 +760,14 @@ impl SliceRecord {
             slice_id,
             order,
             range,
-            block: None,
-            block_state: BlockRefState::LocalOnly,
+            payload: None,
+            payload_state: PayloadRefState::LocalOnly,
         }
     }
 
     /// Returns `true` when this slice removes coverage instead of providing data.
     pub fn is_tombstone(&self) -> bool {
-        self.block.is_none()
+        self.payload.is_none()
     }
 }
 
@@ -846,7 +849,7 @@ impl RegularFileChunkState {
             if shadowed_bytes > 0 {
                 counters.overlapping_slices = counters.overlapping_slices.saturating_add(1);
             }
-            if slice.block.is_some() {
+            if slice.payload.is_some() {
                 counters.live_slices = counters.live_slices.saturating_add(1);
                 counters.fragmented_bytes =
                     counters.fragmented_bytes.saturating_add(shadowed_bytes);
@@ -952,9 +955,9 @@ pub struct ResolvedSliceSpan {
     /// Winning slice order when the span comes from a slice.
     #[serde(default)]
     pub slice_order: Option<SliceOrder>,
-    /// Block ref backing the span, clipped to `range` when data-bearing.
+    /// Payload ref backing the span, clipped to `range` when data-bearing.
     #[serde(default)]
-    pub block: Option<BlockRef>,
+    pub payload: Option<PayloadRef>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -969,12 +972,12 @@ struct ResolveCandidate {
     slice_id: SliceId,
     slice_order: SliceOrder,
     range: SliceRange,
-    block: Option<BlockRef>,
+    payload: Option<PayloadRef>,
 }
 
 impl ResolveCandidate {
     fn source(&self) -> ResolvedSliceSource {
-        match (self.tier, self.block.as_ref()) {
+        match (self.tier, self.payload.as_ref()) {
             (ResolveTier::Overlay, Some(_)) => ResolvedSliceSource::Overlay,
             (ResolveTier::Base, Some(_)) => ResolvedSliceSource::Base,
             (ResolveTier::Overlay, None) => ResolvedSliceSource::OverlayTombstone,
@@ -1009,7 +1012,7 @@ fn push_candidate_set(
                 slice_id: slice.slice_id,
                 slice_order: slice.order,
                 range: slice.range,
-                block: slice.block.clone(),
+                payload: slice.payload.clone(),
             });
         }
     }
@@ -1047,7 +1050,7 @@ pub fn merge_adjacent_spans(mut spans: Vec<ResolvedSliceSpan>) -> Vec<ResolvedSl
             && last.source == span.source
             && last.slice_id == span.slice_id
             && last.slice_order == span.slice_order
-            && last.block == span.block
+            && last.payload == span.payload
         {
             last.range.end = span.range.end;
             continue;
@@ -1086,13 +1089,13 @@ pub fn resolve_chunk_slice_spans(
         for pending in unresolved {
             if let Some(overlap) = pending.intersection(candidate.range) {
                 subtract_range(pending, overlap, &mut next_unresolved);
-                let block = candidate.block.as_ref().map(|block| {
+                let payload = candidate.payload.as_ref().map(|payload| {
                     let delta = overlap.start.saturating_sub(candidate.range.start);
-                    BlockRef {
-                        object_id: block.object_id,
-                        offset: block.offset.saturating_add(delta),
+                    PayloadRef {
+                        object_id: payload.object_id,
+                        offset: payload.offset.saturating_add(delta),
                         length: overlap.len(),
-                        flags: block.flags,
+                        flags: payload.flags,
                     }
                 });
                 resolved.push(ResolvedSliceSpan {
@@ -1101,7 +1104,7 @@ pub fn resolve_chunk_slice_spans(
                     source: candidate.source(),
                     slice_id: Some(candidate.slice_id),
                     slice_order: Some(candidate.slice_order),
-                    block,
+                    payload,
                 });
             } else {
                 next_unresolved.push(pending);
@@ -1117,7 +1120,7 @@ pub fn resolve_chunk_slice_spans(
             source: ResolvedSliceSource::Hole,
             slice_id: None,
             slice_order: None,
-            block: None,
+            payload: None,
         });
     }
 
@@ -1284,8 +1287,8 @@ impl FormatInfo {
 pub mod counters {
     /// Next available inode number.
     pub const NEXT_INODE: &str = "nextInode";
-    /// Next available block ID (sequential).
-    pub const NEXT_BLOCK_ID: &str = "nextBlockId";
+    /// Next available object ID (sequential).
+    pub const NEXT_OBJECT_ID: &str = "nextObjectId";
     /// Total used space in bytes.
     pub const USED_SPACE: &str = "usedSpace";
     /// Total number of inodes in use.
@@ -1412,14 +1415,14 @@ mod tests {
     }
 
     #[test]
-    fn test_block_ref_flags() {
-        let full_block = BlockRef::new_full(123, 4 * 1024 * 1024);
-        assert!(!full_block.is_partial());
-        assert!(!full_block.is_compressed());
+    fn test_payload_ref_flags() {
+        let full_payload_ref = PayloadRef::new_full(123, 4 * 1024 * 1024);
+        assert!(!full_payload_ref.is_partial());
+        assert!(!full_payload_ref.is_compressed());
 
-        let partial_block = BlockRef::new_partial(124, 1000);
-        assert!(partial_block.is_partial());
-        assert!(!partial_block.is_compressed());
+        let partial_payload_ref = PayloadRef::new_partial(124, 1000);
+        assert!(partial_payload_ref.is_partial());
+        assert!(!partial_payload_ref.is_compressed());
     }
 
     #[test]
@@ -1456,7 +1459,7 @@ mod tests {
             SliceId(1),
             SliceOrder(1),
             SliceRange::new(0, 8192).expect("base range"),
-            BlockRef::new_partial(2001, 8192),
+            PayloadRef::new_partial(2001, 8192),
         ));
 
         let mut overlay_chunk = RegularFileChunkState::default();
@@ -1464,7 +1467,7 @@ mod tests {
             SliceId(2),
             SliceOrder(1),
             SliceRange::new(1024, 3072).expect("overlay range"),
-            BlockRef::new_partial(2002, 2048),
+            PayloadRef::new_partial(2002, 2048),
         ));
         overlay_chunk.insert_slice(SliceRecord::tombstone(
             SliceId(3),
@@ -1524,13 +1527,13 @@ mod tests {
             SliceId(1),
             SliceOrder(1),
             SliceRange::new(0, 4096).expect("first slice"),
-            BlockRef::new_partial(1001, 4096),
+            PayloadRef::new_partial(1001, 4096),
         ));
         chunk.insert_slice(SliceRecord::new(
             SliceId(2),
             SliceOrder(2),
             SliceRange::new(0, 4096).expect("shadowed slice"),
-            BlockRef::new_partial(1002, 4096),
+            PayloadRef::new_partial(1002, 4096),
         ));
         chunk.insert_slice(SliceRecord::tombstone(
             SliceId(3),
@@ -1563,7 +1566,7 @@ mod tests {
 
     #[test]
     fn test_regular_file_state_roundtrip() {
-        let block = BlockRef::new_partial(9001, 4096);
+        let block = PayloadRef::new_partial(9001, 4096);
         let slice = SliceRecord::new(
             SliceId(7),
             SliceOrder(3),
@@ -1616,7 +1619,7 @@ mod tests {
                 .slices
                 .get(&SliceId(7))
                 .unwrap()
-                .block
+                .payload
                 .as_ref()
                 .unwrap()
                 .object_id,

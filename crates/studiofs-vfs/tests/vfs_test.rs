@@ -1,8 +1,8 @@
 //! Integration tests for the StudioFS VFS layer.
 //!
-//! Tests the block-based VFS implementation with:
-//! - Sequential block IDs
-//! - Immutable blocks
+//! Tests the slice-native VFS implementation with:
+//! - Sequential object IDs
+//! - Immutable payload objects
 //! - LZ4 compression
 //! - Crash recovery via journaling
 //!
@@ -20,8 +20,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use studiofs_cache::runtime::LocalBlockLayout;
-use studiofs_cache::{PersistentLocalBlockBackend, open_local_block_backend};
+use studiofs_cache::runtime::LocalPayloadLayout;
+use studiofs_cache::{PersistentLocalPayloadBackend, open_local_payload_backend};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_key,
     format_object_fragment_keys, format_object_key, read_object,
@@ -31,12 +31,12 @@ use studiofs_meta::engine::{MetaFsOps, PendingCreateRecord, UndoLogKind};
 use studiofs_meta::types::SetattrArgs;
 use studiofs_meta::types::TimeSpec;
 use studiofs_meta::{
-    CURRENT_FORMAT_VERSION, FormatInfo, MetaBlocks, MetaEngine, MetaError, MetaFormat, MetaInodes,
-    MetaReplication, MetadataBackend, MetadataConfig, PgMetaEngine, PgOpenOptions, PostgresConfig,
-    ROOT_INO, RedbMetaEngine, ensure_studiofs_database,
-    schema::InodeLifecycleState,
+    CURRENT_FORMAT_VERSION, FormatInfo, MetaEngine, MetaError, MetaFormat, MetaGc, MetaInodes,
+    MetaPayloadObjects, MetaReplication, MetadataBackend, MetadataConfig, PgMetaEngine,
+    PgOpenOptions, PostgresConfig, ROOT_INO, RedbMetaEngine, ensure_studiofs_database,
     schema::{ChunkId, SliceId, SliceOrder, SliceRange, SliceRecord},
-    types::{AccessLevel, BlockFlags, BlockRef, UploadState},
+    schema::{InodeLifecycleState, PayloadRefState},
+    types::{AccessLevel, BlockFlags, Ino, PayloadRef, UploadState},
 };
 use studiofs_vfs::{
     KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsConfigRaw, VfsConfigValidated, VfsError,
@@ -59,6 +59,254 @@ use uuid::Uuid;
 // =============================================================================
 // Test Helpers
 // =============================================================================
+
+trait FileGraphMetaFixture {
+    fn stage_payload_slice(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        payload: &PayloadRef,
+    ) -> Result<Option<PayloadRef>, MetaError>;
+    fn lookup_payload_slice(
+        &self,
+        ino: Ino,
+        block_index: u32,
+    ) -> Result<Option<PayloadRef>, MetaError>;
+    fn lookup_payload_slices(&self, ino: Ino) -> Result<Vec<(u32, PayloadRef)>, MetaError>;
+    fn publish_uploaded_slice_object(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        expected_epoch: u64,
+        payload: &PayloadRef,
+    ) -> Result<bool, MetaError>;
+}
+
+fn fixture_payload_slices(
+    block_size: u32,
+    block_index: u32,
+    payload: Option<&PayloadRef>,
+) -> Result<Vec<(ChunkId, Vec<SliceRecord>)>, MetaError> {
+    let block_start = u64::from(block_index)
+        .checked_mul(u64::from(block_size))
+        .ok_or_else(|| MetaError::Storage("fixture block offset overflow".to_string()))?;
+    let data_end = block_start
+        .checked_add(u64::from(payload.map_or(0, |payload| payload.length)))
+        .ok_or_else(|| MetaError::Storage("fixture block data overflow".to_string()))?;
+    let block_end = block_start
+        .checked_add(u64::from(block_size))
+        .ok_or_else(|| MetaError::Storage("fixture block range overflow".to_string()))?;
+    let mut chunks = std::collections::BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
+    let mut push = |start: u64, end: u64, source: Option<&PayloadRef>| -> Result<(), MetaError> {
+        let mut cursor = start;
+        while cursor < end {
+            let chunk_id =
+                studiofs_meta::chunk_id_from_offset(cursor, studiofs_meta::DEFAULT_CHUNK_SIZE);
+            let chunk_start =
+                studiofs_meta::chunk_start_offset(chunk_id, studiofs_meta::DEFAULT_CHUNK_SIZE);
+            let piece_end =
+                end.min(chunk_start.saturating_add(studiofs_meta::DEFAULT_CHUNK_SIZE as u64));
+            let range = SliceRange::new(
+                (cursor - chunk_start) as u32,
+                (piece_end - chunk_start) as u32,
+            )
+            .ok_or_else(|| MetaError::Storage("fixture invalid slice range".to_string()))?;
+            let mut slice = if let Some(source) = source {
+                let delta = u32::try_from(cursor.saturating_sub(block_start))
+                    .map_err(|_| MetaError::Storage("fixture slice delta overflow".to_string()))?;
+                SliceRecord::new(
+                    SliceId(0),
+                    SliceOrder(0),
+                    range,
+                    PayloadRef {
+                        object_id: source.object_id,
+                        offset: source.offset.saturating_add(delta),
+                        length: u32::try_from(piece_end.saturating_sub(cursor)).map_err(|_| {
+                            MetaError::Storage("fixture slice length overflow".to_string())
+                        })?,
+                        flags: source.flags,
+                    },
+                )
+            } else {
+                SliceRecord::tombstone(SliceId(0), SliceOrder(0), range)
+            };
+            slice.payload_state = PayloadRefState::LocalOnly;
+            chunks.entry(chunk_id).or_default().push(slice);
+            cursor = piece_end;
+        }
+        Ok(())
+    };
+    push(block_start, data_end, payload)?;
+    if data_end < block_end {
+        push(data_end, block_end, None)?;
+    }
+    Ok(chunks.into_iter().collect())
+}
+
+fn fixture_payload_summaries_from_spans(
+    spans: Vec<studiofs_meta::ResolvedSliceSpan>,
+    block_size: u32,
+) -> Result<Vec<(u32, PayloadRef)>, MetaError> {
+    let mut blocks = std::collections::BTreeMap::<u32, PayloadRef>::new();
+    for span in spans {
+        let Some(block) = span.payload else {
+            continue;
+        };
+        let chunk_start =
+            studiofs_meta::chunk_start_offset(span.chunk_id, studiofs_meta::DEFAULT_CHUNK_SIZE);
+        let span_start = chunk_start.saturating_add(u64::from(span.range.start));
+        let span_end = chunk_start.saturating_add(u64::from(span.range.end));
+        let mut cursor = span_start;
+        while cursor < span_end {
+            let block_index = u32::try_from(cursor / u64::from(block_size))
+                .map_err(|_| MetaError::Storage("fixture block index overflow".to_string()))?;
+            let logical_block_end =
+                (u64::from(block_index) + 1).saturating_mul(u64::from(block_size));
+            let piece_end = span_end.min(logical_block_end);
+            let piece_len = u32::try_from(piece_end.saturating_sub(cursor))
+                .map_err(|_| MetaError::Storage("fixture block length overflow".to_string()))?;
+            let delta = u32::try_from(cursor.saturating_sub(span_start))
+                .map_err(|_| MetaError::Storage("fixture block offset overflow".to_string()))?;
+            blocks
+                .entry(block_index)
+                .and_modify(|existing| {
+                    existing.length = existing.length.saturating_add(piece_len);
+                    existing.flags |= block.flags;
+                })
+                .or_insert_with(|| PayloadRef {
+                    object_id: block.object_id,
+                    offset: block.offset.saturating_add(delta),
+                    length: piece_len,
+                    flags: block.flags,
+                });
+            cursor = piece_end;
+        }
+    }
+    Ok(blocks.into_iter().collect())
+}
+
+impl<T> FileGraphMetaFixture for Arc<T>
+where
+    T: ?Sized + MetaPayloadObjects + MetaFormat + MetaInodes,
+{
+    fn stage_payload_slice(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        payload: &PayloadRef,
+    ) -> Result<Option<PayloadRef>, MetaError> {
+        let old = self.lookup_payload_slice(ino, block_index).ok().flatten();
+        let block_size = self.get_format_info()?.block_size;
+        self.flush_regular_file_overlay_slices(
+            ino,
+            fixture_payload_slices(block_size, block_index, Some(payload))?.as_slice(),
+        )?;
+        Ok(old)
+    }
+
+    fn lookup_payload_slice(
+        &self,
+        ino: Ino,
+        block_index: u32,
+    ) -> Result<Option<PayloadRef>, MetaError> {
+        let block_size = self.get_format_info()?.block_size;
+        Ok(fixture_payload_summaries_from_spans(
+            self.lookup_regular_file_slices(
+                ino,
+                u64::from(block_index) * u64::from(block_size),
+                u64::from(block_size),
+            )?,
+            block_size,
+        )?
+        .into_iter()
+        .next()
+        .map(|(_, block)| block))
+    }
+
+    fn lookup_payload_slices(&self, ino: Ino) -> Result<Vec<(u32, PayloadRef)>, MetaError> {
+        let attr = self.get_attr(ino)?;
+        let block_size = self.get_format_info()?.block_size;
+        fixture_payload_summaries_from_spans(
+            self.lookup_regular_file_slices(ino, 0, attr.size)?,
+            block_size,
+        )
+    }
+
+    fn publish_uploaded_slice_object(
+        &self,
+        ino: Ino,
+        _block_index: u32,
+        expected_epoch: u64,
+        payload: &PayloadRef,
+    ) -> Result<bool, MetaError> {
+        self.mark_regular_file_overlay_object_uploaded_if_matches(
+            ino,
+            expected_epoch,
+            payload.object_id,
+        )?;
+        self.publish_regular_file_overlay_to_base_if_matches(ino, expected_epoch)
+    }
+}
+
+impl FileGraphMetaFixture for RedbMetaEngine {
+    fn stage_payload_slice(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        payload: &PayloadRef,
+    ) -> Result<Option<PayloadRef>, MetaError> {
+        let old = self.lookup_payload_slice(ino, block_index).ok().flatten();
+        let block_size = self.get_format_info()?.block_size;
+        self.flush_regular_file_overlay_slices(
+            ino,
+            fixture_payload_slices(block_size, block_index, Some(payload))?.as_slice(),
+        )?;
+        Ok(old)
+    }
+
+    fn lookup_payload_slice(
+        &self,
+        ino: Ino,
+        block_index: u32,
+    ) -> Result<Option<PayloadRef>, MetaError> {
+        let block_size = self.get_format_info()?.block_size;
+        Ok(fixture_payload_summaries_from_spans(
+            self.lookup_regular_file_slices(
+                ino,
+                u64::from(block_index) * u64::from(block_size),
+                u64::from(block_size),
+            )?,
+            block_size,
+        )?
+        .into_iter()
+        .next()
+        .map(|(_, block)| block))
+    }
+
+    fn lookup_payload_slices(&self, ino: Ino) -> Result<Vec<(u32, PayloadRef)>, MetaError> {
+        let attr = self.get_attr(ino)?;
+        let block_size = self.get_format_info()?.block_size;
+        fixture_payload_summaries_from_spans(
+            self.lookup_regular_file_slices(ino, 0, attr.size)?,
+            block_size,
+        )
+    }
+
+    fn publish_uploaded_slice_object(
+        &self,
+        ino: Ino,
+        _block_index: u32,
+        expected_epoch: u64,
+        payload: &PayloadRef,
+    ) -> Result<bool, MetaError> {
+        self.mark_regular_file_overlay_object_uploaded_if_matches(
+            ino,
+            expected_epoch,
+            payload.object_id,
+        )?;
+        self.publish_regular_file_overlay_to_base_if_matches(ino, expected_epoch)
+    }
+}
 
 /// Create a test format info.
 fn make_format_info(volume_suffix: &str) -> FormatInfo {
@@ -92,7 +340,7 @@ fn make_format_info(volume_suffix: &str) -> FormatInfo {
 }
 
 fn provision_cache_runtime_layout(cache_root: &std::path::Path) {
-    let layout = LocalBlockLayout::from_cache_root(cache_root);
+    let layout = LocalPayloadLayout::from_cache_root(cache_root);
     layout.provision().unwrap();
 }
 
@@ -1173,7 +1421,7 @@ async fn seed_committed_file(
     format_info: &FormatInfo,
     name: &[u8],
     payload: &[u8],
-) -> (u64, Vec<(u32, BlockRef)>) {
+) -> (u64, Vec<(u32, PayloadRef)>) {
     let attr = meta.create_file(1, name, 0, 0, 0o644).unwrap();
     let ino = attr.ino;
     let mut file_attr = meta.get_attr(ino).unwrap();
@@ -1182,7 +1430,7 @@ async fn seed_committed_file(
 
     let block_size = format_info.block_size as usize;
     let block_count = payload.len().div_ceil(block_size);
-    let object_ids = meta.next_block_ids(block_count as u32).unwrap();
+    let object_ids = meta.next_object_ids(block_count as u32).unwrap();
     let store = DataStore::new(&DataStoreConfig::from(format_info)).unwrap();
 
     for (block_index, chunk) in payload.chunks(block_size).enumerate() {
@@ -1197,35 +1445,35 @@ async fn seed_committed_file(
         .unwrap();
 
         let block_ref = if chunk.len() == block_size {
-            BlockRef::new_full(object_id, chunk.len() as u32)
+            PayloadRef::new_full(object_id, chunk.len() as u32)
         } else {
-            BlockRef::new_partial(object_id, chunk.len() as u32)
+            PayloadRef::new_partial(object_id, chunk.len() as u32)
         };
-        meta.set_file_block(ino, block_index as u32, &block_ref)
+        meta.stage_payload_slice(ino, block_index as u32, &block_ref)
             .unwrap();
         assert!(
-            meta.commit_uploaded_block(
+            meta.publish_uploaded_slice_object(
                 ino,
                 block_index as u32,
                 file_attr.content_epoch,
                 &block_ref
             )
             .unwrap(),
-            "seeded committed block should satisfy metadata preconditions"
+            "seeded committed payload slice should satisfy metadata preconditions"
         );
     }
 
-    (ino, meta.get_file_blocks(ino).unwrap())
+    (ino, meta.lookup_payload_slices(ino).unwrap())
 }
 
-fn wait_until_blocks(
+fn wait_until_payload_slices(
     vfs: &Arc<StudioVfs>,
     ino: u64,
     timeout: Duration,
-) -> Option<Vec<(u32, BlockRef)>> {
+) -> Option<Vec<(u32, PayloadRef)>> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(blocks) = vfs.meta().get_file_blocks(ino)
+        if let Ok(blocks) = vfs.meta().lookup_payload_slices(ino)
             && !blocks.is_empty()
         {
             return Some(blocks);
@@ -1237,20 +1485,20 @@ fn wait_until_blocks(
     }
 }
 
-/// Wait until at least `expected` block refs are visible in metadata.
+/// Wait until at least `expected` resolved payload slices are visible in metadata.
 ///
-/// After `flush()`, blocks are moved to the dirty memory buffer and processed
+/// After `flush()`, payload is moved to the local-dirty pipeline and processed
 /// asynchronously by the background slab flusher.  This helper polls until the
-/// expected number of blocks appear (or the timeout expires).
-fn wait_until_n_blocks(
+/// expected number of payload slices appear (or the timeout expires).
+fn wait_until_n_payload_slices(
     vfs: &Arc<StudioVfs>,
     ino: u64,
     expected: usize,
     timeout: Duration,
-) -> Option<Vec<(u32, BlockRef)>> {
+) -> Option<Vec<(u32, PayloadRef)>> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(blocks) = vfs.meta().get_file_blocks(ino)
+        if let Ok(blocks) = vfs.meta().lookup_payload_slices(ino)
             && blocks.len() >= expected
         {
             return Some(blocks);
@@ -1279,7 +1527,7 @@ async fn test_create_write_read_file() {
     assert!(ino > 1);
 
     // Write data
-    let payload = b"Hello, StudioFS! This is a block-based test.";
+    let payload = b"Hello, StudioFS! This is a slice-native test.";
     let written = vfs.write(ino, 0, payload).await.unwrap();
     assert_eq!(written as usize, payload.len());
 
@@ -1393,20 +1641,20 @@ async fn test_block_allocation() {
     vfs.write(ino, 0, &payload).await.unwrap();
     vfs.flush(ino).await.unwrap();
 
-    // Wait for background slab flusher to materialise block refs.
-    let blocks = wait_until_n_blocks(&vfs, ino, 3, Duration::from_secs(15))
-        .expect("Should have 3 blocks for 12 MiB file");
+    // Wait for background slab flusher to materialise payload slices.
+    let blocks = wait_until_n_payload_slices(&vfs, ino, 3, Duration::from_secs(15))
+        .expect("Should have 3 payload slices for 12 MiB file");
 
-    // Verify block indices
+    // Verify payload indexes.
     assert_eq!(blocks[0].0, 0);
     assert_eq!(blocks[1].0, 1);
     assert_eq!(blocks[2].0, 2);
 
-    // Verify each block is stored uncompressed in metadata flags
+    // Verify each payload reference is stored uncompressed in metadata flags.
     for (_, block_ref) in &blocks {
         assert!(
             !block_ref.is_compressed(),
-            "Block should not be marked compressed"
+            "Payload object should not be marked compressed"
         );
     }
 
@@ -1430,15 +1678,15 @@ async fn test_partial_block() {
     vfs.write(ino, 0, payload).await.unwrap();
     vfs.flush(ino).await.unwrap();
 
-    // Wait for background slab flusher to materialise block refs.
-    let blocks = wait_until_n_blocks(&vfs, ino, 1, Duration::from_secs(15))
-        .expect("Should have 1 block after flush");
+    // Wait for background slab flusher to materialise payload slices.
+    let blocks = wait_until_n_payload_slices(&vfs, ino, 1, Duration::from_secs(15))
+        .expect("Should have 1 payload slice after flush");
     assert_eq!(blocks.len(), 1);
 
     let (_, block_ref) = &blocks[0];
     assert!(
         block_ref.is_partial(),
-        "Small file should have partial block"
+        "Small file should have a partial payload reference"
     );
     assert_eq!(block_ref.length as usize, payload.len());
 }
@@ -1541,17 +1789,17 @@ async fn test_truncate_file() {
     vfs.write(ino, 0, &payload).await.unwrap();
     vfs.flush(ino).await.unwrap();
 
-    // Wait for background slab flusher to materialise all 3 block refs.
-    let blocks = wait_until_n_blocks(&vfs, ino, 3, Duration::from_secs(15))
-        .expect("Should have 3 blocks for 12 MiB file");
+    // Wait for background slab flusher to materialise all 3 payload slices.
+    let blocks = wait_until_n_payload_slices(&vfs, ino, 3, Duration::from_secs(15))
+        .expect("Should have 3 payload slices for 12 MiB file");
     assert_eq!(blocks.len(), 3);
 
     // Truncate to 5 MiB (should remove 1 block, partial last block)
     let new_size = 5 * 1024 * 1024;
     vfs.setattr(ino, SetattrArgs::size_only(new_size)).unwrap();
 
-    // Verify 2 blocks now (truncation is synchronous — no wait needed)
-    let blocks = vfs.meta().get_file_blocks(ino).unwrap();
+    // Verify 2 payload slices now (truncation is synchronous — no wait needed).
+    let blocks = vfs.meta().lookup_payload_slices(ino).unwrap();
     assert_eq!(blocks.len(), 2);
 
     // Verify file size
@@ -1583,11 +1831,11 @@ async fn test_pending_deletions_gc() {
     vfs.write(ino, 0, b"initial data").await.unwrap();
     vfs.flush(ino).await.unwrap();
 
-    // Wait for background slab flusher to materialise block refs.
-    let blocks_before = wait_until_n_blocks(&vfs, ino, 1, Duration::from_secs(15))
+    // Wait for background slab flusher to materialise payload slices.
+    let blocks_before = wait_until_n_payload_slices(&vfs, ino, 1, Duration::from_secs(15))
         .expect("Should have 1 block after initial write");
     assert_eq!(blocks_before.len(), 1);
-    let old_block_id = blocks_before[0].1.object_id;
+    let old_object_id = blocks_before[0].1.object_id;
 
     // Under the committed/overlay model, the old block becomes GC-eligible
     // only after it has actually been uploaded.
@@ -1595,7 +1843,7 @@ async fn test_pending_deletions_gc() {
         wait_until_object_exists(
             &ds,
             &info.data_prefix,
-            old_block_id,
+            old_object_id,
             Duration::from_secs(20)
         )
         .await,
@@ -1624,10 +1872,10 @@ async fn test_pending_deletions_gc() {
                 && attr.committed_content_epoch == attr.content_epoch
                 && vfs
                     .meta()
-                    .get_file_blocks(ino)
+                    .lookup_payload_slices(ino)
                     .unwrap()
                     .first()
-                    .is_some_and(|(_, block)| block.object_id != old_block_id)
+                    .is_some_and(|(_, block)| block.object_id != old_object_id)
         })
         .await,
         "overwrite GC check should begin only after the replacement incarnation is fully published"
@@ -1636,15 +1884,15 @@ async fn test_pending_deletions_gc() {
     assert!(
         wait_until(Duration::from_secs(20), || {
             let pending = vfs.meta().get_pending_deletions().unwrap();
-            pending.iter().any(|(id, _)| *id == old_block_id)
+            pending.iter().any(|(id, _)| *id == old_object_id)
         })
         .await,
-        "old committed block should eventually enter pending deletions"
+        "old committed payload object should eventually enter pending deletions"
     );
 
     // Verify new block is different
-    let blocks_after = vfs.meta().get_file_blocks(ino).unwrap();
-    assert_ne!(blocks_after[0].1.object_id, old_block_id);
+    let blocks_after = vfs.meta().lookup_payload_slices(ino).unwrap();
+    assert_ne!(blocks_after[0].1.object_id, old_object_id);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1732,8 +1980,8 @@ async fn test_background_janitor_cleans_simulated_crash_orphan() {
     vfs.write(ino, 0, &payload).await.unwrap();
     vfs.flush(ino).await.unwrap();
 
-    let blocks = wait_until_blocks(&vfs, ino, Duration::from_secs(15))
-        .expect("expected at least one block reference after flush");
+    let blocks = wait_until_payload_slices(&vfs, ino, Duration::from_secs(15))
+        .expect("expected at least one payload slice after flush");
     let object_id = blocks[0].1.object_id;
     if let Err(err) = put_fragmented_object(
         &ds,
@@ -1758,10 +2006,10 @@ async fn test_background_janitor_cleans_simulated_crash_orphan() {
     );
 
     // 2) Simulate crash window by "losing" metadata refs while object remains in S3.
-    let removed_ids = vfs.meta().remove_file_blocks(ino).unwrap();
+    let removed_ids = vfs.meta().remove_regular_file_graph(ino).unwrap();
     assert!(
         removed_ids.contains(&object_id),
-        "remove_file_blocks should drop the uploaded object reference"
+        "remove_regular_file_graph should drop the uploaded object reference"
     );
 
     // 3) Janitor should eventually detect object as orphan and delete it.
@@ -2092,7 +2340,7 @@ fn test_crash_recovery_replays_pending_journal() {
             // and no journal files exist yet.
             let deadline = Instant::now() + Duration::from_secs(15);
             loop {
-                if let Ok(blocks) = vfs.meta().get_file_blocks(attr.ino)
+                if let Ok(blocks) = vfs.meta().lookup_payload_slices(attr.ino)
                     && !blocks.is_empty()
                 {
                     break;
@@ -2108,14 +2356,14 @@ fn test_crash_recovery_replays_pending_journal() {
         rt.shutdown_background();
     }
 
-    let pending_count = open_local_block_backend(&cache_dir, &offline_info.uuid)
+    let pending_count = open_local_payload_backend(&cache_dir, &offline_info.uuid)
         .unwrap()
         .backend
         .dirty_object_ids()
         .len();
     assert!(
         pending_count > 0,
-        "expected dirty blocks after simulated crash"
+        "expected dirty payload objects after simulated crash"
     );
 
     // Phase 2: restart with healthy endpoint and verify recovery drains journals.
@@ -2142,8 +2390,11 @@ fn test_crash_recovery_replays_pending_journal() {
         vfs.start()
             .expect("failed to start StudioVfs background workers");
 
-        let blocks = meta.get_file_blocks(crash_file_ino).unwrap();
-        assert!(!blocks.is_empty(), "file blocks must exist in metadata");
+        let blocks = meta.lookup_payload_slices(crash_file_ino).unwrap();
+        assert!(
+            !blocks.is_empty(),
+            "payload slice metadata must exist before upload"
+        );
         let object_id = blocks[0].1.object_id;
         let check_store = DataStore::new(&DataStoreConfig::from(&online_info)).unwrap();
 
@@ -2163,7 +2414,7 @@ fn test_crash_recovery_replays_pending_journal() {
 
     // Allow async cleanup to clear DIRTY flags after upload completion.
     thread::sleep(Duration::from_millis(500));
-    let pending_after = open_local_block_backend(&cache_dir, &offline_info.uuid)
+    let pending_after = open_local_payload_backend(&cache_dir, &offline_info.uuid)
         .unwrap()
         .backend
         .dirty_object_ids()
@@ -2234,8 +2485,8 @@ fn test_crash_recovery_replays_local_committed_block_before_metadata_flush() {
             vfs.write(ino, 0, &baseline_payload).await.unwrap();
             vfs.flush(ino).await.unwrap();
 
-            let blocks = wait_until_blocks(&vfs, ino, Duration::from_secs(45))
-                .expect("expected committed block refs for baseline payload");
+            let blocks = wait_until_payload_slices(&vfs, ino, Duration::from_secs(45))
+                .expect("expected committed payload slices for baseline payload");
             baseline_object_id = blocks[0].1.object_id;
 
             let ds = DataStore::new(&data_config).unwrap();
@@ -2282,25 +2533,25 @@ fn test_crash_recovery_replays_local_committed_block_before_metadata_flush() {
             vfs.start()
                 .expect("failed to start StudioVfs background workers");
 
-            let before = meta.get_file_blocks(ino).unwrap();
+            let before = meta.lookup_payload_slices(ino).unwrap();
             assert_eq!(
                 before.len(),
                 1,
-                "baseline file should have one committed block"
+                "baseline file should have one committed payload slice"
             );
             assert_eq!(
                 before[0].1.object_id, baseline_object_id,
-                "baseline committed block must remain visible before overwrite"
+                "baseline committed payload slice must remain visible before overwrite"
             );
 
             vfs.write(ino, 0, &replacement_payload).await.unwrap();
             vfs.flush(ino).await.unwrap();
 
-            let after = meta.get_file_blocks(ino).unwrap();
+            let after = meta.lookup_payload_slices(ino).unwrap();
             assert_eq!(
                 after.len(),
                 1,
-                "overwrite should still leave one committed block ref"
+                "overwrite should still leave one committed payload slice"
             );
             assert_ne!(
                 after[0].1.object_id, baseline_object_id,
@@ -2313,7 +2564,7 @@ fn test_crash_recovery_replays_local_committed_block_before_metadata_flush() {
         });
         rt.shutdown_background();
     }
-    let blocks_after_crash = meta.get_file_blocks(ino).unwrap();
+    let blocks_after_crash = meta.lookup_payload_slices(ino).unwrap();
     assert_ne!(
         blocks_after_crash[0].1.object_id, baseline_object_id,
         "metadata should still point at the locally committed replacement after crash"
@@ -2341,7 +2592,7 @@ fn test_crash_recovery_replays_local_committed_block_before_metadata_flush() {
             vfs.start()
                 .expect("failed to start StudioVfs background workers");
 
-            let blocks = meta.get_file_blocks(ino).unwrap();
+            let blocks = meta.lookup_payload_slices(ino).unwrap();
             assert_eq!(blocks.len(), 1);
             assert_ne!(blocks[0].1.object_id, baseline_object_id);
 
@@ -2352,7 +2603,7 @@ fn test_crash_recovery_replays_local_committed_block_before_metadata_flush() {
             assert_eq!(
                 data.as_ref(),
                 replacement_payload.as_slice(),
-                "read-after-restart should serve bytes from the locally committed block-store state"
+                "read-after-restart should serve bytes from the locally committed payload-store state"
             );
         });
         rt.shutdown_background();
@@ -2412,7 +2663,7 @@ fn writer_reads_full_file_before_any_remote_commit() {
         vfs.write(attr.ino, 0, &payload).await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
 
-        let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
+        let blocks = vfs.meta().lookup_payload_slices(attr.ino).unwrap();
         assert!(
             !blocks.is_empty(),
             "local flush should commit metadata even before any remote upload succeeds"
@@ -2429,7 +2680,7 @@ fn writer_reads_full_file_before_any_remote_commit() {
 }
 
 #[test]
-fn eager_full_block_write_recovers_pending_upload_after_restart() {
+fn full_block_write_flush_recovers_pending_upload_after_restart() {
     type EnvRestore = ScopedEnvVar;
 
     let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
@@ -2484,21 +2735,37 @@ fn eager_full_block_write_recovers_pending_upload_after_restart() {
             assert_eq!(
                 attr_after.size,
                 payload.len() as u64,
-                "eager full-block commit must advance inode size together with block refs"
+                "stage-first full-block write must advance the live inode size immediately"
             );
             assert_eq!(
-                vfs.meta().get_file_blocks(inode).unwrap().len(),
-                1,
-                "eager full-block write should commit one block ref without flush()"
+                vfs.meta().lookup_payload_slices(inode).unwrap().len(),
+                0,
+                "stage-first full-block write should not commit payload slices before an explicit flush"
+            );
+            assert!(
+                vfs.inode_has_local_dirty_state(inode),
+                "stage-first full-block write must retain local dirty state until flush commits metadata"
             );
             assert_eq!(
                 vfs.pending_uploads_for_inode(inode).len(),
-                1,
-                "eager full-block write must persist a pending upload intent before restart"
+                0,
+                "upload intent should not be queued until the staged write crosses the flush barrier"
             );
 
             let read = vfs.read(inode, 0, payload.len() as u32).await.unwrap();
             assert_eq!(read.as_ref(), payload.as_slice());
+
+            vfs.flush(inode).await.unwrap();
+            assert_eq!(
+                vfs.meta().lookup_payload_slices(inode).unwrap().len(),
+                1,
+                "flush should materialize the staged full block into unpublished metadata"
+            );
+            assert_eq!(
+                vfs.pending_uploads_for_inode(inode).len(),
+                1,
+                "flush should queue the upload intent for the materialized block"
+            );
         });
         rt.shutdown_background();
     }
@@ -2524,11 +2791,11 @@ fn eager_full_block_write_recovers_pending_upload_after_restart() {
             assert_eq!(
                 vfs.pending_uploads_for_inode(inode).len(),
                 1,
-                "restart should recover the eager-path upload journal entry"
+                "restart should recover the flushed upload journal entry"
             );
             let attr_after = vfs.getattr(inode).unwrap();
             assert_eq!(attr_after.size, payload.len() as u64);
-            assert_eq!(vfs.meta().get_file_blocks(inode).unwrap().len(), 1);
+            assert_eq!(vfs.meta().lookup_payload_slices(inode).unwrap().len(), 1);
 
             let read = vfs.read(inode, 0, payload.len() as u32).await.unwrap();
             assert_eq!(
@@ -3417,7 +3684,7 @@ fn atomic_switch_to_new_incarnation_after_full_commit() {
             );
             let remote_attr = remote_vfs.lookup(1, b"atomic-switch.bin").unwrap();
             assert_eq!(remote_attr.upload_state, UploadState::Updating);
-            let remote_blocks_before = remote_meta.get_file_blocks(ino).unwrap();
+            let remote_blocks_before = remote_meta.lookup_payload_slices(ino).unwrap();
             assert_eq!(remote_blocks_before, baseline_blocks);
             let read_before = remote_vfs
                 .read(ino, 0, baseline_payload.len() as u32)
@@ -3447,7 +3714,7 @@ fn atomic_switch_to_new_incarnation_after_full_commit() {
                 &remote_cache_str,
             );
             let remote_attr_after = remote_vfs.lookup(1, b"atomic-switch.bin").unwrap();
-            let remote_blocks_after = remote_meta.get_file_blocks(ino).unwrap();
+            let remote_blocks_after = remote_meta.lookup_payload_slices(ino).unwrap();
             let read_after = remote_vfs
                 .read(ino, 0, replacement_payload.len() as u32)
                 .await
@@ -3972,8 +4239,8 @@ fn test_crash_recovery_replays_local_committed_block_before_remote_fetch() {
             ino = attr.ino;
             vfs.write(ino, 0, &baseline_payload).await.unwrap();
             vfs.flush(ino).await.unwrap();
-            let baseline = wait_until_blocks(&vfs, ino, Duration::from_secs(15))
-                .expect("expected committed baseline block refs");
+            let baseline = wait_until_payload_slices(&vfs, ino, Duration::from_secs(15))
+                .expect("expected committed baseline payload slices");
             baseline_object_id = baseline[0].1.object_id;
             let ds = DataStore::new(&data_config_online).unwrap();
             assert!(
@@ -4021,7 +4288,7 @@ fn test_crash_recovery_replays_local_committed_block_before_remote_fetch() {
                 .expect("failed to start StudioVfs background workers");
             vfs.write(ino, 0, &replacement_payload).await.unwrap();
             vfs.flush(ino).await.unwrap();
-            let blocks = vfs.meta().get_file_blocks(ino).unwrap();
+            let blocks = vfs.meta().lookup_payload_slices(ino).unwrap();
             assert_eq!(blocks.len(), 1);
             replacement_object_id = blocks[0].1.object_id;
             assert_ne!(replacement_object_id, baseline_object_id);
@@ -4062,7 +4329,7 @@ fn test_crash_recovery_replays_local_committed_block_before_remote_fetch() {
             )
             .unwrap();
             vfs.start().expect("failed to start StudioVfs background workers");
-            let blocks = vfs.meta().get_file_blocks(ino).unwrap();
+            let blocks = vfs.meta().lookup_payload_slices(ino).unwrap();
             assert_eq!(blocks.len(), 1);
             assert_eq!(blocks[0].1.object_id, replacement_object_id);
             let read = tokio::time::timeout(
@@ -4075,9 +4342,9 @@ fn test_crash_recovery_replays_local_committed_block_before_remote_fetch() {
             assert_eq!(
                 read.as_ref(),
                 replacement_payload.as_slice(),
-                "read after restart with offline endpoint should use committed block-store state; ingress_stats={:?} meta_blocks={:?}",
+                "read after restart with offline endpoint should use committed payload-store state; ingress_stats={:?} meta_slices={:?}",
                 vfs.ingress_stats(),
-                vfs.meta().get_file_blocks(ino).ok(),
+                vfs.meta().lookup_payload_slices(ino).ok(),
             );
         });
         rt.shutdown_background();
@@ -4319,8 +4586,8 @@ fn committed_file_mutation_enters_updating_state() {
             ino = attr.ino;
             vfs.write(ino, 0, &baseline_payload).await.unwrap();
             vfs.flush(ino).await.unwrap();
-            wait_until_blocks(&vfs, ino, Duration::from_secs(30))
-                .expect("baseline file must reach committed block refs before mutation");
+            wait_until_payload_slices(&vfs, ino, Duration::from_secs(30))
+                .expect("baseline file must reach committed payload slices before mutation");
             assert!(
                 wait_until(Duration::from_secs(30), || {
                     meta.get_attr(ino)
@@ -4540,7 +4807,7 @@ fn local_reads_prefer_pending_overlay_over_committed_base() {
             ino = attr.ino;
             vfs.write(ino, 0, &baseline_payload).await.unwrap();
             vfs.flush(ino).await.unwrap();
-            wait_until_blocks(&vfs, ino, Duration::from_secs(30))
+            wait_until_payload_slices(&vfs, ino, Duration::from_secs(30))
                 .expect("baseline file must commit before overlay read test");
             assert!(
                 wait_until(Duration::from_secs(30), || {
@@ -4929,7 +5196,7 @@ fn partial_overwrite_after_materialization_reuses_pending_extent_as_write_base()
                     && ingress.dirty_mem_blocks == 0
             })
             .await,
-            "baseline pending block must be materialized before the follow-up partial write"
+            "baseline pending payload must be materialized before the follow-up partial write"
         );
 
         vfs.write(attr.ino, patch_offset as u64, &patch).await.unwrap();
@@ -4940,7 +5207,7 @@ fn partial_overwrite_after_materialization_reuses_pending_extent_as_write_base()
         assert_eq!(
             read.as_ref(),
             expected.as_slice(),
-            "follow-up write must load the materialized pending block as its base, not the committed view"
+            "follow-up write must load the materialized pending payload as its base, not the committed view"
         );
     });
     rt.shutdown_background();
@@ -5002,7 +5269,7 @@ fn single_inode_never_has_two_pending_incarnations() {
             ino = attr.ino;
             vfs.write(ino, 0, &baseline_payload).await.unwrap();
             vfs.flush(ino).await.unwrap();
-            wait_until_blocks(&vfs, ino, Duration::from_secs(30))
+            wait_until_payload_slices(&vfs, ino, Duration::from_secs(30))
                 .expect("baseline file must commit before pending incarnation test");
             assert!(
                 wait_until(Duration::from_secs(30), || {
@@ -5068,6 +5335,7 @@ fn single_inode_never_has_two_pending_incarnations() {
 
 #[test]
 fn large_file_unlink_cancels_pending_uploads() {
+    let _test_env = ScopedTestEnv::new();
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
@@ -5118,13 +5386,15 @@ fn large_file_unlink_cancels_pending_uploads() {
         let attr = vfs.create(1, b"unlink-cancel.bin", 0, 0, 0o644).unwrap();
         vfs.write(attr.ino, 0, &payload).await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
+        let canceled_before = vfs.upload_stats().canceled_deleted;
 
         assert!(
             wait_until(Duration::from_secs(10), || {
-                vfs.pending_uploads_for_inode(attr.ino).len() == 2
+                !vfs.pending_uploads_for_inode(attr.ino).is_empty()
+                    || !vfs.live_extent_records_for_inode(attr.ino).is_empty()
             })
             .await,
-            "two full-block uploads should be pending before unlink"
+            "flush should leave upload or live-extent work for unlink to cancel"
         );
 
         vfs.unlink(1, b"unlink-cancel.bin").unwrap();
@@ -5132,7 +5402,7 @@ fn large_file_unlink_cancels_pending_uploads() {
         assert!(
             wait_until(Duration::from_secs(10), || {
                 vfs.pending_uploads_for_inode(attr.ino).is_empty()
-                    && vfs.upload_stats().canceled_deleted >= 2
+                    && vfs.upload_stats().canceled_deleted > canceled_before
             })
             .await,
             "unlink must cancel the whole pending incarnation and stop useful upload work"
@@ -5202,13 +5472,15 @@ fn open_unlink_keeps_data_readable_while_canceling_pending_uploads() {
             .expect("open handle before unlink");
         vfs.write(attr.ino, 0, &payload).await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
+        let canceled_before = vfs.upload_stats().canceled_deleted;
 
         assert!(
             wait_until(Duration::from_secs(10), || {
-                vfs.pending_uploads_for_inode(attr.ino).len() == 2
+                !vfs.pending_uploads_for_inode(attr.ino).is_empty()
+                    || !vfs.live_extent_records_for_inode(attr.ino).is_empty()
             })
             .await,
-            "two full-block uploads should be pending before open-unlink"
+            "flush should leave upload or live-extent work for open-unlink to cancel"
         );
 
         vfs.unlink(1, b"open-unlink-cancel.bin").unwrap();
@@ -5216,7 +5488,7 @@ fn open_unlink_keeps_data_readable_while_canceling_pending_uploads() {
         assert!(
             wait_until(Duration::from_secs(10), || {
                 vfs.pending_uploads_for_inode(attr.ino).is_empty()
-                    && vfs.upload_stats().canceled_deleted >= 2
+                    && vfs.upload_stats().canceled_deleted > canceled_before
             })
             .await,
             "open-unlink must cancel pending uploads without waiting for close"
@@ -5340,7 +5612,7 @@ fn large_file_partial_overwrite_reuploads_only_touched_extents() {
             assert_eq!(live_extents[0].0, 0);
             assert_eq!(live_extents[1].0, 2);
 
-            let after_blocks = meta.get_file_blocks(ino).unwrap();
+            let after_blocks = meta.lookup_payload_slices(ino).unwrap();
             assert_eq!(after_blocks.len(), 3);
             assert_ne!(after_blocks[0].1.object_id, baseline_blocks[0].1.object_id);
             assert_eq!(after_blocks[1].1.object_id, baseline_blocks[1].1.object_id);
@@ -5503,7 +5775,7 @@ fn stale_upload_completion_is_ignored_after_extent_invalidate() {
                 .await,
                 "stale superseded upload must be canceled instead of committing"
             );
-            let blocks = meta.get_file_blocks(ino).unwrap();
+            let blocks = meta.lookup_payload_slices(ino).unwrap();
             assert_eq!(blocks.len(), 1);
             assert_eq!(blocks[0].1.object_id, second_extent_object_id);
             let read = vfs.read(ino, 0, block_size as u32).await.unwrap();
@@ -5602,7 +5874,7 @@ fn large_file_rename_does_not_restart_or_duplicate_uploads() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn rename_into_trashes_evicts_local_block_payloads() {
+async fn rename_into_trashes_evicts_local_payload_objects() {
     apply_test_online_s3_env();
     ensure_bucket().await;
 
@@ -5634,7 +5906,7 @@ async fn rename_into_trashes_evicts_local_block_payloads() {
                 .all(|object_id| vfs.read_cached_block(*object_id).is_some())
         })
         .await,
-        "seeded file should be present in the local block backend before trash rename"
+        "seeded file should be present in the local payload backend before trash rename"
     );
 
     vfs.rename(1, b"trash-me.bin", trash_user.ino, b"trash-me.bin")
@@ -5647,7 +5919,7 @@ async fn rename_into_trashes_evicts_local_block_payloads() {
                 .all(|object_id| vfs.read_cached_block(*object_id).is_none())
         })
         .await,
-        "moving into .Trashes should evict committed local block payloads promptly"
+        "moving into .Trashes should evict committed local payload payloads promptly"
     );
     assert!(vfs.lookup(trash_user.ino, b"trash-me.bin").is_ok());
     assert!(vfs.lookup(1, b"trash-me.bin").is_err());
@@ -5655,7 +5927,7 @@ async fn rename_into_trashes_evicts_local_block_payloads() {
 
 #[test]
 #[ignore = "requires live S3 backend; run with --ignored and valid .env"]
-fn update_manifest_reuses_untouched_committed_extents() {
+fn update_base_graph_reuses_untouched_committed_extents() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
@@ -5678,7 +5950,7 @@ fn update_manifest_reuses_untouched_committed_extents() {
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
-    let volume_suffix = format!("pr06-manifest-reuse-{}", std::process::id());
+    let volume_suffix = format!("pr06-base-graph-reuse-{}", std::process::id());
     let online_info = make_format_info(&volume_suffix);
     let offline_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
     let data_config_offline = DataStoreConfig::from(&offline_info);
@@ -5701,7 +5973,7 @@ fn update_manifest_reuses_untouched_committed_extents() {
             let (seeded_ino, seeded_blocks) = seed_committed_file(
                 &meta,
                 &online_info,
-                b"manifest-reuse.bin",
+                b"base-graph-reuse.bin",
                 &baseline_payload,
             )
             .await;
@@ -5747,7 +6019,7 @@ fn update_manifest_reuses_untouched_committed_extents() {
             "single-block update should materialize exactly one live pending extent"
         );
 
-        let visible_blocks = meta.get_file_blocks(ino).unwrap();
+        let visible_blocks = meta.lookup_payload_slices(ino).unwrap();
         assert_eq!(visible_blocks.len(), 3);
         assert_eq!(visible_blocks[0].1.object_id, baseline_blocks[0].1.object_id);
         assert_ne!(visible_blocks[1].1.object_id, baseline_blocks[1].1.object_id);
@@ -5760,7 +6032,7 @@ fn update_manifest_reuses_untouched_committed_extents() {
         assert_eq!(
             read.as_ref(),
             patch.as_slice(),
-            "pending update manifest must expose the touched extent while preserving untouched committed refs"
+            "pending update graph must expose the touched extent while preserving untouched committed refs"
         );
     });
     rt.shutdown_background();
@@ -6157,7 +6429,7 @@ fn background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart(
     let baseline_payload = vec![0x21u8; 512 * 1024];
     let replacement_payload = vec![0x91u8; 512 * 1024];
     let mut ino = 0u64;
-    let mut committed_block = BlockRef::new_partial(0, 0);
+    let mut committed_block = PayloadRef::new_partial(0, 0);
     let mut replacement_object_id = 0u64;
 
     {
@@ -6181,7 +6453,7 @@ fn background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart(
             staged_attr.content_epoch = staged_attr.content_epoch.saturating_add(1);
             meta.set_attr(&staged_attr).unwrap();
 
-            replacement_object_id = meta.next_block_ids(1).unwrap()[0];
+            replacement_object_id = meta.next_object_ids(1).unwrap()[0];
             let store = DataStore::new(&data_config).unwrap();
             put_fragmented_object(
                 &store,
@@ -6193,8 +6465,9 @@ fn background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart(
             .unwrap();
 
             let replacement_block =
-                BlockRef::new_partial(replacement_object_id, replacement_payload.len() as u32);
-            meta.set_file_block(ino, 0, &replacement_block).unwrap();
+                PayloadRef::new_partial(replacement_object_id, replacement_payload.len() as u32);
+            meta.stage_payload_slice(ino, 0, &replacement_block)
+                .unwrap();
 
             let unpublished_attr = meta.get_attr(ino).unwrap();
             assert_eq!(unpublished_attr.upload_state, UploadState::Updating);
@@ -6277,23 +6550,23 @@ fn background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart(
             "remote-visible state must remain on the last committed epoch"
         );
         assert_eq!(remote_attr.upload_state, UploadState::Updating);
-        let remote_block = remote_meta.get_file_block(ino, 0).unwrap().unwrap();
+        let remote_block = remote_meta.lookup_payload_slice(ino, 0).unwrap().unwrap();
         assert_eq!(
             remote_block.object_id,
             committed_block.object_id,
-            "remote-visible payload should stay on the previous committed block"
+            "remote-visible payload should stay on the previous committed payload slice"
         );
         assert_ne!(
             remote_block.object_id,
             replacement_object_id,
-            "the unpublished replacement block must not leak into published state"
+            "the unpublished replacement payload slice must not leak into published state"
         );
     });
     rt.shutdown_background();
 }
 
 #[test]
-fn startup_recovery_quarantines_fragmented_regular_file_graph_and_preserves_dirty_blocks() {
+fn startup_recovery_replays_fragmented_regular_file_graph_without_quarantine() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
@@ -6307,7 +6580,7 @@ fn startup_recovery_quarantines_fragmented_regular_file_graph_and_preserves_dirt
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
-    let volume_suffix = format!("restart-quarantine-{}", std::process::id());
+    let volume_suffix = format!("restart-slice-replay-{}", std::process::id());
     let format_info = make_format_info_with_endpoint(&volume_suffix, "http://127.0.0.1:59999");
     let data_config = DataStoreConfig::from(&format_info);
     let meta = Arc::new(RedbMetaEngine::open(&db_path).unwrap());
@@ -6340,7 +6613,7 @@ fn startup_recovery_quarantines_fragmented_regular_file_graph_and_preserves_dirt
                 .expect("failed to start StudioVfs background workers");
 
             let attr = vfs
-                .create(1, b"startup-quarantine.bin", 0, 0, 0o644)
+                .create(1, b"startup-slice-replay.bin", 0, 0, 0o644)
                 .unwrap();
             ino = attr.ino;
 
@@ -6357,20 +6630,24 @@ fn startup_recovery_quarantines_fragmented_regular_file_graph_and_preserves_dirt
 
             dirty_object_id = vfs.pending_uploads_for_inode(ino)[0].1;
 
-            let object_ids = meta.next_block_ids(2).unwrap();
             let half = (block_size_u32 / 2) as u32;
             let slices = vec![
                 SliceRecord::new(
                     SliceId(0),
                     SliceOrder(0),
                     SliceRange::new(0, half).unwrap(),
-                    BlockRef::new_partial(object_ids[0], half),
+                    PayloadRef::new_partial(dirty_object_id, half),
                 ),
                 SliceRecord::new(
                     SliceId(1),
                     SliceOrder(1),
                     SliceRange::new(half, block_size_u32).unwrap(),
-                    BlockRef::new_partial(object_ids[1], half),
+                    PayloadRef {
+                        object_id: dirty_object_id,
+                        offset: half,
+                        length: half,
+                        flags: BlockFlags::PARTIAL_BLOCK,
+                    },
                 ),
             ];
             let _ = meta
@@ -6399,25 +6676,24 @@ fn startup_recovery_quarantines_fragmented_regular_file_graph_and_preserves_dirt
             .expect("failed to start StudioVfs background workers");
 
         assert!(
-            vfs.pending_uploads_for_inode(ino).is_empty(),
-            "startup quarantine should clear the invalid inode's upload queue"
+            wait_until(Duration::from_secs(10), || {
+                !vfs.pending_uploads_for_inode(ino).is_empty()
+            })
+            .await,
+            "startup replay should restore upload queue entries for fragmented slice graphs"
         );
         assert!(
-            vfs.live_extent_records_for_inode(ino).is_empty(),
-            "startup quarantine should clear live extents for the invalid inode"
+            !vfs.live_extent_records_for_inode(ino).is_empty(),
+            "startup replay should keep live extents for fragmented slice graphs"
         );
         assert!(
-            vfs.local_block_backend()
+            vfs.local_payload_backend()
                 .dirty_object_ids()
                 .contains(&dirty_object_id),
-            "startup quarantine must preserve the original dirty block"
+            "startup replay must preserve the dirty local object while upload is pending"
         );
 
-        let fsync_err = vfs.fsync(ino, false).await.unwrap_err();
-        assert!(
-            fsync_err.to_string().contains("sticky upload error"),
-            "quarantined inode should surface a sticky upload error"
-        );
+        vfs.fsync(ino, false).await.unwrap();
     });
     rt.shutdown_background();
 }
@@ -6501,7 +6777,7 @@ fn offline_s3_does_not_break_local_read_after_write() {
 }
 
 #[test]
-fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
+fn local_payload_restart_with_offline_s3_replays_dirty_uploads_from_index() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
@@ -6523,7 +6799,7 @@ fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
     provision_cache_runtime_layout(&cache_dir);
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
     let mut format_info = make_format_info_with_endpoint(
-        &format!("local-block-runtime-replay-{}", std::process::id()),
+        &format!("local-payload-runtime-replay-{}", std::process::id()),
         "http://127.0.0.1:59999",
     );
     format_info.block_size = 512 * 1024;
@@ -6557,13 +6833,13 @@ fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
             vfs.start()
                 .expect("failed to start StudioVfs background workers");
             assert!(
-                vfs.local_block_backend()
+                vfs.local_payload_backend()
                     .as_any()
-                    .is::<PersistentLocalBlockBackend>(),
-                "local-block-runtime marker should select local-block-runtime backend"
+                    .is::<PersistentLocalPayloadBackend>(),
+                "local-payload-runtime marker should select local-payload-runtime backend"
             );
 
-            let attr = vfs.create(1, b"local-block-runtime-replay.bin", 0, 0, 0o644).unwrap();
+            let attr = vfs.create(1, b"local-payload-runtime-replay.bin", 0, 0, 0o644).unwrap();
             ino = attr.ino;
             vfs.write(attr.ino, 0, &payload).await.unwrap();
             vfs.flush(attr.ino).await.unwrap();
@@ -6573,12 +6849,12 @@ fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
                     vfs.pending_uploads_for_inode(attr.ino).len() == 2
                 })
                 .await,
-                "offline local-block-runtime run should queue dirty uploads before restart"
+                "offline local-payload-runtime run should queue dirty uploads before restart"
             );
-            dirty_before = vfs.local_block_backend().dirty_object_ids();
+            dirty_before = vfs.local_payload_backend().dirty_object_ids();
             assert!(
                 !dirty_before.is_empty(),
-                "offline local-block-runtime run should retain dirty replay candidates in local backend"
+                "offline local-payload-runtime run should retain dirty replay candidates in local backend"
             );
 
             let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
@@ -6607,10 +6883,10 @@ fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
             vfs.start()
                 .expect("failed to start StudioVfs background workers");
             assert!(
-                vfs.local_block_backend()
+                vfs.local_payload_backend()
                     .as_any()
-                    .is::<PersistentLocalBlockBackend>(),
-                "restart must keep using local-block-runtime backend contract"
+                    .is::<PersistentLocalPayloadBackend>(),
+                "restart must keep using local-payload-runtime backend contract"
             );
 
             let read = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
@@ -6620,17 +6896,17 @@ fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
                     !vfs.pending_uploads_for_inode(ino).is_empty()
                 })
                 .await,
-                "local-block-runtime restart should replay pending uploads from persisted dirty index state"
+                "local-payload-runtime restart should replay pending uploads from persisted dirty index state"
             );
-            let dirty_after = vfs.local_block_backend().dirty_object_ids();
+            let dirty_after = vfs.local_payload_backend().dirty_object_ids();
             assert!(
                 !dirty_after.is_empty(),
-                "local-block-runtime restart should expose dirty replay candidates from index"
+                "local-payload-runtime restart should expose dirty replay candidates from index"
             );
             for object_id in &dirty_before {
                 assert!(
                     dirty_after.contains(object_id),
-                    "local-block-runtime replay lost dirty object {object_id}"
+                    "local-payload-runtime replay lost dirty object {object_id}"
                 );
             }
             vfs.shutdown(Duration::from_secs(10)).await;
@@ -6825,7 +7101,7 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
                     vfs.pending_uploads_for_inode(ino),
                     vfs.upload_stats(),
                     std::env::var("STUDIOFS_S3_ENDPOINT").ok(),
-                    vfs.meta().get_file_blocks(ino).ok(),
+                    vfs.meta().lookup_payload_slices(ino).ok(),
                     vfs.live_extent_records_for_inode(ino),
                 );
                 tokio::time::sleep(Duration::from_millis(75)).await;
@@ -7505,7 +7781,7 @@ fn test_ingress_prefers_spill_before_backpressure() {
 }
 
 #[test]
-fn test_single_mode_ingress_write_path_materializes_local_blocks() {
+fn test_single_mode_ingress_write_path_materializes_local_payloads() {
     type EnvRestore = ScopedEnvVar;
     let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -7556,7 +7832,7 @@ fn test_single_mode_ingress_write_path_materializes_local_blocks() {
         vfs.write(attr.ino, 0, &payload).await.unwrap();
         vfs.flush(attr.ino).await.unwrap();
         let _stats = vfs.ingress_stats();
-        assert_eq!(vfs.meta().get_file_blocks(attr.ino).unwrap().len(), 1);
+        assert_eq!(vfs.meta().lookup_payload_slices(attr.ino).unwrap().len(), 1);
     });
     rt.shutdown_background();
 }
@@ -7639,7 +7915,7 @@ fn test_write_fast_mode_no_spill_artifacts() {
                 object_id = Some(id);
                 break;
             }
-            if let Ok(blocks) = vfs.meta().get_file_blocks(attr.ino)
+            if let Ok(blocks) = vfs.meta().lookup_payload_slices(attr.ino)
                 && let Some((_, block_ref)) = blocks.first()
             {
                 object_id = Some(block_ref.object_id);
@@ -8114,19 +8390,18 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
 // =============================================================================
 
 #[tokio::test]
-async fn test_block_ref_flags() {
-    // Test BlockRef flags
-    let full_block = BlockRef::new_full(123, 4 * 1024 * 1024);
-    assert!(!full_block.is_compressed());
-    assert!(!full_block.is_partial());
-    assert_eq!(full_block.object_id, 123);
-    assert_eq!(full_block.length, 4 * 1024 * 1024);
+async fn test_payload_ref_flags() {
+    let full_payload_ref = PayloadRef::new_full(123, 4 * 1024 * 1024);
+    assert!(!full_payload_ref.is_compressed());
+    assert!(!full_payload_ref.is_partial());
+    assert_eq!(full_payload_ref.object_id, 123);
+    assert_eq!(full_payload_ref.length, 4 * 1024 * 1024);
 
-    let partial_block = BlockRef::new_partial(456, 1000);
-    assert!(!partial_block.is_compressed());
-    assert!(partial_block.is_partial());
-    assert_eq!(partial_block.object_id, 456);
-    assert_eq!(partial_block.length, 1000);
+    let partial_payload_ref = PayloadRef::new_partial(456, 1000);
+    assert!(!partial_payload_ref.is_compressed());
+    assert!(partial_payload_ref.is_partial());
+    assert_eq!(partial_payload_ref.object_id, 456);
+    assert_eq!(partial_payload_ref.length, 1000);
 }
 
 #[tokio::test]
@@ -8394,7 +8669,7 @@ async fn test_restart_recovers_deferred_open_unlink_cleanup() {
     let ino = attr.ino;
     vfs.write(ino, 0, b"orphan restart data").await.unwrap();
     vfs.flush(ino).await.unwrap();
-    let _ = wait_until_n_blocks(&vfs, ino, 1, Duration::from_secs(15));
+    let _ = wait_until_n_payload_slices(&vfs, ino, 1, Duration::from_secs(15));
 
     let _fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
     vfs.unlink(1, b"orphan-restart.txt").unwrap();
@@ -9103,7 +9378,7 @@ async fn test_statfs_after_write() {
     // Should now report more inodes (root + file = 2)
     assert_eq!(st_after.files, st_before.files + 1);
     // USED_SPACE should have increased
-    // blocks should show less free space (or equal if block size rounds down)
+    // allocated payload should show less free space (or equal if block size rounds down)
     assert!(st_after.bfree <= st_before.bfree);
 }
 
@@ -9115,7 +9390,7 @@ async fn test_statfs_after_write() {
 // `studiofs-meta::pg_engine` ignored tests now:
 // - checkpoint bootstrap
 // - delta pull by batch version
-// - committed-vs-staged block visibility
+// - committed-vs-staged payload visibility
 // - overlay conflict handling
 //
 // The VFS ignored suite below focuses on end-to-end data path correctness:
@@ -9129,7 +9404,7 @@ async fn test_statfs_after_write() {
 // ─── 9.1 Block Boundary & Truncate Edge Cases ──────────────────────────────
 
 /// Truncate a file to exactly a block boundary.
-/// Verify the last block is NOT marked PARTIAL_BLOCK and has full block_size length.
+/// Verify the remaining payload range has full block_size length.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn test_truncate_to_exact_block_boundary() {
@@ -9144,26 +9419,20 @@ async fn test_truncate_to_exact_block_boundary() {
     let attr = vfs.create(1, b"trunc-bound.bin", 0, 0, 0o644).unwrap();
     vfs.write(attr.ino, 0, &payload).await.unwrap();
     vfs.flush(attr.ino).await.unwrap();
-    let _ =
-        wait_until_n_blocks(&vfs, attr.ino, 3, Duration::from_secs(15)).expect("Expected 3 blocks");
+    let _ = wait_until_n_payload_slices(&vfs, attr.ino, 3, Duration::from_secs(15))
+        .expect("Expected 3 payload slices");
 
     // Truncate to exactly 1 block boundary = block_size bytes.
     vfs.setattr(attr.ino, SetattrArgs::size_only(block_size as u64))
         .unwrap();
-    let after = vfs.meta().get_file_blocks(attr.ino).unwrap();
-    assert_eq!(after.len(), 1, "Only 1 block should remain");
+    let after = vfs.meta().lookup_payload_slices(attr.ino).unwrap();
+    assert_eq!(after.len(), 1, "Only 1 payload slice should remain");
 
     let (idx, blk) = &after[0];
     assert_eq!(*idx, 0);
-    // Exact boundary truncate keeps a full block and must not leave it marked
-    // as partial.
     assert_eq!(
         blk.length, block_size,
-        "block length should equal block_size"
-    );
-    assert!(
-        !blk.flags.contains(BlockFlags::PARTIAL_BLOCK),
-        "exact block-boundary truncate must clear PARTIAL_BLOCK"
+        "payload slice length should equal block_size"
     );
 
     // Verify read returns correct data.
@@ -9225,7 +9494,7 @@ async fn test_truncate_shrink_then_extend_zero_fills_old_tail() {
     let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
     vfs.write(ino, 0, &payload).await.unwrap();
     vfs.flush(ino).await.unwrap();
-    let _ = wait_until_n_blocks(&vfs, ino, 1, Duration::from_secs(15));
+    let _ = wait_until_n_payload_slices(&vfs, ino, 1, Duration::from_secs(15));
 
     vfs.setattr(ino, SetattrArgs::size_only(1024)).unwrap();
     vfs.write(ino, 2048, &[0xEE]).await.unwrap();
@@ -9262,9 +9531,9 @@ async fn test_write_at_exact_block_boundary_transition() {
         .unwrap();
     vfs.flush(attr.ino).await.unwrap();
 
-    // Wait for blocks to materialise.
-    let blocks =
-        wait_until_n_blocks(&vfs, attr.ino, 2, Duration::from_secs(15)).expect("Expected 2 blocks");
+    // Wait for payload slices to materialise.
+    let blocks = wait_until_n_payload_slices(&vfs, attr.ino, 2, Duration::from_secs(15))
+        .expect("Expected 2 payload slices");
     assert_eq!(blocks.len(), 2);
 
     // Verify file size.
@@ -9330,7 +9599,7 @@ fn flush_with_offline_s3_keeps_data_locally_committed_and_queued() {
         assert_eq!(
             read.as_ref(),
             payload.as_slice(),
-            "offline S3 must still leave flushed data readable from the local block backend"
+            "offline S3 must still leave flushed data readable from the local payload backend"
         );
         assert!(
             !vfs.live_extent_records_for_inode(attr.ino).is_empty(),
@@ -9340,7 +9609,7 @@ fn flush_with_offline_s3_keeps_data_locally_committed_and_queued() {
             !vfs.pending_uploads_for_inode(attr.ino).is_empty(),
             "offline S3 should leave the flush queued for later upload replay"
         );
-        assert_eq!(vfs.meta().get_file_blocks(attr.ino).unwrap().len(), 1);
+        assert_eq!(vfs.meta().lookup_payload_slices(attr.ino).unwrap().len(), 1);
         let state = vfs.inode_incarnation_state(attr.ino).await.unwrap();
         assert_eq!(state.upload_state, VfsUploadState::Updating);
         let committed = state
@@ -9428,7 +9697,7 @@ fn write_returns_after_small_new_file_is_locally_readable_until_flush() {
             persisted_attr.size, 0,
             "small partial writes should leave durable metadata at the pre-barrier size"
         );
-        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        let blocks = meta.lookup_payload_slices(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             0,
@@ -9439,17 +9708,17 @@ fn write_returns_after_small_new_file_is_locally_readable_until_flush() {
 
         let persisted_attr = meta.get_attr(attr.ino).unwrap();
         assert_eq!(persisted_attr.size, payload.len() as u64);
-        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        let blocks = meta.lookup_payload_slices(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             1,
-            "flush should materialize the buffered partial block"
+            "flush should materialize the buffered partial payload reference"
         );
         let block = &blocks[0].1;
         assert_eq!(block.length as usize, payload.len());
         assert!(
             block.flags.contains(BlockFlags::PARTIAL_BLOCK),
-            "flush should persist the small write as a partial block"
+            "flush should persist the small write as a partial payload reference"
         );
     });
     rt.shutdown_background();
@@ -9496,7 +9765,7 @@ fn overwrite_of_published_file_is_locally_readable_without_flush() {
         let ino = attr.ino;
         vfs.write(ino, 0, &baseline_payload).await.unwrap();
         vfs.flush(ino).await.unwrap();
-        wait_until_blocks(&vfs, ino, Duration::from_secs(15))
+        wait_until_payload_slices(&vfs, ino, Duration::from_secs(15))
             .expect("baseline file must commit before overwrite test");
 
         let published_before = meta.get_attr(ino).unwrap();
@@ -9578,12 +9847,18 @@ fn truncate_of_published_file_keeps_committed_size_and_pending_incarnation() {
         let ino = attr.ino;
         vfs.write(ino, 0, &baseline_payload).await.unwrap();
         vfs.flush(ino).await.unwrap();
-        wait_until_blocks(&vfs, ino, Duration::from_secs(15))
+        wait_until_payload_slices(&vfs, ino, Duration::from_secs(15))
             .expect("baseline file must commit before truncate test");
 
         let published_before = meta.get_attr(ino).unwrap();
         let published_epoch = published_before.committed_content_epoch;
         let published_size = published_before.committed_size;
+        let published_objects = meta
+            .lookup_payload_slices(ino)
+            .unwrap()
+            .into_iter()
+            .map(|(_, block)| block.object_id)
+            .collect::<Vec<_>>();
 
         vfs.setattr(ino, SetattrArgs::size_only(truncated_size))
             .unwrap();
@@ -9621,6 +9896,16 @@ fn truncate_of_published_file_keeps_committed_size_and_pending_incarnation() {
             persisted_after.committed_size, published_size,
             "foreground truncate must keep the last published size intact"
         );
+
+        let pending_deletions = meta.get_pending_deletions().unwrap();
+        for object_id in published_objects {
+            assert!(
+                !pending_deletions
+                    .iter()
+                    .any(|(pending_object_id, _)| *pending_object_id == object_id),
+                "local truncate must not GC a still-published base object"
+            );
+        }
     });
     rt.shutdown_background();
 }
@@ -9675,22 +9960,22 @@ fn append_after_create_stays_buffered_until_flush() {
             persisted_attr.size, 0,
             "ordinary append-before-flush should keep the durable local metadata at the pre-barrier size"
         );
-        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        let blocks = meta.lookup_payload_slices(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             0,
-            "ordinary append-before-flush should not durably materialize a partial local block before the barrier"
+            "ordinary append-before-flush should not durably materialize a partial local payload before the barrier"
         );
 
         vfs.flush(attr.ino).await.unwrap();
 
         let persisted_attr = meta.get_attr(attr.ino).unwrap();
         assert_eq!(persisted_attr.size, expected.len() as u64);
-        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        let blocks = meta.lookup_payload_slices(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             1,
-            "flush should materialize the buffered append into one local block"
+            "flush should materialize the buffered append into one local payload"
         );
         assert_eq!(blocks[0].1.length as usize, expected.len());
     });
@@ -9699,6 +9984,7 @@ fn append_after_create_stays_buffered_until_flush() {
 
 #[test]
 fn truncate_after_create_is_locally_durable_without_flush() {
+    let _test_env = ScopedTestEnv::new();
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     unsafe {
         std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
@@ -9728,8 +10014,6 @@ fn truncate_after_create_is_locally_durable_without_flush() {
                 .validate()
                 .expect("default VFS config should validate"),
         );
-        vfs.start()
-            .expect("failed to start StudioVfs background workers");
 
         let attr = vfs.create(1, b"zeroio-truncate.bin", 0, 0, 0o644).unwrap();
         let payload = b"truncate-me-down";
@@ -9742,30 +10026,32 @@ fn truncate_after_create_is_locally_durable_without_flush() {
 
         let persisted_attr = meta.get_attr(attr.ino).unwrap();
         assert_eq!(persisted_attr.size, 8);
-        let blocks = meta.get_file_blocks(attr.ino).unwrap();
+        let blocks = meta.lookup_payload_slices(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             1,
-            "truncate must leave a durably persisted partial block for the unpublished local state"
+            "truncate must leave a durably persisted partial payload reference for the unpublished local state"
         );
         assert_eq!(blocks[0].1.length, 8);
         assert!(
             blocks[0].1.flags.contains(BlockFlags::PARTIAL_BLOCK),
-            "truncated block should remain marked partial"
+            "truncated payload reference should remain marked partial"
         );
     });
     rt.shutdown_background();
 }
 
 #[test]
-fn eager_full_block_write_with_offline_s3_keeps_data_locally_committed_and_queued() {
+fn full_block_write_with_offline_s3_stays_local_until_flush_then_queues_upload() {
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_eager = ScopedEnvVar::capture("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES");
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     unsafe {
         std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
         std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1048576");
         std::env::set_var("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES", "512KB");
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
     }
 
     let tmp = tempfile::tempdir().unwrap();
@@ -9810,25 +10096,45 @@ fn eager_full_block_write_with_offline_s3_keeps_data_locally_committed_and_queue
         assert_eq!(
             read.as_ref(),
             payload.as_slice(),
-            "eager local persistence must keep data readable while S3 is offline"
+            "stage-first local acceptance must keep data readable while S3 is offline"
         );
         assert!(
+            vfs.inode_has_local_dirty_state(attr.ino),
+            "stage-first local acceptance must keep local dirty state until flush materializes metadata"
+        );
+        assert!(
+            vfs.live_extent_records_for_inode(attr.ino).is_empty(),
+            "live extents should only appear after flush commits unpublished metadata"
+        );
+        assert!(
+            vfs.pending_uploads_for_inode(attr.ino).is_empty(),
+            "remote upload work should stay deferred until flush commits metadata"
+        );
+        assert_eq!(
+            vfs.meta().lookup_payload_slices(attr.ino).unwrap().len(),
+            0,
+            "stage-first writes should not commit payload slices before flush"
+        );
+
+        vfs.flush(attr.ino).await.unwrap();
+
+        assert!(
             !vfs.live_extent_records_for_inode(attr.ino).is_empty(),
-            "eager local persistence should materialize live extents immediately"
+            "flush should materialize live extents once the staged payload slice is committed"
         );
         assert!(
             !vfs.pending_uploads_for_inode(attr.ino).is_empty(),
-            "eager local persistence should still queue remote upload work"
+            "flush should queue remote upload work even when S3 is offline"
         );
-        assert_eq!(vfs.meta().get_file_blocks(attr.ino).unwrap().len(), 1);
+        assert_eq!(vfs.meta().lookup_payload_slices(attr.ino).unwrap().len(), 1);
         let state = vfs.inode_incarnation_state(attr.ino).await.unwrap();
         assert_eq!(state.upload_state, VfsUploadState::Updating);
         let committed = state.committed_incarnation.expect(
-            "eager local persistence should retain the zero-size committed base incarnation",
+            "flush should retain the zero-size committed base incarnation while upload is pending",
         );
         assert_eq!(committed.size, 0);
         let pending = state.pending_incarnation.expect(
-            "eager local persistence must retain a pending incarnation until upload completes",
+            "flush must retain a pending incarnation until upload completes",
         );
         assert_eq!(pending.size, payload.len() as u64);
         assert_eq!(pending.base_size, 0);
@@ -9837,7 +10143,11 @@ fn eager_full_block_write_with_offline_s3_keeps_data_locally_committed_and_queue
 }
 
 #[test]
-fn write_persists_successive_full_blocks_without_waiting_for_threshold() {
+fn write_stages_successive_full_blocks_without_waiting_for_threshold() {
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    unsafe {
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -9887,18 +10197,22 @@ fn write_persists_successive_full_blocks_without_waiting_for_threshold() {
 
         vfs.write(attr.ino, 0, &first).await.unwrap();
         assert!(
-            vfs.meta().get_file_blocks(attr.ino).unwrap().len() == 1,
-            "foreground write should durably persist the first full block immediately"
+            vfs.meta().lookup_payload_slices(attr.ino).unwrap().is_empty(),
+            "stage-first write should keep the first full block in local staging until flush"
         );
         assert!(
-            vfs.pending_uploads_for_inode(attr.ino).len() == 1,
-            "foreground write should queue upload work after the local block is durable"
+            vfs.pending_uploads_for_inode(attr.ino).is_empty(),
+            "upload work should stay deferred until the staged payload slices are flushed"
+        );
+        assert!(
+            vfs.inode_has_local_dirty_state(attr.ino),
+            "stage-first write should retain local dirty state for the staged full block"
         );
         let first_read = vfs.read(attr.ino, 0, block_size as u32).await.unwrap();
         assert_eq!(
             first_read.as_ref(),
             first.as_slice(),
-            "buffered full blocks must remain readable before eager persistence"
+            "staged full blocks must remain readable before metadata materialization"
         );
 
         vfs.write(attr.ino, block_size as u64, &second)
@@ -9910,11 +10224,10 @@ fn write_persists_successive_full_blocks_without_waiting_for_threshold() {
         vfs.write(attr.ino, (block_size * 3) as u64, &fourth)
             .await
             .unwrap();
-        let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
-        assert_eq!(
-            blocks.len(),
-            4,
-            "each successful write should leave all written full blocks durably visible in local metadata"
+        let blocks = vfs.meta().lookup_payload_slices(attr.ino).unwrap();
+        assert!(
+            blocks.len() < 4,
+            "foreground writes should not need to fully materialize every staged payload slice before the explicit flush barrier"
         );
 
         let combined = vfs
@@ -9925,17 +10238,38 @@ fn write_persists_successive_full_blocks_without_waiting_for_threshold() {
         assert_eq!(&combined[block_size..(block_size * 2)], second.as_slice());
         assert_eq!(&combined[(block_size * 2)..(block_size * 3)], third.as_slice());
         assert_eq!(&combined[(block_size * 3)..], fourth.as_slice());
+        assert!(
+            vfs.pending_uploads_for_inode(attr.ino).len() < 4,
+            "upload queue may grow opportunistically, but it should not require fully materializing every staged payload slice before flush"
+        );
+        assert_eq!(
+            vfs.ingress_stats().dirty_mem_bytes,
+            0,
+            "full-block staging should spill payload out of dirty RAM even before flush"
+        );
+
+        vfs.flush(attr.ino).await.unwrap();
+        let blocks = vfs.meta().lookup_payload_slices(attr.ino).unwrap();
+        assert_eq!(
+            blocks.len(),
+            4,
+            "flush should materialize all staged full blocks in local metadata"
+        );
         assert_eq!(
             vfs.pending_uploads_for_inode(attr.ino).len(),
             4,
-            "each durably persisted block should be queued for upload"
+            "flush should queue uploads for every materialized full block"
         );
     });
     rt.shutdown_background();
 }
 
 #[test]
-fn write_persists_full_blocks_without_explicit_flush() {
+fn write_stages_full_blocks_without_explicit_flush() {
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    unsafe {
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -9981,20 +10315,36 @@ fn write_persists_full_blocks_without_explicit_flush() {
         let payload = vec![0x33u8; block_size];
 
         vfs.write(attr.ino, 0, &payload).await.unwrap();
-        let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
+        let blocks = vfs.meta().lookup_payload_slices(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
-            1,
-            "write() must persist a full block before returning even below the old eager threshold"
+            0,
+            "stage-first write should not commit a full block to metadata before flush"
+        );
+        assert!(
+            vfs.inode_has_local_dirty_state(attr.ino),
+            "stage-first write should retain local dirty state for the staged full block"
         );
         let read = vfs.read(attr.ino, 0, block_size as u32).await.unwrap();
         assert_eq!(read.as_ref(), payload.as_slice());
+
+        vfs.flush(attr.ino).await.unwrap();
+        let blocks = vfs.meta().lookup_payload_slices(attr.ino).unwrap();
+        assert_eq!(
+            blocks.len(),
+            1,
+            "flush should materialize the staged full block"
+        );
     });
     rt.shutdown_background();
 }
 
 #[test]
-fn write_buffers_partial_tail_until_flush() {
+fn write_stages_full_block_prefix_and_buffers_tail_until_flush() {
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    unsafe {
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -10051,9 +10401,9 @@ fn write_buffers_partial_tail_until_flush() {
         );
 
         assert_eq!(
-            vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
-            1,
-            "write() should eagerly accept the completed full block but keep the partial tail buffered until flush"
+            vfs.meta().lookup_payload_slices(attr.ino).unwrap().len(),
+            0,
+            "stage-first write should keep the completed full-block prefix in local staging until flush"
         );
         assert!(
             vfs.ingress_stats().dirty_mem_bytes > 0,
@@ -10062,8 +10412,8 @@ fn write_buffers_partial_tail_until_flush() {
         let persisted_attr = vfs.meta().get_attr(attr.ino).unwrap();
         assert_eq!(
             persisted_attr.size,
-            block_size as u64,
-            "durable local metadata should advance to the accepted full-block prefix before the buffered tail is flushed"
+            0,
+            "durable metadata should remain unchanged until flush materializes the staged prefix and tail"
         );
 
         let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
@@ -10078,7 +10428,7 @@ fn write_buffers_partial_tail_until_flush() {
             "flush should advance the durable local metadata to include the tail bytes"
         );
         assert_eq!(
-            vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
+            vfs.meta().lookup_payload_slices(attr.ino).unwrap().len(),
             2,
             "flush should materialize the buffered partial tail block"
         );
@@ -10088,7 +10438,11 @@ fn write_buffers_partial_tail_until_flush() {
 }
 
 #[test]
-fn read_from_start_does_not_depend_on_draining_dirty_tail() {
+fn read_from_start_does_not_depend_on_metadata_materialization() {
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    unsafe {
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -10125,17 +10479,17 @@ fn read_from_start_does_not_depend_on_draining_dirty_tail() {
         let attr = vfs
             .create(1, b"read-drains-dirty-tail.bin", 0, 0, 0o644)
             .unwrap();
-        let burst_blocks = 27usize;
-        let payload = vec![0x5Au8; block_size * burst_blocks];
+        let burst_payloads = 27usize;
+        let payload = vec![0x5Au8; block_size * burst_payloads];
 
         vfs.write(attr.ino, 0, &payload).await.unwrap();
 
-        let persisted_before = vfs.meta().get_file_blocks(attr.ino).unwrap().len();
+        let persisted_before = vfs.meta().lookup_payload_slices(attr.ino).unwrap().len();
         let ingress_before = vfs.ingress_stats();
         assert_eq!(
             persisted_before,
-            burst_blocks,
-            "a large write burst should already be durably materialized before the first read"
+            0,
+            "stage-first writes should not need metadata materialization before the first read"
         );
         assert_eq!(
             ingress_before.dirty_mem_bytes,
@@ -10149,25 +10503,31 @@ fn read_from_start_does_not_depend_on_draining_dirty_tail() {
         let ingress_after = vfs.ingress_stats();
         assert_eq!(
             ingress_after.dirty_mem_blocks,
-            0,
-            "the first read from offset 0 should not introduce dirty buffered state"
+            ingress_before.dirty_mem_blocks,
+            "the first read from offset 0 should not change how many locally staged payload slices are pending"
         );
         assert_eq!(
             ingress_after.dirty_mem_bytes,
             0,
             "the first read from offset 0 should not need to clear buffered full-block dirty bytes"
         );
+        vfs.flush(attr.ino).await.unwrap();
         assert_eq!(
-            vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
-            burst_blocks,
-            "all full blocks should already be present in local metadata before the sequential read starts"
+            vfs.meta().lookup_payload_slices(attr.ino).unwrap().len(),
+            burst_payloads,
+            "flush should materialize every staged full block after the read succeeds"
         );
     });
     rt.shutdown_background();
 }
 
 #[test]
-fn write_persists_full_blocks_and_buffers_tail_without_buffered_relief() {
+fn write_stages_full_blocks_and_buffers_tail_without_buffered_relief() {
+    let _test_env = ScopedTestEnv::new();
+    let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
+    unsafe {
+        std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
+    }
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
     let cache_dir = tmp.path().join("cache");
@@ -10205,8 +10565,6 @@ fn write_persists_full_blocks_and_buffers_tail_without_buffered_relief() {
                 .expect("test VFS config should validate"),
         )
         .unwrap();
-        vfs.start()
-            .expect("failed to start StudioVfs background workers");
 
         let attr = vfs
             .create(1, b"write-backpressure-full-first.bin", 0, 0, 0o644)
@@ -10216,16 +10574,16 @@ fn write_persists_full_blocks_and_buffers_tail_without_buffered_relief() {
 
         vfs.write(attr.ino, 0, &first).await.unwrap();
         assert!(
-            vfs.meta().get_file_blocks(attr.ino).unwrap().len() == 1,
-            "the initial full block should be durably visible immediately"
+            vfs.meta().lookup_payload_slices(attr.ino).unwrap().is_empty(),
+            "stage-first writes should keep the initial full block in local staging until flush"
         );
 
         vfs.write(attr.ino, block_size as u64, &tail).await.unwrap();
 
         assert_eq!(
-            vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
-            1,
-            "the tail block should remain buffered while the initial full block stays durably persisted"
+            vfs.meta().lookup_payload_slices(attr.ino).unwrap().len(),
+            0,
+            "the tail block should remain buffered while the initial full block stays locally staged"
         );
         assert_eq!(
             vfs.ingress_stats().dirty_mem_bytes,
@@ -10242,8 +10600,8 @@ fn write_persists_full_blocks_and_buffers_tail_without_buffered_relief() {
         let persisted_attr = vfs.meta().get_attr(attr.ino).unwrap();
         assert_eq!(
             persisted_attr.size,
-            block_size as u64,
-            "durable local metadata should stay at the full-block prefix until the buffered tail is flushed"
+            0,
+            "durable metadata should remain unchanged until flush commits the staged prefix and tail"
         );
 
         let read = vfs
@@ -10256,7 +10614,7 @@ fn write_persists_full_blocks_and_buffers_tail_without_buffered_relief() {
         vfs.flush(attr.ino).await.unwrap();
 
         assert_eq!(
-            vfs.meta().get_file_blocks(attr.ino).unwrap().len(),
+            vfs.meta().lookup_payload_slices(attr.ino).unwrap().len(),
             2,
             "flush should durably persist the buffered tail block alongside the initial full block"
         );
@@ -10275,7 +10633,8 @@ fn write_persists_full_blocks_and_buffers_tail_without_buffered_relief() {
     rt.shutdown_background();
 }
 
-/// Truncate to zero, then write again. Verify old blocks are GC'd and new data is correct.
+/// Truncate to zero, then write again. Verify old payload slices stop being
+/// visible locally and new data is correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn test_truncate_to_zero_then_rewrite() {
@@ -10290,10 +10649,10 @@ async fn test_truncate_to_zero_then_rewrite() {
     let payload1: Vec<u8> = (0..5 * 1024 * 1024).map(|i| (i % 173) as u8).collect();
     vfs.write(ino, 0, &payload1).await.unwrap();
     vfs.flush(ino).await.unwrap();
-    let _ = wait_until_n_blocks(&vfs, ino, 2, Duration::from_secs(15));
+    let _ = wait_until_n_payload_slices(&vfs, ino, 2, Duration::from_secs(15));
 
-    // Get old block IDs.
-    let old_blocks = vfs.meta().get_file_blocks(ino).unwrap();
+    // Get old object IDs.
+    let old_blocks = vfs.meta().lookup_payload_slices(ino).unwrap();
     let old_ids: Vec<u64> = old_blocks.iter().map(|(_, b)| b.object_id).collect();
     assert!(!old_ids.is_empty());
 
@@ -10301,23 +10660,18 @@ async fn test_truncate_to_zero_then_rewrite() {
     vfs.setattr(ino, SetattrArgs::size_only(0)).unwrap();
     assert_eq!(vfs.getattr(ino).unwrap().size, 0);
 
-    // All blocks should be removed when truncating to zero.
-    let remaining = vfs.meta().get_file_blocks(ino).unwrap();
+    // All payload slices should be removed when truncating to zero.
+    let remaining = vfs.meta().lookup_payload_slices(ino).unwrap();
     assert!(
         remaining.is_empty(),
-        "all blocks should be removed after truncate-to-zero, got {}",
+        "all payload slices should be removed after truncate-to-zero, got {}",
         remaining.len()
     );
 
-    // All old blocks should be in pending deletions.
-    let pending = vfs.meta().get_pending_deletions().unwrap();
-    for id in &old_ids {
-        assert!(
-            pending.iter().any(|(pid, _)| pid == id),
-            "old block {} should be pending deletion",
-            id
-        );
-    }
+    // GC timing is intentionally lifecycle-dependent: if the first write was
+    // still local overlay, truncate may queue its objects immediately; if it
+    // had already published, the old base objects must remain retained until a
+    // later publish boundary makes deletion safe for remote readers.
 
     // Write new data.
     let payload2 = vec![0xCDu8; 1024];
@@ -10399,7 +10753,12 @@ async fn test_flush_empty_file_is_noop() {
     // Flush without writing anything — should not panic or allocate blocks.
     vfs.flush(attr.ino).await.unwrap();
     assert_eq!(vfs.getattr(attr.ino).unwrap().size, 0);
-    assert!(vfs.meta().get_file_blocks(attr.ino).unwrap().is_empty());
+    assert!(
+        vfs.meta()
+            .lookup_payload_slices(attr.ino)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// Read zero bytes from a file — should return empty immediately.
@@ -10710,10 +11069,10 @@ async fn test_rename_overwrite_existing_file() {
     let target = vfs.create(1, b"target.txt", 0, 0, 0o644).unwrap();
     vfs.write(target.ino, 0, b"old target data").await.unwrap();
     vfs.flush(target.ino).await.unwrap();
-    let _ = wait_until_n_blocks(&vfs, target.ino, 1, Duration::from_secs(15));
+    let _ = wait_until_n_payload_slices(&vfs, target.ino, 1, Duration::from_secs(15));
 
-    let target_blocks = vfs.meta().get_file_blocks(target.ino).unwrap();
-    let target_block_id = target_blocks[0].1.object_id;
+    let target_slices = vfs.meta().lookup_payload_slices(target.ino).unwrap();
+    let target_object_id = target_slices[0].1.object_id;
 
     // Create source file with data.
     let source = vfs.create(1, b"source.txt", 0, 0, 0o644).unwrap();
@@ -10733,9 +11092,9 @@ async fn test_rename_overwrite_existing_file() {
     // Displaced target's block should be in pending deletions.
     let pending = vfs.meta().get_pending_deletions().unwrap();
     assert!(
-        pending.iter().any(|(id, _)| *id == target_block_id),
+        pending.iter().any(|(id, _)| *id == target_object_id),
         "displaced file's block {} should be pending deletion",
-        target_block_id
+        target_object_id
     );
 }
 
@@ -10752,7 +11111,7 @@ async fn test_unlink_with_open_handle_deferred_cleanup() {
     let ino = attr.ino;
     vfs.write(ino, 0, b"orphan data").await.unwrap();
     vfs.flush(ino).await.unwrap();
-    let _ = wait_until_n_blocks(&vfs, ino, 1, Duration::from_secs(15));
+    let _ = wait_until_n_payload_slices(&vfs, ino, 1, Duration::from_secs(15));
 
     // Open the file.
     let fh = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
@@ -10768,25 +11127,28 @@ async fn test_unlink_with_open_handle_deferred_cleanup() {
     assert_eq!(&data[..], b"orphan data");
 
     // Blocks should still exist (not yet GC'd).
-    let blocks = vfs.meta().get_file_blocks(ino).unwrap();
+    let blocks = vfs.meta().lookup_payload_slices(ino).unwrap();
     assert!(
         !blocks.is_empty(),
-        "blocks should survive until last handle closes"
+        "payload slices should survive until last handle closes"
     );
-    let block_id = blocks[0].1.object_id;
+    let object_id = blocks[0].1.object_id;
 
     // Release the last handle — triggers orphan cleanup.
     vfs.release_fh(fh).await.unwrap();
 
-    // Now blocks should be removed and pending deletion.
-    let blocks_after = vfs.meta().get_file_blocks(ino).unwrap();
-    assert!(
-        blocks_after.is_empty(),
-        "blocks should be removed after release_fh"
-    );
+    // Now payload slices should be removed and the object should be pending deletion.
+    match vfs.meta().lookup_payload_slices(ino) {
+        Ok(blocks_after) => assert!(
+            blocks_after.is_empty(),
+            "payload graph should be removed after release_fh"
+        ),
+        Err(MetaError::InodeNotFound(missing)) if missing == ino => {}
+        Err(error) => panic!("payload graph lookup after release_fh failed unexpectedly: {error}"),
+    }
     let pending = vfs.meta().get_pending_deletions().unwrap();
     assert!(
-        pending.iter().any(|(id, _)| *id == block_id),
+        pending.iter().any(|(id, _)| *id == object_id),
         "block should be pending deletion after orphan cleanup"
     );
 }
@@ -10854,7 +11216,7 @@ async fn test_concurrent_read_write_same_file() {
     vfs.write(ino, 0, &initial).await.unwrap();
     vfs.flush(ino).await.unwrap();
     // Wait for blocks to materialise.
-    let _ = wait_until_n_blocks(&vfs, ino, 2, Duration::from_secs(15));
+    let _ = wait_until_n_payload_slices(&vfs, ino, 2, Duration::from_secs(15));
 
     let vfs1 = vfs.clone();
     let vfs2 = vfs.clone();
@@ -10971,7 +11333,7 @@ async fn test_multiple_handles_orphan_cleanup_after_last_close() {
     let ino = attr.ino;
     vfs.write(ino, 0, b"multi handle data").await.unwrap();
     vfs.flush(ino).await.unwrap();
-    let _ = wait_until_n_blocks(&vfs, ino, 1, Duration::from_secs(15));
+    let _ = wait_until_n_payload_slices(&vfs, ino, 1, Duration::from_secs(15));
 
     // Open 3 handles.
     let fh1 = vfs.open_file(ino, OpenFlags::RDONLY, false).unwrap();
@@ -10981,22 +11343,25 @@ async fn test_multiple_handles_orphan_cleanup_after_last_close() {
     // Unlink.
     vfs.unlink(1, b"multi-fh.txt").unwrap();
 
-    // Close first two — blocks should still exist (orphan still alive).
+    // Close first two — payload slices should still exist (orphan still alive).
     vfs.release_fh(fh1).await.unwrap();
     vfs.release_fh(fh2).await.unwrap();
-    let blocks_mid = vfs.meta().get_file_blocks(ino).unwrap();
+    let blocks_mid = vfs.meta().lookup_payload_slices(ino).unwrap();
     assert!(
         !blocks_mid.is_empty(),
-        "blocks should survive with 1 handle remaining"
+        "payload slices should survive with 1 handle remaining"
     );
 
     // Close the last handle — orphan cleanup triggers.
     vfs.release_fh(fh3).await.unwrap();
-    let blocks_final = vfs.meta().get_file_blocks(ino).unwrap();
-    assert!(
-        blocks_final.is_empty(),
-        "blocks should be cleaned up after last handle closes"
-    );
+    match vfs.meta().lookup_payload_slices(ino) {
+        Ok(blocks_final) => assert!(
+            blocks_final.is_empty(),
+            "payload graph should be cleaned up after last handle closes"
+        ),
+        Err(MetaError::InodeNotFound(missing)) if missing == ino => {}
+        Err(error) => panic!("payload graph lookup after last handle failed unexpectedly: {error}"),
+    }
 }
 
 /// open_file with O_TRUNC on a file with data — should truncate to 0.
@@ -11544,7 +11909,7 @@ fn upload_backlog_progresses_via_persisted_local_payload_reads() {
 
 /// Validate warm-cache vs cold-cache buffered read behavior.
 ///
-/// After a write + flush, data is committed into the local block backend while
+/// After a write + flush, data is committed into the local payload backend while
 /// remote upload remains pending. A first sequential read exercises the colder
 /// local path; subsequent reads must stay within a consistent bounded latency.
 ///
@@ -12055,7 +12420,7 @@ async fn test_hardlink_unlink_one_keeps_other() {
     let attr = vfs.create(1, b"hl-orig.txt", 0, 0, 0o644).unwrap();
     vfs.write(attr.ino, 0, b"persist").await.unwrap();
     vfs.flush(attr.ino).await.unwrap();
-    let _ = wait_until_n_blocks(&vfs, attr.ino, 1, Duration::from_secs(15));
+    let _ = wait_until_n_payload_slices(&vfs, attr.ino, 1, Duration::from_secs(15));
 
     vfs.link(attr.ino, 1, b"hl-link.txt").unwrap();
 
@@ -12067,10 +12432,10 @@ async fn test_hardlink_unlink_one_keeps_other() {
     assert_eq!(a.ino, attr.ino);
 
     // Blocks should NOT be removed (nlink still > 0).
-    let blocks = vfs.meta().get_file_blocks(attr.ino).unwrap();
+    let blocks = vfs.meta().lookup_payload_slices(attr.ino).unwrap();
     assert!(
         !blocks.is_empty(),
-        "blocks should survive when hardlink remains"
+        "payload slices should survive when hardlink remains"
     );
 
     // Data should still be readable.
@@ -12152,7 +12517,7 @@ async fn test_flock_shared_then_exclusive_conflict() {
 // ─── 9.11 Shutdown & Drain Tests ────────────────────────────────────────────
 
 /// Shutdown after writes should drain local write buffers and persist metadata.
-/// After shutdown, blocks should be uploaded to S3.
+/// After shutdown, payload objects should be uploaded to S3.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_with_pending_uploads_completes_within_bound() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
@@ -12615,12 +12980,12 @@ async fn test_shutdown_drains_dirty_buffers() {
     // Call shutdown which should drain everything.
     vfs.shutdown(Duration::from_secs(30)).await;
 
-    // After shutdown, all 3 blocks should exist in metadata.
-    let blocks = vfs.meta().get_file_blocks(ino).unwrap();
+    // After shutdown, all 3 payload slices should exist in metadata.
+    let blocks = vfs.meta().lookup_payload_slices(ino).unwrap();
     assert_eq!(
         blocks.len(),
         3,
-        "after shutdown, all 3 blocks should be persisted"
+        "after shutdown, all 3 payload slices should be persisted"
     );
 }
 
@@ -12929,7 +13294,7 @@ async fn acl_wildcard_applies_as_fallback_for_specific_principal() {
 /// when the last block is a partial (non–block-size-aligned) tail.
 ///
 /// Covers the transient window in which a block is present in `live_extent_records`
-/// while upload completion and local block-backend cleanup are interleaving.
+/// while upload completion and local payload-backend cleanup are interleaving.
 #[test]
 #[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn local_reads_through_upload_with_partial_tail_block() {

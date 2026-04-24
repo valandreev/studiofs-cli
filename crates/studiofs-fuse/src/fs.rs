@@ -1758,7 +1758,7 @@ mod tests {
         });
         assert_eq!(vfs_err_to_errno(&xattr_too_big), libc::E2BIG);
 
-        let fragmented = VfsError::Meta(MetaError::FragmentedBlock {
+        let fragmented = VfsError::Meta(MetaError::NonContiguousRegularFileGraph {
             ino: 7,
             block_index: 3,
         });

@@ -181,11 +181,11 @@ pub struct VfsWritePathDirtyPressureStats {
 pub struct VfsWritePathBurstStats {
     pub bursts: u64,
     pub bursts_per_sec: f64,
-    pub total_blocks: u64,
+    pub total_payloads: u64,
     pub total_bytes: u64,
-    pub avg_blocks_per_burst: f64,
+    pub avg_payloads_per_burst: f64,
     pub avg_bytes_per_burst: f64,
-    pub max_blocks_per_burst: u64,
+    pub max_payloads_per_burst: u64,
     pub max_bytes_per_burst: u64,
     pub avg_interval_ms: f64,
     pub max_interval_ms: f64,
@@ -243,7 +243,7 @@ pub struct VfsWritePathObservabilitySnapshot {
     pub backend_tag: String,
     pub flush_barrier_calls: u64,
     pub flush_barrier_calls_per_sec: f64,
-    pub block_store_sync_data: VfsWritePathSyncDataStats,
+    pub payload_store_sync_data: VfsWritePathSyncDataStats,
     #[serde(default)]
     pub local_cache_io: VfsWritePathLocalCacheIoStats,
     pub winfsp_callbacks: VfsWritePathWinfspCallbackStats,
@@ -311,7 +311,7 @@ pub struct VfsZeroIoStartupReplaySnapshot {
     pub replayed_blocks: u64,
     pub queued_publish_ready_epochs: u64,
     pub quarantined_inodes: u64,
-    pub orphan_dirty_blocks_removed: u64,
+    pub orphan_dirty_payloads_removed: u64,
     pub replay_failures: u64,
 }
 

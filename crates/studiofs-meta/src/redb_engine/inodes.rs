@@ -277,26 +277,24 @@ impl RedbMetaEngine {
             attr.ino,
         )?;
         let overlay_state = Self::overlay_lifecycle_state(overlay_chunks.values());
-        let base_manifest = Self::base_manifest_from_graph_rows_in_txn(txn, attr.ino)?;
-        let has_published_base = !base_manifest.is_empty()
-            || attr.committed_size > 0
-            || attr.committed_content_epoch > 0;
-        let (local_matches_published, blockless_manifest_ready) = if overlay_state.is_some() {
+        let has_published_base =
+            Self::has_regular_file_chunk_rows_in_write_txn(txn, REGULAR_FILE_BASE_TABLE, attr.ino)?
+                || attr.committed_size > 0
+                || attr.committed_content_epoch > 0;
+        let (local_matches_published, blockless_graph_ready) = if overlay_state.is_some() {
             (false, false)
         } else {
-            let current_manifest = Self::current_manifest_in_txn(txn, attr.ino)?;
             (
                 attr.size == attr.committed_size
-                    && attr.content_epoch == attr.committed_content_epoch
-                    && current_manifest == base_manifest,
-                current_manifest.is_empty(),
+                    && attr.content_epoch == attr.committed_content_epoch,
+                attr.size == 0 && attr.content_epoch != attr.committed_content_epoch,
             )
         };
         let (state, retention) = Self::derive_inode_lifecycle_state_and_retention(
             has_published_base,
             local_matches_published,
             overlay_state,
-            blockless_manifest_ready,
+            blockless_graph_ready,
         );
         let record = InodeLifecycleRecord {
             ino: attr.ino,
@@ -330,27 +328,25 @@ impl RedbMetaEngine {
             REGULAR_FILE_OVERLAY_TABLE,
             attr.ino,
         )?;
-        let base_manifest = Self::base_manifest_from_graph_rows_in_txn(txn, attr.ino)?;
-        let has_published_base = !base_manifest.is_empty()
-            || attr.committed_size > 0
-            || attr.committed_content_epoch > 0;
+        let has_published_base =
+            Self::has_regular_file_chunk_rows_in_write_txn(txn, REGULAR_FILE_BASE_TABLE, attr.ino)?
+                || attr.committed_size > 0
+                || attr.committed_content_epoch > 0;
         let overlay_state = Self::overlay_lifecycle_state(overlay_chunks.values());
-        let (local_matches_published, blockless_manifest_ready) = if overlay_state.is_some() {
+        let (local_matches_published, blockless_graph_ready) = if overlay_state.is_some() {
             (false, false)
         } else {
-            let current_manifest = Self::current_manifest_in_txn(txn, attr.ino)?;
             (
                 attr.size == attr.committed_size
-                    && attr.content_epoch == attr.committed_content_epoch
-                    && current_manifest == base_manifest,
-                current_manifest.is_empty(),
+                    && attr.content_epoch == attr.committed_content_epoch,
+                attr.size == 0 && attr.content_epoch != attr.committed_content_epoch,
             )
         };
         let (state, retention) = Self::derive_inode_lifecycle_state_and_retention(
             has_published_base,
             local_matches_published,
             overlay_state,
-            blockless_manifest_ready,
+            blockless_graph_ready,
         );
 
         Ok(InodeLifecycleRecord {
@@ -370,7 +366,7 @@ impl RedbMetaEngine {
         has_published_base: bool,
         local_matches_published: bool,
         overlay_state: Option<InodeLifecycleState>,
-        blockless_manifest_ready: bool,
+        blockless_graph_ready: bool,
     ) -> (InodeLifecycleState, PayloadRetentionClass) {
         let state = if local_matches_published {
             if has_published_base {
@@ -378,7 +374,7 @@ impl RedbMetaEngine {
             } else {
                 InodeLifecycleState::LocalOnly
             }
-        } else if blockless_manifest_ready {
+        } else if blockless_graph_ready {
             InodeLifecycleState::PublishReady
         } else {
             match overlay_state {
@@ -418,15 +414,15 @@ impl RedbMetaEngine {
         let mut saw_uploaded = false;
         for chunk_state in chunk_states {
             for slice in chunk_state.slices.values() {
-                match slice.block_state {
-                    BlockRefState::Uploading => return Some(InodeLifecycleState::Uploading),
-                    BlockRefState::LocalOnly | BlockRefState::Recovering => {
+                match slice.payload_state {
+                    PayloadRefState::Uploading => return Some(InodeLifecycleState::Uploading),
+                    PayloadRefState::LocalOnly | PayloadRefState::Recovering => {
                         saw_local_only = true;
                     }
-                    BlockRefState::Uploaded => {
+                    PayloadRefState::Uploaded => {
                         saw_uploaded = true;
                     }
-                    BlockRefState::Published => {}
+                    PayloadRefState::Published => {}
                 }
             }
         }
@@ -658,11 +654,14 @@ impl MetaInodes for RedbMetaEngine {
         {
             let mut normalized = attr.clone();
             if normalized.kind == FileType::RegularFile {
-                let has_committed_manifest =
-                    !Self::base_manifest_from_graph_rows_in_txn(&txn, normalized.ino)?.is_empty();
+                let has_committed_graph = Self::has_regular_file_chunk_rows_in_write_txn(
+                    &txn,
+                    REGULAR_FILE_BASE_TABLE,
+                    normalized.ino,
+                )?;
                 Self::transition_upload_state_for_local_mutation(
                     &mut normalized,
-                    has_committed_manifest,
+                    has_committed_graph,
                 );
             }
             Self::set_inode_overlay_in_txn(&txn, &normalized)?;
@@ -776,7 +775,19 @@ mod tests {
             attr.content_epoch = 1;
             engine.set_attr(&attr).unwrap();
             engine
-                .set_file_block(file.ino, 0, &BlockRef::new_partial(777, 4096))
+                .flush_regular_file_overlay_slices(
+                    file.ino,
+                    &[(ChunkId(0), {
+                        let mut slice = SliceRecord::new(
+                            SliceId(0),
+                            SliceOrder(0),
+                            SliceRange::new(0, 4096).unwrap(),
+                            PayloadRef::new_partial(777, 4096),
+                        );
+                        slice.payload_state = PayloadRefState::LocalOnly;
+                        vec![slice]
+                    })],
+                )
                 .unwrap();
             file.ino
         };

@@ -7,14 +7,14 @@ fn test_regular_file_prefix_scan_is_exact_per_inode() {
         SliceId(1),
         SliceOrder(1),
         SliceRange::new(0, 4096).expect("valid slice ino 1"),
-        BlockRef::new_partial(3001, 4096),
+        PayloadRef::new_partial(3001, 4096),
     ));
     let mut chunk_10 = RegularFileChunkState::default();
     chunk_10.insert_slice(SliceRecord::new(
         SliceId(2),
         SliceOrder(1),
         SliceRange::new(0, 4096).expect("valid slice ino 10"),
-        BlockRef::new_partial(3010, 4096),
+        PayloadRef::new_partial(3010, 4096),
     ));
 
     let txn = engine.db.begin_write().unwrap();
@@ -112,7 +112,7 @@ fn test_block_replace_clears_pending_compaction_rows() {
         &txn,
         REGULAR_FILE_OVERLAY_TABLE,
         ino,
-        &[(0, BlockRef::new_partial(1001, 4096))],
+        &[(0, PayloadRef::new_partial(1001, 4096))],
         DEFAULT_BLOCK_SIZE,
         false,
         true,
@@ -133,9 +133,9 @@ fn test_block_replace_clears_pending_compaction_rows() {
 }
 
 #[test]
-fn test_convert_blocks_to_chunk_state_rejects_slice_overflow() {
-    let block = BlockRef::new_partial(9_999, u32::MAX);
-    let err = RedbMetaEngine::convert_blocks_to_chunk_state(&[(1, block)], u32::MAX)
+fn test_logical_payload_refs_to_chunk_state_rejects_slice_overflow() {
+    let block = PayloadRef::new_partial(9_999, u32::MAX);
+    let err = RedbMetaEngine::logical_payload_refs_to_chunk_state(&[(1, block)], u32::MAX)
         .expect_err("overflowing slice range must fail");
 
     assert!(matches!(err, MetaError::Storage(message) if message.contains("slice range overflow")));
@@ -154,9 +154,9 @@ fn test_regular_file_overlay_detection_ignores_counter_only_changes() {
         SliceId(1),
         SliceOrder(1),
         SliceRange::new(0, 4096).expect("valid overlay slice"),
-        BlockRef::new_partial(501, 4096),
+        PayloadRef::new_partial(501, 4096),
     );
-    overlay_slice.block_state = BlockRefState::Uploading;
+    overlay_slice.payload_state = PayloadRefState::Uploading;
     let mut overlay_slices = BTreeMap::new();
     overlay_slices.insert(overlay_slice.slice_id, overlay_slice);
     let overlay_chunk = RegularFileChunkState {
@@ -186,7 +186,7 @@ fn test_regular_file_overlay_detection_ignores_counter_only_changes() {
         .slices
         .get_mut(&SliceId(1))
         .expect("base slice")
-        .block_state = BlockRefState::Published;
+        .payload_state = PayloadRefState::Published;
 
     let chunk_key = encode_regular_file_chunk_key(ino, ChunkId(11));
     let overlay_bytes = encode(&overlay_chunk).expect("encode overlay chunk");
@@ -216,7 +216,7 @@ fn test_regular_file_graph_signature_ignores_slice_identity_changes() {
         SliceId(1),
         SliceOrder(1),
         SliceRange::new(0, 4096).expect("slice a"),
-        BlockRef::new_partial(501, 4096),
+        PayloadRef::new_partial(501, 4096),
     ));
 
     let mut chunk_b = RegularFileChunkState::default();
@@ -224,7 +224,7 @@ fn test_regular_file_graph_signature_ignores_slice_identity_changes() {
         SliceId(9),
         SliceOrder(17),
         SliceRange::new(0, 4096).expect("slice b"),
-        BlockRef::new_partial(501, 4096),
+        PayloadRef::new_partial(501, 4096),
     ));
 
     let mut chunks_a = BTreeMap::new();
@@ -256,7 +256,7 @@ fn test_regular_file_overlay_flush_allocates_unique_slice_ids_and_orders() {
             SliceId(3),
             SliceOrder(8),
             SliceRange::new(0, 4096).expect("valid existing slice"),
-            BlockRef::new_partial(601, 4096),
+            PayloadRef::new_partial(601, 4096),
         ),
     );
     let existing_chunk = RegularFileChunkState {
@@ -286,15 +286,15 @@ fn test_regular_file_overlay_flush_allocates_unique_slice_ids_and_orders() {
             slice_id: SliceId::default(),
             order: SliceOrder::default(),
             range: SliceRange::new(0, 4096).expect("valid replacement slice"),
-            block: Some(BlockRef::new_partial(701, 4096)),
-            block_state: BlockRefState::LocalOnly,
+            payload: Some(PayloadRef::new_partial(701, 4096)),
+            payload_state: PayloadRefState::LocalOnly,
         },
         SliceRecord {
             slice_id: SliceId::default(),
             order: SliceOrder::default(),
             range: SliceRange::new(4096, 8192).expect("valid appended slice"),
-            block: Some(BlockRef::new_partial(702, 4096)),
-            block_state: BlockRefState::LocalOnly,
+            payload: Some(PayloadRef::new_partial(702, 4096)),
+            payload_state: PayloadRefState::LocalOnly,
         },
     ];
 
@@ -354,7 +354,7 @@ fn test_regular_file_overlay_flush_emits_final_chunk_state() {
             SliceId(3),
             SliceOrder(8),
             SliceRange::new(0, 4096).expect("valid existing slice"),
-            BlockRef::new_partial(801, 4096),
+            PayloadRef::new_partial(801, 4096),
         ),
     );
     let existing_chunk = RegularFileChunkState {
@@ -383,8 +383,8 @@ fn test_regular_file_overlay_flush_emits_final_chunk_state() {
         slice_id: SliceId::default(),
         order: SliceOrder::default(),
         range: SliceRange::new(4096, 8192).expect("incoming range"),
-        block: Some(BlockRef::new_partial(802, 4096)),
-        block_state: BlockRefState::LocalOnly,
+        payload: Some(PayloadRef::new_partial(802, 4096)),
+        payload_state: PayloadRefState::LocalOnly,
     }];
 
     engine
@@ -445,7 +445,7 @@ fn test_regular_file_overlay_slice_events_replace_rows_and_delete_empty_payload(
             SliceId(1),
             SliceOrder(4),
             SliceRange::new(0, 8192).expect("initial slice"),
-            BlockRef::new_partial(901, 8192),
+            PayloadRef::new_partial(901, 8192),
         ),
     );
     let initial_chunk = RegularFileChunkState {
@@ -475,7 +475,7 @@ fn test_regular_file_overlay_slice_events_replace_rows_and_delete_empty_payload(
                     SliceId(9),
                     SliceOrder(9),
                     SliceRange::new(0, 4096).expect("replacement data"),
-                    BlockRef::new_partial(902, 4096),
+                    PayloadRef::new_partial(902, 4096),
                 ),
                 SliceRecord::tombstone(
                     SliceId(10),
@@ -519,7 +519,7 @@ fn test_regular_file_overlay_slice_events_replace_rows_and_delete_empty_payload(
                     SliceId(9),
                     SliceOrder(9),
                     SliceRange::new(0, 4096).expect("expected replacement data"),
-                    BlockRef::new_partial(902, 4096),
+                    PayloadRef::new_partial(902, 4096),
                 ),
                 SliceRecord::tombstone(
                     SliceId(10),
@@ -599,8 +599,8 @@ fn test_flush_regular_file_overlay_slices_with_attr_is_atomic() {
         slice_id: SliceId::default(),
         order: SliceOrder::default(),
         range: SliceRange::new(0, 4096).expect("valid range"),
-        block: Some(BlockRef::new_partial(200_001, 4096)),
-        block_state: BlockRefState::LocalOnly,
+        payload: Some(PayloadRef::new_partial(200_001, 4096)),
+        payload_state: PayloadRefState::LocalOnly,
     }];
 
     let mut new_attr = attr.clone();
@@ -650,13 +650,13 @@ fn test_lookup_regular_file_chunk_slices_overlay_precedence_with_tombstone() {
         SliceId(1),
         SliceOrder(1),
         SliceRange::new(0, 8192).expect("valid base slice 0"),
-        BlockRef::new_partial(901, 8192),
+        PayloadRef::new_partial(901, 8192),
     ));
     base_chunk.insert_slice(SliceRecord::new(
         SliceId(2),
         SliceOrder(2),
         SliceRange::new(8192, 12288).expect("valid base slice 1"),
-        BlockRef::new_partial(902, 4096),
+        PayloadRef::new_partial(902, 4096),
     ));
 
     let mut overlay_chunk = RegularFileChunkState::default();
@@ -664,7 +664,7 @@ fn test_lookup_regular_file_chunk_slices_overlay_precedence_with_tombstone() {
         SliceId(10),
         SliceOrder(1),
         SliceRange::new(2048, 6144).expect("valid overlay data slice"),
-        BlockRef::new_partial(801, 4096),
+        PayloadRef::new_partial(801, 4096),
     ));
     overlay_chunk.insert_slice(SliceRecord::tombstone(
         SliceId(11),
@@ -695,7 +695,7 @@ fn test_lookup_regular_file_chunk_slices_overlay_precedence_with_tombstone() {
         }
     );
     assert_eq!(spans[0].source, ResolvedSliceSource::Base);
-    assert_eq!(spans[0].block.as_ref().unwrap().object_id, 901);
+    assert_eq!(spans[0].payload.as_ref().unwrap().object_id, 901);
 
     assert_eq!(
         spans[1].range,
@@ -705,7 +705,7 @@ fn test_lookup_regular_file_chunk_slices_overlay_precedence_with_tombstone() {
         }
     );
     assert_eq!(spans[1].source, ResolvedSliceSource::Overlay);
-    assert_eq!(spans[1].block.as_ref().unwrap().object_id, 801);
+    assert_eq!(spans[1].payload.as_ref().unwrap().object_id, 801);
 
     assert_eq!(
         spans[2].range,
@@ -715,7 +715,7 @@ fn test_lookup_regular_file_chunk_slices_overlay_precedence_with_tombstone() {
         }
     );
     assert_eq!(spans[2].source, ResolvedSliceSource::Base);
-    assert_eq!(spans[2].block.as_ref().unwrap().object_id, 901);
+    assert_eq!(spans[2].payload.as_ref().unwrap().object_id, 901);
 
     assert_eq!(
         spans[3].range,
@@ -725,7 +725,7 @@ fn test_lookup_regular_file_chunk_slices_overlay_precedence_with_tombstone() {
         }
     );
     assert_eq!(spans[3].source, ResolvedSliceSource::OverlayTombstone);
-    assert!(spans[3].block.is_none());
+    assert!(spans[3].payload.is_none());
 
     assert_eq!(
         spans[4].range,
@@ -735,7 +735,7 @@ fn test_lookup_regular_file_chunk_slices_overlay_precedence_with_tombstone() {
         }
     );
     assert_eq!(spans[4].source, ResolvedSliceSource::Base);
-    assert_eq!(spans[4].block.as_ref().unwrap().object_id, 902);
+    assert_eq!(spans[4].payload.as_ref().unwrap().object_id, 902);
 }
 
 #[test]
@@ -751,13 +751,13 @@ fn test_compact_fragmented_regular_file_chunks_preserves_tombstones() {
         SliceId(1),
         SliceOrder(1),
         SliceRange::new(0, 4096).expect("shadowed slice"),
-        BlockRef::new_partial(1201, 4096),
+        PayloadRef::new_partial(1201, 4096),
     ));
     overlay_chunk.insert_slice(SliceRecord::new(
         SliceId(2),
         SliceOrder(2),
         SliceRange::new(0, 4096).expect("visible slice"),
-        BlockRef::new_partial(1202, 4096),
+        PayloadRef::new_partial(1202, 4096),
     ));
     overlay_chunk.insert_slice(SliceRecord::tombstone(
         SliceId(3),
@@ -783,9 +783,9 @@ fn test_compact_fragmented_regular_file_chunks_preserves_tombstones() {
         .unwrap();
     assert_eq!(before.len(), 2);
     assert_eq!(before[0].source, ResolvedSliceSource::Overlay);
-    assert_eq!(before[0].block.as_ref().unwrap().object_id, 1202);
+    assert_eq!(before[0].payload.as_ref().unwrap().object_id, 1202);
     assert_eq!(before[1].source, ResolvedSliceSource::OverlayTombstone);
-    assert!(before[1].block.is_none());
+    assert!(before[1].payload.is_none());
 
     let compacted = engine.compact_fragmented_regular_file_chunks(1).unwrap();
     assert_eq!(compacted, 1);
@@ -797,7 +797,7 @@ fn test_compact_fragmented_regular_file_chunks_preserves_tombstones() {
     for (expected, actual) in before.iter().zip(after.iter()) {
         assert_eq!(actual.range, expected.range);
         assert_eq!(actual.source, expected.source);
-        assert_eq!(actual.block, expected.block);
+        assert_eq!(actual.payload, expected.payload);
     }
 
     let txn = engine.db.begin_read().unwrap();
@@ -837,14 +837,14 @@ fn test_lookup_regular_file_slices_cross_chunk_and_ordered_base_resolution() {
         SliceId(1),
         SliceOrder(1),
         SliceRange::new(tail_start, DEFAULT_CHUNK_SIZE).expect("valid chunk0 base"),
-        BlockRef::new_partial(1101, 2048),
+        PayloadRef::new_partial(1101, 2048),
     ));
     let mut chunk0_overlay = RegularFileChunkState::default();
     chunk0_overlay.insert_slice(SliceRecord::new(
         SliceId(2),
         SliceOrder(1),
         SliceRange::new(tail_start + 512, tail_start + 1536).expect("valid chunk0 overlay"),
-        BlockRef::new_partial(1201, 1024),
+        PayloadRef::new_partial(1201, 1024),
     ));
 
     let mut chunk1_base = RegularFileChunkState::default();
@@ -852,13 +852,13 @@ fn test_lookup_regular_file_slices_cross_chunk_and_ordered_base_resolution() {
         SliceId(3),
         SliceOrder(1),
         SliceRange::new(0, 1024).expect("valid chunk1 base low order"),
-        BlockRef::new_partial(1301, 1024),
+        PayloadRef::new_partial(1301, 1024),
     ));
     chunk1_base.insert_slice(SliceRecord::new(
         SliceId(4),
         SliceOrder(2),
         SliceRange::new(512, 2048).expect("valid chunk1 base high order"),
-        BlockRef::new_partial(1401, 1536),
+        PayloadRef::new_partial(1401, 1536),
     ));
 
     set_regular_file_chunk_rows(
@@ -882,7 +882,7 @@ fn test_lookup_regular_file_slices_cross_chunk_and_ordered_base_resolution() {
         }
     );
     assert_eq!(spans[0].source, ResolvedSliceSource::Base);
-    assert_eq!(spans[0].block.as_ref().unwrap().object_id, 1101);
+    assert_eq!(spans[0].payload.as_ref().unwrap().object_id, 1101);
 
     assert_eq!(spans[1].chunk_id, ChunkId(0));
     assert_eq!(
@@ -893,7 +893,7 @@ fn test_lookup_regular_file_slices_cross_chunk_and_ordered_base_resolution() {
         }
     );
     assert_eq!(spans[1].source, ResolvedSliceSource::Overlay);
-    assert_eq!(spans[1].block.as_ref().unwrap().object_id, 1201);
+    assert_eq!(spans[1].payload.as_ref().unwrap().object_id, 1201);
 
     assert_eq!(spans[2].chunk_id, ChunkId(0));
     assert_eq!(
@@ -904,12 +904,12 @@ fn test_lookup_regular_file_slices_cross_chunk_and_ordered_base_resolution() {
         }
     );
     assert_eq!(spans[2].source, ResolvedSliceSource::Base);
-    assert_eq!(spans[2].block.as_ref().unwrap().object_id, 1101);
+    assert_eq!(spans[2].payload.as_ref().unwrap().object_id, 1101);
 
     assert_eq!(spans[3].chunk_id, ChunkId(1));
     assert_eq!(spans[3].range, SliceRange { start: 0, end: 512 });
     assert_eq!(spans[3].source, ResolvedSliceSource::Base);
-    assert_eq!(spans[3].block.as_ref().unwrap().object_id, 1301);
+    assert_eq!(spans[3].payload.as_ref().unwrap().object_id, 1301);
 
     assert_eq!(spans[4].chunk_id, ChunkId(1));
     assert_eq!(
@@ -920,7 +920,7 @@ fn test_lookup_regular_file_slices_cross_chunk_and_ordered_base_resolution() {
         }
     );
     assert_eq!(spans[4].source, ResolvedSliceSource::Base);
-    assert_eq!(spans[4].block.as_ref().unwrap().object_id, 1401);
+    assert_eq!(spans[4].payload.as_ref().unwrap().object_id, 1401);
 }
 
 #[test]
@@ -938,14 +938,14 @@ fn test_lookup_regular_file_slices_boundary_spanning_write_is_split_per_chunk() 
         SliceId(1),
         SliceOrder(1),
         SliceRange::new(tail_start, DEFAULT_CHUNK_SIZE).expect("valid chunk0 base"),
-        BlockRef::new_partial(2101, 1024),
+        PayloadRef::new_partial(2101, 1024),
     ));
     let mut chunk1_base = RegularFileChunkState::default();
     chunk1_base.insert_slice(SliceRecord::new(
         SliceId(2),
         SliceOrder(1),
         SliceRange::new(0, 1024).expect("valid chunk1 base"),
-        BlockRef::new_partial(2102, 1024),
+        PayloadRef::new_partial(2102, 1024),
     ));
 
     let mut chunk0_overlay = RegularFileChunkState::default();
@@ -953,14 +953,14 @@ fn test_lookup_regular_file_slices_boundary_spanning_write_is_split_per_chunk() 
         SliceId(10),
         SliceOrder(1),
         SliceRange::new(tail_start + 512, DEFAULT_CHUNK_SIZE).expect("valid chunk0 overlay"),
-        BlockRef::new_partial(2201, 512),
+        PayloadRef::new_partial(2201, 512),
     ));
     let mut chunk1_overlay = RegularFileChunkState::default();
     chunk1_overlay.insert_slice(SliceRecord::new(
         SliceId(11),
         SliceOrder(1),
         SliceRange::new(0, 512).expect("valid chunk1 overlay"),
-        BlockRef::new_partial(2202, 512),
+        PayloadRef::new_partial(2202, 512),
     ));
 
     set_regular_file_chunk_rows(
@@ -984,7 +984,7 @@ fn test_lookup_regular_file_slices_boundary_spanning_write_is_split_per_chunk() 
         }
     );
     assert_eq!(spans[0].source, ResolvedSliceSource::Base);
-    assert_eq!(spans[0].block.as_ref().unwrap().object_id, 2101);
+    assert_eq!(spans[0].payload.as_ref().unwrap().object_id, 2101);
 
     assert_eq!(spans[1].chunk_id, ChunkId(0));
     assert_eq!(
@@ -995,12 +995,12 @@ fn test_lookup_regular_file_slices_boundary_spanning_write_is_split_per_chunk() 
         }
     );
     assert_eq!(spans[1].source, ResolvedSliceSource::Overlay);
-    assert_eq!(spans[1].block.as_ref().unwrap().object_id, 2201);
+    assert_eq!(spans[1].payload.as_ref().unwrap().object_id, 2201);
 
     assert_eq!(spans[2].chunk_id, ChunkId(1));
     assert_eq!(spans[2].range, SliceRange { start: 0, end: 512 });
     assert_eq!(spans[2].source, ResolvedSliceSource::Overlay);
-    assert_eq!(spans[2].block.as_ref().unwrap().object_id, 2202);
+    assert_eq!(spans[2].payload.as_ref().unwrap().object_id, 2202);
 
     assert_eq!(spans[3].chunk_id, ChunkId(1));
     assert_eq!(
@@ -1011,7 +1011,7 @@ fn test_lookup_regular_file_slices_boundary_spanning_write_is_split_per_chunk() 
         }
     );
     assert_eq!(spans[3].source, ResolvedSliceSource::Base);
-    assert_eq!(spans[3].block.as_ref().unwrap().object_id, 2102);
+    assert_eq!(spans[3].payload.as_ref().unwrap().object_id, 2102);
 }
 
 #[test]
@@ -1030,7 +1030,7 @@ fn test_publish_regular_file_overlay_to_base_if_matches_promotes_base_rows() {
         SliceId(1),
         SliceOrder(1),
         SliceRange::new(0, 4096).expect("valid overlay data"),
-        BlockRef::new_partial(1601, 4096),
+        PayloadRef::new_partial(1601, 4096),
     ));
     overlay_chunk.insert_slice(SliceRecord::tombstone(
         SliceId(2),
@@ -1059,13 +1059,11 @@ fn test_publish_regular_file_overlay_to_base_if_matches_promotes_base_rows() {
         .expect("published base chunk");
     let published: RegularFileChunkState = decode(row.value()).unwrap();
     assert_eq!(published.slices.len(), 2);
-    assert_eq!(
-        published.slices.get(&SliceId(1)).unwrap().block_state,
-        BlockRefState::Published
-    );
-    assert_eq!(
-        published.slices.get(&SliceId(2)).unwrap().block_state,
-        BlockRefState::Published
+    assert!(
+        published
+            .slices
+            .values()
+            .all(|slice| slice.payload_state == PayloadRefState::Published)
     );
     let overlay = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
     assert!(
@@ -1080,6 +1078,71 @@ fn test_publish_regular_file_overlay_to_base_if_matches_promotes_base_rows() {
     );
     assert_eq!(published_attr.committed_content_epoch, 7);
     assert_eq!(published_attr.upload_state, UploadState::Ready);
+}
+
+#[test]
+fn test_publish_regular_file_overlay_to_base_preserves_untouched_base_ranges() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"publish-preserve-base.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.content_epoch = 3;
+    attr.size = 12 * 1024;
+    engine.set_attr(&attr).unwrap();
+
+    let mut base_chunk = RegularFileChunkState::default();
+    base_chunk.insert_slice(SliceRecord::new(
+        SliceId(1),
+        SliceOrder(1),
+        SliceRange::new(0, 4096).expect("valid first base range"),
+        PayloadRef::new_partial(3101, 4096),
+    ));
+    base_chunk.insert_slice(SliceRecord::new(
+        SliceId(2),
+        SliceOrder(2),
+        SliceRange::new(4096, 8192).expect("valid second base range"),
+        PayloadRef::new_partial(3102, 4096),
+    ));
+    base_chunk.insert_slice(SliceRecord::new(
+        SliceId(3),
+        SliceOrder(3),
+        SliceRange::new(8192, 12 * 1024).expect("valid third base range"),
+        PayloadRef::new_partial(3103, 4096),
+    ));
+
+    let mut overlay_chunk = RegularFileChunkState::default();
+    overlay_chunk.insert_slice(SliceRecord::new(
+        SliceId(1),
+        SliceOrder(1),
+        SliceRange::new(4096, 8192).expect("valid replacement range"),
+        PayloadRef::new_partial(3202, 4096),
+    ));
+    set_regular_file_chunk_rows(
+        &engine,
+        file.ino,
+        &[(ChunkId(0), overlay_chunk)],
+        &[(ChunkId(0), base_chunk)],
+    );
+
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 3)
+            .unwrap()
+    );
+
+    let spans = engine
+        .lookup_regular_file_slices(file.ino, 0, attr.size)
+        .unwrap();
+    let object_ids: Vec<_> = spans
+        .into_iter()
+        .filter_map(|span| span.payload.map(|block| block.object_id))
+        .collect();
+    assert_eq!(
+        object_ids,
+        vec![3101, 3202, 3103],
+        "publish must resolve overlay over base instead of dropping untouched base ranges"
+    );
 }
 
 #[test]
@@ -1098,7 +1161,7 @@ fn test_publish_regular_file_overlay_to_base_keeps_sparse_tail_committed_size_be
         SliceId(1),
         SliceOrder(1),
         SliceRange::new(0, 4096).expect("valid sparse data slice"),
-        BlockRef::new_partial(2601, 4096),
+        PayloadRef::new_partial(2601, 4096),
     ));
     set_regular_file_chunk_rows(&engine, file.ino, &[(ChunkId(0), overlay_chunk)], &[]);
 
@@ -1115,6 +1178,49 @@ fn test_publish_regular_file_overlay_to_base_keeps_sparse_tail_committed_size_be
 }
 
 #[test]
+fn test_publish_regular_file_overlay_to_base_accepts_fragmented_slice_graph() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"publish-fragmented-slices.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.content_epoch = 9;
+    attr.size = 8192;
+    engine.set_attr(&attr).unwrap();
+
+    let chunk_id = ChunkId(0);
+    let incoming = vec![
+        SliceRecord::new(
+            SliceId(1),
+            SliceOrder(1),
+            SliceRange::new(0, 4096).unwrap(),
+            PayloadRef::new_partial(4_201, 4096),
+        ),
+        SliceRecord::new(
+            SliceId(2),
+            SliceOrder(2),
+            SliceRange::new(4096, 8192).unwrap(),
+            PayloadRef::new_partial(4_202, 4096),
+        ),
+    ];
+    engine
+        .flush_regular_file_overlay_slices(file.ino, &[(chunk_id, incoming)])
+        .unwrap();
+
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 9)
+            .unwrap(),
+        "slice-native publish should not require a contiguous per-block summary"
+    );
+
+    let published_attr = engine.get_attr(file.ino).unwrap();
+    assert_eq!(published_attr.upload_state, UploadState::Ready);
+    assert_eq!(published_attr.committed_content_epoch, 9);
+    assert_eq!(published_attr.committed_size, 8192);
+}
+
+#[test]
 fn test_compute_committed_size_prefers_regular_file_base_rows() {
     let engine = temp_engine();
 
@@ -1128,7 +1234,7 @@ fn test_compute_committed_size_prefers_regular_file_base_rows() {
         SliceId(1),
         SliceOrder(1),
         SliceRange::new(0, 4096).expect("valid committed slice"),
-        BlockRef::new_partial(601, 4096),
+        PayloadRef::new_partial(601, 4096),
     ));
 
     let chunk_key = encode_regular_file_chunk_key(ino, ChunkId(1));
@@ -1149,7 +1255,7 @@ fn test_compute_committed_size_prefers_regular_file_base_rows() {
 }
 
 #[test]
-fn redb_manifest_publish_sets_committed_head() {
+fn redb_base_graph_publish_sets_committed_head() {
     let engine = temp_engine();
     let block_size = DEFAULT_BLOCK_SIZE as u64;
 
@@ -1161,12 +1267,16 @@ fn redb_manifest_publish_sets_committed_head() {
     attr.content_epoch = 1;
     engine.set_attr(&attr).unwrap();
 
-    let block0 = BlockRef::new_full(101, DEFAULT_BLOCK_SIZE);
-    let block1 = BlockRef::new_partial(102, 4096);
-    engine.set_file_block(file.ino, 0, &block0).unwrap();
-    engine.set_file_block(file.ino, 1, &block1).unwrap();
+    let block0 = PayloadRef::new_full(101, DEFAULT_BLOCK_SIZE);
+    let block1 = PayloadRef::new_partial(102, 4096);
+    engine
+        .stage_payload_slice(file.ino, 0, &block0)
+        .unwrap();
+    engine
+        .stage_payload_slice(file.ino, 1, &block1)
+        .unwrap();
 
-    assert!(engine.publish_file_manifest(file.ino, 1).unwrap());
+    assert!(engine.publish_regular_file_overlay_to_base_if_matches(file.ino, 1).unwrap());
 
     let published_attr = engine.get_attr(file.ino).unwrap();
     assert_eq!(published_attr.committed_size, block_size + 4096);
@@ -1182,6 +1292,12 @@ fn redb_manifest_publish_sets_committed_head() {
     assert_eq!(remote_attr.committed_content_epoch, 1);
     assert_eq!(remote_attr.upload_state, UploadState::Ready);
 
-    let remote_blocks = remote.get_file_blocks(file.ino).unwrap();
-    assert_eq!(remote_blocks, vec![(0, block0), (1, block1)]);
+    let remote_spans = remote
+        .lookup_regular_file_slices(file.ino, 0, block_size + 4096)
+        .unwrap();
+    let remote_blocks: Vec<_> = remote_spans
+        .into_iter()
+        .map(|span| span.payload.expect("published payload slice"))
+        .collect();
+    assert_eq!(remote_blocks, vec![block0, block1]);
 }

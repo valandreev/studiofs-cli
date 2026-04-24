@@ -417,13 +417,17 @@ impl<'a> NamespaceDeleteTxn<'a> {
         } else {
             None
         };
-        let published_manifest = if deleted_before_publish
+        let published_base_chunks = if deleted_before_publish
             .as_ref()
             .is_some_and(|record| record.has_published_base)
         {
-            Some(RedbMetaEngine::base_manifest_from_graph_rows_in_txn(
-                self.txn, entry.ino,
-            )?)
+            Some(
+                RedbMetaEngine::regular_file_chunk_rows_for_inode_in_write_txn(
+                    self.txn,
+                    REGULAR_FILE_BASE_TABLE,
+                    entry.ino,
+                )?,
+            )
         } else {
             None
         };
@@ -436,7 +440,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         } else if attr.nlink == 0 {
             RedbMetaEngine::remove_inode_overlay_in_txn(self.txn, entry.ino)?;
             RedbMetaEngine::clear_inode_overlay_aux_in_txn(self.txn, entry.ino)?;
-            self.remove_file_blocks_for_inode(entry.ino)?;
+            self.remove_regular_file_graph_for_inode(entry.ino)?;
             if deleted_before_publish.is_none() {
                 RedbMetaEngine::remove_inode_lifecycle_in_txn(self.txn, entry.ino)?;
             }
@@ -457,7 +461,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
             &attr,
             &parent_attr,
             deleted_before_publish.as_ref(),
-            published_manifest,
+            published_base_chunks,
         )?;
         Ok(NamespaceDeleteResult::File(attr))
     }
@@ -495,7 +499,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         Ok(NamespaceDeleteResult::Directory)
     }
 
-    pub(super) fn remove_file_blocks_for_inode(&self, ino: Ino) -> MetaResult<()> {
+    pub(super) fn remove_regular_file_graph_for_inode(&self, ino: Ino) -> MetaResult<()> {
         RedbMetaEngine::clear_regular_file_graph_in_txn(self.txn, ino)
     }
 
@@ -543,8 +547,8 @@ impl<'a> NamespaceDeleteTxn<'a> {
         let mut object_ids = std::collections::BTreeSet::new();
         for chunk_state in overlay_chunks.values() {
             for slice in chunk_state.slices.values() {
-                if slice.block_state == BlockRefState::Uploaded
-                    && let Some(block) = slice.block.as_ref()
+                if slice.payload_state == PayloadRefState::Uploaded
+                    && let Some(block) = slice.payload.as_ref()
                 {
                     object_ids.insert(block.object_id);
                 }
@@ -590,19 +594,20 @@ impl<'a> NamespaceDeleteTxn<'a> {
         attr: &InodeAttr,
         parent_attr: &InodeAttr,
         deleted_before_publish: Option<&InodeLifecycleRecord>,
-        published_manifest: Option<Vec<(u32, BlockRef)>>,
+        published_base_chunks: Option<Vec<(ChunkId, Vec<SliceRecord>)>>,
     ) -> MetaResult<()> {
         if deleted_before_publish.is_some_and(|record| record.has_published_base) {
-            let published_manifest = published_manifest.ok_or_else(|| {
+            let published_base_chunks = published_base_chunks.ok_or_else(|| {
                 MetaError::Storage(
-                    "missing published manifest for deleted-before-publish rollback".to_string(),
+                    "missing published base chunk rows for deleted-before-publish rollback"
+                        .to_string(),
                 )
             })?;
             RedbMetaEngine::append_event_in_txn(
                 self.txn,
-                &crate::events::MetaEvent::PublishFileManifest {
+                &crate::events::MetaEvent::PublishRegularFileBaseSlices {
                     ino: attr.ino,
-                    blocks: published_manifest,
+                    chunk_slices: published_base_chunks,
                 },
             )?;
             let mut remote_attr = attr.clone();
@@ -632,7 +637,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         } else {
             RedbMetaEngine::append_event_in_txn(
                 self.txn,
-                &crate::events::MetaEvent::RemoveFileBlocks { ino: attr.ino },
+                &crate::events::MetaEvent::RemoveRegularFileGraph { ino: attr.ino },
             )?;
             RedbMetaEngine::append_event_in_txn(
                 self.txn,

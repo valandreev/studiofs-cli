@@ -149,7 +149,7 @@ studiofs fsck myvolume --repair
 Repair mode currently:
 - replays undo logs
 - removes dangling dentries
-- removes orphan regular/symlink inodes and schedules their blocks for GC
+- removes orphan regular/symlink inodes and schedules their payload objects for GC
 - leaves orphan directories / hardlink-like orphan cases and `nlink` mismatch
   entries as report-only
 

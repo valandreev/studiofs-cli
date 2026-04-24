@@ -53,7 +53,7 @@ Path walks are centralized in VFS `NamespaceResolver`:
 | Volume serial | `0x5354_4644` ("STFD") |
 | Filesystem name | "StudioFS" |
 
-`STUDIOFS_WINFSP_SECTOR_SIZE` and `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` are the primary WinFSP bridge throughput geometry controls for local block I/O.
+`STUDIOFS_WINFSP_SECTOR_SIZE` and `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` are the primary WinFSP bridge throughput geometry controls for local payload I/O.
 StudioFS forces WinFSP `FlushAndPurgeOnCleanup` off so non-delete `cleanup`
 callbacks stay observational under the Local-First contract.
 
@@ -160,7 +160,7 @@ Current signature includes additional policy controls:
 | macOS: `volname` | `"StudioFS"` |
 | macOS: `local` | Yes |
 
-`STUDIOFS_FUSE_MAX_WRITE_BYTES` and `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` are the primary FUSE bridge throughput controls for local block I/O.
+`STUDIOFS_FUSE_MAX_WRITE_BYTES` and `STUDIOFS_FUSE_MAX_READAHEAD_BYTES` are the primary FUSE bridge throughput controls for local payload I/O.
 On Linux, `allow_other` also requires `user_allow_other` to be enabled in
 `/etc/fuse.conf`; otherwise `fusermount` rejects the mount request.
 
@@ -181,7 +181,7 @@ Trash semantics, so deletes go through ordinary rename/restore flow instead of
 `unlink` fallback:
 - the file remains available in Trash
 - inode metadata is preserved
-- local L1/L2 cache blocks for the file are evicted promptly via the background
+- local cache payload objects for the file are evicted promptly via the background
   cache priority path so delete bursts do not contend with foreground reads
 
 This keeps Trash recovery semantics intact while preventing local cache growth
@@ -268,7 +268,7 @@ Implements `fuser::Filesystem` trait.
 | `statfs` | `statfs()` |
 
 `unlink()` and cache-only rename cleanup still present a synchronous bridge API,
-but the internal block eviction work is batched and routed through the
+but the internal payload-object eviction work is batched and routed through the
 background local-I/O pool.
 
 FUSE callback barrier semantics:

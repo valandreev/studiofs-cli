@@ -14,9 +14,9 @@
 
 **Files:**
 - Modify: `crates/studiofs-meta/src/pg_engine.rs`
-- Modify: `crates/studiofs-meta/src/redb_engine/tests/blocks.rs`
+- Modify: `crates/studiofs-meta/src/redb_engine/tests/payload_objects.rs`
 - Test: `crates/studiofs-meta/src/pg_engine.rs`
-- Test: `crates/studiofs-meta/src/redb_engine/tests/blocks.rs`
+- Test: `crates/studiofs-meta/src/redb_engine/tests/payload_objects.rs`
 
 - [ ] **Step 1: Write the failing test for PG peer invisibility before first publish**
 
@@ -78,7 +78,7 @@ Expected: FAIL because snapshot export still includes the unpublished file.
 - [ ] **Step 7: Commit the red tests**
 
 ```bash
-git add crates/studiofs-meta/src/pg_engine.rs crates/studiofs-meta/src/redb_engine/tests/blocks.rs
+git add crates/studiofs-meta/src/pg_engine.rs crates/studiofs-meta/src/redb_engine/tests/payload_objects.rs
 git commit -m "test: lock first-publish visibility before implementation (SFS-268)"
 ```
 
@@ -146,8 +146,8 @@ git commit -m "fix: hide unpublished new regular files from peer namespace (SFS-
 
 **Files:**
 - Modify: `crates/studiofs-meta/src/redb_engine/replication.rs`
-- Modify: `crates/studiofs-meta/src/redb_engine/tests/blocks.rs`
-- Test: `crates/studiofs-meta/src/redb_engine/tests/blocks.rs`
+- Modify: `crates/studiofs-meta/src/redb_engine/tests/payload_objects.rs`
+- Test: `crates/studiofs-meta/src/redb_engine/tests/payload_objects.rs`
 
 - [ ] **Step 1: Filter unpublished new regular files out of `export_remote_snapshot()`**
 
@@ -179,7 +179,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit the snapshot export fix**
 
 ```bash
-git add crates/studiofs-meta/src/redb_engine/replication.rs crates/studiofs-meta/src/redb_engine/tests/blocks.rs
+git add crates/studiofs-meta/src/redb_engine/replication.rs crates/studiofs-meta/src/redb_engine/tests/payload_objects.rs
 git commit -m "fix: keep remote snapshots aligned with first-publish visibility (SFS-268)"
 ```
 

@@ -12,8 +12,9 @@ use studiofs_data::object::{
 };
 use studiofs_data::{DataStore, DataStoreConfig};
 use studiofs_meta::{
-    BlockRef, DEFAULT_CHUNK_SIZE, MetaOpenOptions, ROOT_INO, ensure_studiofs_database,
-    open_meta_engine, open_meta_engine_with_options,
+    DEFAULT_CHUNK_SIZE, MetaError, MetaOpenOptions, PayloadRef, ROOT_INO, chunk_id_from_offset,
+    chunk_start_offset, ensure_studiofs_database, open_meta_engine, open_meta_engine_with_options,
+    schema::{ChunkId, PayloadRefState, SliceId, SliceOrder, SliceRange, SliceRecord},
 };
 use uuid::Uuid;
 
@@ -190,6 +191,45 @@ async fn volume_exists(pg_dsn: &str, name: &str) -> bool {
     row.get::<_, bool>(0)
 }
 
+fn single_object_slice_graph(
+    payload: &PayloadRef,
+) -> Result<Vec<(ChunkId, Vec<SliceRecord>)>, MetaError> {
+    let mut chunks = BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
+    let mut cursor = 0_u64;
+    let data_end = u64::from(payload.length);
+    while cursor < data_end {
+        let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);
+        let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
+        let piece_end = data_end.min(chunk_start.saturating_add(DEFAULT_CHUNK_SIZE as u64));
+        let range = SliceRange::new(
+            u32::try_from(cursor - chunk_start)
+                .map_err(|_| MetaError::Storage("slice start overflow".to_string()))?,
+            u32::try_from(piece_end - chunk_start)
+                .map_err(|_| MetaError::Storage("slice end overflow".to_string()))?,
+        )
+        .ok_or_else(|| MetaError::Storage("invalid slice range".to_string()))?;
+        let mut slice = SliceRecord::new(
+            SliceId(0),
+            SliceOrder(0),
+            range,
+            PayloadRef {
+                object_id: payload.object_id,
+                offset: payload.offset.saturating_add(
+                    u32::try_from(cursor)
+                        .map_err(|_| MetaError::Storage("slice offset overflow".to_string()))?,
+                ),
+                length: u32::try_from(piece_end - cursor)
+                    .map_err(|_| MetaError::Storage("slice length overflow".to_string()))?,
+                flags: payload.flags,
+            },
+        );
+        slice.payload_state = PayloadRefState::LocalOnly;
+        chunks.entry(chunk_id).or_default().push(slice);
+        cursor = piece_end;
+    }
+    Ok(chunks.into_iter().collect())
+}
+
 async fn seed_remote_file(home: &Path, disk_name: &str, payload: &[u8]) {
     let db_path = default_meta_dir(home, disk_name).join(format!("{disk_name}.db"));
     {
@@ -205,19 +245,31 @@ async fn seed_remote_file(home: &Path, disk_name: &str, payload: &[u8]) {
         let file = meta
             .create_file(ROOT_INO, b"payload.bin", 0, 0, 0o644)
             .expect("create file");
-        let object_id = meta.next_block_id().expect("next block id");
-        let block = BlockRef::new_partial(object_id, payload.len() as u32);
-        meta.set_file_block(file.ino, 0, &block)
-            .expect("set file block");
-        meta.commit_uploaded_block(file.ino, 0, 0, &block)
-            .expect("commit uploaded block");
-        meta.publish_file_manifest(file.ino, 0)
-            .expect("publish file manifest");
-
+        let object_id = meta.next_object_id().expect("next object ID");
+        let block = PayloadRef::new_partial(object_id, payload.len() as u32);
         let mut attr = meta.get_attr(file.ino).expect("get attr");
         attr.size = payload.len() as u64;
-        attr.committed_size = payload.len() as u64;
         meta.set_attr(&attr).expect("set attr");
+        let expected_epoch = attr.content_epoch;
+        meta.flush_regular_file_overlay_slices(
+            file.ino,
+            single_object_slice_graph(&block)
+                .expect("slice graph")
+                .as_slice(),
+        )
+        .expect("flush slice graph");
+        assert!(
+            meta.mark_regular_file_overlay_object_uploaded_if_matches(
+                file.ino,
+                expected_epoch,
+                object_id
+            )
+            .expect("mark uploaded slice object")
+        );
+        assert!(
+            meta.publish_regular_file_overlay_to_base_if_matches(file.ino, expected_epoch)
+                .expect("publish slice graph")
+        );
 
         let store = DataStore::new(&DataStoreConfig::from(&format_info)).expect("datastore");
         put_fragmented_object(
@@ -264,7 +316,7 @@ async fn verify_payload_from_discovered(home: &Path, disk_name: &str, expected: 
         let mut covered = vec![false; expected.len()];
 
         for span in spans {
-            let block = span.block.expect("committed slice must reference data");
+            let block = span.payload.expect("committed slice must reference data");
             let file_start = span
                 .chunk_id
                 .0

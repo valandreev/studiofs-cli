@@ -24,6 +24,46 @@ fn collect_term_hits(path: &str, terms: &[&str]) -> Vec<String> {
     collect_term_hits_from_contents(path, &contents, terms)
 }
 
+fn collect_term_hits_recursively(path: &str, terms: &[&str]) -> Vec<String> {
+    let root = repo_root().join(path);
+    let mut stack = vec![root];
+    let mut hits = Vec::new();
+
+    while let Some(current) = stack.pop() {
+        let metadata = fs::metadata(&current).unwrap_or_else(|error| {
+            panic!("failed to stat '{}': {error}", current.display());
+        });
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&current).unwrap_or_else(|error| {
+                panic!("failed to read dir '{}': {error}", current.display());
+            }) {
+                let entry = entry.unwrap_or_else(|error| {
+                    panic!(
+                        "failed to read dir entry in '{}': {error}",
+                        current.display()
+                    );
+                });
+                stack.push(entry.path());
+            }
+            continue;
+        }
+        if current.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let relative = current
+            .strip_prefix(repo_root())
+            .unwrap_or(current.as_path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relative == "crates/studiofs/tests/architecture_vocabulary_test.rs" {
+            continue;
+        }
+        hits.extend(collect_term_hits(&relative, terms));
+    }
+
+    hits
+}
+
 fn collect_term_hits_outside_test_modules(path: &str, terms: &[&str]) -> Vec<String> {
     let contents = read_workspace_file(path);
     let filtered = strip_cfg_test_items(&contents);
@@ -273,9 +313,16 @@ fn active_docs_drop_superseded_io_architecture_terms() {
         "AGENTS.md",
         "docs/architecture.md",
         "docs/cache.md",
-        "docs/local-block-runtime-layout.md",
+        "docs/local-payload-runtime-layout.md",
+        "docs/juicefs-local-first-rust-contract.md",
+        "docs/platform-bridges.md",
+        "docs/superpowers/plans/2026-04-18-sfs-261-local-payload-runtime-cleanup.md",
+        "docs/superpowers/specs/2026-04-18-sfs-261-local-payload-runtime-cleanup-design.md",
         "docs/configuration.md",
+        "docs/data-layer.md",
         "docs/examples.md",
+        "docs/local-first-validation-matrix.md",
+        "docs/metadata.md",
         "docs/vfs.md",
     ];
     let forbidden_terms = [
@@ -290,6 +337,39 @@ fn active_docs_drop_superseded_io_architecture_terms() {
         "ReadPipeline",
         "access classifier",
         "planner",
+        "local-block-runtime",
+        "local-block-runtime-layout",
+        "block-level I/O",
+        "Block Cache logo",
+        "hot block",
+        "block-ID ranges",
+        "block ID ranges",
+        "block state",
+        "block preallocation",
+        "block allocation",
+        "dirty blocks",
+        "pending blocks",
+        "block-store entries",
+        "local dirty block",
+        "block-id count",
+        "block-shaped",
+        "payload blocks",
+        "block payload",
+        "local-block runtime",
+        "block eviction",
+        "internal block eviction",
+        "file-per-block",
+        "block_*.rs",
+        "block objects",
+        "block caching",
+        "block lifecycle",
+        "block-store",
+        "block store",
+        "dirty block",
+        "pending block",
+        "local block",
+        "regular-file block",
+        "file block",
     ];
 
     let hits: Vec<_> = files
@@ -533,6 +613,107 @@ fn access_tracking_surface_drops_classifier_wording() {
     assert!(
         hits.is_empty(),
         "access tracking surface still uses classifier wording:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn active_code_drops_flat_block_contract_vocabulary() {
+    let files = [
+        "crates/studiofs-cache/src",
+        "crates/studiofs-data/src",
+        "crates/studiofs-meta/src",
+        "crates/studiofs-vfs/src",
+        "crates/studiofs-vfs/tests",
+        "crates/studiofs/src",
+        "crates/studiofs/tests",
+        "crates/studiofs-winfsp/src",
+        "crates/studiofs-fuse/src",
+    ];
+    let forbidden_terms = [
+        "block_projection",
+        "block projection",
+        "BlockProjection",
+        "MetaBlocks",
+        "redb_engine/blocks.rs",
+        "redb_engine\\blocks.rs",
+        "local-block-runtime",
+        "local-block-runtime-layout",
+        "PendingBlock",
+        "pending_blocks",
+        "orphan_dirty_blocks",
+        "copy_block_payload_into_range",
+        "clear_pending_blocks_for_inode",
+        "flush_pending_blocks_for_shutdown",
+        "snapshot_dirty_local_dirty_blocks",
+        "commit_persisted_local_dirty_blocks",
+        "replace_pending_local_dirty_block",
+        "copy_committed_block_payload_into_range",
+        "remove_file_blocks",
+        "FragmentedBlock",
+        "set_file_block",
+        "commit_uploaded_block",
+        "publish_file_manifest",
+        "stage_block_slices",
+        "stage_block_tombstone_slices",
+        "stage_logical_payload_tombstone",
+        "lookup_file_block_slice",
+        "lookup_file_block_slices",
+        "FileSliceMetaFixture",
+        "PgBlockSliceFixture",
+        "BlockSliceFixture",
+        "fixture_block_slices",
+        "raw data blocks",
+        "block-based VFS",
+        "block_store",
+        "block store",
+        "next_block_id",
+        "next_block_ids",
+        "put_block",
+        "get_block",
+        "delete_block",
+        "block_exists",
+        "block_key",
+        "nextBlockId",
+        "pgBlock",
+        "dirty blocks",
+        "pending blocks",
+        "block-store entries",
+        "local dirty block",
+        "block-id count",
+        "block-shaped",
+        "payload block",
+        "payload blocks",
+        "block payload",
+        "block objects",
+        "block lifecycle",
+        "block-store",
+        "dirty block",
+        "pending block",
+        "local block",
+        "avg_blocks_per_burst",
+        "max_blocks_per_burst",
+        "payload_burst_total_blocks",
+        "payload_burst_max_blocks",
+        "chunk/slice/block",
+        "block graph",
+        "graph-backed",
+    ];
+
+    let hits: Vec<_> = files
+        .iter()
+        .flat_map(|path| {
+            if repo_root().join(path).is_dir() {
+                collect_term_hits_recursively(path, &forbidden_terms)
+            } else {
+                collect_term_hits(path, &forbidden_terms)
+            }
+        })
+        .collect();
+
+    assert!(
+        hits.is_empty(),
+        "active code still exposes flat-block contract vocabulary:\n{}",
         hits.join("\n")
     );
 }

@@ -6,9 +6,9 @@ use crate::cli::utils::format_bytes;
 use clap::Args;
 use std::path::{Path, PathBuf};
 use studiofs_cache::runtime::{
-    CacheIndex, LocalBlockBackendKind, LocalBlockRuntimeDetection, detect_cache_backends,
+    CacheIndex, LocalPayloadBackendKind, LocalPayloadRuntimeDetection, detect_cache_backends,
 };
-use studiofs_cache::{OpenLocalBlockBackendError, open_local_block_backend};
+use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
 use studiofs_meta::counters;
 use studiofs_vfs::VfsWritePathObservabilitySnapshot;
 #[cfg(test)]
@@ -77,8 +77,8 @@ impl StatusArgs {
 
 fn detect_backends_or_warn(
     cache_path: &Path,
-    detector: impl FnOnce(&Path) -> std::io::Result<LocalBlockRuntimeDetection>,
-) -> Option<LocalBlockRuntimeDetection> {
+    detector: impl FnOnce(&Path) -> std::io::Result<LocalPayloadRuntimeDetection>,
+) -> Option<LocalPayloadRuntimeDetection> {
     match detector(cache_path) {
         Ok(detection) => Some(detection),
         Err(error) => {
@@ -91,7 +91,7 @@ fn detect_backends_or_warn(
     }
 }
 
-fn detect_backends(cache_path: &Path) -> Option<LocalBlockRuntimeDetection> {
+fn detect_backends(cache_path: &Path) -> Option<LocalPayloadRuntimeDetection> {
     detect_backends_or_warn(cache_path, detect_cache_backends)
 }
 
@@ -134,15 +134,18 @@ fn read_write_path_observability(
     }
 }
 
-fn map_cache_backend_error(cache_dir: &Path, source: OpenLocalBlockBackendError) -> anyhow::Error {
+fn map_cache_backend_error(
+    cache_dir: &Path,
+    source: OpenLocalPayloadBackendError,
+) -> anyhow::Error {
     anyhow::anyhow!(
         "failed to open local cache backend at '{}': {source}",
         cache_dir.display()
     )
 }
 
-fn scan_local_block_cache(
-    cache_backend_detection: &LocalBlockRuntimeDetection,
+fn scan_local_payload_cache(
+    cache_backend_detection: &LocalPayloadRuntimeDetection,
 ) -> anyhow::Result<CacheUsageStats> {
     // Status is allowed to open the index directly to read aggregate counters.
     let index = CacheIndex::open(&cache_backend_detection.layout.redb_index_path)?;
@@ -155,11 +158,13 @@ fn scan_local_block_cache(
 }
 
 fn scan_cache_usage(
-    cache_backend_detection: Option<&LocalBlockRuntimeDetection>,
+    cache_backend_detection: Option<&LocalPayloadRuntimeDetection>,
 ) -> anyhow::Result<Option<CacheUsageStats>> {
     match cache_backend_detection {
-        Some(detection) if detection.runtime_backend() == Some(LocalBlockBackendKind::Current) => {
-            scan_local_block_cache(detection).map(Some)
+        Some(detection)
+            if detection.runtime_backend() == Some(LocalPayloadBackendKind::Current) =>
+        {
+            scan_local_payload_cache(detection).map(Some)
         }
         _ => Ok(None),
     }
@@ -168,16 +173,16 @@ fn scan_cache_usage(
 fn scan_pending_uploads(
     cache_dir: &Path,
     volume_uuid: &str,
-    cache_backend_detection: Option<&LocalBlockRuntimeDetection>,
+    cache_backend_detection: Option<&LocalPayloadRuntimeDetection>,
 ) -> anyhow::Result<usize> {
     let Some(detection) = cache_backend_detection else {
         return Ok(0);
     };
-    if detection.runtime_backend() != Some(LocalBlockBackendKind::Current) {
+    if detection.runtime_backend() != Some(LocalPayloadBackendKind::Current) {
         return Ok(0);
     }
 
-    let store = open_local_block_backend(cache_dir, volume_uuid)
+    let store = open_local_payload_backend(cache_dir, volume_uuid)
         .map_err(|source| map_cache_backend_error(cache_dir, source))?
         .backend;
     Ok(store.dirty_object_ids().len())
@@ -203,7 +208,7 @@ pub fn run(
     let total_inodes = engine.get_counter(counters::TOTAL_INODES)?;
     let used_space = engine.get_counter(counters::USED_SPACE)?;
     let next_inode = engine.get_counter(counters::NEXT_INODE)?;
-    let next_block = engine.get_counter(counters::NEXT_BLOCK_ID)?;
+    let next_object = engine.get_counter(counters::NEXT_OBJECT_ID)?;
 
     let cache_path = local_cache_path(meta_dir, cache_dir, &format_info.uuid);
     let cache_backend_detection = detect_backends(&cache_path);
@@ -254,7 +259,7 @@ pub fn run(
 
     println!("\n  Inodes:     {}", total_inodes);
     println!("  Next inode: {}", next_inode);
-    println!("  Next block: {}", next_block);
+    println!("  Next block: {}", next_object);
 
     println!("\n  Used space: {}", format_bytes(used_space));
 
@@ -266,11 +271,11 @@ pub fn run(
     println!("  Root:                {}", cache_path.display());
     let runtime_ready = cache_backend_detection
         .as_ref()
-        .and_then(LocalBlockRuntimeDetection::runtime_backend)
-        == Some(LocalBlockBackendKind::Current);
+        .and_then(LocalPayloadRuntimeDetection::runtime_backend)
+        == Some(LocalPayloadBackendKind::Current);
     let contract_state = describe_cache_layout_state(cache_backend_detection.as_ref());
     let remediation = if let Some(detection) = cache_backend_detection.as_ref() {
-        if detection.runtime_backend() == Some(LocalBlockBackendKind::Current) {
+        if detection.runtime_backend() == Some(LocalPayloadBackendKind::Current) {
             "none"
         } else if detection.has_runtime_layout() {
             "runtime layout is incomplete; mount will reprovision missing runtime directories on first use"
@@ -284,7 +289,10 @@ pub fn run(
         || cache_usage
             .and_then(|stats| stats.map(|stats| stats.dirty_bytes > 0))
             .unwrap_or(false);
-    println!("  Runtime:             {}", LocalBlockBackendKind::Current);
+    println!(
+        "  Runtime:             {}",
+        LocalPayloadBackendKind::Current
+    );
     println!(
         "  Runtime readiness:   {}",
         if runtime_ready { "ready" } else { "blocked" }
@@ -302,8 +310,8 @@ pub fn run(
         );
         println!(
             "  Local cache payload: {} ({})",
-            detection.layout.payload_blocks_dir.display(),
-            if detection.payload_blocks_dir_exists {
+            detection.layout.payload_objects_dir.display(),
+            if detection.payload_objects_dir_exists {
                 "present"
             } else {
                 "absent"
@@ -311,8 +319,8 @@ pub fn run(
         );
         println!(
             "  Local cache upload:  {} ({})",
-            detection.layout.upload_stage_blocks_dir.display(),
-            if detection.upload_blocks_dir_exists {
+            detection.layout.upload_stage_objects_dir.display(),
+            if detection.upload_objects_dir_exists {
                 "present"
             } else {
                 "absent"
@@ -376,55 +384,56 @@ pub fn run(
                 snapshot.flush_barrier_calls, snapshot.flush_barrier_calls_per_sec
             );
             println!(
-                "  block_store_sync_data calls: {} ({:.2}/s)",
-                snapshot.block_store_sync_data.calls, snapshot.block_store_sync_data.calls_per_sec
+                "  payload_store_sync_data calls: {} ({:.2}/s)",
+                snapshot.payload_store_sync_data.calls,
+                snapshot.payload_store_sync_data.calls_per_sec
             );
             println!(
-                "  block_store_sync_data total: {}",
-                format_ms(snapshot.block_store_sync_data.total_ms)
+                "  payload_store_sync_data total: {}",
+                format_ms(snapshot.payload_store_sync_data.total_ms)
             );
             println!(
-                "  block_store_sync_data avg:   {}",
-                format_ms(snapshot.block_store_sync_data.avg_ms)
+                "  payload_store_sync_data avg:   {}",
+                format_ms(snapshot.payload_store_sync_data.avg_ms)
             );
             println!(
-                "  block_store_sync_data max:   {}",
-                format_ms(snapshot.block_store_sync_data.max_ms)
+                "  payload_store_sync_data max:   {}",
+                format_ms(snapshot.payload_store_sync_data.max_ms)
             );
             println!(
-                "  block_store_sync_data p50/p95/p99: {}/{}/{}",
+                "  payload_store_sync_data p50/p95/p99: {}/{}/{}",
                 format_quantile_ms(
-                    snapshot.block_store_sync_data.latency_quantiles_ms.p50,
+                    snapshot.payload_store_sync_data.latency_quantiles_ms.p50,
                     snapshot
-                        .block_store_sync_data
+                        .payload_store_sync_data
                         .latency_quantiles_saturated
                         .p50
                 ),
                 format_quantile_ms(
-                    snapshot.block_store_sync_data.latency_quantiles_ms.p95,
+                    snapshot.payload_store_sync_data.latency_quantiles_ms.p95,
                     snapshot
-                        .block_store_sync_data
+                        .payload_store_sync_data
                         .latency_quantiles_saturated
                         .p95
                 ),
                 format_quantile_ms(
-                    snapshot.block_store_sync_data.latency_quantiles_ms.p99,
+                    snapshot.payload_store_sync_data.latency_quantiles_ms.p99,
                     snapshot
-                        .block_store_sync_data
+                        .payload_store_sync_data
                         .latency_quantiles_saturated
                         .p99
                 )
             );
             println!(
                 "  sync barrier queue wait total/avg/max: {}/{}/{}",
-                format_ms(snapshot.block_store_sync_data.queue_wait_total_ms),
-                format_ms(snapshot.block_store_sync_data.queue_wait_avg_ms),
-                format_ms(snapshot.block_store_sync_data.queue_wait_max_ms)
+                format_ms(snapshot.payload_store_sync_data.queue_wait_total_ms),
+                format_ms(snapshot.payload_store_sync_data.queue_wait_avg_ms),
+                format_ms(snapshot.payload_store_sync_data.queue_wait_max_ms)
             );
             println!(
                 "  sync barrier interval avg/max: {}/{}",
-                format_ms(snapshot.block_store_sync_data.barrier_interval_avg_ms),
-                format_ms(snapshot.block_store_sync_data.barrier_interval_max_ms)
+                format_ms(snapshot.payload_store_sync_data.barrier_interval_avg_ms),
+                format_ms(snapshot.payload_store_sync_data.barrier_interval_max_ms)
             );
             println!(
                 "  payload bursts count/bytes: {}/{}",
@@ -437,9 +446,9 @@ pub fn run(
                 format_bytes(snapshot.payload_burst.max_bytes_per_burst)
             );
             println!(
-                "  payload burst avg blocks/max blocks: {:.2}/{}",
-                snapshot.payload_burst.avg_blocks_per_burst,
-                snapshot.payload_burst.max_blocks_per_burst
+                "  payload burst avg payloads/max payloads: {:.2}/{}",
+                snapshot.payload_burst.avg_payloads_per_burst,
+                snapshot.payload_burst.max_payloads_per_burst
             );
             println!(
                 "  payload burst avg interval/max interval: {}/{}",
@@ -542,16 +551,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scan_pending_uploads_supports_current_local_block_runtime() {
+    fn scan_pending_uploads_supports_current_local_payload_runtime() {
         let tmp = tempfile::tempdir().unwrap();
-        let layout = studiofs_cache::runtime::LocalBlockLayout::from_cache_root(tmp.path());
+        let layout = studiofs_cache::runtime::LocalPayloadLayout::from_cache_root(tmp.path());
         layout.provision().unwrap();
         let volume_uuid = Uuid::new_v4();
 
         let detection = detect_backends(tmp.path()).unwrap();
         assert_eq!(
             detection.runtime_backend(),
-            Some(LocalBlockBackendKind::Current)
+            Some(LocalPayloadBackendKind::Current)
         );
         assert_eq!(
             scan_pending_uploads(tmp.path(), &volume_uuid.to_string(), Some(&detection)).unwrap(),
@@ -565,8 +574,8 @@ mod tests {
         let volume_uuid = Uuid::new_v4();
         {
             let backend =
-                studiofs_cache::open_local_block_backend(tmp.path(), &volume_uuid.to_string())
-                    .expect("open local block backend")
+                studiofs_cache::open_local_payload_backend(tmp.path(), &volume_uuid.to_string())
+                    .expect("open local payload backend")
                     .backend;
             backend.put(10, b"dirty", false).unwrap();
             backend.put(11, b"cached", true).unwrap();
@@ -585,7 +594,7 @@ mod tests {
     #[test]
     fn scan_cache_usage_skips_incomplete_runtime_without_creating_index() {
         let tmp = tempfile::tempdir().unwrap();
-        let layout = studiofs_cache::runtime::LocalBlockLayout::from_cache_root(tmp.path());
+        let layout = studiofs_cache::runtime::LocalPayloadLayout::from_cache_root(tmp.path());
         std::fs::create_dir_all(&layout.index_dir).unwrap();
 
         let detection = detect_backends(tmp.path()).unwrap();
@@ -635,10 +644,10 @@ mod tests {
             generated_unix_ms: 123,
             uptime_secs: 4.0,
             pending_uploads: 7,
-            backend_tag: "local-block-runtime".to_string(),
+            backend_tag: "local-payload-runtime".to_string(),
             flush_barrier_calls: 11,
             flush_barrier_calls_per_sec: 2.5,
-            block_store_sync_data: Default::default(),
+            payload_store_sync_data: Default::default(),
             local_cache_io: Default::default(),
             winfsp_callbacks: Default::default(),
             winfsp_write_path: Default::default(),
@@ -657,7 +666,7 @@ mod tests {
 
         let loaded = read_write_path_observability(tmp.path()).expect("metrics");
         assert_eq!(loaded.0, metrics_path);
-        assert_eq!(loaded.1.backend_tag, "local-block-runtime");
+        assert_eq!(loaded.1.backend_tag, "local-payload-runtime");
         assert_eq!(loaded.1.flush_barrier_calls, 11);
     }
 

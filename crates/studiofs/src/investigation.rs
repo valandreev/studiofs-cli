@@ -2212,7 +2212,7 @@ mod tests {
                             source: crate::diagnostics::DiagnosticsEvidenceReferenceSource::ProfilingArtifact,
                             id: "profiles/window-1.json".to_string(),
                             field: Some(
-                                "end_snapshot.write_path.block_store_sync_data.queue_wait_total_ms"
+                                "end_snapshot.write_path.payload_store_sync_data.queue_wait_total_ms"
                                     .to_string(),
                             ),
                         }],
@@ -2488,7 +2488,7 @@ mod tests {
                     supporting_evidence: vec![crate::diagnostics::DiagnosticsEvidenceReference {
                         source: crate::diagnostics::DiagnosticsEvidenceReferenceSource::MarkerSnapshot,
                         id: "2".to_string(),
-                        field: Some("write_path.block_store_sync_data.queue_wait_total_ms".to_string()),
+                        field: Some("write_path.payload_store_sync_data.queue_wait_total_ms".to_string()),
                     }],
                 },
             )

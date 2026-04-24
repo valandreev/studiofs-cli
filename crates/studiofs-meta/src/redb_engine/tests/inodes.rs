@@ -94,13 +94,18 @@ fn test_detect_local_overlay_state() {
     attr.size = 4096;
     engine.set_attr(&attr).unwrap();
     engine
-        .set_file_block(file.ino, 0, &BlockRef::new_partial(11, 4096))
+        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(11, 4096))
         .unwrap();
     assert!(engine.has_local_overlay_state().unwrap());
 
     assert!(
         engine
-            .commit_uploaded_block(file.ino, 0, 0, &BlockRef::new_partial(11, 4096))
+            .mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 0, 11)
+            .unwrap()
+    );
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 0)
             .unwrap()
     );
     assert!(engine.has_local_overlay_state().unwrap());
@@ -143,6 +148,47 @@ fn test_detect_overlay_attr_against_imported_base() {
 
     let overlay = engine.local_overlay_attr_inodes().unwrap();
     assert!(overlay.contains(&base_file.ino));
+}
+
+#[test]
+fn test_set_attr_accepts_fragmented_regular_file_base_graph() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"fragmented-base-attr.txt", 1000, 1000, 0o644)
+        .unwrap();
+
+    let mut base_chunk = RegularFileChunkState::default();
+    base_chunk.slices.insert(
+        SliceId(0),
+        SliceRecord {
+            slice_id: SliceId(0),
+            order: SliceOrder(0),
+            range: SliceRange::new(0, 4096).unwrap(),
+            payload: Some(PayloadRef::new_partial(41, 4096)),
+            payload_state: PayloadRefState::Published,
+        },
+    );
+    base_chunk.slices.insert(
+        SliceId(1),
+        SliceRecord {
+            slice_id: SliceId(1),
+            order: SliceOrder(1),
+            range: SliceRange::new(4096, 8192).unwrap(),
+            payload: Some(PayloadRef::new_partial(42, 4096)),
+            payload_state: PayloadRefState::Published,
+        },
+    );
+    base_chunk.refresh_fragmentation_metrics();
+    set_regular_file_chunk_rows(&engine, file.ino, &[], &[(ChunkId(0), base_chunk)]);
+
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.mode = 0o600;
+    engine
+        .set_attr(&attr)
+        .expect("set_attr should not synthesize a file slice graph for non-contiguous base rows");
+
+    let loaded = engine.get_attr(file.ino).unwrap();
+    assert_eq!(loaded.mode, 0o600);
 }
 
 #[test]

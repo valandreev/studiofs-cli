@@ -1,9 +1,8 @@
 use super::{
-    AccessLevel, BlockRef, Bytes, ExplicitFlushOutcome, FileSessionOperation, Ino, LocalSyncPolicy,
-    StickyErrorPolicy, StudioVfs, VfsError, VfsMeta, VfsResult, block_index_from_offset, debug,
-    error, format_object_fragment_keys, offset_within_block, run_meta, warn,
+    AccessLevel, Bytes, ExplicitFlushOutcome, FileSessionOperation, Ino, LocalSyncPolicy,
+    PayloadRef, StickyErrorPolicy, StudioVfs, VfsError, VfsResult, block_index_from_offset, debug,
+    error, format_object_fragment_keys, offset_within_block, warn,
 };
-use std::sync::Arc;
 
 impl StudioVfs {
     /// Read file data at the given offset.
@@ -146,7 +145,7 @@ impl StudioVfs {
 
     pub(super) async fn fetch_block_for_ref(
         &self,
-        block: &BlockRef,
+        block: &PayloadRef,
         prefetch: bool,
     ) -> Result<Bytes, crate::fetch::FetchError> {
         let keys = format_object_fragment_keys(&self.data_prefix, block.object_id);
@@ -163,7 +162,7 @@ impl StudioVfs {
 
     pub(super) async fn fetch_block_for_ref_after_local_miss(
         &self,
-        block: &BlockRef,
+        block: &PayloadRef,
     ) -> Result<Bytes, crate::fetch::FetchError> {
         let keys = format_object_fragment_keys(&self.data_prefix, block.object_id);
         self.fetch_scheduler
@@ -171,18 +170,13 @@ impl StudioVfs {
             .await
     }
 
-    pub(super) fn copy_block_payload_into_range(
-        &self,
-        data: &[u8],
-        block_offset: u64,
-        dst: &mut [u8],
-    ) {
+    pub(super) fn copy_payload_into_range(&self, data: &[u8], block_offset: u64, dst: &mut [u8]) {
         let Ok(src_start) = usize::try_from(block_offset) else {
             warn!(
                 block_offset,
                 data_len = data.len(),
                 dst_len = dst.len(),
-                "copy_block_payload_into_range: block_offset does not fit usize, zeroing dst"
+                "copy_payload_into_range: block_offset does not fit usize, zeroing dst"
             );
             dst.fill(0);
             return;
@@ -192,7 +186,7 @@ impl StudioVfs {
                 block_offset,
                 data_len = data.len(),
                 dst_len = dst.len(),
-                "copy_block_payload_into_range: block_offset >= data.len(), zeroing dst (possible partial-block read bug)"
+                "copy_payload_into_range: block_offset >= data.len(), zeroing dst (possible partial-payload read bug)"
             );
             dst.fill(0);
             return;
@@ -207,28 +201,28 @@ impl StudioVfs {
                 data_len = data.len(),
                 dst_len = dst.len(),
                 copy_len,
-                "copy_block_payload_into_range: padding with zeros (partial block or short read)"
+                "copy_payload_into_range: padding with zeros (partial payload or short read)"
             );
             dst[copy_len..].fill(0);
         }
     }
 
-    pub(super) fn copy_committed_block_payload_into_range(
+    pub(super) fn copy_committed_payload_into_range(
         &self,
         data: &[u8],
-        block: &BlockRef,
+        block: &PayloadRef,
         file_offset: u64,
         dst: &mut [u8],
     ) -> VfsResult<()> {
         let src_start = usize::try_from(block.offset).map_err(|_| {
             VfsError::Other(format!(
-                "committed block offset does not fit usize: object_id={}, offset={}",
+                "committed payload object offset does not fit usize: object_id={}, offset={}",
                 block.object_id, block.offset
             ))
         })?;
         let Some(src_end) = src_start.checked_add(dst.len()) else {
             return Err(VfsError::Other(format!(
-                "committed block copy range overflow: object_id={}, offset={}, dst_len={}",
+                "committed payload object copy range overflow: object_id={}, offset={}, dst_len={}",
                 block.object_id,
                 block.offset,
                 dst.len()
@@ -242,10 +236,10 @@ impl StudioVfs {
                 block_length = block.length,
                 payload_len = data.len(),
                 requested = dst.len(),
-                "committed block payload shorter than requested span"
+                "committed payload object shorter than requested span"
             );
             return Err(VfsError::Other(format!(
-                "committed block payload too short: object_id={}, payload_len={}, required_end={}",
+                "committed payload object too short: object_id={}, payload_len={}, required_end={}",
                 block.object_id,
                 data.len(),
                 src_end
@@ -253,18 +247,6 @@ impl StudioVfs {
         }
         dst.copy_from_slice(&data[src_start..src_end]);
         Ok(())
-    }
-
-    pub(super) async fn get_file_block_async(
-        &self,
-        ino: Ino,
-        block_index: u32,
-    ) -> VfsResult<Option<BlockRef>> {
-        let meta = self.meta.clone();
-        run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-            engine.get_file_block(ino, block_index)
-        })
-        .await
     }
 
     /// Write data to a file at the given offset.

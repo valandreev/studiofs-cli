@@ -9,7 +9,7 @@ impl RedbMetaEngine {
             let regular: RegularFileBaseState = decode(bytes)?;
             if regular.chunks.values().any(|chunk| {
                 chunk.slices.values().any(|slice| {
-                    slice.block_state == BlockRefState::Published && slice.block.is_some()
+                    slice.payload_state == PayloadRefState::Published && slice.payload.is_some()
                 })
             }) {
                 published_regular_inodes.insert(*ino);
@@ -55,7 +55,7 @@ impl RedbMetaEngine {
             let regular: RegularFileBaseState = decode(bytes)?;
             for chunk in regular.chunks.values() {
                 for slice in chunk.slices.values() {
-                    if let Some(block) = slice.block.as_ref() {
+                    if let Some(block) = slice.payload.as_ref() {
                         referenced_objects
                             .entry(block.object_id)
                             .or_insert(block.length as u64);
@@ -373,7 +373,6 @@ impl RedbMetaEngine {
                 crate::events::MetaEvent::AddEntry { .. } => {}
                 crate::events::MetaEvent::RemoveEntry { .. } => {}
                 crate::events::MetaEvent::RenameEntry { .. } => {}
-                crate::events::MetaEvent::SetFileBlock { .. } => {}
                 crate::events::MetaEvent::SetRegularFileOverlaySlices { ino, chunk_slices } => {
                     for (chunk_id, slices) in chunk_slices {
                         Self::set_regular_file_chunk_state_in_txn(
@@ -386,62 +385,15 @@ impl RedbMetaEngine {
                         )?;
                     }
                 }
-
-                crate::events::MetaEvent::RemoveFileBlock { ino, block_index } => {
-                    let mut committed_manifest =
-                        Self::base_manifest_from_graph_rows_in_txn(&txn, *ino)?;
-                    committed_manifest.retain(|(current_index, _)| current_index != block_index);
-                    let block_size = Self::regular_file_graph_block_size_from_write_txn(&txn)?;
-                    Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
-                        &txn,
-                        REGULAR_FILE_BASE_TABLE,
-                        *ino,
-                        committed_manifest.as_slice(),
-                        block_size,
-                        true,
-                        false,
-                    )?;
-                }
-                crate::events::MetaEvent::RemoveFileBlocks { ino } => {
+                crate::events::MetaEvent::RemoveRegularFileGraph { ino } => {
                     Self::clear_regular_file_graph_in_txn(&txn, *ino)?;
                 }
-                crate::events::MetaEvent::SetFileBlocksBatch { .. } => {}
-                crate::events::MetaEvent::CommitFileBlock {
-                    ino,
-                    block_index,
-                    block,
-                } => {
-                    let mut committed_manifest =
-                        Self::base_manifest_from_graph_rows_in_txn(&txn, *ino)?;
-                    if let Some((_, existing_block)) = committed_manifest
-                        .iter_mut()
-                        .find(|(current_index, _)| current_index == block_index)
-                    {
-                        *existing_block = block.clone();
-                    } else {
-                        committed_manifest.push((*block_index, block.clone()));
-                        committed_manifest.sort_by_key(|(current_index, _)| *current_index);
-                    }
-                    let block_size = Self::regular_file_graph_block_size_from_write_txn(&txn)?;
-                    Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
+                crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
+                    Self::replace_regular_file_chunk_rows_from_chunk_slices_in_txn(
                         &txn,
                         REGULAR_FILE_BASE_TABLE,
                         *ino,
-                        committed_manifest.as_slice(),
-                        block_size,
-                        true,
-                        false,
-                    )?;
-                }
-                crate::events::MetaEvent::PublishFileManifest { ino, blocks } => {
-                    let block_size = Self::regular_file_graph_block_size_from_write_txn(&txn)?;
-                    Self::replace_regular_file_chunk_rows_from_blocks_in_txn(
-                        &txn,
-                        REGULAR_FILE_BASE_TABLE,
-                        *ino,
-                        blocks.as_slice(),
-                        block_size,
-                        true,
+                        chunk_slices.as_slice(),
                         false,
                     )?;
                 }
@@ -767,12 +719,16 @@ impl RedbMetaEngine {
                         )?;
                     }
                 }
-                crate::events::MetaEvent::SetFileBlock { .. }
-                | crate::events::MetaEvent::RemoveFileBlock { .. }
-                | crate::events::MetaEvent::RemoveFileBlocks { .. }
-                | crate::events::MetaEvent::SetFileBlocksBatch { .. }
-                | crate::events::MetaEvent::CommitFileBlock { .. }
-                | crate::events::MetaEvent::PublishFileManifest { .. }
+                crate::events::MetaEvent::PublishRegularFileBaseSlices { ino, chunk_slices } => {
+                    Self::replace_regular_file_chunk_rows_from_chunk_slices_in_txn(
+                        &txn,
+                        REGULAR_FILE_BASE_TABLE,
+                        *ino,
+                        chunk_slices.as_slice(),
+                        false,
+                    )?;
+                }
+                crate::events::MetaEvent::RemoveRegularFileGraph { .. }
                 | crate::events::MetaEvent::AddPendingDeletion { .. }
                 | crate::events::MetaEvent::RemovePendingDeletion { .. }
                 | crate::events::MetaEvent::CreateSnapshot { .. }
@@ -952,12 +908,8 @@ impl RedbMetaEngine {
                         )?;
                     }
                 }
-                crate::events::MetaEvent::SetFileBlock { .. }
-                | crate::events::MetaEvent::RemoveFileBlock { .. }
-                | crate::events::MetaEvent::RemoveFileBlocks { .. }
-                | crate::events::MetaEvent::SetFileBlocksBatch { .. }
-                | crate::events::MetaEvent::CommitFileBlock { .. }
-                | crate::events::MetaEvent::PublishFileManifest { .. }
+                crate::events::MetaEvent::PublishRegularFileBaseSlices { .. } => {}
+                crate::events::MetaEvent::RemoveRegularFileGraph { .. }
                 | crate::events::MetaEvent::AddPendingDeletion { .. }
                 | crate::events::MetaEvent::RemovePendingDeletion { .. }
                 | crate::events::MetaEvent::CreateSnapshot { .. }

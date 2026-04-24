@@ -9,9 +9,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use opendal::services::S3;
 use opendal::{EntryMode, ErrorKind, Operator};
 use studiofs_cache::runtime::{
-    LocalBlockBackendKind, LocalBlockRuntimeDetection, detect_cache_backends,
+    LocalPayloadBackendKind, LocalPayloadRuntimeDetection, detect_cache_backends,
 };
-use studiofs_cache::{OpenLocalBlockBackendError, open_local_block_backend};
+use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
 use studiofs_data::object::{format_object_fragment_keys, parse_object_id_from_key};
 use studiofs_meta::open_meta_engine;
 
@@ -140,7 +140,7 @@ fn local_cache_path(
 
 fn map_cache_backend_error(
     cache_dir: &std::path::Path,
-    source: OpenLocalBlockBackendError,
+    source: OpenLocalPayloadBackendError,
 ) -> anyhow::Error {
     anyhow::anyhow!(
         "failed to open local cache backend at '{}': {source}",
@@ -159,7 +159,7 @@ fn inspect_local_cache_runtime(
     volume_uuid: &str,
 ) -> anyhow::Result<(
     PathBuf,
-    Option<LocalBlockRuntimeDetection>,
+    Option<LocalPayloadRuntimeDetection>,
     Option<JanitorLocalCacheState>,
 )> {
     let cache_path = local_cache_path(meta_dir, cache_dir, volume_uuid);
@@ -173,7 +173,7 @@ fn inspect_local_cache_runtime(
             return Ok((cache_path, None, None));
         }
     };
-    if detection.runtime_backend() != Some(LocalBlockBackendKind::Current) {
+    if detection.runtime_backend() != Some(LocalPayloadBackendKind::Current) {
         return Ok((cache_path, Some(detection), None));
     }
     if detection.needs_runtime_provisioning() {
@@ -184,7 +184,7 @@ fn inspect_local_cache_runtime(
         return Ok((cache_path, Some(detection), None));
     }
 
-    let store = match open_local_block_backend(&cache_path, volume_uuid) {
+    let store = match open_local_payload_backend(&cache_path, volume_uuid) {
         Ok(store) => store.backend,
         Err(source) => {
             let error = map_cache_backend_error(&cache_path, source);
@@ -439,7 +439,7 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use studiofs_cache::runtime::LocalBlockLayout;
+    use studiofs_cache::runtime::LocalPayloadLayout;
 
     #[test]
     fn janitor_parses_flags_and_defaults() {
@@ -490,7 +490,7 @@ mod tests {
         std::fs::create_dir_all(&meta_dir).unwrap();
 
         let cache_root = cache_base.join(volume_uuid);
-        let backend = studiofs_cache::open_local_block_backend_with_budget(
+        let backend = studiofs_cache::open_local_payload_backend_with_budget(
             &cache_root,
             volume_uuid,
             4 * 1024 * 1024,
@@ -512,8 +512,8 @@ mod tests {
         assert_eq!(
             detection
                 .as_ref()
-                .and_then(LocalBlockRuntimeDetection::runtime_backend),
-            Some(LocalBlockBackendKind::Current)
+                .and_then(LocalPayloadRuntimeDetection::runtime_backend),
+            Some(LocalPayloadBackendKind::Current)
         );
         assert_eq!(
             local_cache_state,
@@ -530,7 +530,7 @@ mod tests {
         std::fs::create_dir_all(&meta_dir).unwrap();
 
         let cache_root = cache_base.join(volume_uuid);
-        let _backend_guard = studiofs_cache::open_local_block_backend_with_budget(
+        let _backend_guard = studiofs_cache::open_local_payload_backend_with_budget(
             &cache_root,
             volume_uuid,
             4 * 1024 * 1024,
@@ -545,8 +545,8 @@ mod tests {
         assert_eq!(
             detection
                 .as_ref()
-                .and_then(LocalBlockRuntimeDetection::runtime_backend),
-            Some(LocalBlockBackendKind::Current)
+                .and_then(LocalPayloadRuntimeDetection::runtime_backend),
+            Some(LocalPayloadBackendKind::Current)
         );
         assert_eq!(
             local_cache_state, None,
@@ -563,7 +563,7 @@ mod tests {
         std::fs::create_dir_all(&meta_dir).unwrap();
 
         let cache_root = cache_base.join(volume_uuid);
-        let layout = LocalBlockLayout::from_cache_root(&cache_root);
+        let layout = LocalPayloadLayout::from_cache_root(&cache_root);
         std::fs::create_dir_all(&layout.index_dir).unwrap();
 
         let (inspected_path, detection, local_cache_state) =
@@ -574,12 +574,12 @@ mod tests {
         assert_eq!(
             detection
                 .as_ref()
-                .and_then(LocalBlockRuntimeDetection::runtime_backend),
+                .and_then(LocalPayloadRuntimeDetection::runtime_backend),
             None
         );
         assert_eq!(local_cache_state, None);
         assert!(
-            !layout.payload_blocks_dir.exists(),
+            !layout.payload_objects_dir.exists(),
             "janitor inspection should not provision missing runtime directories"
         );
         assert!(
@@ -587,7 +587,7 @@ mod tests {
             "the seeded partial runtime directory should stay intact"
         );
         assert!(
-            !layout.upload_stage_blocks_dir.exists(),
+            !layout.upload_stage_objects_dir.exists(),
             "janitor inspection should not provision the upload directory as a side effect"
         );
         assert!(

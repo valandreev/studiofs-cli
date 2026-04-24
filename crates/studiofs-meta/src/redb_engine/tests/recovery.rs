@@ -68,6 +68,74 @@ fn test_recover_undo_logs_replays_deferred_delete() {
 }
 
 #[test]
+fn test_recover_undo_logs_replays_deferred_delete_with_fragmented_graph() {
+    let engine = temp_engine();
+    let parent = ROOT_INO;
+    let name = b"orphaned-fragmented-open-unlink.txt";
+
+    let attr = engine.create_file(parent, name, 1000, 1000, 0o644).unwrap();
+    let mut file_attr = engine.get_attr(attr.ino).unwrap();
+    file_attr.size = DEFAULT_BLOCK_SIZE as u64;
+    file_attr.content_epoch = 1;
+    engine.set_attr(&file_attr).unwrap();
+
+    let midpoint = DEFAULT_BLOCK_SIZE / 2;
+    let mut overlay_chunk = RegularFileChunkState::default();
+    overlay_chunk.slices.insert(
+        SliceId(0),
+        SliceRecord {
+            slice_id: SliceId(0),
+            order: SliceOrder(0),
+            range: SliceRange::new(0, midpoint).unwrap(),
+            payload: Some(PayloadRef::new_partial(21_001, midpoint)),
+            payload_state: PayloadRefState::LocalOnly,
+        },
+    );
+    overlay_chunk.slices.insert(
+        SliceId(1),
+        SliceRecord {
+            slice_id: SliceId(1),
+            order: SliceOrder(1),
+            range: SliceRange::new(midpoint, DEFAULT_BLOCK_SIZE).unwrap(),
+            payload: Some(PayloadRef::new_partial(21_002, DEFAULT_BLOCK_SIZE - midpoint)),
+            payload_state: PayloadRefState::LocalOnly,
+        },
+    );
+    overlay_chunk.refresh_fragmentation_metrics();
+    set_regular_file_chunk_rows(&engine, attr.ino, &[(ChunkId(0), overlay_chunk)], &[]);
+
+    let fragmented_spans = engine
+        .lookup_regular_file_slices(attr.ino, 0, u64::from(DEFAULT_BLOCK_SIZE))
+        .unwrap();
+    assert_eq!(
+        fragmented_spans
+            .iter()
+            .filter(|span| span.payload.is_some())
+            .count(),
+        2
+    );
+    let unlinked = engine.unlink_open_handle(parent, name).unwrap();
+    assert_eq!(unlinked.ino, attr.ino);
+
+    let touched = engine.recover_undo_logs().unwrap();
+    assert!(touched.contains(&parent));
+    assert!(matches!(
+        engine.get_attr(attr.ino),
+        Err(MetaError::InodeNotFound(_))
+    ));
+    let pending_deletions: std::collections::BTreeSet<_> = engine
+        .get_pending_deletions()
+        .unwrap()
+        .into_iter()
+        .map(|(object_id, _)| object_id)
+        .collect();
+    assert_eq!(
+        pending_deletions,
+        std::collections::BTreeSet::from([21_001, 21_002])
+    );
+}
+
+#[test]
 fn test_recover_undo_logs_cleans_stale_deferred_undo_record() {
     let engine = temp_engine();
 

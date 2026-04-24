@@ -36,8 +36,8 @@ use crate::vfs::{
 
 use super::{OpenFile, VfsError, VfsResult};
 
-pub(super) const CACHE_RUNTIME_MAX_DIRTY_BYTES_LARGE: usize = 800 * 1024 * 1024;
-pub(super) const CACHE_RUNTIME_MAX_DIRTY_BYTES_HUGE: usize = 800 * 1024 * 1024;
+pub(super) const CACHE_RUNTIME_MAX_DIRTY_BYTES_LARGE: usize = 1_200 * 1024 * 1024;
+pub(super) const CACHE_RUNTIME_MAX_DIRTY_BYTES_HUGE: usize = 1_200 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_MIN_WRITE_EAGER_BATCH_BYTES: usize = 16 * 1024 * 1024;
 pub(super) const CACHE_RUNTIME_MAX_WRITE_EAGER_BATCH_BYTES: usize = 128 * 1024 * 1024;
 pub(super) const WRITE_EAGER_DRAIN_CHUNK_MAX_BYTES: usize = 32 * 1024 * 1024;
@@ -289,7 +289,7 @@ pub struct VfsConfig {
     pub fetch_prefetch_acquire_wait_ms: u64,
     /// Materializer batch limit for each drain cycle.
     pub max_drain_batch: usize,
-    /// Time to wait for remote visibility before publishing a manifest.
+    /// Time to wait for remote visibility before publishing a base graph.
     pub publish_visibility_timeout_secs: u64,
     /// Metadata flush timeout during shutdown.
     pub shutdown_metadata_flush_timeout_secs: u64,

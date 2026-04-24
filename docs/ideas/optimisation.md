@@ -38,9 +38,9 @@ WinFSP callback (kernel)
     ↓ COPY #1: Bytes::copy_from_slice()
 HandleWriterRegistry (Bytes in BTreeMap)
     ↓ COPY #2: BytesMut rehydration + merge
-LocalDirtyState (BytesMut blocks)
+LocalDirtyState (BytesMut payloads)
     ↓ COPY #3: freeze() + persist to disk
-Local block backend (NVMe cache)
+Local payload backend (NVMe cache)
     ↓ (Upload to S3 - no additional copy, but data persists)
 ```
 
@@ -255,20 +255,20 @@ data: data.freeze(),
 // 🔴 COPY #4: BytesMut → Bytes (may reallocate if over-allocated)
 ```
 
-**Data Structure for Dirty Blocks:**
+**Data Structure for Dirty Payloads:**
 
 **File:** `crates/studiofs-vfs/src/local_dirty.rs:153-168`
 
 ```rust
 pub(super) struct LocalDirtyState {
-    pub(super) pending_blocks: Mutex<HashMap<(Ino, u32), PendingBlock>>,
+    pub(super) pending_payloads: Mutex<HashMap<(Ino, u32), PendingPayload>>,
     pub(super) pending_block_indexes: Mutex<HashMap<Ino, BTreeSet<u32>>>,
     pending_chunk_slices: Mutex<HashMap<Ino, BTreeMap<u64, Vec<PendingDirtySlice>>>>,
     pub(super) pending_bytes: AtomicUsize,  // Tracks total dirty bytes
     // ... backpressure metrics ...
 }
 
-pub(super) struct PendingBlock {
+pub(super) struct PendingPayload {
     pub(super) data: BytesMut,  // 🔴 Mutable buffer for staging
     pub(super) dirty: bool,
     pub(super) reserved_object_id: Option<u64>,
@@ -288,10 +288,10 @@ pub(super) async fn persist_dirty_write_snapshots_direct(
     dirty_attr: Option<FileAttr>,
     local_sync_policy: LocalSyncPolicy,
 ) -> VfsResult<()> {
-    // Write to local block backend
+    // Write to local payload backend
     for (block_index, snapshot) in blocks.iter() {
-        let persisted = self.local_blocks.put_payload(
-            PersistedWriteBlock {
+        let persisted = self.local_payloads.put_payload(
+            PersistedPayloadEntry {
                 block_index: *block_index,
                 object_id: object_id,
                 data: snapshot.data.clone(),  // Clone Bytes (Arc, cheap)
@@ -308,7 +308,7 @@ pub(super) async fn persist_dirty_write_snapshots_direct(
 ```rust
 pub struct CachedStore {
     config: CachedStoreConfig,
-    local_block_backend: Arc<dyn LocalBlockBackend>,
+    local_payload_backend: Arc<dyn LocalPayloadBackend>,
     pinned: Mutex<PinnedState>,
     upload_queue: Arc<UploadQueue>,
     metrics: CachePipelineMetrics,
@@ -317,7 +317,7 @@ pub struct CachedStore {
 // put() implementation allocates new Bytes from &[u8]
 pub async fn put(&self, object_id: u64, data: &[u8]) -> Result<()> {
     let bytes = Bytes::from(data);  // 🔴 COPY #5: Allocation in cache layer
-    self.local_block_backend.store(object_id, bytes).await
+    self.local_payload_backend.store(object_id, bytes).await
 }
 ```
 
@@ -489,8 +489,8 @@ pub(super) async fn materialize_handle_writers_for_limits(
 | Layer | Type | Where | Size | When Freed |
 |-------|------|-------|------|-----------|
 | **HandleWriterRegistry** | `BTreeMap<u64, Bytes>` | Per-handle, async | Up to 3×max_dirty | After `mark_materialized()` |
-| **LocalDirtyState** | `HashMap<(Ino, u32), BytesMut>` | Per-inode, blocks | Up to max_dirty | After persist to disk |
-| **Local Block Backend** | Disk/mmap cache | Local NVMe | Based on cache size | LRU eviction |
+| **LocalDirtyState** | `HashMap<(Ino, u32), BytesMut>` | Per-inode, payloads | Up to max_dirty | After persist to disk |
+| **Local Payload Backend** | Disk/mmap cache | Local NVMe | Based on cache size | LRU eviction |
 
 ### Memory Flow for 7GB Write
 
@@ -937,7 +937,7 @@ let max_dirty_bytes = clamp_usize(
 
 **Current:** Materialize only when dirty bytes exceed `max_dirty_bytes`
 
-**Recommendation:** Materialize based on time or block count
+**Recommendation:** Materialize based on time or payload-object count
 
 ```rust
 // File: crates/studiofs-vfs/src/vfs/handle_writer.rs:715
@@ -949,16 +949,16 @@ pub(super) async fn materialize_handle_writers_for_limits(
 ) -> VfsResult<()> {
     // ... existing code ...
     
-    // NEW: Eager materialization based on block count
+    // NEW: Eager materialization based on payload-object count
     let per_inode_dirty = self.state.handle_writers.dirty_bytes_for_inode(ino);
-    let blocks_per_inode = self.state.handle_writers.blocks_count_for_inode(ino);
+    let payloads_per_inode = self.state.handle_writers.payloads_count_for_inode(ino);
     
-    // Materialize if we have too many pending blocks (even if under budget)
-    let too_many_blocks = blocks_per_inode > 32;  // Config tunable
+    // Materialize if we have too many pending payloads (even if under budget)
+    let too_many_payloads = payloads_per_inode > 32;  // Config tunable
     let time_since_last_materialize = Instant::now() - self.last_materialize_time;
     let too_old = time_since_last_materialize > Duration::from_millis(500);  // Config tunable
     
-    if too_many_blocks || too_old || budget_exceeded {
+    if too_many_payloads || too_old || budget_exceeded {
         // Trigger materialization
     }
 }
@@ -1011,7 +1011,7 @@ async fn write(&self, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
 
 #### 6. Streaming Materialization
 
-Instead of materializing entire blocks at once, flush data to disk incrementally:
+Instead of materializing entire payloads at once, flush data to disk incrementally:
 
 ```rust
 // Conceptual:
@@ -1034,7 +1034,7 @@ while data.remaining() > 0 {
 Rather than always copying into Bytes, implement multi-variant storage:
 
 ```rust
-pub enum WriteBuffer {
+pub enum WritePayload {
     Bytes(Bytes),           // Already copied
     RefBuffer(&[u8]),       // Reference to stable memory (unsafe)
     IOSlice(RawIOSlice),    // File descriptor (Linux only)

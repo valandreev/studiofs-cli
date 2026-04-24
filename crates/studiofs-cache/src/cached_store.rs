@@ -14,11 +14,11 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::local::{
-    LocalBlockBackend, LocalBlockLifecycleState, LocalBlockObjectStats, LocalBlockPut,
-    LocalBlockStorageStats,
+    LocalPayloadBackend, LocalPayloadLifecycleState, LocalPayloadObjectStats, LocalPayloadPut,
+    LocalPayloadStorageStats,
 };
 use crate::metrics::{CachePipelineMetrics, CachePipelineMetricsSnapshot};
-use crate::runtime::LocalBlockLayout;
+use crate::runtime::LocalPayloadLayout;
 use crate::upload_queue::{PendingUpload, UploadQueue};
 use crate::upload_stage::{UploadStageStore, UploadStageStoreError};
 
@@ -158,7 +158,7 @@ impl UploadHotState {
 
 pub struct CachedStore {
     config: CachedStoreConfig,
-    local_block_backend: Arc<dyn LocalBlockBackend>,
+    local_payload_backend: Arc<dyn LocalPayloadBackend>,
     upload_stage_store: UploadStageStore,
     upload_hot: Mutex<UploadHotState>,
     pinned: Mutex<PinnedState>,
@@ -169,17 +169,17 @@ pub struct CachedStore {
 impl CachedStore {
     pub fn open(
         config: CachedStoreConfig,
-        local_block_backend: Arc<dyn LocalBlockBackend>,
+        local_payload_backend: Arc<dyn LocalPayloadBackend>,
     ) -> io::Result<(Arc<Self>, mpsc::UnboundedReceiver<PendingUpload>)> {
         std::fs::create_dir_all(&config.cache_dir)?;
         let upload_hot_bytes = config.upload_hot_bytes;
         let upload_stage_store =
-            UploadStageStore::open(LocalBlockLayout::from_cache_root(&config.cache_dir))
+            UploadStageStore::open(LocalPayloadLayout::from_cache_root(&config.cache_dir))
                 .map_err(io::Error::other)?;
         let (upload_queue, upload_rx) = UploadQueue::new(&config.cache_dir);
         let cached_store = Arc::new(Self {
             config,
-            local_block_backend,
+            local_payload_backend,
             upload_stage_store,
             upload_hot: Mutex::new(UploadHotState::new(upload_hot_bytes)),
             pinned: Mutex::new(PinnedState::default()),
@@ -189,12 +189,12 @@ impl CachedStore {
         Ok((cached_store, upload_rx))
     }
 
-    pub fn local_block_backend(&self) -> &Arc<dyn LocalBlockBackend> {
-        &self.local_block_backend
+    pub fn local_payload_backend(&self) -> &Arc<dyn LocalPayloadBackend> {
+        &self.local_payload_backend
     }
 
     pub fn get(&self, object_id: ObjectId) -> Option<bytes::Bytes> {
-        self.local_block_backend.get(object_id)
+        self.local_payload_backend.get(object_id)
     }
 
     pub fn read_into(
@@ -203,12 +203,12 @@ impl CachedStore {
         data_offset: usize,
         out: &mut [u8],
     ) -> Option<usize> {
-        self.local_block_backend
+        self.local_payload_backend
             .read_into(object_id, data_offset, out)
     }
 
     pub fn get_for_upload(&self, object_id: ObjectId) -> Option<bytes::Bytes> {
-        self.local_block_backend.get_for_upload(object_id)
+        self.local_payload_backend.get_for_upload(object_id)
     }
 
     pub fn get_staged_for_upload(&self, object_id: ObjectId) -> Option<bytes::Bytes> {
@@ -224,11 +224,11 @@ impl CachedStore {
     }
 
     pub fn contains(&self, object_id: ObjectId) -> bool {
-        self.local_block_backend.contains(object_id)
+        self.local_payload_backend.contains(object_id)
     }
 
     pub fn advise_will_need(&self, object_id: ObjectId) {
-        self.local_block_backend.advise_will_need(object_id);
+        self.local_payload_backend.advise_will_need(object_id);
     }
 
     pub fn put(
@@ -236,43 +236,43 @@ impl CachedStore {
         object_id: ObjectId,
         data: &[u8],
         evictable: bool,
-    ) -> Result<(), crate::local::LocalBlockBackendError> {
-        self.local_block_backend.put(object_id, data, evictable)
+    ) -> Result<(), crate::local::LocalPayloadBackendError> {
+        self.local_payload_backend.put(object_id, data, evictable)
     }
 
     pub fn put_batch(
         &self,
-        entries: &[LocalBlockPut],
-    ) -> Result<(), crate::local::LocalBlockBackendError> {
-        self.local_block_backend.put_batch(entries)
+        entries: &[LocalPayloadPut],
+    ) -> Result<(), crate::local::LocalPayloadBackendError> {
+        self.local_payload_backend.put_batch(entries)
     }
 
-    pub fn sync_data(&self) -> Result<(), crate::local::LocalBlockBackendError> {
-        self.local_block_backend.sync_data()
+    pub fn sync_data(&self) -> Result<(), crate::local::LocalPayloadBackendError> {
+        self.local_payload_backend.sync_data()
     }
 
-    pub fn run_pressure_maintenance(&self) -> Result<(), crate::local::LocalBlockBackendError> {
-        self.local_block_backend.run_pressure_maintenance()
+    pub fn run_pressure_maintenance(&self) -> Result<(), crate::local::LocalPayloadBackendError> {
+        self.local_payload_backend.run_pressure_maintenance()
     }
 
     pub fn mark_uploading(&self, object_id: ObjectId) {
-        self.local_block_backend.mark_uploading(object_id);
+        self.local_payload_backend.mark_uploading(object_id);
     }
 
     pub fn mark_upload_failed(&self, object_id: ObjectId) {
-        self.local_block_backend.mark_upload_failed(object_id);
+        self.local_payload_backend.mark_upload_failed(object_id);
     }
 
     pub fn mark_uploaded(&self, object_id: ObjectId) {
-        self.local_block_backend.mark_uploaded(object_id);
+        self.local_payload_backend.mark_uploaded(object_id);
     }
 
     pub fn remove(&self, object_id: ObjectId) {
-        self.local_block_backend.remove(object_id);
+        self.local_payload_backend.remove(object_id);
     }
 
     pub fn remove_batch(&self, object_ids: &[ObjectId]) {
-        self.local_block_backend.remove_batch(object_ids);
+        self.local_payload_backend.remove_batch(object_ids);
     }
 
     pub fn link_upload_stage_batch(
@@ -282,7 +282,7 @@ impl CachedStore {
         self.upload_stage_store.link_payload_batch(object_ids)
     }
 
-    pub fn cache_hot_upload_batch(&self, entries: &[LocalBlockPut]) {
+    pub fn cache_hot_upload_batch(&self, entries: &[LocalPayloadPut]) {
         let mut upload_hot = self.upload_hot.lock();
         for entry in entries {
             upload_hot.insert(entry.object_id, entry.data.clone());
@@ -309,37 +309,37 @@ impl CachedStore {
     }
 
     pub fn dirty_object_ids(&self) -> Vec<ObjectId> {
-        self.local_block_backend.dirty_object_ids()
+        self.local_payload_backend.dirty_object_ids()
     }
 
     pub fn dirty_object_count(&self) -> usize {
-        self.local_block_backend.dirty_object_count()
+        self.local_payload_backend.dirty_object_count()
     }
 
-    pub fn lifecycle_state(&self, object_id: ObjectId) -> LocalBlockLifecycleState {
-        self.local_block_backend.lifecycle_state(object_id)
+    pub fn lifecycle_state(&self, object_id: ObjectId) -> LocalPayloadLifecycleState {
+        self.local_payload_backend.lifecycle_state(object_id)
     }
 
     pub fn is_evictable(&self, object_id: ObjectId) -> bool {
-        self.local_block_backend.is_evictable(object_id) && !self.is_pinned(object_id)
+        self.local_payload_backend.is_evictable(object_id) && !self.is_pinned(object_id)
     }
 
-    pub fn storage_stats(&self) -> LocalBlockStorageStats {
-        self.local_block_backend.storage_stats()
+    pub fn storage_stats(&self) -> LocalPayloadStorageStats {
+        self.local_payload_backend.storage_stats()
     }
 
-    pub fn object_stats(&self, object_id: ObjectId) -> Option<LocalBlockObjectStats> {
-        self.local_block_backend.object_stats(object_id)
+    pub fn object_stats(&self, object_id: ObjectId) -> Option<LocalPayloadObjectStats> {
+        self.local_payload_backend.object_stats(object_id)
     }
 
     pub fn object_ids(&self) -> Vec<ObjectId> {
-        self.local_block_backend.object_ids()
+        self.local_payload_backend.object_ids()
     }
 
     pub fn pin(&self, object_id: ObjectId) {
         let first_pin = self.pinned.lock().insert(object_id);
         if first_pin {
-            self.local_block_backend.pin(object_id);
+            self.local_payload_backend.pin(object_id);
         }
     }
 
@@ -350,7 +350,7 @@ impl CachedStore {
     pub fn unpin(&self, object_id: ObjectId) {
         let last_pin = self.pinned.lock().remove(object_id);
         if last_pin {
-            self.local_block_backend.unpin(object_id);
+            self.local_payload_backend.unpin(object_id);
         }
     }
 
@@ -368,7 +368,7 @@ impl CachedStore {
             let mut pinned = self.pinned.lock();
             pinned.insert_many(ops.iter().map(|(_, _, object_id, _)| *object_id))
         };
-        self.local_block_backend.pin_batch(&first_pins);
+        self.local_payload_backend.pin_batch(&first_pins);
         for (ino, offset, object_id, content_epoch) in ops {
             self.upload_queue
                 .submit(*ino, *offset, *object_id, *content_epoch);
@@ -439,14 +439,15 @@ impl CachedStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{open_local_block_backend, open_local_block_backend_with_budget};
+    use crate::{open_local_payload_backend, open_local_payload_backend_with_budget};
 
     fn temp_cached_store(
         dir: &tempfile::TempDir,
     ) -> (Arc<CachedStore>, mpsc::UnboundedReceiver<PendingUpload>) {
-        let backend = open_local_block_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
-            .expect("open backend")
-            .backend;
+        let backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
+                .expect("open backend")
+                .backend;
         CachedStore::open(CachedStoreConfig::new(dir.path()), backend).expect("open cached store")
     }
 
@@ -454,7 +455,7 @@ mod tests {
         dir: &tempfile::TempDir,
         budget_bytes: u64,
     ) -> (Arc<CachedStore>, mpsc::UnboundedReceiver<PendingUpload>) {
-        let backend = open_local_block_backend_with_budget(
+        let backend = open_local_payload_backend_with_budget(
             dir.path(),
             "00000000-0000-0000-0000-000000000001",
             budget_bytes,
@@ -514,7 +515,7 @@ mod tests {
     fn upload_stage_roundtrip_through_cached_store_api() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (cached_store, _rx) = temp_cached_store(&dir);
-        let put = LocalBlockPut {
+        let put = LocalPayloadPut {
             object_id: 404,
             data: bytes::Bytes::from_static(b"staged-payload"),
             evictable: false,
@@ -540,9 +541,10 @@ mod tests {
     #[test]
     fn hot_upload_buffer_evicts_oldest_entries_over_budget() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let backend = open_local_block_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
-            .expect("open backend")
-            .backend;
+        let backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
+                .expect("open backend")
+                .backend;
         let (cached_store, _rx) = CachedStore::open(
             CachedStoreConfig::new(dir.path()).with_upload_hot_bytes(8),
             backend,
@@ -550,17 +552,17 @@ mod tests {
         .expect("open cached store");
 
         cached_store.cache_hot_upload_batch(&[
-            LocalBlockPut {
+            LocalPayloadPut {
                 object_id: 1,
                 data: Bytes::from_static(b"aaaa"),
                 evictable: false,
             },
-            LocalBlockPut {
+            LocalPayloadPut {
                 object_id: 2,
                 data: Bytes::from_static(b"bbbb"),
                 evictable: false,
             },
-            LocalBlockPut {
+            LocalPayloadPut {
                 object_id: 3,
                 data: Bytes::from_static(b"cccc"),
                 evictable: false,
@@ -614,7 +616,7 @@ mod tests {
 
         assert!(
             cached_store.contains(20),
-            "pinned uploaded block must survive pressure maintenance"
+            "pinned uploaded payload object must survive pressure maintenance"
         );
     }
 

@@ -1,6 +1,5 @@
 use super::super::{
-    BlockRef, FileSessionOperation, Ino, InodeAttr, StudioVfs, VfsError, VfsResult,
-    block_index_from_offset,
+    FileSessionOperation, Ino, InodeAttr, StudioVfs, VfsError, VfsResult, block_index_from_offset,
 };
 use crate::VfsMeta;
 use crate::runtime::{TimeoutOrCancel, run_meta, run_with_timeout_or_cancel};
@@ -17,7 +16,6 @@ use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_keys,
 };
-use studiofs_meta::MetaError;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -108,10 +106,6 @@ enum UploadPutOutcome {
     Failed(VfsError),
 }
 
-fn is_fragmented_block_lookup_error(error: &VfsError) -> bool {
-    matches!(error, VfsError::Meta(MetaError::FragmentedBlock { .. }))
-}
-
 fn upload_reread_idle_wait_window(
     foreground_active: bool,
     adaptive_penalty: Duration,
@@ -163,7 +157,7 @@ trait CachedStorePort: Clone + Send + Sync + 'static {
     fn cancel_upload(&self, op: &PendingUpload);
 }
 
-trait UploadLocalBlockPort: Clone + Send + Sync + 'static {
+trait UploadLocalPayloadPort: Clone + Send + Sync + 'static {
     fn mark_uploading(&self, object_id: u64);
     fn mark_upload_failed(&self, object_id: u64);
     async fn prepare_local_priority_read(
@@ -177,25 +171,23 @@ trait UploadLocalBlockPort: Clone + Send + Sync + 'static {
     async fn remove_upload_hot(&self, object_id: u64) -> VfsResult<()>;
     async fn remove_upload_stage(&self, object_id: u64) -> VfsResult<()>;
     fn open_handle_count(&self, ino: Ino) -> usize;
-    fn record_deferred_deleted_local_block(&self, ino: Ino, object_id: u64);
+    fn record_deferred_deleted_local_payload(&self, ino: Ino, object_id: u64);
     fn clear_pending_eviction(&self, object_id: u64) -> bool;
 }
 
 trait UploadMetaPort: Clone + Send + Sync + 'static {
     async fn get_attr(&self, ino: Ino) -> VfsResult<Option<InodeAttr>>;
-    async fn get_file_block(&self, ino: Ino, block_index: u32) -> VfsResult<Option<BlockRef>>;
-    async fn mark_regular_file_overlay_object_uploaded_if_matches(
+    async fn has_regular_file_overlay_object_if_matches(
         &self,
         ino: Ino,
         expected_epoch: u64,
         object_id: u64,
     ) -> VfsResult<bool>;
-    async fn mark_file_block_uploaded_if_matches(
+    async fn mark_regular_file_overlay_object_uploaded_if_matches(
         &self,
         ino: Ino,
-        block_index: u32,
         expected_epoch: u64,
-        block: &BlockRef,
+        object_id: u64,
     ) -> VfsResult<bool>;
     async fn add_pending_deletion(&self, object_id: u64, timestamp: i64) -> VfsResult<()>;
 }
@@ -244,7 +236,7 @@ trait UploadPolicyPort: Clone + Send + Sync + 'static {
 #[derive(Clone)]
 struct UploadProcessor<C, L, M, R, S, P> {
     coordinator: C,
-    local_blocks: L,
+    local_payloads: L,
     meta: M,
     remote: R,
     shutdown: S,
@@ -258,7 +250,7 @@ struct UploadProcessor<C, L, M, R, S, P> {
 impl<C, L, M, R, S, P> UploadProcessor<C, L, M, R, S, P>
 where
     C: CachedStorePort,
-    L: UploadLocalBlockPort,
+    L: UploadLocalPayloadPort,
     M: UploadMetaPort,
     R: RemoteUploadPort,
     S: UploadShutdownPort,
@@ -306,7 +298,7 @@ where
                         error = %error,
                         "upload failed due to invalid regular-file graph, quarantining inode"
                     );
-                    self.local_blocks.mark_upload_failed(op.object_id);
+                    self.local_payloads.mark_upload_failed(op.object_id);
                     self.policy
                         .quarantine_invalid_regular_file_graph(op.ino, attr_size, &error);
                     return UploadOutcome::QuarantinedInvalidRegularFileGraph;
@@ -330,7 +322,7 @@ where
                     return UploadOutcome::CancelledDeleted;
                 }
 
-                self.local_blocks.mark_upload_failed(op.object_id);
+                self.local_payloads.mark_upload_failed(op.object_id);
                 self.policy.mark_upload_sticky_error(op.ino, &error);
 
                 let mut retry_op = op;
@@ -439,22 +431,22 @@ where
             return Ok(SingleUploadOutcome::CancelledStale);
         }
 
-        match self.meta.get_file_block(op.ino, block_index).await {
-            Ok(Some(current)) if current.object_id != op.object_id => {
-                self.cancel_stale_upload(op).await?;
-                return Ok(SingleUploadOutcome::CancelledStale);
-            }
-            Ok(_) => {}
-            Err(error) if is_fragmented_block_lookup_error(&error) => {}
-            Err(error) => return Err(error),
+        let overlay_object_current = self
+            .meta
+            .has_regular_file_overlay_object_if_matches(op.ino, op.content_epoch, op.object_id)
+            .await?;
+
+        if !overlay_object_current {
+            self.cancel_stale_upload(op).await?;
+            return Ok(SingleUploadOutcome::CancelledStale);
         }
 
-        self.local_blocks
+        self.local_payloads
             .prepare_local_priority_read(op.object_id, Duration::from_millis(adaptive_penalty_ms))
             .await?;
 
         let t0 = Instant::now();
-        self.local_blocks.mark_uploading(op.object_id);
+        self.local_payloads.mark_uploading(op.object_id);
         let fragment_keys = self.remote.fragment_keys(op.object_id);
         let mut remote_object_visible = false;
         if op.retry_count > 0 {
@@ -480,7 +472,7 @@ where
         let raw_payload: Option<Bytes> = if remote_object_visible {
             None
         } else {
-            self.local_blocks.read_for_upload(op.object_id).await?
+            self.local_payloads.read_for_upload(op.object_id).await?
         };
 
         let raw_payload = match raw_payload {
@@ -503,7 +495,7 @@ where
                                 return Ok(SingleUploadOutcome::CancelledDeleted);
                             }
                             return Err(VfsError::Other(format!(
-                                "object {} missing from local block backend",
+                                "object {} missing from local payload backend",
                                 op.object_id
                             )));
                         }
@@ -521,7 +513,7 @@ where
                         return Ok(SingleUploadOutcome::CancelledDeleted);
                     }
                     return Err(VfsError::Other(format!(
-                        "object {} missing from local block backend",
+                        "object {} missing from local payload backend",
                         op.object_id
                     )));
                 }
@@ -556,47 +548,23 @@ where
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or(0);
-        let keep_local_object = match self.meta.get_file_block(op.ino, block_index).await {
-            Ok(Some(ref block_ref)) if block_ref.object_id == op.object_id => {
-                let marked = self
-                    .meta
-                    .mark_file_block_uploaded_if_matches(
-                        op.ino,
-                        block_index,
-                        op.content_epoch,
-                        block_ref,
-                    )
-                    .await?;
-                if !marked {
-                    self.meta
-                        .add_pending_deletion(op.object_id, timestamp)
-                        .await?;
-                }
-                marked
-            }
-            Ok(Some(_)) | Ok(None) => {
-                self.meta
-                    .add_pending_deletion(op.object_id, timestamp)
-                    .await?;
-                false
-            }
-            Err(error) if is_fragmented_block_lookup_error(&error) => {
-                let marked = self
-                    .meta
-                    .mark_regular_file_overlay_object_uploaded_if_matches(
-                        op.ino,
-                        op.content_epoch,
-                        op.object_id,
-                    )
-                    .await?;
-                if !marked {
-                    self.meta
-                        .add_pending_deletion(op.object_id, timestamp)
-                        .await?;
-                }
-                marked
-            }
-            Err(error) => return Err(error),
+        let keep_local_object = if self
+            .meta
+            .has_regular_file_overlay_object_if_matches(op.ino, op.content_epoch, op.object_id)
+            .await?
+        {
+            self.meta
+                .mark_regular_file_overlay_object_uploaded_if_matches(
+                    op.ino,
+                    op.content_epoch,
+                    op.object_id,
+                )
+                .await?
+        } else {
+            self.meta
+                .add_pending_deletion(op.object_id, timestamp)
+                .await?;
+            false
         };
         self.coordinator.complete_upload(op);
 
@@ -605,15 +573,17 @@ where
         self.policy
             .debug_pending_inode_state(op.ino, "upload_completed");
 
-        if self.local_blocks.clear_pending_eviction(op.object_id) {
-            self.local_blocks.remove(op.object_id).await?;
+        if self.local_payloads.clear_pending_eviction(op.object_id) {
+            self.local_payloads.remove(op.object_id).await?;
         } else if keep_local_object {
-            self.local_blocks.mark_uploaded(op.object_id).await?;
+            self.local_payloads.mark_uploaded(op.object_id).await?;
         } else {
-            self.local_blocks.remove(op.object_id).await?;
+            self.local_payloads.remove(op.object_id).await?;
         }
-        self.local_blocks.remove_upload_hot(op.object_id).await?;
-        self.local_blocks.remove_upload_stage(op.object_id).await?;
+        self.local_payloads.remove_upload_hot(op.object_id).await?;
+        self.local_payloads
+            .remove_upload_stage(op.object_id)
+            .await?;
 
         debug!(
             object_id = op.object_id,
@@ -634,27 +604,31 @@ where
     }
 
     async fn cancel_upload_for_deleted_inode(&self, op: &PendingUpload) -> VfsResult<()> {
-        let has_open_handles = self.local_blocks.open_handle_count(op.ino) > 0;
+        let has_open_handles = self.local_payloads.open_handle_count(op.ino) > 0;
         self.coordinator.cancel_upload(op);
         if has_open_handles {
-            self.local_blocks
-                .record_deferred_deleted_local_block(op.ino, op.object_id);
+            self.local_payloads
+                .record_deferred_deleted_local_payload(op.ino, op.object_id);
         } else {
-            self.local_blocks.remove(op.object_id).await?;
+            self.local_payloads.remove(op.object_id).await?;
         }
-        self.local_blocks.remove_upload_hot(op.object_id).await?;
-        self.local_blocks.remove_upload_stage(op.object_id).await?;
-        self.local_blocks.clear_pending_eviction(op.object_id);
+        self.local_payloads.remove_upload_hot(op.object_id).await?;
+        self.local_payloads
+            .remove_upload_stage(op.object_id)
+            .await?;
+        self.local_payloads.clear_pending_eviction(op.object_id);
         Ok(())
     }
 
     async fn cancel_stale_upload(&self, op: &PendingUpload) -> VfsResult<()> {
         self.shutdown.record_canceled_stale();
         self.coordinator.cancel_upload(op);
-        self.local_blocks.remove(op.object_id).await?;
-        self.local_blocks.remove_upload_hot(op.object_id).await?;
-        self.local_blocks.remove_upload_stage(op.object_id).await?;
-        self.local_blocks.clear_pending_eviction(op.object_id);
+        self.local_payloads.remove(op.object_id).await?;
+        self.local_payloads.remove_upload_hot(op.object_id).await?;
+        self.local_payloads
+            .remove_upload_stage(op.object_id)
+            .await?;
+        self.local_payloads.clear_pending_eviction(op.object_id);
         Ok(())
     }
 
@@ -691,17 +665,17 @@ impl CachedStorePort for VfsCachedStorePort {
 }
 
 #[derive(Clone)]
-struct VfsUploadLocalBlockPort {
+struct VfsUploadLocalPayloadPort {
     vfs: Arc<StudioVfs>,
 }
 
-impl UploadLocalBlockPort for VfsUploadLocalBlockPort {
+impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
     fn mark_uploading(&self, object_id: u64) {
-        self.vfs.local_block_backend.mark_uploading(object_id);
+        self.vfs.local_payload_backend.mark_uploading(object_id);
     }
 
     fn mark_upload_failed(&self, object_id: u64) {
-        self.vfs.local_block_backend.mark_upload_failed(object_id);
+        self.vfs.local_payload_backend.mark_upload_failed(object_id);
     }
 
     async fn prepare_local_priority_read(
@@ -841,7 +815,10 @@ impl UploadLocalBlockPort for VfsUploadLocalBlockPort {
             })?;
         let wait_ns = wait_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
         let read_started = Instant::now();
-        let read_result = self.vfs.block_store_get_for_upload_async(object_id).await?;
+        let read_result = self
+            .vfs
+            .payload_store_get_for_upload_async(object_id)
+            .await?;
         let read_ns = read_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
         let pacing_delay = read_result
             .as_ref()
@@ -915,11 +892,11 @@ impl UploadLocalBlockPort for VfsUploadLocalBlockPort {
     }
 
     async fn remove(&self, object_id: u64) -> VfsResult<()> {
-        self.vfs.block_store_remove_async(object_id).await
+        self.vfs.payload_store_remove_async(object_id).await
     }
 
     async fn mark_uploaded(&self, object_id: u64) -> VfsResult<()> {
-        self.vfs.block_store_mark_uploaded_async(object_id).await
+        self.vfs.payload_store_mark_uploaded_async(object_id).await
     }
 
     async fn remove_upload_hot(&self, object_id: u64) -> VfsResult<()> {
@@ -935,8 +912,9 @@ impl UploadLocalBlockPort for VfsUploadLocalBlockPort {
         self.vfs.handle_table.open_count(ino) as usize
     }
 
-    fn record_deferred_deleted_local_block(&self, ino: Ino, object_id: u64) {
-        self.vfs.record_deferred_deleted_local_block(ino, object_id);
+    fn record_deferred_deleted_local_payload(&self, ino: Ino, object_id: u64) {
+        self.vfs
+            .record_deferred_deleted_local_payload(ino, object_id);
     }
 
     fn clear_pending_eviction(&self, object_id: u64) -> bool {
@@ -964,10 +942,15 @@ impl UploadMetaPort for VfsUploadMetaPort {
         )
     }
 
-    async fn get_file_block(&self, ino: Ino, block_index: u32) -> VfsResult<Option<BlockRef>> {
+    async fn has_regular_file_overlay_object_if_matches(
+        &self,
+        ino: Ino,
+        expected_epoch: u64,
+        object_id: u64,
+    ) -> VfsResult<bool> {
         let meta = self.vfs.meta.clone();
         run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-            engine.get_file_block(ino, block_index)
+            engine.has_regular_file_overlay_object_if_matches(ino, expected_epoch, object_id)
         })
         .await
     }
@@ -985,21 +968,6 @@ impl UploadMetaPort for VfsUploadMetaPort {
                 expected_epoch,
                 object_id,
             )
-        })
-        .await
-    }
-
-    async fn mark_file_block_uploaded_if_matches(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        expected_epoch: u64,
-        block: &BlockRef,
-    ) -> VfsResult<bool> {
-        let meta = self.vfs.meta.clone();
-        let block = block.clone();
-        run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-            engine.mark_file_block_uploaded_if_matches(ino, block_index, expected_epoch, &block)
         })
         .await
     }
@@ -1285,7 +1253,7 @@ pub(crate) struct UploadLifecycleWorker {
     vfs: Arc<StudioVfs>,
     processor: UploadProcessor<
         VfsCachedStorePort,
-        VfsUploadLocalBlockPort,
+        VfsUploadLocalPayloadPort,
         VfsUploadMetaPort,
         VfsRemoteUploadPort,
         VfsUploadShutdownPort,
@@ -1297,7 +1265,7 @@ impl UploadLifecycleWorker {
     pub(crate) fn new(vfs: Arc<StudioVfs>) -> Self {
         let processor = UploadProcessor {
             coordinator: VfsCachedStorePort { vfs: vfs.clone() },
-            local_blocks: VfsUploadLocalBlockPort { vfs: vfs.clone() },
+            local_payloads: VfsUploadLocalPayloadPort { vfs: vfs.clone() },
             meta: VfsUploadMetaPort { vfs: vfs.clone() },
             remote: VfsRemoteUploadPort { vfs: vfs.clone() },
             shutdown: VfsUploadShutdownPort { vfs: vfs.clone() },
@@ -1519,11 +1487,10 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    type FakeBlockMap = HashMap<(Ino, u32), Option<BlockRef>>;
     type FakePendingInodes = Arc<Mutex<HashSet<Ino>>>;
     type FakeProcessor = UploadProcessor<
         FakeCoordinator,
-        FakeLocalBlocks,
+        FakeLocalPayloads,
         FakeMeta,
         FakeRemote,
         FakeShutdown,
@@ -1556,7 +1523,7 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
-    struct FakeLocalBlocks {
+    struct FakeLocalPayloads {
         upload_reads: Arc<Mutex<HashMap<u64, Option<Bytes>>>>,
         removed: Arc<Mutex<Vec<u64>>>,
         upload_hot_removed: Arc<Mutex<Vec<u64>>>,
@@ -1568,7 +1535,7 @@ mod tests {
         open_handles: Arc<Mutex<HashMap<Ino, usize>>>,
     }
 
-    impl UploadLocalBlockPort for FakeLocalBlocks {
+    impl UploadLocalPayloadPort for FakeLocalPayloads {
         fn mark_uploading(&self, _object_id: u64) {}
 
         fn mark_upload_failed(&self, object_id: u64) {
@@ -1616,7 +1583,7 @@ mod tests {
             self.open_handles.lock().get(&ino).copied().unwrap_or(0)
         }
 
-        fn record_deferred_deleted_local_block(&self, ino: Ino, object_id: u64) {
+        fn record_deferred_deleted_local_payload(&self, ino: Ino, object_id: u64) {
             self.deferred.lock().push((ino, object_id));
         }
 
@@ -1625,17 +1592,13 @@ mod tests {
         }
     }
 
-    type UploadedBlockRecord = (Ino, u32, u64, u64);
     type UploadedOverlayObjectRecord = (Ino, u64, u64);
 
     #[derive(Clone)]
     struct FakeMeta {
         attrs: Arc<Mutex<HashMap<Ino, Option<InodeAttr>>>>,
-        blocks: Arc<Mutex<FakeBlockMap>>,
-        fragmented_blocks: Arc<Mutex<HashSet<(Ino, u32)>>>,
         overlay_objects: Arc<Mutex<HashMap<Ino, HashSet<u64>>>>,
         pending_deletions: Arc<Mutex<Vec<u64>>>,
-        uploaded_blocks: Arc<Mutex<Vec<UploadedBlockRecord>>>,
         uploaded_overlay_objects: Arc<Mutex<Vec<UploadedOverlayObjectRecord>>>,
     }
 
@@ -1643,11 +1606,8 @@ mod tests {
         fn default() -> Self {
             Self {
                 attrs: Arc::new(Mutex::new(HashMap::new())),
-                blocks: Arc::new(Mutex::new(HashMap::new())),
-                fragmented_blocks: Arc::new(Mutex::new(HashSet::new())),
                 overlay_objects: Arc::new(Mutex::new(HashMap::new())),
                 pending_deletions: Arc::new(Mutex::new(Vec::new())),
-                uploaded_blocks: Arc::new(Mutex::new(Vec::new())),
                 uploaded_overlay_objects: Arc::new(Mutex::new(Vec::new())),
             }
         }
@@ -1658,19 +1618,27 @@ mod tests {
             Ok(self.attrs.lock().get(&ino).cloned().flatten())
         }
 
-        async fn get_file_block(&self, ino: Ino, block_index: u32) -> VfsResult<Option<BlockRef>> {
-            if self.fragmented_blocks.lock().contains(&(ino, block_index)) {
-                return Err(VfsError::Meta(MetaError::FragmentedBlock {
-                    ino,
-                    block_index,
-                }));
+        async fn has_regular_file_overlay_object_if_matches(
+            &self,
+            ino: Ino,
+            expected_epoch: u64,
+            object_id: u64,
+        ) -> VfsResult<bool> {
+            let epoch_matches = self
+                .attrs
+                .lock()
+                .get(&ino)
+                .and_then(|attr| attr.as_ref())
+                .map(|attr| attr.content_epoch == expected_epoch)
+                .unwrap_or(false);
+            if !epoch_matches {
+                return Ok(false);
             }
             Ok(self
-                .blocks
+                .overlay_objects
                 .lock()
-                .get(&(ino, block_index))
-                .cloned()
-                .flatten())
+                .get(&ino)
+                .is_some_and(|objects| objects.contains(&object_id)))
         }
 
         async fn mark_regular_file_overlay_object_uploaded_if_matches(
@@ -1695,38 +1663,6 @@ mod tests {
                 self.uploaded_overlay_objects
                     .lock()
                     .push((ino, expected_epoch, object_id));
-            }
-            Ok(matches)
-        }
-
-        async fn mark_file_block_uploaded_if_matches(
-            &self,
-            ino: Ino,
-            block_index: u32,
-            expected_epoch: u64,
-            block: &BlockRef,
-        ) -> VfsResult<bool> {
-            let matches = self
-                .attrs
-                .lock()
-                .get(&ino)
-                .and_then(|attr| attr.as_ref())
-                .map(|attr| attr.content_epoch == expected_epoch)
-                .unwrap_or(false)
-                && self
-                    .blocks
-                    .lock()
-                    .get(&(ino, block_index))
-                    .cloned()
-                    .flatten()
-                    .is_some_and(|current| current == *block);
-            if matches {
-                self.uploaded_blocks.lock().push((
-                    ino,
-                    block_index,
-                    expected_epoch,
-                    block.object_id,
-                ));
             }
             Ok(matches)
         }
@@ -1900,7 +1836,7 @@ mod tests {
     fn processor_fixture() -> (
         FakeProcessor,
         FakeCoordinator,
-        FakeLocalBlocks,
+        FakeLocalPayloads,
         FakeMeta,
         FakeRemote,
         FakeShutdown,
@@ -1911,7 +1847,7 @@ mod tests {
             pending_inodes: pending_inodes.clone(),
             ..FakeCoordinator::default()
         };
-        let local_blocks = FakeLocalBlocks::default();
+        let local_payloads = FakeLocalPayloads::default();
         let meta = FakeMeta::default();
         let remote = FakeRemote::default();
         let shutdown = FakeShutdown {
@@ -1921,7 +1857,7 @@ mod tests {
         let policy = FakePolicy::default();
         let processor = UploadProcessor {
             coordinator: coordinator.clone(),
-            local_blocks: local_blocks.clone(),
+            local_payloads: local_payloads.clone(),
             meta: meta.clone(),
             remote: remote.clone(),
             shutdown: shutdown.clone(),
@@ -1934,7 +1870,7 @@ mod tests {
         (
             processor,
             coordinator,
-            local_blocks,
+            local_payloads,
             meta,
             remote,
             shutdown,
@@ -1956,7 +1892,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_upload_requeues_transient_failures() {
-        let (mut processor, coordinator, local_blocks, meta, remote, shutdown, policy) =
+        let (mut processor, coordinator, local_payloads, meta, remote, shutdown, policy) =
             processor_fixture();
         let op = make_pending_upload();
         let before_retry = now_unix_millis();
@@ -1966,16 +1902,16 @@ mod tests {
         meta.attrs
             .lock()
             .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
-        meta.blocks
+        meta.overlay_objects
             .lock()
-            .insert((op.ino, 0), Some(BlockRef::new_partial(op.object_id, 4096)));
+            .insert(op.ino, HashSet::from([op.object_id]));
         *remote.upload_result.lock() =
             Some(UploadPutOutcome::Failed(VfsError::Other("boom".into())));
 
         let outcome = processor.process_upload(op).await;
 
         assert_eq!(outcome, UploadOutcome::Requeued);
-        assert_eq!(local_blocks.failed.lock().as_slice(), &[77]);
+        assert_eq!(local_payloads.failed.lock().as_slice(), &[77]);
         assert_eq!(policy.sticky_errors.lock().len(), 1);
         assert_eq!(shutdown.requeues.load(Ordering::Relaxed), 1);
         let requeued = coordinator.requeued.lock();
@@ -1987,7 +1923,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_upload_cancels_deleted_inodes_before_reading() {
-        let (processor, coordinator, local_blocks, _meta, _remote, shutdown, _policy) =
+        let (processor, coordinator, local_payloads, _meta, _remote, shutdown, _policy) =
             processor_fixture();
         let op = make_pending_upload();
         coordinator.pending_inodes.lock().insert(op.ino);
@@ -1997,14 +1933,14 @@ mod tests {
 
         assert_eq!(outcome, UploadOutcome::CancelledDeleted);
         assert_eq!(coordinator.cancelled.lock().as_slice(), &[77]);
-        assert_eq!(local_blocks.removed.lock().as_slice(), &[77]);
+        assert_eq!(local_payloads.removed.lock().as_slice(), &[77]);
         assert_eq!(shutdown.canceled_deleted.load(Ordering::Relaxed), 1);
         assert_eq!(shutdown.released_tokens.lock().as_slice(), &[11]);
     }
 
     #[tokio::test]
     async fn process_upload_cancels_stale_content_epoch() {
-        let (processor, coordinator, local_blocks, meta, _remote, shutdown, _policy) =
+        let (processor, coordinator, local_payloads, meta, _remote, shutdown, _policy) =
             processor_fixture();
         let op = make_pending_upload();
         coordinator.pending_inodes.lock().insert(op.ino);
@@ -2016,48 +1952,20 @@ mod tests {
 
         assert_eq!(outcome, UploadOutcome::CancelledStale);
         assert_eq!(coordinator.cancelled.lock().as_slice(), &[77]);
-        assert_eq!(local_blocks.removed.lock().as_slice(), &[77]);
+        assert_eq!(local_payloads.removed.lock().as_slice(), &[77]);
         assert_eq!(shutdown.canceled_stale.load(Ordering::Relaxed), 1);
         assert_eq!(shutdown.released_tokens.lock().as_slice(), &[11]);
     }
 
     #[tokio::test]
     async fn process_upload_records_durable_uploaded_progress_before_local_cleanup() {
-        let (processor, coordinator, local_blocks, meta, _remote, _shutdown, policy) =
+        let (processor, coordinator, local_payloads, meta, _remote, _shutdown, policy) =
             processor_fixture();
         let op = make_pending_upload();
         coordinator.pending_inodes.lock().insert(op.ino);
         meta.attrs
             .lock()
             .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
-        meta.blocks
-            .lock()
-            .insert((op.ino, 0), Some(BlockRef::new_partial(op.object_id, 4096)));
-
-        let outcome = processor.process_upload(op).await;
-
-        assert_eq!(outcome, UploadOutcome::Completed);
-        assert_eq!(
-            meta.uploaded_blocks.lock().as_slice(),
-            &[(11, 0, 3, 77)],
-            "successful upload should durably mark epoch/block progress before publish"
-        );
-        assert_eq!(local_blocks.uploaded.lock().as_slice(), &[77]);
-        assert_eq!(local_blocks.upload_hot_removed.lock().as_slice(), &[77]);
-        assert_eq!(local_blocks.upload_stage_removed.lock().as_slice(), &[77]);
-        assert_eq!(policy.refreshed.lock().as_slice(), &[11]);
-    }
-
-    #[tokio::test]
-    async fn process_upload_marks_fragmented_overlay_object_uploaded_before_local_cleanup() {
-        let (processor, coordinator, local_blocks, meta, _remote, _shutdown, policy) =
-            processor_fixture();
-        let op = make_pending_upload();
-        coordinator.pending_inodes.lock().insert(op.ino);
-        meta.attrs
-            .lock()
-            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
-        meta.fragmented_blocks.lock().insert((op.ino, 0));
         meta.overlay_objects
             .lock()
             .insert(op.ino, HashSet::from([op.object_id]));
@@ -2065,10 +1973,33 @@ mod tests {
         let outcome = processor.process_upload(op).await;
 
         assert_eq!(outcome, UploadOutcome::Completed);
-        assert!(
-            meta.uploaded_blocks.lock().is_empty(),
-            "fragmented overlays should not require a synthesized block manifest"
+        assert_eq!(
+            meta.uploaded_overlay_objects.lock().as_slice(),
+            &[(11, 3, 77)],
+            "successful upload should durably mark epoch/object progress before publish"
         );
+        assert_eq!(local_payloads.uploaded.lock().as_slice(), &[77]);
+        assert_eq!(local_payloads.upload_hot_removed.lock().as_slice(), &[77]);
+        assert_eq!(local_payloads.upload_stage_removed.lock().as_slice(), &[77]);
+        assert_eq!(policy.refreshed.lock().as_slice(), &[11]);
+    }
+
+    #[tokio::test]
+    async fn process_upload_marks_fragmented_overlay_object_uploaded_before_local_cleanup() {
+        let (processor, coordinator, local_payloads, meta, _remote, _shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+
+        let outcome = processor.process_upload(op).await;
+
+        assert_eq!(outcome, UploadOutcome::Completed);
         assert_eq!(
             meta.uploaded_overlay_objects.lock().as_slice(),
             &[(11, 3, 77)],
@@ -2079,14 +2010,36 @@ mod tests {
             "still-referenced fragmented objects must remain live"
         );
         assert_eq!(coordinator.completed.lock().as_slice(), &[77]);
-        assert_eq!(local_blocks.uploaded.lock().as_slice(), &[77]);
-        assert_eq!(local_blocks.upload_hot_removed.lock().as_slice(), &[77]);
-        assert_eq!(local_blocks.upload_stage_removed.lock().as_slice(), &[77]);
+        assert_eq!(local_payloads.uploaded.lock().as_slice(), &[77]);
+        assert_eq!(local_payloads.upload_hot_removed.lock().as_slice(), &[77]);
+        assert_eq!(local_payloads.upload_stage_removed.lock().as_slice(), &[77]);
         assert!(
-            local_blocks.removed.lock().is_empty(),
+            local_payloads.removed.lock().is_empty(),
             "current fragmented overlay object should stay in the local backend"
         );
         assert_eq!(policy.refreshed.lock().as_slice(), &[11]);
+    }
+
+    #[tokio::test]
+    async fn process_upload_cancels_stale_fragmented_overlay_without_quarantine() {
+        let (processor, coordinator, local_payloads, meta, _remote, shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+
+        let outcome = processor.process_upload(op).await;
+
+        assert_eq!(outcome, UploadOutcome::CancelledStale);
+        assert_eq!(coordinator.cancelled.lock().as_slice(), &[77]);
+        assert_eq!(local_payloads.removed.lock().as_slice(), &[77]);
+        assert!(
+            policy.quarantines.lock().is_empty(),
+            "stale fragmented uploads should cancel cleanly instead of quarantining the inode"
+        );
+        assert_eq!(shutdown.canceled_stale.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

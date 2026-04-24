@@ -18,7 +18,7 @@ sub-traits:
 - `MetaInodes`
 - `MetaNamespace`
 - `MetaFsOps`
-- `MetaBlocks`
+- `MetaPayloadObjects`
 - `MetaGc`
 - `MetaRecovery`
 - `MetaSymlink`
@@ -143,7 +143,7 @@ For regular files StudioFS keeps two views:
   - remote-visible regular-file base graph in `regular_file_base`
 
 This is required so a client can finish local writes immediately while remote
-clients only see blocks that have actually finished uploading.
+clients only see payload objects that have actually finished uploading.
 
 Regular-file graph rules:
 - slices are chunk-relative and stay within a single chunk
@@ -179,7 +179,7 @@ Serving rules are:
 6. Periodically refresh the remote-visible checkpoint in `metadata_state`.
 
 Events that stay local-only are not published as remote-visible deltas:
-- staged `SetFileBlock` / `SetFileBlocksBatch`
+- local regular-file overlay graph staging (`StageRegularFileOverlaySlices` and upload-state marks)
 - pending deletion churn
 - local regular-file `size` ahead of `committed_size`
 
@@ -258,10 +258,10 @@ Current operational contract:
 
 - local operations are synchronous and immediate for the current client
 - cross-client visibility is eventual
-- namespace visibility may arrive before all file blocks are committed
-- remote-visible file size advances only with committed blocks
+- namespace visibility may arrive before all file payload objects are committed
+- remote-visible file size advances only with committed payload objects
 - foreign namespace can be present in local `base_*` before local overlay stops masking it
-- stale async completions are rejected using `content_epoch` plus block identity checks
+- stale async completions are rejected using `content_epoch` plus object IDentity checks
 - crash/reopen recovery should converge through ordinary restart plus
   `sync_metadata()` / `flush_metadata()`; `discover` is bootstrap/manual repair,
   not the expected path for normal PG replication recovery
@@ -306,13 +306,13 @@ Regular files now use two size/generation concepts:
 - `content_epoch`
   - monotonic content generation used to reject stale async upload completions
 
-## Important Block Tables
+## Important Regular-File Tables
 
 Regular-file graph tables:
 - `regular_file_overlay`
-  - local-visible chunk/slice/block graph rows, keyed by `(ino, chunk_id)`
+  - local-visible chunk/slice/payload-object graph rows, keyed by `(ino, chunk_id)`
 - `regular_file_base`
-  - remote-visible chunk/slice/block graph rows, keyed by `(ino, chunk_id)`
+  - remote-visible chunk/slice/payload-object graph rows, keyed by `(ino, chunk_id)`
 - `SliceRange`
   - validated as chunk-relative half-open ranges and rejected if they cross the current chunk size
 
@@ -388,9 +388,9 @@ Where:
 Regular-file runtime state is split into chunk-local overlay/base graphs:
 
 - `regular_file_overlay`
-  - local-serving chunk/slice/block rows
+  - local-serving chunk/slice/payload-object rows
 - `regular_file_base`
-  - remote-visible chunk/slice/block rows
+  - remote-visible chunk/slice/payload-object rows
 
 Namespace/attrs gain the same split:
 
@@ -541,7 +541,7 @@ Resource-fork compatibility:
 - Resolve victim via merged `lookup`.
 - Write `Tombstone` for `(parent, name)` into `dentries`.
 - Update victim attr in `inodes` if `nlink` stays non-zero.
-- If local view drops final link, remove local block state and local overlay attr.
+- If local view drops final link, remove local payload state and local overlay attr.
 - Remote-visible removal is published later through PG flush.
 
 ### `rename`
@@ -563,7 +563,7 @@ Destination side:
 
 - update attr only in `inodes`
 - modify local-serving `regular_file_overlay`
-- leave `base_inodes.committed_size` and committed blocks untouched until upload
+- leave `base_inodes.committed_size` and committed payload objects untouched until upload
   completion and PG flush publish remote-visible state
 
 ### `set_symlink_target`
@@ -608,7 +608,7 @@ state.
 
 Current conflict set:
 
-- inode is present in local block overlay
+- inode is present in local payload overlay
 - inode is present in local attr overlay
 - inode is present in local symlink overlay
 - xattr key is present in local xattr overlay
@@ -677,7 +677,7 @@ without the field remain decodable.
   deferred-delete intent in the same transaction.
 - `recover_undo_logs()` is the primary replay entry point:
   - heals dangling pending-create dentries
-  - replays deferred-delete cleanup (blocks/attrs/deferred records)
+  - replays deferred-delete cleanup (payload objects/attrs/deferred records)
   - returns touched parent inodes for namespace cache invalidation
 - `recover_undo_logs()` is intended for startup/crash recovery.
 - Runtime janitor replays only pending-create intents (`recover_pending_creates()`)

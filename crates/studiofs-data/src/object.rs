@@ -392,11 +392,11 @@ pub fn read_header(data: &[u8]) -> Result<ObjectHeader, ObjectError> {
 /// Where:
 /// - `data_prefix`: volume data root, e.g. `mydisk/objects/`
 /// - `prefix`: First 4 hex chars of object_id for S3 partition distribution
-/// - `object_id`: 16-char hex sequential block ID
+/// - `object_id`: 16-char hex sequential object ID
 ///
 /// # Arguments
 /// * `data_prefix` - Volume data prefix
-/// * `object_id` - Sequential block ID
+/// * `object_id` - Sequential object ID
 ///
 /// # Returns
 /// S3 key path string
@@ -436,7 +436,7 @@ pub fn format_fragment_keys(data_prefix: &str, object_id: u64) -> [String; CLOUD
 
 pub use format_fragment_keys as format_object_fragment_keys;
 
-/// Validate cloud fragment shape and return reconstructed logical payload size.
+/// Validate cloud fragment shape and return reconstructed payload size.
 ///
 /// Rules:
 /// - exactly `CLOUD_FRAGMENT_COUNT` fragments are expected;

@@ -8,14 +8,14 @@ with the contract, the contract wins.
 ## System Design
 
 StudioFS mounts S3-compatible object storage as a Local-First filesystem with a
-JuiceFS-inspired, Rust-native chunk/slice/block data plane.
+JuiceFS-inspired, Rust-native chunk/slice/payload-object data plane.
 
 Core principles:
 - Foreground metadata operations read and write local `redb`; the local `redb`
   view is the only metadata authority used by mounted foreground IO.
 - PostgreSQL is the bootstrap source, ordered replication bus, checkpoint
   store, and shared-lock authority when cross-client file locks are enabled.
-- File payloads live in immutable blocks addressed by chunk-relative slices.
+- File payloads live in immutable payload objects addressed by chunk-relative slices.
 - Runtime visibility is split into `writer state`, local authority view, and
   asynchronously replicated shared state.
 - The UUID-scoped cache root itself is the runtime boundary of the current
@@ -48,7 +48,7 @@ studiofs (CLI)
 - each discovered client reserves one durable per-volume local inode window
   during bootstrap/discover and later mounts reuse that persisted window state
   instead of minting a fresh inode lease on reconnect
-- block IDs still reserve a persistent PG client slot and reuse the persisted
+- object IDs still reserve a persistent PG client slot and reuse the persisted
   block ranges across later mounts
 
 Core invariants:
@@ -68,7 +68,7 @@ Core invariants:
 4. `flush(ino)` / `close(ino)` / last-handle release materialize accepted bytes
    into the local authority view through local backend + metadata commit.
 5. `CachedStore` queues committed payloads into the runtime upload queue.
-6. Background workers upload immutable blocks to object storage.
+6. Background workers upload immutable payload objects to object storage.
 7. `fsync(ino)` is the explicit strict request for a crash-safe local sync
    boundary.
 8. Epoch finalization publishes the new file version only after the referenced
@@ -81,7 +81,7 @@ Core invariants:
 Reads resolve data in this order:
 1. active writer state for the current mount/handle
 2. local authority view in `redb`
-3. local cache / object-store fetches supplying the block payloads needed by
+3. local cache / object-store fetches supplying the payload objects needed by
    the selected slice view
 4. zero-fill for holes
 

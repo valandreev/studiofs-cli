@@ -190,13 +190,13 @@ impl<'a> PrefetchBatchBuilder<'a> {
 
     fn primary_blocks_within_eof(to_prefetch: Vec<u32>, eof_block: Option<u32>) -> Vec<u32> {
         let mut primary_blocks = Vec::new();
-        for block_idx in to_prefetch {
+        for object_idx in to_prefetch {
             if let Some(max_block) = eof_block
-                && block_idx > max_block
+                && object_idx > max_block
             {
                 continue;
             }
-            primary_blocks.push(block_idx);
+            primary_blocks.push(object_idx);
         }
         primary_blocks
     }
@@ -218,12 +218,12 @@ pub(super) struct PrefetchBatch {
 impl PrefetchBatch {
     pub(super) fn single(
         ino: Ino,
-        block_idx: u32,
+        object_idx: u32,
         read_context: Option<PrefetchReadContext>,
     ) -> Self {
         Self {
             ino,
-            block_indices: vec![block_idx],
+            block_indices: vec![object_idx],
             read_context,
         }
     }
@@ -311,15 +311,15 @@ impl PrefetchWorker {
                 block_indices,
                 read_context,
             } = batch;
-            for block_idx in &block_indices {
-                self.pending_set.remove(&(ino, *block_idx));
+            for object_idx in &block_indices {
+                self.pending_set.remove(&(ino, *object_idx));
             }
             self.update_queue_depth_metric();
 
             let mut started_blocks = Vec::with_capacity(block_indices.len());
-            for block_idx in block_indices {
-                if self.vfs.readahead.start_prefetch(ino, block_idx) {
-                    started_blocks.push(block_idx);
+            for object_idx in block_indices {
+                if self.vfs.readahead.start_prefetch(ino, object_idx) {
+                    started_blocks.push(object_idx);
                 }
             }
             if started_blocks.is_empty() {
@@ -362,7 +362,7 @@ impl PrefetchWorker {
             let ino = batch.ino;
             batch
                 .block_indices
-                .retain(|block_idx| self.pending_set.insert((ino, *block_idx)));
+                .retain(|object_idx| self.pending_set.insert((ino, *object_idx)));
             if !batch.is_empty() {
                 self.pending_queue.push_back(batch);
             }
@@ -413,13 +413,13 @@ impl StudioVfs {
             return ranges;
         };
         let mut range_end = range_start;
-        for &block_idx in block_indices.iter().skip(1) {
-            if range_end.checked_add(1) == Some(block_idx) {
-                range_end = block_idx;
+        for &object_idx in block_indices.iter().skip(1) {
+            if range_end.checked_add(1) == Some(object_idx) {
+                range_end = object_idx;
             } else {
                 ranges.push((range_start, range_end));
-                range_start = block_idx;
-                range_end = block_idx;
+                range_start = object_idx;
+                range_end = object_idx;
             }
         }
         ranges.push((range_start, range_end));

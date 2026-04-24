@@ -4,7 +4,7 @@ use crate::cli::cache_layout::describe_cache_layout_state;
 use clap::Args;
 use std::io::{self, Write};
 use std::path::Path;
-use studiofs_cache::runtime::{LocalBlockRuntimeDetection, detect_cache_backends};
+use studiofs_cache::runtime::{LocalPayloadRuntimeDetection, detect_cache_backends};
 use studiofs_data::{DataStore, DataStoreConfig, store::DataError};
 use studiofs_meta::engine::MetaError;
 use thiserror::Error;
@@ -78,7 +78,7 @@ impl DestroyArgs {
     }
 }
 
-fn describe_destroy_cache_scope(detection: Option<&LocalBlockRuntimeDetection>) -> &'static str {
+fn describe_destroy_cache_scope(detection: Option<&LocalPayloadRuntimeDetection>) -> &'static str {
     if let Some(detection) = detection {
         if detection.runtime_backend().is_some() {
             "local cleanup removes the entire metadata directory (`meta_dir`), including the default cache root and its active UUID-scoped local-cache runtime"
@@ -189,8 +189,8 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
         );
         println!(
             "  Local cache upload: {} ({})",
-            detection.layout.upload_stage_blocks_dir.display(),
-            if detection.upload_blocks_dir_exists {
+            detection.layout.upload_stage_objects_dir.display(),
+            if detection.upload_objects_dir_exists {
                 "present"
             } else {
                 "absent"
@@ -342,29 +342,29 @@ async fn delete_optional_manifest(operator: &opendal::Operator, path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use studiofs_cache::runtime::LocalBlockLayout;
+    use studiofs_cache::runtime::LocalPayloadLayout;
 
-    fn detection(has_layout: bool) -> LocalBlockRuntimeDetection {
+    fn detection(has_layout: bool) -> LocalPayloadRuntimeDetection {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
-        LocalBlockRuntimeDetection {
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        LocalPayloadRuntimeDetection {
             layout,
             index_exists: false,
-            payload_blocks_dir_exists: has_layout,
-            upload_blocks_dir_exists: has_layout,
+            payload_objects_dir_exists: has_layout,
+            upload_objects_dir_exists: has_layout,
             tmp_dir_exists: has_layout,
             index_dir_exists: has_layout,
         }
     }
 
-    fn partial_detection() -> LocalBlockRuntimeDetection {
+    fn partial_detection() -> LocalPayloadRuntimeDetection {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
-        LocalBlockRuntimeDetection {
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        LocalPayloadRuntimeDetection {
             layout,
             index_exists: false,
-            payload_blocks_dir_exists: false,
-            upload_blocks_dir_exists: false,
+            payload_objects_dir_exists: false,
+            upload_objects_dir_exists: false,
             tmp_dir_exists: false,
             index_dir_exists: true,
         }
@@ -375,15 +375,15 @@ mod tests {
         assert_eq!(describe_cache_layout_state(None), "unknown");
         assert_eq!(
             describe_cache_layout_state(Some(&detection(false))),
-            "Local block runtime not initialized"
+            "Local Payload Runtime not initialized"
         );
         assert_eq!(
             describe_cache_layout_state(Some(&detection(true))),
-            "Local block runtime ready"
+            "Local Payload Runtime ready"
         );
         assert_eq!(
             describe_cache_layout_state(Some(&partial_detection())),
-            "Local block runtime incomplete"
+            "Local Payload Runtime incomplete"
         );
     }
 

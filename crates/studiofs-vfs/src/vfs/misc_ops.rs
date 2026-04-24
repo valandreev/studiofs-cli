@@ -113,7 +113,7 @@ impl StudioVfs {
     /// Called by `truncate_blocks()` for each block that is removed by a
     /// truncation.
     pub(super) fn evict_block_from_caches(&self, ino: Ino, block_index: u32, object_id: u64) {
-        self.clear_pending_block(ino, block_index);
+        self.clear_pending_payload(ino, block_index);
         self.remove_live_extent(ino, block_index);
 
         // Committed cache + L1/L2 upload cache (defer if pinned for pending upload).
@@ -124,7 +124,7 @@ impl StudioVfs {
                 object_id, ino, block_index
             );
         } else {
-            self.local_block_backend.remove(object_id);
+            self.local_payload_backend.remove(object_id);
         }
     }
 }

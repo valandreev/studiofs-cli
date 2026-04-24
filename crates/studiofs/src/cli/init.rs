@@ -400,7 +400,7 @@ fn init_pg_schema_and_volume(
             INSERT INTO counters (vol, name, value)
             VALUES
                 ($1, 'next_inode', 2),
-                ($1, 'next_block_id', 1),
+                ($1, 'nextObjectId', 1),
                 ($1, 'used_space', 0),
                 ($1, 'total_inodes', 1)
             ON CONFLICT (vol, name) DO NOTHING

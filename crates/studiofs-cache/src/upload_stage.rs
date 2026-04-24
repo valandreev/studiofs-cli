@@ -1,4 +1,4 @@
-use crate::runtime::LocalBlockLayout;
+use crate::runtime::LocalPayloadLayout;
 use std::fs;
 use std::io;
 use tracing::warn;
@@ -11,17 +11,17 @@ pub enum UploadStageStoreError {
 
 #[derive(Debug, Clone)]
 pub struct UploadStageStore {
-    layout: LocalBlockLayout,
+    layout: LocalPayloadLayout,
 }
 
 impl UploadStageStore {
-    pub fn open(layout: LocalBlockLayout) -> Result<Self, UploadStageStoreError> {
-        fs::create_dir_all(&layout.upload_stage_blocks_dir)?;
+    pub fn open(layout: LocalPayloadLayout) -> Result<Self, UploadStageStoreError> {
+        fs::create_dir_all(&layout.upload_stage_objects_dir)?;
         Ok(Self { layout })
     }
 
     pub fn get(&self, object_id: u64) -> Option<bytes::Bytes> {
-        let path = self.layout.upload_stage_block_path(object_id);
+        let path = self.layout.upload_stage_object_path(object_id);
         match fs::read(&path) {
             Ok(bytes) => Some(bytes::Bytes::from(bytes)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -39,14 +39,14 @@ impl UploadStageStore {
 
     pub fn contains(&self, object_id: u64) -> bool {
         self.layout
-            .upload_stage_block_path(object_id)
+            .upload_stage_object_path(object_id)
             .try_exists()
             .unwrap_or(false)
     }
 
     pub fn link_payload(&self, object_id: u64) -> Result<(), UploadStageStoreError> {
-        let payload_path = self.layout.payload_block_path(object_id);
-        let stage_path = self.layout.upload_stage_block_path(object_id);
+        let payload_path = self.layout.payload_object_path(object_id);
+        let stage_path = self.layout.upload_stage_object_path(object_id);
         let stage_dir = stage_path.parent().ok_or_else(|| {
             io::Error::other(format!(
                 "upload stage path has no parent directory: {}",
@@ -58,8 +58,17 @@ impl UploadStageStore {
         match fs::hard_link(&payload_path, &stage_path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if stage_path.try_exists().unwrap_or(false) {
+                    return Ok(());
+                }
                 let _ = fs::remove_file(&stage_path);
-                fs::hard_link(&payload_path, &stage_path).map_err(UploadStageStoreError::Io)
+                match fs::hard_link(&payload_path, &stage_path) {
+                    Ok(()) => Ok(()),
+                    Err(retry_error) if retry_error.kind() == io::ErrorKind::AlreadyExists => {
+                        Ok(())
+                    }
+                    Err(retry_error) => Err(UploadStageStoreError::Io(retry_error)),
+                }
             }
             Err(error) => Err(UploadStageStoreError::Io(error)),
         }
@@ -73,7 +82,7 @@ impl UploadStageStore {
     }
 
     pub fn remove(&self, object_id: u64) {
-        let path = self.layout.upload_stage_block_path(object_id);
+        let path = self.layout.upload_stage_object_path(object_id);
         if let Err(error) = fs::remove_file(&path)
             && error.kind() != io::ErrorKind::NotFound
         {
@@ -101,7 +110,7 @@ mod tests {
     #[test]
     fn upload_stage_roundtrip() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let layout = LocalBlockLayout::from_cache_root(tmp.path());
+        let layout = LocalPayloadLayout::from_cache_root(tmp.path());
         layout.provision().expect("provision");
         let payload_store = FilePayloadStore::open(layout.clone()).expect("payload store");
         let store = UploadStageStore::open(layout.clone()).expect("open");
@@ -115,11 +124,29 @@ mod tests {
         store.remove(0x42);
         assert!(!store.contains(0x42));
         assert!(store.get(0x42).is_none());
-        assert!(!layout.upload_stage_block_path(0x42).exists());
+        assert!(!layout.upload_stage_object_path(0x42).exists());
         assert_eq!(
             payload_store.get(0x42).unwrap().as_ref(),
             b"payload",
             "removing the upload hardlink must keep the durable payload file intact"
         );
+    }
+
+    #[test]
+    fn upload_stage_link_payload_is_idempotent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let layout = LocalPayloadLayout::from_cache_root(tmp.path());
+        layout.provision().expect("provision");
+        let payload_store = FilePayloadStore::open(layout.clone()).expect("payload store");
+        let store = UploadStageStore::open(layout).expect("open");
+
+        payload_store.put(0x99, b"payload").expect("put payload");
+        store.link_payload(0x99).expect("first link");
+        store
+            .link_payload(0x99)
+            .expect("second link should be a no-op");
+
+        assert!(store.contains(0x99));
+        assert_eq!(store.get(0x99).unwrap().as_ref(), b"payload");
     }
 }

@@ -46,7 +46,7 @@ pub(super) const REGULAR_FILE_BASE_TABLE: TableDefinition<&[u8], &[u8]> =
 pub(super) const PENDING_REGULAR_FILE_COMPACTION_TABLE: TableDefinition<&[u8], u8> =
     TableDefinition::new("pending_regular_file_compaction");
 
-pub(super) type RegularFileChunkSignature = Vec<(SliceRange, Option<BlockRef>)>;
+pub(super) type RegularFileChunkSignature = Vec<(SliceRange, Option<PayloadRef>)>;
 pub(super) type RegularFileGraphSignature = BTreeMap<ChunkId, RegularFileChunkSignature>;
 
 /// Pending Deletions (GC): object_id (u64) -> deletion_timestamp (i64)

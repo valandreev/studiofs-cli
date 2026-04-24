@@ -63,7 +63,7 @@ fn classify_meta_error(error: &MetaError) -> BridgeVfsErrorKind {
         MetaError::IsADirectory(_) => BridgeVfsErrorKind::IsDirectory,
         MetaError::DirNotEmpty(_) => BridgeVfsErrorKind::DirectoryNotEmpty,
         MetaError::NotFormatted => BridgeVfsErrorKind::UnrecognizedVolume,
-        MetaError::FragmentedBlock { .. } => BridgeVfsErrorKind::DataCorruption,
+        MetaError::NonContiguousRegularFileGraph { .. } => BridgeVfsErrorKind::DataCorruption,
         MetaError::XattrValueTooLarge { .. } => BridgeVfsErrorKind::XattrValueTooLarge,
         MetaError::AccessDenied { .. } => BridgeVfsErrorKind::PermissionDenied,
         _ => BridgeVfsErrorKind::GenericFailure,
