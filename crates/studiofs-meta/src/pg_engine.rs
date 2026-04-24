@@ -4967,7 +4967,7 @@ mod tests {
         set_file_state(engine, file.ino, 64, 1);
         engine
             .stage_logical_payload_slice(file.ino, 0, &BlockRef::new_partial(object_id, 64))
-            .expect("set published file block");
+            .expect("set published payload slice");
         assert!(
             engine
                 .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
@@ -6390,7 +6390,7 @@ mod tests {
         let block = BlockRef::new_partial(701, 4096);
         writer
             .stage_logical_payload_slice(file.ino, 0, &block)
-            .expect("set block");
+            .expect("set payload slice");
         assert!(
             writer
                 .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
@@ -6532,10 +6532,10 @@ mod tests {
         let block1 = BlockRef::new_partial(802, 4096);
         writer
             .stage_logical_payload_slice(file.ino, 0, &block0)
-            .expect("set block 0");
+            .expect("set payload slice 0");
         writer
             .stage_logical_payload_slice(file.ino, 1, &block1)
-            .expect("set block 1");
+            .expect("set payload slice 1");
         assert!(
             writer
                 .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
@@ -7071,7 +7071,7 @@ mod tests {
         set_file_state(&a, file.ino, 4096, 2);
         let block = BlockRef::new_partial(77, 4096);
         a.stage_logical_payload_slice(file.ino, 0, &block)
-            .expect("set staged block");
+            .expect("set staged payload slice");
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
                 .expect("publish committed base graph")
@@ -7122,7 +7122,7 @@ mod tests {
             .expect("create file");
         set_file_state(&a, file.ino, 4096, 1);
         a.stage_logical_payload_slice(file.ino, 0, &BlockRef::new_partial(501, 4096))
-            .expect("set staged block");
+            .expect("set staged payload slice");
         a.flush_metadata().expect("flush uploading marker");
 
         assert!(wait_until(Duration::from_secs(10), || {
@@ -7258,9 +7258,9 @@ mod tests {
         let block0 = BlockRef::new_full(611, DEFAULT_BLOCK_SIZE);
         let block1 = BlockRef::new_partial(612, 4096);
         a.stage_logical_payload_slice(file.ino, 0, &block0)
-            .expect("set block 0");
+            .expect("set payload slice 0");
         a.stage_logical_payload_slice(file.ino, 1, &block1)
-            .expect("set block 1");
+            .expect("set payload slice 1");
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
                 .expect("publish renamed nested base graph")
@@ -7547,7 +7547,7 @@ mod tests {
         draft_attr.size = 4096;
         a.set_attr(&draft_attr).expect("set draft size");
         a.stage_logical_payload_slice(draft.ino, 0, &BlockRef::new_partial(501, 4096))
-            .expect("set draft staged block");
+            .expect("set draft staged payload slice");
         a.flush_metadata().expect("flush draft namespace");
 
         b.create_dir(ROOT_INO, b"foreign.txt", 0, 0, 0o755)
@@ -7772,7 +7772,7 @@ mod tests {
         attr.ctime = attr.mtime;
         a.set_attr(&attr).expect("set staged size");
         a.stage_logical_payload_slice(file.ino, 0, &BlockRef::new_partial(42, 4096))
-            .expect("set staged block");
+            .expect("set staged payload slice");
         a.flush_metadata().expect("flush a");
 
         let b = PgMetaEngine::open(&db_b).expect("open b");
@@ -9479,7 +9479,7 @@ mod tests {
             .expect("create file on a");
         set_file_state(&a, file.ino, 64, 1);
         a.stage_logical_payload_slice(file.ino, 0, &BlockRef::new_partial(44_001, 64))
-            .expect("set block");
+            .expect("set payload slice");
 
         let created = a.create_snapshot(ROOT_INO).expect("create snapshot");
         a.flush_metadata().expect("flush snapshot");
@@ -9583,7 +9583,7 @@ mod tests {
             .expect("create file");
         set_file_state(&a, file.ino, 64, 1);
         a.stage_logical_payload_slice(file.ino, 0, &BlockRef::new_partial(55_001, 64))
-            .expect("set block");
+            .expect("set payload slice");
         let _snapshot = a.create_snapshot(ROOT_INO).expect("create snapshot");
         a.flush_metadata().expect("flush snapshot");
 

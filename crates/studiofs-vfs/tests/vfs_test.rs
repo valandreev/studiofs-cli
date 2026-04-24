@@ -143,7 +143,7 @@ fn fixture_logical_payload_slices(
     Ok(chunks.into_iter().collect())
 }
 
-fn fixture_block_summaries_from_spans(
+fn fixture_logical_payload_summaries_from_spans(
     spans: Vec<studiofs_meta::ResolvedSliceSpan>,
     block_size: u32,
 ) -> Result<Vec<(u32, BlockRef)>, MetaError> {
@@ -213,7 +213,7 @@ where
         block_index: u32,
     ) -> Result<Option<BlockRef>, MetaError> {
         let block_size = self.get_format_info()?.block_size;
-        Ok(fixture_block_summaries_from_spans(
+        Ok(fixture_logical_payload_summaries_from_spans(
             self.lookup_regular_file_slices(
                 ino,
                 u64::from(block_index) * u64::from(block_size),
@@ -229,7 +229,7 @@ where
     fn lookup_logical_payload_slices(&self, ino: Ino) -> Result<Vec<(u32, BlockRef)>, MetaError> {
         let attr = self.get_attr(ino)?;
         let block_size = self.get_format_info()?.block_size;
-        fixture_block_summaries_from_spans(
+        fixture_logical_payload_summaries_from_spans(
             self.lookup_regular_file_slices(ino, 0, attr.size)?,
             block_size,
         )
@@ -276,7 +276,7 @@ impl FileGraphMetaFixture for RedbMetaEngine {
         block_index: u32,
     ) -> Result<Option<BlockRef>, MetaError> {
         let block_size = self.get_format_info()?.block_size;
-        Ok(fixture_block_summaries_from_spans(
+        Ok(fixture_logical_payload_summaries_from_spans(
             self.lookup_regular_file_slices(
                 ino,
                 u64::from(block_index) * u64::from(block_size),
@@ -292,7 +292,7 @@ impl FileGraphMetaFixture for RedbMetaEngine {
     fn lookup_logical_payload_slices(&self, ino: Ino) -> Result<Vec<(u32, BlockRef)>, MetaError> {
         let attr = self.get_attr(ino)?;
         let block_size = self.get_format_info()?.block_size;
-        fixture_block_summaries_from_spans(
+        fixture_logical_payload_summaries_from_spans(
             self.lookup_regular_file_slices(ino, 0, attr.size)?,
             block_size,
         )
@@ -2397,7 +2397,10 @@ fn test_crash_recovery_replays_pending_journal() {
             .expect("failed to start StudioVfs background workers");
 
         let blocks = meta.lookup_logical_payload_slices(crash_file_ino).unwrap();
-        assert!(!blocks.is_empty(), "file blocks must exist in metadata");
+        assert!(
+            !blocks.is_empty(),
+            "payload slice metadata must exist before upload"
+        );
         let object_id = blocks[0].1.object_id;
         let check_store = DataStore::new(&DataStoreConfig::from(&online_info)).unwrap();
 
@@ -9406,7 +9409,7 @@ async fn test_statfs_after_write() {
 // `studiofs-meta::pg_engine` ignored tests now:
 // - checkpoint bootstrap
 // - delta pull by batch version
-// - committed-vs-staged block visibility
+// - committed-vs-staged payload visibility
 // - overlay conflict handling
 //
 // The VFS ignored suite below focuses on end-to-end data path correctness:
@@ -10148,7 +10151,7 @@ fn full_block_write_with_offline_s3_stays_local_until_flush_then_queues_upload()
 
         assert!(
             !vfs.live_extent_records_for_inode(attr.ino).is_empty(),
-            "flush should materialize live extents once the staged block is committed"
+            "flush should materialize live extents once the staged payload slice is committed"
         );
         assert!(
             !vfs.pending_uploads_for_inode(attr.ino).is_empty(),
@@ -10230,7 +10233,7 @@ fn write_stages_successive_full_blocks_without_waiting_for_threshold() {
         );
         assert!(
             vfs.pending_uploads_for_inode(attr.ino).is_empty(),
-            "upload work should stay deferred until the staged blocks are flushed"
+            "upload work should stay deferred until the staged payload slices are flushed"
         );
         assert!(
             vfs.inode_has_local_dirty_state(attr.ino),
@@ -10255,7 +10258,7 @@ fn write_stages_successive_full_blocks_without_waiting_for_threshold() {
         let blocks = vfs.meta().lookup_logical_payload_slices(attr.ino).unwrap();
         assert!(
             blocks.len() < 4,
-            "foreground writes should not need to fully materialize every staged block before the explicit flush barrier"
+            "foreground writes should not need to fully materialize every staged payload slice before the explicit flush barrier"
         );
 
         let combined = vfs
@@ -10268,7 +10271,7 @@ fn write_stages_successive_full_blocks_without_waiting_for_threshold() {
         assert_eq!(&combined[(block_size * 3)..], fourth.as_slice());
         assert!(
             vfs.pending_uploads_for_inode(attr.ino).len() < 4,
-            "upload queue may grow opportunistically, but it should not require fully materializing every staged block before flush"
+            "upload queue may grow opportunistically, but it should not require fully materializing every staged payload slice before flush"
         );
         assert_eq!(
             vfs.ingress_stats().dirty_mem_bytes,
@@ -10532,7 +10535,7 @@ fn read_from_start_does_not_depend_on_metadata_materialization() {
         assert_eq!(
             ingress_after.dirty_mem_blocks,
             ingress_before.dirty_mem_blocks,
-            "the first read from offset 0 should not change how many locally staged blocks are pending"
+            "the first read from offset 0 should not change how many locally staged payload slices are pending"
         );
         assert_eq!(
             ingress_after.dirty_mem_bytes,

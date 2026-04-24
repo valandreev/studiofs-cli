@@ -341,7 +341,7 @@ fn startup_replay_does_not_override_current_epoch_live_extent_with_stale_pending
     attr.upload_state = MetaUploadState::Uploading;
     meta.set_attr(&attr).expect("persist staged attr");
     meta.stage_logical_payload_slice(ino, 0, &BlockRef::new_partial(9001, 4096))
-        .expect("persist current file block");
+        .expect("persist current payload slice");
 
     let pending_uploads = vec![PendingUpload {
         ino,
@@ -399,7 +399,7 @@ fn startup_replay_keeps_metadata_live_extent_when_pending_upload_has_same_epoch(
     attr.upload_state = MetaUploadState::Uploading;
     meta.set_attr(&attr).expect("persist staged attr");
     meta.stage_logical_payload_slice(ino, 0, &BlockRef::new_partial(9001, 4096))
-        .expect("persist current file block");
+        .expect("persist current payload slice");
 
     let pending_uploads = vec![PendingUpload {
         ino,
@@ -437,7 +437,7 @@ fn startup_replay_prefers_overlay_metadata_live_extent_over_base_for_same_epoch(
     attr.upload_state = MetaUploadState::Updating;
     meta.set_attr(&attr).expect("persist staged attr");
     meta.stage_logical_payload_slice(ino, 0, &BlockRef::new_partial(9001, 4096))
-        .expect("persist base file block");
+        .expect("persist base payload slice");
     meta.flush_regular_file_overlay_slices_with_attr(
         ino,
         &[(
@@ -510,7 +510,7 @@ fn pending_upload_views_follow_runtime_queue_after_startup_replay() {
         0,
         &BlockRef::new_partial(object_id, payload.len() as u32),
     )
-    .expect("persist current file block");
+    .expect("persist current payload slice");
     assert!(
         vfs.cached_store().snapshot_pending_uploads().is_empty(),
         "test setup requires startup replay to seed the runtime queue"
@@ -566,7 +566,7 @@ fn startup_replay_rebuilds_runtime_pending_upload_index_from_persisted_state() {
         0,
         &BlockRef::new_partial(object_id, payload.len() as u32),
     )
-    .expect("persist current file block");
+    .expect("persist current payload slice");
 
     assert!(
         vfs.cached_store().snapshot_pending_uploads().is_empty(),
@@ -772,7 +772,7 @@ fn pending_upload_truth_ignores_deleted_inode_local_blocks() {
         0,
         &BlockRef::new_partial(object_id, payload.len() as u32),
     )
-    .expect("persist deleted file block");
+    .expect("persist deleted payload slice");
 
     assert!(
         vfs.pending_uploads_for_inode(ino).is_empty(),
@@ -1126,7 +1126,7 @@ fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
 
         assert_eq!(
             meta.lookup_logical_payload_slices(ino)
-                .expect("load flushed file blocks")
+                .expect("load flushed payload slices")
                 .len(),
             1,
             "setup should create a publishable durable prefix before buffering a newer tail"
@@ -1146,7 +1146,7 @@ fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
 
         assert_eq!(
             meta.lookup_logical_payload_slices(ino)
-                .expect("load durable file blocks")
+                .expect("load durable payload slices")
                 .len(),
             1,
             "the newer tail should remain buffered and must not rewrite the durable prefix yet"
