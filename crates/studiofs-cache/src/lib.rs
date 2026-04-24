@@ -4,7 +4,7 @@
 //! used by the production mount path.
 //! `benchmark_cache` provides the lightweight in-memory benchmark surface used
 //! by `studiofs test-cache`.
-//! `runtime` provides the production file-per-block local backend.
+//! `runtime` provides the production local payload object backend.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -67,14 +67,14 @@ pub struct OpenedLocalBlockBackend {
     pub backend: Arc<dyn local::LocalBlockBackend>,
 }
 
-/// Prepared local block runtime state for a per-volume cache root.
+/// Prepared local payload object runtime state for a per-volume cache root.
 #[derive(Debug, Clone)]
 pub struct PreparedLocalBlockRuntime {
     pub layout: runtime::LocalBlockLayout,
     pub detection: runtime::LocalBlockRuntimeDetection,
 }
 
-/// Errors surfaced while provisioning the local block runtime state.
+/// Errors surfaced while provisioning the local payload object runtime state.
 #[derive(Debug, thiserror::Error)]
 pub enum PrepareLocalBlockRuntimeError {
     #[error("failed to inspect cache backend contract at '{cache_root}': {source}")]
@@ -83,7 +83,9 @@ pub enum PrepareLocalBlockRuntimeError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to provision local block runtime layout under '{cache_root}': {source}")]
+    #[error(
+        "failed to provision local payload object runtime layout under '{cache_root}': {source}"
+    )]
     ProvisionLocalBlockLayout {
         cache_root: String,
         #[source]
@@ -100,13 +102,15 @@ pub enum OpenLocalBlockBackendError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to provision local block runtime layout under '{cache_root}': {source}")]
+    #[error(
+        "failed to provision local payload object runtime layout under '{cache_root}': {source}"
+    )]
     ProvisionLocalBlockLayout {
         cache_root: String,
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to open local block backend at '{cache_root}': {source}")]
+    #[error("failed to open local payload object backend at '{cache_root}': {source}")]
     OpenLocalBlockBackend {
         cache_root: String,
         #[source]
@@ -114,7 +118,7 @@ pub enum OpenLocalBlockBackendError {
     },
 }
 
-/// Ensure the local block runtime contract exists for a per-volume cache root.
+/// Ensure the local payload object runtime contract exists for a per-volume cache root.
 pub fn prepare_local_block_runtime(
     cache_root: impl AsRef<Path>,
 ) -> Result<PreparedLocalBlockRuntime, PrepareLocalBlockRuntimeError> {

@@ -72,7 +72,7 @@ StudioFS must fail locally before remote publication is even relevant.
 Pair append/overwrite changes with this local-backend pressure guard:
 
 ```bash
-cargo test -p studiofs-cache cache_v3_backend_returns_capacity_exhausted_for_non_evictable_pressure -- --nocapture
+cargo test -p studiofs-cache local_backend_returns_capacity_exhausted_for_non_evictable_pressure -- --nocapture
 ```
 
 This is a focused local-backend capacity regression, not a full mounted

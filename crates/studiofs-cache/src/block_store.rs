@@ -1,4 +1,4 @@
-//! File-per-block payload storage for the current local block runtime.
+//! File-per-object payload storage for the current local payload runtime.
 //!
 //! The runtime persists payloads directly under the UUID-scoped cache root.
 
@@ -46,7 +46,7 @@ pub enum FilePayloadStoreError {
     TempFileCreateExhausted { object_id: u64, dir: PathBuf },
 }
 
-/// File-per-block payload store rooted under the current local block runtime
+/// File-per-object payload store rooted under the current local payload runtime
 /// layout.
 #[derive(Debug, Clone)]
 pub struct FilePayloadStore {

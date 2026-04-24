@@ -1,4 +1,4 @@
-//! Persistent local block runtime layout contract.
+//! Persistent local payload object runtime layout contract.
 //!
 //! The UUID-scoped cache root itself is the runtime root. Production code
 //! should avoid versioned subtree vocabulary for the active on-disk layout.
@@ -25,7 +25,7 @@ pub const LOCAL_BLOCK_INDEX_DIR: &str = "index";
 /// redb index file location inside the runtime subtree.
 pub const LOCAL_BLOCK_REDB_INDEX_FILE: &str = "cache.redb";
 
-/// Fully resolved local block runtime paths for a cache root.
+/// Fully resolved local payload object runtime paths for a cache root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalBlockLayout {
     pub cache_root: PathBuf,

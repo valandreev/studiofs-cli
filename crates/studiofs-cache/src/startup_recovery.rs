@@ -1,4 +1,4 @@
-//! Startup reconciliation for the current local block runtime.
+//! Startup reconciliation for the current local payload object runtime.
 //!
 //! Startup reconciliation is intentionally scoped to the runtime root. It never
 //! mutates unrelated files under the cache root.
@@ -58,11 +58,11 @@ impl LocalBlockStartupReconcileReport {
 pub enum LocalBlockStartupReconcileError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
-    #[error("local block runtime index error: {0}")]
+    #[error("local payload object runtime index error: {0}")]
     Index(#[from] CacheIndexError),
 }
 
-/// Reconcile startup state for the current local block runtime.
+/// Reconcile startup state for the current local payload object runtime.
 ///
 /// `Lightweight` mode:
 /// - delete orphan temp files under `tmp/**`;
