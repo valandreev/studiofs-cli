@@ -244,9 +244,9 @@ impl<'a> DataReader<'a> {
             }
         }
 
-        let pending_block_spans =
+        let pending_payload_spans =
             vfs.snapshot_pending_local_dirty_block_read_spans(ino, offset, length);
-        for dirty in pending_block_spans {
+        for dirty in pending_payload_spans {
             if unresolved.is_empty() {
                 break;
             }
@@ -549,10 +549,10 @@ impl<'a> DataReader<'a> {
             let dst = &mut buffer[dst_start..dst_end];
             match &segment.source {
                 ReadSegmentSource::Dirty { data, block_offset } => {
-                    vfs.copy_block_payload_into_range(data.as_ref(), *block_offset, dst);
+                    vfs.copy_payload_into_range(data.as_ref(), *block_offset, dst);
                 }
                 ReadSegmentSource::PendingOverlay { data, block_offset } => {
-                    vfs.copy_block_payload_into_range(data.as_ref(), u64::from(*block_offset), dst);
+                    vfs.copy_payload_into_range(data.as_ref(), u64::from(*block_offset), dst);
                 }
                 ReadSegmentSource::PendingExtent {
                     object_id,
@@ -631,7 +631,7 @@ impl<'a> DataReader<'a> {
                     if !span_resolved {
                         match vfs.fetch_block_for_ref_after_local_miss(payload).await {
                             Ok(data) => {
-                                vfs.copy_committed_block_payload_into_range(
+                                vfs.copy_committed_payload_into_range(
                                     data.as_ref(),
                                     payload,
                                     segment.range.start,
@@ -772,7 +772,7 @@ impl<'a> ReadMetadataResolver<'a> {
     }
 
     fn clear_stale_state(&self) {
-        self.vfs.clear_pending_blocks_for_inode(self.ino);
+        self.vfs.clear_pending_payloads_for_inode(self.ino);
         self.vfs.clear_inode_incarnation(self.ino);
         self.vfs
             .state
@@ -1051,7 +1051,7 @@ impl StudioVfs {
                     .await
                 {
                     Ok(data) => {
-                        self.copy_committed_block_payload_into_range(
+                        self.copy_committed_payload_into_range(
                             data.as_ref(),
                             &planned_block,
                             overlap.start,
@@ -1292,7 +1292,7 @@ impl StudioVfs {
 
 #[cfg(test)]
 mod tests {
-    use super::super::local_dirty::PendingBlock;
+    use super::super::local_dirty::PendingPayload;
     use super::super::*;
     use super::{DataReader, ReadRange, ReadSegment, ReadSegmentSource};
     use bytes::{Bytes, BytesMut};
@@ -1762,9 +1762,9 @@ mod tests {
             let ino = 9_001;
             let mut cached_attr = InodeAttr::new_file(ino, ROOT_INO, 1000, 1000, 0o644);
             cached_attr.size = 5;
-            vfs.state.local_dirty.pending_blocks.lock().insert(
+            vfs.state.local_dirty.pending_payloads.lock().insert(
                 (ino, 0),
-                PendingBlock {
+                PendingPayload {
                     data: BytesMut::from(&b"stale"[..]),
                     dirty: true,
                     reserved_object_id: None,
@@ -1773,7 +1773,7 @@ mod tests {
             );
             vfs.state
                 .local_dirty
-                .pending_block_indexes
+                .pending_payload_indexes
                 .lock()
                 .entry(ino)
                 .or_default()
@@ -1799,7 +1799,7 @@ mod tests {
             assert!(
                 !vfs.state
                     .local_dirty
-                    .pending_blocks
+                    .pending_payloads
                     .lock()
                     .contains_key(&(ino, 0))
             );
@@ -1821,9 +1821,9 @@ mod tests {
         let ino = 9_101;
         let mut cached_attr = InodeAttr::new_file(ino, ROOT_INO, 1000, 1000, 0o644);
         cached_attr.size = 5;
-        vfs.state.local_dirty.pending_blocks.lock().insert(
+        vfs.state.local_dirty.pending_payloads.lock().insert(
             (ino, 0),
-            PendingBlock {
+            PendingPayload {
                 data: BytesMut::from(&b"stale"[..]),
                 dirty: true,
                 reserved_object_id: None,
@@ -1832,7 +1832,7 @@ mod tests {
         );
         vfs.state
             .local_dirty
-            .pending_block_indexes
+            .pending_payload_indexes
             .lock()
             .entry(ino)
             .or_default()
@@ -1857,7 +1857,7 @@ mod tests {
         assert!(
             !vfs.state
                 .local_dirty
-                .pending_blocks
+                .pending_payloads
                 .lock()
                 .contains_key(&(ino, 0))
         );
@@ -2148,7 +2148,7 @@ mod tests {
                 .expect("materialize pending local state");
 
             assert!(
-                !vfs.has_pending_local_dirty_blocks_for_inode(created.ino),
+                !vfs.has_pending_local_dirty_payloads_for_inode(created.ino),
                 "explicit flush should materialize local pending extents before read"
             );
             assert!(

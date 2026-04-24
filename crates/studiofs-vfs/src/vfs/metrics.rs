@@ -311,7 +311,7 @@ pub struct VfsZeroIoStartupReplaySnapshot {
     pub replayed_blocks: u64,
     pub queued_publish_ready_epochs: u64,
     pub quarantined_inodes: u64,
-    pub orphan_dirty_blocks_removed: u64,
+    pub orphan_dirty_payloads_removed: u64,
     pub replay_failures: u64,
 }
 

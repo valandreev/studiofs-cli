@@ -2363,7 +2363,7 @@ fn test_crash_recovery_replays_pending_journal() {
         .len();
     assert!(
         pending_count > 0,
-        "expected dirty blocks after simulated crash"
+        "expected dirty payload objects after simulated crash"
     );
 
     // Phase 2: restart with healthy endpoint and verify recovery drains journals.
@@ -6799,7 +6799,7 @@ fn local_payload_restart_with_offline_s3_replays_dirty_uploads_from_index() {
     provision_cache_runtime_layout(&cache_dir);
     let cache_dir_str = cache_dir.to_str().unwrap().to_string();
     let mut format_info = make_format_info_with_endpoint(
-        &format!("local-block-runtime-replay-{}", std::process::id()),
+        &format!("local-payload-runtime-replay-{}", std::process::id()),
         "http://127.0.0.1:59999",
     );
     format_info.block_size = 512 * 1024;
@@ -6836,10 +6836,10 @@ fn local_payload_restart_with_offline_s3_replays_dirty_uploads_from_index() {
                 vfs.local_payload_backend()
                     .as_any()
                     .is::<PersistentLocalPayloadBackend>(),
-                "local-block-runtime marker should select local-block-runtime backend"
+                "local-payload-runtime marker should select local-payload-runtime backend"
             );
 
-            let attr = vfs.create(1, b"local-block-runtime-replay.bin", 0, 0, 0o644).unwrap();
+            let attr = vfs.create(1, b"local-payload-runtime-replay.bin", 0, 0, 0o644).unwrap();
             ino = attr.ino;
             vfs.write(attr.ino, 0, &payload).await.unwrap();
             vfs.flush(attr.ino).await.unwrap();
@@ -6849,12 +6849,12 @@ fn local_payload_restart_with_offline_s3_replays_dirty_uploads_from_index() {
                     vfs.pending_uploads_for_inode(attr.ino).len() == 2
                 })
                 .await,
-                "offline local-block-runtime run should queue dirty uploads before restart"
+                "offline local-payload-runtime run should queue dirty uploads before restart"
             );
             dirty_before = vfs.local_payload_backend().dirty_object_ids();
             assert!(
                 !dirty_before.is_empty(),
-                "offline local-block-runtime run should retain dirty replay candidates in local backend"
+                "offline local-payload-runtime run should retain dirty replay candidates in local backend"
             );
 
             let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
@@ -6886,7 +6886,7 @@ fn local_payload_restart_with_offline_s3_replays_dirty_uploads_from_index() {
                 vfs.local_payload_backend()
                     .as_any()
                     .is::<PersistentLocalPayloadBackend>(),
-                "restart must keep using local-block-runtime backend contract"
+                "restart must keep using local-payload-runtime backend contract"
             );
 
             let read = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
@@ -6896,17 +6896,17 @@ fn local_payload_restart_with_offline_s3_replays_dirty_uploads_from_index() {
                     !vfs.pending_uploads_for_inode(ino).is_empty()
                 })
                 .await,
-                "local-block-runtime restart should replay pending uploads from persisted dirty index state"
+                "local-payload-runtime restart should replay pending uploads from persisted dirty index state"
             );
             let dirty_after = vfs.local_payload_backend().dirty_object_ids();
             assert!(
                 !dirty_after.is_empty(),
-                "local-block-runtime restart should expose dirty replay candidates from index"
+                "local-payload-runtime restart should expose dirty replay candidates from index"
             );
             for object_id in &dirty_before {
                 assert!(
                     dirty_after.contains(object_id),
-                    "local-block-runtime replay lost dirty object {object_id}"
+                    "local-payload-runtime replay lost dirty object {object_id}"
                 );
             }
             vfs.shutdown(Duration::from_secs(10)).await;

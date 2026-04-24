@@ -1,4 +1,4 @@
-# SFS-261 Local Block Runtime Cleanup Design
+# SFS-261 Local Payload Runtime Cleanup Design
 
 ## Context
 
@@ -83,7 +83,7 @@ The user-visible message should become “current local payload runtime” or si
 Active documentation should describe one runtime model:
 
 - keep [docs/architecture.md](../../architecture.md) aligned with the canonical contract and current implementation;
-- replace or rewrite [docs/local-block-runtime-layout.md](../../local-block-runtime-layout.md) so it no longer presents `cache-v3` as the runtime identity;
+- replace or rewrite [docs/local-payload-runtime-layout.md](../../local-payload-runtime-layout.md) so it no longer presents `cache-v3` as the runtime identity;
 - keep explicit mention that the current disk layout still lives under `v3/` as an implementation detail;
 - preserve real operational guidance for readonly inspection, startup reconciliation scope, and stale-artifact remediation.
 

@@ -170,18 +170,13 @@ impl StudioVfs {
             .await
     }
 
-    pub(super) fn copy_block_payload_into_range(
-        &self,
-        data: &[u8],
-        block_offset: u64,
-        dst: &mut [u8],
-    ) {
+    pub(super) fn copy_payload_into_range(&self, data: &[u8], block_offset: u64, dst: &mut [u8]) {
         let Ok(src_start) = usize::try_from(block_offset) else {
             warn!(
                 block_offset,
                 data_len = data.len(),
                 dst_len = dst.len(),
-                "copy_block_payload_into_range: block_offset does not fit usize, zeroing dst"
+                "copy_payload_into_range: block_offset does not fit usize, zeroing dst"
             );
             dst.fill(0);
             return;
@@ -191,7 +186,7 @@ impl StudioVfs {
                 block_offset,
                 data_len = data.len(),
                 dst_len = dst.len(),
-                "copy_block_payload_into_range: block_offset >= data.len(), zeroing dst (possible partial-block read bug)"
+                "copy_payload_into_range: block_offset >= data.len(), zeroing dst (possible partial-payload read bug)"
             );
             dst.fill(0);
             return;
@@ -206,13 +201,13 @@ impl StudioVfs {
                 data_len = data.len(),
                 dst_len = dst.len(),
                 copy_len,
-                "copy_block_payload_into_range: padding with zeros (partial payload or short read)"
+                "copy_payload_into_range: padding with zeros (partial payload or short read)"
             );
             dst[copy_len..].fill(0);
         }
     }
 
-    pub(super) fn copy_committed_block_payload_into_range(
+    pub(super) fn copy_committed_payload_into_range(
         &self,
         data: &[u8],
         block: &PayloadRef,

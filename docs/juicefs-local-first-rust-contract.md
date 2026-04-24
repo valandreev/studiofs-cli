@@ -48,7 +48,7 @@ Everything else in this document is a consequence of that split.
 
 | Category | Contract |
 |---|---|
-| JuiceFS ideas we are borrowing | chunk/slice modeling over immutable payload objects, per-file writer state, standalone-style local metadata hot path, slice-oriented flush behavior, `dataReader`-style read resolution, adaptive readahead, block prefetch, cached-store cache/object-store structure, and cheap foreground write acceptance |
+| JuiceFS ideas we are borrowing | chunk/slice modeling over immutable payload objects, per-file writer state, standalone-style local metadata hot path, slice-oriented flush behavior, `dataReader`-style read resolution, adaptive readahead, payload prefetch, cached-store cache/object-store structure, and cheap foreground write acceptance |
 | StudioFS invariants we are preserving | Local-First read-your-writes, per-mount local metadata authority, eventual consistency across mounts, background replication through PostgreSQL, background payload replication through S3, file-version atomic cross-client visibility, and PG-backed shared file locks |
 | Invariants we are explicitly dropping | PG as a foreground metadata authority for ordinary mounted IO, synchronous remote visibility on `close`, and multiple user-facing mount consistency modes |
 | Rust-native implementation rules | explicit ownership, enums and state transitions, domain-specific `Result` error types, bounded async concurrency, and module boundaries shaped by responsibilities instead of Go package mirroring |
@@ -58,8 +58,8 @@ Everything else in this document is a consequence of that split.
 | Term | Origin | Meaning in this contract |
 |---|---|---|
 | `chunk` | Borrowed from JuiceFS | Fixed logical file range used for lookup, split, overlap, and compaction boundaries. |
-| `slice` | Borrowed from JuiceFS | Chunk-relative metadata record that maps a byte range to one immutable block or tombstone. |
-| `block` | Borrowed from JuiceFS | Immutable payload object. Any content change produces a new block and new slice reference. |
+| `slice` | Borrowed from JuiceFS | Chunk-relative metadata record that maps a byte range to one immutable payload object or tombstone. |
+| `payload object` | StudioFS target semantic | Immutable object containing file payload bytes. Any content change produces a new payload object and new slice reference. |
 | `writer state` | Borrowed shape, StudioFS-adapted | Per-handle/per-inode transient RAM state that satisfies same-mount reads before local metadata materialization completes. |
 | `local authority view` | StudioFS target semantic | The local `redb`-backed metadata view served by this mount in the foreground. It is the only metadata authority used by mounted foreground IO on that client. |
 | `private overlay` | StudioFS target semantic | The writing client's own unpublished local view layered over the latest shared-applied state. Other clients never reason about or observe it. |
@@ -74,13 +74,13 @@ Invariants:
 
 - A slice never crosses a chunk boundary.
 - Overlap resolution is per byte, not per slice.
-- Blocks are immutable and are never edited in place.
+- Payload objects are immutable and are never edited in place.
 - Foreground reads never consult PostgreSQL directly.
 - Ordinary foreground metadata mutations never require PostgreSQL round-trips
   except for file-lock coordination and bootstrap/discovery/range-reservation
   work that is outside the steady-state file IO hot path.
-- Cross-client visibility changes at file-version granularity, not block by
-  block.
+- Cross-client visibility changes at file-version granularity, not payload
+  object by payload object.
 - A published version must never reference payload that has not already been
   confirmed durable in S3.
 - Presence of payload in S3 does not by itself make a file or version visible.
@@ -203,7 +203,7 @@ Foreground reads resolve data in this order:
 
 1. active writer state / private overlay for the current mount and handle;
 2. local authority view in local `redb`;
-3. local cache / S3 fetch for the selected immutable blocks of an already
+3. local cache / S3 fetch for the selected immutable payload objects of an already
    known published version;
 4. zero-fill for uncovered holes.
 
@@ -301,7 +301,7 @@ The responsibility split is:
   client discovery, preallocated range reservation, and global file-lock
   authority;
 - S3/object storage: payload replication target and cold payload source for
-  already known published blocks.
+  already known published payload objects.
 
 Rules:
 
@@ -314,10 +314,10 @@ Rules:
   reuses its local `current`/`prefetched` inode windows across restarts and
   reserves a new per-volume window from PostgreSQL only when no local inode
   window remains available.
-- Per-client block preallocation also remains mandatory. A discovered client
+- Per-client object preallocation also remains mandatory. A discovered client
   obtains a persistent PG client slot, derives disjoint local payload-ID ranges
   from it, and allocates foreground object IDs without further PG round-trips
-  while the current block range still has headroom.
+  while the current object range still has headroom.
 
 ## 11. Mutation Visibility And Invalidation Matrix
 
@@ -356,7 +356,7 @@ Rules:
 | Current concept | Decision in this rewrite |
 |---|---|
 | `WriteBuffer` as the canonical architecture | Delete as the target design. Transitional code may remain only until slice-writer replacement lands. |
-| `ReadPipeline` as the canonical foreground read engine | Delete as the target design. Replace with a direct merged reader over writer/local authority/block state. |
+| `ReadPipeline` as the canonical foreground read engine | Delete as the target design. Replace with a direct merged reader over writer/local authority/payload-object state. |
 | `UploadCoordinator` as the canonical upload architecture | Simplify/delete as a top-level design concept. Replace with one cached-store-style staging/upload pipeline. |
 | `published` / `local unpublished` as separate architecture authorities | Simplify. They may remain as internal lifecycle labels inside local metadata, but they must not imply PG as a foreground authority. |
 | `cache_safety_mode=fast|durable` as a product-level mount contract | Deleted from the product contract and implementation. A single Fast Local Authority mount model is the target. |
@@ -421,7 +421,7 @@ contract.
 
 | Term to use in new issues | Type | Meaning |
 |---|---|---|
-| `chunk`, `slice`, `block` | Borrowed JuiceFS concept | The rewrite's core data vocabulary. |
+| `chunk`, `slice`, `payload object` | Borrowed shape, StudioFS-adapted | The rewrite's core data vocabulary. |
 | `writer state` | Borrowed-and-adapted concept | Local transient state that serves same-mount reads before local metadata materialization finishes. |
 | `private overlay` | StudioFS target semantic | This client's unpublished local state layered over the latest shared-applied state. |
 | `local authority view` | StudioFS target semantic | The local `redb`-backed metadata truth used by this mount for foreground IO. |
@@ -431,7 +431,7 @@ contract.
 | `Local-First` | Retained StudioFS semantic | The writing mount observes accepted changes immediately through the merged local view. |
 | `eventual consistency` | Retained StudioFS semantic | Other mounts converge later through upload plus replication/apply, not synchronously on each write. |
 | `cached-store pipeline` | Borrowed JuiceFS concept | Unified cache, staging, download, upload, and eviction pipeline. |
-| `client slot` | StudioFS target semantic | Persistent PG-assigned client identity used for client-scoped block-ID ranges and other per-client coordination surfaces; inode allocation is no longer derived from the client slot. |
+| `client slot` | StudioFS target semantic | Persistent PG-assigned client identity used for client-scoped object-ID ranges and other per-client coordination surfaces; inode allocation is no longer derived from the client slot. |
 | `lock lease` | StudioFS target semantic | PG-coordinated hard lock with TTL/renewal semantics and pub/sub notifications. |
 | `orphaned payload` | StudioFS target semantic | Uploaded payload that is not referenced by any published version and can later be removed by janitor. |
 | `Fast Local Authority` | StudioFS target semantic | The single target mount contract: local foreground authority, PG for replication/bootstrap/locks, S3 for payload replication. |

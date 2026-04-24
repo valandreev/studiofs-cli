@@ -5,14 +5,14 @@ use std::time::{Duration, Instant};
 const PENDING_SLICE_COMMIT_MAX_AGE: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
-pub(super) struct PendingBlock {
+pub(super) struct PendingPayload {
     pub(super) data: BytesMut,
     pub(super) dirty: bool,
     pub(super) reserved_object_id: Option<u64>,
     pub(super) persisted_len: Option<usize>,
 }
 
-impl PendingBlock {
+impl PendingPayload {
     fn buffered(data: BytesMut, reserved_object_id: Option<u64>) -> Self {
         Self {
             data,
@@ -202,7 +202,7 @@ impl DirtyWriteData {
         }
     }
 
-    fn into_pending_block_data(self, vfs: &StudioVfs) -> BytesMut {
+    fn into_pending_payload_data(self, vfs: &StudioVfs) -> BytesMut {
         match self {
             Self::Mutable(data) => data,
             Self::Shared(data) => vfs.clone_into_write_buffer(data.as_ref()),
@@ -395,8 +395,8 @@ pub(super) struct LocalSyncGroupState {
 }
 
 pub(super) struct LocalDirtyState {
-    pub(super) pending_blocks: Mutex<std::collections::HashMap<(Ino, u32), PendingBlock>>,
-    pub(super) pending_block_indexes:
+    pub(super) pending_payloads: Mutex<std::collections::HashMap<(Ino, u32), PendingPayload>>,
+    pub(super) pending_payload_indexes:
         Mutex<std::collections::HashMap<Ino, std::collections::BTreeSet<u32>>>,
     pending_chunk_slices: Mutex<
         std::collections::HashMap<Ino, std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>>,
@@ -414,8 +414,8 @@ pub(super) struct LocalDirtyState {
 impl LocalDirtyState {
     pub(super) fn new() -> Self {
         Self {
-            pending_blocks: Mutex::new(std::collections::HashMap::new()),
-            pending_block_indexes: Mutex::new(std::collections::HashMap::new()),
+            pending_payloads: Mutex::new(std::collections::HashMap::new()),
+            pending_payload_indexes: Mutex::new(std::collections::HashMap::new()),
             pending_chunk_slices: Mutex::new(std::collections::HashMap::new()),
             pending_bytes: AtomicUsize::new(0),
             write_backpressure_wait_ms: AtomicU64::new(0),
@@ -434,7 +434,7 @@ impl LocalDirtyState {
 
 #[cfg(test)]
 fn assign_reserved_object_ids(
-    pending: &mut std::collections::HashMap<(Ino, u32), PendingBlock>,
+    pending: &mut std::collections::HashMap<(Ino, u32), PendingPayload>,
     ino: Ino,
     blocks: &mut [PersistedPayloadEntry],
     fresh_object_ids: &[u64],
@@ -455,7 +455,7 @@ fn assign_reserved_object_ids(
 
             let object_id = fresh_ids
                 .next()
-                .expect("missing fresh object id for local dirty block");
+                .expect("missing fresh object id for local dirty payload entry");
             current.reserved_object_id = Some(object_id);
             block.object_id = object_id;
             continue;
@@ -463,7 +463,7 @@ fn assign_reserved_object_ids(
 
         block.object_id = fresh_ids
             .next()
-            .expect("missing fresh object id for local dirty block");
+            .expect("missing fresh object id for local dirty payload entry");
     }
 }
 
@@ -514,7 +514,7 @@ where
 }
 
 fn commit_persisted_payload_state(
-    pending: &mut std::collections::HashMap<(Ino, u32), PendingBlock>,
+    pending: &mut std::collections::HashMap<(Ino, u32), PendingPayload>,
     ino: Ino,
     blocks: &[PersistedPayloadEntry],
 ) -> (usize, Vec<u32>, Vec<BytesMut>) {
@@ -566,7 +566,7 @@ where
     }
 
     fn additional_object_id_count_needed(
-        pending: &std::collections::HashMap<(Ino, u32), PendingBlock>,
+        pending: &std::collections::HashMap<(Ino, u32), PendingPayload>,
         ino: Ino,
         blocks: &[DirtyWriteSnapshot],
     ) -> usize {
@@ -586,7 +586,7 @@ where
 
     fn try_prepare_persisted_blocks(
         &self,
-        pending: &mut std::collections::HashMap<(Ino, u32), PendingBlock>,
+        pending: &mut std::collections::HashMap<(Ino, u32), PendingPayload>,
         ino: Ino,
         blocks: Vec<DirtyWriteSnapshot>,
         fresh_object_ids: &mut std::collections::VecDeque<u64>,
@@ -1025,7 +1025,7 @@ impl LocalPayloadWriterPort for VfsLocalPayloadWriter<'_> {
                 stage,
                 object_count = object_ids.len(),
                 error = %error,
-                "local-dirty cleanup of uncommitted block-store entries failed"
+                "local-dirty cleanup of uncommitted payload-store entries failed"
             );
         }
         if let Err(error) = self
@@ -1204,7 +1204,7 @@ impl<'a> LocalDirtyFlushSession<'a> {
         let mut fresh_object_ids = std::collections::VecDeque::new();
         let persisted_blocks = loop {
             let prepare_result = {
-                let mut pending = self.vfs.state.local_dirty.pending_blocks.lock();
+                let mut pending = self.vfs.state.local_dirty.pending_payloads.lock();
                 self.drain.try_prepare_persisted_blocks(
                     &mut pending,
                     self.ino,
@@ -1220,7 +1220,7 @@ impl<'a> LocalDirtyFlushSession<'a> {
                         VfsError::Io(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             format!(
-                                "requested additional block-id count {} exceeds u32::MAX",
+                                "requested additional object-id count {} exceeds u32::MAX",
                                 additional_needed
                             ),
                         ))
@@ -1243,7 +1243,7 @@ impl<'a> LocalDirtyFlushSession<'a> {
             )
             .await?;
         self.vfs
-            .commit_persisted_local_dirty_blocks(self.ino, &outcome.persisted_blocks);
+            .commit_persisted_local_dirty_payloads(self.ino, &outcome.persisted_blocks);
         if let Some(attr) = attr_to_clear.as_ref() {
             self.vfs
                 .clear_matching_dirty_attr_if_committed(self.ino, attr);
@@ -1262,7 +1262,7 @@ impl<'a> LocalDirtyFlushSession<'a> {
             return Ok(());
         }
 
-        let blocks_to_buffer = self.vfs.snapshot_dirty_local_dirty_blocks(self.ino);
+        let blocks_to_buffer = self.vfs.snapshot_dirty_local_dirty_payloads(self.ino);
         let mut dirty_attr = {
             self.vfs
                 .state
@@ -1332,7 +1332,9 @@ impl<'a> LocalDirtyFlushSession<'a> {
 
         if let Some(attr) = dirty_attr
             && (!matches!(local_sync_policy, LocalSyncPolicy::Opportunistic)
-                || !self.vfs.has_pending_local_dirty_blocks_for_inode(self.ino))
+                || !self
+                    .vfs
+                    .has_pending_local_dirty_payloads_for_inode(self.ino))
         {
             let _ = self
                 .drain
@@ -1590,7 +1592,7 @@ impl StudioVfs {
         self.persist_local_object_payloads(payloads, logical_block_count, local_sync_policy)
             .await?;
         for block_index in &touched_blocks {
-            self.clear_pending_block(ino, *block_index);
+            self.clear_pending_payload(ino, *block_index);
         }
         for (batch, object_id) in spill_batches.iter().zip(object_ids.iter().copied()) {
             for segment in &batch.segments {
@@ -1792,7 +1794,7 @@ impl StudioVfs {
         self.persist_local_object_payloads(payloads, logical_block_count, local_sync_policy)
             .await?;
         for block_index in &touched_block_indexes {
-            self.clear_pending_block(ino, *block_index);
+            self.clear_pending_payload(ino, *block_index);
         }
         let mut installed_slices = std::collections::BTreeMap::<u64, Vec<PendingDirtySlice>>::new();
         for (batch, object_id) in spill_batches.iter().zip(object_ids.iter().copied()) {
@@ -1825,15 +1827,15 @@ impl StudioVfs {
             let reserved_object_id = self
                 .state
                 .local_dirty
-                .pending_blocks
+                .pending_payloads
                 .lock()
                 .get(&(ino, block.block_index))
                 .and_then(|pending| pending.reusable_reserved_object_id());
-            self.replace_pending_local_dirty_block(
+            self.replace_pending_local_dirty_payload(
                 ino,
                 block.block_index,
-                PendingBlock::buffered(
-                    block.data.into_pending_block_data(self),
+                PendingPayload::buffered(
+                    block.data.into_pending_payload_data(self),
                     reserved_object_id,
                 ),
             );
@@ -1861,11 +1863,11 @@ impl StudioVfs {
         self.state.local_dirty.pending_bytes.load(Ordering::Relaxed)
     }
 
-    pub(super) fn has_pending_local_dirty_blocks_for_inode(&self, ino: Ino) -> bool {
+    pub(super) fn has_pending_local_dirty_payloads_for_inode(&self, ino: Ino) -> bool {
         if self
             .state
             .local_dirty
-            .pending_block_indexes
+            .pending_payload_indexes
             .lock()
             .get(&ino)
             .is_some_and(|indexes| !indexes.is_empty())
@@ -1881,8 +1883,8 @@ impl StudioVfs {
     }
 
     pub(super) fn snapshot_pending_local_dirty_inodes(&self) -> Vec<Ino> {
-        let pending = self.state.local_dirty.pending_blocks.lock();
-        let indexes = self.state.local_dirty.pending_block_indexes.lock();
+        let pending = self.state.local_dirty.pending_payloads.lock();
+        let indexes = self.state.local_dirty.pending_payload_indexes.lock();
         let pending_chunk_slices = self.state.local_dirty.pending_chunk_slices.lock();
         let mut inode_bytes = std::collections::BTreeMap::<Ino, usize>::new();
         for (ino, block_indexes) in indexes.iter() {
@@ -2064,7 +2066,7 @@ impl StudioVfs {
     fn pending_buffered_local_dirty_bytes_for_inode(&self, ino: Ino) -> usize {
         self.state
             .local_dirty
-            .pending_blocks
+            .pending_payloads
             .lock()
             .iter()
             .filter(|((candidate_ino, _), _)| *candidate_ino == ino)
@@ -2073,7 +2075,7 @@ impl StudioVfs {
     }
 
     pub(super) fn should_background_flush_pending_local_dirty_inode(&self, ino: Ino) -> bool {
-        if !self.has_pending_local_dirty_blocks_for_inode(ino) {
+        if !self.has_pending_local_dirty_payloads_for_inode(ino) {
             return false;
         }
 
@@ -2298,7 +2300,7 @@ impl StudioVfs {
     }
 
     pub(super) fn clear_matching_dirty_attr_if_committed(&self, ino: Ino, attr: &InodeAttr) {
-        if self.has_pending_local_dirty_blocks_for_inode(ino) {
+        if self.has_pending_local_dirty_payloads_for_inode(ino) {
             return;
         }
         let mut dirty_attrs = self.state.namespace.dirty_attrs.lock();
@@ -2333,9 +2335,14 @@ impl StudioVfs {
         );
     }
 
-    fn replace_pending_local_dirty_block(&self, ino: Ino, block_index: u32, payload: PendingBlock) {
-        let mut pending = self.state.local_dirty.pending_blocks.lock();
-        let mut indexes = self.state.local_dirty.pending_block_indexes.lock();
+    fn replace_pending_local_dirty_payload(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        payload: PendingPayload,
+    ) {
+        let mut pending = self.state.local_dirty.pending_payloads.lock();
+        let mut indexes = self.state.local_dirty.pending_payload_indexes.lock();
         let new_len = payload.memory_len();
         let replaced = pending.insert((ino, block_index), payload);
         let old_len = replaced.as_ref().map(|old| old.memory_len()).unwrap_or(0);
@@ -2429,11 +2436,11 @@ impl StudioVfs {
         }
     }
 
-    pub(super) fn clear_pending_blocks_for_inode(&self, ino: Ino) {
+    pub(super) fn clear_pending_payloads_for_inode(&self, ino: Ino) {
         let mut removed_bytes = 0usize;
         let mut removed_buffers = Vec::new();
-        let mut pending = self.state.local_dirty.pending_blocks.lock();
-        let mut indexes = self.state.local_dirty.pending_block_indexes.lock();
+        let mut pending = self.state.local_dirty.pending_payloads.lock();
+        let mut indexes = self.state.local_dirty.pending_payload_indexes.lock();
         let block_indexes: Vec<u32> = indexes
             .get(&ino)
             .into_iter()
@@ -2457,9 +2464,9 @@ impl StudioVfs {
         self.clear_pending_dirty_slices_for_inode(ino);
     }
 
-    pub(super) fn clear_pending_block(&self, ino: Ino, block_index: u32) {
-        let mut pending = self.state.local_dirty.pending_blocks.lock();
-        let mut indexes = self.state.local_dirty.pending_block_indexes.lock();
+    pub(super) fn clear_pending_payload(&self, ino: Ino, block_index: u32) {
+        let mut pending = self.state.local_dirty.pending_payloads.lock();
+        let mut indexes = self.state.local_dirty.pending_payload_indexes.lock();
         if let Some(removed) = pending.remove(&(ino, block_index)) {
             if let Some(inode_indexes) = indexes.get_mut(&ino) {
                 inode_indexes.remove(&block_index);
@@ -2477,12 +2484,12 @@ impl StudioVfs {
         }
     }
 
-    fn snapshot_dirty_local_dirty_blocks(&self, ino: Ino) -> Vec<DirtyWriteSnapshot> {
+    fn snapshot_dirty_local_dirty_payloads(&self, ino: Ino) -> Vec<DirtyWriteSnapshot> {
         // Point-in-time view of dirty local-visible payload. Writers may race
         // ahead after this snapshot; commit keeps newer bytes dirty so a later
         // flush retries with the fresh view instead of dropping updates.
-        let pending = self.state.local_dirty.pending_blocks.lock();
-        let indexes = self.state.local_dirty.pending_block_indexes.lock();
+        let pending = self.state.local_dirty.pending_payloads.lock();
+        let indexes = self.state.local_dirty.pending_payload_indexes.lock();
         indexes
             .get(&ino)
             .into_iter()
@@ -2568,7 +2575,7 @@ impl StudioVfs {
             return Vec::new();
         }
 
-        let pending_blocks = self.state.local_dirty.pending_blocks.lock();
+        let pending_payloads = self.state.local_dirty.pending_payloads.lock();
         let mut buffered_block_data = HashMap::<u32, Bytes>::new();
         let mut persisted_slice_data = HashMap::<u64, Bytes>::new();
         let mut spans = Vec::new();
@@ -2590,13 +2597,13 @@ impl StudioVfs {
             } else if let Some(data) = buffered_block_data.get(&slice.block_index) {
                 data.clone()
             } else {
-                let Some(pending_block) = pending_blocks.get(&(ino, slice.block_index)) else {
+                let Some(pending_payload) = pending_payloads.get(&(ino, slice.block_index)) else {
                     continue;
                 };
-                if pending_block.is_local_extent() {
+                if pending_payload.is_local_extent() {
                     continue;
                 }
-                let data = pending_block.data.clone().freeze();
+                let data = pending_payload.data.clone().freeze();
                 buffered_block_data.insert(slice.block_index, data.clone());
                 data
             };
@@ -2652,8 +2659,8 @@ impl StudioVfs {
             return Vec::new();
         };
 
-        let pending = self.state.local_dirty.pending_blocks.lock();
-        let indexes = self.state.local_dirty.pending_block_indexes.lock();
+        let pending = self.state.local_dirty.pending_payloads.lock();
+        let indexes = self.state.local_dirty.pending_payload_indexes.lock();
         let Some(inode_indexes) = indexes.get(&ino) else {
             return Vec::new();
         };
@@ -2709,13 +2716,13 @@ impl StudioVfs {
             })
     }
 
-    fn commit_persisted_local_dirty_blocks(&self, ino: Ino, blocks: &[PersistedPayloadEntry]) {
+    fn commit_persisted_local_dirty_payloads(&self, ino: Ino, blocks: &[PersistedPayloadEntry]) {
         if blocks.is_empty() {
             return;
         }
 
-        let mut pending = self.state.local_dirty.pending_blocks.lock();
-        let mut indexes = self.state.local_dirty.pending_block_indexes.lock();
+        let mut pending = self.state.local_dirty.pending_payloads.lock();
+        let mut indexes = self.state.local_dirty.pending_payload_indexes.lock();
         let (removed_bytes, removed_block_indexes, removed_buffers) =
             commit_persisted_payload_state(&mut pending, ino, blocks);
         if let Some(inode_indexes) = indexes.get_mut(&ino) {
@@ -2744,7 +2751,7 @@ impl StudioVfs {
         let mut changed = false;
 
         {
-            let mut pending = self.state.local_dirty.pending_blocks.lock();
+            let mut pending = self.state.local_dirty.pending_payloads.lock();
             if let Some(block) = pending.get_mut(&(ino, block_index))
                 && !block.is_local_extent()
                 && block.data.len() > new_len
@@ -2802,7 +2809,7 @@ impl StudioVfs {
             .await
     }
 
-    pub(super) async fn flush_pending_blocks_for_shutdown(&self) {
+    pub(super) async fn flush_pending_payloads_for_shutdown(&self) {
         let mut inos: BTreeSet<Ino> = self
             .snapshot_pending_local_dirty_inodes()
             .into_iter()
@@ -2895,13 +2902,13 @@ mod tests {
         data: &'static [u8],
         reserved_object_id: Option<u64>,
     ) -> (
-        std::collections::HashMap<(Ino, u32), PendingBlock>,
+        std::collections::HashMap<(Ino, u32), PendingPayload>,
         Vec<DirtyWriteSnapshot>,
     ) {
         (
             std::collections::HashMap::from([(
                 (ino, block_index),
-                PendingBlock::buffered(BytesMut::from(data), reserved_object_id),
+                PendingPayload::buffered(BytesMut::from(data), reserved_object_id),
             )]),
             vec![DirtyWriteSnapshot::from_mutable(
                 block_index,
@@ -2934,11 +2941,11 @@ mod tests {
         let mut pending = std::collections::HashMap::from([
             (
                 (ino, 0),
-                PendingBlock::buffered(BytesMut::from(&b"alpha"[..]), Some(111)),
+                PendingPayload::buffered(BytesMut::from(&b"alpha"[..]), Some(111)),
             ),
             (
                 (ino, 1),
-                PendingBlock::buffered(BytesMut::from(&b"beta"[..]), None),
+                PendingPayload::buffered(BytesMut::from(&b"beta"[..]), None),
             ),
         ]);
         let mut blocks = vec![
@@ -2965,7 +2972,7 @@ mod tests {
         let ino = 7;
         let mut pending = std::collections::HashMap::from([(
             (ino, 3),
-            PendingBlock::buffered(BytesMut::from(&b"newer"[..]), Some(333)),
+            PendingPayload::buffered(BytesMut::from(&b"newer"[..]), Some(333)),
         )]);
         let blocks = vec![PersistedPayloadEntry::from_payload(
             3,
@@ -2979,16 +2986,16 @@ mod tests {
         assert_eq!(removed_bytes, 0);
         assert!(removed_block_indexes.is_empty());
         assert!(removed_buffers.is_empty());
-        let pending_block = pending.get(&(ino, 3)).unwrap();
-        assert_eq!(pending_block.data.as_ref(), b"newer");
-        assert_eq!(pending_block.reserved_object_id, None);
+        let pending_payload = pending.get(&(ino, 3)).unwrap();
+        assert_eq!(pending_payload.data.as_ref(), b"newer");
+        assert_eq!(pending_payload.reserved_object_id, None);
     }
 
     #[test]
     fn commit_persisted_payload_state_removes_matching_local_extent_after_metadata_commit() {
         let ino = 8;
         let mut pending =
-            std::collections::HashMap::from([((ino, 4), PendingBlock::local_extent(444, 4096))]);
+            std::collections::HashMap::from([((ino, 4), PendingPayload::local_extent(444, 4096))]);
         let blocks = vec![PersistedPayloadEntry::from_local_extent(4, 444, 4096)];
 
         let (removed_bytes, removed_block_indexes, removed_buffers) =
@@ -3277,7 +3284,7 @@ mod tests {
 
         pending.insert(
             (ino, 0),
-            PendingBlock::buffered(BytesMut::from(&b"newer"[..]), Some(700)),
+            PendingPayload::buffered(BytesMut::from(&b"newer"[..]), Some(700)),
         );
 
         let (blocks, additional_needed) = drain
@@ -3290,9 +3297,9 @@ mod tests {
             .try_prepare_persisted_blocks(&mut pending, ino, blocks, &mut fresh_object_ids)
             .expect("prepare stale snapshot");
         assert_eq!(persisted_blocks[0].object_id, 701);
-        let pending_block = pending.get(&(ino, 0)).expect("pending block");
-        assert_eq!(pending_block.data.as_ref(), b"newer");
-        assert_eq!(pending_block.reserved_object_id, Some(700));
+        let pending_payload = pending.get(&(ino, 0)).expect("pending block");
+        assert_eq!(pending_payload.data.as_ref(), b"newer");
+        assert_eq!(pending_payload.reserved_object_id, Some(700));
     }
 
     #[test]

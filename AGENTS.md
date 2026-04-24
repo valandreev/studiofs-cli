@@ -253,7 +253,7 @@ AGENTS snapshot differ from that contract, the contract wins.
 
 Tunable at runtime (see `crates/studiofs/src/cli/mount.rs` for full list):
 
-- `STUDIOFS_MAX_DIRTY_BYTES`: Memory budget for dirty blocks
+- `STUDIOFS_MAX_DIRTY_BYTES`: Memory budget for dirty payload objects
 - `STUDIOFS_S3_ENDPOINT`: S3 endpoint URL
 - `STUDIOFS_S3_BUCKET`: S3 bucket name
 - `STUDIOFS_PRINCIPAL`: ACL principal for access control

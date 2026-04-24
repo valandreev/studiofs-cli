@@ -81,7 +81,7 @@ Core invariants:
 Reads resolve data in this order:
 1. active writer state for the current mount/handle
 2. local authority view in `redb`
-3. local cache / object-store fetches supplying the block payloads needed by
+3. local cache / object-store fetches supplying the payload objects needed by
    the selected slice view
 4. zero-fill for holes
 

@@ -2465,7 +2465,7 @@ struct StartupReplayCoordinator<'a> {
     pending_epoch_finalizations: Vec<(Ino, u64)>,
     restored_live_extents: usize,
     replay_failures: u64,
-    orphan_dirty_blocks_removed: u64,
+    orphan_dirty_payloads_removed: u64,
 }
 
 #[derive(Clone)]
@@ -2508,7 +2508,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             pending_epoch_finalizations: Vec::new(),
             restored_live_extents: 0,
             replay_failures: 0,
-            orphan_dirty_blocks_removed: 0,
+            orphan_dirty_payloads_removed: 0,
         }
     }
 
@@ -2711,21 +2711,21 @@ impl<'a> StartupReplayCoordinator<'a> {
         }
     }
 
-    fn cleanup_orphan_dirty_blocks(&mut self) {
+    fn cleanup_orphan_dirty_payloads(&mut self) {
         if self.dirty_set.is_empty() {
             return;
         }
         if !self.quarantined_inodes.is_empty() {
-            self.warn_orphan_dirty_blocks();
+            self.warn_orphan_dirty_payloads();
             return;
         }
-        if !self.retain_non_metadata_reachable_dirty_blocks() {
+        if !self.retain_non_metadata_reachable_dirty_payloads() {
             return;
         }
-        self.remove_orphan_dirty_blocks();
+        self.remove_orphan_dirty_payloads();
     }
 
-    fn retain_non_metadata_reachable_dirty_blocks(&mut self) -> bool {
+    fn retain_non_metadata_reachable_dirty_payloads(&mut self) -> bool {
         // Cache the sync handle once so the recovery error path does
         // not re-enter metadata lookup while we are already cleaning up.
         let meta = self.vfs.sync_meta();
@@ -2734,7 +2734,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             Err(error) => {
                 warn!(
                     error = %error,
-                    "failed to enumerate metadata reachability during startup recovery; preserving dirty blocks"
+                    "failed to enumerate metadata reachability during startup recovery; preserving dirty payload objects"
                 );
                 None
             }
@@ -2749,18 +2749,18 @@ impl<'a> StartupReplayCoordinator<'a> {
         }
     }
 
-    fn remove_orphan_dirty_blocks(&mut self) {
+    fn remove_orphan_dirty_payloads(&mut self) {
         if self.dirty_set.is_empty() {
             return;
         }
         let orphan_count = self.dirty_set.len() as u64;
-        self.orphan_dirty_blocks_removed = self
-            .orphan_dirty_blocks_removed
+        self.orphan_dirty_payloads_removed = self
+            .orphan_dirty_payloads_removed
             .saturating_add(orphan_count);
         for object_id in &self.dirty_set {
             warn!(
                 object_id,
-                "removing orphan dirty block without metadata reference"
+                "removing orphan dirty payload object without metadata reference"
             );
             self.vfs.local_payload_backend.remove(*object_id);
             self.vfs
@@ -2776,15 +2776,15 @@ impl<'a> StartupReplayCoordinator<'a> {
             .upload_canceled_stale
             .fetch_add(orphan_count, Ordering::Relaxed);
         info!(
-            orphan_dirty_blocks = self.dirty_set.len(),
+            orphan_dirty_payloads = self.dirty_set.len(),
             "startup cleanup removed orphan dirty local backend entries"
         );
     }
 
-    fn warn_orphan_dirty_blocks(&self) {
+    fn warn_orphan_dirty_payloads(&self) {
         warn!(
             quarantined_inodes = self.quarantined_inodes.len(),
-            orphan_dirty_blocks = self.dirty_set.len(),
+            orphan_dirty_payloads = self.dirty_set.len(),
             "startup recovery preserved dirty local backend entries because invalid graphs were quarantined"
         );
     }
@@ -2813,7 +2813,7 @@ impl<'a> StartupReplayCoordinator<'a> {
 
         if !self.replay_ops.is_empty() {
             info!(
-                replayed_dirty_blocks = self.replay_ops.len(),
+                replayed_dirty_payloads = self.replay_ops.len(),
                 restored_live_extents = self.restored_live_extents,
                 "startup replay restored runtime pending uploads from local backend"
             );
@@ -2830,7 +2830,7 @@ impl<'a> StartupReplayCoordinator<'a> {
                 .link_upload_stage_batch(&replayed_object_ids)
             {
                 warn!(
-                    replayed_dirty_blocks = self.replay_ops.len(),
+                    replayed_dirty_payloads = self.replay_ops.len(),
                     replayed_object_count = replayed_object_ids.len(),
                     error = %error,
                     "startup replay failed to restore upload links for runtime pending uploads"
@@ -2878,7 +2878,7 @@ impl<'a> StartupReplayCoordinator<'a> {
                 }),
             );
         }
-        self.cleanup_orphan_dirty_blocks();
+        self.cleanup_orphan_dirty_payloads();
 
         self.vfs.record_runtime_event(
             "zeroio",
@@ -2889,7 +2889,7 @@ impl<'a> StartupReplayCoordinator<'a> {
                 "replayed_blocks": replayed_blocks,
                 "queued_publish_ready_epochs": self.queued_epoch_count() as u64,
                 "quarantined_inodes": self.quarantined_inodes.len() as u64,
-                "orphan_dirty_blocks_removed": self.orphan_dirty_blocks_removed,
+                "orphan_dirty_payloads_removed": self.orphan_dirty_payloads_removed,
                 "replay_failures": self.replay_failures,
             }),
         );
@@ -3326,9 +3326,9 @@ impl StudioVfs {
                             "quarantined_inodes",
                         )
                         .unwrap_or(0),
-                        orphan_dirty_blocks_removed: Self::zeroio_event_u64(
+                        orphan_dirty_payloads_removed: Self::zeroio_event_u64(
                             &event.fields,
-                            "orphan_dirty_blocks_removed",
+                            "orphan_dirty_payloads_removed",
                         )
                         .unwrap_or(0),
                         replay_failures: Self::zeroio_event_u64(&event.fields, "replay_failures")
@@ -4071,7 +4071,7 @@ impl StudioVfs {
     }
 
     fn inode_has_unmaterialized_overlay_for_finalize(&self, ino: Ino) -> bool {
-        if self.has_pending_local_dirty_blocks_for_inode(ino)
+        if self.has_pending_local_dirty_payloads_for_inode(ino)
             || self.inode_has_dirty_handle_writers(ino)
             || self
                 .state
@@ -4389,7 +4389,7 @@ impl StudioVfs {
             pending_epochs = ?pending_epochs,
             sticky_error = ?sticky_error,
             has_local_dirty_state = self.inode_has_local_dirty_state(ino),
-            has_pending_local_dirty_blocks = self.has_pending_local_dirty_blocks_for_inode(ino),
+            has_pending_local_dirty_payloads = self.has_pending_local_dirty_payloads_for_inode(ino),
             attr_present = attr.is_some(),
             size,
             committed_size,
@@ -5365,7 +5365,7 @@ impl StudioVfs {
     /// Snapshot accepted local-ingress state for diagnostics and backpressure
     /// observability.
     pub fn ingress_stats(&self) -> VfsIngressStats {
-        let pending = self.state.local_dirty.pending_blocks.lock();
+        let pending = self.state.local_dirty.pending_payloads.lock();
         let dirty_mem_blocks = pending.len();
         let dirty_mem_bytes = self.total_pending_local_dirty_bytes();
         drop(pending);
@@ -5992,7 +5992,7 @@ impl StudioVfs {
     /// Returns true when the inode still has local dirty state that requires a
     /// flush barrier before close/flush callback completion.
     pub fn inode_has_local_dirty_state(&self, ino: Ino) -> bool {
-        self.has_pending_local_dirty_blocks_for_inode(ino)
+        self.has_pending_local_dirty_payloads_for_inode(ino)
             || self.state.namespace.dirty_attrs.lock().contains_key(&ino)
             || self.inode_has_dirty_handle_writers(ino)
     }

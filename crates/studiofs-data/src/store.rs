@@ -72,7 +72,7 @@ impl From<&FormatInfo> for DataStoreConfig {
     }
 }
 
-/// DataStore — manages block-level I/O to S3-compatible storage.
+/// DataStore — manages payload-object I/O to S3-compatible storage.
 pub struct DataStore {
     op: Operator,
     volume_name: String,

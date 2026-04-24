@@ -4,7 +4,7 @@
 
 **Goal:** Implement canonical PostgreSQL-offline write continuation with finite preallocated headroom, read-only degradation on exhaustion, preserved known-lock enforcement, and reconnect replay/coalescing.
 
-**Architecture:** Extend `PgMetaEngine` so inode/block allocation uses explicit persisted active/next preallocated ranges plus a narrow metadata-authority status surface. Reuse the existing local mutation + pending replication pipeline, then gate new VFS mutations and writable opens when PG is unavailable and the persisted headroom is exhausted, while keeping reads and local durability barriers intact.
+**Architecture:** Extend `PgMetaEngine` so inode/object allocation uses explicit persisted active/next preallocated ranges plus a narrow metadata-authority status surface. Reuse the existing local mutation + pending replication pipeline, then gate new VFS mutations and writable opens when PG is unavailable and the persisted headroom is exhausted, while keeping reads and local durability barriers intact.
 
 **Tech Stack:** Rust 2024, `studiofs-meta`, `studiofs-vfs`, PostgreSQL-backed ignored tests, focused `cargo test` slices, existing PG event-log batching/projection.
 

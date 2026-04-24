@@ -255,20 +255,20 @@ data: data.freeze(),
 // 🔴 COPY #4: BytesMut → Bytes (may reallocate if over-allocated)
 ```
 
-**Data Structure for Dirty Blocks:**
+**Data Structure for Dirty Payloads:**
 
 **File:** `crates/studiofs-vfs/src/local_dirty.rs:153-168`
 
 ```rust
 pub(super) struct LocalDirtyState {
-    pub(super) pending_blocks: Mutex<HashMap<(Ino, u32), PendingBlock>>,
+    pub(super) pending_payloads: Mutex<HashMap<(Ino, u32), PendingPayload>>,
     pub(super) pending_block_indexes: Mutex<HashMap<Ino, BTreeSet<u32>>>,
     pending_chunk_slices: Mutex<HashMap<Ino, BTreeMap<u64, Vec<PendingDirtySlice>>>>,
     pub(super) pending_bytes: AtomicUsize,  // Tracks total dirty bytes
     // ... backpressure metrics ...
 }
 
-pub(super) struct PendingBlock {
+pub(super) struct PendingPayload {
     pub(super) data: BytesMut,  // 🔴 Mutable buffer for staging
     pub(super) dirty: bool,
     pub(super) reserved_object_id: Option<u64>,
@@ -937,7 +937,7 @@ let max_dirty_bytes = clamp_usize(
 
 **Current:** Materialize only when dirty bytes exceed `max_dirty_bytes`
 
-**Recommendation:** Materialize based on time or block count
+**Recommendation:** Materialize based on time or payload-object count
 
 ```rust
 // File: crates/studiofs-vfs/src/vfs/handle_writer.rs:715
@@ -949,16 +949,16 @@ pub(super) async fn materialize_handle_writers_for_limits(
 ) -> VfsResult<()> {
     // ... existing code ...
     
-    // NEW: Eager materialization based on block count
+    // NEW: Eager materialization based on payload-object count
     let per_inode_dirty = self.state.handle_writers.dirty_bytes_for_inode(ino);
-    let blocks_per_inode = self.state.handle_writers.blocks_count_for_inode(ino);
+    let payloads_per_inode = self.state.handle_writers.payloads_count_for_inode(ino);
     
-    // Materialize if we have too many pending blocks (even if under budget)
-    let too_many_blocks = blocks_per_inode > 32;  // Config tunable
+    // Materialize if we have too many pending payloads (even if under budget)
+    let too_many_payloads = payloads_per_inode > 32;  // Config tunable
     let time_since_last_materialize = Instant::now() - self.last_materialize_time;
     let too_old = time_since_last_materialize > Duration::from_millis(500);  // Config tunable
     
-    if too_many_blocks || too_old || budget_exceeded {
+    if too_many_payloads || too_old || budget_exceeded {
         // Trigger materialization
     }
 }

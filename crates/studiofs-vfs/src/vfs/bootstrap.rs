@@ -478,7 +478,7 @@ impl VfsBootstrap {
             fetch_scheduler: resources.fetch_scheduler,
             distributed_flock,
             kernel_invalidator: RwLock::new(None),
-            write_path_backend_tag: "local-block-runtime".to_string(),
+            write_path_backend_tag: "local-payload-runtime".to_string(),
             write_path_started_at: Instant::now(),
             known_file_lock_overrides: Mutex::new(HashMap::new()),
             #[cfg(test)]
@@ -653,7 +653,7 @@ mod tests {
         let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
         meta.init_root(0, 0).expect("init root");
 
-        let format_info = test_format_info("local-block-runtime-bootstrap");
+        let format_info = test_format_info("local-payload-runtime-bootstrap");
         meta.set_format_info(&format_info).expect("set format info");
         let data_config = DataStoreConfig::from(&format_info);
         let cache_dir = tmp.path().join("cache");
@@ -796,8 +796,8 @@ mod tests {
             "constructor should carry bootstrap ACL principal into the assembled VFS"
         );
         assert_eq!(
-            vfs.write_path_backend_tag, "local-block-runtime",
-            "constructor should preserve the local-block-runtime write-path backend tag in the assembled VFS"
+            vfs.write_path_backend_tag, "local-payload-runtime",
+            "constructor should preserve the local-payload-runtime write-path backend tag in the assembled VFS"
         );
     }
 

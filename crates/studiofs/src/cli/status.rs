@@ -644,7 +644,7 @@ mod tests {
             generated_unix_ms: 123,
             uptime_secs: 4.0,
             pending_uploads: 7,
-            backend_tag: "local-block-runtime".to_string(),
+            backend_tag: "local-payload-runtime".to_string(),
             flush_barrier_calls: 11,
             flush_barrier_calls_per_sec: 2.5,
             payload_store_sync_data: Default::default(),
@@ -666,7 +666,7 @@ mod tests {
 
         let loaded = read_write_path_observability(tmp.path()).expect("metrics");
         assert_eq!(loaded.0, metrics_path);
-        assert_eq!(loaded.1.backend_tag, "local-block-runtime");
+        assert_eq!(loaded.1.backend_tag, "local-payload-runtime");
         assert_eq!(loaded.1.flush_barrier_calls, 11);
     }
 

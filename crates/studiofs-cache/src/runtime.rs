@@ -68,7 +68,7 @@ pub enum LocalPayloadBackendKind {
 impl LocalPayloadBackendKind {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Current => "local-block-runtime",
+            Self::Current => "local-payload-runtime",
         }
     }
 }
@@ -2014,7 +2014,7 @@ mod tests {
 
         assert!(
             backend.contains(30),
-            "pressure maintenance must keep local pending blocks while reclaiming disposable cache"
+            "pressure maintenance must keep local pending payload objects while reclaiming disposable cache"
         );
         assert!(
             !backend.contains(31),

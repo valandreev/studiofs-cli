@@ -302,7 +302,7 @@ impl StudioVfs {
             pending_uploads = self.pending_uploads_snapshot().len(),
             "VFS shutdown: flushing pending local dirty state"
         );
-        self.flush_pending_blocks_for_shutdown().await;
+        self.flush_pending_payloads_for_shutdown().await;
         info!(
             pending_uploads = self.pending_uploads_snapshot().len(),
             elapsed_ms = t0.elapsed().as_millis() as u64,

@@ -39,7 +39,7 @@
 **Files:**
 - Modify: `crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs`
 
-- [ ] Update the upload worker success path to mark metadata block state as uploaded before local post-upload cleanup.
+- [ ] Update the upload worker success path to mark metadata payload-object state as uploaded before local post-upload cleanup.
 - [ ] Keep retry, delete-cancel, and stale-epoch short-circuit behavior unchanged for local readability.
 - [ ] Refresh VFS incarnation state after durable upload-state transition.
 - [ ] Run focused uploader worker tests to verify success, retry, and stale suppression behavior.

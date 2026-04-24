@@ -222,7 +222,7 @@ impl StudioVfs {
         old_attr: &InodeAttr,
         truncate_mutation: Option<&TruncateMutation>,
     ) -> VfsResult<()> {
-        self.clear_pending_blocks_for_inode(ino);
+        self.clear_pending_payloads_for_inode(ino);
         self.state.namespace.dirty_attrs.lock().remove(&ino);
         self.state.namespace.attr_read_cache.lock().remove(ino);
 
@@ -244,7 +244,7 @@ impl StudioVfs {
         };
 
         if let Some(block_index) = mutation.installed_pending_tail_block {
-            self.clear_pending_block(ino, block_index);
+            self.clear_pending_payload(ino, block_index);
         }
 
         if !mutation.restore_slices.is_empty() {
@@ -418,7 +418,7 @@ impl StudioVfs {
         for object_idx in
             first_block_to_remove..=block_index_from_offset(old_size - 1, self.block_size)
         {
-            self.clear_pending_block(ino, object_idx);
+            self.clear_pending_payload(ino, object_idx);
             self.remove_live_extent(ino, object_idx);
             if let Err(error) = self.fail_size_change_truncate_after_first_removed_block_for_test(
                 mutation.removed_objects.len(),
@@ -534,7 +534,7 @@ impl StudioVfs {
         }
 
         if let Some(ino) = ino_hint {
-            self.clear_pending_blocks_for_inode(ino);
+            self.clear_pending_payloads_for_inode(ino);
             self.clear_inode_incarnation(ino);
             self.state.namespace.dirty_attrs.lock().remove(&ino);
             self.state.namespace.attr_read_cache.lock().remove(ino);

@@ -788,7 +788,7 @@ fn pending_upload_truth_ignores_deleted_inode_local_payloads() {
 }
 
 #[test]
-fn startup_replay_removes_orphan_dirty_blocks_and_clears_pending_evictions() {
+fn startup_replay_removes_orphan_dirty_payloads_and_clears_pending_evictions() {
     let tmp = TempDir::new().expect("tempdir");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "startup-replay-orphan-cleanup");
     let object_id = 991_337;
@@ -1175,8 +1175,8 @@ fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
             "setup should retain the partial tail in handle-writer memory"
         );
         assert!(
-            !vfs.has_pending_local_dirty_blocks_for_inode(ino),
-            "setup should isolate the regression to a buffered handle-writer tail, not staged local_dirty blocks"
+            !vfs.has_pending_local_dirty_payloads_for_inode(ino),
+            "setup should isolate the regression to a buffered handle-writer tail, not staged local_dirty payloads"
         );
 
         let status =
@@ -2451,7 +2451,7 @@ fn same_mount_read_keeps_opportunistic_handle_write_visible_after_local_dirty_cl
             "opportunistic handle writes should not materialize block-backed metadata before a barrier: {overlay_spans:?}"
         );
 
-        vfs.clear_pending_blocks_for_inode(ino);
+        vfs.clear_pending_payloads_for_inode(ino);
 
         let bytes = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
         assert_eq!(bytes.as_ref(), payload);
@@ -2480,7 +2480,7 @@ fn same_mount_read_prefers_newer_opportunistic_handle_writer_spans() {
             .await
             .unwrap();
 
-        vfs.clear_pending_blocks_for_inode(ino);
+        vfs.clear_pending_payloads_for_inode(ino);
 
         let bytes = vfs.read(ino, 0, 5).await.unwrap();
         assert_eq!(bytes.as_ref(), b"hXYZo");
@@ -2668,7 +2668,7 @@ fn inode_write_keeps_partial_state_buffered_until_flush() {
             .unwrap();
 
         assert!(
-            vfs.has_pending_local_dirty_blocks_for_inode(ino),
+            vfs.has_pending_local_dirty_payloads_for_inode(ino),
             "ordinary opportunistic inode writes should keep partial state buffered until the flush barrier"
         );
         let spans = meta
@@ -2758,7 +2758,7 @@ fn write_fh_buffers_partial_tail_after_full_block_boundary_until_flush() {
             "stage-first opportunistic writes should keep the completed full block in local staging until a background or explicit flush commits metadata"
         );
         assert!(
-            vfs.inode_has_dirty_handle_writers(ino) || vfs.has_pending_local_dirty_blocks_for_inode(ino),
+            vfs.inode_has_dirty_handle_writers(ino) || vfs.has_pending_local_dirty_payloads_for_inode(ino),
             "the partial tail should remain buffered after the full-block prefix is accepted"
         );
         let visible_attr = vfs.getattr_unchecked(ino).unwrap();
@@ -2818,7 +2818,7 @@ fn write_fh_full_block_callbacks_persist_in_small_foreground_waves() {
     let snapshot = vfs.write_path_observability_snapshot();
     assert!(
         snapshot.payload_burst.max_blocks_per_burst <= 1,
-        "slice-first foreground persistence should avoid multi-block payload bursts for full-block callbacks: {:?}",
+        "slice-first foreground persistence should avoid multi-payload bursts for full-block callbacks: {:?}",
         snapshot.payload_burst
     );
 }
@@ -2871,10 +2871,10 @@ fn opportunistic_completed_handle_writer_materialization_caps_burst_to_drain_chu
         assert_eq!(
             vfs.total_pending_local_dirty_bytes(),
             0,
-            "completed full-block payload should be spilled out of hot RAM once durably staged locally"
+            "completed full logical block should be spilled out of hot RAM once durably staged locally"
         );
         assert!(
-            vfs.has_pending_local_dirty_blocks_for_inode(ino),
+            vfs.has_pending_local_dirty_payloads_for_inode(ino),
             "payload-staged slices should remain locally visible until metadata commit catches up"
         );
         assert_eq!(
@@ -3240,7 +3240,7 @@ fn write_fh_aligned_full_block_callback_is_accepted_immediately() {
         );
 
         assert!(
-            vfs.has_pending_local_dirty_blocks_for_inode(ino),
+            vfs.has_pending_local_dirty_payloads_for_inode(ino),
             "aligned full-block callbacks should land in local dirty staging right away"
         );
         let visible_attr = vfs.getattr_unchecked(ino).unwrap();
@@ -3312,7 +3312,7 @@ fn write_fh_sub_block_callbacks_batch_completed_blocks_until_flush() {
         assert_eq!(
             meta.lookup_payload_slices(ino).unwrap().len(),
             3,
-            "flush should materialize all completed sequential blocks"
+            "flush should materialize all completed sequential logical blocks"
         );
         vfs.release_fh(fh).await.unwrap();
     });
@@ -3320,7 +3320,7 @@ fn write_fh_sub_block_callbacks_batch_completed_blocks_until_flush() {
     let snapshot = vfs.write_path_observability_snapshot();
     assert!(
         snapshot.payload_burst.max_blocks_per_burst >= 2,
-        "sub-block sequential callbacks should be able to flush as a multi-block payload burst: {:?}",
+        "sub-block sequential callbacks should be able to flush as a multi-payload burst: {:?}",
         snapshot.payload_burst
     );
 }
@@ -5187,7 +5187,7 @@ fn failed_payload_persist_attempts_do_not_count_as_completed_bursts() {
     );
     assert_eq!(
         snapshot.payload_burst.total_blocks, 0,
-        "failed payload persists must not add completed burst block counts"
+        "failed payload persists must not add completed burst payload counts"
     );
     assert_eq!(
         snapshot.payload_burst.total_bytes, 0,
@@ -5402,7 +5402,7 @@ fn committed_copy_rejects_short_payload() {
     let block = PayloadRef::new_full(42, vfs.block_size);
     let mut dst = [0_u8; 8];
     let err = vfs
-        .copy_committed_block_payload_into_range(b"abcd", &block, 0, &mut dst)
+        .copy_committed_payload_into_range(b"abcd", &block, 0, &mut dst)
         .expect_err("short committed payload should error");
     let message = match err {
         VfsError::Other(message) => message,

@@ -156,18 +156,18 @@ impl StudioVfs {
     ) -> Option<PendingOverlayBlockSource> {
         // Stage 1 — local dirty state: newest local bytes not yet represented
         // by committed local-backend metadata.
-        if let Some(pending_block) = self
+        if let Some(pending_payload) = self
             .state
             .local_dirty
-            .pending_blocks
+            .pending_payloads
             .lock()
             .get(&(ino, block_index))
         {
-            if let Some(object_id) = pending_block.local_extent_id() {
+            if let Some(object_id) = pending_payload.local_extent_id() {
                 return Some(PendingOverlayBlockSource::Extent(object_id));
             }
             return Some(PendingOverlayBlockSource::Pending(
-                pending_block.data.clone().freeze(),
+                pending_payload.data.clone().freeze(),
             ));
         }
         if self.has_pending_dirty_slices_for_block(ino, block_index) {
@@ -257,7 +257,7 @@ impl StudioVfs {
         if self
             .state
             .local_dirty
-            .pending_blocks
+            .pending_payloads
             .lock()
             .keys()
             .any(|(candidate, _)| *candidate == ino)

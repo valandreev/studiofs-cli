@@ -156,7 +156,7 @@ impl StudioVfs {
                 "open_count": self.handle_table.open_count(ino),
                 "deleted_marker": self.state.upload.deleted_inodes.lock().contains(&ino),
                 "dirty_handle_bytes": self.state.handle_writers.dirty_bytes_for_inode(ino),
-                "has_pending_local_dirty_blocks": self.has_pending_local_dirty_blocks_for_inode(ino),
+                "has_pending_local_dirty_payloads": self.has_pending_local_dirty_payloads_for_inode(ino),
                 "has_inflight_materialization": self.state.deferred_materialize_inflight.lock().contains_key(&ino),
             }),
         );
@@ -167,7 +167,7 @@ impl StudioVfs {
         // also clearing live extent identities and read-side runtime state even
         // when no object IDs remain to evict.
         self.state.handle_writers.clear_inode(ino);
-        self.clear_pending_blocks_for_inode(ino);
+        self.clear_pending_payloads_for_inode(ino);
         self.remove_live_extents_for_inode(ino);
         self.readahead.evict(ino);
         self.clear_access_tracking(ino);
@@ -209,7 +209,7 @@ impl StudioVfs {
     /// disk / RAM space without waiting for the next background GC run.
     pub(super) async fn evict_inode_from_caches(&self, ino: Ino, object_ids: &[u64]) {
         // L1.5 — dirty memory buffer: drain blocks buffered post-flush.
-        self.clear_pending_blocks_for_inode(ino);
+        self.clear_pending_payloads_for_inode(ino);
 
         self.remove_live_extents_for_inode(ino);
 

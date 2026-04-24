@@ -619,7 +619,7 @@ mod tests {
                 Ok::<(), VfsError>(())
             }
         })
-        .expect("seed dirty blocks");
+        .expect("seed dirty payloads");
 
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);

@@ -386,7 +386,7 @@ impl StudioVfs {
     /// was the last open handle, perform the deferred deletion now.
     ///
     /// This is also the last-handle local-state drain point. If a writable
-    /// handle reaches release with dirty blocks or attrs still pending,
+    /// handle reaches release with dirty payloads or attrs still pending,
     /// `release_fh` must push that state through the current local
     /// payload/metadata pipeline before the handle disappears so later opens,
     /// open-unlink cleanup, and sticky-error reporting all see a coherent
@@ -566,8 +566,8 @@ impl StudioVfs {
             .materialize_handle_writers_for_inode(ino, local_sync_policy)
             .await?;
         let flushed_file_data =
-            materialized_handle_writers || self.has_pending_local_dirty_blocks_for_inode(ino);
-        let residual_pending_local_payloads = self.has_pending_local_dirty_blocks_for_inode(ino);
+            materialized_handle_writers || self.has_pending_local_dirty_payloads_for_inode(ino);
+        let residual_pending_local_payloads = self.has_pending_local_dirty_payloads_for_inode(ino);
         let dirty_attr_present = self.state.namespace.dirty_attrs.lock().contains_key(&ino);
         let persist_dirty_attr_inline = !residual_pending_local_payloads
             && dirty_attr_present

@@ -16,7 +16,7 @@ pub enum MetaError {
     #[error("inode not found: {0}")]
     InodeNotFound(Ino),
 
-    /// The caller asked for a contiguous block-shaped projection of a file range that is represented by multiple slice spans.
+    /// The caller asked for a contiguous single-payload projection of a file range represented by multiple slice spans.
     #[error(
         "non-contiguous regular-file graph cannot be represented as one payload: ino={ino}, block_index={block_index}"
     )]
@@ -503,7 +503,7 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
     fn next_object_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
         let count = usize::try_from(count).map_err(|_| {
             MetaError::Storage(
-                "requested block allocation count exceeds platform limits".to_string(),
+                "requested object allocation count exceeds platform limits".to_string(),
             )
         })?;
         let mut ids = Vec::with_capacity(count);
@@ -576,7 +576,7 @@ pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
     /// Slice-native regular-file writes can keep multiple immutable objects for
     /// one logical block. Upload workers use this check to decide whether an
     /// uploaded object still belongs to the current unpublished epoch without
-    /// requiring a contiguous per-logical-block payload-ref projection of the
+    /// requiring a contiguous per-logical-slot payload-ref projection of the
     /// overlay graph.
     fn has_regular_file_overlay_object_if_matches(
         &self,

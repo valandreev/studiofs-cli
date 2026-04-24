@@ -1,4 +1,4 @@
-# SFS-261 Local Block Runtime Cleanup Implementation Plan
+# SFS-261 Local Payload Runtime Cleanup Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -181,11 +181,11 @@ println!("  Disk subtree:        {}", detection.layout.v3_root.display());
 
 ```rust
 let snapshot = VfsWritePathObservabilitySnapshot {
-    backend_tag: "local-block-runtime".to_string(),
+    backend_tag: "local-payload-runtime".to_string(),
     // ...
 };
 
-assert_eq!(loaded.1.backend_tag, "local-block-runtime");
+assert_eq!(loaded.1.backend_tag, "local-payload-runtime");
 ```
 
 - [ ] **Step 5: Run the narrow CLI/VFS tests to verify the caller migration passes**
@@ -279,7 +279,7 @@ git commit -m "refactor: delete duplicated cache v3 module tree (SFS-261)"
 
 **Files:**
 - Modify: `docs/architecture.md`
-- Modify or replace: `docs/local-block-runtime-layout.md`
+- Modify or replace: `docs/local-payload-runtime-layout.md`
 - Modify: `docs/juicefs-local-first-rust-contract.md`
 - Modify: `crates/studiofs/tests/architecture_vocabulary_test.rs`
 - Modify: `crates/studiofs/src/cli/test_cache_profile_common.rs`
@@ -325,7 +325,7 @@ Expected: FAIL because docs and fixtures still encode the superseded runtime ide
 
 ```rust
 let snapshot = VfsWritePathObservabilitySnapshot {
-    backend_tag: "local-block-runtime".to_string(),
+    backend_tag: "local-payload-runtime".to_string(),
     // ...
 };
 ```
@@ -339,7 +339,7 @@ Expected: PASS
 - [ ] **Step 6: Commit**
 
 ```bash
-git add docs/architecture.md docs/local-block-runtime-layout.md docs/juicefs-local-first-rust-contract.md crates/studiofs/tests/architecture_vocabulary_test.rs crates/studiofs/src/cli/test_cache_profile_common.rs crates/studiofs/src/cli/test_cache_profile_stub.rs
+git add docs/architecture.md docs/local-payload-runtime-layout.md docs/juicefs-local-first-rust-contract.md crates/studiofs/tests/architecture_vocabulary_test.rs crates/studiofs/src/cli/test_cache_profile_common.rs crates/studiofs/src/cli/test_cache_profile_stub.rs
 git commit -m "docs: describe one canonical local payload runtime (SFS-261)"
 ```
 

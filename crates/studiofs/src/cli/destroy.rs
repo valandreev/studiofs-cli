@@ -375,15 +375,15 @@ mod tests {
         assert_eq!(describe_cache_layout_state(None), "unknown");
         assert_eq!(
             describe_cache_layout_state(Some(&detection(false))),
-            "Local block runtime not initialized"
+            "Local Payload Runtime not initialized"
         );
         assert_eq!(
             describe_cache_layout_state(Some(&detection(true))),
-            "Local block runtime ready"
+            "Local Payload Runtime ready"
         );
         assert_eq!(
             describe_cache_layout_state(Some(&partial_detection())),
-            "Local block runtime incomplete"
+            "Local Payload Runtime incomplete"
         );
     }
 
