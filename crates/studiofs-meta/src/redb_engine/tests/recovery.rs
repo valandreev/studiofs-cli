@@ -87,8 +87,8 @@ fn test_recover_undo_logs_replays_deferred_delete_with_fragmented_graph() {
             slice_id: SliceId(0),
             order: SliceOrder(0),
             range: SliceRange::new(0, midpoint).unwrap(),
-            block: Some(BlockRef::new_partial(21_001, midpoint)),
-            block_state: BlockRefState::LocalOnly,
+            block: Some(PayloadRef::new_partial(21_001, midpoint)),
+            payload_state: PayloadRefState::LocalOnly,
         },
     );
     overlay_chunk.slices.insert(
@@ -97,8 +97,8 @@ fn test_recover_undo_logs_replays_deferred_delete_with_fragmented_graph() {
             slice_id: SliceId(1),
             order: SliceOrder(1),
             range: SliceRange::new(midpoint, DEFAULT_BLOCK_SIZE).unwrap(),
-            block: Some(BlockRef::new_partial(21_002, DEFAULT_BLOCK_SIZE - midpoint)),
-            block_state: BlockRefState::LocalOnly,
+            block: Some(PayloadRef::new_partial(21_002, DEFAULT_BLOCK_SIZE - midpoint)),
+            payload_state: PayloadRefState::LocalOnly,
         },
     );
     overlay_chunk.refresh_fragmentation_metrics();

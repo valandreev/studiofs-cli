@@ -1,7 +1,7 @@
 use super::{
-    AccessLevel, BlockRef, Bytes, ExplicitFlushOutcome, FileSessionOperation, Ino, LocalSyncPolicy,
-    StickyErrorPolicy, StudioVfs, VfsError, VfsResult, block_index_from_offset, debug, error,
-    format_object_fragment_keys, offset_within_block, warn,
+    AccessLevel, Bytes, ExplicitFlushOutcome, FileSessionOperation, Ino, LocalSyncPolicy,
+    PayloadRef, StickyErrorPolicy, StudioVfs, VfsError, VfsResult, block_index_from_offset, debug,
+    error, format_object_fragment_keys, offset_within_block, warn,
 };
 
 impl StudioVfs {
@@ -145,7 +145,7 @@ impl StudioVfs {
 
     pub(super) async fn fetch_block_for_ref(
         &self,
-        block: &BlockRef,
+        block: &PayloadRef,
         prefetch: bool,
     ) -> Result<Bytes, crate::fetch::FetchError> {
         let keys = format_object_fragment_keys(&self.data_prefix, block.object_id);
@@ -162,7 +162,7 @@ impl StudioVfs {
 
     pub(super) async fn fetch_block_for_ref_after_local_miss(
         &self,
-        block: &BlockRef,
+        block: &PayloadRef,
     ) -> Result<Bytes, crate::fetch::FetchError> {
         let keys = format_object_fragment_keys(&self.data_prefix, block.object_id);
         self.fetch_scheduler
@@ -215,7 +215,7 @@ impl StudioVfs {
     pub(super) fn copy_committed_block_payload_into_range(
         &self,
         data: &[u8],
-        block: &BlockRef,
+        block: &PayloadRef,
         file_offset: u64,
         dst: &mut [u8],
     ) -> VfsResult<()> {

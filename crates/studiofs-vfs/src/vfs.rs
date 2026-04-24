@@ -154,7 +154,7 @@ use studiofs_meta::schema::{
     UploadState as MetaUploadState, chunk_id_from_offset, chunk_start_offset,
 };
 use studiofs_meta::types::{
-    AccessLevel, BlockRef, FileType, Ino, InodeAttr, block_index_from_offset, offset_within_block,
+    AccessLevel, FileType, Ino, InodeAttr, PayloadRef, block_index_from_offset, offset_within_block,
 };
 use studiofs_meta::{FileLockLease, HardLockKind, MetaError, MetaResult};
 use tempfile::NamedTempFile;

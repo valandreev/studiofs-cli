@@ -244,11 +244,9 @@ impl RedbMetaEngine {
             }
 
             let chunk_state: RegularFileChunkState = decode(value.value())?;
-            if chunk_state
-                .slices
-                .values()
-                .any(|slice| slice.block_state == BlockRefState::Published && slice.block.is_some())
-            {
+            if chunk_state.slices.values().any(|slice| {
+                slice.payload_state == PayloadRefState::Published && slice.block.is_some()
+            }) {
                 return Ok(true);
             }
         }

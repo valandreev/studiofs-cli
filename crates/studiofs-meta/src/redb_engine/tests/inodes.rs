@@ -94,7 +94,7 @@ fn test_detect_local_overlay_state() {
     attr.size = 4096;
     engine.set_attr(&attr).unwrap();
     engine
-        .stage_logical_payload_slice(file.ino, 0, &BlockRef::new_partial(11, 4096))
+        .stage_logical_payload_slice(file.ino, 0, &PayloadRef::new_partial(11, 4096))
         .unwrap();
     assert!(engine.has_local_overlay_state().unwrap());
 
@@ -164,8 +164,8 @@ fn test_set_attr_accepts_fragmented_regular_file_base_graph() {
             slice_id: SliceId(0),
             order: SliceOrder(0),
             range: SliceRange::new(0, 4096).unwrap(),
-            block: Some(BlockRef::new_partial(41, 4096)),
-            block_state: BlockRefState::Published,
+            block: Some(PayloadRef::new_partial(41, 4096)),
+            payload_state: PayloadRefState::Published,
         },
     );
     base_chunk.slices.insert(
@@ -174,8 +174,8 @@ fn test_set_attr_accepts_fragmented_regular_file_base_graph() {
             slice_id: SliceId(1),
             order: SliceOrder(1),
             range: SliceRange::new(4096, 8192).unwrap(),
-            block: Some(BlockRef::new_partial(42, 4096)),
-            block_state: BlockRefState::Published,
+            block: Some(PayloadRef::new_partial(42, 4096)),
+            payload_state: PayloadRefState::Published,
         },
     );
     base_chunk.refresh_fragmentation_metrics();

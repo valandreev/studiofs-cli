@@ -6,7 +6,7 @@ use super::{
     VfsUploadState, block_index_from_offset, chunk_id_from_offset, chunk_start_offset, debug, info,
     offset_within_block, validate_name, warn,
 };
-use studiofs_meta::schema::BlockRefState;
+use studiofs_meta::schema::PayloadRefState;
 
 struct TruncateMutation {
     removed_objects: Vec<(u32, u64)>,
@@ -360,9 +360,9 @@ impl StudioVfs {
                         removed_objects.push((block_index, block.object_id));
                     }
                     let mut slice = SliceRecord::new(SliceId(0), SliceOrder(0), span.range, block);
-                    slice.block_state = match span.source {
-                        ResolvedSliceSource::Base => BlockRefState::Published,
-                        _ => BlockRefState::LocalOnly,
+                    slice.payload_state = match span.source {
+                        ResolvedSliceSource::Base => PayloadRefState::Published,
+                        _ => PayloadRefState::LocalOnly,
                     };
                     restore_chunks.entry(span.chunk_id).or_default().push(slice);
                 }

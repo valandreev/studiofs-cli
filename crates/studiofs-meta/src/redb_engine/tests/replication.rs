@@ -123,8 +123,8 @@ fn test_replica_aux_block_events_accept_fragmented_base_graph() {
             slice_id: SliceId(0),
             order: SliceOrder(0),
             range: SliceRange::new(0, 4096).unwrap(),
-            block: Some(BlockRef::new_partial(71, 4096)),
-            block_state: BlockRefState::Published,
+            block: Some(PayloadRef::new_partial(71, 4096)),
+            payload_state: PayloadRefState::Published,
         },
     );
     base_chunk.slices.insert(
@@ -133,8 +133,8 @@ fn test_replica_aux_block_events_accept_fragmented_base_graph() {
             slice_id: SliceId(1),
             order: SliceOrder(1),
             range: SliceRange::new(4096, 8192).unwrap(),
-            block: Some(BlockRef::new_partial(72, 4096)),
-            block_state: BlockRefState::Published,
+            block: Some(PayloadRef::new_partial(72, 4096)),
+            payload_state: PayloadRefState::Published,
         },
     );
     base_chunk.refresh_fragmentation_metrics();
@@ -150,12 +150,12 @@ fn test_replica_aux_block_events_accept_fragmented_base_graph() {
         2
     );
 
-    let replacement = BlockRef::new_full(73, DEFAULT_BLOCK_SIZE);
+    let replacement = PayloadRef::new_full(73, DEFAULT_BLOCK_SIZE);
     let replacement_slices = RedbMetaEngine::chunk_slices_for_block(
         0,
         DEFAULT_BLOCK_SIZE,
         Some(&replacement),
-        BlockRefState::Published,
+        PayloadRefState::Published,
     )
     .unwrap();
     engine

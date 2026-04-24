@@ -547,7 +547,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         let mut object_ids = std::collections::BTreeSet::new();
         for chunk_state in overlay_chunks.values() {
             for slice in chunk_state.slices.values() {
-                if slice.block_state == BlockRefState::Uploaded
+                if slice.payload_state == PayloadRefState::Uploaded
                     && let Some(block) = slice.block.as_ref()
                 {
                     object_ids.insert(block.object_id);

@@ -2,7 +2,7 @@ use super::*;
 
 fn record_regular_file_object_usage(
     usage: &mut std::collections::BTreeMap<u64, u64>,
-    block: &BlockRef,
+    block: &PayloadRef,
 ) {
     let object_bytes = u64::from(block.offset).saturating_add(u64::from(block.length));
     usage
@@ -363,8 +363,8 @@ impl MetaBlocks for RedbMetaEngine {
                         continue;
                     }
                     matched_object = true;
-                    if slice.block_state != BlockRefState::Uploaded {
-                        slice.block_state = BlockRefState::Uploaded;
+                    if slice.payload_state != PayloadRefState::Uploaded {
+                        slice.payload_state = PayloadRefState::Uploaded;
                         changed = true;
                     }
                 }

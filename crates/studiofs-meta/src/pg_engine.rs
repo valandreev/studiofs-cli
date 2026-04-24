@@ -4554,15 +4554,15 @@ mod tests {
             &self,
             ino: Ino,
             block_index: u32,
-            block: &BlockRef,
+            block: &PayloadRef,
         ) -> MetaResult<()>;
         fn stage_logical_payload_tombstone(&self, ino: Ino, block_index: u32) -> MetaResult<()>;
     }
 
     fn fixture_logical_payload_slices(
         block_index: u32,
-        block: Option<&BlockRef>,
-        state: BlockRefState,
+        block: Option<&PayloadRef>,
+        state: PayloadRefState,
     ) -> MetaResult<Vec<(ChunkId, Vec<SliceRecord>)>> {
         let block_start = u64::from(block_index)
             .checked_mul(u64::from(DEFAULT_BLOCK_SIZE))
@@ -4574,7 +4574,7 @@ mod tests {
             .checked_add(u64::from(DEFAULT_BLOCK_SIZE))
             .ok_or_else(|| MetaError::Storage("fixture block range overflow".to_string()))?;
         let mut chunks = std::collections::BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
-        let mut push = |start: u64, end: u64, source: Option<&BlockRef>| -> MetaResult<()> {
+        let mut push = |start: u64, end: u64, source: Option<&PayloadRef>| -> MetaResult<()> {
             let mut cursor = start;
             while cursor < end {
                 let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);
@@ -4594,7 +4594,7 @@ mod tests {
                         SliceId(0),
                         SliceOrder(0),
                         range,
-                        BlockRef {
+                        PayloadRef {
                             object_id: source.object_id,
                             offset: source.offset.saturating_add(delta),
                             length: u32::try_from(piece_end.saturating_sub(cursor)).map_err(
@@ -4606,7 +4606,7 @@ mod tests {
                 } else {
                     SliceRecord::tombstone(SliceId(0), SliceOrder(0), range)
                 };
-                slice.block_state = state;
+                slice.payload_state = state;
                 chunks.entry(chunk_id).or_default().push(slice);
                 cursor = piece_end;
             }
@@ -4639,12 +4639,16 @@ mod tests {
             &self,
             ino: Ino,
             block_index: u32,
-            block: &BlockRef,
+            block: &PayloadRef,
         ) -> MetaResult<()> {
             self.flush_regular_file_overlay_slices(
                 ino,
-                fixture_logical_payload_slices(block_index, Some(block), BlockRefState::LocalOnly)?
-                    .as_slice(),
+                fixture_logical_payload_slices(
+                    block_index,
+                    Some(block),
+                    PayloadRefState::LocalOnly,
+                )?
+                .as_slice(),
             )?;
             Ok(())
         }
@@ -4652,7 +4656,7 @@ mod tests {
         fn stage_logical_payload_tombstone(&self, ino: Ino, block_index: u32) -> MetaResult<()> {
             self.flush_regular_file_overlay_slices(
                 ino,
-                fixture_logical_payload_slices(block_index, None, BlockRefState::LocalOnly)?
+                fixture_logical_payload_slices(block_index, None, PayloadRefState::LocalOnly)?
                     .as_slice(),
             )?;
             Ok(())
@@ -4918,8 +4922,8 @@ mod tests {
                         slice_id: SliceId(0),
                         order: SliceOrder(0),
                         range: SliceRange::new(0, 4096).unwrap(),
-                        block: Some(BlockRef::new_partial(9001, 4096)),
-                        block_state: BlockRefState::LocalOnly,
+                        block: Some(PayloadRef::new_partial(9001, 4096)),
+                        payload_state: PayloadRefState::LocalOnly,
                     }],
                 )],
             },
@@ -4931,8 +4935,8 @@ mod tests {
                         slice_id: SliceId(1),
                         order: SliceOrder(0),
                         range: SliceRange::new(0, 4096).unwrap(),
-                        block: Some(BlockRef::new_partial(9002, 4096)),
-                        block_state: BlockRefState::Published,
+                        block: Some(PayloadRef::new_partial(9002, 4096)),
+                        payload_state: PayloadRefState::Published,
                     }],
                 )],
             },
@@ -4966,7 +4970,7 @@ mod tests {
             .expect("create published file");
         set_file_state(engine, file.ino, 64, 1);
         engine
-            .stage_logical_payload_slice(file.ino, 0, &BlockRef::new_partial(object_id, 64))
+            .stage_logical_payload_slice(file.ino, 0, &PayloadRef::new_partial(object_id, 64))
             .expect("set published payload slice");
         assert!(
             engine
@@ -6387,7 +6391,7 @@ mod tests {
             .create_file(dir.ino, b"leaf.bin", 0, 0, 0o644)
             .expect("create file");
         set_file_state(&writer, file.ino, 4096, 1);
-        let block = BlockRef::new_partial(701, 4096);
+        let block = PayloadRef::new_partial(701, 4096);
         writer
             .stage_logical_payload_slice(file.ino, 0, &block)
             .expect("set payload slice");
@@ -6432,8 +6436,8 @@ mod tests {
             .create_file(ROOT_INO, b"shrink.bin", 0, 0, 0o644)
             .expect("create file");
         set_file_state(&writer, file.ino, block_size + 4096, 1);
-        let first = BlockRef::new_full(1001, DEFAULT_BLOCK_SIZE);
-        let second = BlockRef::new_partial(block_size + 2, 4096);
+        let first = PayloadRef::new_full(1001, DEFAULT_BLOCK_SIZE);
+        let second = PayloadRef::new_partial(block_size + 2, 4096);
         writer
             .stage_logical_payload_slice(file.ino, 0, &first)
             .expect("set first block");
@@ -6463,7 +6467,7 @@ mod tests {
         writer
             .stage_logical_payload_tombstone(file.ino, 1)
             .expect("remove second block for shrink");
-        let replacement = BlockRef::new_partial(block_size + 3, 4096);
+        let replacement = PayloadRef::new_partial(block_size + 3, 4096);
         writer
             .stage_logical_payload_slice(file.ino, 0, &replacement)
             .expect("set replacement payload slice");
@@ -6528,8 +6532,8 @@ mod tests {
 
         let batch2_start = batch1_end;
         set_file_state(&writer, file.ino, block_size + 4096, 1);
-        let block0 = BlockRef::new_full(801, DEFAULT_BLOCK_SIZE);
-        let block1 = BlockRef::new_partial(802, 4096);
+        let block0 = PayloadRef::new_full(801, DEFAULT_BLOCK_SIZE);
+        let block1 = PayloadRef::new_partial(802, 4096);
         writer
             .stage_logical_payload_slice(file.ino, 0, &block0)
             .expect("set payload slice 0");
@@ -6583,7 +6587,7 @@ mod tests {
             .create_file(dir.ino, b"final.bin", 0, 0, 0o644)
             .expect("create old final");
         set_file_state(&writer, old.ino, 4096, 1);
-        let old_block = BlockRef::new_partial(901, 4096);
+        let old_block = PayloadRef::new_partial(901, 4096);
         writer
             .stage_logical_payload_slice(old.ino, 0, &old_block)
             .expect("set old block");
@@ -6608,8 +6612,8 @@ mod tests {
             .create_file(dir.ino, b"temp.bin", 0, 0, 0o644)
             .expect("create replacement temp");
         set_file_state(&writer, temp.ino, block_size + 4096, 2);
-        let new_block0 = BlockRef::new_full(902, DEFAULT_BLOCK_SIZE);
-        let new_block1 = BlockRef::new_partial(903, 4096);
+        let new_block0 = PayloadRef::new_full(902, DEFAULT_BLOCK_SIZE);
+        let new_block1 = PayloadRef::new_partial(903, 4096);
         writer
             .stage_logical_payload_slice(temp.ino, 0, &new_block0)
             .expect("set replacement payload slice 0");
@@ -6670,7 +6674,7 @@ mod tests {
             .create_file(dir.ino, b"final.bin", 0, 0, 0o644)
             .expect("create final");
         set_file_state(&writer, file.ino, 4096, 1);
-        let published = BlockRef::new_partial(904, 4096);
+        let published = PayloadRef::new_partial(904, 4096);
         writer
             .stage_logical_payload_slice(file.ino, 0, &published)
             .expect("set published payload slice");
@@ -6692,7 +6696,7 @@ mod tests {
 
         let upload_start = seed_end;
         set_file_state(&writer, file.ino, 4096, 2);
-        let uploaded_overlay = BlockRef::new_partial(905, 4096);
+        let uploaded_overlay = PayloadRef::new_partial(905, 4096);
         writer
             .stage_logical_payload_slice(file.ino, 0, &uploaded_overlay)
             .expect("set unpublished overlay");
@@ -6773,7 +6777,7 @@ mod tests {
             .create_file(ROOT_INO, b"overlay.bin", 0, 0, 0o644)
             .expect("create overlay file");
         set_file_state(&writer, file.ino, 4096, 1);
-        let block = BlockRef::new_partial(906, 4096);
+        let block = PayloadRef::new_partial(906, 4096);
         writer
             .stage_logical_payload_slice(file.ino, 0, &block)
             .expect("set overlay block");
@@ -7069,7 +7073,7 @@ mod tests {
 
         let file = create_published_small_file(&a, ROOT_INO, b"remote.bin", 50_301);
         set_file_state(&a, file.ino, 4096, 2);
-        let block = BlockRef::new_partial(77, 4096);
+        let block = PayloadRef::new_partial(77, 4096);
         a.stage_logical_payload_slice(file.ino, 0, &block)
             .expect("set staged payload slice");
         assert!(
@@ -7121,7 +7125,7 @@ mod tests {
             .create_file(ROOT_INO, b"uploading.bin", 0, 0, 0o644)
             .expect("create file");
         set_file_state(&a, file.ino, 4096, 1);
-        a.stage_logical_payload_slice(file.ino, 0, &BlockRef::new_partial(501, 4096))
+        a.stage_logical_payload_slice(file.ino, 0, &PayloadRef::new_partial(501, 4096))
             .expect("set staged payload slice");
         a.flush_metadata().expect("flush uploading marker");
 
@@ -7168,7 +7172,7 @@ mod tests {
             .create_file(dir.ino, b"leaf.bin", 0, 0, 0o644)
             .expect("create nested file");
         set_file_state(&a, file.ino, 4096, 1);
-        let block = BlockRef::new_partial(511, 4096);
+        let block = PayloadRef::new_partial(511, 4096);
         a.stage_logical_payload_slice(file.ino, 0, &block)
             .expect("set nested block");
         assert!(
@@ -7255,8 +7259,8 @@ mod tests {
 
         let block_size = DEFAULT_BLOCK_SIZE as u64;
         set_file_state(&a, file.ino, block_size + 4096, 1);
-        let block0 = BlockRef::new_full(611, DEFAULT_BLOCK_SIZE);
-        let block1 = BlockRef::new_partial(612, 4096);
+        let block0 = PayloadRef::new_full(611, DEFAULT_BLOCK_SIZE);
+        let block1 = PayloadRef::new_partial(612, 4096);
         a.stage_logical_payload_slice(file.ino, 0, &block0)
             .expect("set payload slice 0");
         a.stage_logical_payload_slice(file.ino, 1, &block1)
@@ -7318,7 +7322,7 @@ mod tests {
             .create_file(ROOT_INO, b"committed.bin", 0, 0, 0o644)
             .expect("create file");
         set_file_state(&a, file.ino, 4096, 1);
-        let baseline = BlockRef::new_partial(701, 4096);
+        let baseline = PayloadRef::new_partial(701, 4096);
         a.stage_logical_payload_slice(file.ino, 0, &baseline)
             .expect("set baseline block");
         assert!(
@@ -7342,7 +7346,7 @@ mod tests {
         );
 
         set_file_state(&a, file.ino, 4096, 2);
-        let replacement = BlockRef::new_partial(702, 4096);
+        let replacement = PayloadRef::new_partial(702, 4096);
         a.stage_logical_payload_slice(file.ino, 0, &replacement)
             .expect("set replacement payload slice");
         a.flush_metadata().expect("flush updating marker");
@@ -7391,8 +7395,8 @@ mod tests {
             .expect("create file");
         let block_size = DEFAULT_BLOCK_SIZE as u64;
         set_file_state(&a, file.ino, block_size + 4096, 1);
-        let baseline0 = BlockRef::new_full(801, DEFAULT_BLOCK_SIZE);
-        let baseline1 = BlockRef::new_partial(802, 4096);
+        let baseline0 = PayloadRef::new_full(801, DEFAULT_BLOCK_SIZE);
+        let baseline1 = PayloadRef::new_partial(802, 4096);
         a.stage_logical_payload_slice(file.ino, 0, &baseline0)
             .expect("set baseline block 0");
         a.stage_logical_payload_slice(file.ino, 1, &baseline1)
@@ -7412,8 +7416,8 @@ mod tests {
         let remote = b.lookup(ROOT_INO, b"atomic.bin").expect("lookup remote");
 
         set_file_state(&a, file.ino, block_size + 4096, 2);
-        let replacement0 = BlockRef::new_full(901, DEFAULT_BLOCK_SIZE);
-        let replacement1 = BlockRef::new_partial(902, 4096);
+        let replacement0 = PayloadRef::new_full(901, DEFAULT_BLOCK_SIZE);
+        let replacement1 = PayloadRef::new_partial(902, 4096);
         a.stage_logical_payload_slice(file.ino, 0, &replacement0)
             .expect("set replacement payload slice 0");
         a.stage_logical_payload_slice(file.ino, 1, &replacement1)
@@ -7479,7 +7483,7 @@ mod tests {
             .create_file(ROOT_INO, b"draft.bin", 0, 0, 0o644)
             .expect("create local draft");
         set_file_state(&b, draft.ino, 4096, 1);
-        b.stage_logical_payload_slice(draft.ino, 0, &BlockRef::new_partial(1001, 4096))
+        b.stage_logical_payload_slice(draft.ino, 0, &PayloadRef::new_partial(1001, 4096))
             .expect("set local draft block");
 
         a.create_dir(ROOT_INO, b"foreign", 0, 0, 0o755)
@@ -7546,7 +7550,7 @@ mod tests {
         let mut draft_attr = a.get_attr(draft.ino).expect("get draft attr");
         draft_attr.size = 4096;
         a.set_attr(&draft_attr).expect("set draft size");
-        a.stage_logical_payload_slice(draft.ino, 0, &BlockRef::new_partial(501, 4096))
+        a.stage_logical_payload_slice(draft.ino, 0, &PayloadRef::new_partial(501, 4096))
             .expect("set draft staged payload slice");
         a.flush_metadata().expect("flush draft namespace");
 
@@ -7593,7 +7597,7 @@ mod tests {
             .create_file(ROOT_INO, b"remote.bin", 0, 0, 0o644)
             .expect("create file");
         set_file_state(&a, file.ino, 4096, 1);
-        a.stage_logical_payload_slice(file.ino, 0, &BlockRef::new_partial(87, 4096))
+        a.stage_logical_payload_slice(file.ino, 0, &PayloadRef::new_partial(87, 4096))
             .expect("set baseline remote block");
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
@@ -7613,7 +7617,7 @@ mod tests {
         b.set_attr(&local_attr).expect("set local attr overlay");
 
         set_file_state(&a, file.ino, 4096, 2);
-        let block = BlockRef::new_partial(88, 4096);
+        let block = PayloadRef::new_partial(88, 4096);
         a.stage_logical_payload_slice(file.ino, 0, &block)
             .expect("set staged remote slice");
         assert!(
@@ -7663,7 +7667,7 @@ mod tests {
         let mut draft_attr = pg.get_attr(draft.ino).expect("get draft attr");
         draft_attr.size = 4096;
         pg.set_attr(&draft_attr).expect("set staged size");
-        pg.stage_logical_payload_slice(draft.ino, 0, &BlockRef::new_partial(601, 4096))
+        pg.stage_logical_payload_slice(draft.ino, 0, &PayloadRef::new_partial(601, 4096))
             .expect("set draft block");
 
         let mut conflicted_attr = draft_attr.clone();
@@ -7771,7 +7775,7 @@ mod tests {
         attr.mtime = InodeAttr::now_nanos();
         attr.ctime = attr.mtime;
         a.set_attr(&attr).expect("set staged size");
-        a.stage_logical_payload_slice(file.ino, 0, &BlockRef::new_partial(42, 4096))
+        a.stage_logical_payload_slice(file.ino, 0, &PayloadRef::new_partial(42, 4096))
             .expect("set staged payload slice");
         a.flush_metadata().expect("flush a");
 
@@ -7844,7 +7848,7 @@ mod tests {
             .create_file(ROOT_INO, b"uploading.bin", 0, 0, 0o644)
             .expect("create uploading file");
         set_file_state(&a, file.ino, 4096, 1);
-        a.stage_logical_payload_slice(file.ino, 0, &BlockRef::new_partial(776, 4096))
+        a.stage_logical_payload_slice(file.ino, 0, &PayloadRef::new_partial(776, 4096))
             .expect("set baseline uploading block");
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
@@ -7859,7 +7863,7 @@ mod tests {
         ));
 
         set_file_state(&a, file.ino, 4096, 2);
-        a.stage_logical_payload_slice(file.ino, 0, &BlockRef::new_partial(777, 4096))
+        a.stage_logical_payload_slice(file.ino, 0, &PayloadRef::new_partial(777, 4096))
             .expect("set local uploading block");
         a.flush_metadata().expect("flush uploading namespace");
 
@@ -8508,7 +8512,7 @@ mod tests {
         if let Ok(entry) = a.lookup(ROOT_INO, b"victim") {
             if a.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
                 set_file_state(&a, entry.ino, 64, 1);
-                a.stage_logical_payload_slice(entry.ino, 0, &BlockRef::new_partial(50_320, 64))
+                a.stage_logical_payload_slice(entry.ino, 0, &PayloadRef::new_partial(50_320, 64))
                     .expect("set winner block on a");
                 assert!(
                     a.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
@@ -8519,7 +8523,7 @@ mod tests {
         } else if let Ok(entry) = b.lookup(ROOT_INO, b"victim") {
             if b.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
                 set_file_state(&b, entry.ino, 64, 1);
-                b.stage_logical_payload_slice(entry.ino, 0, &BlockRef::new_partial(50_321, 64))
+                b.stage_logical_payload_slice(entry.ino, 0, &PayloadRef::new_partial(50_321, 64))
                     .expect("set winner block on b");
                 assert!(
                     b.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
@@ -8599,7 +8603,7 @@ mod tests {
         if let Ok(entry) = a.lookup(ROOT_INO, b"victim") {
             if a.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
                 set_file_state(&a, entry.ino, 64, 1);
-                a.stage_logical_payload_slice(entry.ino, 0, &BlockRef::new_partial(50_322, 64))
+                a.stage_logical_payload_slice(entry.ino, 0, &PayloadRef::new_partial(50_322, 64))
                     .expect("set winner block on a");
                 assert!(
                     a.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
@@ -8610,7 +8614,7 @@ mod tests {
         } else if let Ok(entry) = b.lookup(ROOT_INO, b"victim") {
             if b.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
                 set_file_state(&b, entry.ino, 64, 1);
-                b.stage_logical_payload_slice(entry.ino, 0, &BlockRef::new_partial(50_323, 64))
+                b.stage_logical_payload_slice(entry.ino, 0, &PayloadRef::new_partial(50_323, 64))
                     .expect("set winner block on b");
                 assert!(
                     b.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
@@ -9478,7 +9482,7 @@ mod tests {
             .create_file(ROOT_INO, b"snap-peer.txt", 0, 0, 0o644)
             .expect("create file on a");
         set_file_state(&a, file.ino, 64, 1);
-        a.stage_logical_payload_slice(file.ino, 0, &BlockRef::new_partial(44_001, 64))
+        a.stage_logical_payload_slice(file.ino, 0, &PayloadRef::new_partial(44_001, 64))
             .expect("set payload slice");
 
         let created = a.create_snapshot(ROOT_INO).expect("create snapshot");
@@ -9582,7 +9586,7 @@ mod tests {
             .create_file(ROOT_INO, b"snap-gc.txt", 0, 0, 0o644)
             .expect("create file");
         set_file_state(&a, file.ino, 64, 1);
-        a.stage_logical_payload_slice(file.ino, 0, &BlockRef::new_partial(55_001, 64))
+        a.stage_logical_payload_slice(file.ino, 0, &PayloadRef::new_partial(55_001, 64))
             .expect("set payload slice");
         let _snapshot = a.create_snapshot(ROOT_INO).expect("create snapshot");
         a.flush_metadata().expect("flush snapshot");

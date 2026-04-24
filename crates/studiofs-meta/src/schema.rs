@@ -520,7 +520,7 @@ impl Default for BlockFlags {
 /// - Sequential object_id (not content hash) - simpler and faster
 /// - Immutable objects - never modified, only created/deleted
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BlockRef {
+pub struct PayloadRef {
     /// Sequential payload object ID (unique across the volume).
     pub object_id: u64,
     /// Offset within the payload object.
@@ -531,7 +531,7 @@ pub struct BlockRef {
     pub flags: BlockFlags,
 }
 
-impl BlockRef {
+impl PayloadRef {
     /// Create a new payload reference that covers a full logical block.
     pub fn new_full(object_id: u64, length: u32) -> Self {
         Self {
@@ -640,10 +640,10 @@ impl SliceRange {
 /// Lifecycle state attached to a slice's payload object reference.
 ///
 /// The separate state makes the upload/publication/recovery lifecycle explicit
-/// without changing the immutable block payload itself.
+/// without changing the immutable payload object itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum BlockRefState {
+pub enum PayloadRefState {
     /// Accepted locally but not yet uploaded.
     #[default]
     LocalOnly,
@@ -657,8 +657,8 @@ pub enum BlockRefState {
     Recovering,
 }
 
-impl BlockRefState {
-    /// Return the cache-retention policy implied by this block lifecycle state.
+impl PayloadRefState {
+    /// Return the cache-retention policy implied by this payload lifecycle state.
     pub fn retention_class(self) -> PayloadRetentionClass {
         match self {
             Self::LocalOnly | Self::Uploading | Self::Recovering => {
@@ -729,23 +729,23 @@ pub struct SliceRecord {
     pub order: SliceOrder,
     /// Chunk-relative byte range for the slice.
     pub range: SliceRange,
-    /// Block payload reference; `None` represents a tombstone.
+    /// Payload object reference; `None` represents a tombstone.
     #[serde(default)]
-    pub block: Option<BlockRef>,
-    /// Upload/publication/recovery lifecycle for the referenced block.
+    pub block: Option<PayloadRef>,
+    /// Upload/publication/recovery lifecycle for the referenced payload.
     #[serde(default)]
-    pub block_state: BlockRefState,
+    pub payload_state: PayloadRefState,
 }
 
 impl SliceRecord {
     /// Create a data-bearing slice record.
-    pub fn new(slice_id: SliceId, order: SliceOrder, range: SliceRange, block: BlockRef) -> Self {
+    pub fn new(slice_id: SliceId, order: SliceOrder, range: SliceRange, block: PayloadRef) -> Self {
         Self {
             slice_id,
             order,
             range,
             block: Some(block),
-            block_state: BlockRefState::LocalOnly,
+            payload_state: PayloadRefState::LocalOnly,
         }
     }
 
@@ -756,7 +756,7 @@ impl SliceRecord {
             order,
             range,
             block: None,
-            block_state: BlockRefState::LocalOnly,
+            payload_state: PayloadRefState::LocalOnly,
         }
     }
 
@@ -950,9 +950,9 @@ pub struct ResolvedSliceSpan {
     /// Winning slice order when the span comes from a slice.
     #[serde(default)]
     pub slice_order: Option<SliceOrder>,
-    /// Block ref backing the span, clipped to `range` when data-bearing.
+    /// Payload ref backing the span, clipped to `range` when data-bearing.
     #[serde(default)]
-    pub block: Option<BlockRef>,
+    pub block: Option<PayloadRef>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -967,7 +967,7 @@ struct ResolveCandidate {
     slice_id: SliceId,
     slice_order: SliceOrder,
     range: SliceRange,
-    block: Option<BlockRef>,
+    block: Option<PayloadRef>,
 }
 
 impl ResolveCandidate {
@@ -1086,7 +1086,7 @@ pub fn resolve_chunk_slice_spans(
                 subtract_range(pending, overlap, &mut next_unresolved);
                 let block = candidate.block.as_ref().map(|block| {
                     let delta = overlap.start.saturating_sub(candidate.range.start);
-                    BlockRef {
+                    PayloadRef {
                         object_id: block.object_id,
                         offset: block.offset.saturating_add(delta),
                         length: overlap.len(),
@@ -1411,11 +1411,11 @@ mod tests {
 
     #[test]
     fn test_payload_ref_flags() {
-        let full_payload_ref = BlockRef::new_full(123, 4 * 1024 * 1024);
+        let full_payload_ref = PayloadRef::new_full(123, 4 * 1024 * 1024);
         assert!(!full_payload_ref.is_partial());
         assert!(!full_payload_ref.is_compressed());
 
-        let partial_payload_ref = BlockRef::new_partial(124, 1000);
+        let partial_payload_ref = PayloadRef::new_partial(124, 1000);
         assert!(partial_payload_ref.is_partial());
         assert!(!partial_payload_ref.is_compressed());
     }
@@ -1454,7 +1454,7 @@ mod tests {
             SliceId(1),
             SliceOrder(1),
             SliceRange::new(0, 8192).expect("base range"),
-            BlockRef::new_partial(2001, 8192),
+            PayloadRef::new_partial(2001, 8192),
         ));
 
         let mut overlay_chunk = RegularFileChunkState::default();
@@ -1462,7 +1462,7 @@ mod tests {
             SliceId(2),
             SliceOrder(1),
             SliceRange::new(1024, 3072).expect("overlay range"),
-            BlockRef::new_partial(2002, 2048),
+            PayloadRef::new_partial(2002, 2048),
         ));
         overlay_chunk.insert_slice(SliceRecord::tombstone(
             SliceId(3),
@@ -1522,13 +1522,13 @@ mod tests {
             SliceId(1),
             SliceOrder(1),
             SliceRange::new(0, 4096).expect("first slice"),
-            BlockRef::new_partial(1001, 4096),
+            PayloadRef::new_partial(1001, 4096),
         ));
         chunk.insert_slice(SliceRecord::new(
             SliceId(2),
             SliceOrder(2),
             SliceRange::new(0, 4096).expect("shadowed slice"),
-            BlockRef::new_partial(1002, 4096),
+            PayloadRef::new_partial(1002, 4096),
         ));
         chunk.insert_slice(SliceRecord::tombstone(
             SliceId(3),
@@ -1561,7 +1561,7 @@ mod tests {
 
     #[test]
     fn test_regular_file_state_roundtrip() {
-        let block = BlockRef::new_partial(9001, 4096);
+        let block = PayloadRef::new_partial(9001, 4096);
         let slice = SliceRecord::new(
             SliceId(7),
             SliceOrder(3),

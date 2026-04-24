@@ -9,7 +9,7 @@ trait FileGraphFixture {
         &self,
         ino: Ino,
         block_index: u32,
-        block: &BlockRef,
+        block: &PayloadRef,
     ) -> MetaResult<()>;
 }
 
@@ -18,13 +18,13 @@ impl FileGraphFixture for RedbMetaEngine {
         &self,
         ino: Ino,
         block_index: u32,
-        block: &BlockRef,
+        block: &PayloadRef,
     ) -> MetaResult<()> {
         let chunk_slices = Self::chunk_slices_for_block(
             block_index,
             DEFAULT_BLOCK_SIZE,
             Some(block),
-            BlockRefState::LocalOnly,
+            PayloadRefState::LocalOnly,
         )?;
         self.flush_regular_file_overlay_slices(ino, chunk_slices.as_slice())?;
         Ok(())

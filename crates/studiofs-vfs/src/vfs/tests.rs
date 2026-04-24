@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use studiofs_meta::engine::MetadataAuthorityStatus;
 use studiofs_meta::engine::{MetaBlocks, MetaInodes};
 use studiofs_meta::schema::{
-    BlockRefState, CURRENT_FORMAT_VERSION, ChunkId, DEFAULT_BLOCK_SIZE, FormatInfo,
-    InodeLifecycleState, MetadataConfig, PayloadRetentionClass, ROOT_INO, SliceId, SliceOrder,
+    CURRENT_FORMAT_VERSION, ChunkId, DEFAULT_BLOCK_SIZE, FormatInfo, InodeLifecycleState,
+    MetadataConfig, PayloadRefState, PayloadRetentionClass, ROOT_INO, SliceId, SliceOrder,
     SliceRange, SliceRecord,
 };
 use studiofs_meta::{
@@ -93,14 +93,14 @@ trait FileGraphMetaFixture {
         &self,
         ino: Ino,
         block_index: u32,
-        block: &BlockRef,
-    ) -> MetaResult<Option<BlockRef>>;
-    fn lookup_logical_payload_slices(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>>;
+        block: &PayloadRef,
+    ) -> MetaResult<Option<PayloadRef>>;
+    fn lookup_logical_payload_slices(&self, ino: Ino) -> MetaResult<Vec<(u32, PayloadRef)>>;
 }
 
 fn fixture_logical_payload_slices(
     block_index: u32,
-    block: Option<&BlockRef>,
+    block: Option<&PayloadRef>,
 ) -> MetaResult<Vec<(ChunkId, Vec<SliceRecord>)>> {
     let block_start = u64::from(block_index)
         .checked_mul(u64::from(DEFAULT_BLOCK_SIZE))
@@ -112,7 +112,7 @@ fn fixture_logical_payload_slices(
         .checked_add(u64::from(DEFAULT_BLOCK_SIZE))
         .ok_or_else(|| MetaError::Storage("fixture block range overflow".to_string()))?;
     let mut chunks = std::collections::BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
-    let mut push = |start: u64, end: u64, source: Option<&BlockRef>| -> MetaResult<()> {
+    let mut push = |start: u64, end: u64, source: Option<&PayloadRef>| -> MetaResult<()> {
         let mut cursor = start;
         while cursor < end {
             let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);
@@ -130,7 +130,7 @@ fn fixture_logical_payload_slices(
                     SliceId(0),
                     SliceOrder(0),
                     range,
-                    BlockRef {
+                    PayloadRef {
                         object_id: source.object_id,
                         offset: source.offset.saturating_add(delta),
                         length: u32::try_from(piece_end.saturating_sub(cursor)).map_err(|_| {
@@ -142,7 +142,7 @@ fn fixture_logical_payload_slices(
             } else {
                 SliceRecord::tombstone(SliceId(0), SliceOrder(0), range)
             };
-            slice.block_state = BlockRefState::LocalOnly;
+            slice.payload_state = PayloadRefState::LocalOnly;
             chunks.entry(chunk_id).or_default().push(slice);
             cursor = piece_end;
         }
@@ -160,8 +160,8 @@ impl FileGraphMetaFixture for Arc<RedbMetaEngine> {
         &self,
         ino: Ino,
         block_index: u32,
-        block: &BlockRef,
-    ) -> MetaResult<Option<BlockRef>> {
+        block: &PayloadRef,
+    ) -> MetaResult<Option<PayloadRef>> {
         self.flush_regular_file_overlay_slices(
             ino,
             fixture_logical_payload_slices(block_index, Some(block))?.as_slice(),
@@ -169,9 +169,9 @@ impl FileGraphMetaFixture for Arc<RedbMetaEngine> {
         Ok(None)
     }
 
-    fn lookup_logical_payload_slices(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
+    fn lookup_logical_payload_slices(&self, ino: Ino) -> MetaResult<Vec<(u32, PayloadRef)>> {
         let attr = self.get_attr(ino)?;
-        let mut blocks = BTreeMap::<u32, BlockRef>::new();
+        let mut blocks = BTreeMap::<u32, PayloadRef>::new();
         for span in self.lookup_regular_file_slices(ino, 0, attr.size)? {
             let Some(block) = span.block else {
                 continue;
@@ -196,7 +196,7 @@ impl FileGraphMetaFixture for Arc<RedbMetaEngine> {
                         existing.length = existing.length.saturating_add(piece_len);
                         existing.flags |= block.flags;
                     })
-                    .or_insert_with(|| BlockRef {
+                    .or_insert_with(|| PayloadRef {
                         object_id: block.object_id,
                         offset: block.offset.saturating_add(delta),
                         length: piece_len,
@@ -302,13 +302,13 @@ fn install_fragmented_overlay_block(
                     SliceId(0),
                     SliceOrder(0),
                     SliceRange::new(0, half as u32).expect("left slice range"),
-                    BlockRef::new_partial(object_ids[0], half as u32),
+                    PayloadRef::new_partial(object_ids[0], half as u32),
                 ),
                 SliceRecord::new(
                     SliceId(1),
                     SliceOrder(1),
                     SliceRange::new(half as u32, block_size as u32).expect("right slice range"),
-                    BlockRef::new_partial(object_ids[1], (block_size - half) as u32),
+                    PayloadRef::new_partial(object_ids[1], (block_size - half) as u32),
                 ),
             ],
         )],
@@ -340,7 +340,7 @@ fn startup_replay_does_not_override_current_epoch_live_extent_with_stale_pending
     attr.committed_content_epoch = 4;
     attr.upload_state = MetaUploadState::Uploading;
     meta.set_attr(&attr).expect("persist staged attr");
-    meta.stage_logical_payload_slice(ino, 0, &BlockRef::new_partial(9001, 4096))
+    meta.stage_logical_payload_slice(ino, 0, &PayloadRef::new_partial(9001, 4096))
         .expect("persist current payload slice");
 
     let pending_uploads = vec![PendingUpload {
@@ -398,7 +398,7 @@ fn startup_replay_keeps_metadata_live_extent_when_pending_upload_has_same_epoch(
     attr.committed_content_epoch = 4;
     attr.upload_state = MetaUploadState::Uploading;
     meta.set_attr(&attr).expect("persist staged attr");
-    meta.stage_logical_payload_slice(ino, 0, &BlockRef::new_partial(9001, 4096))
+    meta.stage_logical_payload_slice(ino, 0, &PayloadRef::new_partial(9001, 4096))
         .expect("persist current payload slice");
 
     let pending_uploads = vec![PendingUpload {
@@ -436,7 +436,7 @@ fn startup_replay_prefers_overlay_metadata_live_extent_over_base_for_same_epoch(
     attr.committed_content_epoch = 4;
     attr.upload_state = MetaUploadState::Updating;
     meta.set_attr(&attr).expect("persist staged attr");
-    meta.stage_logical_payload_slice(ino, 0, &BlockRef::new_partial(9001, 4096))
+    meta.stage_logical_payload_slice(ino, 0, &PayloadRef::new_partial(9001, 4096))
         .expect("persist base payload slice");
     meta.flush_regular_file_overlay_slices_with_attr(
         ino,
@@ -447,13 +447,13 @@ fn startup_replay_prefers_overlay_metadata_live_extent_over_base_for_same_epoch(
                 order: studiofs_meta::schema::SliceOrder::default(),
                 range: studiofs_meta::schema::SliceRange::new(0, 4096)
                     .expect("overlay slice range"),
-                block: Some(studiofs_meta::schema::BlockRef {
+                block: Some(studiofs_meta::schema::PayloadRef {
                     object_id: 9002,
                     offset: 0,
                     length: 4096,
                     flags: studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK,
                 }),
-                block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
+                payload_state: studiofs_meta::schema::PayloadRefState::LocalOnly,
             }],
         )],
         Some(&attr),
@@ -508,7 +508,7 @@ fn pending_upload_views_follow_runtime_queue_after_startup_replay() {
     meta.stage_logical_payload_slice(
         ino,
         0,
-        &BlockRef::new_partial(object_id, payload.len() as u32),
+        &PayloadRef::new_partial(object_id, payload.len() as u32),
     )
     .expect("persist current payload slice");
     assert!(
@@ -564,7 +564,7 @@ fn startup_replay_rebuilds_runtime_pending_upload_index_from_persisted_state() {
     meta.stage_logical_payload_slice(
         ino,
         0,
-        &BlockRef::new_partial(object_id, payload.len() as u32),
+        &PayloadRef::new_partial(object_id, payload.len() as u32),
     )
     .expect("persist current payload slice");
 
@@ -770,7 +770,7 @@ fn pending_upload_truth_ignores_deleted_inode_local_payloads() {
     meta.stage_logical_payload_slice(
         ino,
         0,
-        &BlockRef::new_partial(object_id, payload.len() as u32),
+        &PayloadRef::new_partial(object_id, payload.len() as u32),
     )
     .expect("persist deleted payload slice");
 
@@ -960,9 +960,9 @@ fn zeroio_snapshot_reports_delete_before_publish_cleanup_visibility() {
         .put(951, b"uploaded", true)
         .expect("persist uploaded object");
     vfs.local_payload_backend().mark_uploaded(951);
-    meta.stage_logical_payload_slice(attr.ino, 0, &BlockRef::new_partial(950, 4096))
+    meta.stage_logical_payload_slice(attr.ino, 0, &PayloadRef::new_partial(950, 4096))
         .expect("persist local-only block");
-    let uploaded = BlockRef::new_partial(951, 4096);
+    let uploaded = PayloadRef::new_partial(951, 4096);
     meta.stage_logical_payload_slice(attr.ino, 1, &uploaded)
         .expect("persist uploaded block");
     assert!(
@@ -5399,7 +5399,7 @@ fn block_store_read_into_prefers_hot_upload_buffer_before_disk() {
 fn committed_copy_rejects_short_payload() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "committed-copy-short-payload");
-    let block = BlockRef::new_full(42, vfs.block_size);
+    let block = PayloadRef::new_full(42, vfs.block_size);
     let mut dst = [0_u8; 8];
     let err = vfs
         .copy_committed_block_payload_into_range(b"abcd", &block, 0, &mut dst)

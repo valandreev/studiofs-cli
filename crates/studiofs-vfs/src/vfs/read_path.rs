@@ -15,7 +15,7 @@ use studiofs_meta::MetaError;
 use studiofs_meta::schema::{
     DEFAULT_CHUNK_SIZE, ResolvedSliceSource, ResolvedSliceSpan, chunk_start_offset,
 };
-use studiofs_meta::types::{BlockRef, Ino, InodeAttr, block_index_from_offset};
+use studiofs_meta::types::{Ino, InodeAttr, PayloadRef, block_index_from_offset};
 use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone, Copy)]
@@ -37,8 +37,8 @@ enum ReadSegmentSource {
     Dirty { data: Bytes, block_offset: u64 },
     PendingOverlay { data: Bytes, block_offset: u32 },
     PendingExtent { object_id: u64, block_offset: u32 },
-    Overlay { block: BlockRef },
-    Base { block: BlockRef },
+    Overlay { block: PayloadRef },
+    Base { block: PayloadRef },
     Zero,
 }
 
@@ -134,7 +134,7 @@ impl<'a> DataReader<'a> {
     }
 
     #[cfg(test)]
-    fn collect_data_payload_refs(segments: &[ReadSegment]) -> BTreeMap<u64, BlockRef> {
+    fn collect_data_payload_refs(segments: &[ReadSegment]) -> BTreeMap<u64, PayloadRef> {
         let mut payload_refs = BTreeMap::new();
         for segment in segments {
             let block = match &segment.source {
@@ -427,7 +427,7 @@ impl<'a> DataReader<'a> {
     ) -> Vec<ReadRange>
     where
         I: Iterator<Item = &'b ResolvedSliceSpan>,
-        F: Fn(BlockRef) -> ReadSegmentSource + Copy,
+        F: Fn(PayloadRef) -> ReadSegmentSource + Copy,
     {
         let mut unresolved = unresolved;
         for span in resolved {
@@ -1301,8 +1301,8 @@ mod tests {
         LocalPayloadObjectStats, LocalPayloadStorageStats,
     };
     use studiofs_meta::schema::{
-        BlockRefState, CURRENT_FORMAT_VERSION, ChunkId, DEFAULT_BLOCK_SIZE, FormatInfo,
-        MetadataConfig, ROOT_INO, SliceId, SliceOrder, SliceRange, SliceRecord,
+        CURRENT_FORMAT_VERSION, ChunkId, DEFAULT_BLOCK_SIZE, FormatInfo, MetadataConfig,
+        PayloadRefState, ROOT_INO, SliceId, SliceOrder, SliceRange, SliceRecord,
     };
     use studiofs_meta::types::BlockFlags as MetaBlockFlags;
     use studiofs_meta::{MetaBlocks, MetaFormat, MetaInodes, RedbMetaEngine};
@@ -1314,13 +1314,13 @@ mod tests {
             &self,
             ino: Ino,
             block_index: u32,
-            block: &BlockRef,
-        ) -> MetaResult<Option<BlockRef>>;
+            block: &PayloadRef,
+        ) -> MetaResult<Option<PayloadRef>>;
     }
 
     fn fixture_logical_payload_slices(
         block_index: u32,
-        block: &BlockRef,
+        block: &PayloadRef,
     ) -> MetaResult<Vec<(ChunkId, Vec<SliceRecord>)>> {
         let block_start = u64::from(block_index)
             .checked_mul(u64::from(DEFAULT_BLOCK_SIZE))
@@ -1345,7 +1345,7 @@ mod tests {
                 SliceId(0),
                 SliceOrder(0),
                 range,
-                BlockRef {
+                PayloadRef {
                     object_id: block.object_id,
                     offset: block.offset.saturating_add(delta),
                     length: u32::try_from(piece_end.saturating_sub(cursor)).map_err(|_| {
@@ -1354,7 +1354,7 @@ mod tests {
                     flags: block.flags,
                 },
             );
-            slice.block_state = BlockRefState::Published;
+            slice.payload_state = PayloadRefState::Published;
             chunks.entry(chunk_id).or_default().push(slice);
             cursor = piece_end;
         }
@@ -1366,8 +1366,8 @@ mod tests {
             &self,
             ino: Ino,
             block_index: u32,
-            block: &BlockRef,
-        ) -> MetaResult<Option<BlockRef>> {
+            block: &PayloadRef,
+        ) -> MetaResult<Option<PayloadRef>> {
             self.flush_regular_file_overlay_slices(
                 ino,
                 fixture_logical_payload_slices(block_index, block)?.as_slice(),
@@ -1609,13 +1609,13 @@ mod tests {
 
     #[test]
     fn collect_data_payload_refs_deduplicates_by_object_id() {
-        let first = BlockRef {
+        let first = PayloadRef {
             object_id: 42,
             offset: 0,
             length: 16,
             flags: MetaBlockFlags::empty(),
         };
-        let second = BlockRef {
+        let second = PayloadRef {
             object_id: 42,
             offset: 8,
             length: 8,
@@ -1909,7 +1909,7 @@ mod tests {
                 .await
                 .expect("block store put");
 
-            let mut block = BlockRef::new_full(object_id, 10);
+            let mut block = PayloadRef::new_full(object_id, 10);
             block.offset = 2;
             block.length = 4;
             let segments = vec![ReadSegment {
@@ -1954,7 +1954,7 @@ mod tests {
             staged_attr.committed_size = 8;
             staged_attr.upload_state = MetaUploadState::Ready;
             meta.set_attr(&staged_attr).expect("persist committed attr");
-            meta.stage_logical_payload_slice(ino, 0, &BlockRef::new_partial(object_id, 8))
+            meta.stage_logical_payload_slice(ino, 0, &PayloadRef::new_partial(object_id, 8))
                 .expect("persist committed payload slice");
 
             vfs.write(ino, 2, b"XY").await.expect("stage dirty patch");
@@ -2039,7 +2039,7 @@ mod tests {
             staged_attr.committed_size = 8;
             staged_attr.upload_state = MetaUploadState::Ready;
             meta.set_attr(&staged_attr).expect("persist committed attr");
-            meta.stage_logical_payload_slice(ino, 0, &BlockRef::new_partial(object_id, 8))
+            meta.stage_logical_payload_slice(ino, 0, &PayloadRef::new_partial(object_id, 8))
                 .expect("persist committed payload slice");
 
             vfs.write(ino, 2, b"XY").await.expect("stage dirty patch");
@@ -2100,7 +2100,7 @@ mod tests {
             staged_attr.committed_content_epoch = 1;
             staged_attr.content_epoch = 2;
             meta.set_attr(&staged_attr).expect("persist staged attr");
-            meta.stage_logical_payload_slice(ino, 0, &BlockRef::new_partial(committed_object_id, 8))
+            meta.stage_logical_payload_slice(ino, 0, &PayloadRef::new_partial(committed_object_id, 8))
                 .expect("persist committed payload slice");
 
             vfs.state.incarnation.live_extent_records.lock().insert(

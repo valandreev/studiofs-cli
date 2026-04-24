@@ -9,7 +9,7 @@ impl RedbMetaEngine {
             let regular: RegularFileBaseState = decode(bytes)?;
             if regular.chunks.values().any(|chunk| {
                 chunk.slices.values().any(|slice| {
-                    slice.block_state == BlockRefState::Published && slice.block.is_some()
+                    slice.payload_state == PayloadRefState::Published && slice.block.is_some()
                 })
             }) {
                 published_regular_inodes.insert(*ino);

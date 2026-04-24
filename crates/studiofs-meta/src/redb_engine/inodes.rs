@@ -414,15 +414,15 @@ impl RedbMetaEngine {
         let mut saw_uploaded = false;
         for chunk_state in chunk_states {
             for slice in chunk_state.slices.values() {
-                match slice.block_state {
-                    BlockRefState::Uploading => return Some(InodeLifecycleState::Uploading),
-                    BlockRefState::LocalOnly | BlockRefState::Recovering => {
+                match slice.payload_state {
+                    PayloadRefState::Uploading => return Some(InodeLifecycleState::Uploading),
+                    PayloadRefState::LocalOnly | PayloadRefState::Recovering => {
                         saw_local_only = true;
                     }
-                    BlockRefState::Uploaded => {
+                    PayloadRefState::Uploaded => {
                         saw_uploaded = true;
                     }
-                    BlockRefState::Published => {}
+                    PayloadRefState::Published => {}
                 }
             }
         }
@@ -782,9 +782,9 @@ mod tests {
                             SliceId(0),
                             SliceOrder(0),
                             SliceRange::new(0, 4096).unwrap(),
-                            BlockRef::new_partial(777, 4096),
+                            PayloadRef::new_partial(777, 4096),
                         );
-                        slice.block_state = BlockRefState::LocalOnly;
+                        slice.payload_state = PayloadRefState::LocalOnly;
                         vec![slice]
                     })],
                 )

@@ -12,9 +12,9 @@ use studiofs_data::object::{
 };
 use studiofs_data::{DataStore, DataStoreConfig};
 use studiofs_meta::{
-    BlockRef, DEFAULT_CHUNK_SIZE, MetaError, MetaOpenOptions, ROOT_INO, chunk_id_from_offset,
+    DEFAULT_CHUNK_SIZE, MetaError, MetaOpenOptions, PayloadRef, ROOT_INO, chunk_id_from_offset,
     chunk_start_offset, ensure_studiofs_database, open_meta_engine, open_meta_engine_with_options,
-    schema::{BlockRefState, ChunkId, SliceId, SliceOrder, SliceRange, SliceRecord},
+    schema::{ChunkId, PayloadRefState, SliceId, SliceOrder, SliceRange, SliceRecord},
 };
 use uuid::Uuid;
 
@@ -192,7 +192,7 @@ async fn volume_exists(pg_dsn: &str, name: &str) -> bool {
 }
 
 fn single_object_slice_graph(
-    block: &BlockRef,
+    block: &PayloadRef,
 ) -> Result<Vec<(ChunkId, Vec<SliceRecord>)>, MetaError> {
     let mut chunks = BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
     let mut cursor = 0_u64;
@@ -212,7 +212,7 @@ fn single_object_slice_graph(
             SliceId(0),
             SliceOrder(0),
             range,
-            BlockRef {
+            PayloadRef {
                 object_id: block.object_id,
                 offset: block.offset.saturating_add(
                     u32::try_from(cursor)
@@ -223,7 +223,7 @@ fn single_object_slice_graph(
                 flags: block.flags,
             },
         );
-        slice.block_state = BlockRefState::LocalOnly;
+        slice.payload_state = PayloadRefState::LocalOnly;
         chunks.entry(chunk_id).or_default().push(slice);
         cursor = piece_end;
     }
@@ -246,7 +246,7 @@ async fn seed_remote_file(home: &Path, disk_name: &str, payload: &[u8]) {
             .create_file(ROOT_INO, b"payload.bin", 0, 0, 0o644)
             .expect("create file");
         let object_id = meta.next_block_id().expect("next block id");
-        let block = BlockRef::new_partial(object_id, payload.len() as u32);
+        let block = PayloadRef::new_partial(object_id, payload.len() as u32);
         let mut attr = meta.get_attr(file.ino).expect("get attr");
         attr.size = payload.len() as u64;
         meta.set_attr(&attr).expect("set attr");

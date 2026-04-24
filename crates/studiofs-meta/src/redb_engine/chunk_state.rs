@@ -378,7 +378,7 @@ impl RedbMetaEngine {
         txn: &redb::WriteTransaction,
         table_def: TableDefinition<&[u8], &[u8]>,
         ino: Ino,
-        blocks: &[(u32, BlockRef)],
+        blocks: &[(u32, PayloadRef)],
         block_size: u32,
         published: bool,
         track_pending_compaction: bool,
@@ -634,7 +634,7 @@ impl RedbMetaEngine {
     /// Convert compact logical-payload fixtures used by tests into chunk/slice state.
     #[cfg(test)]
     pub(super) fn logical_payload_refs_to_chunk_state(
-        blocks: &[(u32, BlockRef)],
+        blocks: &[(u32, PayloadRef)],
         block_size: u32,
     ) -> MetaResult<RegularFileOverlayState> {
         let mut state = RegularFileOverlayState::default();
@@ -730,7 +730,7 @@ impl RedbMetaEngine {
     pub(super) fn chunk_for_published_base(chunk: &RegularFileChunkState) -> RegularFileChunkState {
         let mut published = chunk.clone();
         for slice in published.slices.values_mut() {
-            slice.block_state = BlockRefState::Published;
+            slice.payload_state = PayloadRefState::Published;
         }
         published
     }
@@ -762,7 +762,7 @@ impl RedbMetaEngine {
                     order: slice_order,
                     range: span.range,
                     block: span.block,
-                    block_state: BlockRefState::Published,
+                    payload_state: PayloadRefState::Published,
                 },
             );
         }
@@ -787,7 +787,7 @@ impl RedbMetaEngine {
             slices: BTreeMap::new(),
             fragmentation: ChunkFragmentationCounters::default(),
         };
-        let mut merged: Vec<(SliceRange, Option<BlockRef>, BlockRefState)> = Vec::new();
+        let mut merged: Vec<(SliceRange, Option<PayloadRef>, PayloadRefState)> = Vec::new();
 
         for span in resolved {
             let Some(slice_id) = span.slice_id else {
@@ -796,7 +796,7 @@ impl RedbMetaEngine {
             let source_state = chunk
                 .slices
                 .get(&slice_id)
-                .map(|slice| slice.block_state)
+                .map(|slice| slice.payload_state)
                 .ok_or_else(|| {
                     MetaError::Storage("compaction source slice is missing".to_string())
                 })?;
@@ -833,7 +833,7 @@ impl RedbMetaEngine {
             return Ok(None);
         }
 
-        for (range, block, block_state) in merged {
+        for (range, block, payload_state) in merged {
             let slice_id = compacted
                 .try_alloc_slice_id()
                 .ok_or_else(|| MetaError::Storage("slice id overflow".to_string()))?;
@@ -847,7 +847,7 @@ impl RedbMetaEngine {
                     order: slice_order,
                     range,
                     block,
-                    block_state,
+                    payload_state,
                 },
             );
         }
@@ -960,7 +960,7 @@ impl RedbMetaEngine {
         spans: &[ResolvedSliceSpan],
         block_index: u32,
         block_size: u32,
-    ) -> MetaResult<Option<BlockRef>> {
+    ) -> MetaResult<Option<PayloadRef>> {
         #[derive(Clone, Copy)]
         struct Range {
             start: u64,
@@ -1003,7 +1003,7 @@ impl RedbMetaEngine {
             start: block_start,
             end: block_end,
         }];
-        let mut claimed_refs: Vec<(u64, BlockRef)> = Vec::new();
+        let mut claimed_refs: Vec<(u64, PayloadRef)> = Vec::new();
 
         for source in [ResolvedSliceSource::Overlay, ResolvedSliceSource::Base] {
             for span in spans.iter().filter(|span| span.source == source) {
@@ -1034,7 +1034,7 @@ impl RedbMetaEngine {
                     };
                     claimed_refs.push((
                         overlap.start,
-                        BlockRef {
+                        PayloadRef {
                             object_id: block.object_id,
                             offset: block_offset,
                             length: take_len_u32,
@@ -1050,7 +1050,7 @@ impl RedbMetaEngine {
         }
         claimed_refs.sort_by_key(|(start, _)| *start);
 
-        let mut chosen: Option<BlockRef> = None;
+        let mut chosen: Option<PayloadRef> = None;
         for (_, part) in claimed_refs {
             if let Some(existing) = chosen.as_mut() {
                 if existing.object_id != part.object_id
@@ -1203,7 +1203,7 @@ impl RedbMetaEngine {
         ino: Ino,
         block_index: u32,
         block_size: u32,
-    ) -> MetaResult<Option<BlockRef>> {
+    ) -> MetaResult<Option<PayloadRef>> {
         let block_start = u64::from(block_index).saturating_mul(u64::from(block_size));
         let spans = Self::lookup_regular_file_slices_in_write_txn(
             txn,
@@ -1225,8 +1225,8 @@ impl RedbMetaEngine {
     pub(super) fn chunk_slices_for_block(
         block_index: u32,
         block_size: u32,
-        block: Option<&BlockRef>,
-        block_state: BlockRefState,
+        block: Option<&PayloadRef>,
+        payload_state: PayloadRefState,
     ) -> MetaResult<Vec<(ChunkId, Vec<SliceRecord>)>> {
         if block_size == 0 {
             return Err(MetaError::Storage(
@@ -1255,7 +1255,7 @@ impl RedbMetaEngine {
         let mut chunks = BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
         let mut push_segment = |segment_start: u64,
                                 segment_end: u64,
-                                data_block: Option<&BlockRef>|
+                                data_block: Option<&PayloadRef>|
          -> MetaResult<()> {
             if segment_start >= segment_end {
                 return Ok(());
@@ -1286,18 +1286,18 @@ impl RedbMetaEngine {
                         SliceId(0),
                         SliceOrder(0),
                         range,
-                        BlockRef {
+                        PayloadRef {
                             object_id: block.object_id,
                             offset,
                             length,
                             flags: block.flags,
                         },
                     );
-                    slice.block_state = block_state;
+                    slice.payload_state = payload_state;
                     slice
                 } else {
                     let mut slice = SliceRecord::tombstone(SliceId(0), SliceOrder(0), range);
-                    slice.block_state = block_state;
+                    slice.payload_state = payload_state;
                     slice
                 };
                 chunks.entry(chunk_id).or_default().push(slice);

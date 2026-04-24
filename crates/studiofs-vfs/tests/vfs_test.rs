@@ -34,9 +34,9 @@ use studiofs_meta::{
     CURRENT_FORMAT_VERSION, FormatInfo, MetaBlocks, MetaEngine, MetaError, MetaFormat, MetaGc,
     MetaInodes, MetaReplication, MetadataBackend, MetadataConfig, PgMetaEngine, PgOpenOptions,
     PostgresConfig, ROOT_INO, RedbMetaEngine, ensure_studiofs_database,
-    schema::{BlockRefState, InodeLifecycleState},
     schema::{ChunkId, SliceId, SliceOrder, SliceRange, SliceRecord},
-    types::{AccessLevel, BlockFlags, BlockRef, Ino, UploadState},
+    schema::{InodeLifecycleState, PayloadRefState},
+    types::{AccessLevel, BlockFlags, Ino, PayloadRef, UploadState},
 };
 use studiofs_vfs::{
     KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsConfigRaw, VfsConfigValidated, VfsError,
@@ -65,27 +65,27 @@ trait FileGraphMetaFixture {
         &self,
         ino: Ino,
         block_index: u32,
-        block: &BlockRef,
-    ) -> Result<Option<BlockRef>, MetaError>;
+        block: &PayloadRef,
+    ) -> Result<Option<PayloadRef>, MetaError>;
     fn lookup_logical_payload_slice(
         &self,
         ino: Ino,
         block_index: u32,
-    ) -> Result<Option<BlockRef>, MetaError>;
-    fn lookup_logical_payload_slices(&self, ino: Ino) -> Result<Vec<(u32, BlockRef)>, MetaError>;
+    ) -> Result<Option<PayloadRef>, MetaError>;
+    fn lookup_logical_payload_slices(&self, ino: Ino) -> Result<Vec<(u32, PayloadRef)>, MetaError>;
     fn publish_uploaded_slice_object(
         &self,
         ino: Ino,
         block_index: u32,
         expected_epoch: u64,
-        block: &BlockRef,
+        block: &PayloadRef,
     ) -> Result<bool, MetaError>;
 }
 
 fn fixture_logical_payload_slices(
     block_size: u32,
     block_index: u32,
-    block: Option<&BlockRef>,
+    block: Option<&PayloadRef>,
 ) -> Result<Vec<(ChunkId, Vec<SliceRecord>)>, MetaError> {
     let block_start = u64::from(block_index)
         .checked_mul(u64::from(block_size))
@@ -97,7 +97,7 @@ fn fixture_logical_payload_slices(
         .checked_add(u64::from(block_size))
         .ok_or_else(|| MetaError::Storage("fixture block range overflow".to_string()))?;
     let mut chunks = std::collections::BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
-    let mut push = |start: u64, end: u64, source: Option<&BlockRef>| -> Result<(), MetaError> {
+    let mut push = |start: u64, end: u64, source: Option<&PayloadRef>| -> Result<(), MetaError> {
         let mut cursor = start;
         while cursor < end {
             let chunk_id =
@@ -118,7 +118,7 @@ fn fixture_logical_payload_slices(
                     SliceId(0),
                     SliceOrder(0),
                     range,
-                    BlockRef {
+                    PayloadRef {
                         object_id: source.object_id,
                         offset: source.offset.saturating_add(delta),
                         length: u32::try_from(piece_end.saturating_sub(cursor)).map_err(|_| {
@@ -130,7 +130,7 @@ fn fixture_logical_payload_slices(
             } else {
                 SliceRecord::tombstone(SliceId(0), SliceOrder(0), range)
             };
-            slice.block_state = BlockRefState::LocalOnly;
+            slice.payload_state = PayloadRefState::LocalOnly;
             chunks.entry(chunk_id).or_default().push(slice);
             cursor = piece_end;
         }
@@ -146,8 +146,8 @@ fn fixture_logical_payload_slices(
 fn fixture_logical_payload_summaries_from_spans(
     spans: Vec<studiofs_meta::ResolvedSliceSpan>,
     block_size: u32,
-) -> Result<Vec<(u32, BlockRef)>, MetaError> {
-    let mut blocks = std::collections::BTreeMap::<u32, BlockRef>::new();
+) -> Result<Vec<(u32, PayloadRef)>, MetaError> {
+    let mut blocks = std::collections::BTreeMap::<u32, PayloadRef>::new();
     for span in spans {
         let Some(block) = span.block else {
             continue;
@@ -173,7 +173,7 @@ fn fixture_logical_payload_summaries_from_spans(
                     existing.length = existing.length.saturating_add(piece_len);
                     existing.flags |= block.flags;
                 })
-                .or_insert_with(|| BlockRef {
+                .or_insert_with(|| PayloadRef {
                     object_id: block.object_id,
                     offset: block.offset.saturating_add(delta),
                     length: piece_len,
@@ -193,8 +193,8 @@ where
         &self,
         ino: Ino,
         block_index: u32,
-        block: &BlockRef,
-    ) -> Result<Option<BlockRef>, MetaError> {
+        block: &PayloadRef,
+    ) -> Result<Option<PayloadRef>, MetaError> {
         let old = self
             .lookup_logical_payload_slice(ino, block_index)
             .ok()
@@ -211,7 +211,7 @@ where
         &self,
         ino: Ino,
         block_index: u32,
-    ) -> Result<Option<BlockRef>, MetaError> {
+    ) -> Result<Option<PayloadRef>, MetaError> {
         let block_size = self.get_format_info()?.block_size;
         Ok(fixture_logical_payload_summaries_from_spans(
             self.lookup_regular_file_slices(
@@ -226,7 +226,7 @@ where
         .map(|(_, block)| block))
     }
 
-    fn lookup_logical_payload_slices(&self, ino: Ino) -> Result<Vec<(u32, BlockRef)>, MetaError> {
+    fn lookup_logical_payload_slices(&self, ino: Ino) -> Result<Vec<(u32, PayloadRef)>, MetaError> {
         let attr = self.get_attr(ino)?;
         let block_size = self.get_format_info()?.block_size;
         fixture_logical_payload_summaries_from_spans(
@@ -240,7 +240,7 @@ where
         ino: Ino,
         _block_index: u32,
         expected_epoch: u64,
-        block: &BlockRef,
+        block: &PayloadRef,
     ) -> Result<bool, MetaError> {
         self.mark_regular_file_overlay_object_uploaded_if_matches(
             ino,
@@ -256,8 +256,8 @@ impl FileGraphMetaFixture for RedbMetaEngine {
         &self,
         ino: Ino,
         block_index: u32,
-        block: &BlockRef,
-    ) -> Result<Option<BlockRef>, MetaError> {
+        block: &PayloadRef,
+    ) -> Result<Option<PayloadRef>, MetaError> {
         let old = self
             .lookup_logical_payload_slice(ino, block_index)
             .ok()
@@ -274,7 +274,7 @@ impl FileGraphMetaFixture for RedbMetaEngine {
         &self,
         ino: Ino,
         block_index: u32,
-    ) -> Result<Option<BlockRef>, MetaError> {
+    ) -> Result<Option<PayloadRef>, MetaError> {
         let block_size = self.get_format_info()?.block_size;
         Ok(fixture_logical_payload_summaries_from_spans(
             self.lookup_regular_file_slices(
@@ -289,7 +289,7 @@ impl FileGraphMetaFixture for RedbMetaEngine {
         .map(|(_, block)| block))
     }
 
-    fn lookup_logical_payload_slices(&self, ino: Ino) -> Result<Vec<(u32, BlockRef)>, MetaError> {
+    fn lookup_logical_payload_slices(&self, ino: Ino) -> Result<Vec<(u32, PayloadRef)>, MetaError> {
         let attr = self.get_attr(ino)?;
         let block_size = self.get_format_info()?.block_size;
         fixture_logical_payload_summaries_from_spans(
@@ -303,7 +303,7 @@ impl FileGraphMetaFixture for RedbMetaEngine {
         ino: Ino,
         _block_index: u32,
         expected_epoch: u64,
-        block: &BlockRef,
+        block: &PayloadRef,
     ) -> Result<bool, MetaError> {
         self.mark_regular_file_overlay_object_uploaded_if_matches(
             ino,
@@ -1427,7 +1427,7 @@ async fn seed_committed_file(
     format_info: &FormatInfo,
     name: &[u8],
     payload: &[u8],
-) -> (u64, Vec<(u32, BlockRef)>) {
+) -> (u64, Vec<(u32, PayloadRef)>) {
     let attr = meta.create_file(1, name, 0, 0, 0o644).unwrap();
     let ino = attr.ino;
     let mut file_attr = meta.get_attr(ino).unwrap();
@@ -1451,9 +1451,9 @@ async fn seed_committed_file(
         .unwrap();
 
         let block_ref = if chunk.len() == block_size {
-            BlockRef::new_full(object_id, chunk.len() as u32)
+            PayloadRef::new_full(object_id, chunk.len() as u32)
         } else {
-            BlockRef::new_partial(object_id, chunk.len() as u32)
+            PayloadRef::new_partial(object_id, chunk.len() as u32)
         };
         meta.stage_logical_payload_slice(ino, block_index as u32, &block_ref)
             .unwrap();
@@ -1476,7 +1476,7 @@ fn wait_until_payload_slices(
     vfs: &Arc<StudioVfs>,
     ino: u64,
     timeout: Duration,
-) -> Option<Vec<(u32, BlockRef)>> {
+) -> Option<Vec<(u32, PayloadRef)>> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(blocks) = vfs.meta().lookup_logical_payload_slices(ino)
@@ -1501,7 +1501,7 @@ fn wait_until_n_payload_slices(
     ino: u64,
     expected: usize,
     timeout: Duration,
-) -> Option<Vec<(u32, BlockRef)>> {
+) -> Option<Vec<(u32, PayloadRef)>> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(blocks) = vfs.meta().lookup_logical_payload_slices(ino)
@@ -6441,7 +6441,7 @@ fn background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart(
     let baseline_payload = vec![0x21u8; 512 * 1024];
     let replacement_payload = vec![0x91u8; 512 * 1024];
     let mut ino = 0u64;
-    let mut committed_block = BlockRef::new_partial(0, 0);
+    let mut committed_block = PayloadRef::new_partial(0, 0);
     let mut replacement_object_id = 0u64;
 
     {
@@ -6477,7 +6477,7 @@ fn background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart(
             .unwrap();
 
             let replacement_block =
-                BlockRef::new_partial(replacement_object_id, replacement_payload.len() as u32);
+                PayloadRef::new_partial(replacement_object_id, replacement_payload.len() as u32);
             meta.stage_logical_payload_slice(ino, 0, &replacement_block)
                 .unwrap();
 
@@ -6648,13 +6648,13 @@ fn startup_recovery_replays_fragmented_regular_file_graph_without_quarantine() {
                     SliceId(0),
                     SliceOrder(0),
                     SliceRange::new(0, half).unwrap(),
-                    BlockRef::new_partial(dirty_object_id, half),
+                    PayloadRef::new_partial(dirty_object_id, half),
                 ),
                 SliceRecord::new(
                     SliceId(1),
                     SliceOrder(1),
                     SliceRange::new(half, block_size_u32).unwrap(),
-                    BlockRef {
+                    PayloadRef {
                         object_id: dirty_object_id,
                         offset: half,
                         length: half,
@@ -8409,13 +8409,13 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
 
 #[tokio::test]
 async fn test_payload_ref_flags() {
-    let full_payload_ref = BlockRef::new_full(123, 4 * 1024 * 1024);
+    let full_payload_ref = PayloadRef::new_full(123, 4 * 1024 * 1024);
     assert!(!full_payload_ref.is_compressed());
     assert!(!full_payload_ref.is_partial());
     assert_eq!(full_payload_ref.object_id, 123);
     assert_eq!(full_payload_ref.length, 4 * 1024 * 1024);
 
-    let partial_payload_ref = BlockRef::new_partial(456, 1000);
+    let partial_payload_ref = PayloadRef::new_partial(456, 1000);
     assert!(!partial_payload_ref.is_compressed());
     assert!(partial_payload_ref.is_partial());
     assert_eq!(partial_payload_ref.object_id, 456);

@@ -513,7 +513,7 @@ where
     }
 }
 
-fn commit_persisted_block_state(
+fn commit_persisted_payload_state(
     pending: &mut std::collections::HashMap<(Ino, u32), PendingBlock>,
     ino: Ino,
     blocks: &[PersistedWriteBlock],
@@ -667,13 +667,13 @@ where
                                 slice_id: studiofs_meta::schema::SliceId::default(),
                                 order: studiofs_meta::schema::SliceOrder::default(),
                                 range: slice.range,
-                                block: Some(studiofs_meta::schema::BlockRef {
+                                block: Some(studiofs_meta::schema::PayloadRef {
                                     object_id,
                                     offset: slice.object_offset,
                                     length: slice_len,
                                     flags: studiofs_meta::schema::BlockFlags::PARTIAL_BLOCK,
                                 }),
-                                block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
+                                payload_state: studiofs_meta::schema::PayloadRefState::LocalOnly,
                             },
                         );
                         continue;
@@ -811,13 +811,13 @@ where
                     slice_id: studiofs_meta::schema::SliceId::default(),
                     order: studiofs_meta::schema::SliceOrder::default(),
                     range: slice_range,
-                    block: Some(studiofs_meta::schema::BlockRef {
+                    block: Some(studiofs_meta::schema::PayloadRef {
                         object_id: persisted.object_id,
                         offset: block_offset_u32,
                         length: slice_len_u32,
                         flags,
                     }),
-                    block_state: studiofs_meta::schema::BlockRefState::LocalOnly,
+                    payload_state: studiofs_meta::schema::PayloadRefState::LocalOnly,
                 });
             file_pos = file_pos.checked_add(slice_len).ok_or_else(|| {
                 crate::VfsError::Io(std::io::Error::new(
@@ -2715,7 +2715,7 @@ impl StudioVfs {
         let mut pending = self.state.local_dirty.pending_blocks.lock();
         let mut indexes = self.state.local_dirty.pending_block_indexes.lock();
         let (removed_bytes, removed_block_indexes, removed_buffers) =
-            commit_persisted_block_state(&mut pending, ino, blocks);
+            commit_persisted_payload_state(&mut pending, ino, blocks);
         if let Some(inode_indexes) = indexes.get_mut(&ino) {
             for block_index in &removed_block_indexes {
                 inode_indexes.remove(block_index);
@@ -2959,7 +2959,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_persisted_block_state_clears_reserved_id_without_dropping_newer_bytes() {
+    fn commit_persisted_payload_state_clears_reserved_id_without_dropping_newer_bytes() {
         let ino = 7;
         let mut pending = std::collections::HashMap::from([(
             (ino, 3),
@@ -2972,7 +2972,7 @@ mod tests {
         )];
 
         let (removed_bytes, removed_block_indexes, removed_buffers) =
-            commit_persisted_block_state(&mut pending, ino, &blocks);
+            commit_persisted_payload_state(&mut pending, ino, &blocks);
 
         assert_eq!(removed_bytes, 0);
         assert!(removed_block_indexes.is_empty());
@@ -2983,14 +2983,14 @@ mod tests {
     }
 
     #[test]
-    fn commit_persisted_block_state_removes_matching_local_extent_after_metadata_commit() {
+    fn commit_persisted_payload_state_removes_matching_local_extent_after_metadata_commit() {
         let ino = 8;
         let mut pending =
             std::collections::HashMap::from([((ino, 4), PendingBlock::local_extent(444, 4096))]);
         let blocks = vec![PersistedWriteBlock::from_local_extent(4, 444, 4096)];
 
         let (removed_bytes, removed_block_indexes, removed_buffers) =
-            commit_persisted_block_state(&mut pending, ino, &blocks);
+            commit_persisted_payload_state(&mut pending, ino, &blocks);
 
         assert_eq!(removed_bytes, 0);
         assert_eq!(removed_block_indexes, vec![4]);
