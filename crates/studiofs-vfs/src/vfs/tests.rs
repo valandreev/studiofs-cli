@@ -795,10 +795,10 @@ fn startup_replay_removes_orphan_dirty_payloads_and_clears_pending_evictions() {
 
     vfs.local_payload_backend()
         .put(object_id, b"orphan-dirty-block", false)
-        .expect("persist orphan dirty block");
+        .expect("persist orphan dirty payload");
     vfs.local_payload_backend()
         .sync_data()
-        .expect("sync orphan dirty block");
+        .expect("sync orphan dirty payload");
     vfs.state.upload.pending_evictions.lock().insert(object_id);
 
     assert!(
@@ -820,13 +820,13 @@ fn startup_replay_removes_orphan_dirty_payloads_and_clears_pending_evictions() {
 
     assert!(
         !vfs.local_payload_backend().contains(object_id),
-        "startup replay should remove orphan dirty block without metadata reference"
+        "startup replay should remove orphan dirty payload without metadata reference"
     );
     assert!(
         !vfs.local_payload_backend()
             .dirty_object_ids()
             .contains(&object_id),
-        "startup replay should clear orphan dirty block from dirty index"
+        "startup replay should clear orphan dirty payload from dirty index"
     );
     assert!(
         !vfs.state
@@ -2817,7 +2817,7 @@ fn write_fh_full_block_callbacks_persist_in_small_foreground_waves() {
 
     let snapshot = vfs.write_path_observability_snapshot();
     assert!(
-        snapshot.payload_burst.max_blocks_per_burst <= 1,
+        snapshot.payload_burst.max_payloads_per_burst <= 1,
         "slice-first foreground persistence should avoid multi-payload bursts for full-block callbacks: {:?}",
         snapshot.payload_burst
     );
@@ -3319,7 +3319,7 @@ fn write_fh_sub_block_callbacks_batch_completed_blocks_until_flush() {
 
     let snapshot = vfs.write_path_observability_snapshot();
     assert!(
-        snapshot.payload_burst.max_blocks_per_burst >= 2,
+        snapshot.payload_burst.max_payloads_per_burst >= 2,
         "sub-block sequential callbacks should be able to flush as a multi-payload burst: {:?}",
         snapshot.payload_burst
     );
@@ -4971,7 +4971,7 @@ fn write_path_observability_tracks_burst_shape_and_metadata_commit_stalls() {
         "two write+flush rounds should yield at least two payload bursts"
     );
     assert!(
-        snapshot.payload_burst.total_blocks >= 2,
+        snapshot.payload_burst.total_payloads >= 2,
         "burst accounting should include persisted full blocks"
     );
     assert!(
@@ -5186,7 +5186,7 @@ fn failed_payload_persist_attempts_do_not_count_as_completed_bursts() {
         "failed payload persists must not count as completed bursts"
     );
     assert_eq!(
-        snapshot.payload_burst.total_blocks, 0,
+        snapshot.payload_burst.total_payloads, 0,
         "failed payload persists must not add completed burst payload counts"
     );
     assert_eq!(

@@ -7890,7 +7890,7 @@ mod tests {
         assert_eq!(
             lookup_first_object_id(&a, file.ino)
                 .expect("get local payload after peer unlink")
-                .expect("writer keeps local pending block after peer unlink"),
+                .expect("writer keeps local pending payload after peer unlink"),
             777
         );
 

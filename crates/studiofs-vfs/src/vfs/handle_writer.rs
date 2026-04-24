@@ -1395,7 +1395,7 @@ impl StudioVfs {
                     serde_json::json!({
                         "ino": ino,
                         "visible_size": visible_size,
-                        "completed_block_count": completed_block_indexes.len(),
+                        "completed_payload_count": completed_block_indexes.len(),
                         "current_write_full_block_count": current_write_full_block_indexes.len(),
                         "current_write_crosses_boundary_with_partial_tail": current_write_crosses_boundary_with_partial_tail,
                         "enough_completed_blocks": enough_completed_blocks,

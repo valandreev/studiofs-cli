@@ -490,7 +490,7 @@ pub(super) async fn materialize_handle_writers_for_limits(
 |-------|------|-------|------|-----------|
 | **HandleWriterRegistry** | `BTreeMap<u64, Bytes>` | Per-handle, async | Up to 3×max_dirty | After `mark_materialized()` |
 | **LocalDirtyState** | `HashMap<(Ino, u32), BytesMut>` | Per-inode, blocks | Up to max_dirty | After persist to disk |
-| **Local Block Backend** | Disk/mmap cache | Local NVMe | Based on cache size | LRU eviction |
+| **Local Payload Backend** | Disk/mmap cache | Local NVMe | Based on cache size | LRU eviction |
 
 ### Memory Flow for 7GB Write
 
@@ -1034,7 +1034,7 @@ while data.remaining() > 0 {
 Rather than always copying into Bytes, implement multi-variant storage:
 
 ```rust
-pub enum WriteBuffer {
+pub enum WritePayload {
     Bytes(Bytes),           // Already copied
     RefBuffer(&[u8]),       // Reference to stable memory (unsafe)
     IOSlice(RawIOSlice),    // File descriptor (Linux only)

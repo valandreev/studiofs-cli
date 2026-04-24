@@ -13,7 +13,7 @@ the active data-path descriptions below use the final model.
 - Object payload validation (xxh64 checksums).
 - Read/write connection profile separation (`IoProfile`).
 - Serve as the remote object-store boundary behind the VFS `CachedStore` pipeline.
-- Hybrid cloud layout for chunks: one 16 MiB chunk is stored as four 4 MiB block objects.
+- Hybrid cloud layout for chunks: one 16 MiB chunk is stored as four 4 MiB payload objects.
 
 ## S3 Key Layout
 
@@ -82,7 +82,7 @@ On read, object decode accepts `opendal::Buffer` directly, parses the fixed head
 | `HAS_FOOTER` | `0x0002` | Object contains footer checksums (future use). |
 | `ENCRYPTED` | `0x0004` | Object is encrypted (future use). |
 
-The current build enforces that new objects are raw (uncompressed) data blocks to minimize CPU overhead. Legacy LZ4 compressed objects will return a `LegacyCompressionUnsupported` error if read.
+The current build enforces that new objects are raw (uncompressed) payload objects to minimize CPU overhead. Legacy LZ4 compressed objects will return a `LegacyCompressionUnsupported` error if read.
 
 ## Storage I/O Profiles
 

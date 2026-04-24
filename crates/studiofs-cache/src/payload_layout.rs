@@ -63,7 +63,7 @@ impl LocalPayloadLayout {
         }
     }
 
-    /// Determine the two-level payload shard for a block object id.
+    /// Determine the two-level payload shard for a payload object id.
     ///
     /// We hash object ids before slicing shard bytes so early sequential ids do
     /// not concentrate into a single top-level shard directory.

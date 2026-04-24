@@ -2,17 +2,17 @@
 
 ## Context
 
-`SFS-256` through `SFS-260` established the new production data-plane runtime around a file-per-block local backend, persistent index, simplified read/write paths, index-driven upload recovery, and one shared cache budget. `SFS-261` is the cleanup step that removes superseded production code, tests, docs, and operator-facing terminology so the repository teaches and exposes one active runtime model.
+`SFS-256` through `SFS-260` established the new production data-plane runtime around a file-per-payload-object local backend, persistent index, simplified read/write paths, index-driven upload recovery, and one shared cache budget. `SFS-261` is the cleanup step that removes superseded production code, tests, docs, and operator-facing terminology so the repository teaches and exposes one active runtime model.
 
-The canonical rewrite contract remains [docs/juicefs-local-first-rust-contract.md](../../juicefs-local-first-rust-contract.md). This cleanup must preserve the current on-disk subtree shape under `<cache-root>/v3/**` as an implementation detail while removing `cache-v3` as the product/runtime identity in public surfaces.
+The canonical rewrite contract remains [docs/juicefs-local-first-rust-contract.md](../../juicefs-local-first-rust-contract.md). This cleanup must preserve the current on-disk subtree shape under `<cache-root>/v3/**` as an implementation detail while removing `legacy runtime tag` as the product/runtime identity in public surfaces.
 
 ## Goal
 
-Leave one canonical local-block runtime in the repository by:
+Leave one canonical local payload runtime in the repository by:
 
-- keeping `crates/studiofs-cache/src/runtime.rs` plus `block_*` and `startup_recovery.rs` as the only active implementation;
+- keeping `crates/studiofs-cache/src/runtime.rs` plus `payload_*` and `startup_recovery.rs` as the only active implementation;
 - deleting the duplicated `crates/studiofs-cache/src/v3/**` module tree;
-- renaming public and internal exposed runtime surface from `CacheV3*`/`cache-v3` to `LocalPayload*` or neutral local-runtime wording where appropriate;
+- renaming public and internal exposed runtime surface from `legacy runtime symbols`/`legacy runtime tag` to `LocalPayload*` or neutral local-runtime wording where appropriate;
 - rewriting active docs and tests so they describe the runtime as a local payload runtime whose current disk subtree happens to be `v3/`.
 
 ## Non-Goals
@@ -33,8 +33,8 @@ Leave one canonical local-block runtime in the repository by:
 ### Vocabulary
 
 - User-facing and operator-facing wording should prefer `local payload runtime`, `local cache runtime`, `local backend`, or similarly neutral terms.
-- The literal string `cache-v3` may remain only where it describes the current disk subtree or legacy compatibility details that are still true.
-- Public API names should stop advertising `CacheV3` when the API is the canonical current runtime.
+- The literal string `legacy runtime tag` may remain only where it describes the current disk subtree or legacy compatibility details that are still true.
+- Public API names should stop advertising `LegacyRuntime` when the API is the canonical current runtime.
 
 ## Design
 
@@ -54,16 +54,16 @@ The duplicated `crates/studiofs-cache/src/v3/**` module tree is removed. Any rem
 
 ### 2. Naming Cleanup
 
-The public `studiofs-cache` surface is renamed from `CacheV3*` to `LocalPayload*` wherever the type refers to the active runtime rather than to the disk subtree detail.
+The public `studiofs-cache` surface is renamed from `legacy runtime symbols` to `LocalPayload*` wherever the type refers to the active runtime rather than to the disk subtree detail.
 
 Representative targets:
 
-- `CacheV3LocalPayloadBackend` -> `LocalPayloadBackendRuntime`
-- `CacheV3LocalPayloadBackendConfig` -> `LocalPayloadBackendConfig`
-- `CacheV3LocalPayloadBackendError` -> `LocalPayloadBackendOpenError`
-- `CacheV3PayloadSyncMode` -> `LocalPayloadSyncMode`
-- `PreparedCacheV3Runtime` -> `PreparedLocalPayloadRuntime`
-- `PrepareCacheV3RuntimeError` -> `PrepareLocalPayloadRuntimeError`
+- `LegacyRuntimeLocalPayloadBackend` -> `LocalPayloadBackendRuntime`
+- `LegacyRuntimeLocalPayloadBackendConfig` -> `LocalPayloadBackendConfig`
+- `LegacyRuntimeLocalPayloadBackendError` -> `LocalPayloadBackendOpenError`
+- `LegacyRuntimePayloadSyncMode` -> `LocalPayloadSyncMode`
+- `PreparedLegacyRuntimeRuntime` -> `PreparedLocalPayloadRuntime`
+- `PrepareLegacyRuntimeRuntimeError` -> `PrepareLocalPayloadRuntimeError`
 - `prepare_cache_v3_runtime()` -> `prepare_local_payload_runtime()`
 
 Where compatibility aliases materially reduce churn inside the current change set, they may remain temporarily inside `studiofs-cache::runtime` or `studiofs-cache::lib`, but the rest of the tree should stop depending on them.
@@ -74,7 +74,7 @@ Detection continues to inspect the current disk subtree, but the API should desc
 
 - `CacheBackendKind` becomes a neutral runtime kind type or a single current-runtime label;
 - detection predicates stop centering `has_cache_v3_contract()` and instead use neutral names such as `has_runtime_layout()` or `has_local_payload_layout()`;
-- `status`, `janitor`, mount bootstrap, and VFS diagnostics stop reporting the backend version as `cache-v3`.
+- `status`, `janitor`, mount bootstrap, and VFS diagnostics stop reporting the backend version as `legacy runtime tag`.
 
 The user-visible message should become “current local payload runtime” or similar, with an optional implementation-detail line noting the `v3/` subtree when useful.
 
@@ -83,7 +83,7 @@ The user-visible message should become “current local payload runtime” or si
 Active documentation should describe one runtime model:
 
 - keep [docs/architecture.md](../../architecture.md) aligned with the canonical contract and current implementation;
-- replace or rewrite [docs/local-payload-runtime-layout.md](../../local-payload-runtime-layout.md) so it no longer presents `cache-v3` as the runtime identity;
+- replace or rewrite [docs/local-payload-runtime-layout.md](../../local-payload-runtime-layout.md) so it no longer presents `legacy runtime tag` as the runtime identity;
 - keep explicit mention that the current disk layout still lives under `v3/` as an implementation detail;
 - preserve real operational guidance for readonly inspection, startup reconciliation scope, and stale-artifact remediation.
 
@@ -97,7 +97,7 @@ Targeted tests should guard the cleanup:
 - CLI/VFS tests use the neutral runtime names and wording;
 - vocabulary regression tests keep active docs/CLI surfaces free of superseded runtime identity wording while allowing the retained disk-layout detail where needed.
 
-No test should assert that the product runtime identity is `cache-v3`.
+No test should assert that the product runtime identity is `legacy runtime tag`.
 
 ## Implementation Slices
 
@@ -123,7 +123,7 @@ Mitigation:
 - run targeted crate tests after each slice;
 - use compile errors as the final sweep for stale imports.
 
-### Risk: regression tests still intentionally encode `cache-v3` tags
+### Risk: regression tests still intentionally encode `legacy runtime tag` tags
 
 Mitigation:
 

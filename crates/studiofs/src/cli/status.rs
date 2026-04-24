@@ -446,9 +446,9 @@ pub fn run(
                 format_bytes(snapshot.payload_burst.max_bytes_per_burst)
             );
             println!(
-                "  payload burst avg blocks/max blocks: {:.2}/{}",
-                snapshot.payload_burst.avg_blocks_per_burst,
-                snapshot.payload_burst.max_blocks_per_burst
+                "  payload burst avg payloads/max payloads: {:.2}/{}",
+                snapshot.payload_burst.avg_payloads_per_burst,
+                snapshot.payload_burst.max_payloads_per_burst
             );
             println!(
                 "  payload burst avg interval/max interval: {}/{}",

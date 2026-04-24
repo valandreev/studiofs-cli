@@ -1875,7 +1875,7 @@ mod tests {
         join.join().unwrap();
         assert!(
             !backend.contains(10),
-            "once the older pending block finishes upload, low-space admission should reclaim it before rejecting a new local payload"
+            "once the older pending payload object finishes upload, low-space admission should reclaim it before rejecting a new local payload"
         );
         assert!(
             backend.contains(11),

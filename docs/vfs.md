@@ -75,7 +75,7 @@ Local data-path QoS:
 - foreground reads/writes use the foreground local-data semaphore
 - upload rereads and cache eviction use the background local-data semaphore
 - cache-only delete/rename cleanup stays synchronous at the API boundary, while
-  internal block eviction is batched through the background pool
+  internal payload-object eviction is batched through the background pool
 
 ## Write Path
 
@@ -110,7 +110,7 @@ Handle-aware write path:
 dirty local state for this inode
   │
   ├─ Take a point-in-time snapshot of accepted bytes
-  ├─ Reserve/reuse per-block object IDs
+  ├─ Reserve/reuse per-payload object IDs
   ├─ local backend `put(...)` committed payloads locally
   ├─ local backend `sync_data()` for explicit `flush()`, `fsync()`, or last-handle `close()` / `release()` when dirty unpublished state remains
   ├─ Persist local unpublished slices + attrs in metadata
@@ -164,7 +164,7 @@ persisted payload queued
   ├─ Acquire local-data I/O permits only for the local payload-read phase
   ├─ Read payload from hot upload buffer, upload hardlink, or local backend fallback
   ├─ Split each chunk into cloud blocks
-  ├─ Upload block objects to S3
+  ├─ Upload payload objects to S3
   ├─ Mark payloads uploaded only after remote success
   └─ Requeue with backoff on failure
 ```

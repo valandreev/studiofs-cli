@@ -232,7 +232,7 @@ AGENTS snapshot differ from that contract, the contract wins.
             ┌──────────────────────────────┐
             │  Data Store (S3)             │
             │  - Object storage layer      │
-            │  - Block caching             │
+            │  - Payload-object caching    │
             └──────────────────────────────┘
 ```
 

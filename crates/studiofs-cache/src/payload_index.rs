@@ -1,8 +1,8 @@
 //! Metadata index for the current `v3` local cache backend, backed by redb.
 //!
-//! The index is the source of truth for block lifecycle state, replay ordering,
-//! and space accounting. Accounting counters are updated atomically with row
-//! mutations so budget checks never require payload scans.
+//! The index is the source of truth for payload-object lifecycle state, replay
+//! ordering, and space accounting. Accounting counters are updated atomically
+//! with row mutations so budget checks never require payload scans.
 
 use std::array;
 use std::collections::HashSet;
@@ -624,7 +624,7 @@ impl CacheIndex {
 
             let Some(entry) = read_entry_from_blocks(&blocks, object_id)? else {
                 return Err(CacheIndexError::Corruption(format!(
-                    "dirty order references missing block object_id={object_id}"
+                    "dirty order references missing payload object_id={object_id}"
                 )));
             };
             if entry.dirty_order != Some(order) {
@@ -1496,7 +1496,7 @@ mod tests {
                 upload_state: LocalPayloadUploadState::Pending,
                 evictable: false,
             })
-            .expect("upsert dirty block");
+            .expect("upsert dirty payload object");
     }
 
     fn upsert_uploaded(index: &CacheIndex, object_id: u64, payload_len: u64) {

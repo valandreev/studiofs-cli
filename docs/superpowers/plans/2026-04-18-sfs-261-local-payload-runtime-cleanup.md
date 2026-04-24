@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Remove superseded `cache-v3` runtime surface and duplicate module tree so the repository exposes one canonical local-block runtime while preserving the current `v3/` disk layout as an implementation detail.
+**Goal:** Remove superseded `legacy runtime tag` runtime surface and duplicate module tree so the repository exposes one canonical local payload runtime while preserving the current `v3/` disk layout as an implementation detail.
 
-**Architecture:** Keep `crates/studiofs-cache/src/runtime.rs` plus `block_*` and `startup_recovery.rs` as the only active runtime implementation. Rename public/runtime-facing `CacheV3*` surface to `LocalPayload*`, migrate CLI and VFS callers to the neutral runtime vocabulary, then delete `crates/studiofs-cache/src/v3/**` and rewrite active docs/tests to match.
+**Architecture:** Keep `crates/studiofs-cache/src/runtime.rs` plus `payload_*` and `startup_recovery.rs` as the only active runtime implementation. Rename public/runtime-facing `legacy runtime symbols` surface to `LocalPayload*`, migrate CLI and VFS callers to the neutral runtime vocabulary, then delete `crates/studiofs-cache/src/v3/**` and rewrite active docs/tests to match.
 
 **Tech Stack:** Rust 2024 workspace, `cargo test`, `cargo fmt`, `studiofs-cache`, `studiofs`, `studiofs-vfs`, Markdown docs.
 
@@ -99,7 +99,7 @@ pub struct LocalPayloadLayout {
     // ...
 }
 
-pub type CacheV3Layout = LocalPayloadLayout;
+pub type LegacyRuntimeLayout = LocalPayloadLayout;
 ```
 
 - [ ] **Step 5: Run the focused cache tests to verify the renamed API passes**
@@ -157,11 +157,11 @@ fn prepare_volume_cache_runtime_scopes_layout_by_volume_uuid() {
 }
 ```
 
-- [ ] **Step 2: Run the narrow CLI/VFS tests to verify they fail on old `CacheV3*` names**
+- [ ] **Step 2: Run the narrow CLI/VFS tests to verify they fail on old `legacy runtime symbols` names**
 
 Run: `cargo test -p studiofs scan_pending_uploads_supports_current_local_payload_runtime prepare_volume_cache_runtime_scopes_layout_by_volume_uuid`
 
-Expected: FAIL because the code still imports `CacheV3*` names and old detection helpers.
+Expected: FAIL because the code still imports `legacy runtime symbols` names and old detection helpers.
 
 - [ ] **Step 3: Update status, janitor, mount, and bootstrap code to use the neutral API and wording**
 
@@ -177,7 +177,7 @@ println!("  Runtime:             current local payload runtime");
 println!("  Disk subtree:        {}", detection.layout.v3_root.display());
 ```
 
-- [ ] **Step 4: Rename observability tags and test fixture strings away from `cache-v3`**
+- [ ] **Step 4: Rename observability tags and test fixture strings away from `legacy runtime tag`**
 
 ```rust
 let snapshot = VfsWritePathObservabilitySnapshot {
@@ -291,7 +291,7 @@ git commit -m "refactor: delete duplicated cache v3 module tree (SFS-261)"
 ```rust
 #[test]
 fn active_docs_drop_superseded_runtime_identity_wording() {
-    let forbidden_terms = ["Cache 3.0", "cache-v3 runtime", "cache-v3 backend"];
+    let forbidden_terms = ["legacy cache runtime", "superseded runtime", "superseded backend"];
     // same helper pattern, but allow implementation-detail mentions for `v3/` layout
 }
 
@@ -299,7 +299,7 @@ fn active_docs_drop_superseded_runtime_identity_wording() {
 fn observability_surface_uses_local_payload_runtime_tag() {
     let hits = collect_term_hits(
         "crates/studiofs/src/cli/test_cache_profile_common.rs",
-        &["cache-v3"],
+        &["legacy runtime tag"],
     );
     assert!(hits.is_empty());
 }
@@ -311,7 +311,7 @@ Run: `cargo test -p studiofs --test architecture_vocabulary_test`
 
 Expected: FAIL because docs and fixtures still encode the superseded runtime identity.
 
-- [ ] **Step 3: Rewrite the active docs so they describe one local-block runtime with a retained `v3/` disk-layout detail**
+- [ ] **Step 3: Rewrite the active docs so they describe one local payload runtime with a retained `v3/` disk-layout detail**
 
 ```md
 ## Local Cache Runtime
@@ -379,9 +379,9 @@ Run: `cargo test -p studiofs-vfs studio_vfs_new_selects_current_local_payload_ru
 
 Expected: PASS
 
-- [ ] **Step 5: Inspect the remaining `cache-v3` hits and confirm they are only the retained disk-layout details**
+- [ ] **Step 5: Inspect the remaining `legacy runtime tag` hits and confirm they are only the retained disk-layout details**
 
-Run: `rg -n "cache-v3|CacheV3" crates docs`
+Run: `rg -n "legacy runtime tag|LegacyRuntime" crates docs`
 
 Expected: only implementation-detail aliases or compatibility remnants that are intentionally retained.
 

@@ -19,9 +19,9 @@ pub type Ino = u64;
 /// A pending upload operation.
 #[derive(Debug, Clone)]
 pub struct PendingUpload {
-    /// Inode that owns this block.
+    /// Inode that owns this payload object.
     pub ino: Ino,
-    /// File offset this block corresponds to.
+    /// File offset this payload object corresponds to.
     pub offset: u64,
     /// Object ID (object ID).
     pub object_id: u64,
@@ -48,7 +48,7 @@ pub struct UploadQueue {
 /// Atomically-consistent index of in-flight uploads.
 ///
 /// Both maps are guarded by the same mutex so that `has_pending_for_ino`
-/// never observes an inconsistent state where a block exists in the
+/// never observes an inconsistent state where a payload object exists in the
 /// object-id index but the per-inode counter has not yet been bumped.
 struct PendingState {
     by_object: BTreeMap<u64, PendingUpload>,

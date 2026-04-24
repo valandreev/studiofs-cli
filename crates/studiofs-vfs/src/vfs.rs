@@ -1703,9 +1703,9 @@ struct MetricsState {
     payload_persist_max_ns: AtomicU64,
     payload_persist_histogram: LatencyHistogram,
     payload_burst_count: AtomicU64,
-    payload_burst_total_blocks: AtomicU64,
+    payload_burst_total_payloads: AtomicU64,
     payload_burst_total_bytes: AtomicU64,
-    payload_burst_max_blocks: AtomicU64,
+    payload_burst_max_payloads: AtomicU64,
     payload_burst_max_bytes: AtomicU64,
     payload_burst_last_completed_ns: AtomicU64,
     payload_burst_interval_total_ns: AtomicU64,
@@ -1808,9 +1808,9 @@ impl MetricsState {
             payload_persist_max_ns: AtomicU64::new(0),
             payload_persist_histogram: LatencyHistogram::default(),
             payload_burst_count: AtomicU64::new(0),
-            payload_burst_total_blocks: AtomicU64::new(0),
+            payload_burst_total_payloads: AtomicU64::new(0),
             payload_burst_total_bytes: AtomicU64::new(0),
-            payload_burst_max_blocks: AtomicU64::new(0),
+            payload_burst_max_payloads: AtomicU64::new(0),
             payload_burst_max_bytes: AtomicU64::new(0),
             payload_burst_last_completed_ns: AtomicU64::new(0),
             payload_burst_interval_total_ns: AtomicU64::new(0),
@@ -1913,9 +1913,9 @@ impl MetricsState {
             payload_persist_total_ns,
             payload_persist_max_ns,
             payload_burst_count,
-            payload_burst_total_blocks,
+            payload_burst_total_payloads,
             payload_burst_total_bytes,
-            payload_burst_max_blocks,
+            payload_burst_max_payloads,
             payload_burst_max_bytes,
             payload_burst_last_completed_ns,
             payload_burst_interval_total_ns,
@@ -5604,13 +5604,13 @@ impl StudioVfs {
 
     pub(super) fn record_payload_persist_observability(
         &self,
-        burst_blocks: usize,
+        burst_payloads: usize,
         burst_bytes: u64,
         elapsed: Duration,
         completed_burst: bool,
     ) {
         let elapsed_ns = Self::duration_ns_u64(elapsed);
-        let burst_blocks_u64 = u64::try_from(burst_blocks).unwrap_or(u64::MAX);
+        let burst_payloads_u64 = u64::try_from(burst_payloads).unwrap_or(u64::MAX);
         let metrics = &self.state.metrics;
         Self::observe_latency_counter(
             &metrics.payload_persist_calls,
@@ -5623,14 +5623,14 @@ impl StudioVfs {
             return;
         }
         metrics
-            .payload_burst_total_blocks
-            .fetch_add(burst_blocks_u64, Ordering::Relaxed);
+            .payload_burst_total_payloads
+            .fetch_add(burst_payloads_u64, Ordering::Relaxed);
         metrics
             .payload_burst_total_bytes
             .fetch_add(burst_bytes, Ordering::Relaxed);
         metrics
-            .payload_burst_max_blocks
-            .fetch_max(burst_blocks_u64, Ordering::Relaxed);
+            .payload_burst_max_payloads
+            .fetch_max(burst_payloads_u64, Ordering::Relaxed);
         metrics
             .payload_burst_max_bytes
             .fetch_max(burst_bytes, Ordering::Relaxed);
@@ -6051,9 +6051,9 @@ impl StudioVfs {
             payload_persist_total_ns: payload_persist_total_ns,
             payload_persist_max_ns: payload_persist_max_ns,
             payload_burst_count: payload_burst_count,
-            payload_burst_total_blocks: payload_burst_total_blocks,
+            payload_burst_total_payloads: payload_burst_total_payloads,
             payload_burst_total_bytes: payload_burst_total_bytes,
-            payload_burst_max_blocks: payload_burst_max_blocks,
+            payload_burst_max_payloads: payload_burst_max_payloads,
             payload_burst_max_bytes: payload_burst_max_bytes,
             payload_burst_interval_total_ns: payload_burst_interval_total_ns,
             payload_burst_interval_max_ns: payload_burst_interval_max_ns,
@@ -6474,19 +6474,19 @@ impl StudioVfs {
             payload_burst: VfsWritePathBurstStats {
                 bursts: payload_burst_count,
                 bursts_per_sec: Self::per_second(payload_burst_count, elapsed),
-                total_blocks: payload_burst_total_blocks,
+                total_payloads: payload_burst_total_payloads,
                 total_bytes: payload_burst_total_bytes,
-                avg_blocks_per_burst: if payload_burst_count == 0 {
+                avg_payloads_per_burst: if payload_burst_count == 0 {
                     0.0
                 } else {
-                    payload_burst_total_blocks as f64 / payload_burst_count as f64
+                    payload_burst_total_payloads as f64 / payload_burst_count as f64
                 },
                 avg_bytes_per_burst: if payload_burst_count == 0 {
                     0.0
                 } else {
                     payload_burst_total_bytes as f64 / payload_burst_count as f64
                 },
-                max_blocks_per_burst: payload_burst_max_blocks,
+                max_payloads_per_burst: payload_burst_max_payloads,
                 max_bytes_per_burst: payload_burst_max_bytes,
                 avg_interval_ms: if payload_burst_interval_samples == 0 {
                     0.0

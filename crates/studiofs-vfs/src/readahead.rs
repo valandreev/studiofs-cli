@@ -780,7 +780,7 @@ impl DirAccessTracker {
     /// Called after `readdir(dir_ino)` completes.
     ///
     /// `children` should contain the inodes of regular-file children only
-    /// (exclude directories and symlinks — those have no data blocks).
+    /// (exclude directories and symlinks — those have no file payload).
     pub fn on_readdir(&self, dir_ino: Ino, children: Vec<Ino>) {
         let touch = self.next_touch();
         if let Some((_, prev)) = self.dirs.remove(&dir_ino) {

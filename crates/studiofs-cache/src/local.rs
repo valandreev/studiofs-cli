@@ -1,25 +1,25 @@
 //! Active local payload backend contract used by the current local-cache data path.
 //!
 //! The goal is to keep VFS/data-path code independent of backend internals
-//! while still exposing the block lifecycle states required for upload replay
+//! while still exposing the payload lifecycle states required for upload replay
 //! and transition handling.
 
 use bytes::Bytes;
 use std::any::Any;
 use uuid::Uuid;
 
-/// Lifecycle state of a single locally persisted block.
+/// Lifecycle state of a single locally persisted payload object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalPayloadLifecycleState {
-    /// Block is not present in local storage.
+    /// Payload object is not present in local storage.
     Missing,
-    /// Block is present and dirty (needs upload).
+    /// Payload object is present and dirty (needs upload).
     Dirty,
-    /// Block is present and currently in-flight for upload.
+    /// Payload object is present and currently in-flight for upload.
     Uploading,
-    /// Block is present and uploaded (not dirty/uploading).
+    /// Payload object is present and uploaded (not dirty/uploading).
     ///
-    /// Note: this does not imply the block is evictable in every backend.
+    /// Note: this does not imply the payload object is evictable in every backend.
     /// Backend-specific constraints (for example pinning) may still prevent
     /// eviction.
     Uploaded,
@@ -37,11 +37,11 @@ pub enum LocalPayloadOrigin {
 /// Upload state tracked per persisted local payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalPayloadUploadState {
-    /// No upload work is pending for this block.
+    /// No upload work is pending for this payload object.
     None,
-    /// The block is durably accepted locally and queued for background upload.
+    /// The payload object is durably accepted locally and queued for background upload.
     Pending,
-    /// The block is currently being uploaded by the background pipeline.
+    /// The payload object is currently being uploaded by the background pipeline.
     Uploading,
 }
 

@@ -3186,7 +3186,7 @@ mod tests {
         let mut fresh_object_ids = std::collections::VecDeque::from([111]);
         let persisted_blocks = drain
             .try_prepare_persisted_blocks(&mut pending, ino, blocks, &mut fresh_object_ids)
-            .expect("prepare persisted blocks");
+            .expect("prepare persisted payloads");
 
         futures::executor::block_on(drain.execute_drain(
             ino,
@@ -3241,7 +3241,7 @@ mod tests {
         let mut fresh_object_ids = std::collections::VecDeque::from([222]);
         let persisted_blocks = drain
             .try_prepare_persisted_blocks(&mut pending, ino, blocks, &mut fresh_object_ids)
-            .expect("prepare persisted blocks");
+            .expect("prepare persisted payloads");
 
         let error = futures::executor::block_on(drain.execute_drain(
             ino,
@@ -3297,7 +3297,7 @@ mod tests {
             .try_prepare_persisted_blocks(&mut pending, ino, blocks, &mut fresh_object_ids)
             .expect("prepare stale snapshot");
         assert_eq!(persisted_blocks[0].object_id, 701);
-        let pending_payload = pending.get(&(ino, 0)).expect("pending block");
+        let pending_payload = pending.get(&(ino, 0)).expect("pending payload");
         assert_eq!(pending_payload.data.as_ref(), b"newer");
         assert_eq!(pending_payload.reserved_object_id, Some(700));
     }
@@ -3315,7 +3315,7 @@ mod tests {
 
         let persisted_blocks = drain
             .try_prepare_persisted_blocks(&mut pending, ino, blocks, &mut fresh_object_ids)
-            .expect("prepare persisted blocks");
+            .expect("prepare persisted payloads");
 
         assert_eq!(
             persisted_blocks[0]
@@ -3386,7 +3386,7 @@ mod tests {
         assert_eq!(
             chunk_slices.len(),
             2,
-            "cross-chunk block should split in two"
+            "cross-chunk payload should split in two"
         );
         let first = &chunk_slices[0].1;
         let second = &chunk_slices[1].1;

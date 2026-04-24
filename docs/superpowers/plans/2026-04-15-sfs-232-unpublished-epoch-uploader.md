@@ -4,7 +4,7 @@
 
 **Goal:** Redesign the background uploader so unpublished epochs are uploaded from local durable state, transition to explicit `PublishReady`, and publish exactly once only after the full epoch is complete.
 
-**Architecture:** Keep the current parallel block upload worker pool, but move epoch completion truth into durable metadata instead of inferring readiness from pending queue emptiness. Upload success will advance overlay block lifecycle state for the active epoch; a separate finalizer will publish only when the inode lifecycle says the current epoch is `PublishReady` and still current.
+**Architecture:** Keep the current parallel payload-object upload worker pool, but move epoch completion truth into durable metadata instead of inferring readiness from pending queue emptiness. Upload success will advance overlay payload lifecycle state for the active epoch; a separate finalizer will publish only when the inode lifecycle says the current epoch is `PublishReady` and still current.
 
 **Tech Stack:** Rust 2024, Tokio, StudioFS VFS, Redb/PG metadata engines, focused Rust tests.
 
@@ -21,7 +21,7 @@
 - [ ] Add an uploader worker test that proves successful upload records durable epoch progress instead of only clearing queue state.
 - [ ] Run only the new uploader worker test and verify it fails for the expected reason.
 
-### Task 2: Add durable per-block uploaded bookkeeping
+### Task 2: Add durable per-payload uploaded bookkeeping
 
 **Files:**
 - Modify: `crates/studiofs-meta/src/engine.rs`

@@ -346,7 +346,7 @@ Rules:
 | Regular-file vocabulary and schema | `crates/studiofs-meta/src/redb_engine/{payload_objects.rs,chunk_state.rs,replication.rs}` | `docs/en/introduction/architecture.md`, `pkg/meta/slice.go`, `pkg/meta/*.go` | Chunk/slice layout language, immutable payload references, slice overlap model |
 | Writer path | `crates/studiofs-vfs/src/local_dirty.rs`, `crates/studiofs-vfs/src/vfs/upload_lifecycle.rs` | `pkg/vfs/writer.go` | Per-file writer ownership, chunk/slice decomposition, cheap local-first write acceptance, and incremental flush behavior |
 | Reader path, readahead, prefetch | `crates/studiofs-vfs/src/vfs/read_path.rs`, `crates/studiofs-vfs/src/readahead.rs`, `crates/studiofs-vfs/src/vfs/prefetch.rs` | `pkg/vfs/reader.go`, `pkg/chunk/prefetch.go`, `docs/en/guide/cache.md` | `dataReader`-style resolution, adaptive readahead, whole-block prefetch |
-| Cache, staging, object-store handoff | `crates/studiofs-cache/src/{cached_store.rs,runtime.rs,block_*.rs,startup_recovery.rs}`, `crates/studiofs-data/src/store.rs` | `pkg/chunk/cached_store.go`, `pkg/chunk/cache_eviction.go`, `docs/en/guide/cache.md` | Cached-store lifecycle, cache/download/writeback structure, eviction and background upload concepts |
+| Cache, staging, object-store handoff | `crates/studiofs-cache/src/{cached_store.rs,runtime.rs,payload_*.rs,startup_recovery.rs}`, `crates/studiofs-data/src/store.rs` | `pkg/chunk/cached_store.go`, `pkg/chunk/cache_eviction.go`, `docs/en/guide/cache.md` | Cached-store lifecycle, cache/download/writeback structure, eviction and background upload concepts |
 | Metadata authority model | `crates/studiofs-meta/src/{redb_engine,pg_engine}.rs` | `docs/community/getting-started/standalone`, `docs/community/getting-started/for_distributed` | Standalone-style local metadata hot path, but with StudioFS-specific async replication to peers through PostgreSQL instead of a shared foreground DB |
 | Metadata-cache and operator surface | `crates/studiofs/src/cli/mount/*.rs`, `docs/configuration.md` | `cmd/flags.go`, `cmd/mount.go`, `cmd/mount_unix.go`, `cmd/mount_windows.go`, `docs/en/guide/cache.md` | Coherent mount/cache flags, strong internal metadata-cache defaults, operator-facing terminology |
 | Bridge and mount behavior | `crates/studiofs-fuse/src/lib.rs`, `crates/studiofs-winfsp/src/*.rs` | `pkg/vfs/vfs.go`, `pkg/vfs/vfs_unix.go`, `pkg/vfs/vfs_windows.go`, `cmd/mount*.go` | Performance-sensitive bridge/mount patterns and callback expectations |
@@ -355,9 +355,9 @@ Rules:
 
 | Current concept | Decision in this rewrite |
 |---|---|
-| `WriteBuffer` as the canonical architecture | Delete as the target design. Transitional code may remain only until slice-writer replacement lands. |
-| `ReadPipeline` as the canonical foreground read engine | Delete as the target design. Replace with a direct merged reader over writer/local authority/payload-object state. |
-| `UploadCoordinator` as the canonical upload architecture | Simplify/delete as a top-level design concept. Replace with one cached-store-style staging/upload pipeline. |
+| Superseded buffered-write component as the canonical architecture | Delete as the target design. Transitional code may remain only until slice-writer replacement lands. |
+| Superseded foreground read component as the canonical read engine | Delete as the target design. Replace with a direct merged reader over writer/local authority/payload-object state. |
+| Superseded upload orchestration component as the canonical upload architecture | Simplify/delete as a top-level design concept. Replace with one cached-store-style staging/upload pipeline. |
 | `published` / `local unpublished` as separate architecture authorities | Simplify. They may remain as internal lifecycle labels inside local metadata, but they must not imply PG as a foreground authority. |
 | `cache_safety_mode=fast|durable` as a product-level mount contract | Deleted from the product contract and implementation. A single Fast Local Authority mount model is the target. |
 | Versioned local runtime subtree as product architecture vocabulary | Resolved. The UUID-scoped cache root is now the runtime boundary; no nested versioned subtree is part of the product model. |

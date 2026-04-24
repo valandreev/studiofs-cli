@@ -973,7 +973,7 @@ impl StudioVfs {
             let dst_start = usize::try_from(overlap.start.saturating_sub(block_start)).map_err(
                 |_| {
                     VfsError::Other(format!(
-                        "metadata block read start does not fit usize: ino={}, block_index={}, start={}",
+                        "metadata payload read start does not fit usize: ino={}, block_index={}, start={}",
                         ino, block_index, overlap.start
                     ))
                 },
@@ -981,7 +981,7 @@ impl StudioVfs {
             let dst_end =
                 usize::try_from(overlap.end.saturating_sub(block_start)).map_err(|_| {
                     VfsError::Other(format!(
-                        "metadata block read end does not fit usize: ino={}, block_index={}, end={}",
+                        "metadata payload read end does not fit usize: ino={}, block_index={}, end={}",
                         ino, block_index, overlap.end
                     ))
                 })?;
@@ -990,7 +990,7 @@ impl StudioVfs {
             let delta = overlap.start.saturating_sub(span_range.start);
             let delta_u32 = u32::try_from(delta).map_err(|_| {
                 VfsError::Other(format!(
-                    "metadata block read delta does not fit u32: ino={}, block_index={}, delta={}",
+                    "metadata payload read delta does not fit u32: ino={}, block_index={}, delta={}",
                     ino, block_index, delta
                 ))
             })?;
@@ -998,14 +998,14 @@ impl StudioVfs {
             planned_block.offset =
                 planned_block.offset.checked_add(delta_u32).ok_or_else(|| {
                     VfsError::Other(format!(
-                        "metadata block read offset overflow: ino={}, block_index={}, object_id={}",
+                        "metadata payload read offset overflow: ino={}, block_index={}, object_id={}",
                         ino, block_index, planned_block.object_id
                     ))
                 })?;
             planned_block.length =
                 u32::try_from(overlap.end.saturating_sub(overlap.start)).map_err(|_| {
                     VfsError::Other(format!(
-                        "metadata block read span too large: ino={}, block_index={}, start={}, end={}",
+                        "metadata payload read span too large: ino={}, block_index={}, start={}, end={}",
                         ino, block_index, overlap.start, overlap.end
                     ))
                 })?;
@@ -1013,7 +1013,7 @@ impl StudioVfs {
             let mut span_resolved = false;
             let block_offset = usize::try_from(planned_block.offset).map_err(|_| {
                 VfsError::Other(format!(
-                    "metadata block offset does not fit usize: object_id={}, offset={}",
+                    "metadata payload offset does not fit usize: object_id={}, offset={}",
                     planned_block.object_id, planned_block.offset
                 ))
             })?;

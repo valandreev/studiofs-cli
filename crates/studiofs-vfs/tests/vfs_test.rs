@@ -5196,7 +5196,7 @@ fn partial_overwrite_after_materialization_reuses_pending_extent_as_write_base()
                     && ingress.dirty_mem_blocks == 0
             })
             .await,
-            "baseline pending block must be materialized before the follow-up partial write"
+            "baseline pending payload must be materialized before the follow-up partial write"
         );
 
         vfs.write(attr.ino, patch_offset as u64, &patch).await.unwrap();
@@ -5207,7 +5207,7 @@ fn partial_overwrite_after_materialization_reuses_pending_extent_as_write_base()
         assert_eq!(
             read.as_ref(),
             expected.as_slice(),
-            "follow-up write must load the materialized pending block as its base, not the committed view"
+            "follow-up write must load the materialized pending payload as its base, not the committed view"
         );
     });
     rt.shutdown_background();
@@ -10479,8 +10479,8 @@ fn read_from_start_does_not_depend_on_metadata_materialization() {
         let attr = vfs
             .create(1, b"read-drains-dirty-tail.bin", 0, 0, 0o644)
             .unwrap();
-        let burst_blocks = 27usize;
-        let payload = vec![0x5Au8; block_size * burst_blocks];
+        let burst_payloads = 27usize;
+        let payload = vec![0x5Au8; block_size * burst_payloads];
 
         vfs.write(attr.ino, 0, &payload).await.unwrap();
 
@@ -10514,7 +10514,7 @@ fn read_from_start_does_not_depend_on_metadata_materialization() {
         vfs.flush(attr.ino).await.unwrap();
         assert_eq!(
             vfs.meta().lookup_payload_slices(attr.ino).unwrap().len(),
-            burst_blocks,
+            burst_payloads,
             "flush should materialize every staged full block after the read succeeds"
         );
     });

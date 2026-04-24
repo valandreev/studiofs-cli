@@ -268,7 +268,7 @@ Implements `fuser::Filesystem` trait.
 | `statfs` | `statfs()` |
 
 `unlink()` and cache-only rename cleanup still present a synchronous bridge API,
-but the internal block eviction work is batched and routed through the
+but the internal payload-object eviction work is batched and routed through the
 background local-I/O pool.
 
 FUSE callback barrier semantics:

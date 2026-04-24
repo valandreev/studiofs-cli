@@ -287,7 +287,7 @@ impl VfsBootstrapResources {
             info!(
                 cache_root = %opened_local_backend.detection.layout.cache_root.display(),
                 runtime_root = %opened_local_backend.detection.layout.runtime_root.display(),
-                "using current file-per-block local backend under the volume cache root"
+                "using current file-per-payload-object local backend under the volume cache root"
             );
         }
         let local_payload_backend = opened_local_backend.backend;

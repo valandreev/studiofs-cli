@@ -46,7 +46,7 @@ Legacy cache-v2 storage implementation code has been removed.
 
 ## Metadata Lookup Caches
 
-In addition to block caching, VFS keeps bounded metadata lookup caches:
+In addition to payload-object caching, VFS keeps bounded metadata lookup caches:
 
 - `DentryCache` for `(parent ino, name) -> child ino | negative`
 - `PathShortcutCache` for full-path shortcut resolution
@@ -72,7 +72,7 @@ files under `<cache-root>`.
 `CachedStore` is the canonical cache/object-store pipeline owner for the mount
 runtime. It is intentionally focused on:
 
-- local backend access for cache hits, range/full-block rereads, and persisted
+- local backend access for cache hits, range/full-payload rereads, and persisted
   payload lifecycle
 - pending-upload pinning near upload boundaries
 - runtime pending-upload queue bookkeeping
