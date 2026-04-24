@@ -104,10 +104,16 @@ fn test_recover_undo_logs_replays_deferred_delete_with_fragmented_graph() {
     overlay_chunk.refresh_fragmentation_metrics();
     set_regular_file_chunk_rows(&engine, attr.ino, &[(ChunkId(0), overlay_chunk)], &[]);
 
-    assert!(matches!(
-        engine.lookup_block_projections(attr.ino),
-        Err(MetaError::NonContiguousRegularFileGraph { .. })
-    ));
+    let fragmented_spans = engine
+        .lookup_regular_file_slices(attr.ino, 0, u64::from(DEFAULT_BLOCK_SIZE))
+        .unwrap();
+    assert_eq!(
+        fragmented_spans
+            .iter()
+            .filter(|span| span.block.is_some())
+            .count(),
+        2
+    );
     let unlinked = engine.unlink_open_handle(parent, name).unwrap();
     assert_eq!(unlinked.ino, attr.ino);
 
