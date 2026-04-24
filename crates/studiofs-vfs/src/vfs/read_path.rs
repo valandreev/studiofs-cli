@@ -134,8 +134,8 @@ impl<'a> DataReader<'a> {
     }
 
     #[cfg(test)]
-    fn collect_data_block_refs(segments: &[ReadSegment]) -> BTreeMap<u64, BlockRef> {
-        let mut block_refs = BTreeMap::new();
+    fn collect_data_payload_refs(segments: &[ReadSegment]) -> BTreeMap<u64, BlockRef> {
+        let mut payload_refs = BTreeMap::new();
         for segment in segments {
             let block = match &segment.source {
                 ReadSegmentSource::Overlay { block } | ReadSegmentSource::Base { block } => block,
@@ -144,11 +144,11 @@ impl<'a> DataReader<'a> {
                 | ReadSegmentSource::PendingExtent { .. }
                 | ReadSegmentSource::Zero => continue,
             };
-            block_refs
+            payload_refs
                 .entry(block.object_id)
                 .or_insert_with(|| block.clone());
         }
-        block_refs
+        payload_refs
     }
 
     async fn build_segments(&self) -> VfsResult<Vec<ReadSegment>> {
@@ -1608,7 +1608,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_data_block_refs_deduplicates_by_object_id() {
+    fn collect_data_payload_refs_deduplicates_by_object_id() {
         let first = BlockRef {
             object_id: 42,
             offset: 0,
@@ -1640,7 +1640,7 @@ mod tests {
             },
         ];
 
-        let refs = DataReader::collect_data_block_refs(&segments);
+        let refs = DataReader::collect_data_payload_refs(&segments);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs.get(&42), Some(&first));
     }

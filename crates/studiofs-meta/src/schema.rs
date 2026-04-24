@@ -1410,14 +1410,14 @@ mod tests {
     }
 
     #[test]
-    fn test_block_ref_flags() {
-        let full_block = BlockRef::new_full(123, 4 * 1024 * 1024);
-        assert!(!full_block.is_partial());
-        assert!(!full_block.is_compressed());
+    fn test_payload_ref_flags() {
+        let full_payload_ref = BlockRef::new_full(123, 4 * 1024 * 1024);
+        assert!(!full_payload_ref.is_partial());
+        assert!(!full_payload_ref.is_compressed());
 
-        let partial_block = BlockRef::new_partial(124, 1000);
-        assert!(partial_block.is_partial());
-        assert!(!partial_block.is_compressed());
+        let partial_payload_ref = BlockRef::new_partial(124, 1000);
+        assert!(partial_payload_ref.is_partial());
+        assert!(!partial_payload_ref.is_compressed());
     }
 
     #[test]

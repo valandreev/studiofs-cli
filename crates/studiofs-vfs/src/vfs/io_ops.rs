@@ -206,7 +206,7 @@ impl StudioVfs {
                 data_len = data.len(),
                 dst_len = dst.len(),
                 copy_len,
-                "copy_block_payload_into_range: padding with zeros (partial block or short read)"
+                "copy_block_payload_into_range: padding with zeros (partial payload or short read)"
             );
             dst[copy_len..].fill(0);
         }

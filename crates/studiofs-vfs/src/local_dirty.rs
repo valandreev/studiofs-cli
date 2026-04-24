@@ -3390,19 +3390,19 @@ mod tests {
             first[0].range.end,
             studiofs_meta::schema::DEFAULT_CHUNK_SIZE
         );
-        assert_eq!(first[0].block.as_ref().expect("block ref").offset, 0);
+        assert_eq!(first[0].block.as_ref().expect("payload ref").offset, 0);
         assert_eq!(
-            first[0].block.as_ref().expect("block ref").length,
+            first[0].block.as_ref().expect("payload ref").length,
             4 * 1024 * 1024
         );
         assert_eq!(second[0].range.start, 0);
         assert_eq!(second[0].range.end, 1024 * 1024);
         assert_eq!(
-            second[0].block.as_ref().expect("block ref").offset,
+            second[0].block.as_ref().expect("payload ref").offset,
             4 * 1024 * 1024
         );
         assert_eq!(
-            second[0].block.as_ref().expect("block ref").length,
+            second[0].block.as_ref().expect("payload ref").length,
             1024 * 1024
         );
     }

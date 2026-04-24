@@ -8408,19 +8408,18 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
 // =============================================================================
 
 #[tokio::test]
-async fn test_block_ref_flags() {
-    // Test BlockRef flags
-    let full_block = BlockRef::new_full(123, 4 * 1024 * 1024);
-    assert!(!full_block.is_compressed());
-    assert!(!full_block.is_partial());
-    assert_eq!(full_block.object_id, 123);
-    assert_eq!(full_block.length, 4 * 1024 * 1024);
+async fn test_payload_ref_flags() {
+    let full_payload_ref = BlockRef::new_full(123, 4 * 1024 * 1024);
+    assert!(!full_payload_ref.is_compressed());
+    assert!(!full_payload_ref.is_partial());
+    assert_eq!(full_payload_ref.object_id, 123);
+    assert_eq!(full_payload_ref.length, 4 * 1024 * 1024);
 
-    let partial_block = BlockRef::new_partial(456, 1000);
-    assert!(!partial_block.is_compressed());
-    assert!(partial_block.is_partial());
-    assert_eq!(partial_block.object_id, 456);
-    assert_eq!(partial_block.length, 1000);
+    let partial_payload_ref = BlockRef::new_partial(456, 1000);
+    assert!(!partial_payload_ref.is_compressed());
+    assert!(partial_payload_ref.is_partial());
+    assert_eq!(partial_payload_ref.object_id, 456);
+    assert_eq!(partial_payload_ref.length, 1000);
 }
 
 #[tokio::test]
@@ -9737,13 +9736,13 @@ fn write_returns_after_small_new_file_is_locally_readable_until_flush() {
         assert_eq!(
             blocks.len(),
             1,
-            "flush should materialize the buffered partial block"
+            "flush should materialize the buffered partial payload reference"
         );
         let block = &blocks[0].1;
         assert_eq!(block.length as usize, payload.len());
         assert!(
             block.flags.contains(BlockFlags::PARTIAL_BLOCK),
-            "flush should persist the small write as a partial block"
+            "flush should persist the small write as a partial payload reference"
         );
     });
     rt.shutdown_background();
@@ -10055,12 +10054,12 @@ fn truncate_after_create_is_locally_durable_without_flush() {
         assert_eq!(
             blocks.len(),
             1,
-            "truncate must leave a durably persisted partial block for the unpublished local state"
+            "truncate must leave a durably persisted partial payload reference for the unpublished local state"
         );
         assert_eq!(blocks[0].1.length, 8);
         assert!(
             blocks[0].1.flags.contains(BlockFlags::PARTIAL_BLOCK),
-            "truncated block should remain marked partial"
+            "truncated payload reference should remain marked partial"
         );
     });
     rt.shutdown_background();
