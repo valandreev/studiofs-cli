@@ -1225,6 +1225,12 @@ fn redb_base_graph_publish_sets_committed_head() {
     assert_eq!(remote_attr.committed_content_epoch, 1);
     assert_eq!(remote_attr.upload_state, UploadState::Ready);
 
-    let remote_blocks = remote.lookup_block_projections(file.ino).unwrap();
-    assert_eq!(remote_blocks, vec![(0, block0), (1, block1)]);
+    let remote_spans = remote
+        .lookup_regular_file_slices(file.ino, 0, block_size + 4096)
+        .unwrap();
+    let remote_blocks: Vec<_> = remote_spans
+        .into_iter()
+        .map(|span| span.block.expect("published block slice"))
+        .collect();
+    assert_eq!(remote_blocks, vec![block0, block1]);
 }

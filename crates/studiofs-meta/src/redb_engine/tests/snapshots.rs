@@ -345,8 +345,18 @@ fn test_import_snapshot_keeps_unpublished_regular_file_visible() {
     assert_eq!(imported_attr.size, 4096);
     assert_eq!(imported_attr.committed_size, 0);
     assert_eq!(imported_attr.upload_state, UploadState::Uploading);
-    let imported_block = imported.lookup_block_projection(imported_file.ino, 0).unwrap().unwrap();
-    assert_eq!(imported_block.object_id, block.object_id);
+    let imported_spans = imported
+        .lookup_regular_file_slices(imported_file.ino, 0, imported_attr.size)
+        .unwrap();
+    assert_eq!(imported_spans.len(), 1);
+    assert_eq!(
+        imported_spans[0]
+            .block
+            .as_ref()
+            .expect("imported local-only slice")
+            .object_id,
+        block.object_id
+    );
 }
 
 #[test]

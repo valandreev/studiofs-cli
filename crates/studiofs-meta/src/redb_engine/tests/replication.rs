@@ -158,11 +158,15 @@ fn test_replica_aux_block_events_accept_fragmented_base_graph() {
             chunk_slices: replacement_slices,
         }])
         .expect("slice-native base replay should update fragmented base graph");
+    let replacement_spans = engine
+        .lookup_regular_file_slices(file.ino, 0, u64::from(DEFAULT_BLOCK_SIZE))
+        .unwrap();
+    assert_eq!(replacement_spans.len(), 1);
     assert_eq!(
-        engine
-            .lookup_block_projection(file.ino, 0)
-            .unwrap()
-            .expect("replacement block")
+        replacement_spans[0]
+            .block
+            .as_ref()
+            .expect("replacement block slice")
             .object_id,
         replacement.object_id
     );
@@ -173,5 +177,11 @@ fn test_replica_aux_block_events_accept_fragmented_base_graph() {
             chunk_slices: Vec::new(),
         }])
         .expect("slice-native empty base replay should clear fragmented base graph");
-    assert!(engine.lookup_block_projection(file.ino, 0).unwrap().is_none());
+    let cleared_spans = engine
+        .lookup_regular_file_slices(file.ino, 0, u64::from(DEFAULT_BLOCK_SIZE))
+        .unwrap();
+    assert!(
+        cleared_spans.iter().all(|span| span.block.is_none()),
+        "empty base replay should leave no object-backed slices"
+    );
 }

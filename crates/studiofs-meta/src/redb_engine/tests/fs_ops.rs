@@ -618,7 +618,12 @@ fn test_unlink_last_link_cleans_blocks_for_inode_with_0xff_suffix() {
     let removed = engine.unlink(ROOT_INO, b"ff-suffix.bin").unwrap();
     assert_eq!(removed.nlink, 0);
     assert!(engine.get_attr(attr.ino).is_err());
-    assert!(engine.lookup_block_projections(attr.ino).unwrap().is_empty());
+    assert!(
+        engine
+            .lookup_regular_file_slices(attr.ino, 0, 4096)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 // === xattr Tests ===

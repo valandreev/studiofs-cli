@@ -15,66 +15,6 @@ trait BlockProjectionFixture {
     fn lookup_block_projections(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>>;
 }
 
-fn block_projection_slices(
-    block_index: u32,
-    block: Option<&BlockRef>,
-    state: BlockRefState,
-) -> MetaResult<Vec<(ChunkId, Vec<SliceRecord>)>> {
-    let block_size = DEFAULT_BLOCK_SIZE;
-    let block_start = u64::from(block_index)
-        .checked_mul(u64::from(block_size))
-        .ok_or_else(|| MetaError::Storage("fixture block offset overflow".to_string()))?;
-    let data_len = u64::from(block.map_or(0, |block| block.length));
-    let data_end = block_start
-        .checked_add(data_len)
-        .ok_or_else(|| MetaError::Storage("fixture block data range overflow".to_string()))?;
-    let block_end = block_start
-        .checked_add(u64::from(block_size))
-        .ok_or_else(|| MetaError::Storage("fixture block range overflow".to_string()))?;
-    let mut chunks = std::collections::BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
-    let mut push = |start: u64, end: u64, source: Option<&BlockRef>| -> MetaResult<()> {
-        let mut cursor = start;
-        while cursor < end {
-            let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);
-            let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
-            let piece_end = end.min(chunk_start.saturating_add(DEFAULT_CHUNK_SIZE as u64));
-            let range = SliceRange::new(
-                (cursor - chunk_start) as u32,
-                (piece_end - chunk_start) as u32,
-            )
-            .ok_or_else(|| MetaError::Storage("fixture invalid slice range".to_string()))?;
-            let mut slice = if let Some(source) = source {
-                let delta = u32::try_from(cursor.saturating_sub(block_start))
-                    .map_err(|_| MetaError::Storage("fixture slice delta overflow".to_string()))?;
-                SliceRecord::new(
-                    SliceId(0),
-                    SliceOrder(0),
-                    range,
-                    BlockRef {
-                        object_id: source.object_id,
-                        offset: source.offset.saturating_add(delta),
-                        length: u32::try_from(piece_end.saturating_sub(cursor)).map_err(|_| {
-                            MetaError::Storage("fixture slice length overflow".to_string())
-                        })?,
-                        flags: source.flags,
-                    },
-                )
-            } else {
-                SliceRecord::tombstone(SliceId(0), SliceOrder(0), range)
-            };
-            slice.block_state = state;
-            chunks.entry(chunk_id).or_default().push(slice);
-            cursor = piece_end;
-        }
-        Ok(())
-    };
-    push(block_start, data_end, block)?;
-    if data_end < block_end {
-        push(data_end, block_end, None)?;
-    }
-    Ok(chunks.into_iter().collect())
-}
-
 fn block_projection_from_spans(
     spans: Vec<ResolvedSliceSpan>,
     block_index: u32,
@@ -139,10 +79,13 @@ impl BlockProjectionFixture for RedbMetaEngine {
             .lookup_block_projection(ino, block_index)
             .ok()
             .flatten();
-        self.flush_regular_file_overlay_slices(
-            ino,
-            block_projection_slices(block_index, Some(block), BlockRefState::LocalOnly)?.as_slice(),
+        let chunk_slices = Self::chunk_slices_for_block(
+            block_index,
+            DEFAULT_BLOCK_SIZE,
+            Some(block),
+            BlockRefState::LocalOnly,
         )?;
+        self.flush_regular_file_overlay_slices(ino, chunk_slices.as_slice())?;
         Ok(old)
     }
 
