@@ -576,7 +576,7 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
     /// Slice-native regular-file writes can keep multiple immutable objects for
     /// one logical block. Upload workers use this check to decide whether an
     /// uploaded object still belongs to the current unpublished epoch without
-    /// forcing the overlay graph through legacy single-`BlockRef` synthesis.
+    /// requiring a contiguous per-block `BlockRef` view of the overlay graph.
     fn has_regular_file_overlay_object_if_matches(
         &self,
         ino: Ino,

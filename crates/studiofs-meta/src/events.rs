@@ -66,7 +66,7 @@ pub enum MetaEvent {
     // ─── Regular File Graph Operations ──────────────────────────────────────
     /// Remove all regular-file graph rows for a file (e.g., unlink).
     RemoveRegularFileGraph {
-        /// File inode whose block mapping should be removed.
+        /// File inode whose slice graph should be removed.
         ino: u64,
     },
 

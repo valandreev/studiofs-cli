@@ -933,7 +933,7 @@ fn zeroio_snapshot_distinguishes_single_store_payload_classes_and_publish_backlo
 
         assert!(
             !publish_ready_blocks.is_empty(),
-            "test setup should persist current unpublished blocks"
+            "test setup should persist current unpublished slice payloads"
         );
     });
 }
@@ -1005,22 +1005,22 @@ fn zeroio_snapshot_reports_delete_before_publish_cleanup_visibility() {
 }
 
 #[test]
-fn epoch_finalizer_publishes_graph_backed_zero_length_epoch() {
+fn epoch_finalizer_publishes_slice_graph_zero_length_epoch() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-zero-length");
     let _guard = rt.enter();
 
     rt.block_on(async {
         let attr = vfs
-            .create(1, b"graph-finalizer-zero-length.bin", 0, 0, 0o644)
+            .create(1, b"slice-graph-finalizer-zero-length.bin", 0, 0, 0o644)
             .expect("create test file");
-        let payload = b"graph-backed-finalization";
+        let payload = b"slice-graph-finalization";
         vfs.write(attr.ino, 0, payload)
             .await
             .expect("write test payload");
         vfs.flush(attr.ino)
             .await
-            .expect("materialize unpublished blocks before publish setup");
+            .expect("materialize unpublished slice payloads before publish setup");
 
         let (published_epoch, published_blocks) =
             mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
@@ -1031,22 +1031,22 @@ fn epoch_finalizer_publishes_graph_backed_zero_length_epoch() {
         truncated_attr.content_epoch = truncated_attr.content_epoch.saturating_add(1);
         truncated_attr.upload_state = MetaUploadState::Updating;
         meta.set_attr(&truncated_attr)
-            .expect("stage graph-backed zero-length epoch");
+            .expect("stage slice-graph zero-length epoch");
         meta.remove_regular_file_graph(attr.ino)
-            .expect("remove unpublished blocks for zero-length truncate");
+            .expect("remove unpublished slice graph for zero-length truncate");
 
         assert!(
             !meta
                 .has_local_regular_file_overlay(attr.ino)
                 .expect("query overlay state"),
-            "regression setup should exercise the legacy graph-backed path"
+            "regression setup should exercise a payload-free slice-graph epoch"
         );
 
         let unpublished_attr = meta.get_attr(attr.ino).expect("load unpublished attr");
         let lifecycle = meta
             .get_inode_lifecycle(attr.ino)
             .expect("load lifecycle")
-            .expect("graph-backed epoch should keep lifecycle state");
+            .expect("slice-graph epoch should keep lifecycle state");
         assert_eq!(unpublished_attr.size, 0);
         assert_ne!(
             unpublished_attr.upload_state,
@@ -1060,7 +1060,7 @@ fn epoch_finalizer_publishes_graph_backed_zero_length_epoch() {
         assert_eq!(
             lifecycle.state,
             InodeLifecycleState::PublishReady,
-            "blockless graph-backed zero-length epochs should become publish-ready immediately"
+            "payload-free slice-graph zero-length epochs should become publish-ready immediately"
         );
         assert_eq!(
             meta.lookup_file_block_slices(attr.ino)
@@ -1076,10 +1076,10 @@ fn epoch_finalizer_publishes_graph_backed_zero_length_epoch() {
             unpublished_attr.content_epoch,
         )
         .await
-        .expect("finalize zero-length graph-backed epoch");
+        .expect("finalize zero-length slice-graph epoch");
         assert!(
             matches!(status, super::commit::EpochFinalizeStatus::Published),
-            "graph-backed zero-length epoch should still publish"
+            "slice-graph zero-length epoch should still publish"
         );
 
         let published_attr = meta.get_attr(attr.ino).expect("load published attr");
@@ -1222,13 +1222,13 @@ fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
         let attr = vfs
             .create(1, b"graph-finalizer-inflight.bin", 0, 0, 0o644)
             .expect("create test file");
-        let payload = b"graph-backed-finalization";
+        let payload = b"slice-graph-finalization";
         vfs.write(attr.ino, 0, payload)
             .await
             .expect("write test payload");
         vfs.flush(attr.ino)
             .await
-            .expect("materialize unpublished blocks before publish setup");
+            .expect("materialize unpublished slice payloads before publish setup");
 
         let (published_epoch, published_blocks) =
             mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
@@ -1239,9 +1239,9 @@ fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
         truncated_attr.content_epoch = truncated_attr.content_epoch.saturating_add(1);
         truncated_attr.upload_state = MetaUploadState::Updating;
         meta.set_attr(&truncated_attr)
-            .expect("stage graph-backed zero-length epoch");
+            .expect("stage slice-graph zero-length epoch");
         meta.remove_regular_file_graph(attr.ino)
-            .expect("remove unpublished blocks for zero-length truncate");
+            .expect("remove unpublished slice graph for zero-length truncate");
 
         let unpublished_attr = meta.get_attr(attr.ino).expect("load unpublished attr");
         let lifecycle = meta
@@ -1255,7 +1255,7 @@ fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
         assert_eq!(
             lifecycle.state,
             InodeLifecycleState::PublishReady,
-            "once zero-length graph state is durable, only publication should remain"
+            "once zero-length slice-graph state is durable, only publication should remain"
         );
 
         let task_lock = Arc::new(tokio::sync::Mutex::new(()));
@@ -1316,7 +1316,7 @@ fn graph_finalizer_visibility_timeout_does_not_requeue_uploaded_blocks() {
             .expect("write test payload");
         vfs.flush(attr.ino)
             .await
-            .expect("flush graph-backed epoch");
+            .expect("flush slice-graph epoch");
 
         let (content_epoch, _blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, attr.ino);
         for pending in vfs.pending_uploads_snapshot() {
@@ -3968,7 +3968,7 @@ fn test_size_changing_setattr_rollback_restores_old_local_state_on_failure() {
         assert_eq!(
             blocks.len(),
             1,
-            "failed rollback should restore the original block map"
+            "failed rollback should restore the original logical block summary"
         );
         assert_eq!(
             blocks[0].1.length as usize,
