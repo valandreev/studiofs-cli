@@ -24,6 +24,46 @@ fn collect_term_hits(path: &str, terms: &[&str]) -> Vec<String> {
     collect_term_hits_from_contents(path, &contents, terms)
 }
 
+fn collect_term_hits_recursively(path: &str, terms: &[&str]) -> Vec<String> {
+    let root = repo_root().join(path);
+    let mut stack = vec![root];
+    let mut hits = Vec::new();
+
+    while let Some(current) = stack.pop() {
+        let metadata = fs::metadata(&current).unwrap_or_else(|error| {
+            panic!("failed to stat '{}': {error}", current.display());
+        });
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&current).unwrap_or_else(|error| {
+                panic!("failed to read dir '{}': {error}", current.display());
+            }) {
+                let entry = entry.unwrap_or_else(|error| {
+                    panic!(
+                        "failed to read dir entry in '{}': {error}",
+                        current.display()
+                    );
+                });
+                stack.push(entry.path());
+            }
+            continue;
+        }
+        if current.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let relative = current
+            .strip_prefix(repo_root())
+            .unwrap_or(current.as_path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relative == "crates/studiofs/tests/architecture_vocabulary_test.rs" {
+            continue;
+        }
+        hits.extend(collect_term_hits(&relative, terms));
+    }
+
+    hits
+}
+
 fn collect_term_hits_outside_test_modules(path: &str, terms: &[&str]) -> Vec<String> {
     let contents = read_workspace_file(path);
     let filtered = strip_cfg_test_items(&contents);
@@ -533,6 +573,50 @@ fn access_tracking_surface_drops_classifier_wording() {
     assert!(
         hits.is_empty(),
         "access tracking surface still uses classifier wording:\n{}",
+        hits.join("\n")
+    );
+}
+
+#[test]
+fn active_code_drops_flat_block_contract_vocabulary() {
+    let files = [
+        "crates/studiofs-meta/src",
+        "crates/studiofs-vfs/src",
+        "crates/studiofs-vfs/tests",
+        "crates/studiofs/src",
+        "crates/studiofs/tests",
+        "crates/studiofs-winfsp/src",
+        "crates/studiofs-fuse/src",
+    ];
+    let forbidden_terms = [
+        "block_projection",
+        "block projection",
+        "BlockProjection",
+        "remove_file_blocks",
+        "FragmentedBlock",
+        "set_file_block",
+        "commit_uploaded_block",
+        "publish_file_manifest",
+        "raw data blocks",
+        "chunk/slice/block",
+        "block graph",
+        "graph-backed",
+    ];
+
+    let hits: Vec<_> = files
+        .iter()
+        .flat_map(|path| {
+            if repo_root().join(path).is_dir() {
+                collect_term_hits_recursively(path, &forbidden_terms)
+            } else {
+                collect_term_hits(path, &forbidden_terms)
+            }
+        })
+        .collect();
+
+    assert!(
+        hits.is_empty(),
+        "active code still exposes flat-block contract vocabulary:\n{}",
         hits.join("\n")
     );
 }

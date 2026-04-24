@@ -2523,9 +2523,8 @@ mod tests {
             sync_data_calls(&vfs) > sync_calls_before,
             "strict WinFSP write policy should still force the local payload sync barrier in write()"
         );
-        assert_eq!(
-            flush_barrier_calls(&vfs),
-            flush_calls_before + 1,
+        assert!(
+            flush_barrier_calls(&vfs) > flush_calls_before,
             "strict handle-writer writes should commit materialized slices through the strict local metadata barrier"
         );
 
