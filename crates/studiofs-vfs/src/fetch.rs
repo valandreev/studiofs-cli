@@ -317,7 +317,7 @@ impl FetchScheduler {
     ) -> Result<Bytes, FetchError> {
         // ── Fast path: cache ────────────────────────────────────────
         if matches!(local_cache_hint, LocalCacheHint::CheckFastPath) {
-            if let Some(cached) = self.block_store_get_async(object_id).await? {
+            if let Some(cached) = self.payload_store_get_async(object_id).await? {
                 self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(cached);
             }
@@ -356,7 +356,7 @@ impl FetchScheduler {
             match action {
                 Action::Fetch => {
                     if matches!(local_cache_hint, LocalCacheHint::ConfirmedMiss) {
-                        match self.block_store_get_async(object_id).await {
+                        match self.payload_store_get_async(object_id).await {
                             Ok(Some(cached)) => {
                                 self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
                                 if let Some((_, tx)) = self.inflight.remove(&object_id) {
@@ -382,7 +382,7 @@ impl FetchScheduler {
                     match recv {
                         // Fetcher succeeded — grab from cache.
                         Ok(Ok(true)) => {
-                            if let Some(cached) = self.block_store_get_async(object_id).await? {
+                            if let Some(cached) = self.payload_store_get_async(object_id).await? {
                                 self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
                                 return Ok(cached);
                             }
@@ -608,13 +608,13 @@ impl FetchScheduler {
         let payload = Bytes::from(assembled);
 
         // Populate cache (L1 + L2) with the reconstructed logical block.
-        self.block_store_put_async(object_id, payload.clone(), true)
+        self.payload_store_put_async(object_id, payload.clone(), true)
             .await?;
 
         Ok(payload)
     }
 
-    async fn block_store_get_async(&self, object_id: u64) -> Result<Option<Bytes>, FetchError> {
+    async fn payload_store_get_async(&self, object_id: u64) -> Result<Option<Bytes>, FetchError> {
         let cached_store = self.cached_store.clone();
         let submitted_at = Instant::now();
         let (result, timing) = task::spawn_blocking(move || {
@@ -635,13 +635,13 @@ impl FetchScheduler {
         })
         .await
         .map_err(|error| {
-            FetchError::CacheAccess(format!("block store get task failed: {error}"))
+            FetchError::CacheAccess(format!("payload store get task failed: {error}"))
         })?;
         self.record_local_cache_io(timing);
         Ok(result)
     }
 
-    async fn block_store_put_async(
+    async fn payload_store_put_async(
         &self,
         object_id: u64,
         payload: Bytes,
@@ -667,7 +667,7 @@ impl FetchScheduler {
         })
         .await
         .map_err(|error| {
-            FetchError::CacheAccess(format!("block store put task failed: {error}"))
+            FetchError::CacheAccess(format!("payload store put task failed: {error}"))
         })?;
         self.record_local_cache_io(timing);
         result.map_err(|error| FetchError::CacheAccess(error.to_string()))

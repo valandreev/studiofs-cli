@@ -1,6 +1,5 @@
 //! DataStore — S3 storage abstraction via OpenDAL.
 
-use bytes::Bytes;
 use opendal::layers::{ConcurrentLimitLayer, RetryLayer, TimeoutLayer};
 use opendal::{Buffer, Operator, services::S3};
 use std::fmt;
@@ -251,17 +250,6 @@ impl DataStore {
         self.profile
     }
 
-    /// Get the S3 object key for a block.
-    ///
-    /// Format: `{volume}/data/chunks/{hash}/{sliceId}_{blockIndex}_{blockSize}`
-    pub fn block_key(&self, slice_id: u64, block_index: u32, block_size: u32) -> String {
-        let hash = self.hash_path(slice_id);
-        format!(
-            "{}/data/chunks/{}/{}_{}_{}",
-            self.volume_name, hash, slice_id, block_index, block_size
-        )
-    }
-
     /// Get the S3 object key for a generic object (content-addressable).
     /// Format: `{volume}/objects/{ab}/{cd}/{id}`
     pub fn object_key(&self, object_id: &str) -> String {
@@ -275,60 +263,6 @@ impl DataStore {
             &object_id[2..4],
             object_id
         )
-    }
-
-    /// Hash path for distributing objects (same as JuiceFS without HashPrefix).
-    fn hash_path(&self, slice_id: u64) -> String {
-        format!("{}/{}", slice_id / 1_000_000, slice_id / 1_000)
-    }
-
-    /// Upload a block to S3.
-    pub async fn put_block(&self, slice_id: u64, block_index: u32, data: Bytes) -> DataResult<()> {
-        let block_size = u32::try_from(data.len())
-            .map_err(|_| DataError::Storage("block payload size exceeds u32".into()))?;
-        let key = self.block_key(slice_id, block_index, block_size);
-        debug!("uploading block: {key} ({block_size} bytes)");
-
-        self.op.write(&key, data).await?;
-        Ok(())
-    }
-
-    /// Download a block from S3.
-    pub async fn get_block(
-        &self,
-        slice_id: u64,
-        block_index: u32,
-        block_size: u32,
-    ) -> DataResult<Bytes> {
-        let key = self.block_key(slice_id, block_index, block_size);
-        debug!("downloading block: {key}");
-
-        let data = self.op.read(&key).await?.to_bytes();
-        Ok(data)
-    }
-
-    /// Download a range within a block from S3.
-    pub async fn get_block_range(
-        &self,
-        slice_id: u64,
-        block_index: u32,
-        block_size: u32,
-        offset: u64,
-        length: u64,
-    ) -> DataResult<Bytes> {
-        let key = self.block_key(slice_id, block_index, block_size);
-        debug!("downloading block range: {key} offset={offset} len={length}");
-        let range_end = offset
-            .checked_add(length)
-            .ok_or_else(|| DataError::Storage("block range offset + length overflow".into()))?;
-
-        let data = self
-            .op
-            .read_with(&key)
-            .range(offset..range_end)
-            .await?
-            .to_bytes();
-        Ok(data)
     }
 
     /// Upload a generic object to S3.
@@ -367,20 +301,6 @@ impl DataStore {
         Ok(data)
     }
 
-    /// Delete a block from S3.
-    pub async fn delete_block(
-        &self,
-        slice_id: u64,
-        block_index: u32,
-        block_size: u32,
-    ) -> DataResult<()> {
-        let key = self.block_key(slice_id, block_index, block_size);
-        debug!("deleting block: {key}");
-
-        self.op.delete(&key).await?;
-        Ok(())
-    }
-
     /// Delete a generic object from S3.
     pub async fn delete_object(&self, object_id: &str) -> DataResult<()> {
         let key = self.object_key(object_id);
@@ -394,17 +314,6 @@ impl DataStore {
         debug!("deleting by key: {key}");
         self.op.delete(key).await?;
         Ok(())
-    }
-
-    /// Check if a block exists in S3.
-    pub async fn block_exists(
-        &self,
-        slice_id: u64,
-        block_index: u32,
-        block_size: u32,
-    ) -> DataResult<bool> {
-        let key = self.block_key(slice_id, block_index, block_size);
-        Ok(self.op.exists(&key).await?)
     }
 
     /// Check if the storage backend is accessible and the bucket exists.

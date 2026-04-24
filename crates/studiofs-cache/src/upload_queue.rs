@@ -23,7 +23,7 @@ pub struct PendingUpload {
     pub ino: Ino,
     /// File offset this block corresponds to.
     pub offset: u64,
-    /// Object ID (block ID).
+    /// Object ID (object ID).
     pub object_id: u64,
     /// Monotonic content generation captured when the upload was queued.
     pub content_epoch: u64,

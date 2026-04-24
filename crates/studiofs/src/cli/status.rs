@@ -208,7 +208,7 @@ pub fn run(
     let total_inodes = engine.get_counter(counters::TOTAL_INODES)?;
     let used_space = engine.get_counter(counters::USED_SPACE)?;
     let next_inode = engine.get_counter(counters::NEXT_INODE)?;
-    let next_block = engine.get_counter(counters::NEXT_BLOCK_ID)?;
+    let next_object = engine.get_counter(counters::NEXT_OBJECT_ID)?;
 
     let cache_path = local_cache_path(meta_dir, cache_dir, &format_info.uuid);
     let cache_backend_detection = detect_backends(&cache_path);
@@ -259,7 +259,7 @@ pub fn run(
 
     println!("\n  Inodes:     {}", total_inodes);
     println!("  Next inode: {}", next_inode);
-    println!("  Next block: {}", next_block);
+    println!("  Next block: {}", next_object);
 
     println!("\n  Used space: {}", format_bytes(used_space));
 
@@ -384,55 +384,56 @@ pub fn run(
                 snapshot.flush_barrier_calls, snapshot.flush_barrier_calls_per_sec
             );
             println!(
-                "  block_store_sync_data calls: {} ({:.2}/s)",
-                snapshot.block_store_sync_data.calls, snapshot.block_store_sync_data.calls_per_sec
+                "  payload_store_sync_data calls: {} ({:.2}/s)",
+                snapshot.payload_store_sync_data.calls,
+                snapshot.payload_store_sync_data.calls_per_sec
             );
             println!(
-                "  block_store_sync_data total: {}",
-                format_ms(snapshot.block_store_sync_data.total_ms)
+                "  payload_store_sync_data total: {}",
+                format_ms(snapshot.payload_store_sync_data.total_ms)
             );
             println!(
-                "  block_store_sync_data avg:   {}",
-                format_ms(snapshot.block_store_sync_data.avg_ms)
+                "  payload_store_sync_data avg:   {}",
+                format_ms(snapshot.payload_store_sync_data.avg_ms)
             );
             println!(
-                "  block_store_sync_data max:   {}",
-                format_ms(snapshot.block_store_sync_data.max_ms)
+                "  payload_store_sync_data max:   {}",
+                format_ms(snapshot.payload_store_sync_data.max_ms)
             );
             println!(
-                "  block_store_sync_data p50/p95/p99: {}/{}/{}",
+                "  payload_store_sync_data p50/p95/p99: {}/{}/{}",
                 format_quantile_ms(
-                    snapshot.block_store_sync_data.latency_quantiles_ms.p50,
+                    snapshot.payload_store_sync_data.latency_quantiles_ms.p50,
                     snapshot
-                        .block_store_sync_data
+                        .payload_store_sync_data
                         .latency_quantiles_saturated
                         .p50
                 ),
                 format_quantile_ms(
-                    snapshot.block_store_sync_data.latency_quantiles_ms.p95,
+                    snapshot.payload_store_sync_data.latency_quantiles_ms.p95,
                     snapshot
-                        .block_store_sync_data
+                        .payload_store_sync_data
                         .latency_quantiles_saturated
                         .p95
                 ),
                 format_quantile_ms(
-                    snapshot.block_store_sync_data.latency_quantiles_ms.p99,
+                    snapshot.payload_store_sync_data.latency_quantiles_ms.p99,
                     snapshot
-                        .block_store_sync_data
+                        .payload_store_sync_data
                         .latency_quantiles_saturated
                         .p99
                 )
             );
             println!(
                 "  sync barrier queue wait total/avg/max: {}/{}/{}",
-                format_ms(snapshot.block_store_sync_data.queue_wait_total_ms),
-                format_ms(snapshot.block_store_sync_data.queue_wait_avg_ms),
-                format_ms(snapshot.block_store_sync_data.queue_wait_max_ms)
+                format_ms(snapshot.payload_store_sync_data.queue_wait_total_ms),
+                format_ms(snapshot.payload_store_sync_data.queue_wait_avg_ms),
+                format_ms(snapshot.payload_store_sync_data.queue_wait_max_ms)
             );
             println!(
                 "  sync barrier interval avg/max: {}/{}",
-                format_ms(snapshot.block_store_sync_data.barrier_interval_avg_ms),
-                format_ms(snapshot.block_store_sync_data.barrier_interval_max_ms)
+                format_ms(snapshot.payload_store_sync_data.barrier_interval_avg_ms),
+                format_ms(snapshot.payload_store_sync_data.barrier_interval_max_ms)
             );
             println!(
                 "  payload bursts count/bytes: {}/{}",
@@ -646,7 +647,7 @@ mod tests {
             backend_tag: "local-block-runtime".to_string(),
             flush_barrier_calls: 11,
             flush_barrier_calls_per_sec: 2.5,
-            block_store_sync_data: Default::default(),
+            payload_store_sync_data: Default::default(),
             local_cache_io: Default::default(),
             winfsp_callbacks: Default::default(),
             winfsp_write_path: Default::default(),

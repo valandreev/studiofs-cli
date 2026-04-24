@@ -40,7 +40,7 @@ HandleWriterRegistry (Bytes in BTreeMap)
     ↓ COPY #2: BytesMut rehydration + merge
 LocalDirtyState (BytesMut blocks)
     ↓ COPY #3: freeze() + persist to disk
-Local block backend (NVMe cache)
+Local payload backend (NVMe cache)
     ↓ (Upload to S3 - no additional copy, but data persists)
 ```
 
@@ -291,7 +291,7 @@ pub(super) async fn persist_dirty_write_snapshots_direct(
     // Write to local payload backend
     for (block_index, snapshot) in blocks.iter() {
         let persisted = self.local_payloads.put_payload(
-            PersistedWriteBlock {
+            PersistedPayloadEntry {
                 block_index: *block_index,
                 object_id: object_id,
                 data: snapshot.data.clone(),  // Clone Bytes (Arc, cheap)

@@ -1287,8 +1287,8 @@ impl FormatInfo {
 pub mod counters {
     /// Next available inode number.
     pub const NEXT_INODE: &str = "nextInode";
-    /// Next available block ID (sequential).
-    pub const NEXT_BLOCK_ID: &str = "nextBlockId";
+    /// Next available object ID (sequential).
+    pub const NEXT_OBJECT_ID: &str = "nextObjectId";
     /// Total used space in bytes.
     pub const USED_SPACE: &str = "usedSpace";
     /// Total number of inodes in use.

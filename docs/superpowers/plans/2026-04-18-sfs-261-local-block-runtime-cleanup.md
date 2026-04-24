@@ -15,8 +15,8 @@
 **Files:**
 - Modify: `crates/studiofs-cache/src/lib.rs`
 - Modify: `crates/studiofs-cache/src/runtime.rs`
-- Modify: `crates/studiofs-cache/src/block_layout.rs`
-- Modify: `crates/studiofs-cache/src/block_store.rs`
+- Modify: `crates/studiofs-cache/src/payload_layout.rs`
+- Modify: `crates/studiofs-cache/src/payload_store.rs`
 - Modify: `crates/studiofs-cache/src/startup_recovery.rs`
 - Test: `crates/studiofs-cache/src/lib.rs`
 - Test: `crates/studiofs-cache/src/runtime.rs`
@@ -111,7 +111,7 @@ Expected: PASS
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/studiofs-cache/src/lib.rs crates/studiofs-cache/src/runtime.rs crates/studiofs-cache/src/block_layout.rs crates/studiofs-cache/src/block_store.rs crates/studiofs-cache/src/startup_recovery.rs
+git add crates/studiofs-cache/src/lib.rs crates/studiofs-cache/src/runtime.rs crates/studiofs-cache/src/payload_layout.rs crates/studiofs-cache/src/payload_store.rs crates/studiofs-cache/src/startup_recovery.rs
 git commit -m "refactor: rename canonical local payload runtime surface (SFS-261)"
 ```
 

@@ -243,7 +243,7 @@ pub struct VfsWritePathObservabilitySnapshot {
     pub backend_tag: String,
     pub flush_barrier_calls: u64,
     pub flush_barrier_calls_per_sec: f64,
-    pub block_store_sync_data: VfsWritePathSyncDataStats,
+    pub payload_store_sync_data: VfsWritePathSyncDataStats,
     #[serde(default)]
     pub local_cache_io: VfsWritePathLocalCacheIoStats,
     pub winfsp_callbacks: VfsWritePathWinfspCallbackStats,

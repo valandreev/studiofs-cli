@@ -241,14 +241,14 @@ impl DirtyWriteSnapshot {
 }
 
 #[derive(Debug, Clone)]
-struct PersistedWriteBlock {
+struct PersistedPayloadEntry {
     block_index: u32,
     object_id: u64,
     data: Option<Bytes>,
     len: usize,
 }
 
-impl PersistedWriteBlock {
+impl PersistedPayloadEntry {
     fn from_payload(block_index: u32, object_id: u64, data: Bytes) -> Self {
         let len = data.len();
         Self {
@@ -289,20 +289,20 @@ struct PayloadPersistConfig {
 }
 
 trait BlockIdAllocatorPort {
-    async fn next_block_ids(&self, count: u32) -> VfsResult<Vec<u64>>;
+    async fn next_object_ids(&self, count: u32) -> VfsResult<Vec<u64>>;
 }
 
 trait LocalPayloadWriterPort {
     async fn persist_payload(
         &self,
-        persisted_blocks: &[PersistedWriteBlock],
+        persisted_blocks: &[PersistedPayloadEntry],
         persist_config: PayloadPersistConfig,
     ) -> VfsResult<()>;
 
     async fn cleanup_uncommitted(
         &self,
         ino: Ino,
-        blocks: &[PersistedWriteBlock],
+        blocks: &[PersistedPayloadEntry],
         stage: &'static str,
     );
 }
@@ -326,7 +326,7 @@ trait UploadSubmissionPort {
     async fn submit_uploads(
         &self,
         ino: Ino,
-        persisted_blocks: &[PersistedWriteBlock],
+        persisted_blocks: &[PersistedPayloadEntry],
         content_epoch: u64,
     );
 }
@@ -338,7 +338,7 @@ trait DrainCommitObserverPort {
 struct LocalDirtyDrainCore<L, C, B, U, O> {
     local_payloads: L,
     commit_meta: C,
-    block_ids: B,
+    object_ids: B,
     uploads: U,
     observer: O,
     block_size: u32,
@@ -361,7 +361,7 @@ struct LocalDirtyFlushSession<'a> {
 
 #[derive(Debug)]
 struct DrainOutcome {
-    persisted_blocks: Vec<PersistedWriteBlock>,
+    persisted_blocks: Vec<PersistedPayloadEntry>,
 }
 
 #[derive(Clone, Copy)]
@@ -436,7 +436,7 @@ impl LocalDirtyState {
 fn assign_reserved_object_ids(
     pending: &mut std::collections::HashMap<(Ino, u32), PendingBlock>,
     ino: Ino,
-    blocks: &mut [PersistedWriteBlock],
+    blocks: &mut [PersistedPayloadEntry],
     fresh_object_ids: &[u64],
 ) {
     let mut fresh_ids = fresh_object_ids.iter().copied();
@@ -516,7 +516,7 @@ where
 fn commit_persisted_payload_state(
     pending: &mut std::collections::HashMap<(Ino, u32), PendingBlock>,
     ino: Ino,
-    blocks: &[PersistedWriteBlock],
+    blocks: &[PersistedPayloadEntry],
 ) -> (usize, Vec<u32>, Vec<BytesMut>) {
     let mut removed_bytes = 0usize;
     let mut removed_block_indexes = Vec::new();
@@ -557,11 +557,11 @@ where
     U: UploadSubmissionPort,
     O: DrainCommitObserverPort,
 {
-    async fn allocate_block_ids(&self, count: u32) -> VfsResult<Vec<u64>> {
+    async fn allocate_object_ids(&self, count: u32) -> VfsResult<Vec<u64>> {
         if count == 0 {
             Ok(Vec::new())
         } else {
-            self.block_ids.next_block_ids(count).await
+            self.object_ids.next_object_ids(count).await
         }
     }
 
@@ -590,7 +590,7 @@ where
         ino: Ino,
         blocks: Vec<DirtyWriteSnapshot>,
         fresh_object_ids: &mut std::collections::VecDeque<u64>,
-    ) -> Result<Vec<PersistedWriteBlock>, (Vec<DirtyWriteSnapshot>, usize)> {
+    ) -> Result<Vec<PersistedPayloadEntry>, (Vec<DirtyWriteSnapshot>, usize)> {
         let fresh_needed = Self::additional_object_id_count_needed(pending, ino, &blocks);
         let additional_needed = fresh_needed.saturating_sub(fresh_object_ids.len());
         if additional_needed > 0 {
@@ -613,7 +613,7 @@ where
                     current.reserved_object_id = Some(object_id);
                     object_id
                 };
-                persisted_blocks.push(PersistedWriteBlock::from_payload(
+                persisted_blocks.push(PersistedPayloadEntry::from_payload(
                     block.block_index,
                     object_id,
                     block.data.freeze(),
@@ -624,7 +624,7 @@ where
             let object_id = fresh_object_ids
                 .pop_front()
                 .expect("fresh object ids prevalidated");
-            persisted_blocks.push(PersistedWriteBlock::from_payload(
+            persisted_blocks.push(PersistedPayloadEntry::from_payload(
                 block.block_index,
                 object_id,
                 block.data.freeze(),
@@ -637,7 +637,7 @@ where
     fn build_overlay_slice_records(
         &self,
         ino: Ino,
-        persisted_blocks: &[PersistedWriteBlock],
+        persisted_blocks: &[PersistedPayloadEntry],
         dirty_chunk_slices: std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
     ) -> VfsResult<
         Vec<(
@@ -724,7 +724,7 @@ where
     fn append_persisted_block_slice_records(
         &self,
         chunks: &mut std::collections::BTreeMap<u64, Vec<studiofs_meta::schema::SliceRecord>>,
-        persisted: &PersistedWriteBlock,
+        persisted: &PersistedPayloadEntry,
     ) -> VfsResult<()> {
         let block_start = (persisted.block_index as u64).saturating_mul(self.block_size as u64);
         let block_len = u64::try_from(persisted.len()).map_err(|_| {
@@ -836,7 +836,7 @@ where
     async fn execute_drain(
         &self,
         ino: Ino,
-        persisted_blocks: Vec<PersistedWriteBlock>,
+        persisted_blocks: Vec<PersistedPayloadEntry>,
         dirty_chunk_slices: std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
         content_epoch: u64,
         attr_to_persist: Option<InodeAttr>,
@@ -912,9 +912,9 @@ impl<'a> LocalDirtyDrain<'a> {
 }
 
 impl BlockIdAllocatorPort for VfsBlockIdAllocator<'_> {
-    async fn next_block_ids(&self, count: u32) -> VfsResult<Vec<u64>> {
+    async fn next_object_ids(&self, count: u32) -> VfsResult<Vec<u64>> {
         run_meta(self.vfs.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-            engine.next_block_ids(count)
+            engine.next_object_ids(count)
         })
         .await
     }
@@ -923,10 +923,10 @@ impl BlockIdAllocatorPort for VfsBlockIdAllocator<'_> {
 impl LocalPayloadWriterPort for VfsLocalPayloadWriter<'_> {
     async fn persist_payload(
         &self,
-        persisted_blocks: &[PersistedWriteBlock],
+        persisted_blocks: &[PersistedPayloadEntry],
         persist_config: PayloadPersistConfig,
     ) -> VfsResult<()> {
-        let payload_entries: Vec<&PersistedWriteBlock> = persisted_blocks
+        let payload_entries: Vec<&PersistedPayloadEntry> = persisted_blocks
             .iter()
             .filter(|block| block.requires_payload_persist())
             .collect();
@@ -952,7 +952,7 @@ impl LocalPayloadWriterPort for VfsLocalPayloadWriter<'_> {
                         evictable: false,
                     })
                     .collect();
-                self.vfs.block_store_put_batch_async(batch).await?;
+                self.vfs.payload_store_put_batch_async(batch).await?;
             }
             for chunk in payload_entries.chunks(persist_config.put_concurrency.max(1)) {
                 let batch = chunk
@@ -969,7 +969,7 @@ impl LocalPayloadWriterPort for VfsLocalPayloadWriter<'_> {
                 self.vfs.cache_upload_hot_batch(batch);
             }
             self.vfs
-                .maybe_block_store_sync_data_async(
+                .maybe_payload_store_sync_data_async(
                     persisted_bytes,
                     persist_config.local_sync_policy,
                 )
@@ -981,7 +981,7 @@ impl LocalPayloadWriterPort for VfsLocalPayloadWriter<'_> {
                     .await
             {
                 warn!(
-                    persisted_block_count = persisted_blocks.len(),
+                    persisted_payload_entry_count = payload_entries.len(),
                     error = %error,
                     "failed to create zero-copy upload links for durable payload objects"
                 );
@@ -1004,7 +1004,7 @@ impl LocalPayloadWriterPort for VfsLocalPayloadWriter<'_> {
     async fn cleanup_uncommitted(
         &self,
         ino: Ino,
-        blocks: &[PersistedWriteBlock],
+        blocks: &[PersistedPayloadEntry],
         stage: &'static str,
     ) {
         let object_ids: Vec<u64> = blocks
@@ -1017,7 +1017,7 @@ impl LocalPayloadWriterPort for VfsLocalPayloadWriter<'_> {
         }
         if let Err(error) = self
             .vfs
-            .block_store_remove_batch_async(object_ids.clone())
+            .payload_store_remove_batch_async(object_ids.clone())
             .await
         {
             warn!(
@@ -1070,7 +1070,7 @@ impl UploadSubmissionPort for VfsUploadSubmitter<'_> {
     async fn submit_uploads(
         &self,
         ino: Ino,
-        persisted_blocks: &[PersistedWriteBlock],
+        persisted_blocks: &[PersistedPayloadEntry],
         content_epoch: u64,
     ) {
         let mut submit_ops = Vec::with_capacity(persisted_blocks.len());
@@ -1200,7 +1200,7 @@ impl<'a> LocalDirtyFlushSession<'a> {
         content_epoch: u64,
         attr_to_persist: Option<InodeAttr>,
         persist_config: PayloadPersistConfig,
-    ) -> VfsResult<Vec<PersistedWriteBlock>> {
+    ) -> VfsResult<Vec<PersistedPayloadEntry>> {
         let mut fresh_object_ids = std::collections::VecDeque::new();
         let persisted_blocks = loop {
             let prepare_result = {
@@ -1225,7 +1225,7 @@ impl<'a> LocalDirtyFlushSession<'a> {
                             ),
                         ))
                     })?;
-                    let additional_ids = self.drain.allocate_block_ids(additional_needed).await?;
+                    let additional_ids = self.drain.allocate_object_ids(additional_needed).await?;
                     fresh_object_ids.extend(additional_ids);
                 }
             }
@@ -1571,7 +1571,7 @@ impl StudioVfs {
         })?;
         let object_ids = self
             .local_dirty_drain()
-            .allocate_block_ids(object_count)
+            .allocate_object_ids(object_count)
             .await?;
         let payloads: Vec<(u64, Bytes)> = spill_batches
             .iter()
@@ -1775,7 +1775,7 @@ impl StudioVfs {
         })?;
         let object_ids = self
             .local_dirty_drain()
-            .allocate_block_ids(object_count)
+            .allocate_object_ids(object_count)
             .await?;
         let payloads: Vec<(u64, Bytes)> = spill_batches
             .iter()
@@ -1845,7 +1845,7 @@ impl StudioVfs {
         LocalDirtyDrainCore {
             local_payloads: VfsLocalPayloadWriter { vfs: self },
             commit_meta: VfsOverlayCommitter { vfs: self },
-            block_ids: VfsBlockIdAllocator { vfs: self },
+            object_ids: VfsBlockIdAllocator { vfs: self },
             uploads: VfsUploadSubmitter { vfs: self },
             observer: VfsDrainCommitObserver { vfs: self },
             block_size: self.block_size,
@@ -2131,7 +2131,7 @@ impl StudioVfs {
                         evictable: false,
                     })
                     .collect();
-                self.block_store_put_batch_async(batch).await?;
+                self.payload_store_put_batch_async(batch).await?;
             }
             for chunk in entries.chunks(self.payload_put_concurrency.max(1)) {
                 let batch = chunk
@@ -2144,7 +2144,7 @@ impl StudioVfs {
                     .collect();
                 self.cache_upload_hot_batch(batch);
             }
-            self.maybe_block_store_sync_data_async(persisted_bytes, local_sync_policy)
+            self.maybe_payload_store_sync_data_async(persisted_bytes, local_sync_policy)
                 .await?;
             if !persisted_object_ids.is_empty()
                 && let Err(error) = self
@@ -2168,7 +2168,7 @@ impl StudioVfs {
         );
         if result.is_err() {
             let _ = self
-                .block_store_remove_batch_async(persisted_object_ids.clone())
+                .payload_store_remove_batch_async(persisted_object_ids.clone())
                 .await;
             let _ = self
                 .upload_stage_remove_batch_async(persisted_object_ids.clone())
@@ -2709,7 +2709,7 @@ impl StudioVfs {
             })
     }
 
-    fn commit_persisted_local_dirty_blocks(&self, ino: Ino, blocks: &[PersistedWriteBlock]) {
+    fn commit_persisted_local_dirty_blocks(&self, ino: Ino, blocks: &[PersistedPayloadEntry]) {
         if blocks.is_empty() {
             return;
         }
@@ -2942,8 +2942,8 @@ mod tests {
             ),
         ]);
         let mut blocks = vec![
-            PersistedWriteBlock::from_payload(0, 0, Bytes::from_static(b"alpha")),
-            PersistedWriteBlock::from_payload(1, 0, Bytes::from_static(b"beta")),
+            PersistedPayloadEntry::from_payload(0, 0, Bytes::from_static(b"alpha")),
+            PersistedPayloadEntry::from_payload(1, 0, Bytes::from_static(b"beta")),
         ];
 
         assign_reserved_object_ids(&mut pending, ino, &mut blocks, &[222]);
@@ -2967,7 +2967,7 @@ mod tests {
             (ino, 3),
             PendingBlock::buffered(BytesMut::from(&b"newer"[..]), Some(333)),
         )]);
-        let blocks = vec![PersistedWriteBlock::from_payload(
+        let blocks = vec![PersistedPayloadEntry::from_payload(
             3,
             333,
             Bytes::from_static(b"older"),
@@ -2989,7 +2989,7 @@ mod tests {
         let ino = 8;
         let mut pending =
             std::collections::HashMap::from([((ino, 4), PendingBlock::local_extent(444, 4096))]);
-        let blocks = vec![PersistedWriteBlock::from_local_extent(4, 444, 4096)];
+        let blocks = vec![PersistedPayloadEntry::from_local_extent(4, 444, 4096)];
 
         let (removed_bytes, removed_block_indexes, removed_buffers) =
             commit_persisted_payload_state(&mut pending, ino, &blocks);
@@ -3024,8 +3024,8 @@ mod tests {
     struct PanicBlockIds;
 
     impl BlockIdAllocatorPort for PanicBlockIds {
-        async fn next_block_ids(&self, _count: u32) -> VfsResult<Vec<u64>> {
-            panic!("block id allocator should not be used in this test")
+        async fn next_object_ids(&self, _count: u32) -> VfsResult<Vec<u64>> {
+            panic!("object ID allocator should not be used in this test")
         }
     }
 
@@ -3037,7 +3037,7 @@ mod tests {
     impl LocalPayloadWriterPort for TestLocalPayloadWriter {
         async fn persist_payload(
             &self,
-            _persisted_blocks: &[PersistedWriteBlock],
+            _persisted_blocks: &[PersistedPayloadEntry],
             _persist_config: PayloadPersistConfig,
         ) -> VfsResult<()> {
             self.events.push("payload");
@@ -3051,7 +3051,7 @@ mod tests {
         async fn cleanup_uncommitted(
             &self,
             _ino: Ino,
-            _blocks: &[PersistedWriteBlock],
+            _blocks: &[PersistedPayloadEntry],
             stage: &'static str,
         ) {
             self.events.push(format!("cleanup:{stage}"));
@@ -3092,7 +3092,7 @@ mod tests {
         async fn submit_uploads(
             &self,
             ino: Ino,
-            persisted_blocks: &[PersistedWriteBlock],
+            persisted_blocks: &[PersistedPayloadEntry],
             content_epoch: u64,
         ) {
             self.events.push("upload");
@@ -3147,7 +3147,7 @@ mod tests {
                 fail_commit,
                 committed_attr,
             },
-            block_ids: PanicBlockIds,
+            object_ids: PanicBlockIds,
             uploads: TestUploadSubmitter {
                 events: events.clone(),
                 uploads,
@@ -3367,7 +3367,7 @@ mod tests {
         let chunk_slices = drain
             .build_overlay_slice_records(
                 41,
-                &[PersistedWriteBlock::from_payload(
+                &[PersistedPayloadEntry::from_payload(
                     12,
                     9001,
                     Bytes::from(vec![0xAB; drain.block_size as usize]),

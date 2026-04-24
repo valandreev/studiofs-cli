@@ -27,23 +27,17 @@ Remote storage uses a 4x4 hybrid scheme:
 ```
 - `<ab>/<cd>`: First 4 hex characters of object ID for S3 partition distribution.
 
-### Block Keys (4 blocks per chunk)
+### Fragment Keys (4 fragments per payload object)
 ```
 <volume>/objects/<ab>/<cd>/<object_id>/<block_index>
 ```
 - `block_index`: `0..3`
-- Each block stores an independent STFS object payload (typically up to 4 MiB raw payload + 30-byte header).
-- Block writes/retries are independent, so network failures only retry the affected piece.
-
-Legacy `DataStore::put_block/get_block/...` APIs still use the historical:
-```
-<volume>/data/chunks/<hash>/<slice_id>_<block_index>_<block_size>
-```
-These are retained for compatibility/tests; VFS read/write path uses `<volume>/objects/.../<block_index>`.
+- Each fragment stores an independent STFS object payload (typically up to 4 MiB raw payload + 30-byte header).
+- Fragment writes/retries are independent, so network failures only retry the affected piece.
 
 In the active Local-First runtime, `CachedStore` owns local cache hits,
 local-durable payload handling, upload rereads, and runtime queueing. `DataStore` is the
-remote object-store edge that `CachedStore`/VFS call for block download,
+remote object-store edge that `CachedStore`/VFS call for object download,
 range reads, and eventual upload.
 
 ## Object Format (Version 2)

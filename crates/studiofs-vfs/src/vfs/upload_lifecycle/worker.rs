@@ -815,7 +815,10 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
             })?;
         let wait_ns = wait_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
         let read_started = Instant::now();
-        let read_result = self.vfs.block_store_get_for_upload_async(object_id).await?;
+        let read_result = self
+            .vfs
+            .payload_store_get_for_upload_async(object_id)
+            .await?;
         let read_ns = read_started.elapsed().as_nanos().clamp(0, u64::MAX as u128) as u64;
         let pacing_delay = read_result
             .as_ref()
@@ -889,11 +892,11 @@ impl UploadLocalPayloadPort for VfsUploadLocalPayloadPort {
     }
 
     async fn remove(&self, object_id: u64) -> VfsResult<()> {
-        self.vfs.block_store_remove_async(object_id).await
+        self.vfs.payload_store_remove_async(object_id).await
     }
 
     async fn mark_uploaded(&self, object_id: u64) -> VfsResult<()> {
-        self.vfs.block_store_mark_uploaded_async(object_id).await
+        self.vfs.payload_store_mark_uploaded_async(object_id).await
     }
 
     async fn remove_upload_hot(&self, object_id: u64) -> VfsResult<()> {

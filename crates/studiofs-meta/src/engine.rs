@@ -151,8 +151,8 @@ pub struct MetadataReplicationBacklog {
 pub struct MetadataAuthorityStatus {
     /// `true` when inode id allocation still has local headroom.
     pub inode_id_headroom: bool,
-    /// `true` when block id allocation still has local headroom.
-    pub block_id_headroom: bool,
+    /// `true` when object ID allocation still has local headroom.
+    pub object_id_headroom: bool,
 }
 
 impl MetadataAuthorityStatus {
@@ -160,7 +160,7 @@ impl MetadataAuthorityStatus {
     pub const fn writable() -> Self {
         Self {
             inode_id_headroom: true,
-            block_id_headroom: true,
+            object_id_headroom: true,
         }
     }
 
@@ -168,13 +168,13 @@ impl MetadataAuthorityStatus {
     pub const fn read_only() -> Self {
         Self {
             inode_id_headroom: false,
-            block_id_headroom: false,
+            object_id_headroom: false,
         }
     }
 
     /// Return `true` when both inode and block allocators still have headroom.
     pub const fn allows_new_mutations(self) -> bool {
-        self.inode_id_headroom && self.block_id_headroom
+        self.inode_id_headroom && self.object_id_headroom
     }
 }
 
@@ -493,14 +493,14 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
     /// Returns the list of removed object IDs for GC.
     fn remove_regular_file_graph(&self, ino: Ino) -> MetaResult<Vec<u64>>;
 
-    /// Allocate a new sequential block ID.
-    fn next_block_id(&self) -> MetaResult<u64>;
+    /// Allocate a new sequential object ID.
+    fn next_object_id(&self) -> MetaResult<u64>;
 
-    /// Allocate `count` consecutive block IDs in a single transaction.
+    /// Allocate `count` consecutive object IDs in a single transaction.
     ///
     /// Returns `count` IDs starting from the current counter value.
-    /// Default implementation calls `next_block_id()` repeatedly.
-    fn next_block_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
+    /// Default implementation calls `next_object_id()` repeatedly.
+    fn next_object_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
         let count = usize::try_from(count).map_err(|_| {
             MetaError::Storage(
                 "requested block allocation count exceeds platform limits".to_string(),
@@ -508,7 +508,7 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
         })?;
         let mut ids = Vec::with_capacity(count);
         for _ in 0..count {
-            ids.push(self.next_block_id()?);
+            ids.push(self.next_object_id()?);
         }
         Ok(ids)
     }

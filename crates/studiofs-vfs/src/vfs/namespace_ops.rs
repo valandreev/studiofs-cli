@@ -415,11 +415,11 @@ impl StudioVfs {
             return Err(error.into());
         }
 
-        for block_idx in
+        for object_idx in
             first_block_to_remove..=block_index_from_offset(old_size - 1, self.block_size)
         {
-            self.clear_pending_block(ino, block_idx);
-            self.remove_live_extent(ino, block_idx);
+            self.clear_pending_block(ino, object_idx);
+            self.remove_live_extent(ino, object_idx);
             if let Err(error) = self.fail_size_change_truncate_after_first_removed_block_for_test(
                 mutation.removed_objects.len(),
             ) {

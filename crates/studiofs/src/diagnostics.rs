@@ -1574,11 +1574,14 @@ fn derive_blocking_intervals(
                 OPERATION_SYNC_DATA_QUEUE_WAIT,
                 snapshot
                     .write_path
-                    .block_store_sync_data
+                    .payload_store_sync_data
                     .queue_wait_total_ms,
-                snapshot.write_path.block_store_sync_data.queue_wait_max_ms,
+                snapshot
+                    .write_path
+                    .payload_store_sync_data
+                    .queue_wait_max_ms,
                 vec![runtime_snapshot_reference(
-                    "write_path.block_store_sync_data.queue_wait_total_ms",
+                    "write_path.payload_store_sync_data.queue_wait_total_ms",
                 )],
             );
             push_blocking_interval(
@@ -1631,12 +1634,12 @@ fn derive_blocking_intervals(
         let queue_wait_delta = artifact
             .end_snapshot
             .write_path
-            .block_store_sync_data
+            .payload_store_sync_data
             .queue_wait_total_ms
             - artifact
                 .start_snapshot
                 .write_path
-                .block_store_sync_data
+                .payload_store_sync_data
                 .queue_wait_total_ms;
         push_blocking_interval(
             &mut intervals,
@@ -1647,13 +1650,13 @@ fn derive_blocking_intervals(
             artifact
                 .end_snapshot
                 .write_path
-                .block_store_sync_data
+                .payload_store_sync_data
                 .queue_wait_max_ms,
             vec![
                 profile_window_reference(window),
                 profile_artifact_reference(
                     artifact_path,
-                    "end_snapshot.write_path.block_store_sync_data.queue_wait_total_ms",
+                    "end_snapshot.write_path.payload_store_sync_data.queue_wait_total_ms",
                 ),
             ],
         );
@@ -1749,13 +1752,13 @@ fn derive_hotspots(
                 scope,
                 SUBSYSTEM_WRITE_PATH,
                 OPERATION_SYNC_DATA_QUEUE_WAIT,
-                "block_store_sync_data.queue_wait_total_ms",
+                "payload_store_sync_data.queue_wait_total_ms",
                 snapshot
                     .write_path
-                    .block_store_sync_data
+                    .payload_store_sync_data
                     .queue_wait_total_ms,
                 vec![runtime_snapshot_reference(
-                    "write_path.block_store_sync_data.queue_wait_total_ms",
+                    "write_path.payload_store_sync_data.queue_wait_total_ms",
                 )],
             );
             push_hotspot(
@@ -1811,22 +1814,22 @@ fn derive_hotspots(
             scope,
             SUBSYSTEM_WRITE_PATH,
             OPERATION_SYNC_DATA_QUEUE_WAIT,
-            "block_store_sync_data.queue_wait_total_ms_delta",
+            "payload_store_sync_data.queue_wait_total_ms_delta",
             artifact
                 .end_snapshot
                 .write_path
-                .block_store_sync_data
+                .payload_store_sync_data
                 .queue_wait_total_ms
                 - artifact
                     .start_snapshot
                     .write_path
-                    .block_store_sync_data
+                    .payload_store_sync_data
                     .queue_wait_total_ms,
             vec![
                 profile_window_reference(window),
                 profile_artifact_reference(
                     artifact_path,
-                    "end_snapshot.write_path.block_store_sync_data.queue_wait_total_ms",
+                    "end_snapshot.write_path.payload_store_sync_data.queue_wait_total_ms",
                 ),
             ],
         );
@@ -2476,28 +2479,28 @@ fn materialize_run_span_comparison(
             "upload.pending_uploads",
         ),
         (
-            "write_path.block_store_sync_data.queue_wait_total_ms_delta",
+            "write_path.payload_store_sync_data.queue_wait_total_ms_delta",
             baseline_end
                 .runtime_snapshot
                 .write_path
-                .block_store_sync_data
+                .payload_store_sync_data
                 .queue_wait_total_ms
                 - baseline_start
                     .runtime_snapshot
                     .write_path
-                    .block_store_sync_data
+                    .payload_store_sync_data
                     .queue_wait_total_ms,
             candidate_end
                 .runtime_snapshot
                 .write_path
-                .block_store_sync_data
+                .payload_store_sync_data
                 .queue_wait_total_ms
                 - candidate_start
                     .runtime_snapshot
                     .write_path
-                    .block_store_sync_data
+                    .payload_store_sync_data
                     .queue_wait_total_ms,
-            "write_path.block_store_sync_data.queue_wait_total_ms",
+            "write_path.payload_store_sync_data.queue_wait_total_ms",
         ),
         (
             "write_path.write_backpressure.wait_total_ms_delta",
@@ -5932,21 +5935,21 @@ mod tests {
         let mut start_health = DiagnosticsHealthSnapshot::default();
         start_health
             .write_path
-            .block_store_sync_data
+            .payload_store_sync_data
             .queue_wait_total_ms = 10.0;
         start_health
             .write_path
-            .block_store_sync_data
+            .payload_store_sync_data
             .queue_wait_max_ms = 4.0;
         start_health.write_path.write_backpressure.wait_total_ms = 20;
         let mut end_health = DiagnosticsHealthSnapshot::default();
         end_health
             .write_path
-            .block_store_sync_data
+            .payload_store_sync_data
             .queue_wait_total_ms = 70.0;
         end_health
             .write_path
-            .block_store_sync_data
+            .payload_store_sync_data
             .queue_wait_max_ms = 25.0;
         end_health.write_path.write_backpressure.wait_total_ms = 65;
         end_health.upload.pending_uploads = 9;
@@ -6025,7 +6028,7 @@ mod tests {
                 && interval.total_blocked_ms == 60.0
         }));
         assert!(view.derived.hotspots.iter().any(|hotspot| {
-            hotspot.metric == "block_store_sync_data.queue_wait_total_ms_delta"
+            hotspot.metric == "payload_store_sync_data.queue_wait_total_ms_delta"
                 && hotspot.subsystem == SUBSYSTEM_WRITE_PATH
         }));
         assert!(
@@ -6180,8 +6183,11 @@ mod tests {
 
         let mut health = DiagnosticsHealthSnapshot::default();
         health.upload.pending_uploads = 9;
-        health.write_path.block_store_sync_data.queue_wait_total_ms = 75.0;
-        health.write_path.block_store_sync_data.queue_wait_max_ms = 30.0;
+        health
+            .write_path
+            .payload_store_sync_data
+            .queue_wait_total_ms = 75.0;
+        health.write_path.payload_store_sync_data.queue_wait_max_ms = 30.0;
         let source = StaticDiagnosticsSource {
             health,
             recent_events: vec![
@@ -6285,8 +6291,11 @@ mod tests {
 
         let mut health = DiagnosticsHealthSnapshot::default();
         health.upload.pending_uploads = 12;
-        health.write_path.block_store_sync_data.queue_wait_total_ms = 100.0;
-        health.write_path.block_store_sync_data.queue_wait_max_ms = 50.0;
+        health
+            .write_path
+            .payload_store_sync_data
+            .queue_wait_total_ms = 100.0;
+        health.write_path.payload_store_sync_data.queue_wait_max_ms = 50.0;
         health.write_path.write_backpressure.wait_total_ms = 80;
 
         let source = StaticDiagnosticsSource {
@@ -7717,7 +7726,7 @@ mod tests {
         baseline_end_snapshot.upload.pending_uploads = 9;
         baseline_end_snapshot
             .write_path
-            .block_store_sync_data
+            .payload_store_sync_data
             .queue_wait_total_ms = 40.0;
         let mut candidate_start_snapshot = DiagnosticsRuntimeSnapshot::default();
         candidate_start_snapshot.upload.pending_uploads = 1;
@@ -7725,7 +7734,7 @@ mod tests {
         candidate_end_snapshot.upload.pending_uploads = 4;
         candidate_end_snapshot
             .write_path
-            .block_store_sync_data
+            .payload_store_sync_data
             .queue_wait_total_ms = 10.0;
 
         store
@@ -7865,7 +7874,7 @@ mod tests {
                 && anomaly.candidate_count == 1
         }));
         assert!(comparison.summary.hotspot_deltas.iter().any(|hotspot| {
-            hotspot.metric == "block_store_sync_data.queue_wait_total_ms_delta"
+            hotspot.metric == "payload_store_sync_data.queue_wait_total_ms_delta"
                 && hotspot.delta < 0.0
         }));
         assert!(

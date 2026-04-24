@@ -101,7 +101,7 @@ Invariants:
 - If the current inode window is nearing exhaustion, StudioFS reserves and
   persists one prefetched inode window so the foreground create path can switch
   locally when the current window is consumed.
-- Block IDs still use a persistent PG client slot plus disjoint local payload
+- object IDs still use a persistent PG client slot plus disjoint local payload
   ranges; that rule remains part of the contract, not a disposable
   implementation trick.
 
@@ -316,7 +316,7 @@ Rules:
   window remains available.
 - Per-client block preallocation also remains mandatory. A discovered client
   obtains a persistent PG client slot, derives disjoint local payload-ID ranges
-  from it, and allocates foreground block IDs without further PG round-trips
+  from it, and allocates foreground object IDs without further PG round-trips
   while the current block range still has headroom.
 
 ## 11. Mutation Visibility And Invalidation Matrix

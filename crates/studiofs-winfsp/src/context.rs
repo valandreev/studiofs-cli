@@ -1756,7 +1756,7 @@ mod tests {
 
     fn sync_data_calls(vfs: &StudioVfs) -> u64 {
         vfs.write_path_observability_snapshot()
-            .block_store_sync_data
+            .payload_store_sync_data
             .calls
     }
 

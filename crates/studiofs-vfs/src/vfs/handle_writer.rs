@@ -887,7 +887,7 @@ impl StudioVfs {
             ))
         })?;
         let object_ids = run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-            engine.next_block_ids(object_count)
+            engine.next_object_ids(object_count)
         })
         .await?;
         let payloads: Vec<(u64, Bytes)> = spill_batches

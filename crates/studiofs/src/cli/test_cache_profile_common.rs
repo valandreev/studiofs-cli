@@ -168,7 +168,7 @@ pub(crate) fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
     ));
     out.push_str(&format!(
         "sync_data_calls_per_gib: {:.2}\n",
-        snapshot.block_store_sync_data.calls_per_gib
+        snapshot.payload_store_sync_data.calls_per_gib
     ));
     out.push_str(&format!(
         "winfsp_callbacks: write={} overwrite={} cleanup={} cleanup_flush_fh={} flush={} close={}\n",

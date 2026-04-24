@@ -48,7 +48,7 @@ Leave one canonical local-block runtime in the repository by:
 - active local payload backend implementation;
 - startup reconciliation wiring.
 
-`crates/studiofs-cache/src/block_layout.rs`, `block_store.rs`, `block_index.rs`, `block_eviction.rs`, `block_platform.rs`, and `startup_recovery.rs` remain the implementation modules beneath that runtime.
+`crates/studiofs-cache/src/payload_layout.rs`, `payload_store.rs`, `payload_index.rs`, `payload_eviction.rs`, `payload_platform.rs`, and `startup_recovery.rs` remain the implementation modules beneath that runtime.
 
 The duplicated `crates/studiofs-cache/src/v3/**` module tree is removed. Any remaining callers must use `studiofs_cache::runtime` or top-level re-exports from `studiofs_cache`.
 

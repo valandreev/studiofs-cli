@@ -280,7 +280,7 @@ fn install_fragmented_overlay_block(
     let left = vec![left_fill; half];
     let right = vec![right_fill; block_size - half];
     let object_ids = meta
-        .next_block_ids(2)
+        .next_object_ids(2)
         .expect("allocate fragmented object ids");
 
     vfs.local_payload_backend()
@@ -4319,16 +4319,16 @@ fn strict_local_sync_flushes_pending_group_commit_bytes() {
     let calls_before = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let synced_before = vfs
         .state
         .metrics
-        .block_store_sync_data_synced_bytes
+        .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
 
     rt.block_on(async {
-        vfs.maybe_block_store_sync_data_async(0, LocalSyncPolicy::Strict)
+        vfs.maybe_payload_store_sync_data_async(0, LocalSyncPolicy::Strict)
             .await
             .expect("strict local sync");
     });
@@ -4336,12 +4336,12 @@ fn strict_local_sync_flushes_pending_group_commit_bytes() {
     let calls_after = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let synced_after = vfs
         .state
         .metrics
-        .block_store_sync_data_synced_bytes
+        .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
     assert!(
         calls_after > calls_before,
@@ -4370,16 +4370,16 @@ fn opportunistic_local_sync_defers_when_threshold_not_reached() {
     let calls_before = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let deferred_before = vfs
         .state
         .metrics
-        .block_store_sync_data_deferred_calls
+        .payload_store_sync_data_deferred_calls
         .load(Ordering::Relaxed);
 
     rt.block_on(async {
-        vfs.maybe_block_store_sync_data_async(0, LocalSyncPolicy::Opportunistic)
+        vfs.maybe_payload_store_sync_data_async(0, LocalSyncPolicy::Opportunistic)
             .await
             .expect("opportunistic local sync");
     });
@@ -4387,12 +4387,12 @@ fn opportunistic_local_sync_defers_when_threshold_not_reached() {
     let calls_after = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let deferred_after = vfs
         .state
         .metrics
-        .block_store_sync_data_deferred_calls
+        .payload_store_sync_data_deferred_calls
         .load(Ordering::Relaxed);
     assert_eq!(
         calls_after, calls_before,
@@ -4435,12 +4435,12 @@ fn flush_fh_enforces_strict_local_durability_in_single_mode() {
     let calls_before = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let synced_before = vfs
         .state
         .metrics
-        .block_store_sync_data_synced_bytes
+        .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
 
     rt.block_on(async {
@@ -4450,12 +4450,12 @@ fn flush_fh_enforces_strict_local_durability_in_single_mode() {
     let calls_after = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let synced_after = vfs
         .state
         .metrics
-        .block_store_sync_data_synced_bytes
+        .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
     assert!(
         calls_after > calls_before,
@@ -4514,12 +4514,12 @@ fn flush_fh_default_config_enforces_strict_local_durability() {
     let calls_before = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let synced_before = vfs
         .state
         .metrics
-        .block_store_sync_data_synced_bytes
+        .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
 
     rt.block_on(async {
@@ -4529,12 +4529,12 @@ fn flush_fh_default_config_enforces_strict_local_durability() {
     let calls_after = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let synced_after = vfs
         .state
         .metrics
-        .block_store_sync_data_synced_bytes
+        .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
     assert!(
         calls_after > calls_before,
@@ -4756,12 +4756,12 @@ fn release_fh_enforces_strict_local_durability_on_last_handle() {
     let calls_before = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let synced_before = vfs
         .state
         .metrics
-        .block_store_sync_data_synced_bytes
+        .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
 
     rt.block_on(async {
@@ -4782,12 +4782,12 @@ fn release_fh_enforces_strict_local_durability_on_last_handle() {
     let calls_after = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let synced_after = vfs
         .state
         .metrics
-        .block_store_sync_data_synced_bytes
+        .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
     assert!(
         calls_after > calls_before,
@@ -4842,12 +4842,12 @@ fn release_fh_default_config_enforces_strict_local_durability() {
     let calls_before = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let synced_before = vfs
         .state
         .metrics
-        .block_store_sync_data_synced_bytes
+        .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
 
     rt.block_on(async {
@@ -4868,12 +4868,12 @@ fn release_fh_default_config_enforces_strict_local_durability() {
     let calls_after = vfs
         .state
         .metrics
-        .block_store_sync_data_calls
+        .payload_store_sync_data_calls
         .load(Ordering::Relaxed);
     let synced_after = vfs
         .state
         .metrics
-        .block_store_sync_data_synced_bytes
+        .payload_store_sync_data_synced_bytes
         .load(Ordering::Relaxed);
     assert!(
         calls_after > calls_before,
@@ -5006,7 +5006,7 @@ fn write_path_observability_tracks_burst_shape_and_metadata_commit_stalls() {
         "metadata commit cadence should expose a positive interval after multiple commits"
     );
     assert!(
-        snapshot.block_store_sync_data.calls >= 1,
+        snapshot.payload_store_sync_data.calls >= 1,
         "sync barrier calls should be surfaced in write-path observability"
     );
     assert_eq!(
@@ -5216,13 +5216,13 @@ fn local_cache_io_stats_track_handoff_and_backend_time_separately() {
         .load(Ordering::Relaxed);
 
     rt.block_on(async {
-        vfs.block_store_put_async(0xAA55, Bytes::from_static(b"payload"), false)
+        vfs.payload_store_put_async(0xAA55, Bytes::from_static(b"payload"), false)
             .await
-            .expect("block store put");
+            .expect("payload store put");
         let payload = vfs
-            .block_store_get_async(0xAA55)
+            .payload_store_get_async(0xAA55)
             .await
-            .expect("block store get")
+            .expect("payload store get")
             .expect("cached payload");
         assert_eq!(payload.as_ref(), b"payload");
     });
@@ -5284,9 +5284,9 @@ fn local_cache_io_stats_track_direct_partial_read_into() {
         .load(Ordering::Relaxed);
 
     rt.block_on(async {
-        vfs.block_store_put_async(0xBB66, Bytes::from_static(b"payload"), false)
+        vfs.payload_store_put_async(0xBB66, Bytes::from_static(b"payload"), false)
             .await
-            .expect("block store put");
+            .expect("payload store put");
         let handoff_before_read = vfs
             .state
             .metrics
@@ -5294,9 +5294,9 @@ fn local_cache_io_stats_track_direct_partial_read_into() {
             .load(Ordering::Relaxed);
         let mut out = [0_u8; 3];
         let read = vfs
-            .block_store_read_into_async(0xBB66, 2, &mut out)
+            .payload_store_read_into_async(0xBB66, 2, &mut out)
             .await
-            .expect("block store read_into");
+            .expect("payload store read_into");
         assert_eq!(read, Some(3));
         assert_eq!(&out, b"ylo");
         let handoff_after_read = vfs
@@ -5347,7 +5347,7 @@ fn local_cache_read_into_returns_none_for_missing_block() {
     rt.block_on(async {
         let mut out = [0_u8; 8];
         let read = vfs
-            .block_store_read_into_async(0xDEADBEEF, 0, &mut out)
+            .payload_store_read_into_async(0xDEADBEEF, 0, &mut out)
             .await
             .expect("read_into should not error on cache miss");
         assert_eq!(read, None);
@@ -5355,7 +5355,7 @@ fn local_cache_read_into_returns_none_for_missing_block() {
 }
 
 #[test]
-fn block_store_get_prefers_hot_upload_buffer_before_disk() {
+fn payload_store_get_prefers_hot_upload_buffer_before_disk() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "local-cache-get-hot-upload");
     rt.block_on(async {
@@ -5366,16 +5366,16 @@ fn block_store_get_prefers_hot_upload_buffer_before_disk() {
         }]);
 
         let payload = vfs
-            .block_store_get_async(0xABCD)
+            .payload_store_get_async(0xABCD)
             .await
-            .expect("block store get from hot upload buffer")
+            .expect("payload store get from hot upload buffer")
             .expect("hot upload payload");
         assert_eq!(payload.as_ref(), b"hot-payload");
     });
 }
 
 #[test]
-fn block_store_read_into_prefers_hot_upload_buffer_before_disk() {
+fn payload_store_read_into_prefers_hot_upload_buffer_before_disk() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "local-cache-read-into-hot-upload");
     rt.block_on(async {
@@ -5387,9 +5387,9 @@ fn block_store_read_into_prefers_hot_upload_buffer_before_disk() {
 
         let mut out = [0_u8; 7];
         let read = vfs
-            .block_store_read_into_async(0xBCDE, 4, &mut out)
+            .payload_store_read_into_async(0xBCDE, 4, &mut out)
             .await
-            .expect("block store read_into from hot upload buffer");
+            .expect("payload store read_into from hot upload buffer");
         assert_eq!(read, Some(7));
         assert_eq!(&out, b"payload");
     });

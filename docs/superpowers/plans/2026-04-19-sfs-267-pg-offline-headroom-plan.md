@@ -30,7 +30,7 @@
 
 - [ ] Add the narrow metadata-authority status model to `MetaReplication`, exposing PG reachability, writable headroom, and exhaustion-driven read-only degradation without turning raw storage errors into policy.
 - [ ] Replace the current implicit slot-derived “large local ID space” behavior in `PgMetaEngine` with explicit persisted active/next inode and block ranges plus deterministic low-water reservation of the next range.
-- [ ] Make `next_inode()` and `next_block_ids()` consume only from persisted local ranges, switching into a previously reserved next range when available and surfacing true exhaustion when no safe range remains.
+- [ ] Make `next_inode()` and `next_object_ids()` consume only from persisted local ranges, switching into a previously reserved next range when available and surfacing true exhaustion when no safe range remains.
 - [ ] Keep local mutations accepted while PG is down but headroom remains, and make the authority status flip to read-only only when the real allocation boundary is reached.
 - [ ] Re-run the targeted metadata tests and verify the new range/status behavior passes.
 

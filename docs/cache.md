@@ -14,7 +14,7 @@ Current runtime components:
 
 | Component | Modules | Role |
 |---|---|---|
-| Current local cache backend | `block_layout`, `block_index`, `block_store`, `startup_recovery` | Persistent local payloads + lifecycle/index state |
+| Current local cache backend | `payload_layout`, `payload_index`, `payload_store`, `startup_recovery` | Persistent local payloads + lifecycle/index state |
 | Local-backend contract | `local` | Backend-agnostic trait used by VFS read/write/upload paths |
 | Cached-store runtime | `cached_store`, `upload_queue`, `upload_stage` | Unified local cache handle, runtime pending-upload queue, upload helpers, pending-upload pinning, and runtime metrics |
 | Benchmark-only cache surface | `benchmark_cache` | Lightweight in-memory cache used by `studiofs test-cache` |

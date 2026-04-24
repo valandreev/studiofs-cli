@@ -1684,20 +1684,20 @@ struct MetricsState {
     local_cache_io_backend_total_ns: AtomicU64,
     local_cache_io_backend_max_ns: AtomicU64,
     local_cache_io_backend_histogram: LatencyHistogram,
-    block_store_sync_data_calls: AtomicU64,
-    block_store_sync_data_deferred_calls: AtomicU64,
-    block_store_sync_data_synced_bytes: AtomicU64,
-    block_store_sync_data_total_ns: AtomicU64,
-    block_store_sync_data_max_ns: AtomicU64,
-    block_store_sync_data_histogram: LatencyHistogram,
-    block_store_sync_data_queue_wait_calls: AtomicU64,
-    block_store_sync_data_queue_wait_total_ns: AtomicU64,
-    block_store_sync_data_queue_wait_max_ns: AtomicU64,
-    block_store_sync_data_queue_wait_histogram: LatencyHistogram,
-    block_store_sync_data_last_completed_ns: AtomicU64,
-    block_store_sync_data_interval_total_ns: AtomicU64,
-    block_store_sync_data_interval_max_ns: AtomicU64,
-    block_store_sync_data_interval_histogram: LatencyHistogram,
+    payload_store_sync_data_calls: AtomicU64,
+    payload_store_sync_data_deferred_calls: AtomicU64,
+    payload_store_sync_data_synced_bytes: AtomicU64,
+    payload_store_sync_data_total_ns: AtomicU64,
+    payload_store_sync_data_max_ns: AtomicU64,
+    payload_store_sync_data_histogram: LatencyHistogram,
+    payload_store_sync_data_queue_wait_calls: AtomicU64,
+    payload_store_sync_data_queue_wait_total_ns: AtomicU64,
+    payload_store_sync_data_queue_wait_max_ns: AtomicU64,
+    payload_store_sync_data_queue_wait_histogram: LatencyHistogram,
+    payload_store_sync_data_last_completed_ns: AtomicU64,
+    payload_store_sync_data_interval_total_ns: AtomicU64,
+    payload_store_sync_data_interval_max_ns: AtomicU64,
+    payload_store_sync_data_interval_histogram: LatencyHistogram,
     payload_persist_calls: AtomicU64,
     payload_persist_total_ns: AtomicU64,
     payload_persist_max_ns: AtomicU64,
@@ -1789,20 +1789,20 @@ impl MetricsState {
             local_cache_io_backend_total_ns: AtomicU64::new(0),
             local_cache_io_backend_max_ns: AtomicU64::new(0),
             local_cache_io_backend_histogram: LatencyHistogram::default(),
-            block_store_sync_data_calls: AtomicU64::new(0),
-            block_store_sync_data_deferred_calls: AtomicU64::new(0),
-            block_store_sync_data_synced_bytes: AtomicU64::new(0),
-            block_store_sync_data_total_ns: AtomicU64::new(0),
-            block_store_sync_data_max_ns: AtomicU64::new(0),
-            block_store_sync_data_histogram: LatencyHistogram::default(),
-            block_store_sync_data_queue_wait_calls: AtomicU64::new(0),
-            block_store_sync_data_queue_wait_total_ns: AtomicU64::new(0),
-            block_store_sync_data_queue_wait_max_ns: AtomicU64::new(0),
-            block_store_sync_data_queue_wait_histogram: LatencyHistogram::default(),
-            block_store_sync_data_last_completed_ns: AtomicU64::new(0),
-            block_store_sync_data_interval_total_ns: AtomicU64::new(0),
-            block_store_sync_data_interval_max_ns: AtomicU64::new(0),
-            block_store_sync_data_interval_histogram: LatencyHistogram::default(),
+            payload_store_sync_data_calls: AtomicU64::new(0),
+            payload_store_sync_data_deferred_calls: AtomicU64::new(0),
+            payload_store_sync_data_synced_bytes: AtomicU64::new(0),
+            payload_store_sync_data_total_ns: AtomicU64::new(0),
+            payload_store_sync_data_max_ns: AtomicU64::new(0),
+            payload_store_sync_data_histogram: LatencyHistogram::default(),
+            payload_store_sync_data_queue_wait_calls: AtomicU64::new(0),
+            payload_store_sync_data_queue_wait_total_ns: AtomicU64::new(0),
+            payload_store_sync_data_queue_wait_max_ns: AtomicU64::new(0),
+            payload_store_sync_data_queue_wait_histogram: LatencyHistogram::default(),
+            payload_store_sync_data_last_completed_ns: AtomicU64::new(0),
+            payload_store_sync_data_interval_total_ns: AtomicU64::new(0),
+            payload_store_sync_data_interval_max_ns: AtomicU64::new(0),
+            payload_store_sync_data_interval_histogram: LatencyHistogram::default(),
             payload_persist_calls: AtomicU64::new(0),
             payload_persist_total_ns: AtomicU64::new(0),
             payload_persist_max_ns: AtomicU64::new(0),
@@ -1898,17 +1898,17 @@ impl MetricsState {
             local_cache_io_handoff_max_ns,
             local_cache_io_backend_total_ns,
             local_cache_io_backend_max_ns,
-            block_store_sync_data_calls,
-            block_store_sync_data_deferred_calls,
-            block_store_sync_data_synced_bytes,
-            block_store_sync_data_total_ns,
-            block_store_sync_data_max_ns,
-            block_store_sync_data_queue_wait_calls,
-            block_store_sync_data_queue_wait_total_ns,
-            block_store_sync_data_queue_wait_max_ns,
-            block_store_sync_data_last_completed_ns,
-            block_store_sync_data_interval_total_ns,
-            block_store_sync_data_interval_max_ns,
+            payload_store_sync_data_calls,
+            payload_store_sync_data_deferred_calls,
+            payload_store_sync_data_synced_bytes,
+            payload_store_sync_data_total_ns,
+            payload_store_sync_data_max_ns,
+            payload_store_sync_data_queue_wait_calls,
+            payload_store_sync_data_queue_wait_total_ns,
+            payload_store_sync_data_queue_wait_max_ns,
+            payload_store_sync_data_last_completed_ns,
+            payload_store_sync_data_interval_total_ns,
+            payload_store_sync_data_interval_max_ns,
             payload_persist_calls,
             payload_persist_total_ns,
             payload_persist_max_ns,
@@ -1970,9 +1970,9 @@ impl MetricsState {
         );
         self.local_cache_io_handoff_histogram.reset();
         self.local_cache_io_backend_histogram.reset();
-        self.block_store_sync_data_histogram.reset();
-        self.block_store_sync_data_queue_wait_histogram.reset();
-        self.block_store_sync_data_interval_histogram.reset();
+        self.payload_store_sync_data_histogram.reset();
+        self.payload_store_sync_data_queue_wait_histogram.reset();
+        self.payload_store_sync_data_interval_histogram.reset();
         self.payload_persist_histogram.reset();
         self.payload_burst_interval_histogram.reset();
         self.metadata_commit_histogram.reset();
@@ -4682,7 +4682,7 @@ impl StudioVfs {
         cached
     }
 
-    async fn block_store_get_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
+    async fn payload_store_get_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
         if let Some(payload) = self.upload_hot_get(object_id) {
             return Ok(Some(payload));
         }
@@ -4691,7 +4691,7 @@ impl StudioVfs {
         Ok(result)
     }
 
-    async fn block_store_read_into_async(
+    async fn payload_store_read_into_async(
         &self,
         object_id: u64,
         data_offset: usize,
@@ -4724,10 +4724,11 @@ impl StudioVfs {
         }
     }
 
-    async fn block_store_get_for_upload_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
-        let block_store = self.local_payload_backend.clone();
+    async fn payload_store_get_for_upload_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
+        let payload_store = self.local_payload_backend.clone();
         let (result, timing) =
-            run_local_cache_io_blocking(move || Ok(block_store.get_for_upload(object_id))).await?;
+            run_local_cache_io_blocking(move || Ok(payload_store.get_for_upload(object_id)))
+                .await?;
         self.record_local_cache_io_timing(timing);
         Ok(result)
     }
@@ -4770,11 +4771,11 @@ impl StudioVfs {
         Ok(())
     }
 
-    async fn block_store_run_pressure_maintenance_async(&self) -> VfsResult<()> {
-        let block_store = self.local_payload_backend.clone();
+    async fn payload_store_run_pressure_maintenance_async(&self) -> VfsResult<()> {
+        let payload_store = self.local_payload_backend.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
-            block_store.run_pressure_maintenance().map_err(|error| {
-                VfsError::Other(format!("block backend maintenance failed: {error}"))
+            payload_store.run_pressure_maintenance().map_err(|error| {
+                VfsError::Other(format!("payload backend maintenance failed: {error}"))
             })
         })
         .await?;
@@ -4783,32 +4784,32 @@ impl StudioVfs {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    async fn block_store_put_async(
+    async fn payload_store_put_async(
         &self,
         object_id: u64,
         data: Bytes,
         evictable: bool,
     ) -> VfsResult<()> {
-        let block_store = self.local_payload_backend.clone();
+        let payload_store = self.local_payload_backend.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
-            block_store
+            payload_store
                 .put(object_id, data.as_ref(), evictable)
-                .map_err(|error| VfsError::Other(format!("block store put failed: {error}")))
+                .map_err(|error| VfsError::Other(format!("payload store put failed: {error}")))
         })
         .await?;
         self.record_local_cache_io_timing(timing);
         Ok(())
     }
 
-    async fn block_store_put_batch_async(&self, entries: Vec<LocalPayloadPut>) -> VfsResult<()> {
+    async fn payload_store_put_batch_async(&self, entries: Vec<LocalPayloadPut>) -> VfsResult<()> {
         if entries.is_empty() {
             return Ok(());
         }
-        let block_store = self.local_payload_backend.clone();
+        let payload_store = self.local_payload_backend.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
-            block_store
-                .put_batch(&entries)
-                .map_err(|error| VfsError::Other(format!("block store batch put failed: {error}")))
+            payload_store.put_batch(&entries).map_err(|error| {
+                VfsError::Other(format!("payload store batch put failed: {error}"))
+            })
         })
         .await?;
         self.record_local_cache_io_timing(timing);
@@ -4822,7 +4823,7 @@ impl StudioVfs {
         self.cached_store.cache_hot_upload_batch(&entries);
     }
 
-    async fn maybe_block_store_sync_data_async(
+    async fn maybe_payload_store_sync_data_async(
         &self,
         persisted_bytes: u64,
         local_sync_policy: LocalSyncPolicy,
@@ -4846,7 +4847,7 @@ impl StudioVfs {
                 if local_sync_group.pending_bytes > 0 {
                     self.state
                         .metrics
-                        .block_store_sync_data_deferred_calls
+                        .payload_store_sync_data_deferred_calls
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 return Ok(());
@@ -4867,7 +4868,7 @@ impl StudioVfs {
                 if local_sync_group.pending_bytes > 0 {
                     self.state
                         .metrics
-                        .block_store_sync_data_deferred_calls
+                        .payload_store_sync_data_deferred_calls
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 return Ok(());
@@ -4882,14 +4883,14 @@ impl StudioVfs {
             bytes_to_sync
         };
 
-        match self.block_store_sync_data_async().await {
+        match self.payload_store_sync_data_async().await {
             Ok(()) => {
                 let mut local_sync_group = self.state.local_dirty.local_sync_group.lock().await;
                 local_sync_group.last_sync_at = Instant::now();
                 drop(local_sync_group);
                 self.state
                     .metrics
-                    .block_store_sync_data_synced_bytes
+                    .payload_store_sync_data_synced_bytes
                     .fetch_add(bytes_to_sync, Ordering::Relaxed);
                 Ok(())
             }
@@ -4902,12 +4903,12 @@ impl StudioVfs {
         }
     }
 
-    async fn block_store_sync_data_async(&self) -> VfsResult<()> {
-        let block_store = self.local_payload_backend.clone();
+    async fn payload_store_sync_data_async(&self) -> VfsResult<()> {
+        let payload_store = self.local_payload_backend.clone();
         let started = Instant::now();
         let ((), timing) = run_local_cache_io_blocking(move || {
-            block_store.sync_data().map_err(|error| {
-                VfsError::Other(format!("block backend sync_data failed: {error}"))
+            payload_store.sync_data().map_err(|error| {
+                VfsError::Other(format!("payload backend sync_data failed: {error}"))
             })
         })
         .await?;
@@ -4915,20 +4916,20 @@ impl StudioVfs {
         let elapsed_ns = Self::duration_ns_u64(started.elapsed());
         let metrics = &self.state.metrics;
         Self::observe_latency_counter(
-            &metrics.block_store_sync_data_calls,
-            &metrics.block_store_sync_data_total_ns,
-            &metrics.block_store_sync_data_max_ns,
-            &metrics.block_store_sync_data_histogram,
+            &metrics.payload_store_sync_data_calls,
+            &metrics.payload_store_sync_data_total_ns,
+            &metrics.payload_store_sync_data_max_ns,
+            &metrics.payload_store_sync_data_histogram,
             elapsed_ns,
         );
         self.record_sync_data_interval();
         Ok(())
     }
 
-    async fn block_store_mark_uploaded_async(&self, object_id: u64) -> VfsResult<()> {
-        let block_store = self.local_payload_backend.clone();
+    async fn payload_store_mark_uploaded_async(&self, object_id: u64) -> VfsResult<()> {
+        let payload_store = self.local_payload_backend.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
-            block_store.mark_uploaded(object_id);
+            payload_store.mark_uploaded(object_id);
             Ok(())
         })
         .await?;
@@ -4936,10 +4937,10 @@ impl StudioVfs {
         Ok(())
     }
 
-    async fn block_store_remove_async(&self, object_id: u64) -> VfsResult<()> {
-        let block_store = self.local_payload_backend.clone();
+    async fn payload_store_remove_async(&self, object_id: u64) -> VfsResult<()> {
+        let payload_store = self.local_payload_backend.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
-            block_store.remove(object_id);
+            payload_store.remove(object_id);
             Ok(())
         })
         .await?;
@@ -4947,10 +4948,10 @@ impl StudioVfs {
         Ok(())
     }
 
-    async fn block_store_remove_batch_async(&self, object_ids: Vec<u64>) -> VfsResult<()> {
-        let block_store = self.local_payload_backend.clone();
+    async fn payload_store_remove_batch_async(&self, object_ids: Vec<u64>) -> VfsResult<()> {
+        let payload_store = self.local_payload_backend.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
-            block_store.remove_batch(&object_ids);
+            payload_store.remove_batch(&object_ids);
             Ok(())
         })
         .await?;
@@ -5548,10 +5549,10 @@ impl StudioVfs {
         let elapsed_ns = Self::duration_ns_u64(queue_wait);
         let metrics = &self.state.metrics;
         Self::observe_latency_counter(
-            &metrics.block_store_sync_data_queue_wait_calls,
-            &metrics.block_store_sync_data_queue_wait_total_ns,
-            &metrics.block_store_sync_data_queue_wait_max_ns,
-            &metrics.block_store_sync_data_queue_wait_histogram,
+            &metrics.payload_store_sync_data_queue_wait_calls,
+            &metrics.payload_store_sync_data_queue_wait_total_ns,
+            &metrics.payload_store_sync_data_queue_wait_max_ns,
+            &metrics.payload_store_sync_data_queue_wait_histogram,
             elapsed_ns,
         );
     }
@@ -5594,10 +5595,10 @@ impl StudioVfs {
     fn record_sync_data_interval(&self) {
         let metrics = &self.state.metrics;
         self.record_completion_interval(
-            &metrics.block_store_sync_data_last_completed_ns,
-            &metrics.block_store_sync_data_interval_total_ns,
-            &metrics.block_store_sync_data_interval_max_ns,
-            &metrics.block_store_sync_data_interval_histogram,
+            &metrics.payload_store_sync_data_last_completed_ns,
+            &metrics.payload_store_sync_data_interval_total_ns,
+            &metrics.payload_store_sync_data_interval_max_ns,
+            &metrics.payload_store_sync_data_interval_histogram,
         );
     }
 
@@ -6036,16 +6037,16 @@ impl StudioVfs {
             winfsp_write_callback_vfs_max_ns: winfsp_write_callback_vfs_max_ns,
             winfsp_write_callback_getattr_total_ns: winfsp_write_callback_getattr_total_ns,
             winfsp_write_callback_getattr_max_ns: winfsp_write_callback_getattr_max_ns,
-            sync_calls: block_store_sync_data_calls,
-            sync_deferred_calls: block_store_sync_data_deferred_calls,
-            sync_bytes: block_store_sync_data_synced_bytes,
-            sync_total_ns: block_store_sync_data_total_ns,
-            sync_max_ns: block_store_sync_data_max_ns,
-            sync_queue_wait_calls: block_store_sync_data_queue_wait_calls,
-            sync_queue_wait_total_ns: block_store_sync_data_queue_wait_total_ns,
-            sync_queue_wait_max_ns: block_store_sync_data_queue_wait_max_ns,
-            sync_interval_total_ns: block_store_sync_data_interval_total_ns,
-            sync_interval_max_ns: block_store_sync_data_interval_max_ns,
+            sync_calls: payload_store_sync_data_calls,
+            sync_deferred_calls: payload_store_sync_data_deferred_calls,
+            sync_bytes: payload_store_sync_data_synced_bytes,
+            sync_total_ns: payload_store_sync_data_total_ns,
+            sync_max_ns: payload_store_sync_data_max_ns,
+            sync_queue_wait_calls: payload_store_sync_data_queue_wait_calls,
+            sync_queue_wait_total_ns: payload_store_sync_data_queue_wait_total_ns,
+            sync_queue_wait_max_ns: payload_store_sync_data_queue_wait_max_ns,
+            sync_interval_total_ns: payload_store_sync_data_interval_total_ns,
+            sync_interval_max_ns: payload_store_sync_data_interval_max_ns,
             payload_persist_calls: payload_persist_calls,
             payload_persist_total_ns: payload_persist_total_ns,
             payload_persist_max_ns: payload_persist_max_ns,
@@ -6080,17 +6081,17 @@ impl StudioVfs {
         let sync_histogram = self
             .state
             .metrics
-            .block_store_sync_data_histogram
+            .payload_store_sync_data_histogram
             .snapshot();
         let sync_queue_wait_histogram = self
             .state
             .metrics
-            .block_store_sync_data_queue_wait_histogram
+            .payload_store_sync_data_queue_wait_histogram
             .snapshot();
         let sync_interval_histogram = self
             .state
             .metrics
-            .block_store_sync_data_interval_histogram
+            .payload_store_sync_data_interval_histogram
             .snapshot();
         let vfs_write_record_handle_writer_state_histogram = self
             .state
@@ -6173,7 +6174,7 @@ impl StudioVfs {
             backend_tag: self.write_path_backend_tag.clone(),
             flush_barrier_calls,
             flush_barrier_calls_per_sec: Self::per_second(flush_barrier_calls, elapsed),
-            block_store_sync_data: VfsWritePathSyncDataStats {
+            payload_store_sync_data: VfsWritePathSyncDataStats {
                 calls: sync_calls,
                 calls_per_sec: Self::per_second(sync_calls, elapsed),
                 deferred_calls: sync_deferred_calls,

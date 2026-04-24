@@ -143,7 +143,7 @@ impl MetaBlocks for RedbMetaEngine {
         Ok(removed_ids)
     }
 
-    fn next_block_id(&self) -> MetaResult<u64> {
+    fn next_object_id(&self) -> MetaResult<u64> {
         let txn = self
             .db
             .begin_write()
@@ -154,14 +154,14 @@ impl MetaBlocks for RedbMetaEngine {
                 .open_table(COUNTERS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             id = match table
-                .get(counters::NEXT_BLOCK_ID)
+                .get(counters::NEXT_OBJECT_ID)
                 .map_err(|e| MetaError::Storage(e.to_string()))?
             {
                 Some(v) => v.value(),
                 None => 1, // Start from 1
             };
             table
-                .insert(counters::NEXT_BLOCK_ID, id + 1)
+                .insert(counters::NEXT_OBJECT_ID, id + 1)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
         txn.commit()
@@ -169,8 +169,8 @@ impl MetaBlocks for RedbMetaEngine {
         Ok(id)
     }
 
-    /// Allocate `count` consecutive block IDs in a single redb transaction.
-    fn next_block_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
+    /// Allocate `count` consecutive object IDs in a single redb transaction.
+    fn next_object_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
         let txn = self
             .db
             .begin_write()
@@ -181,14 +181,14 @@ impl MetaBlocks for RedbMetaEngine {
                 .open_table(COUNTERS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             first_id = match table
-                .get(counters::NEXT_BLOCK_ID)
+                .get(counters::NEXT_OBJECT_ID)
                 .map_err(|e| MetaError::Storage(e.to_string()))?
             {
                 Some(v) => v.value(),
                 None => 1,
             };
             table
-                .insert(counters::NEXT_BLOCK_ID, first_id + count as u64)
+                .insert(counters::NEXT_OBJECT_ID, first_id + count as u64)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
         txn.commit()

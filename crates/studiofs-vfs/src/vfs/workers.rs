@@ -364,7 +364,7 @@ impl StudioVfs {
             if self.shutdown_requested() {
                 break;
             }
-            if let Err(error) = self.block_store_run_pressure_maintenance_async().await {
+            if let Err(error) = self.payload_store_run_pressure_maintenance_async().await {
                 warn!(error = %error, "background local backend pressure maintenance failed");
             }
             let pending_uploads = self.pending_uploads_snapshot();

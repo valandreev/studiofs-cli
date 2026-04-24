@@ -1430,7 +1430,7 @@ async fn seed_committed_file(
 
     let block_size = format_info.block_size as usize;
     let block_count = payload.len().div_ceil(block_size);
-    let object_ids = meta.next_block_ids(block_count as u32).unwrap();
+    let object_ids = meta.next_object_ids(block_count as u32).unwrap();
     let store = DataStore::new(&DataStoreConfig::from(format_info)).unwrap();
 
     for (block_index, chunk) in payload.chunks(block_size).enumerate() {
@@ -1835,7 +1835,7 @@ async fn test_pending_deletions_gc() {
     let blocks_before = wait_until_n_payload_slices(&vfs, ino, 1, Duration::from_secs(15))
         .expect("Should have 1 block after initial write");
     assert_eq!(blocks_before.len(), 1);
-    let old_block_id = blocks_before[0].1.object_id;
+    let old_object_id = blocks_before[0].1.object_id;
 
     // Under the committed/overlay model, the old block becomes GC-eligible
     // only after it has actually been uploaded.
@@ -1843,7 +1843,7 @@ async fn test_pending_deletions_gc() {
         wait_until_object_exists(
             &ds,
             &info.data_prefix,
-            old_block_id,
+            old_object_id,
             Duration::from_secs(20)
         )
         .await,
@@ -1875,7 +1875,7 @@ async fn test_pending_deletions_gc() {
                     .lookup_payload_slices(ino)
                     .unwrap()
                     .first()
-                    .is_some_and(|(_, block)| block.object_id != old_block_id)
+                    .is_some_and(|(_, block)| block.object_id != old_object_id)
         })
         .await,
         "overwrite GC check should begin only after the replacement incarnation is fully published"
@@ -1884,7 +1884,7 @@ async fn test_pending_deletions_gc() {
     assert!(
         wait_until(Duration::from_secs(20), || {
             let pending = vfs.meta().get_pending_deletions().unwrap();
-            pending.iter().any(|(id, _)| *id == old_block_id)
+            pending.iter().any(|(id, _)| *id == old_object_id)
         })
         .await,
         "old committed payload object should eventually enter pending deletions"
@@ -1892,7 +1892,7 @@ async fn test_pending_deletions_gc() {
 
     // Verify new block is different
     let blocks_after = vfs.meta().lookup_payload_slices(ino).unwrap();
-    assert_ne!(blocks_after[0].1.object_id, old_block_id);
+    assert_ne!(blocks_after[0].1.object_id, old_object_id);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6453,7 +6453,7 @@ fn background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart(
             staged_attr.content_epoch = staged_attr.content_epoch.saturating_add(1);
             meta.set_attr(&staged_attr).unwrap();
 
-            replacement_object_id = meta.next_block_ids(1).unwrap()[0];
+            replacement_object_id = meta.next_object_ids(1).unwrap()[0];
             let store = DataStore::new(&data_config).unwrap();
             put_fragmented_object(
                 &store,
@@ -10651,7 +10651,7 @@ async fn test_truncate_to_zero_then_rewrite() {
     vfs.flush(ino).await.unwrap();
     let _ = wait_until_n_payload_slices(&vfs, ino, 2, Duration::from_secs(15));
 
-    // Get old block IDs.
+    // Get old object IDs.
     let old_blocks = vfs.meta().lookup_payload_slices(ino).unwrap();
     let old_ids: Vec<u64> = old_blocks.iter().map(|(_, b)| b.object_id).collect();
     assert!(!old_ids.is_empty());
@@ -11071,8 +11071,8 @@ async fn test_rename_overwrite_existing_file() {
     vfs.flush(target.ino).await.unwrap();
     let _ = wait_until_n_payload_slices(&vfs, target.ino, 1, Duration::from_secs(15));
 
-    let target_blocks = vfs.meta().lookup_payload_slices(target.ino).unwrap();
-    let target_block_id = target_blocks[0].1.object_id;
+    let target_slices = vfs.meta().lookup_payload_slices(target.ino).unwrap();
+    let target_object_id = target_slices[0].1.object_id;
 
     // Create source file with data.
     let source = vfs.create(1, b"source.txt", 0, 0, 0o644).unwrap();
@@ -11092,9 +11092,9 @@ async fn test_rename_overwrite_existing_file() {
     // Displaced target's block should be in pending deletions.
     let pending = vfs.meta().get_pending_deletions().unwrap();
     assert!(
-        pending.iter().any(|(id, _)| *id == target_block_id),
+        pending.iter().any(|(id, _)| *id == target_object_id),
         "displaced file's block {} should be pending deletion",
-        target_block_id
+        target_object_id
     );
 }
 
@@ -11132,7 +11132,7 @@ async fn test_unlink_with_open_handle_deferred_cleanup() {
         !blocks.is_empty(),
         "payload slices should survive until last handle closes"
     );
-    let block_id = blocks[0].1.object_id;
+    let object_id = blocks[0].1.object_id;
 
     // Release the last handle — triggers orphan cleanup.
     vfs.release_fh(fh).await.unwrap();
@@ -11148,7 +11148,7 @@ async fn test_unlink_with_open_handle_deferred_cleanup() {
     }
     let pending = vfs.meta().get_pending_deletions().unwrap();
     assert!(
-        pending.iter().any(|(id, _)| *id == block_id),
+        pending.iter().any(|(id, _)| *id == object_id),
         "block should be pending deletion after orphan cleanup"
     );
 }

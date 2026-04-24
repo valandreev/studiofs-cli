@@ -583,7 +583,7 @@ impl StudioVfs {
             self.flush_local_dirty_state(ino, local_sync_policy).await?;
         }
         if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
-            self.maybe_block_store_sync_data_async(0, LocalSyncPolicy::Strict)
+            self.maybe_payload_store_sync_data_async(0, LocalSyncPolicy::Strict)
                 .await?;
         }
 
@@ -929,7 +929,7 @@ impl StudioVfs {
     /// * Any materialization error will surface at the next `Strict` barrier
     ///   (flush / fsync / close) because those paths call
     ///   `materialize_handle_writers_for_inode` synchronously.
-    /// * Duplicate materialization is safe: the block store uses last-writer-wins
+    /// * Duplicate materialization is safe: the payload store uses last-writer-wins
     ///   for overlapping ranges, and orphaned objects are reclaimed by the janitor.
     /// * Budget enforcement runs in the background task: if dirty bytes exceed
     ///   `2 × max_dirty_bytes` the next write will detect it synchronously via

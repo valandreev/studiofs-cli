@@ -261,7 +261,7 @@ Current operational contract:
 - namespace visibility may arrive before all file blocks are committed
 - remote-visible file size advances only with committed blocks
 - foreign namespace can be present in local `base_*` before local overlay stops masking it
-- stale async completions are rejected using `content_epoch` plus block identity checks
+- stale async completions are rejected using `content_epoch` plus object IDentity checks
 - crash/reopen recovery should converge through ordinary restart plus
   `sync_metadata()` / `flush_metadata()`; `discover` is bootstrap/manual repair,
   not the expected path for normal PG replication recovery

@@ -248,7 +248,7 @@ impl StudioVfs {
         match source {
             PendingOverlayBlockSource::Pending(data) => Ok(Some(data)),
             PendingOverlayBlockSource::Extent(object_id) => {
-                self.block_store_get_async(object_id).await
+                self.payload_store_get_async(object_id).await
             }
         }
     }

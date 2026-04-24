@@ -22,15 +22,15 @@ use crate::local::{
     LocalPayloadUploadState,
 };
 
-#[path = "block_index.rs"]
+#[path = "payload_index.rs"]
 pub mod cache_index;
-#[path = "block_eviction.rs"]
+#[path = "payload_eviction.rs"]
 pub mod eviction;
-#[path = "block_store.rs"]
+#[path = "payload_store.rs"]
 pub mod file_payload_store;
-#[path = "block_layout.rs"]
+#[path = "payload_layout.rs"]
 pub mod layout;
-#[path = "block_platform.rs"]
+#[path = "payload_platform.rs"]
 pub mod platform;
 #[path = "startup_recovery.rs"]
 pub mod reconcile;

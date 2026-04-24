@@ -124,7 +124,7 @@ Local durability notes:
   boundary directly, but explicit `flush()` and last-handle
   `close()` / `release()` also reach that boundary when dirty unpublished
   state still exists.
-- Reserved object IDs make retrying the same dirty block idempotent across
+- Reserved object IDs make retrying the same dirty object IDempotent across
   metadata failures.
 - Historical `ingress_spill` directories are outside the active Local-First
   contract and are deleted during startup cleanup.

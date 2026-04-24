@@ -565,7 +565,7 @@ impl<'a> DataReader<'a> {
                         ))
                     })?;
                     let read = vfs
-                        .block_store_read_into_async(*object_id, block_offset, dst)
+                        .payload_store_read_into_async(*object_id, block_offset, dst)
                         .await?;
                     match read {
                         Some(read) if read == dst.len() => {}
@@ -601,7 +601,7 @@ impl<'a> DataReader<'a> {
                     })?;
                     let mut span_resolved = false;
                     if let Some(read) = vfs
-                        .block_store_read_into_async(payload.object_id, block_offset, dst)
+                        .payload_store_read_into_async(payload.object_id, block_offset, dst)
                         .await?
                     {
                         if read == dst.len() {
@@ -617,7 +617,7 @@ impl<'a> DataReader<'a> {
                                 "data_reader: short local backend read for committed payload object; evicting and refetching"
                             );
                             if let Err(evict_error) =
-                                vfs.block_store_remove_async(payload.object_id).await
+                                vfs.payload_store_remove_async(payload.object_id).await
                             {
                                 warn!(
                                     object_id = payload.object_id,
@@ -1018,7 +1018,7 @@ impl StudioVfs {
                 ))
             })?;
             if let Some(read) = self
-                .block_store_read_into_async(planned_block.object_id, block_offset, dst)
+                .payload_store_read_into_async(planned_block.object_id, block_offset, dst)
                 .await?
             {
                 if read == dst.len() {
@@ -1032,8 +1032,9 @@ impl StudioVfs {
                         read,
                         "metadata slice-graph base read saw short local payload read; evicting before refetch"
                     );
-                    if let Err(evict_error) =
-                        self.block_store_remove_async(planned_block.object_id).await
+                    if let Err(evict_error) = self
+                        .payload_store_remove_async(planned_block.object_id)
+                        .await
                     {
                         warn!(
                             object_id = planned_block.object_id,
@@ -1201,7 +1202,8 @@ impl StudioVfs {
         }
 
         let result = async {
-            block_indices.retain(|block_idx| self.readahead.is_prefetch_relevant(ino, *block_idx));
+            block_indices
+                .retain(|object_idx| self.readahead.is_prefetch_relevant(ino, *object_idx));
             if block_indices.is_empty() {
                 return Ok(());
             }
@@ -1218,7 +1220,7 @@ impl StudioVfs {
             let Some(eof_block) = context.eof_block(self.block_size) else {
                 return Ok(());
             };
-            block_indices.retain(|block_idx| *block_idx <= eof_block);
+            block_indices.retain(|object_idx| *object_idx <= eof_block);
             if block_indices.is_empty() {
                 return Ok(());
             }
@@ -1907,9 +1909,9 @@ mod tests {
             .local_payload_backend = counting_backend.clone();
         rt.block_on(async {
             let object_id = 0xCC77;
-            vfs.block_store_put_async(object_id, Bytes::from_static(b"0123456789"), false)
+            vfs.payload_store_put_async(object_id, Bytes::from_static(b"0123456789"), false)
                 .await
-                .expect("block store put");
+                .expect("payload store put");
 
             let mut payload = PayloadRef::new_full(object_id, 10);
             payload.offset = 2;
@@ -1947,7 +1949,7 @@ mod tests {
                 .expect("create test file");
             let ino = attr.ino;
             let object_id = 0xDADA;
-            vfs.block_store_put_async(object_id, Bytes::from_static(b"abcdefgh"), false)
+            vfs.payload_store_put_async(object_id, Bytes::from_static(b"abcdefgh"), false)
                 .await
                 .expect("seed committed payload object");
 
@@ -2032,7 +2034,7 @@ mod tests {
                 .expect("create test file");
             let ino = attr.ino;
             let object_id = 0xA11CE;
-            vfs.block_store_put_async(object_id, Bytes::from_static(b"abcdefgh"), false)
+            vfs.payload_store_put_async(object_id, Bytes::from_static(b"abcdefgh"), false)
                 .await
                 .expect("seed committed payload object");
 
@@ -2087,7 +2089,7 @@ mod tests {
             let committed_object_id = 0xC0FFEE;
             let missing_pending_object_id = 0xDEADBEEF;
 
-            vfs.block_store_put_async(
+            vfs.payload_store_put_async(
                 committed_object_id,
                 Bytes::from_static(b"abcdefgh"),
                 false,

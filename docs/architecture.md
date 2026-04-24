@@ -48,7 +48,7 @@ studiofs (CLI)
 - each discovered client reserves one durable per-volume local inode window
   during bootstrap/discover and later mounts reuse that persisted window state
   instead of minting a fresh inode lease on reconnect
-- block IDs still reserve a persistent PG client slot and reuse the persisted
+- object IDs still reserve a persistent PG client slot and reuse the persisted
   block ranges across later mounts
 
 Core invariants:

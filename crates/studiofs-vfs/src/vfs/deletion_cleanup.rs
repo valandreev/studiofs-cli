@@ -234,7 +234,7 @@ impl StudioVfs {
             }
         }
         if !evicted.is_empty() {
-            if let Err(error) = self.block_store_remove_batch_async(evicted.clone()).await {
+            if let Err(error) = self.payload_store_remove_batch_async(evicted.clone()).await {
                 warn!(
                     ino,
                     error = %error,
@@ -279,7 +279,8 @@ impl StudioVfs {
             }
         }
         if !evicted.is_empty() {
-            self.block_store_remove_batch_async(evicted.clone()).await?;
+            self.payload_store_remove_batch_async(evicted.clone())
+                .await?;
         }
         if !evicted.is_empty() || deferred_pinned > 0 {
             info!(

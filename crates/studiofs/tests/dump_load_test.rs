@@ -245,7 +245,7 @@ async fn seed_remote_file(home: &Path, disk_name: &str, payload: &[u8]) {
         let file = meta
             .create_file(ROOT_INO, b"payload.bin", 0, 0, 0o644)
             .expect("create file");
-        let object_id = meta.next_block_id().expect("next block id");
+        let object_id = meta.next_object_id().expect("next object ID");
         let block = PayloadRef::new_partial(object_id, payload.len() as u32);
         let mut attr = meta.get_attr(file.ino).expect("get attr");
         attr.size = payload.len() as u64;

@@ -11,14 +11,14 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use studiofs_data::store::{DataStore, DataStoreConfig};
 
-/// Atomic counter to generate unique slice IDs per test run.
-static SLICE_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Atomic counter to generate unique object IDs per test run.
+static OBJECT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Generate a unique slice ID using PID + counter to avoid cross-run collisions.
-fn unique_slice_id() -> u64 {
+/// Generate a unique object ID using PID + counter to avoid cross-run collisions.
+fn unique_object_id() -> String {
     let pid = std::process::id() as u64;
-    let seq = SLICE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    pid * 10_000 + seq + 100_000
+    let seq = OBJECT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{:016x}", pid * 10_000 + seq + 100_000)
 }
 
 fn workspace_env_path() -> std::path::PathBuf {
@@ -112,167 +112,96 @@ async fn ensure_bucket() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn put_and_get_block() {
+async fn put_and_get_object() {
     ensure_bucket().await;
     let store = make_store();
 
     let payload = Bytes::from(vec![0xABu8; 1024]);
-    let slice_id = unique_slice_id();
-    let block_idx = 0;
-    let payload_size =
-        u32::try_from(payload.len()).expect("payload size must fit u32 for S3 block test payload");
+    let object_id = unique_object_id();
 
-    // Upload
-    store
-        .put_block(slice_id, block_idx, payload.clone())
-        .await
-        .unwrap();
+    store.put_object(&object_id, payload.clone()).await.unwrap();
 
-    // Download
-    let got = store
-        .get_block(slice_id, block_idx, payload_size)
-        .await
-        .unwrap();
-    assert_eq!(got, payload, "downloaded block must match uploaded data");
+    let got = store.get_object(&object_id).await.unwrap().to_bytes();
+    assert_eq!(got, payload, "downloaded object must match uploaded data");
 
-    // Cleanup
-    store
-        .delete_block(slice_id, block_idx, payload_size)
-        .await
-        .unwrap();
+    store.delete_object(&object_id).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn get_block_range() {
+async fn put_and_get_by_key() {
     ensure_bucket().await;
     let store = make_store();
 
-    // Create a 4 KiB block with ascending byte pattern
     let data: Vec<u8> = (0..4096u32).map(|i| (i % 256) as u8).collect();
     let payload = Bytes::from(data.clone());
-    let slice_id = unique_slice_id();
-    let block_idx = 0;
-    let block_size =
-        u32::try_from(payload.len()).expect("payload size must fit u32 for S3 block test payload");
+    let key = format!("integration-test/raw/{}", unique_object_id());
 
-    store.put_block(slice_id, block_idx, payload).await.unwrap();
+    store.put_by_key(&key, payload).await.unwrap();
+    let got = store.get_by_key(&key).await.unwrap().to_bytes();
 
-    // Read range [1024..2048)
-    let range = store
-        .get_block_range(slice_id, block_idx, block_size, 1024, 1024)
-        .await
-        .unwrap();
+    assert_eq!(got.len(), 4096);
+    assert_eq!(&got[..], &data[..]);
 
-    assert_eq!(range.len(), 1024);
-    assert_eq!(&range[..], &data[1024..2048]);
-
-    // Cleanup
-    store
-        .delete_block(slice_id, block_idx, block_size)
-        .await
-        .unwrap();
+    store.delete_by_key(&key).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn block_exists_lifecycle() {
+async fn object_exists_lifecycle() {
     ensure_bucket().await;
     let store = make_store();
 
-    let slice_id = unique_slice_id();
-    let block_idx = 0;
+    let object_id = unique_object_id();
     let payload = Bytes::from(vec![1u8; 512]);
-    let block_size =
-        u32::try_from(payload.len()).expect("payload size must fit u32 for S3 block test payload");
+    let key = store.object_key(&object_id);
 
-    // Should not exist initially (unique slice ID guarantees this)
-    assert!(
-        !store
-            .block_exists(slice_id, block_idx, block_size)
-            .await
-            .unwrap()
-    );
+    assert!(!store.exists(&key).await.unwrap());
 
-    // Upload
-    store.put_block(slice_id, block_idx, payload).await.unwrap();
-    assert!(
-        store
-            .block_exists(slice_id, block_idx, block_size)
-            .await
-            .unwrap()
-    );
+    store.put_object(&object_id, payload).await.unwrap();
+    assert!(store.exists(&key).await.unwrap());
 
-    // Delete
-    store
-        .delete_block(slice_id, block_idx, block_size)
-        .await
-        .unwrap();
-    assert!(
-        !store
-            .block_exists(slice_id, block_idx, block_size)
-            .await
-            .unwrap()
-    );
+    store.delete_object(&object_id).await.unwrap();
+    assert!(!store.exists(&key).await.unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn delete_block_idempotent() {
+async fn delete_object_idempotent() {
     ensure_bucket().await;
     let store = make_store();
 
-    let slice_id = unique_slice_id();
-    let block_idx = 0;
+    let object_id = unique_object_id();
     let payload = Bytes::from(vec![9u8; 256]);
-    let block_size =
-        u32::try_from(payload.len()).expect("payload size must fit u32 for S3 block test payload");
 
-    store.put_block(slice_id, block_idx, payload).await.unwrap();
-    store
-        .delete_block(slice_id, block_idx, block_size)
-        .await
-        .unwrap();
+    store.put_object(&object_id, payload).await.unwrap();
+    store.delete_object(&object_id).await.unwrap();
 
     // Second delete should not error (S3 DELETE is idempotent)
-    store
-        .delete_block(slice_id, block_idx, block_size)
-        .await
-        .unwrap();
+    store.delete_object(&object_id).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn large_multiblock_write() {
+async fn large_multi_object_write() {
     ensure_bucket().await;
     let store = make_store();
 
-    let slice_id = unique_slice_id();
-
-    // Upload 3 blocks of 1 MiB each with different patterns
+    let mut object_ids = Vec::new();
     for idx in 0u32..3 {
+        let object_id = unique_object_id();
         let data = Bytes::from(vec![(idx as u8) + 0xA0; 1024 * 1024]);
-        store.put_block(slice_id, idx, data).await.unwrap();
+        store.put_object(&object_id, data).await.unwrap();
+        object_ids.push(object_id);
     }
 
-    // Read back each block and verify
-    let block_size = 1024usize * 1024;
-    let block_size_u32 =
-        u32::try_from(block_size).expect("test block size must fit u32 for storage API");
-    for idx in 0u32..3 {
-        let block = store
-            .get_block(slice_id, idx, block_size_u32)
-            .await
-            .unwrap();
-        assert_eq!(block.len(), block_size);
-        assert!(block.iter().all(|&b| b == (idx as u8) + 0xA0));
+    for (idx, object_id) in object_ids.iter().enumerate() {
+        let payload = store.get_object(object_id).await.unwrap().to_bytes();
+        assert_eq!(payload.len(), 1024usize * 1024);
+        assert!(payload.iter().all(|&b| b == (idx as u8) + 0xA0));
     }
 
-    // Cleanup
-    for idx in 0u32..3 {
-        store
-            .delete_block(slice_id, idx, block_size_u32)
-            .await
-            .unwrap();
+    for object_id in object_ids {
+        store.delete_object(&object_id).await.unwrap();
     }
 }
