@@ -137,6 +137,36 @@ impl PendingDirtySlice {
         Some(Self { range, ..self })
     }
 
+    fn committed_prefix_len(self, committed: Self) -> Option<u32> {
+        if self.block_index != committed.block_index
+            || self.seq != committed.seq
+            || self.object_id != committed.object_id
+            || self.range.start != committed.range.start
+            || self.block_offset != committed.block_offset
+            || self.object_offset != committed.object_offset
+            || committed.range.end > self.range.end
+        {
+            return None;
+        }
+        Some(committed.range.len())
+    }
+
+    fn trim_prefix(self, len: u32) -> Option<Self> {
+        if len >= self.range.len() {
+            return None;
+        }
+        let range_start = self.range.start.checked_add(len)?;
+        let range = studiofs_meta::schema::SliceRange::new(range_start, self.range.end)?;
+        let block_offset = self.block_offset.checked_add(len)?;
+        let object_offset = self.object_offset.checked_add(len)?;
+        Some(Self {
+            range,
+            block_offset,
+            object_offset,
+            ..self
+        })
+    }
+
     fn commit_key(self, chunk_id: u64) -> PendingDirtySliceCommitKey {
         PendingDirtySliceCommitKey {
             chunk_id,
@@ -2286,12 +2316,35 @@ impl StudioVfs {
             .iter()
             .flat_map(|(chunk_id, slices)| slices.iter().map(|slice| slice.commit_key(*chunk_id)))
             .collect();
+        let mut committed_by_chunk = committed.clone();
+        for slices in committed_by_chunk.values_mut() {
+            slices.sort_by_key(|slice| (slice.seq, slice.range.start, slice.block_offset));
+        }
         let mut pending_chunk_slices = self.state.local_dirty.pending_chunk_slices.lock();
         let Some(chunks) = pending_chunk_slices.get_mut(&ino) else {
             return;
         };
         chunks.retain(|chunk_id, slices| {
-            slices.retain(|slice| !committed_entries.contains(&slice.commit_key(*chunk_id)));
+            slices.retain_mut(|slice| {
+                if committed_entries.contains(&slice.commit_key(*chunk_id)) {
+                    return false;
+                }
+                let Some(committed_slices) = committed_by_chunk.get(chunk_id) else {
+                    return true;
+                };
+                let mut current = *slice;
+                for committed_slice in committed_slices {
+                    let Some(committed_len) = current.committed_prefix_len(*committed_slice) else {
+                        continue;
+                    };
+                    let Some(trimmed) = current.trim_prefix(committed_len) else {
+                        return false;
+                    };
+                    current = trimmed;
+                }
+                *slice = current;
+                true
+            });
             !slices.is_empty()
         });
         if chunks.is_empty() {
@@ -2933,6 +2986,62 @@ mod tests {
             vfs.state.local_dirty.pending_bytes.load(Ordering::Relaxed),
             0
         );
+    }
+
+    #[test]
+    fn commit_pending_local_dirty_slices_trims_committed_prefix() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-slice-prefix");
+        let ino = 77;
+        let chunk_id = 0;
+        let original = PendingDirtySlice::persisted(
+            studiofs_meta::schema::SliceRange::new(0, 4096).expect("slice range"),
+            3,
+            0,
+            11,
+            7001,
+            0,
+        );
+        vfs.state
+            .local_dirty
+            .pending_chunk_slices
+            .lock()
+            .entry(ino)
+            .or_default()
+            .insert(chunk_id, vec![original]);
+
+        let committed_prefix = original.prefix(1024).expect("prefix slice");
+        let committed = std::collections::BTreeMap::from([(chunk_id, vec![committed_prefix])]);
+
+        vfs.commit_pending_local_dirty_slices(ino, &committed);
+
+        {
+            let pending = vfs.state.local_dirty.pending_chunk_slices.lock();
+            let remaining = pending
+                .get(&ino)
+                .and_then(|chunks| chunks.get(&chunk_id))
+                .expect("remaining suffix");
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].range.start, 1024);
+            assert_eq!(remaining[0].range.end, 4096);
+            assert_eq!(remaining[0].block_offset, 1024);
+            assert_eq!(remaining[0].object_offset, 1024);
+            assert_eq!(remaining[0].seq, original.seq);
+            assert_eq!(remaining[0].object_id, original.object_id);
+        }
+
+        vfs.commit_pending_local_dirty_slices(ino, &committed);
+
+        {
+            let pending = vfs.state.local_dirty.pending_chunk_slices.lock();
+            let remaining = pending
+                .get(&ino)
+                .and_then(|chunks| chunks.get(&chunk_id))
+                .expect("prefix should not match suffix again");
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].range.start, 1024);
+            assert_eq!(remaining[0].range.end, 4096);
+        }
     }
 
     #[test]

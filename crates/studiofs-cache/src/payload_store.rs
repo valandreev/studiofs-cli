@@ -551,15 +551,15 @@ impl FilePayloadStore {
         SyncFile: FnMut(u64) -> Result<(), FilePayloadStoreError>,
         SyncDir: FnMut(&Path) -> Result<(), FilePayloadStoreError>,
     {
-        for &object_id in &pending_object_ids {
+        for (index, &object_id) in pending_object_ids.iter().enumerate() {
             if let Err(error) = sync_file(object_id) {
-                self.requeue_grouped_sync_targets(&pending_object_ids, &pending_dirs);
+                self.requeue_grouped_sync_targets(&pending_object_ids[index..], &pending_dirs);
                 return Err(error);
             }
         }
-        for dir in &pending_dirs {
+        for (index, dir) in pending_dirs.iter().enumerate() {
             if let Err(error) = sync_dir(dir) {
-                self.requeue_grouped_sync_targets(&pending_object_ids, &pending_dirs);
+                self.requeue_grouped_sync_targets(&[], &pending_dirs[index..]);
                 return Err(error);
             }
         }
@@ -843,7 +843,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_mode_requeues_grouped_sync_targets_after_grouped_sync_failure() {
+    fn fast_mode_requeues_only_unsynced_grouped_file_targets_after_grouped_sync_failure() {
         let temp = tempfile::tempdir().unwrap();
         let layout = LocalPayloadLayout::from_cache_root(temp.path());
         let store =
@@ -877,9 +877,48 @@ mod tests {
         let after_failure = store.sync_barrier_snapshot();
         assert_eq!(
             after_failure.pending_grouped_file_syncs,
-            pending_object_ids.len()
+            pending_object_ids.len().saturating_sub(1)
         );
         assert_eq!(after_failure.pending_grouped_dir_syncs, pending_dirs.len());
+    }
+
+    #[test]
+    fn fast_mode_requeues_only_unsynced_grouped_dirs_after_grouped_dir_sync_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store =
+            FilePayloadStore::open_with_sync_mode(layout, LocalPayloadSyncMode::Fast).unwrap();
+        store.put(8151, b"one").unwrap();
+        store.put(8152, b"two").unwrap();
+
+        let (pending_object_ids, pending_dirs) = store.take_grouped_sync_targets();
+        assert!(pending_dirs.len() >= 2);
+
+        let mut synced_dirs = 0usize;
+        let error = store
+            .sync_pending_grouped_targets(
+                pending_object_ids.clone(),
+                pending_dirs.clone(),
+                |_object_id| Ok(()),
+                |_dir| {
+                    if synced_dirs == 0 {
+                        synced_dirs += 1;
+                        return Ok(());
+                    }
+                    Err(FilePayloadStoreError::Io(io::Error::other(
+                        "simulated grouped dir sync failure",
+                    )))
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, FilePayloadStoreError::Io(_)));
+
+        let after_failure = store.sync_barrier_snapshot();
+        assert_eq!(after_failure.pending_grouped_file_syncs, 0);
+        assert_eq!(
+            after_failure.pending_grouped_dir_syncs,
+            pending_dirs.len().saturating_sub(1)
+        );
     }
 
     #[test]
