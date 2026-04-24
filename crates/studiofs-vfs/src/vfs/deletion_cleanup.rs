@@ -59,12 +59,7 @@ impl StudioVfs {
 
         let graph_usage = self.regular_file_graph_usage(meta, ino)?;
         let removed_ids = meta.remove_regular_file_graph(ino)?;
-        let deletion_ids = if graph_usage.object_ids.is_empty() {
-            removed_ids.as_slice()
-        } else {
-            graph_usage.object_ids.as_slice()
-        };
-        self.queue_pending_deletions_for_object_ids(meta, deletion_ids, gc_reason)?;
+        self.queue_pending_deletions_for_object_ids(meta, &removed_ids, gc_reason)?;
 
         let freed_bytes = if graph_usage.total_bytes > 0 {
             graph_usage.total_bytes
@@ -99,10 +94,6 @@ impl StudioVfs {
                 Err(MetaError::InodeNotFound(_)) => Vec::new(),
                 Err(err) => return Err(err),
             };
-            let graph_object_ids: Vec<u64> = graph_usage
-                .iter()
-                .map(|(object_id, _)| *object_id)
-                .collect();
             let freed_bytes = graph_usage
                 .iter()
                 .fold(0_u64, |acc, (_, bytes)| acc.saturating_add(*bytes));
@@ -112,12 +103,7 @@ impl StudioVfs {
                 Err(MetaError::InodeNotFound(_)) => Vec::new(),
                 Err(err) => return Err(err),
             };
-            let deletion_ids = if graph_object_ids.is_empty() {
-                removed_ids.as_slice()
-            } else {
-                graph_object_ids.as_slice()
-            };
-            for &object_id in deletion_ids {
+            for &object_id in &removed_ids {
                 engine.add_pending_deletion(object_id, timestamp)?;
             }
 
