@@ -25,8 +25,8 @@ mod supported {
     ));
     const ICON_PADDING_DIVISOR: u32 = 16;
     const COLOR_BLACK: [u8; 3] = [0x11, 0x13, 0x17];
-    const COLOR_BLUE: [u8; 3] = [0x23, 0x4A, 0x78];
-    const COLOR_ORANGE: [u8; 3] = [0xA8, 0x57, 0x2A];
+    const COLOR_BLUE: [u8; 3] = [0x00, 0xC8, 0x00];
+    const COLOR_ORANGE: [u8; 3] = [0xFF, 0x00, 0x00];
     const COLOR_WHITE: [u8; 3] = [0xF7, 0xF7, 0xF3];
     const ANIMATION_TICK: Duration = Duration::from_millis(100);
     const DIAGNOSTICS_POLL_INTERVAL: Duration = Duration::from_millis(300);
