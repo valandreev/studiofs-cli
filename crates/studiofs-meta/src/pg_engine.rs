@@ -4549,24 +4549,20 @@ mod tests {
         rt.block_on(fut)
     }
 
-    trait BlockProjectionFixture {
-        fn stage_block_projection(
+    trait PgBlockProjectionFixture {
+        fn stage_block_slices(
             &self,
             ino: Ino,
             block_index: u32,
             block: &BlockRef,
-        ) -> MetaResult<Option<BlockRef>>;
+        ) -> MetaResult<()>;
         fn lookup_block_projection(
             &self,
             ino: Ino,
             block_index: u32,
         ) -> MetaResult<Option<BlockRef>>;
         fn lookup_block_projections(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>>;
-        fn stage_block_projection_tombstone(
-            &self,
-            ino: Ino,
-            block_index: u32,
-        ) -> MetaResult<Option<u64>>;
+        fn stage_block_tombstone_slices(&self, ino: Ino, block_index: u32) -> MetaResult<()>;
     }
 
     fn block_projection_slices(
@@ -4683,23 +4679,26 @@ mod tests {
         Ok(merged)
     }
 
-    impl BlockProjectionFixture for PgMetaEngine {
-        fn stage_block_projection(
+    fn lookup_first_object_id(engine: &PgMetaEngine, ino: Ino) -> MetaResult<Option<u64>> {
+        Ok(engine
+            .lookup_regular_file_slices(ino, 0, u64::from(DEFAULT_BLOCK_SIZE))?
+            .into_iter()
+            .find_map(|span| span.block.map(|block| block.object_id)))
+    }
+
+    impl PgBlockProjectionFixture for PgMetaEngine {
+        fn stage_block_slices(
             &self,
             ino: Ino,
             block_index: u32,
             block: &BlockRef,
-        ) -> MetaResult<Option<BlockRef>> {
-            let old = self
-                .lookup_block_projection(ino, block_index)
-                .ok()
-                .flatten();
+        ) -> MetaResult<()> {
             self.flush_regular_file_overlay_slices(
                 ino,
                 block_projection_slices(block_index, Some(block), BlockRefState::LocalOnly)?
                     .as_slice(),
             )?;
-            Ok(old)
+            Ok(())
         }
 
         fn lookup_block_projection(
@@ -4729,17 +4728,12 @@ mod tests {
             Ok(out)
         }
 
-        fn stage_block_projection_tombstone(
-            &self,
-            ino: Ino,
-            block_index: u32,
-        ) -> MetaResult<Option<u64>> {
-            let old = self.lookup_block_projection(ino, block_index)?;
+        fn stage_block_tombstone_slices(&self, ino: Ino, block_index: u32) -> MetaResult<()> {
             self.flush_regular_file_overlay_slices(
                 ino,
                 block_projection_slices(block_index, None, BlockRefState::LocalOnly)?.as_slice(),
             )?;
-            Ok(old.map(|block| block.object_id))
+            Ok(())
         }
     }
 
@@ -5050,7 +5044,7 @@ mod tests {
             .expect("create published file");
         set_file_state(engine, file.ino, 64, 1);
         engine
-            .stage_block_projection(file.ino, 0, &BlockRef::new_partial(object_id, 64))
+            .stage_block_slices(file.ino, 0, &BlockRef::new_partial(object_id, 64))
             .expect("set published file block");
         assert!(
             engine
@@ -6473,7 +6467,7 @@ mod tests {
         set_file_state(&writer, file.ino, 4096, 1);
         let block = BlockRef::new_partial(701, 4096);
         writer
-            .stage_block_projection(file.ino, 0, &block)
+            .stage_block_slices(file.ino, 0, &block)
             .expect("set block");
         assert!(
             writer
@@ -6518,10 +6512,10 @@ mod tests {
         let first = BlockRef::new_full(1001, DEFAULT_BLOCK_SIZE);
         let second = BlockRef::new_partial(block_size + 2, 4096);
         writer
-            .stage_block_projection(file.ino, 0, &first)
+            .stage_block_slices(file.ino, 0, &first)
             .expect("set first block");
         writer
-            .stage_block_projection(file.ino, 1, &second)
+            .stage_block_slices(file.ino, 1, &second)
             .expect("set second block");
         assert!(
             writer
@@ -6543,11 +6537,11 @@ mod tests {
         let batch2_start = batch1_end;
         set_file_state(&writer, file.ino, 4096, 2);
         writer
-            .stage_block_projection_tombstone(file.ino, 1)
+            .stage_block_tombstone_slices(file.ino, 1)
             .expect("remove second block for shrink");
         let replacement = BlockRef::new_partial(block_size + 3, 4096);
         writer
-            .stage_block_projection(file.ino, 0, &replacement)
+            .stage_block_slices(file.ino, 0, &replacement)
             .expect("set replacement block");
         assert!(
             writer
@@ -6615,10 +6609,10 @@ mod tests {
         let block0 = BlockRef::new_full(801, DEFAULT_BLOCK_SIZE);
         let block1 = BlockRef::new_partial(802, 4096);
         writer
-            .stage_block_projection(file.ino, 0, &block0)
+            .stage_block_slices(file.ino, 0, &block0)
             .expect("set block 0");
         writer
-            .stage_block_projection(file.ino, 1, &block1)
+            .stage_block_slices(file.ino, 1, &block1)
             .expect("set block 1");
         assert!(
             writer
@@ -6668,7 +6662,7 @@ mod tests {
         set_file_state(&writer, old.ino, 4096, 1);
         let old_block = BlockRef::new_partial(901, 4096);
         writer
-            .stage_block_projection(old.ino, 0, &old_block)
+            .stage_block_slices(old.ino, 0, &old_block)
             .expect("set old block");
         assert!(
             writer
@@ -6694,10 +6688,10 @@ mod tests {
         let new_block0 = BlockRef::new_full(902, DEFAULT_BLOCK_SIZE);
         let new_block1 = BlockRef::new_partial(903, 4096);
         writer
-            .stage_block_projection(temp.ino, 0, &new_block0)
+            .stage_block_slices(temp.ino, 0, &new_block0)
             .expect("set replacement block 0");
         writer
-            .stage_block_projection(temp.ino, 1, &new_block1)
+            .stage_block_slices(temp.ino, 1, &new_block1)
             .expect("set replacement block 1");
         assert!(
             writer
@@ -6754,7 +6748,7 @@ mod tests {
         set_file_state(&writer, file.ino, 4096, 1);
         let published = BlockRef::new_partial(904, 4096);
         writer
-            .stage_block_projection(file.ino, 0, &published)
+            .stage_block_slices(file.ino, 0, &published)
             .expect("set published block");
         assert!(
             writer
@@ -6776,7 +6770,7 @@ mod tests {
         set_file_state(&writer, file.ino, 4096, 2);
         let uploaded_overlay = BlockRef::new_partial(905, 4096);
         writer
-            .stage_block_projection(file.ino, 0, &uploaded_overlay)
+            .stage_block_slices(file.ino, 0, &uploaded_overlay)
             .expect("set unpublished overlay");
         assert!(
             writer
@@ -6857,7 +6851,7 @@ mod tests {
         set_file_state(&writer, file.ino, 4096, 1);
         let block = BlockRef::new_partial(906, 4096);
         writer
-            .stage_block_projection(file.ino, 0, &block)
+            .stage_block_slices(file.ino, 0, &block)
             .expect("set overlay block");
         assert!(
             writer
@@ -7151,7 +7145,7 @@ mod tests {
         let file = create_published_small_file(&a, ROOT_INO, b"remote.bin", 50_301);
         set_file_state(&a, file.ino, 4096, 2);
         let block = BlockRef::new_partial(77, 4096);
-        a.stage_block_projection(file.ino, 0, &block)
+        a.stage_block_slices(file.ino, 0, &block)
             .expect("set staged block");
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
@@ -7166,11 +7160,12 @@ mod tests {
             Duration::from_secs(10)
         ));
         let remote = b.lookup(ROOT_INO, b"remote.bin").expect("lookup remote");
-        let remote_block = b
-            .lookup_block_projection(remote.ino, 0)
-            .expect("get remote block")
-            .expect("remote committed block");
-        assert_eq!(remote_block.object_id, 77);
+        assert_eq!(
+            lookup_first_object_id(&b, remote.ino)
+                .expect("get remote block")
+                .expect("remote committed block"),
+            77
+        );
 
         let remote_blocks = b
             .lookup_block_projections(remote.ino)
@@ -7203,7 +7198,7 @@ mod tests {
             .create_file(ROOT_INO, b"uploading.bin", 0, 0, 0o644)
             .expect("create file");
         set_file_state(&a, file.ino, 4096, 1);
-        a.stage_block_projection(file.ino, 0, &BlockRef::new_partial(501, 4096))
+        a.stage_block_slices(file.ino, 0, &BlockRef::new_partial(501, 4096))
             .expect("set staged block");
         a.flush_metadata().expect("flush uploading marker");
 
@@ -7251,7 +7246,7 @@ mod tests {
             .expect("create nested file");
         set_file_state(&a, file.ino, 4096, 1);
         let block = BlockRef::new_partial(511, 4096);
-        a.stage_block_projection(file.ino, 0, &block)
+        a.stage_block_slices(file.ino, 0, &block)
             .expect("set nested block");
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
@@ -7339,9 +7334,9 @@ mod tests {
         set_file_state(&a, file.ino, block_size + 4096, 1);
         let block0 = BlockRef::new_full(611, DEFAULT_BLOCK_SIZE);
         let block1 = BlockRef::new_partial(612, 4096);
-        a.stage_block_projection(file.ino, 0, &block0)
+        a.stage_block_slices(file.ino, 0, &block0)
             .expect("set block 0");
-        a.stage_block_projection(file.ino, 1, &block1)
+        a.stage_block_slices(file.ino, 1, &block1)
             .expect("set block 1");
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
@@ -7399,7 +7394,7 @@ mod tests {
             .expect("create file");
         set_file_state(&a, file.ino, 4096, 1);
         let baseline = BlockRef::new_partial(701, 4096);
-        a.stage_block_projection(file.ino, 0, &baseline)
+        a.stage_block_slices(file.ino, 0, &baseline)
             .expect("set baseline block");
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
@@ -7415,16 +7410,15 @@ mod tests {
         ));
         let remote = b.lookup(ROOT_INO, b"committed.bin").expect("lookup remote");
         assert_eq!(
-            b.lookup_block_projection(remote.ino, 0)
+            lookup_first_object_id(&b, remote.ino)
                 .expect("get baseline remote block")
-                .expect("baseline remote block")
-                .object_id,
+                .expect("baseline remote block"),
             701
         );
 
         set_file_state(&a, file.ino, 4096, 2);
         let replacement = BlockRef::new_partial(702, 4096);
-        a.stage_block_projection(file.ino, 0, &replacement)
+        a.stage_block_slices(file.ino, 0, &replacement)
             .expect("set replacement block");
         a.flush_metadata().expect("flush updating marker");
 
@@ -7439,12 +7433,11 @@ mod tests {
             .get_attr(remote.ino)
             .expect("get remote attr after update");
         assert_eq!(remote_attr.upload_state, UploadState::Updating);
-        let remote_block = b
-            .lookup_block_projection(remote.ino, 0)
-            .expect("get remote block after update")
-            .expect("remote block after update");
         assert_eq!(
-            remote_block.object_id, 701,
+            lookup_first_object_id(&b, remote.ino)
+                .expect("get remote block after update")
+                .expect("remote block after update"),
+            701,
             "remote peer must keep serving the previous committed version until publish"
         );
     }
@@ -7475,9 +7468,9 @@ mod tests {
         set_file_state(&a, file.ino, block_size + 4096, 1);
         let baseline0 = BlockRef::new_full(801, DEFAULT_BLOCK_SIZE);
         let baseline1 = BlockRef::new_partial(802, 4096);
-        a.stage_block_projection(file.ino, 0, &baseline0)
+        a.stage_block_slices(file.ino, 0, &baseline0)
             .expect("set baseline block 0");
-        a.stage_block_projection(file.ino, 1, &baseline1)
+        a.stage_block_slices(file.ino, 1, &baseline1)
             .expect("set baseline block 1");
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
@@ -7496,9 +7489,9 @@ mod tests {
         set_file_state(&a, file.ino, block_size + 4096, 2);
         let replacement0 = BlockRef::new_full(901, DEFAULT_BLOCK_SIZE);
         let replacement1 = BlockRef::new_partial(902, 4096);
-        a.stage_block_projection(file.ino, 0, &replacement0)
+        a.stage_block_slices(file.ino, 0, &replacement0)
             .expect("set replacement block 0");
-        a.stage_block_projection(file.ino, 1, &replacement1)
+        a.stage_block_slices(file.ino, 1, &replacement1)
             .expect("set replacement block 1");
         a.flush_metadata().expect("flush updating state");
 
@@ -7565,7 +7558,7 @@ mod tests {
             .create_file(ROOT_INO, b"draft.bin", 0, 0, 0o644)
             .expect("create local draft");
         set_file_state(&b, draft.ino, 4096, 1);
-        b.stage_block_projection(draft.ino, 0, &BlockRef::new_partial(1001, 4096))
+        b.stage_block_slices(draft.ino, 0, &BlockRef::new_partial(1001, 4096))
             .expect("set local draft block");
 
         a.create_dir(ROOT_INO, b"foreign", 0, 0, 0o755)
@@ -7585,11 +7578,12 @@ mod tests {
         assert_eq!(local_attr.size, 4096);
         assert_eq!(local_attr.committed_size, 0);
         assert_eq!(local_attr.upload_state, UploadState::Uploading);
-        let local_block = b
-            .lookup_block_projection(draft.ino, 0)
-            .expect("get local draft block")
-            .expect("local draft block");
-        assert_eq!(local_block.object_id, 1001);
+        assert_eq!(
+            lookup_first_object_id(&b, draft.ino)
+                .expect("get local draft block")
+                .expect("local draft block"),
+            1001
+        );
 
         if let Ok(mut state) = b.pending_state.lock() {
             state.force_flush = false;
@@ -7631,7 +7625,7 @@ mod tests {
         let mut draft_attr = a.get_attr(draft.ino).expect("get draft attr");
         draft_attr.size = 4096;
         a.set_attr(&draft_attr).expect("set draft size");
-        a.stage_block_projection(draft.ino, 0, &BlockRef::new_partial(501, 4096))
+        a.stage_block_slices(draft.ino, 0, &BlockRef::new_partial(501, 4096))
             .expect("set draft staged block");
         a.flush_metadata().expect("flush draft namespace");
 
@@ -7647,11 +7641,12 @@ mod tests {
         let draft_after = a.get_attr(draft.ino).expect("get local draft");
         assert_eq!(draft_after.size, 4096);
         assert_eq!(draft_after.committed_size, 0);
-        let local_block = a
-            .lookup_block_projection(draft.ino, 0)
-            .expect("get staged draft block")
-            .expect("staged draft block exists");
-        assert_eq!(local_block.object_id, 501);
+        assert_eq!(
+            lookup_first_object_id(&a, draft.ino)
+                .expect("get staged draft block")
+                .expect("staged draft block exists"),
+            501
+        );
     }
 
     #[test]
@@ -7677,7 +7672,7 @@ mod tests {
             .create_file(ROOT_INO, b"remote.bin", 0, 0, 0o644)
             .expect("create file");
         set_file_state(&a, file.ino, 4096, 1);
-        a.stage_block_projection(file.ino, 0, &BlockRef::new_partial(87, 4096))
+        a.stage_block_slices(file.ino, 0, &BlockRef::new_partial(87, 4096))
             .expect("set baseline remote block");
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
@@ -7698,7 +7693,7 @@ mod tests {
 
         set_file_state(&a, file.ino, 4096, 2);
         let block = BlockRef::new_partial(88, 4096);
-        a.stage_block_projection(file.ino, 0, &block)
+        a.stage_block_slices(file.ino, 0, &block)
             .expect("set staged remote block");
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
@@ -7708,16 +7703,17 @@ mod tests {
 
         assert!(wait_until(Duration::from_secs(12), || {
             let _ = b.sync_metadata();
-            b.lookup_block_projection(b_file.ino, 0)
-                .map(|block| block.map(|value| value.object_id == 88).unwrap_or(false))
+            lookup_first_object_id(&b, b_file.ino)
+                .map(|object_id| object_id == Some(88))
                 .unwrap_or(false)
         }));
 
-        let committed = b
-            .lookup_block_projection(b_file.ino, 0)
-            .expect("get committed block on b")
-            .expect("committed block visible on b");
-        assert_eq!(committed.object_id, 88);
+        assert_eq!(
+            lookup_first_object_id(&b, b_file.ino)
+                .expect("get committed block on b")
+                .expect("committed block visible on b"),
+            88
+        );
 
         let attr_after = b.get_attr(b_file.ino).expect("get local attr after sync");
         assert_eq!(
@@ -7746,7 +7742,7 @@ mod tests {
         let mut draft_attr = pg.get_attr(draft.ino).expect("get draft attr");
         draft_attr.size = 4096;
         pg.set_attr(&draft_attr).expect("set staged size");
-        pg.stage_block_projection(draft.ino, 0, &BlockRef::new_partial(601, 4096))
+        pg.stage_block_slices(draft.ino, 0, &BlockRef::new_partial(601, 4096))
             .expect("set draft block");
 
         let mut conflicted_attr = draft_attr.clone();
@@ -7854,7 +7850,7 @@ mod tests {
         attr.mtime = InodeAttr::now_nanos();
         attr.ctime = attr.mtime;
         a.set_attr(&attr).expect("set staged size");
-        a.stage_block_projection(file.ino, 0, &BlockRef::new_partial(42, 4096))
+        a.stage_block_slices(file.ino, 0, &BlockRef::new_partial(42, 4096))
             .expect("set staged block");
         a.flush_metadata().expect("flush a");
 
@@ -7927,7 +7923,7 @@ mod tests {
             .create_file(ROOT_INO, b"uploading.bin", 0, 0, 0o644)
             .expect("create uploading file");
         set_file_state(&a, file.ino, 4096, 1);
-        a.stage_block_projection(file.ino, 0, &BlockRef::new_partial(776, 4096))
+        a.stage_block_slices(file.ino, 0, &BlockRef::new_partial(776, 4096))
             .expect("set baseline uploading block");
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
@@ -7942,7 +7938,7 @@ mod tests {
         ));
 
         set_file_state(&a, file.ino, 4096, 2);
-        a.stage_block_projection(file.ino, 0, &BlockRef::new_partial(777, 4096))
+        a.stage_block_slices(file.ino, 0, &BlockRef::new_partial(777, 4096))
             .expect("set local uploading block");
         a.flush_metadata().expect("flush uploading namespace");
 
@@ -7971,22 +7967,21 @@ mod tests {
             .get_attr(file.ino)
             .expect("get local attr after peer unlink");
         assert_eq!(local_attr.upload_state, UploadState::Ready);
-        let local_block = a
-            .lookup_block_projection(file.ino, 0)
-            .expect("get local block after peer unlink")
-            .expect("writer keeps local pending block after peer unlink");
-        assert_eq!(local_block.object_id, 777);
+        assert_eq!(
+            lookup_first_object_id(&a, file.ino)
+                .expect("get local block after peer unlink")
+                .expect("writer keeps local pending block after peer unlink"),
+            777
+        );
 
         drop(a);
         let reopened = reopen_pg_engine_with_retry(&db_a);
         reopened.sync_metadata().expect("sync reopened a");
         assert!(reopened.lookup(ROOT_INO, b"uploading.bin").is_ok());
         assert_eq!(
-            reopened
-                .lookup_block_projection(file.ino, 0)
+            lookup_first_object_id(&reopened, file.ino)
                 .expect("get reopened local block")
-                .expect("reopened local block")
-                .object_id,
+                .expect("reopened local block"),
             777
         );
     }
@@ -8592,7 +8587,7 @@ mod tests {
         if let Ok(entry) = a.lookup(ROOT_INO, b"victim") {
             if a.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
                 set_file_state(&a, entry.ino, 64, 1);
-                a.stage_block_projection(entry.ino, 0, &BlockRef::new_partial(50_320, 64))
+                a.stage_block_slices(entry.ino, 0, &BlockRef::new_partial(50_320, 64))
                     .expect("set winner block on a");
                 assert!(
                     a.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
@@ -8603,7 +8598,7 @@ mod tests {
         } else if let Ok(entry) = b.lookup(ROOT_INO, b"victim") {
             if b.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
                 set_file_state(&b, entry.ino, 64, 1);
-                b.stage_block_projection(entry.ino, 0, &BlockRef::new_partial(50_321, 64))
+                b.stage_block_slices(entry.ino, 0, &BlockRef::new_partial(50_321, 64))
                     .expect("set winner block on b");
                 assert!(
                     b.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
@@ -8683,7 +8678,7 @@ mod tests {
         if let Ok(entry) = a.lookup(ROOT_INO, b"victim") {
             if a.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
                 set_file_state(&a, entry.ino, 64, 1);
-                a.stage_block_projection(entry.ino, 0, &BlockRef::new_partial(50_322, 64))
+                a.stage_block_slices(entry.ino, 0, &BlockRef::new_partial(50_322, 64))
                     .expect("set winner block on a");
                 assert!(
                     a.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
@@ -8694,7 +8689,7 @@ mod tests {
         } else if let Ok(entry) = b.lookup(ROOT_INO, b"victim") {
             if b.get_attr(entry.ino).map(|attr| attr.kind).ok() == Some(FileType::RegularFile) {
                 set_file_state(&b, entry.ino, 64, 1);
-                b.stage_block_projection(entry.ino, 0, &BlockRef::new_partial(50_323, 64))
+                b.stage_block_slices(entry.ino, 0, &BlockRef::new_partial(50_323, 64))
                     .expect("set winner block on b");
                 assert!(
                     b.publish_regular_file_overlay_to_base_if_matches(entry.ino, 1)
@@ -9562,7 +9557,7 @@ mod tests {
             .create_file(ROOT_INO, b"snap-peer.txt", 0, 0, 0o644)
             .expect("create file on a");
         set_file_state(&a, file.ino, 64, 1);
-        a.stage_block_projection(file.ino, 0, &BlockRef::new_partial(44_001, 64))
+        a.stage_block_slices(file.ino, 0, &BlockRef::new_partial(44_001, 64))
             .expect("set block");
 
         let created = a.create_snapshot(ROOT_INO).expect("create snapshot");
@@ -9666,7 +9661,7 @@ mod tests {
             .create_file(ROOT_INO, b"snap-gc.txt", 0, 0, 0o644)
             .expect("create file");
         set_file_state(&a, file.ino, 64, 1);
-        a.stage_block_projection(file.ino, 0, &BlockRef::new_partial(55_001, 64))
+        a.stage_block_slices(file.ino, 0, &BlockRef::new_partial(55_001, 64))
             .expect("set block");
         let _snapshot = a.create_snapshot(ROOT_INO).expect("create snapshot");
         a.flush_metadata().expect("flush snapshot");
