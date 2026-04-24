@@ -66,7 +66,7 @@ impl FilePayloadStore {
         layout: LocalBlockLayout,
         sync_mode: LocalBlockPayloadSyncMode,
     ) -> Result<Self, FilePayloadStoreError> {
-        std::fs::create_dir_all(&layout.payload_blocks_dir)?;
+        std::fs::create_dir_all(&layout.payload_objects_dir)?;
         std::fs::create_dir_all(&layout.tmp_dir)?;
         Ok(Self {
             layout,
@@ -83,7 +83,7 @@ impl FilePayloadStore {
     }
 
     pub fn get(&self, object_id: u64) -> Option<Bytes> {
-        let path = self.layout.payload_block_path(object_id);
+        let path = self.layout.payload_object_path(object_id);
         let file = self.cached_read_handle(object_id, &path).ok()?;
         let metadata = match file.metadata() {
             Ok(metadata) => metadata,
@@ -130,7 +130,7 @@ impl FilePayloadStore {
         }
         let start = u64::try_from(data_offset).ok()?;
 
-        let path = self.layout.payload_block_path(object_id);
+        let path = self.layout.payload_object_path(object_id);
         let file = self.cached_read_handle(object_id, &path).ok()?;
         if out.len() >= READ_HINT_MIN_LEN {
             let hint_len = u64::try_from(out.len()).unwrap_or(u64::MAX);
@@ -175,11 +175,11 @@ impl FilePayloadStore {
     }
 
     pub fn payload_exists(&self, object_id: u64) -> io::Result<bool> {
-        self.layout.payload_block_path(object_id).try_exists()
+        self.layout.payload_object_path(object_id).try_exists()
     }
 
     pub fn put(&self, object_id: u64, data: &[u8]) -> Result<(), FilePayloadStoreError> {
-        let payload_path = self.layout.payload_block_path(object_id);
+        let payload_path = self.layout.payload_object_path(object_id);
         let payload_dir = payload_path.parent().ok_or_else(|| {
             io::Error::other(format!(
                 "payload path has no parent directory: {}",
@@ -240,7 +240,7 @@ impl FilePayloadStore {
         let mut prepared_dirs = HashSet::new();
         let mut staged = Vec::with_capacity(entries.len());
         for entry in entries {
-            let payload_path = self.layout.payload_block_path(entry.object_id);
+            let payload_path = self.layout.payload_object_path(entry.object_id);
             let payload_dir = payload_path
                 .parent()
                 .ok_or_else(|| {
@@ -309,7 +309,7 @@ impl FilePayloadStore {
             .object_ids
             .lock()
             .remove(&object_id);
-        let payload_path = self.layout.payload_block_path(object_id);
+        let payload_path = self.layout.payload_object_path(object_id);
         if let Err(error) = std::fs::remove_file(&payload_path)
             && error.kind() != io::ErrorKind::NotFound
         {
@@ -340,7 +340,7 @@ impl FilePayloadStore {
         }
 
         for dir in [
-            self.layout.payload_blocks_dir.as_path(),
+            self.layout.payload_objects_dir.as_path(),
             self.layout.payload_root.as_path(),
             self.layout.runtime_root.as_path(),
         ] {
@@ -512,7 +512,7 @@ impl FilePayloadStore {
         let mut directories = self.pending_grouped_sync.directories.lock();
         directories.insert(self.layout.tmp_dir.clone());
         directories.insert(payload_dir.to_path_buf());
-        directories.insert(self.layout.payload_blocks_dir.clone());
+        directories.insert(self.layout.payload_objects_dir.clone());
         directories.insert(self.layout.payload_root.clone());
         directories.insert(self.layout.runtime_root.clone());
     }
@@ -567,7 +567,7 @@ impl FilePayloadStore {
     }
 
     fn sync_payload_file_grouped(&self, object_id: u64) -> Result<(), FilePayloadStoreError> {
-        let path = self.layout.payload_block_path(object_id);
+        let path = self.layout.payload_object_path(object_id);
         let file = match OpenOptions::new().read(true).write(true).open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {

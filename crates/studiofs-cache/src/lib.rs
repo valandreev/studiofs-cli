@@ -356,8 +356,8 @@ mod tests {
         );
         assert!(prepared.detection.has_runtime_layout());
         assert!(prepared.layout.tmp_dir.exists());
-        assert!(prepared.layout.payload_blocks_dir.exists());
-        assert!(prepared.layout.upload_stage_blocks_dir.exists());
+        assert!(prepared.layout.payload_objects_dir.exists());
+        assert!(prepared.layout.upload_stage_objects_dir.exists());
         assert!(prepared.layout.index_dir.exists());
     }
 
@@ -386,7 +386,7 @@ mod tests {
 
         assert!(prepared.detection.has_runtime_layout());
         assert!(!retired_root.exists());
-        assert!(prepared.layout.upload_stage_blocks_dir.exists());
+        assert!(prepared.layout.upload_stage_objects_dir.exists());
     }
 
     #[test]

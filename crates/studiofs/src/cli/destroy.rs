@@ -189,8 +189,8 @@ pub fn run(name: &str, meta_dir: &Path, mode: DestroyMode) -> DestroyResult<()> 
         );
         println!(
             "  Local cache upload: {} ({})",
-            detection.layout.upload_stage_blocks_dir.display(),
-            if detection.upload_blocks_dir_exists {
+            detection.layout.upload_stage_objects_dir.display(),
+            if detection.upload_objects_dir_exists {
                 "present"
             } else {
                 "absent"
@@ -350,8 +350,8 @@ mod tests {
         LocalBlockRuntimeDetection {
             layout,
             index_exists: false,
-            payload_blocks_dir_exists: has_layout,
-            upload_blocks_dir_exists: has_layout,
+            payload_objects_dir_exists: has_layout,
+            upload_objects_dir_exists: has_layout,
             tmp_dir_exists: has_layout,
             index_dir_exists: has_layout,
         }
@@ -363,8 +363,8 @@ mod tests {
         LocalBlockRuntimeDetection {
             layout,
             index_exists: false,
-            payload_blocks_dir_exists: false,
-            upload_blocks_dir_exists: false,
+            payload_objects_dir_exists: false,
+            upload_objects_dir_exists: false,
             tmp_dir_exists: false,
             index_dir_exists: true,
         }

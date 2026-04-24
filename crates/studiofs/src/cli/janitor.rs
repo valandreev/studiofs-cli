@@ -579,7 +579,7 @@ mod tests {
         );
         assert_eq!(local_cache_state, None);
         assert!(
-            !layout.payload_blocks_dir.exists(),
+            !layout.payload_objects_dir.exists(),
             "janitor inspection should not provision missing runtime directories"
         );
         assert!(
@@ -587,7 +587,7 @@ mod tests {
             "the seeded partial runtime directory should stay intact"
         );
         assert!(
-            !layout.upload_stage_blocks_dir.exists(),
+            !layout.upload_stage_objects_dir.exists(),
             "janitor inspection should not provision the upload directory as a side effect"
         );
         assert!(

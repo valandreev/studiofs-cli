@@ -302,8 +302,8 @@ pub fn run(
         );
         println!(
             "  Local cache payload: {} ({})",
-            detection.layout.payload_blocks_dir.display(),
-            if detection.payload_blocks_dir_exists {
+            detection.layout.payload_objects_dir.display(),
+            if detection.payload_objects_dir_exists {
                 "present"
             } else {
                 "absent"
@@ -311,8 +311,8 @@ pub fn run(
         );
         println!(
             "  Local cache upload:  {} ({})",
-            detection.layout.upload_stage_blocks_dir.display(),
-            if detection.upload_blocks_dir_exists {
+            detection.layout.upload_stage_objects_dir.display(),
+            if detection.upload_objects_dir_exists {
                 "present"
             } else {
                 "absent"

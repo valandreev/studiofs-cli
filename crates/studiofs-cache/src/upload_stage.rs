@@ -16,12 +16,12 @@ pub struct UploadStageStore {
 
 impl UploadStageStore {
     pub fn open(layout: LocalBlockLayout) -> Result<Self, UploadStageStoreError> {
-        fs::create_dir_all(&layout.upload_stage_blocks_dir)?;
+        fs::create_dir_all(&layout.upload_stage_objects_dir)?;
         Ok(Self { layout })
     }
 
     pub fn get(&self, object_id: u64) -> Option<bytes::Bytes> {
-        let path = self.layout.upload_stage_block_path(object_id);
+        let path = self.layout.upload_stage_object_path(object_id);
         match fs::read(&path) {
             Ok(bytes) => Some(bytes::Bytes::from(bytes)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -39,14 +39,14 @@ impl UploadStageStore {
 
     pub fn contains(&self, object_id: u64) -> bool {
         self.layout
-            .upload_stage_block_path(object_id)
+            .upload_stage_object_path(object_id)
             .try_exists()
             .unwrap_or(false)
     }
 
     pub fn link_payload(&self, object_id: u64) -> Result<(), UploadStageStoreError> {
-        let payload_path = self.layout.payload_block_path(object_id);
-        let stage_path = self.layout.upload_stage_block_path(object_id);
+        let payload_path = self.layout.payload_object_path(object_id);
+        let stage_path = self.layout.upload_stage_object_path(object_id);
         let stage_dir = stage_path.parent().ok_or_else(|| {
             io::Error::other(format!(
                 "upload stage path has no parent directory: {}",
@@ -82,7 +82,7 @@ impl UploadStageStore {
     }
 
     pub fn remove(&self, object_id: u64) {
-        let path = self.layout.upload_stage_block_path(object_id);
+        let path = self.layout.upload_stage_object_path(object_id);
         if let Err(error) = fs::remove_file(&path)
             && error.kind() != io::ErrorKind::NotFound
         {
@@ -124,7 +124,7 @@ mod tests {
         store.remove(0x42);
         assert!(!store.contains(0x42));
         assert!(store.get(0x42).is_none());
-        assert!(!layout.upload_stage_block_path(0x42).exists());
+        assert!(!layout.upload_stage_object_path(0x42).exists());
         assert_eq!(
             payload_store.get(0x42).unwrap().as_ref(),
             b"payload",

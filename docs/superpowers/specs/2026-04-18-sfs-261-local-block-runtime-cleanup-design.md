@@ -27,7 +27,7 @@ Leave one canonical local-block runtime in the repository by:
 ### Compatibility
 
 - The mounted runtime must continue to detect and provision `v3/LAYOUT_V1`.
-- The payload and index locations remain `v3/payload/blocks/**` and `v3/index/cache.redb`.
+- The payload and index locations remain `payload/objects/**` and `index/cache.redb`.
 - Existing mounts and restart/recovery flows must continue to work without cache migration.
 
 ### Vocabulary

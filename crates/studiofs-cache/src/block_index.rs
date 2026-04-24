@@ -1486,7 +1486,7 @@ mod tests {
         index
             .upsert(CacheIndexUpsert {
                 object_id,
-                payload_key: format!("payload/{object_id}.block").into_bytes(),
+                payload_key: format!("payload/{object_id}.object").into_bytes(),
                 payload_len,
                 lifecycle: LocalBlockLifecycleState::Dirty,
                 origin: LocalBlockOrigin::Local,
@@ -1500,7 +1500,7 @@ mod tests {
         index
             .upsert(CacheIndexUpsert {
                 object_id,
-                payload_key: format!("payload/{object_id}.block").into_bytes(),
+                payload_key: format!("payload/{object_id}.object").into_bytes(),
                 payload_len,
                 lifecycle: LocalBlockLifecycleState::Uploaded,
                 origin: LocalBlockOrigin::Downloaded,
@@ -1557,7 +1557,7 @@ mod tests {
             .upsert_many(&[
                 CacheIndexUpsert {
                     object_id: 21,
-                    payload_key: b"payload/21.block".to_vec(),
+                    payload_key: b"payload/21.object".to_vec(),
                     payload_len: 64,
                     lifecycle: LocalBlockLifecycleState::Dirty,
                     origin: LocalBlockOrigin::Local,
@@ -1566,7 +1566,7 @@ mod tests {
                 },
                 CacheIndexUpsert {
                     object_id: 22,
-                    payload_key: b"payload/22.block".to_vec(),
+                    payload_key: b"payload/22.object".to_vec(),
                     payload_len: 32,
                     lifecycle: LocalBlockLifecycleState::Uploaded,
                     origin: LocalBlockOrigin::Downloaded,
@@ -1669,7 +1669,7 @@ mod tests {
         let dirty = index.dirty_uploading_entries().unwrap();
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].object_id, 2);
-        assert_eq!(dirty[0].payload_key, b"payload/2.block".to_vec());
+        assert_eq!(dirty[0].payload_key, b"payload/2.object".to_vec());
         assert_eq!(dirty[0].payload_len, 20);
         assert_eq!(dirty[0].lifecycle, LocalBlockLifecycleState::Uploading);
     }
@@ -1825,7 +1825,7 @@ mod tests {
         index
             .upsert(CacheIndexUpsert {
                 object_id: 99,
-                payload_key: b"payload/99.block".to_vec(),
+                payload_key: b"payload/99.object".to_vec(),
                 payload_len: 9,
                 lifecycle: LocalBlockLifecycleState::Dirty,
                 origin: LocalBlockOrigin::Local,

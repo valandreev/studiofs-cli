@@ -81,8 +81,8 @@ impl fmt::Display for LocalBlockBackendKind {
 pub struct LocalBlockRuntimeDetection {
     pub layout: LocalBlockLayout,
     pub index_exists: bool,
-    pub payload_blocks_dir_exists: bool,
-    pub upload_blocks_dir_exists: bool,
+    pub payload_objects_dir_exists: bool,
+    pub upload_objects_dir_exists: bool,
     pub tmp_dir_exists: bool,
     pub index_dir_exists: bool,
 }
@@ -90,8 +90,8 @@ pub struct LocalBlockRuntimeDetection {
 impl LocalBlockRuntimeDetection {
     pub fn has_runtime_layout(&self) -> bool {
         self.index_exists
-            || self.payload_blocks_dir_exists
-            || self.upload_blocks_dir_exists
+            || self.payload_objects_dir_exists
+            || self.upload_objects_dir_exists
             || self.tmp_dir_exists
             || self.index_dir_exists
     }
@@ -101,8 +101,8 @@ impl LocalBlockRuntimeDetection {
     }
 
     pub const fn needs_runtime_provisioning(&self) -> bool {
-        !self.payload_blocks_dir_exists
-            || !self.upload_blocks_dir_exists
+        !self.payload_objects_dir_exists
+            || !self.upload_objects_dir_exists
             || !self.tmp_dir_exists
             || !self.index_dir_exists
     }
@@ -120,15 +120,15 @@ impl LocalBlockRuntimeDetection {
 pub fn detect_cache_backends(cache_root: &Path) -> io::Result<LocalBlockRuntimeDetection> {
     let layout = LocalBlockLayout::from_cache_root(cache_root);
     let index_exists = layout.redb_index_path.try_exists()?;
-    let payload_blocks_dir_exists = layout.payload_blocks_dir.try_exists()?;
-    let upload_blocks_dir_exists = layout.upload_stage_blocks_dir.try_exists()?;
+    let payload_objects_dir_exists = layout.payload_objects_dir.try_exists()?;
+    let upload_objects_dir_exists = layout.upload_stage_objects_dir.try_exists()?;
     let tmp_dir_exists = layout.tmp_dir.try_exists()?;
     let index_dir_exists = layout.index_dir.try_exists()?;
     Ok(LocalBlockRuntimeDetection {
         layout,
         index_exists,
-        payload_blocks_dir_exists,
-        upload_blocks_dir_exists,
+        payload_objects_dir_exists,
+        upload_objects_dir_exists,
         tmp_dir_exists,
         index_dir_exists,
     })
@@ -245,8 +245,8 @@ impl LocalBlockBackendRuntime {
         payload_sync_mode: LocalBlockPayloadSyncMode,
     ) -> Result<Self, LocalBlockBackendOpenError> {
         let layout = LocalBlockLayout::from_cache_root(&config.cache_root);
-        if !layout.payload_blocks_dir.try_exists()?
-            || !layout.upload_stage_blocks_dir.try_exists()?
+        if !layout.payload_objects_dir.try_exists()?
+            || !layout.upload_stage_objects_dir.try_exists()?
             || !layout.tmp_dir.try_exists()?
             || !layout.index_dir.try_exists()?
         {
@@ -786,7 +786,7 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
         };
         let payload_key = self
             .layout
-            .payload_block_relative_path(object_id)
+            .payload_object_relative_path(object_id)
             .to_string_lossy()
             .into_owned()
             .into_bytes();
@@ -885,7 +885,7 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
             };
             let payload_key = self
                 .layout
-                .payload_block_relative_path(entry.object_id)
+                .payload_object_relative_path(entry.object_id)
                 .to_string_lossy()
                 .into_owned()
                 .into_bytes();
@@ -1329,8 +1329,8 @@ mod tests {
 
         assert!(!detection.has_runtime_layout());
         assert!(!detection.index_exists);
-        assert!(!detection.payload_blocks_dir_exists);
-        assert!(!detection.upload_blocks_dir_exists);
+        assert!(!detection.payload_objects_dir_exists);
+        assert!(!detection.upload_objects_dir_exists);
         assert!(!detection.tmp_dir_exists);
         assert!(!detection.index_dir_exists);
         assert!(detection.needs_runtime_provisioning());
@@ -1346,8 +1346,8 @@ mod tests {
         let detection = detect_cache_backends(temp.path()).unwrap();
         assert!(detection.has_runtime_layout());
         assert!(!detection.index_exists);
-        assert!(detection.payload_blocks_dir_exists);
-        assert!(detection.upload_blocks_dir_exists);
+        assert!(detection.payload_objects_dir_exists);
+        assert!(detection.upload_objects_dir_exists);
         assert!(detection.tmp_dir_exists);
         assert!(detection.index_dir_exists);
         assert!(!detection.needs_runtime_provisioning());
@@ -1593,7 +1593,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_v3_backend_persists_blocks_in_file_per_block_payload_layout() {
+    fn local_block_backend_persists_payload_objects_in_file_per_object_layout() {
         let temp = tempfile::tempdir().unwrap();
         let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
@@ -1606,8 +1606,8 @@ mod tests {
         backend.put(0xABCD, b"payload", false).unwrap();
 
         assert!(
-            layout.payload_block_path(0xABCD).exists(),
-            "local block runtime must persist each block as an individual payload file"
+            layout.payload_object_path(0xABCD).exists(),
+            "local runtime must persist each payload object as an individual payload file"
         );
         let entry = backend.index.get_entry(0xABCD).unwrap().unwrap();
         assert_eq!(entry.origin, LocalBlockOrigin::Local);
@@ -1651,7 +1651,7 @@ mod tests {
         .unwrap();
         backend.put(501, b"stale-index", false).unwrap();
         backend.sync_data().unwrap();
-        std::fs::remove_file(layout.payload_block_path(501)).unwrap();
+        std::fs::remove_file(layout.payload_object_path(501)).unwrap();
         drop(backend);
 
         let index_before = CacheIndex::open(&layout.redb_index_path).unwrap();
@@ -1737,7 +1737,7 @@ mod tests {
         .unwrap();
         backend.put(10, b"ten", false).unwrap();
         backend.put(11, b"eleven", false).unwrap();
-        std::fs::remove_file(layout.payload_block_path(10)).unwrap();
+        std::fs::remove_file(layout.payload_object_path(10)).unwrap();
 
         assert_eq!(
             backend.dirty_object_ids(),
@@ -1764,7 +1764,7 @@ mod tests {
         .unwrap();
         backend.put(10, b"ten", false).unwrap();
         backend.sync_data().unwrap();
-        std::fs::remove_file(layout.payload_block_path(10)).unwrap();
+        std::fs::remove_file(layout.payload_object_path(10)).unwrap();
 
         assert!(
             backend.object_stats(10).is_some(),

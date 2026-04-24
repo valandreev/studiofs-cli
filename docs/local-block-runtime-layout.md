@@ -1,13 +1,13 @@
-# Local Block Runtime Layout and Safety
+# Local Payload Object Runtime Layout and Safety
 
-This file documents the current local block runtime disk layout and safety
+This file documents the current local payload object runtime disk layout and safety
 rules for the in-tree implementation. It is not the canonical SFS-242 rewrite
 contract. The rewrite source of truth lives in
 [juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
 
 ## Purpose
 
-Define the current local block runtime disk layout, detection rules, startup
+Define the current local payload object runtime disk layout, detection rules, startup
 reconciliation behavior, and operator remediation for stale local cache state.
 
 This document is the source of truth only for the current implementation
@@ -22,13 +22,13 @@ All local runtime data lives directly under the per-volume cache root.
 <cache-root>/
 ├── tmp/
 ├── payload/
-│   └── blocks/
+│   └── objects/
 │       ├── 00/
 │       ├── 01/
 │       └── ff/
-│           └── <object-id>.block
+│           └── <object-id>.object
 ├── upload/
-│   └── blocks/
+│   └── objects/
 │       ├── 00/
 │       ├── 01/
 │       └── ff/
@@ -39,7 +39,7 @@ All local runtime data lives directly under the per-volume cache root.
 
 Notes:
 - `index/cache.redb` is the fixed redb index location.
-- Payload blocks are sharded into two levels (`00/00`..`ff/ff`) using a stable
+- Payload objects are sharded into two levels (`00/00`..`ff/ff`) using a stable
   hash of `object_id`.
 
 ## 2. Mount and Status Detection Contract

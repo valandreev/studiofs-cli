@@ -178,7 +178,7 @@ fn remove_orphan_payloads_and_legacy_temps(
 ) -> Result<(u64, u64), LocalBlockStartupReconcileError> {
     let mut temp_files_removed = 0_u64;
     let mut orphan_payload_files_removed = 0_u64;
-    visit_files_recursive(&layout.payload_blocks_dir, &mut |file| -> Result<
+    visit_files_recursive(&layout.payload_objects_dir, &mut |file| -> Result<
         (),
         LocalBlockStartupReconcileError,
     > {
@@ -191,7 +191,7 @@ fn remove_orphan_payloads_and_legacy_temps(
             }
             return Ok(());
         };
-        let Some(object_id) = LocalBlockLayout::parse_payload_block_file_name(file_name) else {
+        let Some(object_id) = LocalBlockLayout::parse_payload_object_file_name(file_name) else {
             return Ok(());
         };
         if index.get_entry(object_id)?.is_none() && remove_file_if_present(file)? {
@@ -229,7 +229,7 @@ where
 }
 
 fn payload_exists(layout: &LocalBlockLayout, object_id: u64) -> io::Result<bool> {
-    layout.payload_block_path(object_id).try_exists()
+    layout.payload_object_path(object_id).try_exists()
 }
 
 fn remove_file_if_present(path: &Path) -> Result<bool, io::Error> {
@@ -252,7 +252,7 @@ mod tests {
 
     fn payload_key(layout: &LocalBlockLayout, object_id: u64) -> Vec<u8> {
         layout
-            .payload_block_relative_path(object_id)
+            .payload_object_relative_path(object_id)
             .to_string_lossy()
             .into_owned()
             .into_bytes()
@@ -293,7 +293,7 @@ mod tests {
                 evictable: false,
             })
             .unwrap();
-        std::fs::remove_file(layout.payload_block_path(2)).unwrap();
+        std::fs::remove_file(layout.payload_object_path(2)).unwrap();
 
         let tmp_in_tmp_dir = layout.tmp_dir.join("pending").join("upload.tmp");
         std::fs::create_dir_all(tmp_in_tmp_dir.parent().unwrap()).unwrap();
@@ -333,11 +333,11 @@ mod tests {
             })
             .unwrap();
 
-        let orphan_payload_path = layout.payload_block_path(8);
+        let orphan_payload_path = layout.payload_object_path(8);
         std::fs::create_dir_all(orphan_payload_path.parent().unwrap()).unwrap();
         std::fs::write(&orphan_payload_path, b"orphan").unwrap();
         let legacy_tmp_path = layout
-            .payload_block_path(9)
+            .payload_object_path(9)
             .with_file_name("0000000000000009-legacy.tmp");
         std::fs::create_dir_all(legacy_tmp_path.parent().unwrap()).unwrap();
         std::fs::write(&legacy_tmp_path, b"legacy-tmp").unwrap();
@@ -357,7 +357,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let layout = LocalBlockLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
-        std::fs::create_dir_all(&layout.payload_blocks_dir).unwrap();
+        std::fs::create_dir_all(&layout.payload_objects_dir).unwrap();
 
         let unrelated_path = layout.cache_root.join("unrelated.cache-artifact");
         std::fs::write(&unrelated_path, b"keep-me").unwrap();
