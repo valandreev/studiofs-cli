@@ -1312,7 +1312,7 @@ mod tests {
     use tokio::runtime::Runtime;
 
     trait FileGraphMetaFixture {
-        fn stage_logical_payload_slice(
+        fn stage_payload_slice(
             &self,
             ino: Ino,
             block_index: u32,
@@ -1320,7 +1320,7 @@ mod tests {
         ) -> MetaResult<Option<PayloadRef>>;
     }
 
-    fn fixture_logical_payload_slices(
+    fn fixture_payload_slices(
         block_index: u32,
         payload: &PayloadRef,
     ) -> MetaResult<Vec<(ChunkId, Vec<SliceRecord>)>> {
@@ -1364,7 +1364,7 @@ mod tests {
     }
 
     impl FileGraphMetaFixture for Arc<RedbMetaEngine> {
-        fn stage_logical_payload_slice(
+        fn stage_payload_slice(
             &self,
             ino: Ino,
             block_index: u32,
@@ -1372,7 +1372,7 @@ mod tests {
         ) -> MetaResult<Option<PayloadRef>> {
             self.flush_regular_file_overlay_slices(
                 ino,
-                fixture_logical_payload_slices(block_index, payload)?.as_slice(),
+                fixture_payload_slices(block_index, payload)?.as_slice(),
             )?;
             self.publish_regular_file_overlay_to_base_if_matches(
                 ino,
@@ -1956,7 +1956,7 @@ mod tests {
             staged_attr.committed_size = 8;
             staged_attr.upload_state = MetaUploadState::Ready;
             meta.set_attr(&staged_attr).expect("persist committed attr");
-            meta.stage_logical_payload_slice(ino, 0, &PayloadRef::new_partial(object_id, 8))
+            meta.stage_payload_slice(ino, 0, &PayloadRef::new_partial(object_id, 8))
                 .expect("persist committed payload slice");
 
             vfs.write(ino, 2, b"XY").await.expect("stage dirty patch");
@@ -2041,7 +2041,7 @@ mod tests {
             staged_attr.committed_size = 8;
             staged_attr.upload_state = MetaUploadState::Ready;
             meta.set_attr(&staged_attr).expect("persist committed attr");
-            meta.stage_logical_payload_slice(ino, 0, &PayloadRef::new_partial(object_id, 8))
+            meta.stage_payload_slice(ino, 0, &PayloadRef::new_partial(object_id, 8))
                 .expect("persist committed payload slice");
 
             vfs.write(ino, 2, b"XY").await.expect("stage dirty patch");
@@ -2102,7 +2102,7 @@ mod tests {
             staged_attr.committed_content_epoch = 1;
             staged_attr.content_epoch = 2;
             meta.set_attr(&staged_attr).expect("persist staged attr");
-            meta.stage_logical_payload_slice(ino, 0, &PayloadRef::new_partial(committed_object_id, 8))
+            meta.stage_payload_slice(ino, 0, &PayloadRef::new_partial(committed_object_id, 8))
                 .expect("persist committed payload slice");
 
             vfs.state.incarnation.live_extent_records.lock().insert(

@@ -1270,10 +1270,10 @@ fn redb_base_graph_publish_sets_committed_head() {
     let block0 = PayloadRef::new_full(101, DEFAULT_BLOCK_SIZE);
     let block1 = PayloadRef::new_partial(102, 4096);
     engine
-        .stage_logical_payload_slice(file.ino, 0, &block0)
+        .stage_payload_slice(file.ino, 0, &block0)
         .unwrap();
     engine
-        .stage_logical_payload_slice(file.ino, 1, &block1)
+        .stage_payload_slice(file.ino, 1, &block1)
         .unwrap();
 
     assert!(engine.publish_regular_file_overlay_to_base_if_matches(file.ino, 1).unwrap());

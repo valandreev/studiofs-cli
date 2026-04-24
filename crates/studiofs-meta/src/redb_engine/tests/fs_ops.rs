@@ -129,11 +129,11 @@ fn zeroio_delete_before_publish_persists_tombstone_lifecycle() {
     attr.content_epoch = 1;
     engine.set_attr(&attr).unwrap();
     engine
-        .stage_logical_payload_slice(file.ino, 0, &PayloadRef::new_partial(950, 4096))
+        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(950, 4096))
         .unwrap();
     let uploaded = PayloadRef::new_partial(951, 4096);
     engine
-        .stage_logical_payload_slice(file.ino, 1, &uploaded)
+        .stage_payload_slice(file.ino, 1, &uploaded)
         .unwrap();
     assert!(
         engine
@@ -182,7 +182,7 @@ fn zeroio_unlink_open_handle_marks_unpublished_epoch_deleted_before_publish() {
     engine.set_attr(&published_attr).unwrap();
     let published = PayloadRef::new_partial(960, 4096);
     engine
-        .stage_logical_payload_slice(file.ino, 0, &published)
+        .stage_payload_slice(file.ino, 0, &published)
         .unwrap();
     assert!(engine.publish_regular_file_overlay_to_base_if_matches(file.ino, 1).unwrap());
 
@@ -191,7 +191,7 @@ fn zeroio_unlink_open_handle_marks_unpublished_epoch_deleted_before_publish() {
     engine.set_attr(&overwrite_attr).unwrap();
     let uploaded_overlay = PayloadRef::new_partial(961, 4096);
     engine
-        .stage_logical_payload_slice(file.ino, 0, &uploaded_overlay)
+        .stage_payload_slice(file.ino, 0, &uploaded_overlay)
         .unwrap();
     assert!(
         engine
@@ -508,7 +508,7 @@ fn redb_rename_keeps_same_inode_and_incarnation_ids() {
     attr.content_epoch = 7;
     engine.set_attr(&attr).unwrap();
     engine
-        .stage_logical_payload_slice(file.ino, 0, &PayloadRef::new_partial(401, 4096))
+        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(401, 4096))
         .unwrap();
     assert!(engine.publish_regular_file_overlay_to_base_if_matches(file.ino, 7).unwrap());
 
@@ -618,7 +618,7 @@ fn test_unlink_last_link_cleans_blocks_for_inode_with_0xff_suffix() {
     persisted.size = 4096;
     engine.set_attr(&persisted).unwrap();
     engine
-        .stage_logical_payload_slice(attr.ino, 0, &PayloadRef::new_partial(4_255, 4096))
+        .stage_payload_slice(attr.ino, 0, &PayloadRef::new_partial(4_255, 4096))
         .unwrap();
 
     let removed = engine.unlink(ROOT_INO, b"ff-suffix.bin").unwrap();

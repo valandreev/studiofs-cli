@@ -94,7 +94,7 @@ fn test_detect_local_overlay_state() {
     attr.size = 4096;
     engine.set_attr(&attr).unwrap();
     engine
-        .stage_logical_payload_slice(file.ino, 0, &PayloadRef::new_partial(11, 4096))
+        .stage_payload_slice(file.ino, 0, &PayloadRef::new_partial(11, 4096))
         .unwrap();
     assert!(engine.has_local_overlay_state().unwrap());
 

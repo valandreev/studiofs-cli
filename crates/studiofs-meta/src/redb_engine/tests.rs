@@ -5,16 +5,12 @@ use super::*;
 use crate::events::MetaEvent;
 
 trait FileGraphFixture {
-    fn stage_logical_payload_slice(
-        &self,
-        ino: Ino,
-        block_index: u32,
-        block: &PayloadRef,
-    ) -> MetaResult<()>;
+    fn stage_payload_slice(&self, ino: Ino, block_index: u32, block: &PayloadRef)
+    -> MetaResult<()>;
 }
 
 impl FileGraphFixture for RedbMetaEngine {
-    fn stage_logical_payload_slice(
+    fn stage_payload_slice(
         &self,
         ino: Ino,
         block_index: u32,
