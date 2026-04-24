@@ -188,7 +188,7 @@ pub(super) struct LatencyHistogramReport {
 #[derive(Debug, Serialize)]
 pub(super) struct MaterializeBatchStatsReport {
     pub(super) batches: u64,
-    pub(super) blocks: u64,
+    pub(super) payloads: u64,
     pub(super) bytes: u64,
     pub(super) inflight_batches: usize,
     pub(super) inflight_batches_peak: usize,
@@ -286,7 +286,7 @@ impl From<studiofs_cache::metrics::MaterializeBatchStatsSnapshot> for Materializ
     fn from(snapshot: studiofs_cache::metrics::MaterializeBatchStatsSnapshot) -> Self {
         Self {
             batches: snapshot.batches,
-            blocks: snapshot.blocks,
+            payloads: snapshot.payloads,
             bytes: snapshot.bytes,
             inflight_batches: snapshot.inflight_batches,
             inflight_batches_peak: snapshot.inflight_batches_peak,
@@ -386,7 +386,7 @@ pub(crate) fn sample_report() -> BenchmarkReport {
         cache_pipeline: Some(CachePipelineReport {
             materialize_batches: MaterializeBatchStatsReport {
                 batches: 4,
-                blocks: 16,
+                payloads: 16,
                 bytes: 128 * 1024 * 1024,
                 inflight_batches: 0,
                 inflight_batches_peak: 2,

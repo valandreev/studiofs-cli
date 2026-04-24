@@ -319,7 +319,10 @@ fn active_docs_drop_superseded_io_architecture_terms() {
         "docs/superpowers/plans/2026-04-18-sfs-261-local-payload-runtime-cleanup.md",
         "docs/superpowers/specs/2026-04-18-sfs-261-local-payload-runtime-cleanup-design.md",
         "docs/configuration.md",
+        "docs/data-layer.md",
         "docs/examples.md",
+        "docs/local-first-validation-matrix.md",
+        "docs/metadata.md",
         "docs/vfs.md",
     ];
     let forbidden_terms = [
@@ -617,6 +620,8 @@ fn access_tracking_surface_drops_classifier_wording() {
 #[test]
 fn active_code_drops_flat_block_contract_vocabulary() {
     let files = [
+        "crates/studiofs-cache/src",
+        "crates/studiofs-data/src",
         "crates/studiofs-meta/src",
         "crates/studiofs-vfs/src",
         "crates/studiofs-vfs/tests",

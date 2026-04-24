@@ -351,6 +351,20 @@ Rules:
 | Metadata-cache and operator surface | `crates/studiofs/src/cli/mount/*.rs`, `docs/configuration.md` | `cmd/flags.go`, `cmd/mount.go`, `cmd/mount_unix.go`, `cmd/mount_windows.go`, `docs/en/guide/cache.md` | Coherent mount/cache flags, strong internal metadata-cache defaults, operator-facing terminology |
 | Bridge and mount behavior | `crates/studiofs-fuse/src/lib.rs`, `crates/studiofs-winfsp/src/*.rs` | `pkg/vfs/vfs.go`, `pkg/vfs/vfs_unix.go`, `pkg/vfs/vfs_windows.go`, `cmd/mount*.go` | Performance-sensitive bridge/mount patterns and callback expectations |
 
+### 12.1 Writeback Parity Checkpoint Before Performance Testing
+
+The minimum JuiceFS writeback mechanisms that must be present before AJA-style
+performance validation are:
+
+| JuiceFS mechanism | StudioFS counterpart |
+|---|---|
+| Per-file writer ownership with chunk/slice ordering | `HandleWriterRegistry` plus local payload materialization in `studiofs-vfs` |
+| Soft throttling before memory runaway | `max_dirty_bytes`, hard backpressure, and opportunistic handle-writer materialization |
+| Local staging before remote upload | `FilePayloadStore` temp-file writes, atomic rename, and local payload index state |
+| Restart replay of accepted local writes | local payload startup reconciliation plus VFS pending-upload replay |
+| Background delayed upload | `UploadQueue`, upload lifecycle worker, and local payload lifecycle transitions |
+| Foreground flush as durability boundary, not remote publish | `flush_fh`, `fsync`, and release barriers force local `sync_data()` without waiting for S3/PG publication |
+
 ## 13. Current StudioFS Concepts: Delete, Retain, Rename, Simplify
 
 | Current concept | Decision in this rewrite |

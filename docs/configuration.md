@@ -223,7 +223,7 @@ Notes:
 - `--repair` applies repairs immediately:
   - undo replay (`recover_undo_logs`)
   - dangling dentry cleanup
-  - orphan regular/symlink inode cleanup (blocks are moved to pending GC)
+  - orphan regular/symlink inode cleanup (payload objects are moved to pending GC)
 - orphan directories and hardlink-like orphan cases (`nlink > 1`) are reported
   and skipped for safety.
 - `nlink` mismatches are currently report-only.
@@ -483,7 +483,7 @@ Metadata cache observability is emitted through the existing `upload pipeline` /
 
 - dentry cache, full-path shortcut cache, and attr read cache metrics: hits/misses/evictions, occupancy, protected-tier (hotset) occupancy, and hot-hit contribution
 - ingress artifact counters/checkpoint stats (expected to remain at zero during normal local-cache foreground operation unless recovering older artifacts)
-- local dirty-state persist batch metrics (batch size in blocks/bytes, batch duration histogram, concurrent batch depth/peak)
+- local dirty-state persist batch metrics (batch size in payloads/bytes, batch duration histogram, concurrent batch depth/peak)
 - cache shim read/write throughput and latency histograms
 - VFS synchronous read fast-path counters (`vfs_read_sync_fast_path_hits`, `vfs_read_sync_fast_path_misses`)
 - queue depth/backpressure metrics (`upload_queue_depth`, `upload_queue_depth_peak`, `write_backpressure_wait_ms`, `write_backpressure_events`)

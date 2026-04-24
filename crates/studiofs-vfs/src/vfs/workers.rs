@@ -504,7 +504,7 @@ impl StudioVfs {
                     fast_backpressure_events = ingress.fast_backpressure_events,
                     fast_backpressure_stall_max_ms = ingress.fast_backpressure_stall_max_ms,
                     materialize_batches_total = materialize_batches.batches,
-                    materialize_batches_blocks = materialize_batches.blocks,
+                    materialize_batches_payloads = materialize_batches.payloads,
                     materialize_batches_bytes = materialize_batches.bytes,
                     materialize_batches_inflight = materialize_batches.inflight_batches,
                     materialize_batches_inflight_peak = materialize_batches.inflight_batches_peak,

@@ -794,7 +794,7 @@ fn startup_replay_removes_orphan_dirty_payloads_and_clears_pending_evictions() {
     let object_id = 991_337;
 
     vfs.local_payload_backend()
-        .put(object_id, b"orphan-dirty-block", false)
+        .put(object_id, b"orphan-dirty-payload", false)
         .expect("persist orphan dirty payload");
     vfs.local_payload_backend()
         .sync_data()

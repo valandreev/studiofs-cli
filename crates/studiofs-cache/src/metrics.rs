@@ -84,7 +84,7 @@ impl LatencyHistogram {
 #[derive(Debug, Clone)]
 pub struct MaterializeBatchStatsSnapshot {
     pub batches: u64,
-    pub blocks: u64,
+    pub payloads: u64,
     pub bytes: u64,
     pub inflight_batches: usize,
     pub inflight_batches_peak: usize,
@@ -94,7 +94,7 @@ pub struct MaterializeBatchStatsSnapshot {
 #[derive(Debug, Default)]
 pub struct MaterializeBatchStats {
     batches: AtomicU64,
-    blocks: AtomicU64,
+    payloads: AtomicU64,
     bytes: AtomicU64,
     inflight_batches: AtomicUsize,
     inflight_batches_peak: AtomicUsize,
@@ -102,9 +102,9 @@ pub struct MaterializeBatchStats {
 }
 
 impl MaterializeBatchStats {
-    pub fn record_batch(&self, blocks: u64, bytes: u64, elapsed: Duration) {
+    pub fn record_batch(&self, payloads: u64, bytes: u64, elapsed: Duration) {
         self.batches.fetch_add(1, Ordering::Relaxed);
-        self.blocks.fetch_add(blocks, Ordering::Relaxed);
+        self.payloads.fetch_add(payloads, Ordering::Relaxed);
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
         self.duration_histogram.observe_duration(elapsed);
     }
@@ -125,7 +125,7 @@ impl MaterializeBatchStats {
     pub fn snapshot(&self) -> MaterializeBatchStatsSnapshot {
         MaterializeBatchStatsSnapshot {
             batches: self.batches.load(Ordering::Relaxed),
-            blocks: self.blocks.load(Ordering::Relaxed),
+            payloads: self.payloads.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
             inflight_batches: self.inflight_batches.load(Ordering::Relaxed),
             inflight_batches_peak: self.inflight_batches_peak.load(Ordering::Relaxed),
@@ -135,7 +135,7 @@ impl MaterializeBatchStats {
 
     pub fn reset(&self) {
         self.batches.store(0, Ordering::Relaxed);
-        self.blocks.store(0, Ordering::Relaxed);
+        self.payloads.store(0, Ordering::Relaxed);
         self.bytes.store(0, Ordering::Relaxed);
         self.inflight_batches.store(0, Ordering::Relaxed);
         self.inflight_batches_peak.store(0, Ordering::Relaxed);

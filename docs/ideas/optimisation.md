@@ -38,7 +38,7 @@ WinFSP callback (kernel)
     ↓ COPY #1: Bytes::copy_from_slice()
 HandleWriterRegistry (Bytes in BTreeMap)
     ↓ COPY #2: BytesMut rehydration + merge
-LocalDirtyState (BytesMut blocks)
+LocalDirtyState (BytesMut payloads)
     ↓ COPY #3: freeze() + persist to disk
 Local payload backend (NVMe cache)
     ↓ (Upload to S3 - no additional copy, but data persists)
@@ -489,7 +489,7 @@ pub(super) async fn materialize_handle_writers_for_limits(
 | Layer | Type | Where | Size | When Freed |
 |-------|------|-------|------|-----------|
 | **HandleWriterRegistry** | `BTreeMap<u64, Bytes>` | Per-handle, async | Up to 3×max_dirty | After `mark_materialized()` |
-| **LocalDirtyState** | `HashMap<(Ino, u32), BytesMut>` | Per-inode, blocks | Up to max_dirty | After persist to disk |
+| **LocalDirtyState** | `HashMap<(Ino, u32), BytesMut>` | Per-inode, payloads | Up to max_dirty | After persist to disk |
 | **Local Payload Backend** | Disk/mmap cache | Local NVMe | Based on cache size | LRU eviction |
 
 ### Memory Flow for 7GB Write
@@ -1011,7 +1011,7 @@ async fn write(&self, ino: Ino, offset: u64, data: &[u8]) -> VfsResult<u32> {
 
 #### 6. Streaming Materialization
 
-Instead of materializing entire blocks at once, flush data to disk incrementally:
+Instead of materializing entire payloads at once, flush data to disk incrementally:
 
 ```rust
 // Conceptual:

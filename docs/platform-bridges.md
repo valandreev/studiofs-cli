@@ -181,7 +181,7 @@ Trash semantics, so deletes go through ordinary rename/restore flow instead of
 `unlink` fallback:
 - the file remains available in Trash
 - inode metadata is preserved
-- local L1/L2 cache blocks for the file are evicted promptly via the background
+- local cache payload objects for the file are evicted promptly via the background
   cache priority path so delete bursts do not contend with foreground reads
 
 This keeps Trash recovery semantics intact while preventing local cache growth

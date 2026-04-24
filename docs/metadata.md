@@ -143,7 +143,7 @@ For regular files StudioFS keeps two views:
   - remote-visible regular-file base graph in `regular_file_base`
 
 This is required so a client can finish local writes immediately while remote
-clients only see blocks that have actually finished uploading.
+clients only see payload objects that have actually finished uploading.
 
 Regular-file graph rules:
 - slices are chunk-relative and stay within a single chunk
@@ -677,7 +677,7 @@ without the field remain decodable.
   deferred-delete intent in the same transaction.
 - `recover_undo_logs()` is the primary replay entry point:
   - heals dangling pending-create dentries
-  - replays deferred-delete cleanup (blocks/attrs/deferred records)
+  - replays deferred-delete cleanup (payload objects/attrs/deferred records)
   - returns touched parent inodes for namespace cache invalidation
 - `recover_undo_logs()` is intended for startup/crash recovery.
 - Runtime janitor replays only pending-create intents (`recover_pending_creates()`)

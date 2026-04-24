@@ -68,7 +68,7 @@ Core invariants:
 4. `flush(ino)` / `close(ino)` / last-handle release materialize accepted bytes
    into the local authority view through local backend + metadata commit.
 5. `CachedStore` queues committed payloads into the runtime upload queue.
-6. Background workers upload immutable blocks to object storage.
+6. Background workers upload immutable payload objects to object storage.
 7. `fsync(ino)` is the explicit strict request for a crash-safe local sync
    boundary.
 8. Epoch finalization publishes the new file version only after the referenced

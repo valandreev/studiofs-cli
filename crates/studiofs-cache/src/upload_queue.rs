@@ -338,7 +338,7 @@ mod tests {
         assert!(!queue.has_pending_for_ino(1));
         assert!(!queue.has_pending_for_ino(2));
 
-        // Submit two blocks for ino 1 and one for ino 2.
+        // Submit two payload objects for ino 1 and one for ino 2.
         queue.submit(1, 0, 100, 1);
         queue.submit(1, 4096, 101, 1);
         queue.submit(2, 0, 200, 1);
@@ -347,12 +347,12 @@ mod tests {
         assert!(queue.has_pending_for_ino(2));
         assert!(!queue.has_pending_for_ino(3));
 
-        // Complete one of the two blocks for ino 1.
+        // Complete one of the two payload objects for ino 1.
         let op = rx.recv().await.unwrap();
         assert_eq!(op.ino, 1);
         queue.complete(&op);
 
-        // ino 1 still has the second block pending.
+        // ino 1 still has the second payload object pending.
         assert!(queue.has_pending_for_ino(1));
 
         // Drain remaining ops.

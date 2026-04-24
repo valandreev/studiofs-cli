@@ -26,7 +26,7 @@ const LEGACY_ENTRY_ENCODING_VERSION: u8 = 1;
 const ENTRY_ENCODING_VERSION: u8 = 2;
 const NO_DIRTY_ORDER: u64 = u64::MAX;
 
-const BLOCKS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("blocks");
+const PAYLOAD_OBJECTS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("payload_objects");
 const DIRTY_ORDER_TABLE: TableDefinition<u64, u64> = TableDefinition::new("dirty_order");
 const ACCESS_ORDER_TABLE: TableDefinition<u64, u64> = TableDefinition::new("access_order");
 const COUNTERS_TABLE: TableDefinition<&str, u64> = TableDefinition::new("counters");
@@ -207,8 +207,11 @@ impl CacheIndex {
 
     pub fn get_entry(&self, object_id: u64) -> Result<Option<CacheIndexEntry>, CacheIndexError> {
         let txn = self.db.begin_read().map_err(storage_error)?;
-        let blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
-        Ok(read_entry_from_blocks(&blocks, object_id)?.map(|entry| entry.into_public(object_id)))
+        let payloads = txn
+            .open_table(PAYLOAD_OBJECTS_TABLE)
+            .map_err(storage_error)?;
+        Ok(read_entry_from_payloads(&payloads, object_id)?
+            .map(|entry| entry.into_public(object_id)))
     }
 
     pub fn upsert(&self, mut update: CacheIndexUpsert) -> Result<(), CacheIndexError> {
@@ -216,12 +219,14 @@ impl CacheIndex {
 
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
-            let mut blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+            let mut payloads = txn
+                .open_table(PAYLOAD_OBJECTS_TABLE)
+                .map_err(storage_error)?;
             let mut dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
-            let old = read_entry_write(&blocks, update.object_id)?;
+            let old = read_entry_write(&payloads, update.object_id)?;
             let mut new = StoredEntry {
                 payload_key: update.payload_key,
                 payload_len: update.payload_len,
@@ -241,7 +246,7 @@ impl CacheIndex {
                 update.object_id,
                 old.as_ref(),
                 Some(&new),
-                &mut blocks,
+                &mut payloads,
                 &mut dirty_order,
                 &mut access_order,
                 &mut counters,
@@ -259,13 +264,15 @@ impl CacheIndex {
 
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
-            let mut blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+            let mut payloads = txn
+                .open_table(PAYLOAD_OBJECTS_TABLE)
+                .map_err(storage_error)?;
             let mut dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
             for update in updates.iter().cloned().map(normalize_upsert) {
-                let old = read_entry_write(&blocks, update.object_id)?;
+                let old = read_entry_write(&payloads, update.object_id)?;
                 let mut new = StoredEntry {
                     payload_key: update.payload_key,
                     payload_len: update.payload_len,
@@ -286,7 +293,7 @@ impl CacheIndex {
                     update.object_id,
                     old.as_ref(),
                     Some(&new),
-                    &mut blocks,
+                    &mut payloads,
                     &mut dirty_order,
                     &mut access_order,
                     &mut counters,
@@ -375,13 +382,15 @@ impl CacheIndex {
 
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
-            let mut blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+            let mut payloads = txn
+                .open_table(PAYLOAD_OBJECTS_TABLE)
+                .map_err(storage_error)?;
             let mut dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
             for object_id in object_ids {
-                let Some(old) = read_entry_write(&blocks, *object_id)? else {
+                let Some(old) = read_entry_write(&payloads, *object_id)? else {
                     continue;
                 };
                 let mut new = old.clone();
@@ -392,7 +401,7 @@ impl CacheIndex {
                     *object_id,
                     Some(&old),
                     Some(&new),
-                    &mut blocks,
+                    &mut payloads,
                     &mut dirty_order,
                     &mut access_order,
                     &mut counters,
@@ -407,12 +416,14 @@ impl CacheIndex {
     pub fn mark_uploading(&self, object_id: u64) -> Result<(), CacheIndexError> {
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
-            let mut blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+            let mut payloads = txn
+                .open_table(PAYLOAD_OBJECTS_TABLE)
+                .map_err(storage_error)?;
             let mut dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
-            let Some(old) = read_entry_write(&blocks, object_id)? else {
+            let Some(old) = read_entry_write(&payloads, object_id)? else {
                 return Ok(());
             };
             if old.lifecycle != LocalPayloadLifecycleState::Dirty {
@@ -431,7 +442,7 @@ impl CacheIndex {
                 object_id,
                 Some(&old),
                 Some(&new),
-                &mut blocks,
+                &mut payloads,
                 &mut dirty_order,
                 &mut access_order,
                 &mut counters,
@@ -445,12 +456,14 @@ impl CacheIndex {
     pub fn mark_upload_failed(&self, object_id: u64) -> Result<(), CacheIndexError> {
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
-            let mut blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+            let mut payloads = txn
+                .open_table(PAYLOAD_OBJECTS_TABLE)
+                .map_err(storage_error)?;
             let mut dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
-            let Some(old) = read_entry_write(&blocks, object_id)? else {
+            let Some(old) = read_entry_write(&payloads, object_id)? else {
                 return Ok(());
             };
             if old.lifecycle != LocalPayloadLifecycleState::Uploading {
@@ -467,7 +480,7 @@ impl CacheIndex {
                 object_id,
                 Some(&old),
                 Some(&new),
-                &mut blocks,
+                &mut payloads,
                 &mut dirty_order,
                 &mut access_order,
                 &mut counters,
@@ -481,12 +494,14 @@ impl CacheIndex {
     pub fn mark_uploaded(&self, object_id: u64) -> Result<(), CacheIndexError> {
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
-            let mut blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+            let mut payloads = txn
+                .open_table(PAYLOAD_OBJECTS_TABLE)
+                .map_err(storage_error)?;
             let mut dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
-            let Some(old) = read_entry_write(&blocks, object_id)? else {
+            let Some(old) = read_entry_write(&payloads, object_id)? else {
                 return Ok(());
             };
             let mut new = old.clone();
@@ -499,7 +514,7 @@ impl CacheIndex {
                 object_id,
                 Some(&old),
                 Some(&new),
-                &mut blocks,
+                &mut payloads,
                 &mut dirty_order,
                 &mut access_order,
                 &mut counters,
@@ -513,12 +528,14 @@ impl CacheIndex {
     pub fn remove(&self, object_id: u64) -> Result<(), CacheIndexError> {
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
-            let mut blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+            let mut payloads = txn
+                .open_table(PAYLOAD_OBJECTS_TABLE)
+                .map_err(storage_error)?;
             let mut dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
 
-            let Some(old) = read_entry_write(&blocks, object_id)? else {
+            let Some(old) = read_entry_write(&payloads, object_id)? else {
                 return Ok(());
             };
 
@@ -526,7 +543,7 @@ impl CacheIndex {
                 object_id,
                 Some(&old),
                 None,
-                &mut blocks,
+                &mut payloads,
                 &mut dirty_order,
                 &mut access_order,
                 &mut counters,
@@ -546,14 +563,16 @@ impl CacheIndex {
 
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
-            let mut blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+            let mut payloads = txn
+                .open_table(PAYLOAD_OBJECTS_TABLE)
+                .map_err(storage_error)?;
             let mut dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
             let mut access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
             let mut counters = txn.open_table(COUNTERS_TABLE).map_err(storage_error)?;
             let mut batch_delta = AccountingDelta::default();
 
             for object_id in object_ids {
-                let Some(old) = read_entry_write(&blocks, *object_id)? else {
+                let Some(old) = read_entry_write(&payloads, *object_id)? else {
                     continue;
                 };
                 remove_order_link(&mut dirty_order, old.dirty_order, *object_id, "dirty")?;
@@ -563,7 +582,7 @@ impl CacheIndex {
                     *object_id,
                     "access",
                 )?;
-                let _ = blocks.remove(object_id).map_err(storage_error)?;
+                let _ = payloads.remove(object_id).map_err(storage_error)?;
                 batch_delta.subtract_entry(&old)?;
             }
 
@@ -601,7 +620,9 @@ impl CacheIndex {
             return Ok(Vec::new());
         }
         let txn = self.db.begin_read().map_err(storage_error)?;
-        let blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+        let payloads = txn
+            .open_table(PAYLOAD_OBJECTS_TABLE)
+            .map_err(storage_error)?;
         let dirty_order = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
 
         let start = match start_after {
@@ -622,7 +643,7 @@ impl CacheIndex {
             let order = order.value();
             let object_id = object_id.value();
 
-            let Some(entry) = read_entry_from_blocks(&blocks, object_id)? else {
+            let Some(entry) = read_entry_from_payloads(&payloads, object_id)? else {
                 return Err(CacheIndexError::Corruption(format!(
                     "dirty order references missing payload object_id={object_id}"
                 )));
@@ -678,7 +699,9 @@ impl CacheIndex {
             return Ok(Vec::new());
         }
         let txn = self.db.begin_read().map_err(storage_error)?;
-        let blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+        let payloads = txn
+            .open_table(PAYLOAD_OBJECTS_TABLE)
+            .map_err(storage_error)?;
         let access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
 
         let start = match start_after {
@@ -698,7 +721,7 @@ impl CacheIndex {
             let (order, object_id) = pair.map_err(storage_error)?;
             let order = order.value();
             let object_id = object_id.value();
-            if read_entry_from_blocks(&blocks, object_id)?.is_some() {
+            if read_entry_from_payloads(&payloads, object_id)?.is_some() {
                 ordered.push((object_id, order));
             }
         }
@@ -734,7 +757,9 @@ impl CacheIndex {
             return Ok(EvictionCandidatePage::default());
         }
         let txn = self.db.begin_read().map_err(storage_error)?;
-        let blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
+        let payloads = txn
+            .open_table(PAYLOAD_OBJECTS_TABLE)
+            .map_err(storage_error)?;
         let access_order = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
 
         let start = match start_after {
@@ -758,7 +783,7 @@ impl CacheIndex {
             let object_id = object_id.value();
             scanned_rows = scanned_rows.saturating_add(1);
 
-            let Some(entry) = read_entry_from_blocks(&blocks, object_id)? else {
+            let Some(entry) = read_entry_from_payloads(&payloads, object_id)? else {
                 continue;
             };
             if entry.access_order != order {
@@ -788,9 +813,11 @@ impl CacheIndex {
     fn initialize_schema(&self) -> Result<(), CacheIndexError> {
         let txn = self.db.begin_write().map_err(storage_error)?;
         {
-            let blocks_exist = {
-                let blocks = txn.open_table(BLOCKS_TABLE).map_err(storage_error)?;
-                blocks.first().map_err(storage_error)?.is_some()
+            let payloads_exist = {
+                let payloads = txn
+                    .open_table(PAYLOAD_OBJECTS_TABLE)
+                    .map_err(storage_error)?;
+                payloads.first().map_err(storage_error)?.is_some()
             };
             let _ = txn.open_table(DIRTY_ORDER_TABLE).map_err(storage_error)?;
             let _ = txn.open_table(ACCESS_ORDER_TABLE).map_err(storage_error)?;
@@ -812,7 +839,7 @@ impl CacheIndex {
                         found,
                     });
                 }
-            } else if blocks_exist {
+            } else if payloads_exist {
                 return Err(CacheIndexError::Corruption(format!(
                     "missing '{COUNTER_INDEX_FORMAT}' counter in non-empty index"
                 )));
@@ -830,7 +857,7 @@ impl CacheIndex {
                 (COUNTER_NEXT_ACCESS_SEQ, 0_u64),
             ] {
                 if counters.get(name).map_err(storage_error)?.is_none() {
-                    if blocks_exist {
+                    if payloads_exist {
                         return Err(CacheIndexError::Corruption(format!(
                             "missing '{name}' counter in non-empty index"
                         )));
@@ -904,11 +931,11 @@ impl StoredEntry {
     }
 }
 
-fn read_entry_from_blocks(
-    blocks: &redb::ReadOnlyTable<u64, &[u8]>,
+fn read_entry_from_payloads(
+    payloads: &redb::ReadOnlyTable<u64, &[u8]>,
     object_id: u64,
 ) -> Result<Option<StoredEntry>, CacheIndexError> {
-    blocks
+    payloads
         .get(&object_id)
         .map_err(storage_error)?
         .map(|value| decode_entry(value.value(), object_id))
@@ -916,10 +943,10 @@ fn read_entry_from_blocks(
 }
 
 fn read_entry_write(
-    blocks: &redb::Table<'_, u64, &[u8]>,
+    payloads: &redb::Table<'_, u64, &[u8]>,
     object_id: u64,
 ) -> Result<Option<StoredEntry>, CacheIndexError> {
-    blocks
+    payloads
         .get(&object_id)
         .map_err(storage_error)?
         .map(|value| decode_entry(value.value(), object_id))
@@ -930,7 +957,7 @@ fn apply_entry_change(
     object_id: u64,
     old: Option<&StoredEntry>,
     new: Option<&StoredEntry>,
-    blocks: &mut redb::Table<'_, u64, &[u8]>,
+    payloads: &mut redb::Table<'_, u64, &[u8]>,
     dirty_order: &mut redb::Table<'_, u64, u64>,
     access_order: &mut redb::Table<'_, u64, u64>,
     counters: &mut redb::Table<'_, &str, u64>,
@@ -966,12 +993,12 @@ fn apply_entry_change(
     match new {
         Some(new_entry) => {
             let encoded = encode_entry(new_entry)?;
-            blocks
+            payloads
                 .insert(&object_id, encoded.as_slice())
                 .map_err(storage_error)?;
         }
         None => {
-            let _ = blocks.remove(&object_id).map_err(storage_error)?;
+            let _ = payloads.remove(&object_id).map_err(storage_error)?;
         }
     }
 

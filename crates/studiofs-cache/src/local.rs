@@ -178,12 +178,12 @@ pub(crate) mod contract_tests {
             LocalPayloadLifecycleState::Missing
         );
 
-        backend.put(object_id, b"dirty-block", false).unwrap();
+        backend.put(object_id, b"dirty-payload", false).unwrap();
         backend.sync_data().unwrap();
         assert!(backend.contains(object_id));
         assert_eq!(
             backend.get(object_id).unwrap().as_ref(),
-            b"dirty-block",
+            b"dirty-payload",
             "read path must return persisted bytes"
         );
         assert_eq!(
@@ -200,7 +200,7 @@ pub(crate) mod contract_tests {
         assert_eq!(backend.dirty_object_ids(), vec![object_id]);
         assert_eq!(
             backend.get_for_upload(object_id).unwrap().as_ref(),
-            b"dirty-block",
+            b"dirty-payload",
             "upload reread must return persisted bytes"
         );
 
@@ -271,7 +271,7 @@ pub(crate) mod contract_tests {
         );
         assert!(
             backend.dirty_object_ids().is_empty(),
-            "removed blocks must no longer appear as dirty"
+            "removed payload objects must no longer appear as dirty"
         );
     }
 }
