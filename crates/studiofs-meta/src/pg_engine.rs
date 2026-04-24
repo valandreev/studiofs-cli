@@ -6466,7 +6466,7 @@ mod tests {
         let replacement = BlockRef::new_partial(block_size + 3, 4096);
         writer
             .stage_logical_payload_slice(file.ino, 0, &replacement)
-            .expect("set replacement block");
+            .expect("set replacement payload slice");
         assert!(
             writer
                 .publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
@@ -6612,10 +6612,10 @@ mod tests {
         let new_block1 = BlockRef::new_partial(903, 4096);
         writer
             .stage_logical_payload_slice(temp.ino, 0, &new_block0)
-            .expect("set replacement block 0");
+            .expect("set replacement payload slice 0");
         writer
             .stage_logical_payload_slice(temp.ino, 1, &new_block1)
-            .expect("set replacement block 1");
+            .expect("set replacement payload slice 1");
         assert!(
             writer
                 .publish_regular_file_overlay_to_base_if_matches(temp.ino, 2)
@@ -6673,7 +6673,7 @@ mod tests {
         let published = BlockRef::new_partial(904, 4096);
         writer
             .stage_logical_payload_slice(file.ino, 0, &published)
-            .expect("set published block");
+            .expect("set published payload slice");
         assert!(
             writer
                 .publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
@@ -7087,8 +7087,8 @@ mod tests {
         let remote = b.lookup(ROOT_INO, b"remote.bin").expect("lookup remote");
         assert_eq!(
             lookup_first_object_id(&b, remote.ino)
-                .expect("get remote block")
-                .expect("remote committed block"),
+                .expect("get remote payload slice")
+                .expect("remote committed payload slice"),
             77
         );
 
@@ -7344,7 +7344,7 @@ mod tests {
         set_file_state(&a, file.ino, 4096, 2);
         let replacement = BlockRef::new_partial(702, 4096);
         a.stage_logical_payload_slice(file.ino, 0, &replacement)
-            .expect("set replacement block");
+            .expect("set replacement payload slice");
         a.flush_metadata().expect("flush updating marker");
 
         assert!(wait_until(Duration::from_secs(10), || {
@@ -7415,9 +7415,9 @@ mod tests {
         let replacement0 = BlockRef::new_full(901, DEFAULT_BLOCK_SIZE);
         let replacement1 = BlockRef::new_partial(902, 4096);
         a.stage_logical_payload_slice(file.ino, 0, &replacement0)
-            .expect("set replacement block 0");
+            .expect("set replacement payload slice 0");
         a.stage_logical_payload_slice(file.ino, 1, &replacement1)
-            .expect("set replacement block 1");
+            .expect("set replacement payload slice 1");
         a.flush_metadata().expect("flush updating state");
 
         assert!(wait_until(Duration::from_secs(10), || {
@@ -7631,8 +7631,8 @@ mod tests {
 
         assert_eq!(
             lookup_first_object_id(&b, b_file.ino)
-                .expect("get committed block on b")
-                .expect("committed block visible on b"),
+                .expect("get committed payload slice on b")
+                .expect("committed payload slice visible on b"),
             88
         );
 

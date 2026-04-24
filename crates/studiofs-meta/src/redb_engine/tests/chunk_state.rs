@@ -133,9 +133,9 @@ fn test_block_replace_clears_pending_compaction_rows() {
 }
 
 #[test]
-fn test_logical_block_refs_to_chunk_state_rejects_slice_overflow() {
+fn test_logical_payload_refs_to_chunk_state_rejects_slice_overflow() {
     let block = BlockRef::new_partial(9_999, u32::MAX);
-    let err = RedbMetaEngine::logical_block_refs_to_chunk_state(&[(1, block)], u32::MAX)
+    let err = RedbMetaEngine::logical_payload_refs_to_chunk_state(&[(1, block)], u32::MAX)
         .expect_err("overflowing slice range must fail");
 
     assert!(matches!(err, MetaError::Storage(message) if message.contains("slice range overflow")));
@@ -1059,13 +1059,11 @@ fn test_publish_regular_file_overlay_to_base_if_matches_promotes_base_rows() {
         .expect("published base chunk");
     let published: RegularFileChunkState = decode(row.value()).unwrap();
     assert_eq!(published.slices.len(), 2);
-    assert_eq!(
-        published.slices.get(&SliceId(1)).unwrap().block_state,
-        BlockRefState::Published
-    );
-    assert_eq!(
-        published.slices.get(&SliceId(2)).unwrap().block_state,
-        BlockRefState::Published
+    assert!(
+        published
+            .slices
+            .values()
+            .all(|slice| slice.block_state == BlockRefState::Published)
     );
     let overlay = txn.open_table(REGULAR_FILE_OVERLAY_TABLE).unwrap();
     assert!(
@@ -1080,6 +1078,71 @@ fn test_publish_regular_file_overlay_to_base_if_matches_promotes_base_rows() {
     );
     assert_eq!(published_attr.committed_content_epoch, 7);
     assert_eq!(published_attr.upload_state, UploadState::Ready);
+}
+
+#[test]
+fn test_publish_regular_file_overlay_to_base_preserves_untouched_base_ranges() {
+    let engine = temp_engine();
+    let file = engine
+        .create_file(ROOT_INO, b"publish-preserve-base.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let mut attr = engine.get_attr(file.ino).unwrap();
+    attr.content_epoch = 3;
+    attr.size = 12 * 1024;
+    engine.set_attr(&attr).unwrap();
+
+    let mut base_chunk = RegularFileChunkState::default();
+    base_chunk.insert_slice(SliceRecord::new(
+        SliceId(1),
+        SliceOrder(1),
+        SliceRange::new(0, 4096).expect("valid first base range"),
+        BlockRef::new_partial(3101, 4096),
+    ));
+    base_chunk.insert_slice(SliceRecord::new(
+        SliceId(2),
+        SliceOrder(2),
+        SliceRange::new(4096, 8192).expect("valid second base range"),
+        BlockRef::new_partial(3102, 4096),
+    ));
+    base_chunk.insert_slice(SliceRecord::new(
+        SliceId(3),
+        SliceOrder(3),
+        SliceRange::new(8192, 12 * 1024).expect("valid third base range"),
+        BlockRef::new_partial(3103, 4096),
+    ));
+
+    let mut overlay_chunk = RegularFileChunkState::default();
+    overlay_chunk.insert_slice(SliceRecord::new(
+        SliceId(1),
+        SliceOrder(1),
+        SliceRange::new(4096, 8192).expect("valid replacement range"),
+        BlockRef::new_partial(3202, 4096),
+    ));
+    set_regular_file_chunk_rows(
+        &engine,
+        file.ino,
+        &[(ChunkId(0), overlay_chunk)],
+        &[(ChunkId(0), base_chunk)],
+    );
+
+    assert!(
+        engine
+            .publish_regular_file_overlay_to_base_if_matches(file.ino, 3)
+            .unwrap()
+    );
+
+    let spans = engine
+        .lookup_regular_file_slices(file.ino, 0, attr.size)
+        .unwrap();
+    let object_ids: Vec<_> = spans
+        .into_iter()
+        .filter_map(|span| span.block.map(|block| block.object_id))
+        .collect();
+    assert_eq!(
+        object_ids,
+        vec![3101, 3202, 3103],
+        "publish must resolve overlay over base instead of dropping untouched base ranges"
+    );
 }
 
 #[test]
@@ -1234,7 +1297,7 @@ fn redb_base_graph_publish_sets_committed_head() {
         .unwrap();
     let remote_blocks: Vec<_> = remote_spans
         .into_iter()
-        .map(|span| span.block.expect("published block slice"))
+        .map(|span| span.block.expect("published payload slice"))
         .collect();
     assert_eq!(remote_blocks, vec![block0, block1]);
 }

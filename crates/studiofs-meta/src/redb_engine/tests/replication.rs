@@ -172,7 +172,7 @@ fn test_replica_aux_block_events_accept_fragmented_base_graph() {
         replacement_spans[0]
             .block
             .as_ref()
-            .expect("replacement block slice")
+            .expect("replacement payload slice")
             .object_id,
         replacement.object_id
     );

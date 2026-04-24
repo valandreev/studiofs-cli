@@ -222,7 +222,7 @@ pub struct InodeAttr {
     pub gid: u32,
     /// File size in bytes.
     pub size: u64,
-    /// Size visible to remote clients after committed block uploads.
+    /// Size visible to remote clients after committed payload uploads.
     #[serde(default)]
     pub committed_size: u64,
     /// Number of hard links.

@@ -611,7 +611,7 @@ fn flush_queues_runtime_upload_immediately_after_local_durability() {
     assert_eq!(
         pending_uploads.len(),
         1,
-        "local durability should enqueue the unpublished block into the runtime upload queue"
+        "local durability should enqueue the unpublished payload object into the runtime upload queue"
     );
 
     let runtime_pending = vfs.cached_store().snapshot_pending_uploads();
@@ -656,7 +656,7 @@ fn buffered_partial_write_uses_fragmented_overlay_slice_graph_as_base() {
         assert_eq!(
             read.as_ref(),
             expected.as_slice(),
-            "buffered write path should reuse fragmented overlay slice graph as its base block"
+            "buffered write path should reuse fragmented overlay slice graph as its base payload"
         );
     });
 }
@@ -710,7 +710,7 @@ fn release_fh_materializes_fragmented_overlay_slice_graph_base() {
         assert_eq!(
             read.as_ref(),
             expected.as_slice(),
-            "handle-writer materialization should reuse fragmented overlay slice graph as its base block"
+            "handle-writer materialization should reuse fragmented overlay slice graph as its base payload"
         );
     });
 }
@@ -3326,7 +3326,7 @@ fn write_fh_sub_block_callbacks_batch_completed_blocks_until_flush() {
 }
 
 #[test]
-fn inode_write_overwrite_updates_current_block_graph_over_published_base() {
+fn inode_write_overwrite_updates_current_slice_graph_over_published_base() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-inode-write-overwrite");
     let _guard = rt.enter();
@@ -3353,7 +3353,7 @@ fn inode_write_overwrite_updates_current_block_graph_over_published_base() {
         assert_ne!(
             current_blocks[0].1.object_id,
             published_blocks[0],
-            "current file graph must advance to the replacement block instead of reusing the published base"
+            "current file graph must advance to the replacement payload slice instead of reusing the published base"
         );
 
         let spans = meta
@@ -3372,7 +3372,7 @@ fn inode_write_overwrite_updates_current_block_graph_over_published_base() {
                 .expect("block-backed overwrite span")
                 .object_id,
             current_blocks[0].1.object_id,
-            "regular-file slice lookup and logical payload helper must agree on the current unpublished block"
+            "regular-file slice lookup and logical payload helper must agree on the current unpublished payload"
         );
     });
 }
@@ -4019,7 +4019,7 @@ fn test_size_changing_setattr_rolls_back_partial_truncate_mutation_failure() {
         assert_eq!(
             blocks.len(),
             2,
-            "rollback should restore both originally committed blocks"
+            "rollback should restore both originally committed payload slices"
         );
         let read = vfs.read(attr.ino, 0, payload.len() as u32).await.unwrap();
         assert_eq!(
@@ -5409,7 +5409,7 @@ fn committed_copy_rejects_short_payload() {
         other => panic!("expected VfsError::Other, got {other}"),
     };
     assert!(
-        message.contains("committed block payload too short"),
+        message.contains("committed payload object too short"),
         "error message should highlight short committed payload"
     );
 }

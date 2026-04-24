@@ -432,6 +432,7 @@ impl StudioVfs {
             let new_last_block = block_index_from_offset(new_size - 1, self.block_size);
             let last_block_offset = offset_within_block(new_size - 1, self.block_size);
             let new_last_len = last_block_offset as usize + 1;
+            self.remove_live_extent(ino, new_last_block);
             let trimmed_local =
                 match self.trim_local_block_staging(ino, new_last_block, new_last_len) {
                     Ok(trimmed_local) => trimmed_local,

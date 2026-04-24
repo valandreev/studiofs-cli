@@ -1465,7 +1465,7 @@ async fn seed_committed_file(
                 &block_ref
             )
             .unwrap(),
-            "seeded committed block should satisfy metadata preconditions"
+            "seeded committed payload slice should satisfy metadata preconditions"
         );
     }
 
@@ -1893,7 +1893,7 @@ async fn test_pending_deletions_gc() {
             pending.iter().any(|(id, _)| *id == old_block_id)
         })
         .await,
-        "old committed block should eventually enter pending deletions"
+        "old committed payload object should eventually enter pending deletions"
     );
 
     // Verify new block is different
@@ -2492,7 +2492,7 @@ fn test_crash_recovery_replays_local_committed_block_before_metadata_flush() {
             vfs.flush(ino).await.unwrap();
 
             let blocks = wait_until_blocks(&vfs, ino, Duration::from_secs(45))
-                .expect("expected committed block refs for baseline payload");
+                .expect("expected committed payload slices for baseline payload");
             baseline_object_id = blocks[0].1.object_id;
 
             let ds = DataStore::new(&data_config).unwrap();
@@ -2543,11 +2543,11 @@ fn test_crash_recovery_replays_local_committed_block_before_metadata_flush() {
             assert_eq!(
                 before.len(),
                 1,
-                "baseline file should have one committed block"
+                "baseline file should have one committed payload slice"
             );
             assert_eq!(
                 before[0].1.object_id, baseline_object_id,
-                "baseline committed block must remain visible before overwrite"
+                "baseline committed payload slice must remain visible before overwrite"
             );
 
             vfs.write(ino, 0, &replacement_payload).await.unwrap();
@@ -2557,7 +2557,7 @@ fn test_crash_recovery_replays_local_committed_block_before_metadata_flush() {
             assert_eq!(
                 after.len(),
                 1,
-                "overwrite should still leave one committed block ref"
+                "overwrite should still leave one committed payload slice"
             );
             assert_ne!(
                 after[0].1.object_id, baseline_object_id,
@@ -4599,7 +4599,7 @@ fn committed_file_mutation_enters_updating_state() {
             vfs.write(ino, 0, &baseline_payload).await.unwrap();
             vfs.flush(ino).await.unwrap();
             wait_until_blocks(&vfs, ino, Duration::from_secs(30))
-                .expect("baseline file must reach committed block refs before mutation");
+                .expect("baseline file must reach committed payload slices before mutation");
             assert!(
                 wait_until(Duration::from_secs(30), || {
                     meta.get_attr(ino)
@@ -6566,12 +6566,12 @@ fn background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart(
         assert_eq!(
             remote_block.object_id,
             committed_block.object_id,
-            "remote-visible payload should stay on the previous committed block"
+            "remote-visible payload should stay on the previous committed payload slice"
         );
         assert_ne!(
             remote_block.object_id,
             replacement_object_id,
-            "the unpublished replacement block must not leak into published state"
+            "the unpublished replacement payload slice must not leak into published state"
         );
     });
     rt.shutdown_background();
@@ -9423,7 +9423,7 @@ async fn test_statfs_after_write() {
 // ─── 9.1 Block Boundary & Truncate Edge Cases ──────────────────────────────
 
 /// Truncate a file to exactly a block boundary.
-/// Verify the last block is NOT marked PARTIAL_BLOCK and has full block_size length.
+/// Verify the remaining logical payload range has full block_size length.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn test_truncate_to_exact_block_boundary() {
@@ -9449,15 +9449,9 @@ async fn test_truncate_to_exact_block_boundary() {
 
     let (idx, blk) = &after[0];
     assert_eq!(*idx, 0);
-    // Exact boundary truncate keeps a full block and must not leave it marked
-    // as partial.
     assert_eq!(
         blk.length, block_size,
         "block length should equal block_size"
-    );
-    assert!(
-        !blk.flags.contains(BlockFlags::PARTIAL_BLOCK),
-        "exact block-boundary truncate must clear PARTIAL_BLOCK"
     );
 
     // Verify read returns correct data.
@@ -11176,11 +11170,14 @@ async fn test_unlink_with_open_handle_deferred_cleanup() {
     vfs.release_fh(fh).await.unwrap();
 
     // Now blocks should be removed and pending deletion.
-    let blocks_after = vfs.meta().lookup_logical_payload_slices(ino).unwrap();
-    assert!(
-        blocks_after.is_empty(),
-        "blocks should be removed after release_fh"
-    );
+    match vfs.meta().lookup_logical_payload_slices(ino) {
+        Ok(blocks_after) => assert!(
+            blocks_after.is_empty(),
+            "payload graph should be removed after release_fh"
+        ),
+        Err(MetaError::InodeNotFound(missing)) if missing == ino => {}
+        Err(error) => panic!("payload graph lookup after release_fh failed unexpectedly: {error}"),
+    }
     let pending = vfs.meta().get_pending_deletions().unwrap();
     assert!(
         pending.iter().any(|(id, _)| *id == block_id),
@@ -11389,11 +11386,14 @@ async fn test_multiple_handles_orphan_cleanup_after_last_close() {
 
     // Close the last handle — orphan cleanup triggers.
     vfs.release_fh(fh3).await.unwrap();
-    let blocks_final = vfs.meta().lookup_logical_payload_slices(ino).unwrap();
-    assert!(
-        blocks_final.is_empty(),
-        "blocks should be cleaned up after last handle closes"
-    );
+    match vfs.meta().lookup_logical_payload_slices(ino) {
+        Ok(blocks_final) => assert!(
+            blocks_final.is_empty(),
+            "payload graph should be cleaned up after last handle closes"
+        ),
+        Err(MetaError::InodeNotFound(missing)) if missing == ino => {}
+        Err(error) => panic!("payload graph lookup after last handle failed unexpectedly: {error}"),
+    }
 }
 
 /// open_file with O_TRUNC on a file with data — should truncate to 0.

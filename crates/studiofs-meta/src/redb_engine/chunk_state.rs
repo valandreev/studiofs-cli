@@ -391,7 +391,7 @@ impl RedbMetaEngine {
             return Ok(());
         }
 
-        let graph = Self::logical_block_refs_to_chunk_state(blocks, block_size)?;
+        let graph = Self::logical_payload_refs_to_chunk_state(blocks, block_size)?;
         let mut table = txn
             .open_table(table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -631,9 +631,9 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    /// Convert logical block refs used by tests into chunk/slice state.
+    /// Convert compact logical-payload fixtures used by tests into chunk/slice state.
     #[cfg(test)]
-    pub(super) fn logical_block_refs_to_chunk_state(
+    pub(super) fn logical_payload_refs_to_chunk_state(
         blocks: &[(u32, BlockRef)],
         block_size: u32,
     ) -> MetaResult<RegularFileOverlayState> {
@@ -726,12 +726,52 @@ impl RedbMetaEngine {
         size
     }
 
+    #[cfg(test)]
     pub(super) fn chunk_for_published_base(chunk: &RegularFileChunkState) -> RegularFileChunkState {
         let mut published = chunk.clone();
         for slice in published.slices.values_mut() {
             slice.block_state = BlockRefState::Published;
         }
         published
+    }
+
+    fn resolved_chunk_for_published_base(
+        chunk_id: ChunkId,
+        overlay: Option<&RegularFileChunkState>,
+        base: Option<&RegularFileChunkState>,
+    ) -> MetaResult<Option<RegularFileChunkState>> {
+        let full_range = SliceRange::new(0, DEFAULT_CHUNK_SIZE)
+            .expect("full chunk range should always be valid");
+        let resolved = resolve_chunk_slice_spans(chunk_id, full_range, overlay, base);
+        let mut published = RegularFileChunkState::default();
+
+        for span in resolved {
+            if span.source == ResolvedSliceSource::Hole {
+                continue;
+            }
+            let slice_id = published
+                .try_alloc_slice_id()
+                .ok_or_else(|| MetaError::Storage("slice id overflow".to_string()))?;
+            let slice_order = published
+                .try_alloc_slice_order()
+                .ok_or_else(|| MetaError::Storage("slice order overflow".to_string()))?;
+            published.slices.insert(
+                slice_id,
+                SliceRecord {
+                    slice_id,
+                    order: slice_order,
+                    range: span.range,
+                    block: span.block,
+                    block_state: BlockRefState::Published,
+                },
+            );
+        }
+
+        if published.slices.is_empty() {
+            return Ok(None);
+        }
+        published.refresh_fragmentation_metrics();
+        Ok(Some(published))
     }
 
     pub(super) fn compact_regular_file_chunk_state(
@@ -835,8 +875,16 @@ impl RedbMetaEngine {
         )?;
 
         let mut desired_base = BTreeMap::new();
-        for (chunk_id, chunk_state) in &overlay_chunks {
-            desired_base.insert(*chunk_id, Self::chunk_for_published_base(chunk_state));
+        let mut desired_chunk_ids: BTreeSet<ChunkId> = existing_base.keys().copied().collect();
+        desired_chunk_ids.extend(overlay_chunks.keys().copied());
+        for chunk_id in desired_chunk_ids {
+            if let Some(published) = Self::resolved_chunk_for_published_base(
+                chunk_id,
+                overlay_chunks.get(&chunk_id),
+                existing_base.get(&chunk_id),
+            )? {
+                desired_base.insert(chunk_id, published);
+            }
         }
 
         let mut existing_object_ids = BTreeSet::new();

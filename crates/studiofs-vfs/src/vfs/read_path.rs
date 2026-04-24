@@ -612,7 +612,7 @@ impl<'a> DataReader<'a> {
                                 block_offset = block.offset,
                                 requested = dst.len(),
                                 read,
-                                "data_reader: short local backend read for committed block; evicting and refetching"
+                                "data_reader: short local backend read for committed payload object; evicting and refetching"
                             );
                             if let Err(evict_error) =
                                 vfs.block_store_remove_async(block.object_id).await
@@ -1947,7 +1947,7 @@ mod tests {
             let object_id = 0xDADA;
             vfs.block_store_put_async(object_id, Bytes::from_static(b"abcdefgh"), false)
                 .await
-                .expect("seed committed block");
+                .expect("seed committed payload object");
 
             let mut staged_attr = meta.get_attr(ino).expect("load staged attr");
             staged_attr.size = 8;
@@ -1955,7 +1955,7 @@ mod tests {
             staged_attr.upload_state = MetaUploadState::Ready;
             meta.set_attr(&staged_attr).expect("persist committed attr");
             meta.stage_logical_payload_slice(ino, 0, &BlockRef::new_partial(object_id, 8))
-                .expect("persist committed block");
+                .expect("persist committed payload slice");
 
             vfs.write(ino, 2, b"XY").await.expect("stage dirty patch");
 
@@ -2032,7 +2032,7 @@ mod tests {
             let object_id = 0xA11CE;
             vfs.block_store_put_async(object_id, Bytes::from_static(b"abcdefgh"), false)
                 .await
-                .expect("seed committed block");
+                .expect("seed committed payload object");
 
             let mut staged_attr = meta.get_attr(ino).expect("load staged attr");
             staged_attr.size = 8;
@@ -2040,7 +2040,7 @@ mod tests {
             staged_attr.upload_state = MetaUploadState::Ready;
             meta.set_attr(&staged_attr).expect("persist committed attr");
             meta.stage_logical_payload_slice(ino, 0, &BlockRef::new_partial(object_id, 8))
-                .expect("persist committed block");
+                .expect("persist committed payload slice");
 
             vfs.write(ino, 2, b"XY").await.expect("stage dirty patch");
 
@@ -2091,7 +2091,7 @@ mod tests {
                 false,
             )
             .await
-            .expect("seed committed block");
+            .expect("seed committed payload object");
 
             let mut staged_attr = meta.get_attr(ino).expect("load staged attr");
             staged_attr.size = 8;
@@ -2101,7 +2101,7 @@ mod tests {
             staged_attr.content_epoch = 2;
             meta.set_attr(&staged_attr).expect("persist staged attr");
             meta.stage_logical_payload_slice(ino, 0, &BlockRef::new_partial(committed_object_id, 8))
-                .expect("persist committed block");
+                .expect("persist committed payload slice");
 
             vfs.state.incarnation.live_extent_records.lock().insert(
                 (ino, 0),

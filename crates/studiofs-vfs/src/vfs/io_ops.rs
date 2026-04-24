@@ -221,13 +221,13 @@ impl StudioVfs {
     ) -> VfsResult<()> {
         let src_start = usize::try_from(block.offset).map_err(|_| {
             VfsError::Other(format!(
-                "committed block offset does not fit usize: object_id={}, offset={}",
+                "committed payload object offset does not fit usize: object_id={}, offset={}",
                 block.object_id, block.offset
             ))
         })?;
         let Some(src_end) = src_start.checked_add(dst.len()) else {
             return Err(VfsError::Other(format!(
-                "committed block copy range overflow: object_id={}, offset={}, dst_len={}",
+                "committed payload object copy range overflow: object_id={}, offset={}, dst_len={}",
                 block.object_id,
                 block.offset,
                 dst.len()
@@ -241,10 +241,10 @@ impl StudioVfs {
                 block_length = block.length,
                 payload_len = data.len(),
                 requested = dst.len(),
-                "committed block payload shorter than requested span"
+                "committed payload object shorter than requested span"
             );
             return Err(VfsError::Other(format!(
-                "committed block payload too short: object_id={}, payload_len={}, required_end={}",
+                "committed payload object too short: object_id={}, payload_len={}, required_end={}",
                 block.object_id,
                 data.len(),
                 src_end

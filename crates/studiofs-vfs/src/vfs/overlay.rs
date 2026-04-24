@@ -1,4 +1,4 @@
-use super::{StudioVfs, VfsResult};
+use super::{ResolvedSliceSource, StudioVfs, VfsResult};
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -174,13 +174,60 @@ impl StudioVfs {
             return None;
         }
         // Stage 2 — committed local cache state for the pending epoch.
-        self.pending_live_extent_record(
+        let extent = self.pending_live_extent_record(
             ino,
             block_index,
             pending_content_epoch,
             pending_upload_index,
-        )
-        .map(|extent| PendingOverlayBlockSource::Extent(extent.object_id))
+        )?;
+        if !self.pending_live_extent_matches_current_slice_graph(ino, block_index, extent) {
+            return None;
+        }
+        Some(PendingOverlayBlockSource::Extent(extent.object_id))
+    }
+
+    fn pending_live_extent_matches_current_slice_graph(
+        &self,
+        ino: Ino,
+        block_index: u32,
+        extent: ExtentRecordId,
+    ) -> bool {
+        let visible_size = if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino) {
+            attr.size
+        } else {
+            match self.sync_meta().get_attr(ino) {
+                Ok(attr) => attr.size,
+                Err(_) => return false,
+            }
+        };
+        let logical_len = self.logical_block_len(visible_size, block_index);
+        if logical_len == 0 {
+            return false;
+        }
+
+        let block_start = u64::from(block_index).saturating_mul(u64::from(self.block_size));
+        let Ok(spans) =
+            self.sync_meta()
+                .lookup_regular_file_slices(ino, block_start, logical_len as u64)
+        else {
+            return false;
+        };
+        if spans.len() != 1 {
+            return false;
+        }
+        let span = &spans[0];
+        if !matches!(
+            span.source,
+            ResolvedSliceSource::Overlay | ResolvedSliceSource::Base
+        ) {
+            return false;
+        }
+        let Some(block) = span.block.as_ref() else {
+            return false;
+        };
+        block.object_id == extent.object_id
+            && block.offset == 0
+            && block.length as usize == logical_len
     }
 
     pub(super) async fn read_pending_overlay_block_async(
