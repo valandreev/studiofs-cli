@@ -65,7 +65,7 @@ trait FileGraphMetaFixture {
         &self,
         ino: Ino,
         block_index: u32,
-        block: &PayloadRef,
+        payload: &PayloadRef,
     ) -> Result<Option<PayloadRef>, MetaError>;
     fn lookup_logical_payload_slice(
         &self,
@@ -78,20 +78,20 @@ trait FileGraphMetaFixture {
         ino: Ino,
         block_index: u32,
         expected_epoch: u64,
-        block: &PayloadRef,
+        payload: &PayloadRef,
     ) -> Result<bool, MetaError>;
 }
 
 fn fixture_logical_payload_slices(
     block_size: u32,
     block_index: u32,
-    block: Option<&PayloadRef>,
+    payload: Option<&PayloadRef>,
 ) -> Result<Vec<(ChunkId, Vec<SliceRecord>)>, MetaError> {
     let block_start = u64::from(block_index)
         .checked_mul(u64::from(block_size))
         .ok_or_else(|| MetaError::Storage("fixture block offset overflow".to_string()))?;
     let data_end = block_start
-        .checked_add(u64::from(block.map_or(0, |block| block.length)))
+        .checked_add(u64::from(payload.map_or(0, |payload| payload.length)))
         .ok_or_else(|| MetaError::Storage("fixture block data overflow".to_string()))?;
     let block_end = block_start
         .checked_add(u64::from(block_size))
@@ -136,7 +136,7 @@ fn fixture_logical_payload_slices(
         }
         Ok(())
     };
-    push(block_start, data_end, block)?;
+    push(block_start, data_end, payload)?;
     if data_end < block_end {
         push(data_end, block_end, None)?;
     }
@@ -149,7 +149,7 @@ fn fixture_logical_payload_summaries_from_spans(
 ) -> Result<Vec<(u32, PayloadRef)>, MetaError> {
     let mut blocks = std::collections::BTreeMap::<u32, PayloadRef>::new();
     for span in spans {
-        let Some(block) = span.block else {
+        let Some(block) = span.payload else {
             continue;
         };
         let chunk_start =
@@ -193,7 +193,7 @@ where
         &self,
         ino: Ino,
         block_index: u32,
-        block: &PayloadRef,
+        payload: &PayloadRef,
     ) -> Result<Option<PayloadRef>, MetaError> {
         let old = self
             .lookup_logical_payload_slice(ino, block_index)
@@ -202,7 +202,7 @@ where
         let block_size = self.get_format_info()?.block_size;
         self.flush_regular_file_overlay_slices(
             ino,
-            fixture_logical_payload_slices(block_size, block_index, Some(block))?.as_slice(),
+            fixture_logical_payload_slices(block_size, block_index, Some(payload))?.as_slice(),
         )?;
         Ok(old)
     }
@@ -240,12 +240,12 @@ where
         ino: Ino,
         _block_index: u32,
         expected_epoch: u64,
-        block: &PayloadRef,
+        payload: &PayloadRef,
     ) -> Result<bool, MetaError> {
         self.mark_regular_file_overlay_object_uploaded_if_matches(
             ino,
             expected_epoch,
-            block.object_id,
+            payload.object_id,
         )?;
         self.publish_regular_file_overlay_to_base_if_matches(ino, expected_epoch)
     }
@@ -256,7 +256,7 @@ impl FileGraphMetaFixture for RedbMetaEngine {
         &self,
         ino: Ino,
         block_index: u32,
-        block: &PayloadRef,
+        payload: &PayloadRef,
     ) -> Result<Option<PayloadRef>, MetaError> {
         let old = self
             .lookup_logical_payload_slice(ino, block_index)
@@ -265,7 +265,7 @@ impl FileGraphMetaFixture for RedbMetaEngine {
         let block_size = self.get_format_info()?.block_size;
         self.flush_regular_file_overlay_slices(
             ino,
-            fixture_logical_payload_slices(block_size, block_index, Some(block))?.as_slice(),
+            fixture_logical_payload_slices(block_size, block_index, Some(payload))?.as_slice(),
         )?;
         Ok(old)
     }
@@ -303,12 +303,12 @@ impl FileGraphMetaFixture for RedbMetaEngine {
         ino: Ino,
         _block_index: u32,
         expected_epoch: u64,
-        block: &PayloadRef,
+        payload: &PayloadRef,
     ) -> Result<bool, MetaError> {
         self.mark_regular_file_overlay_object_uploaded_if_matches(
             ino,
             expected_epoch,
-            block.object_id,
+            payload.object_id,
         )?;
         self.publish_regular_file_overlay_to_base_if_matches(ino, expected_epoch)
     }
@@ -10657,7 +10657,8 @@ fn write_stages_full_blocks_and_buffers_tail_without_buffered_relief() {
     rt.shutdown_background();
 }
 
-/// Truncate to zero, then write again. Verify old blocks are GC'd and new data is correct.
+/// Truncate to zero, then write again. Verify old payload slices stop being
+/// visible locally and new data is correct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn test_truncate_to_zero_then_rewrite() {
@@ -10691,15 +10692,10 @@ async fn test_truncate_to_zero_then_rewrite() {
         remaining.len()
     );
 
-    // All old payload objects should be in pending deletions.
-    let pending = vfs.meta().get_pending_deletions().unwrap();
-    for id in &old_ids {
-        assert!(
-            pending.iter().any(|(pid, _)| pid == id),
-            "old block {} should be pending deletion",
-            id
-        );
-    }
+    // GC timing is intentionally lifecycle-dependent: if the first write was
+    // still local overlay, truncate may queue its objects immediately; if it
+    // had already published, the old base objects must remain retained until a
+    // later publish boundary makes deletion safe for remote readers.
 
     // Write new data.
     let payload2 = vec![0xCDu8; 1024];

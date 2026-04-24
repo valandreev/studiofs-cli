@@ -146,7 +146,7 @@ impl RedbMetaEngine {
             }
             let mut chunk_signature = Vec::with_capacity(chunk.slices.len());
             for slice in chunk.slices.values() {
-                chunk_signature.push((slice.range, slice.block.clone()));
+                chunk_signature.push((slice.range, slice.payload.clone()));
             }
             signature.insert(*chunk_id, chunk_signature);
         }
@@ -265,7 +265,7 @@ impl RedbMetaEngine {
             let (_key, value) = row.map_err(|e| MetaError::Storage(e.to_string()))?;
             let chunk: RegularFileChunkState = decode(value.value())?;
             for slice in chunk.slices.values() {
-                if let Some(block) = &slice.block {
+                if let Some(block) = &slice.payload {
                     refs.insert(block.object_id);
                 }
             }
@@ -465,7 +465,7 @@ impl RedbMetaEngine {
                 visible.extend(
                     resolve_chunk_slice_spans(chunk_id, *query, Some(current), lower_precedence)
                         .into_iter()
-                        .filter_map(|span| span.block.map(|_| span.range)),
+                        .filter_map(|span| span.payload.map(|_| span.range)),
                 );
             }
             if visible.len() <= 1 {
@@ -537,7 +537,7 @@ impl RedbMetaEngine {
             let tombstone_queries = merge_covered_ranges(
                 new_slices
                     .iter()
-                    .filter(|slice| slice.block.is_none())
+                    .filter(|slice| slice.payload.is_none())
                     .map(|slice| slice.range)
                     .collect::<Vec<_>>(),
             );
@@ -560,7 +560,7 @@ impl RedbMetaEngine {
             );
             let mut effective_new_slices = Vec::new();
             for new_slice in new_slices.iter().cloned() {
-                if new_slice.block.is_some() {
+                if new_slice.payload.is_some() {
                     effective_new_slices.push(new_slice);
                     continue;
                 }
@@ -717,7 +717,7 @@ impl RedbMetaEngine {
         for (chunk_id, chunk_state) in chunks {
             let chunk_start = chunk_start_offset(*chunk_id, DEFAULT_CHUNK_SIZE);
             for slice in chunk_state.slices.values() {
-                if slice.block.is_some() {
+                if slice.payload.is_some() {
                     let absolute_end = chunk_start.saturating_add(slice.range.end as u64);
                     size = size.max(absolute_end);
                 }
@@ -761,7 +761,7 @@ impl RedbMetaEngine {
                     slice_id,
                     order: slice_order,
                     range: span.range,
-                    block: span.block,
+                    payload: span.payload,
                     payload_state: PayloadRefState::Published,
                 },
             );
@@ -800,7 +800,7 @@ impl RedbMetaEngine {
                 .ok_or_else(|| {
                     MetaError::Storage("compaction source slice is missing".to_string())
                 })?;
-            let block = span.block.clone();
+            let block = span.payload.clone();
 
             if let Some((last_range, last_block, last_state)) = merged.last_mut() {
                 match (last_block.as_mut(), block.as_ref()) {
@@ -833,7 +833,7 @@ impl RedbMetaEngine {
             return Ok(None);
         }
 
-        for (range, block, payload_state) in merged {
+        for (range, payload, payload_state) in merged {
             let slice_id = compacted
                 .try_alloc_slice_id()
                 .ok_or_else(|| MetaError::Storage("slice id overflow".to_string()))?;
@@ -846,7 +846,7 @@ impl RedbMetaEngine {
                     slice_id,
                     order: slice_order,
                     range,
-                    block,
+                    payload,
                     payload_state,
                 },
             );
@@ -890,7 +890,7 @@ impl RedbMetaEngine {
         let mut existing_object_ids = BTreeSet::new();
         for chunk_state in existing_base.values() {
             for slice in chunk_state.slices.values() {
-                if let Some(block) = slice.block.as_ref() {
+                if let Some(block) = slice.payload.as_ref() {
                     existing_object_ids.insert(block.object_id);
                 }
             }
@@ -899,7 +899,7 @@ impl RedbMetaEngine {
         let mut desired_object_ids = BTreeSet::new();
         for chunk_state in desired_base.values() {
             for slice in chunk_state.slices.values() {
-                if let Some(block) = slice.block.as_ref() {
+                if let Some(block) = slice.payload.as_ref() {
                     desired_object_ids.insert(block.object_id);
                 }
             }
@@ -1010,7 +1010,7 @@ impl RedbMetaEngine {
                 if unresolved.is_empty() {
                     break;
                 }
-                let Some(block) = span.block.as_ref() else {
+                let Some(block) = span.payload.as_ref() else {
                     continue;
                 };
                 let chunk_start = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
@@ -1090,7 +1090,7 @@ impl RedbMetaEngine {
             let chunk: RegularFileChunkState = decode(value.value())?;
             let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
             for slice in chunk.slices.values() {
-                if slice.block.is_some() {
+                if slice.payload.is_some() {
                     let slice_end = chunk_start.saturating_add(slice.range.end as u64);
                     size = size.max(slice_end);
                 }
@@ -1225,7 +1225,7 @@ impl RedbMetaEngine {
     pub(super) fn chunk_slices_for_block(
         block_index: u32,
         block_size: u32,
-        block: Option<&PayloadRef>,
+        payload: Option<&PayloadRef>,
         payload_state: PayloadRefState,
     ) -> MetaResult<Vec<(ChunkId, Vec<SliceRecord>)>> {
         if block_size == 0 {
@@ -1233,12 +1233,12 @@ impl RedbMetaEngine {
                 "invalid zero block size for block mutation".to_string(),
             ));
         }
-        if let Some(block) = block
-            && block.length > block_size
+        if let Some(payload) = payload
+            && payload.length > block_size
         {
             return Err(MetaError::Storage(format!(
                 "block length {} exceeds block size {}",
-                block.length, block_size
+                payload.length, block_size
             )));
         }
 
@@ -1246,7 +1246,7 @@ impl RedbMetaEngine {
             .checked_mul(u64::from(block_size))
             .ok_or_else(|| MetaError::Storage("block offset overflow".to_string()))?;
         let data_end = block_start
-            .checked_add(u64::from(block.map_or(0, |entry| entry.length)))
+            .checked_add(u64::from(payload.map_or(0, |entry| entry.length)))
             .ok_or_else(|| MetaError::Storage("block data range overflow".to_string()))?;
         let block_end = block_start
             .checked_add(u64::from(block_size))
@@ -1306,7 +1306,7 @@ impl RedbMetaEngine {
             Ok(())
         };
 
-        push_segment(block_start, data_end, block)?;
+        push_segment(block_start, data_end, payload)?;
         if data_end < block_end {
             push_segment(data_end, block_end, None)?;
         }
@@ -1368,7 +1368,7 @@ impl RedbMetaEngine {
         let normalize = |spans: Vec<ResolvedSliceSpan>| {
             spans
                 .into_iter()
-                .map(|span| (span.chunk_id, span.range, span.block))
+                .map(|span| (span.chunk_id, span.range, span.payload))
                 .collect::<Vec<_>>()
         };
         Ok(normalize(current) == normalize(committed))

@@ -481,7 +481,7 @@ impl RedbMetaEngine {
                     // Snapshots pin the visible file contents, so resolve the
                     // overlay/base graph instead of synthesizing block-shaped rows.
                     for span in self.lookup_regular_file_slices(ino, 0, attr.size)? {
-                        if let Some(block) = span.block {
+                        if let Some(block) = span.payload {
                             pinned.insert(block.object_id);
                         }
                     }

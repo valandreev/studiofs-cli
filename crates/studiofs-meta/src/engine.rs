@@ -18,7 +18,7 @@ pub enum MetaError {
 
     /// The caller asked for a contiguous block-shaped projection of a file range that is represented by multiple slice spans.
     #[error(
-        "non-contiguous regular-file graph cannot be represented as one block: ino={ino}, block_index={block_index}"
+        "non-contiguous regular-file graph cannot be represented as one payload: ino={ino}, block_index={block_index}"
     )]
     NonContiguousRegularFileGraph {
         /// Inode whose graph projection is non-contiguous.
@@ -541,7 +541,7 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
         let mut ids = HashSet::new();
         let attr = self.get_attr(ino)?;
         for span in self.lookup_regular_file_slices(ino, 0, attr.size)? {
-            if let Some(block) = span.block {
+            if let Some(block) = span.payload {
                 ids.insert(block.object_id);
             }
         }
@@ -559,7 +559,7 @@ pub trait MetaBlocks: Send + Sync + MetaInodes {
         let mut usage: HashMap<u64, u64> = HashMap::new();
         let attr = self.get_attr(ino)?;
         for span in self.lookup_regular_file_slices(ino, 0, attr.size)? {
-            if let Some(block) = span.block {
+            if let Some(block) = span.payload {
                 let object_bytes = u64::from(block.offset).saturating_add(u64::from(block.length));
                 usage
                     .entry(block.object_id)

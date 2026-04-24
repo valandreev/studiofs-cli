@@ -245,7 +245,7 @@ impl RedbMetaEngine {
 
             let chunk_state: RegularFileChunkState = decode(value.value())?;
             if chunk_state.slices.values().any(|slice| {
-                slice.payload_state == PayloadRefState::Published && slice.block.is_some()
+                slice.payload_state == PayloadRefState::Published && slice.payload.is_some()
             }) {
                 return Ok(true);
             }

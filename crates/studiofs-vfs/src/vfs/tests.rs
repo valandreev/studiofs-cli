@@ -93,20 +93,20 @@ trait FileGraphMetaFixture {
         &self,
         ino: Ino,
         block_index: u32,
-        block: &PayloadRef,
+        payload: &PayloadRef,
     ) -> MetaResult<Option<PayloadRef>>;
     fn lookup_logical_payload_slices(&self, ino: Ino) -> MetaResult<Vec<(u32, PayloadRef)>>;
 }
 
 fn fixture_logical_payload_slices(
     block_index: u32,
-    block: Option<&PayloadRef>,
+    payload: Option<&PayloadRef>,
 ) -> MetaResult<Vec<(ChunkId, Vec<SliceRecord>)>> {
     let block_start = u64::from(block_index)
         .checked_mul(u64::from(DEFAULT_BLOCK_SIZE))
         .ok_or_else(|| MetaError::Storage("fixture block offset overflow".to_string()))?;
     let data_end = block_start
-        .checked_add(u64::from(block.map_or(0, |block| block.length)))
+        .checked_add(u64::from(payload.map_or(0, |payload| payload.length)))
         .ok_or_else(|| MetaError::Storage("fixture block data overflow".to_string()))?;
     let block_end = block_start
         .checked_add(u64::from(DEFAULT_BLOCK_SIZE))
@@ -148,7 +148,7 @@ fn fixture_logical_payload_slices(
         }
         Ok(())
     };
-    push(block_start, data_end, block)?;
+    push(block_start, data_end, payload)?;
     if data_end < block_end {
         push(data_end, block_end, None)?;
     }
@@ -160,11 +160,11 @@ impl FileGraphMetaFixture for Arc<RedbMetaEngine> {
         &self,
         ino: Ino,
         block_index: u32,
-        block: &PayloadRef,
+        payload: &PayloadRef,
     ) -> MetaResult<Option<PayloadRef>> {
         self.flush_regular_file_overlay_slices(
             ino,
-            fixture_logical_payload_slices(block_index, Some(block))?.as_slice(),
+            fixture_logical_payload_slices(block_index, Some(payload))?.as_slice(),
         )?;
         Ok(None)
     }
@@ -173,7 +173,7 @@ impl FileGraphMetaFixture for Arc<RedbMetaEngine> {
         let attr = self.get_attr(ino)?;
         let mut blocks = BTreeMap::<u32, PayloadRef>::new();
         for span in self.lookup_regular_file_slices(ino, 0, attr.size)? {
-            let Some(block) = span.block else {
+            let Some(block) = span.payload else {
                 continue;
             };
             let chunk_start = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
@@ -447,7 +447,7 @@ fn startup_replay_prefers_overlay_metadata_live_extent_over_base_for_same_epoch(
                 order: studiofs_meta::schema::SliceOrder::default(),
                 range: studiofs_meta::schema::SliceRange::new(0, 4096)
                     .expect("overlay slice range"),
-                block: Some(studiofs_meta::schema::PayloadRef {
+                payload: Some(studiofs_meta::schema::PayloadRef {
                     object_id: 9002,
                     offset: 0,
                     length: 4096,
@@ -2447,7 +2447,7 @@ fn same_mount_read_keeps_opportunistic_handle_write_visible_after_local_dirty_cl
             .lookup_regular_file_slices(ino, 0, payload.len() as u64)
             .unwrap();
         assert!(
-            overlay_spans.iter().all(|span| span.block.is_none()),
+            overlay_spans.iter().all(|span| span.payload.is_none()),
             "opportunistic handle writes should not materialize block-backed metadata before a barrier: {overlay_spans:?}"
         );
 
@@ -2675,7 +2675,7 @@ fn inode_write_keeps_partial_state_buffered_until_flush() {
             .lookup_regular_file_slices(ino, 0, payload.len() as u64)
             .unwrap();
         assert!(
-            spans.iter().all(|span| span.block.is_none()),
+            spans.iter().all(|span| span.payload.is_none()),
             "ordinary opportunistic inode writes should not materialize block-backed unpublished slices before flush: {spans:?}"
         );
 
@@ -2688,7 +2688,7 @@ fn inode_write_keeps_partial_state_buffered_until_flush() {
             .lookup_regular_file_slices(ino, 0, payload.len() as u64)
             .unwrap();
         assert!(
-            spans.iter().any(|span| span.block.is_some()),
+            spans.iter().any(|span| span.payload.is_some()),
             "flush should materialize block-backed unpublished slices for the buffered inode write: {spans:?}"
         );
     });
@@ -2717,7 +2717,7 @@ fn write_fh_default_buffers_partial_state_until_flush() {
             .lookup_regular_file_slices(ino, 0, payload.len() as u64)
             .unwrap();
         assert!(
-            spans.iter().all(|span| span.block.is_none()),
+            spans.iter().all(|span| span.payload.is_none()),
             "default buffered handle writes should not materialize block-backed unpublished slices before flush: {spans:?}"
         );
 
@@ -2727,7 +2727,7 @@ fn write_fh_default_buffers_partial_state_until_flush() {
             .lookup_regular_file_slices(ino, 0, payload.len() as u64)
             .unwrap();
         assert!(
-            spans.iter().any(|span| span.block.is_some()),
+            spans.iter().any(|span| span.payload.is_some()),
             "flush_fh should materialize block-backed unpublished slices for the buffered handle write: {spans:?}"
         );
 
@@ -3360,14 +3360,14 @@ fn inode_write_overwrite_updates_current_slice_graph_over_published_base() {
             .lookup_regular_file_slices(ino, 0, replacement.len() as u64)
             .expect("load current regular-file slices");
         assert_eq!(
-            spans.iter().filter_map(|span| span.block.as_ref()).count(),
+            spans.iter().filter_map(|span| span.payload.as_ref()).count(),
             1,
             "overwrite should resolve to one block-backed span"
         );
         assert_eq!(
             spans
                 .iter()
-                .filter_map(|span| span.block.as_ref())
+                .filter_map(|span| span.payload.as_ref())
                 .next()
                 .expect("block-backed overwrite span")
                 .object_id,
@@ -4585,7 +4585,7 @@ fn flush_fh_materializes_opportunistic_handle_writer_state_into_overlay_slices()
             .lookup_regular_file_slices(ino, 0, payload.len() as u64)
             .unwrap();
         assert!(
-            spans.iter().any(|span| span.block.is_some()),
+            spans.iter().any(|span| span.payload.is_some()),
             "flush_fh should materialize block-backed local unpublished slices: {spans:?}"
         );
         assert!(
@@ -4928,7 +4928,7 @@ fn release_fh_materializes_opportunistic_handle_writer_state() {
             .lookup_regular_file_slices(ino, 0, payload.len() as u64)
             .unwrap();
         assert!(
-            spans.iter().any(|span| span.block.is_some()),
+            spans.iter().any(|span| span.payload.is_some()),
             "last-handle release should materialize block-backed local unpublished slices: {spans:?}"
         );
         assert!(

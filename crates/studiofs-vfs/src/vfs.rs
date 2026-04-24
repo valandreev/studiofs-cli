@@ -2565,7 +2565,7 @@ impl<'a> StartupReplayCoordinator<'a> {
         let mut seen = HashSet::new();
         let mut objects = Vec::new();
         for span in spans {
-            let Some(block) = span.block else {
+            let Some(block) = span.payload else {
                 continue;
             };
             if !seen.insert(block.object_id) {
@@ -4576,7 +4576,7 @@ impl StudioVfs {
             && let Ok(spans) = self.sync_meta().lookup_regular_file_slices(ino, 0, size)
         {
             for span in spans {
-                if let Some(block) = span.block {
+                if let Some(block) = span.payload {
                     object_ids.insert(block.object_id);
                 }
             }

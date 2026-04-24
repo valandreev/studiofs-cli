@@ -123,7 +123,7 @@ fn test_replica_aux_block_events_accept_fragmented_base_graph() {
             slice_id: SliceId(0),
             order: SliceOrder(0),
             range: SliceRange::new(0, 4096).unwrap(),
-            block: Some(PayloadRef::new_partial(71, 4096)),
+            payload: Some(PayloadRef::new_partial(71, 4096)),
             payload_state: PayloadRefState::Published,
         },
     );
@@ -133,7 +133,7 @@ fn test_replica_aux_block_events_accept_fragmented_base_graph() {
             slice_id: SliceId(1),
             order: SliceOrder(1),
             range: SliceRange::new(4096, 8192).unwrap(),
-            block: Some(PayloadRef::new_partial(72, 4096)),
+            payload: Some(PayloadRef::new_partial(72, 4096)),
             payload_state: PayloadRefState::Published,
         },
     );
@@ -145,7 +145,7 @@ fn test_replica_aux_block_events_accept_fragmented_base_graph() {
     assert_eq!(
         fragmented_spans
             .iter()
-            .filter(|span| span.block.is_some())
+            .filter(|span| span.payload.is_some())
             .count(),
         2
     );
@@ -170,7 +170,7 @@ fn test_replica_aux_block_events_accept_fragmented_base_graph() {
     assert_eq!(replacement_spans.len(), 1);
     assert_eq!(
         replacement_spans[0]
-            .block
+            .payload
             .as_ref()
             .expect("replacement payload slice")
             .object_id,
@@ -187,7 +187,7 @@ fn test_replica_aux_block_events_accept_fragmented_base_graph() {
         .lookup_regular_file_slices(file.ino, 0, u64::from(DEFAULT_BLOCK_SIZE))
         .unwrap();
     assert!(
-        cleared_spans.iter().all(|span| span.block.is_none()),
+        cleared_spans.iter().all(|span| span.payload.is_none()),
         "empty base replay should leave no object-backed slices"
     );
 }

@@ -625,7 +625,7 @@ fn test_unlink_last_link_cleans_blocks_for_inode_with_0xff_suffix() {
     assert_eq!(removed.nlink, 0);
     assert!(engine.get_attr(attr.ino).is_err());
     let spans = engine.lookup_regular_file_slices(attr.ino, 0, 4096).unwrap();
-    assert!(spans.into_iter().all(|span| span.block.is_none()));
+    assert!(spans.into_iter().all(|span| span.payload.is_none()));
 }
 
 // === xattr Tests ===

@@ -2,11 +2,11 @@ use super::*;
 
 fn record_regular_file_object_usage(
     usage: &mut std::collections::BTreeMap<u64, u64>,
-    block: &PayloadRef,
+    payload: &PayloadRef,
 ) {
-    let object_bytes = u64::from(block.offset).saturating_add(u64::from(block.length));
+    let object_bytes = u64::from(payload.offset).saturating_add(u64::from(payload.length));
     usage
-        .entry(block.object_id)
+        .entry(payload.object_id)
         .and_modify(|existing| *existing = (*existing).max(object_bytes))
         .or_insert(object_bytes);
 }
@@ -123,7 +123,7 @@ impl MetaBlocks for RedbMetaEngine {
             )?;
             for chunk_state in overlay_chunks.values().chain(base_chunks.values()) {
                 for slice in chunk_state.slices.values() {
-                    if let Some(block) = &slice.block {
+                    if let Some(block) = &slice.payload {
                         removed_object_ids.insert(block.object_id);
                     }
                 }
@@ -233,7 +233,7 @@ impl MetaBlocks for RedbMetaEngine {
             }
             let chunk: RegularFileChunkState = decode(value.value())?;
             for slice in chunk.slices.values() {
-                if let Some(block) = &slice.block {
+                if let Some(block) = &slice.payload {
                     ids.insert(block.object_id);
                 }
             }
@@ -259,7 +259,7 @@ impl MetaBlocks for RedbMetaEngine {
         let mut usage = std::collections::BTreeMap::new();
         for chunk_state in overlay_chunks.values().chain(base_chunks.values()) {
             for slice in chunk_state.slices.values() {
-                if let Some(block) = &slice.block {
+                if let Some(block) = &slice.payload {
                     record_regular_file_object_usage(&mut usage, block);
                 }
             }
@@ -309,7 +309,7 @@ impl MetaBlocks for RedbMetaEngine {
             if chunk
                 .slices
                 .values()
-                .filter_map(|slice| slice.block.as_ref())
+                .filter_map(|slice| slice.payload.as_ref())
                 .any(|block| block.object_id == object_id)
             {
                 return Ok(true);
@@ -356,7 +356,7 @@ impl MetaBlocks for RedbMetaEngine {
             for (chunk_id, mut chunk_state) in overlay_chunks {
                 let mut changed = false;
                 for slice in chunk_state.slices.values_mut() {
-                    let Some(block) = slice.block.as_ref() else {
+                    let Some(block) = slice.payload.as_ref() else {
                         continue;
                     };
                     if block.object_id != object_id {
@@ -694,7 +694,7 @@ impl RedbMetaEngine {
 
                 for id in fully_covered {
                     if let Some(removed) = state.slices.remove(&id) {
-                        if let Some(block) = &removed.block {
+                        if let Some(block) = &removed.payload {
                             space_delta -= block.length as i64;
                         }
                     }
@@ -710,7 +710,7 @@ impl RedbMetaEngine {
                     new_slice.slice_id = slice_id;
                     new_slice.order = slice_order;
 
-                    if let Some(block) = &new_slice.block {
+                    if let Some(block) = &new_slice.payload {
                         space_delta += block.length as i64;
                     }
 

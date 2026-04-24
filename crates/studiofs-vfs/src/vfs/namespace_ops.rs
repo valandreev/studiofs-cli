@@ -256,7 +256,7 @@ impl StudioVfs {
         for (chunk_id, slices) in &mutation.restore_slices {
             let chunk_base = chunk_start_offset(*chunk_id, DEFAULT_CHUNK_SIZE);
             for slice in slices {
-                let Some(block) = slice.block.as_ref() else {
+                let Some(block) = slice.payload.as_ref() else {
                     continue;
                 };
                 let absolute_offset = chunk_base.saturating_add(slice.range.start as u64);
@@ -334,7 +334,7 @@ impl StudioVfs {
                 .sync_meta()
                 .lookup_regular_file_slices(ino, 0, new_size)?
             {
-                if let Some(block) = span.block {
+                if let Some(block) = span.payload {
                     kept_object_ids.insert(block.object_id);
                 }
             }
@@ -351,7 +351,7 @@ impl StudioVfs {
             let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
             let absolute_offset = chunk_base.saturating_add(span.range.start as u64);
             let block_index = block_index_from_offset(absolute_offset, self.block_size);
-            match span.block {
+            match span.payload {
                 Some(block) => {
                     if matches!(span.source, ResolvedSliceSource::Overlay)
                         && !kept_object_ids.contains(&block.object_id)

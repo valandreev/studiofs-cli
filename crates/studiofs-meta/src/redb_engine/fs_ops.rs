@@ -548,7 +548,7 @@ impl<'a> NamespaceDeleteTxn<'a> {
         for chunk_state in overlay_chunks.values() {
             for slice in chunk_state.slices.values() {
                 if slice.payload_state == PayloadRefState::Uploaded
-                    && let Some(block) = slice.block.as_ref()
+                    && let Some(block) = slice.payload.as_ref()
                 {
                     object_ids.insert(block.object_id);
                 }

@@ -667,7 +667,7 @@ where
                                 slice_id: studiofs_meta::schema::SliceId::default(),
                                 order: studiofs_meta::schema::SliceOrder::default(),
                                 range: slice.range,
-                                block: Some(studiofs_meta::schema::PayloadRef {
+                                payload: Some(studiofs_meta::schema::PayloadRef {
                                     object_id,
                                     offset: slice.object_offset,
                                     length: slice_len,
@@ -811,7 +811,7 @@ where
                     slice_id: studiofs_meta::schema::SliceId::default(),
                     order: studiofs_meta::schema::SliceOrder::default(),
                     range: slice_range,
-                    block: Some(studiofs_meta::schema::PayloadRef {
+                    payload: Some(studiofs_meta::schema::PayloadRef {
                         object_id: persisted.object_id,
                         offset: block_offset_u32,
                         length: slice_len_u32,
@@ -2331,11 +2331,11 @@ impl StudioVfs {
         );
     }
 
-    fn replace_pending_local_dirty_block(&self, ino: Ino, block_index: u32, block: PendingBlock) {
+    fn replace_pending_local_dirty_block(&self, ino: Ino, block_index: u32, payload: PendingBlock) {
         let mut pending = self.state.local_dirty.pending_blocks.lock();
         let mut indexes = self.state.local_dirty.pending_block_indexes.lock();
-        let new_len = block.memory_len();
-        let replaced = pending.insert((ino, block_index), block);
+        let new_len = payload.memory_len();
+        let replaced = pending.insert((ino, block_index), payload);
         let old_len = replaced.as_ref().map(|old| old.memory_len()).unwrap_or(0);
         indexes.entry(ino).or_default().insert(block_index);
         drop(indexes);
@@ -3390,19 +3390,19 @@ mod tests {
             first[0].range.end,
             studiofs_meta::schema::DEFAULT_CHUNK_SIZE
         );
-        assert_eq!(first[0].block.as_ref().expect("payload ref").offset, 0);
+        assert_eq!(first[0].payload.as_ref().expect("payload ref").offset, 0);
         assert_eq!(
-            first[0].block.as_ref().expect("payload ref").length,
+            first[0].payload.as_ref().expect("payload ref").length,
             4 * 1024 * 1024
         );
         assert_eq!(second[0].range.start, 0);
         assert_eq!(second[0].range.end, 1024 * 1024);
         assert_eq!(
-            second[0].block.as_ref().expect("payload ref").offset,
+            second[0].payload.as_ref().expect("payload ref").offset,
             4 * 1024 * 1024
         );
         assert_eq!(
-            second[0].block.as_ref().expect("payload ref").length,
+            second[0].payload.as_ref().expect("payload ref").length,
             1024 * 1024
         );
     }

@@ -222,7 +222,7 @@ impl StudioVfs {
         ) {
             return false;
         }
-        let Some(block) = span.block.as_ref() else {
+        let Some(block) = span.payload.as_ref() else {
             return false;
         };
         block.object_id == extent.object_id

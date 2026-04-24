@@ -286,14 +286,14 @@ fn test_regular_file_overlay_flush_allocates_unique_slice_ids_and_orders() {
             slice_id: SliceId::default(),
             order: SliceOrder::default(),
             range: SliceRange::new(0, 4096).expect("valid replacement slice"),
-            block: Some(PayloadRef::new_partial(701, 4096)),
+            payload: Some(PayloadRef::new_partial(701, 4096)),
             payload_state: PayloadRefState::LocalOnly,
         },
         SliceRecord {
             slice_id: SliceId::default(),
             order: SliceOrder::default(),
             range: SliceRange::new(4096, 8192).expect("valid appended slice"),
-            block: Some(PayloadRef::new_partial(702, 4096)),
+            payload: Some(PayloadRef::new_partial(702, 4096)),
             payload_state: PayloadRefState::LocalOnly,
         },
     ];
@@ -383,7 +383,7 @@ fn test_regular_file_overlay_flush_emits_final_chunk_state() {
         slice_id: SliceId::default(),
         order: SliceOrder::default(),
         range: SliceRange::new(4096, 8192).expect("incoming range"),
-        block: Some(PayloadRef::new_partial(802, 4096)),
+        payload: Some(PayloadRef::new_partial(802, 4096)),
         payload_state: PayloadRefState::LocalOnly,
     }];
 
@@ -599,7 +599,7 @@ fn test_flush_regular_file_overlay_slices_with_attr_is_atomic() {
         slice_id: SliceId::default(),
         order: SliceOrder::default(),
         range: SliceRange::new(0, 4096).expect("valid range"),
-        block: Some(PayloadRef::new_partial(200_001, 4096)),
+        payload: Some(PayloadRef::new_partial(200_001, 4096)),
         payload_state: PayloadRefState::LocalOnly,
     }];
 
@@ -695,7 +695,7 @@ fn test_lookup_regular_file_chunk_slices_overlay_precedence_with_tombstone() {
         }
     );
     assert_eq!(spans[0].source, ResolvedSliceSource::Base);
-    assert_eq!(spans[0].block.as_ref().unwrap().object_id, 901);
+    assert_eq!(spans[0].payload.as_ref().unwrap().object_id, 901);
 
     assert_eq!(
         spans[1].range,
@@ -705,7 +705,7 @@ fn test_lookup_regular_file_chunk_slices_overlay_precedence_with_tombstone() {
         }
     );
     assert_eq!(spans[1].source, ResolvedSliceSource::Overlay);
-    assert_eq!(spans[1].block.as_ref().unwrap().object_id, 801);
+    assert_eq!(spans[1].payload.as_ref().unwrap().object_id, 801);
 
     assert_eq!(
         spans[2].range,
@@ -715,7 +715,7 @@ fn test_lookup_regular_file_chunk_slices_overlay_precedence_with_tombstone() {
         }
     );
     assert_eq!(spans[2].source, ResolvedSliceSource::Base);
-    assert_eq!(spans[2].block.as_ref().unwrap().object_id, 901);
+    assert_eq!(spans[2].payload.as_ref().unwrap().object_id, 901);
 
     assert_eq!(
         spans[3].range,
@@ -725,7 +725,7 @@ fn test_lookup_regular_file_chunk_slices_overlay_precedence_with_tombstone() {
         }
     );
     assert_eq!(spans[3].source, ResolvedSliceSource::OverlayTombstone);
-    assert!(spans[3].block.is_none());
+    assert!(spans[3].payload.is_none());
 
     assert_eq!(
         spans[4].range,
@@ -735,7 +735,7 @@ fn test_lookup_regular_file_chunk_slices_overlay_precedence_with_tombstone() {
         }
     );
     assert_eq!(spans[4].source, ResolvedSliceSource::Base);
-    assert_eq!(spans[4].block.as_ref().unwrap().object_id, 902);
+    assert_eq!(spans[4].payload.as_ref().unwrap().object_id, 902);
 }
 
 #[test]
@@ -783,9 +783,9 @@ fn test_compact_fragmented_regular_file_chunks_preserves_tombstones() {
         .unwrap();
     assert_eq!(before.len(), 2);
     assert_eq!(before[0].source, ResolvedSliceSource::Overlay);
-    assert_eq!(before[0].block.as_ref().unwrap().object_id, 1202);
+    assert_eq!(before[0].payload.as_ref().unwrap().object_id, 1202);
     assert_eq!(before[1].source, ResolvedSliceSource::OverlayTombstone);
-    assert!(before[1].block.is_none());
+    assert!(before[1].payload.is_none());
 
     let compacted = engine.compact_fragmented_regular_file_chunks(1).unwrap();
     assert_eq!(compacted, 1);
@@ -797,7 +797,7 @@ fn test_compact_fragmented_regular_file_chunks_preserves_tombstones() {
     for (expected, actual) in before.iter().zip(after.iter()) {
         assert_eq!(actual.range, expected.range);
         assert_eq!(actual.source, expected.source);
-        assert_eq!(actual.block, expected.block);
+        assert_eq!(actual.payload, expected.payload);
     }
 
     let txn = engine.db.begin_read().unwrap();
@@ -882,7 +882,7 @@ fn test_lookup_regular_file_slices_cross_chunk_and_ordered_base_resolution() {
         }
     );
     assert_eq!(spans[0].source, ResolvedSliceSource::Base);
-    assert_eq!(spans[0].block.as_ref().unwrap().object_id, 1101);
+    assert_eq!(spans[0].payload.as_ref().unwrap().object_id, 1101);
 
     assert_eq!(spans[1].chunk_id, ChunkId(0));
     assert_eq!(
@@ -893,7 +893,7 @@ fn test_lookup_regular_file_slices_cross_chunk_and_ordered_base_resolution() {
         }
     );
     assert_eq!(spans[1].source, ResolvedSliceSource::Overlay);
-    assert_eq!(spans[1].block.as_ref().unwrap().object_id, 1201);
+    assert_eq!(spans[1].payload.as_ref().unwrap().object_id, 1201);
 
     assert_eq!(spans[2].chunk_id, ChunkId(0));
     assert_eq!(
@@ -904,12 +904,12 @@ fn test_lookup_regular_file_slices_cross_chunk_and_ordered_base_resolution() {
         }
     );
     assert_eq!(spans[2].source, ResolvedSliceSource::Base);
-    assert_eq!(spans[2].block.as_ref().unwrap().object_id, 1101);
+    assert_eq!(spans[2].payload.as_ref().unwrap().object_id, 1101);
 
     assert_eq!(spans[3].chunk_id, ChunkId(1));
     assert_eq!(spans[3].range, SliceRange { start: 0, end: 512 });
     assert_eq!(spans[3].source, ResolvedSliceSource::Base);
-    assert_eq!(spans[3].block.as_ref().unwrap().object_id, 1301);
+    assert_eq!(spans[3].payload.as_ref().unwrap().object_id, 1301);
 
     assert_eq!(spans[4].chunk_id, ChunkId(1));
     assert_eq!(
@@ -920,7 +920,7 @@ fn test_lookup_regular_file_slices_cross_chunk_and_ordered_base_resolution() {
         }
     );
     assert_eq!(spans[4].source, ResolvedSliceSource::Base);
-    assert_eq!(spans[4].block.as_ref().unwrap().object_id, 1401);
+    assert_eq!(spans[4].payload.as_ref().unwrap().object_id, 1401);
 }
 
 #[test]
@@ -984,7 +984,7 @@ fn test_lookup_regular_file_slices_boundary_spanning_write_is_split_per_chunk() 
         }
     );
     assert_eq!(spans[0].source, ResolvedSliceSource::Base);
-    assert_eq!(spans[0].block.as_ref().unwrap().object_id, 2101);
+    assert_eq!(spans[0].payload.as_ref().unwrap().object_id, 2101);
 
     assert_eq!(spans[1].chunk_id, ChunkId(0));
     assert_eq!(
@@ -995,12 +995,12 @@ fn test_lookup_regular_file_slices_boundary_spanning_write_is_split_per_chunk() 
         }
     );
     assert_eq!(spans[1].source, ResolvedSliceSource::Overlay);
-    assert_eq!(spans[1].block.as_ref().unwrap().object_id, 2201);
+    assert_eq!(spans[1].payload.as_ref().unwrap().object_id, 2201);
 
     assert_eq!(spans[2].chunk_id, ChunkId(1));
     assert_eq!(spans[2].range, SliceRange { start: 0, end: 512 });
     assert_eq!(spans[2].source, ResolvedSliceSource::Overlay);
-    assert_eq!(spans[2].block.as_ref().unwrap().object_id, 2202);
+    assert_eq!(spans[2].payload.as_ref().unwrap().object_id, 2202);
 
     assert_eq!(spans[3].chunk_id, ChunkId(1));
     assert_eq!(
@@ -1011,7 +1011,7 @@ fn test_lookup_regular_file_slices_boundary_spanning_write_is_split_per_chunk() 
         }
     );
     assert_eq!(spans[3].source, ResolvedSliceSource::Base);
-    assert_eq!(spans[3].block.as_ref().unwrap().object_id, 2102);
+    assert_eq!(spans[3].payload.as_ref().unwrap().object_id, 2102);
 }
 
 #[test]
@@ -1136,7 +1136,7 @@ fn test_publish_regular_file_overlay_to_base_preserves_untouched_base_ranges() {
         .unwrap();
     let object_ids: Vec<_> = spans
         .into_iter()
-        .filter_map(|span| span.block.map(|block| block.object_id))
+        .filter_map(|span| span.payload.map(|block| block.object_id))
         .collect();
     assert_eq!(
         object_ids,
@@ -1297,7 +1297,7 @@ fn redb_base_graph_publish_sets_committed_head() {
         .unwrap();
     let remote_blocks: Vec<_> = remote_spans
         .into_iter()
-        .map(|span| span.block.expect("published payload slice"))
+        .map(|span| span.payload.expect("published payload slice"))
         .collect();
     assert_eq!(remote_blocks, vec![block0, block1]);
 }

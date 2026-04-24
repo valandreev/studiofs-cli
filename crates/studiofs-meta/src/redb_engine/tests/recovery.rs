@@ -87,7 +87,7 @@ fn test_recover_undo_logs_replays_deferred_delete_with_fragmented_graph() {
             slice_id: SliceId(0),
             order: SliceOrder(0),
             range: SliceRange::new(0, midpoint).unwrap(),
-            block: Some(PayloadRef::new_partial(21_001, midpoint)),
+            payload: Some(PayloadRef::new_partial(21_001, midpoint)),
             payload_state: PayloadRefState::LocalOnly,
         },
     );
@@ -97,7 +97,7 @@ fn test_recover_undo_logs_replays_deferred_delete_with_fragmented_graph() {
             slice_id: SliceId(1),
             order: SliceOrder(1),
             range: SliceRange::new(midpoint, DEFAULT_BLOCK_SIZE).unwrap(),
-            block: Some(PayloadRef::new_partial(21_002, DEFAULT_BLOCK_SIZE - midpoint)),
+            payload: Some(PayloadRef::new_partial(21_002, DEFAULT_BLOCK_SIZE - midpoint)),
             payload_state: PayloadRefState::LocalOnly,
         },
     );
@@ -110,7 +110,7 @@ fn test_recover_undo_logs_replays_deferred_delete_with_fragmented_graph() {
     assert_eq!(
         fragmented_spans
             .iter()
-            .filter(|span| span.block.is_some())
+            .filter(|span| span.payload.is_some())
             .count(),
         2
     );

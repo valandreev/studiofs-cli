@@ -192,11 +192,11 @@ async fn volume_exists(pg_dsn: &str, name: &str) -> bool {
 }
 
 fn single_object_slice_graph(
-    block: &PayloadRef,
+    payload: &PayloadRef,
 ) -> Result<Vec<(ChunkId, Vec<SliceRecord>)>, MetaError> {
     let mut chunks = BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
     let mut cursor = 0_u64;
-    let data_end = u64::from(block.length);
+    let data_end = u64::from(payload.length);
     while cursor < data_end {
         let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);
         let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
@@ -213,14 +213,14 @@ fn single_object_slice_graph(
             SliceOrder(0),
             range,
             PayloadRef {
-                object_id: block.object_id,
-                offset: block.offset.saturating_add(
+                object_id: payload.object_id,
+                offset: payload.offset.saturating_add(
                     u32::try_from(cursor)
                         .map_err(|_| MetaError::Storage("slice offset overflow".to_string()))?,
                 ),
                 length: u32::try_from(piece_end - cursor)
                     .map_err(|_| MetaError::Storage("slice length overflow".to_string()))?,
-                flags: block.flags,
+                flags: payload.flags,
             },
         );
         slice.payload_state = PayloadRefState::LocalOnly;
@@ -316,7 +316,7 @@ async fn verify_payload_from_discovered(home: &Path, disk_name: &str, expected: 
         let mut covered = vec![false; expected.len()];
 
         for span in spans {
-            let block = span.block.expect("committed slice must reference data");
+            let block = span.payload.expect("committed slice must reference data");
             let file_start = span
                 .chunk_id
                 .0

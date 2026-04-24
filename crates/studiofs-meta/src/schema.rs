@@ -731,7 +731,7 @@ pub struct SliceRecord {
     pub range: SliceRange,
     /// Payload object reference; `None` represents a tombstone.
     #[serde(default)]
-    pub block: Option<PayloadRef>,
+    pub payload: Option<PayloadRef>,
     /// Upload/publication/recovery lifecycle for the referenced payload.
     #[serde(default)]
     pub payload_state: PayloadRefState,
@@ -739,12 +739,17 @@ pub struct SliceRecord {
 
 impl SliceRecord {
     /// Create a data-bearing slice record.
-    pub fn new(slice_id: SliceId, order: SliceOrder, range: SliceRange, block: PayloadRef) -> Self {
+    pub fn new(
+        slice_id: SliceId,
+        order: SliceOrder,
+        range: SliceRange,
+        payload: PayloadRef,
+    ) -> Self {
         Self {
             slice_id,
             order,
             range,
-            block: Some(block),
+            payload: Some(payload),
             payload_state: PayloadRefState::LocalOnly,
         }
     }
@@ -755,14 +760,14 @@ impl SliceRecord {
             slice_id,
             order,
             range,
-            block: None,
+            payload: None,
             payload_state: PayloadRefState::LocalOnly,
         }
     }
 
     /// Returns `true` when this slice removes coverage instead of providing data.
     pub fn is_tombstone(&self) -> bool {
-        self.block.is_none()
+        self.payload.is_none()
     }
 }
 
@@ -844,7 +849,7 @@ impl RegularFileChunkState {
             if shadowed_bytes > 0 {
                 counters.overlapping_slices = counters.overlapping_slices.saturating_add(1);
             }
-            if slice.block.is_some() {
+            if slice.payload.is_some() {
                 counters.live_slices = counters.live_slices.saturating_add(1);
                 counters.fragmented_bytes =
                     counters.fragmented_bytes.saturating_add(shadowed_bytes);
@@ -952,7 +957,7 @@ pub struct ResolvedSliceSpan {
     pub slice_order: Option<SliceOrder>,
     /// Payload ref backing the span, clipped to `range` when data-bearing.
     #[serde(default)]
-    pub block: Option<PayloadRef>,
+    pub payload: Option<PayloadRef>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -967,12 +972,12 @@ struct ResolveCandidate {
     slice_id: SliceId,
     slice_order: SliceOrder,
     range: SliceRange,
-    block: Option<PayloadRef>,
+    payload: Option<PayloadRef>,
 }
 
 impl ResolveCandidate {
     fn source(&self) -> ResolvedSliceSource {
-        match (self.tier, self.block.as_ref()) {
+        match (self.tier, self.payload.as_ref()) {
             (ResolveTier::Overlay, Some(_)) => ResolvedSliceSource::Overlay,
             (ResolveTier::Base, Some(_)) => ResolvedSliceSource::Base,
             (ResolveTier::Overlay, None) => ResolvedSliceSource::OverlayTombstone,
@@ -1007,7 +1012,7 @@ fn push_candidate_set(
                 slice_id: slice.slice_id,
                 slice_order: slice.order,
                 range: slice.range,
-                block: slice.block.clone(),
+                payload: slice.payload.clone(),
             });
         }
     }
@@ -1045,7 +1050,7 @@ pub fn merge_adjacent_spans(mut spans: Vec<ResolvedSliceSpan>) -> Vec<ResolvedSl
             && last.source == span.source
             && last.slice_id == span.slice_id
             && last.slice_order == span.slice_order
-            && last.block == span.block
+            && last.payload == span.payload
         {
             last.range.end = span.range.end;
             continue;
@@ -1084,13 +1089,13 @@ pub fn resolve_chunk_slice_spans(
         for pending in unresolved {
             if let Some(overlap) = pending.intersection(candidate.range) {
                 subtract_range(pending, overlap, &mut next_unresolved);
-                let block = candidate.block.as_ref().map(|block| {
+                let payload = candidate.payload.as_ref().map(|payload| {
                     let delta = overlap.start.saturating_sub(candidate.range.start);
                     PayloadRef {
-                        object_id: block.object_id,
-                        offset: block.offset.saturating_add(delta),
+                        object_id: payload.object_id,
+                        offset: payload.offset.saturating_add(delta),
                         length: overlap.len(),
-                        flags: block.flags,
+                        flags: payload.flags,
                     }
                 });
                 resolved.push(ResolvedSliceSpan {
@@ -1099,7 +1104,7 @@ pub fn resolve_chunk_slice_spans(
                     source: candidate.source(),
                     slice_id: Some(candidate.slice_id),
                     slice_order: Some(candidate.slice_order),
-                    block,
+                    payload,
                 });
             } else {
                 next_unresolved.push(pending);
@@ -1115,7 +1120,7 @@ pub fn resolve_chunk_slice_spans(
             source: ResolvedSliceSource::Hole,
             slice_id: None,
             slice_order: None,
-            block: None,
+            payload: None,
         });
     }
 
@@ -1614,7 +1619,7 @@ mod tests {
                 .slices
                 .get(&SliceId(7))
                 .unwrap()
-                .block
+                .payload
                 .as_ref()
                 .unwrap()
                 .object_id,

@@ -353,7 +353,7 @@ fn test_import_snapshot_keeps_unpublished_regular_file_visible() {
     assert_eq!(imported_spans.len(), 1);
     assert_eq!(
         imported_spans[0]
-            .block
+            .payload
             .as_ref()
             .expect("imported local-only slice")
             .object_id,

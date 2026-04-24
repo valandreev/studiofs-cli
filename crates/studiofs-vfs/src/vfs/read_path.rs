@@ -37,8 +37,8 @@ enum ReadSegmentSource {
     Dirty { data: Bytes, block_offset: u64 },
     PendingOverlay { data: Bytes, block_offset: u32 },
     PendingExtent { object_id: u64, block_offset: u32 },
-    Overlay { block: PayloadRef },
-    Base { block: PayloadRef },
+    Overlay { payload: PayloadRef },
+    Base { payload: PayloadRef },
     Zero,
 }
 
@@ -137,16 +137,18 @@ impl<'a> DataReader<'a> {
     fn collect_data_payload_refs(segments: &[ReadSegment]) -> BTreeMap<u64, PayloadRef> {
         let mut payload_refs = BTreeMap::new();
         for segment in segments {
-            let block = match &segment.source {
-                ReadSegmentSource::Overlay { block } | ReadSegmentSource::Base { block } => block,
+            let payload = match &segment.source {
+                ReadSegmentSource::Overlay { payload } | ReadSegmentSource::Base { payload } => {
+                    payload
+                }
                 ReadSegmentSource::Dirty { .. }
                 | ReadSegmentSource::PendingOverlay { .. }
                 | ReadSegmentSource::PendingExtent { .. }
                 | ReadSegmentSource::Zero => continue,
             };
             payload_refs
-                .entry(block.object_id)
-                .or_insert_with(|| block.clone());
+                .entry(payload.object_id)
+                .or_insert_with(|| payload.clone());
         }
         payload_refs
     }
@@ -345,7 +347,7 @@ impl<'a> DataReader<'a> {
                     &mut segments,
                     requested,
                     ResolvedSliceSource::Overlay,
-                    |block| ReadSegmentSource::Overlay { block },
+                    |payload| ReadSegmentSource::Overlay { payload },
                 );
                 unresolved = Self::claim_meta_spans_into_segments(
                     resolved.iter(),
@@ -353,7 +355,7 @@ impl<'a> DataReader<'a> {
                     &mut segments,
                     requested,
                     ResolvedSliceSource::Base,
-                    |block| ReadSegmentSource::Base { block },
+                    |payload| ReadSegmentSource::Base { payload },
                 );
             } else {
                 let meta = vfs.meta.clone();
@@ -367,7 +369,7 @@ impl<'a> DataReader<'a> {
                     &mut segments,
                     requested,
                     ResolvedSliceSource::Overlay,
-                    |block| ReadSegmentSource::Overlay { block },
+                    |payload| ReadSegmentSource::Overlay { payload },
                 );
                 unresolved = Self::claim_meta_spans_into_segments(
                     resolved.iter(),
@@ -375,7 +377,7 @@ impl<'a> DataReader<'a> {
                     &mut segments,
                     requested,
                     ResolvedSliceSource::Base,
-                    |block| ReadSegmentSource::Base { block },
+                    |payload| ReadSegmentSource::Base { payload },
                 );
             }
         }
@@ -437,7 +439,7 @@ impl<'a> DataReader<'a> {
             if span.source != source_filter {
                 continue;
             }
-            let Some(block) = span.block.as_ref() else {
+            let Some(block) = span.payload.as_ref() else {
                 continue;
             };
             let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
@@ -483,10 +485,10 @@ impl<'a> DataReader<'a> {
         let mut local_pending = BTreeSet::new();
         for segment in segments {
             match &segment.source {
-                ReadSegmentSource::Overlay { block } | ReadSegmentSource::Base { block } => {
+                ReadSegmentSource::Overlay { payload } | ReadSegmentSource::Base { payload } => {
                     remote_blocks
-                        .entry(block.object_id)
-                        .or_insert_with(|| block.clone());
+                        .entry(payload.object_id)
+                        .or_insert_with(|| payload.clone());
                 }
                 ReadSegmentSource::PendingExtent { object_id, .. } => {
                     local_pending.insert(*object_id);
@@ -590,16 +592,16 @@ impl<'a> DataReader<'a> {
                         }
                     }
                 }
-                ReadSegmentSource::Overlay { block } | ReadSegmentSource::Base { block } => {
-                    let block_offset = usize::try_from(block.offset).map_err(|_| {
+                ReadSegmentSource::Overlay { payload } | ReadSegmentSource::Base { payload } => {
+                    let block_offset = usize::try_from(payload.offset).map_err(|_| {
                         VfsError::Other(format!(
                             "block offset does not fit usize: object_id={}, offset={}",
-                            block.object_id, block.offset
+                            payload.object_id, payload.offset
                         ))
                     })?;
                     let mut span_resolved = false;
                     if let Some(read) = vfs
-                        .block_store_read_into_async(block.object_id, block_offset, dst)
+                        .block_store_read_into_async(payload.object_id, block_offset, dst)
                         .await?
                     {
                         if read == dst.len() {
@@ -607,18 +609,18 @@ impl<'a> DataReader<'a> {
                         }
                         if !span_resolved {
                             error!(
-                                object_id = block.object_id,
+                                object_id = payload.object_id,
                                 file_offset = segment.range.start,
-                                block_offset = block.offset,
+                                block_offset = payload.offset,
                                 requested = dst.len(),
                                 read,
                                 "data_reader: short local backend read for committed payload object; evicting and refetching"
                             );
                             if let Err(evict_error) =
-                                vfs.block_store_remove_async(block.object_id).await
+                                vfs.block_store_remove_async(payload.object_id).await
                             {
                                 warn!(
-                                    object_id = block.object_id,
+                                    object_id = payload.object_id,
                                     error = %evict_error,
                                     "data_reader: failed to evict short-read local payload before refetch"
                                 );
@@ -627,22 +629,22 @@ impl<'a> DataReader<'a> {
                     }
 
                     if !span_resolved {
-                        match vfs.fetch_block_for_ref_after_local_miss(block).await {
+                        match vfs.fetch_block_for_ref_after_local_miss(payload).await {
                             Ok(data) => {
                                 vfs.copy_committed_block_payload_into_range(
                                     data.as_ref(),
-                                    block,
+                                    payload,
                                     segment.range.start,
                                     dst,
                                 )?;
                             }
                             Err(crate::fetch::FetchError::NotFound { key }) => {
                                 warn!(
-                                    object_id = block.object_id,
+                                    object_id = payload.object_id,
                                     key,
                                     file_offset = segment.range.start,
-                                    block_offset = block.offset,
-                                    block_length = block.length,
+                                    block_offset = payload.offset,
+                                    block_length = payload.length,
                                     "data_reader: S3 object not found during foreground read, zeroing range (upload incomplete or evicted before upload?)"
                                 );
                                 dst.fill(0);
@@ -955,7 +957,7 @@ impl StudioVfs {
         };
         let mut buffer = vec![0u8; logical_len];
         for span in &resolved {
-            let Some(block) = span.block.as_ref() else {
+            let Some(block) = span.payload.as_ref() else {
                 continue;
             };
 
@@ -1314,19 +1316,19 @@ mod tests {
             &self,
             ino: Ino,
             block_index: u32,
-            block: &PayloadRef,
+            payload: &PayloadRef,
         ) -> MetaResult<Option<PayloadRef>>;
     }
 
     fn fixture_logical_payload_slices(
         block_index: u32,
-        block: &PayloadRef,
+        payload: &PayloadRef,
     ) -> MetaResult<Vec<(ChunkId, Vec<SliceRecord>)>> {
         let block_start = u64::from(block_index)
             .checked_mul(u64::from(DEFAULT_BLOCK_SIZE))
             .ok_or_else(|| MetaError::Storage("fixture block offset overflow".to_string()))?;
         let data_end = block_start
-            .checked_add(u64::from(block.length))
+            .checked_add(u64::from(payload.length))
             .ok_or_else(|| MetaError::Storage("fixture data range overflow".to_string()))?;
         let mut chunks = std::collections::BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
         let mut cursor = block_start;
@@ -1346,12 +1348,12 @@ mod tests {
                 SliceOrder(0),
                 range,
                 PayloadRef {
-                    object_id: block.object_id,
-                    offset: block.offset.saturating_add(delta),
+                    object_id: payload.object_id,
+                    offset: payload.offset.saturating_add(delta),
                     length: u32::try_from(piece_end.saturating_sub(cursor)).map_err(|_| {
                         MetaError::Storage("fixture slice length overflow".to_string())
                     })?,
-                    flags: block.flags,
+                    flags: payload.flags,
                 },
             );
             slice.payload_state = PayloadRefState::Published;
@@ -1366,11 +1368,11 @@ mod tests {
             &self,
             ino: Ino,
             block_index: u32,
-            block: &PayloadRef,
+            payload: &PayloadRef,
         ) -> MetaResult<Option<PayloadRef>> {
             self.flush_regular_file_overlay_slices(
                 ino,
-                fixture_logical_payload_slices(block_index, block)?.as_slice(),
+                fixture_logical_payload_slices(block_index, payload)?.as_slice(),
             )?;
             self.publish_regular_file_overlay_to_base_if_matches(
                 ino,
@@ -1625,13 +1627,13 @@ mod tests {
             ReadSegment {
                 range: ReadRange { start: 0, end: 16 },
                 source: ReadSegmentSource::Base {
-                    block: first.clone(),
+                    payload: first.clone(),
                 },
             },
             ReadSegment {
                 range: ReadRange { start: 16, end: 24 },
                 source: ReadSegmentSource::Overlay {
-                    block: second.clone(),
+                    payload: second.clone(),
                 },
             },
             ReadSegment {
@@ -1909,12 +1911,12 @@ mod tests {
                 .await
                 .expect("block store put");
 
-            let mut block = PayloadRef::new_full(object_id, 10);
-            block.offset = 2;
-            block.length = 4;
+            let mut payload = PayloadRef::new_full(object_id, 10);
+            payload.offset = 2;
+            payload.length = 4;
             let segments = vec![ReadSegment {
                 range: ReadRange { start: 0, end: 4 },
-                source: ReadSegmentSource::Base { block },
+                source: ReadSegmentSource::Base { payload },
             }];
             let mut buffer = [0_u8; 4];
             counting_backend.reset_counters();

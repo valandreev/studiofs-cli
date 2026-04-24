@@ -4554,21 +4554,21 @@ mod tests {
             &self,
             ino: Ino,
             block_index: u32,
-            block: &PayloadRef,
+            payload: &PayloadRef,
         ) -> MetaResult<()>;
         fn stage_logical_payload_tombstone(&self, ino: Ino, block_index: u32) -> MetaResult<()>;
     }
 
     fn fixture_logical_payload_slices(
         block_index: u32,
-        block: Option<&PayloadRef>,
+        payload: Option<&PayloadRef>,
         state: PayloadRefState,
     ) -> MetaResult<Vec<(ChunkId, Vec<SliceRecord>)>> {
         let block_start = u64::from(block_index)
             .checked_mul(u64::from(DEFAULT_BLOCK_SIZE))
             .ok_or_else(|| MetaError::Storage("fixture block offset overflow".to_string()))?;
         let data_end = block_start
-            .checked_add(u64::from(block.map_or(0, |block| block.length)))
+            .checked_add(u64::from(payload.map_or(0, |payload| payload.length)))
             .ok_or_else(|| MetaError::Storage("fixture data range overflow".to_string()))?;
         let block_end = block_start
             .checked_add(u64::from(DEFAULT_BLOCK_SIZE))
@@ -4612,7 +4612,7 @@ mod tests {
             }
             Ok(())
         };
-        push(block_start, data_end, block)?;
+        push(block_start, data_end, payload)?;
         if data_end < block_end {
             push(data_end, block_end, None)?;
         }
@@ -4623,14 +4623,14 @@ mod tests {
         Ok(engine
             .lookup_regular_file_slices(ino, 0, u64::from(DEFAULT_BLOCK_SIZE))?
             .into_iter()
-            .find_map(|span| span.block.map(|block| block.object_id)))
+            .find_map(|span| span.payload.map(|block| block.object_id)))
     }
 
     fn lookup_object_ids(engine: &PgMetaEngine, ino: Ino, length: u64) -> MetaResult<Vec<u64>> {
         Ok(engine
             .lookup_regular_file_slices(ino, 0, length)?
             .into_iter()
-            .filter_map(|span| span.block.map(|block| block.object_id))
+            .filter_map(|span| span.payload.map(|block| block.object_id))
             .collect())
     }
 
@@ -4639,13 +4639,13 @@ mod tests {
             &self,
             ino: Ino,
             block_index: u32,
-            block: &PayloadRef,
+            payload: &PayloadRef,
         ) -> MetaResult<()> {
             self.flush_regular_file_overlay_slices(
                 ino,
                 fixture_logical_payload_slices(
                     block_index,
-                    Some(block),
+                    Some(payload),
                     PayloadRefState::LocalOnly,
                 )?
                 .as_slice(),
@@ -4922,7 +4922,7 @@ mod tests {
                         slice_id: SliceId(0),
                         order: SliceOrder(0),
                         range: SliceRange::new(0, 4096).unwrap(),
-                        block: Some(PayloadRef::new_partial(9001, 4096)),
+                        payload: Some(PayloadRef::new_partial(9001, 4096)),
                         payload_state: PayloadRefState::LocalOnly,
                     }],
                 )],
@@ -4935,7 +4935,7 @@ mod tests {
                         slice_id: SliceId(1),
                         order: SliceOrder(0),
                         range: SliceRange::new(0, 4096).unwrap(),
-                        block: Some(PayloadRef::new_partial(9002, 4096)),
+                        payload: Some(PayloadRef::new_partial(9002, 4096)),
                         payload_state: PayloadRefState::Published,
                     }],
                 )],

@@ -164,7 +164,7 @@ fn test_set_attr_accepts_fragmented_regular_file_base_graph() {
             slice_id: SliceId(0),
             order: SliceOrder(0),
             range: SliceRange::new(0, 4096).unwrap(),
-            block: Some(PayloadRef::new_partial(41, 4096)),
+            payload: Some(PayloadRef::new_partial(41, 4096)),
             payload_state: PayloadRefState::Published,
         },
     );
@@ -174,7 +174,7 @@ fn test_set_attr_accepts_fragmented_regular_file_base_graph() {
             slice_id: SliceId(1),
             order: SliceOrder(1),
             range: SliceRange::new(4096, 8192).unwrap(),
-            block: Some(PayloadRef::new_partial(42, 4096)),
+            payload: Some(PayloadRef::new_partial(42, 4096)),
             payload_state: PayloadRefState::Published,
         },
     );
