@@ -133,9 +133,9 @@ fn test_block_replace_clears_pending_compaction_rows() {
 }
 
 #[test]
-fn test_block_projection_to_chunk_state_rejects_slice_overflow() {
+fn test_file_block_slices_to_chunk_state_rejects_slice_overflow() {
     let block = BlockRef::new_partial(9_999, u32::MAX);
-    let err = RedbMetaEngine::block_projection_to_chunk_state(&[(1, block)], u32::MAX)
+    let err = RedbMetaEngine::file_block_slices_to_chunk_state(&[(1, block)], u32::MAX)
         .expect_err("overflowing slice range must fail");
 
     assert!(matches!(err, MetaError::Storage(message) if message.contains("slice range overflow")));
@@ -1148,7 +1148,7 @@ fn test_publish_regular_file_overlay_to_base_accepts_fragmented_block_graph() {
         engine
             .publish_regular_file_overlay_to_base_if_matches(file.ino, 9)
             .unwrap(),
-        "slice-native publish should not require block projection synthesis"
+        "slice-native publish should not require file slice graph synthesis"
     );
 
     let published_attr = engine.get_attr(file.ino).unwrap();

@@ -4549,23 +4549,17 @@ mod tests {
         rt.block_on(fut)
     }
 
-    trait PgBlockProjectionFixture {
+    trait PgBlockSliceFixture {
         fn stage_block_slices(
             &self,
             ino: Ino,
             block_index: u32,
             block: &BlockRef,
         ) -> MetaResult<()>;
-        fn lookup_block_projection(
-            &self,
-            ino: Ino,
-            block_index: u32,
-        ) -> MetaResult<Option<BlockRef>>;
-        fn lookup_block_projections(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>>;
         fn stage_block_tombstone_slices(&self, ino: Ino, block_index: u32) -> MetaResult<()>;
     }
 
-    fn block_projection_slices(
+    fn fixture_block_slices(
         block_index: u32,
         block: Option<&BlockRef>,
         state: BlockRefState,
@@ -4625,60 +4619,6 @@ mod tests {
         Ok(chunks.into_iter().collect())
     }
 
-    fn block_projection_from_spans(
-        spans: Vec<ResolvedSliceSpan>,
-        block_index: u32,
-    ) -> MetaResult<Option<BlockRef>> {
-        let block_start = u64::from(block_index) * u64::from(DEFAULT_BLOCK_SIZE);
-        let block_end = block_start + u64::from(DEFAULT_BLOCK_SIZE);
-        let mut parts = Vec::new();
-        for span in spans {
-            let Some(block) = span.block else {
-                continue;
-            };
-            let chunk_start = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
-            let span_start = chunk_start + u64::from(span.range.start);
-            let span_end = chunk_start + u64::from(span.range.end);
-            let overlap_start = span_start.max(block_start);
-            let overlap_end = span_end.min(block_end);
-            if overlap_start >= overlap_end {
-                continue;
-            }
-            let delta = u32::try_from(overlap_start - span_start)
-                .map_err(|_| MetaError::Storage("fixture block delta overflow".to_string()))?;
-            parts.push((
-                overlap_start,
-                BlockRef {
-                    object_id: block.object_id,
-                    offset: block.offset.saturating_add(delta),
-                    length: u32::try_from(overlap_end - overlap_start).map_err(|_| {
-                        MetaError::Storage("fixture block length overflow".to_string())
-                    })?,
-                    flags: block.flags,
-                },
-            ));
-        }
-        parts.sort_by_key(|(offset, _)| *offset);
-        let mut merged: Option<BlockRef> = None;
-        for (_, part) in parts {
-            if let Some(current) = merged.as_mut() {
-                if current.object_id != part.object_id
-                    || current.offset.saturating_add(current.length) != part.offset
-                {
-                    return Err(MetaError::NonContiguousRegularFileGraph {
-                        ino: 0,
-                        block_index,
-                    });
-                }
-                current.length = current.length.saturating_add(part.length);
-                current.flags |= part.flags;
-            } else {
-                merged = Some(part);
-            }
-        }
-        Ok(merged)
-    }
-
     fn lookup_first_object_id(engine: &PgMetaEngine, ino: Ino) -> MetaResult<Option<u64>> {
         Ok(engine
             .lookup_regular_file_slices(ino, 0, u64::from(DEFAULT_BLOCK_SIZE))?
@@ -4686,7 +4626,15 @@ mod tests {
             .find_map(|span| span.block.map(|block| block.object_id)))
     }
 
-    impl PgBlockProjectionFixture for PgMetaEngine {
+    fn lookup_object_ids(engine: &PgMetaEngine, ino: Ino, length: u64) -> MetaResult<Vec<u64>> {
+        Ok(engine
+            .lookup_regular_file_slices(ino, 0, length)?
+            .into_iter()
+            .filter_map(|span| span.block.map(|block| block.object_id))
+            .collect())
+    }
+
+    impl PgBlockSliceFixture for PgMetaEngine {
         fn stage_block_slices(
             &self,
             ino: Ino,
@@ -4695,43 +4643,16 @@ mod tests {
         ) -> MetaResult<()> {
             self.flush_regular_file_overlay_slices(
                 ino,
-                block_projection_slices(block_index, Some(block), BlockRefState::LocalOnly)?
+                fixture_block_slices(block_index, Some(block), BlockRefState::LocalOnly)?
                     .as_slice(),
             )?;
             Ok(())
         }
 
-        fn lookup_block_projection(
-            &self,
-            ino: Ino,
-            block_index: u32,
-        ) -> MetaResult<Option<BlockRef>> {
-            self.lookup_regular_file_slices(
-                ino,
-                u64::from(block_index) * u64::from(DEFAULT_BLOCK_SIZE),
-                u64::from(DEFAULT_BLOCK_SIZE),
-            )
-            .and_then(|spans| block_projection_from_spans(spans, block_index))
-        }
-
-        fn lookup_block_projections(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
-            let attr = self.get_attr(ino)?;
-            let blocks = attr.size.div_ceil(u64::from(DEFAULT_BLOCK_SIZE));
-            let mut out = Vec::new();
-            for idx in 0..blocks {
-                let idx = u32::try_from(idx)
-                    .map_err(|_| MetaError::Storage("fixture block index overflow".to_string()))?;
-                if let Some(block) = self.lookup_block_projection(ino, idx)? {
-                    out.push((idx, block));
-                }
-            }
-            Ok(out)
-        }
-
         fn stage_block_tombstone_slices(&self, ino: Ino, block_index: u32) -> MetaResult<()> {
             self.flush_regular_file_overlay_slices(
                 ino,
-                block_projection_slices(block_index, None, BlockRefState::LocalOnly)?.as_slice(),
+                fixture_block_slices(block_index, None, BlockRefState::LocalOnly)?.as_slice(),
             )?;
             Ok(())
         }
@@ -6489,10 +6410,11 @@ mod tests {
         assert_eq!(remote_attr.committed_size, 4096);
         assert_eq!(remote_attr.committed_content_epoch, 1);
         assert_eq!(remote_attr.upload_state, UploadState::Ready);
-        let remote_blocks = remote
-            .lookup_block_projections(remote_file.ino)
-            .expect("remote blocks");
-        assert_eq!(remote_blocks, vec![(0, block)]);
+        assert_eq!(
+            lookup_object_ids(&remote, remote_file.ino, remote_attr.size)
+                .expect("remote object ids"),
+            vec![block.object_id]
+        );
     }
 
     #[test]
@@ -6529,10 +6451,11 @@ mod tests {
             .expect("batch1 end");
         apply_projected_remote_range(&writer, &remote, batch1_start, batch1_end);
 
-        let remote_initial = remote
-            .lookup_block_projections(file.ino)
-            .expect("remote initial blocks");
-        assert_eq!(remote_initial, vec![(0, first), (1, second)]);
+        assert_eq!(
+            lookup_object_ids(&remote, file.ino, block_size + 4096)
+                .expect("remote initial object ids"),
+            vec![first.object_id, second.object_id]
+        );
 
         let batch2_start = batch1_end;
         set_file_state(&writer, file.ino, 4096, 2);
@@ -6560,12 +6483,10 @@ mod tests {
         assert_eq!(remote_attr.committed_size, 4096);
         assert_eq!(remote_attr.committed_content_epoch, 2);
         assert_eq!(remote_attr.upload_state, UploadState::Ready);
-        let remote_blocks = remote
-            .lookup_block_projections(file.ino)
-            .expect("remote blocks after shrink");
         assert_eq!(
-            remote_blocks,
-            vec![(0, replacement)],
+            lookup_object_ids(&remote, file.ino, remote_attr.size)
+                .expect("remote object ids after shrink"),
+            vec![replacement.object_id],
             "base graph publish must replace the full remote base graph and drop stale trailing blocks"
         );
     }
@@ -6637,10 +6558,11 @@ mod tests {
         assert_eq!(remote_attr_after.size, block_size + 4096);
         assert_eq!(remote_attr_after.committed_size, block_size + 4096);
         assert_eq!(remote_attr_after.upload_state, UploadState::Ready);
-        let remote_blocks = remote
-            .lookup_block_projections(remote_file_after.ino)
-            .expect("remote blocks after publish");
-        assert_eq!(remote_blocks, vec![(0, block0), (1, block1)]);
+        assert_eq!(
+            lookup_object_ids(&remote, remote_file_after.ino, remote_attr_after.size)
+                .expect("remote object ids after publish"),
+            vec![block0.object_id, block1.object_id]
+        );
     }
 
     #[test]
@@ -6724,10 +6646,11 @@ mod tests {
         assert_eq!(remote_attr.committed_size, block_size + 4096);
         assert_eq!(remote_attr.committed_content_epoch, 2);
         assert_eq!(remote_attr.upload_state, UploadState::Ready);
-        let remote_blocks = remote
-            .lookup_block_projections(remote_final.ino)
-            .expect("replacement blocks");
-        assert_eq!(remote_blocks, vec![(0, new_block0), (1, new_block1)]);
+        assert_eq!(
+            lookup_object_ids(&remote, remote_final.ino, remote_attr.size)
+                .expect("replacement object ids"),
+            vec![new_block0.object_id, new_block1.object_id]
+        );
     }
 
     #[test]
@@ -6808,10 +6731,10 @@ mod tests {
         assert_eq!(remote_attr.committed_size, 4096);
         assert_eq!(remote_attr.content_epoch, 1);
         assert_eq!(remote_attr.committed_content_epoch, 1);
-        let remote_blocks = remote
-            .lookup_block_projections(file.ino)
-            .expect("remote blocks");
-        assert_eq!(remote_blocks, vec![(0, published)]);
+        assert_eq!(
+            lookup_object_ids(&remote, file.ino, remote_attr.size).expect("remote object ids"),
+            vec![published.object_id]
+        );
 
         assert!(
             writer.get_attr(file.ino).is_err(),
@@ -6877,10 +6800,11 @@ mod tests {
         assert_eq!(remote_attr.committed_size, 4096);
         assert_eq!(remote_attr.committed_content_epoch, 1);
         assert_eq!(remote_attr.upload_state, UploadState::Ready);
-        let remote_blocks = remote
-            .lookup_block_projections(remote_file.ino)
-            .expect("remote overlay blocks");
-        assert_eq!(remote_blocks, vec![(0, block)]);
+        assert_eq!(
+            lookup_object_ids(&remote, remote_file.ino, remote_attr.size)
+                .expect("remote overlay object ids"),
+            vec![block.object_id]
+        );
     }
 
     #[test]
@@ -7167,12 +7091,10 @@ mod tests {
             77
         );
 
-        let remote_blocks = b
-            .lookup_block_projections(remote.ino)
-            .expect("get remote blocks");
-        assert_eq!(remote_blocks.len(), 1);
-        assert_eq!(remote_blocks[0].0, 0);
-        assert_eq!(remote_blocks[0].1.object_id, 77);
+        assert_eq!(
+            lookup_object_ids(&b, remote.ino, 4096).expect("get remote object ids"),
+            vec![77]
+        );
     }
 
     #[test]
@@ -7276,10 +7198,10 @@ mod tests {
         let remote_file = b
             .lookup(remote_dir.ino, b"leaf.bin")
             .expect("lookup remote nested file");
-        let remote_blocks = b
-            .lookup_block_projections(remote_file.ino)
-            .expect("get remote nested blocks");
-        assert_eq!(remote_blocks, vec![(0, block)]);
+        assert_eq!(
+            lookup_object_ids(&b, remote_file.ino, 4096).expect("get remote nested object ids"),
+            vec![block.object_id]
+        );
     }
 
     #[test]
@@ -7357,10 +7279,12 @@ mod tests {
                                     && attr.upload_state == UploadState::Ready
                             })
                             .unwrap_or(false);
-                        let blocks_ready = b
-                            .lookup_block_projections(remote_file.ino)
-                            .map(|blocks| blocks == vec![(0, block0.clone()), (1, block1.clone())])
-                            .unwrap_or(false);
+                        let blocks_ready =
+                            lookup_object_ids(&b, remote_file.ino, block_size + 4096)
+                                .map(|object_ids| {
+                                    object_ids == vec![block0.object_id, block1.object_id]
+                                })
+                                .unwrap_or(false);
                         attr_ready && blocks_ready
                     }
                     Err(_) => false,
@@ -7497,10 +7421,9 @@ mod tests {
 
         assert!(wait_until(Duration::from_secs(10), || {
             let _ = b.sync_metadata();
-            let blocks = b.lookup_block_projections(remote.ino).unwrap_or_default();
-            blocks.len() == 2
-                && blocks[0].1.object_id == 801
-                && blocks[1].1.object_id == 802
+            let object_ids =
+                lookup_object_ids(&b, remote.ino, block_size + 4096).unwrap_or_default();
+            object_ids == vec![801, 802]
                 && b.get_attr(remote.ino)
                     .map(|attr| attr.upload_state == UploadState::Updating)
                     .unwrap_or(false)
@@ -7514,21 +7437,18 @@ mod tests {
 
         assert!(wait_until(Duration::from_secs(10), || {
             let _ = b.sync_metadata();
-            let blocks = b.lookup_block_projections(remote.ino).unwrap_or_default();
-            blocks.len() == 2
-                && blocks[0].1.object_id == 901
-                && blocks[1].1.object_id == 902
+            let object_ids =
+                lookup_object_ids(&b, remote.ino, block_size + 4096).unwrap_or_default();
+            object_ids == vec![901, 902]
                 && b.get_attr(remote.ino)
                     .map(|attr| attr.upload_state == UploadState::Ready)
                     .unwrap_or(false)
         }));
 
-        let remote_blocks = b
-            .lookup_block_projections(remote.ino)
-            .expect("get remote blocks");
-        assert_eq!(remote_blocks.len(), 2);
-        assert_eq!(remote_blocks[0].1.object_id, 901);
-        assert_eq!(remote_blocks[1].1.object_id, 902);
+        assert_eq!(
+            lookup_object_ids(&b, remote.ino, block_size + 4096).expect("get remote object ids"),
+            vec![901, 902]
+        );
     }
 
     #[test]

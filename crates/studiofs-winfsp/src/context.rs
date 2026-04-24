@@ -1893,7 +1893,7 @@ mod tests {
         let status = vfs_to_winfsp_err(denied).to_ntstatus();
         assert_eq!(status, STATUS_ACCESS_DENIED.0);
 
-        let fragmented = VfsError::Meta(MetaError::FragmentedBlock {
+        let fragmented = VfsError::Meta(MetaError::NonContiguousRegularFileGraph {
             ino: 7,
             block_index: 3,
         });

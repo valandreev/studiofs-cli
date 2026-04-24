@@ -1309,8 +1309,8 @@ mod tests {
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
-    trait BlockProjectionMetaFixture {
-        fn stage_block_projection(
+    trait FileSliceMetaFixture {
+        fn stage_block_slices(
             &self,
             ino: Ino,
             block_index: u32,
@@ -1318,7 +1318,7 @@ mod tests {
         ) -> MetaResult<Option<BlockRef>>;
     }
 
-    fn block_projection_slices(
+    fn fixture_block_slices(
         block_index: u32,
         block: &BlockRef,
     ) -> MetaResult<Vec<(ChunkId, Vec<SliceRecord>)>> {
@@ -1361,8 +1361,8 @@ mod tests {
         Ok(chunks.into_iter().collect())
     }
 
-    impl BlockProjectionMetaFixture for Arc<RedbMetaEngine> {
-        fn stage_block_projection(
+    impl FileSliceMetaFixture for Arc<RedbMetaEngine> {
+        fn stage_block_slices(
             &self,
             ino: Ino,
             block_index: u32,
@@ -1370,7 +1370,7 @@ mod tests {
         ) -> MetaResult<Option<BlockRef>> {
             self.flush_regular_file_overlay_slices(
                 ino,
-                block_projection_slices(block_index, block)?.as_slice(),
+                fixture_block_slices(block_index, block)?.as_slice(),
             )?;
             self.publish_regular_file_overlay_to_base_if_matches(
                 ino,
@@ -1954,7 +1954,7 @@ mod tests {
             staged_attr.committed_size = 8;
             staged_attr.upload_state = MetaUploadState::Ready;
             meta.set_attr(&staged_attr).expect("persist committed attr");
-            meta.stage_block_projection(ino, 0, &BlockRef::new_partial(object_id, 8))
+            meta.stage_block_slices(ino, 0, &BlockRef::new_partial(object_id, 8))
                 .expect("persist committed block");
 
             vfs.write(ino, 2, b"XY").await.expect("stage dirty patch");
@@ -2039,7 +2039,7 @@ mod tests {
             staged_attr.committed_size = 8;
             staged_attr.upload_state = MetaUploadState::Ready;
             meta.set_attr(&staged_attr).expect("persist committed attr");
-            meta.stage_block_projection(ino, 0, &BlockRef::new_partial(object_id, 8))
+            meta.stage_block_slices(ino, 0, &BlockRef::new_partial(object_id, 8))
                 .expect("persist committed block");
 
             vfs.write(ino, 2, b"XY").await.expect("stage dirty patch");
@@ -2100,7 +2100,7 @@ mod tests {
             staged_attr.committed_content_epoch = 1;
             staged_attr.content_epoch = 2;
             meta.set_attr(&staged_attr).expect("persist staged attr");
-            meta.stage_block_projection(ino, 0, &BlockRef::new_partial(committed_object_id, 8))
+            meta.stage_block_slices(ino, 0, &BlockRef::new_partial(committed_object_id, 8))
                 .expect("persist committed block");
 
             vfs.state.incarnation.live_extent_records.lock().insert(

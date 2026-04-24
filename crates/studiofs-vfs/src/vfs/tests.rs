@@ -88,17 +88,17 @@ fn make_test_vfs_with_config(
     (rt, vfs, meta)
 }
 
-trait BlockProjectionMetaFixture {
-    fn stage_block_projection(
+trait FileSliceMetaFixture {
+    fn stage_block_slices(
         &self,
         ino: Ino,
         block_index: u32,
         block: &BlockRef,
     ) -> MetaResult<Option<BlockRef>>;
-    fn lookup_block_projections(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>>;
+    fn lookup_file_block_slices(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>>;
 }
 
-fn block_projection_slices(
+fn fixture_block_slices(
     block_index: u32,
     block: Option<&BlockRef>,
 ) -> MetaResult<Vec<(ChunkId, Vec<SliceRecord>)>> {
@@ -155,8 +155,8 @@ fn block_projection_slices(
     Ok(chunks.into_iter().collect())
 }
 
-impl BlockProjectionMetaFixture for Arc<RedbMetaEngine> {
-    fn stage_block_projection(
+impl FileSliceMetaFixture for Arc<RedbMetaEngine> {
+    fn stage_block_slices(
         &self,
         ino: Ino,
         block_index: u32,
@@ -164,12 +164,12 @@ impl BlockProjectionMetaFixture for Arc<RedbMetaEngine> {
     ) -> MetaResult<Option<BlockRef>> {
         self.flush_regular_file_overlay_slices(
             ino,
-            block_projection_slices(block_index, Some(block))?.as_slice(),
+            fixture_block_slices(block_index, Some(block))?.as_slice(),
         )?;
         Ok(None)
     }
 
-    fn lookup_block_projections(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
+    fn lookup_file_block_slices(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
         let attr = self.get_attr(ino)?;
         self.lookup_regular_file_slices(ino, 0, attr.size)
             .map(|spans| {
@@ -318,7 +318,7 @@ fn startup_replay_does_not_override_current_epoch_live_extent_with_stale_pending
     attr.committed_content_epoch = 4;
     attr.upload_state = MetaUploadState::Uploading;
     meta.set_attr(&attr).expect("persist staged attr");
-    meta.stage_block_projection(ino, 0, &BlockRef::new_partial(9001, 4096))
+    meta.stage_block_slices(ino, 0, &BlockRef::new_partial(9001, 4096))
         .expect("persist current file block");
 
     let pending_uploads = vec![PendingUpload {
@@ -376,7 +376,7 @@ fn startup_replay_keeps_metadata_live_extent_when_pending_upload_has_same_epoch(
     attr.committed_content_epoch = 4;
     attr.upload_state = MetaUploadState::Uploading;
     meta.set_attr(&attr).expect("persist staged attr");
-    meta.stage_block_projection(ino, 0, &BlockRef::new_partial(9001, 4096))
+    meta.stage_block_slices(ino, 0, &BlockRef::new_partial(9001, 4096))
         .expect("persist current file block");
 
     let pending_uploads = vec![PendingUpload {
@@ -414,7 +414,7 @@ fn startup_replay_prefers_overlay_metadata_live_extent_over_base_for_same_epoch(
     attr.committed_content_epoch = 4;
     attr.upload_state = MetaUploadState::Updating;
     meta.set_attr(&attr).expect("persist staged attr");
-    meta.stage_block_projection(ino, 0, &BlockRef::new_partial(9001, 4096))
+    meta.stage_block_slices(ino, 0, &BlockRef::new_partial(9001, 4096))
         .expect("persist base file block");
     meta.flush_regular_file_overlay_slices_with_attr(
         ino,
@@ -483,7 +483,7 @@ fn pending_upload_views_follow_runtime_queue_after_startup_replay() {
     attr.committed_content_epoch = 4;
     attr.upload_state = MetaUploadState::Uploading;
     meta.set_attr(&attr).expect("persist staged attr");
-    meta.stage_block_projection(
+    meta.stage_block_slices(
         ino,
         0,
         &BlockRef::new_partial(object_id, payload.len() as u32),
@@ -539,7 +539,7 @@ fn startup_replay_rebuilds_runtime_pending_upload_index_from_persisted_state() {
     attr.committed_content_epoch = 8;
     attr.upload_state = MetaUploadState::Uploading;
     meta.set_attr(&attr).expect("persist staged attr");
-    meta.stage_block_projection(
+    meta.stage_block_slices(
         ino,
         0,
         &BlockRef::new_partial(object_id, payload.len() as u32),
@@ -745,7 +745,7 @@ fn pending_upload_truth_ignores_deleted_inode_local_blocks() {
     attr.nlink = 0;
     attr.upload_state = MetaUploadState::Uploading;
     meta.set_attr(&attr).expect("persist deleted attr");
-    meta.stage_block_projection(
+    meta.stage_block_slices(
         ino,
         0,
         &BlockRef::new_partial(object_id, payload.len() as u32),
@@ -938,10 +938,10 @@ fn zeroio_snapshot_reports_delete_before_publish_cleanup_visibility() {
         .put(951, b"uploaded", true)
         .expect("persist uploaded object");
     vfs.local_block_backend().mark_uploaded(951);
-    meta.stage_block_projection(attr.ino, 0, &BlockRef::new_partial(950, 4096))
+    meta.stage_block_slices(attr.ino, 0, &BlockRef::new_partial(950, 4096))
         .expect("persist local-only block");
     let uploaded = BlockRef::new_partial(951, 4096);
-    meta.stage_block_projection(attr.ino, 1, &uploaded)
+    meta.stage_block_slices(attr.ino, 1, &uploaded)
         .expect("persist uploaded block");
     assert!(
         meta.mark_regular_file_overlay_object_uploaded_if_matches(attr.ino, 1, uploaded.object_id)
@@ -1041,7 +1041,7 @@ fn epoch_finalizer_publishes_graph_backed_zero_length_epoch() {
             "blockless graph-backed zero-length epochs should become publish-ready immediately"
         );
         assert_eq!(
-            meta.lookup_block_projections(attr.ino)
+            meta.lookup_file_block_slices(attr.ino)
                 .expect("load unpublished graph")
                 .len(),
             0,
@@ -1103,7 +1103,7 @@ fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
             .expect("flush the initial full block into durable unpublished metadata");
 
         assert_eq!(
-            meta.lookup_block_projections(ino)
+            meta.lookup_file_block_slices(ino)
                 .expect("load flushed file blocks")
                 .len(),
             1,
@@ -1123,7 +1123,7 @@ fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
         .expect("buffer a newer partial tail without flushing it");
 
         assert_eq!(
-            meta.lookup_block_projections(ino)
+            meta.lookup_file_block_slices(ino)
                 .expect("load durable file blocks")
                 .len(),
             1,
@@ -1340,7 +1340,7 @@ fn zeroio_snapshot_reports_repeated_restart_replay_as_health_signal() {
     });
     let attr = meta.get_attr(ino).expect("load replay attr");
     let block = meta
-        .lookup_block_projections(ino)
+        .lookup_file_block_slices(ino)
         .expect("load replay blocks")
         .into_iter()
         .next()
@@ -2731,7 +2731,7 @@ fn write_fh_buffers_partial_tail_after_full_block_boundary_until_flush() {
         vfs.write_fh(fh, ino, 0, &payload).await.unwrap();
 
         assert_eq!(
-            meta.lookup_block_projections(ino).unwrap().len(),
+            meta.lookup_file_block_slices(ino).unwrap().len(),
             0,
             "stage-first opportunistic writes should keep the completed full block in local staging until a background or explicit flush commits metadata"
         );
@@ -2751,7 +2751,7 @@ fn write_fh_buffers_partial_tail_after_full_block_boundary_until_flush() {
         vfs.flush_fh(fh).await.unwrap();
 
         assert_eq!(
-            meta.lookup_block_projections(ino).unwrap().len(),
+            meta.lookup_file_block_slices(ino).unwrap().len(),
             2,
             "flush should materialize the buffered tail block"
         );
@@ -2842,7 +2842,7 @@ fn opportunistic_completed_handle_writer_materialization_caps_burst_to_drain_chu
             "opportunistic materialization should stage at least one capped burst"
         );
         assert_eq!(
-            meta.lookup_block_projections(ino).unwrap().len(),
+            meta.lookup_file_block_slices(ino).unwrap().len(),
             0,
             "completed blocks should stay in local staging until a later flush commits metadata"
         );
@@ -3212,7 +3212,7 @@ fn write_fh_aligned_full_block_callback_is_accepted_immediately() {
         vfs.write_fh(fh, ino, 0, &payload).await.unwrap();
 
         assert_eq!(
-            meta.lookup_block_projections(ino).unwrap().len(),
+            meta.lookup_file_block_slices(ino).unwrap().len(),
             0,
             "aligned full-block callbacks should be staged immediately instead of forcing inline metadata commits"
         );
@@ -3232,7 +3232,7 @@ fn write_fh_aligned_full_block_callback_is_accepted_immediately() {
 
         vfs.flush_fh(fh).await.unwrap();
         assert_eq!(
-            meta.lookup_block_projections(ino).unwrap().len(),
+            meta.lookup_file_block_slices(ino).unwrap().len(),
             1,
             "flush should durably materialize the staged full block"
         );
@@ -3281,14 +3281,14 @@ fn write_fh_sub_block_callbacks_batch_completed_blocks_until_flush() {
         }
 
         assert_eq!(
-            meta.lookup_block_projections(ino).unwrap().len(),
+            meta.lookup_file_block_slices(ino).unwrap().len(),
             0,
             "sub-block sequential callbacks should keep completed blocks buffered until flush can drain a larger burst"
         );
 
         vfs.flush_fh(fh).await.unwrap();
         assert_eq!(
-            meta.lookup_block_projections(ino).unwrap().len(),
+            meta.lookup_file_block_slices(ino).unwrap().len(),
             3,
             "flush should materialize all completed sequential blocks"
         );
@@ -3324,7 +3324,7 @@ fn inode_write_overwrite_updates_current_block_graph_over_published_base() {
         vfs.write(ino, 0, replacement).await.unwrap();
         vfs.flush(ino).await.unwrap();
 
-        let current_blocks = meta.lookup_block_projections(ino).expect("load current file graph");
+        let current_blocks = meta.lookup_file_block_slices(ino).expect("load current file graph");
         assert_eq!(current_blocks.len(), 1, "overwrite test should stay single-block");
         assert_ne!(
             current_blocks[0].1.object_id,
@@ -3348,7 +3348,7 @@ fn inode_write_overwrite_updates_current_block_graph_over_published_base() {
                 .expect("block-backed overwrite span")
                 .object_id,
             current_blocks[0].1.object_id,
-            "lookup_regular_file_slices and lookup_block_projections must agree on the current unpublished block"
+            "lookup_regular_file_slices and lookup_file_block_slices must agree on the current unpublished block"
         );
     });
 }
@@ -3942,7 +3942,7 @@ fn test_size_changing_setattr_rollback_restores_old_local_state_on_failure() {
             "failed size-changing setattr must preserve the last durable local contents"
         );
 
-        let blocks = meta.lookup_block_projections(attr.ino).unwrap();
+        let blocks = meta.lookup_file_block_slices(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             1,
@@ -3991,7 +3991,7 @@ fn test_size_changing_setattr_rolls_back_partial_truncate_mutation_failure() {
             "failed truncate mutation must not leave dirty local state behind"
         );
 
-        let blocks = meta.lookup_block_projections(attr.ino).unwrap();
+        let blocks = meta.lookup_file_block_slices(attr.ino).unwrap();
         assert_eq!(
             blocks.len(),
             2,

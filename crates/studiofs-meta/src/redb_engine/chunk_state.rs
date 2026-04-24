@@ -391,7 +391,7 @@ impl RedbMetaEngine {
             return Ok(());
         }
 
-        let graph = Self::block_projection_to_chunk_state(blocks, block_size)?;
+        let graph = Self::file_block_slices_to_chunk_state(blocks, block_size)?;
         let mut table = txn
             .open_table(table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -633,7 +633,7 @@ impl RedbMetaEngine {
 
     /// Convert a block-shaped test projection to chunk/slice state using the provided block size.
     #[cfg(test)]
-    pub(super) fn block_projection_to_chunk_state(
+    pub(super) fn file_block_slices_to_chunk_state(
         blocks: &[(u32, BlockRef)],
         block_size: u32,
     ) -> MetaResult<RegularFileOverlayState> {
@@ -728,7 +728,7 @@ impl RedbMetaEngine {
 
     #[cfg(test)]
     #[allow(dead_code)]
-    pub(super) fn block_projection_from_chunk_states(
+    pub(super) fn file_block_slices_from_chunk_states(
         ino: Ino,
         overlay_chunks: Option<&BTreeMap<ChunkId, RegularFileChunkState>>,
         base_chunks: Option<&BTreeMap<ChunkId, RegularFileChunkState>>,
@@ -777,7 +777,7 @@ impl RedbMetaEngine {
                 (query_end - chunk_start) as u32,
             )
             .ok_or_else(|| {
-                MetaError::Storage("invalid chunk-local block projection range".to_string())
+                MetaError::Storage("invalid chunk-local file slice graph range".to_string())
             })?;
             spans.extend(resolve_chunk_slice_spans(
                 chunk_id,
@@ -790,7 +790,7 @@ impl RedbMetaEngine {
         let spans = merge_adjacent_spans(spans);
         if block_size == 0 {
             return Err(MetaError::Storage(
-                "invalid zero block size in block projection synthesis".to_string(),
+                "invalid zero block size in file slice graph synthesis".to_string(),
             ));
         }
         let block_count = ((size.saturating_sub(1)) / block_size as u64).saturating_add(1);
@@ -1176,7 +1176,7 @@ impl RedbMetaEngine {
 
     #[cfg(test)]
     #[allow(dead_code)]
-    pub(super) fn current_block_projection_in_txn(
+    pub(super) fn current_file_block_slices_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
     ) -> MetaResult<Vec<(u32, BlockRef)>> {
@@ -1201,7 +1201,7 @@ impl RedbMetaEngine {
             ino,
         )?;
         let block_size = Self::regular_file_graph_block_size_from_write_txn(txn)?;
-        Self::block_projection_from_chunk_states(
+        Self::file_block_slices_from_chunk_states(
             ino,
             Some(&overlay_chunks),
             Some(&base_chunks),
@@ -1433,7 +1433,7 @@ impl RedbMetaEngine {
 
     #[cfg(test)]
     #[allow(dead_code)]
-    pub(super) fn block_projection_matches_committed_in_txn(
+    pub(super) fn regular_file_slices_match_committed_in_txn(
         txn: &redb::WriteTransaction,
         ino: Ino,
     ) -> MetaResult<bool> {

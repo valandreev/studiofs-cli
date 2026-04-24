@@ -326,12 +326,12 @@ fn remove_orphan_file(
     orphan_blocks_pending_gc: &mut usize,
     removed_orphans: &mut usize,
 ) -> FsckResult<()> {
-    let removed_ids = match meta.remove_file_blocks(ino) {
+    let removed_ids = match meta.remove_regular_file_graph(ino) {
         Ok(ids) => ids,
         Err(MetaError::InodeNotFound(_)) => Vec::new(),
         Err(err) => {
             return Err(FsckError::Message(format!(
-                "failed to remove orphan blocks for ino {ino}: {err}"
+                "failed to remove orphan regular-file graph for ino {ino}: {err}"
             )));
         }
     };

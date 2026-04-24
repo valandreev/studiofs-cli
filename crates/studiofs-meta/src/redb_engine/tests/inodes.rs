@@ -185,7 +185,7 @@ fn test_set_attr_accepts_fragmented_regular_file_base_graph() {
     attr.mode = 0o600;
     engine
         .set_attr(&attr)
-        .expect("set_attr should not synthesize a block projection for non-contiguous base rows");
+        .expect("set_attr should not synthesize a file slice graph for non-contiguous base rows");
 
     let loaded = engine.get_attr(file.ino).unwrap();
     assert_eq!(loaded.mode, 0o600);
