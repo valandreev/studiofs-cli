@@ -4556,7 +4556,7 @@ mod tests {
             block_index: u32,
             payload: &PayloadRef,
         ) -> MetaResult<()>;
-        fn stage_logical_payload_tombstone(&self, ino: Ino, block_index: u32) -> MetaResult<()>;
+        fn stage_payload_tombstone(&self, ino: Ino, block_index: u32) -> MetaResult<()>;
     }
 
     fn fixture_payload_slices(
@@ -4649,7 +4649,7 @@ mod tests {
             Ok(())
         }
 
-        fn stage_logical_payload_tombstone(&self, ino: Ino, block_index: u32) -> MetaResult<()> {
+        fn stage_payload_tombstone(&self, ino: Ino, block_index: u32) -> MetaResult<()> {
             self.flush_regular_file_overlay_slices(
                 ino,
                 fixture_payload_slices(block_index, None, PayloadRefState::LocalOnly)?.as_slice(),
@@ -6460,7 +6460,7 @@ mod tests {
         let batch2_start = batch1_end;
         set_file_state(&writer, file.ino, 4096, 2);
         writer
-            .stage_logical_payload_tombstone(file.ino, 1)
+            .stage_payload_tombstone(file.ino, 1)
             .expect("remove second block for shrink");
         let replacement = PayloadRef::new_partial(block_size + 3, 4096);
         writer

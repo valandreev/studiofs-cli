@@ -143,7 +143,7 @@ the failing backend in the CI job log.
 
 ## Final Architecture Invariants
 
-The final chunk/slice/block model is directly covered by these focused
+The final chunk/slice/payload-object model is directly covered by these focused
 regressions:
 
 - Read/write resolution

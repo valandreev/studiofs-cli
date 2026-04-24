@@ -48,7 +48,7 @@ Everything else in this document is a consequence of that split.
 
 | Category | Contract |
 |---|---|
-| JuiceFS ideas we are borrowing | chunk/slice/block modeling, per-file writer state, standalone-style local metadata hot path, slice-oriented flush behavior, `dataReader`-style read resolution, adaptive readahead, block prefetch, cached-store cache/object-store structure, and cheap foreground write acceptance |
+| JuiceFS ideas we are borrowing | chunk/slice modeling over immutable payload objects, per-file writer state, standalone-style local metadata hot path, slice-oriented flush behavior, `dataReader`-style read resolution, adaptive readahead, block prefetch, cached-store cache/object-store structure, and cheap foreground write acceptance |
 | StudioFS invariants we are preserving | Local-First read-your-writes, per-mount local metadata authority, eventual consistency across mounts, background replication through PostgreSQL, background payload replication through S3, file-version atomic cross-client visibility, and PG-backed shared file locks |
 | Invariants we are explicitly dropping | PG as a foreground metadata authority for ordinary mounted IO, synchronous remote visibility on `close`, and multiple user-facing mount consistency modes |
 | Rust-native implementation rules | explicit ownership, enums and state transitions, domain-specific `Result` error types, bounded async concurrency, and module boundaries shaped by responsibilities instead of Go package mirroring |
@@ -343,7 +343,7 @@ Rules:
 
 | StudioFS area | Current StudioFS paths | JuiceFS reference files | What is borrowed |
 |---|---|---|---|
-| Regular-file vocabulary and schema | `crates/studiofs-meta/src/redb_engine/{blocks.rs,chunk_state.rs,replication.rs}` | `docs/en/introduction/architecture.md`, `pkg/meta/slice.go`, `pkg/meta/*.go` | Chunk/slice/block language, immutable block references, slice overlap model |
+| Regular-file vocabulary and schema | `crates/studiofs-meta/src/redb_engine/{blocks.rs,chunk_state.rs,replication.rs}` | `docs/en/introduction/architecture.md`, `pkg/meta/slice.go`, `pkg/meta/*.go` | Chunk/slice layout language, immutable payload references, slice overlap model |
 | Writer path | `crates/studiofs-vfs/src/local_dirty.rs`, `crates/studiofs-vfs/src/vfs/upload_lifecycle.rs` | `pkg/vfs/writer.go` | Per-file writer ownership, chunk/slice decomposition, cheap local-first write acceptance, and incremental flush behavior |
 | Reader path, readahead, prefetch | `crates/studiofs-vfs/src/vfs/read_path.rs`, `crates/studiofs-vfs/src/readahead.rs`, `crates/studiofs-vfs/src/vfs/prefetch.rs` | `pkg/vfs/reader.go`, `pkg/chunk/prefetch.go`, `docs/en/guide/cache.md` | `dataReader`-style resolution, adaptive readahead, whole-block prefetch |
 | Cache, staging, object-store handoff | `crates/studiofs-cache/src/{cached_store.rs,runtime.rs,block_*.rs,startup_recovery.rs}`, `crates/studiofs-data/src/store.rs` | `pkg/chunk/cached_store.go`, `pkg/chunk/cache_eviction.go`, `docs/en/guide/cache.md` | Cached-store lifecycle, cache/download/writeback structure, eviction and background upload concepts |
@@ -397,7 +397,7 @@ Review guardrails:
 - Reject generic `anyhow`-style library errors where callers need domain
   decisions.
 - Reject publication paths that expose a peer-visible version before every
-  referenced payload block is already durable in S3.
+  referenced payload object is already durable in S3.
 - Reject rewrite decisions whose main purpose is preserving legacy pre-rewrite
   behavior that conflicts with this contract. Backward-compatibility with the
   old mount mode is not a design goal when it weakens the target semantics.

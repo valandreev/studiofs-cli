@@ -8,14 +8,14 @@ with the contract, the contract wins.
 ## System Design
 
 StudioFS mounts S3-compatible object storage as a Local-First filesystem with a
-JuiceFS-inspired, Rust-native chunk/slice/block data plane.
+JuiceFS-inspired, Rust-native chunk/slice/payload-object data plane.
 
 Core principles:
 - Foreground metadata operations read and write local `redb`; the local `redb`
   view is the only metadata authority used by mounted foreground IO.
 - PostgreSQL is the bootstrap source, ordered replication bus, checkpoint
   store, and shared-lock authority when cross-client file locks are enabled.
-- File payloads live in immutable blocks addressed by chunk-relative slices.
+- File payloads live in immutable payload objects addressed by chunk-relative slices.
 - Runtime visibility is split into `writer state`, local authority view, and
   asynchronously replicated shared state.
 - The UUID-scoped cache root itself is the runtime boundary of the current

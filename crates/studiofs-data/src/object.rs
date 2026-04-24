@@ -436,7 +436,7 @@ pub fn format_fragment_keys(data_prefix: &str, object_id: u64) -> [String; CLOUD
 
 pub use format_fragment_keys as format_object_fragment_keys;
 
-/// Validate cloud fragment shape and return reconstructed logical payload size.
+/// Validate cloud fragment shape and return reconstructed payload size.
 ///
 /// Rules:
 /// - exactly `CLOUD_FRAGMENT_COUNT` fragments are expected;

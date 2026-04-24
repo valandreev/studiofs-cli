@@ -2,9 +2,9 @@
 
 `studiofs-data` handles object I/O against S3-compatible storage and object encoding/decoding.
 
-This document follows the frozen chunk/slice/block vocabulary. Historical helper
-APIs still use the older `chunks/...` compatibility keys for tests, but the
-active data-path descriptions below use the final model.
+This document follows the frozen chunk/slice/payload-object vocabulary. Historical
+helper APIs still use the older `chunks/...` compatibility keys for tests, but
+the active data-path descriptions below use the final model.
 
 ## Responsibilities
 
@@ -75,8 +75,8 @@ Little-endian encoding is used for all multi-byte fields.
 ```
 
 On write, object upload paths use `create_object_buffer` / `create_object_buffer_with_flags`
-and an `opendal::Buffer` (`header` + payload chunks) to avoid copying full block payload
-buffers when prepending the fixed header.
+and an `opendal::Buffer` (`header` + payload chunks) to avoid copying full
+payload-object buffers when prepending the fixed header.
 
 On read, object decode accepts `opendal::Buffer` directly, parses the fixed header from a small stack buffer, and validates checksum incrementally across buffer chunks. Payload is returned as zero-copy `Bytes` when the payload is a single contiguous chunk, with contiguous materialization only as a fallback for fragmented payloads.
 

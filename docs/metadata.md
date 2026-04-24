@@ -306,13 +306,13 @@ Regular files now use two size/generation concepts:
 - `content_epoch`
   - monotonic content generation used to reject stale async upload completions
 
-## Important Block Tables
+## Important Regular-File Tables
 
 Regular-file graph tables:
 - `regular_file_overlay`
-  - local-visible chunk/slice/block graph rows, keyed by `(ino, chunk_id)`
+  - local-visible chunk/slice/payload-object graph rows, keyed by `(ino, chunk_id)`
 - `regular_file_base`
-  - remote-visible chunk/slice/block graph rows, keyed by `(ino, chunk_id)`
+  - remote-visible chunk/slice/payload-object graph rows, keyed by `(ino, chunk_id)`
 - `SliceRange`
   - validated as chunk-relative half-open ranges and rejected if they cross the current chunk size
 
@@ -388,9 +388,9 @@ Where:
 Regular-file runtime state is split into chunk-local overlay/base graphs:
 
 - `regular_file_overlay`
-  - local-serving chunk/slice/block rows
+  - local-serving chunk/slice/payload-object rows
 - `regular_file_base`
-  - remote-visible chunk/slice/block rows
+  - remote-visible chunk/slice/payload-object rows
 
 Namespace/attrs gain the same split:
 

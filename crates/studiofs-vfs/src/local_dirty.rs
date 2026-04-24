@@ -926,40 +926,42 @@ impl LocalPayloadWriterPort for VfsLocalPayloadWriter<'_> {
         persisted_blocks: &[PersistedWriteBlock],
         persist_config: PayloadPersistConfig,
     ) -> VfsResult<()> {
-        let payload_blocks: Vec<&PersistedWriteBlock> = persisted_blocks
+        let payload_entries: Vec<&PersistedWriteBlock> = persisted_blocks
             .iter()
             .filter(|block| block.requires_payload_persist())
             .collect();
-        if payload_blocks.is_empty() {
+        if payload_entries.is_empty() {
             return Ok(());
         }
-        let persisted_bytes: u64 = payload_blocks.iter().map(|b| b.len() as u64).sum();
+        let persisted_bytes: u64 = payload_entries.iter().map(|b| b.len() as u64).sum();
         let started = Instant::now();
         let result: VfsResult<()> = async {
-            let persisted_object_ids: Vec<u64> =
-                payload_blocks.iter().map(|block| block.object_id).collect();
-            for chunk in payload_blocks.chunks(persist_config.put_concurrency.max(1)) {
+            let persisted_object_ids: Vec<u64> = payload_entries
+                .iter()
+                .map(|block| block.object_id)
+                .collect();
+            for chunk in payload_entries.chunks(persist_config.put_concurrency.max(1)) {
                 let batch = chunk
                     .iter()
                     .map(|block| studiofs_cache::local::LocalPayloadPut {
                         object_id: block.object_id,
                         data: block
                             .payload_bytes()
-                            .expect("payload blocks keep inline bytes")
+                            .expect("payload entries keep inline bytes")
                             .clone(),
                         evictable: false,
                     })
                     .collect();
                 self.vfs.block_store_put_batch_async(batch).await?;
             }
-            for chunk in payload_blocks.chunks(persist_config.put_concurrency.max(1)) {
+            for chunk in payload_entries.chunks(persist_config.put_concurrency.max(1)) {
                 let batch = chunk
                     .iter()
                     .map(|block| studiofs_cache::local::LocalPayloadPut {
                         object_id: block.object_id,
                         data: block
                             .payload_bytes()
-                            .expect("payload blocks keep inline bytes")
+                            .expect("payload entries keep inline bytes")
                             .clone(),
                         evictable: false,
                     })
@@ -981,7 +983,7 @@ impl LocalPayloadWriterPort for VfsLocalPayloadWriter<'_> {
                 warn!(
                     persisted_block_count = persisted_blocks.len(),
                     error = %error,
-                    "failed to create zero-copy upload links for durable payload blocks"
+                    "failed to create zero-copy upload links for durable payload objects"
                 );
             }
             Ok(())
@@ -990,7 +992,7 @@ impl LocalPayloadWriterPort for VfsLocalPayloadWriter<'_> {
         let completed_burst = result.is_ok();
         if persisted_bytes > 0 {
             self.vfs.record_payload_persist_observability(
-                payload_blocks.len(),
+                payload_entries.len(),
                 persisted_bytes,
                 started.elapsed(),
                 completed_burst,
