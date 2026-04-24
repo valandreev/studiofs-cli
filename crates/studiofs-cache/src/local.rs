@@ -219,7 +219,7 @@ pub(crate) mod contract_tests {
         );
         assert!(
             backend.dirty_object_ids().is_empty(),
-            "uploaded block must no longer be dirty"
+            "uploaded payload object must no longer be dirty"
         );
     }
 

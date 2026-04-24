@@ -8,9 +8,9 @@ use studiofs_meta::engine::{
 };
 use studiofs_meta::{
     AccessLevel, ChunkId, DirEntry, DirEntryValue, FormatInfo, Ino, InodeAttr,
-    InodeLifecycleRecord, MetaAcl, MetaBlocks, MetaEngine, MetaEngineCore, MetaFormat, MetaFsOps,
-    MetaGc, MetaInodes, MetaNamespace, MetaRecovery, MetaReplication, MetaResult, MetaSymlink,
-    MetaXattr, RenameAtomicResult, ResolvedSliceSpan, SliceRange, SliceRecord,
+    InodeLifecycleRecord, MetaAcl, MetaEngine, MetaEngineCore, MetaFormat, MetaFsOps, MetaGc,
+    MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery, MetaReplication, MetaResult,
+    MetaSymlink, MetaXattr, RenameAtomicResult, ResolvedSliceSpan, SliceRange, SliceRecord,
     SyncMetaEngineAdapter, execute_sync_meta,
 };
 use tokio::task;
@@ -55,7 +55,7 @@ pub trait VfsMeta:
     + MetaInodes
     + MetaNamespace
     + MetaFsOps
-    + MetaBlocks
+    + MetaPayloadObjects
     + MetaGc
     + MetaRecovery
     + MetaSymlink
@@ -75,7 +75,7 @@ impl<T> VfsMeta for T where
         + MetaInodes
         + MetaNamespace
         + MetaFsOps
-        + MetaBlocks
+        + MetaPayloadObjects
         + MetaGc
         + MetaRecovery
         + MetaSymlink
@@ -85,14 +85,14 @@ impl<T> VfsMeta for T where
 {
 }
 
-pub trait ReadPathMeta: Send + Sync + MetaInodes + MetaBlocks {}
-impl<T> ReadPathMeta for T where T: ?Sized + Send + Sync + MetaInodes + MetaBlocks {}
+pub trait ReadPathMeta: Send + Sync + MetaInodes + MetaPayloadObjects {}
+impl<T> ReadPathMeta for T where T: ?Sized + Send + Sync + MetaInodes + MetaPayloadObjects {}
 
 pub trait AclMeta: Send + Sync + MetaInodes + MetaAcl {}
 impl<T> AclMeta for T where T: ?Sized + Send + Sync + MetaInodes + MetaAcl {}
 
-pub trait UploadMeta: Send + Sync + MetaInodes + MetaBlocks + MetaGc {}
-impl<T> UploadMeta for T where T: ?Sized + Send + Sync + MetaInodes + MetaBlocks + MetaGc {}
+pub trait UploadMeta: Send + Sync + MetaInodes + MetaPayloadObjects + MetaGc {}
+impl<T> UploadMeta for T where T: ?Sized + Send + Sync + MetaInodes + MetaPayloadObjects + MetaGc {}
 
 pub trait JanitorMeta:
     Send
@@ -100,7 +100,7 @@ pub trait JanitorMeta:
     + MetaEngineCore
     + MetaInodes
     + MetaNamespace
-    + MetaBlocks
+    + MetaPayloadObjects
     + MetaGc
     + MetaRecovery
     + MetaReplication
@@ -113,7 +113,7 @@ impl<T> JanitorMeta for T where
         + MetaEngineCore
         + MetaInodes
         + MetaNamespace
-        + MetaBlocks
+        + MetaPayloadObjects
         + MetaGc
         + MetaRecovery
         + MetaReplication
@@ -278,7 +278,7 @@ impl<M: ?Sized + MetaFsOps> MetaFsOps for RuntimeMetaHandle<M> {
     );
 }
 
-impl<M: ?Sized + MetaBlocks> MetaBlocks for RuntimeMetaHandle<M> {
+impl<M: ?Sized + MetaPayloadObjects> MetaPayloadObjects for RuntimeMetaHandle<M> {
     forward_method!(
         fn lookup_regular_file_chunk_slices(
             &self,

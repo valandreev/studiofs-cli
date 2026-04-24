@@ -11,7 +11,7 @@ fn record_regular_file_object_usage(
         .or_insert(object_bytes);
 }
 
-impl MetaBlocks for RedbMetaEngine {
+impl MetaPayloadObjects for RedbMetaEngine {
     fn lookup_regular_file_chunk_slices(
         &self,
         ino: Ino,

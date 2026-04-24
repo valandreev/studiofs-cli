@@ -18,7 +18,7 @@ sub-traits:
 - `MetaInodes`
 - `MetaNamespace`
 - `MetaFsOps`
-- `MetaBlocks`
+- `MetaPayloadObjects`
 - `MetaGc`
 - `MetaRecovery`
 - `MetaSymlink`
@@ -258,8 +258,8 @@ Current operational contract:
 
 - local operations are synchronous and immediate for the current client
 - cross-client visibility is eventual
-- namespace visibility may arrive before all file blocks are committed
-- remote-visible file size advances only with committed blocks
+- namespace visibility may arrive before all file payload objects are committed
+- remote-visible file size advances only with committed payload objects
 - foreign namespace can be present in local `base_*` before local overlay stops masking it
 - stale async completions are rejected using `content_epoch` plus object IDentity checks
 - crash/reopen recovery should converge through ordinary restart plus
@@ -563,7 +563,7 @@ Destination side:
 
 - update attr only in `inodes`
 - modify local-serving `regular_file_overlay`
-- leave `base_inodes.committed_size` and committed blocks untouched until upload
+- leave `base_inodes.committed_size` and committed payload objects untouched until upload
   completion and PG flush publish remote-visible state
 
 ### `set_symlink_target`

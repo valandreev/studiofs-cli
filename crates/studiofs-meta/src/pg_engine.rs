@@ -1,8 +1,8 @@
 use crate::engine::{
-    DeferredDeleteRecord, MetaAcl, MetaBlocks, MetaEngineCore, MetaError, MetaFormat, MetaFsOps,
-    MetaGc, MetaInodes, MetaNamespace, MetaRecovery, MetaReplication, MetaResult, MetaSnapshots,
-    MetaSymlink, MetaXattr, MetadataAuthorityStatus, PendingCreateRecord, UndoLogKind,
-    UndoLogRecord,
+    DeferredDeleteRecord, MetaAcl, MetaEngineCore, MetaError, MetaFormat, MetaFsOps, MetaGc,
+    MetaInodes, MetaNamespace, MetaPayloadObjects, MetaRecovery, MetaReplication, MetaResult,
+    MetaSnapshots, MetaSymlink, MetaXattr, MetadataAuthorityStatus, PendingCreateRecord,
+    UndoLogKind, UndoLogRecord,
 };
 use crate::events::MetaEvent;
 use crate::redb_engine::{RedbMetaEngine, RedbSnapshot};
@@ -4109,7 +4109,7 @@ impl MetaFsOps for PgMetaEngine {
         self.mutate(|local| local.create_symlink_with_ino(ino, parent, name, target, uid, gid))
     }
 }
-impl MetaBlocks for PgMetaEngine {
+impl MetaPayloadObjects for PgMetaEngine {
     fn lookup_regular_file_chunk_slices(
         &self,
         ino: Ino,

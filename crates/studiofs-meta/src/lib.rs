@@ -27,8 +27,8 @@ use std::sync::Arc;
 
 pub use async_engine::{SyncMetaEngineAdapter, execute_sync_meta};
 pub use engine::{
-    MetaAcl, MetaBlocks, MetaEngine, MetaEngineCore, MetaError, MetaFormat, MetaFsOps, MetaGc,
-    MetaInodes, MetaNamespace, MetaRecovery, MetaReplication, MetaResult, MetaSnapshots,
+    MetaAcl, MetaEngine, MetaEngineCore, MetaError, MetaFormat, MetaFsOps, MetaGc, MetaInodes,
+    MetaNamespace, MetaPayloadObjects, MetaRecovery, MetaReplication, MetaResult, MetaSnapshots,
     MetaSymlink, MetaXattr,
 };
 pub use events::MetaEvent;

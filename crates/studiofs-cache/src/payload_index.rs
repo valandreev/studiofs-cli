@@ -1510,7 +1510,7 @@ mod tests {
                 upload_state: LocalPayloadUploadState::None,
                 evictable: true,
             })
-            .expect("upsert uploaded block");
+            .expect("upsert uploaded payload object");
     }
 
     #[test]

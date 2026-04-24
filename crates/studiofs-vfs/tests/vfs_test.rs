@@ -31,9 +31,9 @@ use studiofs_meta::engine::{MetaFsOps, PendingCreateRecord, UndoLogKind};
 use studiofs_meta::types::SetattrArgs;
 use studiofs_meta::types::TimeSpec;
 use studiofs_meta::{
-    CURRENT_FORMAT_VERSION, FormatInfo, MetaBlocks, MetaEngine, MetaError, MetaFormat, MetaGc,
-    MetaInodes, MetaReplication, MetadataBackend, MetadataConfig, PgMetaEngine, PgOpenOptions,
-    PostgresConfig, ROOT_INO, RedbMetaEngine, ensure_studiofs_database,
+    CURRENT_FORMAT_VERSION, FormatInfo, MetaEngine, MetaError, MetaFormat, MetaGc, MetaInodes,
+    MetaPayloadObjects, MetaReplication, MetadataBackend, MetadataConfig, PgMetaEngine,
+    PgOpenOptions, PostgresConfig, ROOT_INO, RedbMetaEngine, ensure_studiofs_database,
     schema::{ChunkId, SliceId, SliceOrder, SliceRange, SliceRecord},
     schema::{InodeLifecycleState, PayloadRefState},
     types::{AccessLevel, BlockFlags, Ino, PayloadRef, UploadState},
@@ -187,7 +187,7 @@ fn fixture_payload_summaries_from_spans(
 
 impl<T> FileGraphMetaFixture for Arc<T>
 where
-    T: ?Sized + MetaBlocks + MetaFormat + MetaInodes,
+    T: ?Sized + MetaPayloadObjects + MetaFormat + MetaInodes,
 {
     fn stage_payload_slice(
         &self,
@@ -2603,7 +2603,7 @@ fn test_crash_recovery_replays_local_committed_block_before_metadata_flush() {
             assert_eq!(
                 data.as_ref(),
                 replacement_payload.as_slice(),
-                "read-after-restart should serve bytes from the locally committed block-store state"
+                "read-after-restart should serve bytes from the locally committed payload-store state"
             );
         });
         rt.shutdown_background();
@@ -4342,7 +4342,7 @@ fn test_crash_recovery_replays_local_committed_block_before_remote_fetch() {
             assert_eq!(
                 read.as_ref(),
                 replacement_payload.as_slice(),
-                "read after restart with offline endpoint should use committed block-store state; ingress_stats={:?} meta_blocks={:?}",
+                "read after restart with offline endpoint should use committed payload-store state; ingress_stats={:?} meta_slices={:?}",
                 vfs.ingress_stats(),
                 vfs.meta().lookup_payload_slices(ino).ok(),
             );

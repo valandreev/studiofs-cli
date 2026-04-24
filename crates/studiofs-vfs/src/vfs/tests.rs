@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use studiofs_meta::engine::MetadataAuthorityStatus;
-use studiofs_meta::engine::{MetaBlocks, MetaInodes};
+use studiofs_meta::engine::{MetaInodes, MetaPayloadObjects};
 use studiofs_meta::schema::{
     CURRENT_FORMAT_VERSION, ChunkId, DEFAULT_BLOCK_SIZE, FormatInfo, InodeLifecycleState,
     MetadataConfig, PayloadRefState, PayloadRetentionClass, ROOT_INO, SliceId, SliceOrder,
@@ -964,7 +964,7 @@ fn zeroio_snapshot_reports_delete_before_publish_cleanup_visibility() {
         .expect("persist local-only block");
     let uploaded = PayloadRef::new_partial(951, 4096);
     meta.stage_payload_slice(attr.ino, 1, &uploaded)
-        .expect("persist uploaded block");
+        .expect("persist uploaded payload object");
     assert!(
         meta.mark_regular_file_overlay_object_uploaded_if_matches(attr.ino, 1, uploaded.object_id)
             .expect("mark uploaded object"),
@@ -1326,7 +1326,7 @@ fn graph_finalizer_visibility_timeout_does_not_requeue_uploaded_blocks() {
         }
         assert!(
             vfs.pending_uploads_for_inode(attr.ino).is_empty(),
-            "setup should simulate uploaded blocks that are no longer pending locally"
+            "setup should simulate uploaded payload objects that are no longer pending locally"
         );
 
         let status =
@@ -1335,11 +1335,11 @@ fn graph_finalizer_visibility_timeout_does_not_requeue_uploaded_blocks() {
                 .expect("visibility timeout should defer instead of failing");
         assert!(
             matches!(status, super::commit::EpochFinalizeStatus::Deferred),
-            "visibility lag should defer publish instead of requeueing uploaded blocks"
+            "visibility lag should defer publish instead of requeueing uploaded payload objects"
         );
         assert!(
             vfs.pending_uploads_for_inode(attr.ino).is_empty(),
-            "uploaded blocks awaiting remote visibility should not be requeued into the upload backlog"
+            "uploaded payload objects awaiting remote visibility should not be requeued into the upload backlog"
         );
     });
 }

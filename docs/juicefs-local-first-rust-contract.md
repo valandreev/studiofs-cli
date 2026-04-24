@@ -67,7 +67,7 @@ Everything else in this document is a consequence of that split.
 | `replication event` | StudioFS target semantic | Ordered metadata delta published to PostgreSQL so other mounts can converge their local authority views. |
 | `replicated shared state` | StudioFS target semantic | The portion of state that has been published and can become visible on other mounts after they apply it into their own local authority views. |
 | `lock lease` | StudioFS target semantic | PG-coordinated hard-lock state with TTL/renewal semantics and pub/sub notifications. |
-| `orphaned payload` | StudioFS target semantic | Uploaded blocks that are no longer referenced by any published version and may later be removed by janitor. |
+| `orphaned payload` | StudioFS target semantic | Uploaded payload objects that are no longer referenced by any published version and may later be removed by janitor. |
 | `hole` | Shared filesystem concept | Uncovered byte range that reads as zeroes. |
 
 Invariants:
@@ -337,13 +337,13 @@ Rules:
 | Upload completion | Payloads may already exist in S3, but peers do not see the new file version until the metadata switch is published and applied. | No direct namespace visibility switch happens on upload alone. |
 | PG replication event publish | The new version becomes eligible for peer visibility. | Peers still see it only after local apply into their own `redb`. |
 | Remote event apply | A mount converges its local authority view toward foreign changes while keeping its own private overlay ahead locally when conflict policy says so. | Namespace epochs and affected attrs/dentries invalidate locally before serving newer applied state. |
-| Delete before publish | The writing mount removes the file locally. Peers never observe the unpublished file/version. | Any already uploaded blocks become orphaned payload and are later cleaned by janitor. |
+| Delete before publish | The writing mount removes the file locally. Peers never observe the unpublished file/version. | Any already uploaded payload objects become orphaned payload and are later cleaned by janitor. |
 
 ## 12. Borrowed JuiceFS Ideas By Subsystem
 
 | StudioFS area | Current StudioFS paths | JuiceFS reference files | What is borrowed |
 |---|---|---|---|
-| Regular-file vocabulary and schema | `crates/studiofs-meta/src/redb_engine/{blocks.rs,chunk_state.rs,replication.rs}` | `docs/en/introduction/architecture.md`, `pkg/meta/slice.go`, `pkg/meta/*.go` | Chunk/slice layout language, immutable payload references, slice overlap model |
+| Regular-file vocabulary and schema | `crates/studiofs-meta/src/redb_engine/{payload_objects.rs,chunk_state.rs,replication.rs}` | `docs/en/introduction/architecture.md`, `pkg/meta/slice.go`, `pkg/meta/*.go` | Chunk/slice layout language, immutable payload references, slice overlap model |
 | Writer path | `crates/studiofs-vfs/src/local_dirty.rs`, `crates/studiofs-vfs/src/vfs/upload_lifecycle.rs` | `pkg/vfs/writer.go` | Per-file writer ownership, chunk/slice decomposition, cheap local-first write acceptance, and incremental flush behavior |
 | Reader path, readahead, prefetch | `crates/studiofs-vfs/src/vfs/read_path.rs`, `crates/studiofs-vfs/src/readahead.rs`, `crates/studiofs-vfs/src/vfs/prefetch.rs` | `pkg/vfs/reader.go`, `pkg/chunk/prefetch.go`, `docs/en/guide/cache.md` | `dataReader`-style resolution, adaptive readahead, whole-block prefetch |
 | Cache, staging, object-store handoff | `crates/studiofs-cache/src/{cached_store.rs,runtime.rs,block_*.rs,startup_recovery.rs}`, `crates/studiofs-data/src/store.rs` | `pkg/chunk/cached_store.go`, `pkg/chunk/cache_eviction.go`, `docs/en/guide/cache.md` | Cached-store lifecycle, cache/download/writeback structure, eviction and background upload concepts |

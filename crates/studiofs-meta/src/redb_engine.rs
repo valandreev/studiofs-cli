@@ -165,12 +165,12 @@ impl RedbMetaEngine {
 }
 
 mod acl;
-mod blocks;
 mod chunk_state;
 mod format;
 mod gc;
 mod inodes;
 mod namespace;
+mod payload_objects;
 mod recovery;
 mod replication;
 mod snapshots;

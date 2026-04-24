@@ -1309,7 +1309,7 @@ mod tests {
         PayloadRefState, ROOT_INO, SliceId, SliceOrder, SliceRange, SliceRecord,
     };
     use studiofs_meta::types::BlockFlags as MetaBlockFlags;
-    use studiofs_meta::{MetaBlocks, MetaFormat, MetaInodes, RedbMetaEngine};
+    use studiofs_meta::{MetaFormat, MetaInodes, MetaPayloadObjects, RedbMetaEngine};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 

@@ -616,7 +616,7 @@ mod tests {
 
         assert!(
             cached_store.contains(20),
-            "pinned uploaded block must survive pressure maintenance"
+            "pinned uploaded payload object must survive pressure maintenance"
         );
     }
 

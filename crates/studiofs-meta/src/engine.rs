@@ -464,7 +464,7 @@ pub trait MetaFsOps: Send + Sync + MetaInodes {
 }
 
 /// Capability trait for object ids and regular-file overlay/base graphs.
-pub trait MetaBlocks: Send + Sync + MetaInodes {
+pub trait MetaPayloadObjects: Send + Sync + MetaInodes {
     /// Resolve merged regular-file slice coverage for one chunk-local range.
     ///
     /// Implementations must apply deterministic precedence:
@@ -789,7 +789,7 @@ pub trait MetaEngine:
     + MetaInodes
     + MetaNamespace
     + MetaFsOps
-    + MetaBlocks
+    + MetaPayloadObjects
     + MetaGc
     + MetaRecovery
     + MetaSymlink

@@ -1813,7 +1813,7 @@ mod tests {
         assert_eq!(stats.current_bytes, 64);
         assert!(
             !backend.contains(1),
-            "oldest uploaded block should be reclaimed first"
+            "oldest uploaded payload object should be reclaimed first"
         );
         assert!(backend.contains(2));
         assert!(backend.contains(3));
@@ -1879,7 +1879,7 @@ mod tests {
         );
         assert!(
             backend.contains(11),
-            "the new block should be admitted after reclaiming the older uploaded block"
+            "the new payload object should be admitted after reclaiming the older uploaded payload object"
         );
         assert_eq!(
             backend.lifecycle_state(11),
@@ -1923,7 +1923,7 @@ mod tests {
         );
         assert!(
             !backend.contains(10),
-            "the uploaded block should be reclaimed once it becomes evictable"
+            "the uploaded payload object should be reclaimed once it becomes evictable"
         );
     }
 
@@ -1956,7 +1956,7 @@ mod tests {
         );
         assert!(
             !backend.contains(20),
-            "oldest uploaded block should be reclaimed during pressure maintenance"
+            "oldest uploaded payload object should be reclaimed during pressure maintenance"
         );
         assert!(backend.contains(21));
     }
@@ -1977,7 +1977,7 @@ mod tests {
         backend.pin(20);
         assert!(
             !backend.is_evictable(20),
-            "runtime pin must make an uploaded block non-evictable in-process"
+            "runtime pin must make an uploaded payload object non-evictable in-process"
         );
         assert_eq!(backend.storage_stats().evictable_bytes, 0);
         assert!(!backend.object_stats(20).unwrap().evictable);
@@ -2018,7 +2018,7 @@ mod tests {
         );
         assert!(
             !backend.contains(31),
-            "the oldest disposable downloaded/uploaded block should be reclaimed first"
+            "the oldest disposable downloaded/uploaded payload object should be reclaimed first"
         );
         assert!(backend.contains(32));
         assert!(

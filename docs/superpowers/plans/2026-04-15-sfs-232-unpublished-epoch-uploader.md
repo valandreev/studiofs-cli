@@ -14,7 +14,7 @@
 
 **Files:**
 - Modify: `crates/studiofs-vfs/src/vfs/upload_lifecycle/worker.rs`
-- Modify: `crates/studiofs-meta/src/redb_engine/tests/blocks.rs`
+- Modify: `crates/studiofs-meta/src/redb_engine/tests/payload_objects.rs`
 
 - [ ] Add a metadata test that proves uploaded overlay slices transition inode lifecycle to `PublishReady` without publishing the inode yet.
 - [ ] Run only the new metadata test and verify it fails for the expected reason.
@@ -26,7 +26,7 @@
 **Files:**
 - Modify: `crates/studiofs-meta/src/engine.rs`
 - Modify: `crates/studiofs-vfs/src/runtime.rs`
-- Modify: `crates/studiofs-meta/src/redb_engine/blocks.rs`
+- Modify: `crates/studiofs-meta/src/redb_engine/payload_objects.rs`
 - Modify: `crates/studiofs-meta/src/pg_engine.rs`
 
 - [ ] Add a metadata API that marks the current overlay block for `(ino, block_index, expected_epoch, expected_block)` as uploaded without publishing base visibility.
