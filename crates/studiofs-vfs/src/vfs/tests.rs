@@ -2866,12 +2866,12 @@ fn opportunistic_completed_handle_writer_materialization_caps_burst_to_drain_chu
         assert_eq!(
             meta.lookup_logical_payload_slices(ino).unwrap().len(),
             0,
-            "completed blocks should stay in local staging until a later flush commits metadata"
+            "completed payload should stay in local staging until a later flush commits metadata"
         );
         assert_eq!(
             vfs.total_pending_local_dirty_bytes(),
             0,
-            "completed full blocks should be spilled out of hot RAM once their payload is durably staged locally"
+            "completed full-block payload should be spilled out of hot RAM once durably staged locally"
         );
         assert!(
             vfs.has_pending_local_dirty_blocks_for_inode(ino),

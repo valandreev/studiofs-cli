@@ -492,16 +492,16 @@ pub struct DirEntryValue {
 }
 
 // =============================================================================
-// Block Reference Types
+// Payload Object Reference Types
 // =============================================================================
 
 bitflags::bitflags! {
-    /// Block flags indicating block properties.
+    /// Payload object flags retained for compatibility with existing slice records.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub struct BlockFlags: u8 {
         /// Legacy flag from earlier builds that used LZ4 compression.
         const COMPRESSED_LZ4 = 0x01;
-        /// Block is partial (not a full block, typically the last block of a file).
+        /// Payload object represents less than one logical block's worth of data.
         const PARTIAL_BLOCK = 0x02;
     }
 }
@@ -512,29 +512,27 @@ impl Default for BlockFlags {
     }
 }
 
-/// Block reference - stored in FILE_BLOCKS table.
+/// Payload object reference embedded in regular-file slice records.
 ///
-/// Points to an immutable S3 object containing block payload data.
-/// Key: (inode, block_index) - each block has a single owner.
+/// Points to an immutable S3/local object containing payload bytes for a slice.
 ///
 /// Design decisions:
 /// - Sequential object_id (not content hash) - simpler and faster
-/// - No reference counting - block belongs to exactly one file position
 /// - Immutable objects - never modified, only created/deleted
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockRef {
-    /// Sequential block ID (unique across the volume).
+    /// Sequential payload object ID (unique across the volume).
     pub object_id: u64,
-    /// Offset within the block (for partial blocks, typically 0).
+    /// Offset within the payload object.
     pub offset: u32,
-    /// Length of valid data in this block.
+    /// Length of valid data in this slice view.
     pub length: u32,
     /// Compression and other flags.
     pub flags: BlockFlags,
 }
 
 impl BlockRef {
-    /// Create a new block reference for a full block.
+    /// Create a new payload reference that covers a full logical block.
     pub fn new_full(object_id: u64, length: u32) -> Self {
         Self {
             object_id,
@@ -544,7 +542,7 @@ impl BlockRef {
         }
     }
 
-    /// Create a new block reference for a partial block (last block of file).
+    /// Create a new payload reference that covers less than one logical block.
     pub fn new_partial(object_id: u64, length: u32) -> Self {
         Self {
             object_id,
@@ -554,12 +552,12 @@ impl BlockRef {
         }
     }
 
-    /// Check if this is a partial block.
+    /// Check if this reference is marked as partial.
     pub fn is_partial(&self) -> bool {
         self.flags.contains(BlockFlags::PARTIAL_BLOCK)
     }
 
-    /// Check if this block is compressed.
+    /// Check if this payload object is marked as compressed.
     pub fn is_compressed(&self) -> bool {
         self.flags.contains(BlockFlags::COMPRESSED_LZ4)
     }
@@ -639,7 +637,7 @@ impl SliceRange {
     }
 }
 
-/// Lifecycle state attached to a slice's block reference.
+/// Lifecycle state attached to a slice's payload object reference.
 ///
 /// The separate state makes the upload/publication/recovery lifecycle explicit
 /// without changing the immutable block payload itself.

@@ -163,7 +163,7 @@ impl StudioVfs {
         // #endregion debug log
 
         // Deleted inodes should never retain staged writes, even if no committed
-        // block refs existed yet. Preserve the old immediate-unlink contract by
+        // payload slice refs existed yet. Preserve the old immediate-unlink contract by
         // also clearing live extent identities and read-side runtime state even
         // when no object IDs remain to evict.
         self.state.handle_writers.clear_inode(ino);
