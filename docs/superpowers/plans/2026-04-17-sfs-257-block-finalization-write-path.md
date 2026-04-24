@@ -4,9 +4,9 @@
 
 **Goal:** Move normal write-path behavior to block-finalization semantics where completed full blocks are locally accepted eagerly, while partial tail state remains buffered until an explicit durability barrier.
 
-**Architecture:** Keep the new `SFS-256` local block store and cache index as the acceptance boundary. Normal writes should use opportunistic local sync by default, eagerly finalizing completed full blocks into the local block store + overlay metadata + pending-upload queue, while partial current-block state stays in memory until `flush`, `fsync`, size-changing operations, or last-handle release force the strict barrier path.
+**Architecture:** Keep the new `SFS-256` local payload store and cache index as the acceptance boundary. Normal writes should use opportunistic local sync by default, eagerly finalizing completed full blocks into the local payload store + overlay metadata + pending-upload queue, while partial current-block state stays in memory until `flush`, `fsync`, size-changing operations, or last-handle release force the strict barrier path.
 
-**Tech Stack:** Rust 2024, `studiofs-vfs`, `studiofs-cache`, redb metadata, local block backend, focused `cargo test` verification.
+**Tech Stack:** Rust 2024, `studiofs-vfs`, `studiofs-cache`, redb metadata, local payload backend, focused `cargo test` verification.
 
 ---
 
@@ -28,7 +28,7 @@
 - Modify: `crates/studiofs-vfs/src/vfs/io_ops.rs`
 
 - [ ] Factor the direct inode-write helper so it can persist prebuilt full-block snapshots without forcing the partial tail down the same path.
-- [ ] For opportunistic inode writes, persist only completed full blocks into the local block store + overlay metadata + pending-upload queue.
+- [ ] For opportunistic inode writes, persist only completed full blocks into the local payload store + overlay metadata + pending-upload queue.
 - [ ] Stage partial/current-block snapshots in local in-memory dirty state so read-your-writes stays intact before `flush`.
 - [ ] Leave strict barriers (`flush`, `fsync`, size-changing operations) responsible for draining the remaining staged tail bytes to locally durable state.
 

@@ -18,7 +18,7 @@ use redb::{
     TableDefinition,
 };
 
-use crate::local::{LocalBlockLifecycleState, LocalBlockOrigin, LocalBlockUploadState};
+use crate::local::{LocalPayloadLifecycleState, LocalPayloadOrigin, LocalPayloadUploadState};
 
 const LEGACY_INDEX_FORMAT_VERSION: u64 = 1;
 const INDEX_FORMAT_VERSION: u64 = 2;
@@ -93,9 +93,9 @@ pub struct CacheIndexEntry {
     pub object_id: u64,
     pub payload_key: Vec<u8>,
     pub payload_len: u64,
-    pub lifecycle: LocalBlockLifecycleState,
-    pub origin: LocalBlockOrigin,
-    pub upload_state: LocalBlockUploadState,
+    pub lifecycle: LocalPayloadLifecycleState,
+    pub origin: LocalPayloadOrigin,
+    pub upload_state: LocalPayloadUploadState,
     pub last_access_unix_millis: u64,
     pub evictable: bool,
     pub dirty_order: Option<u64>,
@@ -107,9 +107,9 @@ pub struct CacheIndexUpsert {
     pub object_id: u64,
     pub payload_key: Vec<u8>,
     pub payload_len: u64,
-    pub lifecycle: LocalBlockLifecycleState,
-    pub origin: LocalBlockOrigin,
-    pub upload_state: LocalBlockUploadState,
+    pub lifecycle: LocalPayloadLifecycleState,
+    pub origin: LocalPayloadOrigin,
+    pub upload_state: LocalPayloadUploadState,
     pub evictable: bool,
 }
 
@@ -118,9 +118,9 @@ pub struct DirtyReplayEntry {
     pub object_id: u64,
     pub payload_key: Vec<u8>,
     pub payload_len: u64,
-    pub lifecycle: LocalBlockLifecycleState,
-    pub origin: LocalBlockOrigin,
-    pub upload_state: LocalBlockUploadState,
+    pub lifecycle: LocalPayloadLifecycleState,
+    pub origin: LocalPayloadOrigin,
+    pub upload_state: LocalPayloadUploadState,
     pub dirty_order: u64,
 }
 
@@ -148,16 +148,16 @@ pub struct CacheIndex {
 fn normalize_upsert(mut update: CacheIndexUpsert) -> CacheIndexUpsert {
     if matches!(
         update.lifecycle,
-        LocalBlockLifecycleState::Dirty | LocalBlockLifecycleState::Uploading
+        LocalPayloadLifecycleState::Dirty | LocalPayloadLifecycleState::Uploading
     ) {
         update.evictable = false;
     }
-    if matches!(update.upload_state, LocalBlockUploadState::Uploading) {
-        update.lifecycle = LocalBlockLifecycleState::Uploading;
-    } else if matches!(update.upload_state, LocalBlockUploadState::Pending) {
-        update.lifecycle = LocalBlockLifecycleState::Dirty;
-    } else if update.origin == LocalBlockOrigin::Downloaded {
-        update.lifecycle = LocalBlockLifecycleState::Uploaded;
+    if matches!(update.upload_state, LocalPayloadUploadState::Uploading) {
+        update.lifecycle = LocalPayloadLifecycleState::Uploading;
+    } else if matches!(update.upload_state, LocalPayloadUploadState::Pending) {
+        update.lifecycle = LocalPayloadLifecycleState::Dirty;
+    } else if update.origin == LocalPayloadOrigin::Downloaded {
+        update.lifecycle = LocalPayloadLifecycleState::Uploaded;
     }
     update
 }
@@ -415,13 +415,13 @@ impl CacheIndex {
             let Some(old) = read_entry_write(&blocks, object_id)? else {
                 return Ok(());
             };
-            if old.lifecycle != LocalBlockLifecycleState::Dirty {
+            if old.lifecycle != LocalPayloadLifecycleState::Dirty {
                 return Ok(());
             }
 
             let mut new = old.clone();
-            new.lifecycle = LocalBlockLifecycleState::Uploading;
-            new.upload_state = LocalBlockUploadState::Uploading;
+            new.lifecycle = LocalPayloadLifecycleState::Uploading;
+            new.upload_state = LocalPayloadUploadState::Uploading;
             new.evictable = false;
             if new.dirty_order.is_none() {
                 new.dirty_order = Some(allocate_sequence(&mut counters, COUNTER_NEXT_DIRTY_SEQ)?);
@@ -453,13 +453,13 @@ impl CacheIndex {
             let Some(old) = read_entry_write(&blocks, object_id)? else {
                 return Ok(());
             };
-            if old.lifecycle != LocalBlockLifecycleState::Uploading {
+            if old.lifecycle != LocalPayloadLifecycleState::Uploading {
                 return Ok(());
             }
 
             let mut new = old.clone();
-            new.lifecycle = LocalBlockLifecycleState::Dirty;
-            new.upload_state = LocalBlockUploadState::Pending;
+            new.lifecycle = LocalPayloadLifecycleState::Dirty;
+            new.upload_state = LocalPayloadUploadState::Pending;
             new.evictable = false;
             new.dirty_order = Some(allocate_sequence(&mut counters, COUNTER_NEXT_DIRTY_SEQ)?);
 
@@ -490,8 +490,8 @@ impl CacheIndex {
                 return Ok(());
             };
             let mut new = old.clone();
-            new.lifecycle = LocalBlockLifecycleState::Uploaded;
-            new.upload_state = LocalBlockUploadState::None;
+            new.lifecycle = LocalPayloadLifecycleState::Uploaded;
+            new.upload_state = LocalPayloadUploadState::None;
             new.evictable = true;
             new.dirty_order = None;
 
@@ -767,7 +767,7 @@ impl CacheIndex {
                     entry.access_order
                 )));
             }
-            if entry.lifecycle == LocalBlockLifecycleState::Uploaded && entry.evictable {
+            if entry.lifecycle == LocalPayloadLifecycleState::Uploaded && entry.evictable {
                 ordered.push(EvictionCandidateEntry {
                     object_id,
                     payload_len: entry.payload_len,
@@ -878,9 +878,9 @@ impl CacheIndex {
 struct StoredEntry {
     payload_key: Vec<u8>,
     payload_len: u64,
-    lifecycle: LocalBlockLifecycleState,
-    origin: LocalBlockOrigin,
-    upload_state: LocalBlockUploadState,
+    lifecycle: LocalPayloadLifecycleState,
+    origin: LocalPayloadOrigin,
+    upload_state: LocalPayloadUploadState,
     last_access_unix_millis: u64,
     evictable: bool,
     dirty_order: Option<u64>,
@@ -1140,10 +1140,10 @@ fn allocate_sequence(
     Ok(current)
 }
 
-fn is_dirty_like(lifecycle: LocalBlockLifecycleState) -> bool {
+fn is_dirty_like(lifecycle: LocalPayloadLifecycleState) -> bool {
     matches!(
         lifecycle,
-        LocalBlockLifecycleState::Dirty | LocalBlockLifecycleState::Uploading
+        LocalPayloadLifecycleState::Dirty | LocalPayloadLifecycleState::Uploading
     )
 }
 
@@ -1366,75 +1366,78 @@ fn read_u32_field(
     Ok(u32::from_le_bytes(array))
 }
 
-fn encode_lifecycle(lifecycle: LocalBlockLifecycleState) -> u8 {
+fn encode_lifecycle(lifecycle: LocalPayloadLifecycleState) -> u8 {
     match lifecycle {
-        LocalBlockLifecycleState::Missing => 0,
-        LocalBlockLifecycleState::Dirty => 1,
-        LocalBlockLifecycleState::Uploading => 2,
-        LocalBlockLifecycleState::Uploaded => 3,
+        LocalPayloadLifecycleState::Missing => 0,
+        LocalPayloadLifecycleState::Dirty => 1,
+        LocalPayloadLifecycleState::Uploading => 2,
+        LocalPayloadLifecycleState::Uploaded => 3,
     }
 }
 
-fn decode_lifecycle(raw: u8) -> Option<LocalBlockLifecycleState> {
+fn decode_lifecycle(raw: u8) -> Option<LocalPayloadLifecycleState> {
     match raw {
-        0 => Some(LocalBlockLifecycleState::Missing),
-        1 => Some(LocalBlockLifecycleState::Dirty),
-        2 => Some(LocalBlockLifecycleState::Uploading),
-        3 => Some(LocalBlockLifecycleState::Uploaded),
+        0 => Some(LocalPayloadLifecycleState::Missing),
+        1 => Some(LocalPayloadLifecycleState::Dirty),
+        2 => Some(LocalPayloadLifecycleState::Uploading),
+        3 => Some(LocalPayloadLifecycleState::Uploaded),
         _ => None,
     }
 }
 
-fn encode_origin(origin: LocalBlockOrigin) -> u8 {
+fn encode_origin(origin: LocalPayloadOrigin) -> u8 {
     match origin {
-        LocalBlockOrigin::Local => 1,
-        LocalBlockOrigin::Downloaded => 2,
+        LocalPayloadOrigin::Local => 1,
+        LocalPayloadOrigin::Downloaded => 2,
     }
 }
 
-fn decode_origin(raw: u8) -> Option<LocalBlockOrigin> {
+fn decode_origin(raw: u8) -> Option<LocalPayloadOrigin> {
     match raw {
-        1 => Some(LocalBlockOrigin::Local),
-        2 => Some(LocalBlockOrigin::Downloaded),
+        1 => Some(LocalPayloadOrigin::Local),
+        2 => Some(LocalPayloadOrigin::Downloaded),
         _ => None,
     }
 }
 
-fn encode_upload_state(upload_state: LocalBlockUploadState) -> u8 {
+fn encode_upload_state(upload_state: LocalPayloadUploadState) -> u8 {
     match upload_state {
-        LocalBlockUploadState::None => 0,
-        LocalBlockUploadState::Pending => 1,
-        LocalBlockUploadState::Uploading => 2,
+        LocalPayloadUploadState::None => 0,
+        LocalPayloadUploadState::Pending => 1,
+        LocalPayloadUploadState::Uploading => 2,
     }
 }
 
-fn decode_upload_state(raw: u8) -> Option<LocalBlockUploadState> {
+fn decode_upload_state(raw: u8) -> Option<LocalPayloadUploadState> {
     match raw {
-        0 => Some(LocalBlockUploadState::None),
-        1 => Some(LocalBlockUploadState::Pending),
-        2 => Some(LocalBlockUploadState::Uploading),
+        0 => Some(LocalPayloadUploadState::None),
+        1 => Some(LocalPayloadUploadState::Pending),
+        2 => Some(LocalPayloadUploadState::Uploading),
         _ => None,
     }
 }
 
-fn infer_legacy_origin(lifecycle: LocalBlockLifecycleState, evictable: bool) -> LocalBlockOrigin {
+fn infer_legacy_origin(
+    lifecycle: LocalPayloadLifecycleState,
+    evictable: bool,
+) -> LocalPayloadOrigin {
     if matches!(
         lifecycle,
-        LocalBlockLifecycleState::Dirty | LocalBlockLifecycleState::Uploading
+        LocalPayloadLifecycleState::Dirty | LocalPayloadLifecycleState::Uploading
     ) || !evictable
     {
-        LocalBlockOrigin::Local
+        LocalPayloadOrigin::Local
     } else {
-        LocalBlockOrigin::Downloaded
+        LocalPayloadOrigin::Downloaded
     }
 }
 
-fn infer_legacy_upload_state(lifecycle: LocalBlockLifecycleState) -> LocalBlockUploadState {
+fn infer_legacy_upload_state(lifecycle: LocalPayloadLifecycleState) -> LocalPayloadUploadState {
     match lifecycle {
-        LocalBlockLifecycleState::Missing => LocalBlockUploadState::None,
-        LocalBlockLifecycleState::Dirty => LocalBlockUploadState::Pending,
-        LocalBlockLifecycleState::Uploading => LocalBlockUploadState::Uploading,
-        LocalBlockLifecycleState::Uploaded => LocalBlockUploadState::None,
+        LocalPayloadLifecycleState::Missing => LocalPayloadUploadState::None,
+        LocalPayloadLifecycleState::Dirty => LocalPayloadUploadState::Pending,
+        LocalPayloadLifecycleState::Uploading => LocalPayloadUploadState::Uploading,
+        LocalPayloadLifecycleState::Uploaded => LocalPayloadUploadState::None,
     }
 }
 
@@ -1466,7 +1469,7 @@ fn touch_access_lru_shard(object_id: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::local::{LocalBlockOrigin, LocalBlockUploadState};
+    use crate::local::{LocalPayloadOrigin, LocalPayloadUploadState};
     use std::time::Duration;
 
     fn open_index(path: &Path) -> CacheIndex {
@@ -1488,9 +1491,9 @@ mod tests {
                 object_id,
                 payload_key: format!("payload/{object_id}.object").into_bytes(),
                 payload_len,
-                lifecycle: LocalBlockLifecycleState::Dirty,
-                origin: LocalBlockOrigin::Local,
-                upload_state: LocalBlockUploadState::Pending,
+                lifecycle: LocalPayloadLifecycleState::Dirty,
+                origin: LocalPayloadOrigin::Local,
+                upload_state: LocalPayloadUploadState::Pending,
                 evictable: false,
             })
             .expect("upsert dirty block");
@@ -1502,9 +1505,9 @@ mod tests {
                 object_id,
                 payload_key: format!("payload/{object_id}.object").into_bytes(),
                 payload_len,
-                lifecycle: LocalBlockLifecycleState::Uploaded,
-                origin: LocalBlockOrigin::Downloaded,
-                upload_state: LocalBlockUploadState::None,
+                lifecycle: LocalPayloadLifecycleState::Uploaded,
+                origin: LocalPayloadOrigin::Downloaded,
+                upload_state: LocalPayloadUploadState::None,
                 evictable: true,
             })
             .expect("upsert uploaded block");
@@ -1559,18 +1562,18 @@ mod tests {
                     object_id: 21,
                     payload_key: b"payload/21.object".to_vec(),
                     payload_len: 64,
-                    lifecycle: LocalBlockLifecycleState::Dirty,
-                    origin: LocalBlockOrigin::Local,
-                    upload_state: LocalBlockUploadState::Pending,
+                    lifecycle: LocalPayloadLifecycleState::Dirty,
+                    origin: LocalPayloadOrigin::Local,
+                    upload_state: LocalPayloadUploadState::Pending,
                     evictable: false,
                 },
                 CacheIndexUpsert {
                     object_id: 22,
                     payload_key: b"payload/22.object".to_vec(),
                     payload_len: 32,
-                    lifecycle: LocalBlockLifecycleState::Uploaded,
-                    origin: LocalBlockOrigin::Downloaded,
-                    upload_state: LocalBlockUploadState::None,
+                    lifecycle: LocalPayloadLifecycleState::Uploaded,
+                    origin: LocalPayloadOrigin::Downloaded,
+                    upload_state: LocalPayloadUploadState::None,
                     evictable: true,
                 },
             ])
@@ -1588,7 +1591,7 @@ mod tests {
         assert_eq!(dirty.len(), 1);
         assert_eq!(dirty[0].object_id, 21);
         assert_eq!(dirty[0].payload_len, 64);
-        assert_eq!(dirty[0].lifecycle, LocalBlockLifecycleState::Dirty);
+        assert_eq!(dirty[0].lifecycle, LocalPayloadLifecycleState::Dirty);
     }
 
     #[test]
@@ -1609,10 +1612,13 @@ mod tests {
             assert_eq!(before_restart[0].object_id, 2);
             assert_eq!(
                 before_restart[0].lifecycle,
-                LocalBlockLifecycleState::Uploading
+                LocalPayloadLifecycleState::Uploading
             );
             assert_eq!(before_restart[1].object_id, 1);
-            assert_eq!(before_restart[1].lifecycle, LocalBlockLifecycleState::Dirty);
+            assert_eq!(
+                before_restart[1].lifecycle,
+                LocalPayloadLifecycleState::Dirty
+            );
         }
 
         let reopened = open_index(&db_path);
@@ -1621,10 +1627,13 @@ mod tests {
         assert_eq!(after_restart[0].object_id, 2);
         assert_eq!(
             after_restart[0].lifecycle,
-            LocalBlockLifecycleState::Uploading
+            LocalPayloadLifecycleState::Uploading
         );
         assert_eq!(after_restart[1].object_id, 1);
-        assert_eq!(after_restart[1].lifecycle, LocalBlockLifecycleState::Dirty);
+        assert_eq!(
+            after_restart[1].lifecycle,
+            LocalPayloadLifecycleState::Dirty
+        );
 
         let stats = reopened.stats().unwrap();
         assert_eq!(stats.current_bytes, 30);
@@ -1671,7 +1680,7 @@ mod tests {
         assert_eq!(dirty[0].object_id, 2);
         assert_eq!(dirty[0].payload_key, b"payload/2.object".to_vec());
         assert_eq!(dirty[0].payload_len, 20);
-        assert_eq!(dirty[0].lifecycle, LocalBlockLifecycleState::Uploading);
+        assert_eq!(dirty[0].lifecycle, LocalPayloadLifecycleState::Uploading);
     }
 
     #[test]
@@ -1692,8 +1701,8 @@ mod tests {
                 .map(|entry| (entry.object_id, entry.lifecycle))
                 .collect::<Vec<_>>(),
             vec![
-                (2, LocalBlockLifecycleState::Dirty),
-                (1, LocalBlockLifecycleState::Dirty)
+                (2, LocalPayloadLifecycleState::Dirty),
+                (1, LocalPayloadLifecycleState::Dirty)
             ]
         );
 
@@ -1705,8 +1714,8 @@ mod tests {
                 .map(|entry| (entry.object_id, entry.lifecycle))
                 .collect::<Vec<_>>(),
             vec![
-                (2, LocalBlockLifecycleState::Uploading),
-                (1, LocalBlockLifecycleState::Dirty)
+                (2, LocalPayloadLifecycleState::Uploading),
+                (1, LocalPayloadLifecycleState::Dirty)
             ]
         );
 
@@ -1717,7 +1726,7 @@ mod tests {
                 .iter()
                 .map(|entry| (entry.object_id, entry.lifecycle))
                 .collect::<Vec<_>>(),
-            vec![(1, LocalBlockLifecycleState::Dirty)]
+            vec![(1, LocalPayloadLifecycleState::Dirty)]
         );
 
         let stats = index.stats().unwrap();
@@ -1827,15 +1836,15 @@ mod tests {
                 object_id: 99,
                 payload_key: b"payload/99.object".to_vec(),
                 payload_len: 9,
-                lifecycle: LocalBlockLifecycleState::Dirty,
-                origin: LocalBlockOrigin::Local,
-                upload_state: LocalBlockUploadState::Pending,
+                lifecycle: LocalPayloadLifecycleState::Dirty,
+                origin: LocalPayloadOrigin::Local,
+                upload_state: LocalPayloadUploadState::Pending,
                 evictable: false,
             })
             .unwrap();
         let before_touch = index.get_entry(99).unwrap().unwrap();
-        assert_eq!(before_touch.origin, LocalBlockOrigin::Local);
-        assert_eq!(before_touch.upload_state, LocalBlockUploadState::Pending);
+        assert_eq!(before_touch.origin, LocalPayloadOrigin::Local);
+        assert_eq!(before_touch.upload_state, LocalPayloadUploadState::Pending);
         assert!(before_touch.last_access_unix_millis > 0);
 
         std::thread::sleep(Duration::from_millis(1));
@@ -1847,8 +1856,11 @@ mod tests {
 
         let reopened = open_index(&db_path);
         let reopened_entry = reopened.get_entry(99).unwrap().unwrap();
-        assert_eq!(reopened_entry.origin, LocalBlockOrigin::Local);
-        assert_eq!(reopened_entry.upload_state, LocalBlockUploadState::Pending);
+        assert_eq!(reopened_entry.origin, LocalPayloadOrigin::Local);
+        assert_eq!(
+            reopened_entry.upload_state,
+            LocalPayloadUploadState::Pending
+        );
         assert_eq!(
             reopened_entry.last_access_unix_millis,
             after_touch.last_access_unix_millis

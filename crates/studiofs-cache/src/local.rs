@@ -1,4 +1,4 @@
-//! Active local block backend contract used by the current local-cache data path.
+//! Active local payload backend contract used by the current local-cache data path.
 //!
 //! The goal is to keep VFS/data-path code independent of backend internals
 //! while still exposing the block lifecycle states required for upload replay
@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 /// Lifecycle state of a single locally persisted block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LocalBlockLifecycleState {
+pub enum LocalPayloadLifecycleState {
     /// Block is not present in local storage.
     Missing,
     /// Block is present and dirty (needs upload).
@@ -25,18 +25,18 @@ pub enum LocalBlockLifecycleState {
     Uploaded,
 }
 
-/// Where a persisted local block originated.
+/// Where a persisted local payload originated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LocalBlockOrigin {
+pub enum LocalPayloadOrigin {
     /// Materialized locally by the write path and may need upload/publish work.
     Local,
     /// Downloaded from the published remote view for read-cache reuse.
     Downloaded,
 }
 
-/// Upload state tracked per persisted local block.
+/// Upload state tracked per persisted local payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LocalBlockUploadState {
+pub enum LocalPayloadUploadState {
     /// No upload work is pending for this block.
     None,
     /// The block is durably accepted locally and queued for background upload.
@@ -46,32 +46,32 @@ pub enum LocalBlockUploadState {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LocalBlockStorageStats {
+pub struct LocalPayloadStorageStats {
     pub current_bytes: u64,
     pub dirty_bytes: u64,
     pub evictable_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LocalBlockObjectStats {
+pub struct LocalPayloadObjectStats {
     pub payload_len: u64,
-    pub lifecycle: LocalBlockLifecycleState,
-    pub origin: LocalBlockOrigin,
-    pub upload_state: LocalBlockUploadState,
+    pub lifecycle: LocalPayloadLifecycleState,
+    pub origin: LocalPayloadOrigin,
+    pub upload_state: LocalPayloadUploadState,
     pub last_access_unix_millis: u64,
     pub evictable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LocalBlockPut {
+pub struct LocalPayloadPut {
     pub object_id: u64,
     pub data: Bytes,
     pub evictable: bool,
 }
 
-/// Backend-agnostic error surface for local block operations.
+/// Backend-agnostic error surface for local payload operations.
 #[derive(Debug, thiserror::Error)]
-pub enum LocalBlockBackendError {
+pub enum LocalPayloadBackendError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("local backend full: need {needed} bytes, free {free} bytes")]
@@ -80,8 +80,8 @@ pub enum LocalBlockBackendError {
     Other(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
-/// Minimal local block API required by read/write/upload paths.
-pub trait LocalBlockBackend: Send + Sync {
+/// Minimal local payload API required by read/write/upload paths.
+pub trait LocalPayloadBackend: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn get(&self, object_id: u64) -> Option<Bytes>;
     fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize>;
@@ -94,15 +94,15 @@ pub trait LocalBlockBackend: Send + Sync {
         object_id: u64,
         data: &[u8],
         evictable: bool,
-    ) -> Result<(), LocalBlockBackendError>;
-    fn put_batch(&self, entries: &[LocalBlockPut]) -> Result<(), LocalBlockBackendError> {
+    ) -> Result<(), LocalPayloadBackendError>;
+    fn put_batch(&self, entries: &[LocalPayloadPut]) -> Result<(), LocalPayloadBackendError> {
         for entry in entries {
             self.put(entry.object_id, entry.data.as_ref(), entry.evictable)?;
         }
         Ok(())
     }
-    fn sync_data(&self) -> Result<(), LocalBlockBackendError>;
-    fn run_pressure_maintenance(&self) -> Result<(), LocalBlockBackendError>;
+    fn sync_data(&self) -> Result<(), LocalPayloadBackendError>;
+    fn run_pressure_maintenance(&self) -> Result<(), LocalPayloadBackendError>;
 
     fn mark_uploading(&self, object_id: u64);
     fn mark_upload_failed(&self, object_id: u64);
@@ -127,12 +127,12 @@ pub trait LocalBlockBackend: Send + Sync {
     fn dirty_object_count(&self) -> usize {
         self.dirty_object_ids().len()
     }
-    fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState;
+    fn lifecycle_state(&self, object_id: u64) -> LocalPayloadLifecycleState;
     fn is_evictable(&self, object_id: u64) -> bool;
-    fn storage_stats(&self) -> LocalBlockStorageStats {
-        LocalBlockStorageStats::default()
+    fn storage_stats(&self) -> LocalPayloadStorageStats {
+        LocalPayloadStorageStats::default()
     }
-    fn object_stats(&self, object_id: u64) -> Option<LocalBlockObjectStats> {
+    fn object_stats(&self, object_id: u64) -> Option<LocalPayloadObjectStats> {
         let _ = object_id;
         None
     }
@@ -153,11 +153,11 @@ pub fn derive_backend_volume_uuid(volume_uuid: &str) -> [u8; 16] {
 
 #[cfg(test)]
 pub(crate) mod contract_tests {
-    use super::{LocalBlockBackend, LocalBlockLifecycleState};
+    use super::{LocalPayloadBackend, LocalPayloadLifecycleState};
 
-    pub(crate) fn assert_local_block_backend_contract<B, G, F>(factory: F)
+    pub(crate) fn assert_local_payload_backend_contract<B, G, F>(factory: F)
     where
-        B: LocalBlockBackend,
+        B: LocalPayloadBackend,
         F: Fn() -> (B, G),
     {
         dirty_upload_lifecycle_roundtrip(&factory);
@@ -167,7 +167,7 @@ pub(crate) mod contract_tests {
 
     fn dirty_upload_lifecycle_roundtrip<B, G, F>(factory: &F)
     where
-        B: LocalBlockBackend,
+        B: LocalPayloadBackend,
         F: Fn() -> (B, G),
     {
         let (backend, _guard) = factory();
@@ -175,7 +175,7 @@ pub(crate) mod contract_tests {
 
         assert_eq!(
             backend.lifecycle_state(object_id),
-            LocalBlockLifecycleState::Missing
+            LocalPayloadLifecycleState::Missing
         );
 
         backend.put(object_id, b"dirty-block", false).unwrap();
@@ -188,14 +188,14 @@ pub(crate) mod contract_tests {
         );
         assert_eq!(
             backend.lifecycle_state(object_id),
-            LocalBlockLifecycleState::Dirty
+            LocalPayloadLifecycleState::Dirty
         );
         assert_eq!(backend.dirty_object_ids(), vec![object_id]);
 
         backend.mark_uploading(object_id);
         assert_eq!(
             backend.lifecycle_state(object_id),
-            LocalBlockLifecycleState::Uploading
+            LocalPayloadLifecycleState::Uploading
         );
         assert_eq!(backend.dirty_object_ids(), vec![object_id]);
         assert_eq!(
@@ -207,7 +207,7 @@ pub(crate) mod contract_tests {
         backend.mark_upload_failed(object_id);
         assert_eq!(
             backend.lifecycle_state(object_id),
-            LocalBlockLifecycleState::Dirty
+            LocalPayloadLifecycleState::Dirty
         );
         assert_eq!(backend.dirty_object_ids(), vec![object_id]);
 
@@ -215,7 +215,7 @@ pub(crate) mod contract_tests {
         backend.mark_uploaded(object_id);
         assert_eq!(
             backend.lifecycle_state(object_id),
-            LocalBlockLifecycleState::Uploaded
+            LocalPayloadLifecycleState::Uploaded
         );
         assert!(
             backend.dirty_object_ids().is_empty(),
@@ -225,7 +225,7 @@ pub(crate) mod contract_tests {
 
     fn dirty_snapshot_ordering<B, G, F>(factory: &F)
     where
-        B: LocalBlockBackend,
+        B: LocalPayloadBackend,
         F: Fn() -> (B, G),
     {
         let (backend, _guard) = factory();
@@ -242,13 +242,13 @@ pub(crate) mod contract_tests {
         );
         assert_eq!(
             backend.lifecycle_state(2),
-            LocalBlockLifecycleState::Uploaded
+            LocalPayloadLifecycleState::Uploaded
         );
     }
 
     fn remove_operations_clear_visibility<B, G, F>(factory: &F)
     where
-        B: LocalBlockBackend,
+        B: LocalPayloadBackend,
         F: Fn() -> (B, G),
     {
         let (backend, _guard) = factory();
@@ -260,14 +260,14 @@ pub(crate) mod contract_tests {
         backend.remove(10);
         assert_eq!(
             backend.lifecycle_state(10),
-            LocalBlockLifecycleState::Missing
+            LocalPayloadLifecycleState::Missing
         );
         assert!(!backend.contains(10));
 
         backend.remove_batch(&[11, 12]);
         assert_eq!(
             backend.lifecycle_state(11),
-            LocalBlockLifecycleState::Missing
+            LocalPayloadLifecycleState::Missing
         );
         assert!(
             backend.dirty_object_ids().is_empty(),

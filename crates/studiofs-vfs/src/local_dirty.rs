@@ -292,7 +292,7 @@ trait BlockIdAllocatorPort {
     async fn next_block_ids(&self, count: u32) -> VfsResult<Vec<u64>>;
 }
 
-trait LocalBlockWriterPort {
+trait LocalPayloadWriterPort {
     async fn persist_payload(
         &self,
         persisted_blocks: &[PersistedWriteBlock],
@@ -336,7 +336,7 @@ trait DrainCommitObserverPort {
 }
 
 struct LocalDirtyDrainCore<L, C, B, U, O> {
-    local_blocks: L,
+    local_payloads: L,
     commit_meta: C,
     block_ids: B,
     uploads: U,
@@ -346,7 +346,7 @@ struct LocalDirtyDrainCore<L, C, B, U, O> {
 }
 
 type LocalDirtyDrain<'a> = LocalDirtyDrainCore<
-    VfsLocalBlockWriter<'a>,
+    VfsLocalPayloadWriter<'a>,
     VfsOverlayCommitter<'a>,
     VfsBlockIdAllocator<'a>,
     VfsUploadSubmitter<'a>,
@@ -365,7 +365,7 @@ struct DrainOutcome {
 }
 
 #[derive(Clone, Copy)]
-struct VfsLocalBlockWriter<'a> {
+struct VfsLocalPayloadWriter<'a> {
     vfs: &'a StudioVfs,
 }
 
@@ -551,7 +551,7 @@ fn commit_persisted_block_state(
 
 impl<L, C, B, U, O> LocalDirtyDrainCore<L, C, B, U, O>
 where
-    L: LocalBlockWriterPort,
+    L: LocalPayloadWriterPort,
     C: OverlayCommitPort,
     B: BlockIdAllocatorPort,
     U: UploadSubmissionPort,
@@ -857,11 +857,11 @@ where
         }
 
         if let Err(error) = self
-            .local_blocks
+            .local_payloads
             .persist_payload(&persisted_blocks, persist_config)
             .await
         {
-            self.local_blocks
+            self.local_payloads
                 .cleanup_uncommitted(ino, &persisted_blocks, "payload-persist")
                 .await;
             return Err(error);
@@ -871,7 +871,7 @@ where
             match self.build_overlay_slice_records(ino, &persisted_blocks, dirty_chunk_slices) {
                 Ok(slices) => slices,
                 Err(error) => {
-                    self.local_blocks
+                    self.local_payloads
                         .cleanup_uncommitted(ino, &persisted_blocks, "metadata-build")
                         .await;
                     return Err(error);
@@ -884,7 +884,7 @@ where
         {
             Ok(attr) => attr,
             Err(error) => {
-                self.local_blocks
+                self.local_payloads
                     .cleanup_uncommitted(ino, &persisted_blocks, "metadata-commit")
                     .await;
                 return Err(error);
@@ -920,7 +920,7 @@ impl BlockIdAllocatorPort for VfsBlockIdAllocator<'_> {
     }
 }
 
-impl LocalBlockWriterPort for VfsLocalBlockWriter<'_> {
+impl LocalPayloadWriterPort for VfsLocalPayloadWriter<'_> {
     async fn persist_payload(
         &self,
         persisted_blocks: &[PersistedWriteBlock],
@@ -941,7 +941,7 @@ impl LocalBlockWriterPort for VfsLocalBlockWriter<'_> {
             for chunk in payload_blocks.chunks(persist_config.put_concurrency.max(1)) {
                 let batch = chunk
                     .iter()
-                    .map(|block| studiofs_cache::local::LocalBlockPut {
+                    .map(|block| studiofs_cache::local::LocalPayloadPut {
                         object_id: block.object_id,
                         data: block
                             .payload_bytes()
@@ -955,7 +955,7 @@ impl LocalBlockWriterPort for VfsLocalBlockWriter<'_> {
             for chunk in payload_blocks.chunks(persist_config.put_concurrency.max(1)) {
                 let batch = chunk
                     .iter()
-                    .map(|block| studiofs_cache::local::LocalBlockPut {
+                    .map(|block| studiofs_cache::local::LocalPayloadPut {
                         object_id: block.object_id,
                         data: block
                             .payload_bytes()
@@ -1841,7 +1841,7 @@ impl StudioVfs {
 
     fn local_dirty_drain(&self) -> LocalDirtyDrain<'_> {
         LocalDirtyDrainCore {
-            local_blocks: VfsLocalBlockWriter { vfs: self },
+            local_payloads: VfsLocalPayloadWriter { vfs: self },
             commit_meta: VfsOverlayCommitter { vfs: self },
             block_ids: VfsBlockIdAllocator { vfs: self },
             uploads: VfsUploadSubmitter { vfs: self },
@@ -2123,7 +2123,7 @@ impl StudioVfs {
             for chunk in entries.chunks(self.payload_put_concurrency.max(1)) {
                 let batch = chunk
                     .iter()
-                    .map(|(object_id, data)| studiofs_cache::local::LocalBlockPut {
+                    .map(|(object_id, data)| studiofs_cache::local::LocalPayloadPut {
                         object_id: *object_id,
                         data: data.clone(),
                         evictable: false,
@@ -2134,7 +2134,7 @@ impl StudioVfs {
             for chunk in entries.chunks(self.payload_put_concurrency.max(1)) {
                 let batch = chunk
                     .iter()
-                    .map(|(object_id, data)| studiofs_cache::local::LocalBlockPut {
+                    .map(|(object_id, data)| studiofs_cache::local::LocalPayloadPut {
                         object_id: *object_id,
                         data: data.clone(),
                         evictable: false,
@@ -2579,7 +2579,7 @@ impl StudioVfs {
                 if let Some(data) = persisted_slice_data.get(&object_id) {
                     data.clone()
                 } else {
-                    let Some(data) = self.local_block_backend.get(object_id) else {
+                    let Some(data) = self.local_payload_backend.get(object_id) else {
                         continue;
                     };
                     persisted_slice_data.insert(object_id, data.clone());
@@ -2733,7 +2733,7 @@ impl StudioVfs {
         self.clear_pending_dirty_slices_for_blocks(ino, &removed_block_indexes);
     }
 
-    pub(super) fn trim_local_block_staging(
+    pub(super) fn trim_local_payload_staging(
         &self,
         ino: Ino,
         block_index: u32,
@@ -3027,12 +3027,12 @@ mod tests {
         }
     }
 
-    struct TestLocalBlockWriter {
+    struct TestLocalPayloadWriter {
         events: EventLog,
         fail_persist: bool,
     }
 
-    impl LocalBlockWriterPort for TestLocalBlockWriter {
+    impl LocalPayloadWriterPort for TestLocalPayloadWriter {
         async fn persist_payload(
             &self,
             _persisted_blocks: &[PersistedWriteBlock],
@@ -3129,14 +3129,14 @@ mod tests {
         uploads: SharedUploads,
         observed_inodes: SharedInodes,
     ) -> LocalDirtyDrainCore<
-        TestLocalBlockWriter,
+        TestLocalPayloadWriter,
         TestOverlayCommitter,
         PanicBlockIds,
         TestUploadSubmitter,
         TestDrainObserver,
     > {
         LocalDirtyDrainCore {
-            local_blocks: TestLocalBlockWriter {
+            local_payloads: TestLocalPayloadWriter {
                 events: events.clone(),
                 fail_persist,
             },

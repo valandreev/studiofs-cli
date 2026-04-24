@@ -6,11 +6,11 @@
 use std::io;
 use std::path::Path;
 
-use super::{CacheIndex, CacheIndexError, LocalBlockLayout};
+use super::{CacheIndex, CacheIndexError, LocalPayloadLayout};
 
 const LIST_PAGE_SIZE: usize = 4_096;
 const INDEX_REMOVE_BATCH_SIZE: usize = 1_024;
-const STARTUP_RECONCILE_MODE_ENV: &str = "STUDIOFS_LOCAL_BLOCK_STARTUP_RECONCILE_MODE";
+const STARTUP_RECONCILE_MODE_ENV: &str = "STUDIOFS_LOCAL_PAYLOAD_STARTUP_RECONCILE_MODE";
 const LEGACY_STARTUP_RECONCILE_MODE_ENV: &str = "STUDIOFS_CACHE_V3_STARTUP_RECONCILE_MODE";
 const STARTUP_RECONCILE_MODE_FULL: &str = "full";
 
@@ -20,12 +20,12 @@ const STARTUP_RECONCILE_MODE_FULL: &str = "full";
 /// needed to recover interrupted temp writes and dirty replay viability.
 /// `Full` additionally runs expensive global index/payload mismatch sweeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LocalBlockStartupReconcileMode {
+pub enum LocalPayloadStartupReconcileMode {
     Lightweight,
     Full,
 }
 
-impl LocalBlockStartupReconcileMode {
+impl LocalPayloadStartupReconcileMode {
     pub fn from_env() -> Self {
         let configured = std::env::var(STARTUP_RECONCILE_MODE_ENV)
             .ok()
@@ -39,13 +39,13 @@ impl LocalBlockStartupReconcileMode {
 
 /// Result of startup reconciliation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct LocalBlockStartupReconcileReport {
+pub struct LocalPayloadStartupReconcileReport {
     pub temp_files_removed: u64,
     pub stale_index_entries_removed: u64,
     pub orphan_payload_files_removed: u64,
 }
 
-impl LocalBlockStartupReconcileReport {
+impl LocalPayloadStartupReconcileReport {
     pub fn is_clean(self) -> bool {
         self.temp_files_removed == 0
             && self.stale_index_entries_removed == 0
@@ -55,7 +55,7 @@ impl LocalBlockStartupReconcileReport {
 
 /// Errors returned by startup reconciliation.
 #[derive(Debug, thiserror::Error)]
-pub enum LocalBlockStartupReconcileError {
+pub enum LocalPayloadStartupReconcileError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
     #[error("local payload object runtime index error: {0}")]
@@ -72,23 +72,23 @@ pub enum LocalBlockStartupReconcileError {
 /// - scan all index rows and remove stale rows with missing payload;
 /// - scan payload files and remove payload orphans with no index entry.
 pub fn reconcile_startup_state(
-    layout: &LocalBlockLayout,
+    layout: &LocalPayloadLayout,
     index: &CacheIndex,
-    mode: LocalBlockStartupReconcileMode,
-) -> Result<LocalBlockStartupReconcileReport, LocalBlockStartupReconcileError> {
+    mode: LocalPayloadStartupReconcileMode,
+) -> Result<LocalPayloadStartupReconcileReport, LocalPayloadStartupReconcileError> {
     let temp_files_removed = remove_temp_files(layout)?;
     let stale_index_entries_removed = match mode {
-        LocalBlockStartupReconcileMode::Lightweight => prune_dirty_payloads(layout, index)?,
-        LocalBlockStartupReconcileMode::Full => prune_all_payloads(layout, index)?,
+        LocalPayloadStartupReconcileMode::Lightweight => prune_dirty_payloads(layout, index)?,
+        LocalPayloadStartupReconcileMode::Full => prune_all_payloads(layout, index)?,
     };
     let (additional_temp_files_removed, orphan_payload_files_removed) = match mode {
-        LocalBlockStartupReconcileMode::Lightweight => (0, 0),
-        LocalBlockStartupReconcileMode::Full => {
+        LocalPayloadStartupReconcileMode::Lightweight => (0, 0),
+        LocalPayloadStartupReconcileMode::Full => {
             remove_orphan_payloads_and_legacy_temps(layout, index)?
         }
     };
 
-    Ok(LocalBlockStartupReconcileReport {
+    Ok(LocalPayloadStartupReconcileReport {
         temp_files_removed: temp_files_removed.saturating_add(additional_temp_files_removed),
         stale_index_entries_removed,
         orphan_payload_files_removed,
@@ -96,9 +96,9 @@ pub fn reconcile_startup_state(
 }
 
 fn prune_dirty_payloads(
-    layout: &LocalBlockLayout,
+    layout: &LocalPayloadLayout,
     index: &CacheIndex,
-) -> Result<u64, LocalBlockStartupReconcileError> {
+) -> Result<u64, LocalPayloadStartupReconcileError> {
     let mut cursor = None;
     let mut removed_total = 0_u64;
 
@@ -128,9 +128,9 @@ fn prune_dirty_payloads(
 }
 
 fn prune_all_payloads(
-    layout: &LocalBlockLayout,
+    layout: &LocalPayloadLayout,
     index: &CacheIndex,
-) -> Result<u64, LocalBlockStartupReconcileError> {
+) -> Result<u64, LocalPayloadStartupReconcileError> {
     let mut cursor = None;
     let mut removed_total = 0_u64;
     loop {
@@ -161,7 +161,7 @@ fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
-fn remove_temp_files(layout: &LocalBlockLayout) -> Result<u64, io::Error> {
+fn remove_temp_files(layout: &LocalPayloadLayout) -> Result<u64, io::Error> {
     let mut removed = 0_u64;
     visit_files_recursive(&layout.tmp_dir, &mut |file| -> io::Result<()> {
         if remove_file_if_present(file)? {
@@ -173,14 +173,14 @@ fn remove_temp_files(layout: &LocalBlockLayout) -> Result<u64, io::Error> {
 }
 
 fn remove_orphan_payloads_and_legacy_temps(
-    layout: &LocalBlockLayout,
+    layout: &LocalPayloadLayout,
     index: &CacheIndex,
-) -> Result<(u64, u64), LocalBlockStartupReconcileError> {
+) -> Result<(u64, u64), LocalPayloadStartupReconcileError> {
     let mut temp_files_removed = 0_u64;
     let mut orphan_payload_files_removed = 0_u64;
     visit_files_recursive(&layout.payload_objects_dir, &mut |file| -> Result<
         (),
-        LocalBlockStartupReconcileError,
+        LocalPayloadStartupReconcileError,
     > {
         let Some(file_name) = file.file_name().and_then(|name| name.to_str()) else {
             return Ok(());
@@ -191,7 +191,7 @@ fn remove_orphan_payloads_and_legacy_temps(
             }
             return Ok(());
         };
-        let Some(object_id) = LocalBlockLayout::parse_payload_object_file_name(file_name) else {
+        let Some(object_id) = LocalPayloadLayout::parse_payload_object_file_name(file_name) else {
             return Ok(());
         };
         if index.get_entry(object_id)?.is_none() && remove_file_if_present(file)? {
@@ -228,7 +228,7 @@ where
     Ok(())
 }
 
-fn payload_exists(layout: &LocalBlockLayout, object_id: u64) -> io::Result<bool> {
+fn payload_exists(layout: &LocalPayloadLayout, object_id: u64) -> io::Result<bool> {
     layout.payload_object_path(object_id).try_exists()
 }
 
@@ -244,13 +244,13 @@ fn remove_file_if_present(path: &Path) -> Result<bool, io::Error> {
 mod tests {
     use super::super::FilePayloadStore;
     use super::*;
-    use crate::local::{LocalBlockLifecycleState, LocalBlockOrigin, LocalBlockUploadState};
+    use crate::local::{LocalPayloadLifecycleState, LocalPayloadOrigin, LocalPayloadUploadState};
 
-    fn create_v3_marker(layout: &LocalBlockLayout) {
+    fn create_v3_marker(layout: &LocalPayloadLayout) {
         layout.provision().unwrap();
     }
 
-    fn payload_key(layout: &LocalBlockLayout, object_id: u64) -> Vec<u8> {
+    fn payload_key(layout: &LocalPayloadLayout, object_id: u64) -> Vec<u8> {
         layout
             .payload_object_relative_path(object_id)
             .to_string_lossy()
@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn startup_reconcile_lightweight_repairs_temp_and_dirty_index_payload_mismatches() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
         let index = CacheIndex::open(&layout.redb_index_path).unwrap();
@@ -273,9 +273,9 @@ mod tests {
                 object_id: 1,
                 payload_key: payload_key(&layout, 1),
                 payload_len: 4,
-                lifecycle: LocalBlockLifecycleState::Dirty,
-                origin: LocalBlockOrigin::Local,
-                upload_state: LocalBlockUploadState::Pending,
+                lifecycle: LocalPayloadLifecycleState::Dirty,
+                origin: LocalPayloadOrigin::Local,
+                upload_state: LocalPayloadUploadState::Pending,
                 evictable: false,
             })
             .unwrap();
@@ -287,9 +287,9 @@ mod tests {
                 object_id: 2,
                 payload_key: payload_key(&layout, 2),
                 payload_len: 5,
-                lifecycle: LocalBlockLifecycleState::Dirty,
-                origin: LocalBlockOrigin::Local,
-                upload_state: LocalBlockUploadState::Pending,
+                lifecycle: LocalPayloadLifecycleState::Dirty,
+                origin: LocalPayloadOrigin::Local,
+                upload_state: LocalPayloadUploadState::Pending,
                 evictable: false,
             })
             .unwrap();
@@ -299,9 +299,12 @@ mod tests {
         std::fs::create_dir_all(tmp_in_tmp_dir.parent().unwrap()).unwrap();
         std::fs::write(&tmp_in_tmp_dir, b"staged").unwrap();
 
-        let report =
-            reconcile_startup_state(&layout, &index, LocalBlockStartupReconcileMode::Lightweight)
-                .unwrap();
+        let report = reconcile_startup_state(
+            &layout,
+            &index,
+            LocalPayloadStartupReconcileMode::Lightweight,
+        )
+        .unwrap();
         assert_eq!(report.temp_files_removed, 1);
         assert_eq!(report.stale_index_entries_removed, 1);
         assert_eq!(report.orphan_payload_files_removed, 0);
@@ -314,7 +317,7 @@ mod tests {
     #[test]
     fn startup_reconcile_full_removes_orphan_payload_files() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
         let index = CacheIndex::open(&layout.redb_index_path).unwrap();
@@ -326,9 +329,9 @@ mod tests {
                 object_id: 7,
                 payload_key: payload_key(&layout, 7),
                 payload_len: 7,
-                lifecycle: LocalBlockLifecycleState::Uploaded,
-                origin: LocalBlockOrigin::Downloaded,
-                upload_state: LocalBlockUploadState::None,
+                lifecycle: LocalPayloadLifecycleState::Uploaded,
+                origin: LocalPayloadOrigin::Downloaded,
+                upload_state: LocalPayloadUploadState::None,
                 evictable: true,
             })
             .unwrap();
@@ -343,7 +346,8 @@ mod tests {
         std::fs::write(&legacy_tmp_path, b"legacy-tmp").unwrap();
 
         let report =
-            reconcile_startup_state(&layout, &index, LocalBlockStartupReconcileMode::Full).unwrap();
+            reconcile_startup_state(&layout, &index, LocalPayloadStartupReconcileMode::Full)
+                .unwrap();
 
         assert_eq!(report.temp_files_removed, 1);
         assert_eq!(report.orphan_payload_files_removed, 1);
@@ -355,7 +359,7 @@ mod tests {
     #[test]
     fn startup_reconcile_never_touches_unrelated_cache_root_files() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
         std::fs::create_dir_all(&layout.payload_objects_dir).unwrap();
 
@@ -363,9 +367,12 @@ mod tests {
         std::fs::write(&unrelated_path, b"keep-me").unwrap();
 
         let index = CacheIndex::open(&layout.redb_index_path).unwrap();
-        let report =
-            reconcile_startup_state(&layout, &index, LocalBlockStartupReconcileMode::Lightweight)
-                .unwrap();
+        let report = reconcile_startup_state(
+            &layout,
+            &index,
+            LocalPayloadStartupReconcileMode::Lightweight,
+        )
+        .unwrap();
 
         assert!(report.is_clean());
         assert_eq!(std::fs::read(&unrelated_path).unwrap(), b"keep-me");

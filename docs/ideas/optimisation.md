@@ -288,9 +288,9 @@ pub(super) async fn persist_dirty_write_snapshots_direct(
     dirty_attr: Option<FileAttr>,
     local_sync_policy: LocalSyncPolicy,
 ) -> VfsResult<()> {
-    // Write to local block backend
+    // Write to local payload backend
     for (block_index, snapshot) in blocks.iter() {
-        let persisted = self.local_blocks.put_payload(
+        let persisted = self.local_payloads.put_payload(
             PersistedWriteBlock {
                 block_index: *block_index,
                 object_id: object_id,
@@ -308,7 +308,7 @@ pub(super) async fn persist_dirty_write_snapshots_direct(
 ```rust
 pub struct CachedStore {
     config: CachedStoreConfig,
-    local_block_backend: Arc<dyn LocalBlockBackend>,
+    local_payload_backend: Arc<dyn LocalPayloadBackend>,
     pinned: Mutex<PinnedState>,
     upload_queue: Arc<UploadQueue>,
     metrics: CachePipelineMetrics,
@@ -317,7 +317,7 @@ pub struct CachedStore {
 // put() implementation allocates new Bytes from &[u8]
 pub async fn put(&self, object_id: u64, data: &[u8]) -> Result<()> {
     let bytes = Bytes::from(data);  // 🔴 COPY #5: Allocation in cache layer
-    self.local_block_backend.store(object_id, bytes).await
+    self.local_payload_backend.store(object_id, bytes).await
 }
 ```
 

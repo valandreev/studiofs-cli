@@ -541,7 +541,7 @@ Resource-fork compatibility:
 - Resolve victim via merged `lookup`.
 - Write `Tombstone` for `(parent, name)` into `dentries`.
 - Update victim attr in `inodes` if `nlink` stays non-zero.
-- If local view drops final link, remove local block state and local overlay attr.
+- If local view drops final link, remove local payload state and local overlay attr.
 - Remote-visible removal is published later through PG flush.
 
 ### `rename`
@@ -608,7 +608,7 @@ state.
 
 Current conflict set:
 
-- inode is present in local block overlay
+- inode is present in local payload overlay
 - inode is present in local attr overlay
 - inode is present in local symlink overlay
 - xattr key is present in local xattr overlay

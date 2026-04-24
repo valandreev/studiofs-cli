@@ -25,14 +25,14 @@ Active invariants:
 |-------|------|---------|
 | `meta` | `MetaExecutor<dyn VfsMeta>` | Typed metadata executor used by `run_meta(...)` |
 | `data_write` | `Arc<DataStore>` | S3 write/delete path |
-| `local_block_backend` | `Arc<dyn LocalBlockBackend>` | Current local cache backend for committed payloads and upload rereads |
+| `local_payload_backend` | `Arc<dyn LocalPayloadBackend>` | Current local cache backend for committed payloads and upload rereads |
 | `cached_store` | `Arc<CachedStore>` | Local-durable payload runtime, pending-upload queue, upload helpers, and pinning |
 | `fetch_scheduler` | `Arc<FetchScheduler>` | Adaptive S3 fetcher |
 | `readahead` | `Arc<ReadAheadTracker>` | Sequential prefetch |
 | `dir_prefetch` | `Arc<DirAccessTracker>` | Directory-level prefetch |
 | `state` | `Arc<VfsState>` | Local dirty state, namespace caches, file sessions, and backpressure |
 
-`local_block_backend()` remains the accessor used by helper modules that need
+`local_payload_backend()` remains the accessor used by helper modules that need
 the backend boundary without reaching through backend-specific internals.
 
 ## Lifecycle

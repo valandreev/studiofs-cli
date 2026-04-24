@@ -12,8 +12,8 @@ Leave one canonical local-block runtime in the repository by:
 
 - keeping `crates/studiofs-cache/src/runtime.rs` plus `block_*` and `startup_recovery.rs` as the only active implementation;
 - deleting the duplicated `crates/studiofs-cache/src/v3/**` module tree;
-- renaming public and internal exposed runtime surface from `CacheV3*`/`cache-v3` to `LocalBlock*` or neutral local-runtime wording where appropriate;
-- rewriting active docs and tests so they describe the runtime as a local block runtime whose current disk subtree happens to be `v3/`.
+- renaming public and internal exposed runtime surface from `CacheV3*`/`cache-v3` to `LocalPayload*` or neutral local-runtime wording where appropriate;
+- rewriting active docs and tests so they describe the runtime as a local payload runtime whose current disk subtree happens to be `v3/`.
 
 ## Non-Goals
 
@@ -32,7 +32,7 @@ Leave one canonical local-block runtime in the repository by:
 
 ### Vocabulary
 
-- User-facing and operator-facing wording should prefer `local block runtime`, `local cache runtime`, `local backend`, or similarly neutral terms.
+- User-facing and operator-facing wording should prefer `local payload runtime`, `local cache runtime`, `local backend`, or similarly neutral terms.
 - The literal string `cache-v3` may remain only where it describes the current disk subtree or legacy compatibility details that are still true.
 - Public API names should stop advertising `CacheV3` when the API is the canonical current runtime.
 
@@ -45,7 +45,7 @@ Leave one canonical local-block runtime in the repository by:
 - backend detection;
 - backend kind reporting;
 - runtime config and errors;
-- active local block backend implementation;
+- active local payload backend implementation;
 - startup reconciliation wiring.
 
 `crates/studiofs-cache/src/block_layout.rs`, `block_store.rs`, `block_index.rs`, `block_eviction.rs`, `block_platform.rs`, and `startup_recovery.rs` remain the implementation modules beneath that runtime.
@@ -54,17 +54,17 @@ The duplicated `crates/studiofs-cache/src/v3/**` module tree is removed. Any rem
 
 ### 2. Naming Cleanup
 
-The public `studiofs-cache` surface is renamed from `CacheV3*` to `LocalBlock*` wherever the type refers to the active runtime rather than to the disk subtree detail.
+The public `studiofs-cache` surface is renamed from `CacheV3*` to `LocalPayload*` wherever the type refers to the active runtime rather than to the disk subtree detail.
 
 Representative targets:
 
-- `CacheV3LocalBlockBackend` -> `LocalBlockBackendRuntime`
-- `CacheV3LocalBlockBackendConfig` -> `LocalBlockBackendConfig`
-- `CacheV3LocalBlockBackendError` -> `LocalBlockBackendOpenError`
-- `CacheV3PayloadSyncMode` -> `LocalBlockPayloadSyncMode`
-- `PreparedCacheV3Runtime` -> `PreparedLocalBlockRuntime`
-- `PrepareCacheV3RuntimeError` -> `PrepareLocalBlockRuntimeError`
-- `prepare_cache_v3_runtime()` -> `prepare_local_block_runtime()`
+- `CacheV3LocalPayloadBackend` -> `LocalPayloadBackendRuntime`
+- `CacheV3LocalPayloadBackendConfig` -> `LocalPayloadBackendConfig`
+- `CacheV3LocalPayloadBackendError` -> `LocalPayloadBackendOpenError`
+- `CacheV3PayloadSyncMode` -> `LocalPayloadSyncMode`
+- `PreparedCacheV3Runtime` -> `PreparedLocalPayloadRuntime`
+- `PrepareCacheV3RuntimeError` -> `PrepareLocalPayloadRuntimeError`
+- `prepare_cache_v3_runtime()` -> `prepare_local_payload_runtime()`
 
 Where compatibility aliases materially reduce churn inside the current change set, they may remain temporarily inside `studiofs-cache::runtime` or `studiofs-cache::lib`, but the rest of the tree should stop depending on them.
 
@@ -73,10 +73,10 @@ Where compatibility aliases materially reduce churn inside the current change se
 Detection continues to inspect the current disk subtree, but the API should describe it generically:
 
 - `CacheBackendKind` becomes a neutral runtime kind type or a single current-runtime label;
-- detection predicates stop centering `has_cache_v3_contract()` and instead use neutral names such as `has_runtime_layout()` or `has_local_block_layout()`;
+- detection predicates stop centering `has_cache_v3_contract()` and instead use neutral names such as `has_runtime_layout()` or `has_local_payload_layout()`;
 - `status`, `janitor`, mount bootstrap, and VFS diagnostics stop reporting the backend version as `cache-v3`.
 
-The user-visible message should become “current local block runtime” or similar, with an optional implementation-detail line noting the `v3/` subtree when useful.
+The user-visible message should become “current local payload runtime” or similar, with an optional implementation-detail line noting the `v3/` subtree when useful.
 
 ### 4. Docs Cleanup
 

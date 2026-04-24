@@ -17,8 +17,9 @@ use parking_lot::{Condvar, Mutex};
 use tracing::{debug, warn};
 
 use crate::local::{
-    LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState, LocalBlockObjectStats,
-    LocalBlockOrigin, LocalBlockPut, LocalBlockStorageStats, LocalBlockUploadState,
+    LocalPayloadBackend, LocalPayloadBackendError, LocalPayloadLifecycleState,
+    LocalPayloadObjectStats, LocalPayloadOrigin, LocalPayloadPut, LocalPayloadStorageStats,
+    LocalPayloadUploadState,
 };
 
 #[path = "block_index.rs"]
@@ -40,9 +41,11 @@ pub use cache_index::{
 };
 use eviction::{CacheBudgetGovernor, EVICTION_CANDIDATE_PAGE_SIZE, EVICTION_DELETE_BATCH_SIZE};
 pub use file_payload_store::{FilePayloadStore, FilePayloadStoreError, PayloadBatchEntry};
-pub use layout::{LOCAL_BLOCK_PAYLOAD_SHARD_COUNT, LOCAL_BLOCK_REDB_INDEX_FILE, LocalBlockLayout};
-pub use reconcile::{LocalBlockStartupReconcileError, LocalBlockStartupReconcileReport};
-use reconcile::{LocalBlockStartupReconcileMode, reconcile_startup_state};
+pub use layout::{
+    LOCAL_PAYLOAD_OBJECT_SHARD_COUNT, LOCAL_PAYLOAD_REDB_INDEX_FILE, LocalPayloadLayout,
+};
+pub use reconcile::{LocalPayloadStartupReconcileError, LocalPayloadStartupReconcileReport};
+use reconcile::{LocalPayloadStartupReconcileMode, reconcile_startup_state};
 
 const ACCESS_TOUCH_MIN_INTERVAL: Duration = Duration::from_secs(60);
 const ACCESS_TOUCH_BATCH_SIZE: usize = 128;
@@ -58,11 +61,11 @@ const LOW_SPACE_UPLOAD_DRAIN_RETRIES: usize = 4;
 
 /// Backend kind available on the runtime path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LocalBlockBackendKind {
+pub enum LocalPayloadBackendKind {
     Current,
 }
 
-impl LocalBlockBackendKind {
+impl LocalPayloadBackendKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Current => "local-block-runtime",
@@ -70,7 +73,7 @@ impl LocalBlockBackendKind {
     }
 }
 
-impl fmt::Display for LocalBlockBackendKind {
+impl fmt::Display for LocalPayloadBackendKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -78,8 +81,8 @@ impl fmt::Display for LocalBlockBackendKind {
 
 /// Detection snapshot for a per-volume cache root.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LocalBlockRuntimeDetection {
-    pub layout: LocalBlockLayout,
+pub struct LocalPayloadRuntimeDetection {
+    pub layout: LocalPayloadLayout,
     pub index_exists: bool,
     pub payload_objects_dir_exists: bool,
     pub upload_objects_dir_exists: bool,
@@ -87,7 +90,7 @@ pub struct LocalBlockRuntimeDetection {
     pub index_dir_exists: bool,
 }
 
-impl LocalBlockRuntimeDetection {
+impl LocalPayloadRuntimeDetection {
     pub fn has_runtime_layout(&self) -> bool {
         self.index_exists
             || self.payload_objects_dir_exists
@@ -107,24 +110,24 @@ impl LocalBlockRuntimeDetection {
             || !self.index_dir_exists
     }
 
-    pub fn runtime_backend(&self) -> Option<LocalBlockBackendKind> {
+    pub fn runtime_backend(&self) -> Option<LocalPayloadBackendKind> {
         if !self.has_complete_runtime_layout() {
             None
         } else {
-            Some(LocalBlockBackendKind::Current)
+            Some(LocalPayloadBackendKind::Current)
         }
     }
 }
 
 /// Detect backend contracts for a per-volume cache root.
-pub fn detect_cache_backends(cache_root: &Path) -> io::Result<LocalBlockRuntimeDetection> {
-    let layout = LocalBlockLayout::from_cache_root(cache_root);
+pub fn detect_cache_backends(cache_root: &Path) -> io::Result<LocalPayloadRuntimeDetection> {
+    let layout = LocalPayloadLayout::from_cache_root(cache_root);
     let index_exists = layout.redb_index_path.try_exists()?;
     let payload_objects_dir_exists = layout.payload_objects_dir.try_exists()?;
     let upload_objects_dir_exists = layout.upload_stage_objects_dir.try_exists()?;
     let tmp_dir_exists = layout.tmp_dir.try_exists()?;
     let index_dir_exists = layout.index_dir.try_exists()?;
-    Ok(LocalBlockRuntimeDetection {
+    Ok(LocalPayloadRuntimeDetection {
         layout,
         index_exists,
         payload_objects_dir_exists,
@@ -136,14 +139,14 @@ pub fn detect_cache_backends(cache_root: &Path) -> io::Result<LocalBlockRuntimeD
 
 /// Configuration for opening the current local payload object backend.
 #[derive(Debug, Clone)]
-pub struct LocalBlockBackendConfig {
+pub struct LocalPayloadBackendConfig {
     pub cache_root: PathBuf,
     pub volume_uuid: [u8; 16],
 }
 
 /// Payload-store sync cadence policy for the current local payload object backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum LocalBlockPayloadSyncMode {
+pub enum LocalPayloadSyncMode {
     /// Keep per-write file+directory barriers at payload commit time.
     #[default]
     Durable,
@@ -153,32 +156,32 @@ pub enum LocalBlockPayloadSyncMode {
 
 /// Errors returned while opening the current local payload object backend.
 #[derive(Debug, thiserror::Error)]
-pub enum LocalBlockBackendOpenError {
+pub enum LocalPayloadBackendOpenError {
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
     #[error("local payload object runtime layout under '{cache_root}' is incomplete")]
     IncompleteRuntimeLayout { cache_root: PathBuf },
-    #[error("failed to open local block index at '{path}': {source}")]
+    #[error("failed to open local payload index at '{path}': {source}")]
     OpenCacheIndex {
         path: PathBuf,
         #[source]
         source: CacheIndexError,
     },
-    #[error("failed to open local block payload store at '{cache_root}': {source}")]
+    #[error("failed to open local payload payload store at '{cache_root}': {source}")]
     OpenPayloadStore {
         cache_root: PathBuf,
         #[source]
         source: FilePayloadStoreError,
     },
-    #[error("failed to reconcile local block startup state under '{cache_root}': {source}")]
+    #[error("failed to reconcile local payload startup state under '{cache_root}': {source}")]
     StartupReconcile {
         cache_root: PathBuf,
         #[source]
-        source: LocalBlockStartupReconcileError,
+        source: LocalPayloadStartupReconcileError,
     },
 }
 
-impl LocalBlockBackendOpenError {
+impl LocalPayloadBackendOpenError {
     pub fn is_transient_open_lock_conflict(&self) -> bool {
         match self {
             Self::OpenCacheIndex { source, .. } => source.is_database_lock_conflict(),
@@ -189,8 +192,8 @@ impl LocalBlockBackendOpenError {
 
 /// Current local backend backed by file-per-object payload files and redb index.
 #[derive(Debug)]
-pub struct LocalBlockBackendRuntime {
-    layout: LocalBlockLayout,
+pub struct LocalPayloadBackendRuntime {
+    layout: LocalPayloadLayout,
     volume_uuid: [u8; 16],
     index: CacheIndex,
     payload_store: FilePayloadStore,
@@ -206,7 +209,7 @@ pub struct LocalBlockBackendRuntime {
 }
 
 struct DirtyValidationGuard<'a> {
-    backend: &'a LocalBlockBackendRuntime,
+    backend: &'a LocalPayloadBackendRuntime,
 }
 
 impl Drop for DirtyValidationGuard<'_> {
@@ -217,46 +220,46 @@ impl Drop for DirtyValidationGuard<'_> {
     }
 }
 
-impl Drop for LocalBlockBackendRuntime {
+impl Drop for LocalPayloadBackendRuntime {
     fn drop(&mut self) {
         self.flush_access_touches(true, "drop");
     }
 }
 
-impl LocalBlockBackendRuntime {
-    pub fn open(config: LocalBlockBackendConfig) -> Result<Self, LocalBlockBackendOpenError> {
-        Self::open_with_budget_and_sync_mode(config, None, LocalBlockPayloadSyncMode::Durable)
+impl LocalPayloadBackendRuntime {
+    pub fn open(config: LocalPayloadBackendConfig) -> Result<Self, LocalPayloadBackendOpenError> {
+        Self::open_with_budget_and_sync_mode(config, None, LocalPayloadSyncMode::Durable)
     }
 
     pub fn open_with_budget(
-        config: LocalBlockBackendConfig,
+        config: LocalPayloadBackendConfig,
         cache_budget_bytes: Option<u64>,
-    ) -> Result<Self, LocalBlockBackendOpenError> {
+    ) -> Result<Self, LocalPayloadBackendOpenError> {
         Self::open_with_budget_and_sync_mode(
             config,
             cache_budget_bytes,
-            LocalBlockPayloadSyncMode::Durable,
+            LocalPayloadSyncMode::Durable,
         )
     }
 
     pub fn open_with_budget_and_sync_mode(
-        config: LocalBlockBackendConfig,
+        config: LocalPayloadBackendConfig,
         cache_budget_bytes: Option<u64>,
-        payload_sync_mode: LocalBlockPayloadSyncMode,
-    ) -> Result<Self, LocalBlockBackendOpenError> {
-        let layout = LocalBlockLayout::from_cache_root(&config.cache_root);
+        payload_sync_mode: LocalPayloadSyncMode,
+    ) -> Result<Self, LocalPayloadBackendOpenError> {
+        let layout = LocalPayloadLayout::from_cache_root(&config.cache_root);
         if !layout.payload_objects_dir.try_exists()?
             || !layout.upload_stage_objects_dir.try_exists()?
             || !layout.tmp_dir.try_exists()?
             || !layout.index_dir.try_exists()?
         {
-            return Err(LocalBlockBackendOpenError::IncompleteRuntimeLayout {
+            return Err(LocalPayloadBackendOpenError::IncompleteRuntimeLayout {
                 cache_root: layout.runtime_root.clone(),
             });
         }
 
         let index = CacheIndex::open(&layout.redb_index_path).map_err(|source| {
-            LocalBlockBackendOpenError::OpenCacheIndex {
+            LocalPayloadBackendOpenError::OpenCacheIndex {
                 path: layout.redb_index_path.clone(),
                 source,
             }
@@ -264,16 +267,16 @@ impl LocalBlockBackendRuntime {
 
         let payload_store =
             FilePayloadStore::open_with_sync_mode(layout.clone(), payload_sync_mode).map_err(
-                |source| LocalBlockBackendOpenError::OpenPayloadStore {
+                |source| LocalPayloadBackendOpenError::OpenPayloadStore {
                     cache_root: layout.runtime_root.clone(),
                     source,
                 },
             )?;
 
-        let startup_reconcile_mode = LocalBlockStartupReconcileMode::from_env();
+        let startup_reconcile_mode = LocalPayloadStartupReconcileMode::from_env();
         let startup_reconcile_report =
             reconcile_startup_state(&layout, &index, startup_reconcile_mode).map_err(|source| {
-                LocalBlockBackendOpenError::StartupReconcile {
+                LocalPayloadBackendOpenError::StartupReconcile {
                     cache_root: layout.runtime_root.clone(),
                     source,
                 }
@@ -285,7 +288,7 @@ impl LocalBlockBackendRuntime {
                 stale_index_entries_removed = startup_reconcile_report.stale_index_entries_removed,
                 orphan_payload_files_removed =
                     startup_reconcile_report.orphan_payload_files_removed,
-                "local block runtime startup reconciliation repaired cache artifacts"
+                "local payload runtime startup reconciliation repaired cache artifacts"
             );
         }
 
@@ -320,7 +323,7 @@ impl LocalBlockBackendRuntime {
                 warn!(
                     object_id,
                     error = ?error,
-                    "local block runtime index lookup failed while checking payload presence"
+                    "local payload runtime index lookup failed while checking payload presence"
                 );
                 false
             }
@@ -345,14 +348,14 @@ impl LocalBlockBackendRuntime {
         warn!(
             object_id,
             operation,
-            "local block runtime detected index entry without payload; pruning stale index entry"
+            "local payload runtime detected index entry without payload; pruning stale index entry"
         );
         if let Err(error) = self.index.remove(object_id) {
             warn!(
                 object_id,
                 operation,
                 error = ?error,
-                "local block runtime failed to prune stale index entry"
+                "local payload runtime failed to prune stale index entry"
             );
         }
     }
@@ -365,7 +368,7 @@ impl LocalBlockBackendRuntime {
                     object_id,
                     operation,
                     error = ?error,
-                    "local block runtime payload existence probe failed"
+                    "local payload runtime payload existence probe failed"
                 );
                 false
             }
@@ -397,14 +400,14 @@ impl LocalBlockBackendRuntime {
         warn!(
             operation,
             orphan_count = object_ids.len(),
-            "local block runtime pruning stale index entries that no longer have payload files"
+            "local payload runtime pruning stale index entries that no longer have payload files"
         );
         if let Err(error) = self.index.remove_batch(object_ids) {
             warn!(
                 operation,
                 orphan_count = object_ids.len(),
                 error = ?error,
-                "local block runtime batch prune of stale index entries failed"
+                "local payload runtime batch prune of stale index entries failed"
             );
         } else {
             self.forget_access_touches(object_ids);
@@ -439,7 +442,7 @@ impl LocalBlockBackendRuntime {
         target_bytes: u64,
         payload_len: u64,
         mut current_after_evict: u64,
-    ) -> Result<u64, LocalBlockBackendError> {
+    ) -> Result<u64, LocalPayloadBackendError> {
         for attempt in 0..LOW_SPACE_UPLOAD_DRAIN_RETRIES {
             if !self
                 .budget_governor
@@ -451,7 +454,7 @@ impl LocalBlockBackendRuntime {
             let dirty_object_count = self
                 .index
                 .dirty_object_count()
-                .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
+                .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
             if dirty_object_count == 0 {
                 current_after_evict =
                     self.evict_to_target_bytes(target_bytes, "put_low_space_retry")?;
@@ -466,7 +469,7 @@ impl LocalBlockBackendRuntime {
                 payload_len,
                 dirty_object_count,
                 wait_ms = LOW_SPACE_UPLOAD_DRAIN_WAIT.as_millis(),
-                "local block runtime low-space put waiting briefly for pending upload drain"
+                "local payload runtime low-space put waiting briefly for pending upload drain"
             );
             self.wait_for_storage_state_change(observed_epoch);
             current_after_evict =
@@ -495,7 +498,7 @@ impl LocalBlockBackendRuntime {
                 operation,
                 count = pending_ids.len(),
                 error = ?error,
-                "local block runtime batched access touch failed"
+                "local payload runtime batched access touch failed"
             );
             let mut pending = self.pending_access_touches.lock();
             pending.requeue_after_failure(pending_ids);
@@ -516,12 +519,12 @@ impl LocalBlockBackendRuntime {
         &self,
         target_bytes: u64,
         operation: &'static str,
-    ) -> Result<u64, LocalBlockBackendError> {
+    ) -> Result<u64, LocalPayloadBackendError> {
         self.flush_access_touches(true, operation);
         let stats = self
             .index
             .stats()
-            .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
+            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
         if stats.current_bytes <= target_bytes {
             return Ok(stats.current_bytes);
         }
@@ -537,7 +540,7 @@ impl LocalBlockBackendRuntime {
             let page = self
                 .index
                 .eviction_candidates_page_stats(cursor, EVICTION_CANDIDATE_PAGE_SIZE)
-                .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
+                .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
             if page.entries.is_empty() {
                 break;
             }
@@ -555,7 +558,7 @@ impl LocalBlockBackendRuntime {
                 estimated_current = estimated_current.saturating_sub(candidate.payload_len);
                 if batch.len() >= EVICTION_DELETE_BATCH_SIZE {
                     self.remove_batch_internal(&batch)
-                        .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
+                        .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
                     batch.clear();
                 }
             }
@@ -569,12 +572,12 @@ impl LocalBlockBackendRuntime {
                     scanned_rows = page.scanned_rows,
                     skipped_non_evictable,
                     skipped_non_evictable_total = skipped_total,
-                    "local block runtime eviction candidate scan skipped non-evictable rows"
+                    "local payload runtime eviction candidate scan skipped non-evictable rows"
                 );
             }
             if !batch.is_empty() {
                 self.remove_batch_internal(&batch)
-                    .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
+                    .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
                 batch.clear();
             }
         }
@@ -582,14 +585,14 @@ impl LocalBlockBackendRuntime {
         let final_current = self
             .index
             .stats()
-            .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?
+            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?
             .current_bytes;
         if final_current > target_bytes {
             warn!(
                 operation,
                 current_bytes = final_current,
                 target_bytes,
-                "local block runtime budget pressure remained above target after deterministic eviction pass"
+                "local payload runtime budget pressure remained above target after deterministic eviction pass"
             );
         }
         Ok(final_current)
@@ -599,7 +602,7 @@ impl LocalBlockBackendRuntime {
         &self,
         target_bytes: u64,
         operation: &'static str,
-    ) -> Result<u64, LocalBlockBackendError> {
+    ) -> Result<u64, LocalPayloadBackendError> {
         let _eviction_guard = self.eviction_pass_lock.lock();
         self.evict_to_target_bytes_impl(target_bytes, operation)
     }
@@ -608,7 +611,7 @@ impl LocalBlockBackendRuntime {
         &self,
         target_bytes: u64,
         operation: &'static str,
-    ) -> Result<Option<u64>, LocalBlockBackendError> {
+    ) -> Result<Option<u64>, LocalPayloadBackendError> {
         let Some(_eviction_guard) = self.eviction_pass_lock.try_lock() else {
             return Ok(None);
         };
@@ -621,11 +624,11 @@ impl LocalBlockBackendRuntime {
         object_id: u64,
         payload_len: u64,
         evictable: bool,
-    ) -> Result<bool, LocalBlockBackendError> {
+    ) -> Result<bool, LocalPayloadBackendError> {
         let stats = self
             .index
             .stats()
-            .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
+            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
         let Some(target_bytes) = self
             .budget_governor
             .target_before_insert(stats.current_bytes, payload_len)
@@ -654,12 +657,12 @@ impl LocalBlockBackendRuntime {
                 payload_len,
                 current_bytes = current_after_evict,
                 budget_bytes = ?self.budget_governor.budget_bytes(),
-                "local block runtime skipped evictable put because budget remained under hard pressure"
+                "local payload runtime skipped evictable put because budget remained under hard pressure"
             );
             return Ok(true);
         }
 
-        Err(LocalBlockBackendError::CapacityExhausted {
+        Err(LocalPayloadBackendError::CapacityExhausted {
             needed: payload_len,
             free: self.budget_governor.free_bytes(current_after_evict),
         })
@@ -680,7 +683,7 @@ impl LocalBlockBackendRuntime {
             .into_iter()
             .filter_map(|object_id| self.index.get_entry(object_id).ok().flatten())
             .filter(|entry| {
-                entry.lifecycle == LocalBlockLifecycleState::Uploaded && entry.evictable
+                entry.lifecycle == LocalPayloadLifecycleState::Uploaded && entry.evictable
             })
             .fold(0_u64, |total, entry| {
                 total.saturating_add(entry.payload_len)
@@ -698,7 +701,7 @@ impl LocalBlockBackendRuntime {
     }
 }
 
-impl LocalBlockBackend for LocalBlockBackendRuntime {
+impl LocalPayloadBackend for LocalPayloadBackendRuntime {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -741,7 +744,7 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
                 warn!(
                     object_id,
                     error = ?error,
-                    "local block runtime index get_for_upload lookup failed"
+                    "local payload runtime index get_for_upload lookup failed"
                 );
                 return None;
             }
@@ -764,9 +767,9 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
         object_id: u64,
         data: &[u8],
         evictable: bool,
-    ) -> Result<(), LocalBlockBackendError> {
+    ) -> Result<(), LocalPayloadBackendError> {
         let payload_len = u64::try_from(data.len()).map_err(|_| {
-            LocalBlockBackendError::Io(io::Error::new(
+            LocalPayloadBackendError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "payload length exceeds u64",
             ))
@@ -777,12 +780,12 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
 
         self.payload_store
             .put(object_id, data)
-            .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
+            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
 
         let lifecycle = if evictable {
-            LocalBlockLifecycleState::Uploaded
+            LocalPayloadLifecycleState::Uploaded
         } else {
-            LocalBlockLifecycleState::Dirty
+            LocalPayloadLifecycleState::Dirty
         };
         let payload_key = self
             .layout
@@ -796,14 +799,14 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
             payload_len,
             lifecycle,
             origin: if evictable {
-                LocalBlockOrigin::Downloaded
+                LocalPayloadOrigin::Downloaded
             } else {
-                LocalBlockOrigin::Local
+                LocalPayloadOrigin::Local
             },
             upload_state: if evictable {
-                LocalBlockUploadState::None
+                LocalPayloadUploadState::None
             } else {
-                LocalBlockUploadState::Pending
+                LocalPayloadUploadState::Pending
             },
             evictable,
         }) {
@@ -812,15 +815,15 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
                 object_id,
                 volume_uuid = ?self.volume_uuid,
                 error = ?error,
-                "local block runtime index upsert failed after payload write; removed payload for rollback"
+                "local payload runtime index upsert failed after payload write; removed payload for rollback"
             );
-            return Err(LocalBlockBackendError::Other(Box::new(error)));
+            return Err(LocalPayloadBackendError::Other(Box::new(error)));
         }
 
         Ok(())
     }
 
-    fn put_batch(&self, entries: &[LocalBlockPut]) -> Result<(), LocalBlockBackendError> {
+    fn put_batch(&self, entries: &[LocalPayloadPut]) -> Result<(), LocalPayloadBackendError> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -830,12 +833,12 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
         let mut estimated_current = self
             .index
             .stats()
-            .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?
+            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?
             .current_bytes;
 
         for entry in entries {
             let payload_len = u64::try_from(entry.data.len()).map_err(|_| {
-                LocalBlockBackendError::Io(io::Error::new(
+                LocalPayloadBackendError::Io(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "payload length exceeds u64",
                 ))
@@ -864,12 +867,12 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
                             payload_len,
                             current_bytes = current_after_evict,
                             budget_bytes = ?self.budget_governor.budget_bytes(),
-                            "local block runtime skipped evictable batch put because budget remained under hard pressure"
+                            "local payload runtime skipped evictable batch put because budget remained under hard pressure"
                         );
                         estimated_current = current_after_evict;
                         continue;
                     }
-                    return Err(LocalBlockBackendError::CapacityExhausted {
+                    return Err(LocalPayloadBackendError::CapacityExhausted {
                         needed: payload_len,
                         free: self.budget_governor.free_bytes(current_after_evict),
                     });
@@ -879,9 +882,9 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
             estimated_current = estimated_current.saturating_add(payload_len);
 
             let lifecycle = if entry.evictable {
-                LocalBlockLifecycleState::Uploaded
+                LocalPayloadLifecycleState::Uploaded
             } else {
-                LocalBlockLifecycleState::Dirty
+                LocalPayloadLifecycleState::Dirty
             };
             let payload_key = self
                 .layout
@@ -895,14 +898,14 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
                 payload_len,
                 lifecycle,
                 origin: if entry.evictable {
-                    LocalBlockOrigin::Downloaded
+                    LocalPayloadOrigin::Downloaded
                 } else {
-                    LocalBlockOrigin::Local
+                    LocalPayloadOrigin::Local
                 },
                 upload_state: if entry.evictable {
-                    LocalBlockUploadState::None
+                    LocalPayloadUploadState::None
                 } else {
-                    LocalBlockUploadState::Pending
+                    LocalPayloadUploadState::Pending
                 },
                 evictable: entry.evictable,
             });
@@ -917,7 +920,7 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
         }
 
         if let Err(error) = self.payload_store.put_batch(&persisted_entries) {
-            return Err(LocalBlockBackendError::Other(Box::new(error)));
+            return Err(LocalPayloadBackendError::Other(Box::new(error)));
         }
 
         if let Err(error) = self.index.upsert_many(&updates) {
@@ -929,40 +932,40 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
             warn!(
                 object_count = persisted_entries.len(),
                 error = ?error,
-                "local block runtime batch index upsert failed after payload writes; removed payloads for rollback"
+                "local payload runtime batch index upsert failed after payload writes; removed payloads for rollback"
             );
-            return Err(LocalBlockBackendError::Other(Box::new(error)));
+            return Err(LocalPayloadBackendError::Other(Box::new(error)));
         }
 
         Ok(())
     }
 
-    fn sync_data(&self) -> Result<(), LocalBlockBackendError> {
+    fn sync_data(&self) -> Result<(), LocalPayloadBackendError> {
         self.flush_access_touches(true, "sync_data");
         self.payload_store
             .sync_data()
-            .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))
+            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))
     }
 
-    fn run_pressure_maintenance(&self) -> Result<(), LocalBlockBackendError> {
+    fn run_pressure_maintenance(&self) -> Result<(), LocalPayloadBackendError> {
         self.flush_access_touches(true, "run_pressure_maintenance");
         let stats = self
             .index
             .stats()
-            .map_err(|error| LocalBlockBackendError::Other(Box::new(error)))?;
+            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
         if let Some(target_bytes) = self.budget_governor.background_target(stats.current_bytes) {
             match self.try_evict_to_target_bytes(target_bytes, "run_pressure_maintenance")? {
                 Some(current_bytes) => {
                     debug!(
                         current_bytes,
                         target_bytes,
-                        "local block runtime background pressure maintenance eviction pass completed"
+                        "local payload runtime background pressure maintenance eviction pass completed"
                     );
                 }
                 None => {
                     debug!(
                         target_bytes,
-                        "local block runtime background pressure maintenance skipped because another eviction pass is in progress"
+                        "local payload runtime background pressure maintenance skipped because another eviction pass is in progress"
                     );
                 }
             }
@@ -972,7 +975,7 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
 
     fn mark_uploading(&self, object_id: u64) {
         if let Err(error) = self.index.mark_uploading(object_id) {
-            warn!(object_id, error = ?error, "local block runtime index mark_uploading failed");
+            warn!(object_id, error = ?error, "local payload runtime index mark_uploading failed");
         }
     }
 
@@ -981,14 +984,14 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
             warn!(
                 object_id,
                 error = ?error,
-                "local block runtime index mark_upload_failed failed"
+                "local payload runtime index mark_upload_failed failed"
             );
         }
     }
 
     fn mark_uploaded(&self, object_id: u64) {
         if let Err(error) = self.index.mark_uploaded(object_id) {
-            warn!(object_id, error = ?error, "local block runtime index mark_uploaded failed");
+            warn!(object_id, error = ?error, "local payload runtime index mark_uploaded failed");
         } else {
             self.note_storage_state_change();
         }
@@ -1046,7 +1049,7 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
 
     fn remove(&self, object_id: u64) {
         if let Err(error) = self.index.remove(object_id) {
-            warn!(object_id, error = ?error, "local block runtime index remove failed");
+            warn!(object_id, error = ?error, "local payload runtime index remove failed");
             return;
         }
         self.forget_runtime_pins(&[object_id]);
@@ -1063,7 +1066,7 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
             warn!(
                 count = object_ids.len(),
                 error = ?error,
-                "local block runtime index remove_batch failed"
+                "local payload runtime index remove_batch failed"
             );
             return;
         }
@@ -1095,7 +1098,7 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
             Err(error) => {
                 warn!(
                     error = ?error,
-                    "local block runtime index dirty snapshot failed"
+                    "local payload runtime index dirty snapshot failed"
                 );
                 Vec::new()
             }
@@ -1106,30 +1109,30 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
         match self.index.dirty_object_count() {
             Ok(count) => count,
             Err(error) => {
-                warn!(error = ?error, "local block runtime index dirty count lookup failed");
+                warn!(error = ?error, "local payload runtime index dirty count lookup failed");
                 0
             }
         }
     }
 
-    fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState {
+    fn lifecycle_state(&self, object_id: u64) -> LocalPayloadLifecycleState {
         match self.index.get_entry(object_id) {
             Ok(Some(entry)) => {
                 if self.payload_missing(object_id, "lifecycle_state") {
                     self.remove_orphaned_index_entry(object_id, "lifecycle_state");
-                    LocalBlockLifecycleState::Missing
+                    LocalPayloadLifecycleState::Missing
                 } else {
                     entry.lifecycle
                 }
             }
-            Ok(None) => LocalBlockLifecycleState::Missing,
+            Ok(None) => LocalPayloadLifecycleState::Missing,
             Err(error) => {
                 warn!(
                     object_id,
                     error = ?error,
-                    "local block runtime index lifecycle lookup failed"
+                    "local payload runtime index lifecycle lookup failed"
                 );
-                LocalBlockLifecycleState::Missing
+                LocalPayloadLifecycleState::Missing
             }
         }
     }
@@ -1149,18 +1152,18 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
                 warn!(
                     object_id,
                     error = ?error,
-                    "local block runtime index evictable lookup failed"
+                    "local payload runtime index evictable lookup failed"
                 );
                 false
             }
         }
     }
 
-    fn storage_stats(&self) -> LocalBlockStorageStats {
+    fn storage_stats(&self) -> LocalPayloadStorageStats {
         match self.index.stats() {
             Ok(stats) => {
                 let runtime_pinned_evictable_bytes = self.runtime_pinned_evictable_bytes();
-                LocalBlockStorageStats {
+                LocalPayloadStorageStats {
                     current_bytes: stats.current_bytes,
                     dirty_bytes: stats.dirty_bytes,
                     evictable_bytes: stats
@@ -1169,15 +1172,15 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
                 }
             }
             Err(error) => {
-                warn!(error = ?error, "local block runtime index storage stats lookup failed");
-                LocalBlockStorageStats::default()
+                warn!(error = ?error, "local payload runtime index storage stats lookup failed");
+                LocalPayloadStorageStats::default()
             }
         }
     }
 
-    fn object_stats(&self, object_id: u64) -> Option<LocalBlockObjectStats> {
+    fn object_stats(&self, object_id: u64) -> Option<LocalPayloadObjectStats> {
         match self.index.get_entry(object_id) {
-            Ok(Some(entry)) => Some(LocalBlockObjectStats {
+            Ok(Some(entry)) => Some(LocalPayloadObjectStats {
                 payload_len: entry.payload_len,
                 lifecycle: entry.lifecycle,
                 origin: entry.origin,
@@ -1190,7 +1193,7 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
                 warn!(
                     object_id,
                     error = ?error,
-                    "local block runtime index object stats lookup failed"
+                    "local payload runtime index object stats lookup failed"
                 );
                 None
             }
@@ -1201,7 +1204,7 @@ impl LocalBlockBackend for LocalBlockBackendRuntime {
         match self.index.access_order_object_ids() {
             Ok(object_ids) => object_ids,
             Err(error) => {
-                warn!(error = ?error, "local block runtime index object id snapshot failed");
+                warn!(error = ?error, "local payload runtime index object id snapshot failed");
                 Vec::new()
             }
         }
@@ -1314,11 +1317,11 @@ impl PendingAccessTouches {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::local::contract_tests::assert_local_block_backend_contract;
-    use crate::local::{LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState};
-    use crate::local::{LocalBlockOrigin, LocalBlockUploadState};
+    use crate::local::contract_tests::assert_local_payload_backend_contract;
+    use crate::local::{LocalPayloadBackend, LocalPayloadBackendError, LocalPayloadLifecycleState};
+    use crate::local::{LocalPayloadOrigin, LocalPayloadUploadState};
 
-    fn create_v3_marker(layout: &LocalBlockLayout) {
+    fn create_v3_marker(layout: &LocalPayloadLayout) {
         layout.provision().unwrap();
     }
 
@@ -1340,7 +1343,7 @@ mod tests {
     #[test]
     fn detects_current_runtime_layout() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
         let detection = detect_cache_backends(temp.path()).unwrap();
@@ -1353,14 +1356,14 @@ mod tests {
         assert!(!detection.needs_runtime_provisioning());
         assert_eq!(
             detection.runtime_backend(),
-            Some(LocalBlockBackendKind::Current)
+            Some(LocalPayloadBackendKind::Current)
         );
     }
 
     #[test]
     fn partial_runtime_layout_is_not_reported_as_current_backend() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         std::fs::create_dir_all(&layout.index_dir).unwrap();
 
         let detection = detect_cache_backends(temp.path()).unwrap();
@@ -1371,26 +1374,26 @@ mod tests {
     }
 
     #[test]
-    fn local_block_backend_requires_runtime_dirs() {
+    fn local_payload_backend_requires_runtime_dirs() {
         let temp = tempfile::tempdir().unwrap();
-        let err = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+        let err = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0xAB; 16],
         })
         .unwrap_err();
         assert!(matches!(
             err,
-            LocalBlockBackendOpenError::IncompleteRuntimeLayout { .. }
+            LocalPayloadBackendOpenError::IncompleteRuntimeLayout { .. }
         ));
     }
 
     #[test]
-    fn local_block_backend_satisfies_local_block_backend_contract() {
-        assert_local_block_backend_contract(|| {
+    fn local_payload_backend_satisfies_local_payload_backend_contract() {
+        assert_local_payload_backend_contract(|| {
             let temp = tempfile::tempdir().unwrap();
-            let layout = LocalBlockLayout::from_cache_root(temp.path());
+            let layout = LocalPayloadLayout::from_cache_root(temp.path());
             create_v3_marker(&layout);
-            let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+            let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
                 cache_root: temp.path().to_path_buf(),
                 volume_uuid: [0xCA; 16],
             })
@@ -1400,12 +1403,12 @@ mod tests {
     }
 
     #[test]
-    fn local_block_backend_roundtrips_payload_and_index_state() {
+    fn local_payload_backend_roundtrips_payload_and_index_state() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0xCD; 16],
         })
@@ -1413,23 +1416,26 @@ mod tests {
         backend.put(42, b"payload", false).unwrap();
         backend.sync_data().unwrap();
         assert_eq!(backend.get_for_upload(42).unwrap().as_ref(), b"payload");
-        assert_eq!(backend.lifecycle_state(42), LocalBlockLifecycleState::Dirty);
+        assert_eq!(
+            backend.lifecycle_state(42),
+            LocalPayloadLifecycleState::Dirty
+        );
         assert_eq!(backend.dirty_object_ids(), vec![42]);
     }
 
     #[test]
-    fn local_block_fast_sync_mode_defers_payload_store_barriers_until_sync_data() {
+    fn local_payload_fast_sync_mode_defers_payload_store_barriers_until_sync_data() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = LocalBlockBackendRuntime::open_with_budget_and_sync_mode(
-            LocalBlockBackendConfig {
+        let backend = LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+            LocalPayloadBackendConfig {
                 cache_root: temp.path().to_path_buf(),
                 volume_uuid: [0xCE; 16],
             },
             None,
-            LocalBlockPayloadSyncMode::Fast,
+            LocalPayloadSyncMode::Fast,
         )
         .unwrap();
         backend.put(101, b"one", false).unwrap();
@@ -1452,10 +1458,10 @@ mod tests {
     #[test]
     fn local_backend_uses_index_state_after_reopen() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x11; 16],
         })
@@ -1471,35 +1477,38 @@ mod tests {
         index.mark_uploaded(1).unwrap();
         drop(index);
 
-        let reopened = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+        let reopened = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x11; 16],
         })
         .unwrap();
         assert_eq!(
             reopened.lifecycle_state(1),
-            LocalBlockLifecycleState::Uploaded
+            LocalPayloadLifecycleState::Uploaded
         );
         assert_eq!(
             reopened.lifecycle_state(2),
-            LocalBlockLifecycleState::Uploading
+            LocalPayloadLifecycleState::Uploading
         );
         assert_eq!(reopened.dirty_object_ids(), vec![2]);
         let uploaded_stats = reopened.object_stats(1).unwrap();
-        assert_eq!(uploaded_stats.origin, LocalBlockOrigin::Local);
-        assert_eq!(uploaded_stats.upload_state, LocalBlockUploadState::None);
+        assert_eq!(uploaded_stats.origin, LocalPayloadOrigin::Local);
+        assert_eq!(uploaded_stats.upload_state, LocalPayloadUploadState::None);
         let pending_stats = reopened.object_stats(2).unwrap();
-        assert_eq!(pending_stats.origin, LocalBlockOrigin::Local);
-        assert_eq!(pending_stats.upload_state, LocalBlockUploadState::Uploading);
+        assert_eq!(pending_stats.origin, LocalPayloadOrigin::Local);
+        assert_eq!(
+            pending_stats.upload_state,
+            LocalPayloadUploadState::Uploading
+        );
     }
 
     #[test]
-    fn local_block_backend_reopens_existing_index_state() {
+    fn local_payload_backend_reopens_existing_index_state() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let existing_backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+        let existing_backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x12; 16],
         })
@@ -1509,18 +1518,18 @@ mod tests {
         existing_backend.sync_data().unwrap();
         drop(existing_backend);
 
-        let reopened = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+        let reopened = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x12; 16],
         })
         .unwrap();
         assert_eq!(
             reopened.lifecycle_state(7),
-            LocalBlockLifecycleState::Uploading
+            LocalPayloadLifecycleState::Uploading
         );
         let stats = reopened.object_stats(7).unwrap();
-        assert_eq!(stats.origin, LocalBlockOrigin::Local);
-        assert_eq!(stats.upload_state, LocalBlockUploadState::Uploading);
+        assert_eq!(stats.origin, LocalPayloadOrigin::Local);
+        assert_eq!(stats.upload_state, LocalPayloadUploadState::Uploading);
         assert_eq!(reopened.dirty_object_ids(), vec![7]);
         assert_eq!(reopened.get(7).unwrap().as_ref(), b"legacy-pending");
     }
@@ -1528,10 +1537,10 @@ mod tests {
     #[test]
     fn local_backend_object_stats_distinguish_local_pending_and_downloaded_cache() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x21; 16],
         })
@@ -1540,23 +1549,23 @@ mod tests {
         backend.put(11, b"downloaded-cache", true).unwrap();
 
         let pending = backend.object_stats(10).unwrap();
-        assert_eq!(pending.origin, LocalBlockOrigin::Local);
-        assert_eq!(pending.upload_state, LocalBlockUploadState::Pending);
+        assert_eq!(pending.origin, LocalPayloadOrigin::Local);
+        assert_eq!(pending.upload_state, LocalPayloadUploadState::Pending);
         assert!(pending.last_access_unix_millis > 0);
 
         let cached = backend.object_stats(11).unwrap();
-        assert_eq!(cached.origin, LocalBlockOrigin::Downloaded);
-        assert_eq!(cached.upload_state, LocalBlockUploadState::None);
+        assert_eq!(cached.origin, LocalPayloadOrigin::Downloaded);
+        assert_eq!(cached.upload_state, LocalPayloadUploadState::None);
         assert!(cached.last_access_unix_millis > 0);
     }
 
     #[test]
     fn local_backend_get_refreshes_access_order() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x22; 16],
         })
@@ -1573,10 +1582,10 @@ mod tests {
     #[test]
     fn local_backend_read_into_refreshes_access_order() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x23; 16],
         })
@@ -1593,12 +1602,12 @@ mod tests {
     }
 
     #[test]
-    fn local_block_backend_persists_payload_objects_in_file_per_object_layout() {
+    fn local_payload_backend_persists_payload_objects_in_file_per_object_layout() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x33; 16],
         })
@@ -1610,18 +1619,18 @@ mod tests {
             "local runtime must persist each payload object as an individual payload file"
         );
         let entry = backend.index.get_entry(0xABCD).unwrap().unwrap();
-        assert_eq!(entry.origin, LocalBlockOrigin::Local);
-        assert_eq!(entry.upload_state, LocalBlockUploadState::Pending);
+        assert_eq!(entry.origin, LocalPayloadOrigin::Local);
+        assert_eq!(entry.upload_state, LocalPayloadUploadState::Pending);
         backend.sync_data().unwrap();
     }
 
     #[test]
     fn local_backend_reopens_with_existing_payload_file() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x44; 16],
         })
@@ -1630,7 +1639,7 @@ mod tests {
         backend.sync_data().unwrap();
         drop(backend);
 
-        let reopened = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+        let reopened = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x44; 16],
         })
@@ -1641,10 +1650,10 @@ mod tests {
     #[test]
     fn local_backend_open_reconciles_stale_index_entries() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x45; 16],
         })
@@ -1658,7 +1667,7 @@ mod tests {
         assert!(index_before.get_entry(501).unwrap().is_some());
         drop(index_before);
 
-        let reopened = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+        let reopened = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x45; 16],
         })
@@ -1672,14 +1681,14 @@ mod tests {
     #[test]
     fn local_backend_open_removes_orphan_temp_files() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
         let staged_tmp_dir_file = layout.tmp_dir.join("pending").join("write.tmp");
         std::fs::create_dir_all(staged_tmp_dir_file.parent().unwrap()).unwrap();
         std::fs::write(&staged_tmp_dir_file, b"staged").unwrap();
 
-        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x46; 16],
         })
@@ -1692,10 +1701,10 @@ mod tests {
     #[test]
     fn local_backend_failed_upload_requeues_without_losing_payload_bytes() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x55; 16],
         })
@@ -1707,11 +1716,14 @@ mod tests {
         backend.mark_uploading(1);
         assert_eq!(
             backend.lifecycle_state(1),
-            LocalBlockLifecycleState::Uploading
+            LocalPayloadLifecycleState::Uploading
         );
         backend.mark_upload_failed(1);
 
-        assert_eq!(backend.lifecycle_state(1), LocalBlockLifecycleState::Dirty);
+        assert_eq!(
+            backend.lifecycle_state(1),
+            LocalPayloadLifecycleState::Dirty
+        );
         assert_eq!(
             backend.get_for_upload(1).unwrap().as_ref(),
             b"one",
@@ -1727,10 +1739,10 @@ mod tests {
     #[test]
     fn local_backend_prunes_missing_payload_entries_from_dirty_replay() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x66; 16],
         })
@@ -1746,7 +1758,7 @@ mod tests {
         );
         assert_eq!(
             backend.lifecycle_state(10),
-            LocalBlockLifecycleState::Missing
+            LocalPayloadLifecycleState::Missing
         );
         assert!(!backend.contains(10));
     }
@@ -1754,10 +1766,10 @@ mod tests {
     #[test]
     fn local_backend_object_stats_do_not_prune_missing_payload_entries() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x67; 16],
         })
@@ -1782,11 +1794,11 @@ mod tests {
     #[test]
     fn local_backend_enforces_budget_with_deterministic_eviction_order() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = LocalBlockBackendRuntime::open_with_budget(
-            LocalBlockBackendConfig {
+        let backend = LocalPayloadBackendRuntime::open_with_budget(
+            LocalPayloadBackendConfig {
                 cache_root: temp.path().to_path_buf(),
                 volume_uuid: [0x71; 16],
             },
@@ -1810,11 +1822,11 @@ mod tests {
     #[test]
     fn local_backend_returns_capacity_exhausted_for_non_evictable_pressure() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = LocalBlockBackendRuntime::open_with_budget(
-            LocalBlockBackendConfig {
+        let backend = LocalPayloadBackendRuntime::open_with_budget(
+            LocalPayloadBackendConfig {
                 cache_root: temp.path().to_path_buf(),
                 volume_uuid: [0x72; 16],
             },
@@ -1825,23 +1837,23 @@ mod tests {
         let err = backend.put(11, &[0xBB; 16], false).unwrap_err();
         assert!(matches!(
             err,
-            LocalBlockBackendError::CapacityExhausted { .. }
+            LocalPayloadBackendError::CapacityExhausted { .. }
         ));
         assert_eq!(
             backend.lifecycle_state(11),
-            LocalBlockLifecycleState::Missing
+            LocalPayloadLifecycleState::Missing
         );
     }
 
     #[test]
     fn local_backend_waits_for_pending_upload_drain_before_capacity_exhausted() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
         let backend = std::sync::Arc::new(
-            LocalBlockBackendRuntime::open_with_budget(
-                LocalBlockBackendConfig {
+            LocalPayloadBackendRuntime::open_with_budget(
+                LocalPayloadBackendConfig {
                     cache_root: temp.path().to_path_buf(),
                     volume_uuid: [0x7B; 16],
                 },
@@ -1863,7 +1875,7 @@ mod tests {
         join.join().unwrap();
         assert!(
             !backend.contains(10),
-            "once the older pending block finishes upload, low-space admission should reclaim it before rejecting a new local block"
+            "once the older pending block finishes upload, low-space admission should reclaim it before rejecting a new local payload"
         );
         assert!(
             backend.contains(11),
@@ -1871,19 +1883,19 @@ mod tests {
         );
         assert_eq!(
             backend.lifecycle_state(11),
-            LocalBlockLifecycleState::Dirty,
-            "the newly admitted local block remains dirty until a later upload transition marks it uploaded"
+            LocalPayloadLifecycleState::Dirty,
+            "the newly admitted local payload remains dirty until a later upload transition marks it uploaded"
         );
     }
 
     #[test]
     fn local_backend_retry_low_space_reclaims_when_pending_upload_already_finished() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = LocalBlockBackendRuntime::open_with_budget(
-            LocalBlockBackendConfig {
+        let backend = LocalPayloadBackendRuntime::open_with_budget(
+            LocalPayloadBackendConfig {
                 cache_root: temp.path().to_path_buf(),
                 volume_uuid: [0x7C; 16],
             },
@@ -1918,11 +1930,11 @@ mod tests {
     #[test]
     fn local_backend_background_pressure_reclaims_to_low_watermark() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = LocalBlockBackendRuntime::open_with_budget(
-            LocalBlockBackendConfig {
+        let backend = LocalPayloadBackendRuntime::open_with_budget(
+            LocalPayloadBackendConfig {
                 cache_root: temp.path().to_path_buf(),
                 volume_uuid: [0x73; 16],
             },
@@ -1952,15 +1964,15 @@ mod tests {
     #[test]
     fn local_runtime_pins_do_not_persist_across_reopen() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let config = LocalBlockBackendConfig {
+        let config = LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x7A; 16],
         };
         let backend =
-            LocalBlockBackendRuntime::open_with_budget(config.clone(), Some(100)).unwrap();
+            LocalPayloadBackendRuntime::open_with_budget(config.clone(), Some(100)).unwrap();
         backend.put(20, &[0x01; 30], true).unwrap();
         backend.pin(20);
         assert!(
@@ -1971,7 +1983,7 @@ mod tests {
         assert!(!backend.object_stats(20).unwrap().evictable);
         drop(backend);
 
-        let reopened = LocalBlockBackendRuntime::open_with_budget(config, Some(100)).unwrap();
+        let reopened = LocalPayloadBackendRuntime::open_with_budget(config, Some(100)).unwrap();
         assert!(
             reopened.is_evictable(20),
             "runtime pin state must be cleared on reopen instead of persisting in redb"
@@ -1983,11 +1995,11 @@ mod tests {
     #[test]
     fn local_backend_eviction_tracks_skipped_non_evictable_scan_rows() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = LocalBlockBackendRuntime::open_with_budget(
-            LocalBlockBackendConfig {
+        let backend = LocalPayloadBackendRuntime::open_with_budget(
+            LocalPayloadBackendConfig {
                 cache_root: temp.path().to_path_buf(),
                 volume_uuid: [0x74; 16],
             },
@@ -2020,10 +2032,10 @@ mod tests {
     #[test]
     fn dirty_validation_gate_allows_single_runner_per_interval() {
         let temp = tempfile::tempdir().unwrap();
-        let layout = LocalBlockLayout::from_cache_root(temp.path());
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
         create_v3_marker(&layout);
 
-        let backend = LocalBlockBackendRuntime::open(LocalBlockBackendConfig {
+        let backend = LocalPayloadBackendRuntime::open(LocalPayloadBackendConfig {
             cache_root: temp.path().to_path_buf(),
             volume_uuid: [0x77; 16],
         })

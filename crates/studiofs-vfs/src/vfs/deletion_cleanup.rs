@@ -176,10 +176,10 @@ impl StudioVfs {
             self.evict_inode_from_caches(ino, &removed_ids).await;
         }
 
-        let deferred_local_blocks = self.take_deferred_deleted_local_blocks(ino);
-        let deferred_local_blocks_len = deferred_local_blocks.len();
-        if deferred_local_blocks_len > 0 {
-            self.evict_inode_from_caches(ino, &deferred_local_blocks)
+        let deferred_local_payloads = self.take_deferred_deleted_local_payloads(ino);
+        let deferred_local_payloads_len = deferred_local_payloads.len();
+        if deferred_local_payloads_len > 0 {
+            self.evict_inode_from_caches(ino, &deferred_local_payloads)
                 .await;
         }
 
@@ -187,7 +187,7 @@ impl StudioVfs {
         self.state.namespace.dirty_attrs.lock().remove(&ino);
         self.state.namespace.attr_read_cache.lock().remove(ino);
         self.maybe_clear_deleted_inode_marker(ino);
-        deferred_local_blocks_len
+        deferred_local_payloads_len
     }
 
     pub(super) async fn cleanup_deleted_inode_storage(

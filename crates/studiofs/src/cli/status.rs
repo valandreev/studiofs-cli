@@ -6,9 +6,9 @@ use crate::cli::utils::format_bytes;
 use clap::Args;
 use std::path::{Path, PathBuf};
 use studiofs_cache::runtime::{
-    CacheIndex, LocalBlockBackendKind, LocalBlockRuntimeDetection, detect_cache_backends,
+    CacheIndex, LocalPayloadBackendKind, LocalPayloadRuntimeDetection, detect_cache_backends,
 };
-use studiofs_cache::{OpenLocalBlockBackendError, open_local_block_backend};
+use studiofs_cache::{OpenLocalPayloadBackendError, open_local_payload_backend};
 use studiofs_meta::counters;
 use studiofs_vfs::VfsWritePathObservabilitySnapshot;
 #[cfg(test)]
@@ -77,8 +77,8 @@ impl StatusArgs {
 
 fn detect_backends_or_warn(
     cache_path: &Path,
-    detector: impl FnOnce(&Path) -> std::io::Result<LocalBlockRuntimeDetection>,
-) -> Option<LocalBlockRuntimeDetection> {
+    detector: impl FnOnce(&Path) -> std::io::Result<LocalPayloadRuntimeDetection>,
+) -> Option<LocalPayloadRuntimeDetection> {
     match detector(cache_path) {
         Ok(detection) => Some(detection),
         Err(error) => {
@@ -91,7 +91,7 @@ fn detect_backends_or_warn(
     }
 }
 
-fn detect_backends(cache_path: &Path) -> Option<LocalBlockRuntimeDetection> {
+fn detect_backends(cache_path: &Path) -> Option<LocalPayloadRuntimeDetection> {
     detect_backends_or_warn(cache_path, detect_cache_backends)
 }
 
@@ -134,15 +134,18 @@ fn read_write_path_observability(
     }
 }
 
-fn map_cache_backend_error(cache_dir: &Path, source: OpenLocalBlockBackendError) -> anyhow::Error {
+fn map_cache_backend_error(
+    cache_dir: &Path,
+    source: OpenLocalPayloadBackendError,
+) -> anyhow::Error {
     anyhow::anyhow!(
         "failed to open local cache backend at '{}': {source}",
         cache_dir.display()
     )
 }
 
-fn scan_local_block_cache(
-    cache_backend_detection: &LocalBlockRuntimeDetection,
+fn scan_local_payload_cache(
+    cache_backend_detection: &LocalPayloadRuntimeDetection,
 ) -> anyhow::Result<CacheUsageStats> {
     // Status is allowed to open the index directly to read aggregate counters.
     let index = CacheIndex::open(&cache_backend_detection.layout.redb_index_path)?;
@@ -155,11 +158,13 @@ fn scan_local_block_cache(
 }
 
 fn scan_cache_usage(
-    cache_backend_detection: Option<&LocalBlockRuntimeDetection>,
+    cache_backend_detection: Option<&LocalPayloadRuntimeDetection>,
 ) -> anyhow::Result<Option<CacheUsageStats>> {
     match cache_backend_detection {
-        Some(detection) if detection.runtime_backend() == Some(LocalBlockBackendKind::Current) => {
-            scan_local_block_cache(detection).map(Some)
+        Some(detection)
+            if detection.runtime_backend() == Some(LocalPayloadBackendKind::Current) =>
+        {
+            scan_local_payload_cache(detection).map(Some)
         }
         _ => Ok(None),
     }
@@ -168,16 +173,16 @@ fn scan_cache_usage(
 fn scan_pending_uploads(
     cache_dir: &Path,
     volume_uuid: &str,
-    cache_backend_detection: Option<&LocalBlockRuntimeDetection>,
+    cache_backend_detection: Option<&LocalPayloadRuntimeDetection>,
 ) -> anyhow::Result<usize> {
     let Some(detection) = cache_backend_detection else {
         return Ok(0);
     };
-    if detection.runtime_backend() != Some(LocalBlockBackendKind::Current) {
+    if detection.runtime_backend() != Some(LocalPayloadBackendKind::Current) {
         return Ok(0);
     }
 
-    let store = open_local_block_backend(cache_dir, volume_uuid)
+    let store = open_local_payload_backend(cache_dir, volume_uuid)
         .map_err(|source| map_cache_backend_error(cache_dir, source))?
         .backend;
     Ok(store.dirty_object_ids().len())
@@ -266,11 +271,11 @@ pub fn run(
     println!("  Root:                {}", cache_path.display());
     let runtime_ready = cache_backend_detection
         .as_ref()
-        .and_then(LocalBlockRuntimeDetection::runtime_backend)
-        == Some(LocalBlockBackendKind::Current);
+        .and_then(LocalPayloadRuntimeDetection::runtime_backend)
+        == Some(LocalPayloadBackendKind::Current);
     let contract_state = describe_cache_layout_state(cache_backend_detection.as_ref());
     let remediation = if let Some(detection) = cache_backend_detection.as_ref() {
-        if detection.runtime_backend() == Some(LocalBlockBackendKind::Current) {
+        if detection.runtime_backend() == Some(LocalPayloadBackendKind::Current) {
             "none"
         } else if detection.has_runtime_layout() {
             "runtime layout is incomplete; mount will reprovision missing runtime directories on first use"
@@ -284,7 +289,10 @@ pub fn run(
         || cache_usage
             .and_then(|stats| stats.map(|stats| stats.dirty_bytes > 0))
             .unwrap_or(false);
-    println!("  Runtime:             {}", LocalBlockBackendKind::Current);
+    println!(
+        "  Runtime:             {}",
+        LocalPayloadBackendKind::Current
+    );
     println!(
         "  Runtime readiness:   {}",
         if runtime_ready { "ready" } else { "blocked" }
@@ -542,16 +550,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scan_pending_uploads_supports_current_local_block_runtime() {
+    fn scan_pending_uploads_supports_current_local_payload_runtime() {
         let tmp = tempfile::tempdir().unwrap();
-        let layout = studiofs_cache::runtime::LocalBlockLayout::from_cache_root(tmp.path());
+        let layout = studiofs_cache::runtime::LocalPayloadLayout::from_cache_root(tmp.path());
         layout.provision().unwrap();
         let volume_uuid = Uuid::new_v4();
 
         let detection = detect_backends(tmp.path()).unwrap();
         assert_eq!(
             detection.runtime_backend(),
-            Some(LocalBlockBackendKind::Current)
+            Some(LocalPayloadBackendKind::Current)
         );
         assert_eq!(
             scan_pending_uploads(tmp.path(), &volume_uuid.to_string(), Some(&detection)).unwrap(),
@@ -565,8 +573,8 @@ mod tests {
         let volume_uuid = Uuid::new_v4();
         {
             let backend =
-                studiofs_cache::open_local_block_backend(tmp.path(), &volume_uuid.to_string())
-                    .expect("open local block backend")
+                studiofs_cache::open_local_payload_backend(tmp.path(), &volume_uuid.to_string())
+                    .expect("open local payload backend")
                     .backend;
             backend.put(10, b"dirty", false).unwrap();
             backend.put(11, b"cached", true).unwrap();
@@ -585,7 +593,7 @@ mod tests {
     #[test]
     fn scan_cache_usage_skips_incomplete_runtime_without_creating_index() {
         let tmp = tempfile::tempdir().unwrap();
-        let layout = studiofs_cache::runtime::LocalBlockLayout::from_cache_root(tmp.path());
+        let layout = studiofs_cache::runtime::LocalPayloadLayout::from_cache_root(tmp.path());
         std::fs::create_dir_all(&layout.index_dir).unwrap();
 
         let detection = detect_backends(tmp.path()).unwrap();

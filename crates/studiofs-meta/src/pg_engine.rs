@@ -7747,7 +7747,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires STUDIOFS_TEST_PG_DSN with local postgres"]
-    fn test_pg_checkpoint_excludes_uncommitted_local_blocks() {
+    fn test_pg_checkpoint_excludes_uncommitted_local_payloads() {
         let Some(dsn) = pg_dsn() else {
             return;
         };
@@ -7890,7 +7890,7 @@ mod tests {
         assert_eq!(local_attr.upload_state, UploadState::Ready);
         assert_eq!(
             lookup_first_object_id(&a, file.ino)
-                .expect("get local block after peer unlink")
+                .expect("get local payload after peer unlink")
                 .expect("writer keeps local pending block after peer unlink"),
             777
         );
@@ -7901,8 +7901,8 @@ mod tests {
         assert!(reopened.lookup(ROOT_INO, b"uploading.bin").is_ok());
         assert_eq!(
             lookup_first_object_id(&reopened, file.ino)
-                .expect("get reopened local block")
-                .expect("reopened local block"),
+                .expect("get reopened local payload")
+                .expect("reopened local payload"),
             777
         );
     }

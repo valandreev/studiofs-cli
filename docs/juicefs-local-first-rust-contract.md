@@ -20,7 +20,7 @@ is not trying to preserve the old "PG in the middle of every important mount
 decision" model. The target mount contract is now:
 
 - every mounted client runs foreground IO against its own local `redb` plus
-  local block cache/backend;
+  local payload cache/backend;
 - PostgreSQL is used for bootstrap of new clients, ordered metadata
   replication, invalidation/sync, checkpoints, client discovery, preallocated
   ID-range reservation, and global file-lock coordination;
@@ -101,7 +101,7 @@ Invariants:
 - If the current inode window is nearing exhaustion, StudioFS reserves and
   persists one prefetched inode window so the foreground create path can switch
   locally when the current window is consumed.
-- Block IDs still use a persistent PG client slot plus disjoint local block
+- Block IDs still use a persistent PG client slot plus disjoint local payload
   ranges; that rule remains part of the contract, not a disposable
   implementation trick.
 
@@ -142,7 +142,7 @@ Locally accepted bytes move through these stages:
    writer state and the merged local view.
 2. explicit `flush`, `fsync`, last-handle `close`/`release`, size-changing
    metadata transitions, and background local materialization persist accepted
-   state into the local authority view and local block backend.
+   state into the local authority view and local payload backend.
 3. background upload and replication make selected states eligible for peer
    visibility.
 
@@ -295,7 +295,7 @@ Global file locks are always enabled. They are not an optional product mode.
 The responsibility split is:
 
 - local `redb`: the only foreground metadata authority for a mounted client;
-- local block backend/cache: the only foreground payload authority for accepted
+- local payload backend/cache: the only foreground payload authority for accepted
   local writes;
 - PostgreSQL: bootstrap source, ordered replication bus, checkpoint source,
   client discovery, preallocated range reservation, and global file-lock
@@ -315,7 +315,7 @@ Rules:
   reserves a new per-volume window from PostgreSQL only when no local inode
   window remains available.
 - Per-client block preallocation also remains mandatory. A discovered client
-  obtains a persistent PG client slot, derives disjoint local block-ID ranges
+  obtains a persistent PG client slot, derives disjoint local payload-ID ranges
   from it, and allocates foreground block IDs without further PG round-trips
   while the current block range still has headroom.
 
@@ -390,7 +390,7 @@ Review guardrails:
 
 - Reject code that drags PostgreSQL into ordinary mounted read/write hot paths.
 - Reject APIs that make per-inode or per-block foreground allocation depend on
-  a PG round-trip once the local inode windows or local block ranges are
+  a PG round-trip once the local inode windows or local payload ranges are
   already reserved.
 - Reject designs that require remote readers to reason about another mount's
   private overlay.

@@ -241,7 +241,7 @@ fn mark_all_overlay_objects_uploaded(
         .get_regular_file_overlay_object_ids(ino)
         .expect("load overlay object ids");
     for object_id in &object_ids {
-        vfs.local_block_backend().mark_uploaded(*object_id);
+        vfs.local_payload_backend().mark_uploaded(*object_id);
         assert!(
             meta.mark_regular_file_overlay_object_uploaded_if_matches(
                 ino,
@@ -283,13 +283,13 @@ fn install_fragmented_overlay_block(
         .next_block_ids(2)
         .expect("allocate fragmented object ids");
 
-    vfs.local_block_backend()
+    vfs.local_payload_backend()
         .put(object_ids[0], &left, false)
         .expect("persist left fragmented object");
-    vfs.local_block_backend()
+    vfs.local_payload_backend()
         .put(object_ids[1], &right, false)
         .expect("persist right fragmented object");
-    vfs.local_block_backend()
+    vfs.local_payload_backend()
         .sync_data()
         .expect("sync fragmented overlay objects");
 
@@ -491,12 +491,12 @@ fn pending_upload_views_follow_runtime_queue_after_startup_replay() {
     let object_id = 7_001;
     let payload = vec![0xAB; 4096];
 
-    vfs.local_block_backend()
+    vfs.local_payload_backend()
         .put(object_id, &payload, false)
-        .expect("persist local block");
-    vfs.local_block_backend()
+        .expect("persist local payload");
+    vfs.local_payload_backend()
         .sync_data()
-        .expect("sync local block");
+        .expect("sync local payload");
 
     let mut attr = meta.get_attr(ino).expect("load test attr");
     attr.size = payload.len() as u64;
@@ -547,12 +547,12 @@ fn startup_replay_rebuilds_runtime_pending_upload_index_from_persisted_state() {
     let object_id = 7_011;
     let payload = vec![0xDA; 4096];
 
-    vfs.local_block_backend()
+    vfs.local_payload_backend()
         .put(object_id, &payload, false)
-        .expect("persist local block");
-    vfs.local_block_backend()
+        .expect("persist local payload");
+    vfs.local_payload_backend()
         .sync_data()
-        .expect("sync local block");
+        .expect("sync local payload");
 
     let mut attr = meta.get_attr(ino).expect("load test attr");
     attr.size = payload.len() as u64;
@@ -580,7 +580,7 @@ fn startup_replay_rebuilds_runtime_pending_upload_index_from_persisted_state() {
     assert_eq!(runtime_pending[0].object_id, object_id);
     assert!(
         vfs.cached_store().is_pinned(object_id),
-        "requeued runtime upload should repin the durable local block"
+        "requeued runtime upload should repin the durable local payload"
     );
     assert!(
         vfs.cached_store().has_staged_upload(object_id),
@@ -741,7 +741,7 @@ fn wait_for_uploads_idle_observes_runtime_upload_queue() {
 }
 
 #[test]
-fn pending_upload_truth_ignores_deleted_inode_local_blocks() {
+fn pending_upload_truth_ignores_deleted_inode_local_payloads() {
     let tmp = TempDir::new().expect("tempdir");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-views-deleted-inode");
 
@@ -752,12 +752,12 @@ fn pending_upload_truth_ignores_deleted_inode_local_blocks() {
     let object_id = 7_002;
     let payload = vec![0xCD; 4096];
 
-    vfs.local_block_backend()
+    vfs.local_payload_backend()
         .put(object_id, &payload, false)
-        .expect("persist local block");
-    vfs.local_block_backend()
+        .expect("persist local payload");
+    vfs.local_payload_backend()
         .sync_data()
-        .expect("sync local block");
+        .expect("sync local payload");
 
     let mut attr = meta.get_attr(ino).expect("load test attr");
     attr.size = payload.len() as u64;
@@ -776,7 +776,7 @@ fn pending_upload_truth_ignores_deleted_inode_local_blocks() {
 
     assert!(
         vfs.pending_uploads_for_inode(ino).is_empty(),
-        "deleted inodes must keep local blocks readable without advertising them as pending uploads"
+        "deleted inodes must keep local payloads readable without advertising them as pending uploads"
     );
 
     let pending_upload_index = vfs.snapshot_pending_upload_index();
@@ -793,16 +793,16 @@ fn startup_replay_removes_orphan_dirty_blocks_and_clears_pending_evictions() {
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "startup-replay-orphan-cleanup");
     let object_id = 991_337;
 
-    vfs.local_block_backend()
+    vfs.local_payload_backend()
         .put(object_id, b"orphan-dirty-block", false)
         .expect("persist orphan dirty block");
-    vfs.local_block_backend()
+    vfs.local_payload_backend()
         .sync_data()
         .expect("sync orphan dirty block");
     vfs.state.upload.pending_evictions.lock().insert(object_id);
 
     assert!(
-        vfs.local_block_backend()
+        vfs.local_payload_backend()
             .dirty_object_ids()
             .contains(&object_id),
         "test setup should expose orphan as dirty before replay"
@@ -819,11 +819,11 @@ fn startup_replay_removes_orphan_dirty_blocks_and_clears_pending_evictions() {
     vfs.replay_dirty_uploads_from_local_backend(&[], &[]);
 
     assert!(
-        !vfs.local_block_backend().contains(object_id),
+        !vfs.local_payload_backend().contains(object_id),
         "startup replay should remove orphan dirty block without metadata reference"
     );
     assert!(
-        !vfs.local_block_backend()
+        !vfs.local_payload_backend()
             .dirty_object_ids()
             .contains(&object_id),
         "startup replay should clear orphan dirty block from dirty index"
@@ -953,13 +953,13 @@ fn zeroio_snapshot_reports_delete_before_publish_cleanup_visibility() {
     staged_attr.size = 8192;
     staged_attr.content_epoch = 1;
     meta.set_attr(&staged_attr).expect("persist staged attr");
-    vfs.local_block_backend()
+    vfs.local_payload_backend()
         .put(950, b"local-only", false)
         .expect("persist local-only object");
-    vfs.local_block_backend()
+    vfs.local_payload_backend()
         .put(951, b"uploaded", true)
         .expect("persist uploaded object");
-    vfs.local_block_backend().mark_uploaded(951);
+    vfs.local_payload_backend().mark_uploaded(951);
     meta.stage_logical_payload_slice(attr.ino, 0, &BlockRef::new_partial(950, 4096))
         .expect("persist local-only block");
     let uploaded = BlockRef::new_partial(951, 4096);
@@ -1492,7 +1492,7 @@ fn cache_backend_detection_errors_are_structured() {
     );
     let mapped = map_cache_backend_detection_error("E:\\cache-root", error);
     match mapped {
-        VfsError::LocalBlockRuntimeDetection { cache_root, source } => {
+        VfsError::LocalPayloadRuntimeDetection { cache_root, source } => {
             assert_eq!(cache_root, "E:\\cache-root");
             assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
         }
@@ -2926,14 +2926,14 @@ fn opportunistic_handle_writer_slice_spill_batches_adjacent_callbacks_into_singl
             "three sequential 2 MiB callbacks should spill the first 4 MiB as one staged slice object"
         );
 
-        let dirty_object_ids = vfs.local_block_backend().dirty_object_ids();
+        let dirty_object_ids = vfs.local_payload_backend().dirty_object_ids();
         assert_eq!(
             dirty_object_ids.len(),
             1,
             "adjacent slice spill should batch the first two callbacks into one staged object"
         );
         let staged = vfs
-            .local_block_backend()
+            .local_payload_backend()
             .get(dirty_object_ids[0])
             .expect("staged slice payload should be readable locally");
         assert_eq!(
@@ -2984,7 +2984,7 @@ fn opportunistic_handle_writer_slice_spill_drains_multiple_4mib_batches_per_pass
             "a single opportunistic drain pass should spill multiple 4 MiB batches when enough old callbacks are queued"
         );
 
-        let dirty_object_ids = vfs.local_block_backend().dirty_object_ids();
+        let dirty_object_ids = vfs.local_payload_backend().dirty_object_ids();
         assert_eq!(
             dirty_object_ids.len(),
             4,
@@ -2992,7 +2992,7 @@ fn opportunistic_handle_writer_slice_spill_drains_multiple_4mib_batches_per_pass
         );
         for object_id in dirty_object_ids {
             let staged = vfs
-                .local_block_backend()
+                .local_payload_backend()
                 .get(object_id)
                 .expect("staged slice payload should be readable locally");
             assert_eq!(staged.len(), 4 * 1024 * 1024);
@@ -3040,7 +3040,7 @@ fn opportunistic_handle_writer_slice_spill_splits_large_current_callback_into_ba
             "a single large callback should spill all but the active hot tail into staged 4 MiB slice batches"
         );
 
-        let dirty_object_ids = vfs.local_block_backend().dirty_object_ids();
+        let dirty_object_ids = vfs.local_payload_backend().dirty_object_ids();
         assert_eq!(
             dirty_object_ids.len(),
             2,
@@ -3048,7 +3048,7 @@ fn opportunistic_handle_writer_slice_spill_splits_large_current_callback_into_ba
         );
         for object_id in dirty_object_ids {
             let staged = vfs
-                .local_block_backend()
+                .local_payload_backend()
                 .get(object_id)
                 .expect("staged slice payload should be readable locally");
             assert_eq!(staged.len(), 4 * 1024 * 1024);
@@ -5359,7 +5359,7 @@ fn block_store_get_prefers_hot_upload_buffer_before_disk() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "local-cache-get-hot-upload");
     rt.block_on(async {
-        vfs.cache_upload_hot_batch(vec![studiofs_cache::local::LocalBlockPut {
+        vfs.cache_upload_hot_batch(vec![studiofs_cache::local::LocalPayloadPut {
             object_id: 0xABCD,
             data: Bytes::from_static(b"hot-payload"),
             evictable: false,
@@ -5379,7 +5379,7 @@ fn block_store_read_into_prefers_hot_upload_buffer_before_disk() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "local-cache-read-into-hot-upload");
     rt.block_on(async {
-        vfs.cache_upload_hot_batch(vec![studiofs_cache::local::LocalBlockPut {
+        vfs.cache_upload_hot_batch(vec![studiofs_cache::local::LocalPayloadPut {
             object_id: 0xBCDE,
             data: Bytes::from_static(b"hot-payload"),
             evictable: false,

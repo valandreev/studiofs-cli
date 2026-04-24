@@ -297,7 +297,7 @@ impl<'a> DataReader<'a> {
                 if matches!(
                     &source,
                     PendingOverlayBlockSource::Extent(object_id)
-                        if !vfs.local_block_backend.contains(*object_id)
+                        if !vfs.local_payload_backend.contains(*object_id)
                 ) {
                     continue;
                 }
@@ -497,7 +497,7 @@ impl<'a> DataReader<'a> {
             }
         }
         for object_id in local_pending {
-            vfs.local_block_backend.advise_will_need(object_id);
+            vfs.local_payload_backend.advise_will_need(object_id);
         }
         if remote_blocks.is_empty() {
             return Ok(());
@@ -620,7 +620,7 @@ impl<'a> DataReader<'a> {
                                 warn!(
                                     object_id = block.object_id,
                                     error = %evict_error,
-                                    "data_reader: failed to evict short-read local block before refetch"
+                                    "data_reader: failed to evict short-read local payload before refetch"
                                 );
                             }
                         }
@@ -1028,7 +1028,7 @@ impl StudioVfs {
                         block_index,
                         requested = dst.len(),
                         read,
-                        "metadata slice-graph base read saw short local block read; evicting before refetch"
+                        "metadata slice-graph base read saw short local payload read; evicting before refetch"
                     );
                     if let Err(evict_error) =
                         self.block_store_remove_async(planned_block.object_id).await
@@ -1036,7 +1036,7 @@ impl StudioVfs {
                         warn!(
                             object_id = planned_block.object_id,
                             error = %evict_error,
-                            "metadata slice-graph base read failed to evict short-read local block"
+                            "metadata slice-graph base read failed to evict short-read local payload"
                         );
                     }
                 }
@@ -1297,8 +1297,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::time::Instant;
     use studiofs_cache::local::{
-        LocalBlockBackend, LocalBlockBackendError, LocalBlockLifecycleState, LocalBlockObjectStats,
-        LocalBlockStorageStats,
+        LocalPayloadBackend, LocalPayloadBackendError, LocalPayloadLifecycleState,
+        LocalPayloadObjectStats, LocalPayloadStorageStats,
     };
     use studiofs_meta::schema::{
         BlockRefState, CURRENT_FORMAT_VERSION, ChunkId, DEFAULT_BLOCK_SIZE, FormatInfo,
@@ -1380,14 +1380,14 @@ mod tests {
         }
     }
 
-    struct CountingLocalBlockBackend {
-        inner: Arc<dyn LocalBlockBackend>,
+    struct CountingLocalPayloadBackend {
+        inner: Arc<dyn LocalPayloadBackend>,
         get_calls: AtomicU64,
         read_into_calls: AtomicU64,
     }
 
-    impl CountingLocalBlockBackend {
-        fn new(inner: Arc<dyn LocalBlockBackend>) -> Self {
+    impl CountingLocalPayloadBackend {
+        fn new(inner: Arc<dyn LocalPayloadBackend>) -> Self {
             Self {
                 inner,
                 get_calls: AtomicU64::new(0),
@@ -1409,7 +1409,7 @@ mod tests {
         }
     }
 
-    impl LocalBlockBackend for CountingLocalBlockBackend {
+    impl LocalPayloadBackend for CountingLocalPayloadBackend {
         fn as_any(&self) -> &dyn Any {
             self
         }
@@ -1441,15 +1441,15 @@ mod tests {
             object_id: u64,
             data: &[u8],
             evictable: bool,
-        ) -> Result<(), LocalBlockBackendError> {
+        ) -> Result<(), LocalPayloadBackendError> {
             self.inner.put(object_id, data, evictable)
         }
 
-        fn sync_data(&self) -> Result<(), LocalBlockBackendError> {
+        fn sync_data(&self) -> Result<(), LocalPayloadBackendError> {
             self.inner.sync_data()
         }
 
-        fn run_pressure_maintenance(&self) -> Result<(), LocalBlockBackendError> {
+        fn run_pressure_maintenance(&self) -> Result<(), LocalPayloadBackendError> {
             self.inner.run_pressure_maintenance()
         }
 
@@ -1493,7 +1493,7 @@ mod tests {
             self.inner.dirty_object_ids()
         }
 
-        fn lifecycle_state(&self, object_id: u64) -> LocalBlockLifecycleState {
+        fn lifecycle_state(&self, object_id: u64) -> LocalPayloadLifecycleState {
             self.inner.lifecycle_state(object_id)
         }
 
@@ -1501,11 +1501,11 @@ mod tests {
             self.inner.is_evictable(object_id)
         }
 
-        fn storage_stats(&self) -> LocalBlockStorageStats {
+        fn storage_stats(&self) -> LocalPayloadStorageStats {
             self.inner.storage_stats()
         }
 
-        fn object_stats(&self, object_id: u64) -> Option<LocalBlockObjectStats> {
+        fn object_stats(&self, object_id: u64) -> Option<LocalPayloadObjectStats> {
             self.inner.object_stats(object_id)
         }
 
@@ -1580,7 +1580,7 @@ mod tests {
             .get_regular_file_overlay_object_ids(ino)
             .expect("load overlay object ids");
         for object_id in &object_ids {
-            vfs.local_block_backend().mark_uploaded(*object_id);
+            vfs.local_payload_backend().mark_uploaded(*object_id);
             assert!(
                 meta.mark_regular_file_overlay_object_uploaded_if_matches(
                     ino,
@@ -1898,11 +1898,11 @@ mod tests {
     fn committed_local_cache_hit_uses_direct_backend_read_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, "assemble-read-plan-written");
-        let inner = vfs.local_block_backend.clone();
-        let counting_backend = Arc::new(CountingLocalBlockBackend::new(inner));
+        let inner = vfs.local_payload_backend.clone();
+        let counting_backend = Arc::new(CountingLocalPayloadBackend::new(inner));
         Arc::get_mut(&mut vfs)
             .expect("unstarted test VFS should be uniquely owned")
-            .local_block_backend = counting_backend.clone();
+            .local_payload_backend = counting_backend.clone();
         rt.block_on(async {
             let object_id = 0xCC77;
             vfs.block_store_put_async(object_id, Bytes::from_static(b"0123456789"), false)
@@ -2124,11 +2124,11 @@ mod tests {
     fn materialized_pending_local_read_uses_direct_backend_read_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (rt, mut vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-local-read-fast-path");
-        let inner = vfs.local_block_backend.clone();
-        let counting_backend = Arc::new(CountingLocalBlockBackend::new(inner));
+        let inner = vfs.local_payload_backend.clone();
+        let counting_backend = Arc::new(CountingLocalPayloadBackend::new(inner));
         Arc::get_mut(&mut vfs)
             .expect("unstarted test VFS should be uniquely owned")
-            .local_block_backend = counting_backend.clone();
+            .local_payload_backend = counting_backend.clone();
 
         rt.block_on(async {
             let created = vfs

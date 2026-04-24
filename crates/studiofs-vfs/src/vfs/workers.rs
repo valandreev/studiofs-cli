@@ -372,7 +372,7 @@ impl StudioVfs {
             let pending_upload_bytes = pending_uploads
                 .iter()
                 .map(|op| {
-                    self.local_block_backend
+                    self.local_payload_backend
                         .object_stats(op.object_id)
                         .map(|stats| stats.payload_len)
                         .unwrap_or(u64::from(self.block_size))
@@ -419,7 +419,7 @@ impl StudioVfs {
             let dentry_cache = self.dentry_cache_metrics();
             let path_shortcut_cache = self.path_shortcut_cache_metrics();
             let attr_read_cache = self.attr_read_cache_metrics();
-            let local_backend_dirty_count = self.local_block_backend.dirty_object_count();
+            let local_backend_dirty_count = self.local_payload_backend.dirty_object_count();
             let transit_memory = self.transit_memory_budget.snapshot();
             let file_sessions = self.file_session_stats();
 

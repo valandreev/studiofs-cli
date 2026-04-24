@@ -434,12 +434,12 @@ impl StudioVfs {
         let cleanup = self.collect_orphan_deleted_inode_cleanup(ino).await?;
         let removed_blocks = cleanup.removed_ids.len();
         let freed_bytes = cleanup.freed_bytes;
-        let deferred_local_blocks = self
+        let deferred_local_payloads = self
             .finalize_deleted_inode_runtime_cleanup(ino, cleanup.removed_ids)
             .await;
         debug!(
-            "orphan cleanup complete: ino={} removed_blocks={} deferred_local_blocks={} freed_bytes={}",
-            ino, removed_blocks, deferred_local_blocks, freed_bytes
+            "orphan cleanup complete: ino={} removed_blocks={} deferred_local_payloads={} freed_bytes={}",
+            ino, removed_blocks, deferred_local_payloads, freed_bytes
         );
         Ok(ReleaseFhOutcome {
             closed_last_handle: true,
@@ -567,16 +567,16 @@ impl StudioVfs {
             .await?;
         let flushed_file_data =
             materialized_handle_writers || self.has_pending_local_dirty_blocks_for_inode(ino);
-        let residual_pending_local_blocks = self.has_pending_local_dirty_blocks_for_inode(ino);
+        let residual_pending_local_payloads = self.has_pending_local_dirty_blocks_for_inode(ino);
         let dirty_attr_present = self.state.namespace.dirty_attrs.lock().contains_key(&ino);
-        let persist_dirty_attr_inline = !residual_pending_local_blocks
+        let persist_dirty_attr_inline = !residual_pending_local_payloads
             && dirty_attr_present
             && matches!(
                 dirty_attr_persist_policy,
                 DirtyAttrPersistPolicy::PersistIfPresent
             );
         let residual_local_dirty_state =
-            residual_pending_local_blocks || (dirty_attr_present && !persist_dirty_attr_inline);
+            residual_pending_local_payloads || (dirty_attr_present && !persist_dirty_attr_inline);
         let had_local_dirty_state =
             materialized_handle_writers || residual_local_dirty_state || persist_dirty_attr_inline;
         if residual_local_dirty_state {
@@ -860,7 +860,7 @@ impl StudioVfs {
             // opportunistic writes. This lets concurrent writes to the same inode proceed
             // through buffering while this write's materialization is in-flight.
             //
-            // Duplicate materialization is safe: the local block store uses last-writer-wins
+            // Duplicate materialization is safe: the local payload store uses last-writer-wins
             // for overlapping block ranges, and orphaned objects are reclaimed by the
             // background janitor. Strict writes keep the gate to serialize flush/fsync
             // callers with any concurrent materialization on the same inode.

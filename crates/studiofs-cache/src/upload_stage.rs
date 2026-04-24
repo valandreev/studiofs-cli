@@ -1,4 +1,4 @@
-use crate::runtime::LocalBlockLayout;
+use crate::runtime::LocalPayloadLayout;
 use std::fs;
 use std::io;
 use tracing::warn;
@@ -11,11 +11,11 @@ pub enum UploadStageStoreError {
 
 #[derive(Debug, Clone)]
 pub struct UploadStageStore {
-    layout: LocalBlockLayout,
+    layout: LocalPayloadLayout,
 }
 
 impl UploadStageStore {
-    pub fn open(layout: LocalBlockLayout) -> Result<Self, UploadStageStoreError> {
+    pub fn open(layout: LocalPayloadLayout) -> Result<Self, UploadStageStoreError> {
         fs::create_dir_all(&layout.upload_stage_objects_dir)?;
         Ok(Self { layout })
     }
@@ -110,7 +110,7 @@ mod tests {
     #[test]
     fn upload_stage_roundtrip() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let layout = LocalBlockLayout::from_cache_root(tmp.path());
+        let layout = LocalPayloadLayout::from_cache_root(tmp.path());
         layout.provision().expect("provision");
         let payload_store = FilePayloadStore::open(layout.clone()).expect("payload store");
         let store = UploadStageStore::open(layout.clone()).expect("open");
@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn upload_stage_link_payload_is_idempotent() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let layout = LocalBlockLayout::from_cache_root(tmp.path());
+        let layout = LocalPayloadLayout::from_cache_root(tmp.path());
         layout.provision().expect("provision");
         let payload_store = FilePayloadStore::open(layout.clone()).expect("payload store");
         let store = UploadStageStore::open(layout).expect("open");

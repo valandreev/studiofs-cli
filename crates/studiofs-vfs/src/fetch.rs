@@ -1158,7 +1158,7 @@ mod tests {
                 "confirmed local misses should not issue an eager whole-block cache get before waiting"
             );
 
-            vfs.local_block_backend()
+            vfs.local_payload_backend()
                 .put(object_id, b"payload-from-cache", false)
                 .expect("seed cache for waiter");
             let _ = tx.send(true);
@@ -1190,7 +1190,7 @@ mod tests {
                 .local_cache_io_calls
                 .load(Ordering::Relaxed);
 
-            vfs.local_block_backend()
+            vfs.local_payload_backend()
                 .put(object_id, b"payload-from-cache", false)
                 .expect("seed cache for fetcher recheck");
 

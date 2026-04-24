@@ -17,9 +17,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 #[cfg(test)]
-use studiofs_cache::runtime::LocalBlockLayout;
+use studiofs_cache::runtime::LocalPayloadLayout;
 use studiofs_cache::{
-    DEFAULT_MEMORY_CACHE_SIZE, PreparedLocalBlockRuntime, prepare_local_block_runtime,
+    DEFAULT_MEMORY_CACHE_SIZE, PreparedLocalPayloadRuntime, prepare_local_payload_runtime,
 };
 use studiofs_data::DataStoreConfig;
 use studiofs_meta::{
@@ -79,7 +79,7 @@ struct MountPlan {
 struct PreparedVolumeCacheRuntime {
     cache_path: PathBuf,
     cache_path_str: String,
-    cache_runtime: PreparedLocalBlockRuntime,
+    cache_runtime: PreparedLocalPayloadRuntime,
 }
 
 struct PreparedMount {
@@ -858,9 +858,9 @@ fn prepare_volume_cache_runtime(
     volume_uuid: &str,
 ) -> anyhow::Result<PreparedVolumeCacheRuntime> {
     let cache_path = cache_dir.join(volume_uuid);
-    let cache_runtime = prepare_local_block_runtime(&cache_path).map_err(|source| {
+    let cache_runtime = prepare_local_payload_runtime(&cache_path).map_err(|source| {
         anyhow::anyhow!(
-            "failed to prepare local block runtime at '{}': {source}",
+            "failed to prepare local payload runtime at '{}': {source}",
             cache_path.display()
         )
     })?;
@@ -1782,7 +1782,7 @@ mod tests {
         );
         assert_eq!(
             prepared.cache_runtime.layout,
-            LocalBlockLayout::from_cache_root(&prepared.cache_path)
+            LocalPayloadLayout::from_cache_root(&prepared.cache_path)
         );
         assert!(prepared.cache_runtime.detection.has_runtime_layout());
     }

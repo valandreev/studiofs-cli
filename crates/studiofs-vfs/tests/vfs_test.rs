@@ -20,8 +20,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use studiofs_cache::runtime::LocalBlockLayout;
-use studiofs_cache::{PersistentLocalBlockBackend, open_local_block_backend};
+use studiofs_cache::runtime::LocalPayloadLayout;
+use studiofs_cache::{PersistentLocalPayloadBackend, open_local_payload_backend};
 use studiofs_data::object::{
     CLOUD_FRAGMENT_COUNT, CLOUD_FRAGMENT_SIZE, create_object_buffer, format_object_fragment_key,
     format_object_fragment_keys, format_object_key, read_object,
@@ -346,7 +346,7 @@ fn make_format_info(volume_suffix: &str) -> FormatInfo {
 }
 
 fn provision_cache_runtime_layout(cache_root: &std::path::Path) {
-    let layout = LocalBlockLayout::from_cache_root(cache_root);
+    let layout = LocalPayloadLayout::from_cache_root(cache_root);
     layout.provision().unwrap();
 }
 
@@ -2362,7 +2362,7 @@ fn test_crash_recovery_replays_pending_journal() {
         rt.shutdown_background();
     }
 
-    let pending_count = open_local_block_backend(&cache_dir, &offline_info.uuid)
+    let pending_count = open_local_payload_backend(&cache_dir, &offline_info.uuid)
         .unwrap()
         .backend
         .dirty_object_ids()
@@ -2420,7 +2420,7 @@ fn test_crash_recovery_replays_pending_journal() {
 
     // Allow async cleanup to clear DIRTY flags after upload completion.
     thread::sleep(Duration::from_millis(500));
-    let pending_after = open_local_block_backend(&cache_dir, &offline_info.uuid)
+    let pending_after = open_local_payload_backend(&cache_dir, &offline_info.uuid)
         .unwrap()
         .backend
         .dirty_object_ids()
@@ -5886,7 +5886,7 @@ fn large_file_rename_does_not_restart_or_duplicate_uploads() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn rename_into_trashes_evicts_local_block_payloads() {
+async fn rename_into_trashes_evicts_local_payload_objects() {
     apply_test_online_s3_env();
     ensure_bucket().await;
 
@@ -5918,7 +5918,7 @@ async fn rename_into_trashes_evicts_local_block_payloads() {
                 .all(|object_id| vfs.read_cached_block(*object_id).is_some())
         })
         .await,
-        "seeded file should be present in the local block backend before trash rename"
+        "seeded file should be present in the local payload backend before trash rename"
     );
 
     vfs.rename(1, b"trash-me.bin", trash_user.ino, b"trash-me.bin")
@@ -5931,7 +5931,7 @@ async fn rename_into_trashes_evicts_local_block_payloads() {
                 .all(|object_id| vfs.read_cached_block(*object_id).is_none())
         })
         .await,
-        "moving into .Trashes should evict committed local block payloads promptly"
+        "moving into .Trashes should evict committed local payload payloads promptly"
     );
     assert!(vfs.lookup(trash_user.ino, b"trash-me.bin").is_ok());
     assert!(vfs.lookup(1, b"trash-me.bin").is_err());
@@ -6699,7 +6699,7 @@ fn startup_recovery_replays_fragmented_regular_file_graph_without_quarantine() {
             "startup replay should keep live extents for fragmented slice graphs"
         );
         assert!(
-            vfs.local_block_backend()
+            vfs.local_payload_backend()
                 .dirty_object_ids()
                 .contains(&dirty_object_id),
             "startup replay must preserve the dirty local object while upload is pending"
@@ -6789,7 +6789,7 @@ fn offline_s3_does_not_break_local_read_after_write() {
 }
 
 #[test]
-fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
+fn local_payload_restart_with_offline_s3_replays_dirty_uploads_from_index() {
     let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = ScopedEnvVar::capture("STUDIOFS_MAX_SPILL_BYTES");
     let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
@@ -6845,9 +6845,9 @@ fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
             vfs.start()
                 .expect("failed to start StudioVfs background workers");
             assert!(
-                vfs.local_block_backend()
+                vfs.local_payload_backend()
                     .as_any()
-                    .is::<PersistentLocalBlockBackend>(),
+                    .is::<PersistentLocalPayloadBackend>(),
                 "local-block-runtime marker should select local-block-runtime backend"
             );
 
@@ -6863,7 +6863,7 @@ fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
                 .await,
                 "offline local-block-runtime run should queue dirty uploads before restart"
             );
-            dirty_before = vfs.local_block_backend().dirty_object_ids();
+            dirty_before = vfs.local_payload_backend().dirty_object_ids();
             assert!(
                 !dirty_before.is_empty(),
                 "offline local-block-runtime run should retain dirty replay candidates in local backend"
@@ -6895,9 +6895,9 @@ fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
             vfs.start()
                 .expect("failed to start StudioVfs background workers");
             assert!(
-                vfs.local_block_backend()
+                vfs.local_payload_backend()
                     .as_any()
-                    .is::<PersistentLocalBlockBackend>(),
+                    .is::<PersistentLocalPayloadBackend>(),
                 "restart must keep using local-block-runtime backend contract"
             );
 
@@ -6910,7 +6910,7 @@ fn cache_v3_restart_with_offline_s3_replays_dirty_uploads_from_index() {
                 .await,
                 "local-block-runtime restart should replay pending uploads from persisted dirty index state"
             );
-            let dirty_after = vfs.local_block_backend().dirty_object_ids();
+            let dirty_after = vfs.local_payload_backend().dirty_object_ids();
             assert!(
                 !dirty_after.is_empty(),
                 "local-block-runtime restart should expose dirty replay candidates from index"
@@ -7793,7 +7793,7 @@ fn test_ingress_prefers_spill_before_backpressure() {
 }
 
 #[test]
-fn test_single_mode_ingress_write_path_materializes_local_blocks() {
+fn test_single_mode_ingress_write_path_materializes_local_payloads() {
     type EnvRestore = ScopedEnvVar;
     let _restore_dirty = EnvRestore::capture("STUDIOFS_MAX_DIRTY_BYTES");
     let _restore_spill = EnvRestore::capture("STUDIOFS_MAX_SPILL_BYTES");
@@ -9617,7 +9617,7 @@ fn flush_with_offline_s3_keeps_data_locally_committed_and_queued() {
         assert_eq!(
             read.as_ref(),
             payload.as_slice(),
-            "offline S3 must still leave flushed data readable from the local block backend"
+            "offline S3 must still leave flushed data readable from the local payload backend"
         );
         assert!(
             !vfs.live_extent_records_for_inode(attr.ino).is_empty(),
@@ -9988,7 +9988,7 @@ fn append_after_create_stays_buffered_until_flush() {
         assert_eq!(
             blocks.len(),
             0,
-            "ordinary append-before-flush should not durably materialize a partial local block before the barrier"
+            "ordinary append-before-flush should not durably materialize a partial local payload before the barrier"
         );
 
         vfs.flush(attr.ino).await.unwrap();
@@ -9999,7 +9999,7 @@ fn append_after_create_stays_buffered_until_flush() {
         assert_eq!(
             blocks.len(),
             1,
-            "flush should materialize the buffered append into one local block"
+            "flush should materialize the buffered append into one local payload"
         );
         assert_eq!(blocks[0].1.length as usize, expected.len());
     });
@@ -11940,7 +11940,7 @@ fn upload_backlog_progresses_via_persisted_local_payload_reads() {
 
 /// Validate warm-cache vs cold-cache buffered read behavior.
 ///
-/// After a write + flush, data is committed into the local block backend while
+/// After a write + flush, data is committed into the local payload backend while
 /// remote upload remains pending. A first sequential read exercises the colder
 /// local path; subsequent reads must stay within a consistent bounded latency.
 ///
@@ -13325,7 +13325,7 @@ async fn acl_wildcard_applies_as_fallback_for_specific_principal() {
 /// when the last block is a partial (non–block-size-aligned) tail.
 ///
 /// Covers the transient window in which a block is present in `live_extent_records`
-/// while upload completion and local block-backend cleanup are interleaving.
+/// while upload completion and local payload-backend cleanup are interleaving.
 #[test]
 #[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn local_reads_through_upload_with_partial_tail_block() {

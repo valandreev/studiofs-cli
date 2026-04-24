@@ -65,20 +65,20 @@ impl StudioVfs {
         }
     }
 
-    pub(super) fn record_deferred_deleted_local_block(&self, ino: Ino, object_id: u64) {
+    pub(super) fn record_deferred_deleted_local_payload(&self, ino: Ino, object_id: u64) {
         self.state
             .upload
-            .deferred_deleted_local_blocks
+            .deferred_deleted_local_payloads
             .lock()
             .entry(ino)
             .or_default()
             .insert(object_id);
     }
 
-    pub(super) fn take_deferred_deleted_local_blocks(&self, ino: Ino) -> Vec<u64> {
+    pub(super) fn take_deferred_deleted_local_payloads(&self, ino: Ino) -> Vec<u64> {
         self.state
             .upload
-            .deferred_deleted_local_blocks
+            .deferred_deleted_local_payloads
             .lock()
             .remove(&ino)
             .map(|ids| ids.into_iter().collect())
@@ -242,7 +242,7 @@ impl StudioVfs {
     /// stay consistent across remounts.
     pub async fn persist_cache(&self) -> bool {
         self.cached_store.shutdown().await;
-        if let Err(error) = self.local_block_backend.sync_data() {
+        if let Err(error) = self.local_payload_backend.sync_data() {
             warn!(error = %error, "local cache backend sync failed during shutdown");
             tracing::info!(
                 "cached-store upload journal persisted, but local cache backend sync failed"

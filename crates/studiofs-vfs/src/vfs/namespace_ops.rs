@@ -434,7 +434,7 @@ impl StudioVfs {
             let new_last_len = last_block_offset as usize + 1;
             self.remove_live_extent(ino, new_last_block);
             let trimmed_local =
-                match self.trim_local_block_staging(ino, new_last_block, new_last_len) {
+                match self.trim_local_payload_staging(ino, new_last_block, new_last_len) {
                     Ok(trimmed_local) => trimmed_local,
                     Err(error) => {
                         self.rollback_truncate_mutation(

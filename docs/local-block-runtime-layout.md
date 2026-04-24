@@ -87,7 +87,7 @@ Default startup mode (`lightweight`):
    missing.
 
 Optional full sweep mode (`full`), enabled via
-`STUDIOFS_LOCAL_BLOCK_STARTUP_RECONCILE_MODE=full`:
+`STUDIOFS_LOCAL_PAYLOAD_STARTUP_RECONCILE_MODE=full`:
 
 1. Scan all index object ids and prune stale rows whose payload files are
    missing.

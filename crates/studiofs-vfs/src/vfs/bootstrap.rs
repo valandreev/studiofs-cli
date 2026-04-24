@@ -1,5 +1,5 @@
 use super::*;
-use studiofs_cache::LocalBlockPayloadSyncMode;
+use studiofs_cache::LocalPayloadSyncMode;
 
 const UPLOAD_HOT_BUFFER_CAP_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
@@ -11,7 +11,7 @@ pub(super) struct VfsBootstrapPlan {
     cache_runtime_tuning: CacheRuntimeTuning,
     pub(super) minimum_local_backend_budget_bytes: u64,
     pub(super) local_backend_budget_bytes: u64,
-    payload_sync_mode: LocalBlockPayloadSyncMode,
+    payload_sync_mode: LocalPayloadSyncMode,
     pub(super) access_tracker: AccessTrackerConfig,
     readahead_base_width: u32,
     pub(super) readahead_max_width: u32,
@@ -124,7 +124,7 @@ impl VfsBootstrapPlan {
             cache_runtime_tuning,
             minimum_local_backend_budget_bytes,
             local_backend_budget_bytes,
-            payload_sync_mode: LocalBlockPayloadSyncMode::Fast,
+            payload_sync_mode: LocalPayloadSyncMode::Fast,
             access_tracker,
             readahead_base_width,
             readahead_max_width,
@@ -241,7 +241,7 @@ fn remove_retired_ingress_spill(cache_root: &Path) -> VfsResult<()> {
 
 struct VfsBootstrapResources {
     zeroio_runtime_state_dir: PathBuf,
-    local_block_backend: Arc<dyn LocalBlockBackend>,
+    local_payload_backend: Arc<dyn LocalPayloadBackend>,
     cached_store: Arc<CachedStore>,
     readahead: Arc<ReadAheadTracker>,
     dir_prefetch: Arc<DirAccessTracker>,
@@ -260,7 +260,7 @@ impl VfsBootstrapResources {
         cache_dir: &str,
         plan: &VfsBootstrapPlan,
         config: &VfsConfigValidated,
-        cache_runtime: Option<PreparedLocalBlockRuntime>,
+        cache_runtime: Option<PreparedLocalPayloadRuntime>,
     ) -> VfsResult<Self> {
         remove_retired_ingress_spill(Path::new(cache_dir))?;
 
@@ -269,20 +269,20 @@ impl VfsBootstrapResources {
         std::fs::create_dir_all(&zeroio_runtime_state_dir).map_err(VfsError::Io)?;
 
         let opened_local_backend = match cache_runtime {
-            Some(cache_runtime) => open_prepared_local_block_backend_with_budget_and_sync_mode(
+            Some(cache_runtime) => open_prepared_local_payload_backend_with_budget_and_sync_mode(
                 cache_runtime,
                 &plan.format_info.uuid,
                 plan.local_backend_budget_bytes,
                 plan.payload_sync_mode,
             ),
-            None => open_local_block_backend_with_budget_and_sync_mode(
+            None => open_local_payload_backend_with_budget_and_sync_mode(
                 Path::new(cache_dir),
                 &plan.format_info.uuid,
                 plan.local_backend_budget_bytes,
                 plan.payload_sync_mode,
             ),
         }
-        .map_err(|source| map_open_local_block_backend_error(cache_dir, source))?;
+        .map_err(|source| map_open_local_payload_backend_error(cache_dir, source))?;
         if opened_local_backend.detection.has_runtime_layout() {
             info!(
                 cache_root = %opened_local_backend.detection.layout.cache_root.display(),
@@ -290,12 +290,12 @@ impl VfsBootstrapResources {
                 "using current file-per-block local backend under the volume cache root"
             );
         }
-        let local_block_backend = opened_local_backend.backend;
+        let local_payload_backend = opened_local_backend.backend;
         let upload_hot_bytes = plan.max_dirty_bytes.min(UPLOAD_HOT_BUFFER_CAP_BYTES);
 
         let (cached_store, upload_rx) = CachedStore::open(
             CachedStoreConfig::new(cache_dir).with_upload_hot_bytes(upload_hot_bytes),
-            local_block_backend.clone(),
+            local_payload_backend.clone(),
         )
         .map_err(VfsError::Io)?;
 
@@ -336,7 +336,7 @@ impl VfsBootstrapResources {
 
         Ok(Self {
             zeroio_runtime_state_dir,
-            local_block_backend,
+            local_payload_backend,
             cached_store,
             readahead,
             dir_prefetch,
@@ -369,7 +369,7 @@ impl VfsBootstrap {
         cache_size: u64,
         memory_cache_budget_bytes: u64,
         config: VfsConfigValidated,
-        cache_runtime: Option<PreparedLocalBlockRuntime>,
+        cache_runtime: Option<PreparedLocalPayloadRuntime>,
     ) -> VfsResult<Self>
     where
         M: ?Sized + VfsMeta + 'static,
@@ -410,7 +410,7 @@ impl VfsBootstrap {
         Arc::new(StudioVfs {
             meta: MetaExecutor::new(meta),
             data_write: resources.data_write,
-            local_block_backend: resources.local_block_backend,
+            local_payload_backend: resources.local_payload_backend,
             cached_store: resources.cached_store,
             block_size,
             data_prefix: plan.data_prefix,
@@ -508,7 +508,7 @@ impl StudioVfs {
         Ok(())
     }
 
-    /// Create a new VFS instance using the current local block backend contract.
+    /// Create a new VFS instance using the current local payload backend contract.
     pub fn new<M>(
         meta: Arc<M>,
         data_config: &DataStoreConfig,
@@ -539,7 +539,7 @@ impl StudioVfs {
         cache_size: u64,
         memory_cache_budget_bytes: u64,
         config: VfsConfigValidated,
-        cache_runtime: PreparedLocalBlockRuntime,
+        cache_runtime: PreparedLocalPayloadRuntime,
     ) -> VfsResult<Arc<Self>>
     where
         M: ?Sized + VfsMeta + 'static,
@@ -562,7 +562,7 @@ impl StudioVfs {
         cache_size: u64,
         memory_cache_budget_bytes: u64,
         config: VfsConfigValidated,
-        cache_runtime: Option<PreparedLocalBlockRuntime>,
+        cache_runtime: Option<PreparedLocalPayloadRuntime>,
     ) -> VfsResult<Arc<Self>>
     where
         M: ?Sized + VfsMeta + 'static,
@@ -609,17 +609,17 @@ mod tests {
     }
 
     #[test]
-    fn open_local_block_backend_detection_errors_map_to_structured_vfs_error() {
-        let source = OpenLocalBlockBackendError::DetectCacheBackend {
+    fn open_local_payload_backend_detection_errors_map_to_structured_vfs_error() {
+        let source = OpenLocalPayloadBackendError::DetectCacheBackend {
             cache_root: "ignored".to_string(),
             source: std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "simulated permission error",
             ),
         };
-        let mapped = map_open_local_block_backend_error("E:\\cache-root", source);
+        let mapped = map_open_local_payload_backend_error("E:\\cache-root", source);
         match mapped {
-            VfsError::LocalBlockRuntimeDetection { cache_root, source } => {
+            VfsError::LocalPayloadRuntimeDetection { cache_root, source } => {
                 assert_eq!(cache_root, "E:\\cache-root");
                 assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
             }
@@ -628,18 +628,18 @@ mod tests {
     }
 
     #[test]
-    fn open_local_block_backend_provision_errors_surface_clear_runtime_message() {
-        let source = OpenLocalBlockBackendError::ProvisionLocalBlockLayout {
+    fn open_local_payload_backend_provision_errors_surface_clear_runtime_message() {
+        let source = OpenLocalPayloadBackendError::ProvisionLocalPayloadLayout {
             cache_root: "E:\\cache-root".to_string(),
             source: std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "simulated permission error",
             ),
         };
-        let mapped = map_open_local_block_backend_error("E:\\cache-root", source);
+        let mapped = map_open_local_payload_backend_error("E:\\cache-root", source);
         match mapped {
             VfsError::Other(message) => {
-                assert!(message.contains("failed to provision local block runtime layout"));
+                assert!(message.contains("failed to provision local payload runtime layout"));
                 assert!(message.contains("E:\\cache-root"));
             }
             other => panic!("unexpected error variant: {other}"),
@@ -647,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn studio_vfs_new_selects_local_block_runtime_for_runtime_root_layout() {
+    fn studio_vfs_new_selects_local_payload_runtime_for_runtime_root_layout() {
         let tmp = TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("meta.redb");
         let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
@@ -657,7 +657,7 @@ mod tests {
         meta.set_format_info(&format_info).expect("set format info");
         let data_config = DataStoreConfig::from(&format_info);
         let cache_dir = tmp.path().join("cache");
-        let layout = studiofs_cache::runtime::LocalBlockLayout::from_cache_root(&cache_dir);
+        let layout = studiofs_cache::runtime::LocalPayloadLayout::from_cache_root(&cache_dir);
         layout.provision().expect("provision runtime layout");
 
         let rt = Runtime::new().expect("runtime");
@@ -675,10 +675,10 @@ mod tests {
         .expect("create vfs");
 
         assert!(
-            vfs.local_block_backend()
+            vfs.local_payload_backend()
                 .as_any()
-                .is::<studiofs_cache::runtime::LocalBlockBackendRuntime>(),
-            "layout-only runtime root should select the current local block runtime backend"
+                .is::<studiofs_cache::runtime::LocalPayloadBackendRuntime>(),
+            "layout-only runtime root should select the current local payload runtime backend"
         );
     }
 

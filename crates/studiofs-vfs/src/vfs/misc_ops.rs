@@ -124,7 +124,7 @@ impl StudioVfs {
                 object_id, ino, block_index
             );
         } else {
-            self.local_block_backend.remove(object_id);
+            self.local_payload_backend.remove(object_id);
         }
     }
 }

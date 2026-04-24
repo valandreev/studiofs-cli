@@ -133,12 +133,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use studiofs_cache::OpenLocalBlockBackendError;
-use studiofs_cache::PreparedLocalBlockRuntime;
-use studiofs_cache::local::{LocalBlockBackend, LocalBlockLifecycleState, LocalBlockPut};
+use studiofs_cache::OpenLocalPayloadBackendError;
+use studiofs_cache::PreparedLocalPayloadRuntime;
+use studiofs_cache::local::{LocalPayloadBackend, LocalPayloadLifecycleState, LocalPayloadPut};
 use studiofs_cache::metrics::{LatencyHistogram, LatencyHistogramSnapshot, MaterializeBatchStats};
-use studiofs_cache::open_local_block_backend_with_budget_and_sync_mode;
-use studiofs_cache::open_prepared_local_block_backend_with_budget_and_sync_mode;
+use studiofs_cache::open_local_payload_backend_with_budget_and_sync_mode;
+use studiofs_cache::open_prepared_local_payload_backend_with_budget_and_sync_mode;
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_cache::{CachedStore, CachedStoreConfig};
 use studiofs_data::object::{
@@ -239,7 +239,7 @@ pub enum VfsError {
     Fetch(#[from] crate::fetch::FetchError),
 
     #[error("cache backend detection failed for root '{cache_root}': {source}")]
-    LocalBlockRuntimeDetection {
+    LocalPayloadRuntimeDetection {
         cache_root: String,
         #[source]
         source: std::io::Error,
@@ -979,7 +979,7 @@ struct UploadState {
     deleted_inodes: Mutex<std::collections::HashSet<Ino>>,
     upload_cancel_tokens: Mutex<std::collections::HashMap<Ino, CancellationToken>>,
     pending_evictions: Mutex<std::collections::HashSet<u64>>,
-    deferred_deleted_local_blocks:
+    deferred_deleted_local_payloads:
         Mutex<std::collections::HashMap<Ino, std::collections::HashSet<u64>>>,
     pending_epoch_finalizations: Mutex<BTreeSet<(Ino, u64)>>,
     pending_epoch_finalizations_notify: tokio::sync::Notify,
@@ -1182,7 +1182,7 @@ impl UploadState {
             deleted_inodes: Mutex::new(std::collections::HashSet::new()),
             upload_cancel_tokens: Mutex::new(std::collections::HashMap::new()),
             pending_evictions: Mutex::new(std::collections::HashSet::new()),
-            deferred_deleted_local_blocks: Mutex::new(std::collections::HashMap::new()),
+            deferred_deleted_local_payloads: Mutex::new(std::collections::HashMap::new()),
             pending_epoch_finalizations: Mutex::new(BTreeSet::new()),
             pending_epoch_finalizations_notify: tokio::sync::Notify::new(),
             upload_sticky_errors: Mutex::new(std::collections::HashMap::new()),
@@ -2292,8 +2292,8 @@ pub struct StudioVfs {
     meta: MetaExecutor<dyn VfsMeta>,
     /// Data store for writes (uploads, deletes, GC).
     data_write: Arc<DataStore>,
-    /// Shared local block backend used by the foreground read path.
-    local_block_backend: Arc<dyn LocalBlockBackend>,
+    /// Shared local payload backend used by the foreground read path.
+    local_payload_backend: Arc<dyn LocalPayloadBackend>,
     /// Shared cached-store runtime that owns local staging + pending uploads.
     cached_store: Arc<CachedStore>,
     /// Block size in bytes.
@@ -2497,7 +2497,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             vfs,
             pending_catalog: PendingUploadCatalog::from_ops(pending_uploads.iter().cloned()),
             dirty_set: vfs
-                .local_block_backend
+                .local_payload_backend
                 .dirty_object_ids()
                 .into_iter()
                 .collect(),
@@ -2762,7 +2762,7 @@ impl<'a> StartupReplayCoordinator<'a> {
                 object_id,
                 "removing orphan dirty block without metadata reference"
             );
-            self.vfs.local_block_backend.remove(*object_id);
+            self.vfs.local_payload_backend.remove(*object_id);
             self.vfs
                 .state
                 .upload
@@ -2902,7 +2902,7 @@ impl<'a> StartupReplayCoordinator<'a> {
 }
 
 fn map_cache_backend_detection_error(cache_dir: &str, source: std::io::Error) -> VfsError {
-    VfsError::LocalBlockRuntimeDetection {
+    VfsError::LocalPayloadRuntimeDetection {
         cache_root: cache_dir.to_string(),
         source,
     }
@@ -2910,23 +2910,23 @@ fn map_cache_backend_detection_error(cache_dir: &str, source: std::io::Error) ->
 
 fn map_cache_backend_provision_error(cache_root: &str, source: std::io::Error) -> VfsError {
     VfsError::Other(format!(
-        "failed to provision local block runtime layout under '{cache_root}': {source}"
+        "failed to provision local payload runtime layout under '{cache_root}': {source}"
     ))
 }
 
-fn map_open_local_block_backend_error(
+fn map_open_local_payload_backend_error(
     cache_dir: &str,
-    source: OpenLocalBlockBackendError,
+    source: OpenLocalPayloadBackendError,
 ) -> VfsError {
     match source {
-        OpenLocalBlockBackendError::DetectCacheBackend { source, .. } => {
+        OpenLocalPayloadBackendError::DetectCacheBackend { source, .. } => {
             map_cache_backend_detection_error(cache_dir, source)
         }
-        OpenLocalBlockBackendError::ProvisionLocalBlockLayout { cache_root, source } => {
+        OpenLocalPayloadBackendError::ProvisionLocalPayloadLayout { cache_root, source } => {
             map_cache_backend_provision_error(&cache_root, source)
         }
-        OpenLocalBlockBackendError::OpenLocalBlockBackend { source, .. } => VfsError::Other(
-            format!("failed to open local block runtime backend: {source}"),
+        OpenLocalPayloadBackendError::OpenLocalPayloadBackend { source, .. } => VfsError::Other(
+            format!("failed to open local payload runtime backend: {source}"),
         ),
     }
 }
@@ -3036,7 +3036,7 @@ impl StudioVfs {
             dentry_cache: dentry.into(),
             path_shortcut_cache: path_shortcut.into(),
             attr_read_cache: Self::attr_read_cache_snapshot(self.attr_read_cache_metrics()),
-            local_backend_dirty_objects: self.local_block_backend.dirty_object_count(),
+            local_backend_dirty_objects: self.local_payload_backend.dirty_object_count(),
             prefetch_queue_depth: self
                 .state
                 .metrics
@@ -3247,7 +3247,7 @@ impl StudioVfs {
     fn zeroio_object_bytes(&self, object_ids: &[u64]) -> u64 {
         object_ids
             .iter()
-            .filter_map(|object_id| self.local_block_backend.object_stats(*object_id))
+            .filter_map(|object_id| self.local_payload_backend.object_stats(*object_id))
             .map(|stats| stats.payload_len)
             .sum()
     }
@@ -3284,7 +3284,7 @@ impl StudioVfs {
 
     pub fn zeroio_runtime_snapshot(&self) -> VfsZeroIoRuntimeSnapshot {
         let generated_unix_ms = now_unix_millis();
-        let storage_stats = self.local_block_backend.storage_stats();
+        let storage_stats = self.local_payload_backend.storage_stats();
         let backend_non_evictable_bytes = storage_stats
             .current_bytes
             .saturating_sub(storage_stats.evictable_bytes);
@@ -3456,7 +3456,7 @@ impl StudioVfs {
                 .map(|uploads| {
                     uploads
                         .iter()
-                        .filter_map(|op| self.local_block_backend.object_stats(op.object_id))
+                        .filter_map(|op| self.local_payload_backend.object_stats(op.object_id))
                         .map(|stats| stats.payload_len)
                         .sum()
                 })
@@ -3621,7 +3621,7 @@ impl StudioVfs {
 
         let classified_object_ids: HashSet<u64> = object_retentions.keys().copied().collect();
         for (&object_id, &retention) in &object_retentions {
-            let Some(stats) = self.local_block_backend.object_stats(object_id) else {
+            let Some(stats) = self.local_payload_backend.object_stats(object_id) else {
                 continue;
             };
             match retention {
@@ -3646,14 +3646,14 @@ impl StudioVfs {
                 }
             }
         }
-        for object_id in self.local_block_backend.object_ids() {
+        for object_id in self.local_payload_backend.object_ids() {
             if classified_object_ids.contains(&object_id) {
                 continue;
             }
-            let Some(stats) = self.local_block_backend.object_stats(object_id) else {
+            let Some(stats) = self.local_payload_backend.object_stats(object_id) else {
                 continue;
             };
-            if stats.lifecycle == LocalBlockLifecycleState::Uploaded {
+            if stats.lifecycle == LocalPayloadLifecycleState::Uploaded {
                 snapshot.cache_bytes.published_warm_bytes = snapshot
                     .cache_bytes
                     .published_warm_bytes
@@ -4677,7 +4677,7 @@ impl StudioVfs {
     }
 
     pub fn read_cached_block(&self, object_id: u64) -> Option<Bytes> {
-        let (cached, timing) = run_local_cache_io(|| self.local_block_backend.get(object_id));
+        let (cached, timing) = run_local_cache_io(|| self.local_payload_backend.get(object_id));
         self.record_local_cache_io_timing(timing);
         cached
     }
@@ -4686,7 +4686,7 @@ impl StudioVfs {
         if let Some(payload) = self.upload_hot_get(object_id) {
             return Ok(Some(payload));
         }
-        let (result, timing) = run_local_cache_io(|| self.local_block_backend.get(object_id));
+        let (result, timing) = run_local_cache_io(|| self.local_payload_backend.get(object_id));
         self.record_local_cache_io_timing(timing);
         Ok(result)
     }
@@ -4707,7 +4707,7 @@ impl StudioVfs {
             return Ok(Some(read));
         }
         let (result, timing) = run_local_cache_io(|| {
-            self.local_block_backend
+            self.local_payload_backend
                 .read_into(object_id, data_offset, out)
         });
         self.record_local_cache_io_timing(timing);
@@ -4725,7 +4725,7 @@ impl StudioVfs {
     }
 
     async fn block_store_get_for_upload_async(&self, object_id: u64) -> VfsResult<Option<Bytes>> {
-        let block_store = self.local_block_backend.clone();
+        let block_store = self.local_payload_backend.clone();
         let (result, timing) =
             run_local_cache_io_blocking(move || Ok(block_store.get_for_upload(object_id))).await?;
         self.record_local_cache_io_timing(timing);
@@ -4771,7 +4771,7 @@ impl StudioVfs {
     }
 
     async fn block_store_run_pressure_maintenance_async(&self) -> VfsResult<()> {
-        let block_store = self.local_block_backend.clone();
+        let block_store = self.local_payload_backend.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
             block_store.run_pressure_maintenance().map_err(|error| {
                 VfsError::Other(format!("block backend maintenance failed: {error}"))
@@ -4789,7 +4789,7 @@ impl StudioVfs {
         data: Bytes,
         evictable: bool,
     ) -> VfsResult<()> {
-        let block_store = self.local_block_backend.clone();
+        let block_store = self.local_payload_backend.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
             block_store
                 .put(object_id, data.as_ref(), evictable)
@@ -4800,11 +4800,11 @@ impl StudioVfs {
         Ok(())
     }
 
-    async fn block_store_put_batch_async(&self, entries: Vec<LocalBlockPut>) -> VfsResult<()> {
+    async fn block_store_put_batch_async(&self, entries: Vec<LocalPayloadPut>) -> VfsResult<()> {
         if entries.is_empty() {
             return Ok(());
         }
-        let block_store = self.local_block_backend.clone();
+        let block_store = self.local_payload_backend.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
             block_store
                 .put_batch(&entries)
@@ -4815,7 +4815,7 @@ impl StudioVfs {
         Ok(())
     }
 
-    fn cache_upload_hot_batch(&self, entries: Vec<LocalBlockPut>) {
+    fn cache_upload_hot_batch(&self, entries: Vec<LocalPayloadPut>) {
         if entries.is_empty() {
             return;
         }
@@ -4903,7 +4903,7 @@ impl StudioVfs {
     }
 
     async fn block_store_sync_data_async(&self) -> VfsResult<()> {
-        let block_store = self.local_block_backend.clone();
+        let block_store = self.local_payload_backend.clone();
         let started = Instant::now();
         let ((), timing) = run_local_cache_io_blocking(move || {
             block_store.sync_data().map_err(|error| {
@@ -4926,7 +4926,7 @@ impl StudioVfs {
     }
 
     async fn block_store_mark_uploaded_async(&self, object_id: u64) -> VfsResult<()> {
-        let block_store = self.local_block_backend.clone();
+        let block_store = self.local_payload_backend.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
             block_store.mark_uploaded(object_id);
             Ok(())
@@ -4937,7 +4937,7 @@ impl StudioVfs {
     }
 
     async fn block_store_remove_async(&self, object_id: u64) -> VfsResult<()> {
-        let block_store = self.local_block_backend.clone();
+        let block_store = self.local_payload_backend.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
             block_store.remove(object_id);
             Ok(())
@@ -4948,7 +4948,7 @@ impl StudioVfs {
     }
 
     async fn block_store_remove_batch_async(&self, object_ids: Vec<u64>) -> VfsResult<()> {
-        let block_store = self.local_block_backend.clone();
+        let block_store = self.local_payload_backend.clone();
         let ((), timing) = run_local_cache_io_blocking(move || {
             block_store.remove_batch(&object_ids);
             Ok(())
@@ -5337,9 +5337,9 @@ impl StudioVfs {
         &self.cached_store
     }
 
-    /// Shared reference to the local block backend contract.
-    pub fn local_block_backend(&self) -> &(dyn LocalBlockBackend + 'static) {
-        self.local_block_backend.as_ref()
+    /// Shared reference to the local payload backend contract.
+    pub fn local_payload_backend(&self) -> &(dyn LocalPayloadBackend + 'static) {
+        self.local_payload_backend.as_ref()
     }
 
     /// Shared reference to the fetch scheduler.
