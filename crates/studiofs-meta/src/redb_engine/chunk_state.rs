@@ -391,7 +391,7 @@ impl RedbMetaEngine {
             return Ok(());
         }
 
-        let graph = Self::file_block_slices_to_chunk_state(blocks, block_size)?;
+        let graph = Self::logical_block_refs_to_chunk_state(blocks, block_size)?;
         let mut table = txn
             .open_table(table_def)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
@@ -631,9 +631,9 @@ impl RedbMetaEngine {
         Ok(())
     }
 
-    /// Convert a block-shaped test projection to chunk/slice state using the provided block size.
+    /// Convert logical block refs used by tests into chunk/slice state.
     #[cfg(test)]
-    pub(super) fn file_block_slices_to_chunk_state(
+    pub(super) fn logical_block_refs_to_chunk_state(
         blocks: &[(u32, BlockRef)],
         block_size: u32,
     ) -> MetaResult<RegularFileOverlayState> {
@@ -721,107 +721,6 @@ impl RedbMetaEngine {
                     let absolute_end = chunk_start.saturating_add(slice.range.end as u64);
                     size = size.max(absolute_end);
                 }
-            }
-        }
-        size
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(super) fn file_block_slices_from_chunk_states(
-        ino: Ino,
-        overlay_chunks: Option<&BTreeMap<ChunkId, RegularFileChunkState>>,
-        base_chunks: Option<&BTreeMap<ChunkId, RegularFileChunkState>>,
-        block_size: u32,
-    ) -> MetaResult<Vec<(u32, BlockRef)>> {
-        let mut chunk_ids = BTreeSet::new();
-        if let Some(overlay_chunks) = overlay_chunks {
-            chunk_ids.extend(overlay_chunks.keys().copied());
-        }
-        if let Some(base_chunks) = base_chunks {
-            chunk_ids.extend(base_chunks.keys().copied());
-        }
-        if chunk_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut size = 0u64;
-        for chunk_id in &chunk_ids {
-            let query = SliceRange::new(0, DEFAULT_CHUNK_SIZE)
-                .ok_or_else(|| MetaError::Storage("invalid full-chunk range".to_string()))?;
-            for span in resolve_chunk_slice_spans(
-                *chunk_id,
-                query,
-                overlay_chunks.and_then(|chunks| chunks.get(chunk_id)),
-                base_chunks.and_then(|chunks| chunks.get(chunk_id)),
-            ) {
-                if span.block.is_some() {
-                    let chunk_start = chunk_start_offset(*chunk_id, DEFAULT_CHUNK_SIZE);
-                    size = size.max(chunk_start.saturating_add(span.range.end as u64));
-                }
-            }
-        }
-        if size == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut spans = Vec::new();
-        let mut cursor = 0u64;
-        while cursor < size {
-            let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);
-            let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
-            let chunk_end = chunk_start.saturating_add(DEFAULT_CHUNK_SIZE as u64);
-            let query_end = size.min(chunk_end);
-            let query = SliceRange::new(
-                (cursor - chunk_start) as u32,
-                (query_end - chunk_start) as u32,
-            )
-            .ok_or_else(|| {
-                MetaError::Storage("invalid chunk-local file slice graph range".to_string())
-            })?;
-            spans.extend(resolve_chunk_slice_spans(
-                chunk_id,
-                query,
-                overlay_chunks.and_then(|chunks| chunks.get(&chunk_id)),
-                base_chunks.and_then(|chunks| chunks.get(&chunk_id)),
-            ));
-            cursor = query_end;
-        }
-        let spans = merge_adjacent_spans(spans);
-        if block_size == 0 {
-            return Err(MetaError::Storage(
-                "invalid zero block size in file slice graph synthesis".to_string(),
-            ));
-        }
-        let block_count = ((size.saturating_sub(1)) / block_size as u64).saturating_add(1);
-        let mut synthesized = Vec::new();
-        for idx in 0..block_count {
-            let block_index = idx as u32;
-            if let Some(block) = Self::synthesize_block_ref_from_resolved_spans(
-                ino,
-                spans.as_slice(),
-                block_index,
-                block_size,
-            )? {
-                synthesized.push((block_index, block));
-            }
-        }
-        Ok(synthesized)
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(super) fn legacy_committed_size_from_blocks(blocks: &[(u32, BlockRef)]) -> u64 {
-        let mut size = 0u64;
-        let mut expected = 0u32;
-        for (block_index, block) in blocks {
-            if *block_index != expected {
-                break;
-            }
-            size = size.saturating_add(block.length as u64);
-            expected = expected.saturating_add(1);
-            if block.is_partial() {
-                break;
             }
         }
         size
@@ -1172,41 +1071,6 @@ impl RedbMetaEngine {
             .open_table(REGULAR_FILE_BASE_TABLE)
             .map_err(|e| MetaError::Storage(e.to_string()))?;
         Self::regular_file_committed_size_from_base_table(&table, ino)
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(super) fn current_file_block_slices_in_txn(
-        txn: &redb::WriteTransaction,
-        ino: Ino,
-    ) -> MetaResult<Vec<(u32, BlockRef)>> {
-        let attr = Self::get_attr_from_write_table(txn, INODES_TABLE, ino)?
-            .or_else(|| {
-                Self::get_attr_from_write_table(txn, BASE_INODES_TABLE, ino)
-                    .ok()
-                    .flatten()
-            })
-            .ok_or(MetaError::InodeNotFound(ino))?;
-        if attr.size == 0 {
-            return Ok(Vec::new());
-        }
-        let overlay_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
-            txn,
-            REGULAR_FILE_OVERLAY_TABLE,
-            ino,
-        )?;
-        let base_chunks = Self::regular_file_chunk_states_for_inode_in_write_txn(
-            txn,
-            REGULAR_FILE_BASE_TABLE,
-            ino,
-        )?;
-        let block_size = Self::regular_file_graph_block_size_from_write_txn(txn)?;
-        Self::file_block_slices_from_chunk_states(
-            ino,
-            Some(&overlay_chunks),
-            Some(&base_chunks),
-            block_size,
-        )
     }
 
     #[cfg(test)]

@@ -1,12 +1,12 @@
 //! StudioFS Metadata Types
 //!
-//! Core types for the virtual filesystem metadata and the chunk/slice/block model.
+//! Core types for the virtual filesystem metadata and the chunk/slice object model.
 //!
 //! Architecture Key Changes:
-//! - Regular files can be represented as chunk/slice/block graphs
-//! - Blocks are immutable - never modified, only created/deleted
+//! - Regular files are represented as chunk/slice object graphs
+//! - Payload objects are immutable - never modified, only created/deleted
 //! - Local overlay and remote-visible base views are modeled explicitly
-//! - All metadata in redb, S3 stores only raw data blocks
+//! - All metadata lives in redb, S3 stores only raw payload objects
 
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -17,9 +17,9 @@ use std::time::SystemTime;
 // Constants
 // =============================================================================
 
-/// Fixed block size: 4 MiB.
+/// Default logical block size: 4 MiB.
 pub const DEFAULT_BLOCK_SIZE: u32 = 4 * 1024 * 1024;
-/// Default chunk size for the chunk/slice/block graph: 64 MiB.
+/// Default chunk size for the chunk/slice object graph: 64 MiB.
 ///
 /// Follow-up: promote this into persisted `FormatInfo` once chunk-size
 /// migration/versioning is introduced.

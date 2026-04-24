@@ -1,16 +1,15 @@
 //! Core VFS implementation for the current Local-First data plane.
 //!
 //! Key design:
-//! - Files are split into fixed-size blocks (default 16MB)
-//! - Each block has a sequential ID (not content hash)
-//! - Blocks are immutable - never modified, only created/deleted
+//! - Files are represented as chunk/slice object graphs
+//! - Payload objects are immutable and addressed by sequential IDs
 //! - No deduplication = no reference counting overhead
-//! - All metadata in redb, S3 stores only raw data blocks
+//! - All metadata lives in redb, S3 stores only raw payload objects
 //!
 //! Write Path:
-//! 1. Split data into blocks
+//! 1. Split data into logical slices
 //! 2. Merge accepted bytes into local dirty state
-//! 3. Persist full dirty blocks locally via the current local cache backend `put(...)`
+//! 3. Persist dirty payload objects locally via the current local cache backend `put(...)`
 //! 4. Apply local `sync_data()` barriers (strict for fsync / durable mode,
 //!    grouped in fast mode) and persist extent metadata / attrs
 //! 5. Queue committed extents for async upload + remote publish

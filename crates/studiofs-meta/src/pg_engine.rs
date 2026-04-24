@@ -7614,12 +7614,12 @@ mod tests {
         set_file_state(&a, file.ino, 4096, 2);
         let block = BlockRef::new_partial(88, 4096);
         a.stage_block_slices(file.ino, 0, &block)
-            .expect("set staged remote block");
+            .expect("set staged remote slice");
         assert!(
             a.publish_regular_file_overlay_to_base_if_matches(file.ino, 2)
-                .expect("publish remote block graph")
+                .expect("publish remote slice graph")
         );
-        a.flush_metadata().expect("flush remote block");
+        a.flush_metadata().expect("flush remote slice graph");
 
         assert!(wait_until(Duration::from_secs(12), || {
             let _ = b.sync_metadata();
