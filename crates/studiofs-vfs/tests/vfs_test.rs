@@ -34,7 +34,7 @@ use studiofs_meta::{
     CURRENT_FORMAT_VERSION, FormatInfo, MetaBlocks, MetaEngine, MetaError, MetaFormat, MetaGc,
     MetaInodes, MetaReplication, MetadataBackend, MetadataConfig, PgMetaEngine, PgOpenOptions,
     PostgresConfig, ROOT_INO, RedbMetaEngine, ensure_studiofs_database,
-    schema::{BlockRefState, DEFAULT_BLOCK_SIZE, InodeLifecycleState},
+    schema::{BlockRefState, InodeLifecycleState},
     schema::{ChunkId, SliceId, SliceOrder, SliceRange, SliceRecord},
     types::{AccessLevel, BlockFlags, BlockRef, Ino, UploadState},
 };
@@ -83,17 +83,18 @@ trait FileSliceMetaFixture {
 }
 
 fn fixture_block_slices(
+    block_size: u32,
     block_index: u32,
     block: Option<&BlockRef>,
 ) -> Result<Vec<(ChunkId, Vec<SliceRecord>)>, MetaError> {
     let block_start = u64::from(block_index)
-        .checked_mul(u64::from(DEFAULT_BLOCK_SIZE))
+        .checked_mul(u64::from(block_size))
         .ok_or_else(|| MetaError::Storage("fixture block offset overflow".to_string()))?;
     let data_end = block_start
         .checked_add(u64::from(block.map_or(0, |block| block.length)))
         .ok_or_else(|| MetaError::Storage("fixture block data overflow".to_string()))?;
     let block_end = block_start
-        .checked_add(u64::from(DEFAULT_BLOCK_SIZE))
+        .checked_add(u64::from(block_size))
         .ok_or_else(|| MetaError::Storage("fixture block range overflow".to_string()))?;
     let mut chunks = std::collections::BTreeMap::<ChunkId, Vec<SliceRecord>>::new();
     let mut push = |start: u64, end: u64, source: Option<&BlockRef>| -> Result<(), MetaError> {
@@ -142,63 +143,51 @@ fn fixture_block_slices(
     Ok(chunks.into_iter().collect())
 }
 
-fn fixture_block_from_spans(
+fn fixture_block_summaries_from_spans(
     spans: Vec<studiofs_meta::ResolvedSliceSpan>,
-    block_index: u32,
-) -> Result<Option<BlockRef>, MetaError> {
-    let block_start = u64::from(block_index) * u64::from(DEFAULT_BLOCK_SIZE);
-    let block_end = block_start + u64::from(DEFAULT_BLOCK_SIZE);
-    let mut parts = Vec::new();
+    block_size: u32,
+) -> Result<Vec<(u32, BlockRef)>, MetaError> {
+    let mut blocks = std::collections::BTreeMap::<u32, BlockRef>::new();
     for span in spans {
         let Some(block) = span.block else {
             continue;
         };
         let chunk_start =
             studiofs_meta::chunk_start_offset(span.chunk_id, studiofs_meta::DEFAULT_CHUNK_SIZE);
-        let span_start = chunk_start + u64::from(span.range.start);
-        let span_end = chunk_start + u64::from(span.range.end);
-        let overlap_start = span_start.max(block_start);
-        let overlap_end = span_end.min(block_end);
-        if overlap_start >= overlap_end {
-            continue;
-        }
-        let delta = u32::try_from(overlap_start - span_start)
-            .map_err(|_| MetaError::Storage("fixture block delta overflow".to_string()))?;
-        parts.push((
-            overlap_start,
-            BlockRef {
-                object_id: block.object_id,
-                offset: block.offset.saturating_add(delta),
-                length: u32::try_from(overlap_end - overlap_start)
-                    .map_err(|_| MetaError::Storage("fixture block length overflow".to_string()))?,
-                flags: block.flags,
-            },
-        ));
-    }
-    parts.sort_by_key(|(offset, _)| *offset);
-    let mut merged: Option<BlockRef> = None;
-    for (_, part) in parts {
-        if let Some(current) = merged.as_mut() {
-            if current.object_id != part.object_id
-                || current.offset.saturating_add(current.length) != part.offset
-            {
-                return Err(MetaError::NonContiguousRegularFileGraph {
-                    ino: 0,
-                    block_index,
+        let span_start = chunk_start.saturating_add(u64::from(span.range.start));
+        let span_end = chunk_start.saturating_add(u64::from(span.range.end));
+        let mut cursor = span_start;
+        while cursor < span_end {
+            let block_index = u32::try_from(cursor / u64::from(block_size))
+                .map_err(|_| MetaError::Storage("fixture block index overflow".to_string()))?;
+            let logical_block_end =
+                (u64::from(block_index) + 1).saturating_mul(u64::from(block_size));
+            let piece_end = span_end.min(logical_block_end);
+            let piece_len = u32::try_from(piece_end.saturating_sub(cursor))
+                .map_err(|_| MetaError::Storage("fixture block length overflow".to_string()))?;
+            let delta = u32::try_from(cursor.saturating_sub(span_start))
+                .map_err(|_| MetaError::Storage("fixture block offset overflow".to_string()))?;
+            blocks
+                .entry(block_index)
+                .and_modify(|existing| {
+                    existing.length = existing.length.saturating_add(piece_len);
+                    existing.flags |= block.flags;
+                })
+                .or_insert_with(|| BlockRef {
+                    object_id: block.object_id,
+                    offset: block.offset.saturating_add(delta),
+                    length: piece_len,
+                    flags: block.flags,
                 });
-            }
-            current.length = current.length.saturating_add(part.length);
-            current.flags |= part.flags;
-        } else {
-            merged = Some(part);
+            cursor = piece_end;
         }
     }
-    Ok(merged)
+    Ok(blocks.into_iter().collect())
 }
 
 impl<T> FileSliceMetaFixture for Arc<T>
 where
-    T: ?Sized + MetaBlocks + MetaInodes,
+    T: ?Sized + MetaBlocks + MetaFormat + MetaInodes,
 {
     fn stage_block_slices(
         &self,
@@ -210,9 +199,10 @@ where
             .lookup_file_block_slice(ino, block_index)
             .ok()
             .flatten();
+        let block_size = self.get_format_info()?.block_size;
         self.flush_regular_file_overlay_slices(
             ino,
-            fixture_block_slices(block_index, Some(block))?.as_slice(),
+            fixture_block_slices(block_size, block_index, Some(block))?.as_slice(),
         )?;
         Ok(old)
     }
@@ -222,26 +212,27 @@ where
         ino: Ino,
         block_index: u32,
     ) -> Result<Option<BlockRef>, MetaError> {
-        self.lookup_regular_file_slices(
-            ino,
-            u64::from(block_index) * u64::from(DEFAULT_BLOCK_SIZE),
-            u64::from(DEFAULT_BLOCK_SIZE),
-        )
-        .and_then(|spans| fixture_block_from_spans(spans, block_index))
+        let block_size = self.get_format_info()?.block_size;
+        Ok(fixture_block_summaries_from_spans(
+            self.lookup_regular_file_slices(
+                ino,
+                u64::from(block_index) * u64::from(block_size),
+                u64::from(block_size),
+            )?,
+            block_size,
+        )?
+        .into_iter()
+        .next()
+        .map(|(_, block)| block))
     }
 
     fn lookup_file_block_slices(&self, ino: Ino) -> Result<Vec<(u32, BlockRef)>, MetaError> {
         let attr = self.get_attr(ino)?;
-        let blocks = attr.size.div_ceil(u64::from(DEFAULT_BLOCK_SIZE));
-        let mut out = Vec::new();
-        for idx in 0..blocks {
-            let idx = u32::try_from(idx)
-                .map_err(|_| MetaError::Storage("fixture block index overflow".to_string()))?;
-            if let Some(block) = self.lookup_file_block_slice(ino, idx)? {
-                out.push((idx, block));
-            }
-        }
-        Ok(out)
+        let block_size = self.get_format_info()?.block_size;
+        fixture_block_summaries_from_spans(
+            self.lookup_regular_file_slices(ino, 0, attr.size)?,
+            block_size,
+        )
     }
 
     fn publish_uploaded_slice_object(
@@ -271,9 +262,10 @@ impl FileSliceMetaFixture for RedbMetaEngine {
             .lookup_file_block_slice(ino, block_index)
             .ok()
             .flatten();
+        let block_size = self.get_format_info()?.block_size;
         self.flush_regular_file_overlay_slices(
             ino,
-            fixture_block_slices(block_index, Some(block))?.as_slice(),
+            fixture_block_slices(block_size, block_index, Some(block))?.as_slice(),
         )?;
         Ok(old)
     }
@@ -283,26 +275,27 @@ impl FileSliceMetaFixture for RedbMetaEngine {
         ino: Ino,
         block_index: u32,
     ) -> Result<Option<BlockRef>, MetaError> {
-        self.lookup_regular_file_slices(
-            ino,
-            u64::from(block_index) * u64::from(DEFAULT_BLOCK_SIZE),
-            u64::from(DEFAULT_BLOCK_SIZE),
-        )
-        .and_then(|spans| fixture_block_from_spans(spans, block_index))
+        let block_size = self.get_format_info()?.block_size;
+        Ok(fixture_block_summaries_from_spans(
+            self.lookup_regular_file_slices(
+                ino,
+                u64::from(block_index) * u64::from(block_size),
+                u64::from(block_size),
+            )?,
+            block_size,
+        )?
+        .into_iter()
+        .next()
+        .map(|(_, block)| block))
     }
 
     fn lookup_file_block_slices(&self, ino: Ino) -> Result<Vec<(u32, BlockRef)>, MetaError> {
         let attr = self.get_attr(ino)?;
-        let blocks = attr.size.div_ceil(u64::from(DEFAULT_BLOCK_SIZE));
-        let mut out = Vec::new();
-        for idx in 0..blocks {
-            let idx = u32::try_from(idx)
-                .map_err(|_| MetaError::Storage("fixture block index overflow".to_string()))?;
-            if let Some(block) = self.lookup_file_block_slice(ino, idx)? {
-                out.push((idx, block));
-            }
-        }
-        Ok(out)
+        let block_size = self.get_format_info()?.block_size;
+        fixture_block_summaries_from_spans(
+            self.lookup_regular_file_slices(ino, 0, attr.size)?,
+            block_size,
+        )
     }
 
     fn publish_uploaded_slice_object(

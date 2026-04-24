@@ -900,6 +900,9 @@ impl StudioVfs {
                 );
                 limits_result?;
             }
+            if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
+                self.flush_local_dirty_state(ino, local_sync_policy).await?;
+            }
             Ok(written)
         }
         .await;
@@ -1054,6 +1057,11 @@ impl StudioVfs {
                 self.record_vfs_write_materialize_for_limits(
                     materialize_for_limits_started.elapsed(),
                 );
+                if let Err(e) = self.flush_local_dirty_state(ino, local_sync_policy).await {
+                    drop(session);
+                    self.state.file_session.gc_if_idle(ino);
+                    return Err(e);
+                }
             }
             _ => {
                 // Write failed or unknown policy — nothing to materialize.

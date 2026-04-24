@@ -2441,8 +2441,9 @@ mod tests {
             "explicit flush callback should force the local payload sync barrier after buffered writes"
         );
         assert_eq!(
-            flush_calls_after, flush_calls_before,
-            "explicit flush should materialize dirty buffered handle state directly without routing through the legacy ordered flush path"
+            flush_calls_after,
+            flush_calls_before + 1,
+            "explicit flush should commit materialized dirty handle state through the strict local metadata barrier"
         );
         assert!(
             !vfs.inode_has_local_dirty_state(attr.ino),
@@ -2524,8 +2525,8 @@ mod tests {
         );
         assert_eq!(
             flush_barrier_calls(&vfs),
-            flush_calls_before,
-            "strict handle-writer writes now materialize directly without routing through the legacy ordered flush path"
+            flush_calls_before + 1,
+            "strict handle-writer writes should commit materialized slices through the strict local metadata barrier"
         );
 
         ctx.spawn_wait({

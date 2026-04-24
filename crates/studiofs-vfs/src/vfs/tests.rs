@@ -1,5 +1,5 @@
 use super::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use studiofs_meta::engine::MetadataAuthorityStatus;
@@ -171,19 +171,41 @@ impl FileSliceMetaFixture for Arc<RedbMetaEngine> {
 
     fn lookup_file_block_slices(&self, ino: Ino) -> MetaResult<Vec<(u32, BlockRef)>> {
         let attr = self.get_attr(ino)?;
-        self.lookup_regular_file_slices(ino, 0, attr.size)
-            .map(|spans| {
-                spans
-                    .into_iter()
-                    .filter_map(|span| {
-                        span.block.map(|block| {
-                            let offset = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE)
-                                + u64::from(span.range.start);
-                            ((offset / u64::from(DEFAULT_BLOCK_SIZE)) as u32, block)
-                        })
+        let mut blocks = BTreeMap::<u32, BlockRef>::new();
+        for span in self.lookup_regular_file_slices(ino, 0, attr.size)? {
+            let Some(block) = span.block else {
+                continue;
+            };
+            let chunk_start = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
+            let span_start = chunk_start.saturating_add(u64::from(span.range.start));
+            let span_end = chunk_start.saturating_add(u64::from(span.range.end));
+            let mut cursor = span_start;
+            while cursor < span_end {
+                let block_index = u32::try_from(cursor / u64::from(DEFAULT_BLOCK_SIZE))
+                    .map_err(|_| MetaError::Storage("fixture block index overflow".to_string()))?;
+                let logical_block_end =
+                    (u64::from(block_index) + 1).saturating_mul(u64::from(DEFAULT_BLOCK_SIZE));
+                let piece_end = span_end.min(logical_block_end);
+                let piece_len = u32::try_from(piece_end.saturating_sub(cursor))
+                    .map_err(|_| MetaError::Storage("fixture block length overflow".to_string()))?;
+                let delta = u32::try_from(cursor.saturating_sub(span_start))
+                    .map_err(|_| MetaError::Storage("fixture block offset overflow".to_string()))?;
+                blocks
+                    .entry(block_index)
+                    .and_modify(|existing| {
+                        existing.length = existing.length.saturating_add(piece_len);
+                        existing.flags |= block.flags;
                     })
-                    .collect()
-            })
+                    .or_insert_with(|| BlockRef {
+                        object_id: block.object_id,
+                        offset: block.offset.saturating_add(delta),
+                        length: piece_len,
+                        flags: block.flags,
+                    });
+                cursor = piece_end;
+            }
+        }
+        Ok(blocks.into_iter().collect())
     }
 }
 
