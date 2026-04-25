@@ -1287,7 +1287,7 @@ impl FormatInfo {
 pub mod counters {
     /// Next available inode number.
     pub const NEXT_INODE: &str = "nextInode";
-    /// Next available object ID (sequential).
+    /// Legacy next object ID counter. New object IDs share the inode allocation stream.
     pub const NEXT_OBJECT_ID: &str = "nextObjectId";
     /// Total used space in bytes.
     pub const USED_SPACE: &str = "usedSpace";
