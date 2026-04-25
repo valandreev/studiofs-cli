@@ -1046,11 +1046,7 @@ impl LocalPayloadWriterPort for VfsLocalPayloadWriter<'_> {
         if object_ids.is_empty() {
             return;
         }
-        if let Err(error) = self
-            .vfs
-            .payload_store_remove_batch_async(object_ids.clone())
-            .await
-        {
+        if let Err(error) = self.vfs.payload_store_remove_batch_async(&object_ids).await {
             warn!(
                 ino,
                 stage,
@@ -1059,11 +1055,7 @@ impl LocalPayloadWriterPort for VfsLocalPayloadWriter<'_> {
                 "local-dirty cleanup of uncommitted payload-store entries failed"
             );
         }
-        if let Err(error) = self
-            .vfs
-            .upload_stage_remove_batch_async(object_ids.clone())
-            .await
-        {
+        if let Err(error) = self.vfs.upload_stage_remove_batch_async(&object_ids).await {
             warn!(
                 ino,
                 stage,
@@ -1072,7 +1064,7 @@ impl LocalPayloadWriterPort for VfsLocalPayloadWriter<'_> {
                 "local-dirty cleanup of uncommitted upload entries failed"
             );
         }
-        self.vfs.upload_hot_remove_batch(object_ids);
+        self.vfs.upload_hot_remove_batch(&object_ids);
     }
 }
 
@@ -2201,12 +2193,12 @@ impl StudioVfs {
         );
         if result.is_err() {
             let _ = self
-                .payload_store_remove_batch_async(persisted_object_ids.clone())
+                .payload_store_remove_batch_async(&persisted_object_ids)
                 .await;
             let _ = self
-                .upload_stage_remove_batch_async(persisted_object_ids.clone())
+                .upload_stage_remove_batch_async(&persisted_object_ids)
                 .await;
-            self.upload_hot_remove_batch(persisted_object_ids);
+            self.upload_hot_remove_batch(&persisted_object_ids);
         }
         result
     }

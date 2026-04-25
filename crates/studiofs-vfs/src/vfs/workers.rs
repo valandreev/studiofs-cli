@@ -5,6 +5,11 @@ use super::*;
 use crate::vfs::upload_lifecycle::UploadLifecycleWorker;
 use crate::{JanitorMeta, VfsMeta};
 
+struct MetadataTraversalSnapshot {
+    inodes: HashSet<Ino>,
+    payloads: HashMap<Ino, Vec<u64>>,
+}
+
 impl StudioVfs {
     pub(super) async fn background_aggressive_materialization(self: Arc<Self>) {
         let mut interval = tokio::time::interval(AGGRESSIVE_MATERIALIZATION_INTERVAL);
@@ -210,9 +215,12 @@ impl StudioVfs {
         self.kernel_invalidator.read().clone()
     }
 
-    fn collect_metadata_inodes<M: ?Sized + JanitorMeta>(engine: &M) -> MetaResult<HashSet<Ino>> {
+    fn collect_metadata_snapshot<M: ?Sized + JanitorMeta>(
+        engine: &M,
+    ) -> MetaResult<MetadataTraversalSnapshot> {
         let mut seen = HashSet::from([ROOT_INO]);
         let mut stack = vec![ROOT_INO];
+        let mut payloads = HashMap::new();
 
         while let Some(ino) = stack.pop() {
             let attr = match engine.get_attr(ino) {
@@ -220,22 +228,117 @@ impl StudioVfs {
                 Err(MetaError::InodeNotFound(_)) => continue,
                 Err(err) => return Err(err),
             };
-            if attr.kind != FileType::Directory {
-                continue;
-            }
-            let entries = match engine.readdir(ino) {
-                Ok(entries) => entries,
-                Err(MetaError::InodeNotFound(_)) => continue,
-                Err(err) => return Err(err),
-            };
-            for entry in entries {
-                if seen.insert(entry.ino) {
-                    stack.push(entry.ino);
+            match attr.kind {
+                FileType::Directory => {
+                    let entries = match engine.readdir(ino) {
+                        Ok(entries) => entries,
+                        Err(MetaError::InodeNotFound(_)) => continue,
+                        Err(err) => return Err(err),
+                    };
+                    for entry in entries {
+                        if seen.insert(entry.ino) {
+                            stack.push(entry.ino);
+                        }
+                    }
                 }
+                FileType::RegularFile => {
+                    let mut object_ids = engine
+                        .get_regular_file_graph_object_usage(ino)?
+                        .into_iter()
+                        .map(|(object_id, _)| object_id)
+                        .collect::<Vec<_>>();
+                    object_ids.sort_unstable();
+                    object_ids.dedup();
+                    if !object_ids.is_empty() {
+                        payloads.insert(ino, object_ids);
+                    }
+                }
+                FileType::Symlink => {}
             }
         }
 
-        Ok(seen)
+        Ok(MetadataTraversalSnapshot {
+            inodes: seen,
+            payloads,
+        })
+    }
+
+    pub(super) async fn lazy_evict_removed_metadata_payloads(
+        &self,
+        removed_payloads: HashMap<Ino, Vec<u64>>,
+        current_inodes: &HashSet<Ino>,
+    ) {
+        for (ino, object_ids) in removed_payloads {
+            if object_ids.is_empty() {
+                continue;
+            }
+            let inode_deleted = !current_inodes.contains(&ino);
+            if !inode_deleted {
+                self.evict_payload_objects_from_caches(ino, &object_ids)
+                    .await;
+                continue;
+            }
+            self.mark_inode_deleted_for_uploads(ino);
+            if self.handle_table.open_count(ino) > 0 {
+                self.handle_table.mark_orphan(ino);
+                for object_id in object_ids {
+                    self.record_deferred_deleted_local_payload(ino, object_id);
+                }
+                continue;
+            }
+            self.evict_inode_from_caches(ino, &object_ids).await;
+            self.maybe_clear_deleted_inode_marker(ino);
+        }
+    }
+
+    pub(super) fn removed_metadata_payloads(
+        previous: &HashMap<Ino, Vec<u64>>,
+        current: &HashMap<Ino, Vec<u64>>,
+    ) -> HashMap<Ino, Vec<u64>> {
+        debug_assert!(
+            previous
+                .values()
+                .all(|ids| ids.windows(2).all(|pair| pair[0] < pair[1])),
+            "previous metadata payload snapshot must be sorted and deduplicated"
+        );
+        debug_assert!(
+            current
+                .values()
+                .all(|ids| ids.windows(2).all(|pair| pair[0] < pair[1])),
+            "current metadata payload snapshot must be sorted and deduplicated"
+        );
+
+        previous
+            .iter()
+            .filter_map(|(ino, previous_object_ids)| {
+                let current_object_ids = current.get(ino).map(Vec::as_slice).unwrap_or(&[]);
+                let mut removed = Vec::new();
+                let mut previous_index = 0;
+                let mut current_index = 0;
+                while previous_index < previous_object_ids.len() {
+                    if current_index >= current_object_ids.len() {
+                        removed.extend_from_slice(&previous_object_ids[previous_index..]);
+                        break;
+                    }
+                    let previous_object_id = previous_object_ids[previous_index];
+                    let current_object_id = current_object_ids[current_index];
+                    if previous_object_id == current_object_id {
+                        previous_index += 1;
+                        current_index += 1;
+                    } else if previous_object_id < current_object_id {
+                        removed.push(previous_object_id);
+                        previous_index += 1;
+                    } else {
+                        current_index += 1;
+                    }
+                }
+                if removed.is_empty() {
+                    None
+                } else {
+                    Some((*ino, removed))
+                }
+            })
+            .collect()
     }
 
     pub(super) fn invalidate_kernel_inodes(&self, inodes: impl IntoIterator<Item = Ino>) {
@@ -262,15 +365,17 @@ impl StudioVfs {
         let mut last_namespace_token = meta.namespace_version_token();
         let mut last_metadata_token = meta.metadata_version_token();
         let mut last_snapshot: HashSet<Ino> = HashSet::new();
+        let mut last_payload_snapshot = HashMap::<Ino, Vec<u64>>::new();
 
         if last_namespace_token.is_some() || last_metadata_token.is_some() {
             let meta = self.meta.clone();
             if let Ok(snapshot) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                Self::collect_metadata_inodes(engine.as_ref())
+                Self::collect_metadata_snapshot(engine.as_ref())
             })
             .await
             {
-                last_snapshot = snapshot;
+                last_snapshot = snapshot.inodes;
+                last_payload_snapshot = snapshot.payloads;
             }
         }
 
@@ -282,10 +387,6 @@ impl StudioVfs {
             if self.shutdown_requested() {
                 break;
             }
-            if self.kernel_invalidator().is_none() {
-                continue;
-            }
-
             let meta = self.meta.clone();
             let sync = run_meta(meta.clone(), move |engine: Arc<dyn VfsMeta>| {
                 let before_namespace = engine.namespace_version_token();
@@ -322,15 +423,20 @@ impl StudioVfs {
 
             let meta = self.meta.clone();
             let Ok(current_snapshot) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                Self::collect_metadata_inodes(engine.as_ref())
+                Self::collect_metadata_snapshot(engine.as_ref())
             })
             .await
             else {
                 continue;
             };
 
+            let removed_payloads =
+                Self::removed_metadata_payloads(&last_payload_snapshot, &current_snapshot.payloads);
+            self.lazy_evict_removed_metadata_payloads(removed_payloads, &current_snapshot.inodes)
+                .await;
+
             let mut to_invalidate = last_snapshot.clone();
-            to_invalidate.extend(current_snapshot.iter().copied());
+            to_invalidate.extend(current_snapshot.inodes.iter().copied());
             self.invalidate_attr_read_cache(to_invalidate.iter().copied());
             self.invalidate_kernel_inodes(to_invalidate.iter().copied());
             if namespace_changed {
@@ -339,7 +445,8 @@ impl StudioVfs {
             if namespace_changed || metadata_changed {
                 self.bump_acl_namespace_epoch();
             }
-            last_snapshot = current_snapshot;
+            last_snapshot = current_snapshot.inodes;
+            last_payload_snapshot = current_snapshot.payloads;
         }
     }
 
