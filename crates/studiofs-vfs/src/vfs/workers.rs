@@ -266,9 +266,16 @@ impl StudioVfs {
     pub(super) async fn lazy_evict_removed_metadata_payloads(
         &self,
         removed_payloads: HashMap<Ino, Vec<u64>>,
+        current_inodes: &HashSet<Ino>,
     ) {
         for (ino, object_ids) in removed_payloads {
             if object_ids.is_empty() {
+                continue;
+            }
+            let inode_deleted = !current_inodes.contains(&ino);
+            if !inode_deleted {
+                self.evict_payload_objects_from_caches(ino, &object_ids)
+                    .await;
                 continue;
             }
             self.mark_inode_deleted_for_uploads(ino);
@@ -412,7 +419,7 @@ impl StudioVfs {
 
             let removed_payloads =
                 Self::removed_metadata_payloads(&last_payload_snapshot, &current_snapshot.payloads);
-            self.lazy_evict_removed_metadata_payloads(removed_payloads)
+            self.lazy_evict_removed_metadata_payloads(removed_payloads, &current_snapshot.inodes)
                 .await;
 
             let mut to_invalidate = last_snapshot.clone();

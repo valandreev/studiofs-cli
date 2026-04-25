@@ -227,38 +227,36 @@ impl StudioVfs {
         // for ordinary cache pressure or upload completion.
         self.cancel_pending_uploads_for_inode(ino);
 
-        let mut evicted = Vec::with_capacity(object_ids.len());
         let mut forced_pinned = 0;
         for &object_id in object_ids {
             if self.cached_store.is_pinned(object_id) {
                 forced_pinned += 1;
                 self.cached_store.unpin(object_id);
             }
-            evicted.push(object_id);
         }
 
         {
             let mut pending_evictions = self.state.upload.pending_evictions.lock();
-            for object_id in &evicted {
+            for object_id in object_ids {
                 pending_evictions.remove(object_id);
             }
         }
 
-        self.upload_hot_remove_batch(&evicted);
-        if let Err(error) = self.upload_stage_remove_batch_async(&evicted).await {
+        self.upload_hot_remove_batch(object_ids);
+        if let Err(error) = self.upload_stage_remove_batch_async(object_ids).await {
             warn!(
                 ino,
                 error = %error,
-                evicted_blocks = evicted.len(),
+                evicted_blocks = object_ids.len(),
                 "evict_inode: upload stage batch removal failed"
             );
         }
-        if !evicted.is_empty() {
-            if let Err(error) = self.payload_store_remove_batch_async(&evicted).await {
+        if !object_ids.is_empty() {
+            if let Err(error) = self.payload_store_remove_batch_async(object_ids).await {
                 warn!(
                     ino,
                     error = %error,
-                    evicted_blocks = evicted.len(),
+                    evicted_blocks = object_ids.len(),
                     "evict_inode: local backend batch removal failed"
                 );
             }
@@ -266,11 +264,59 @@ impl StudioVfs {
         debug!(
             "evict_inode: ino={} evicted {} blocks, forced_pinned={}",
             ino,
-            evicted.len(),
+            object_ids.len(),
             forced_pinned
         );
 
         // Invalidate readahead state for this inode.
+        self.readahead.evict(ino);
+        self.clear_access_tracking(ino);
+    }
+
+    pub(super) async fn evict_payload_objects_from_caches(&self, ino: Ino, object_ids: &[u64]) {
+        if object_ids.is_empty() {
+            return;
+        }
+
+        let mut forced_pinned = 0;
+        for &object_id in object_ids {
+            if self.cached_store.is_pinned(object_id) {
+                forced_pinned += 1;
+                self.cached_store.unpin(object_id);
+            }
+        }
+
+        {
+            let mut pending_evictions = self.state.upload.pending_evictions.lock();
+            for object_id in object_ids {
+                pending_evictions.remove(object_id);
+            }
+        }
+
+        self.upload_hot_remove_batch(object_ids);
+        if let Err(error) = self.upload_stage_remove_batch_async(object_ids).await {
+            warn!(
+                ino,
+                error = %error,
+                evicted_blocks = object_ids.len(),
+                "evict_payload_objects: upload stage batch removal failed"
+            );
+        }
+        if let Err(error) = self.payload_store_remove_batch_async(object_ids).await {
+            warn!(
+                ino,
+                error = %error,
+                evicted_blocks = object_ids.len(),
+                "evict_payload_objects: local backend batch removal failed"
+            );
+        }
+        debug!(
+            "evict_payload_objects: ino={} evicted {} blocks, forced_pinned={}",
+            ino,
+            object_ids.len(),
+            forced_pinned
+        );
+
         self.readahead.evict(ino);
         self.clear_access_tracking(ino);
     }

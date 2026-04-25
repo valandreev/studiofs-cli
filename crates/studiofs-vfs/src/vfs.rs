@@ -411,7 +411,7 @@ const DENTRY_CACHE_ORDER_COMPACT_SLACK: usize = 64;
 const DENTRY_CACHE_INDEX_NODE_OVERHEAD: usize = 32;
 const DEFAULT_XATTR_MAX_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS: u64 = 10;
-const DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS: u64 = 500;
+const DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS: u64 = 5 * 60 * 1000;
 const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
@@ -2474,6 +2474,7 @@ struct StartupReplayCoordinator<'a> {
     restored_live_extents: usize,
     replay_failures: u64,
     orphan_dirty_payloads_removed: u64,
+    unreferenced_local_payloads_removed: u64,
 }
 
 #[derive(Clone)]
@@ -2517,6 +2518,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             restored_live_extents: 0,
             replay_failures: 0,
             orphan_dirty_payloads_removed: 0,
+            unreferenced_local_payloads_removed: 0,
         }
     }
 
@@ -2789,6 +2791,70 @@ impl<'a> StartupReplayCoordinator<'a> {
         );
     }
 
+    fn cleanup_unreferenced_local_payloads(&mut self, protected_object_ids: &HashSet<u64>) {
+        let local_object_ids: BTreeSet<_> = self
+            .vfs
+            .local_payload_backend
+            .object_ids()
+            .into_iter()
+            .collect();
+        if local_object_ids.is_empty() {
+            return;
+        }
+
+        let meta = self.vfs.sync_meta();
+        let reachable_object_ids = match meta.get_referenced_object_ids() {
+            Ok(ids) => ids,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "failed to enumerate metadata reachability during startup cache cleanup; preserving local payload objects"
+                );
+                return;
+            }
+        };
+
+        let stale_object_ids: Vec<_> = local_object_ids
+            .into_iter()
+            .filter(|object_id| {
+                !reachable_object_ids.contains(object_id)
+                    && !protected_object_ids.contains(object_id)
+                    && !self.quarantined_object_ids.contains(object_id)
+            })
+            .collect();
+        if stale_object_ids.is_empty() {
+            return;
+        }
+
+        self.vfs
+            .cached_store
+            .remove_hot_upload_batch(&stale_object_ids);
+        self.vfs
+            .cached_store
+            .remove_staged_upload_batch(&stale_object_ids);
+        self.vfs.cached_store.remove_batch(&stale_object_ids);
+        {
+            let mut pending_evictions = self.vfs.state.upload.pending_evictions.lock();
+            for object_id in &stale_object_ids {
+                pending_evictions.remove(object_id);
+            }
+        }
+
+        let stale_count = stale_object_ids.len() as u64;
+        self.unreferenced_local_payloads_removed = self
+            .unreferenced_local_payloads_removed
+            .saturating_add(stale_count);
+        self.vfs
+            .state
+            .upload
+            .upload_canceled_stale
+            .fetch_add(stale_count, Ordering::Relaxed);
+        info!(
+            unreferenced_payloads = stale_object_ids.len(),
+            "startup cleanup removed local payload objects without metadata references"
+        );
+    }
+
     fn warn_orphan_dirty_payloads(&self) {
         warn!(
             quarantined_inodes = self.quarantined_inodes.len(),
@@ -2887,6 +2953,12 @@ impl<'a> StartupReplayCoordinator<'a> {
             );
         }
         self.cleanup_orphan_dirty_payloads();
+        let protected_object_ids: HashSet<_> = replayed_object_ids
+            .iter()
+            .copied()
+            .chain(self.dirty_set.iter().copied())
+            .collect();
+        self.cleanup_unreferenced_local_payloads(&protected_object_ids);
 
         self.vfs.record_runtime_event(
             "zeroio",
@@ -2898,6 +2970,7 @@ impl<'a> StartupReplayCoordinator<'a> {
                 "queued_publish_ready_epochs": self.queued_epoch_count() as u64,
                 "quarantined_inodes": self.quarantined_inodes.len() as u64,
                 "orphan_dirty_payloads_removed": self.orphan_dirty_payloads_removed,
+                "unreferenced_local_payloads_removed": self.unreferenced_local_payloads_removed,
                 "replay_failures": self.replay_failures,
             }),
         );

@@ -847,6 +847,59 @@ fn startup_replay_removes_orphan_dirty_payloads_and_clears_pending_evictions() {
 }
 
 #[test]
+fn startup_replay_removes_unreferenced_warm_payloads_and_stage_links() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "startup-replay-warm-cache-cleanup");
+    let object_id = 991_338;
+
+    vfs.local_payload_backend()
+        .put(object_id, b"orphan-warm-payload", true)
+        .expect("persist orphan warm payload");
+    vfs.local_payload_backend().mark_uploaded(object_id);
+    vfs.local_payload_backend()
+        .sync_data()
+        .expect("sync orphan warm payload");
+    vfs.cached_store
+        .link_upload_stage_batch(&[object_id])
+        .expect("seed stale upload-stage hardlink");
+    vfs.state.upload.pending_evictions.lock().insert(object_id);
+
+    assert!(
+        vfs.local_payload_backend().contains(object_id),
+        "test setup should expose orphan warm payload before replay"
+    );
+    assert!(
+        !vfs.local_payload_backend()
+            .dirty_object_ids()
+            .contains(&object_id),
+        "warm uploaded payload should not be covered by dirty-only orphan cleanup"
+    );
+
+    vfs.replay_dirty_uploads_from_local_backend(&[], &[]);
+
+    assert!(
+        !vfs.local_payload_backend().contains(object_id),
+        "startup replay should remove unreferenced warm payload cache entries"
+    );
+    assert!(
+        !vfs.state
+            .upload
+            .pending_evictions
+            .lock()
+            .contains(&object_id),
+        "startup replay should clear stale pending eviction bookkeeping"
+    );
+    assert_eq!(
+        vfs.state
+            .upload
+            .upload_canceled_stale
+            .load(Ordering::Relaxed),
+        1,
+        "startup replay should attribute warm orphan removal to stale-cache cleanup"
+    );
+}
+
+#[test]
 fn zeroio_snapshot_distinguishes_single_store_payload_classes_and_publish_backlog() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "zeroio-snapshot-classes");
@@ -3749,10 +3802,10 @@ fn foreign_delete_lazy_evict_removes_local_payload_artifacts() {
         assert!(vfs.cached_store().has_staged_upload(object_id));
         assert!(vfs.cached_store().is_pinned(object_id));
 
-        vfs.lazy_evict_removed_metadata_payloads(std::collections::HashMap::from([(
-            attr.ino,
-            vec![object_id],
-        )]))
+        vfs.lazy_evict_removed_metadata_payloads(
+            std::collections::HashMap::from([(attr.ino, vec![object_id])]),
+            &std::collections::HashSet::new(),
+        )
         .await;
 
         assert!(
@@ -3770,6 +3823,45 @@ fn foreign_delete_lazy_evict_removes_local_payload_artifacts() {
         assert!(
             !vfs.local_payload_backend().contains(object_id),
             "lazy eviction should remove local cached payload bytes"
+        );
+    });
+}
+
+#[test]
+fn retained_inode_payload_evict_does_not_mark_inode_deleted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "retained-inode-payload-evict");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"retained-inode-payload-evict.bin", 0, 0, 0o644)
+            .unwrap();
+        let payload = vec![0x7A; vfs.block_size as usize];
+
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        let object_id = vfs
+            .local_payload_backend()
+            .object_ids()
+            .into_iter()
+            .next()
+            .expect("flushed file should seed one local payload object");
+
+        vfs.lazy_evict_removed_metadata_payloads(
+            std::collections::HashMap::from([(attr.ino, vec![object_id])]),
+            &std::collections::HashSet::from([ROOT_INO, attr.ino]),
+        )
+        .await;
+
+        assert!(
+            !vfs.state.upload.deleted_inodes.lock().contains(&attr.ino),
+            "removed payloads for a retained inode must not poison future uploads with a delete marker"
+        );
+        assert!(
+            !vfs.local_payload_backend().contains(object_id),
+            "retained-inode payload eviction should still reclaim removed local payload bytes"
         );
     });
 }
