@@ -719,7 +719,7 @@ impl<'a> ReadMetadataResolver<'a> {
         }
         if let Some(attr) = self.dirty_attr() {
             let resolved_slices = self
-                .resolve_slices_for_attr(&attr, offset, buffer_len)
+                .resolve_slices_for_attr(&attr, offset, buffer_len, true)
                 .await?;
             return Ok(ReadMetadata {
                 attr,
@@ -728,7 +728,7 @@ impl<'a> ReadMetadataResolver<'a> {
         }
         if let Some(attr) = self.cached_attr() {
             let resolved_slices = self
-                .resolve_slices_for_attr(&attr, offset, buffer_len)
+                .resolve_slices_for_attr(&attr, offset, buffer_len, false)
                 .await?;
             return Ok(ReadMetadata {
                 attr,
@@ -803,18 +803,12 @@ impl<'a> ReadMetadataResolver<'a> {
         attr: &InodeAttr,
         offset: u64,
         buffer_len: u64,
+        dirty_attr_present: bool,
     ) -> VfsResult<Arc<[ResolvedSliceSpan]>> {
         let read_len = self.read_len_for_attr(attr, offset, buffer_len);
         if read_len == 0 {
             return Ok(Arc::from(Vec::<ResolvedSliceSpan>::new()));
         }
-        let dirty_attr_present = self
-            .vfs
-            .state
-            .namespace
-            .dirty_attrs
-            .lock()
-            .contains_key(&self.ino);
         let dirty_attr_cacheable = dirty_attr_present
             && !self
                 .vfs
@@ -928,7 +922,7 @@ impl<'a> ReadMetadataResolver<'a> {
     ) -> VfsResult<ReadMetadata> {
         let attr = self.load_attr_from_meta().await?;
         let resolved_slices = self
-            .resolve_slices_for_attr(&attr, offset, buffer_len)
+            .resolve_slices_for_attr(&attr, offset, buffer_len, false)
             .await?;
         self.cache_attr(&attr);
         Ok(ReadMetadata {
