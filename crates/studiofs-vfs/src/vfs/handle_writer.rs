@@ -6,10 +6,11 @@ use bytes::BytesMut;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use studiofs_meta::schema::offset_within_block;
 
 const JUICEFS_LIKE_SLICE_FLUSH_BYTES: usize = 4 * 1024 * 1024;
+const HANDLE_WRITER_SHARD_COUNT: usize = 64;
 
 #[derive(Debug, Clone)]
 pub(super) struct HandleWriterReadSpan {
@@ -55,12 +56,13 @@ struct HandleSliceWriter {
 struct HandleWriterRegistryState {
     writers: HashMap<u64, HandleSliceWriter>,
     writers_by_ino: HashMap<Ino, HashSet<u64>>,
-    total_dirty_bytes: usize,
 }
 
 #[derive(Debug)]
 pub(super) struct HandleWriterRegistry {
-    writers: Mutex<HandleWriterRegistryState>,
+    shards: Box<[Mutex<HandleWriterRegistryState>]>,
+    handle_shards: Mutex<HashMap<u64, usize>>,
+    total_dirty_bytes: AtomicUsize,
     next_seq: AtomicU64,
 }
 
@@ -263,9 +265,22 @@ impl HandleSliceWriter {
 impl HandleWriterRegistry {
     pub(super) fn new() -> Self {
         Self {
-            writers: Mutex::new(HandleWriterRegistryState::default()),
+            shards: (0..HANDLE_WRITER_SHARD_COUNT)
+                .map(|_| Mutex::new(HandleWriterRegistryState::default()))
+                .collect(),
+            handle_shards: Mutex::new(HashMap::new()),
+            total_dirty_bytes: AtomicUsize::new(0),
             next_seq: AtomicU64::new(1),
         }
+    }
+
+    fn shard_index_for_inode(ino: Ino) -> usize {
+        (ino % HANDLE_WRITER_SHARD_COUNT as u64) as usize
+    }
+
+    #[cfg(test)]
+    fn shard_index_for_inode_for_test(&self, ino: Ino) -> usize {
+        Self::shard_index_for_inode(ino)
     }
 
     pub(super) fn write(
@@ -301,8 +316,23 @@ impl HandleWriterRegistry {
             return 0;
         }
 
-        let mut writers = self.writers.lock();
-        let previous_ino = writers.writers.get(&fh).map(|writer| writer.ino);
+        let shard_index = Self::shard_index_for_inode(ino);
+        let previous_shard_index = { self.handle_shards.lock().get(&fh).copied() };
+        let moved_writer = previous_shard_index
+            .filter(|previous| *previous != shard_index)
+            .and_then(|previous| {
+                let mut previous_shard = self.shards[previous].lock();
+                Self::remove_writer_without_dirty_adjustment(&mut previous_shard, fh)
+            });
+        let mut writers = self.shards[shard_index].lock();
+        let previous_ino = writers
+            .writers
+            .get(&fh)
+            .or(moved_writer.as_ref())
+            .map(|writer| writer.ino);
+        if let Some(writer) = moved_writer {
+            writers.writers.insert(fh, writer);
+        }
         let (old_dirty_bytes, new_dirty_bytes) = {
             let writer = writers
                 .writers
@@ -335,12 +365,10 @@ impl HandleWriterRegistry {
             }
             (old_dirty_bytes, writer.dirty_bytes)
         };
-        Self::adjust_total_dirty_bytes(
-            &mut writers.total_dirty_bytes,
-            old_dirty_bytes,
-            new_dirty_bytes,
-        );
+        self.adjust_total_dirty_bytes(old_dirty_bytes, new_dirty_bytes);
         Self::reindex_writer(&mut writers, fh, previous_ino, ino);
+        drop(writers);
+        self.handle_shards.lock().insert(fh, shard_index);
         data_len as u32
     }
 
@@ -356,7 +384,7 @@ impl HandleWriterRegistry {
         let Some(end) = offset.checked_add(length) else {
             return Vec::new();
         };
-        let writers = self.writers.lock();
+        let writers = self.shards[Self::shard_index_for_inode(ino)].lock();
         let mut spans = Vec::new();
         if let Some(handles) = writers.writers_by_ino.get(&ino) {
             for fh in handles {
@@ -370,7 +398,7 @@ impl HandleWriterRegistry {
     }
 
     pub(super) fn max_visible_size(&self, ino: Ino) -> Option<u64> {
-        let writers = self.writers.lock();
+        let writers = self.shards[Self::shard_index_for_inode(ino)].lock();
         writers.writers_by_ino.get(&ino).and_then(|handles| {
             handles
                 .iter()
@@ -382,7 +410,7 @@ impl HandleWriterRegistry {
     }
 
     pub(super) fn has_dirty_writers(&self, ino: Ino) -> bool {
-        let writers = self.writers.lock();
+        let writers = self.shards[Self::shard_index_for_inode(ino)].lock();
         writers.writers_by_ino.get(&ino).is_some_and(|handles| {
             handles
                 .iter()
@@ -392,7 +420,7 @@ impl HandleWriterRegistry {
     }
 
     pub(super) fn dirty_bytes_for_inode(&self, ino: Ino) -> usize {
-        let writers = self.writers.lock();
+        let writers = self.shards[Self::shard_index_for_inode(ino)].lock();
         writers
             .writers_by_ino
             .get(&ino)
@@ -404,49 +432,68 @@ impl HandleWriterRegistry {
     }
 
     pub(super) fn total_dirty_bytes(&self) -> usize {
-        self.writers.lock().total_dirty_bytes
+        self.total_dirty_bytes.load(Ordering::Acquire)
     }
 
     pub(super) fn total_buffered_write_count(&self) -> usize {
-        let writers = self.writers.lock();
-        writers
-            .writers
-            .values()
-            .map(|writer| writer.writes.len())
+        self.shards
+            .iter()
+            .map(|shard| {
+                let writers = shard.lock();
+                writers
+                    .writers
+                    .values()
+                    .map(|writer| writer.writes.len())
+                    .sum::<usize>()
+            })
             .sum()
     }
 
     pub(super) fn snapshot_dirty_inodes_by_bytes(&self) -> Vec<(Ino, usize)> {
-        let writers = self.writers.lock();
-        writers
-            .writers_by_ino
+        self.shards
             .iter()
-            .filter_map(|(&ino, handles)| {
-                let dirty_bytes: usize = handles
+            .flat_map(|shard| {
+                let writers = shard.lock();
+                writers
+                    .writers_by_ino
                     .iter()
-                    .filter_map(|fh| writers.writers.get(fh))
-                    .map(|writer| writer.dirty_bytes)
-                    .sum();
-                (dirty_bytes > 0).then_some((ino, dirty_bytes))
+                    .filter_map(|(&ino, handles)| {
+                        let dirty_bytes: usize = handles
+                            .iter()
+                            .filter_map(|fh| writers.writers.get(fh))
+                            .map(|writer| writer.dirty_bytes)
+                            .sum();
+                        (dirty_bytes > 0).then_some((ino, dirty_bytes))
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
 
     pub(super) fn mark_closed(&self, fh: u64) {
-        let mut writers = self.writers.lock();
-        let remove = if let Some(writer) = writers.writers.get_mut(&fh) {
-            writer.open = false;
-            writer.writes.is_empty()
-        } else {
-            false
+        let Some(shard_index) = self.handle_shards.lock().get(&fh).copied() else {
+            return;
+        };
+        let remove = {
+            let mut writers = self.shards[shard_index].lock();
+            let remove = if let Some(writer) = writers.writers.get_mut(&fh) {
+                writer.open = false;
+                writer.writes.is_empty()
+            } else {
+                false
+            };
+            if remove {
+                self.remove_writer(&mut writers, fh);
+            }
+            remove
         };
         if remove {
-            Self::remove_writer(&mut writers, fh);
+            self.handle_shards.lock().remove(&fh);
         }
     }
 
     pub(super) fn clear_inode(&self, ino: Ino) {
-        let mut writers = self.writers.lock();
+        let mut writers = self.shards[Self::shard_index_for_inode(ino)].lock();
         let inode_handles: Vec<u64> = writers
             .writers_by_ino
             .get(&ino)
@@ -454,13 +501,15 @@ impl HandleWriterRegistry {
             .flatten()
             .copied()
             .collect();
-        for fh in inode_handles {
-            Self::remove_writer(&mut writers, fh);
+        for fh in &inode_handles {
+            self.remove_writer(&mut writers, *fh);
         }
+        drop(writers);
+        self.remove_handle_shard_entries(&inode_handles);
     }
 
     pub(super) fn snapshot_materialization_writes(&self, ino: Ino) -> Vec<BufferedHandleWrite> {
-        let writers = self.writers.lock();
+        let writers = self.shards[Self::shard_index_for_inode(ino)].lock();
         let mut writes = Vec::new();
         if let Some(handles) = writers.writers_by_ino.get(&ino) {
             for fh in handles {
@@ -474,7 +523,7 @@ impl HandleWriterRegistry {
     }
 
     pub(super) fn snapshot_ready_full_block_indexes(&self, ino: Ino) -> HashSet<u32> {
-        let writers = self.writers.lock();
+        let writers = self.shards[Self::shard_index_for_inode(ino)].lock();
         let mut ready = HashSet::new();
         if let Some(handles) = writers.writers_by_ino.get(&ino) {
             for fh in handles {
@@ -488,7 +537,7 @@ impl HandleWriterRegistry {
 
     #[cfg(test)]
     pub(super) fn mark_materialized(&self, ino: Ino, seq: u64) {
-        let mut writers = self.writers.lock();
+        let mut writers = self.shards[Self::shard_index_for_inode(ino)].lock();
         let mut empty_closed = Vec::new();
         let inode_handles: Vec<u64> = writers
             .writers_by_ino
@@ -514,22 +563,20 @@ impl HandleWriterRegistry {
             else {
                 continue;
             };
-            Self::adjust_total_dirty_bytes(
-                &mut writers.total_dirty_bytes,
-                old_dirty_bytes,
-                new_dirty_bytes,
-            );
+            self.adjust_total_dirty_bytes(old_dirty_bytes, new_dirty_bytes);
             if remove_closed {
                 empty_closed.push(fh);
             }
         }
-        for fh in empty_closed {
-            Self::remove_writer(&mut writers, fh);
+        for fh in &empty_closed {
+            self.remove_writer(&mut writers, *fh);
         }
+        drop(writers);
+        self.remove_handle_shard_entries(&empty_closed);
     }
 
     pub(super) fn mark_blocks_materialized(&self, ino: Ino, seqs_by_block: &HashMap<u32, u64>) {
-        let mut writers = self.writers.lock();
+        let mut writers = self.shards[Self::shard_index_for_inode(ino)].lock();
         let mut empty_closed = Vec::new();
         let inode_handles: Vec<u64> = writers
             .writers_by_ino
@@ -555,38 +602,63 @@ impl HandleWriterRegistry {
             else {
                 continue;
             };
-            Self::adjust_total_dirty_bytes(
-                &mut writers.total_dirty_bytes,
-                old_dirty_bytes,
-                new_dirty_bytes,
-            );
+            self.adjust_total_dirty_bytes(old_dirty_bytes, new_dirty_bytes);
             if remove_closed {
                 empty_closed.push(fh);
             }
         }
-        for fh in empty_closed {
-            Self::remove_writer(&mut writers, fh);
+        for fh in &empty_closed {
+            self.remove_writer(&mut writers, *fh);
         }
+        drop(writers);
+        self.remove_handle_shard_entries(&empty_closed);
     }
 
     #[cfg(test)]
     pub(super) fn open_writer_for_test(&self, fh: u64, ino: Ino, current_size: u64) {
-        let mut writers = self.writers.lock();
+        let shard_index = Self::shard_index_for_inode(ino);
+        let mut writers = self.shards[shard_index].lock();
         if let std::collections::hash_map::Entry::Vacant(entry) = writers.writers.entry(fh) {
             entry.insert(HandleSliceWriter::new(ino, current_size, 4096));
             writers.writers_by_ino.entry(ino).or_default().insert(fh);
+            drop(writers);
+            self.handle_shards.lock().insert(fh, shard_index);
         }
     }
 
-    fn adjust_total_dirty_bytes(total: &mut usize, old_bytes: usize, new_bytes: usize) {
+    fn adjust_total_dirty_bytes(&self, old_bytes: usize, new_bytes: usize) {
         match new_bytes.cmp(&old_bytes) {
             std::cmp::Ordering::Greater => {
-                *total = total.saturating_add(new_bytes - old_bytes);
+                self.total_dirty_bytes
+                    .fetch_add(new_bytes - old_bytes, Ordering::AcqRel);
             }
             std::cmp::Ordering::Less => {
-                *total = total.saturating_sub(old_bytes - new_bytes);
+                let delta = old_bytes - new_bytes;
+                let _ = self.total_dirty_bytes.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |current| {
+                        debug_assert!(
+                            current >= delta,
+                            "total_dirty_bytes underflow: current={}, delta={}",
+                            current,
+                            delta
+                        );
+                        Some(current.saturating_sub(delta))
+                    },
+                );
             }
             std::cmp::Ordering::Equal => {}
+        }
+    }
+
+    fn remove_handle_shard_entries(&self, handles: &[u64]) {
+        if handles.is_empty() {
+            return;
+        }
+        let mut handle_shards = self.handle_shards.lock();
+        for fh in handles {
+            handle_shards.remove(fh);
         }
     }
 
@@ -615,12 +687,20 @@ impl HandleWriterRegistry {
         }
     }
 
-    fn remove_writer(state: &mut HandleWriterRegistryState, fh: u64) {
-        let Some(writer) = state.writers.remove(&fh) else {
+    fn remove_writer_without_dirty_adjustment(
+        state: &mut HandleWriterRegistryState,
+        fh: u64,
+    ) -> Option<HandleSliceWriter> {
+        let writer = state.writers.remove(&fh)?;
+        Self::remove_writer_from_inode_index(state, writer.ino, fh);
+        Some(writer)
+    }
+
+    fn remove_writer(&self, state: &mut HandleWriterRegistryState, fh: u64) {
+        let Some(writer) = Self::remove_writer_without_dirty_adjustment(state, fh) else {
             return;
         };
-        state.total_dirty_bytes = state.total_dirty_bytes.saturating_sub(writer.dirty_bytes);
-        Self::remove_writer_from_inode_index(state, writer.ino, fh);
+        self.adjust_total_dirty_bytes(writer.dirty_bytes, 0);
     }
 }
 
@@ -1574,5 +1654,43 @@ mod tests {
             materialized[1].data.as_ptr(),
             payload.as_ptr().wrapping_add(4)
         );
+    }
+
+    #[test]
+    fn handle_writer_registry_shards_independent_inode_writes_without_lost_dirty_state() {
+        let registry = Arc::new(HandleWriterRegistry::new());
+        let first_ino = 1;
+        let second_ino = 2;
+
+        assert_ne!(
+            registry.shard_index_for_inode_for_test(first_ino),
+            registry.shard_index_for_inode_for_test(second_ino),
+            "test inodes should exercise distinct writer-state shards"
+        );
+
+        let first_registry = Arc::clone(&registry);
+        let first = std::thread::spawn(move || {
+            first_registry.write(101, first_ino, 0, 4096, 0, b"alpha");
+        });
+        let second_registry = Arc::clone(&registry);
+        let second = std::thread::spawn(move || {
+            second_registry.write(202, second_ino, 0, 4096, 0, b"bravo!");
+        });
+
+        first.join().expect("first writer thread should not panic");
+        second
+            .join()
+            .expect("second writer thread should not panic");
+
+        assert_eq!(registry.dirty_bytes_for_inode(first_ino), 5);
+        assert_eq!(registry.dirty_bytes_for_inode(second_ino), 6);
+        assert_eq!(registry.total_dirty_bytes(), 11);
+
+        let first_writes = registry.snapshot_materialization_writes(first_ino);
+        let second_writes = registry.snapshot_materialization_writes(second_ino);
+        assert_eq!(first_writes.len(), 1);
+        assert_eq!(first_writes[0].data.as_ref(), b"alpha");
+        assert_eq!(second_writes.len(), 1);
+        assert_eq!(second_writes[0].data.as_ref(), b"bravo!");
     }
 }
