@@ -4710,7 +4710,22 @@ impl StudioVfs {
             self.local_payload_backend
                 .read_into(object_id, data_offset, out)
         });
+        let read_handle_stats = self.local_payload_backend.read_handle_stats();
         self.record_local_cache_io_timing(timing);
+        if timing.backend_io_ns >= 5_000_000 {
+            debug!(
+                object_id,
+                data_offset,
+                requested_len = out.len(),
+                read = result,
+                backend_io_ns = timing.backend_io_ns,
+                read_handle_hits = read_handle_stats.map(|stats| stats.hits),
+                read_handle_misses = read_handle_stats.map(|stats| stats.misses),
+                read_handle_cached = read_handle_stats.map(|stats| stats.cached),
+                read_handle_evictions = read_handle_stats.map(|stats| stats.evictions),
+                "local payload read_into slow sample"
+            );
+        }
         if let Some(read) = result {
             if read > out.len() {
                 return Err(VfsError::Other(format!(

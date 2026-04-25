@@ -62,6 +62,14 @@ pub struct LocalPayloadObjectStats {
     pub evictable: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocalPayloadReadHandleStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub cached: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalPayloadPut {
     pub object_id: u64,
@@ -131,6 +139,9 @@ pub trait LocalPayloadBackend: Send + Sync {
     fn is_evictable(&self, object_id: u64) -> bool;
     fn storage_stats(&self) -> LocalPayloadStorageStats {
         LocalPayloadStorageStats::default()
+    }
+    fn read_handle_stats(&self) -> Option<LocalPayloadReadHandleStats> {
+        None
     }
     fn object_stats(&self, object_id: u64) -> Option<LocalPayloadObjectStats> {
         let _ = object_id;

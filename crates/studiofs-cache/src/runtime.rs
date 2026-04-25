@@ -736,6 +736,10 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
         None
     }
 
+    fn read_handle_stats(&self) -> Option<crate::local::LocalPayloadReadHandleStats> {
+        Some(self.payload_store.read_handle_stats())
+    }
+
     fn get_for_upload(&self, object_id: u64) -> Option<Bytes> {
         match self.index.get_entry(object_id) {
             Ok(Some(_)) => {}
