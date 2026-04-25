@@ -4,13 +4,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IntervalRange {
-    pub(crate) start: u64,
-    pub(crate) end: u64,
+    start: u64,
+    end: u64,
 }
 
 impl IntervalRange {
     pub(crate) fn new(start: u64, end: u64) -> Option<Self> {
         (start < end).then_some(Self { start, end })
+    }
+
+    pub(crate) fn start(self) -> u64 {
+        self.start
+    }
+
+    pub(crate) fn end(self) -> u64 {
+        self.end
     }
 
     pub(crate) fn intersection(self, other: Self) -> Option<Self> {
@@ -20,6 +28,10 @@ impl IntervalRange {
     }
 }
 
+/// Subtracts `candidate` from ordered unresolved ranges.
+///
+/// Overlapping fragments are appended to `claimed`; non-overlapping prefixes,
+/// suffixes, and untouched ranges are appended to `remaining` in input order.
 pub(crate) fn subtract_claimed_range<I, R, C>(
     ranges: I,
     candidate: IntervalRange,

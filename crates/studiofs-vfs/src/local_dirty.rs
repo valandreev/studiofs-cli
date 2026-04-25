@@ -2472,22 +2472,24 @@ impl StudioVfs {
                 if slice_len <= new_len.saturating_sub(slice.block_offset as usize) {
                     return true;
                 }
+                let Some(slice_range) =
+                    IntervalRange::new(slice.range.start as u64, slice.range.end as u64)
+                else {
+                    return false;
+                };
                 let Some(trimmed) = trim_range_to_available_len(
-                    IntervalRange {
-                        start: slice.range.start as u64,
-                        end: slice.range.end as u64,
-                    },
+                    slice_range,
                     slice.block_offset as u64,
                     new_len as u64,
                     studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64,
                 ) else {
                     return false;
                 };
-                let Some(new_end) = u32::try_from(trimmed.end).ok() else {
+                let Some(new_end) = u32::try_from(trimmed.end()).ok() else {
                     return false;
                 };
                 slice.range.end = new_end;
-                slice.range.start < slice.range.end
+                true
             });
             !slices.is_empty()
         });
@@ -2675,13 +2677,15 @@ impl StudioVfs {
             ) else {
                 continue;
             };
-            let Some(overlap) = slice_range.intersection(IntervalRange { start: offset, end })
-            else {
+            let Some(requested_range) = IntervalRange::new(offset, end) else {
                 continue;
             };
-            let start = overlap.start;
-            let stop = overlap.end;
-            let slice_start = slice_range.start;
+            let Some(overlap) = slice_range.intersection(requested_range) else {
+                continue;
+            };
+            let start = overlap.start();
+            let stop = overlap.end();
+            let slice_start = slice_range.start();
             let advance = start.saturating_sub(slice_start);
             let Some(advance_u32) = u32::try_from(advance).ok() else {
                 continue;
