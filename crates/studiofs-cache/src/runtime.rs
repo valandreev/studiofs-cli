@@ -480,6 +480,14 @@ impl LocalPayloadBackendRuntime {
                 "local payload runtime low-space put waiting for pending upload drain progress"
             );
             if !self.wait_for_storage_state_change(observed_epoch) {
+                current_after_evict =
+                    self.evict_to_target_bytes(target_bytes, "put_low_space_retry")?;
+                if !self
+                    .budget_governor
+                    .exceeds_budget_after_insert(current_after_evict, payload_len)
+                {
+                    break;
+                }
                 let exhausted_total = self
                     .low_space_exhausted_waits
                     .fetch_add(1, Ordering::Relaxed)
@@ -1993,6 +2001,48 @@ mod tests {
             !backend.contains(10),
             "the uploaded payload object should be reclaimed once it becomes evictable"
         );
+    }
+
+    #[test]
+    fn local_backend_retry_reclaims_completed_upload_while_other_dirty_objects_remain() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = LocalPayloadBackendRuntime::open_with_budget(
+            LocalPayloadBackendConfig {
+                cache_root: temp.path().to_path_buf(),
+                volume_uuid: [0x87; 16],
+            },
+            Some(64),
+        )
+        .unwrap();
+        backend.put(10, &[0xAA; 32], false).unwrap();
+        backend.put(11, &[0xBB; 32], false).unwrap();
+        backend.mark_uploading(10);
+        backend.mark_uploading(11);
+
+        let current_after_evict = backend.index.stats().unwrap().current_bytes;
+        let target_bytes = backend
+            .budget_governor
+            .target_before_insert(current_after_evict, 32)
+            .expect("budget pressure should require eviction before insert");
+
+        backend.mark_uploaded(10);
+
+        let current_after_retry = backend
+            .retry_non_evictable_put_after_upload_drain(target_bytes, 32, current_after_evict)
+            .unwrap();
+
+        assert!(
+            current_after_retry <= target_bytes,
+            "retry should reclaim already-completed uploads even when other dirty objects remain"
+        );
+        assert!(
+            !backend.contains(10),
+            "the completed upload should be reclaimed by the retry eviction pass"
+        );
+        assert!(backend.contains(11));
     }
 
     #[test]
