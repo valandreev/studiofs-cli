@@ -58,7 +58,7 @@ const ACCESS_TOUCH_RETRY_BASE_BACKOFF_MS: u64 = 10;
 const ACCESS_TOUCH_RETRY_MAX_EXPONENT: u8 = 8;
 const DIRTY_ORPHAN_PRUNE_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const LOW_SPACE_UPLOAD_DRAIN_WAIT: Duration = Duration::from_millis(25);
-const LOW_SPACE_UPLOAD_DRAIN_RETRIES: usize = 4;
+const LOW_SPACE_UPLOAD_DRAIN_PROGRESS_RETRIES: usize = 4;
 
 /// Backend kind available on the runtime path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +207,8 @@ pub struct LocalPayloadBackendRuntime {
     dirty_validation_in_progress: AtomicBool,
     storage_state_epoch: Mutex<u64>,
     storage_state_changed: Condvar,
+    low_space_progress_waits: AtomicU64,
+    low_space_exhausted_waits: AtomicU64,
 }
 
 struct DirtyValidationGuard<'a> {
@@ -313,6 +315,8 @@ impl LocalPayloadBackendRuntime {
             dirty_validation_in_progress: AtomicBool::new(false),
             storage_state_epoch: Mutex::new(0),
             storage_state_changed: Condvar::new(),
+            low_space_progress_waits: AtomicU64::new(0),
+            low_space_exhausted_waits: AtomicU64::new(0),
         })
     }
 
@@ -429,13 +433,14 @@ impl LocalPayloadBackendRuntime {
         self.storage_state_changed.notify_all();
     }
 
-    fn wait_for_storage_state_change(&self, observed_epoch: u64) {
+    fn wait_for_storage_state_change(&self, observed_epoch: u64) -> bool {
         let mut epoch = self.storage_state_epoch.lock();
         if *epoch != observed_epoch {
-            return;
+            return true;
         }
         self.storage_state_changed
             .wait_for(&mut epoch, LOW_SPACE_UPLOAD_DRAIN_WAIT);
+        *epoch != observed_epoch
     }
 
     fn retry_non_evictable_put_after_upload_drain(
@@ -444,7 +449,8 @@ impl LocalPayloadBackendRuntime {
         payload_len: u64,
         mut current_after_evict: u64,
     ) -> Result<u64, LocalPayloadBackendError> {
-        for attempt in 0..LOW_SPACE_UPLOAD_DRAIN_RETRIES {
+        let mut progress_waits = 0;
+        loop {
             if !self
                 .budget_governor
                 .exceeds_budget_after_insert(current_after_evict, payload_len)
@@ -464,19 +470,78 @@ impl LocalPayloadBackendRuntime {
 
             let observed_epoch = *self.storage_state_epoch.lock();
             debug!(
-                attempt = attempt + 1,
+                progress_waits,
                 current_bytes = current_after_evict,
                 target_bytes,
                 payload_len,
                 dirty_object_count,
+                progress_wait_limit = LOW_SPACE_UPLOAD_DRAIN_PROGRESS_RETRIES,
                 wait_ms = LOW_SPACE_UPLOAD_DRAIN_WAIT.as_millis(),
-                "local payload runtime low-space put waiting briefly for pending upload drain"
+                "local payload runtime low-space put waiting for pending upload drain progress"
             );
-            self.wait_for_storage_state_change(observed_epoch);
+            if !self.wait_for_storage_state_change(observed_epoch) {
+                let exhausted_total = self
+                    .low_space_exhausted_waits
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                debug!(
+                    current_bytes = current_after_evict,
+                    target_bytes,
+                    payload_len,
+                    dirty_object_count,
+                    exhausted_total,
+                    "local payload runtime low-space put retry exhausted without upload drain progress"
+                );
+                break;
+            }
+
+            progress_waits += 1;
+            let progress_total = self
+                .low_space_progress_waits
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
             current_after_evict =
                 self.evict_to_target_bytes(target_bytes, "put_low_space_retry")?;
+            debug!(
+                progress_waits,
+                progress_wait_limit = LOW_SPACE_UPLOAD_DRAIN_PROGRESS_RETRIES,
+                progress_total,
+                current_bytes = current_after_evict,
+                target_bytes,
+                payload_len,
+                "local payload runtime low-space put observed upload drain progress"
+            );
+            if progress_waits >= LOW_SPACE_UPLOAD_DRAIN_PROGRESS_RETRIES
+                && self
+                    .budget_governor
+                    .exceeds_budget_after_insert(current_after_evict, payload_len)
+            {
+                let exhausted_total = self
+                    .low_space_exhausted_waits
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                debug!(
+                    current_bytes = current_after_evict,
+                    target_bytes,
+                    payload_len,
+                    progress_waits,
+                    exhausted_total,
+                    "local payload runtime low-space put retry exhausted after bounded upload drain progress waits"
+                );
+                break;
+            }
         }
         Ok(current_after_evict)
+    }
+
+    #[cfg(test)]
+    fn low_space_progress_wait_count(&self) -> u64 {
+        self.low_space_progress_waits.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn low_space_exhausted_wait_count(&self) -> u64 {
+        self.low_space_exhausted_waits.load(Ordering::Relaxed)
     }
 
     fn flush_access_touches(&self, force: bool, operation: &'static str) {
@@ -1927,6 +1992,166 @@ mod tests {
         assert!(
             !backend.contains(10),
             "the uploaded payload object should be reclaimed once it becomes evictable"
+        );
+    }
+
+    #[test]
+    fn low_space_retry_exits_immediately_when_no_dirty_objects_remain() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = LocalPayloadBackendRuntime::open_with_budget(
+            LocalPayloadBackendConfig {
+                cache_root: temp.path().to_path_buf(),
+                volume_uuid: [0x83; 16],
+            },
+            Some(32),
+        )
+        .unwrap();
+        backend.put(10, &[0xAA; 32], false).unwrap();
+        backend.mark_uploading(10);
+        backend.mark_uploaded(10);
+
+        let current_after_evict = backend.index.stats().unwrap().current_bytes;
+        let target_bytes = backend
+            .budget_governor
+            .target_before_insert(current_after_evict, 16)
+            .expect("budget pressure should require eviction before insert");
+        let before = Instant::now();
+
+        let current_after_retry = backend
+            .retry_non_evictable_put_after_upload_drain(target_bytes, 16, current_after_evict)
+            .unwrap();
+
+        assert!(current_after_retry <= target_bytes);
+        assert!(
+            before.elapsed() < LOW_SPACE_UPLOAD_DRAIN_WAIT,
+            "no-dirty retry path should not spend a wait window"
+        );
+    }
+
+    #[test]
+    fn low_space_retry_extends_while_upload_drain_makes_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = std::sync::Arc::new(
+            LocalPayloadBackendRuntime::open_with_budget(
+                LocalPayloadBackendConfig {
+                    cache_root: temp.path().to_path_buf(),
+                    volume_uuid: [0x84; 16],
+                },
+                Some(64),
+            )
+            .unwrap(),
+        );
+        backend.put(10, &[0xAA; 32], false).unwrap();
+        backend.put(11, &[0xBB; 32], false).unwrap();
+        backend.mark_uploading(10);
+        backend.mark_uploading(11);
+
+        let background = std::sync::Arc::clone(&backend);
+        let join = std::thread::spawn(move || {
+            for object_id in [10, 11] {
+                std::thread::sleep(LOW_SPACE_UPLOAD_DRAIN_WAIT / 2);
+                background.mark_uploaded(object_id);
+            }
+        });
+
+        backend.put(12, &[0xCC; 48], false).unwrap();
+
+        join.join().unwrap();
+        assert_eq!(
+            backend.lifecycle_state(12),
+            LocalPayloadLifecycleState::Dirty
+        );
+        assert_eq!(
+            backend.low_space_progress_wait_count(),
+            2,
+            "each upload completion should be recorded as a progress-driven low-space wait"
+        );
+    }
+
+    #[test]
+    fn low_space_retry_stops_promptly_without_upload_drain_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = LocalPayloadBackendRuntime::open_with_budget(
+            LocalPayloadBackendConfig {
+                cache_root: temp.path().to_path_buf(),
+                volume_uuid: [0x85; 16],
+            },
+            Some(32),
+        )
+        .unwrap();
+        backend.put(10, &[0xAA; 32], false).unwrap();
+        backend.mark_uploading(10);
+        let before = Instant::now();
+
+        let err = backend.put(11, &[0xBB; 16], false).unwrap_err();
+
+        assert!(matches!(
+            err,
+            LocalPayloadBackendError::CapacityExhausted { .. }
+        ));
+        assert!(
+            before.elapsed() < LOW_SPACE_UPLOAD_DRAIN_WAIT * 3,
+            "stalled upload drain should not consume repeated retry windows"
+        );
+        assert_eq!(backend.low_space_exhausted_wait_count(), 1);
+    }
+
+    #[test]
+    fn low_space_retry_has_bounded_progress_driven_waits() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let backend = std::sync::Arc::new(
+            LocalPayloadBackendRuntime::open_with_budget(
+                LocalPayloadBackendConfig {
+                    cache_root: temp.path().to_path_buf(),
+                    volume_uuid: [0x86; 16],
+                },
+                Some(192),
+            )
+            .unwrap(),
+        );
+        for object_id in 10..20 {
+            backend
+                .put(object_id, &[object_id as u8; 16], false)
+                .unwrap();
+            backend.mark_uploading(object_id);
+        }
+
+        let background = std::sync::Arc::clone(&backend);
+        let join = std::thread::spawn(move || {
+            for object_id in 10..20 {
+                std::thread::sleep(LOW_SPACE_UPLOAD_DRAIN_WAIT / 2);
+                background.mark_uploaded(object_id);
+            }
+        });
+        let before = Instant::now();
+        let result = backend.put(99, &[0xDD; 160], false);
+
+        join.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(LocalPayloadBackendError::CapacityExhausted { .. })
+        ));
+        assert_eq!(
+            backend.low_space_progress_wait_count(),
+            LOW_SPACE_UPLOAD_DRAIN_PROGRESS_RETRIES as u64
+        );
+        assert!(
+            before.elapsed()
+                < LOW_SPACE_UPLOAD_DRAIN_WAIT
+                    * (LOW_SPACE_UPLOAD_DRAIN_PROGRESS_RETRIES as u32 + 2),
+            "progress-driven relief path should remain bounded even with continuing upload events"
         );
     }
 
