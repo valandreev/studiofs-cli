@@ -919,9 +919,10 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
             return Ok(());
         }
 
-        if let Err(error) = self.payload_store.put_batch(&persisted_entries) {
-            return Err(LocalPayloadBackendError::Other(Box::new(error)));
-        }
+        let batch_commit = self
+            .payload_store
+            .put_batch(&persisted_entries)
+            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
 
         if let Err(error) = self.index.upsert_many(&updates) {
             let written_object_ids: Vec<u64> = persisted_entries
@@ -929,6 +930,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
                 .map(|entry| entry.object_id)
                 .collect();
             self.payload_store.remove_batch(&written_object_ids);
+            batch_commit.complete();
             warn!(
                 object_count = persisted_entries.len(),
                 error = ?error,
@@ -937,6 +939,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
             return Err(LocalPayloadBackendError::Other(Box::new(error)));
         }
 
+        batch_commit.complete();
         Ok(())
     }
 
