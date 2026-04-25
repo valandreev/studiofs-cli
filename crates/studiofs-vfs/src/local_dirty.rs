@@ -1,4 +1,5 @@
 use super::*;
+use crate::utils::{IntervalRange, trim_range_to_available_len};
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::time::{Duration, Instant};
 
@@ -2468,17 +2469,26 @@ impl StudioVfs {
                 if slice.block_offset as usize >= new_len {
                     return false;
                 }
-                let allowed_len = new_len.saturating_sub(slice.block_offset as usize);
-                if slice_len <= allowed_len {
+                if slice_len <= new_len.saturating_sub(slice.block_offset as usize) {
                     return true;
                 }
-                let new_end = (slice.range.start as usize).saturating_add(allowed_len);
-                if new_end <= slice.range.start as usize
-                    || new_end > studiofs_meta::schema::DEFAULT_CHUNK_SIZE as usize
-                {
+                let Some(slice_range) =
+                    IntervalRange::new(slice.range.start as u64, slice.range.end as u64)
+                else {
                     return false;
-                }
-                slice.range.end = new_end as u32;
+                };
+                let Some(trimmed) = trim_range_to_available_len(
+                    slice_range,
+                    slice.block_offset as u64,
+                    new_len as u64,
+                    studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64,
+                ) else {
+                    return false;
+                };
+                let Some(new_end) = u32::try_from(trimmed.end()).ok() else {
+                    return false;
+                };
+                slice.range.end = new_end;
                 true
             });
             !slices.is_empty()
@@ -2632,6 +2642,9 @@ impl StudioVfs {
         let mut buffered_block_data = HashMap::<u32, Bytes>::new();
         let mut persisted_slice_data = HashMap::<u64, Bytes>::new();
         let mut spans = Vec::new();
+        let Some(requested_range) = IntervalRange::new(offset, end) else {
+            return Vec::new();
+        };
         for (chunk_id, slice) in slice_entries {
             let chunk_start = studiofs_meta::schema::chunk_start_offset(
                 studiofs_meta::schema::ChunkId(chunk_id),
@@ -2661,13 +2674,18 @@ impl StudioVfs {
                 data
             };
 
-            let slice_start = chunk_start.saturating_add(slice.range.start as u64);
-            let slice_end = chunk_start.saturating_add(slice.range.end as u64);
-            let start = slice_start.max(offset);
-            let stop = slice_end.min(end);
-            if start >= stop {
+            let Some(slice_range) = IntervalRange::new(
+                chunk_start.saturating_add(slice.range.start as u64),
+                chunk_start.saturating_add(slice.range.end as u64),
+            ) else {
                 continue;
-            }
+            };
+            let Some(overlap) = slice_range.intersection(requested_range) else {
+                continue;
+            };
+            let start = overlap.start();
+            let stop = overlap.end();
+            let slice_start = slice_range.start();
             let advance = start.saturating_sub(slice_start);
             let Some(advance_u32) = u32::try_from(advance).ok() else {
                 continue;
@@ -2893,7 +2911,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
     use studiofs_meta::{MetaFormat, RedbMetaEngine};
     use tempfile::TempDir;
@@ -3042,6 +3060,128 @@ mod tests {
             assert_eq!(remaining[0].range.start, 1024);
             assert_eq!(remaining[0].range.end, 4096);
         }
+    }
+
+    #[test]
+    fn trim_local_payload_staging_trims_and_drops_pending_slices() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "trim-pending-slices");
+        let ino = 78;
+        let block_index = 3;
+        let chunk_id = 0;
+
+        vfs.state.local_dirty.pending_payloads.lock().insert(
+            (ino, block_index),
+            PendingPayload::buffered(BytesMut::from(&b"abcdefgh"[..]), None),
+        );
+        vfs.state
+            .local_dirty
+            .pending_chunk_slices
+            .lock()
+            .entry(ino)
+            .or_default()
+            .insert(
+                chunk_id,
+                vec![
+                    PendingDirtySlice {
+                        range: studiofs_meta::schema::SliceRange::new(100, 106)
+                            .expect("slice range"),
+                        block_index,
+                        block_offset: 2,
+                        seq: 10,
+                        object_id: None,
+                        object_offset: 0,
+                        created_at: Instant::now(),
+                    },
+                    PendingDirtySlice {
+                        range: studiofs_meta::schema::SliceRange::new(200, 202)
+                            .expect("slice range"),
+                        block_index,
+                        block_offset: 5,
+                        seq: 11,
+                        object_id: None,
+                        object_offset: 0,
+                        created_at: Instant::now(),
+                    },
+                ],
+            );
+
+        let changed = vfs
+            .trim_local_payload_staging(ino, block_index, 5)
+            .expect("trim payload staging");
+        assert!(changed, "payload bytes should be truncated");
+        assert_eq!(
+            vfs.state
+                .local_dirty
+                .pending_payloads
+                .lock()
+                .get(&(ino, block_index))
+                .expect("pending payload")
+                .data
+                .len(),
+            5
+        );
+
+        let pending = vfs.state.local_dirty.pending_chunk_slices.lock();
+        let remaining = pending
+            .get(&ino)
+            .and_then(|chunks| chunks.get(&chunk_id))
+            .expect("trimmed slice should remain");
+        assert_eq!(remaining.len(), 1, "slice beyond new len should be dropped");
+        assert_eq!(remaining[0].range.start, 100);
+        assert_eq!(remaining[0].range.end, 103);
+        assert_eq!(remaining[0].block_offset, 2);
+    }
+
+    #[test]
+    fn snapshot_pending_dirty_slice_read_spans_handles_boundaries_and_offsets() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "snapshot-pending-slices");
+        let ino = 79;
+        let block_index = 4;
+        let chunk_id = 0;
+
+        vfs.state.local_dirty.pending_payloads.lock().insert(
+            (ino, block_index),
+            PendingPayload::buffered(BytesMut::from(&b"0123456789"[..]), None),
+        );
+        vfs.state
+            .local_dirty
+            .pending_chunk_slices
+            .lock()
+            .entry(ino)
+            .or_default()
+            .insert(
+                chunk_id,
+                vec![PendingDirtySlice {
+                    range: studiofs_meta::schema::SliceRange::new(100, 106).expect("slice range"),
+                    block_index,
+                    block_offset: 2,
+                    seq: 7,
+                    object_id: None,
+                    object_offset: 0,
+                    created_at: Instant::now(),
+                }],
+            );
+
+        assert!(
+            vfs.snapshot_pending_dirty_slice_read_spans(ino, 94, 6)
+                .is_empty(),
+            "request ending at slice start should not overlap"
+        );
+        assert!(
+            vfs.snapshot_pending_dirty_slice_read_spans(ino, 106, 4)
+                .is_empty(),
+            "request starting at slice end should not overlap"
+        );
+
+        let spans = vfs.snapshot_pending_dirty_slice_read_spans(ino, 102, 10);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].start, 102);
+        assert_eq!(spans[0].end, 106);
+        assert_eq!(spans[0].block_offset, 4);
+        assert_eq!(spans[0].seq, 7);
+        assert_eq!(spans[0].data.as_ref(), b"0123456789");
     }
 
     #[test]

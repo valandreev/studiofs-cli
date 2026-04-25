@@ -6,6 +6,7 @@ use super::{
 };
 use crate::VfsMeta;
 use crate::runtime::run_meta;
+use crate::utils::{IntervalRange, subtract_claimed_range};
 use bytes::Bytes;
 use futures::future::join_all;
 use smallvec::{SmallVec, smallvec};
@@ -19,19 +20,7 @@ use studiofs_meta::schema::{
 use studiofs_meta::types::{Ino, InodeAttr, PayloadRef, block_index_from_offset};
 use tracing::{debug, error, info, warn};
 
-#[derive(Debug, Clone, Copy)]
-struct ReadRange {
-    start: u64,
-    end: u64,
-}
-
-impl ReadRange {
-    fn intersection(self, other: Self) -> Option<Self> {
-        let start = self.start.max(other.start);
-        let end = self.end.min(other.end);
-        (start < end).then_some(Self { start, end })
-    }
-}
+type ReadRange = IntervalRange;
 
 #[derive(Debug, Clone)]
 enum ReadSegmentSource {
@@ -96,7 +85,7 @@ impl<'a> DataReader<'a> {
 
     async fn read_into(&self, buffer: &mut [u8]) -> VfsResult<usize> {
         let mut segments = self.build_segments().await?;
-        segments.sort_by_key(|segment| segment.range.start);
+        segments.sort_by_key(|segment| segment.range.start());
         Self::log_debug_target_segments(self.vfs, self.ino, self.offset, self.length, &segments);
         let written = Self::assemble_into(self.vfs, self.offset, &segments, buffer).await?;
         Ok(written)
@@ -104,7 +93,7 @@ impl<'a> DataReader<'a> {
 
     async fn prefetch_only(&self) -> VfsResult<()> {
         let mut segments = self.build_segments().await?;
-        segments.sort_by_key(|segment| segment.range.start);
+        segments.sort_by_key(|segment| segment.range.start());
         Self::populate_missing_remote_blocks(self.vfs, &segments, true).await?;
         Ok(())
     }
@@ -199,10 +188,7 @@ impl<'a> DataReader<'a> {
                 "read range overflow: ino={ino}, offset={offset}, length={length}"
             )));
         };
-        let requested = ReadRange {
-            start: offset,
-            end: read_end,
-        };
+        let requested = ReadRange::new(offset, read_end).expect("non-empty checked read range");
         let mut unresolved = smallvec![requested];
         let mut claim_buffers = ReadClaimBuffers::new();
         let mut segments = Vec::new();
@@ -213,13 +199,12 @@ impl<'a> DataReader<'a> {
             if unresolved.is_empty() {
                 break;
             }
-            let dirty_range = ReadRange {
-                start: dirty.start,
-                end: dirty.end,
+            let Some(dirty_range) = ReadRange::new(dirty.start, dirty.end) else {
+                continue;
             };
             Self::claim_unresolved_ranges(&mut unresolved, dirty_range, &mut claim_buffers);
             for overlap in claim_buffers.claimed.iter().copied() {
-                let delta = overlap.start.saturating_sub(dirty.start);
+                let delta = overlap.start().saturating_sub(dirty.start);
                 let Some(block_offset) = dirty.block_offset.checked_add(delta) else {
                     continue;
                 };
@@ -238,13 +223,12 @@ impl<'a> DataReader<'a> {
             if unresolved.is_empty() {
                 break;
             }
-            let dirty_range = ReadRange {
-                start: dirty.start,
-                end: dirty.end,
+            let Some(dirty_range) = ReadRange::new(dirty.start, dirty.end) else {
+                continue;
             };
             Self::claim_unresolved_ranges(&mut unresolved, dirty_range, &mut claim_buffers);
             for overlap in claim_buffers.claimed.iter().copied() {
-                let delta = overlap.start.saturating_sub(dirty.start);
+                let delta = overlap.start().saturating_sub(dirty.start);
                 let Some(delta_u32) = u32::try_from(delta).ok() else {
                     continue;
                 };
@@ -267,13 +251,12 @@ impl<'a> DataReader<'a> {
             if unresolved.is_empty() {
                 break;
             }
-            let dirty_range = ReadRange {
-                start: dirty.start,
-                end: dirty.end,
+            let Some(dirty_range) = ReadRange::new(dirty.start, dirty.end) else {
+                continue;
             };
             Self::claim_unresolved_ranges(&mut unresolved, dirty_range, &mut claim_buffers);
             for overlap in claim_buffers.claimed.iter().copied() {
-                let delta = overlap.start.saturating_sub(dirty.start);
+                let delta = overlap.start().saturating_sub(dirty.start);
                 let Some(delta_u32) = u32::try_from(delta).ok() else {
                     continue;
                 };
@@ -293,9 +276,9 @@ impl<'a> DataReader<'a> {
         if !unresolved.is_empty() {
             let mut candidate_blocks = ReadBlockList::new();
             for range in &unresolved {
-                let start_block = block_index_from_offset(range.start, vfs.block_size);
+                let start_block = block_index_from_offset(range.start(), vfs.block_size);
                 let end_block =
-                    block_index_from_offset(range.end.saturating_sub(1), vfs.block_size);
+                    block_index_from_offset(range.end().saturating_sub(1), vfs.block_size);
                 for block_index in start_block..=end_block {
                     candidate_blocks.push(block_index);
                 }
@@ -325,14 +308,11 @@ impl<'a> DataReader<'a> {
                 let block_end = block_start.saturating_add(vfs.block_size as u64);
                 Self::claim_unresolved_ranges(
                     &mut unresolved,
-                    ReadRange {
-                        start: block_start,
-                        end: block_end,
-                    },
+                    ReadRange::new(block_start, block_end).expect("block range is non-empty"),
                     &mut claim_buffers,
                 );
                 for overlap in claim_buffers.claimed.iter().copied() {
-                    let delta = overlap.start.saturating_sub(block_start);
+                    let delta = overlap.start().saturating_sub(block_start);
                     let Some(block_offset) = u32::try_from(delta).ok() else {
                         continue;
                     };
@@ -420,25 +400,12 @@ impl<'a> DataReader<'a> {
     ) {
         buffers.claimed.clear();
         buffers.scratch.clear();
-        for range in unresolved.drain(..) {
-            let Some(overlap) = range.intersection(candidate) else {
-                buffers.scratch.push(range);
-                continue;
-            };
-            if range.start < overlap.start {
-                buffers.scratch.push(ReadRange {
-                    start: range.start,
-                    end: overlap.start,
-                });
-            }
-            buffers.claimed.push(overlap);
-            if overlap.end < range.end {
-                buffers.scratch.push(ReadRange {
-                    start: overlap.end,
-                    end: range.end,
-                });
-            }
-        }
+        subtract_claimed_range(
+            unresolved.drain(..),
+            candidate,
+            &mut buffers.scratch,
+            &mut buffers.claimed,
+        );
         std::mem::swap(unresolved, &mut buffers.scratch);
     }
 
@@ -465,23 +432,25 @@ impl<'a> DataReader<'a> {
                 continue;
             };
             let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
-            let span_range = ReadRange {
-                start: chunk_base.saturating_add(span.range.start as u64),
-                end: chunk_base.saturating_add(span.range.end as u64),
+            let Some(span_range) = ReadRange::new(
+                chunk_base.saturating_add(span.range.start as u64),
+                chunk_base.saturating_add(span.range.end as u64),
+            ) else {
+                continue;
             };
             let Some(clipped) = span_range.intersection(requested) else {
                 continue;
             };
             Self::claim_unresolved_ranges(unresolved, clipped, buffers);
             for overlap in buffers.claimed.iter().copied() {
-                let delta = overlap.start.saturating_sub(span_range.start);
+                let delta = overlap.start().saturating_sub(span_range.start());
                 let Some(delta_u32) = u32::try_from(delta).ok() else {
                     continue;
                 };
                 let Some(block_offset) = block.offset.checked_add(delta_u32) else {
                     continue;
                 };
-                let length = overlap.end.saturating_sub(overlap.start);
+                let length = overlap.end().saturating_sub(overlap.start());
                 let Some(block_length) = u32::try_from(length).ok() else {
                     continue;
                 };
@@ -561,8 +530,8 @@ impl<'a> DataReader<'a> {
     ) -> VfsResult<usize> {
         let mut written = 0usize;
         for segment in segments {
-            let dst_start = segment.range.start.saturating_sub(offset) as usize;
-            let dst_end = segment.range.end.saturating_sub(offset) as usize;
+            let dst_start = segment.range.start().saturating_sub(offset) as usize;
+            let dst_end = segment.range.end().saturating_sub(offset) as usize;
             if dst_start >= buffer.len() || dst_end > buffer.len() || dst_start >= dst_end {
                 continue;
             }
@@ -592,7 +561,7 @@ impl<'a> DataReader<'a> {
                         Some(read) => {
                             debug!(
                                 object_id,
-                                file_offset = segment.range.start,
+                                file_offset = segment.range.start(),
                                 block_offset,
                                 requested = dst.len(),
                                 read,
@@ -603,7 +572,7 @@ impl<'a> DataReader<'a> {
                         None => {
                             warn!(
                                 object_id,
-                                file_offset = segment.range.start,
+                                file_offset = segment.range.start(),
                                 block_offset,
                                 requested = dst.len(),
                                 "data_reader: pending extent missing from local backend, zeroing range"
@@ -630,7 +599,7 @@ impl<'a> DataReader<'a> {
                         if !span_resolved {
                             error!(
                                 object_id = payload.object_id,
-                                file_offset = segment.range.start,
+                                file_offset = segment.range.start(),
                                 block_offset = payload.offset,
                                 requested = dst.len(),
                                 read,
@@ -654,7 +623,7 @@ impl<'a> DataReader<'a> {
                                 vfs.copy_committed_payload_into_range(
                                     data.as_ref(),
                                     payload,
-                                    segment.range.start,
+                                    segment.range.start(),
                                     dst,
                                 )?;
                             }
@@ -662,7 +631,7 @@ impl<'a> DataReader<'a> {
                                 warn!(
                                     object_id = payload.object_id,
                                     key,
-                                    file_offset = segment.range.start,
+                                    file_offset = segment.range.start(),
                                     block_offset = payload.offset,
                                     block_length = payload.length,
                                     "data_reader: S3 object not found during foreground read, zeroing range (upload incomplete or evicted before upload?)"
@@ -975,10 +944,8 @@ impl StudioVfs {
             return Ok(None);
         }
 
-        let requested = ReadRange {
-            start: block_start,
-            end: block_end,
-        };
+        let requested =
+            ReadRange::new(block_start, block_end).expect("metadata block range is non-empty");
         let mut buffer = vec![0u8; logical_len];
         for span in &resolved {
             let Some(block) = span.payload.as_ref() else {
@@ -986,32 +953,34 @@ impl StudioVfs {
             };
 
             let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
-            let span_range = ReadRange {
-                start: chunk_base.saturating_add(span.range.start as u64),
-                end: chunk_base.saturating_add(span.range.end as u64),
+            let Some(span_range) = ReadRange::new(
+                chunk_base.saturating_add(span.range.start as u64),
+                chunk_base.saturating_add(span.range.end as u64),
+            ) else {
+                continue;
             };
             let Some(overlap) = span_range.intersection(requested) else {
                 continue;
             };
 
-            let dst_start = usize::try_from(overlap.start.saturating_sub(block_start)).map_err(
+            let dst_start = usize::try_from(overlap.start().saturating_sub(block_start)).map_err(
                 |_| {
                     VfsError::Other(format!(
                         "metadata payload read start does not fit usize: ino={}, block_index={}, start={}",
-                        ino, block_index, overlap.start
+                        ino, block_index, overlap.start()
                     ))
                 },
             )?;
             let dst_end =
-                usize::try_from(overlap.end.saturating_sub(block_start)).map_err(|_| {
+                usize::try_from(overlap.end().saturating_sub(block_start)).map_err(|_| {
                     VfsError::Other(format!(
                         "metadata payload read end does not fit usize: ino={}, block_index={}, end={}",
-                        ino, block_index, overlap.end
+                        ino, block_index, overlap.end()
                     ))
                 })?;
             let dst = &mut buffer[dst_start..dst_end];
 
-            let delta = overlap.start.saturating_sub(span_range.start);
+            let delta = overlap.start().saturating_sub(span_range.start());
             let delta_u32 = u32::try_from(delta).map_err(|_| {
                 VfsError::Other(format!(
                     "metadata payload read delta does not fit u32: ino={}, block_index={}, delta={}",
@@ -1027,10 +996,10 @@ impl StudioVfs {
                     ))
                 })?;
             planned_block.length =
-                u32::try_from(overlap.end.saturating_sub(overlap.start)).map_err(|_| {
+                u32::try_from(overlap.end().saturating_sub(overlap.start())).map_err(|_| {
                     VfsError::Other(format!(
                         "metadata payload read span too large: ino={}, block_index={}, start={}, end={}",
-                        ino, block_index, overlap.start, overlap.end
+                        ino, block_index, overlap.start(), overlap.end()
                     ))
                 })?;
 
@@ -1078,7 +1047,7 @@ impl StudioVfs {
                         self.copy_committed_payload_into_range(
                             data.as_ref(),
                             &planned_block,
-                            overlap.start,
+                            overlap.start(),
                             dst,
                         )?;
                     }
@@ -1338,6 +1307,10 @@ mod tests {
     use studiofs_meta::{MetaFormat, MetaInodes, MetaPayloadObjects, RedbMetaEngine};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
+
+    fn read_range(start: u64, end: u64) -> ReadRange {
+        ReadRange::new(start, end).expect("test range is non-empty")
+    }
 
     trait FileGraphMetaFixture {
         fn stage_payload_slice(
@@ -1653,19 +1626,19 @@ mod tests {
         };
         let segments = vec![
             ReadSegment {
-                range: ReadRange { start: 0, end: 16 },
+                range: read_range(0, 16),
                 source: ReadSegmentSource::Base {
                     payload: first.clone(),
                 },
             },
             ReadSegment {
-                range: ReadRange { start: 16, end: 24 },
+                range: read_range(16, 24),
                 source: ReadSegmentSource::Overlay {
                     payload: second.clone(),
                 },
             },
             ReadSegment {
-                range: ReadRange { start: 24, end: 32 },
+                range: read_range(24, 32),
                 source: ReadSegmentSource::Zero,
             },
         ];
@@ -1677,28 +1650,21 @@ mod tests {
 
     #[test]
     fn claim_unresolved_ranges_keeps_common_fragmented_case_inline() {
-        let mut unresolved = smallvec::smallvec![
-            ReadRange { start: 0, end: 8 },
-            ReadRange { start: 16, end: 24 },
-        ];
+        let mut unresolved = smallvec::smallvec![read_range(0, 8), read_range(16, 24),];
         let mut buffers = ReadClaimBuffers::new();
 
-        DataReader::claim_unresolved_ranges(
-            &mut unresolved,
-            ReadRange { start: 4, end: 20 },
-            &mut buffers,
-        );
+        DataReader::claim_unresolved_ranges(&mut unresolved, read_range(4, 20), &mut buffers);
 
         assert_eq!(buffers.claimed.len(), 2);
-        assert_eq!(buffers.claimed[0].start, 4);
-        assert_eq!(buffers.claimed[0].end, 8);
-        assert_eq!(buffers.claimed[1].start, 16);
-        assert_eq!(buffers.claimed[1].end, 20);
+        assert_eq!(buffers.claimed[0].start(), 4);
+        assert_eq!(buffers.claimed[0].end(), 8);
+        assert_eq!(buffers.claimed[1].start(), 16);
+        assert_eq!(buffers.claimed[1].end(), 20);
         assert_eq!(unresolved.len(), 2);
-        assert_eq!(unresolved[0].start, 0);
-        assert_eq!(unresolved[0].end, 4);
-        assert_eq!(unresolved[1].start, 20);
-        assert_eq!(unresolved[1].end, 24);
+        assert_eq!(unresolved[0].start(), 0);
+        assert_eq!(unresolved[0].end(), 4);
+        assert_eq!(unresolved[1].start(), 20);
+        assert_eq!(unresolved[1].end(), 24);
         assert!(
             !buffers.claimed.spilled(),
             "short claimed read ranges should avoid heap allocation"
@@ -1713,18 +1679,11 @@ mod tests {
     fn claim_unresolved_ranges_reuses_spilled_buffers_for_fragmented_reads() {
         let mut unresolved = ReadRangeList::new();
         for i in 0..12 {
-            unresolved.push(ReadRange {
-                start: i * 10,
-                end: i * 10 + 5,
-            });
+            unresolved.push(read_range(i * 10, i * 10 + 5));
         }
         let mut buffers = ReadClaimBuffers::new();
 
-        DataReader::claim_unresolved_ranges(
-            &mut unresolved,
-            ReadRange { start: 12, end: 97 },
-            &mut buffers,
-        );
+        DataReader::claim_unresolved_ranges(&mut unresolved, read_range(12, 97), &mut buffers);
 
         assert!(buffers.claimed.spilled());
         assert!(buffers.scratch.spilled());
@@ -1733,11 +1692,7 @@ mod tests {
         assert_eq!(buffers.claimed.len(), 9);
         assert_eq!(unresolved.len(), 4);
 
-        DataReader::claim_unresolved_ranges(
-            &mut unresolved,
-            ReadRange { start: 0, end: 200 },
-            &mut buffers,
-        );
+        DataReader::claim_unresolved_ranges(&mut unresolved, read_range(0, 200), &mut buffers);
 
         assert!(buffers.claimed.capacity() >= claimed_capacity);
         assert!(unresolved.capacity() >= scratch_capacity);
@@ -2138,7 +2093,7 @@ mod tests {
             payload.offset = 2;
             payload.length = 4;
             let segments = vec![ReadSegment {
-                range: ReadRange { start: 0, end: 4 },
+                range: read_range(0, 4),
                 source: ReadSegmentSource::Base { payload },
             }];
             let mut buffer = [0_u8; 4];
@@ -2287,13 +2242,13 @@ mod tests {
                         | ReadSegmentSource::PendingOverlay { .. }
                         | ReadSegmentSource::PendingExtent { .. }
                         | ReadSegmentSource::Overlay { .. }
-                        if segment.range.start < 4 && segment.range.end > 2
+                        if segment.range.start() < 4 && segment.range.end() > 2
                 )
             }));
             assert!(!segments.iter().any(|segment| {
                 matches!(&segment.source, ReadSegmentSource::Base { .. })
-                    && segment.range.start < 4
-                    && segment.range.end > 2
+                    && segment.range.start() < 4
+                    && segment.range.end() > 2
             }));
         });
     }
