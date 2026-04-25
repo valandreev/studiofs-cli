@@ -8,6 +8,7 @@ use crate::VfsMeta;
 use crate::runtime::run_meta;
 use bytes::Bytes;
 use futures::future::join_all;
+use smallvec::{SmallVec, smallvec};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Instant;
@@ -47,6 +48,8 @@ struct ReadSegment {
     range: ReadRange,
     source: ReadSegmentSource,
 }
+
+type ReadRangeList = SmallVec<[ReadRange; 8]>;
 
 struct DataReader<'a> {
     vfs: &'a StudioVfs,
@@ -185,7 +188,7 @@ impl<'a> DataReader<'a> {
             start: offset,
             end: read_end,
         };
-        let mut unresolved = vec![requested];
+        let mut unresolved = smallvec![requested];
         let mut segments = Vec::new();
         let pending_upload_index = vfs.snapshot_pending_upload_index();
 
@@ -392,11 +395,11 @@ impl<'a> DataReader<'a> {
     }
 
     fn claim_unresolved_ranges(
-        unresolved: Vec<ReadRange>,
+        unresolved: ReadRangeList,
         candidate: ReadRange,
-    ) -> (Vec<ReadRange>, Vec<ReadRange>) {
-        let mut next_unresolved = Vec::new();
-        let mut claimed = Vec::new();
+    ) -> (ReadRangeList, ReadRangeList) {
+        let mut next_unresolved = ReadRangeList::new();
+        let mut claimed = ReadRangeList::new();
         for range in unresolved {
             let Some(overlap) = range.intersection(candidate) else {
                 next_unresolved.push(range);
@@ -421,12 +424,12 @@ impl<'a> DataReader<'a> {
 
     fn claim_meta_spans_into_segments<'b, I, F>(
         resolved: I,
-        unresolved: Vec<ReadRange>,
+        unresolved: ReadRangeList,
         segments: &mut Vec<ReadSegment>,
         requested: ReadRange,
         source_filter: ResolvedSliceSource,
         source_ctor: F,
-    ) -> Vec<ReadRange>
+    ) -> ReadRangeList
     where
         I: Iterator<Item = &'b ResolvedSliceSpan>,
         F: Fn(PayloadRef) -> ReadSegmentSource + Copy,
@@ -1651,6 +1654,36 @@ mod tests {
         let refs = DataReader::collect_data_payload_refs(&segments);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs.get(&42), Some(&first));
+    }
+
+    #[test]
+    fn claim_unresolved_ranges_keeps_common_fragmented_case_inline() {
+        let unresolved = smallvec::smallvec![
+            ReadRange { start: 0, end: 8 },
+            ReadRange { start: 16, end: 24 },
+        ];
+
+        let (remaining, claimed) =
+            DataReader::claim_unresolved_ranges(unresolved, ReadRange { start: 4, end: 20 });
+
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed[0].start, 4);
+        assert_eq!(claimed[0].end, 8);
+        assert_eq!(claimed[1].start, 16);
+        assert_eq!(claimed[1].end, 20);
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].start, 0);
+        assert_eq!(remaining[0].end, 4);
+        assert_eq!(remaining[1].start, 20);
+        assert_eq!(remaining[1].end, 24);
+        assert!(
+            !claimed.spilled(),
+            "short claimed read ranges should avoid heap allocation"
+        );
+        assert!(
+            !remaining.spilled(),
+            "short unresolved read ranges should avoid heap allocation"
+        );
     }
 
     #[test]
