@@ -3775,6 +3775,31 @@ fn foreign_delete_lazy_evict_removes_local_payload_artifacts() {
 }
 
 #[test]
+fn metadata_payload_diff_detects_removed_objects_for_retained_inode() {
+    let previous = std::collections::HashMap::from([(42, vec![1001, 1002]), (77, vec![2001])]);
+    let current = std::collections::HashMap::from([(42, vec![1002, 1003])]);
+
+    let removed = StudioVfs::removed_metadata_payloads(&previous, &current);
+
+    assert_eq!(
+        removed.get(&42).cloned(),
+        Some(vec![1001]),
+        "payload diff should evict objects removed by a same-inode remote update"
+    );
+    assert_eq!(
+        removed.get(&77).cloned(),
+        Some(vec![2001]),
+        "payload diff should still evict all objects when the inode disappears"
+    );
+    assert!(
+        !removed
+            .get(&42)
+            .is_some_and(|object_ids| object_ids.contains(&1002)),
+        "payload diff must retain objects still referenced by the current snapshot"
+    );
+}
+
+#[test]
 fn test_rename_over_existing_target_discards_pending_local_state() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "rename-displaced-cleanup");

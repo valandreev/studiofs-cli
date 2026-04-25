@@ -302,6 +302,31 @@ impl StudioVfs {
         }
     }
 
+    pub(super) fn removed_metadata_payloads(
+        previous: &std::collections::HashMap<Ino, Vec<u64>>,
+        current: &std::collections::HashMap<Ino, Vec<u64>>,
+    ) -> std::collections::HashMap<Ino, Vec<u64>> {
+        previous
+            .iter()
+            .filter_map(|(ino, previous_object_ids)| {
+                let current_object_ids = current
+                    .get(ino)
+                    .map(|ids| ids.iter().copied().collect::<HashSet<_>>())
+                    .unwrap_or_default();
+                let removed = previous_object_ids
+                    .iter()
+                    .copied()
+                    .filter(|object_id| !current_object_ids.contains(object_id))
+                    .collect::<Vec<_>>();
+                if removed.is_empty() {
+                    None
+                } else {
+                    Some((*ino, removed))
+                }
+            })
+            .collect()
+    }
+
     pub(super) fn invalidate_kernel_inodes(&self, inodes: impl IntoIterator<Item = Ino>) {
         let Some(invalidator) = self.kernel_invalidator() else {
             return;
@@ -399,11 +424,8 @@ impl StudioVfs {
                 continue;
             };
 
-            let removed_payloads = last_payload_snapshot
-                .iter()
-                .filter(|(ino, _)| !current_payload_snapshot.contains_key(ino))
-                .map(|(ino, object_ids)| (*ino, object_ids.clone()))
-                .collect::<std::collections::HashMap<_, _>>();
+            let removed_payloads =
+                Self::removed_metadata_payloads(&last_payload_snapshot, &current_payload_snapshot);
             self.lazy_evict_removed_metadata_payloads(removed_payloads)
                 .await;
 
