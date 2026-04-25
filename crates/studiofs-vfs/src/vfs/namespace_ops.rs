@@ -141,7 +141,7 @@ impl StudioVfs {
             if let Some(new_size) = args.size
                 && new_size != attr.size
             {
-                self.begin_pending_incarnation(ino, &mut attr);
+                self.begin_size_change_incarnation(ino, &mut attr);
                 if new_size < attr.size {
                     truncate_mutation = Some(self.truncate_blocks(
                         ino,

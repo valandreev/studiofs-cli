@@ -1094,6 +1094,62 @@ fn epoch_finalizer_publishes_slice_graph_zero_length_epoch() {
 }
 
 #[test]
+fn size_change_after_unpublished_flush_advances_content_epoch() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "setattr-size-advances-epoch");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"setattr-size-advances-epoch.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let payload = b"unpublished payload";
+
+        vfs.write(ino, 0, payload)
+            .await
+            .expect("write test payload");
+        vfs.flush(ino).await.expect("flush first unpublished epoch");
+
+        let flushed_attr = meta.get_attr(ino).expect("load flushed attr");
+        let old_epoch = flushed_attr.content_epoch;
+        let old_objects = meta
+            .get_regular_file_overlay_object_ids(ino)
+            .expect("load old overlay object ids");
+        assert!(
+            !old_objects.is_empty(),
+            "setup should leave unpublished upload work in the old epoch"
+        );
+
+        vfs.setattr(ino, SetattrArgs::size_only(0))
+            .expect("truncate flushed unpublished file to zero");
+
+        let truncated_attr = meta.get_attr(ino).expect("load truncated attr");
+        assert_eq!(truncated_attr.size, 0);
+        assert!(
+            truncated_attr.content_epoch > old_epoch,
+            "truncate-to-zero must stale queued upload/finalize work from the prior epoch"
+        );
+        assert!(
+            !meta
+                .mark_regular_file_overlay_object_uploaded_if_matches(
+                    ino,
+                    old_epoch,
+                    old_objects[0],
+                )
+                .expect("stale upload completion should be ignored"),
+            "old upload completion must not match the newer size-changing epoch"
+        );
+        assert!(
+            meta.lookup_payload_slices(ino)
+                .expect("load truncated payload slices")
+                .is_empty(),
+            "truncate-to-zero should leave no visible payload slices"
+        );
+    });
+}
+
+#[test]
 fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-buffered-tail");

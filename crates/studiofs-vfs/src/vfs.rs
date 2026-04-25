@@ -4201,6 +4201,59 @@ impl StudioVfs {
         }
     }
 
+    fn begin_size_change_incarnation(&self, ino: Ino, attr: &mut InodeAttr) {
+        if attr.kind != FileType::RegularFile {
+            return;
+        }
+
+        let mut states = self.state.incarnation.inode_incarnations.lock();
+        let state = states.entry(ino).or_insert_with(|| InodeIncarnationState {
+            committed_incarnation: self.derive_committed_incarnation_from_attr(attr),
+            pending_incarnation: None,
+            upload_state: VfsUploadState::Idle,
+        });
+
+        if state.pending_incarnation.is_none() {
+            drop(states);
+            self.begin_pending_incarnation(ino, attr);
+            return;
+        }
+
+        let committed = state.committed_incarnation.clone().or({
+            if attr.committed_size == 0 {
+                None
+            } else {
+                Some(CommittedIncarnation {
+                    content_epoch: attr.committed_content_epoch,
+                    size: attr.committed_size,
+                })
+            }
+        });
+        let previous_pending_epoch = state
+            .pending_incarnation
+            .as_ref()
+            .map(|pending| pending.content_epoch)
+            .unwrap_or(attr.content_epoch);
+        let next_epoch = attr
+            .content_epoch
+            .max(previous_pending_epoch)
+            .saturating_add(1);
+        let base_size = committed.as_ref().map(|base| base.size).unwrap_or(0);
+
+        state.committed_incarnation = committed.clone();
+        state.pending_incarnation = Some(PendingIncarnation {
+            content_epoch: next_epoch,
+            size: attr.size,
+            base_size,
+        });
+        state.upload_state = if committed.is_some() {
+            VfsUploadState::Updating
+        } else {
+            VfsUploadState::Uploading
+        };
+        attr.content_epoch = next_epoch;
+    }
+
     fn refresh_inode_incarnation_state_from_attr(
         &self,
         ino: Ino,
