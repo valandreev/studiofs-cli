@@ -508,6 +508,7 @@ impl LocalPayloadBackendRuntime {
                 .low_space_progress_waits
                 .fetch_add(1, Ordering::Relaxed)
                 .saturating_add(1);
+            let before_retry_evict_bytes = current_after_evict;
             current_after_evict =
                 self.evict_to_target_bytes(target_bytes, "put_low_space_retry")?;
             debug!(
@@ -515,6 +516,7 @@ impl LocalPayloadBackendRuntime {
                 progress_wait_limit = LOW_SPACE_UPLOAD_DRAIN_PROGRESS_RETRIES,
                 progress_total,
                 current_bytes = current_after_evict,
+                freed_bytes = before_retry_evict_bytes.saturating_sub(current_after_evict),
                 target_bytes,
                 payload_len,
                 "local payload runtime low-space put observed upload drain progress"
