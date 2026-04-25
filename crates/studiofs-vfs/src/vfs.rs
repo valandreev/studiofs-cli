@@ -4576,27 +4576,30 @@ impl StudioVfs {
             return;
         }
 
-        let pending_uploads: Vec<_> = self
-            .pending_uploads_snapshot()
-            .into_iter()
-            .filter(|op| inos.contains(&op.ino))
-            .collect();
+        let pending_uploads: Vec<_> = {
+            let deleted_inodes = self.state.upload.deleted_inodes.lock();
+            self.pending_uploads_snapshot()
+                .into_iter()
+                .filter(|op| inos.contains(&op.ino))
+                .map(|op| {
+                    let deleted = deleted_inodes.contains(&op.ino);
+                    (op, deleted)
+                })
+                .collect()
+        };
         if pending_uploads.is_empty() {
             return;
         }
 
-        let deleted_cancel_count = {
-            let deleted_inodes = self.state.upload.deleted_inodes.lock();
-            pending_uploads
-                .iter()
-                .filter(|op| deleted_inodes.contains(&op.ino))
-                .count() as u64
-        };
-
-        for op in &pending_uploads {
+        let mut deleted_cancel_count = 0;
+        for (op, deleted) in &pending_uploads {
+            if *deleted {
+                deleted_cancel_count += 1;
+            }
             self.cached_store.cancel_upload(op);
         }
         if deleted_cancel_count > 0 {
+            // Telemetry only; upload cancellation state is carried by the queue.
             self.state
                 .upload
                 .upload_canceled_deleted
@@ -4604,7 +4607,7 @@ impl StudioVfs {
         }
 
         let mut pending_evictions = self.state.upload.pending_evictions.lock();
-        for op in pending_uploads {
+        for (op, _) in pending_uploads {
             pending_evictions.remove(&op.object_id);
             self.debug_pending_inode_state(op.ino, "pending_upload_canceled");
         }
@@ -5023,8 +5026,12 @@ impl StudioVfs {
         Ok(())
     }
 
-    async fn payload_store_remove_batch_async(&self, object_ids: Vec<u64>) -> VfsResult<()> {
+    async fn payload_store_remove_batch_async(&self, object_ids: &[u64]) -> VfsResult<()> {
+        if object_ids.is_empty() {
+            return Ok(());
+        }
         let payload_store = self.local_payload_backend.clone();
+        let object_ids = object_ids.to_vec();
         let ((), timing) = run_local_cache_io_blocking(move || {
             payload_store.remove_batch(&object_ids);
             Ok(())
@@ -5049,11 +5056,12 @@ impl StudioVfs {
         self.cached_store.remove_hot_upload(object_id);
     }
 
-    async fn upload_stage_remove_batch_async(&self, object_ids: Vec<u64>) -> VfsResult<()> {
+    async fn upload_stage_remove_batch_async(&self, object_ids: &[u64]) -> VfsResult<()> {
         if object_ids.is_empty() {
             return Ok(());
         }
         let cached_store = self.cached_store.clone();
+        let object_ids = object_ids.to_vec();
         let ((), timing) = run_local_cache_io_blocking(move || {
             cached_store.remove_staged_upload_batch(&object_ids);
             Ok(())
@@ -5063,11 +5071,11 @@ impl StudioVfs {
         Ok(())
     }
 
-    fn upload_hot_remove_batch(&self, object_ids: Vec<u64>) {
+    fn upload_hot_remove_batch(&self, object_ids: &[u64]) {
         if object_ids.is_empty() {
             return;
         }
-        self.cached_store.remove_hot_upload_batch(&object_ids);
+        self.cached_store.remove_hot_upload_batch(object_ids);
     }
 
     pub fn upload_stats(&self) -> VfsUploadStats {

@@ -2345,7 +2345,7 @@ mod tests {
                 .into_iter()
                 .map(|(_, object_id, _)| object_id)
                 .collect();
-            vfs.upload_hot_remove_batch(pending_object_ids);
+            vfs.upload_hot_remove_batch(&pending_object_ids);
 
             counting_backend.reset_counters();
 

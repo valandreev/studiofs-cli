@@ -244,8 +244,8 @@ impl StudioVfs {
             }
         }
 
-        self.upload_hot_remove_batch(evicted.clone());
-        if let Err(error) = self.upload_stage_remove_batch_async(evicted.clone()).await {
+        self.upload_hot_remove_batch(&evicted);
+        if let Err(error) = self.upload_stage_remove_batch_async(&evicted).await {
             warn!(
                 ino,
                 error = %error,
@@ -254,7 +254,7 @@ impl StudioVfs {
             );
         }
         if !evicted.is_empty() {
-            if let Err(error) = self.payload_store_remove_batch_async(evicted.clone()).await {
+            if let Err(error) = self.payload_store_remove_batch_async(&evicted).await {
                 warn!(
                     ino,
                     error = %error,
@@ -297,8 +297,7 @@ impl StudioVfs {
             }
         }
         if !evicted.is_empty() {
-            self.payload_store_remove_batch_async(evicted.clone())
-                .await?;
+            self.payload_store_remove_batch_async(&evicted).await?;
         }
         if !evicted.is_empty() || deferred_pinned > 0 {
             info!(

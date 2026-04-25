@@ -5,6 +5,11 @@ use super::*;
 use crate::vfs::upload_lifecycle::UploadLifecycleWorker;
 use crate::{JanitorMeta, VfsMeta};
 
+struct MetadataTraversalSnapshot {
+    inodes: HashSet<Ino>,
+    payloads: HashMap<Ino, Vec<u64>>,
+}
+
 impl StudioVfs {
     pub(super) async fn background_aggressive_materialization(self: Arc<Self>) {
         let mut interval = tokio::time::interval(AGGRESSIVE_MATERIALIZATION_INTERVAL);
@@ -210,40 +215,12 @@ impl StudioVfs {
         self.kernel_invalidator.read().clone()
     }
 
-    fn collect_metadata_inodes<M: ?Sized + JanitorMeta>(engine: &M) -> MetaResult<HashSet<Ino>> {
-        let mut seen = HashSet::from([ROOT_INO]);
-        let mut stack = vec![ROOT_INO];
-
-        while let Some(ino) = stack.pop() {
-            let attr = match engine.get_attr(ino) {
-                Ok(attr) => attr,
-                Err(MetaError::InodeNotFound(_)) => continue,
-                Err(err) => return Err(err),
-            };
-            if attr.kind != FileType::Directory {
-                continue;
-            }
-            let entries = match engine.readdir(ino) {
-                Ok(entries) => entries,
-                Err(MetaError::InodeNotFound(_)) => continue,
-                Err(err) => return Err(err),
-            };
-            for entry in entries {
-                if seen.insert(entry.ino) {
-                    stack.push(entry.ino);
-                }
-            }
-        }
-
-        Ok(seen)
-    }
-
-    fn collect_metadata_payload_snapshot<M: ?Sized + JanitorMeta>(
+    fn collect_metadata_snapshot<M: ?Sized + JanitorMeta>(
         engine: &M,
-    ) -> MetaResult<std::collections::HashMap<Ino, Vec<u64>>> {
-        let mut payloads = std::collections::HashMap::new();
+    ) -> MetaResult<MetadataTraversalSnapshot> {
         let mut seen = HashSet::from([ROOT_INO]);
         let mut stack = vec![ROOT_INO];
+        let mut payloads = HashMap::new();
 
         while let Some(ino) = stack.pop() {
             let attr = match engine.get_attr(ino) {
@@ -265,11 +242,13 @@ impl StudioVfs {
                     }
                 }
                 FileType::RegularFile => {
-                    let object_ids = engine
+                    let mut object_ids = engine
                         .get_regular_file_graph_object_usage(ino)?
                         .into_iter()
                         .map(|(object_id, _)| object_id)
                         .collect::<Vec<_>>();
+                    object_ids.sort_unstable();
+                    object_ids.dedup();
                     if !object_ids.is_empty() {
                         payloads.insert(ino, object_ids);
                     }
@@ -278,12 +257,15 @@ impl StudioVfs {
             }
         }
 
-        Ok(payloads)
+        Ok(MetadataTraversalSnapshot {
+            inodes: seen,
+            payloads,
+        })
     }
 
     pub(super) async fn lazy_evict_removed_metadata_payloads(
         &self,
-        removed_payloads: std::collections::HashMap<Ino, Vec<u64>>,
+        removed_payloads: HashMap<Ino, Vec<u64>>,
     ) {
         for (ino, object_ids) in removed_payloads {
             if object_ids.is_empty() {
@@ -303,21 +285,33 @@ impl StudioVfs {
     }
 
     pub(super) fn removed_metadata_payloads(
-        previous: &std::collections::HashMap<Ino, Vec<u64>>,
-        current: &std::collections::HashMap<Ino, Vec<u64>>,
-    ) -> std::collections::HashMap<Ino, Vec<u64>> {
+        previous: &HashMap<Ino, Vec<u64>>,
+        current: &HashMap<Ino, Vec<u64>>,
+    ) -> HashMap<Ino, Vec<u64>> {
         previous
             .iter()
             .filter_map(|(ino, previous_object_ids)| {
-                let current_object_ids = current
-                    .get(ino)
-                    .map(|ids| ids.iter().copied().collect::<HashSet<_>>())
-                    .unwrap_or_default();
-                let removed = previous_object_ids
-                    .iter()
-                    .copied()
-                    .filter(|object_id| !current_object_ids.contains(object_id))
-                    .collect::<Vec<_>>();
+                let current_object_ids = current.get(ino).map(Vec::as_slice).unwrap_or(&[]);
+                let mut removed = Vec::new();
+                let mut previous_index = 0;
+                let mut current_index = 0;
+                while previous_index < previous_object_ids.len() {
+                    if current_index >= current_object_ids.len() {
+                        removed.extend_from_slice(&previous_object_ids[previous_index..]);
+                        break;
+                    }
+                    let previous_object_id = previous_object_ids[previous_index];
+                    let current_object_id = current_object_ids[current_index];
+                    if previous_object_id == current_object_id {
+                        previous_index += 1;
+                        current_index += 1;
+                    } else if previous_object_id < current_object_id {
+                        removed.push(previous_object_id);
+                        previous_index += 1;
+                    } else {
+                        current_index += 1;
+                    }
+                }
                 if removed.is_empty() {
                     None
                 } else {
@@ -351,21 +345,17 @@ impl StudioVfs {
         let mut last_namespace_token = meta.namespace_version_token();
         let mut last_metadata_token = meta.metadata_version_token();
         let mut last_snapshot: HashSet<Ino> = HashSet::new();
-        let mut last_payload_snapshot = std::collections::HashMap::<Ino, Vec<u64>>::new();
+        let mut last_payload_snapshot = HashMap::<Ino, Vec<u64>>::new();
 
         if last_namespace_token.is_some() || last_metadata_token.is_some() {
             let meta = self.meta.clone();
-            if let Ok((snapshot, payload_snapshot)) =
-                run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                    Ok((
-                        Self::collect_metadata_inodes(engine.as_ref())?,
-                        Self::collect_metadata_payload_snapshot(engine.as_ref())?,
-                    ))
-                })
-                .await
+            if let Ok(snapshot) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                Self::collect_metadata_snapshot(engine.as_ref())
+            })
+            .await
             {
-                last_snapshot = snapshot;
-                last_payload_snapshot = payload_snapshot;
+                last_snapshot = snapshot.inodes;
+                last_payload_snapshot = snapshot.payloads;
             }
         }
 
@@ -412,25 +402,21 @@ impl StudioVfs {
             }
 
             let meta = self.meta.clone();
-            let Ok((current_snapshot, current_payload_snapshot)) =
-                run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
-                    Ok((
-                        Self::collect_metadata_inodes(engine.as_ref())?,
-                        Self::collect_metadata_payload_snapshot(engine.as_ref())?,
-                    ))
-                })
-                .await
+            let Ok(current_snapshot) = run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
+                Self::collect_metadata_snapshot(engine.as_ref())
+            })
+            .await
             else {
                 continue;
             };
 
             let removed_payloads =
-                Self::removed_metadata_payloads(&last_payload_snapshot, &current_payload_snapshot);
+                Self::removed_metadata_payloads(&last_payload_snapshot, &current_snapshot.payloads);
             self.lazy_evict_removed_metadata_payloads(removed_payloads)
                 .await;
 
             let mut to_invalidate = last_snapshot.clone();
-            to_invalidate.extend(current_snapshot.iter().copied());
+            to_invalidate.extend(current_snapshot.inodes.iter().copied());
             self.invalidate_attr_read_cache(to_invalidate.iter().copied());
             self.invalidate_kernel_inodes(to_invalidate.iter().copied());
             if namespace_changed {
@@ -439,8 +425,8 @@ impl StudioVfs {
             if namespace_changed || metadata_changed {
                 self.bump_acl_namespace_epoch();
             }
-            last_snapshot = current_snapshot;
-            last_payload_snapshot = current_payload_snapshot;
+            last_snapshot = current_snapshot.inodes;
+            last_payload_snapshot = current_snapshot.payloads;
         }
     }
 
