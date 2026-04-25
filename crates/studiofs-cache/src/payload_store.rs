@@ -459,10 +459,14 @@ impl FilePayloadStore {
         for entry in staged {
             content.push_str("object=");
             content.push_str(&entry.entry.object_id.to_string());
-            content.push_str("|temp=");
-            content.push_str(&self.intent_relative_path(&entry.temp_path)?);
-            content.push_str("|final=");
-            content.push_str(&self.intent_relative_path(&entry.payload_path)?);
+            content.push_str("|temp_hex=");
+            content.push_str(&encode_batch_intent_path_hex(
+                &self.intent_relative_path(&entry.temp_path)?,
+            ));
+            content.push_str("|final_hex=");
+            content.push_str(&encode_batch_intent_path_hex(
+                &self.intent_relative_path(&entry.payload_path)?,
+            ));
             content.push('\n');
         }
 
@@ -793,6 +797,15 @@ fn remove_batch_payload_intent(path: &Path) {
             "local payload runtime batch intent remove failed"
         );
     }
+}
+
+fn encode_batch_intent_path_hex(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    encoded
 }
 
 #[cfg(test)]

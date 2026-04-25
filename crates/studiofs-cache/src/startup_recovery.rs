@@ -216,6 +216,12 @@ fn parse_batch_payload_intent_object(
     for (idx, part) in row.split('|').enumerate() {
         if idx == 0 {
             object_id = part.parse::<u64>().ok();
+        } else if let Some(path_hex) = part.strip_prefix("temp_hex=") {
+            temp = decode_batch_intent_path_hex(path_hex)
+                .and_then(|path| resolve_batch_intent_relative_path(layout, &path));
+        } else if let Some(path_hex) = part.strip_prefix("final_hex=") {
+            final_path = decode_batch_intent_path_hex(path_hex)
+                .and_then(|path| resolve_batch_intent_relative_path(layout, &path));
         } else if let Some(path) = part.strip_prefix("temp=") {
             temp = resolve_batch_intent_relative_path(layout, path);
         } else if let Some(path) = part.strip_prefix("final=") {
@@ -241,6 +247,18 @@ fn resolve_batch_intent_relative_path(layout: &LocalPayloadLayout, value: &str) 
         path.push(component);
     }
     Some(path)
+}
+
+fn decode_batch_intent_path_hex(value: &str) -> Option<String> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for idx in (0..value.len()).step_by(2) {
+        let byte = u8::from_str_radix(&value[idx..idx + 2], 16).ok()?;
+        bytes.push(byte);
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn batch_intent_dir(layout: &LocalPayloadLayout) -> PathBuf {
@@ -607,6 +625,49 @@ mod tests {
         assert!(intent_path.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn startup_reconcile_batch_intent_accepts_hex_encoded_paths_with_delimiters() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let index = CacheIndex::open(&layout.redb_index_path).unwrap();
+        let payload_path = layout
+            .payload_objects_dir
+            .join("aa")
+            .join("bb")
+            .join("contains|delimiter.object");
+        std::fs::create_dir_all(payload_path.parent().unwrap()).unwrap();
+        std::fs::write(&payload_path, b"payload").unwrap();
+        let final_path = payload_path
+            .strip_prefix(&layout.runtime_root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let final_path_hex = encode_test_path_hex(&final_path);
+
+        let intent_dir = batch_intent_dir(&layout);
+        std::fs::create_dir_all(&intent_dir).unwrap();
+        std::fs::write(
+            intent_dir.join("batch-0000000000000005.intent"),
+            format!(
+                "version=1\nphase=committing\nobject=15|temp_hex=|final_hex={final_path_hex}\n"
+            ),
+        )
+        .unwrap();
+
+        let report = reconcile_startup_state(
+            &layout,
+            &index,
+            LocalPayloadStartupReconcileMode::Lightweight,
+        )
+        .unwrap();
+
+        assert_eq!(report.batch_intents_resolved, 1);
+        assert!(!payload_path.exists());
+    }
+
     #[cfg(windows)]
     #[test]
     fn startup_reconcile_batch_intent_rejects_rooted_paths() {
@@ -639,6 +700,15 @@ mod tests {
 
         assert_eq!(report.batch_intents_resolved, 1);
         assert_eq!(std::fs::read(&outside_path).unwrap(), b"outside-runtime");
+    }
+
+    #[cfg(unix)]
+    fn encode_test_path_hex(value: &str) -> String {
+        let mut encoded = String::with_capacity(value.len() * 2);
+        for byte in value.as_bytes() {
+            encoded.push_str(&format!("{byte:02x}"));
+        }
+        encoded
     }
 
     #[test]
