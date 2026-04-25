@@ -2,6 +2,73 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IntervalRange {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+}
+
+impl IntervalRange {
+    pub(crate) fn new(start: u64, end: u64) -> Option<Self> {
+        (start < end).then_some(Self { start, end })
+    }
+
+    pub(crate) fn intersection(self, other: Self) -> Option<Self> {
+        let start = self.start.max(other.start);
+        let end = self.end.min(other.end);
+        Self::new(start, end)
+    }
+}
+
+pub(crate) fn subtract_claimed_range<I, R, C>(
+    ranges: I,
+    candidate: IntervalRange,
+    remaining: &mut R,
+    claimed: &mut C,
+) where
+    I: IntoIterator<Item = IntervalRange>,
+    R: Extend<IntervalRange>,
+    C: Extend<IntervalRange>,
+{
+    for range in ranges {
+        let Some(overlap) = range.intersection(candidate) else {
+            remaining.extend(std::iter::once(range));
+            continue;
+        };
+        if range.start < overlap.start {
+            remaining.extend(std::iter::once(IntervalRange {
+                start: range.start,
+                end: overlap.start,
+            }));
+        }
+        claimed.extend(std::iter::once(overlap));
+        if overlap.end < range.end {
+            remaining.extend(std::iter::once(IntervalRange {
+                start: overlap.end,
+                end: range.end,
+            }));
+        }
+    }
+}
+
+pub(crate) fn trim_range_to_available_len(
+    range: IntervalRange,
+    range_offset: u64,
+    available_len: u64,
+    max_end: u64,
+) -> Option<IntervalRange> {
+    if range_offset >= available_len {
+        return None;
+    }
+    let allowed_len = available_len.checked_sub(range_offset)?;
+    let new_end = range.start.checked_add(allowed_len)?;
+    let end = range.end.min(new_end);
+    if end > max_end {
+        return None;
+    }
+    IntervalRange::new(range.start, end)
+}
+
 /// Parse a human-readable size string into bytes.
 ///
 /// Supports plain bytes and `KB`, `MB`, `GB`, `TB`, `PB`, and `EB` suffixes.
@@ -81,6 +148,92 @@ pub(crate) fn now_unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interval_intersection_handles_empty_boundary_and_full_cover() {
+        let range = IntervalRange::new(10, 20).unwrap();
+
+        assert_eq!(
+            range.intersection(IntervalRange::new(15, 25).unwrap()),
+            Some(IntervalRange::new(15, 20).unwrap())
+        );
+        assert_eq!(
+            range.intersection(IntervalRange::new(20, 30).unwrap()),
+            None
+        );
+        assert_eq!(
+            range.intersection(IntervalRange::new(0, 30).unwrap()),
+            Some(range)
+        );
+        assert!(IntervalRange::new(7, 7).is_none());
+        assert!(IntervalRange::new(8, 7).is_none());
+    }
+
+    #[test]
+    fn subtract_claimed_range_preserves_order_and_fragments() {
+        let source = [
+            IntervalRange::new(0, 8).unwrap(),
+            IntervalRange::new(16, 24).unwrap(),
+            IntervalRange::new(30, 40).unwrap(),
+        ];
+        let mut remaining = Vec::new();
+        let mut claimed = Vec::new();
+
+        subtract_claimed_range(
+            source,
+            IntervalRange::new(4, 35).unwrap(),
+            &mut remaining,
+            &mut claimed,
+        );
+
+        assert_eq!(
+            claimed,
+            vec![
+                IntervalRange::new(4, 8).unwrap(),
+                IntervalRange::new(16, 24).unwrap(),
+                IntervalRange::new(30, 35).unwrap(),
+            ]
+        );
+        assert_eq!(
+            remaining,
+            vec![
+                IntervalRange::new(0, 4).unwrap(),
+                IntervalRange::new(35, 40).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn trim_range_to_available_len_keeps_prefix_and_trims_suffix() {
+        let range = IntervalRange::new(20, 30).unwrap();
+
+        assert_eq!(
+            trim_range_to_available_len(range, 4, 20, 64),
+            Some(IntervalRange::new(20, 30).unwrap())
+        );
+        assert_eq!(
+            trim_range_to_available_len(range, 4, 10, 64),
+            Some(IntervalRange::new(20, 26).unwrap())
+        );
+        assert_eq!(trim_range_to_available_len(range, 10, 10, 64), None);
+    }
+
+    #[test]
+    fn trim_range_to_available_len_rejects_overflow_and_bounds() {
+        assert_eq!(
+            trim_range_to_available_len(
+                IntervalRange::new(u64::MAX - 2, u64::MAX).unwrap(),
+                0,
+                8,
+                u64::MAX
+            ),
+            None
+        );
+        assert_eq!(
+            trim_range_to_available_len(IntervalRange::new(20, 30).unwrap(), 0, 20, 25),
+            None
+        );
+    }
 
     #[test]
     fn parse_size_bytes_accepts_fractional_values() {

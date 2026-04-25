@@ -1,4 +1,5 @@
 use super::*;
+use crate::utils::{IntervalRange, trim_range_to_available_len};
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::time::{Duration, Instant};
 
@@ -2468,18 +2469,25 @@ impl StudioVfs {
                 if slice.block_offset as usize >= new_len {
                     return false;
                 }
-                let allowed_len = new_len.saturating_sub(slice.block_offset as usize);
-                if slice_len <= allowed_len {
+                if slice_len <= new_len.saturating_sub(slice.block_offset as usize) {
                     return true;
                 }
-                let new_end = (slice.range.start as usize).saturating_add(allowed_len);
-                if new_end <= slice.range.start as usize
-                    || new_end > studiofs_meta::schema::DEFAULT_CHUNK_SIZE as usize
-                {
+                let Some(trimmed) = trim_range_to_available_len(
+                    IntervalRange {
+                        start: slice.range.start as u64,
+                        end: slice.range.end as u64,
+                    },
+                    slice.block_offset as u64,
+                    new_len as u64,
+                    studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64,
+                ) else {
                     return false;
-                }
-                slice.range.end = new_end as u32;
-                true
+                };
+                let Some(new_end) = u32::try_from(trimmed.end).ok() else {
+                    return false;
+                };
+                slice.range.end = new_end;
+                slice.range.start < slice.range.end
             });
             !slices.is_empty()
         });
@@ -2661,13 +2669,19 @@ impl StudioVfs {
                 data
             };
 
-            let slice_start = chunk_start.saturating_add(slice.range.start as u64);
-            let slice_end = chunk_start.saturating_add(slice.range.end as u64);
-            let start = slice_start.max(offset);
-            let stop = slice_end.min(end);
-            if start >= stop {
+            let Some(slice_range) = IntervalRange::new(
+                chunk_start.saturating_add(slice.range.start as u64),
+                chunk_start.saturating_add(slice.range.end as u64),
+            ) else {
                 continue;
-            }
+            };
+            let Some(overlap) = slice_range.intersection(IntervalRange { start: offset, end })
+            else {
+                continue;
+            };
+            let start = overlap.start;
+            let stop = overlap.end;
+            let slice_start = slice_range.start;
             let advance = start.saturating_sub(slice_start);
             let Some(advance_u32) = u32::try_from(advance).ok() else {
                 continue;

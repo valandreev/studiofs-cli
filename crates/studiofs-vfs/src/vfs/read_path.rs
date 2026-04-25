@@ -6,6 +6,7 @@ use super::{
 };
 use crate::VfsMeta;
 use crate::runtime::run_meta;
+use crate::utils::{IntervalRange, subtract_claimed_range};
 use bytes::Bytes;
 use futures::future::join_all;
 use smallvec::{SmallVec, smallvec};
@@ -19,19 +20,7 @@ use studiofs_meta::schema::{
 use studiofs_meta::types::{Ino, InodeAttr, PayloadRef, block_index_from_offset};
 use tracing::{debug, error, info, warn};
 
-#[derive(Debug, Clone, Copy)]
-struct ReadRange {
-    start: u64,
-    end: u64,
-}
-
-impl ReadRange {
-    fn intersection(self, other: Self) -> Option<Self> {
-        let start = self.start.max(other.start);
-        let end = self.end.min(other.end);
-        (start < end).then_some(Self { start, end })
-    }
-}
+type ReadRange = IntervalRange;
 
 #[derive(Debug, Clone)]
 enum ReadSegmentSource {
@@ -420,25 +409,12 @@ impl<'a> DataReader<'a> {
     ) {
         buffers.claimed.clear();
         buffers.scratch.clear();
-        for range in unresolved.drain(..) {
-            let Some(overlap) = range.intersection(candidate) else {
-                buffers.scratch.push(range);
-                continue;
-            };
-            if range.start < overlap.start {
-                buffers.scratch.push(ReadRange {
-                    start: range.start,
-                    end: overlap.start,
-                });
-            }
-            buffers.claimed.push(overlap);
-            if overlap.end < range.end {
-                buffers.scratch.push(ReadRange {
-                    start: overlap.end,
-                    end: range.end,
-                });
-            }
-        }
+        subtract_claimed_range(
+            unresolved.drain(..),
+            candidate,
+            &mut buffers.scratch,
+            &mut buffers.claimed,
+        );
         std::mem::swap(unresolved, &mut buffers.scratch);
     }
 
