@@ -359,18 +359,18 @@ impl<'a> DataReader<'a> {
 
         if !unresolved.is_empty() {
             if let Some(resolved) = resolved_regular_file_slices {
-                unresolved = Self::claim_meta_spans_into_segments(
+                Self::claim_meta_spans_into_segments(
                     resolved.iter(),
-                    unresolved,
+                    &mut unresolved,
                     &mut segments,
                     requested,
                     ResolvedSliceSource::Overlay,
                     |payload| ReadSegmentSource::Overlay { payload },
                     &mut claim_buffers,
                 );
-                unresolved = Self::claim_meta_spans_into_segments(
+                Self::claim_meta_spans_into_segments(
                     resolved.iter(),
-                    unresolved,
+                    &mut unresolved,
                     &mut segments,
                     requested,
                     ResolvedSliceSource::Base,
@@ -383,18 +383,18 @@ impl<'a> DataReader<'a> {
                     engine.lookup_regular_file_slices(ino, offset, length)
                 })
                 .await?;
-                unresolved = Self::claim_meta_spans_into_segments(
+                Self::claim_meta_spans_into_segments(
                     resolved.iter(),
-                    unresolved,
+                    &mut unresolved,
                     &mut segments,
                     requested,
                     ResolvedSliceSource::Overlay,
                     |payload| ReadSegmentSource::Overlay { payload },
                     &mut claim_buffers,
                 );
-                unresolved = Self::claim_meta_spans_into_segments(
+                Self::claim_meta_spans_into_segments(
                     resolved.iter(),
-                    unresolved,
+                    &mut unresolved,
                     &mut segments,
                     requested,
                     ResolvedSliceSource::Base,
@@ -444,18 +444,16 @@ impl<'a> DataReader<'a> {
 
     fn claim_meta_spans_into_segments<'b, I, F>(
         resolved: I,
-        unresolved: ReadRangeList,
+        unresolved: &mut ReadRangeList,
         segments: &mut Vec<ReadSegment>,
         requested: ReadRange,
         source_filter: ResolvedSliceSource,
         source_ctor: F,
         buffers: &mut ReadClaimBuffers,
-    ) -> ReadRangeList
-    where
+    ) where
         I: Iterator<Item = &'b ResolvedSliceSpan>,
         F: Fn(PayloadRef) -> ReadSegmentSource + Copy,
     {
-        let mut unresolved = unresolved;
         for span in resolved {
             if unresolved.is_empty() {
                 break;
@@ -474,7 +472,7 @@ impl<'a> DataReader<'a> {
             let Some(clipped) = span_range.intersection(requested) else {
                 continue;
             };
-            Self::claim_unresolved_ranges(&mut unresolved, clipped, buffers);
+            Self::claim_unresolved_ranges(unresolved, clipped, buffers);
             for overlap in buffers.claimed.iter().copied() {
                 let delta = overlap.start.saturating_sub(span_range.start);
                 let Some(delta_u32) = u32::try_from(delta).ok() else {
@@ -496,7 +494,6 @@ impl<'a> DataReader<'a> {
                 });
             }
         }
-        unresolved
     }
 
     async fn populate_missing_remote_blocks(
