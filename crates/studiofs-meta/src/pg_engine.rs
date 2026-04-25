@@ -603,6 +603,7 @@ impl PgMetaEngine {
     fn reserve_inode_window_from_postgres(
         &self,
         initial_next_hint: u64,
+        minimum_window_size: u64,
     ) -> MetaResult<InodeWindow> {
         #[cfg(test)]
         if let Some(override_result) = tests::pop_inode_window_reservation_override() {
@@ -614,6 +615,7 @@ impl PgMetaEngine {
         let connect_timeout = self.connect_timeout;
         let command_timeout = self.command_timeout;
         let initial_next_hint = initial_next_hint.max(ROOT_INO + 1);
+        let window_size = PG_INODE_WINDOW_SIZE.max(minimum_window_size);
         Self::run_async_once(async move {
             Self::with_postgres_client_timeout(
                 postgres_url,
@@ -652,9 +654,9 @@ impl PgMetaEngine {
                             i64::MAX
                         ))
                     })?;
-                    let window_size = i64::try_from(PG_INODE_WINDOW_SIZE).map_err(|_| {
+                    let window_size = i64::try_from(window_size).map_err(|_| {
                         MetaError::Storage(format!(
-                            "invalid inode window size: {PG_INODE_WINDOW_SIZE} exceeds PostgreSQL BIGINT max {}",
+                            "invalid inode window size: {window_size} exceeds PostgreSQL BIGINT max {}",
                             i64::MAX
                         ))
                     })?;
@@ -804,6 +806,15 @@ impl PgMetaEngine {
         slot: u64,
         reason: InodeWindowReservationReason,
     ) -> MetaResult<InodeAllocatorState> {
+        self.reserve_inode_window_if_needed_with_min_size(slot, reason, PG_INODE_WINDOW_SIZE)
+    }
+
+    fn reserve_inode_window_if_needed_with_min_size(
+        &self,
+        slot: u64,
+        reason: InodeWindowReservationReason,
+        minimum_window_size: u64,
+    ) -> MetaResult<InodeAllocatorState> {
         let _reservation_guard = self.inode_window_reservation_lock.lock().map_err(|_| {
             MetaError::Storage("inode window reservation lock poisoned".to_string())
         })?;
@@ -820,7 +831,7 @@ impl PgMetaEngine {
             self.inode_window_seed_hint(state, reason)?
         };
 
-        let window = self.reserve_inode_window_from_postgres(seed_hint)?;
+        let window = self.reserve_inode_window_from_postgres(seed_hint, minimum_window_size)?;
         let _allocator_guard = self
             .inode_allocator_lock
             .lock()
@@ -850,6 +861,109 @@ impl PgMetaEngine {
             format!(
                 "failed to reserve a new inode window from PostgreSQL after exhausting local inode windows: {error_text}"
             )
+        }
+    }
+
+    fn allocate_inode_object_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let slot = self.client_slot()?;
+        let count = u64::from(count);
+        loop {
+            let allocation = {
+                let _guard = self
+                    .inode_allocator_lock
+                    .lock()
+                    .map_err(|_| MetaError::Storage("inode allocator lock poisoned".to_string()))?;
+                let mut state = self.load_runtime_inode_allocator_state(slot)?;
+                if state.current.remaining() < count && state.prefetched.has_headroom() {
+                    state.current = state.prefetched;
+                    state.prefetched = InodeWindow::default();
+                }
+                if state.current.remaining() < count {
+                    if state.current.has_headroom() {
+                        state.current.next = state.current.end;
+                        self.persist_inode_allocator_state(state)?;
+                    }
+                    self.update_inode_headroom_flag(state);
+                    None
+                } else {
+                    let first = state.current.next;
+                    state.current.next =
+                        state.current.next.checked_add(count).ok_or_else(|| {
+                            MetaError::Storage("pg inode/object ID allocation overflow".to_string())
+                        })?;
+
+                    if state.current.next == state.current.end && state.prefetched.has_headroom() {
+                        state.current = state.prefetched;
+                        state.prefetched = InodeWindow::default();
+                    }
+
+                    let needs_current_refill = Self::inode_window_reservation_needed(
+                        state,
+                        InodeWindowReservationReason::Current,
+                    );
+                    let needs_prefetch = Self::inode_window_reservation_needed(
+                        state,
+                        InodeWindowReservationReason::Prefetch,
+                    );
+                    self.persist_inode_allocator_state(state)?;
+                    self.update_inode_headroom_flag(state);
+                    Some((first, state, needs_current_refill, needs_prefetch))
+                }
+            };
+
+            let Some((first, state, needs_current_refill, needs_prefetch)) = allocation else {
+                match self.reserve_inode_window_if_needed_with_min_size(
+                    slot,
+                    InodeWindowReservationReason::Current,
+                    count,
+                ) {
+                    Ok(_) => continue,
+                    Err(error) => {
+                        let state = {
+                            let _guard = self.inode_allocator_lock.lock().map_err(|_| {
+                                MetaError::Storage("inode allocator lock poisoned".to_string())
+                            })?;
+                            let state = self.load_runtime_inode_allocator_state(slot)?;
+                            self.update_inode_headroom_flag(state);
+                            state
+                        };
+                        return Err(MetaError::Storage(
+                            self.format_inode_window_reservation_error(state, &error),
+                        ));
+                    }
+                }
+            };
+
+            if needs_current_refill {
+                if let Err(error) =
+                    self.reserve_inode_window_if_needed(slot, InodeWindowReservationReason::Current)
+                {
+                    warn!(
+                        error = %error,
+                        volume_id = self.volume_id,
+                        exhausted_end = state.current.next,
+                        "postgres inode/object window refill unavailable after exhausting current window"
+                    );
+                }
+            } else if needs_prefetch {
+                if let Err(error) = self
+                    .reserve_inode_window_if_needed(slot, InodeWindowReservationReason::Prefetch)
+                {
+                    warn!(
+                        error = %error,
+                        volume_id = self.volume_id,
+                        current_start = state.current.start,
+                        current_next = state.current.next,
+                        current_end = state.current.end,
+                        "postgres inode/object window prefetch failed; continuing with current local window"
+                    );
+                }
+            }
+
+            return Ok((first..first + count).collect());
         }
     }
 
@@ -3613,95 +3727,10 @@ impl MetaInodes for PgMetaEngine {
     }
 
     fn next_inode(&self) -> MetaResult<Ino> {
-        let slot = self.client_slot()?;
-        loop {
-            let allocation = {
-                let _guard = self
-                    .inode_allocator_lock
-                    .lock()
-                    .map_err(|_| MetaError::Storage("inode allocator lock poisoned".to_string()))?;
-                let mut state = self.load_runtime_inode_allocator_state(slot)?;
-                if !state.current.has_headroom() && state.prefetched.has_headroom() {
-                    state.current = state.prefetched;
-                    state.prefetched = InodeWindow::default();
-                }
-                if !state.current.has_headroom() {
-                    self.update_inode_headroom_flag(state);
-                    None
-                } else {
-                    let ino = state.current.next;
-                    state.current.next = state.current.next.checked_add(1).ok_or_else(|| {
-                        MetaError::Storage("pg inode allocation overflow".to_string())
-                    })?;
-
-                    if state.current.next == state.current.end && state.prefetched.has_headroom() {
-                        state.current = state.prefetched;
-                        state.prefetched = InodeWindow::default();
-                    }
-
-                    let needs_current_refill = Self::inode_window_reservation_needed(
-                        state,
-                        InodeWindowReservationReason::Current,
-                    );
-                    let needs_prefetch = Self::inode_window_reservation_needed(
-                        state,
-                        InodeWindowReservationReason::Prefetch,
-                    );
-                    self.persist_inode_allocator_state(state)?;
-                    self.update_inode_headroom_flag(state);
-                    Some((ino, state, needs_current_refill, needs_prefetch))
-                }
-            };
-
-            let Some((ino, state, needs_current_refill, needs_prefetch)) = allocation else {
-                match self
-                    .reserve_inode_window_if_needed(slot, InodeWindowReservationReason::Current)
-                {
-                    Ok(_) => continue,
-                    Err(error) => {
-                        let state = {
-                            let _guard = self.inode_allocator_lock.lock().map_err(|_| {
-                                MetaError::Storage("inode allocator lock poisoned".to_string())
-                            })?;
-                            let state = self.load_runtime_inode_allocator_state(slot)?;
-                            self.update_inode_headroom_flag(state);
-                            state
-                        };
-                        return Err(MetaError::Storage(
-                            self.format_inode_window_reservation_error(state, &error),
-                        ));
-                    }
-                }
-            };
-
-            if needs_current_refill {
-                if let Err(error) =
-                    self.reserve_inode_window_if_needed(slot, InodeWindowReservationReason::Current)
-                {
-                    warn!(
-                        error = %error,
-                        volume_id = self.volume_id,
-                        exhausted_end = state.current.next,
-                        "postgres inode window refill unavailable after exhausting current window"
-                    );
-                }
-            } else if needs_prefetch {
-                if let Err(error) = self
-                    .reserve_inode_window_if_needed(slot, InodeWindowReservationReason::Prefetch)
-                {
-                    warn!(
-                        error = %error,
-                        volume_id = self.volume_id,
-                        current_start = state.current.start,
-                        current_next = state.current.next,
-                        current_end = state.current.end,
-                        "postgres inode window prefetch failed; continuing with current local window"
-                    );
-                }
-            }
-
-            return Ok(ino);
-        }
+        self.allocate_inode_object_ids(1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| MetaError::Storage("missing allocated inode".to_string()))
     }
 
     fn get_attr(&self, ino: Ino) -> MetaResult<InodeAttr> {
@@ -3852,109 +3881,7 @@ impl MetaPayloadObjects for PgMetaEngine {
     }
 
     fn next_object_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
-        if count == 0 {
-            return Ok(Vec::new());
-        }
-        let slot = self.client_slot()?;
-        let count = u64::from(count);
-        if count > PG_INODE_WINDOW_SIZE {
-            return Err(MetaError::Storage(format!(
-                "requested object ID batch {count} exceeds PostgreSQL inode/object window size {PG_INODE_WINDOW_SIZE}"
-            )));
-        }
-        loop {
-            let allocation = {
-                let _guard = self
-                    .inode_allocator_lock
-                    .lock()
-                    .map_err(|_| MetaError::Storage("inode allocator lock poisoned".to_string()))?;
-                let mut state = self.load_runtime_inode_allocator_state(slot)?;
-                if state.current.remaining() < count && state.prefetched.has_headroom() {
-                    state.current = state.prefetched;
-                    state.prefetched = InodeWindow::default();
-                }
-                if state.current.remaining() < count {
-                    if state.current.has_headroom() {
-                        state.current.next = state.current.end;
-                        self.persist_inode_allocator_state(state)?;
-                    }
-                    self.update_inode_headroom_flag(state);
-                    None
-                } else {
-                    let first = state.current.next;
-                    state.current.next =
-                        state.current.next.checked_add(count).ok_or_else(|| {
-                            MetaError::Storage("pg object ID allocation overflow".to_string())
-                        })?;
-
-                    if state.current.next == state.current.end && state.prefetched.has_headroom() {
-                        state.current = state.prefetched;
-                        state.prefetched = InodeWindow::default();
-                    }
-
-                    let needs_current_refill = Self::inode_window_reservation_needed(
-                        state,
-                        InodeWindowReservationReason::Current,
-                    );
-                    let needs_prefetch = Self::inode_window_reservation_needed(
-                        state,
-                        InodeWindowReservationReason::Prefetch,
-                    );
-                    self.persist_inode_allocator_state(state)?;
-                    self.update_inode_headroom_flag(state);
-                    Some((first, state, needs_current_refill, needs_prefetch))
-                }
-            };
-
-            let Some((first, state, needs_current_refill, needs_prefetch)) = allocation else {
-                match self
-                    .reserve_inode_window_if_needed(slot, InodeWindowReservationReason::Current)
-                {
-                    Ok(_) => continue,
-                    Err(error) => {
-                        let state = {
-                            let _guard = self.inode_allocator_lock.lock().map_err(|_| {
-                                MetaError::Storage("inode allocator lock poisoned".to_string())
-                            })?;
-                            let state = self.load_runtime_inode_allocator_state(slot)?;
-                            self.update_inode_headroom_flag(state);
-                            state
-                        };
-                        return Err(MetaError::Storage(
-                            self.format_inode_window_reservation_error(state, &error),
-                        ));
-                    }
-                }
-            };
-
-            if needs_current_refill {
-                if let Err(error) =
-                    self.reserve_inode_window_if_needed(slot, InodeWindowReservationReason::Current)
-                {
-                    warn!(
-                        error = %error,
-                        volume_id = self.volume_id,
-                        exhausted_end = state.current.next,
-                        "postgres inode/object window refill unavailable after exhausting current window"
-                    );
-                }
-            } else if needs_prefetch {
-                if let Err(error) = self
-                    .reserve_inode_window_if_needed(slot, InodeWindowReservationReason::Prefetch)
-                {
-                    warn!(
-                        error = %error,
-                        volume_id = self.volume_id,
-                        current_start = state.current.start,
-                        current_next = state.current.next,
-                        current_end = state.current.end,
-                        "postgres inode/object window prefetch failed; continuing with current local window"
-                    );
-                }
-            }
-
-            return Ok((first..first + count).collect());
-        }
+        self.allocate_inode_object_ids(count)
     }
 
     fn flush_regular_file_overlay_slices(
@@ -5549,6 +5476,38 @@ mod tests {
 
         assert_eq!(object_ids, vec![500, 501, 502]);
         assert_eq!(load_inode_state(&pg.local).current.next, 503);
+    }
+
+    #[test]
+    fn next_object_ids_allows_batch_larger_than_default_window() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let count = PG_INODE_WINDOW_SIZE + 1;
+        let _inode_window_override = set_inode_window_reservation_override([Ok(InodeWindow {
+            start: 500,
+            next: 500,
+            end: 500 + count,
+        })]);
+
+        persist_inode_state(
+            &pg.local,
+            InodeAllocatorState {
+                current: InodeWindow {
+                    start: 100,
+                    next: 100,
+                    end: 102,
+                },
+                prefetched: InodeWindow::default(),
+            },
+        );
+
+        let object_ids = pg
+            .next_object_ids(u32::try_from(count).expect("test count fits u32"))
+            .expect("allocate object IDs");
+
+        assert_eq!(object_ids.len(), count as usize);
+        assert_eq!(object_ids.first().copied(), Some(500));
+        assert_eq!(object_ids.last().copied(), Some(500 + count - 1));
+        assert_eq!(load_inode_state(&pg.local).current.next, 500 + count);
     }
 
     #[test]
