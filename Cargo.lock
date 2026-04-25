@@ -4967,6 +4967,7 @@ dependencies = [
  "postcard",
  "serde",
  "serde_json",
+ "smallvec",
  "studiofs-cache",
  "studiofs-data",
  "studiofs-meta",
