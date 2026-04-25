@@ -112,7 +112,7 @@ impl UploadQueue {
 
     /// Mark an upload as complete.
     pub fn complete(&self, op: &PendingUpload) {
-        if self.remove_pending(op.object_id) {
+        if self.remove_pending_if_matches(op) {
             self.mark_done();
         }
     }
@@ -124,7 +124,7 @@ impl UploadQueue {
 
     /// Cancel a pending upload and decrement pending count.
     pub fn cancel(&self, op: &PendingUpload) {
-        if self.remove_pending(op.object_id) {
+        if self.remove_pending_if_matches(op) {
             self.mark_done();
         }
     }
@@ -229,6 +229,30 @@ impl UploadQueue {
         }
         false
     }
+
+    fn remove_pending_if_matches(&self, op: &PendingUpload) -> bool {
+        let mut state = self.pending_state.lock();
+        let Some(current) = state.by_object.get(&op.object_id) else {
+            return false;
+        };
+        if current.ino != op.ino
+            || current.offset != op.offset
+            || current.content_epoch != op.content_epoch
+        {
+            return false;
+        }
+        if let Some(removed) = state.by_object.remove(&op.object_id)
+            && let std::collections::btree_map::Entry::Occupied(mut e) =
+                state.ino_counts.entry(removed.ino)
+        {
+            *e.get_mut() -= 1;
+            if *e.get() == 0 {
+                e.remove_entry();
+            }
+            return true;
+        }
+        false
+    }
 }
 
 fn now_unix_ms() -> u64 {
@@ -307,6 +331,26 @@ mod tests {
 
         queue.complete(&second);
         assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_cancel_does_not_remove_newer_epoch_for_same_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        queue.submit(10, 0, 100, 1);
+        let stale = rx.recv().await.unwrap();
+        queue.cancel(&stale);
+        assert_eq!(queue.pending_count(), 0);
+
+        queue.submit(10, 0, 100, 2);
+        queue.cancel(&stale);
+
+        assert_eq!(queue.pending_count(), 1);
+        let pending = queue.snapshot_pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].object_id, 100);
+        assert_eq!(pending[0].content_epoch, 2);
     }
 
     #[tokio::test]

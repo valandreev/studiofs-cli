@@ -206,6 +206,11 @@ impl StudioVfs {
                 return Err(error);
             }
 
+            self.requeue_retained_overlay_uploads_for_size_change(
+                ino,
+                attr.size,
+                attr.content_epoch,
+            );
             self.finalize_truncate_cleanup(ino, truncate_mutation.as_ref());
             self.refresh_inode_incarnation_state_from_attr(ino, &attr);
             Ok(attr)
@@ -294,6 +299,86 @@ impl StudioVfs {
             }
             self.evict_block_from_caches(ino, *block_index, *object_id);
         }
+    }
+
+    fn requeue_retained_overlay_uploads_for_size_change(
+        &self,
+        ino: Ino,
+        size: u64,
+        content_epoch: u64,
+    ) {
+        let mut retained = std::collections::BTreeMap::<u64, (u64, u32)>::new();
+        if size > 0 {
+            match self.sync_meta().lookup_regular_file_slices(ino, 0, size) {
+                Ok(spans) => {
+                    for span in spans {
+                        if span.source != ResolvedSliceSource::Overlay {
+                            continue;
+                        }
+                        let Some(payload) = span.payload else {
+                            continue;
+                        };
+                        let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
+                        let absolute_offset =
+                            chunk_base.saturating_add(u64::from(span.range.start));
+                        retained
+                            .entry(payload.object_id)
+                            .and_modify(|(offset, block_index)| {
+                                if absolute_offset < *offset {
+                                    *offset = absolute_offset;
+                                    *block_index =
+                                        block_index_from_offset(absolute_offset, self.block_size);
+                                }
+                            })
+                            .or_insert_with(|| {
+                                (
+                                    absolute_offset,
+                                    block_index_from_offset(absolute_offset, self.block_size),
+                                )
+                            });
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        ino,
+                        error = %error,
+                        "failed to inspect retained overlay payloads after size change"
+                    );
+                    return;
+                }
+            }
+        }
+
+        self.cancel_pending_uploads_for_inode(ino);
+        if retained.is_empty() {
+            return;
+        }
+
+        let object_ids: Vec<_> = retained.keys().copied().collect();
+        if let Err(error) = self.cached_store.link_upload_stage_batch(&object_ids) {
+            warn!(
+                ino,
+                object_count = object_ids.len(),
+                error = %error,
+                "failed to relink retained overlay payloads after size change"
+            );
+        }
+
+        let upload_ops: Vec<_> = retained
+            .iter()
+            .map(|(object_id, (offset, _))| (ino, *offset, *object_id, content_epoch))
+            .collect();
+        let live_extents: Vec<_> = retained
+            .into_iter()
+            .map(|(object_id, (_, block_index))| (ino, block_index, object_id, content_epoch))
+            .collect();
+        self.record_live_extents(&live_extents);
+        self.cached_store.submit_uploads_batch(&upload_ops);
+        self.state.file_session.note_background_transition(
+            ino,
+            FileSessionOperation::Upload,
+            "queued",
+        );
     }
 
     fn truncate_tombstone_slices(

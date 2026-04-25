@@ -623,6 +623,23 @@ where
     async fn cancel_stale_upload(&self, op: &PendingUpload) -> VfsResult<()> {
         self.shutdown.record_canceled_stale();
         self.coordinator.cancel_upload(op);
+        let still_referenced = match self.meta.get_attr(op.ino).await? {
+            Some(attr) => {
+                self.meta
+                    .has_regular_file_overlay_object_if_matches(
+                        op.ino,
+                        attr.content_epoch,
+                        op.object_id,
+                    )
+                    .await?
+            }
+            None => false,
+        };
+        if still_referenced {
+            self.local_payloads.mark_upload_failed(op.object_id);
+            self.local_payloads.clear_pending_eviction(op.object_id);
+            return Ok(());
+        }
         self.local_payloads.remove(op.object_id).await?;
         self.local_payloads.remove_upload_hot(op.object_id).await?;
         self.local_payloads

@@ -1150,6 +1150,58 @@ fn size_change_after_unpublished_flush_advances_content_epoch() {
 }
 
 #[test]
+fn nonzero_truncate_requeues_retained_overlay_uploads_with_new_epoch() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "truncate-requeues-retained");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"truncate-requeues-retained.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let payload = vec![0x5Au8; 8192];
+
+        vfs.write(ino, 0, &payload).await.expect("write payload");
+        vfs.flush(ino).await.expect("flush first unpublished epoch");
+
+        let flushed_attr = meta.get_attr(ino).expect("load flushed attr");
+        let old_epoch = flushed_attr.content_epoch;
+        let old_objects = meta
+            .get_regular_file_overlay_object_ids(ino)
+            .expect("load old overlay object ids");
+        assert_eq!(
+            vfs.pending_uploads_for_inode(ino)
+                .iter()
+                .map(|(_, object_id, content_epoch)| (*object_id, *content_epoch))
+                .collect::<Vec<_>>(),
+            old_objects
+                .iter()
+                .map(|object_id| (*object_id, old_epoch))
+                .collect::<Vec<_>>(),
+            "setup should queue uploads for the original unpublished epoch"
+        );
+
+        vfs.setattr(ino, SetattrArgs::size_only(4096))
+            .expect("truncate while retaining the first overlay payload");
+
+        let truncated_attr = meta.get_attr(ino).expect("load truncated attr");
+        assert!(truncated_attr.content_epoch > old_epoch);
+        let pending = vfs.pending_uploads_for_inode(ino);
+        assert!(
+            !pending.is_empty(),
+            "retained overlay payloads must remain queued after the epoch advances"
+        );
+        assert!(
+            pending
+                .iter()
+                .all(|(_, _, content_epoch)| *content_epoch == truncated_attr.content_epoch),
+            "retained payload uploads must be queued under the new content epoch"
+        );
+    });
+}
+
+#[test]
 fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-buffered-tail");
