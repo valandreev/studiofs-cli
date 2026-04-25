@@ -1246,23 +1246,21 @@ impl PublishedReadPlanCacheKey {
             && attr.upload_state == MetaUploadState::Ready
             && attr.content_epoch == attr.committed_content_epoch
             && attr.size == attr.committed_size)
-            .then_some(Self {
-                size: attr.size,
-                committed_size: attr.committed_size,
-                content_epoch: attr.content_epoch,
-                committed_content_epoch: attr.committed_content_epoch,
-                upload_state: attr.upload_state,
-            })
+            .then_some(Self::from_regular_attr(attr))
     }
 
     fn from_locally_stable_attr(attr: &InodeAttr) -> Option<Self> {
-        (attr.kind == FileType::RegularFile).then_some(Self {
+        (attr.kind == FileType::RegularFile).then_some(Self::from_regular_attr(attr))
+    }
+
+    fn from_regular_attr(attr: &InodeAttr) -> Self {
+        Self {
             size: attr.size,
             committed_size: attr.committed_size,
             content_epoch: attr.content_epoch,
             committed_content_epoch: attr.committed_content_epoch,
             upload_state: attr.upload_state,
-        })
+        }
     }
 }
 

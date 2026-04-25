@@ -1787,6 +1787,78 @@ mod tests {
     }
 
     #[test]
+    fn resolve_read_metadata_async_bypasses_dirty_attr_read_plan_when_local_dirty_exists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "read-metadata-dirty-plan-cache-bypass");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"dirty-read-plan-cache-bypass.txt",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create file");
+            let ino = created.ino;
+            let payload = vec![0x52_u8; 512 * 1024];
+
+            vfs.write(ino, 0, &payload).await.expect("write payload");
+            vfs.flush(ino).await.expect("flush durable local payload");
+
+            let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+            publish_current_file_graph(&meta, ino, content_epoch, &blocks);
+            vfs.state.namespace.attr_read_cache.lock().remove(ino);
+
+            let mut dirty_attr = meta.get_attr(ino).expect("load published attr");
+            dirty_attr.upload_state = MetaUploadState::Updating;
+            dirty_attr.content_epoch = dirty_attr.content_epoch.saturating_add(1);
+            vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .insert(ino, dirty_attr);
+
+            let (_, cached_slices) = vfs
+                .resolve_read_metadata_async(ino, 0, 64 * 1024)
+                .await
+                .expect("resolve cached read plan");
+
+            vfs.state.local_dirty.pending_payloads.lock().insert(
+                (ino, 1),
+                PendingPayload {
+                    data: BytesMut::from(&payload[64 * 1024..128 * 1024]),
+                    dirty: true,
+                    reserved_object_id: None,
+                    persisted_len: None,
+                },
+            );
+            vfs.state
+                .local_dirty
+                .pending_payload_indexes
+                .lock()
+                .entry(ino)
+                .or_default()
+                .insert(1);
+            vfs.state
+                .local_dirty
+                .pending_bytes
+                .fetch_add(64 * 1024, AtomicOrdering::Relaxed);
+
+            let (_, bypassed_slices) = vfs
+                .resolve_read_metadata_async(ino, 64 * 1024, 64 * 1024)
+                .await
+                .expect("resolve while local dirty state is active");
+
+            assert!(
+                !Arc::ptr_eq(&cached_slices, &bypassed_slices),
+                "active local dirty payloads must bypass the dirty-attr read-plan cache"
+            );
+        });
+    }
+
+    #[test]
     fn getattr_unchecked_prefers_dirty_attr_over_cached_attr() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (_rt, vfs, meta) = make_test_vfs(&tmp, "getattr-dirty-over-cache");
