@@ -208,7 +208,6 @@ pub fn run(
     let total_inodes = engine.get_counter(counters::TOTAL_INODES)?;
     let used_space = engine.get_counter(counters::USED_SPACE)?;
     let next_inode = engine.get_counter(counters::NEXT_INODE)?;
-    let next_object = engine.get_counter(counters::NEXT_OBJECT_ID)?;
 
     let cache_path = local_cache_path(meta_dir, cache_dir, &format_info.uuid);
     let cache_backend_detection = detect_backends(&cache_path);
@@ -259,7 +258,7 @@ pub fn run(
 
     println!("\n  Inodes:     {}", total_inodes);
     println!("  Next inode: {}", next_inode);
-    println!("  Next block: {}", next_object);
+    println!("  Next inode/object ID: {}", next_inode);
 
     println!("\n  Used space: {}", format_bytes(used_space));
 

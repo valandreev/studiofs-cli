@@ -144,33 +144,17 @@ impl MetaPayloadObjects for RedbMetaEngine {
     }
 
     fn next_object_id(&self) -> MetaResult<u64> {
-        let txn = self
-            .db
-            .begin_write()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        let id;
-        {
-            let mut table = txn
-                .open_table(COUNTERS_TABLE)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-            id = match table
-                .get(counters::NEXT_OBJECT_ID)
-                .map_err(|e| MetaError::Storage(e.to_string()))?
-            {
-                Some(v) => v.value(),
-                None => 1, // Start from 1
-            };
-            table
-                .insert(counters::NEXT_OBJECT_ID, id + 1)
-                .map_err(|e| MetaError::Storage(e.to_string()))?;
-        }
-        txn.commit()
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        Ok(id)
+        self.next_object_ids(1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| MetaError::Storage("missing allocated object ID".to_string()))
     }
 
-    /// Allocate `count` consecutive object IDs in a single redb transaction.
+    /// Allocate `count` consecutive object IDs from the shared local inode/object stream.
     fn next_object_ids(&self, count: u32) -> MetaResult<Vec<u64>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
         let txn = self
             .db
             .begin_write()
@@ -181,14 +165,17 @@ impl MetaPayloadObjects for RedbMetaEngine {
                 .open_table(COUNTERS_TABLE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
             first_id = match table
-                .get(counters::NEXT_OBJECT_ID)
+                .get(counters::NEXT_INODE)
                 .map_err(|e| MetaError::Storage(e.to_string()))?
             {
                 Some(v) => v.value(),
-                None => 1,
+                None => ROOT_INO + 1,
             };
+            let next_id = first_id
+                .checked_add(count as u64)
+                .ok_or_else(|| MetaError::Storage("object ID allocation overflow".to_string()))?;
             table
-                .insert(counters::NEXT_OBJECT_ID, first_id + count as u64)
+                .insert(counters::NEXT_INODE, next_id)
                 .map_err(|e| MetaError::Storage(e.to_string()))?;
         }
         txn.commit()

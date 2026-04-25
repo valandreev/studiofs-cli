@@ -30,20 +30,6 @@ pub(crate) struct CounterWriteTransaction<'a> {
 }
 
 impl CounterWriteTransaction<'_> {
-    pub(crate) fn get(&self, name: &str) -> MetaResult<u64> {
-        let table = self
-            .txn
-            .open_table(COUNTERS_TABLE)
-            .map_err(|e| MetaError::Storage(e.to_string()))?;
-        match table
-            .get(name)
-            .map_err(|e| MetaError::Storage(e.to_string()))?
-        {
-            Some(value) => Ok(value.value()),
-            None => Ok(0),
-        }
-    }
-
     pub(crate) fn set(&self, name: &str, value: u64) -> MetaResult<()> {
         let mut table = self
             .txn

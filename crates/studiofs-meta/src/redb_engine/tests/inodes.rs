@@ -48,6 +48,37 @@ fn test_next_inode_increments() {
 }
 
 #[test]
+fn test_object_ids_share_inode_allocation_stream() {
+    let engine = temp_engine();
+
+    let file = engine
+        .create_file(ROOT_INO, b"stream.txt", 1000, 1000, 0o644)
+        .unwrap();
+    let object_ids = engine.next_object_ids(3).unwrap();
+    let next_ino = engine.next_inode().unwrap();
+
+    assert_eq!(object_ids, vec![file.ino + 1, file.ino + 2, file.ino + 3]);
+    assert_eq!(next_ino, file.ino + 4);
+    assert_eq!(
+        engine.get_counter(counters::NEXT_OBJECT_ID).unwrap(),
+        0,
+        "legacy object counter must not drive new object allocations"
+    );
+}
+
+#[test]
+fn test_object_id_allocation_reports_hard_stream_overflow() {
+    let engine = temp_engine();
+    engine.set_counter(counters::NEXT_INODE, u64::MAX).unwrap();
+
+    let error = engine
+        .next_object_ids(1)
+        .expect_err("object allocation must fail at the hard u64 stream limit");
+
+    assert!(error.to_string().contains("object ID allocation overflow"));
+}
+
+#[test]
 fn test_list_inode_attrs_ignores_sparse_next_inode_range() {
     let engine = temp_engine();
     let file = engine
