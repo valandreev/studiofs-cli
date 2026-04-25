@@ -98,11 +98,14 @@ struct UploadHotState {
     budget_bytes: usize,
     total_bytes: usize,
     next_generation: u64,
+    stale_order_entries: usize,
     order: VecDeque<(ObjectId, u64)>,
     entries: HashMap<ObjectId, UploadHotEntry>,
 }
 
 impl UploadHotState {
+    const MIN_STALE_COMPACT_ENTRIES: usize = 64;
+
     fn new(budget_bytes: usize) -> Self {
         Self {
             budget_bytes,
@@ -122,10 +125,12 @@ impl UploadHotState {
             .insert(object_id, UploadHotEntry { data, generation })
         {
             self.total_bytes = self.total_bytes.saturating_sub(previous.data.len());
+            self.stale_order_entries = self.stale_order_entries.saturating_add(1);
         }
         self.total_bytes = self.total_bytes.saturating_add(len);
         self.order.push_back((object_id, generation));
         self.evict_over_budget();
+        self.compact_stale_order_if_needed();
     }
 
     fn get(&self, object_id: ObjectId) -> Option<Bytes> {
@@ -135,6 +140,8 @@ impl UploadHotState {
     fn remove(&mut self, object_id: ObjectId) {
         if let Some(previous) = self.entries.remove(&object_id) {
             self.total_bytes = self.total_bytes.saturating_sub(previous.data.len());
+            self.stale_order_entries = self.stale_order_entries.saturating_add(1);
+            self.compact_stale_order_if_needed();
         }
     }
 
@@ -151,8 +158,34 @@ impl UploadHotState {
                 if let Some(previous) = self.entries.remove(&object_id) {
                     self.total_bytes = self.total_bytes.saturating_sub(previous.data.len());
                 }
+            } else {
+                self.stale_order_entries = self.stale_order_entries.saturating_sub(1);
             }
         }
+    }
+
+    fn compact_stale_order_if_needed(&mut self) {
+        let compact_threshold = self
+            .entries
+            .len()
+            .saturating_mul(2)
+            .max(Self::MIN_STALE_COMPACT_ENTRIES);
+        if self.stale_order_entries <= compact_threshold {
+            return;
+        }
+
+        let mut compacted = VecDeque::with_capacity(self.entries.len());
+        for (object_id, generation) in self.order.drain(..) {
+            if self
+                .entries
+                .get(&object_id)
+                .is_some_and(|entry| entry.generation == generation)
+            {
+                compacted.push_back((object_id, generation));
+            }
+        }
+        self.order = compacted;
+        self.stale_order_entries = 0;
     }
 }
 
@@ -618,6 +651,20 @@ mod tests {
         assert_eq!(state.get(5).as_deref(), Some(&b"cccc"[..]));
         assert_eq!(state.get(6).as_deref(), Some(&b"dddd"[..]));
         assert_eq!(state.total_bytes, 8);
+    }
+
+    #[test]
+    fn hot_upload_buffer_repeated_remove_bounds_stale_lru_entries() {
+        let mut state = UploadHotState::new(1024);
+
+        for object_id in 1..=128 {
+            state.insert(object_id, Bytes::from_static(b"aaaa"));
+            state.remove(object_id);
+        }
+
+        assert_eq!(state.entries.len(), 0);
+        assert_eq!(state.total_bytes, 0);
+        assert!(state.order.len() <= 64);
     }
 
     #[test]
