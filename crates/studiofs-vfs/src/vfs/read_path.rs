@@ -50,6 +50,21 @@ struct ReadSegment {
 }
 
 type ReadRangeList = SmallVec<[ReadRange; 8]>;
+type ReadBlockList = SmallVec<[u32; 16]>;
+
+struct ReadClaimBuffers {
+    claimed: ReadRangeList,
+    scratch: ReadRangeList,
+}
+
+impl ReadClaimBuffers {
+    fn new() -> Self {
+        Self {
+            claimed: ReadRangeList::new(),
+            scratch: ReadRangeList::new(),
+        }
+    }
+}
 
 struct DataReader<'a> {
     vfs: &'a StudioVfs,
@@ -189,6 +204,7 @@ impl<'a> DataReader<'a> {
             end: read_end,
         };
         let mut unresolved = smallvec![requested];
+        let mut claim_buffers = ReadClaimBuffers::new();
         let mut segments = Vec::new();
         let pending_upload_index = vfs.snapshot_pending_upload_index();
 
@@ -201,9 +217,8 @@ impl<'a> DataReader<'a> {
                 start: dirty.start,
                 end: dirty.end,
             };
-            let (next_unresolved, claimed) = Self::claim_unresolved_ranges(unresolved, dirty_range);
-            unresolved = next_unresolved;
-            for overlap in claimed {
+            Self::claim_unresolved_ranges(&mut unresolved, dirty_range, &mut claim_buffers);
+            for overlap in claim_buffers.claimed.iter().copied() {
                 let delta = overlap.start.saturating_sub(dirty.start);
                 let Some(block_offset) = dirty.block_offset.checked_add(delta) else {
                     continue;
@@ -227,9 +242,8 @@ impl<'a> DataReader<'a> {
                 start: dirty.start,
                 end: dirty.end,
             };
-            let (next_unresolved, claimed) = Self::claim_unresolved_ranges(unresolved, dirty_range);
-            unresolved = next_unresolved;
-            for overlap in claimed {
+            Self::claim_unresolved_ranges(&mut unresolved, dirty_range, &mut claim_buffers);
+            for overlap in claim_buffers.claimed.iter().copied() {
                 let delta = overlap.start.saturating_sub(dirty.start);
                 let Some(delta_u32) = u32::try_from(delta).ok() else {
                     continue;
@@ -257,9 +271,8 @@ impl<'a> DataReader<'a> {
                 start: dirty.start,
                 end: dirty.end,
             };
-            let (next_unresolved, claimed) = Self::claim_unresolved_ranges(unresolved, dirty_range);
-            unresolved = next_unresolved;
-            for overlap in claimed {
+            Self::claim_unresolved_ranges(&mut unresolved, dirty_range, &mut claim_buffers);
+            for overlap in claim_buffers.claimed.iter().copied() {
                 let delta = overlap.start.saturating_sub(dirty.start);
                 let Some(delta_u32) = u32::try_from(delta).ok() else {
                     continue;
@@ -278,15 +291,17 @@ impl<'a> DataReader<'a> {
         }
 
         if !unresolved.is_empty() {
-            let mut candidate_blocks = BTreeSet::new();
+            let mut candidate_blocks = ReadBlockList::new();
             for range in &unresolved {
                 let start_block = block_index_from_offset(range.start, vfs.block_size);
                 let end_block =
                     block_index_from_offset(range.end.saturating_sub(1), vfs.block_size);
                 for block_index in start_block..=end_block {
-                    candidate_blocks.insert(block_index);
+                    candidate_blocks.push(block_index);
                 }
             }
+            candidate_blocks.sort_unstable();
+            candidate_blocks.dedup();
             for block_index in candidate_blocks {
                 if unresolved.is_empty() {
                     break;
@@ -308,15 +323,15 @@ impl<'a> DataReader<'a> {
                 }
                 let block_start = (block_index as u64).saturating_mul(vfs.block_size as u64);
                 let block_end = block_start.saturating_add(vfs.block_size as u64);
-                let (next_unresolved, claimed) = Self::claim_unresolved_ranges(
-                    unresolved,
+                Self::claim_unresolved_ranges(
+                    &mut unresolved,
                     ReadRange {
                         start: block_start,
                         end: block_end,
                     },
+                    &mut claim_buffers,
                 );
-                unresolved = next_unresolved;
-                for overlap in claimed {
+                for overlap in claim_buffers.claimed.iter().copied() {
                     let delta = overlap.start.saturating_sub(block_start);
                     let Some(block_offset) = u32::try_from(delta).ok() else {
                         continue;
@@ -351,6 +366,7 @@ impl<'a> DataReader<'a> {
                     requested,
                     ResolvedSliceSource::Overlay,
                     |payload| ReadSegmentSource::Overlay { payload },
+                    &mut claim_buffers,
                 );
                 unresolved = Self::claim_meta_spans_into_segments(
                     resolved.iter(),
@@ -359,6 +375,7 @@ impl<'a> DataReader<'a> {
                     requested,
                     ResolvedSliceSource::Base,
                     |payload| ReadSegmentSource::Base { payload },
+                    &mut claim_buffers,
                 );
             } else {
                 let meta = vfs.meta.clone();
@@ -373,6 +390,7 @@ impl<'a> DataReader<'a> {
                     requested,
                     ResolvedSliceSource::Overlay,
                     |payload| ReadSegmentSource::Overlay { payload },
+                    &mut claim_buffers,
                 );
                 unresolved = Self::claim_meta_spans_into_segments(
                     resolved.iter(),
@@ -381,6 +399,7 @@ impl<'a> DataReader<'a> {
                     requested,
                     ResolvedSliceSource::Base,
                     |payload| ReadSegmentSource::Base { payload },
+                    &mut claim_buffers,
                 );
             }
         }
@@ -395,31 +414,32 @@ impl<'a> DataReader<'a> {
     }
 
     fn claim_unresolved_ranges(
-        unresolved: ReadRangeList,
+        unresolved: &mut ReadRangeList,
         candidate: ReadRange,
-    ) -> (ReadRangeList, ReadRangeList) {
-        let mut next_unresolved = ReadRangeList::new();
-        let mut claimed = ReadRangeList::new();
-        for range in unresolved {
+        buffers: &mut ReadClaimBuffers,
+    ) {
+        buffers.claimed.clear();
+        buffers.scratch.clear();
+        for range in unresolved.drain(..) {
             let Some(overlap) = range.intersection(candidate) else {
-                next_unresolved.push(range);
+                buffers.scratch.push(range);
                 continue;
             };
             if range.start < overlap.start {
-                next_unresolved.push(ReadRange {
+                buffers.scratch.push(ReadRange {
                     start: range.start,
                     end: overlap.start,
                 });
             }
-            claimed.push(overlap);
+            buffers.claimed.push(overlap);
             if overlap.end < range.end {
-                next_unresolved.push(ReadRange {
+                buffers.scratch.push(ReadRange {
                     start: overlap.end,
                     end: range.end,
                 });
             }
         }
-        (next_unresolved, claimed)
+        std::mem::swap(unresolved, &mut buffers.scratch);
     }
 
     fn claim_meta_spans_into_segments<'b, I, F>(
@@ -429,6 +449,7 @@ impl<'a> DataReader<'a> {
         requested: ReadRange,
         source_filter: ResolvedSliceSource,
         source_ctor: F,
+        buffers: &mut ReadClaimBuffers,
     ) -> ReadRangeList
     where
         I: Iterator<Item = &'b ResolvedSliceSpan>,
@@ -453,9 +474,8 @@ impl<'a> DataReader<'a> {
             let Some(clipped) = span_range.intersection(requested) else {
                 continue;
             };
-            let (next_unresolved, claimed) = Self::claim_unresolved_ranges(unresolved, clipped);
-            unresolved = next_unresolved;
-            for overlap in claimed {
+            Self::claim_unresolved_ranges(&mut unresolved, clipped, buffers);
+            for overlap in buffers.claimed.iter().copied() {
                 let delta = overlap.start.saturating_sub(span_range.start);
                 let Some(delta_u32) = u32::try_from(delta).ok() else {
                     continue;
@@ -1301,7 +1321,9 @@ impl StudioVfs {
 mod tests {
     use super::super::local_dirty::PendingPayload;
     use super::super::*;
-    use super::{DataReader, ReadRange, ReadSegment, ReadSegmentSource};
+    use super::{
+        DataReader, ReadClaimBuffers, ReadRange, ReadRangeList, ReadSegment, ReadSegmentSource,
+    };
     use bytes::{Bytes, BytesMut};
     use std::any::Any;
     use std::sync::Arc;
@@ -1658,32 +1680,72 @@ mod tests {
 
     #[test]
     fn claim_unresolved_ranges_keeps_common_fragmented_case_inline() {
-        let unresolved = smallvec::smallvec![
+        let mut unresolved = smallvec::smallvec![
             ReadRange { start: 0, end: 8 },
             ReadRange { start: 16, end: 24 },
         ];
+        let mut buffers = ReadClaimBuffers::new();
 
-        let (remaining, claimed) =
-            DataReader::claim_unresolved_ranges(unresolved, ReadRange { start: 4, end: 20 });
+        DataReader::claim_unresolved_ranges(
+            &mut unresolved,
+            ReadRange { start: 4, end: 20 },
+            &mut buffers,
+        );
 
-        assert_eq!(claimed.len(), 2);
-        assert_eq!(claimed[0].start, 4);
-        assert_eq!(claimed[0].end, 8);
-        assert_eq!(claimed[1].start, 16);
-        assert_eq!(claimed[1].end, 20);
-        assert_eq!(remaining.len(), 2);
-        assert_eq!(remaining[0].start, 0);
-        assert_eq!(remaining[0].end, 4);
-        assert_eq!(remaining[1].start, 20);
-        assert_eq!(remaining[1].end, 24);
+        assert_eq!(buffers.claimed.len(), 2);
+        assert_eq!(buffers.claimed[0].start, 4);
+        assert_eq!(buffers.claimed[0].end, 8);
+        assert_eq!(buffers.claimed[1].start, 16);
+        assert_eq!(buffers.claimed[1].end, 20);
+        assert_eq!(unresolved.len(), 2);
+        assert_eq!(unresolved[0].start, 0);
+        assert_eq!(unresolved[0].end, 4);
+        assert_eq!(unresolved[1].start, 20);
+        assert_eq!(unresolved[1].end, 24);
         assert!(
-            !claimed.spilled(),
+            !buffers.claimed.spilled(),
             "short claimed read ranges should avoid heap allocation"
         );
         assert!(
-            !remaining.spilled(),
+            !unresolved.spilled(),
             "short unresolved read ranges should avoid heap allocation"
         );
+    }
+
+    #[test]
+    fn claim_unresolved_ranges_reuses_spilled_buffers_for_fragmented_reads() {
+        let mut unresolved = ReadRangeList::new();
+        for i in 0..12 {
+            unresolved.push(ReadRange {
+                start: i * 10,
+                end: i * 10 + 5,
+            });
+        }
+        let mut buffers = ReadClaimBuffers::new();
+
+        DataReader::claim_unresolved_ranges(
+            &mut unresolved,
+            ReadRange { start: 12, end: 97 },
+            &mut buffers,
+        );
+
+        assert!(buffers.claimed.spilled());
+        assert!(buffers.scratch.spilled());
+        let claimed_capacity = buffers.claimed.capacity();
+        let scratch_capacity = buffers.scratch.capacity();
+        assert_eq!(buffers.claimed.len(), 9);
+        assert_eq!(unresolved.len(), 4);
+
+        DataReader::claim_unresolved_ranges(
+            &mut unresolved,
+            ReadRange { start: 0, end: 200 },
+            &mut buffers,
+        );
+
+        assert!(buffers.claimed.capacity() >= claimed_capacity);
+        assert!(unresolved.capacity() >= scratch_capacity);
+        assert_eq!(buffers.claimed.len(), 4);
+        assert!(unresolved.is_empty());
     }
 
     #[test]
