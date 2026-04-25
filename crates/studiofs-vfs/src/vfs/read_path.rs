@@ -719,7 +719,7 @@ impl<'a> ReadMetadataResolver<'a> {
         }
         if let Some(attr) = self.dirty_attr() {
             let resolved_slices = self
-                .resolve_slices_for_attr(&attr, offset, buffer_len)
+                .resolve_slices_for_attr(&attr, offset, buffer_len, true)
                 .await?;
             return Ok(ReadMetadata {
                 attr,
@@ -728,7 +728,7 @@ impl<'a> ReadMetadataResolver<'a> {
         }
         if let Some(attr) = self.cached_attr() {
             let resolved_slices = self
-                .resolve_slices_for_attr(&attr, offset, buffer_len)
+                .resolve_slices_for_attr(&attr, offset, buffer_len, false)
                 .await?;
             return Ok(ReadMetadata {
                 attr,
@@ -803,19 +803,18 @@ impl<'a> ReadMetadataResolver<'a> {
         attr: &InodeAttr,
         offset: u64,
         buffer_len: u64,
+        dirty_attr_present: bool,
     ) -> VfsResult<Arc<[ResolvedSliceSpan]>> {
         let read_len = self.read_len_for_attr(attr, offset, buffer_len);
         if read_len == 0 {
             return Ok(Arc::from(Vec::<ResolvedSliceSpan>::new()));
         }
-        if self
-            .vfs
-            .state
-            .namespace
-            .dirty_attrs
-            .lock()
-            .contains_key(&self.ino)
-        {
+        let dirty_attr_cacheable = dirty_attr_present
+            && !self
+                .vfs
+                .has_pending_local_dirty_payloads_for_inode(self.ino)
+            && !self.vfs.inode_has_dirty_handle_writers(self.ino);
+        if dirty_attr_present && !dirty_attr_cacheable {
             let ino = self.ino;
             let meta = self.vfs.meta.clone();
             let resolved = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
@@ -832,7 +831,12 @@ impl<'a> ReadMetadataResolver<'a> {
             return Ok(Arc::from(resolved));
         }
 
-        if let Some(key) = PublishedReadPlanCacheKey::from_attr(attr) {
+        let cache_key = if dirty_attr_cacheable {
+            PublishedReadPlanCacheKey::from_locally_stable_attr(attr)
+        } else {
+            PublishedReadPlanCacheKey::from_attr(attr)
+        };
+        if let Some(key) = cache_key {
             let requested_end = offset.saturating_add(read_len);
             if let Some(cached) = self.vfs.state.read.published_read_plan_cache_get(
                 self.ino,
@@ -918,7 +922,7 @@ impl<'a> ReadMetadataResolver<'a> {
     ) -> VfsResult<ReadMetadata> {
         let attr = self.load_attr_from_meta().await?;
         let resolved_slices = self
-            .resolve_slices_for_attr(&attr, offset, buffer_len)
+            .resolve_slices_for_attr(&attr, offset, buffer_len, false)
             .await?;
         self.cache_attr(&attr);
         Ok(ReadMetadata {
@@ -1719,6 +1723,131 @@ mod tests {
             assert!(
                 Arc::ptr_eq(&first_slices, &second_slices),
                 "sequential reads inside the widened published window should reuse the cached slice plan"
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_read_metadata_async_reuses_dirty_attr_read_plan_when_local_dirty_is_drained() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "read-metadata-dirty-plan-cache");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(ROOT_INO, b"dirty-read-plan-cache.txt", 1000, 1000, 0o644)
+                .expect("create file");
+            let ino = created.ino;
+            let payload = vec![0x51_u8; 512 * 1024];
+
+            vfs.write(ino, 0, &payload).await.expect("write payload");
+            vfs.flush(ino).await.expect("flush durable local payload");
+
+            let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+            publish_current_file_graph(&meta, ino, content_epoch, &blocks);
+            vfs.state.namespace.attr_read_cache.lock().remove(ino);
+
+            let mut dirty_attr = meta.get_attr(ino).expect("load published attr");
+            dirty_attr.upload_state = MetaUploadState::Updating;
+            dirty_attr.content_epoch = dirty_attr.content_epoch.saturating_add(1);
+            vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .insert(ino, dirty_attr);
+
+            assert!(
+                !vfs.has_pending_local_dirty_payloads_for_inode(ino),
+                "setup should leave no pending local payloads after flush"
+            );
+            assert!(
+                !vfs.inode_has_dirty_handle_writers(ino),
+                "setup should leave no dirty handle-writer state after flush"
+            );
+
+            let (_, first_slices) = vfs
+                .resolve_read_metadata_async(ino, 0, 64 * 1024)
+                .await
+                .expect("resolve first read");
+            let (_, second_slices) = vfs
+                .resolve_read_metadata_async(ino, 64 * 1024, 64 * 1024)
+                .await
+                .expect("resolve second read");
+
+            assert!(
+                Arc::ptr_eq(&first_slices, &second_slices),
+                "dirty attrs with drained local payload state should reuse the widened slice plan"
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_read_metadata_async_bypasses_dirty_attr_read_plan_when_local_dirty_exists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "read-metadata-dirty-plan-cache-bypass");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"dirty-read-plan-cache-bypass.txt",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create file");
+            let ino = created.ino;
+            let payload = vec![0x52_u8; 512 * 1024];
+
+            vfs.write(ino, 0, &payload).await.expect("write payload");
+            vfs.flush(ino).await.expect("flush durable local payload");
+
+            let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+            publish_current_file_graph(&meta, ino, content_epoch, &blocks);
+            vfs.state.namespace.attr_read_cache.lock().remove(ino);
+
+            let mut dirty_attr = meta.get_attr(ino).expect("load published attr");
+            dirty_attr.upload_state = MetaUploadState::Updating;
+            dirty_attr.content_epoch = dirty_attr.content_epoch.saturating_add(1);
+            vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .insert(ino, dirty_attr);
+
+            let (_, cached_slices) = vfs
+                .resolve_read_metadata_async(ino, 0, 64 * 1024)
+                .await
+                .expect("resolve cached read plan");
+
+            vfs.state.local_dirty.pending_payloads.lock().insert(
+                (ino, 1),
+                PendingPayload {
+                    data: BytesMut::from(&payload[64 * 1024..128 * 1024]),
+                    dirty: true,
+                    reserved_object_id: None,
+                    persisted_len: None,
+                },
+            );
+            vfs.state
+                .local_dirty
+                .pending_payload_indexes
+                .lock()
+                .entry(ino)
+                .or_default()
+                .insert(1);
+            vfs.state
+                .local_dirty
+                .pending_bytes
+                .fetch_add(64 * 1024, AtomicOrdering::Relaxed);
+
+            let (_, bypassed_slices) = vfs
+                .resolve_read_metadata_async(ino, 64 * 1024, 64 * 1024)
+                .await
+                .expect("resolve while local dirty state is active");
+
+            assert!(
+                !Arc::ptr_eq(&cached_slices, &bypassed_slices),
+                "active local dirty payloads must bypass the dirty-attr read-plan cache"
             );
         });
     }
