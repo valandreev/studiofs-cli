@@ -18,7 +18,9 @@ use tracing::warn;
 use uuid::Uuid;
 
 use super::LocalPayloadSyncMode;
-use super::layout::LocalPayloadLayout;
+use super::layout::{
+    LOCAL_PAYLOAD_BATCH_INTENT_DIR, LOCAL_PAYLOAD_BATCH_INTENT_FILE_EXTENSION, LocalPayloadLayout,
+};
 use super::platform;
 
 const TEMP_FILE_CREATE_ATTEMPTS: usize = 32;
@@ -31,11 +33,24 @@ const READ_FD_CACHE_SHARDS: usize = 16;
 const READ_HINT_MIN_LEN: usize = 512 * 1024;
 
 static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
+static BATCH_INTENT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug)]
 pub struct PayloadBatchEntry<'a> {
     pub object_id: u64,
     pub data: &'a [u8],
+}
+
+#[derive(Debug)]
+#[must_use = "batch payload commit intents must be completed after the index commit succeeds"]
+pub struct PayloadBatchCommit {
+    intent_path: PathBuf,
+}
+
+impl PayloadBatchCommit {
+    pub fn complete(self) {
+        remove_batch_payload_intent(&self.intent_path);
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -231,9 +246,11 @@ impl FilePayloadStore {
     pub fn put_batch(
         &self,
         entries: &[PayloadBatchEntry<'_>],
-    ) -> Result<(), FilePayloadStoreError> {
+    ) -> Result<PayloadBatchCommit, FilePayloadStoreError> {
         if entries.is_empty() {
-            return Ok(());
+            return Ok(PayloadBatchCommit {
+                intent_path: PathBuf::new(),
+            });
         }
 
         let durable_sync = matches!(self.sync_mode, LocalPayloadSyncMode::Durable);
@@ -269,6 +286,7 @@ impl FilePayloadStore {
 
         let mut renamed_object_ids = Vec::with_capacity(staged.len());
         let mut synced_dirs = HashSet::new();
+        let intent = self.write_batch_payload_intent("committing", &staged, durable_sync)?;
         for idx in 0..staged.len() {
             let staged_entry = &staged[idx];
             if let Err(error) = self.commit_staged_batch_payload(staged_entry, durable_sync) {
@@ -300,7 +318,9 @@ impl FilePayloadStore {
                 );
             }
         }
-        Ok(())
+        Ok(PayloadBatchCommit {
+            intent_path: intent,
+        })
     }
 
     pub fn remove(&self, object_id: u64) {
@@ -402,6 +422,82 @@ impl FilePayloadStore {
         for entry in staged {
             let _ = std::fs::remove_file(&entry.temp_path);
         }
+    }
+
+    fn write_batch_payload_intent(
+        &self,
+        phase: &str,
+        staged: &[StagedBatchPayload<'_>],
+        durable_sync: bool,
+    ) -> Result<PathBuf, FilePayloadStoreError> {
+        let intent_dir = self.layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR);
+        std::fs::create_dir_all(&intent_dir)?;
+        if durable_sync {
+            self.sync_directory_put_barrier(&self.layout.tmp_dir)?;
+        }
+        let path = intent_dir.join(format!(
+            "batch-{}.{}",
+            next_batch_intent_token(),
+            LOCAL_PAYLOAD_BATCH_INTENT_FILE_EXTENSION
+        ));
+        self.write_batch_payload_intent_phase(&path, phase, staged, durable_sync)?;
+        Ok(path)
+    }
+
+    fn write_batch_payload_intent_phase(
+        &self,
+        path: &Path,
+        phase: &str,
+        staged: &[StagedBatchPayload<'_>],
+        durable_sync: bool,
+    ) -> Result<(), FilePayloadStoreError> {
+        let mut content = String::new();
+        content.push_str("version=1\n");
+        content.push_str("phase=");
+        content.push_str(phase);
+        content.push('\n');
+        for entry in staged {
+            content.push_str("object=");
+            content.push_str(&entry.entry.object_id.to_string());
+            content.push_str("|temp_hex=");
+            content.push_str(&encode_batch_intent_path_hex(
+                &self.intent_relative_path(&entry.temp_path)?,
+            ));
+            content.push_str("|final_hex=");
+            content.push_str(&encode_batch_intent_path_hex(
+                &self.intent_relative_path(&entry.payload_path)?,
+            ));
+            content.push('\n');
+        }
+
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::other(format!(
+                "batch intent path has no parent directory: {}",
+                path.display()
+            ))
+        })?;
+        let temp_path = parent.join(format!("{}.tmp", next_batch_intent_token()));
+        let mut temp_file = File::create(&temp_path)?;
+        platform::write_all(&mut temp_file, content.as_bytes())?;
+        if durable_sync {
+            platform::sync_data(&temp_file)?;
+        }
+        drop(temp_file);
+        platform::rename_atomic(&temp_path, path)?;
+        if durable_sync {
+            self.sync_directory_put_barrier(parent)?;
+        }
+        Ok(())
+    }
+
+    fn intent_relative_path(&self, path: &Path) -> Result<String, FilePayloadStoreError> {
+        let relative = path.strip_prefix(&self.layout.runtime_root).map_err(|_| {
+            io::Error::other(format!(
+                "batch intent path is outside runtime root: {}",
+                path.display()
+            ))
+        })?;
+        Ok(relative.to_string_lossy().replace('\\', "/"))
     }
 
     #[cfg(test)]
@@ -683,6 +779,35 @@ fn next_temp_token() -> String {
     format!("{:016x}-{}", seq, Uuid::new_v4().simple())
 }
 
+fn next_batch_intent_token() -> String {
+    let seq = BATCH_INTENT_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{:016x}-{}", seq, Uuid::new_v4().simple())
+}
+
+fn remove_batch_payload_intent(path: &Path) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        warn!(
+            path = %path.display(),
+            error = ?error,
+            "local payload runtime batch intent remove failed"
+        );
+    }
+}
+
+fn encode_batch_intent_path_hex(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut encoded, "{byte:02x}");
+    }
+    encoded
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -938,7 +1063,7 @@ mod tests {
             },
         ];
 
-        store.put_batch(&entries).unwrap();
+        store.put_batch(&entries).unwrap().complete();
 
         let before_sync = store.sync_barrier_snapshot();
         assert_eq!(before_sync.per_put_file_sync_calls, 0);

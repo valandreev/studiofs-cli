@@ -42,6 +42,7 @@ pub use cache_index::{
 use eviction::{CacheBudgetGovernor, EVICTION_CANDIDATE_PAGE_SIZE, EVICTION_DELETE_BATCH_SIZE};
 pub use file_payload_store::{FilePayloadStore, FilePayloadStoreError, PayloadBatchEntry};
 pub use layout::{
+    LOCAL_PAYLOAD_BATCH_INTENT_DIR, LOCAL_PAYLOAD_BATCH_INTENT_FILE_EXTENSION,
     LOCAL_PAYLOAD_OBJECT_SHARD_COUNT, LOCAL_PAYLOAD_REDB_INDEX_FILE, LocalPayloadLayout,
 };
 pub use reconcile::{LocalPayloadStartupReconcileError, LocalPayloadStartupReconcileReport};
@@ -919,9 +920,10 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
             return Ok(());
         }
 
-        if let Err(error) = self.payload_store.put_batch(&persisted_entries) {
-            return Err(LocalPayloadBackendError::Other(Box::new(error)));
-        }
+        let batch_commit = self
+            .payload_store
+            .put_batch(&persisted_entries)
+            .map_err(|error| LocalPayloadBackendError::Other(Box::new(error)))?;
 
         if let Err(error) = self.index.upsert_many(&updates) {
             let written_object_ids: Vec<u64> = persisted_entries
@@ -937,6 +939,7 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
             return Err(LocalPayloadBackendError::Other(Box::new(error)));
         }
 
+        batch_commit.complete();
         Ok(())
     }
 

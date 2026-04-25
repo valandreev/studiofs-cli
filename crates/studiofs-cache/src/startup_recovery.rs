@@ -4,9 +4,13 @@
 //! mutates unrelated files under the cache root.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use super::{CacheIndex, CacheIndexError, LocalPayloadLayout};
+use super::{
+    CacheIndex, CacheIndexError, LOCAL_PAYLOAD_BATCH_INTENT_DIR,
+    LOCAL_PAYLOAD_BATCH_INTENT_FILE_EXTENSION, LocalPayloadLayout,
+};
+use tracing::warn;
 
 const LIST_PAGE_SIZE: usize = 4_096;
 const INDEX_REMOVE_BATCH_SIZE: usize = 1_024;
@@ -43,6 +47,7 @@ pub struct LocalPayloadStartupReconcileReport {
     pub temp_files_removed: u64,
     pub stale_index_entries_removed: u64,
     pub orphan_payload_files_removed: u64,
+    pub batch_intents_resolved: u64,
 }
 
 impl LocalPayloadStartupReconcileReport {
@@ -50,6 +55,7 @@ impl LocalPayloadStartupReconcileReport {
         self.temp_files_removed == 0
             && self.stale_index_entries_removed == 0
             && self.orphan_payload_files_removed == 0
+            && self.batch_intents_resolved == 0
     }
 }
 
@@ -76,6 +82,7 @@ pub fn reconcile_startup_state(
     index: &CacheIndex,
     mode: LocalPayloadStartupReconcileMode,
 ) -> Result<LocalPayloadStartupReconcileReport, LocalPayloadStartupReconcileError> {
+    let batch_recovery = recover_batch_payload_intents(layout, index)?;
     let temp_files_removed = remove_temp_files(layout)?;
     let stale_index_entries_removed = match mode {
         LocalPayloadStartupReconcileMode::Lightweight => prune_dirty_payloads(layout, index)?,
@@ -89,10 +96,177 @@ pub fn reconcile_startup_state(
     };
 
     Ok(LocalPayloadStartupReconcileReport {
-        temp_files_removed: temp_files_removed.saturating_add(additional_temp_files_removed),
+        temp_files_removed: temp_files_removed
+            .saturating_add(additional_temp_files_removed)
+            .saturating_add(batch_recovery.temp_files_removed),
         stale_index_entries_removed,
         orphan_payload_files_removed,
+        batch_intents_resolved: batch_recovery.intents_resolved,
     })
+}
+
+#[derive(Debug, Default)]
+struct BatchIntentRecoveryReport {
+    intents_resolved: u64,
+    temp_files_removed: u64,
+}
+
+#[derive(Debug, Default)]
+struct BatchPayloadIntent {
+    phase: String,
+    objects: Vec<BatchPayloadIntentObject>,
+}
+
+#[derive(Debug, Default)]
+struct BatchPayloadIntentObject {
+    object_id: u64,
+    temp: Option<PathBuf>,
+    final_path: Option<PathBuf>,
+}
+
+fn recover_batch_payload_intents(
+    layout: &LocalPayloadLayout,
+    index: &CacheIndex,
+) -> Result<BatchIntentRecoveryReport, LocalPayloadStartupReconcileError> {
+    let intent_dir = batch_intent_dir(layout);
+    let mut report = BatchIntentRecoveryReport::default();
+
+    visit_files_recursive(&intent_dir, &mut |intent_path| -> Result<
+        (),
+        LocalPayloadStartupReconcileError,
+    > {
+        let Some(file_name) = intent_path.file_name().and_then(|name| name.to_str()) else {
+            return Ok(());
+        };
+        if !file_name.ends_with(&batch_intent_file_suffix()) {
+            return Ok(());
+        }
+
+        let Some(intent) = read_batch_payload_intent(layout, intent_path)? else {
+            return Ok(());
+        };
+        for object in &intent.objects {
+            if index.get_entry(object.object_id)?.is_none()
+                && let Some(final_path) = &object.final_path
+            {
+                let _ = remove_file_if_present(final_path)?;
+            }
+            if let Some(temp_path) = &object.temp
+                && remove_file_if_present(temp_path)?
+            {
+                report.temp_files_removed = report.temp_files_removed.saturating_add(1);
+            }
+        }
+
+        let _ = remove_file_if_present(intent_path)?;
+        report.intents_resolved = report.intents_resolved.saturating_add(1);
+        Ok(())
+    })?;
+
+    Ok(report)
+}
+
+fn read_batch_payload_intent(
+    layout: &LocalPayloadLayout,
+    path: &Path,
+) -> Result<Option<BatchPayloadIntent>, LocalPayloadStartupReconcileError> {
+    let content = std::fs::read_to_string(path)?;
+    let mut intent = BatchPayloadIntent::default();
+    let mut saw_version = false;
+    for line in content.lines() {
+        if let Some(version) = line.strip_prefix("version=") {
+            if version != "1" {
+                warn!(
+                    path = %path.display(),
+                    version,
+                    "local payload runtime skipped unsupported batch payload intent version"
+                );
+                return Ok(None);
+            }
+            saw_version = true;
+            continue;
+        }
+        if let Some(phase) = line.strip_prefix("phase=") {
+            intent.phase = phase.to_string();
+            continue;
+        }
+        if let Some(row) = line.strip_prefix("object=") {
+            if let Some(object) = parse_batch_payload_intent_object(layout, row) {
+                intent.objects.push(object);
+            }
+        }
+    }
+    if !saw_version {
+        warn!(
+            path = %path.display(),
+            "local payload runtime skipped batch payload intent without version header"
+        );
+        return Ok(None);
+    }
+    Ok(Some(intent))
+}
+
+fn parse_batch_payload_intent_object(
+    layout: &LocalPayloadLayout,
+    row: &str,
+) -> Option<BatchPayloadIntentObject> {
+    let mut object_id = None;
+    let mut temp = None;
+    let mut final_path = None;
+    for (idx, part) in row.split('|').enumerate() {
+        if idx == 0 {
+            object_id = part.parse::<u64>().ok();
+        } else if let Some(path_hex) = part.strip_prefix("temp_hex=") {
+            temp = decode_batch_intent_path_hex(path_hex)
+                .and_then(|path| resolve_batch_intent_relative_path(layout, &path));
+        } else if let Some(path_hex) = part.strip_prefix("final_hex=") {
+            final_path = decode_batch_intent_path_hex(path_hex)
+                .and_then(|path| resolve_batch_intent_relative_path(layout, &path));
+        } else if let Some(path) = part.strip_prefix("temp=") {
+            temp = resolve_batch_intent_relative_path(layout, path);
+        } else if let Some(path) = part.strip_prefix("final=") {
+            final_path = resolve_batch_intent_relative_path(layout, path);
+        }
+    }
+    Some(BatchPayloadIntentObject {
+        object_id: object_id?,
+        temp,
+        final_path,
+    })
+}
+
+fn resolve_batch_intent_relative_path(layout: &LocalPayloadLayout, value: &str) -> Option<PathBuf> {
+    if value.is_empty() || value.contains('\\') || value.contains(':') || value.contains("..") {
+        return None;
+    }
+    let mut path = layout.runtime_root.clone();
+    for component in value.split('/') {
+        if component.is_empty() {
+            return None;
+        }
+        path.push(component);
+    }
+    Some(path)
+}
+
+fn decode_batch_intent_path_hex(value: &str) -> Option<String> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for idx in (0..value.len()).step_by(2) {
+        let byte = u8::from_str_radix(&value[idx..idx + 2], 16).ok()?;
+        bytes.push(byte);
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn batch_intent_dir(layout: &LocalPayloadLayout) -> PathBuf {
+    layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR)
+}
+
+fn batch_intent_file_suffix() -> String {
+    format!(".{LOCAL_PAYLOAD_BATCH_INTENT_FILE_EXTENSION}")
 }
 
 fn prune_dirty_payloads(
@@ -163,7 +337,11 @@ fn usize_to_u64(value: usize) -> u64 {
 
 fn remove_temp_files(layout: &LocalPayloadLayout) -> Result<u64, io::Error> {
     let mut removed = 0_u64;
+    let intent_dir = batch_intent_dir(layout);
     visit_files_recursive(&layout.tmp_dir, &mut |file| -> io::Result<()> {
+        if file.starts_with(&intent_dir) {
+            return Ok(());
+        }
         if remove_file_if_present(file)? {
             removed = removed.saturating_add(1);
         }
@@ -312,6 +490,225 @@ mod tests {
         assert!(index.get_entry(1).unwrap().is_some());
         assert!(index.get_entry(2).unwrap().is_none());
         assert!(!tmp_in_tmp_dir.exists());
+    }
+
+    #[test]
+    fn startup_reconcile_lightweight_resolves_incomplete_batch_payload_intent() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let index = CacheIndex::open(&layout.redb_index_path).unwrap();
+
+        let committed_payload_path = layout.payload_object_path(10);
+        std::fs::create_dir_all(committed_payload_path.parent().unwrap()).unwrap();
+        std::fs::write(&committed_payload_path, b"committed-without-index").unwrap();
+
+        let staged_temp_path = layout.tmp_dir.join("batch-staged-11.tmp");
+        std::fs::create_dir_all(staged_temp_path.parent().unwrap()).unwrap();
+        std::fs::write(&staged_temp_path, b"staged").unwrap();
+
+        let intent_dir = layout.tmp_dir.join("batch-intents");
+        std::fs::create_dir_all(&intent_dir).unwrap();
+        let final_path_10 = layout
+            .payload_object_relative_path(10)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let temp_path_11 = staged_temp_path
+            .strip_prefix(&layout.runtime_root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        std::fs::write(
+            intent_dir.join("batch-0000000000000001.intent"),
+            format!(
+                "version=1\nphase=committing\nobject=10|temp=|final={final_path_10}\nobject=11|temp={temp_path_11}|final=\n"
+            ),
+        )
+        .unwrap();
+
+        let report = reconcile_startup_state(
+            &layout,
+            &index,
+            LocalPayloadStartupReconcileMode::Lightweight,
+        )
+        .unwrap();
+
+        assert_eq!(report.batch_intents_resolved, 1);
+        assert_eq!(report.temp_files_removed, 1);
+        assert!(!committed_payload_path.exists());
+        assert!(!staged_temp_path.exists());
+        assert!(!intent_dir.join("batch-0000000000000001.intent").exists());
+    }
+
+    #[test]
+    fn startup_reconcile_batch_intent_preserves_payloads_that_reached_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let index = CacheIndex::open(&layout.redb_index_path).unwrap();
+        let payload_store = FilePayloadStore::open(layout.clone()).unwrap();
+        payload_store.put(12, b"indexed").unwrap();
+        index
+            .upsert(super::super::CacheIndexUpsert {
+                object_id: 12,
+                payload_key: payload_key(&layout, 12),
+                payload_len: 7,
+                lifecycle: LocalPayloadLifecycleState::Uploaded,
+                origin: LocalPayloadOrigin::Downloaded,
+                upload_state: LocalPayloadUploadState::None,
+                evictable: true,
+            })
+            .unwrap();
+
+        let final_path_12 = layout
+            .payload_object_relative_path(12)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let intent_dir = layout.tmp_dir.join("batch-intents");
+        std::fs::create_dir_all(&intent_dir).unwrap();
+        std::fs::write(
+            intent_dir.join("batch-0000000000000002.intent"),
+            format!("version=1\nphase=committed\nobject=12|temp=|final={final_path_12}\n"),
+        )
+        .unwrap();
+
+        let report = reconcile_startup_state(
+            &layout,
+            &index,
+            LocalPayloadStartupReconcileMode::Lightweight,
+        )
+        .unwrap();
+
+        assert_eq!(report.batch_intents_resolved, 1);
+        assert_eq!(payload_store.get(12).unwrap().as_ref(), b"indexed");
+        assert!(!intent_dir.join("batch-0000000000000002.intent").exists());
+    }
+
+    #[test]
+    fn startup_reconcile_skips_unsupported_batch_intent_version() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let index = CacheIndex::open(&layout.redb_index_path).unwrap();
+        let payload_path = layout.payload_object_path(14);
+        std::fs::create_dir_all(payload_path.parent().unwrap()).unwrap();
+        std::fs::write(&payload_path, b"future-format-payload").unwrap();
+
+        let final_path_14 = layout
+            .payload_object_relative_path(14)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let intent_dir = batch_intent_dir(&layout);
+        let intent_path = intent_dir.join("batch-0000000000000004.intent");
+        std::fs::create_dir_all(&intent_dir).unwrap();
+        std::fs::write(
+            &intent_path,
+            format!("version=2\nphase=committing\nobject=14|temp=|final={final_path_14}\n"),
+        )
+        .unwrap();
+
+        let report = reconcile_startup_state(
+            &layout,
+            &index,
+            LocalPayloadStartupReconcileMode::Lightweight,
+        )
+        .unwrap();
+
+        assert_eq!(report.batch_intents_resolved, 0);
+        assert_eq!(
+            std::fs::read(&payload_path).unwrap(),
+            b"future-format-payload"
+        );
+        assert!(intent_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_reconcile_batch_intent_accepts_hex_encoded_paths_with_delimiters() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let index = CacheIndex::open(&layout.redb_index_path).unwrap();
+        let payload_path = layout
+            .payload_objects_dir
+            .join("aa")
+            .join("bb")
+            .join("contains|delimiter.object");
+        std::fs::create_dir_all(payload_path.parent().unwrap()).unwrap();
+        std::fs::write(&payload_path, b"payload").unwrap();
+        let final_path = payload_path
+            .strip_prefix(&layout.runtime_root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let final_path_hex = encode_test_path_hex(&final_path);
+
+        let intent_dir = batch_intent_dir(&layout);
+        std::fs::create_dir_all(&intent_dir).unwrap();
+        std::fs::write(
+            intent_dir.join("batch-0000000000000005.intent"),
+            format!(
+                "version=1\nphase=committing\nobject=15|temp_hex=|final_hex={final_path_hex}\n"
+            ),
+        )
+        .unwrap();
+
+        let report = reconcile_startup_state(
+            &layout,
+            &index,
+            LocalPayloadStartupReconcileMode::Lightweight,
+        )
+        .unwrap();
+
+        assert_eq!(report.batch_intents_resolved, 1);
+        assert!(!payload_path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_reconcile_batch_intent_rejects_rooted_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_path = outside.path().join("outside.object");
+        std::fs::write(&outside_path, b"outside-runtime").unwrap();
+
+        let index = CacheIndex::open(&layout.redb_index_path).unwrap();
+        let intent_dir = layout.tmp_dir.join("batch-intents");
+        std::fs::create_dir_all(&intent_dir).unwrap();
+        std::fs::write(
+            intent_dir.join("batch-0000000000000003.intent"),
+            format!(
+                "version=1\nphase=committing\nobject=13|temp=|final={}\n",
+                outside_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let report = reconcile_startup_state(
+            &layout,
+            &index,
+            LocalPayloadStartupReconcileMode::Lightweight,
+        )
+        .unwrap();
+
+        assert_eq!(report.batch_intents_resolved, 1);
+        assert_eq!(std::fs::read(&outside_path).unwrap(), b"outside-runtime");
+    }
+
+    #[cfg(unix)]
+    fn encode_test_path_hex(value: &str) -> String {
+        let mut encoded = String::with_capacity(value.len() * 2);
+        for byte in value.as_bytes() {
+            encoded.push_str(&format!("{byte:02x}"));
+        }
+        encoded
     }
 
     #[test]

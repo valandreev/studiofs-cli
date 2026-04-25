@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 
 /// Temporary-file area for atomic writes and staging.
 pub const LOCAL_PAYLOAD_TMP_DIR: &str = "tmp";
+/// Directory under `tmp/` holding recoverable batch payload commit intents.
+pub const LOCAL_PAYLOAD_BATCH_INTENT_DIR: &str = "batch-intents";
+/// Extension used by batch payload commit intent sidecars.
+pub const LOCAL_PAYLOAD_BATCH_INTENT_FILE_EXTENSION: &str = "intent";
 /// Root directory for on-disk payload data.
 pub const LOCAL_PAYLOAD_DIR: &str = "payload";
 /// Root directory for upload data used by writeback.
