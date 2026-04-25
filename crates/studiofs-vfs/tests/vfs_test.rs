@@ -10043,14 +10043,8 @@ fn truncate_after_create_is_locally_durable_without_flush() {
 
 #[test]
 fn full_block_write_with_offline_s3_stays_local_until_flush_then_queues_upload() {
-    let _restore_endpoint = ScopedEnvVar::capture("STUDIOFS_S3_ENDPOINT");
-    let _restore_dirty = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
-    let _restore_eager = ScopedEnvVar::capture("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES");
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     unsafe {
-        std::env::set_var("STUDIOFS_S3_ENDPOINT", "http://127.0.0.1:59999");
-        std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1048576");
-        std::env::set_var("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES", "512KB");
         std::env::set_var("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH", "1");
     }
 
@@ -10074,13 +10068,20 @@ fn full_block_write_with_offline_s3_stays_local_until_flush_then_queues_upload()
         .build()
         .unwrap();
     rt.block_on(async {
+        let vfs_config = VfsConfigRaw {
+            max_dirty_bytes: Some(16 * 1024 * 1024),
+            write_eager_flush_batch_bytes: Some(block_size * 4),
+            ..VfsConfigRaw::default()
+        }
+        .validate()
+        .expect("test VFS config should validate");
         let vfs = StudioVfs::new(
             meta,
             &data_config,
             &cache_dir_str,
             4096,
             16 * 1024 * 1024,
-            test_vfs_config_from_env(),
+            vfs_config,
         )
         .unwrap();
         vfs.start()

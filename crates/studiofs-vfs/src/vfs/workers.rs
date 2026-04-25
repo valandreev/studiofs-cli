@@ -295,6 +295,19 @@ impl StudioVfs {
         previous: &HashMap<Ino, Vec<u64>>,
         current: &HashMap<Ino, Vec<u64>>,
     ) -> HashMap<Ino, Vec<u64>> {
+        debug_assert!(
+            previous
+                .values()
+                .all(|ids| ids.windows(2).all(|pair| pair[0] < pair[1])),
+            "previous metadata payload snapshot must be sorted and deduplicated"
+        );
+        debug_assert!(
+            current
+                .values()
+                .all(|ids| ids.windows(2).all(|pair| pair[0] < pair[1])),
+            "current metadata payload snapshot must be sorted and deduplicated"
+        );
+
         previous
             .iter()
             .filter_map(|(ino, previous_object_ids)| {
