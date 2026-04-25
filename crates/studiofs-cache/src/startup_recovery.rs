@@ -206,7 +206,7 @@ fn parse_batch_payload_intent_object(
 }
 
 fn resolve_batch_intent_relative_path(layout: &LocalPayloadLayout, value: &str) -> Option<PathBuf> {
-    if value.is_empty() || value.contains("..") {
+    if value.is_empty() || value.contains('\\') || value.contains(':') || value.contains("..") {
         return None;
     }
     let mut path = layout.runtime_root.clone();
@@ -534,6 +534,40 @@ mod tests {
         assert_eq!(report.batch_intents_resolved, 1);
         assert_eq!(payload_store.get(12).unwrap().as_ref(), b"indexed");
         assert!(!intent_dir.join("batch-0000000000000002.intent").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn startup_reconcile_batch_intent_rejects_rooted_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let outside = tempfile::tempdir().unwrap();
+        let outside_path = outside.path().join("outside.object");
+        std::fs::write(&outside_path, b"outside-runtime").unwrap();
+
+        let index = CacheIndex::open(&layout.redb_index_path).unwrap();
+        let intent_dir = layout.tmp_dir.join("batch-intents");
+        std::fs::create_dir_all(&intent_dir).unwrap();
+        std::fs::write(
+            intent_dir.join("batch-0000000000000003.intent"),
+            format!(
+                "version=1\nphase=committing\nobject=13|temp=|final={}\n",
+                outside_path.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let report = reconcile_startup_state(
+            &layout,
+            &index,
+            LocalPayloadStartupReconcileMode::Lightweight,
+        )
+        .unwrap();
+
+        assert_eq!(report.batch_intents_resolved, 1);
+        assert_eq!(std::fs::read(&outside_path).unwrap(), b"outside-runtime");
     }
 
     #[test]
