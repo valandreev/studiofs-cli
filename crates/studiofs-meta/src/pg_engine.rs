@@ -3857,6 +3857,11 @@ impl MetaPayloadObjects for PgMetaEngine {
         }
         let slot = self.client_slot()?;
         let count = u64::from(count);
+        if count > PG_INODE_WINDOW_SIZE {
+            return Err(MetaError::Storage(format!(
+                "requested object ID batch {count} exceeds PostgreSQL inode/object window size {PG_INODE_WINDOW_SIZE}"
+            )));
+        }
         loop {
             let allocation = {
                 let _guard = self
@@ -3869,6 +3874,10 @@ impl MetaPayloadObjects for PgMetaEngine {
                     state.prefetched = InodeWindow::default();
                 }
                 if state.current.remaining() < count {
+                    if state.current.has_headroom() {
+                        state.current.next = state.current.end;
+                        self.persist_inode_allocator_state(state)?;
+                    }
                     self.update_inode_headroom_flag(state);
                     None
                 } else {
@@ -5513,6 +5522,33 @@ mod tests {
 
         assert_eq!(object_ids, vec![500, 501]);
         assert_eq!(load_inode_state(&pg.local).current.next, 502);
+    }
+
+    #[test]
+    fn next_object_ids_reserves_new_window_when_tail_is_too_small() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let _inode_window_override = set_inode_window_reservation_override([Ok(InodeWindow {
+            start: 500,
+            next: 500,
+            end: 510,
+        })]);
+
+        persist_inode_state(
+            &pg.local,
+            InodeAllocatorState {
+                current: InodeWindow {
+                    start: 100,
+                    next: 100,
+                    end: 102,
+                },
+                prefetched: InodeWindow::default(),
+            },
+        );
+
+        let object_ids = pg.next_object_ids(3).expect("allocate object IDs");
+
+        assert_eq!(object_ids, vec![500, 501, 502]);
+        assert_eq!(load_inode_state(&pg.local).current.next, 503);
     }
 
     #[test]
