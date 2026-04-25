@@ -42,6 +42,7 @@ pub use cache_index::{
 use eviction::{CacheBudgetGovernor, EVICTION_CANDIDATE_PAGE_SIZE, EVICTION_DELETE_BATCH_SIZE};
 pub use file_payload_store::{FilePayloadStore, FilePayloadStoreError, PayloadBatchEntry};
 pub use layout::{
+    LOCAL_PAYLOAD_BATCH_INTENT_DIR, LOCAL_PAYLOAD_BATCH_INTENT_FILE_EXTENSION,
     LOCAL_PAYLOAD_OBJECT_SHARD_COUNT, LOCAL_PAYLOAD_REDB_INDEX_FILE, LocalPayloadLayout,
 };
 pub use reconcile::{LocalPayloadStartupReconcileError, LocalPayloadStartupReconcileReport};
@@ -930,7 +931,6 @@ impl LocalPayloadBackend for LocalPayloadBackendRuntime {
                 .map(|entry| entry.object_id)
                 .collect();
             self.payload_store.remove_batch(&written_object_ids);
-            batch_commit.complete();
             warn!(
                 object_count = persisted_entries.len(),
                 error = ?error,

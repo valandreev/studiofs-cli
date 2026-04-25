@@ -18,13 +18,13 @@ use tracing::warn;
 use uuid::Uuid;
 
 use super::LocalPayloadSyncMode;
-use super::layout::LocalPayloadLayout;
+use super::layout::{
+    LOCAL_PAYLOAD_BATCH_INTENT_DIR, LOCAL_PAYLOAD_BATCH_INTENT_FILE_EXTENSION, LocalPayloadLayout,
+};
 use super::platform;
 
 const TEMP_FILE_CREATE_ATTEMPTS: usize = 32;
 const TEMP_FILE_SUFFIX: &str = ".tmp";
-const BATCH_INTENT_DIR: &str = "batch-intents";
-const BATCH_INTENT_SUFFIX: &str = ".intent";
 #[cfg(not(test))]
 const READ_FD_CACHE_CAPACITY: usize = 2_048;
 #[cfg(test)]
@@ -42,6 +42,7 @@ pub struct PayloadBatchEntry<'a> {
 }
 
 #[derive(Debug)]
+#[must_use = "batch payload commit intents must be completed after the index commit succeeds"]
 pub struct PayloadBatchCommit {
     intent_path: PathBuf,
 }
@@ -285,15 +286,12 @@ impl FilePayloadStore {
 
         let mut renamed_object_ids = Vec::with_capacity(staged.len());
         let mut synced_dirs = HashSet::new();
-        let intent = self.write_batch_payload_intent("staged", &staged)?;
-        self.write_batch_payload_intent_phase(&intent, "committing", &staged)?;
+        let intent = self.write_batch_payload_intent("committing", &staged, durable_sync)?;
         for idx in 0..staged.len() {
             let staged_entry = &staged[idx];
             if let Err(error) = self.commit_staged_batch_payload(staged_entry, durable_sync) {
-                let _ = self.write_batch_payload_intent_phase(&intent, "rollback-needed", &staged);
                 self.cleanup_staged_batch_payloads(&staged[idx + 1..]);
                 self.remove_batch(&renamed_object_ids);
-                remove_batch_payload_intent(&intent);
                 return Err(error);
             }
             renamed_object_ids.push(staged_entry.entry.object_id);
@@ -303,17 +301,12 @@ impl FilePayloadStore {
 
         if durable_sync {
             if let Err(error) = self.sync_directory_put_barrier(&self.layout.tmp_dir) {
-                let _ = self.write_batch_payload_intent_phase(&intent, "rollback-needed", &staged);
                 self.remove_batch(&renamed_object_ids);
-                remove_batch_payload_intent(&intent);
                 return Err(error);
             }
             for dir in synced_dirs {
                 if let Err(error) = self.sync_directory_put_barrier(&dir) {
-                    let _ =
-                        self.write_batch_payload_intent_phase(&intent, "rollback-needed", &staged);
                     self.remove_batch(&renamed_object_ids);
-                    remove_batch_payload_intent(&intent);
                     return Err(error);
                 }
             }
@@ -325,7 +318,6 @@ impl FilePayloadStore {
                 );
             }
         }
-        self.write_batch_payload_intent_phase(&intent, "committed", &staged)?;
         Ok(PayloadBatchCommit {
             intent_path: intent,
         })
@@ -436,15 +428,19 @@ impl FilePayloadStore {
         &self,
         phase: &str,
         staged: &[StagedBatchPayload<'_>],
+        durable_sync: bool,
     ) -> Result<PathBuf, FilePayloadStoreError> {
-        let intent_dir = self.layout.tmp_dir.join(BATCH_INTENT_DIR);
+        let intent_dir = self.layout.tmp_dir.join(LOCAL_PAYLOAD_BATCH_INTENT_DIR);
         std::fs::create_dir_all(&intent_dir)?;
+        if durable_sync {
+            self.sync_directory_put_barrier(&self.layout.tmp_dir)?;
+        }
         let path = intent_dir.join(format!(
-            "batch-{}{}",
+            "batch-{}.{}",
             next_batch_intent_token(),
-            BATCH_INTENT_SUFFIX
+            LOCAL_PAYLOAD_BATCH_INTENT_FILE_EXTENSION
         ));
-        self.write_batch_payload_intent_phase(&path, phase, staged)?;
+        self.write_batch_payload_intent_phase(&path, phase, staged, durable_sync)?;
         Ok(path)
     }
 
@@ -453,6 +449,7 @@ impl FilePayloadStore {
         path: &Path,
         phase: &str,
         staged: &[StagedBatchPayload<'_>],
+        durable_sync: bool,
     ) -> Result<(), FilePayloadStoreError> {
         let mut content = String::new();
         content.push_str("version=1\n");
@@ -476,8 +473,16 @@ impl FilePayloadStore {
             ))
         })?;
         let temp_path = parent.join(format!("{}.tmp", next_batch_intent_token()));
-        std::fs::write(&temp_path, content)?;
+        let mut temp_file = File::create(&temp_path)?;
+        platform::write_all(&mut temp_file, content.as_bytes())?;
+        if durable_sync {
+            platform::sync_data(&temp_file)?;
+        }
+        drop(temp_file);
         platform::rename_atomic(&temp_path, path)?;
+        if durable_sync {
+            self.sync_directory_put_barrier(parent)?;
+        }
         Ok(())
     }
 
@@ -1045,7 +1050,7 @@ mod tests {
             },
         ];
 
-        store.put_batch(&entries).unwrap();
+        store.put_batch(&entries).unwrap().complete();
 
         let before_sync = store.sync_barrier_snapshot();
         assert_eq!(before_sync.per_put_file_sync_calls, 0);
