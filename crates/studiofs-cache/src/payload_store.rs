@@ -17,8 +17,6 @@ use parking_lot::Mutex;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::local::LocalPayloadReadHandleStats;
-
 use super::LocalPayloadSyncMode;
 use super::layout::LocalPayloadLayout;
 use super::platform;
@@ -611,8 +609,9 @@ impl FilePayloadStore {
         }
     }
 
-    pub(crate) fn read_handle_stats(&self) -> LocalPayloadReadHandleStats {
-        LocalPayloadReadHandleStats {
+    #[cfg(test)]
+    fn read_handle_stats(&self) -> ReadHandleStats {
+        ReadHandleStats {
             hits: self.read_handles.hits.load(Ordering::Relaxed),
             misses: self.read_handles.misses.load(Ordering::Relaxed),
             evictions: self.read_handles.evictions.load(Ordering::Relaxed),
@@ -657,6 +656,15 @@ pub(crate) struct SyncBarrierSnapshot {
     pub(crate) grouped_dir_sync_calls: u64,
     pub(crate) pending_grouped_file_syncs: usize,
     pub(crate) pending_grouped_dir_syncs: usize,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadHandleStats {
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+    cached: usize,
 }
 
 fn read_fd_cache_shard_cap() -> NonZeroUsize {

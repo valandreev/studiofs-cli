@@ -48,58 +48,6 @@ struct ReadSegment {
     source: ReadSegmentSource,
 }
 
-#[derive(Debug, Default)]
-struct ReadSegmentStats {
-    dirty_spans: usize,
-    pending_overlay_spans: usize,
-    pending_extent_spans: usize,
-    overlay_spans: usize,
-    base_spans: usize,
-    zero_spans: usize,
-    dirty_bytes: u64,
-    pending_overlay_bytes: u64,
-    pending_extent_bytes: u64,
-    overlay_bytes: u64,
-    base_bytes: u64,
-    zero_bytes: u64,
-}
-
-impl ReadSegmentStats {
-    fn from_segments(segments: &[ReadSegment]) -> Self {
-        let mut stats = Self::default();
-        for segment in segments {
-            let bytes = segment.range.end.saturating_sub(segment.range.start);
-            match &segment.source {
-                ReadSegmentSource::Dirty { .. } => {
-                    stats.dirty_spans += 1;
-                    stats.dirty_bytes = stats.dirty_bytes.saturating_add(bytes);
-                }
-                ReadSegmentSource::PendingOverlay { .. } => {
-                    stats.pending_overlay_spans += 1;
-                    stats.pending_overlay_bytes = stats.pending_overlay_bytes.saturating_add(bytes);
-                }
-                ReadSegmentSource::PendingExtent { .. } => {
-                    stats.pending_extent_spans += 1;
-                    stats.pending_extent_bytes = stats.pending_extent_bytes.saturating_add(bytes);
-                }
-                ReadSegmentSource::Overlay { .. } => {
-                    stats.overlay_spans += 1;
-                    stats.overlay_bytes = stats.overlay_bytes.saturating_add(bytes);
-                }
-                ReadSegmentSource::Base { .. } => {
-                    stats.base_spans += 1;
-                    stats.base_bytes = stats.base_bytes.saturating_add(bytes);
-                }
-                ReadSegmentSource::Zero => {
-                    stats.zero_spans += 1;
-                    stats.zero_bytes = stats.zero_bytes.saturating_add(bytes);
-                }
-            }
-        }
-        stats
-    }
-}
-
 struct DataReader<'a> {
     vfs: &'a StudioVfs,
     ino: Ino,
@@ -153,38 +101,34 @@ impl<'a> DataReader<'a> {
         let Some(path) = vfs.debug_pending_target_path(ino) else {
             return;
         };
-        let stats = ReadSegmentStats::from_segments(segments);
-        let pending_uploads = vfs.pending_uploads_for_inode(ino);
-        let pending_upload_bytes: u64 = pending_uploads
-            .iter()
-            .filter_map(|(_, object_id, _)| vfs.local_payload_backend.object_stats(*object_id))
-            .map(|stats| stats.payload_len)
-            .sum();
-        let read_handle_stats = vfs.local_payload_backend.read_handle_stats();
+        let mut dirty_spans = 0usize;
+        let mut pending_overlay_spans = 0usize;
+        let mut pending_extent_spans = 0usize;
+        let mut overlay_spans = 0usize;
+        let mut base_spans = 0usize;
+        let mut zero_spans = 0usize;
+        for segment in segments {
+            match &segment.source {
+                ReadSegmentSource::Dirty { .. } => dirty_spans += 1,
+                ReadSegmentSource::PendingOverlay { .. } => pending_overlay_spans += 1,
+                ReadSegmentSource::PendingExtent { .. } => pending_extent_spans += 1,
+                ReadSegmentSource::Overlay { .. } => overlay_spans += 1,
+                ReadSegmentSource::Base { .. } => base_spans += 1,
+                ReadSegmentSource::Zero => zero_spans += 1,
+            }
+        }
         info!(
             ino,
             path = %path,
             offset,
             length,
             spans = segments.len(),
-            dirty_spans = stats.dirty_spans,
-            dirty_bytes = stats.dirty_bytes,
-            pending_overlay_spans = stats.pending_overlay_spans,
-            pending_overlay_bytes = stats.pending_overlay_bytes,
-            pending_extent_spans = stats.pending_extent_spans,
-            pending_extent_bytes = stats.pending_extent_bytes,
-            overlay_spans = stats.overlay_spans,
-            overlay_bytes = stats.overlay_bytes,
-            base_spans = stats.base_spans,
-            base_bytes = stats.base_bytes,
-            zero_spans = stats.zero_spans,
-            zero_bytes = stats.zero_bytes,
-            pending_upload_count = pending_uploads.len(),
-            pending_upload_bytes,
-            read_handle_hits = read_handle_stats.map(|stats| stats.hits),
-            read_handle_misses = read_handle_stats.map(|stats| stats.misses),
-            read_handle_cached = read_handle_stats.map(|stats| stats.cached),
-            read_handle_evictions = read_handle_stats.map(|stats| stats.evictions),
+            dirty_spans,
+            pending_overlay_spans,
+            pending_extent_spans,
+            overlay_spans,
+            base_spans,
+            zero_spans,
             "debug target data reader resolution"
         );
     }
@@ -864,26 +808,19 @@ impl<'a> ReadMetadataResolver<'a> {
         if read_len == 0 {
             return Ok(Arc::from(Vec::<ResolvedSliceSpan>::new()));
         }
-        if self
+        let dirty_attr_present = self
             .vfs
             .state
             .namespace
             .dirty_attrs
             .lock()
-            .contains_key(&self.ino)
-        {
-            if let Some(path) = self.vfs.debug_pending_target_path(self.ino) {
-                info!(
-                    ino = self.ino,
-                    path = %path,
-                    offset,
-                    read_len,
-                    attr_size = attr.size,
-                    content_epoch = attr.content_epoch,
-                    committed_content_epoch = attr.committed_content_epoch,
-                    "debug target read plan cache bypassed because dirty_attr is present"
-                );
-            }
+            .contains_key(&self.ino);
+        let dirty_attr_cacheable = dirty_attr_present
+            && !self
+                .vfs
+                .has_pending_local_dirty_payloads_for_inode(self.ino)
+            && !self.vfs.inode_has_dirty_handle_writers(self.ino);
+        if dirty_attr_present && !dirty_attr_cacheable {
             let ino = self.ino;
             let meta = self.vfs.meta.clone();
             let resolved = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
@@ -900,7 +837,12 @@ impl<'a> ReadMetadataResolver<'a> {
             return Ok(Arc::from(resolved));
         }
 
-        if let Some(key) = PublishedReadPlanCacheKey::from_attr(attr) {
+        let cache_key = if dirty_attr_cacheable {
+            PublishedReadPlanCacheKey::from_locally_stable_attr(attr)
+        } else {
+            PublishedReadPlanCacheKey::from_attr(attr)
+        };
+        if let Some(key) = cache_key {
             let requested_end = offset.saturating_add(read_len);
             if let Some(cached) = self.vfs.state.read.published_read_plan_cache_get(
                 self.ino,
@@ -908,18 +850,6 @@ impl<'a> ReadMetadataResolver<'a> {
                 offset,
                 requested_end,
             ) {
-                if let Some(path) = self.vfs.debug_pending_target_path(self.ino) {
-                    info!(
-                        ino = self.ino,
-                        path = %path,
-                        offset,
-                        requested_end,
-                        spans = cached.len(),
-                        content_epoch = attr.content_epoch,
-                        committed_content_epoch = attr.committed_content_epoch,
-                        "debug target published read plan cache hit"
-                    );
-                }
                 return Ok(cached);
             }
 
@@ -930,19 +860,6 @@ impl<'a> ReadMetadataResolver<'a> {
             let cache_end =
                 offset.saturating_add(attr.size.saturating_sub(offset).min(cache_window_len));
             let cache_read_len = cache_end.saturating_sub(offset);
-            if let Some(path) = self.vfs.debug_pending_target_path(self.ino) {
-                info!(
-                    ino = self.ino,
-                    path = %path,
-                    offset,
-                    requested_end,
-                    cache_end,
-                    cache_read_len,
-                    content_epoch = attr.content_epoch,
-                    committed_content_epoch = attr.committed_content_epoch,
-                    "debug target published read plan cache miss"
-                );
-            }
             let ino = self.ino;
             let meta = self.vfs.meta.clone();
             let resolved = match run_meta(meta, move |engine: Arc<dyn VfsMeta>| {
@@ -1387,7 +1304,7 @@ impl StudioVfs {
 mod tests {
     use super::super::local_dirty::PendingPayload;
     use super::super::*;
-    use super::{DataReader, ReadRange, ReadSegment, ReadSegmentSource, ReadSegmentStats};
+    use super::{DataReader, ReadRange, ReadSegment, ReadSegmentSource};
     use bytes::{Bytes, BytesMut};
     use std::any::Any;
     use std::sync::Arc;
@@ -1405,42 +1322,6 @@ mod tests {
     use studiofs_meta::{MetaFormat, MetaInodes, MetaPayloadObjects, RedbMetaEngine};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
-
-    #[test]
-    fn read_segment_stats_counts_spans_and_bytes_by_source() {
-        let payload = PayloadRef::new_full(42, 16);
-        let segments = vec![
-            ReadSegment {
-                range: ReadRange { start: 0, end: 4 },
-                source: ReadSegmentSource::Dirty {
-                    data: Bytes::from_static(b"abcd"),
-                    block_offset: 0,
-                },
-            },
-            ReadSegment {
-                range: ReadRange { start: 4, end: 10 },
-                source: ReadSegmentSource::PendingExtent {
-                    object_id: 7,
-                    block_offset: 0,
-                },
-            },
-            ReadSegment {
-                range: ReadRange { start: 10, end: 16 },
-                source: ReadSegmentSource::Base { payload },
-            },
-        ];
-
-        let stats = ReadSegmentStats::from_segments(&segments);
-
-        assert_eq!(stats.dirty_spans, 1);
-        assert_eq!(stats.dirty_bytes, 4);
-        assert_eq!(stats.pending_extent_spans, 1);
-        assert_eq!(stats.pending_extent_bytes, 6);
-        assert_eq!(stats.base_spans, 1);
-        assert_eq!(stats.base_bytes, 6);
-        assert_eq!(stats.overlay_spans, 0);
-        assert_eq!(stats.zero_bytes, 0);
-    }
 
     trait FileGraphMetaFixture {
         fn stage_payload_slice(
@@ -1848,6 +1729,59 @@ mod tests {
             assert!(
                 Arc::ptr_eq(&first_slices, &second_slices),
                 "sequential reads inside the widened published window should reuse the cached slice plan"
+            );
+        });
+    }
+
+    #[test]
+    fn resolve_read_metadata_async_reuses_dirty_attr_read_plan_when_local_dirty_is_drained() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "read-metadata-dirty-plan-cache");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(ROOT_INO, b"dirty-read-plan-cache.txt", 1000, 1000, 0o644)
+                .expect("create file");
+            let ino = created.ino;
+            let payload = vec![0x51_u8; 512 * 1024];
+
+            vfs.write(ino, 0, &payload).await.expect("write payload");
+            vfs.flush(ino).await.expect("flush durable local payload");
+
+            let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+            publish_current_file_graph(&meta, ino, content_epoch, &blocks);
+            vfs.state.namespace.attr_read_cache.lock().remove(ino);
+
+            let mut dirty_attr = meta.get_attr(ino).expect("load published attr");
+            dirty_attr.upload_state = MetaUploadState::Updating;
+            dirty_attr.content_epoch = dirty_attr.content_epoch.saturating_add(1);
+            vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .insert(ino, dirty_attr);
+
+            assert!(
+                !vfs.has_pending_local_dirty_payloads_for_inode(ino),
+                "setup should leave no pending local payloads after flush"
+            );
+            assert!(
+                !vfs.inode_has_dirty_handle_writers(ino),
+                "setup should leave no dirty handle-writer state after flush"
+            );
+
+            let (_, first_slices) = vfs
+                .resolve_read_metadata_async(ino, 0, 64 * 1024)
+                .await
+                .expect("resolve first read");
+            let (_, second_slices) = vfs
+                .resolve_read_metadata_async(ino, 64 * 1024, 64 * 1024)
+                .await
+                .expect("resolve second read");
+
+            assert!(
+                Arc::ptr_eq(&first_slices, &second_slices),
+                "dirty attrs with drained local payload state should reuse the widened slice plan"
             );
         });
     }
