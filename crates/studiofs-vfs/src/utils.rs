@@ -48,17 +48,17 @@ pub(crate) fn subtract_claimed_range<I, R, C>(
             continue;
         };
         if range.start < overlap.start {
-            remaining.extend(std::iter::once(IntervalRange {
-                start: range.start,
-                end: overlap.start,
-            }));
+            remaining.extend(std::iter::once(
+                IntervalRange::new(range.start, overlap.start)
+                    .expect("prefix fragment must be a valid non-empty interval"),
+            ));
         }
         claimed.extend(std::iter::once(overlap));
         if overlap.end < range.end {
-            remaining.extend(std::iter::once(IntervalRange {
-                start: overlap.end,
-                end: range.end,
-            }));
+            remaining.extend(std::iter::once(
+                IntervalRange::new(overlap.end, range.end)
+                    .expect("suffix fragment must be a valid non-empty interval"),
+            ));
         }
     }
 }
