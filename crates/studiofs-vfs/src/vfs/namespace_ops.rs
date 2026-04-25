@@ -868,6 +868,10 @@ impl StudioVfs {
         name: &[u8],
         target: UnlinkTarget,
     ) -> VfsResult<Option<Ino>> {
+        let pre_unlink_object_ids = self
+            .regular_file_graph_usage(meta, target.ino)
+            .map(|usage| usage.object_ids)
+            .unwrap_or_default();
         let attr = match meta.unlink(parent, name) {
             Ok(attr) => attr,
             Err(MetaError::InodeNotFound(_)) => {
@@ -878,8 +882,14 @@ impl StudioVfs {
         };
 
         if attr.nlink == 0 {
-            self.cleanup_deleted_inode_storage(meta, attr.ino, attr.size, "unlink")
-                .await?;
+            self.cleanup_deleted_inode_storage(
+                meta,
+                attr.ino,
+                attr.size,
+                "unlink",
+                pre_unlink_object_ids,
+            )
+            .await?;
         } else {
             info!(
                 "unlink ino={}: nlink={}, keeping inode alive (hardlink)",
@@ -1164,13 +1174,23 @@ impl StudioVfs {
             && self.directory_has_probable_trash_ancestor(new_parent)?;
 
         if let Some(ino) = rename_result.displaced_ino {
-            let total_bytes = meta
-                .get_regular_file_graph_object_usage(ino)?
+            let displaced_usage = meta.get_regular_file_graph_object_usage(ino)?;
+            let total_bytes = displaced_usage
+                .iter()
+                .fold(0_u64, |acc, (_, bytes)| acc.saturating_add(*bytes));
+            let displaced_object_ids = displaced_usage
                 .into_iter()
-                .fold(0_u64, |acc, (_, bytes)| acc.saturating_add(bytes));
+                .map(|(object_id, _)| object_id)
+                .collect();
 
-            self.cleanup_deleted_inode_storage(&meta, ino, total_bytes, "rename overwrite")
-                .await?;
+            self.cleanup_deleted_inode_storage(
+                &meta,
+                ino,
+                total_bytes,
+                "rename overwrite",
+                displaced_object_ids,
+            )
+            .await?;
             self.bump_directory_generation(ino);
             self.dentry_cache_invalidate_parent(ino);
         }

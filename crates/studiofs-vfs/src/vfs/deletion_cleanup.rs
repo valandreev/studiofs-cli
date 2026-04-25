@@ -4,13 +4,13 @@ use tracing::{debug, info, warn};
 
 use crate::runtime::run_meta;
 
-struct RegularFileGraphUsage {
-    object_ids: Vec<u64>,
-    total_bytes: u64,
+pub(super) struct RegularFileGraphUsage {
+    pub(super) object_ids: Vec<u64>,
+    pub(super) total_bytes: u64,
 }
 
 impl StudioVfs {
-    fn regular_file_graph_usage(
+    pub(super) fn regular_file_graph_usage(
         &self,
         meta: &Arc<dyn VfsMeta>,
         ino: Ino,
@@ -54,12 +54,20 @@ impl StudioVfs {
         ino: Ino,
         used_space_bytes: u64,
         gc_reason: &str,
+        fallback_object_ids: Vec<u64>,
     ) -> VfsResult<DeletedInodeCleanup> {
         self.mark_inode_deleted_for_uploads(ino);
 
         let graph_usage = self.regular_file_graph_usage(meta, ino)?;
         let removed_ids = meta.remove_regular_file_graph(ino)?;
         self.queue_pending_deletions_for_object_ids(meta, &removed_ids, gc_reason)?;
+        let cleanup_ids = if !removed_ids.is_empty() {
+            removed_ids
+        } else if !graph_usage.object_ids.is_empty() {
+            graph_usage.object_ids
+        } else {
+            fallback_object_ids
+        };
 
         let freed_bytes = if graph_usage.total_bytes > 0 {
             graph_usage.total_bytes
@@ -72,7 +80,7 @@ impl StudioVfs {
         }
 
         Ok(DeletedInodeCleanup {
-            removed_ids,
+            removed_ids: cleanup_ids,
             freed_bytes,
         })
     }
@@ -152,6 +160,7 @@ impl StudioVfs {
         // payload slice refs existed yet. Preserve the old immediate-unlink contract by
         // also clearing live extent identities and read-side runtime state even
         // when no object IDs remain to evict.
+        self.cancel_pending_uploads_for_inode(ino);
         self.state.handle_writers.clear_inode(ino);
         self.clear_pending_payloads_for_inode(ino);
         self.remove_live_extents_for_inode(ino);
@@ -182,8 +191,15 @@ impl StudioVfs {
         ino: Ino,
         used_space_bytes: u64,
         gc_reason: &str,
+        fallback_object_ids: Vec<u64>,
     ) -> VfsResult<()> {
-        let cleanup = self.collect_deleted_inode_cleanup(meta, ino, used_space_bytes, gc_reason)?;
+        let cleanup = self.collect_deleted_inode_cleanup(
+            meta,
+            ino,
+            used_space_bytes,
+            gc_reason,
+            fallback_object_ids,
+        )?;
         self.finalize_deleted_inode_runtime_cleanup(ino, cleanup.removed_ids)
             .await;
         Ok(())
@@ -194,30 +210,48 @@ impl StudioVfs {
     /// Called by `unlink()` so that deleted file data is no longer occupying
     /// disk / RAM space without waiting for the next background GC run.
     pub(super) async fn evict_inode_from_caches(&self, ino: Ino, object_ids: &[u64]) {
+        if object_ids.is_empty() {
+            self.readahead.evict(ino);
+            self.clear_access_tracking(ino);
+            return;
+        }
+
         // L1.5 — dirty memory buffer: drain blocks buffered post-flush.
         self.clear_pending_payloads_for_inode(ino);
 
         self.remove_live_extents_for_inode(ino);
 
-        // Committed cache + L1/L2 upload cache: remove each object.
-        // Blocks with a pending upload are pinned — schedule deferred eviction
-        // so they are cleaned up once the upload completes (or is cancelled by
-        // the uploader when it detects the inode is deleted).
-        let mut evicted = Vec::new();
-        let mut deferred_pinned = Vec::new();
+        // User-visible delete cleanup is allowed to spend foreground time
+        // reclaiming local space. Cancel pending uploads first, then remove
+        // every local artifact owned by the deleted inode instead of waiting
+        // for ordinary cache pressure or upload completion.
+        self.cancel_pending_uploads_for_inode(ino);
+
+        let mut evicted = Vec::with_capacity(object_ids.len());
+        let mut forced_pinned = 0;
         for &object_id in object_ids {
             if self.cached_store.is_pinned(object_id) {
-                // Record for post-upload cleanup instead of silently skipping.
-                deferred_pinned.push(object_id);
-            } else {
-                evicted.push(object_id);
+                forced_pinned += 1;
+                self.cached_store.unpin(object_id);
+            }
+            evicted.push(object_id);
+        }
+
+        {
+            let mut pending_evictions = self.state.upload.pending_evictions.lock();
+            for object_id in &evicted {
+                pending_evictions.remove(object_id);
             }
         }
-        if !deferred_pinned.is_empty() {
-            let mut pending_evictions = self.state.upload.pending_evictions.lock();
-            for object_id in deferred_pinned.iter() {
-                pending_evictions.insert(*object_id);
-            }
+
+        self.upload_hot_remove_batch(evicted.clone());
+        if let Err(error) = self.upload_stage_remove_batch_async(evicted.clone()).await {
+            warn!(
+                ino,
+                error = %error,
+                evicted_blocks = evicted.len(),
+                "evict_inode: upload stage batch removal failed"
+            );
         }
         if !evicted.is_empty() {
             if let Err(error) = self.payload_store_remove_batch_async(evicted.clone()).await {
@@ -229,14 +263,12 @@ impl StudioVfs {
                 );
             }
         }
-        if !evicted.is_empty() || !deferred_pinned.is_empty() {
-            debug!(
-                "evict_inode: ino={} evicted {} blocks, deferred pinned={}",
-                ino,
-                evicted.len(),
-                deferred_pinned.len()
-            );
-        }
+        debug!(
+            "evict_inode: ino={} evicted {} blocks, forced_pinned={}",
+            ino,
+            evicted.len(),
+            forced_pinned
+        );
 
         // Invalidate readahead state for this inode.
         self.readahead.evict(ino);

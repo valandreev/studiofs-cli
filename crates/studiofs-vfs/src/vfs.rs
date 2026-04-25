@@ -4585,8 +4585,22 @@ impl StudioVfs {
             return;
         }
 
+        let deleted_cancel_count = {
+            let deleted_inodes = self.state.upload.deleted_inodes.lock();
+            pending_uploads
+                .iter()
+                .filter(|op| deleted_inodes.contains(&op.ino))
+                .count() as u64
+        };
+
         for op in &pending_uploads {
             self.cached_store.cancel_upload(op);
+        }
+        if deleted_cancel_count > 0 {
+            self.state
+                .upload
+                .upload_canceled_deleted
+                .fetch_add(deleted_cancel_count, Ordering::Relaxed);
         }
 
         let mut pending_evictions = self.state.upload.pending_evictions.lock();

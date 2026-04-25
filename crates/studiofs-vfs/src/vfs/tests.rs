@@ -3648,6 +3648,133 @@ fn test_unlink_immediate_cleanup_clears_pending_inode_dirty_state() {
 }
 
 #[test]
+fn unlink_immediate_cleanup_removes_pending_upload_payload_artifacts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "unlink-pending-upload-cleanup");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"unlink-pending-upload-cleanup.bin", 0, 0, 0o644)
+            .unwrap();
+        let payload = vec![0xA5; vfs.block_size as usize];
+
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        let object_id = meta
+            .lookup_payload_slices(attr.ino)
+            .expect("load flushed payload slices")
+            .into_iter()
+            .next()
+            .expect("flushed file should have one payload object")
+            .1
+            .object_id;
+
+        assert!(
+            vfs.local_payload_backend().contains(object_id),
+            "setup should leave the flushed payload in the local backend"
+        );
+        assert!(
+            vfs.cached_store().has_staged_upload(object_id),
+            "setup should create the upload-stage hardlink"
+        );
+        assert!(
+            vfs.cached_store().is_pinned(object_id),
+            "pending upload should pin the local payload before unlink"
+        );
+        assert!(
+            !vfs.pending_uploads_for_inode(attr.ino).is_empty(),
+            "setup should queue a pending upload before unlink"
+        );
+
+        vfs.unlink(1, b"unlink-pending-upload-cleanup.bin").unwrap();
+
+        assert!(
+            vfs.pending_uploads_for_inode(attr.ino).is_empty(),
+            "unlink should cancel queued uploads for the deleted inode"
+        );
+        assert!(
+            !vfs.cached_store().is_pinned(object_id),
+            "unlink should unpin canceled upload payloads so they can be removed immediately"
+        );
+        assert!(
+            !vfs.cached_store().has_staged_upload(object_id),
+            "unlink should remove upload-stage hardlinks for deleted payloads"
+        );
+        assert!(
+            vfs.cached_store().get_hot_upload(object_id).is_none(),
+            "unlink should clear any hot upload copy for deleted payloads"
+        );
+        assert!(
+            !vfs.local_payload_backend().contains(object_id),
+            "unlink should remove deleted file payloads from the local backend before returning"
+        );
+        assert!(
+            !vfs.state
+                .upload
+                .pending_evictions
+                .lock()
+                .contains(&object_id),
+            "immediate cleanup should not leave a deferred eviction for the canceled upload"
+        );
+    });
+}
+
+#[test]
+fn foreign_delete_lazy_evict_removes_local_payload_artifacts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "foreign-delete-lazy-evict");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"foreign-delete-lazy-evict.bin", 0, 0, 0o644)
+            .unwrap();
+        let payload = vec![0x5C; vfs.block_size as usize];
+
+        vfs.write(attr.ino, 0, &payload).await.unwrap();
+        vfs.flush(attr.ino).await.unwrap();
+
+        let object_id = meta
+            .lookup_payload_slices(attr.ino)
+            .expect("load flushed payload slices")
+            .into_iter()
+            .next()
+            .expect("flushed file should have one payload object")
+            .1
+            .object_id;
+
+        assert!(vfs.local_payload_backend().contains(object_id));
+        assert!(vfs.cached_store().has_staged_upload(object_id));
+        assert!(vfs.cached_store().is_pinned(object_id));
+
+        vfs.lazy_evict_removed_metadata_payloads(std::collections::HashMap::from([(
+            attr.ino,
+            vec![object_id],
+        )]))
+        .await;
+
+        assert!(
+            vfs.pending_uploads_for_inode(attr.ino).is_empty(),
+            "lazy eviction should cancel queued uploads for a remotely deleted inode"
+        );
+        assert!(
+            !vfs.cached_store().is_pinned(object_id),
+            "lazy eviction should unpin remotely deleted payloads"
+        );
+        assert!(
+            !vfs.cached_store().has_staged_upload(object_id),
+            "lazy eviction should remove upload-stage hardlinks"
+        );
+        assert!(
+            !vfs.local_payload_backend().contains(object_id),
+            "lazy eviction should remove local cached payload bytes"
+        );
+    });
+}
+
+#[test]
 fn test_rename_over_existing_target_discards_pending_local_state() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "rename-displaced-cleanup");
