@@ -135,8 +135,6 @@ impl UploadHotState {
     fn remove(&mut self, object_id: ObjectId) {
         if let Some(previous) = self.entries.remove(&object_id) {
             self.total_bytes = self.total_bytes.saturating_sub(previous.data.len());
-            self.order
-                .retain(|(queued_object_id, _)| *queued_object_id != object_id);
         }
     }
 
@@ -150,7 +148,9 @@ impl UploadHotState {
                 .get(&object_id)
                 .is_some_and(|entry| entry.generation == generation);
             if should_evict {
-                self.remove(object_id);
+                if let Some(previous) = self.entries.remove(&object_id) {
+                    self.total_bytes = self.total_bytes.saturating_sub(previous.data.len());
+                }
             }
         }
     }
@@ -581,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn hot_upload_buffer_remove_cleans_lru_queue_entries() {
+    fn hot_upload_buffer_remove_leaves_lru_entry_stale_without_affecting_accounting() {
         let mut state = UploadHotState::new(64);
 
         state.insert(1, Bytes::from_static(b"aaaa"));
@@ -592,11 +592,32 @@ mod tests {
         state.remove(1);
 
         assert!(state.get(1).is_none());
-        assert_eq!(state.order.len(), 1);
-        assert_eq!(
-            state.order.front().map(|(object_id, _)| *object_id),
-            Some(2)
-        );
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.total_bytes, 4);
+        assert_eq!(state.order.len(), 3);
+    }
+
+    #[test]
+    fn hot_upload_buffer_repeated_remove_leaves_stale_lru_entries_but_evicts_correctly() {
+        let mut state = UploadHotState::new(8);
+
+        for object_id in 1..=3 {
+            state.insert(object_id, Bytes::from_static(b"aaaa"));
+            state.remove(object_id);
+        }
+
+        assert_eq!(state.entries.len(), 0);
+        assert_eq!(state.total_bytes, 0);
+        assert_eq!(state.order.len(), 3);
+
+        state.insert(4, Bytes::from_static(b"bbbb"));
+        state.insert(5, Bytes::from_static(b"cccc"));
+        state.insert(6, Bytes::from_static(b"dddd"));
+
+        assert!(state.get(4).is_none());
+        assert_eq!(state.get(5).as_deref(), Some(&b"cccc"[..]));
+        assert_eq!(state.get(6).as_deref(), Some(&b"dddd"[..]));
+        assert_eq!(state.total_bytes, 8);
     }
 
     #[test]
