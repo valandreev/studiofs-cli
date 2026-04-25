@@ -3068,6 +3068,39 @@ fn opportunistic_handle_writer_slice_spill_splits_large_current_callback_into_ba
 }
 
 #[test]
+fn opportunistic_handle_writer_spill_does_not_split_single_write_and_drop_hot_tail() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-282-spill-keeps-hot-tail");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-282-spill-keeps-hot-tail.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let payload = vec![0x6Du8; 3 * 1024 * 1024];
+
+        vfs.record_handle_writer_state(fh, ino, 0, &payload)
+            .await
+            .unwrap();
+        vfs.set_max_dirty_bytes(1);
+
+        assert!(
+            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
+                .await
+                .unwrap(),
+            "limit pressure should still make progress without partially spilling a single write"
+        );
+
+        let read = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(read.as_ref(), payload.as_slice());
+
+        vfs.flush_fh(fh).await.unwrap();
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn background_flush_defers_active_persisted_slice_batches_until_commit_window() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-257-background-flush-defers-slices");

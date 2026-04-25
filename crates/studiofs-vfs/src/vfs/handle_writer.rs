@@ -765,14 +765,7 @@ impl StudioVfs {
                 continue;
             }
 
-            let spill_len = write_len.saturating_sub(retain_tail_bytes);
             retain_tail_bytes = 0;
-            spillable.push(BufferedHandleWrite {
-                block_index: write.block_index,
-                offset: write.offset,
-                seq: write.seq,
-                data: write.data.slice(..spill_len),
-            });
         }
         spillable.reverse();
 
@@ -781,20 +774,14 @@ impl StudioVfs {
         let mut selected_bytes = 0usize;
         for write in spillable {
             let remaining = spill_bytes_cap.saturating_sub(selected_bytes);
-            if remaining == 0 {
+            if remaining == 0 || write.data.len() > remaining {
                 break;
             }
-            let take_len = remaining.min(write.data.len());
-            if take_len == 0 {
+            if write.data.is_empty() {
                 break;
             }
-            selected.push(BufferedHandleWrite {
-                block_index: write.block_index,
-                offset: write.offset,
-                seq: write.seq,
-                data: write.data.slice(..take_len),
-            });
-            selected_bytes = selected_bytes.saturating_add(take_len);
+            selected_bytes = selected_bytes.saturating_add(write.data.len());
+            selected.push(write);
             if selected_bytes >= spill_bytes_cap {
                 break;
             }
