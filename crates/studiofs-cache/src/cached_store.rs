@@ -98,6 +98,7 @@ struct UploadHotState {
     budget_bytes: usize,
     total_bytes: usize,
     next_generation: u64,
+    // Queue entries made stale by remove/replace and not yet skipped or compacted.
     stale_order_entries: usize,
     order: VecDeque<(ObjectId, u64)>,
     entries: HashMap<ObjectId, UploadHotEntry>,
@@ -174,17 +175,12 @@ impl UploadHotState {
             return;
         }
 
-        let mut compacted = VecDeque::with_capacity(self.entries.len());
-        for (object_id, generation) in self.order.drain(..) {
-            if self
-                .entries
-                .get(&object_id)
-                .is_some_and(|entry| entry.generation == generation)
-            {
-                compacted.push_back((object_id, generation));
-            }
-        }
-        self.order = compacted;
+        // Rare compaction trades a bounded latency spike for O(1) ordinary removes.
+        self.order.retain(|(object_id, generation)| {
+            self.entries
+                .get(object_id)
+                .is_some_and(|entry| entry.generation == *generation)
+        });
         self.stale_order_entries = 0;
     }
 }
@@ -664,7 +660,7 @@ mod tests {
 
         assert_eq!(state.entries.len(), 0);
         assert_eq!(state.total_bytes, 0);
-        assert!(state.order.len() <= 64);
+        assert!(state.order.len() <= UploadHotState::MIN_STALE_COMPACT_ENTRIES);
     }
 
     #[test]
