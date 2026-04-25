@@ -98,11 +98,15 @@ struct UploadHotState {
     budget_bytes: usize,
     total_bytes: usize,
     next_generation: u64,
+    // Queue entries made stale by remove/replace and not yet skipped or compacted.
+    stale_order_entries: usize,
     order: VecDeque<(ObjectId, u64)>,
     entries: HashMap<ObjectId, UploadHotEntry>,
 }
 
 impl UploadHotState {
+    const MIN_STALE_COMPACT_ENTRIES: usize = 64;
+
     fn new(budget_bytes: usize) -> Self {
         Self {
             budget_bytes,
@@ -122,10 +126,12 @@ impl UploadHotState {
             .insert(object_id, UploadHotEntry { data, generation })
         {
             self.total_bytes = self.total_bytes.saturating_sub(previous.data.len());
+            self.stale_order_entries = self.stale_order_entries.saturating_add(1);
         }
         self.total_bytes = self.total_bytes.saturating_add(len);
         self.order.push_back((object_id, generation));
         self.evict_over_budget();
+        self.compact_stale_order_if_needed();
     }
 
     fn get(&self, object_id: ObjectId) -> Option<Bytes> {
@@ -135,8 +141,8 @@ impl UploadHotState {
     fn remove(&mut self, object_id: ObjectId) {
         if let Some(previous) = self.entries.remove(&object_id) {
             self.total_bytes = self.total_bytes.saturating_sub(previous.data.len());
-            self.order
-                .retain(|(queued_object_id, _)| *queued_object_id != object_id);
+            self.stale_order_entries = self.stale_order_entries.saturating_add(1);
+            self.compact_stale_order_if_needed();
         }
     }
 
@@ -150,9 +156,32 @@ impl UploadHotState {
                 .get(&object_id)
                 .is_some_and(|entry| entry.generation == generation);
             if should_evict {
-                self.remove(object_id);
+                if let Some(previous) = self.entries.remove(&object_id) {
+                    self.total_bytes = self.total_bytes.saturating_sub(previous.data.len());
+                }
+            } else {
+                self.stale_order_entries = self.stale_order_entries.saturating_sub(1);
             }
         }
+    }
+
+    fn compact_stale_order_if_needed(&mut self) {
+        let compact_threshold = self
+            .entries
+            .len()
+            .saturating_mul(2)
+            .max(Self::MIN_STALE_COMPACT_ENTRIES);
+        if self.stale_order_entries <= compact_threshold {
+            return;
+        }
+
+        // Rare compaction trades a bounded latency spike for O(1) ordinary removes.
+        self.order.retain(|(object_id, generation)| {
+            self.entries
+                .get(object_id)
+                .is_some_and(|entry| entry.generation == *generation)
+        });
+        self.stale_order_entries = 0;
     }
 }
 
@@ -581,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn hot_upload_buffer_remove_cleans_lru_queue_entries() {
+    fn hot_upload_buffer_remove_leaves_lru_entry_stale_without_affecting_accounting() {
         let mut state = UploadHotState::new(64);
 
         state.insert(1, Bytes::from_static(b"aaaa"));
@@ -592,11 +621,46 @@ mod tests {
         state.remove(1);
 
         assert!(state.get(1).is_none());
-        assert_eq!(state.order.len(), 1);
-        assert_eq!(
-            state.order.front().map(|(object_id, _)| *object_id),
-            Some(2)
-        );
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.total_bytes, 4);
+        assert_eq!(state.order.len(), 3);
+    }
+
+    #[test]
+    fn hot_upload_buffer_repeated_remove_leaves_stale_lru_entries_but_evicts_correctly() {
+        let mut state = UploadHotState::new(8);
+
+        for object_id in 1..=3 {
+            state.insert(object_id, Bytes::from_static(b"aaaa"));
+            state.remove(object_id);
+        }
+
+        assert_eq!(state.entries.len(), 0);
+        assert_eq!(state.total_bytes, 0);
+        assert_eq!(state.order.len(), 3);
+
+        state.insert(4, Bytes::from_static(b"bbbb"));
+        state.insert(5, Bytes::from_static(b"cccc"));
+        state.insert(6, Bytes::from_static(b"dddd"));
+
+        assert!(state.get(4).is_none());
+        assert_eq!(state.get(5).as_deref(), Some(&b"cccc"[..]));
+        assert_eq!(state.get(6).as_deref(), Some(&b"dddd"[..]));
+        assert_eq!(state.total_bytes, 8);
+    }
+
+    #[test]
+    fn hot_upload_buffer_repeated_remove_bounds_stale_lru_entries() {
+        let mut state = UploadHotState::new(1024);
+
+        for object_id in 1..=128 {
+            state.insert(object_id, Bytes::from_static(b"aaaa"));
+            state.remove(object_id);
+        }
+
+        assert_eq!(state.entries.len(), 0);
+        assert_eq!(state.total_bytes, 0);
+        assert!(state.order.len() <= UploadHotState::MIN_STALE_COMPACT_ENTRIES);
     }
 
     #[test]
