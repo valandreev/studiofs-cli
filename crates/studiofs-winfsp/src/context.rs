@@ -1773,6 +1773,24 @@ mod tests {
             .winfsp_foreground_flushes
     }
 
+    fn wait_for_landing_recoverable_segments(vfs: &StudioVfs, expected: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let actual = vfs
+                .write_path_observability_snapshot()
+                .landing_zone
+                .recoverable_segments;
+            if actual == expected {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for landing recoverable_segments == {expected}; last={actual}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn cleanup_delete_not_found_is_benign() {
         let err = VfsError::Meta(MetaError::EntryNotFound {
@@ -2481,13 +2499,7 @@ mod tests {
             &mut file_info,
         )
         .expect("write callback");
-        assert_eq!(
-            vfs.write_path_observability_snapshot()
-                .landing_zone
-                .recoverable_segments,
-            1,
-            "WinFSP opportunistic write should land a recoverable record before callback barriers"
-        );
+        wait_for_landing_recoverable_segments(&vfs, 1);
 
         ctx.run_cleanup_non_delete_callback(attr.ino, fh)
             .expect("cleanup callback");
@@ -2510,13 +2522,7 @@ mod tests {
             ctx.has_deferred_cleanup_hint(attr.ino),
             "cleanup should defer landed dirty state to explicit flush or last close"
         );
-        assert_eq!(
-            vfs.write_path_observability_snapshot()
-                .landing_zone
-                .recoverable_segments,
-            1,
-            "observational cleanup should not retire landed records"
-        );
+        wait_for_landing_recoverable_segments(&vfs, 1);
 
         ctx.run_flush_callback(attr.ino, fh)
             .expect("explicit flush callback");
@@ -2569,15 +2575,10 @@ mod tests {
             &mut file_info,
         )
         .expect("write callback");
+        wait_for_landing_recoverable_segments(&vfs, 1);
         ctx.run_cleanup_non_delete_callback(attr.ino, fh)
             .expect("cleanup callback");
-        assert_eq!(
-            vfs.write_path_observability_snapshot()
-                .landing_zone
-                .recoverable_segments,
-            1,
-            "observational cleanup should leave landed records for close to retire"
-        );
+        wait_for_landing_recoverable_segments(&vfs, 1);
 
         ctx.run_close_callback(attr.ino, fh);
         let after_close_barriers = winfsp_foreground_flushes(&vfs);

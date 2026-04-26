@@ -134,6 +134,110 @@ fn read_write_path_observability(
     }
 }
 
+fn read_write_path_observability_from_cache_root(
+    cache_root: &Path,
+) -> Option<(PathBuf, VfsWritePathObservabilitySnapshot)> {
+    let mut best = read_write_path_observability(cache_root);
+    let entries = match std::fs::read_dir(cache_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return best,
+        Err(error) => {
+            eprintln!(
+                "warning: failed to scan cache root for mounted write-path metrics '{}': {error}",
+                cache_root.display()
+            );
+            return best;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if let Some(candidate) = read_write_path_observability(&path) {
+            let replace = best
+                .as_ref()
+                .map(|(_, current)| candidate.1.generated_unix_ms > current.generated_unix_ms)
+                .unwrap_or(true);
+            if replace {
+                best = Some(candidate);
+            }
+        }
+    }
+    best
+}
+
+fn print_mounted_write_path_fallback(
+    mounted_write_path: Option<(PathBuf, VfsWritePathObservabilitySnapshot)>,
+) {
+    println!("\nMounted Write Path");
+    println!("──────────────────");
+    let Some((metrics_path, snapshot)) = mounted_write_path else {
+        println!("  Metrics file:              unavailable");
+        println!("  Hint:                      check --cache-dir or wait for mounted publisher");
+        return;
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
+        .unwrap_or(0);
+    let snapshot_age_ms = now_ms.saturating_sub(snapshot.generated_unix_ms);
+
+    println!("  Metrics file:              {}", metrics_path.display());
+    println!("  Snapshot age:              {}ms", snapshot_age_ms);
+    println!("  Backend tag:               {}", snapshot.backend_tag);
+    println!("  Uptime:                    {:.1}s", snapshot.uptime_secs);
+    println!(
+        "  flush barrier calls:       {} ({:.2}/s)",
+        snapshot.flush_barrier_calls, snapshot.flush_barrier_calls_per_sec
+    );
+    println!(
+        "  landing accepted writes:   {} ({}, {:.2}MiB/s)",
+        snapshot.landing_zone.accepted_writes,
+        format_bytes(snapshot.landing_zone.accepted_bytes),
+        snapshot.landing_zone.accepted_mib_per_sec
+    );
+    println!(
+        "  landing recoverable segs:  {}",
+        snapshot.landing_zone.recoverable_segments
+    );
+    println!(
+        "  landing accept avg/max:    {}/{}",
+        format_ms(snapshot.landing_zone.accept_avg_ms),
+        format_ms(snapshot.landing_zone.accept_max_ms)
+    );
+    println!(
+        "  landing syncs data/manifest/rewrite: {}/{}/{}",
+        snapshot.landing_zone.data_syncs,
+        snapshot.landing_zone.manifest_syncs,
+        snapshot.landing_zone.manifest_rewrites
+    );
+    println!(
+        "  payload_store_sync_data calls: {} ({:.2}/s)",
+        snapshot.payload_store_sync_data.calls, snapshot.payload_store_sync_data.calls_per_sec
+    );
+    println!(
+        "  payload bursts count/bytes: {}/{}",
+        snapshot.payload_burst.bursts,
+        format_bytes(snapshot.payload_burst.total_bytes)
+    );
+    println!(
+        "  payload persist calls/avg/max: {}/{}/{}",
+        snapshot.payload_persist.calls,
+        format_ms(snapshot.payload_persist.avg_ms),
+        format_ms(snapshot.payload_persist.max_ms)
+    );
+    println!(
+        "  metadata commit calls/avg/max: {}/{}/{}",
+        snapshot.metadata_commit.calls,
+        format_ms(snapshot.metadata_commit.avg_ms),
+        format_ms(snapshot.metadata_commit.max_ms)
+    );
+}
+
 fn map_cache_backend_error(
     cache_dir: &Path,
     source: OpenLocalPayloadBackendError,
@@ -188,6 +292,23 @@ fn scan_pending_uploads(
     Ok(store.dirty_object_ids().len())
 }
 
+fn scan_pending_uploads_or_warn(
+    cache_path: &Path,
+    volume_uuid: &str,
+    cache_backend_detection: Option<&LocalPayloadRuntimeDetection>,
+) -> usize {
+    match scan_pending_uploads(cache_path, volume_uuid, cache_backend_detection) {
+        Ok(count) => count,
+        Err(error) => {
+            eprintln!(
+                "warning: failed to compute pending upload count at '{}': {error}",
+                cache_path.display()
+            );
+            0
+        }
+    }
+}
+
 pub fn run(
     name: &str,
     meta_dir: &Path,
@@ -202,7 +323,33 @@ pub fn run(
         return Ok(());
     }
 
-    let engine = studiofs_meta::open_meta_engine(&db_path)?;
+    let engine = match studiofs_meta::open_meta_engine(&db_path) {
+        Ok(engine) => engine,
+        Err(error) if verbosity.is_verbose() => {
+            eprintln!(
+                "warning: failed to open volume metadata at '{}': {error}",
+                db_path.display()
+            );
+            println!("StudioFS Volume Status");
+            println!("──────────────────────");
+            println!("  Name:       {}", name);
+            println!("  Metadata:   {:?}", db_path);
+            println!(
+                "  Warning:    metadata DB is locked; showing mounted write-path metrics only"
+            );
+            let cache_root = cache_dir
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| meta_dir.join("cache"));
+            println!("\nLocal Cache");
+            println!("───────────");
+            println!("  Root:                {}", cache_root.display());
+            print_mounted_write_path_fallback(read_write_path_observability_from_cache_root(
+                &cache_root,
+            ));
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
     let format_info = engine.get_format_info()?;
 
     let total_inodes = engine.get_counter(counters::TOTAL_INODES)?;
@@ -211,11 +358,11 @@ pub fn run(
 
     let cache_path = local_cache_path(meta_dir, cache_dir, &format_info.uuid);
     let cache_backend_detection = detect_backends(&cache_path);
-    let pending_uploads = scan_pending_uploads(
+    let pending_uploads = scan_pending_uploads_or_warn(
         &cache_path,
         &format_info.uuid,
         cache_backend_detection.as_ref(),
-    )?;
+    );
     let cache_usage = match scan_cache_usage(cache_backend_detection.as_ref()) {
         Ok(stats) => Some(stats),
         Err(error) => {
@@ -381,6 +528,33 @@ pub fn run(
             println!(
                 "  flush barrier calls:       {} ({:.2}/s)",
                 snapshot.flush_barrier_calls, snapshot.flush_barrier_calls_per_sec
+            );
+            println!(
+                "  landing accepted writes:   {} ({}, {:.2}MiB/s)",
+                snapshot.landing_zone.accepted_writes,
+                format_bytes(snapshot.landing_zone.accepted_bytes),
+                snapshot.landing_zone.accepted_mib_per_sec
+            );
+            println!(
+                "  landing recoverable segs:  {}",
+                snapshot.landing_zone.recoverable_segments
+            );
+            println!(
+                "  landing accept avg/max:    {}/{}",
+                format_ms(snapshot.landing_zone.accept_avg_ms),
+                format_ms(snapshot.landing_zone.accept_max_ms)
+            );
+            println!(
+                "  landing syncs data/manifest/rewrite: {}/{}/{}",
+                snapshot.landing_zone.data_syncs,
+                snapshot.landing_zone.manifest_syncs,
+                snapshot.landing_zone.manifest_rewrites
+            );
+            println!(
+                "  landing sync total/avg/max: {}/{}/{}",
+                format_ms(snapshot.landing_zone.sync_total_ms),
+                format_ms(snapshot.landing_zone.sync_avg_ms),
+                format_ms(snapshot.landing_zone.sync_max_ms)
             );
             println!(
                 "  payload_store_sync_data calls: {} ({:.2}/s)",
@@ -568,6 +742,22 @@ mod tests {
     }
 
     #[test]
+    fn scan_pending_uploads_or_warn_returns_zero_when_cache_index_is_locked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let volume_uuid = Uuid::new_v4();
+        let _mounted_backend =
+            studiofs_cache::open_local_payload_backend(tmp.path(), &volume_uuid.to_string())
+                .expect("open mounted local payload backend")
+                .backend;
+
+        let detection = detect_backends(tmp.path()).unwrap();
+        assert_eq!(
+            scan_pending_uploads_or_warn(tmp.path(), &volume_uuid.to_string(), Some(&detection)),
+            0
+        );
+    }
+
+    #[test]
     fn scan_cache_usage_reads_runtime_written_index() {
         let tmp = tempfile::tempdir().unwrap();
         let volume_uuid = Uuid::new_v4();
@@ -669,6 +859,39 @@ mod tests {
         assert_eq!(loaded.0, metrics_path);
         assert_eq!(loaded.1.backend_tag, "local-payload-runtime");
         assert_eq!(loaded.1.flush_barrier_calls, 11);
+    }
+
+    #[test]
+    fn read_write_path_observability_from_cache_root_finds_uuid_child_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let older_dir = tmp.path().join(Uuid::new_v4().to_string());
+        let newer_dir = tmp.path().join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&older_dir).unwrap();
+        std::fs::create_dir_all(&newer_dir).unwrap();
+        let older = VfsWritePathObservabilitySnapshot {
+            generated_unix_ms: 100,
+            backend_tag: "older".to_string(),
+            ..Default::default()
+        };
+        let newer = VfsWritePathObservabilitySnapshot {
+            generated_unix_ms: 200,
+            backend_tag: "newer".to_string(),
+            ..Default::default()
+        };
+        std::fs::write(
+            older_dir.join(WRITE_PATH_OBSERVABILITY_FILE),
+            serde_json::to_vec(&older).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            newer_dir.join(WRITE_PATH_OBSERVABILITY_FILE),
+            serde_json::to_vec(&newer).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = read_write_path_observability_from_cache_root(tmp.path()).expect("metrics");
+        assert_eq!(loaded.1.backend_tag, "newer");
+        assert_eq!(loaded.0, newer_dir.join(WRITE_PATH_OBSERVABILITY_FILE));
     }
 
     #[test]

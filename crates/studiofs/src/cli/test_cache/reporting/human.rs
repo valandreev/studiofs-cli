@@ -510,28 +510,6 @@ mod tests {
             upload_dir: r"D:\test-cache\vol-123\upload".to_string(),
             phases: vec![
                 MountedLocalFirstReadPhaseReport {
-                    phase: "baseline-read".to_string(),
-                    wait_target: "idle".to_string(),
-                    target_state_observed: true,
-                    valid_for_target: true,
-                    required_pending_uploads: 0,
-                    wait_ms: 120.0,
-                    pending_uploads_before: 0,
-                    pending_uploads_after: 0,
-                    validation_message: None,
-                    results: OpReport {
-                        operations: 16,
-                        bytes: 128 * 1024 * 1024,
-                        elapsed_ms: 72.0,
-                        avg_latency_ms: 4.4,
-                        p50_ms: 4.1,
-                        p95_ms: 7.3,
-                        p99_ms: 7.8,
-                        throughput_bytes_per_sec: 1_700.0 * 1024.0 * 1024.0,
-                        operations_log: Vec::new(),
-                    },
-                },
-                MountedLocalFirstReadPhaseReport {
                     phase: "during-upload-read".to_string(),
                     wait_target: "active".to_string(),
                     target_state_observed: true,
@@ -581,7 +559,7 @@ mod tests {
         let summary = render_human_summary(&report);
 
         assert!(summary.contains("Local-First read comparison"));
-        assert!(summary.contains("baseline-read"));
+        assert!(!summary.contains("baseline-read"));
         assert!(summary.contains("during-upload-read"));
         assert!(summary.contains("post-upload-read"));
         assert!(summary.contains("Pending before"));

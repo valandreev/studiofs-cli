@@ -316,8 +316,6 @@ fn active_docs_drop_superseded_io_architecture_terms() {
         "docs/local-payload-runtime-layout.md",
         "docs/juicefs-local-first-rust-contract.md",
         "docs/platform-bridges.md",
-        "docs/superpowers/plans/2026-04-18-sfs-261-local-payload-runtime-cleanup.md",
-        "docs/superpowers/specs/2026-04-18-sfs-261-local-payload-runtime-cleanup-design.md",
         "docs/configuration.md",
         "docs/data-layer.md",
         "docs/examples.md",

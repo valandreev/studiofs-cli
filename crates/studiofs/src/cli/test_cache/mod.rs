@@ -9,6 +9,7 @@ mod direct;
 mod mode;
 mod mounted;
 mod profiling;
+mod progress;
 mod reporting;
 mod result;
 mod telemetry;
@@ -16,7 +17,7 @@ mod workload;
 
 use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
 use crate::cli::test_cache_profile::TestCacheProfileSession;
-use crate::cli::test_cache_profile_types::TestCacheProfileResult;
+use crate::cli::test_cache_profile_types::{TestCacheProfileMode, TestCacheProfileResult};
 use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -37,6 +38,72 @@ use workload::{
 };
 
 static TEST_CACHE_RUNTIME: OnceLock<std::io::Result<tokio::runtime::Runtime>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+pub(crate) struct MountedRuntimeInfo {
+    pub(crate) pid: u32,
+    pub(crate) volume: String,
+    pub(crate) mount_point: PathBuf,
+    pub(crate) cache_path: Option<PathBuf>,
+}
+
+pub(crate) fn resolve_mounted_runtime(target: &Path) -> Result<Option<MountedRuntimeInfo>> {
+    match resolve_run_mode(target)? {
+        ResolvedRunMode::MountedE2E {
+            pid,
+            volume,
+            mount_point,
+            cache_path,
+            ..
+        } => Ok(Some(MountedRuntimeInfo {
+            pid,
+            volume,
+            mount_point,
+            cache_path,
+        })),
+        ResolvedRunMode::DirectShim { .. } => Ok(None),
+    }
+}
+
+pub(crate) fn run_operator_test(target: PathBuf, report: PathBuf) -> Result<()> {
+    let runtime = resolve_mounted_runtime(&target)?.ok_or_else(|| {
+        anyhow!(
+            "'{}' is not inside an active StudioFS mount",
+            target.display()
+        )
+    })?;
+    let cache_label = runtime
+        .cache_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "unpublished".to_string());
+    eprintln!(
+        "StudioFS test target: mount={} volume={} pid={} cache={}",
+        runtime.mount_point.display(),
+        runtime.volume,
+        runtime.pid,
+        cache_label
+    );
+    run(TestCacheRunRequest {
+        target,
+        block_size: None,
+        read_size: None,
+        small_max: None,
+        medium_max: None,
+        workload_repeat: 1,
+        concurrency: 1,
+        sequential_streams: false,
+        io_depth: 32,
+        warmup_runs: 0,
+        sizes: None,
+        access_pattern: TestCacheAccessPattern::Sequential,
+        during_upload_min_pending: 1,
+        during_upload_timeout_ms: 10_000,
+        l1_limit: None,
+        profile: Some(TestCacheProfileMode::Pyroscope),
+        json_output: Some(report),
+    })
+}
 
 #[derive(Debug)]
 struct TestCacheParams {

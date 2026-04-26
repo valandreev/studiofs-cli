@@ -638,6 +638,62 @@ fn test_flush_regular_file_overlay_slices_with_attr_is_atomic() {
 }
 
 #[test]
+fn test_local_slice_batch_commits_with_attr_and_resolves_holes() {
+    let engine = temp_engine();
+    let mut attr = engine
+        .create_file(ROOT_INO, b"local-slice-batch.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let ino = attr.ino;
+    attr.size = DEFAULT_CHUNK_SIZE as u64 + 64;
+    attr.content_epoch = 2;
+
+    let mut batch = LocalSliceBatch::new(ino);
+    batch
+        .append_data_range(DEFAULT_CHUNK_SIZE as u64 - 8, 24, 300_001, 4)
+        .expect("data range splits by chunk");
+    batch
+        .append_hole_range(DEFAULT_CHUNK_SIZE as u64 + 24, 16)
+        .expect("hole range stays chunk-local");
+
+    let committed_attr = engine
+        .flush_regular_file_overlay_slices_with_attr(
+            ino,
+            &batch.into_chunk_slices(),
+            Some(&attr),
+        )
+        .unwrap()
+        .expect("attr committed with slice batch");
+    assert_eq!(committed_attr.size, DEFAULT_CHUNK_SIZE as u64 + 64);
+    assert_eq!(committed_attr.content_epoch, 2);
+    assert_eq!(committed_attr.upload_state, UploadState::Uploading);
+
+    let spans = engine
+        .lookup_regular_file_slices(ino, DEFAULT_CHUNK_SIZE as u64 - 8, 72)
+        .unwrap();
+    assert_eq!(spans.len(), 5);
+    assert_eq!(spans[0].chunk_id, ChunkId(0));
+    assert_eq!(
+        spans[0].range,
+        SliceRange::new(DEFAULT_CHUNK_SIZE - 8, DEFAULT_CHUNK_SIZE).unwrap()
+    );
+    assert_eq!(spans[0].source, ResolvedSliceSource::Overlay);
+    assert_eq!(spans[0].payload.as_ref().unwrap().object_id, 300_001);
+    assert_eq!(spans[0].payload.as_ref().unwrap().offset, 4);
+
+    assert_eq!(spans[1].chunk_id, ChunkId(1));
+    assert_eq!(spans[1].range, SliceRange::new(0, 16).unwrap());
+    assert_eq!(spans[1].source, ResolvedSliceSource::Overlay);
+    assert_eq!(spans[1].payload.as_ref().unwrap().offset, 12);
+
+    assert_eq!(spans[2].range, SliceRange::new(16, 24).unwrap());
+    assert_eq!(spans[2].source, ResolvedSliceSource::Hole);
+    assert_eq!(spans[3].range, SliceRange::new(24, 40).unwrap());
+    assert_eq!(spans[3].source, ResolvedSliceSource::OverlayTombstone);
+    assert_eq!(spans[4].range, SliceRange::new(40, 64).unwrap());
+    assert_eq!(spans[4].source, ResolvedSliceSource::Hole);
+}
+
+#[test]
 fn test_lookup_regular_file_chunk_slices_overlay_precedence_with_tombstone() {
     let engine = temp_engine();
     let ino = engine

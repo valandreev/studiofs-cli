@@ -68,16 +68,17 @@ Prefer `#[cfg(windows)]`/`#[cfg(target_os = "linux")]`/`#[cfg(target_os = "macos
   - `feat`, `fix`, `docs`, `refactor`, `test`, `perf`, `ci`
 - PR checklists and quality gates are defined in `docs/contributing.md`.
 
-## VFS state decomposition (SFS-96)
+## VFS state decomposition
 
 `VfsState` is decomposed into explicit subsystems (example groups):
 
+- `writer`
+- `cached_store`
 - `upload`
 - `file_session`
 - `namespace`
 - `acl`
 - `incarnation`
-- `local_dirty`
 - `read`
 - `file_lock`
 - `shutdown`
@@ -90,23 +91,24 @@ Access pattern: use `self.state.<subsystem>.<field>` instead of direct monolithi
 Higher priority (lower tier number) must be acquired first:
 
 1. `ShutdownState`
-2. `local_dirty`
-3. Reserved `DirtyBufferState`
-4. Reserved legacy `IngressState`
-5. `NamespaceState`
-6. `IncarnationState`
-7. `UploadState`
-8. `AclState`
-9. `FileLockState`
-10. `MetricsState`
+2. Writer/cache dirty-state owners
+3. `NamespaceState`
+4. `IncarnationState`
+5. `UploadState`
+6. `AclState`
+7. `FileLockState`
+8. `MetricsState`
 
-## Local-only durability contracts (SFS-250)
+## Local-only durability contracts
 
-- `flush` remains the explicit caller-requested local-durability barrier for dirty unpublished state.
+- `write` accepts bytes into file/chunk/slice writer state and does not wait for
+  upload or PostgreSQL replication.
+- `flush` freezes and finishes the dirty slices it owns through the cached-store
+  pipeline.
 - `fsync` is the strict caller-requested local sync API and must not imply remote publication.
 - WinFSP `cleanup`:
   - delete + `FspCleanupDelete` finalizes deletion.
   - non-delete cleanup is observational; it should not be the ownership point for dirty local persistence.
 - `overwrite`, WinFSP `set_file_size`, and size-changing FUSE paths must persist new EOF/attrs before returning.
-- `release` (FUSE) and `close`/`release_fh` (WinFSP) are release-path checks; they must reach strict local durability when required without moving remote publication to the foreground.
+- `release` (FUSE) and `close`/`release_fh` (WinFSP) are release-path checks; they drain remaining local writer state when required without moving remote publication to the foreground.
 - Treat repeated/non-delete cleanup foreground barriers in sequential-write Windows validation (`cleanup_skipped_clean`, `cleanup_flush_fh`) as signs of avoidable callback work (SFS-192 follow-up signal).

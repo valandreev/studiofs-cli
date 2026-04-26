@@ -1,10 +1,30 @@
-//! Internal S3 SigV4 helpers used by CLI init flows.
+//! Mounted runtime test-report command and internal S3 SigV4 helpers used by CLI init flows.
 
+use crate::cli::test_cache::run_operator_test;
 use anyhow::{Context, anyhow};
+use clap::Args;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 
 type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug, Args)]
+#[command(about = "Collect a mounted StudioFS write-path test report")]
+pub(crate) struct TestArgs {
+    /// StudioFS mount point, for example `Z:` or `/mnt/studio`.
+    pub(super) mount: PathBuf,
+
+    /// JSON report output path.
+    #[arg(long)]
+    pub(super) report: PathBuf,
+}
+
+impl TestArgs {
+    pub(crate) fn dispatch(self) -> anyhow::Result<()> {
+        run_operator_test(self.mount, self.report)
+    }
+}
 
 fn hmac_sha256_raw(key: &[u8], msg: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut mac = HmacSha256::new_from_slice(key).context("invalid HMAC key length")?;

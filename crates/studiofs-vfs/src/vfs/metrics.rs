@@ -140,7 +140,27 @@ pub struct VfsWritePathLandingZoneStats {
     pub accepted_writes: u64,
     pub accepted_bytes: u64,
     #[serde(default)]
+    pub accepted_mib_per_sec: f64,
+    #[serde(default)]
     pub recoverable_segments: usize,
+    #[serde(default)]
+    pub accept_total_ms: f64,
+    #[serde(default)]
+    pub accept_avg_ms: f64,
+    #[serde(default)]
+    pub accept_max_ms: f64,
+    #[serde(default)]
+    pub data_syncs: u64,
+    #[serde(default)]
+    pub manifest_syncs: u64,
+    #[serde(default)]
+    pub manifest_rewrites: u64,
+    #[serde(default)]
+    pub sync_total_ms: f64,
+    #[serde(default)]
+    pub sync_avg_ms: f64,
+    #[serde(default)]
+    pub sync_max_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

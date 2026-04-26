@@ -143,10 +143,26 @@ pub(crate) fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
         format_bytes(snapshot.tuning.sync_group_min_bytes)
     ));
     out.push_str(&format!(
-        "landing_zone: accepted_writes={} accepted_bytes={} recoverable_segments={}\n",
+        "landing_zone: accepted_writes={} accepted_bytes={} accepted_mib_per_sec={:.2} recoverable_segments={}\n",
         snapshot.landing_zone.accepted_writes,
         format_bytes(snapshot.landing_zone.accepted_bytes),
+        snapshot.landing_zone.accepted_mib_per_sec,
         snapshot.landing_zone.recoverable_segments
+    ));
+    out.push_str(&format!(
+        "landing_zone_accept: total_ms={:.2} avg_ms={:.3} max_ms={:.3}\n",
+        snapshot.landing_zone.accept_total_ms,
+        snapshot.landing_zone.accept_avg_ms,
+        snapshot.landing_zone.accept_max_ms
+    ));
+    out.push_str(&format!(
+        "landing_zone_syncs: data_syncs={} manifest_syncs={} manifest_rewrites={} total_ms={:.2} avg_ms={:.3} max_ms={:.3}\n",
+        snapshot.landing_zone.data_syncs,
+        snapshot.landing_zone.manifest_syncs,
+        snapshot.landing_zone.manifest_rewrites,
+        snapshot.landing_zone.sync_total_ms,
+        snapshot.landing_zone.sync_avg_ms,
+        snapshot.landing_zone.sync_max_ms
     ));
     out.push_str(&format!(
         "drain_lag: current={} steady_quota={} soft_pacing_events={} soft_pacing_total_ms={} soft_pacing_max_ms={}\n",
@@ -292,7 +308,17 @@ mod tests {
             landing_zone: VfsWritePathLandingZoneStats {
                 accepted_writes: 12,
                 accepted_bytes: 48 * 1024 * 1024,
+                accepted_mib_per_sec: 1536.0,
                 recoverable_segments: 5,
+                accept_total_ms: 24.0,
+                accept_avg_ms: 2.0,
+                accept_max_ms: 6.0,
+                data_syncs: 2,
+                manifest_syncs: 3,
+                manifest_rewrites: 1,
+                sync_total_ms: 15.0,
+                sync_avg_ms: 3.0,
+                sync_max_ms: 9.0,
             },
             drain_lag: VfsWritePathDrainLagStats {
                 current_bytes: 20 * 1024 * 1024,
@@ -308,8 +334,10 @@ mod tests {
         let summary = render_write_path_summary(&bytes).expect("render summary");
 
         assert!(summary.contains(
-            "landing_zone: accepted_writes=12 accepted_bytes=48.0MiB recoverable_segments=5"
+            "landing_zone: accepted_writes=12 accepted_bytes=48.0MiB accepted_mib_per_sec=1536.00 recoverable_segments=5"
         ));
+        assert!(summary.contains("landing_zone_accept: total_ms=24.00 avg_ms=2.000 max_ms=6.000"));
+        assert!(summary.contains("landing_zone_syncs: data_syncs=2 manifest_syncs=3 manifest_rewrites=1 total_ms=15.00 avg_ms=3.000 max_ms=9.000"));
         assert!(summary.contains("drain_lag: current=20.0MiB steady_quota=4.0MiB soft_pacing_events=3 soft_pacing_total_ms=9 soft_pacing_max_ms=4"));
     }
 

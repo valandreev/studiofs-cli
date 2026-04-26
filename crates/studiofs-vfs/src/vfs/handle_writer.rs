@@ -283,6 +283,7 @@ impl HandleWriterRegistry {
         Self::shard_index_for_inode(ino)
     }
 
+    #[cfg(test)]
     pub(super) fn write(
         &self,
         fh: u64,
@@ -302,7 +303,7 @@ impl HandleWriterRegistry {
         )
     }
 
-    fn write_bytes(
+    pub(super) fn write_bytes(
         &self,
         fh: u64,
         ino: Ino,
@@ -1178,12 +1179,24 @@ impl StudioVfs {
         self.state.handle_writers.has_dirty_writers(ino)
     }
 
+    #[cfg(test)]
     pub(super) async fn record_handle_writer_state(
         &self,
         fh: u64,
         ino: Ino,
         offset: u64,
         data: &[u8],
+    ) -> VfsResult<u32> {
+        self.record_handle_writer_state_bytes(fh, ino, offset, Bytes::copy_from_slice(data))
+            .await
+    }
+
+    pub(super) async fn record_handle_writer_state_bytes(
+        &self,
+        fh: u64,
+        ino: Ino,
+        offset: u64,
+        data: Bytes,
     ) -> VfsResult<u32> {
         let mut base_attr =
             if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino).cloned() {
@@ -1193,10 +1206,14 @@ impl StudioVfs {
             };
         self.refresh_inode_incarnation_state_from_attr(ino, &base_attr);
         self.begin_pending_incarnation(ino, &mut base_attr);
-        let written =
-            self.state
-                .handle_writers
-                .write(fh, ino, base_attr.size, self.block_size, offset, data);
+        let written = self.state.handle_writers.write_bytes(
+            fh,
+            ino,
+            base_attr.size,
+            self.block_size,
+            offset,
+            data,
+        );
         {
             let mut dirty = self.state.namespace.dirty_attrs.lock();
             let attr = dirty.entry(ino).or_insert_with(|| base_attr.clone());

@@ -133,6 +133,7 @@ enum Commands {
     Destroy(destroy::DestroyArgs),
     Dump(dump_load::DumpArgs),
     Load(dump_load::LoadArgs),
+    Test(test::TestArgs),
     TestCache(test_cache::TestCacheArgs),
     Snapshot(snapshot::SnapshotArgs),
     Internal(internal::InternalArgs),
@@ -152,6 +153,7 @@ impl Commands {
             Self::Destroy(args) => args.dispatch(),
             Self::Dump(args) => args.dispatch(),
             Self::Load(args) => args.dispatch(),
+            Self::Test(args) => args.dispatch(),
             Self::TestCache(args) => args.dispatch(),
             Self::Snapshot(args) => args.dispatch(),
             Self::Internal(args) => args.dispatch(),
@@ -196,6 +198,22 @@ mod tests {
     fn log_level_propagates_to_umount() {
         let cli = parse_for_test(&["--log-level", "trace", "umount", "Z:"]).unwrap();
         assert_eq!(cli.log_level, "trace");
+    }
+
+    #[test]
+    fn test_command_parses_mount_and_report() {
+        let cli =
+            parse_for_test(&["test", "Z:", "--report", "reports\\studiofs-test.json"]).unwrap();
+        match cli.command {
+            Commands::Test(test::TestArgs { mount, report }) => {
+                assert_eq!(mount, std::path::PathBuf::from("Z:"));
+                assert_eq!(
+                    report,
+                    std::path::PathBuf::from("reports\\studiofs-test.json")
+                );
+            }
+            other => panic!("expected Test command, got {other:?}"),
+        }
     }
 
     #[test]
