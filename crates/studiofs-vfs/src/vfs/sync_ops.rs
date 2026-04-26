@@ -45,6 +45,27 @@ impl StudioVfs {
         Ok(())
     }
 
+    fn land_opportunistic_write(
+        &self,
+        ino: Ino,
+        fh: u64,
+        offset: u64,
+        data: &[u8],
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<()> {
+        if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+            self.landing_zone
+                .accept(LandingWrite {
+                    ino,
+                    fh,
+                    offset,
+                    data,
+                })
+                .map_err(VfsError::Io)?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(super) fn arm_fail_next_inline_dirty_attr_persist_for_test(&self) {
         self.fail_next_inline_dirty_attr_persist
@@ -882,16 +903,7 @@ impl StudioVfs {
             }
             self.note_vfs_write_call(data.len());
 
-            if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
-                self.landing_zone
-                    .accept(LandingWrite {
-                        ino,
-                        fh,
-                        offset,
-                        data,
-                    })
-                    .map_err(VfsError::Io)?;
-            }
+            self.land_opportunistic_write(ino, fh, offset, data, local_sync_policy)?;
 
             let record_handle_writer_state_started = Instant::now();
             let written = self.record_handle_writer_state(fh, ino, offset, data).await;
@@ -1054,16 +1066,7 @@ impl StudioVfs {
             }
             self.note_vfs_write_call(data.len());
 
-            if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
-                self.landing_zone
-                    .accept(LandingWrite {
-                        ino,
-                        fh,
-                        offset,
-                        data,
-                    })
-                    .map_err(VfsError::Io)?;
-            }
+            self.land_opportunistic_write(ino, fh, offset, data, local_sync_policy)?;
 
             let record_handle_writer_state_started = Instant::now();
             let written = self.record_handle_writer_state(fh, ino, offset, data).await;

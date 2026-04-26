@@ -1,11 +1,13 @@
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const DATA_FILE: &str = "landing.data";
 const MANIFEST_FILE: &str = "landing.manifest";
+const MANIFEST_TMP_FILE: &str = "landing.manifest.tmp";
+const MANIFEST_BACKUP_FILE: &str = "landing.manifest.bak";
 
 pub(super) struct LandingWrite<'a> {
     pub(super) ino: u64,
@@ -97,6 +99,8 @@ pub(super) struct LandingZone {
     #[allow(dead_code)]
     data_path: PathBuf,
     manifest_path: PathBuf,
+    manifest_tmp_path: PathBuf,
+    manifest_backup_path: PathBuf,
     data_lock: Mutex<()>,
     manifest_lock: Mutex<()>,
     accepted_writes: AtomicU64,
@@ -109,6 +113,13 @@ impl LandingZone {
         std::fs::create_dir_all(root)?;
         let data_path = root.join(DATA_FILE);
         let manifest_path = root.join(MANIFEST_FILE);
+        let manifest_tmp_path = root.join(MANIFEST_TMP_FILE);
+        let manifest_backup_path = root.join(MANIFEST_BACKUP_FILE);
+        Self::repair_manifest_swap_files(
+            &manifest_path,
+            &manifest_tmp_path,
+            &manifest_backup_path,
+        )?;
         OpenOptions::new()
             .create(true)
             .read(true)
@@ -122,6 +133,8 @@ impl LandingZone {
         Ok(Self {
             data_path,
             manifest_path,
+            manifest_tmp_path,
+            manifest_backup_path,
             data_lock: Mutex::new(()),
             manifest_lock: Mutex::new(()),
             accepted_writes: AtomicU64::new(0),
@@ -179,8 +192,16 @@ impl LandingZone {
         }
         let requested_end = offset.saturating_add(len as u64);
         let mut result = vec![0; len];
+        let _data_guard = self
+            .data_lock
+            .lock()
+            .map_err(|_| io::Error::other("landing data lock poisoned"))?;
+        let _manifest_guard = self
+            .manifest_lock
+            .lock()
+            .map_err(|_| io::Error::other("landing manifest lock poisoned"))?;
         let mut data = File::open(&self.data_path)?;
-        for segment in self.recover_segments()? {
+        for segment in self.recover_segments_unlocked()? {
             if segment.ino != ino {
                 continue;
             }
@@ -211,12 +232,24 @@ impl LandingZone {
     }
 
     pub(super) fn recover(&self) -> io::Result<Vec<RecoveredLandingSegment>> {
-        self.recover_segments()
+        let _manifest_guard = self
+            .manifest_lock
+            .lock()
+            .map_err(|_| io::Error::other("landing manifest lock poisoned"))?;
+        self.recover_segments_unlocked()
             .map(|segments| segments.into_iter().map(Into::into).collect())
     }
 
     pub(super) fn recover_with_data(&self) -> io::Result<Vec<LandingRecoverySegment>> {
-        let segments = self.recover_segments()?;
+        let _data_guard = self
+            .data_lock
+            .lock()
+            .map_err(|_| io::Error::other("landing data lock poisoned"))?;
+        let _manifest_guard = self
+            .manifest_lock
+            .lock()
+            .map_err(|_| io::Error::other("landing manifest lock poisoned"))?;
+        let segments = self.recover_segments_unlocked()?;
         let mut data = File::open(&self.data_path)?;
         segments
             .into_iter()
@@ -239,17 +272,21 @@ impl LandingZone {
     }
 
     pub(super) fn clear_inode(&self, ino: u64) -> io::Result<()> {
+        let _data_guard = self
+            .data_lock
+            .lock()
+            .map_err(|_| io::Error::other("landing data lock poisoned"))?;
+        let _manifest_guard = self
+            .manifest_lock
+            .lock()
+            .map_err(|_| io::Error::other("landing manifest lock poisoned"))?;
         let retained: Vec<_> = self
-            .recover_segments()?
+            .recover_segments_unlocked()?
             .into_iter()
             .filter(|segment| segment.ino != ino)
             .collect();
-        self.rewrite_manifest(&retained)?;
+        self.rewrite_manifest_unlocked(&retained)?;
         if retained.is_empty() {
-            let _data_guard = self
-                .data_lock
-                .lock()
-                .map_err(|_| io::Error::other("landing data lock poisoned"))?;
             OpenOptions::new()
                 .write(true)
                 .open(&self.data_path)?
@@ -265,28 +302,63 @@ impl LandingZone {
         }
     }
 
-    fn recover_segments(&self) -> io::Result<Vec<LandingSegment>> {
-        let manifest = std::fs::read_to_string(&self.manifest_path)?;
-        manifest
+    fn recover_segments_unlocked(&self) -> io::Result<Vec<LandingSegment>> {
+        let manifest = File::open(&self.manifest_path)?;
+        BufReader::new(manifest)
             .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(LandingSegment::parse)
+            .filter_map(|line| match line {
+                Ok(line) if line.trim().is_empty() => None,
+                other => Some(other),
+            })
+            .map(|line| LandingSegment::parse(&line?))
             .collect()
     }
 
-    fn rewrite_manifest(&self, segments: &[LandingSegment]) -> io::Result<()> {
-        let _manifest_guard = self
-            .manifest_lock
-            .lock()
-            .map_err(|_| io::Error::other("landing manifest lock poisoned"))?;
+    fn rewrite_manifest_unlocked(&self, segments: &[LandingSegment]) -> io::Result<()> {
+        remove_file_if_exists(&self.manifest_tmp_path)?;
         let mut manifest = OpenOptions::new()
+            .create(true)
             .write(true)
             .truncate(true)
-            .open(&self.manifest_path)?;
+            .open(&self.manifest_tmp_path)?;
         for segment in segments {
             manifest.write_all(segment.as_manifest_record().as_bytes())?;
         }
-        manifest.flush()
+        manifest.flush()?;
+        manifest.sync_data()?;
+        drop(manifest);
+        remove_file_if_exists(&self.manifest_backup_path)?;
+        if self.manifest_path.exists() {
+            std::fs::rename(&self.manifest_path, &self.manifest_backup_path)?;
+        }
+        if let Err(error) = std::fs::rename(&self.manifest_tmp_path, &self.manifest_path) {
+            if self.manifest_backup_path.exists() && !self.manifest_path.exists() {
+                let _ = std::fs::rename(&self.manifest_backup_path, &self.manifest_path);
+            }
+            return Err(error);
+        }
+        remove_file_if_exists(&self.manifest_backup_path)
+    }
+
+    fn repair_manifest_swap_files(
+        manifest_path: &Path,
+        manifest_tmp_path: &Path,
+        manifest_backup_path: &Path,
+    ) -> io::Result<()> {
+        if !manifest_path.exists() && manifest_backup_path.exists() {
+            std::fs::rename(manifest_backup_path, manifest_path)?;
+        } else if manifest_path.exists() {
+            remove_file_if_exists(manifest_backup_path)?;
+        }
+        remove_file_if_exists(manifest_tmp_path)
+    }
+}
+
+fn remove_file_if_exists(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -365,5 +437,60 @@ mod tests {
                 .is_empty(),
             "cleared landed writes must not look recoverable after normal drain"
         );
+    }
+
+    #[test]
+    fn landing_zone_open_recovers_manifest_backup_after_interrupted_swap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        {
+            let zone = LandingZone::open(tmp.path()).expect("open landing zone");
+            zone.accept(LandingWrite {
+                ino: 42,
+                fh: 7,
+                offset: 0,
+                data: b"survives".as_slice(),
+            })
+            .expect("accept segment");
+            std::fs::rename(&zone.manifest_path, &zone.manifest_backup_path)
+                .expect("simulate crash after manifest moved to backup");
+        }
+
+        let reopened = LandingZone::open(tmp.path()).expect("reopen landing zone");
+        let recovered = reopened.recover().expect("recover landed segments");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].ino, 42);
+        assert_eq!(
+            reopened.read(42, 0, 8).expect("read recovered"),
+            b"survives"
+        );
+    }
+
+    #[test]
+    fn landing_zone_clear_inode_preserves_other_inode_manifest_records() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let zone = LandingZone::open(tmp.path()).expect("open landing zone");
+        zone.accept(LandingWrite {
+            ino: 1,
+            fh: 10,
+            offset: 0,
+            data: b"clear-me".as_slice(),
+        })
+        .expect("accept cleared segment");
+        zone.accept(LandingWrite {
+            ino: 2,
+            fh: 11,
+            offset: 0,
+            data: b"keep-me".as_slice(),
+        })
+        .expect("accept retained segment");
+
+        zone.clear_inode(1).expect("clear one inode");
+
+        let recovered = zone.recover().expect("recover landed segments");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].ino, 2);
+        assert_eq!(zone.read(2, 0, 7).expect("read retained"), b"keep-me");
+        assert!(!zone.manifest_tmp_path.exists());
+        assert!(!zone.manifest_backup_path.exists());
     }
 }
