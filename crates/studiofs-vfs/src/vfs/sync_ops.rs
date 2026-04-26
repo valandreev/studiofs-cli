@@ -146,12 +146,30 @@ impl StudioVfs {
         }
 
         let buffered_write_count = self.state.handle_writers.total_buffered_write_count();
-        let Some(delay_ms) = super::soft_dirty_budget_pacing_delay_ms(
+        let dirty_budget_delay_ms = super::soft_dirty_budget_pacing_delay_ms(
             total_dirty_bytes,
             max_dirty,
             buffered_write_count,
-        ) else {
+        );
+        let drain_lag_bytes = self.total_landed_write_drain_lag_bytes();
+        let drain_lag_delay_ms = super::soft_drain_lag_pacing_delay_ms(
+            drain_lag_bytes,
+            self.handle_writer_slice_flush_bytes(),
+        );
+        let Some(delay_ms) = dirty_budget_delay_ms.max(drain_lag_delay_ms) else {
             return false;
+        };
+        debug_assert!(
+            dirty_budget_delay_ms.is_some() || drain_lag_delay_ms.is_some(),
+            "delay_ms is present only when at least one pacing delay is present"
+        );
+        let pacing_trigger = match (dirty_budget_delay_ms, drain_lag_delay_ms) {
+            (Some(dirty), Some(drain)) if dirty == drain => "dirty_budget_and_drain_lag",
+            (Some(dirty), Some(drain)) if dirty > drain => "dirty_budget",
+            (Some(_), Some(_)) => "drain_lag",
+            (Some(_), None) => "dirty_budget",
+            (None, Some(_)) => "drain_lag",
+            (None, None) => unreachable!("delay_ms exists only when at least one delay exists"),
         };
 
         self.spawn_deferred_materialization_if_needed(preferred_ino)
@@ -160,17 +178,35 @@ impl StudioVfs {
         self.debug_write_probe(
             "H2",
             "crates/studiofs-vfs/src/vfs/sync_ops.rs:86",
-            "soft dirty-budget pacing applied",
+            "soft write-path pacing applied",
             serde_json::json!({
                 "preferred_ino": preferred_ino,
                 "total_dirty_bytes": total_dirty_bytes,
+                "drain_lag_bytes": drain_lag_bytes,
                 "max_dirty_bytes": max_dirty,
                 "buffered_write_count": buffered_write_count,
+                "dirty_budget_delay_ms": dirty_budget_delay_ms,
+                "drain_lag_delay_ms": drain_lag_delay_ms,
                 "delay_ms": delay_ms,
+                "pacing_trigger": pacing_trigger,
             }),
         );
 
+        let started = Instant::now();
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        let waited_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        self.state
+            .local_dirty
+            .fast_backpressure_events
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.state
+            .local_dirty
+            .fast_backpressure_wait_ms
+            .fetch_add(waited_ms, std::sync::atomic::Ordering::Relaxed);
+        self.state
+            .local_dirty
+            .fast_backpressure_stall_max_ms
+            .fetch_max(waited_ms, std::sync::atomic::Ordering::Relaxed);
         true
     }
 
