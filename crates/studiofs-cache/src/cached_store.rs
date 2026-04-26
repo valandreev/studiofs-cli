@@ -25,6 +25,7 @@ use crate::upload_queue::{PendingUpload, UploadQueue};
 use crate::upload_stage::{UploadStageStore, UploadStageStoreError};
 
 pub type ObjectId = u64;
+const DEFAULT_WRITER_MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct CachedStoreConfig {
@@ -62,6 +63,8 @@ pub struct StagedSlice {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedStoreWriterCountersSnapshot {
+    /// Writer-owned bytes retained by the cached-store slice writer, including
+    /// zero-filled sparse gaps that will be staged locally.
     pub dirty_bytes: u64,
     pub staged_bytes: u64,
     pub pending_upload_bytes: u64,
@@ -669,13 +672,13 @@ impl CachedStoreWriterSlice {
         let end = relative
             .checked_add(data.len())
             .ok_or(CachedStoreWriterError::OffsetTooLarge)?;
-        self.validate_buffer_limit(end)?;
         let absolute_end = self
             .head
             .checked_add(end)
             .ok_or(CachedStoreWriterError::OffsetTooLarge)?;
+        let target_capacity = round_up_to_page(absolute_end, self.config.page_size);
+        self.validate_buffer_limit(target_capacity)?;
         if self.pages.len() < absolute_end {
-            let target_capacity = round_up_to_page(absolute_end, self.config.page_size);
             if self.pages.capacity() < target_capacity {
                 self.pages
                     .reserve(target_capacity.saturating_sub(self.pages.capacity()));
@@ -768,19 +771,19 @@ impl CachedStoreWriterSlice {
 
     fn stage_prefix(&mut self, len: usize) -> Result<StagedSlice, CachedStoreWriterError> {
         let started_at = Instant::now();
-        let data = Bytes::copy_from_slice(&self.pages[self.head..self.head + len]);
+        let payload = &self.pages[self.head..self.head + len];
         let object_id = self.next_object_id;
         self.next_object_id = self.next_object_id.saturating_add(1);
 
         self.store
             .local_payload_backend
-            .put(object_id, data.as_ref(), false)
+            .put(object_id, payload, false)
             .map_err(|source| CachedStoreWriterError::LocalPayload { object_id, source })?;
         self.store
             .upload_stage_store
             .link_payload(object_id)
             .map_err(|source| CachedStoreWriterError::UploadStage { object_id, source })?;
-        self.store.upload_hot.lock().insert(object_id, data);
+        self.cache_hot_upload_if_enabled(object_id, payload);
         self.store.metrics.materialize_batches.record_batch(
             1,
             saturating_u64_from_usize(len),
@@ -808,10 +811,19 @@ impl CachedStoreWriterSlice {
         Ok(staged)
     }
 
+    fn cache_hot_upload_if_enabled(&self, object_id: ObjectId, payload: &[u8]) {
+        let mut upload_hot = self.store.upload_hot.lock();
+        if upload_hot.budget_bytes > 0 {
+            upload_hot.insert(object_id, Bytes::copy_from_slice(payload));
+        }
+    }
+
     fn validate_buffer_limit(&self, requested: usize) -> Result<(), CachedStoreWriterError> {
-        if let Some(limit) = self.config.max_buffer_bytes
-            && requested > limit
-        {
+        let limit = self
+            .config
+            .max_buffer_bytes
+            .unwrap_or(DEFAULT_WRITER_MAX_BUFFER_BYTES);
+        if requested > limit {
             return Err(CachedStoreWriterError::BufferLimitExceeded { requested, limit });
         }
         Ok(())
@@ -833,6 +845,17 @@ impl CachedStoreWriterSlice {
             Err(CachedStoreWriterError::InvalidPageGeometry)
         } else {
             Ok(())
+        }
+    }
+}
+
+impl Drop for CachedStoreWriterSlice {
+    fn drop(&mut self) {
+        let remaining_dirty = self.dirty_bytes();
+        if remaining_dirty > 0 {
+            self.store
+                .writer_counters
+                .subtract_dirty_bytes(remaining_dirty);
         }
     }
 }
@@ -1034,11 +1057,69 @@ mod tests {
         assert!(matches!(
             err,
             CachedStoreWriterError::BufferLimitExceeded {
-                requested: 1025,
+                requested: 1028,
                 limit: 8
             }
         ));
         assert_eq!(writer.dirty_bytes(), 0);
+        assert_eq!(cached_store.snapshot_writer_counters().dirty_bytes, 0);
+    }
+
+    #[test]
+    fn writer_slice_default_buffer_limit_rejects_unbounded_sparse_gap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        let mut writer = cached_store.open_writer_slice(writer_config());
+
+        let offset = u64::try_from(DEFAULT_WRITER_MAX_BUFFER_BYTES).unwrap() + 1;
+        let err = writer
+            .write_at(offset, b"x")
+            .expect_err("default buffer limit");
+
+        assert!(matches!(
+            err,
+            CachedStoreWriterError::BufferLimitExceeded { limit, .. }
+                if limit == DEFAULT_WRITER_MAX_BUFFER_BYTES
+        ));
+        assert_eq!(writer.dirty_bytes(), 0);
+        assert_eq!(cached_store.snapshot_writer_counters().dirty_bytes, 0);
+    }
+
+    #[test]
+    fn writer_slice_rejects_write_when_rounded_capacity_exceeds_buffer_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        let mut config = writer_config();
+        config.page_size = 16;
+        config.max_buffer_bytes = Some(8);
+        let mut writer = cached_store.open_writer_slice(config);
+
+        let err = writer
+            .write_at(0, b"abcdefgh")
+            .expect_err("rounded capacity exceeds limit");
+
+        assert!(matches!(
+            err,
+            CachedStoreWriterError::BufferLimitExceeded {
+                requested: 16,
+                limit: 8
+            }
+        ));
+        assert_eq!(writer.dirty_bytes(), 0);
+        assert_eq!(cached_store.snapshot_writer_counters().dirty_bytes, 0);
+    }
+
+    #[test]
+    fn writer_slice_drop_releases_unstaged_dirty_byte_accounting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+
+        {
+            let mut writer = cached_store.open_writer_slice(writer_config());
+            writer.write_at(0, b"dirty").expect("write dirty tail");
+            assert_eq!(cached_store.snapshot_writer_counters().dirty_bytes, 5);
+        }
+
         assert_eq!(cached_store.snapshot_writer_counters().dirty_bytes, 0);
     }
 
