@@ -148,6 +148,29 @@ Regular-file graph rules:
 - overlay and base graphs resolve as `overlay over base`
 - `committed_size` follows the remote-visible committed state derived from `regular_file_base`
 
+### Local Regular-File Slice API
+
+The mounted data plane should build locally durable file-content commits with
+`LocalSliceBatch` / `LocalSliceRecord` rather than redb table rows.
+
+API rules:
+- `LocalSliceRecord` carries `ino`, `chunk_id`, chunk-relative offset/length,
+  optional payload object id, object offset, and caller-side sequence.
+- `LocalSliceRecord::data(...)` and `LocalSliceRecord::hole(...)` reject any
+  single slice that crosses `DEFAULT_CHUNK_SIZE`.
+- `LocalSliceBatch::append_data_range(...)` and
+  `LocalSliceBatch::append_hole_range(...)` accept file-coordinate ranges and
+  split them into chunk-local records.
+- `LocalSliceBatch::into_chunk_slices()` converts the batch into the
+  `(ChunkId, Vec<SliceRecord>)` shape consumed by
+  `flush_regular_file_overlay_slices_with_attr(...)`, which commits slice rows
+  and local inode attrs in one local metadata transaction for redb-backed
+  engines.
+
+Holes and truncate masks are represented as tombstone records
+(`payload_object_id == None`) and participate in the same per-byte overlap
+resolution as data-bearing slices.
+
 For namespace, attrs, symlink targets, and xattrs StudioFS also keeps two views:
 - base view:
   - `base_inodes`

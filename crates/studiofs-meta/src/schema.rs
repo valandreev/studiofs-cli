@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::time::SystemTime;
 
 // =============================================================================
@@ -768,6 +769,296 @@ impl SliceRecord {
     /// Returns `true` when this slice removes coverage instead of providing data.
     pub fn is_tombstone(&self) -> bool {
         self.payload.is_none()
+    }
+}
+
+/// Error returned while constructing chunk-local local slice metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalSliceError {
+    /// A single slice must cover at least one byte.
+    EmptySlice,
+    /// A single slice would extend past the end of its chunk.
+    CrossesChunkBoundary,
+    /// A record for a different inode was pushed into a single-inode batch.
+    InodeMismatch {
+        /// Inode owned by the batch.
+        expected: Ino,
+        /// Inode carried by the pushed record.
+        actual: Ino,
+    },
+    /// A file-range or object-range calculation overflowed.
+    OffsetOverflow,
+}
+
+impl fmt::Display for LocalSliceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptySlice => write!(f, "local slice must cover at least one byte"),
+            Self::CrossesChunkBoundary => write!(f, "local slice crosses a chunk boundary"),
+            Self::InodeMismatch { expected, actual } => write!(
+                f,
+                "local slice inode mismatch: expected {expected}, got {actual}"
+            ),
+            Self::OffsetOverflow => write!(f, "local slice offset calculation overflowed"),
+        }
+    }
+}
+
+impl std::error::Error for LocalSliceError {}
+
+/// Chunk-local slice record accepted by the local mounted data plane.
+///
+/// The record includes inode and chunk identity so writer, reader, flush/fsync,
+/// publication, and recovery code can pass slice metadata around without
+/// exposing the redb table layout. `payload_object_id == None` represents a
+/// tombstone/hole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSliceRecord {
+    /// Inode whose regular-file graph receives this slice.
+    pub ino: Ino,
+    /// Chunk containing this slice.
+    pub chunk_id: ChunkId,
+    /// Chunk-relative start offset.
+    pub chunk_offset: u32,
+    /// Slice length in bytes.
+    pub length: u32,
+    /// Payload object id, or `None` for a tombstone/hole.
+    pub payload_object_id: Option<u64>,
+    /// Offset inside the payload object, present only for data-bearing slices.
+    pub object_offset: Option<u32>,
+    /// Caller-side sequence used to preserve accepted order before metadata
+    /// assigns durable per-chunk [`SliceOrder`] values.
+    pub sequence: u64,
+}
+
+impl LocalSliceRecord {
+    /// Create a data-bearing chunk-local slice.
+    pub fn data(
+        ino: Ino,
+        chunk_id: ChunkId,
+        chunk_offset: u32,
+        length: u32,
+        payload_object_id: u64,
+        object_offset: u32,
+    ) -> Result<Self, LocalSliceError> {
+        Self::validate_chunk_range(chunk_offset, length)?;
+        object_offset
+            .checked_add(length)
+            .ok_or(LocalSliceError::OffsetOverflow)?;
+        Ok(Self {
+            ino,
+            chunk_id,
+            chunk_offset,
+            length,
+            payload_object_id: Some(payload_object_id),
+            object_offset: Some(object_offset),
+            sequence: 0,
+        })
+    }
+
+    /// Create a tombstone/hole chunk-local slice.
+    pub fn hole(
+        ino: Ino,
+        chunk_id: ChunkId,
+        chunk_offset: u32,
+        length: u32,
+    ) -> Result<Self, LocalSliceError> {
+        Self::validate_chunk_range(chunk_offset, length)?;
+        Ok(Self {
+            ino,
+            chunk_id,
+            chunk_offset,
+            length,
+            payload_object_id: None,
+            object_offset: None,
+            sequence: 0,
+        })
+    }
+
+    fn validate_chunk_range(chunk_offset: u32, length: u32) -> Result<(), LocalSliceError> {
+        if length == 0 {
+            return Err(LocalSliceError::EmptySlice);
+        }
+        let end = chunk_offset
+            .checked_add(length)
+            .ok_or(LocalSliceError::OffsetOverflow)?;
+        if end > DEFAULT_CHUNK_SIZE {
+            return Err(LocalSliceError::CrossesChunkBoundary);
+        }
+        Ok(())
+    }
+
+    fn with_sequence(mut self, sequence: u64) -> Self {
+        self.sequence = sequence;
+        self
+    }
+
+    fn to_slice_record(&self) -> SliceRecord {
+        let range = SliceRange {
+            start: self.chunk_offset,
+            end: self.chunk_offset + self.length,
+        };
+        let payload = self
+            .payload_object_id
+            .zip(self.object_offset)
+            .map(|(object_id, offset)| PayloadRef {
+                object_id,
+                offset,
+                length: self.length,
+                flags: BlockFlags::PARTIAL_BLOCK,
+            });
+        SliceRecord {
+            slice_id: SliceId::default(),
+            order: SliceOrder::default(),
+            range,
+            payload,
+            payload_state: PayloadRefState::LocalOnly,
+        }
+    }
+}
+
+/// Ordered local slice batch for one regular file.
+///
+/// This type is the metadata-facing shape produced by finished slice writers.
+/// It can split file-coordinate data and hole ranges into chunk-local records,
+/// then convert them into the `(ChunkId, Vec<SliceRecord>)` input expected by
+/// atomic local metadata commit APIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSliceBatch {
+    ino: Ino,
+    records: Vec<LocalSliceRecord>,
+    next_sequence: u64,
+}
+
+impl LocalSliceBatch {
+    /// Create an empty batch for `ino`.
+    pub fn new(ino: Ino) -> Self {
+        Self {
+            ino,
+            records: Vec::new(),
+            next_sequence: 0,
+        }
+    }
+
+    /// Return the inode owned by this batch.
+    pub fn ino(&self) -> Ino {
+        self.ino
+    }
+
+    /// Return the ordered records in this batch.
+    pub fn records(&self) -> &[LocalSliceRecord] {
+        &self.records
+    }
+
+    /// Append one already chunk-local record.
+    pub fn push(&mut self, record: LocalSliceRecord) -> Result<(), LocalSliceError> {
+        if record.ino != self.ino {
+            return Err(LocalSliceError::InodeMismatch {
+                expected: self.ino,
+                actual: record.ino,
+            });
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or(LocalSliceError::OffsetOverflow)?;
+        self.records.push(record.with_sequence(sequence));
+        Ok(())
+    }
+
+    /// Append a file-coordinate data range, splitting at chunk boundaries.
+    pub fn append_data_range(
+        &mut self,
+        file_offset: u64,
+        length: u32,
+        payload_object_id: u64,
+        object_offset: u32,
+    ) -> Result<(), LocalSliceError> {
+        self.append_file_range(
+            file_offset,
+            length,
+            |ino, chunk_id, chunk_offset, segment_len, consumed| {
+                let object_offset = (object_offset as u64)
+                    .checked_add(consumed)
+                    .ok_or(LocalSliceError::OffsetOverflow)?;
+                let object_offset =
+                    u32::try_from(object_offset).map_err(|_| LocalSliceError::OffsetOverflow)?;
+                LocalSliceRecord::data(
+                    ino,
+                    chunk_id,
+                    chunk_offset,
+                    segment_len,
+                    payload_object_id,
+                    object_offset,
+                )
+            },
+        )
+    }
+
+    /// Append a file-coordinate tombstone/hole range, splitting at chunk boundaries.
+    pub fn append_hole_range(
+        &mut self,
+        file_offset: u64,
+        length: u32,
+    ) -> Result<(), LocalSliceError> {
+        self.append_file_range(
+            file_offset,
+            length,
+            |ino, chunk_id, chunk_offset, segment_len, _consumed| {
+                LocalSliceRecord::hole(ino, chunk_id, chunk_offset, segment_len)
+            },
+        )
+    }
+
+    fn append_file_range<F>(
+        &mut self,
+        file_offset: u64,
+        length: u32,
+        mut make_record: F,
+    ) -> Result<(), LocalSliceError>
+    where
+        F: FnMut(Ino, ChunkId, u32, u32, u64) -> Result<LocalSliceRecord, LocalSliceError>,
+    {
+        if length == 0 {
+            return Ok(());
+        }
+        let end = file_offset
+            .checked_add(u64::from(length))
+            .ok_or(LocalSliceError::OffsetOverflow)?;
+        let mut cursor = file_offset;
+        let mut consumed = 0u64;
+        while cursor < end {
+            let chunk_id = chunk_id_from_offset(cursor, DEFAULT_CHUNK_SIZE);
+            let chunk_start = chunk_start_offset(chunk_id, DEFAULT_CHUNK_SIZE);
+            let chunk_end = chunk_start
+                .checked_add(u64::from(DEFAULT_CHUNK_SIZE))
+                .ok_or(LocalSliceError::OffsetOverflow)?;
+            let segment_end = end.min(chunk_end);
+            let chunk_offset =
+                u32::try_from(cursor - chunk_start).map_err(|_| LocalSliceError::OffsetOverflow)?;
+            let segment_len =
+                u32::try_from(segment_end - cursor).map_err(|_| LocalSliceError::OffsetOverflow)?;
+            let record = make_record(self.ino, chunk_id, chunk_offset, segment_len, consumed)?;
+            self.push(record)?;
+            consumed = consumed
+                .checked_add(u64::from(segment_len))
+                .ok_or(LocalSliceError::OffsetOverflow)?;
+            cursor = segment_end;
+        }
+        Ok(())
+    }
+
+    /// Convert this batch into chunk-grouped metadata records for commit.
+    pub fn into_chunk_slices(self) -> Vec<(ChunkId, Vec<SliceRecord>)> {
+        let mut chunks: BTreeMap<ChunkId, Vec<SliceRecord>> = BTreeMap::new();
+        for record in self.records {
+            chunks
+                .entry(record.chunk_id)
+                .or_default()
+                .push(record.to_slice_record());
+        }
+        chunks.into_iter().collect()
     }
 }
 
@@ -1562,6 +1853,77 @@ mod tests {
 
         assert!(chunk.try_alloc_slice_id().is_none());
         assert!(chunk.try_alloc_slice_order().is_none());
+    }
+
+    #[test]
+    fn test_local_slice_record_rejects_chunk_boundary_crossing() {
+        let err = LocalSliceRecord::data(42, ChunkId(7), DEFAULT_CHUNK_SIZE - 16, 32, 9001, 0)
+            .expect_err("single slice must not cross a chunk boundary");
+
+        assert_eq!(err, LocalSliceError::CrossesChunkBoundary);
+    }
+
+    #[test]
+    fn test_local_slice_batch_splits_data_and_holes_by_chunk() {
+        let mut batch = LocalSliceBatch::new(42);
+        batch
+            .append_data_range(DEFAULT_CHUNK_SIZE as u64 - 8, 24, 9001, 4)
+            .expect("split data write");
+        batch
+            .append_hole_range(DEFAULT_CHUNK_SIZE as u64 + 24, 16)
+            .expect("split hole");
+
+        let records = batch.records();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].chunk_id, ChunkId(0));
+        assert_eq!(records[0].chunk_offset, DEFAULT_CHUNK_SIZE - 8);
+        assert_eq!(records[0].length, 8);
+        assert_eq!(records[0].object_offset, Some(4));
+        assert_eq!(records[1].chunk_id, ChunkId(1));
+        assert_eq!(records[1].chunk_offset, 0);
+        assert_eq!(records[1].length, 16);
+        assert_eq!(records[1].object_offset, Some(12));
+        assert_eq!(records[2].chunk_id, ChunkId(1));
+        assert_eq!(records[2].chunk_offset, 24);
+        assert_eq!(records[2].length, 16);
+        assert!(records[2].payload_object_id.is_none());
+
+        let chunk_slices = batch.into_chunk_slices();
+        assert_eq!(chunk_slices.len(), 2);
+        assert_eq!(chunk_slices[0].0, ChunkId(0));
+        assert_eq!(chunk_slices[0].1.len(), 1);
+        assert_eq!(
+            chunk_slices[0].1[0].range,
+            SliceRange::new(DEFAULT_CHUNK_SIZE - 8, DEFAULT_CHUNK_SIZE).unwrap()
+        );
+        assert_eq!(
+            chunk_slices[0].1[0].payload.as_ref().unwrap().object_id,
+            9001
+        );
+        assert_eq!(chunk_slices[0].1[0].payload.as_ref().unwrap().offset, 4);
+        assert_eq!(chunk_slices[1].0, ChunkId(1));
+        assert_eq!(chunk_slices[1].1.len(), 2);
+        assert_eq!(chunk_slices[1].1[0].range, SliceRange::new(0, 16).unwrap());
+        assert_eq!(chunk_slices[1].1[0].payload.as_ref().unwrap().offset, 12);
+        assert!(chunk_slices[1].1[1].is_tombstone());
+        assert_eq!(chunk_slices[1].1[1].range, SliceRange::new(24, 40).unwrap());
+    }
+
+    #[test]
+    fn test_local_slice_batch_rejects_other_inode_records() {
+        let mut batch = LocalSliceBatch::new(42);
+        let record = LocalSliceRecord::hole(43, ChunkId(0), 0, 16).expect("valid chunk-local hole");
+        let err = batch
+            .push(record)
+            .expect_err("batch must only contain records for one inode");
+
+        assert_eq!(
+            err,
+            LocalSliceError::InodeMismatch {
+                expected: 42,
+                actual: 43
+            }
+        );
     }
 
     #[test]

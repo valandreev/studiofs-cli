@@ -174,6 +174,20 @@ Rules:
 - Shared locks are the explicit foreground exception: lock grant/renew/release
   may talk to PostgreSQL.
 
+Local slice metadata API:
+
+- Finished slice writers pass file-coordinate data/hole ranges through
+  `LocalSliceBatch`.
+- Each `LocalSliceRecord` is chunk-local and includes inode, chunk index,
+  chunk-relative offset, length, payload object id when present, object offset,
+  and caller-side sequence.
+- A single `LocalSliceRecord` must never cross a chunk boundary. File-coordinate
+  helpers split wider ranges before commit.
+- `LocalSliceBatch::into_chunk_slices()` is the public bridge into
+  `flush_regular_file_overlay_slices_with_attr(...)`, preserving the rule that
+  local attr updates and finished slice metadata are committed together for
+  flush/fsync/close/truncate-style foreground boundaries.
+
 ## 7. Publication And Peer Visibility
 
 StudioFS keeps JuiceFS-like writeback IO economics and StudioFS peer-visible
