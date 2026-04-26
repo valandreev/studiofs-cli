@@ -1,7 +1,8 @@
 use super::{
-    AccessLevel, DirtyAttrPersistPolicy, ExplicitFlushOutcome, FileSessionOperation, FsyncOutcome,
-    HandleReleaseContext, Ino, LastHandleReleaseAction, LocalSyncBarrierOutcome, LocalSyncPolicy,
-    OpenFile, OpenFlags, ReleaseFhOutcome, StickyErrorPolicy, StudioVfs, VfsResult,
+    AccessLevel, Bytes, DirtyAttrPersistPolicy, ExplicitFlushOutcome, FileSessionOperation,
+    FsyncOutcome, HandleReleaseContext, Ino, LastHandleReleaseAction, LocalSyncBarrierOutcome,
+    LocalSyncPolicy, OpenFile, OpenFlags, ReleaseFhOutcome, StickyErrorPolicy, StudioVfs,
+    VfsResult,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -50,7 +51,7 @@ impl StudioVfs {
         ino: Ino,
         fh: u64,
         offset: u64,
-        data: &[u8],
+        data: Bytes,
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<()> {
         if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
@@ -133,6 +134,7 @@ impl StudioVfs {
         self.state.handle_writers.dirty_bytes_for_inode(ino) > 0
     }
 
+    #[cfg(test)]
     pub(super) async fn apply_write_path_soft_pacing(self: &Arc<Self>, preferred_ino: Ino) -> bool {
         if self.shutdown_requested() {
             return false;
@@ -226,6 +228,7 @@ impl StudioVfs {
         true
     }
 
+    #[cfg(test)]
     pub(super) async fn wait_for_soft_dirty_budget_relief(self: &Arc<Self>, preferred_ino: Ino) {
         if self.shutdown_requested() {
             return;
@@ -954,11 +957,14 @@ impl StudioVfs {
                 return Ok(data.len() as u32);
             }
             self.note_vfs_write_call(data.len());
+            let shared_data = Bytes::copy_from_slice(data);
 
-            self.land_opportunistic_write(ino, fh, offset, data, local_sync_policy)?;
+            self.land_opportunistic_write(ino, fh, offset, shared_data.clone(), local_sync_policy)?;
 
             let record_handle_writer_state_started = Instant::now();
-            let written = self.record_handle_writer_state(fh, ino, offset, data).await;
+            let written = self
+                .record_handle_writer_state_bytes(fh, ino, offset, shared_data)
+                .await;
             self.record_vfs_write_record_handle_writer_state(
                 record_handle_writer_state_started.elapsed(),
             );
@@ -1039,9 +1045,10 @@ impl StudioVfs {
     ///   `materialize_handle_writers_for_inode` synchronously.
     /// * Duplicate materialization is safe: the payload store uses last-writer-wins
     ///   for overlapping ranges, and orphaned objects are reclaimed by the janitor.
-    /// * Budget enforcement runs in the background task: if dirty bytes exceed
-    ///   `2 × max_dirty_bytes` the next write will detect it synchronously via
-    ///   the hard-backpressure guard at the top and block until drain catches up.
+    /// * Soft pacing is deliberately not applied on this foreground writeback
+    ///   path. If dirty bytes exceed `2 × max_dirty_bytes` the next write will
+    ///   detect it synchronously via the hard-backpressure guard at the top and
+    ///   block until drain catches up.
     pub async fn write_fh_with_deferred_materialize(
         self: &Arc<Self>,
         fh: u64,
@@ -1050,12 +1057,6 @@ impl StudioVfs {
         data: &[u8],
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<u32> {
-        let pre_buffer_paced = if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
-            self.apply_write_path_soft_pacing(ino).await
-        } else {
-            false
-        };
-
         // ── Hard backpressure safety valve ───────────────────────────────
         // If background materialization falls behind and dirty memory is
         // dangerously high, fall back to the fully-synchronous path so we
@@ -1117,11 +1118,14 @@ impl StudioVfs {
                 return Ok(data.len() as u32);
             }
             self.note_vfs_write_call(data.len());
+            let shared_data = Bytes::copy_from_slice(data);
 
-            self.land_opportunistic_write(ino, fh, offset, data, local_sync_policy)?;
+            self.land_opportunistic_write(ino, fh, offset, shared_data.clone(), local_sync_policy)?;
 
             let record_handle_writer_state_started = Instant::now();
-            let written = self.record_handle_writer_state(fh, ino, offset, data).await;
+            let written = self
+                .record_handle_writer_state_bytes(fh, ino, offset, shared_data)
+                .await;
             self.record_vfs_write_record_handle_writer_state(
                 record_handle_writer_state_started.elapsed(),
             );
@@ -1138,9 +1142,6 @@ impl StudioVfs {
         match (&result, local_sync_policy) {
             (Ok(_), LocalSyncPolicy::Opportunistic) => {
                 self.spawn_deferred_materialization_if_needed(ino).await;
-                if !pre_buffer_paced {
-                    self.apply_write_path_soft_pacing(ino).await;
-                }
             }
             (Ok(_), LocalSyncPolicy::Strict) => {
                 // Strict: await materialization inline (same as original).

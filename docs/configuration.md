@@ -1,8 +1,7 @@
 # Configuration Reference
 
-This page describes the current operator surface in the repository. It is not
-the canonical SFS-242 rewrite contract. The rewrite source of truth lives in
-[juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
+This page describes the operator surface for the canonical mounted-IO contract
+in [juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
 
 ## Global
 
@@ -407,7 +406,7 @@ fractional inputs such as `1.5GB`; parsing rounds down fractional bytes.
 Supported suffixes are `B`, `KB`, `MB`, `GB`, `TB`, `PB`, `EB` using binary
 multipliers (`1KB = 1024B`).
 
-Operator stance for the rewrite:
+Operator stance:
 
 - Normal mount UX should stay focused on local data-cache and I/O behavior.
 - Metadata-cache knobs are internal runtime defaults for developers and
@@ -429,11 +428,10 @@ Operator stance for the rewrite:
 The writeback dirty-buffer default is hardcoded to `1200MB` (`max_dirty_bytes`) to give
 long sequential writers a slightly wider smoothing window before hard backpressure.
 
-### Transitional and expert overrides
+### Expert overrides
 
-The current code still accepts additional `STUDIOFS_*` runtime overrides through
-the existing raw/validated VFS config pipeline. They are no longer documented as
-the normal operator API.
+The code accepts additional `STUDIOFS_*` runtime overrides through the
+raw/validated VFS config pipeline. They are not the normal operator API.
 
 Use them only when one of these is true:
 
@@ -442,15 +440,15 @@ Use them only when one of these is true:
 - you are working on bridge-specific tuning that belongs to `SFS-250`
 - you are changing maintenance/recovery behavior that belongs to `SFS-251`
 
-For the new public IO knobs, the current migration mapping is:
+For the public IO knobs, the env mapping is:
 
-| Public flag | Transitional env override |
+| Public flag | Environment override |
 |---|---|
 | `--read-buffer` | `STUDIOFS_READ_BUFFER_MB` |
 | `--readahead` | `STUDIOFS_READAHEAD_WIDTH` |
 | `--prefetch` | `STUDIOFS_PREFETCH_CONCURRENCY` |
 
-Important families that remain supported in code today:
+Important families supported in code:
 
 - metadata-cache internals: `STUDIOFS_DENTRY_CACHE_*`,
   `STUDIOFS_PATH_SHORTCUT_CACHE_*`, `STUDIOFS_ATTR_READ_CACHE_*`,
@@ -472,7 +470,7 @@ Internal metadata-cache defaults:
   `STUDIOFS_EFFECTIVE_ACL_CACHE_CAPACITY`, and
   `STUDIOFS_METADATA_INVALIDATION_SYNC_INTERVAL_MS` are internal defaults, not
   part of the intended simple operator UX.
-- Current numeric defaults live in `crates/studiofs-vfs/src/vfs.rs` as
+- Numeric defaults live in `crates/studiofs-vfs/src/vfs.rs` as
   `DEFAULT_*` constants.
 - Typed config fields and validation live in
   `crates/studiofs-vfs/src/vfs/config.rs` (`VfsConfig` and `VfsConfigRaw`).
@@ -482,12 +480,12 @@ Internal metadata-cache defaults:
 Metadata cache observability is emitted through the existing `upload pipeline` / `upload pipeline counters` log events and includes:
 
 - dentry cache, full-path shortcut cache, and attr read cache metrics: hits/misses/evictions, occupancy, protected-tier (hotset) occupancy, and hot-hit contribution
-- ingress artifact counters/checkpoint stats (expected to remain at zero during normal local-cache foreground operation unless recovering older artifacts)
-- local dirty-state persist batch metrics (batch size in payloads/bytes, batch duration histogram, concurrent batch depth/peak)
+- writer/cache recovery counters and checkpoint stats
+- cached-store staging batch metrics (batch size in payloads/bytes, batch duration histogram, concurrent batch depth/peak)
 - cache shim read/write throughput and latency histograms
 - VFS synchronous read fast-path counters (`vfs_read_sync_fast_path_hits`, `vfs_read_sync_fast_path_misses`)
 - queue depth/backpressure metrics (`upload_queue_depth`, `upload_queue_depth_peak`, `write_backpressure_wait_ms`, `write_backpressure_events`)
-- fast-mode backpressure metrics (`fast_backpressure_wait_ms`, `fast_backpressure_events`, `fast_backpressure_stall_max_ms`)
+- writer/cache backpressure metrics (`fast_backpressure_wait_ms`, `fast_backpressure_events`, `fast_backpressure_stall_max_ms`)
 - upload local payload-read metrics (`upload_local_payload_reads`, `upload_local_payload_read_bytes`, `upload_fallback_deferrals`, `upload_fallback_rereads`, `upload_fallback_reread_bytes`, `upload_fallback_reread_cache_misses`, `upload_fallback_wait_ms`, `upload_fallback_wait_max_ms`, `upload_fallback_read_ms`, `upload_fallback_read_max_ms`)
 - transit-memory budget metrics (`transit_memory_budget_bytes`, `transit_memory_used_bytes`, `transit_memory_available_bytes`, `transit_memory_waiting_foreground`, `transit_memory_waiting_background`)
 - foreground access-policy metrics (`dominant_access_class`, `dominant_prefetch_enabled`, `dominant_cache_promotion_on_read`, `dominant_readahead_base_width`, `dominant_readahead_max_width`, `dominant_readahead_min_prefetch`, `dominant_upload_pressure_boost`, `active_sequential_media_reads`, `active_random_interactive_reads`, `active_sequential_writers`, `active_random_writers`)

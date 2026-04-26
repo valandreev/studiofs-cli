@@ -1,25 +1,21 @@
 # Cache System
 
-This page is the current implementation snapshot for the cache subsystem. It is
-not the canonical SFS-242 rewrite contract. The rewrite source of truth lives
+This page describes the cache subsystem under the canonical mounted-IO contract
 in [juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
 
-The cache subsystem (`studiofs-cache`) provides one Local-First cache/object
-pipeline centered on `CachedStore` plus the current local cache backend
-implementation.
+The cache subsystem (`studiofs-cache`) provides the single JuiceFS-equivalent
+cache/object pipeline centered on `CachedStore` plus the local cache backend.
 
 ## Runtime Scope
 
-Current runtime components:
+Runtime components:
 
 | Component | Modules | Role |
 |---|---|---|
-| Current local cache backend | `payload_layout`, `payload_index`, `payload_store`, `startup_recovery` | Persistent local payloads + lifecycle/index state |
+| Local cache backend | `payload_layout`, `payload_index`, `payload_store`, `startup_recovery` | Persistent local payloads + lifecycle/index state |
 | Local-backend contract | `local` | Backend-agnostic trait used by VFS read/write/upload paths |
-| Cached-store runtime | `cached_store`, `upload_queue`, `upload_stage` | Unified local cache handle, runtime pending-upload queue, upload helpers, pending-upload pinning, and runtime metrics |
+| Cached-store runtime | `cached_store`, `upload_queue`, `upload_stage` | Writer pages, staging, cached reads, pending-upload queue, upload helpers, pinning, and runtime metrics |
 | Benchmark-only cache surface | `benchmark_cache` | Lightweight in-memory cache used by `studiofs test-cache` |
-
-Legacy cache-v2 storage implementation code has been removed.
 
 ## Architecture
 
@@ -32,14 +28,14 @@ Legacy cache-v2 storage implementation code has been removed.
           ┌─────────────────┴──────────────────┐
           │                                    │
    ┌──────▼────────┐                  ┌────────▼─────────┐
-   │ Pending-upload│                  │ Upload Queue     │
-   │ pin tracking  │                  │ (seeded on commit│
+   │ Writer pages  │                  │ Upload Queue     │
+   │ + pin tracking│                  │ (staged payloads │
    │               │                  │  + startup replay)│
    └───────────────┘                  └──────────────────┘
                             │
                             ▼
                 ┌────────────────────────────┐
-                │ Current local cache backend│
+                │ Local cache backend        │
                 │      (UUID cache root)     │
                 └────────────────────────────┘
 ```
@@ -72,8 +68,8 @@ files under `<cache-root>`.
 `CachedStore` is the canonical cache/object-store pipeline owner for the mount
 runtime. It is intentionally focused on:
 
-- local backend access for cache hits, range/full-payload rereads, and persisted
-  payload lifecycle
+- writer-page ownership, slice/block staging, cache hits, range/full-payload
+  rereads, and payload lifecycle
 - pending-upload pinning near upload boundaries
 - runtime pending-upload queue bookkeeping
 - upload helpers used by the background uploader
@@ -82,17 +78,15 @@ runtime. It is intentionally focused on:
 `BenchmarkCache` is separate and only backs `studiofs test-cache`; it is not
 part of the production mount runtime.
 
-Durable local payload state still lives in the local backend plus metadata;
-`CachedStore` orchestrates that runtime instead of becoming a second source of
-truth.
+Durable local payload state lives in the cached store plus local metadata; the
+mount must not create a second foreground payload pipeline.
 
 ## Operational Notes
 
-- Runtime local payload durability and lifecycle state come from backend
-  persistence + index state surfaced through `CachedStore`.
-- Upload intent is seeded directly from local durable commit and from startup
-  replay of durable local payloads.
+- Runtime local payload durability and lifecycle state come from cached-store
+  staging, backend persistence, and index state.
+- Upload intent is seeded from staged payloads and startup replay.
 - Upload workers read committed payloads through `CachedStore` local payload
   sources: hot upload buffer, upload helpers, or local backend fallback.
-- `studiofs status` reports local cache layout/index/payload health without
-  depending on retired storage formats or terminology.
+- `studiofs status` reports local cache layout/index/payload health and the
+  dirty/staged/upload counters needed for JuiceFS comparison.

@@ -181,23 +181,41 @@ const AGGRESSIVE_MATERIALIZATION_INTERVAL: Duration = Duration::from_millis(25);
 const LOCAL_DIRTY_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
 const DEFERRED_MATERIALIZATION_LINGER_WAIT_MS: u64 = 5;
 const DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES: usize = 6;
+#[cfg(test)]
 const SOFT_DIRTY_PACING_START_NUMERATOR: usize = 9;
+#[cfg(test)]
 const SOFT_DIRTY_PACING_START_DENOMINATOR: usize = 20;
+#[cfg(test)]
 const SOFT_DIRTY_PACING_HIGH_NUMERATOR: usize = 3;
+#[cfg(test)]
 const SOFT_DIRTY_PACING_HIGH_DENOMINATOR: usize = 5;
+#[cfg(test)]
 const SOFT_DIRTY_PACING_NEAR_LIMIT_NUMERATOR: usize = 3;
+#[cfg(test)]
 const SOFT_DIRTY_PACING_NEAR_LIMIT_DENOMINATOR: usize = 4;
+#[cfg(test)]
 const SOFT_DIRTY_PACING_CRITICAL_NUMERATOR: usize = 17;
+#[cfg(test)]
 const SOFT_DIRTY_PACING_CRITICAL_DENOMINATOR: usize = 20;
+#[cfg(test)]
 const SOFT_DIRTY_PACING_DELAY_LIGHT_MS: u64 = 1;
+#[cfg(test)]
 const SOFT_DIRTY_PACING_DELAY_MEDIUM_MS: u64 = 3;
+#[cfg(test)]
 const SOFT_DIRTY_PACING_DELAY_HEAVY_MS: u64 = 6;
+#[cfg(test)]
 const SOFT_DIRTY_PACING_DELAY_CRITICAL_MS: u64 = 10;
+#[cfg(test)]
 const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_LIGHT: usize = 256;
+#[cfg(test)]
 const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_HIGH: usize = 512;
+#[cfg(test)]
 const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_CRITICAL: usize = 1024;
+#[cfg(test)]
 const SOFT_DRAIN_LAG_PACING_DELAY_LIGHT_MS: u64 = 1;
+#[cfg(test)]
 const SOFT_DRAIN_LAG_PACING_DELAY_MEDIUM_MS: u64 = 3;
+#[cfg(test)]
 const SOFT_DRAIN_LAG_PACING_DELAY_HEAVY_MS: u64 = 6;
 const WRITE_BUFFER_POOL_MIN_BUFFERS: usize = 4;
 const WRITE_BUFFER_POOL_BUFFER_MULTIPLIER: usize = 2;
@@ -2143,6 +2161,7 @@ fn aggressive_materialization_threshold_bytes(max_dirty_bytes: usize) -> usize {
         .max(1)
 }
 
+#[cfg(test)]
 fn soft_dirty_budget_pacing_delay_ms(
     total_dirty_bytes: usize,
     max_dirty_bytes: usize,
@@ -2192,6 +2211,7 @@ fn soft_dirty_budget_pacing_delay_ms(
     (delay_ms > 0).then_some(delay_ms)
 }
 
+#[cfg(test)]
 fn soft_drain_lag_pacing_delay_ms(
     drain_lag_bytes: usize,
     steady_drain_quota_bytes: usize,
@@ -2211,6 +2231,7 @@ fn soft_drain_lag_pacing_delay_ms(
     })
 }
 
+#[cfg(test)]
 fn drain_lag_pacing_attribution_ms(
     waited_ms: u64,
     requested_delay_ms: u64,
@@ -6376,6 +6397,9 @@ impl StudioVfs {
 
         let landing_zone_stats = self.landing_zone.stats();
         let drain_lag_current_bytes = self.total_landed_write_drain_lag_bytes();
+        let landing_zone_syncs = landing_zone_stats
+            .data_syncs
+            .saturating_add(landing_zone_stats.manifest_syncs);
 
         VfsWritePathObservabilitySnapshot {
             publisher_pid: std::process::id(),
@@ -6630,7 +6654,29 @@ impl StudioVfs {
             landing_zone: VfsWritePathLandingZoneStats {
                 accepted_writes: landing_zone_stats.accepted_writes,
                 accepted_bytes: landing_zone_stats.accepted_bytes,
+                accepted_mib_per_sec: Self::per_second(landing_zone_stats.accepted_bytes, elapsed)
+                    / (1024.0 * 1024.0),
                 recoverable_segments: landing_zone_stats.recoverable_segments,
+                accept_total_ms: landing_zone_stats.accept_total_ns as f64 / 1_000_000.0,
+                accept_avg_ms: if landing_zone_stats.accepted_writes == 0 {
+                    0.0
+                } else {
+                    (landing_zone_stats.accept_total_ns as f64
+                        / landing_zone_stats.accepted_writes as f64)
+                        / 1_000_000.0
+                },
+                accept_max_ms: landing_zone_stats.accept_max_ns as f64 / 1_000_000.0,
+                data_syncs: landing_zone_stats.data_syncs,
+                manifest_syncs: landing_zone_stats.manifest_syncs,
+                manifest_rewrites: landing_zone_stats.manifest_rewrites,
+                sync_total_ms: landing_zone_stats.sync_total_ns as f64 / 1_000_000.0,
+                sync_avg_ms: if landing_zone_syncs == 0 {
+                    0.0
+                } else {
+                    (landing_zone_stats.sync_total_ns as f64 / landing_zone_syncs as f64)
+                        / 1_000_000.0
+                },
+                sync_max_ms: landing_zone_stats.sync_max_ns as f64 / 1_000_000.0,
             },
             drain_lag: VfsWritePathDrainLagStats {
                 current_bytes: drain_lag_current_bytes,

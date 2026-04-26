@@ -55,7 +55,7 @@ Path walks are centralized in VFS `NamespaceResolver`:
 
 `STUDIOFS_WINFSP_SECTOR_SIZE` and `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` are the primary WinFSP bridge throughput geometry controls for local payload I/O.
 StudioFS forces WinFSP `FlushAndPurgeOnCleanup` off so non-delete `cleanup`
-callbacks stay observational under the Local-First contract.
+callbacks stay observational under the mounted-IO contract.
 
 Windows mount-point handling:
 - StudioFS requests Mount Manager drive syntax (`\\.\X:`) internally for drive-letter mounts.
@@ -100,11 +100,15 @@ I/O buffer behavior on Windows callbacks:
 - `read_directory`: per-entry UTF-16 conversion reuses a single `Vec<u16>` buffer and only falls back to lossy replacement semantics for invalid UTF-8 names.
 
 WinFSP callback barrier semantics:
-- Explicit `flush(context=Some(..))` remains a mandatory dirty-inode foreground local-durability barrier.
+- Explicit `flush(context=Some(..))` freezes/finishes dirty writer slices for
+  the handle or inode through the cached-store pipeline.
 - `cleanup` with delete finalizes `unlink()` / `rmdir()` in the cleanup callback itself.
-- Non-delete `cleanup` is observational only; for real file handles it records that the callback happened, but any remaining dirty local state is deferred to a later explicit `flush` or the last-handle `close` / `release_fh()` path.
+- Non-delete `cleanup` is observational only; for real file handles it records that the callback happened, but any remaining writer state is deferred to a later explicit `flush` or the last-handle `close` / `release_fh()` path.
 - `fh == 0` contexts, such as directories, do not have a `release_fh()` fallback; they stay observational unless an explicit `flush` callback makes local state visible.
-- `close` is the release-path hook for WinFSP. Under the canonical Fast Local Authority contract it becomes a strict local crash-safe durability barrier when dirty unpublished state remains, matching explicit dirty-handle `flush`, but it must not force synchronous PG/S3 replication or upload completion. `fsync` remains the explicit caller-requested strict sync API even though it is no longer the only callback path that reaches local crash-safe durability. The legacy `cache_safety_mode=fast|durable` knob has been removed.
+- `close` is the release-path hook for WinFSP. It drains remaining local writer
+  state for the last handle, but it must not force synchronous PostgreSQL
+  replication, object upload completion, or peer publication. `fsync` remains
+  the explicit caller-requested strict sync API.
 - `overwrite` and EOF-changing `set_file_size` commit the new local EOF before the callback returns; they are not backgroundable flush barriers.
 
 **Attribute mapping:**
@@ -201,8 +205,7 @@ StudioFS drops these names at the VFS layer:
   kept local-only
 - any nested activity underneath an ignored metadata directory is blackholed
 - no inode, xattr, cache, or object-store state is persisted for these names
-- these root metadata directories are filtered from `readdir`, even if a legacy
-  metadata entry already exists
+- these root metadata directories are filtered from `readdir`
 
 StudioFS also enforces a size limit on xattr values to avoid unbounded metadata
 in-memory pressure from very large native `com.apple.*` writes:

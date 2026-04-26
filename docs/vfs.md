@@ -1,21 +1,22 @@
 # VFS Layer
 
-This page is the current implementation snapshot for `studiofs-vfs`. It is not
-the canonical SFS-242 rewrite contract. The rewrite source of truth lives in
+This page describes the `studiofs-vfs` responsibilities under the canonical
+mounted-IO contract in
 [juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
 
 The VFS (`studiofs-vfs`) is the platform-agnostic core of StudioFS. It
-orchestrates metadata operations, local cache access, background tasks, and the
-Local-First visibility rules consumed by the FUSE and WinFSP bridges.
+orchestrates metadata operations, the JuiceFS-equivalent cached-store data
+plane, background tasks, and the local-first visibility rules consumed by the
+FUSE and WinFSP bridges.
 
 Active invariants:
-- `write()` makes bytes visible immediately through writer state.
-- `flush()` / ordinary `close()` / last-handle release materialize accepted
-  bytes into the local authority view without waiting for remote upload or
-  replication.
-- `fsync()` is the explicit strict request for a crash-safe local sync
-  boundary.
+- `write()` copies bytes into file/chunk/slice writer state and returns after
+  local acceptance.
 - Same-mount reads observe accepted writes immediately through writer state.
+- Frozen slices finish through `CachedStore` staging and local slice metadata
+  commit.
+- `flush()` / `fsync()` / ordinary `close()` / last-handle release force only
+  the required local slice/cache boundary.
 - Remote visibility is file-version atomic and advances only after background
   upload plus replication/apply succeed.
 
@@ -25,12 +26,12 @@ Active invariants:
 |-------|------|---------|
 | `meta` | `MetaExecutor<dyn VfsMeta>` | Typed metadata executor used by `run_meta(...)` |
 | `data_write` | `Arc<DataStore>` | S3 write/delete path |
-| `local_payload_backend` | `Arc<dyn LocalPayloadBackend>` | Current local cache backend for committed payloads and upload rereads |
-| `cached_store` | `Arc<CachedStore>` | Local-durable payload runtime, pending-upload queue, upload helpers, and pinning |
+| `local_payload_backend` | `Arc<dyn LocalPayloadBackend>` | Local cache backend used by the cached-store pipeline |
+| `cached_store` | `Arc<CachedStore>` | Writer-page, staging, read-cache, pending-upload, upload-helper, and pinning owner |
 | `fetch_scheduler` | `Arc<FetchScheduler>` | Adaptive S3 fetcher |
 | `readahead` | `Arc<ReadAheadTracker>` | Sequential prefetch |
 | `dir_prefetch` | `Arc<DirAccessTracker>` | Directory-level prefetch |
-| `state` | `Arc<VfsState>` | Local dirty state, namespace caches, file sessions, and backpressure |
+| `state` | `Arc<VfsState>` | Writer/cache pressure, namespace caches, file sessions, locks, and metrics |
 
 `local_payload_backend()` remains the accessor used by helper modules that need
 the backend boundary without reaching through backend-specific internals.
@@ -63,9 +64,9 @@ inode toward root; no match defaults to `rw`.
 | `cache_dir` | — | Root for the local cache backend and runtime state |
 | `cache_size` | 100 GiB | Local cache size budget |
 | `block_size` | 16 MiB | Chunk size (cloud transfer currently uses 4x4 MiB fragments) |
-| `max_concurrent_uploads` | 4 | Transitional static upload knob |
+| `max_concurrent_uploads` | 4 | Upload worker concurrency |
 | `readahead_width` | 18 | Base prefetch depth |
-| `max_dirty_bytes` | 1200 MiB | Local dirty-state memory limit before backpressure |
+| `max_dirty_bytes` | 1200 MiB | Writer/cache dirty-byte limit before backpressure |
 | `upload_stats_interval_secs` | 1 | Upload control-loop tick interval |
 | `upload_fg_read_latency_target_ms` | 35 | Foreground-read P90 target for upload throttling |
 | `upload_fg_read_latency_window_ms` | 1500 | Foreground-read speedometer sliding window |
@@ -84,24 +85,20 @@ Local data-path QoS:
 ```text
 data arrives
   │
-  ├─ Split into chunk-aligned ranges
-  ├─ Store/merge in handle-owned writer state
-  ├─ Update local inode size and pending content epoch
-  └─ If enough full aligned chunks accumulate, VFS may eagerly persist the
-    coalesced batch through local backend -> sync_data() -> metadata
+  ├─ Split by chunk boundary
+  ├─ Append/copy into writable slice pages
+  ├─ Update writer-visible length and dirty slice state
+  └─ Return after local acceptance unless dirty-byte backpressure must slow the writer
 ```
 
 Handle-aware write path:
 - `write_fh(fh, ino, offset, data)` buffers data identically to `write()`.
-- `flush_fh()` runs the foreground local materialization step for the inode and
-  then surfaces any sticky async-upload error for that inode.
-- The canonical mount contract is single-mode Fast Local Authority: ordinary
-  `flush()` and last-handle `close()` / `release()` become strict local
-  crash-safe durability barriers whenever dirty unpublished state remains.
-  `fsync()` remains the explicit caller-requested strict local-durability API,
-  but it is no longer the only callback path that reaches that boundary. The
-  legacy `cache_safety_mode=fast|durable` knob has been removed.
-- Foreground backpressure is driven by local dirty-state pressure; upload
+- `flush_fh()` freezes/finishes dirty slices needed for that handle or inode and
+  surfaces local errors.
+- `fsync()` is the explicit caller-requested crash-safe local boundary.
+- Ordinary writeback does not wait for object upload, PostgreSQL replication, or
+  peer publication.
+- Foreground backpressure is driven by writer/cache dirty-byte pressure; upload
   backlog alone does not stall writes.
 
 ### 2. `flush(ino)` / `fsync(ino)` / `close(ino)`
@@ -109,37 +106,34 @@ Handle-aware write path:
 ```text
 dirty local state for this inode
   │
-  ├─ Take a point-in-time snapshot of accepted bytes
-  ├─ Reserve/reuse per-payload object IDs
-  ├─ local backend `put(...)` committed payloads locally
-  ├─ local backend `sync_data()` for explicit `flush()`, `fsync()`, or last-handle `close()` / `release()` when dirty unpublished state remains
-  ├─ Persist local unpublished slices + attrs in metadata
-  └─ Enqueue uploads for the committed payloads
+  ├─ Freeze dirty slice writers
+  ├─ Finish slices through cached-store staging
+  ├─ Commit local slice metadata + attrs
+  ├─ Sync local cache/metadata when the operation requires crash-safety
+  └─ Leave upload/publication in the background
 ```
 
 Local durability notes:
-- Accepted bytes stay in local dirty state until the local backend ->
-  metadata sequence succeeds.
-- `fsync()` is the explicit API that requests the strict local `sync_data()`
-  boundary directly, but explicit `flush()` and last-handle
-  `close()` / `release()` also reach that boundary when dirty unpublished
-  state still exists.
-- Reserved object IDs make retrying the same dirty object IDempotent across
-  metadata failures.
-- Historical `ingress_spill` directories are outside the active Local-First
-  contract and are deleted during startup cleanup.
+- Accepted bytes may live only in writer pages until a local boundary freezes
+  and finishes the relevant slices.
+- `fsync()` requests the strict local sync boundary directly.
+- Explicit `flush()` and last-handle `close()` / `release()` also drain the
+  writer state they own, without pulling remote publication into the foreground.
+- Reserved object IDs make retrying the same slice/object commit idempotent
+  across metadata failures.
 
 ## Read Resolution
 
 Foreground reads resolve data in this order:
 
 1. active writer state for the current mount/handle
-2. durable local unpublished state
-3. published state
-4. zero-fill for holes
+2. local slice metadata in `redb`
+3. cached-store local payload/cache
+4. object-store cold fetch for known published payload objects
+5. zero-fill for holes
 
-The chosen slice view then sources payload bytes from the local backend first
-and object storage only when needed.
+The chosen slice view sources payload bytes from the cached store first and
+object storage only when needed.
 
 Per-handle access tracking feeds prefetch and cache-promotion decisions so a
 random reader on one handle does not suppress sequential behavior on another
@@ -154,15 +148,15 @@ handle for the same inode.
 - Background stages (`local persist`, `upload`, `finalize`) publish explicit
   per-inode transition events through the same file-session state.
 
-## Background Upload Worker
+## Cached-Store Upload Worker
 
 The upload worker consumes from the cached-store pending-upload queue:
 
 ```text
-persisted payload queued
+finished staged payload queued
   │
   ├─ Acquire local-data I/O permits only for the local payload-read phase
-  ├─ Read payload from hot upload buffer, upload hardlink, or local backend fallback
+  ├─ Read payload from writer/stage cache, upload helper, or local backend fallback
   ├─ Split each chunk into cloud fragments
   ├─ Upload payload objects to S3
   ├─ Mark payloads uploaded only after remote success
@@ -170,8 +164,7 @@ persisted payload queued
 ```
 
 Upload is the payload data plane only. Publication of a new file version is a
-separate control-plane step gated by durable metadata lifecycle
-(`PublishReady`).
+separate control-plane step gated by verified payload readiness.
 
 ## Background Epoch Finalizer
 
@@ -187,8 +180,9 @@ queued (ino, content_epoch)
 ```
 
 Why this split exists:
-- `flush()` / `close()` stay focused on local durability
-- buffered foreground I/O does not synchronously publish whole file versions
+- `flush()` / `fsync()` / `close()` stay focused on local cache and metadata
+  boundaries
+- foreground writeback does not synchronously publish whole file versions
 - publication stays conditional on verified metadata/object alignment
 
 ## Deleted-Inode Cancellation Behavior

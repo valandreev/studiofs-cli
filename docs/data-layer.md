@@ -2,9 +2,8 @@
 
 `studiofs-data` handles object I/O against S3-compatible storage and object encoding/decoding.
 
-This document follows the frozen chunk/slice/payload-object vocabulary. Historical
-helper APIs still use the older `chunks/...` compatibility keys for tests, but
-the active data-path descriptions below use the final model.
+This document follows the canonical chunk/slice/payload-object vocabulary from
+[juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
 
 ## Responsibilities
 
@@ -35,8 +34,8 @@ Remote storage uses a 4x4 hybrid scheme:
 - Each fragment stores an independent STFS object payload (typically up to 4 MiB raw payload + 30-byte header).
 - Fragment writes/retries are independent, so network failures only retry the affected piece.
 
-In the active Local-First runtime, `CachedStore` owns local cache hits,
-local-durable payload handling, upload rereads, and runtime queueing. `DataStore` is the
+In the active mounted runtime, `CachedStore` owns local cache hits, local
+payload staging, upload rereads, and runtime queueing. `DataStore` is the
 remote object-store edge that `CachedStore`/VFS call for object download,
 range reads, and eventual upload.
 
@@ -78,11 +77,12 @@ On read, object decode accepts `opendal::Buffer` directly, parses the fixed head
 
 | Flag | Value | Description |
 |---|---|---|
-| `LEGACY_LZ4_COMPRESSED` | `0x0001` | Object uses LZ4 compression. Rejected by current build. |
+| `LEGACY_LZ4_COMPRESSED` | `0x0001` | Object uses LZ4 compression. Rejected by this build. |
 | `HAS_FOOTER` | `0x0002` | Object contains footer checksums (future use). |
 | `ENCRYPTED` | `0x0004` | Object is encrypted (future use). |
 
-The current build enforces that new objects are raw (uncompressed) payload objects to minimize CPU overhead. Legacy LZ4 compressed objects will return a `LegacyCompressionUnsupported` error if read.
+This build writes raw (uncompressed) payload objects to minimize CPU overhead.
+LZ4-compressed objects return `LegacyCompressionUnsupported` if read.
 
 ## Storage I/O Profiles
 
@@ -96,5 +96,5 @@ To prevent background S3 uploads from overwhelming the connection pool and starv
 
 ## Note on Metadata
 
-Metadata is not stored in S3 manifests anymore.
-Current metadata authority is PostgreSQL (`studiofs-meta` / `PgMetaEngine`).
+Metadata is not stored in S3 manifests. PostgreSQL (`studiofs-meta` /
+`PgMetaEngine`) carries shared metadata replication.
