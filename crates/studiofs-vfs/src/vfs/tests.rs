@@ -3024,6 +3024,77 @@ fn opportunistic_write_fh_lands_before_deferred_materialization() {
 }
 
 #[test]
+fn fsync_retires_landed_write_records_at_strict_local_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-285-landing-fsync");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-285-landing-fsync.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let payload = b"landed-fsync-boundary";
+
+        vfs.write_fh_with_deferred_materialize(fh, ino, 0, payload, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        assert_eq!(
+            vfs.recover_landing_zone_segments().unwrap().len(),
+            1,
+            "opportunistic write should create a recoverable landed record before fsync"
+        );
+
+        let outcome = vfs.fsync_with_outcome(ino, false).await.unwrap();
+        assert!(
+            outcome.flushed_file_data,
+            "fsync should report that it crossed the strict local data boundary for landed dirty state"
+        );
+        assert!(
+            vfs.recover_landing_zone_segments().unwrap().is_empty(),
+            "fsync strict local boundary should retire landed records for this inode"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn last_handle_release_retires_landed_write_records_at_strict_local_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-285-landing-release");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-285-landing-release.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let payload = b"landed-release-boundary";
+
+        vfs.write_fh_with_deferred_materialize(fh, ino, 0, payload, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        assert_eq!(
+            vfs.recover_landing_zone_segments().unwrap().len(),
+            1,
+            "opportunistic write should create a recoverable landed record before last close"
+        );
+
+        let outcome = vfs.release_fh_with_outcome(fh).await.unwrap();
+        assert!(outcome.closed_last_handle);
+        assert!(
+            outcome.flushed_local_dirty_state,
+            "last-handle release should own the strict local boundary for landed dirty state"
+        );
+        assert!(
+            vfs.recover_landing_zone_segments().unwrap().is_empty(),
+            "last-handle strict local boundary should retire landed records for this inode"
+        );
+    });
+}
+
+#[test]
 fn startup_replays_landed_write_after_restart() {
     let tmp = tempfile::tempdir().unwrap();
     let volume_suffix = "sfs-284-landing-restart";

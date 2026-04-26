@@ -2458,6 +2458,162 @@ mod tests {
     }
 
     #[test]
+    fn landed_write_cleanup_stays_observational_until_explicit_flush() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("sfs-285-landing-cleanup-flush");
+        let attr = vfs
+            .create(ROOT_INO, b"sfs-285-landing-cleanup-flush.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+        let handle = StudioFileHandle::new(attr.ino, false, fh, OpenFlags::RDWR);
+        let mut file_info = winfsp::filesystem::FileInfo::default();
+        let callbacks_before = winfsp_callbacks(&vfs);
+        let barriers_before = winfsp_foreground_flushes(&vfs);
+
+        <StudioFsContext as FileSystemContext>::write(
+            &ctx,
+            &handle,
+            b"landed-cleanup-flush",
+            0,
+            false,
+            false,
+            &mut file_info,
+        )
+        .expect("write callback");
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .landing_zone
+                .recoverable_segments,
+            1,
+            "WinFSP opportunistic write should land a recoverable record before callback barriers"
+        );
+
+        ctx.run_cleanup_non_delete_callback(attr.ino, fh)
+            .expect("cleanup callback");
+        let after_cleanup_callbacks = winfsp_callbacks(&vfs);
+        let after_cleanup_barriers = winfsp_foreground_flushes(&vfs);
+        assert_eq!(
+            after_cleanup_callbacks.cleanup,
+            callbacks_before.cleanup + 1,
+            "non-delete cleanup should still be observable for landed writes"
+        );
+        assert_eq!(
+            after_cleanup_barriers.cleanup, barriers_before.cleanup,
+            "non-delete cleanup must not reclaim foreground barrier ownership for landed writes"
+        );
+        assert_eq!(
+            after_cleanup_barriers.cleanup_skipped_clean, barriers_before.cleanup_skipped_clean,
+            "non-delete cleanup should not be attributed as a clean-skip barrier"
+        );
+        assert!(
+            ctx.has_deferred_cleanup_hint(attr.ino),
+            "cleanup should defer landed dirty state to explicit flush or last close"
+        );
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .landing_zone
+                .recoverable_segments,
+            1,
+            "observational cleanup should not retire landed records"
+        );
+
+        ctx.run_flush_callback(attr.ino, fh)
+            .expect("explicit flush callback");
+        let after_flush_barriers = winfsp_foreground_flushes(&vfs);
+        assert_eq!(
+            after_flush_barriers.flush,
+            barriers_before.flush + 1,
+            "explicit flush should own the strict local boundary for landed dirty state"
+        );
+        assert!(
+            !ctx.has_deferred_cleanup_hint(attr.ino),
+            "explicit flush should clear the deferred cleanup hint"
+        );
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .landing_zone
+                .recoverable_segments,
+            0,
+            "explicit flush should retire landed records"
+        );
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh).await }
+        })
+        .expect("release_fh");
+    }
+
+    #[test]
+    fn landed_write_last_handle_close_owns_fallback_barrier_after_cleanup() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("sfs-285-landing-cleanup-close");
+        let attr = vfs
+            .create(ROOT_INO, b"sfs-285-landing-cleanup-close.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+        let handle = StudioFileHandle::new(attr.ino, false, fh, OpenFlags::RDWR);
+        let mut file_info = winfsp::filesystem::FileInfo::default();
+        let barriers_before = winfsp_foreground_flushes(&vfs);
+        let flush_calls_before = flush_barrier_calls(&vfs);
+
+        <StudioFsContext as FileSystemContext>::write(
+            &ctx,
+            &handle,
+            b"landed-cleanup-close",
+            0,
+            false,
+            false,
+            &mut file_info,
+        )
+        .expect("write callback");
+        ctx.run_cleanup_non_delete_callback(attr.ino, fh)
+            .expect("cleanup callback");
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .landing_zone
+                .recoverable_segments,
+            1,
+            "observational cleanup should leave landed records for close to retire"
+        );
+
+        ctx.run_close_callback(attr.ino, fh);
+        let after_close_barriers = winfsp_foreground_flushes(&vfs);
+        assert_eq!(
+            after_close_barriers.cleanup, barriers_before.cleanup,
+            "cleanup should remain observational before landed-write close fallback"
+        );
+        assert_eq!(
+            after_close_barriers.close,
+            barriers_before.close + 1,
+            "last-handle close should own the strict local boundary for landed dirty state"
+        );
+        assert_eq!(
+            after_close_barriers.close_skipped_clean, barriers_before.close_skipped_clean,
+            "dirty landed-write close should not be classified as a clean skip"
+        );
+        assert_eq!(
+            flush_barrier_calls(&vfs),
+            flush_calls_before + 1,
+            "last-handle close should commit landed dirty state through the strict local barrier"
+        );
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .landing_zone
+                .recoverable_segments,
+            0,
+            "last-handle close should retire landed records"
+        );
+        assert_eq!(
+            vfs.open_count(attr.ino),
+            0,
+            "close should release the handle"
+        );
+    }
+
+    #[test]
     fn write_create_options_select_expected_local_sync_policy_by_create_options() {
         assert_eq!(
             write_local_sync_policy_from_create_options(0),
