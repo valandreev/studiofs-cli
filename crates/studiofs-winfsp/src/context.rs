@@ -2571,6 +2571,13 @@ mod tests {
         .expect("write callback");
         ctx.run_cleanup_non_delete_callback(attr.ino, fh)
             .expect("cleanup callback");
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .landing_zone
+                .recoverable_segments,
+            1,
+            "observational cleanup should leave landed records for close to retire"
+        );
 
         ctx.run_close_callback(attr.ino, fh);
         let after_close_barriers = winfsp_foreground_flushes(&vfs);
