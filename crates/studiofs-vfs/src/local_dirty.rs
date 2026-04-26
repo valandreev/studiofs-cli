@@ -2058,16 +2058,14 @@ impl StudioVfs {
             )
         });
 
-        let mut retain_tail_bytes =
-            if oldest_age.is_some_and(|age| age >= PENDING_SLICE_COMMIT_MAX_AGE) {
-                0
-            } else {
-                self.pending_slice_commit_hot_tail_bytes()
-            };
+        let now = Instant::now();
+        let mut retain_tail_bytes = self.pending_slice_commit_hot_tail_bytes();
         let mut commit_candidates = Vec::<(u64, PendingDirtySlice)>::new();
         for (chunk_id, slice) in ordered_slices.iter().rev().copied() {
             let slice_len = slice.len();
-            if retain_tail_bytes == 0 {
+            let protect_fresh_tail =
+                retain_tail_bytes > 0 && slice.age(now) < PENDING_SLICE_COMMIT_MAX_AGE;
+            if !protect_fresh_tail {
                 commit_candidates.push((chunk_id, slice));
                 continue;
             }

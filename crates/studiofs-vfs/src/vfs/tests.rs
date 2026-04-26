@@ -3654,6 +3654,71 @@ fn background_flush_commits_persisted_slices_at_steady_quota() {
 }
 
 #[test]
+fn aged_slice_catchup_keeps_fresh_staged_tail_protected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-286-aged-fresh-tail");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-286-aged-fresh-tail.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let slice_bytes = 2 * 1024 * 1024usize;
+
+        let active_tail = vec![0x60u8; slice_bytes];
+        vfs.record_handle_writer_state(fh, ino, 4 * 1024 * 1024, &active_tail)
+            .await
+            .unwrap();
+        vfs.install_persisted_pending_local_dirty_slice(
+            ino,
+            local_dirty::PersistedPendingLocalDirtySliceSpec {
+                block_index: 0,
+                file_offset: 0,
+                len: slice_bytes,
+                seq: 900,
+                object_id: 900,
+                initial_object_offset: 0,
+            },
+        );
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            slice_bytes
+        );
+
+        tokio::time::sleep(Duration::from_millis(125)).await;
+
+        vfs.install_persisted_pending_local_dirty_slice(
+            ino,
+            local_dirty::PersistedPendingLocalDirtySliceSpec {
+                block_index: 0,
+                file_offset: slice_bytes as u64,
+                len: slice_bytes,
+                seq: 901,
+                object_id: 901,
+                initial_object_offset: 0,
+            },
+        );
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            2 * slice_bytes
+        );
+
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            slice_bytes,
+            "aged catch-up should commit old staged slices without draining the fresh staged tail"
+        );
+
+        vfs.flush_fh(fh).await.unwrap();
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn soft_pacing_reacts_to_handle_writer_drain_lag_before_dirty_budget_limit() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-286-lag-soft-pacing");
