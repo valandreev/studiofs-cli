@@ -3007,6 +3007,18 @@ fn opportunistic_write_fh_lands_before_deferred_materialization() {
         let snapshot = vfs.write_path_observability_snapshot();
         assert_eq!(snapshot.landing_zone.accepted_writes, 1);
         assert_eq!(snapshot.landing_zone.accepted_bytes, payload.len() as u64);
+        assert_eq!(
+            snapshot.landing_zone.data_syncs, 0,
+            "opportunistic writeback accept must not issue a foreground landing data sync"
+        );
+        assert_eq!(
+            snapshot.landing_zone.manifest_syncs, 0,
+            "opportunistic writeback accept must not issue a foreground landing manifest sync"
+        );
+        assert!(
+            snapshot.landing_zone.accept_avg_ms >= 0.0,
+            "landing accept latency should be exported for AJA evidence"
+        );
 
         let recovered = vfs.recover_landing_zone_segments().unwrap();
         assert_eq!(recovered.len(), 1);
@@ -3019,6 +3031,16 @@ fn opportunistic_write_fh_lands_before_deferred_materialization() {
             vfs.recover_landing_zone_segments().unwrap().is_empty(),
             "strict local drain should retire landed records for this inode"
         );
+        let drained_snapshot = vfs.write_path_observability_snapshot();
+        assert!(
+            drained_snapshot.landing_zone.data_syncs > 0,
+            "strict local boundary should group landing data sync with landed-record retirement"
+        );
+        assert!(
+            drained_snapshot.landing_zone.manifest_syncs > 0,
+            "strict local boundary should group landing manifest sync with landed-record retirement"
+        );
+        assert_eq!(drained_snapshot.landing_zone.manifest_rewrites, 1);
         vfs.release_fh(fh).await.unwrap();
     });
 }

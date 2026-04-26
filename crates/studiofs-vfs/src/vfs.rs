@@ -6376,6 +6376,9 @@ impl StudioVfs {
 
         let landing_zone_stats = self.landing_zone.stats();
         let drain_lag_current_bytes = self.total_landed_write_drain_lag_bytes();
+        let landing_zone_syncs = landing_zone_stats
+            .data_syncs
+            .saturating_add(landing_zone_stats.manifest_syncs);
 
         VfsWritePathObservabilitySnapshot {
             publisher_pid: std::process::id(),
@@ -6630,7 +6633,29 @@ impl StudioVfs {
             landing_zone: VfsWritePathLandingZoneStats {
                 accepted_writes: landing_zone_stats.accepted_writes,
                 accepted_bytes: landing_zone_stats.accepted_bytes,
+                accepted_mib_per_sec: Self::per_second(landing_zone_stats.accepted_bytes, elapsed)
+                    / (1024.0 * 1024.0),
                 recoverable_segments: landing_zone_stats.recoverable_segments,
+                accept_total_ms: landing_zone_stats.accept_total_ns as f64 / 1_000_000.0,
+                accept_avg_ms: if landing_zone_stats.accepted_writes == 0 {
+                    0.0
+                } else {
+                    (landing_zone_stats.accept_total_ns as f64
+                        / landing_zone_stats.accepted_writes as f64)
+                        / 1_000_000.0
+                },
+                accept_max_ms: landing_zone_stats.accept_max_ns as f64 / 1_000_000.0,
+                data_syncs: landing_zone_stats.data_syncs,
+                manifest_syncs: landing_zone_stats.manifest_syncs,
+                manifest_rewrites: landing_zone_stats.manifest_rewrites,
+                sync_total_ms: landing_zone_stats.sync_total_ns as f64 / 1_000_000.0,
+                sync_avg_ms: if landing_zone_syncs == 0 {
+                    0.0
+                } else {
+                    (landing_zone_stats.sync_total_ns as f64 / landing_zone_syncs as f64)
+                        / 1_000_000.0
+                },
+                sync_max_ms: landing_zone_stats.sync_max_ns as f64 / 1_000_000.0,
             },
             drain_lag: VfsWritePathDrainLagStats {
                 current_bytes: drain_lag_current_bytes,

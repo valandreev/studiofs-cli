@@ -16,6 +16,7 @@ use tokio::sync::watch;
 
 use super::TestCacheParams;
 use super::profiling::{cpu_utilization_percent, process_cpu_time};
+use super::progress::{ProgressBar, ProgressCounter};
 use super::result::{
     BenchmarkProfileReport, BenchmarkReport, CpuProfileReport,
     MountedLocalFirstReadComparisonReport, MountedLocalFirstReadPhaseReport, MountedMemoryReport,
@@ -344,6 +345,8 @@ async fn run_mounted_write_phase(
     order: &[usize],
     size_class_bounds: SizeClassBounds,
 ) -> Result<(PhaseTelemetry, Vec<PhaseTelemetry>)> {
+    let progress = ProgressBar::start("StudioFS test write", order.len());
+    let counter = progress.counter();
     if params.sequential_streams {
         let writes_by_stream = run_filesystem_writes_sequential_streams(
             files,
@@ -351,25 +354,28 @@ async fn run_mounted_write_phase(
             params.concurrency,
             params.io_depth,
             size_class_bounds,
+            counter,
         )
-        .await?;
+        .await;
+        progress.finish();
+        let writes_by_stream = writes_by_stream?;
         let mut merged = PhaseTelemetry::default();
         for stream in &writes_by_stream {
             merged.merge_from_ref(stream);
         }
         Ok((merged, writes_by_stream))
     } else {
-        Ok((
-            run_filesystem_writes(
-                files,
-                order,
-                params.io_depth,
-                params.concurrency,
-                size_class_bounds,
-            )
-            .await?,
-            Vec::new(),
-        ))
+        let writes = run_filesystem_writes(
+            files,
+            order,
+            params.io_depth,
+            params.concurrency,
+            size_class_bounds,
+            counter,
+        )
+        .await;
+        progress.finish();
+        Ok((writes?, Vec::new()))
     }
 }
 
@@ -379,6 +385,8 @@ async fn run_mounted_read_phase(
     order: &[usize],
     size_class_bounds: SizeClassBounds,
 ) -> Result<(PhaseTelemetry, Vec<PhaseTelemetry>)> {
+    let progress = ProgressBar::start("StudioFS test read", order.len());
+    let counter = progress.counter();
     if params.sequential_streams {
         let reads_by_stream = run_filesystem_reads_sequential_streams(
             files,
@@ -387,26 +395,29 @@ async fn run_mounted_read_phase(
             params.io_depth,
             params.read_size,
             size_class_bounds,
+            counter,
         )
-        .await?;
+        .await;
+        progress.finish();
+        let reads_by_stream = reads_by_stream?;
         let mut merged = PhaseTelemetry::default();
         for stream in &reads_by_stream {
             merged.merge_from_ref(stream);
         }
         Ok((merged, reads_by_stream))
     } else {
-        Ok((
-            run_filesystem_reads(
-                files,
-                order,
-                params.io_depth,
-                params.concurrency,
-                params.read_size,
-                size_class_bounds,
-            )
-            .await?,
-            Vec::new(),
-        ))
+        let reads = run_filesystem_reads(
+            files,
+            order,
+            params.io_depth,
+            params.concurrency,
+            params.read_size,
+            size_class_bounds,
+            counter,
+        )
+        .await;
+        progress.finish();
+        Ok((reads?, Vec::new()))
     }
 }
 
@@ -416,6 +427,7 @@ async fn run_filesystem_writes(
     io_depth: usize,
     concurrency: usize,
     size_class_bounds: SizeClassBounds,
+    progress: ProgressCounter,
 ) -> Result<PhaseTelemetry> {
     let queue_depth = io_depth.max(1);
     let worker_count = concurrency.max(queue_depth);
@@ -432,6 +444,7 @@ async fn run_filesystem_writes(
         let stats = Arc::clone(&stats);
         let counter = Arc::clone(&counter);
         let sem = Arc::clone(&sem);
+        let progress = progress.clone();
 
         handles.push(tokio::spawn(async move {
             loop {
@@ -478,6 +491,7 @@ async fn run_filesystem_writes(
                     bytes: item.size,
                     elapsed,
                 });
+                progress.inc();
             }
         }));
     }
@@ -502,6 +516,7 @@ async fn run_filesystem_reads(
     concurrency: usize,
     read_size: u64,
     size_class_bounds: SizeClassBounds,
+    progress: ProgressCounter,
 ) -> Result<PhaseTelemetry> {
     let queue_depth = io_depth.max(1);
     let worker_count = concurrency.max(queue_depth);
@@ -518,6 +533,7 @@ async fn run_filesystem_reads(
         let stats = Arc::clone(&stats);
         let counter = Arc::clone(&counter);
         let sem = Arc::clone(&sem);
+        let progress = progress.clone();
 
         handles.push(tokio::spawn(async move {
             loop {
@@ -562,6 +578,7 @@ async fn run_filesystem_reads(
                     bytes: read_len as u64,
                     elapsed,
                 });
+                progress.inc();
             }
         }));
     }
@@ -585,6 +602,7 @@ async fn run_filesystem_writes_sequential_streams(
     stream_count: usize,
     io_depth: usize,
     size_class_bounds: SizeClassBounds,
+    progress: ProgressCounter,
 ) -> Result<Vec<PhaseTelemetry>> {
     let segments = split_stream_segments(order, stream_count);
     let sem = Arc::new(Semaphore::new(io_depth.max(1)));
@@ -595,6 +613,7 @@ async fn run_filesystem_writes_sequential_streams(
     for (stream_id, segment) in segments.into_iter().enumerate() {
         let sem = Arc::clone(&sem);
         let files = Arc::clone(&files);
+        let progress = progress.clone();
         handles.push(tokio::spawn(async move {
             let mut telemetry = PhaseTelemetry::default();
             for work_index in segment {
@@ -631,6 +650,7 @@ async fn run_filesystem_writes_sequential_streams(
                     bytes: item.size,
                     elapsed,
                 });
+                progress.inc();
             }
             Ok::<_, anyhow::Error>((stream_id, telemetry))
         }));
@@ -654,6 +674,7 @@ async fn run_filesystem_reads_sequential_streams(
     io_depth: usize,
     read_size: u64,
     size_class_bounds: SizeClassBounds,
+    progress: ProgressCounter,
 ) -> Result<Vec<PhaseTelemetry>> {
     let segments = split_stream_segments(order, stream_count);
     let sem = Arc::new(Semaphore::new(io_depth.max(1)));
@@ -664,6 +685,7 @@ async fn run_filesystem_reads_sequential_streams(
     for (stream_id, segment) in segments.into_iter().enumerate() {
         let sem = Arc::clone(&sem);
         let files = Arc::clone(&files);
+        let progress = progress.clone();
         handles.push(tokio::spawn(async move {
             let mut telemetry = PhaseTelemetry::default();
             for work_index in segment {
@@ -697,6 +719,7 @@ async fn run_filesystem_reads_sequential_streams(
                     bytes: read_len as u64,
                     elapsed,
                 });
+                progress.inc();
             }
             Ok::<_, anyhow::Error>((stream_id, telemetry))
         }));

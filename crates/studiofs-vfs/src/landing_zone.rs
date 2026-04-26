@@ -1,14 +1,19 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 const DATA_FILE: &str = "landing.data";
 const MANIFEST_FILE: &str = "landing.manifest";
 const MANIFEST_TMP_FILE: &str = "landing.manifest.tmp";
 const MANIFEST_BACKUP_FILE: &str = "landing.manifest.bak";
+#[cfg(windows)]
+const LANDING_FILE_SHARE_MODE: u32 = 0x00000001 | 0x00000002 | 0x00000004;
 
 pub(super) struct LandingWrite<'a> {
     pub(super) ino: u64,
@@ -37,6 +42,13 @@ pub(super) struct LandingZoneStats {
     pub(super) accepted_writes: u64,
     pub(super) accepted_bytes: u64,
     pub(super) recoverable_segments: usize,
+    pub(super) accept_total_ns: u64,
+    pub(super) accept_max_ns: u64,
+    pub(super) data_syncs: u64,
+    pub(super) manifest_syncs: u64,
+    pub(super) manifest_rewrites: u64,
+    pub(super) sync_total_ns: u64,
+    pub(super) sync_max_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -98,16 +110,22 @@ fn parse_manifest_u64(value: Option<&str>, field: &str) -> io::Result<u64> {
 
 #[derive(Debug)]
 pub(super) struct LandingZone {
-    #[allow(dead_code)]
     data_path: PathBuf,
     manifest_path: PathBuf,
     manifest_tmp_path: PathBuf,
     manifest_backup_path: PathBuf,
-    data_lock: Mutex<()>,
-    manifest_lock: Mutex<()>,
+    data_file: Mutex<File>,
+    manifest_file: Mutex<Option<File>>,
     accepted_writes: AtomicU64,
     accepted_bytes: AtomicU64,
     recoverable_segments: AtomicUsize,
+    accept_total_ns: AtomicU64,
+    accept_max_ns: AtomicU64,
+    data_syncs: AtomicU64,
+    manifest_syncs: AtomicU64,
+    manifest_rewrites: AtomicU64,
+    sync_total_ns: AtomicU64,
+    sync_max_ns: AtomicU64,
 }
 
 impl LandingZone {
@@ -123,46 +141,41 @@ impl LandingZone {
             &manifest_tmp_path,
             &manifest_backup_path,
         )?;
-        OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&data_path)?;
-        OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&manifest_path)?;
+        let data_file = open_landing_append_file(&data_path)?;
+        let manifest_file = open_landing_append_file(&manifest_path)?;
         let recoverable_segments = Self::count_manifest_segments(&manifest_path)?;
         Ok(Self {
             data_path,
             manifest_path,
             manifest_tmp_path,
             manifest_backup_path,
-            data_lock: Mutex::new(()),
-            manifest_lock: Mutex::new(()),
+            data_file: Mutex::new(data_file),
+            manifest_file: Mutex::new(Some(manifest_file)),
             accepted_writes: AtomicU64::new(0),
             accepted_bytes: AtomicU64::new(0),
             recoverable_segments: AtomicUsize::new(recoverable_segments),
+            accept_total_ns: AtomicU64::new(0),
+            accept_max_ns: AtomicU64::new(0),
+            data_syncs: AtomicU64::new(0),
+            manifest_syncs: AtomicU64::new(0),
+            manifest_rewrites: AtomicU64::new(0),
+            sync_total_ns: AtomicU64::new(0),
+            sync_max_ns: AtomicU64::new(0),
         })
     }
 
     pub(super) fn accept(&self, write: LandingWrite<'_>) -> io::Result<RecoveredLandingSegment> {
-        let _data_guard = self
-            .data_lock
+        let accept_started = Instant::now();
+        let mut data = self
+            .data_file
             .lock()
             .map_err(|_| io::Error::other("landing data lock poisoned"))?;
-        let _manifest_guard = self
-            .manifest_lock
+        let mut manifest_guard = self
+            .manifest_file
             .lock()
             .map_err(|_| io::Error::other("landing manifest lock poisoned"))?;
-        let mut data = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&self.data_path)?;
         let data_offset = data.seek(SeekFrom::End(0))?;
         data.write_all(write.data)?;
-        data.sync_data()?;
 
         let len = u64::try_from(write.data.len()).map_err(|_| {
             io::Error::new(
@@ -177,16 +190,14 @@ impl LandingZone {
             len,
             data_offset,
         };
-        let mut manifest = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&self.manifest_path)?;
+        let manifest = Self::ensure_manifest_file(&self.manifest_path, &mut manifest_guard)?;
+        manifest.seek(SeekFrom::End(0))?;
         manifest.write_all(segment.as_manifest_record().as_bytes())?;
-        manifest.sync_data()?;
 
         self.accepted_writes.fetch_add(1, Ordering::Relaxed);
         self.accepted_bytes.fetch_add(len, Ordering::Relaxed);
         self.recoverable_segments.fetch_add(1, Ordering::Relaxed);
+        self.record_accept_latency(accept_started.elapsed());
         Ok(segment.into())
     }
 
@@ -198,14 +209,14 @@ impl LandingZone {
         let requested_end = offset.saturating_add(len as u64);
         let mut result = vec![0; len];
         let _data_guard = self
-            .data_lock
+            .data_file
             .lock()
             .map_err(|_| io::Error::other("landing data lock poisoned"))?;
         let _manifest_guard = self
-            .manifest_lock
+            .manifest_file
             .lock()
             .map_err(|_| io::Error::other("landing manifest lock poisoned"))?;
-        let mut data = File::open(&self.data_path)?;
+        let mut data = open_landing_read_file(&self.data_path)?;
         for segment in self.recover_segments_unlocked()? {
             if segment.ino != ino {
                 continue;
@@ -239,7 +250,7 @@ impl LandingZone {
     #[cfg(test)]
     pub(super) fn recover(&self) -> io::Result<Vec<RecoveredLandingSegment>> {
         let _manifest_guard = self
-            .manifest_lock
+            .manifest_file
             .lock()
             .map_err(|_| io::Error::other("landing manifest lock poisoned"))?;
         self.recover_segments_unlocked()
@@ -248,15 +259,15 @@ impl LandingZone {
 
     pub(super) fn recover_with_data(&self) -> io::Result<Vec<LandingRecoverySegment>> {
         let _data_guard = self
-            .data_lock
+            .data_file
             .lock()
             .map_err(|_| io::Error::other("landing data lock poisoned"))?;
         let _manifest_guard = self
-            .manifest_lock
+            .manifest_file
             .lock()
             .map_err(|_| io::Error::other("landing manifest lock poisoned"))?;
         let segments = self.recover_segments_unlocked()?;
-        let mut data = File::open(&self.data_path)?;
+        let mut data = open_landing_read_file(&self.data_path)?;
         segments
             .into_iter()
             .map(|segment| {
@@ -278,26 +289,44 @@ impl LandingZone {
     }
 
     pub(super) fn clear_inode(&self, ino: u64) -> io::Result<()> {
-        let _data_guard = self
-            .data_lock
+        let data = self
+            .data_file
             .lock()
             .map_err(|_| io::Error::other("landing data lock poisoned"))?;
-        let _manifest_guard = self
-            .manifest_lock
+        let mut manifest_guard = self
+            .manifest_file
             .lock()
             .map_err(|_| io::Error::other("landing manifest lock poisoned"))?;
-        let retained: Vec<_> = self
-            .recover_segments_unlocked()?
-            .into_iter()
+        let segments = self.recover_segments_unlocked()?;
+        let retained: Vec<_> = segments
+            .iter()
+            .copied()
             .filter(|segment| segment.ino != ino)
             .collect();
         let retained_count = retained.len();
-        self.rewrite_manifest_unlocked(&retained)?;
+        if retained_count == segments.len() {
+            self.recoverable_segments
+                .store(retained_count, Ordering::Relaxed);
+            return Ok(());
+        }
+        self.sync_landing_unlocked(&data, manifest_guard.as_ref())
+            .map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("landing sync before retire failed: {err}"),
+                )
+            })?;
+        self.rewrite_manifest_unlocked(&retained, &mut manifest_guard)
+            .map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("landing manifest rewrite failed: {err}"),
+                )
+            })?;
         if retained.is_empty() {
-            OpenOptions::new()
-                .write(true)
-                .open(&self.data_path)?
-                .set_len(0)?;
+            data.set_len(0).map_err(|err| {
+                io::Error::new(err.kind(), format!("landing data truncate failed: {err}"))
+            })?;
         }
         self.recoverable_segments
             .store(retained_count, Ordering::Relaxed);
@@ -308,26 +337,44 @@ impl LandingZone {
         if inos.is_empty() {
             return Ok(());
         }
-        let _data_guard = self
-            .data_lock
+        let data = self
+            .data_file
             .lock()
             .map_err(|_| io::Error::other("landing data lock poisoned"))?;
-        let _manifest_guard = self
-            .manifest_lock
+        let mut manifest_guard = self
+            .manifest_file
             .lock()
             .map_err(|_| io::Error::other("landing manifest lock poisoned"))?;
-        let retained: Vec<_> = self
-            .recover_segments_unlocked()?
-            .into_iter()
+        let segments = self.recover_segments_unlocked()?;
+        let retained: Vec<_> = segments
+            .iter()
+            .copied()
             .filter(|segment| !inos.contains(&segment.ino))
             .collect();
         let retained_count = retained.len();
-        self.rewrite_manifest_unlocked(&retained)?;
+        if retained_count == segments.len() {
+            self.recoverable_segments
+                .store(retained_count, Ordering::Relaxed);
+            return Ok(());
+        }
+        self.sync_landing_unlocked(&data, manifest_guard.as_ref())
+            .map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("landing sync before retire failed: {err}"),
+                )
+            })?;
+        self.rewrite_manifest_unlocked(&retained, &mut manifest_guard)
+            .map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("landing manifest rewrite failed: {err}"),
+                )
+            })?;
         if retained.is_empty() {
-            OpenOptions::new()
-                .write(true)
-                .open(&self.data_path)?
-                .set_len(0)?;
+            data.set_len(0).map_err(|err| {
+                io::Error::new(err.kind(), format!("landing data truncate failed: {err}"))
+            })?;
         }
         self.recoverable_segments
             .store(retained_count, Ordering::Relaxed);
@@ -339,11 +386,44 @@ impl LandingZone {
             accepted_writes: self.accepted_writes.load(Ordering::Relaxed),
             accepted_bytes: self.accepted_bytes.load(Ordering::Relaxed),
             recoverable_segments: self.recoverable_segments.load(Ordering::Relaxed),
+            accept_total_ns: self.accept_total_ns.load(Ordering::Relaxed),
+            accept_max_ns: self.accept_max_ns.load(Ordering::Relaxed),
+            data_syncs: self.data_syncs.load(Ordering::Relaxed),
+            manifest_syncs: self.manifest_syncs.load(Ordering::Relaxed),
+            manifest_rewrites: self.manifest_rewrites.load(Ordering::Relaxed),
+            sync_total_ns: self.sync_total_ns.load(Ordering::Relaxed),
+            sync_max_ns: self.sync_max_ns.load(Ordering::Relaxed),
         }
     }
 
+    fn ensure_manifest_file<'a>(
+        manifest_path: &Path,
+        manifest_file: &'a mut Option<File>,
+    ) -> io::Result<&'a mut File> {
+        if manifest_file.is_none() {
+            *manifest_file = Some(open_landing_append_file(manifest_path)?);
+        }
+        manifest_file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("landing manifest handle unavailable"))
+    }
+
+    fn sync_landing_unlocked(&self, data: &File, manifest: Option<&File>) -> io::Result<()> {
+        let data_sync_started = Instant::now();
+        data.sync_data()?;
+        self.data_syncs.fetch_add(1, Ordering::Relaxed);
+        self.record_sync_latency(data_sync_started.elapsed());
+        if let Some(manifest) = manifest {
+            let manifest_sync_started = Instant::now();
+            manifest.sync_data()?;
+            self.manifest_syncs.fetch_add(1, Ordering::Relaxed);
+            self.record_sync_latency(manifest_sync_started.elapsed());
+        }
+        Ok(())
+    }
+
     fn recover_segments_unlocked(&self) -> io::Result<Vec<LandingSegment>> {
-        let manifest = File::open(&self.manifest_path)?;
+        let manifest = open_landing_read_file(&self.manifest_path)?;
         let mut reader = BufReader::new(manifest);
         let mut segments = Vec::new();
         let mut line = String::new();
@@ -364,18 +444,22 @@ impl LandingZone {
         Ok(segments)
     }
 
-    fn rewrite_manifest_unlocked(&self, segments: &[LandingSegment]) -> io::Result<()> {
+    fn rewrite_manifest_unlocked(
+        &self,
+        segments: &[LandingSegment],
+        manifest_file: &mut Option<File>,
+    ) -> io::Result<()> {
+        *manifest_file = None;
         remove_file_if_exists(&self.manifest_tmp_path)?;
-        let mut manifest = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.manifest_tmp_path)?;
+        let mut manifest = open_landing_truncate_file(&self.manifest_tmp_path)?;
         for segment in segments {
             manifest.write_all(segment.as_manifest_record().as_bytes())?;
         }
         manifest.flush()?;
+        let sync_started = Instant::now();
         manifest.sync_data()?;
+        self.manifest_syncs.fetch_add(1, Ordering::Relaxed);
+        self.record_sync_latency(sync_started.elapsed());
         drop(manifest);
         remove_file_if_exists(&self.manifest_backup_path)?;
         if self.manifest_path.exists() {
@@ -387,7 +471,23 @@ impl LandingZone {
             }
             return Err(error);
         }
-        remove_file_if_exists(&self.manifest_backup_path)
+        remove_file_if_exists(&self.manifest_backup_path)?;
+        *manifest_file = Some(open_landing_append_file(&self.manifest_path)?);
+        self.manifest_rewrites.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn record_accept_latency(&self, duration: Duration) {
+        let elapsed_ns = duration_ns_u64(duration);
+        self.accept_total_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.accept_max_ns.fetch_max(elapsed_ns, Ordering::Relaxed);
+    }
+
+    fn record_sync_latency(&self, duration: Duration) {
+        let elapsed_ns = duration_ns_u64(duration);
+        self.sync_total_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.sync_max_ns.fetch_max(elapsed_ns, Ordering::Relaxed);
     }
 
     fn repair_manifest_swap_files(
@@ -404,7 +504,7 @@ impl LandingZone {
     }
 
     fn count_manifest_segments(manifest_path: &Path) -> io::Result<usize> {
-        let manifest = File::open(manifest_path)?;
+        let manifest = open_landing_read_file(manifest_path)?;
         let mut reader = BufReader::new(manifest);
         let mut count = 0usize;
         let mut line = String::new();
@@ -432,6 +532,39 @@ fn remove_file_if_exists(path: &Path) -> io::Result<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn open_landing_append_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    set_landing_share_mode(&mut options);
+    options.open(path)
+}
+
+fn open_landing_read_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    set_landing_share_mode(&mut options);
+    options.open(path)
+}
+
+fn open_landing_truncate_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+    set_landing_share_mode(&mut options);
+    options.open(path)
+}
+
+#[cfg(windows)]
+fn set_landing_share_mode(options: &mut OpenOptions) {
+    options.share_mode(LANDING_FILE_SHARE_MODE);
+}
+
+#[cfg(not(windows))]
+fn set_landing_share_mode(_options: &mut OpenOptions) {}
+
+fn duration_ns_u64(duration: Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
 }
 
 impl From<LandingSegment> for RecoveredLandingSegment {
@@ -616,5 +749,43 @@ mod tests {
         assert_eq!(zone.stats().recoverable_segments, 1);
         zone.clear_inode(2).expect("clear second inode");
         assert_eq!(zone.stats().recoverable_segments, 0);
+    }
+
+    #[test]
+    fn opportunistic_accept_defers_sync_until_landing_records_retire() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let zone = LandingZone::open(tmp.path()).expect("open landing zone");
+
+        zone.accept(LandingWrite {
+            ino: 1,
+            fh: 10,
+            offset: 0,
+            data: b"writeback".as_slice(),
+        })
+        .expect("accept segment");
+        zone.accept(LandingWrite {
+            ino: 1,
+            fh: 10,
+            offset: 9,
+            data: b"-mode".as_slice(),
+        })
+        .expect("accept second segment");
+
+        let accepted = zone.stats();
+        assert_eq!(accepted.data_syncs, 0);
+        assert_eq!(accepted.manifest_syncs, 0);
+        assert_eq!(accepted.manifest_rewrites, 0);
+        assert_eq!(
+            zone.read(1, 0, 14).expect("read landed bytes"),
+            b"writeback-mode"
+        );
+
+        zone.clear_inode(1).expect("retire landed records");
+
+        let retired = zone.stats();
+        assert!(retired.data_syncs > 0);
+        assert!(retired.manifest_syncs > 0);
+        assert_eq!(retired.manifest_rewrites, 1);
+        assert_eq!(retired.recoverable_segments, 0);
     }
 }
