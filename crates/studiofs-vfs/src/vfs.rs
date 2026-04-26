@@ -2212,10 +2212,18 @@ fn soft_drain_lag_pacing_delay_ms(
 }
 
 fn drain_lag_pacing_attribution_ms(
-    _waited_ms: u64,
+    waited_ms: u64,
+    requested_delay_ms: u64,
     drain_lag_delay_ms: Option<u64>,
 ) -> Option<u64> {
-    drain_lag_delay_ms
+    let drain_lag_delay_ms = drain_lag_delay_ms?;
+    if requested_delay_ms == 0 {
+        return Some(0);
+    }
+    let numerator = u128::from(waited_ms) * u128::from(drain_lag_delay_ms);
+    let denominator = u128::from(requested_delay_ms);
+    let attributed_ms = numerator.div_ceil(denominator);
+    Some(attributed_ms.min(u128::from(u64::MAX)) as u64)
 }
 
 fn warn_small_block_addressability(block_size: u32) {

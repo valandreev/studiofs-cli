@@ -208,7 +208,7 @@ impl StudioVfs {
             .fast_backpressure_stall_max_ms
             .fetch_max(waited_ms, std::sync::atomic::Ordering::Relaxed);
         if let Some(drain_lag_attribution_ms) =
-            super::drain_lag_pacing_attribution_ms(waited_ms, drain_lag_delay_ms)
+            super::drain_lag_pacing_attribution_ms(waited_ms, delay_ms, drain_lag_delay_ms)
         {
             self.state
                 .metrics

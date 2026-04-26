@@ -3755,13 +3755,20 @@ fn soft_pacing_reacts_to_handle_writer_drain_lag_before_dirty_budget_limit() {
 }
 
 #[test]
-fn drain_lag_pacing_attribution_uses_drain_lag_delay_not_combined_sleep() {
-    assert_eq!(super::drain_lag_pacing_attribution_ms(12, Some(4)), Some(4));
+fn drain_lag_pacing_attribution_scales_drain_lag_share_to_actual_wait() {
     assert_eq!(
-        super::drain_lag_pacing_attribution_ms(4, Some(12)),
-        Some(12)
+        super::drain_lag_pacing_attribution_ms(12, 12, Some(4)),
+        Some(4)
     );
-    assert_eq!(super::drain_lag_pacing_attribution_ms(12, None), None);
+    assert_eq!(
+        super::drain_lag_pacing_attribution_ms(18, 12, Some(4)),
+        Some(6)
+    );
+    assert_eq!(
+        super::drain_lag_pacing_attribution_ms(18, 12, Some(12)),
+        Some(18)
+    );
+    assert_eq!(super::drain_lag_pacing_attribution_ms(12, 12, None), None);
 }
 
 #[test]

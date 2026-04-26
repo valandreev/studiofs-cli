@@ -156,6 +156,51 @@ impl Drop for AlignedChunk {
     }
 }
 
+enum AjaSequentialChunk {
+    Cached(Vec<u8>),
+    Unbuffered(AlignedChunk),
+}
+
+impl AjaSequentialChunk {
+    fn new(mode: AjaCacheValidationMode, len: usize) -> Result<Self, String> {
+        match mode {
+            AjaCacheValidationMode::CacheOn => Ok(Self::Cached(vec![0; len])),
+            AjaCacheValidationMode::CacheOff => AlignedChunk::new(len).map(Self::Unbuffered),
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::Cached(chunk) => chunk.as_mut_slice(),
+            Self::Unbuffered(chunk) => chunk.as_mut_slice(),
+        }
+    }
+}
+
+fn write_aja_chunk(
+    writer: &mut impl std::io::Write,
+    mode: AjaCacheValidationMode,
+    chunk: &[u8],
+) -> std::io::Result<()> {
+    match mode {
+        AjaCacheValidationMode::CacheOn => writer.write_all(chunk),
+        AjaCacheValidationMode::CacheOff => {
+            let written = writer.write(chunk)?;
+            if written == chunk.len() {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    format!(
+                        "partial unbuffered AJA cache-off write: wrote {written} of {} bytes",
+                        chunk.len()
+                    ),
+                ))
+            }
+        }
+    }
+}
+
 fn aja_sequential_validation_modes(
     value: Option<&str>,
 ) -> Result<Vec<AjaCacheValidationMode>, String> {
@@ -363,6 +408,44 @@ fn aligned_chunk_rejects_unaligned_lengths() {
     };
 
     assert!(err.contains("4096-byte aligned"), "unexpected error: {err}");
+}
+
+#[test]
+fn aja_cache_on_chunk_allows_unaligned_lengths() {
+    let mut chunk = AjaSequentialChunk::new(AjaCacheValidationMode::CacheOn, 4097)
+        .expect("cache-on chunk allocation should not require unbuffered I/O alignment");
+
+    assert_eq!(chunk.as_mut_slice().len(), 4097);
+}
+
+#[test]
+fn aja_cache_off_write_rejects_partial_unbuffered_write() {
+    struct PartialWriter {
+        max_bytes: usize,
+    }
+
+    impl std::io::Write for PartialWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len().min(self.max_bytes))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let chunk = vec![0; AJA_CACHE_OFF_ALIGNMENT_BYTES];
+    let err = write_aja_chunk(
+        &mut PartialWriter { max_bytes: 2048 },
+        AjaCacheValidationMode::CacheOff,
+        &chunk,
+    )
+    .expect_err("cache-off unbuffered writes should reject partial chunks");
+
+    assert!(
+        err.to_string().contains("partial"),
+        "unexpected error: {err}"
+    );
 }
 
 fn validate_aja_sequential_throughput(
@@ -1112,7 +1195,7 @@ fn winfsp_mount_aja_style_sequential_writer_validation_smoke() {
                         mode.label()
                     )
                 });
-            let mut chunk = AlignedChunk::new(chunk_bytes).unwrap_or_else(|err| {
+            let mut chunk = AjaSequentialChunk::new(*mode, chunk_bytes).unwrap_or_else(|err| {
                 panic!(
                     "allocate aligned AJA-style {} sequential chunk buffer: {err}",
                     mode.label()
@@ -1123,14 +1206,12 @@ fn winfsp_mount_aja_style_sequential_writer_validation_smoke() {
             for chunk_index in 0..chunk_count {
                 let fill = b'A' + (chunk_index % 26) as u8;
                 chunk.as_mut_slice().fill(fill);
-                writer
-                    .write_all(chunk.as_mut_slice())
-                    .unwrap_or_else(|err| {
-                        panic!(
-                            "write AJA-style {} sequential chunk through WinFSP mount: {err}",
-                            mode.label()
-                        )
-                    });
+                write_aja_chunk(&mut writer, *mode, chunk.as_mut_slice()).unwrap_or_else(|err| {
+                    panic!(
+                        "write AJA-style {} sequential chunk through WinFSP mount: {err}",
+                        mode.label()
+                    )
+                });
             }
             writer.flush().unwrap_or_else(|err| {
                 panic!(
