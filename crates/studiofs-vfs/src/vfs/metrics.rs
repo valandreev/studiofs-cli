@@ -136,6 +136,14 @@ pub struct VfsWritePathVfsWriteStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsWritePathLandingZoneStats {
+    pub accepted_writes: u64,
+    pub accepted_bytes: u64,
+    #[serde(default)]
+    pub recoverable_segments: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsWritePathWinfspForegroundFlushStats {
     pub cleanup: u64,
     pub flush: u64,
@@ -251,6 +259,8 @@ pub struct VfsWritePathObservabilitySnapshot {
     pub winfsp_write_path: VfsWritePathWinfspWritePathStats,
     #[serde(default)]
     pub vfs_write_path: VfsWritePathVfsWriteStats,
+    #[serde(default)]
+    pub landing_zone: VfsWritePathLandingZoneStats,
     #[serde(default)]
     pub winfsp_foreground_flushes: VfsWritePathWinfspForegroundFlushStats,
     pub write_backpressure: VfsWritePathBackpressureStats,

@@ -6,8 +6,9 @@ use super::{
 use std::sync::Arc;
 use tracing::{debug, warn};
 
-use crate::VfsMeta;
+use crate::landing_zone::LandingWrite;
 use crate::runtime::run_meta;
+use crate::{VfsError, VfsMeta};
 
 use std::time::{Duration, Instant};
 
@@ -849,6 +850,17 @@ impl StudioVfs {
             }
             self.note_vfs_write_call(data.len());
 
+            if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+                self.landing_zone
+                    .accept(LandingWrite {
+                        ino,
+                        fh,
+                        offset,
+                        data,
+                    })
+                    .map_err(VfsError::Io)?;
+            }
+
             let record_handle_writer_state_started = Instant::now();
             let written = self.record_handle_writer_state(fh, ino, offset, data).await;
             self.record_vfs_write_record_handle_writer_state(
@@ -1009,6 +1021,17 @@ impl StudioVfs {
                 return Ok(data.len() as u32);
             }
             self.note_vfs_write_call(data.len());
+
+            if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+                self.landing_zone
+                    .accept(LandingWrite {
+                        ino,
+                        fh,
+                        offset,
+                        data,
+                    })
+                    .map_err(VfsError::Io)?;
+            }
 
             let record_handle_writer_state_started = Instant::now();
             let written = self.record_handle_writer_state(fh, ino, offset, data).await;

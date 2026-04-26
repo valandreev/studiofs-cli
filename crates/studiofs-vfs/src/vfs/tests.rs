@@ -2985,6 +2985,41 @@ fn write_fh_full_block_callbacks_persist_in_small_foreground_waves() {
 }
 
 #[test]
+fn opportunistic_write_fh_lands_before_deferred_materialization() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-284-landing-zone");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-284-landing-zone.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let payload = b"landing-zone-visible";
+
+        vfs.write_fh_with_deferred_materialize(fh, ino, 0, payload, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+
+        let read = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(read.as_ref(), payload);
+
+        let snapshot = vfs.write_path_observability_snapshot();
+        assert_eq!(snapshot.landing_zone.accepted_writes, 1);
+        assert_eq!(snapshot.landing_zone.accepted_bytes, payload.len() as u64);
+
+        let recovered = vfs.recover_landing_zone_segments().unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].ino, ino);
+        assert_eq!(recovered[0].offset, 0);
+        assert_eq!(recovered[0].len, payload.len() as u64);
+
+        vfs.flush_fh(fh).await.unwrap();
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn opportunistic_completed_handle_writer_materialization_caps_burst_to_drain_chunk() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = VfsConfig {

@@ -241,6 +241,7 @@ fn remove_retired_ingress_spill(cache_root: &Path) -> VfsResult<()> {
 
 struct VfsBootstrapResources {
     zeroio_runtime_state_dir: PathBuf,
+    landing_zone: LandingZone,
     local_payload_backend: Arc<dyn LocalPayloadBackend>,
     cached_store: Arc<CachedStore>,
     readahead: Arc<ReadAheadTracker>,
@@ -267,6 +268,8 @@ impl VfsBootstrapResources {
         let zeroio_runtime_state_dir =
             PathBuf::from(cache_dir).join(super::ZEROIO_RUNTIME_STATE_DIR);
         std::fs::create_dir_all(&zeroio_runtime_state_dir).map_err(VfsError::Io)?;
+        let landing_zone = LandingZone::open(zeroio_runtime_state_dir.join("landing-zone"))
+            .map_err(VfsError::Io)?;
 
         let opened_local_backend = match cache_runtime {
             Some(cache_runtime) => open_prepared_local_payload_backend_with_budget_and_sync_mode(
@@ -336,6 +339,7 @@ impl VfsBootstrapResources {
 
         Ok(Self {
             zeroio_runtime_state_dir,
+            landing_zone,
             local_payload_backend,
             cached_store,
             readahead,
@@ -464,6 +468,7 @@ impl VfsBootstrap {
             local_sync_group_min_bytes: plan.local_sync_group_min_bytes,
             max_xattr_bytes: plan.max_xattr_bytes,
             zeroio_runtime_state_dir: resources.zeroio_runtime_state_dir,
+            landing_zone: resources.landing_zone,
             handle_table: HandleTable::new(),
             janitor_lease: None,
             janitor_interval: plan.janitor_interval,
