@@ -59,7 +59,6 @@ struct HandleWriterRegistryState {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(super) struct HandleWriterRegistry {
     shards: Box<[Mutex<HandleWriterRegistryState>]>,
     handle_shards: Mutex<HashMap<u64, usize>>,
@@ -67,7 +66,6 @@ pub(super) struct HandleWriterRegistry {
     next_seq: AtomicU64,
 }
 
-#[allow(dead_code)]
 impl HandleSliceWriter {
     fn new(ino: Ino, current_size: u64, block_size: u32) -> Self {
         Self {
@@ -264,7 +262,6 @@ impl HandleSliceWriter {
     }
 }
 
-#[allow(dead_code)]
 impl HandleWriterRegistry {
     pub(super) fn new() -> Self {
         Self {

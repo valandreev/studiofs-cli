@@ -385,7 +385,7 @@ impl StudioVfs {
         self.track_background_task(tokio::spawn(async move {
             let mut no_progress_retries = 0usize;
             loop {
-                let writer_stack_dirty_before = vfs.state.writer_stack.total_dirty_bytes();
+                let writer_stack_dirty_before = vfs.state.writer_stack.dirty_bytes_for_inode(ino);
                 let handle_dirty_before = vfs.state.handle_writers.dirty_bytes_for_inode(ino);
                 let dirty_before = writer_stack_dirty_before.saturating_add(handle_dirty_before);
                 let total_before = vfs.total_pending_write_buffer_bytes();
@@ -490,7 +490,7 @@ impl StudioVfs {
                 let dirty_after = vfs
                     .state
                     .writer_stack
-                    .total_dirty_bytes()
+                    .dirty_bytes_for_inode(ino)
                     .saturating_add(vfs.state.handle_writers.dirty_bytes_for_inode(ino));
                 let total_after = vfs.total_pending_write_buffer_bytes();
                 let made_progress = completed_materialized
@@ -688,7 +688,7 @@ impl StudioVfs {
         // Wait for any in-flight deferred materialization task to finish
         // before we run our own strict materialization pass.  Without this
         // the flush/close path and the background task would race on
-        // HandleWriterRegistry snapshots, producing fragmented blocks.
+        // writer-stack snapshots, producing fragmented blocks.
         //
         // The parking_lot lock is scoped so the MutexGuard (which is !Send)
         // is dropped before the .await point.  We then acquire the
@@ -1007,7 +1007,7 @@ impl StudioVfs {
             let written = self
                 .record_writer_stack_state_bytes(fh, ino, offset, shared_data)
                 .await?;
-            self.record_vfs_write_record_handle_writer_state(record_writer_stack_started.elapsed());
+            self.record_vfs_write_record_writer_stack_state(record_writer_stack_started.elapsed());
 
             // Release the per-inode write gate before local-disk materialization for
             // opportunistic writes. This lets concurrent writes to the same inode proceed
@@ -1072,7 +1072,7 @@ impl StudioVfs {
     /// Write with deferred materialization for high-throughput streaming writes.
     ///
     /// For `Opportunistic` writes the callback returns as soon as data is buffered
-    /// in the `HandleWriterRegistry`.  NVMe materialization and budget enforcement
+    /// in the `MountedWriterStack`. NVMe materialization and budget enforcement
     /// are spawned as a fire-and-forget background task so the calling thread
     /// (e.g. WinFSP dispatcher) is never blocked on local I/O.
     ///
@@ -1081,10 +1081,10 @@ impl StudioVfs {
     ///
     /// # Safety of fire-and-forget materialization
     ///
-    /// * Data is safely held in `HandleWriterRegistry` memory buffers.
+    /// * Data is safely held in `MountedWriterStack` memory buffers.
     /// * Any materialization error will surface at the next `Strict` barrier
     ///   (flush / fsync / close) because those paths call
-    ///   `materialize_handle_writers_for_inode` synchronously.
+    ///   `materialize_writer_stack_for_inode` synchronously.
     /// * Duplicate materialization is safe: the payload store uses last-writer-wins
     ///   for overlapping ranges, and orphaned objects are reclaimed by the janitor.
     /// * Soft pacing is deliberately not applied on this foreground writeback
@@ -1167,12 +1167,12 @@ impl StudioVfs {
             let written = self
                 .record_writer_stack_state_bytes(fh, ino, offset, shared_data)
                 .await;
-            self.record_vfs_write_record_handle_writer_state(record_writer_stack_started.elapsed());
+            self.record_vfs_write_record_writer_stack_state(record_writer_stack_started.elapsed());
             written
         }
         .await;
 
-        // Release the gate immediately — data is safe in HandleWriterRegistry.
+        // Release the gate immediately: data is safe in MountedWriterStack.
         if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
             session = None;
         }
@@ -1183,7 +1183,7 @@ impl StudioVfs {
                 self.spawn_deferred_materialization_if_needed(ino).await;
             }
             (Ok(_), LocalSyncPolicy::Strict) => {
-                // Strict: await materialization inline (same as original).
+                // Strict: await writer-stack materialization inline.
                 let materialize_strict_started = Instant::now();
                 let materialized_bytes = match self.materialize_writer_stack_for_limits(ino).await {
                     Ok(materialized_bytes) => materialized_bytes,
@@ -1265,7 +1265,7 @@ impl StudioVfs {
         {
             let mut dirty = self.state.namespace.dirty_attrs.lock();
             let attr = dirty.entry(ino).or_insert_with(|| base_attr.clone());
-            attr.content_epoch = base_attr.content_epoch;
+            attr.content_epoch = attr.content_epoch.max(base_attr.content_epoch);
             attr.kind = FileType::RegularFile;
             if accepted.visible_len > attr.size {
                 attr.size = accepted.visible_len;
@@ -1368,19 +1368,17 @@ impl StudioVfs {
         let mut materialized_bytes = self
             .materialize_writer_stack_for_inode(preferred_ino)
             .await?;
-        while self.total_pending_write_buffer_bytes() > self.max_dirty_bytes() {
-            let Some(ino) = self
-                .state
-                .writer_stack
-                .snapshot_dirty_inodes_by_bytes()
-                .into_iter()
-                .next()
-            else {
+        let dirty_inodes = self.state.writer_stack.snapshot_dirty_inodes_by_bytes();
+        for ino in dirty_inodes {
+            if self.total_pending_write_buffer_bytes() <= self.max_dirty_bytes() {
                 break;
-            };
+            }
+            if ino == preferred_ino {
+                continue;
+            }
             let materialized = self.materialize_writer_stack_for_inode(ino).await?;
             if materialized == 0 {
-                break;
+                continue;
             }
             materialized_bytes = materialized_bytes.saturating_add(materialized);
         }

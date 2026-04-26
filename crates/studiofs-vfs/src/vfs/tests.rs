@@ -6104,6 +6104,7 @@ fn write_path_observability_reports_vfs_write_stage_breakdown() {
 
     vfs.note_vfs_write_call(4 * 1024 * 1024);
     vfs.record_vfs_write_record_handle_writer_state(Duration::from_millis(5));
+    vfs.record_vfs_write_record_writer_stack_state(Duration::from_millis(3));
     vfs.record_vfs_write_materialize_completed(Duration::from_millis(7));
     vfs.record_vfs_write_materialize_for_limits(Duration::from_millis(2));
 
@@ -6111,6 +6112,7 @@ fn write_path_observability_reports_vfs_write_stage_breakdown() {
     assert_eq!(snapshot.vfs_write_path.calls, 1);
     assert_eq!(snapshot.vfs_write_path.write_bytes, 4 * 1024 * 1024);
     assert_eq!(snapshot.vfs_write_path.record_handle_writer_state.calls, 1);
+    assert_eq!(snapshot.vfs_write_path.record_writer_stack_state.calls, 1);
     assert_eq!(snapshot.vfs_write_path.materialize_completed.calls, 1);
     assert_eq!(snapshot.vfs_write_path.materialize_strict.calls, 0);
     assert_eq!(snapshot.vfs_write_path.materialize_for_limits.calls, 1);

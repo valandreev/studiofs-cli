@@ -1768,6 +1768,10 @@ struct MetricsState {
     vfs_write_record_handle_writer_state_total_ns: AtomicU64,
     vfs_write_record_handle_writer_state_max_ns: AtomicU64,
     vfs_write_record_handle_writer_state_histogram: LatencyHistogram,
+    vfs_write_record_writer_stack_state_calls: AtomicU64,
+    vfs_write_record_writer_stack_state_total_ns: AtomicU64,
+    vfs_write_record_writer_stack_state_max_ns: AtomicU64,
+    vfs_write_record_writer_stack_state_histogram: LatencyHistogram,
     vfs_write_materialize_completed_calls: AtomicU64,
     vfs_write_materialize_completed_total_ns: AtomicU64,
     vfs_write_materialize_completed_max_ns: AtomicU64,
@@ -1876,6 +1880,10 @@ impl MetricsState {
             vfs_write_record_handle_writer_state_total_ns: AtomicU64::new(0),
             vfs_write_record_handle_writer_state_max_ns: AtomicU64::new(0),
             vfs_write_record_handle_writer_state_histogram: LatencyHistogram::default(),
+            vfs_write_record_writer_stack_state_calls: AtomicU64::new(0),
+            vfs_write_record_writer_stack_state_total_ns: AtomicU64::new(0),
+            vfs_write_record_writer_stack_state_max_ns: AtomicU64::new(0),
+            vfs_write_record_writer_stack_state_histogram: LatencyHistogram::default(),
             vfs_write_materialize_completed_calls: AtomicU64::new(0),
             vfs_write_materialize_completed_total_ns: AtomicU64::new(0),
             vfs_write_materialize_completed_max_ns: AtomicU64::new(0),
@@ -1980,6 +1988,9 @@ impl MetricsState {
             vfs_write_record_handle_writer_state_calls,
             vfs_write_record_handle_writer_state_total_ns,
             vfs_write_record_handle_writer_state_max_ns,
+            vfs_write_record_writer_stack_state_calls,
+            vfs_write_record_writer_stack_state_total_ns,
+            vfs_write_record_writer_stack_state_max_ns,
             vfs_write_materialize_completed_calls,
             vfs_write_materialize_completed_total_ns,
             vfs_write_materialize_completed_max_ns,
@@ -2022,6 +2033,7 @@ impl MetricsState {
         self.metadata_commit_histogram.reset();
         self.metadata_commit_interval_histogram.reset();
         self.vfs_write_record_handle_writer_state_histogram.reset();
+        self.vfs_write_record_writer_stack_state_histogram.reset();
         self.vfs_write_materialize_completed_histogram.reset();
         self.vfs_write_materialize_strict_histogram.reset();
         self.vfs_write_materialize_for_limits_histogram.reset();
@@ -6123,6 +6135,7 @@ impl StudioVfs {
             .fetch_add(write_bytes as u64, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     pub(super) fn record_vfs_write_record_handle_writer_state(&self, elapsed: Duration) {
         let metrics = &self.state.metrics;
         Self::observe_latency_counter(
@@ -6130,6 +6143,17 @@ impl StudioVfs {
             &metrics.vfs_write_record_handle_writer_state_total_ns,
             &metrics.vfs_write_record_handle_writer_state_max_ns,
             &metrics.vfs_write_record_handle_writer_state_histogram,
+            Self::duration_ns_u64(elapsed),
+        );
+    }
+
+    pub(super) fn record_vfs_write_record_writer_stack_state(&self, elapsed: Duration) {
+        let metrics = &self.state.metrics;
+        Self::observe_latency_counter(
+            &metrics.vfs_write_record_writer_stack_state_calls,
+            &metrics.vfs_write_record_writer_stack_state_total_ns,
+            &metrics.vfs_write_record_writer_stack_state_max_ns,
+            &metrics.vfs_write_record_writer_stack_state_histogram,
             Self::duration_ns_u64(elapsed),
         );
     }
@@ -6271,6 +6295,9 @@ impl StudioVfs {
             vfs_write_record_handle_writer_state_calls: vfs_write_record_handle_writer_state_calls,
             vfs_write_record_handle_writer_state_total_ns: vfs_write_record_handle_writer_state_total_ns,
             vfs_write_record_handle_writer_state_max_ns: vfs_write_record_handle_writer_state_max_ns,
+            vfs_write_record_writer_stack_state_calls: vfs_write_record_writer_stack_state_calls,
+            vfs_write_record_writer_stack_state_total_ns: vfs_write_record_writer_stack_state_total_ns,
+            vfs_write_record_writer_stack_state_max_ns: vfs_write_record_writer_stack_state_max_ns,
             vfs_write_materialize_completed_calls: vfs_write_materialize_completed_calls,
             vfs_write_materialize_completed_total_ns: vfs_write_materialize_completed_total_ns,
             vfs_write_materialize_completed_max_ns: vfs_write_materialize_completed_max_ns,
@@ -6347,6 +6374,11 @@ impl StudioVfs {
             .state
             .metrics
             .vfs_write_record_handle_writer_state_histogram
+            .snapshot();
+        let vfs_write_record_writer_stack_state_histogram = self
+            .state
+            .metrics
+            .vfs_write_record_writer_stack_state_histogram
             .snapshot();
         let vfs_write_materialize_completed_histogram = self
             .state
@@ -6648,6 +6680,13 @@ impl StudioVfs {
                     vfs_write_record_handle_writer_state_total_ns,
                     vfs_write_record_handle_writer_state_max_ns,
                     vfs_write_record_handle_writer_state_histogram,
+                    elapsed,
+                ),
+                record_writer_stack_state: Self::build_stage_latency_stats(
+                    vfs_write_record_writer_stack_state_calls,
+                    vfs_write_record_writer_stack_state_total_ns,
+                    vfs_write_record_writer_stack_state_max_ns,
+                    vfs_write_record_writer_stack_state_histogram,
                     elapsed,
                 ),
                 materialize_completed: Self::build_stage_latency_stats(
