@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -39,6 +39,7 @@ pub(super) struct WriterAccept {
     pub(super) dirty_bytes: usize,
     pub(super) visible_len: u64,
     pub(super) throttled: bool,
+    pub(super) next_object_id: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -94,6 +95,7 @@ struct ChunkWriter {
 struct FileWriter {
     ino: Ino,
     visible_len: u64,
+    next_object_id: u64,
     chunks: BTreeMap<ChunkId, ChunkWriter>,
     dirty_bytes: usize,
     sticky_error: Option<String>,
@@ -141,12 +143,12 @@ impl MountedWriterStack {
                 dirty_bytes: self.total_dirty_bytes(),
                 visible_len: spec.current_size,
                 throttled: false,
+                next_object_id: spec.first_object_id,
             });
         }
         let accepted_bytes =
             u32::try_from(data.len()).map_err(|_| WriterStackError::WriteTooLarge)?;
-        let write_end = spec
-            .offset
+        spec.offset
             .checked_add(data.len() as u64)
             .ok_or(WriterStackError::OffsetOverflow)?;
 
@@ -169,6 +171,7 @@ impl MountedWriterStack {
                 Arc::new(Mutex::new(FileWriter {
                     ino: spec.ino,
                     visible_len: spec.current_size,
+                    next_object_id: spec.first_object_id,
                     chunks: BTreeMap::new(),
                     dirty_bytes: 0,
                     sticky_error: None,
@@ -182,11 +185,14 @@ impl MountedWriterStack {
                 message,
             });
         }
-        file.visible_len = file.visible_len.max(spec.current_size).max(write_end);
+        if file.next_object_id < spec.first_object_id {
+            file.next_object_id = spec.first_object_id;
+        }
+        file.visible_len = file.visible_len.max(spec.current_size);
 
         let mut cursor = spec.offset;
         let mut data_offset = 0usize;
-        let mut next_object_id = spec.first_object_id;
+        let mut next_object_id = file.next_object_id;
         let mut throttled = false;
         while data_offset < data.len() {
             let chunk_id = chunk_id_from_offset(cursor, self.config.chunk_size);
@@ -194,48 +200,71 @@ impl MountedWriterStack {
             let chunk_end = chunk_start.saturating_add(u64::from(self.config.chunk_size));
             let take = (chunk_end - cursor).min((data.len() - data_offset) as u64) as usize;
             let segment = data.slice(data_offset..data_offset + take);
-            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-            let mut writer = self
-                .cached_store
-                .open_writer_slice(CachedStoreWriterConfig {
-                    ino: spec.ino,
-                    base_offset: cursor,
-                    first_object_id: next_object_id,
-                    content_epoch: spec.content_epoch,
-                    block_size: self.config.block_size as usize,
-                    page_size: self.config.page_size,
-                    dirty_byte_limit: self.config.dirty_byte_limit,
-                    max_buffer_bytes: self.config.max_buffer_bytes,
-                });
-            let result = writer.write_at(cursor, segment.as_ref())?;
-            throttled |= result.throttled;
             let end = cursor
                 .checked_add(take as u64)
                 .ok_or(WriterStackError::OffsetOverflow)?;
-            file.dirty_bytes = file.dirty_bytes.saturating_add(result.accepted_bytes);
-            self.dirty_bytes
-                .fetch_add(result.accepted_bytes, Ordering::AcqRel);
-            let chunk = file.chunks.entry(chunk_id).or_insert_with(|| ChunkWriter {
-                chunk_id,
-                slices: Vec::new(),
-            });
-            chunk.slices.push(SliceWriter {
-                seq,
-                start: cursor,
-                end,
-                chunk_offset: cursor.saturating_sub(chunk_start) as u32,
-                content_epoch: spec.content_epoch,
-                writer,
-                accepted: segment,
-                frozen: false,
-                finished: Vec::new(),
-            });
+            let (accepted_delta, object_ids_used, segment_throttled) = {
+                let chunk = file.chunks.entry(chunk_id).or_insert_with(|| ChunkWriter {
+                    chunk_id,
+                    slices: Vec::new(),
+                });
+                if let Some(slice) = chunk.slices.last_mut().filter(|slice| {
+                    !slice.frozen
+                        && slice.finished.is_empty()
+                        && slice.end == cursor
+                        && slice.content_epoch == spec.content_epoch
+                }) {
+                    let before_objects =
+                        staged_object_count(slice.writer.dirty_bytes(), self.config.block_size);
+                    let result = slice.writer.write_at(cursor, segment.as_ref())?;
+                    let after_objects =
+                        staged_object_count(result.dirty_bytes, self.config.block_size);
+                    slice.end = end;
+                    append_accepted_bytes(&mut slice.accepted, segment);
+                    (
+                        result.accepted_bytes,
+                        after_objects.saturating_sub(before_objects),
+                        result.throttled,
+                    )
+                } else {
+                    let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+                    let mut writer = self
+                        .cached_store
+                        .open_writer_slice(CachedStoreWriterConfig {
+                            ino: spec.ino,
+                            base_offset: cursor,
+                            first_object_id: next_object_id,
+                            content_epoch: spec.content_epoch,
+                            block_size: self.config.block_size as usize,
+                            page_size: self.config.page_size,
+                            dirty_byte_limit: self.config.dirty_byte_limit,
+                            max_buffer_bytes: self.config.max_buffer_bytes,
+                        });
+                    let result = writer.write_at(cursor, segment.as_ref())?;
+                    let object_ids_used =
+                        staged_object_count(result.dirty_bytes, self.config.block_size);
+                    chunk.slices.push(SliceWriter {
+                        seq,
+                        start: cursor,
+                        end,
+                        chunk_offset: cursor.saturating_sub(chunk_start) as u32,
+                        content_epoch: spec.content_epoch,
+                        writer,
+                        accepted: segment,
+                        frozen: false,
+                        finished: Vec::new(),
+                    });
+                    (result.accepted_bytes, object_ids_used, result.throttled)
+                }
+            };
+            throttled |= segment_throttled;
+            file.visible_len = file.visible_len.max(end);
+            file.dirty_bytes = file.dirty_bytes.saturating_add(accepted_delta);
+            self.dirty_bytes.fetch_add(accepted_delta, Ordering::AcqRel);
             cursor = end;
             data_offset += take;
-            next_object_id = next_object_id.saturating_add(staged_object_count(
-                result.accepted_bytes,
-                self.config.block_size,
-            ));
+            next_object_id = next_object_id.saturating_add(object_ids_used);
+            file.next_object_id = next_object_id;
         }
 
         Ok(WriterAccept {
@@ -243,6 +272,7 @@ impl MountedWriterStack {
             dirty_bytes: self.total_dirty_bytes(),
             visible_len: file.visible_len,
             throttled,
+            next_object_id,
         })
     }
 
@@ -327,7 +357,12 @@ impl MountedWriterStack {
             }
         }
         file.dirty_bytes = file.dirty_bytes.saturating_sub(staged_dirty_bytes);
+        let clean = file.dirty_bytes == 0;
+        drop(file);
         self.subtract_dirty(staged_dirty_bytes);
+        if clean {
+            self.remove_file_if_clean_and_closed(ino);
+        }
         Ok(finished)
     }
 
@@ -378,6 +413,7 @@ impl MountedWriterStack {
                 Arc::new(Mutex::new(FileWriter {
                     ino,
                     visible_len: 0,
+                    next_object_id: 0,
                     chunks: BTreeMap::new(),
                     dirty_bytes: 0,
                     sticky_error: None,
@@ -412,6 +448,20 @@ impl MountedWriterStack {
     fn shard_index(ino: Ino) -> usize {
         (ino % Self::SHARDS as u64) as usize
     }
+
+    fn remove_file_if_clean_and_closed(&self, ino: Ino) {
+        let mut shard = self.shards[Self::shard_index(ino)].lock();
+        if shard.handles_by_ino.contains_key(&ino) {
+            return;
+        }
+        if shard
+            .files
+            .get(&ino)
+            .is_some_and(|file| file.lock().dirty_bytes == 0)
+        {
+            shard.files.remove(&ino);
+        }
+    }
 }
 
 fn staged_object_count(len: usize, block_size: u32) -> u64 {
@@ -420,6 +470,13 @@ fn staged_object_count(len: usize, block_size: u32) -> u64 {
         return 0;
     }
     len.div_ceil(block_size) as u64
+}
+
+fn append_accepted_bytes(accepted: &mut Bytes, tail: Bytes) {
+    let mut combined = BytesMut::with_capacity(accepted.len().saturating_add(tail.len()));
+    combined.extend_from_slice(accepted.as_ref());
+    combined.extend_from_slice(tail.as_ref());
+    *accepted = combined.freeze();
 }
 
 fn finished_slice_from_staged(
@@ -605,6 +662,24 @@ mod tests {
         (dir, stack, rx)
     }
 
+    fn temp_stack_with_config(
+        config: WriterStackConfig,
+    ) -> (
+        tempfile::TempDir,
+        MountedWriterStack,
+        mpsc::UnboundedReceiver<PendingUpload>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000291")
+                .expect("open backend")
+                .backend;
+        let (store, rx) =
+            CachedStore::open(CachedStoreConfig::new(dir.path()), backend).expect("open store");
+        let stack = MountedWriterStack::new(store, config);
+        (dir, stack, rx)
+    }
+
     fn write_spec(fh: u64, ino: Ino, offset: u64, first_object_id: u64) -> WriterWriteSpec {
         WriterWriteSpec {
             fh,
@@ -753,6 +828,79 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![600, 601, 602]
         );
+    }
+
+    #[test]
+    fn writer_stack_returns_next_object_id_after_acceptance() {
+        let (_dir, stack, _rx) = temp_stack(8, 4);
+
+        let accepted = stack
+            .write_bytes(write_spec(1, 7, 0, 600), Bytes::from_static(b"abcdefghijk"))
+            .expect("write full chunk plus tail");
+
+        assert_eq!(accepted.next_object_id, 603);
+    }
+
+    #[test]
+    fn writer_stack_reuses_unfrozen_slice_for_contiguous_writes() {
+        let (_dir, stack, _rx) = temp_stack(16, 8);
+
+        let first = stack
+            .write_bytes(write_spec(1, 7, 0, 700), Bytes::from_static(b"ab"))
+            .expect("first write");
+        let second = stack
+            .write_bytes(
+                WriterWriteSpec {
+                    first_object_id: first.next_object_id,
+                    ..write_spec(1, 7, 2, 999)
+                },
+                Bytes::from_static(b"cd"),
+            )
+            .expect("contiguous write");
+
+        assert_eq!(second.next_object_id, 701);
+        let finished = stack.finish_inode(7).expect("finish inode");
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].object_id, 700);
+        assert_eq!(finished[0].len, 4);
+    }
+
+    #[test]
+    fn writer_stack_finish_cleans_closed_clean_file() {
+        let (_dir, stack, _rx) = temp_stack(16, 8);
+
+        stack
+            .write_bytes(write_spec(99, 7, 0, 800), Bytes::from_static(b"dirty"))
+            .expect("write");
+        stack.mark_closed(99);
+        assert_eq!(stack.visible_len(7), Some(5));
+
+        stack.finish_inode(7).expect("finish after close");
+
+        assert_eq!(stack.visible_len(7), None);
+        assert!(!stack.has_dirty_writers(7));
+    }
+
+    #[test]
+    fn writer_stack_failed_write_does_not_extend_visible_len() {
+        let (_dir, stack, _rx) = temp_stack_with_config(WriterStackConfig {
+            block_size: 4,
+            chunk_size: 16,
+            page_size: 4,
+            dirty_byte_limit: None,
+            max_buffer_bytes: Some(2),
+        });
+
+        let err = stack
+            .write_bytes(write_spec(1, 7, 0, 900), Bytes::from_static(b"toolong"))
+            .expect_err("buffer limit should reject write");
+
+        assert!(matches!(
+            err,
+            WriterStackError::CachedStore(CachedStoreWriterError::BufferLimitExceeded { .. })
+        ));
+        assert_eq!(stack.visible_len(7), Some(0));
+        assert!(!stack.has_dirty_writers(7));
     }
 
     #[test]
