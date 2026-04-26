@@ -49,6 +49,7 @@ mod statfs;
 mod sync_ops;
 mod upload_lifecycle;
 mod workers;
+mod writer_stack;
 
 pub use config::{
     ExplicitFlushOutcome, LocalSyncPolicy, ReleaseFhOutcome, VfsConfig, VfsConfigRaw,
@@ -105,6 +106,7 @@ use prefetch::{
 };
 use startup::StartupChannels;
 use startup::StartupState;
+use writer_stack::{MountedWriterStack, WriterStackConfig};
 
 use crate::access::{
     AccessClass, AccessDecision, AccessPolicy, AccessTrackerConfig, HandleAccessState,
@@ -2035,7 +2037,12 @@ impl MetricsState {
 // =============================================================================
 
 impl VfsState {
-    fn new(_block_size: u32, cfg: &VfsConfig, upload_cache_io_foreground_cost_base: u32) -> Self {
+    fn new(
+        cached_store: Arc<CachedStore>,
+        block_size: u32,
+        cfg: &VfsConfig,
+        upload_cache_io_foreground_cost_base: u32,
+    ) -> Self {
         Self {
             upload: UploadState::new(upload_cache_io_foreground_cost_base),
             file_session: FileSessionState::new(),
@@ -2050,6 +2057,16 @@ impl VfsState {
             acl: AclState::new(),
             incarnation: IncarnationState::new(),
             handle_writers: HandleWriterRegistry::new(),
+            writer_stack: MountedWriterStack::new(
+                cached_store,
+                WriterStackConfig {
+                    block_size,
+                    chunk_size: DEFAULT_CHUNK_SIZE,
+                    page_size: block_size as usize,
+                    dirty_byte_limit: Some(cfg.max_dirty_bytes),
+                    max_buffer_bytes: Some(cfg.max_dirty_bytes),
+                },
+            ),
             local_dirty: LocalDirtyState::new(),
             read: ReadState::new(cfg.foreground_read_speedometer_shards),
             file_lock: FileLockState::new(),
@@ -2067,6 +2084,7 @@ struct VfsState {
     acl: AclState,
     incarnation: IncarnationState,
     handle_writers: HandleWriterRegistry,
+    writer_stack: MountedWriterStack,
     local_dirty: LocalDirtyState,
     read: ReadState,
     file_lock: FileLockState,
@@ -5638,6 +5656,7 @@ impl StudioVfs {
     fn total_pending_write_buffer_bytes(&self) -> usize {
         self.total_pending_local_dirty_bytes()
             .saturating_add(self.state.handle_writers.total_dirty_bytes())
+            .saturating_add(self.state.writer_stack.total_dirty_bytes())
     }
 
     fn per_second(total: u64, elapsed: Duration) -> f64 {

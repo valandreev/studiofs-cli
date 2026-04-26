@@ -1,0 +1,616 @@
+#![allow(dead_code)]
+
+use bytes::Bytes;
+use parking_lot::Mutex;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use studiofs_cache::{
+    CachedStore, CachedStoreWriterConfig, CachedStoreWriterError, CachedStoreWriterSlice,
+    StagedSlice,
+};
+use studiofs_meta::schema::{ChunkId, chunk_id_from_offset, chunk_start_offset};
+use studiofs_meta::types::Ino;
+
+#[derive(Debug, Clone)]
+pub(super) struct WriterStackReadSpan {
+    pub(super) start: u64,
+    pub(super) end: u64,
+    pub(super) block_offset: u64,
+    pub(super) seq: u64,
+    pub(super) data: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FinishedWriterSlice {
+    pub(super) ino: Ino,
+    pub(super) chunk_id: ChunkId,
+    pub(super) chunk_offset: u32,
+    pub(super) len: u32,
+    pub(super) object_id: u64,
+    pub(super) object_offset: u32,
+    pub(super) seq: u64,
+    pub(super) content_epoch: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WriterAccept {
+    pub(super) accepted_bytes: u32,
+    pub(super) dirty_bytes: usize,
+    pub(super) visible_len: u64,
+    pub(super) throttled: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct WriterStackConfig {
+    pub(super) block_size: u32,
+    pub(super) chunk_size: u32,
+    pub(super) page_size: usize,
+    pub(super) dirty_byte_limit: Option<usize>,
+    pub(super) max_buffer_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct WriterWriteSpec {
+    pub(super) fh: u64,
+    pub(super) ino: Ino,
+    pub(super) current_size: u64,
+    pub(super) content_epoch: u64,
+    pub(super) first_object_id: u64,
+    pub(super) offset: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum WriterStackError {
+    #[error("writer geometry must use non-zero block, chunk, and page sizes")]
+    InvalidGeometry,
+    #[error("writer offset range overflow")]
+    OffsetOverflow,
+    #[error("write length exceeds u32::MAX")]
+    WriteTooLarge,
+    #[error("cached-store writer failed: {0}")]
+    CachedStore(#[from] CachedStoreWriterError),
+    #[error("sticky writer error for inode {ino}: {message}")]
+    Sticky { ino: Ino, message: String },
+}
+
+struct SliceWriter {
+    seq: u64,
+    start: u64,
+    end: u64,
+    chunk_offset: u32,
+    content_epoch: u64,
+    writer: CachedStoreWriterSlice,
+    accepted: Bytes,
+    frozen: bool,
+    finished: Vec<FinishedWriterSlice>,
+}
+
+struct ChunkWriter {
+    chunk_id: ChunkId,
+    slices: Vec<SliceWriter>,
+}
+
+struct FileWriter {
+    ino: Ino,
+    visible_len: u64,
+    chunks: BTreeMap<ChunkId, ChunkWriter>,
+    dirty_bytes: usize,
+    sticky_error: Option<String>,
+}
+
+#[derive(Default)]
+struct WriterShard {
+    files: HashMap<Ino, FileWriter>,
+    handles_by_ino: HashMap<Ino, HashSet<u64>>,
+    ino_by_handle: HashMap<u64, Ino>,
+}
+
+pub(super) struct MountedWriterStack {
+    cached_store: Arc<CachedStore>,
+    config: WriterStackConfig,
+    shards: Box<[Mutex<WriterShard>]>,
+    next_seq: AtomicU64,
+    dirty_bytes: AtomicUsize,
+}
+
+impl MountedWriterStack {
+    const SHARDS: usize = 64;
+
+    pub(super) fn new(cached_store: Arc<CachedStore>, config: WriterStackConfig) -> Self {
+        Self {
+            cached_store,
+            config,
+            shards: (0..Self::SHARDS)
+                .map(|_| Mutex::new(WriterShard::default()))
+                .collect(),
+            next_seq: AtomicU64::new(1),
+            dirty_bytes: AtomicUsize::new(0),
+        }
+    }
+
+    pub(super) fn write_bytes(
+        &self,
+        spec: WriterWriteSpec,
+        data: Bytes,
+    ) -> Result<WriterAccept, WriterStackError> {
+        self.validate_geometry()?;
+        if data.is_empty() {
+            return Ok(WriterAccept {
+                accepted_bytes: 0,
+                dirty_bytes: self.total_dirty_bytes(),
+                visible_len: spec.current_size,
+                throttled: false,
+            });
+        }
+        let accepted_bytes =
+            u32::try_from(data.len()).map_err(|_| WriterStackError::WriteTooLarge)?;
+        let write_end = spec
+            .offset
+            .checked_add(data.len() as u64)
+            .ok_or(WriterStackError::OffsetOverflow)?;
+
+        let shard_index = Self::shard_index(spec.ino);
+        let mut shard = self.shards[shard_index].lock();
+        if let Some(previous_ino) = shard.ino_by_handle.insert(spec.fh, spec.ino)
+            && previous_ino != spec.ino
+            && let Some(handles) = shard.handles_by_ino.get_mut(&previous_ino)
+        {
+            handles.remove(&spec.fh);
+        }
+        shard
+            .handles_by_ino
+            .entry(spec.ino)
+            .or_default()
+            .insert(spec.fh);
+
+        let file = shard.files.entry(spec.ino).or_insert_with(|| FileWriter {
+            ino: spec.ino,
+            visible_len: spec.current_size,
+            chunks: BTreeMap::new(),
+            dirty_bytes: 0,
+            sticky_error: None,
+        });
+        if let Some(message) = file.sticky_error.clone() {
+            return Err(WriterStackError::Sticky {
+                ino: spec.ino,
+                message,
+            });
+        }
+        file.visible_len = file.visible_len.max(spec.current_size).max(write_end);
+
+        let mut cursor = spec.offset;
+        let mut data_offset = 0usize;
+        let mut next_object_id = spec.first_object_id;
+        let mut throttled = false;
+        while data_offset < data.len() {
+            let chunk_id = chunk_id_from_offset(cursor, self.config.chunk_size);
+            let chunk_start = chunk_start_offset(chunk_id, self.config.chunk_size);
+            let chunk_end = chunk_start.saturating_add(u64::from(self.config.chunk_size));
+            let take = (chunk_end - cursor).min((data.len() - data_offset) as u64) as usize;
+            let segment = data.slice(data_offset..data_offset + take);
+            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            let mut writer = self
+                .cached_store
+                .open_writer_slice(CachedStoreWriterConfig {
+                    ino: spec.ino,
+                    base_offset: cursor,
+                    first_object_id: next_object_id,
+                    content_epoch: spec.content_epoch,
+                    block_size: self.config.block_size as usize,
+                    page_size: self.config.page_size,
+                    dirty_byte_limit: self.config.dirty_byte_limit,
+                    max_buffer_bytes: self.config.max_buffer_bytes,
+                });
+            let result = writer.write_at(cursor, segment.as_ref())?;
+            throttled |= result.throttled;
+            let end = cursor
+                .checked_add(take as u64)
+                .ok_or(WriterStackError::OffsetOverflow)?;
+            file.dirty_bytes = file.dirty_bytes.saturating_add(result.accepted_bytes);
+            self.dirty_bytes
+                .fetch_add(result.accepted_bytes, Ordering::AcqRel);
+            let chunk = file.chunks.entry(chunk_id).or_insert_with(|| ChunkWriter {
+                chunk_id,
+                slices: Vec::new(),
+            });
+            chunk.slices.push(SliceWriter {
+                seq,
+                start: cursor,
+                end,
+                chunk_offset: cursor.saturating_sub(chunk_start) as u32,
+                content_epoch: spec.content_epoch,
+                writer,
+                accepted: segment,
+                frozen: false,
+                finished: Vec::new(),
+            });
+            cursor = end;
+            data_offset += take;
+            next_object_id = next_object_id.saturating_add(1);
+        }
+
+        Ok(WriterAccept {
+            accepted_bytes,
+            dirty_bytes: self.total_dirty_bytes(),
+            visible_len: file.visible_len,
+            throttled,
+        })
+    }
+
+    pub(super) fn snapshot_read_spans(
+        &self,
+        ino: Ino,
+        offset: u64,
+        length: u64,
+    ) -> Vec<WriterStackReadSpan> {
+        let Some(end) = offset.checked_add(length) else {
+            return Vec::new();
+        };
+        let shard = self.shards[Self::shard_index(ino)].lock();
+        let Some(file) = shard.files.get(&ino) else {
+            return Vec::new();
+        };
+        let mut spans = Vec::new();
+        for chunk in file.chunks.values() {
+            for slice in &chunk.slices {
+                let start = slice.start.max(offset);
+                let stop = slice.end.min(end);
+                if start >= stop {
+                    continue;
+                }
+                spans.push(WriterStackReadSpan {
+                    start,
+                    end: stop,
+                    block_offset: start.saturating_sub(slice.start),
+                    seq: slice.seq,
+                    data: slice.accepted.clone(),
+                });
+            }
+        }
+        spans.sort_by_key(|span| std::cmp::Reverse(span.seq));
+        spans
+    }
+
+    pub(super) fn finish_inode(
+        &self,
+        ino: Ino,
+    ) -> Result<Vec<FinishedWriterSlice>, WriterStackError> {
+        let mut shard = self.shards[Self::shard_index(ino)].lock();
+        let Some(file) = shard.files.get_mut(&ino) else {
+            return Ok(Vec::new());
+        };
+        let mut finished = Vec::new();
+        let chunk_size = self.config.chunk_size;
+        for chunk in file.chunks.values_mut() {
+            chunk.slices.sort_by_key(|slice| slice.seq);
+            for slice in &mut chunk.slices {
+                if !slice.finished.is_empty() {
+                    finished.extend(slice.finished.clone());
+                    continue;
+                }
+                slice.frozen = true;
+                let staged = slice.writer.finish()?;
+                let converted = staged
+                    .into_iter()
+                    .map(|staged| {
+                        finished_slice_from_staged(chunk.chunk_id, chunk_size, slice, staged)
+                    })
+                    .collect::<Vec<_>>();
+                let staged_len: usize = converted.iter().map(|slice| slice.len as usize).sum();
+                file.dirty_bytes = file.dirty_bytes.saturating_sub(staged_len);
+                self.subtract_dirty(staged_len);
+                slice.finished = converted.clone();
+                finished.extend(converted);
+            }
+        }
+        Ok(finished)
+    }
+
+    pub(super) fn mark_closed(&self, fh: u64) {
+        for shard in self.shards.iter() {
+            let mut shard = shard.lock();
+            let Some(ino) = shard.ino_by_handle.remove(&fh) else {
+                continue;
+            };
+            if let Some(handles) = shard.handles_by_ino.get_mut(&ino) {
+                handles.remove(&fh);
+                if handles.is_empty() {
+                    shard.handles_by_ino.remove(&ino);
+                    if shard
+                        .files
+                        .get(&ino)
+                        .is_some_and(|file| file.dirty_bytes == 0)
+                    {
+                        shard.files.remove(&ino);
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    pub(super) fn has_dirty_writers(&self, ino: Ino) -> bool {
+        self.shards[Self::shard_index(ino)]
+            .lock()
+            .files
+            .get(&ino)
+            .is_some_and(|file| file.dirty_bytes > 0)
+    }
+
+    pub(super) fn visible_len(&self, ino: Ino) -> Option<u64> {
+        self.shards[Self::shard_index(ino)]
+            .lock()
+            .files
+            .get(&ino)
+            .map(|file| file.visible_len)
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_sticky_error_for_test(&self, ino: Ino, message: impl Into<String>) {
+        let mut shard = self.shards[Self::shard_index(ino)].lock();
+        let file = shard.files.entry(ino).or_insert_with(|| FileWriter {
+            ino,
+            visible_len: 0,
+            chunks: BTreeMap::new(),
+            dirty_bytes: 0,
+            sticky_error: None,
+        });
+        file.sticky_error = Some(message.into());
+    }
+
+    pub(super) fn total_dirty_bytes(&self) -> usize {
+        self.dirty_bytes.load(Ordering::Acquire)
+    }
+
+    fn subtract_dirty(&self, amount: usize) {
+        let _ = self
+            .dirty_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(amount))
+            });
+    }
+
+    fn validate_geometry(&self) -> Result<(), WriterStackError> {
+        if self.config.block_size == 0 || self.config.chunk_size == 0 || self.config.page_size == 0
+        {
+            Err(WriterStackError::InvalidGeometry)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn shard_index(ino: Ino) -> usize {
+        (ino % Self::SHARDS as u64) as usize
+    }
+}
+
+fn finished_slice_from_staged(
+    chunk_id: ChunkId,
+    chunk_size: u32,
+    slice: &SliceWriter,
+    staged: StagedSlice,
+) -> FinishedWriterSlice {
+    let chunk_start = chunk_start_offset(chunk_id, chunk_size);
+    let staged_delta = staged.offset.saturating_sub(chunk_start);
+    FinishedWriterSlice {
+        ino: staged.ino,
+        chunk_id,
+        chunk_offset: staged_delta as u32,
+        len: staged.len as u32,
+        object_id: staged.object_id,
+        object_offset: 0,
+        seq: slice.seq,
+        content_epoch: slice.content_epoch,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use studiofs_cache::{
+        CachedStoreConfig, open_local_payload_backend, upload_queue::PendingUpload,
+    };
+    use tokio::sync::mpsc;
+
+    fn temp_stack(
+        chunk_size: u32,
+        block_size: u32,
+    ) -> (
+        tempfile::TempDir,
+        MountedWriterStack,
+        mpsc::UnboundedReceiver<PendingUpload>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000291")
+                .expect("open backend")
+                .backend;
+        let (store, rx) =
+            CachedStore::open(CachedStoreConfig::new(dir.path()), backend).expect("open store");
+        let stack = MountedWriterStack::new(
+            store,
+            WriterStackConfig {
+                block_size,
+                chunk_size,
+                page_size: 4,
+                dirty_byte_limit: None,
+                max_buffer_bytes: None,
+            },
+        );
+        (dir, stack, rx)
+    }
+
+    fn write_spec(fh: u64, ino: Ino, offset: u64, first_object_id: u64) -> WriterWriteSpec {
+        WriterWriteSpec {
+            fh,
+            ino,
+            current_size: 0,
+            content_epoch: 9,
+            first_object_id,
+            offset,
+        }
+    }
+
+    #[test]
+    fn writer_stack_splits_writes_at_chunk_boundaries() {
+        let (_dir, stack, _rx) = temp_stack(8, 4);
+
+        let accepted = stack
+            .write_bytes(
+                WriterWriteSpec {
+                    current_size: 0,
+                    ..write_spec(1, 7, 6, 100)
+                },
+                Bytes::from_static(b"abcdef"),
+            )
+            .expect("accept write");
+
+        assert_eq!(accepted.accepted_bytes, 6);
+        let finished = stack.finish_inode(7).expect("finish inode");
+        assert_eq!(finished.len(), 2);
+        assert_eq!(finished[0].chunk_id, ChunkId(0));
+        assert_eq!(finished[0].chunk_offset, 6);
+        assert_eq!(finished[0].len, 2);
+        assert_eq!(finished[1].chunk_id, ChunkId(1));
+        assert_eq!(finished[1].chunk_offset, 0);
+        assert_eq!(finished[1].len, 4);
+    }
+
+    #[test]
+    fn writer_stack_read_spans_return_latest_overwrite_first() {
+        let (_dir, stack, _rx) = temp_stack(16, 8);
+
+        stack
+            .write_bytes(write_spec(1, 7, 0, 100), Bytes::from_static(b"abcdef"))
+            .expect("base write");
+        stack
+            .write_bytes(write_spec(1, 7, 2, 101), Bytes::from_static(b"XY"))
+            .expect("overwrite");
+
+        let spans = stack.snapshot_read_spans(7, 0, 6);
+        assert_eq!(spans[0].start, 2);
+        assert_eq!(spans[0].end, 4);
+        assert_eq!(spans[0].data.as_ref(), b"XY");
+        assert!(spans[0].seq > spans[1].seq);
+    }
+
+    #[test]
+    fn writer_stack_finish_preserves_creation_order_within_chunk() {
+        let (_dir, stack, _rx) = temp_stack(16, 8);
+
+        stack
+            .write_bytes(write_spec(1, 7, 8, 200), Bytes::from_static(b"tail"))
+            .expect("tail write");
+        stack
+            .write_bytes(write_spec(1, 7, 0, 201), Bytes::from_static(b"head"))
+            .expect("head write");
+
+        let finished = stack.finish_inode(7).expect("finish inode");
+        assert_eq!(finished.len(), 2);
+        assert_eq!(finished[0].seq + 1, finished[1].seq);
+        assert_eq!(finished[0].chunk_offset, 8);
+        assert_eq!(finished[1].chunk_offset, 0);
+    }
+
+    #[test]
+    fn writer_stack_tracks_dirty_bytes_and_cleans_up_closed_finished_handles() {
+        let (_dir, stack, _rx) = temp_stack(16, 8);
+
+        stack
+            .write_bytes(write_spec(99, 7, 0, 300), Bytes::from_static(b"dirty"))
+            .expect("write");
+
+        assert!(stack.has_dirty_writers(7));
+        assert_eq!(stack.total_dirty_bytes(), 5);
+        stack.finish_inode(7).expect("finish");
+        assert!(!stack.has_dirty_writers(7));
+        assert_eq!(stack.total_dirty_bytes(), 0);
+        stack.mark_closed(99);
+        assert!(!stack.has_dirty_writers(7));
+    }
+
+    #[test]
+    fn writer_stack_append_updates_visible_length_without_finishing() {
+        let (_dir, stack, _rx) = temp_stack(16, 8);
+
+        let accepted = stack
+            .write_bytes(
+                WriterWriteSpec {
+                    current_size: 4,
+                    ..write_spec(1, 7, 4, 400)
+                },
+                Bytes::from_static(b"tail"),
+            )
+            .expect("append");
+
+        assert_eq!(accepted.visible_len, 8);
+        assert_eq!(stack.visible_len(7), Some(8));
+        assert!(stack.has_dirty_writers(7));
+    }
+
+    #[test]
+    fn writer_stack_sparse_write_keeps_only_accepted_range_dirty() {
+        let (_dir, stack, _rx) = temp_stack(32, 8);
+
+        let accepted = stack
+            .write_bytes(write_spec(1, 7, 24, 500), Bytes::from_static(b"end"))
+            .expect("sparse write");
+
+        assert_eq!(accepted.visible_len, 27);
+        let spans = stack.snapshot_read_spans(7, 0, 32);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].start, 24);
+        assert_eq!(spans[0].end, 27);
+        assert_eq!(spans[0].data.as_ref(), b"end");
+    }
+
+    #[test]
+    fn writer_stack_finishes_full_chunk_and_partial_tail_separately() {
+        let (_dir, stack, _rx) = temp_stack(8, 4);
+
+        stack
+            .write_bytes(write_spec(1, 7, 0, 600), Bytes::from_static(b"abcdefghijk"))
+            .expect("write full chunk plus tail");
+
+        let finished = stack.finish_inode(7).expect("finish");
+        assert_eq!(finished.len(), 3);
+        assert_eq!(finished[0].chunk_id, ChunkId(0));
+        assert_eq!(finished[0].len, 4);
+        assert_eq!(finished[1].chunk_id, ChunkId(0));
+        assert_eq!(finished[1].chunk_offset, 4);
+        assert_eq!(finished[1].len, 4);
+        assert_eq!(finished[2].chunk_id, ChunkId(1));
+        assert_eq!(finished[2].len, 3);
+    }
+
+    #[test]
+    fn writer_stack_concurrent_files_do_not_share_dirty_locks_or_cleanup() {
+        let (_dir, stack, _rx) = temp_stack(16, 8);
+
+        stack
+            .write_bytes(write_spec(1, 7, 0, 700), Bytes::from_static(b"one"))
+            .expect("write first file");
+        stack
+            .write_bytes(write_spec(2, 70, 0, 800), Bytes::from_static(b"two"))
+            .expect("write second file");
+
+        assert!(stack.has_dirty_writers(7));
+        assert!(stack.has_dirty_writers(70));
+        stack.finish_inode(7).expect("finish first");
+        assert!(!stack.has_dirty_writers(7));
+        assert!(stack.has_dirty_writers(70));
+    }
+
+    #[test]
+    fn writer_stack_sticky_errors_block_followup_writes() {
+        let (_dir, stack, _rx) = temp_stack(16, 8);
+
+        stack.inject_sticky_error_for_test(7, "staging failed");
+
+        let err = stack
+            .write_bytes(write_spec(1, 7, 0, 900), Bytes::from_static(b"data"))
+            .expect_err("sticky error");
+        assert!(matches!(err, WriterStackError::Sticky { ino: 7, .. }));
+    }
+}
