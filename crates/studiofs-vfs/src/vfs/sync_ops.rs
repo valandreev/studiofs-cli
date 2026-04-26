@@ -159,13 +159,17 @@ impl StudioVfs {
         let Some(delay_ms) = dirty_budget_delay_ms.max(drain_lag_delay_ms) else {
             return false;
         };
+        debug_assert!(
+            dirty_budget_delay_ms.is_some() || drain_lag_delay_ms.is_some(),
+            "delay_ms is present only when at least one pacing delay is present"
+        );
         let pacing_trigger = match (dirty_budget_delay_ms, drain_lag_delay_ms) {
             (Some(dirty), Some(drain)) if dirty == drain => "dirty_budget_and_drain_lag",
             (Some(dirty), Some(drain)) if dirty > drain => "dirty_budget",
             (Some(_), Some(_)) => "drain_lag",
             (Some(_), None) => "dirty_budget",
             (None, Some(_)) => "drain_lag",
-            (None, None) => "none",
+            (None, None) => unreachable!("delay_ms exists only when at least one delay exists"),
         };
 
         self.spawn_deferred_materialization_if_needed(preferred_ino)
@@ -174,7 +178,7 @@ impl StudioVfs {
         self.debug_write_probe(
             "H2",
             "crates/studiofs-vfs/src/vfs/sync_ops.rs:86",
-            "soft dirty-budget pacing applied",
+            "soft write-path pacing applied",
             serde_json::json!({
                 "preferred_ino": preferred_ino,
                 "total_dirty_bytes": total_dirty_bytes,
