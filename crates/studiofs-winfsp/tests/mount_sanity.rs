@@ -127,6 +127,11 @@ struct AlignedChunk {
 
 impl AlignedChunk {
     fn new(len: usize) -> Result<Self, String> {
+        if len % AJA_CACHE_OFF_ALIGNMENT_BYTES != 0 {
+            return Err(format!(
+                "aligned chunk length {len} must be 4096-byte aligned for unbuffered I/O"
+            ));
+        }
         let layout = std::alloc::Layout::from_size_align(len, AJA_CACHE_OFF_ALIGNMENT_BYTES)
             .map_err(|err| format!("invalid aligned chunk layout for {len} bytes: {err}"))?;
         // SAFETY: `layout` has non-zero alignment and the returned pointer is
@@ -347,6 +352,15 @@ fn aja_cache_off_validation_rejects_unaligned_chunk_bytes() {
     let err =
         validate_aja_sequential_workload_for_modes(4097, 1, &[AjaCacheValidationMode::CacheOff])
             .expect_err("cache-off validation should reject unaligned chunks");
+
+    assert!(err.contains("4096-byte aligned"), "unexpected error: {err}");
+}
+
+#[test]
+fn aligned_chunk_rejects_unaligned_lengths() {
+    let Err(err) = AlignedChunk::new(4097) else {
+        panic!("unaligned chunks should be rejected");
+    };
 
     assert!(err.contains("4096-byte aligned"), "unexpected error: {err}");
 }

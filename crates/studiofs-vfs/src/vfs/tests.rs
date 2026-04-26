@@ -3755,6 +3755,16 @@ fn soft_pacing_reacts_to_handle_writer_drain_lag_before_dirty_budget_limit() {
 }
 
 #[test]
+fn drain_lag_pacing_attribution_uses_drain_lag_delay_not_combined_sleep() {
+    assert_eq!(super::drain_lag_pacing_attribution_ms(12, Some(4)), Some(4));
+    assert_eq!(
+        super::drain_lag_pacing_attribution_ms(4, Some(12)),
+        Some(12)
+    );
+    assert_eq!(super::drain_lag_pacing_attribution_ms(12, None), None);
+}
+
+#[test]
 fn write_path_observability_reports_landing_drain_lag_and_pacing() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-287-drain-lag-observability");

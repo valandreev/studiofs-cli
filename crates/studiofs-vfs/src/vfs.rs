@@ -2211,6 +2211,13 @@ fn soft_drain_lag_pacing_delay_ms(
     })
 }
 
+fn drain_lag_pacing_attribution_ms(
+    _waited_ms: u64,
+    drain_lag_delay_ms: Option<u64>,
+) -> Option<u64> {
+    drain_lag_delay_ms
+}
+
 fn warn_small_block_addressability(block_size: u32) {
     let block_size_nonzero = block_size.max(1) as u128;
     const MIN_PRACTICAL_ADDRESSABLE_BYTES: u128 = 64u128 * 1024 * 1024 * 1024 * 1024;
