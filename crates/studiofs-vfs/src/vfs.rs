@@ -67,7 +67,7 @@ pub use metrics::{
     VfsNamespaceCacheSnapshot, VfsRuntimeEvent, VfsSynchronizationStateSnapshot,
     VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
     VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats,
-    VfsWritePathEagerFlushStats, VfsWritePathLatencyQuantilesMs,
+    VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
     VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
     VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
     VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
@@ -111,6 +111,9 @@ use crate::access::{
 use crate::incarnation::{
     CommittedIncarnation, InodeIncarnationState, PendingIncarnation, VfsUploadState,
 };
+use crate::landing_zone::LandingZone;
+#[cfg(test)]
+use crate::landing_zone::RecoveredLandingSegment;
 use crate::qos::{QosController, TransitMemoryBudget};
 use crate::readahead::{DirAccessTracker, ReadAheadTracker, ReadStreamKey};
 
@@ -2372,6 +2375,7 @@ pub struct StudioVfs {
     /// Maximum bytes allowed for a single xattr value.
     max_xattr_bytes: usize,
     zeroio_runtime_state_dir: PathBuf,
+    landing_zone: LandingZone,
     /// Handle table: tracks all open file descriptors.
     handle_table: HandleTable,
     /// Optional distributed lease for janitor leader election.
@@ -3892,6 +3896,7 @@ impl StudioVfs {
             upload_rx,
         }: StartupChannels,
     ) -> VfsResult<()> {
+        self.spawn_landing_zone_recovery_worker();
         self.spawn_aggressive_materialization_worker();
         self.spawn_local_dirty_flush_worker();
         self.spawn_prefetch_worker(prefetch_rx);
@@ -6322,6 +6327,8 @@ impl StudioVfs {
         let payload_burst_interval_samples: u64 =
             payload_burst_interval_histogram.bucket_counts.iter().sum();
 
+        let landing_zone_stats = self.landing_zone.stats();
+
         VfsWritePathObservabilitySnapshot {
             publisher_pid: std::process::id(),
             generated_unix_ms: now_unix_millis(),
@@ -6572,6 +6579,11 @@ impl StudioVfs {
                     elapsed,
                 ),
             },
+            landing_zone: VfsWritePathLandingZoneStats {
+                accepted_writes: landing_zone_stats.accepted_writes,
+                accepted_bytes: landing_zone_stats.accepted_bytes,
+                recoverable_segments: landing_zone_stats.recoverable_segments,
+            },
             winfsp_foreground_flushes: VfsWritePathWinfspForegroundFlushStats {
                 cleanup: self
                     .state
@@ -6686,6 +6698,13 @@ impl StudioVfs {
                 sync_group_min_bytes: self.local_sync_group_min_bytes,
             },
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recover_landing_zone_segments(
+        &self,
+    ) -> std::io::Result<Vec<RecoveredLandingSegment>> {
+        self.landing_zone.recover()
     }
 
     /// Describe whether a new locally materialized payload would still fit in

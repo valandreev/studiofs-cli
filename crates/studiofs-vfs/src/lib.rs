@@ -8,6 +8,7 @@ pub mod aimd;
 pub mod bridge;
 pub mod fetch;
 pub mod incarnation;
+mod landing_zone;
 pub mod lock_order;
 pub mod qos;
 pub mod readahead;
@@ -41,11 +42,11 @@ pub use vfs::{
     VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot, VfsNamespaceCacheSnapshot,
     VfsResult, VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot,
     VfsUploadStats, VfsWritePathBackpressureStats, VfsWritePathBurstStats,
-    VfsWritePathDirtyPressureStats, VfsWritePathEagerFlushStats, VfsWritePathLatencyQuantilesMs,
-    VfsWritePathLatencyQuantilesSaturated, VfsWritePathObservabilitySnapshot,
-    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
-    VfsWritePathWinfspCallbackStats, VfsWritePathWinfspForegroundFlushStats,
-    VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
-    VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
-    is_hidden_non_macos_root_metadata_name,
+    VfsWritePathDirtyPressureStats, VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats,
+    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
+    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
+    VfsWritePathTuningStats, VfsWritePathWinfspCallbackStats,
+    VfsWritePathWinfspForegroundFlushStats, VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry,
+    VfsZeroIoHealthSignal, VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot,
+    VfsZeroIoStartupReplaySnapshot, is_hidden_non_macos_root_metadata_name,
 };

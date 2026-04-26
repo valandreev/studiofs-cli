@@ -651,6 +651,7 @@ mod tests {
             winfsp_callbacks: Default::default(),
             winfsp_write_path: Default::default(),
             vfs_write_path: Default::default(),
+            landing_zone: Default::default(),
             winfsp_foreground_flushes: Default::default(),
             write_backpressure: Default::default(),
             dirty_pressure: Default::default(),
