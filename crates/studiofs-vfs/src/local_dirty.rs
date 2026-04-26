@@ -2648,6 +2648,16 @@ impl StudioVfs {
                 studiofs_meta::schema::ChunkId(chunk_id),
                 studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
             );
+            let Some(slice_range) = IntervalRange::new(
+                chunk_start.saturating_add(slice.range.start as u64),
+                chunk_start.saturating_add(slice.range.end as u64),
+            ) else {
+                continue;
+            };
+            let Some(overlap) = slice_range.intersection(requested_range) else {
+                continue;
+            };
+
             let data = if let Some(object_id) = slice.object_id {
                 if let Some(data) = persisted_slice_data.get(&object_id) {
                     data.clone()
@@ -2672,15 +2682,6 @@ impl StudioVfs {
                 data
             };
 
-            let Some(slice_range) = IntervalRange::new(
-                chunk_start.saturating_add(slice.range.start as u64),
-                chunk_start.saturating_add(slice.range.end as u64),
-            ) else {
-                continue;
-            };
-            let Some(overlap) = slice_range.intersection(requested_range) else {
-                continue;
-            };
             let start = overlap.start();
             let stop = overlap.end();
             let slice_start = slice_range.start();
