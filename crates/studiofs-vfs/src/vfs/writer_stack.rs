@@ -101,7 +101,7 @@ struct FileWriter {
 
 #[derive(Default)]
 struct WriterShard {
-    files: HashMap<Ino, FileWriter>,
+    files: HashMap<Ino, Arc<Mutex<FileWriter>>>,
     handles_by_ino: HashMap<Ino, HashSet<u64>>,
     ino_by_handle: HashMap<u64, Ino>,
 }
@@ -151,26 +151,31 @@ impl MountedWriterStack {
             .ok_or(WriterStackError::OffsetOverflow)?;
 
         let shard_index = Self::shard_index(spec.ino);
-        let mut shard = self.shards[shard_index].lock();
-        if let Some(previous_ino) = shard.ino_by_handle.insert(spec.fh, spec.ino)
-            && previous_ino != spec.ino
-            && let Some(handles) = shard.handles_by_ino.get_mut(&previous_ino)
-        {
-            handles.remove(&spec.fh);
-        }
-        shard
-            .handles_by_ino
-            .entry(spec.ino)
-            .or_default()
-            .insert(spec.fh);
+        let file = {
+            let mut shard = self.shards[shard_index].lock();
+            if let Some(previous_ino) = shard.ino_by_handle.insert(spec.fh, spec.ino)
+                && previous_ino != spec.ino
+                && let Some(handles) = shard.handles_by_ino.get_mut(&previous_ino)
+            {
+                handles.remove(&spec.fh);
+            }
+            shard
+                .handles_by_ino
+                .entry(spec.ino)
+                .or_default()
+                .insert(spec.fh);
 
-        let file = shard.files.entry(spec.ino).or_insert_with(|| FileWriter {
-            ino: spec.ino,
-            visible_len: spec.current_size,
-            chunks: BTreeMap::new(),
-            dirty_bytes: 0,
-            sticky_error: None,
-        });
+            Arc::clone(shard.files.entry(spec.ino).or_insert_with(|| {
+                Arc::new(Mutex::new(FileWriter {
+                    ino: spec.ino,
+                    visible_len: spec.current_size,
+                    chunks: BTreeMap::new(),
+                    dirty_bytes: 0,
+                    sticky_error: None,
+                }))
+            }))
+        };
+        let mut file = file.lock();
         if let Some(message) = file.sticky_error.clone() {
             return Err(WriterStackError::Sticky {
                 ino: spec.ino,
@@ -227,7 +232,10 @@ impl MountedWriterStack {
             });
             cursor = end;
             data_offset += take;
-            next_object_id = next_object_id.saturating_add(1);
+            next_object_id = next_object_id.saturating_add(staged_object_count(
+                result.accepted_bytes,
+                self.config.block_size,
+            ));
         }
 
         Ok(WriterAccept {
@@ -247,10 +255,17 @@ impl MountedWriterStack {
         let Some(end) = offset.checked_add(length) else {
             return Vec::new();
         };
-        let shard = self.shards[Self::shard_index(ino)].lock();
-        let Some(file) = shard.files.get(&ino) else {
-            return Vec::new();
+        let file = {
+            let shard = self.shards[Self::shard_index(ino)].lock();
+            let Some(file) = shard.files.get(&ino) else {
+                return Vec::new();
+            };
+            Arc::clone(file)
         };
+        let file = file.lock();
+        if file.ino != ino {
+            return Vec::new();
+        }
         let mut spans = Vec::new();
         for chunk in file.chunks.values() {
             for slice in &chunk.slices {
@@ -276,11 +291,19 @@ impl MountedWriterStack {
         &self,
         ino: Ino,
     ) -> Result<Vec<FinishedWriterSlice>, WriterStackError> {
-        let mut shard = self.shards[Self::shard_index(ino)].lock();
-        let Some(file) = shard.files.get_mut(&ino) else {
+        let file = {
+            let shard = self.shards[Self::shard_index(ino)].lock();
+            let Some(file) = shard.files.get(&ino) else {
+                return Ok(Vec::new());
+            };
+            Arc::clone(file)
+        };
+        let mut file = file.lock();
+        if file.ino != ino {
             return Ok(Vec::new());
         };
         let mut finished = Vec::new();
+        let mut staged_dirty_bytes = 0usize;
         let chunk_size = self.config.chunk_size;
         for chunk in file.chunks.values_mut() {
             chunk.slices.sort_by_key(|slice| slice.seq);
@@ -298,12 +321,13 @@ impl MountedWriterStack {
                     })
                     .collect::<Vec<_>>();
                 let staged_len: usize = converted.iter().map(|slice| slice.len as usize).sum();
-                file.dirty_bytes = file.dirty_bytes.saturating_sub(staged_len);
-                self.subtract_dirty(staged_len);
+                staged_dirty_bytes = staged_dirty_bytes.saturating_add(staged_len);
                 slice.finished = converted.clone();
                 finished.extend(converted);
             }
         }
+        file.dirty_bytes = file.dirty_bytes.saturating_sub(staged_dirty_bytes);
+        self.subtract_dirty(staged_dirty_bytes);
         Ok(finished)
     }
 
@@ -320,7 +344,7 @@ impl MountedWriterStack {
                     if shard
                         .files
                         .get(&ino)
-                        .is_some_and(|file| file.dirty_bytes == 0)
+                        .is_some_and(|file| file.lock().dirty_bytes == 0)
                     {
                         shard.files.remove(&ino);
                     }
@@ -331,31 +355,36 @@ impl MountedWriterStack {
     }
 
     pub(super) fn has_dirty_writers(&self, ino: Ino) -> bool {
-        self.shards[Self::shard_index(ino)]
-            .lock()
-            .files
-            .get(&ino)
-            .is_some_and(|file| file.dirty_bytes > 0)
+        let file = {
+            let shard = self.shards[Self::shard_index(ino)].lock();
+            shard.files.get(&ino).cloned()
+        };
+        file.is_some_and(|file| file.lock().dirty_bytes > 0)
     }
 
     pub(super) fn visible_len(&self, ino: Ino) -> Option<u64> {
-        self.shards[Self::shard_index(ino)]
-            .lock()
-            .files
-            .get(&ino)
-            .map(|file| file.visible_len)
+        let file = {
+            let shard = self.shards[Self::shard_index(ino)].lock();
+            shard.files.get(&ino).cloned()
+        };
+        file.map(|file| file.lock().visible_len)
     }
 
     #[cfg(test)]
     pub(super) fn inject_sticky_error_for_test(&self, ino: Ino, message: impl Into<String>) {
-        let mut shard = self.shards[Self::shard_index(ino)].lock();
-        let file = shard.files.entry(ino).or_insert_with(|| FileWriter {
-            ino,
-            visible_len: 0,
-            chunks: BTreeMap::new(),
-            dirty_bytes: 0,
-            sticky_error: None,
-        });
+        let file = {
+            let mut shard = self.shards[Self::shard_index(ino)].lock();
+            Arc::clone(shard.files.entry(ino).or_insert_with(|| {
+                Arc::new(Mutex::new(FileWriter {
+                    ino,
+                    visible_len: 0,
+                    chunks: BTreeMap::new(),
+                    dirty_bytes: 0,
+                    sticky_error: None,
+                }))
+            }))
+        };
+        let mut file = file.lock();
         file.sticky_error = Some(message.into());
     }
 
@@ -385,6 +414,14 @@ impl MountedWriterStack {
     }
 }
 
+fn staged_object_count(len: usize, block_size: u32) -> u64 {
+    let block_size = block_size as usize;
+    if len == 0 || block_size == 0 {
+        return 0;
+    }
+    len.div_ceil(block_size) as u64
+}
+
 fn finished_slice_from_staged(
     chunk_id: ChunkId,
     chunk_size: u32,
@@ -408,10 +445,137 @@ fn finished_slice_from_staged(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::any::Any;
+    use std::sync::mpsc as std_mpsc;
+    use std::time::Duration;
+    use studiofs_cache::local::{
+        LocalPayloadBackend, LocalPayloadBackendError, LocalPayloadLifecycleState,
+        LocalPayloadStorageStats,
+    };
     use studiofs_cache::{
         CachedStoreConfig, open_local_payload_backend, upload_queue::PendingUpload,
     };
     use tokio::sync::mpsc;
+
+    struct SlowPutBackend {
+        inner: Arc<dyn LocalPayloadBackend>,
+        entered_tx: std_mpsc::Sender<()>,
+        release_rx: Mutex<std_mpsc::Receiver<()>>,
+    }
+
+    impl SlowPutBackend {
+        fn new(
+            inner: Arc<dyn LocalPayloadBackend>,
+            entered_tx: std_mpsc::Sender<()>,
+            release_rx: std_mpsc::Receiver<()>,
+        ) -> Self {
+            Self {
+                inner,
+                entered_tx,
+                release_rx: Mutex::new(release_rx),
+            }
+        }
+    }
+
+    impl LocalPayloadBackend for SlowPutBackend {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn get(&self, object_id: u64) -> Option<Bytes> {
+            self.inner.get(object_id)
+        }
+
+        fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize> {
+            self.inner.read_into(object_id, data_offset, out)
+        }
+
+        fn get_for_upload(&self, object_id: u64) -> Option<Bytes> {
+            self.inner.get_for_upload(object_id)
+        }
+
+        fn contains(&self, object_id: u64) -> bool {
+            self.inner.contains(object_id)
+        }
+
+        fn advise_will_need(&self, object_id: u64) {
+            self.inner.advise_will_need(object_id);
+        }
+
+        fn put(
+            &self,
+            object_id: u64,
+            data: &[u8],
+            evictable: bool,
+        ) -> Result<(), LocalPayloadBackendError> {
+            let _ = self.entered_tx.send(());
+            let _ = self.release_rx.lock().recv();
+            self.inner.put(object_id, data, evictable)
+        }
+
+        fn sync_data(&self) -> Result<(), LocalPayloadBackendError> {
+            self.inner.sync_data()
+        }
+
+        fn run_pressure_maintenance(&self) -> Result<(), LocalPayloadBackendError> {
+            self.inner.run_pressure_maintenance()
+        }
+
+        fn mark_uploading(&self, object_id: u64) {
+            self.inner.mark_uploading(object_id);
+        }
+
+        fn mark_upload_failed(&self, object_id: u64) {
+            self.inner.mark_upload_failed(object_id);
+        }
+
+        fn mark_uploaded(&self, object_id: u64) {
+            self.inner.mark_uploaded(object_id);
+        }
+
+        fn pin(&self, object_id: u64) {
+            self.inner.pin(object_id);
+        }
+
+        fn unpin(&self, object_id: u64) {
+            self.inner.unpin(object_id);
+        }
+
+        fn remove(&self, object_id: u64) {
+            self.inner.remove(object_id);
+        }
+
+        fn remove_batch(&self, object_ids: &[u64]) {
+            self.inner.remove_batch(object_ids);
+        }
+
+        fn dirty_object_ids(&self) -> Vec<u64> {
+            self.inner.dirty_object_ids()
+        }
+
+        fn lifecycle_state(&self, object_id: u64) -> LocalPayloadLifecycleState {
+            self.inner.lifecycle_state(object_id)
+        }
+
+        fn is_evictable(&self, object_id: u64) -> bool {
+            self.inner.is_evictable(object_id)
+        }
+
+        fn storage_stats(&self) -> LocalPayloadStorageStats {
+            self.inner.storage_stats()
+        }
+
+        fn object_stats(
+            &self,
+            object_id: u64,
+        ) -> Option<studiofs_cache::local::LocalPayloadObjectStats> {
+            self.inner.object_stats(object_id)
+        }
+
+        fn object_ids(&self) -> Vec<u64> {
+            self.inner.object_ids()
+        }
+    }
 
     fn temp_stack(
         chunk_size: u32,
@@ -582,6 +746,65 @@ mod tests {
         assert_eq!(finished[1].len, 4);
         assert_eq!(finished[2].chunk_id, ChunkId(1));
         assert_eq!(finished[2].len, 3);
+        assert_eq!(
+            finished
+                .iter()
+                .map(|slice| slice.object_id)
+                .collect::<Vec<_>>(),
+            vec![600, 601, 602]
+        );
+    }
+
+    #[test]
+    fn writer_stack_finish_does_not_hold_shard_lock_during_staging() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000291")
+                .expect("open backend")
+                .backend;
+        let (entered_tx, entered_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let slow_backend = Arc::new(SlowPutBackend::new(backend, entered_tx, release_rx));
+        let (store, _rx) = CachedStore::open(CachedStoreConfig::new(dir.path()), slow_backend)
+            .expect("open store");
+        let stack = Arc::new(MountedWriterStack::new(
+            store,
+            WriterStackConfig {
+                block_size: 4,
+                chunk_size: 8,
+                page_size: 4,
+                dirty_byte_limit: None,
+                max_buffer_bytes: None,
+            },
+        ));
+
+        stack
+            .write_bytes(write_spec(1, 7, 0, 700), Bytes::from_static(b"slow"))
+            .expect("write slow file");
+        let finishing = Arc::clone(&stack);
+        let finish_thread = std::thread::spawn(move || finishing.finish_inode(7));
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("finish should enter backend put");
+
+        let writing = Arc::clone(&stack);
+        let (done_tx, done_rx) = std_mpsc::channel();
+        let write_thread = std::thread::spawn(move || {
+            let result =
+                writing.write_bytes(write_spec(2, 71, 0, 800), Bytes::from_static(b"fast"));
+            done_tx.send(result).expect("send write result");
+        });
+
+        let unrelated_write = done_rx.recv_timeout(Duration::from_millis(100));
+        release_tx.send(()).expect("release slow put");
+        finish_thread
+            .join()
+            .expect("finish thread")
+            .expect("finish inode");
+        write_thread.join().expect("write thread");
+        unrelated_write
+            .expect("unrelated inode in the same shard should not wait for staging")
+            .expect("write unrelated inode");
     }
 
     #[test]
