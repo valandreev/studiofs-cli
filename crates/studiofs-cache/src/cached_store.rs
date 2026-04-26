@@ -10,7 +10,9 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 use crate::local::{
@@ -28,6 +30,134 @@ pub type ObjectId = u64;
 pub struct CachedStoreConfig {
     pub cache_dir: PathBuf,
     pub upload_hot_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedStoreWriterConfig {
+    pub ino: u64,
+    pub base_offset: u64,
+    pub first_object_id: ObjectId,
+    pub content_epoch: u64,
+    pub block_size: usize,
+    pub page_size: usize,
+    pub dirty_byte_limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriterWriteResult {
+    pub accepted_bytes: usize,
+    pub dirty_bytes: usize,
+    pub throttled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedSlice {
+    pub ino: u64,
+    pub offset: u64,
+    pub object_id: ObjectId,
+    pub len: usize,
+    pub content_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CachedStoreWriterCountersSnapshot {
+    pub dirty_bytes: u64,
+    pub staged_bytes: u64,
+    pub pending_upload_bytes: u64,
+    pub staged_slices: u64,
+    pub staging_latency_observations: u64,
+    pub throttle_events: u64,
+}
+
+#[derive(Debug, Default)]
+struct CachedStoreWriterCounters {
+    dirty_bytes: AtomicU64,
+    staged_bytes: AtomicU64,
+    pending_upload_bytes: AtomicU64,
+    staged_slices: AtomicU64,
+    staging_latency_observations: AtomicU64,
+    throttle_events: AtomicU64,
+}
+
+impl CachedStoreWriterCounters {
+    fn snapshot(&self) -> CachedStoreWriterCountersSnapshot {
+        CachedStoreWriterCountersSnapshot {
+            dirty_bytes: self.dirty_bytes.load(Ordering::Relaxed),
+            staged_bytes: self.staged_bytes.load(Ordering::Relaxed),
+            pending_upload_bytes: self.pending_upload_bytes.load(Ordering::Relaxed),
+            staged_slices: self.staged_slices.load(Ordering::Relaxed),
+            staging_latency_observations: self.staging_latency_observations.load(Ordering::Relaxed),
+            throttle_events: self.throttle_events.load(Ordering::Relaxed),
+        }
+    }
+
+    fn add_dirty_bytes(&self, bytes: usize) {
+        self.dirty_bytes
+            .fetch_add(saturating_u64_from_usize(bytes), Ordering::Relaxed);
+    }
+
+    fn subtract_dirty_bytes(&self, bytes: usize) {
+        subtract_saturating(&self.dirty_bytes, saturating_u64_from_usize(bytes));
+    }
+
+    fn record_staged(&self, bytes: usize) {
+        let bytes = saturating_u64_from_usize(bytes);
+        self.staged_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.pending_upload_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.staged_slices.fetch_add(1, Ordering::Relaxed);
+        self.staging_latency_observations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_upload_terminal(&self, bytes: u64) {
+        subtract_saturating(&self.pending_upload_bytes, bytes);
+    }
+
+    fn record_throttle(&self) {
+        self.throttle_events.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn saturating_u64_from_usize(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn subtract_saturating(value: &AtomicU64, amount: u64) {
+    let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_sub(amount))
+    });
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CachedStoreWriterError {
+    #[error("writer page size and block size must be greater than zero")]
+    InvalidPageGeometry,
+    #[error("write offset {offset} targets bytes already frozen before {frozen_before}")]
+    WriteBeforeFrozen { offset: u64, frozen_before: u64 },
+    #[error("writer offset is too large for this platform")]
+    OffsetTooLarge,
+    #[error("local payload backend failed while staging object {object_id}: {source}")]
+    LocalPayload {
+        object_id: ObjectId,
+        #[source]
+        source: crate::local::LocalPayloadBackendError,
+    },
+    #[error("upload stage failed while staging object {object_id}: {source}")]
+    UploadStage {
+        object_id: ObjectId,
+        #[source]
+        source: UploadStageStoreError,
+    },
+}
+
+pub struct CachedStoreWriterSlice {
+    store: Arc<CachedStore>,
+    config: CachedStoreWriterConfig,
+    active_start: u64,
+    next_object_id: ObjectId,
+    created_at: Instant,
+    pages: Vec<u8>,
 }
 
 impl CachedStoreConfig {
@@ -192,6 +322,8 @@ pub struct CachedStore {
     upload_hot: Mutex<UploadHotState>,
     pinned: Mutex<PinnedState>,
     upload_queue: Arc<UploadQueue>,
+    pending_upload_bytes_by_object: Mutex<HashMap<ObjectId, u64>>,
+    writer_counters: CachedStoreWriterCounters,
     metrics: CachePipelineMetrics,
 }
 
@@ -213,9 +345,29 @@ impl CachedStore {
             upload_hot: Mutex::new(UploadHotState::new(upload_hot_bytes)),
             pinned: Mutex::new(PinnedState::default()),
             upload_queue,
+            pending_upload_bytes_by_object: Mutex::new(HashMap::new()),
+            writer_counters: CachedStoreWriterCounters::default(),
             metrics: CachePipelineMetrics::default(),
         });
         Ok((cached_store, upload_rx))
+    }
+
+    pub fn open_writer_slice(
+        self: &Arc<Self>,
+        config: CachedStoreWriterConfig,
+    ) -> CachedStoreWriterSlice {
+        CachedStoreWriterSlice {
+            active_start: config.base_offset,
+            next_object_id: config.first_object_id,
+            created_at: Instant::now(),
+            store: Arc::clone(self),
+            config,
+            pages: Vec::new(),
+        }
+    }
+
+    pub fn snapshot_writer_counters(&self) -> CachedStoreWriterCountersSnapshot {
+        self.writer_counters.snapshot()
     }
 
     pub fn local_payload_backend(&self) -> &Arc<dyn LocalPayloadBackend> {
@@ -409,6 +561,7 @@ impl CachedStore {
 
     pub fn complete_upload(&self, op: &PendingUpload) {
         self.upload_queue.complete(op);
+        self.record_upload_terminal(op.object_id);
         self.unpin(op.object_id);
         self.metrics.upload_queue.record_complete();
     }
@@ -423,6 +576,7 @@ impl CachedStore {
 
     pub fn cancel_upload(&self, op: &PendingUpload) {
         self.upload_queue.cancel(op);
+        self.record_upload_terminal(op.object_id);
         self.unpin(op.object_id);
         self.metrics.upload_queue.record_cancel();
     }
@@ -463,6 +617,194 @@ impl CachedStore {
         self.upload_queue.shutdown();
         self.flush_upload_journal().await;
     }
+
+    fn submit_staged_upload(
+        &self,
+        ino: u64,
+        offset: u64,
+        object_id: ObjectId,
+        content_epoch: u64,
+        payload_len: usize,
+    ) {
+        self.pending_upload_bytes_by_object
+            .lock()
+            .insert(object_id, saturating_u64_from_usize(payload_len));
+        self.writer_counters.record_staged(payload_len);
+        self.submit_upload(ino, offset, object_id, content_epoch);
+    }
+
+    fn record_upload_terminal(&self, object_id: ObjectId) {
+        if let Some(bytes) = self
+            .pending_upload_bytes_by_object
+            .lock()
+            .remove(&object_id)
+        {
+            self.writer_counters.record_upload_terminal(bytes);
+        }
+    }
+}
+
+impl CachedStoreWriterSlice {
+    pub fn write_at(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<WriterWriteResult, CachedStoreWriterError> {
+        self.validate_geometry()?;
+        if offset < self.active_start {
+            return Err(CachedStoreWriterError::WriteBeforeFrozen {
+                offset,
+                frozen_before: self.active_start,
+            });
+        }
+
+        let relative = usize::try_from(offset - self.active_start)
+            .map_err(|_| CachedStoreWriterError::OffsetTooLarge)?;
+        let old_len = self.pages.len();
+        let end = relative
+            .checked_add(data.len())
+            .ok_or(CachedStoreWriterError::OffsetTooLarge)?;
+        if self.pages.len() < end {
+            let target_capacity = round_up_to_page(end, self.config.page_size);
+            if self.pages.capacity() < target_capacity {
+                self.pages
+                    .reserve(target_capacity.saturating_sub(self.pages.capacity()));
+            }
+            self.pages.resize(end, 0);
+        }
+        self.pages[relative..end].copy_from_slice(data);
+
+        let dirty_delta = end.saturating_sub(old_len);
+        if dirty_delta > 0 {
+            self.store.writer_counters.add_dirty_bytes(dirty_delta);
+        }
+        let dirty_bytes = self.dirty_bytes();
+        let throttled = self
+            .config
+            .dirty_byte_limit
+            .is_some_and(|limit| dirty_bytes > limit);
+        if throttled {
+            self.store.writer_counters.record_throttle();
+        }
+
+        Ok(WriterWriteResult {
+            accepted_bytes: data.len(),
+            dirty_bytes,
+            throttled,
+        })
+    }
+
+    pub fn flush_to(
+        &mut self,
+        target_offset: u64,
+    ) -> Result<Vec<StagedSlice>, CachedStoreWriterError> {
+        self.validate_geometry()?;
+        let mut staged = Vec::new();
+        while self.pages.len() >= self.config.block_size
+            && self
+                .active_start
+                .saturating_add(self.config.block_size as u64)
+                <= target_offset
+        {
+            staged.push(self.stage_prefix(self.config.block_size)?);
+        }
+        Ok(staged)
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<StagedSlice>, CachedStoreWriterError> {
+        self.validate_geometry()?;
+        let mut staged = Vec::new();
+        while !self.pages.is_empty() {
+            let len = self.pages.len().min(self.config.block_size);
+            staged.push(self.stage_prefix(len)?);
+        }
+        Ok(staged)
+    }
+
+    pub fn freeze_if_older_than(
+        &mut self,
+        max_age: Duration,
+    ) -> Result<Vec<StagedSlice>, CachedStoreWriterError> {
+        if self.pages.is_empty() || self.created_at.elapsed() < max_age {
+            return Ok(Vec::new());
+        }
+        self.finish()
+    }
+
+    pub fn read_accepted(&self, offset: u64, out: &mut [u8]) -> usize {
+        if offset < self.active_start {
+            return 0;
+        }
+        let Ok(relative) = usize::try_from(offset - self.active_start) else {
+            return 0;
+        };
+        if relative >= self.pages.len() {
+            return 0;
+        }
+        let len = out.len().min(self.pages.len() - relative);
+        out[..len].copy_from_slice(&self.pages[relative..relative + len]);
+        len
+    }
+
+    pub fn dirty_bytes(&self) -> usize {
+        self.pages.len()
+    }
+
+    fn stage_prefix(&mut self, len: usize) -> Result<StagedSlice, CachedStoreWriterError> {
+        let started_at = Instant::now();
+        let data = Bytes::copy_from_slice(&self.pages[..len]);
+        let object_id = self.next_object_id;
+        self.next_object_id = self.next_object_id.saturating_add(1);
+
+        self.store
+            .local_payload_backend
+            .put(object_id, data.as_ref(), false)
+            .map_err(|source| CachedStoreWriterError::LocalPayload { object_id, source })?;
+        self.store
+            .upload_stage_store
+            .link_payload(object_id)
+            .map_err(|source| CachedStoreWriterError::UploadStage { object_id, source })?;
+        self.store.upload_hot.lock().insert(object_id, data);
+        self.store.metrics.materialize_batches.record_batch(
+            1,
+            saturating_u64_from_usize(len),
+            started_at.elapsed(),
+        );
+        self.store.writer_counters.subtract_dirty_bytes(len);
+        self.store.submit_staged_upload(
+            self.config.ino,
+            self.active_start,
+            object_id,
+            self.config.content_epoch,
+            len,
+        );
+
+        let staged = StagedSlice {
+            ino: self.config.ino,
+            offset: self.active_start,
+            object_id,
+            len,
+            content_epoch: self.config.content_epoch,
+        };
+        self.pages.drain(..len);
+        self.active_start = self.active_start.saturating_add(len as u64);
+        Ok(staged)
+    }
+
+    fn validate_geometry(&self) -> Result<(), CachedStoreWriterError> {
+        if self.config.block_size == 0 || self.config.page_size == 0 {
+            Err(CachedStoreWriterError::InvalidPageGeometry)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn round_up_to_page(len: usize, page_size: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    len.div_ceil(page_size) * page_size
 }
 
 #[cfg(test)]
@@ -492,6 +834,153 @@ mod tests {
         .expect("open budgeted backend")
         .backend;
         CachedStore::open(CachedStoreConfig::new(dir.path()), backend).expect("open cached store")
+    }
+
+    fn writer_config() -> CachedStoreWriterConfig {
+        CachedStoreWriterConfig {
+            ino: 7,
+            base_offset: 0,
+            first_object_id: 10_000,
+            content_epoch: 3,
+            block_size: 8,
+            page_size: 4,
+            dirty_byte_limit: None,
+        }
+    }
+
+    #[test]
+    fn writer_slice_accepts_in_order_writes_into_pages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        let mut writer = cached_store.open_writer_slice(writer_config());
+
+        writer.write_at(0, b"abcd").expect("write first page");
+        writer.write_at(4, b"ef").expect("write tail");
+
+        let mut out = [0; 6];
+        assert_eq!(writer.read_accepted(0, &mut out), 6);
+        assert_eq!(&out, b"abcdef");
+        assert_eq!(writer.dirty_bytes(), 6);
+        assert!(cached_store.snapshot_writer_counters().dirty_bytes >= 6);
+    }
+
+    #[test]
+    fn writer_slice_zero_fills_sparse_gap_before_offset() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        let mut writer = cached_store.open_writer_slice(writer_config());
+
+        writer.write_at(4, b"tail").expect("sparse write");
+
+        let mut out = [0xff; 8];
+        assert_eq!(writer.read_accepted(0, &mut out), 8);
+        assert_eq!(&out[..4], &[0, 0, 0, 0]);
+        assert_eq!(&out[4..], b"tail");
+    }
+
+    #[tokio::test]
+    async fn writer_slice_full_block_flush_stages_and_registers_upload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, mut rx) = temp_cached_store(&dir);
+        let mut writer = cached_store.open_writer_slice(writer_config());
+
+        writer.write_at(0, b"abcdefgh").expect("write full block");
+        let staged = writer.flush_to(8).expect("flush full block");
+
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].offset, 0);
+        assert_eq!(staged[0].len, 8);
+        assert_eq!(staged[0].object_id, 10_000);
+        assert_eq!(
+            cached_store
+                .get_staged_for_upload(staged[0].object_id)
+                .expect("staged payload")
+                .as_ref(),
+            b"abcdefgh"
+        );
+        let op = rx.recv().await.expect("pending upload");
+        assert_eq!(op.object_id, staged[0].object_id);
+        assert_eq!(op.ino, 7);
+        assert_eq!(op.offset, 0);
+    }
+
+    #[test]
+    fn writer_slice_finish_stages_partial_tail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        let mut writer = cached_store.open_writer_slice(writer_config());
+
+        writer.write_at(0, b"abc").expect("write partial tail");
+        let staged = writer.finish().expect("finish partial");
+
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].len, 3);
+        assert_eq!(
+            cached_store
+                .get_staged_for_upload(staged[0].object_id)
+                .expect("staged tail")
+                .as_ref(),
+            b"abc"
+        );
+        assert_eq!(writer.dirty_bytes(), 0);
+    }
+
+    #[test]
+    fn writer_slice_age_threshold_freezes_dirty_tail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        let mut writer = cached_store.open_writer_slice(writer_config());
+
+        writer.write_at(0, b"aged").expect("write dirty tail");
+        let staged = writer
+            .freeze_if_older_than(Duration::ZERO)
+            .expect("age threshold freeze");
+
+        assert_eq!(staged.len(), 1);
+        assert_eq!(
+            cached_store
+                .get_staged_for_upload(staged[0].object_id)
+                .expect("staged aged tail")
+                .as_ref(),
+            b"aged"
+        );
+    }
+
+    #[test]
+    fn writer_slice_staged_payload_survives_reopen_under_same_cache_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let object_id = {
+            let (cached_store, _rx) = temp_cached_store(&dir);
+            let mut writer = cached_store.open_writer_slice(writer_config());
+            writer.write_at(0, b"recover").expect("write payload");
+            writer.finish().expect("finish payload")[0].object_id
+        };
+
+        let (reopened, _rx) = temp_cached_store(&dir);
+
+        assert_eq!(
+            reopened
+                .get_staged_for_upload(object_id)
+                .expect("recovered staged payload")
+                .as_ref(),
+            b"recover"
+        );
+    }
+
+    #[test]
+    fn writer_slice_pressure_accounting_reports_throttle_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        let mut config = writer_config();
+        config.dirty_byte_limit = Some(4);
+        let mut writer = cached_store.open_writer_slice(config);
+
+        let result = writer.write_at(0, b"abcde").expect("write over limit");
+
+        assert!(result.throttled);
+        let counters = cached_store.snapshot_writer_counters();
+        assert_eq!(counters.throttle_events, 1);
+        assert!(counters.dirty_bytes >= 5);
     }
 
     #[tokio::test]
