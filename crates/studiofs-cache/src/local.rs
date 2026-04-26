@@ -95,9 +95,12 @@ pub trait LocalPayloadBackend: Send + Sync {
         data: &[u8],
         evictable: bool,
     ) -> Result<(), LocalPayloadBackendError>;
+    fn put_owned(&self, put: LocalPayloadPut) -> Result<(), LocalPayloadBackendError> {
+        self.put(put.object_id, put.data.as_ref(), put.evictable)
+    }
     fn put_batch(&self, entries: &[LocalPayloadPut]) -> Result<(), LocalPayloadBackendError> {
         for entry in entries {
-            self.put(entry.object_id, entry.data.as_ref(), entry.evictable)?;
+            self.put_owned(entry.clone())?;
         }
         Ok(())
     }

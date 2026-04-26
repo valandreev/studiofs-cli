@@ -4,7 +4,7 @@
 //! object pinning, and cache-pipeline diagnostics used by the mount runtime.
 //! Benchmark-only cache helpers live in `benchmark_cache`.
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -163,8 +163,7 @@ pub struct CachedStoreWriterSlice {
     active_start: u64,
     next_object_id: ObjectId,
     created_at: Instant,
-    head: usize,
-    pages: Vec<u8>,
+    pages: BytesMut,
 }
 
 impl CachedStoreConfig {
@@ -367,10 +366,9 @@ impl CachedStore {
             active_start: config.base_offset,
             next_object_id: config.first_object_id,
             created_at: Instant::now(),
-            head: 0,
             store: Arc::clone(self),
             config,
-            pages: Vec::new(),
+            pages: BytesMut::new(),
         }
     }
 
@@ -427,6 +425,13 @@ impl CachedStore {
         evictable: bool,
     ) -> Result<(), crate::local::LocalPayloadBackendError> {
         self.local_payload_backend.put(object_id, data, evictable)
+    }
+
+    pub fn put_owned(
+        &self,
+        put: LocalPayloadPut,
+    ) -> Result<(), crate::local::LocalPayloadBackendError> {
+        self.local_payload_backend.put_owned(put)
     }
 
     pub fn put_batch(
@@ -672,10 +677,7 @@ impl CachedStoreWriterSlice {
         let end = relative
             .checked_add(data.len())
             .ok_or(CachedStoreWriterError::OffsetTooLarge)?;
-        let absolute_end = self
-            .head
-            .checked_add(end)
-            .ok_or(CachedStoreWriterError::OffsetTooLarge)?;
+        let absolute_end = end;
         let target_capacity = round_up_to_page(absolute_end, self.config.page_size);
         self.validate_buffer_limit(target_capacity)?;
         if self.pages.len() < absolute_end {
@@ -685,10 +687,7 @@ impl CachedStoreWriterSlice {
             }
             self.pages.resize(absolute_end, 0);
         }
-        let write_start = self
-            .head
-            .checked_add(relative)
-            .ok_or(CachedStoreWriterError::OffsetTooLarge)?;
+        let write_start = relative;
         self.pages[write_start..absolute_end].copy_from_slice(data);
 
         let dirty_delta = end.saturating_sub(old_len);
@@ -760,30 +759,34 @@ impl CachedStoreWriterSlice {
             return 0;
         }
         let len = out.len().min(dirty_bytes - relative);
-        let start = self.head + relative;
+        let start = relative;
         out[..len].copy_from_slice(&self.pages[start..start + len]);
         len
     }
 
     pub fn dirty_bytes(&self) -> usize {
-        self.pages.len().saturating_sub(self.head)
+        self.pages.len()
     }
 
     fn stage_prefix(&mut self, len: usize) -> Result<StagedSlice, CachedStoreWriterError> {
         let started_at = Instant::now();
-        let payload = &self.pages[self.head..self.head + len];
+        let payload = self.pages.split_to(len).freeze();
         let object_id = self.next_object_id;
         self.next_object_id = self.next_object_id.saturating_add(1);
 
         self.store
             .local_payload_backend
-            .put(object_id, payload, false)
+            .put_owned(LocalPayloadPut {
+                object_id,
+                data: payload.clone(),
+                evictable: false,
+            })
             .map_err(|source| CachedStoreWriterError::LocalPayload { object_id, source })?;
         self.store
             .upload_stage_store
             .link_payload(object_id)
             .map_err(|source| CachedStoreWriterError::UploadStage { object_id, source })?;
-        self.cache_hot_upload_if_enabled(object_id, payload);
+        self.cache_hot_upload_if_enabled(object_id, payload.clone());
         self.store.metrics.materialize_batches.record_batch(
             1,
             saturating_u64_from_usize(len),
@@ -805,16 +808,14 @@ impl CachedStoreWriterSlice {
             len,
             content_epoch: self.config.content_epoch,
         };
-        self.head = self.head.saturating_add(len);
-        self.compact_staged_prefix();
         self.active_start = self.active_start.saturating_add(len as u64);
         Ok(staged)
     }
 
-    fn cache_hot_upload_if_enabled(&self, object_id: ObjectId, payload: &[u8]) {
+    fn cache_hot_upload_if_enabled(&self, object_id: ObjectId, payload: Bytes) {
         let mut upload_hot = self.store.upload_hot.lock();
         if upload_hot.budget_bytes > 0 {
-            upload_hot.insert(object_id, Bytes::copy_from_slice(payload));
+            upload_hot.insert(object_id, payload);
         }
     }
 
@@ -827,17 +828,6 @@ impl CachedStoreWriterSlice {
             return Err(CachedStoreWriterError::BufferLimitExceeded { requested, limit });
         }
         Ok(())
-    }
-
-    fn compact_staged_prefix(&mut self) {
-        if self.head == self.pages.len() {
-            self.pages.clear();
-            self.head = 0;
-        } else if self.head >= self.pages.len().saturating_sub(self.head) {
-            self.pages.copy_within(self.head.., 0);
-            self.pages.truncate(self.pages.len() - self.head);
-            self.head = 0;
-        }
     }
 
     fn validate_geometry(&self) -> Result<(), CachedStoreWriterError> {
@@ -909,6 +899,145 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct RecordedPayloadPut {
+        object_id: ObjectId,
+        data: Bytes,
+        used_owned_entry_point: bool,
+    }
+
+    #[derive(Clone)]
+    struct RecordingOwnedPayloadBackend {
+        inner: Arc<dyn LocalPayloadBackend>,
+        puts: Arc<Mutex<Vec<RecordedPayloadPut>>>,
+    }
+
+    impl RecordingOwnedPayloadBackend {
+        fn new(inner: Arc<dyn LocalPayloadBackend>) -> Self {
+            Self {
+                inner,
+                puts: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn take_owned_puts(&self) -> Vec<RecordedPayloadPut> {
+            std::mem::take(&mut *self.puts.lock())
+        }
+    }
+
+    impl LocalPayloadBackend for RecordingOwnedPayloadBackend {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn get(&self, object_id: u64) -> Option<Bytes> {
+            self.inner.get(object_id)
+        }
+
+        fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize> {
+            self.inner.read_into(object_id, data_offset, out)
+        }
+
+        fn get_for_upload(&self, object_id: u64) -> Option<Bytes> {
+            self.inner.get_for_upload(object_id)
+        }
+
+        fn contains(&self, object_id: u64) -> bool {
+            self.inner.contains(object_id)
+        }
+
+        fn advise_will_need(&self, object_id: u64) {
+            self.inner.advise_will_need(object_id);
+        }
+
+        fn put(
+            &self,
+            object_id: u64,
+            data: &[u8],
+            evictable: bool,
+        ) -> Result<(), crate::local::LocalPayloadBackendError> {
+            let owned = Bytes::copy_from_slice(data);
+            self.puts.lock().push(RecordedPayloadPut {
+                object_id,
+                data: owned,
+                used_owned_entry_point: false,
+            });
+            self.inner.put(object_id, data, evictable)
+        }
+
+        fn put_owned(
+            &self,
+            put: LocalPayloadPut,
+        ) -> Result<(), crate::local::LocalPayloadBackendError> {
+            self.puts.lock().push(RecordedPayloadPut {
+                object_id: put.object_id,
+                data: put.data.clone(),
+                used_owned_entry_point: true,
+            });
+            self.inner.put_owned(put)
+        }
+
+        fn sync_data(&self) -> Result<(), crate::local::LocalPayloadBackendError> {
+            self.inner.sync_data()
+        }
+
+        fn run_pressure_maintenance(&self) -> Result<(), crate::local::LocalPayloadBackendError> {
+            self.inner.run_pressure_maintenance()
+        }
+
+        fn mark_uploading(&self, object_id: u64) {
+            self.inner.mark_uploading(object_id);
+        }
+
+        fn mark_upload_failed(&self, object_id: u64) {
+            self.inner.mark_upload_failed(object_id);
+        }
+
+        fn mark_uploaded(&self, object_id: u64) {
+            self.inner.mark_uploaded(object_id);
+        }
+
+        fn pin(&self, object_id: u64) {
+            self.inner.pin(object_id);
+        }
+
+        fn unpin(&self, object_id: u64) {
+            self.inner.unpin(object_id);
+        }
+
+        fn remove(&self, object_id: u64) {
+            self.inner.remove(object_id);
+        }
+
+        fn remove_batch(&self, object_ids: &[u64]) {
+            self.inner.remove_batch(object_ids);
+        }
+
+        fn dirty_object_ids(&self) -> Vec<u64> {
+            self.inner.dirty_object_ids()
+        }
+
+        fn lifecycle_state(&self, object_id: u64) -> LocalPayloadLifecycleState {
+            self.inner.lifecycle_state(object_id)
+        }
+
+        fn is_evictable(&self, object_id: u64) -> bool {
+            self.inner.is_evictable(object_id)
+        }
+
+        fn storage_stats(&self) -> LocalPayloadStorageStats {
+            self.inner.storage_stats()
+        }
+
+        fn object_stats(&self, object_id: u64) -> Option<LocalPayloadObjectStats> {
+            self.inner.object_stats(object_id)
+        }
+
+        fn object_ids(&self) -> Vec<u64> {
+            self.inner.object_ids()
+        }
+    }
+
     #[test]
     fn writer_slice_accepts_in_order_writes_into_pages() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -963,6 +1092,45 @@ mod tests {
         assert_eq!(op.object_id, staged[0].object_id);
         assert_eq!(op.ino, 7);
         assert_eq!(op.offset, 0);
+    }
+
+    #[test]
+    fn writer_slice_full_block_flush_uses_owned_payload_for_backend_and_hot_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inner_backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
+                .expect("open backend")
+                .backend;
+        let backend = Arc::new(RecordingOwnedPayloadBackend::new(inner_backend));
+        let (cached_store, _rx) = CachedStore::open(
+            CachedStoreConfig::new(dir.path()).with_upload_hot_bytes(64),
+            backend.clone(),
+        )
+        .expect("open cached store");
+        let mut writer = cached_store.open_writer_slice(writer_config());
+
+        writer.write_at(0, b"abcdefgh").expect("write full block");
+        let staged = writer.flush_to(8).expect("flush full block");
+
+        assert_eq!(staged.len(), 1);
+        let recorded = backend.take_owned_puts();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].object_id, staged[0].object_id);
+        assert_eq!(recorded[0].data.as_ref(), b"abcdefgh");
+        assert!(
+            recorded[0].used_owned_entry_point,
+            "writer staging should hand frozen payload ownership to the backend"
+        );
+
+        let hot = cached_store
+            .get_hot_upload(staged[0].object_id)
+            .expect("hot upload payload");
+        assert_eq!(hot.as_ref(), b"abcdefgh");
+        assert_eq!(
+            recorded[0].data.as_ptr(),
+            hot.as_ptr(),
+            "backend and hot upload cache should share the frozen staged bytes"
+        );
     }
 
     #[test]
