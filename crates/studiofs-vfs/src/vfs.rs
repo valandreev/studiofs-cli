@@ -6328,11 +6328,6 @@ impl StudioVfs {
             payload_burst_interval_histogram.bucket_counts.iter().sum();
 
         let landing_zone_stats = self.landing_zone.stats();
-        let recoverable_landing_segments = self
-            .landing_zone
-            .recover()
-            .map(|segments| segments.len())
-            .unwrap_or_default();
 
         VfsWritePathObservabilitySnapshot {
             publisher_pid: std::process::id(),
@@ -6587,7 +6582,7 @@ impl StudioVfs {
             landing_zone: VfsWritePathLandingZoneStats {
                 accepted_writes: landing_zone_stats.accepted_writes,
                 accepted_bytes: landing_zone_stats.accepted_bytes,
-                recoverable_segments: recoverable_landing_segments,
+                recoverable_segments: landing_zone_stats.recoverable_segments,
             },
             winfsp_foreground_flushes: VfsWritePathWinfspForegroundFlushStats {
                 cleanup: self

@@ -39,9 +39,9 @@ impl StudioVfs {
             .await?;
             replayed_inodes.insert(item.segment.ino);
         }
-        for ino in replayed_inodes {
-            self.landing_zone.clear_inode(ino).map_err(VfsError::Io)?;
-        }
+        self.landing_zone
+            .clear_inodes(&replayed_inodes)
+            .map_err(VfsError::Io)?;
         Ok(())
     }
 
