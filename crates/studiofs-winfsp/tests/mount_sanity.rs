@@ -81,6 +81,7 @@ const MAX_AJA_SEQUENTIAL_TOTAL_BYTES: usize = 512 * 1024 * 1024;
 const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
 const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
 const AJA_CACHE_OFF_OPEN_OPTIONS_FLAGS: u32 = FILE_FLAG_WRITE_THROUGH | FILE_FLAG_NO_BUFFERING;
+const AJA_CACHE_OFF_ALIGNMENT_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AjaCacheValidationMode {
@@ -126,7 +127,7 @@ struct AlignedChunk {
 
 impl AlignedChunk {
     fn new(len: usize) -> Result<Self, String> {
-        let layout = std::alloc::Layout::from_size_align(len, 4096)
+        let layout = std::alloc::Layout::from_size_align(len, AJA_CACHE_OFF_ALIGNMENT_BYTES)
             .map_err(|err| format!("invalid aligned chunk layout for {len} bytes: {err}"))?;
         // SAFETY: `layout` has non-zero alignment and the returned pointer is
         // checked before it is stored. Drop deallocates with the same layout.
@@ -294,8 +295,20 @@ fn validate_aja_sequential_workload(
     Ok((chunk_bytes, chunk_count))
 }
 
-fn aja_sequential_workload() -> Result<(usize, usize), String> {
-    validate_aja_sequential_workload(aja_sequential_chunk_bytes(), aja_sequential_chunk_count())
+fn validate_aja_sequential_workload_for_modes(
+    chunk_bytes: usize,
+    chunk_count: usize,
+    modes: &[AjaCacheValidationMode],
+) -> Result<(usize, usize), String> {
+    let workload = validate_aja_sequential_workload(chunk_bytes, chunk_count)?;
+    if modes.contains(&AjaCacheValidationMode::CacheOff)
+        && chunk_bytes % AJA_CACHE_OFF_ALIGNMENT_BYTES != 0
+    {
+        return Err(format!(
+            "STUDIOFS_WINFSP_AJA_CHUNK_BYTES={chunk_bytes} must be 4096-byte aligned when cache-off validation is selected"
+        ));
+    }
+    Ok(workload)
 }
 
 #[test]
@@ -327,6 +340,15 @@ fn aja_cache_off_validation_mode_uses_stricter_open_flags() {
             == AJA_CACHE_OFF_OPEN_OPTIONS_FLAGS,
         "cache-off validation should request the Windows no-intermediate-buffering/write-through path"
     );
+}
+
+#[test]
+fn aja_cache_off_validation_rejects_unaligned_chunk_bytes() {
+    let err =
+        validate_aja_sequential_workload_for_modes(4097, 1, &[AjaCacheValidationMode::CacheOff])
+            .expect_err("cache-off validation should reject unaligned chunks");
+
+    assert!(err.contains("4096-byte aligned"), "unexpected error: {err}");
 }
 
 fn validate_aja_sequential_throughput(
@@ -1033,7 +1055,18 @@ fn winfsp_mount_aja_style_sequential_writer_validation_smoke() {
         "Local\\StudioFsAjaSequentialWriterSmoke-{}",
         std::process::id()
     );
-    let (chunk_bytes, chunk_count) = match aja_sequential_workload() {
+    let validation_modes = match aja_sequential_validation_modes_from_env() {
+        Ok(modes) => modes,
+        Err(reason) => {
+            eprintln!("Skipping WinFSP AJA-style sequential writer smoke test: {reason}");
+            return;
+        }
+    };
+    let (chunk_bytes, chunk_count) = match validate_aja_sequential_workload_for_modes(
+        aja_sequential_chunk_bytes(),
+        aja_sequential_chunk_count(),
+        &validation_modes,
+    ) {
         Ok(workload) => workload,
         Err(reason) => {
             eprintln!("Skipping WinFSP AJA-style sequential writer smoke test: {reason}");
@@ -1044,13 +1077,6 @@ fn winfsp_mount_aja_style_sequential_writer_validation_smoke() {
         eprintln!("Skipping WinFSP AJA-style sequential writer smoke test: {reason}");
         return;
     }
-    let validation_modes = match aja_sequential_validation_modes_from_env() {
-        Ok(modes) => modes,
-        Err(reason) => {
-            eprintln!("Skipping WinFSP AJA-style sequential writer smoke test: {reason}");
-            return;
-        }
-    };
 
     with_winfsp_mount(vfs, rt, mount_point, event_name, |drive_root| {
         // Approximate a media-style single-handle sequential writer: large

@@ -3811,6 +3811,49 @@ fn write_path_observability_reports_landing_drain_lag_and_pacing() {
 }
 
 #[test]
+fn reset_diagnostics_observability_clears_drain_lag_pacing_counters() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-287-reset-drain-lag-counters");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        vfs.set_max_dirty_bytes(128 * 1024 * 1024);
+        let attr = vfs
+            .create(1, b"sfs-287-reset-drain-lag-counters.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let slice_bytes = 2 * 1024 * 1024usize;
+
+        for index in 0..3u64 {
+            let payload = vec![0x70u8.saturating_add(index as u8); slice_bytes];
+            vfs.write_fh_with_deferred_materialize(
+                fh,
+                ino,
+                index * slice_bytes as u64,
+                &payload,
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await
+            .unwrap();
+        }
+
+        let before_reset = vfs.write_path_observability_snapshot();
+        assert!(before_reset.drain_lag.soft_pacing_events > 0);
+        assert!(before_reset.drain_lag.soft_pacing_total_ms > 0);
+
+        vfs.reset_diagnostics_observability();
+
+        let after_reset = vfs.write_path_observability_snapshot();
+        assert_eq!(after_reset.drain_lag.soft_pacing_events, 0);
+        assert_eq!(after_reset.drain_lag.soft_pacing_total_ms, 0);
+        assert_eq!(after_reset.drain_lag.soft_pacing_max_ms, 0);
+
+        vfs.flush_fh(fh).await.unwrap();
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn write_fh_aligned_full_block_callback_is_accepted_immediately() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-257-write-fh-aligned-full-block");
