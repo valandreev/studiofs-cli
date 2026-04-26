@@ -41,6 +41,7 @@ pub struct CachedStoreWriterConfig {
     pub block_size: usize,
     pub page_size: usize,
     pub dirty_byte_limit: Option<usize>,
+    pub max_buffer_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +138,8 @@ pub enum CachedStoreWriterError {
     WriteBeforeFrozen { offset: u64, frozen_before: u64 },
     #[error("writer offset is too large for this platform")]
     OffsetTooLarge,
+    #[error("writer buffer limit exceeded: requested {requested} bytes, limit {limit} bytes")]
+    BufferLimitExceeded { requested: usize, limit: usize },
     #[error("local payload backend failed while staging object {object_id}: {source}")]
     LocalPayload {
         object_id: ObjectId,
@@ -157,6 +160,7 @@ pub struct CachedStoreWriterSlice {
     active_start: u64,
     next_object_id: ObjectId,
     created_at: Instant,
+    head: usize,
     pages: Vec<u8>,
 }
 
@@ -360,6 +364,7 @@ impl CachedStore {
             active_start: config.base_offset,
             next_object_id: config.first_object_id,
             created_at: Instant::now(),
+            head: 0,
             store: Arc::clone(self),
             config,
             pages: Vec::new(),
@@ -660,19 +665,28 @@ impl CachedStoreWriterSlice {
 
         let relative = usize::try_from(offset - self.active_start)
             .map_err(|_| CachedStoreWriterError::OffsetTooLarge)?;
-        let old_len = self.pages.len();
+        let old_len = self.dirty_bytes();
         let end = relative
             .checked_add(data.len())
             .ok_or(CachedStoreWriterError::OffsetTooLarge)?;
-        if self.pages.len() < end {
-            let target_capacity = round_up_to_page(end, self.config.page_size);
+        self.validate_buffer_limit(end)?;
+        let absolute_end = self
+            .head
+            .checked_add(end)
+            .ok_or(CachedStoreWriterError::OffsetTooLarge)?;
+        if self.pages.len() < absolute_end {
+            let target_capacity = round_up_to_page(absolute_end, self.config.page_size);
             if self.pages.capacity() < target_capacity {
                 self.pages
                     .reserve(target_capacity.saturating_sub(self.pages.capacity()));
             }
-            self.pages.resize(end, 0);
+            self.pages.resize(absolute_end, 0);
         }
-        self.pages[relative..end].copy_from_slice(data);
+        let write_start = self
+            .head
+            .checked_add(relative)
+            .ok_or(CachedStoreWriterError::OffsetTooLarge)?;
+        self.pages[write_start..absolute_end].copy_from_slice(data);
 
         let dirty_delta = end.saturating_sub(old_len);
         if dirty_delta > 0 {
@@ -700,7 +714,7 @@ impl CachedStoreWriterSlice {
     ) -> Result<Vec<StagedSlice>, CachedStoreWriterError> {
         self.validate_geometry()?;
         let mut staged = Vec::new();
-        while self.pages.len() >= self.config.block_size
+        while self.dirty_bytes() >= self.config.block_size
             && self
                 .active_start
                 .saturating_add(self.config.block_size as u64)
@@ -714,8 +728,8 @@ impl CachedStoreWriterSlice {
     pub fn finish(&mut self) -> Result<Vec<StagedSlice>, CachedStoreWriterError> {
         self.validate_geometry()?;
         let mut staged = Vec::new();
-        while !self.pages.is_empty() {
-            let len = self.pages.len().min(self.config.block_size);
+        while self.dirty_bytes() > 0 {
+            let len = self.dirty_bytes().min(self.config.block_size);
             staged.push(self.stage_prefix(len)?);
         }
         Ok(staged)
@@ -725,7 +739,7 @@ impl CachedStoreWriterSlice {
         &mut self,
         max_age: Duration,
     ) -> Result<Vec<StagedSlice>, CachedStoreWriterError> {
-        if self.pages.is_empty() || self.created_at.elapsed() < max_age {
+        if self.dirty_bytes() == 0 || self.created_at.elapsed() < max_age {
             return Ok(Vec::new());
         }
         self.finish()
@@ -738,21 +752,23 @@ impl CachedStoreWriterSlice {
         let Ok(relative) = usize::try_from(offset - self.active_start) else {
             return 0;
         };
-        if relative >= self.pages.len() {
+        let dirty_bytes = self.dirty_bytes();
+        if relative >= dirty_bytes {
             return 0;
         }
-        let len = out.len().min(self.pages.len() - relative);
-        out[..len].copy_from_slice(&self.pages[relative..relative + len]);
+        let len = out.len().min(dirty_bytes - relative);
+        let start = self.head + relative;
+        out[..len].copy_from_slice(&self.pages[start..start + len]);
         len
     }
 
     pub fn dirty_bytes(&self) -> usize {
-        self.pages.len()
+        self.pages.len().saturating_sub(self.head)
     }
 
     fn stage_prefix(&mut self, len: usize) -> Result<StagedSlice, CachedStoreWriterError> {
         let started_at = Instant::now();
-        let data = Bytes::copy_from_slice(&self.pages[..len]);
+        let data = Bytes::copy_from_slice(&self.pages[self.head..self.head + len]);
         let object_id = self.next_object_id;
         self.next_object_id = self.next_object_id.saturating_add(1);
 
@@ -786,9 +802,30 @@ impl CachedStoreWriterSlice {
             len,
             content_epoch: self.config.content_epoch,
         };
-        self.pages.drain(..len);
+        self.head = self.head.saturating_add(len);
+        self.compact_staged_prefix();
         self.active_start = self.active_start.saturating_add(len as u64);
         Ok(staged)
+    }
+
+    fn validate_buffer_limit(&self, requested: usize) -> Result<(), CachedStoreWriterError> {
+        if let Some(limit) = self.config.max_buffer_bytes
+            && requested > limit
+        {
+            return Err(CachedStoreWriterError::BufferLimitExceeded { requested, limit });
+        }
+        Ok(())
+    }
+
+    fn compact_staged_prefix(&mut self) {
+        if self.head == self.pages.len() {
+            self.pages.clear();
+            self.head = 0;
+        } else if self.head >= self.pages.len().saturating_sub(self.head) {
+            self.pages.copy_within(self.head.., 0);
+            self.pages.truncate(self.pages.len() - self.head);
+            self.head = 0;
+        }
     }
 
     fn validate_geometry(&self) -> Result<(), CachedStoreWriterError> {
@@ -845,6 +882,7 @@ mod tests {
             block_size: 8,
             page_size: 4,
             dirty_byte_limit: None,
+            max_buffer_bytes: None,
         }
     }
 
@@ -981,6 +1019,47 @@ mod tests {
         let counters = cached_store.snapshot_writer_counters();
         assert_eq!(counters.throttle_events, 1);
         assert!(counters.dirty_bytes >= 5);
+    }
+
+    #[test]
+    fn writer_slice_rejects_sparse_write_before_allocating_past_buffer_limit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        let mut config = writer_config();
+        config.max_buffer_bytes = Some(8);
+        let mut writer = cached_store.open_writer_slice(config);
+
+        let err = writer.write_at(1024, b"x").expect_err("buffer limit");
+
+        assert!(matches!(
+            err,
+            CachedStoreWriterError::BufferLimitExceeded {
+                requested: 1025,
+                limit: 8
+            }
+        ));
+        assert_eq!(writer.dirty_bytes(), 0);
+        assert_eq!(cached_store.snapshot_writer_counters().dirty_bytes, 0);
+    }
+
+    #[test]
+    fn writer_slice_flushes_multiple_blocks_and_keeps_tail_readable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        let mut writer = cached_store.open_writer_slice(writer_config());
+
+        writer
+            .write_at(0, b"abcdefghijklmnopqr")
+            .expect("write two blocks and tail");
+        let staged = writer.flush_to(16).expect("flush full blocks");
+
+        assert_eq!(staged.len(), 2);
+        assert_eq!(staged[0].offset, 0);
+        assert_eq!(staged[1].offset, 8);
+        let mut tail = [0; 2];
+        assert_eq!(writer.read_accepted(16, &mut tail), 2);
+        assert_eq!(&tail, b"qr");
+        assert_eq!(writer.dirty_bytes(), 2);
     }
 
     #[tokio::test]
