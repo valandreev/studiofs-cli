@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use studiofs_cache::{
@@ -72,6 +72,8 @@ pub(super) enum WriterStackError {
     OffsetOverflow,
     #[error("write length exceeds u32::MAX")]
     WriteTooLarge,
+    #[error("writer stack object reservation exceeds u32::MAX")]
+    ObjectReservationTooLarge,
     #[error("cached-store writer failed: {0}")]
     CachedStore(#[from] CachedStoreWriterError),
     #[error("sticky writer error for inode {ino}: {message}")]
@@ -111,6 +113,7 @@ struct FileWriter {
 struct WriterShard {
     files: HashMap<Ino, Arc<Mutex<FileWriter>>>,
     handle_counts_by_ino: HashMap<Ino, usize>,
+    dirty_inodes: HashSet<Ino>,
 }
 
 #[derive(Default)]
@@ -202,6 +205,7 @@ impl MountedWriterStack {
         let mut data_offset = 0usize;
         let mut next_object_id = file.next_object_id;
         let mut throttled = false;
+        let mut accepted_dirty_bytes = 0usize;
         while data_offset < data.len() {
             let chunk_id = chunk_id_from_offset(cursor, self.config.chunk_size);
             let chunk_start = chunk_start_offset(chunk_id, self.config.chunk_size);
@@ -267,17 +271,26 @@ impl MountedWriterStack {
             throttled |= segment_throttled;
             file.visible_len = file.visible_len.max(end);
             file.dirty_bytes = file.dirty_bytes.saturating_add(accepted_delta);
+            accepted_dirty_bytes = accepted_dirty_bytes.saturating_add(accepted_delta);
             self.dirty_bytes.fetch_add(accepted_delta, Ordering::AcqRel);
             cursor = end;
             data_offset += take;
             next_object_id = next_object_id.saturating_add(object_ids_used);
             file.next_object_id = next_object_id;
         }
+        let visible_len = file.visible_len;
+        drop(file);
+        if accepted_dirty_bytes > 0 {
+            self.shards[shard_index]
+                .lock()
+                .dirty_inodes
+                .insert(spec.ino);
+        }
 
         Ok(WriterAccept {
             accepted_bytes,
             dirty_bytes: self.total_dirty_bytes(),
-            visible_len: file.visible_len,
+            visible_len,
             throttled,
             next_object_id,
         })
@@ -292,6 +305,9 @@ impl MountedWriterStack {
         let Some(end) = offset.checked_add(length) else {
             return Vec::new();
         };
+        if length == 0 {
+            return Vec::new();
+        }
         let file = {
             let shard = self.shards[Self::inode_shard_index(ino)].lock();
             let Some(file) = shard.files.get(&ino) else {
@@ -304,7 +320,13 @@ impl MountedWriterStack {
             return Vec::new();
         }
         let mut spans = Vec::new();
-        for chunk in file.chunks.values() {
+        let start_chunk = chunk_id_from_offset(offset, self.config.chunk_size);
+        let end_chunk = chunk_id_from_offset(end.saturating_sub(1), self.config.chunk_size);
+        for chunk in file
+            .chunks
+            .range(start_chunk..=end_chunk)
+            .map(|(_, chunk)| chunk)
+        {
             for slice in &chunk.slices {
                 let start = slice.start.max(offset);
                 let stop = slice.end.min(end);
@@ -335,6 +357,50 @@ impl MountedWriterStack {
         &self,
         ino: Ino,
     ) -> Result<Vec<FinishedWriterSlice>, WriterStackError> {
+        self.prepare_finish_inode(ino)?;
+        self.finish_prepared_inode_with_object_ids(ino, None)
+    }
+
+    pub(super) fn prepare_finish_inode(&self, ino: Ino) -> Result<u32, WriterStackError> {
+        let file = {
+            let shard = self.shards[Self::inode_shard_index(ino)].lock();
+            let Some(file) = shard.files.get(&ino) else {
+                return Ok(0);
+            };
+            Arc::clone(file)
+        };
+        let mut file = file.lock();
+        if file.ino != ino {
+            return Ok(0);
+        };
+        let mut object_count = 0u64;
+        for chunk in file.chunks.values_mut() {
+            for slice in &mut chunk.slices {
+                if slice.finished.is_empty() {
+                    slice.frozen = true;
+                    object_count = object_count.saturating_add(staged_object_count(
+                        slice.writer.dirty_bytes(),
+                        self.config.block_size,
+                    ));
+                }
+            }
+        }
+        u32::try_from(object_count).map_err(|_| WriterStackError::ObjectReservationTooLarge)
+    }
+
+    pub(super) fn finish_prepared_inode(
+        &self,
+        ino: Ino,
+        first_object_id: u64,
+    ) -> Result<Vec<FinishedWriterSlice>, WriterStackError> {
+        self.finish_prepared_inode_with_object_ids(ino, Some(first_object_id))
+    }
+
+    fn finish_prepared_inode_with_object_ids(
+        &self,
+        ino: Ino,
+        first_object_id: Option<u64>,
+    ) -> Result<Vec<FinishedWriterSlice>, WriterStackError> {
         let file = {
             let shard = self.shards[Self::inode_shard_index(ino)].lock();
             let Some(file) = shard.files.get(&ino) else {
@@ -349,11 +415,21 @@ impl MountedWriterStack {
         let mut finished = Vec::new();
         let mut staged_dirty_bytes = 0usize;
         let chunk_size = self.config.chunk_size;
+        let mut next_object_id = first_object_id;
         for chunk in file.chunks.values_mut() {
             chunk.slices.sort_by_key(|slice| slice.seq);
             for slice in &mut chunk.slices {
                 if !slice.finished.is_empty() {
                     continue;
+                }
+                if !slice.frozen {
+                    continue;
+                }
+                if let Some(object_id) = next_object_id {
+                    let object_count =
+                        staged_object_count(slice.writer.dirty_bytes(), self.config.block_size);
+                    slice.writer.set_next_object_id(object_id);
+                    next_object_id = Some(object_id.saturating_add(object_count));
                 }
                 slice.frozen = true;
                 let staged = slice.writer.finish()?;
@@ -373,6 +449,12 @@ impl MountedWriterStack {
         let clean = file.dirty_bytes == 0;
         drop(file);
         self.subtract_dirty(staged_dirty_bytes);
+        if clean {
+            self.shards[Self::inode_shard_index(ino)]
+                .lock()
+                .dirty_inodes
+                .remove(&ino);
+        }
         if clean {
             self.remove_file_if_clean_and_closed(ino);
         }
@@ -394,6 +476,7 @@ impl MountedWriterStack {
         let file = {
             let mut shard = self.shards[Self::inode_shard_index(ino)].lock();
             shard.handle_counts_by_ino.remove(&ino);
+            shard.dirty_inodes.remove(&ino);
             shard.files.remove(&ino)
         };
         if let Some(file) = file {
@@ -417,10 +500,12 @@ impl MountedWriterStack {
         let mut dirty = Vec::new();
         for shard in self.shards.iter() {
             let shard = shard.lock();
-            for (ino, file) in &shard.files {
-                let bytes = file.lock().dirty_bytes;
-                if bytes > 0 {
-                    dirty.push((*ino, bytes));
+            for ino in &shard.dirty_inodes {
+                if let Some(file) = shard.files.get(ino) {
+                    let bytes = file.lock().dirty_bytes;
+                    if bytes > 0 {
+                        dirty.push((*ino, bytes));
+                    }
                 }
             }
         }
@@ -536,6 +621,7 @@ impl MountedWriterStack {
             .get(&ino)
             .is_some_and(|file| file.lock().dirty_bytes == 0)
         {
+            shard.dirty_inodes.remove(&ino);
             shard.files.remove(&ino);
         }
     }

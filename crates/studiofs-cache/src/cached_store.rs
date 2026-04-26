@@ -769,6 +769,10 @@ impl CachedStoreWriterSlice {
         self.pages.len()
     }
 
+    pub fn set_next_object_id(&mut self, next_object_id: ObjectId) {
+        self.next_object_id = next_object_id;
+    }
+
     fn stage_prefix(&mut self, len: usize) -> Result<StagedSlice, CachedStoreWriterError> {
         let started_at = Instant::now();
         let payload = self.pages.split_to(len).freeze();

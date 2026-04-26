@@ -1238,18 +1238,15 @@ impl StudioVfs {
         offset: u64,
         data: Bytes,
     ) -> VfsResult<u32> {
-        let mut base_attr =
-            if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino).cloned() {
-                attr
-            } else {
-                self.getattr_async(ino).await?
-            };
-        self.refresh_inode_incarnation_state_from_attr(ino, &base_attr);
-        self.begin_pending_incarnation(ino, &mut base_attr);
+        let mut base_attr;
+        if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino).cloned() {
+            base_attr = attr;
+        } else {
+            base_attr = self.getattr_async(ino).await?;
+            self.refresh_inode_incarnation_state_from_attr(ino, &base_attr);
+            self.begin_pending_incarnation(ino, &mut base_attr);
+        }
 
-        let first_object_id = self
-            .reserve_writer_stack_object_ids(offset, data.len())
-            .await?;
         let accepted = self
             .state
             .writer_stack
@@ -1259,7 +1256,7 @@ impl StudioVfs {
                     ino,
                     current_size: base_attr.size,
                     content_epoch: base_attr.content_epoch,
-                    first_object_id,
+                    first_object_id: 0,
                     offset,
                 },
                 data,
@@ -1279,11 +1276,10 @@ impl StudioVfs {
         Ok(accepted.accepted_bytes)
     }
 
-    async fn reserve_writer_stack_object_ids(&self, offset: u64, len: usize) -> VfsResult<u64> {
-        if len == 0 {
+    async fn reserve_writer_stack_object_ids_by_count(&self, object_count: u32) -> VfsResult<u64> {
+        if object_count == 0 {
             return Ok(0);
         }
-        let object_count = self.writer_stack_object_upper_bound(offset, len)?;
         let ids = run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
             engine.next_object_ids(object_count)
         })
@@ -1293,7 +1289,12 @@ impl StudioVfs {
             .ok_or_else(|| VfsError::Other("writer stack object id reservation was empty".into()))
     }
 
-    fn writer_stack_object_upper_bound(&self, offset: u64, len: usize) -> VfsResult<u32> {
+    #[cfg(test)]
+    pub(super) fn writer_stack_object_upper_bound(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> VfsResult<u32> {
         let mut remaining = len;
         let mut cursor = offset;
         let mut object_count = 0usize;
@@ -1317,20 +1318,26 @@ impl StudioVfs {
             cursor = cursor.saturating_add(take as u64);
             remaining -= take;
         }
-        object_count = object_count.max(
-            self.max_dirty_bytes()
-                .div_ceil(self.block_size as usize)
-                .saturating_add(1),
-        );
         u32::try_from(object_count)
             .map_err(|_| VfsError::Other("writer stack object reservation exceeds u32::MAX".into()))
     }
 
     async fn materialize_writer_stack_for_inode(&self, ino: Ino) -> VfsResult<usize> {
+        let object_count = self
+            .state
+            .writer_stack
+            .prepare_finish_inode(ino)
+            .map_err(|err| VfsError::Other(format!("writer stack finish failed: {err}")))?;
+        if object_count == 0 {
+            return Ok(0);
+        }
+        let first_object_id = self
+            .reserve_writer_stack_object_ids_by_count(object_count)
+            .await?;
         let finished = self
             .state
             .writer_stack
-            .finish_inode(ino)
+            .finish_prepared_inode(ino, first_object_id)
             .map_err(|err| VfsError::Other(format!("writer stack finish failed: {err}")))?;
         if finished.is_empty() {
             return Ok(0);

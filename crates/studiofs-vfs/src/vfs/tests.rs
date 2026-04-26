@@ -1406,6 +1406,25 @@ fn epoch_finalizer_guard_observes_writer_stack_tail() {
 }
 
 #[test]
+fn writer_stack_object_reservation_counts_only_current_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "writer-stack-object-reservation");
+    let block_size = vfs.block_size as usize;
+    let expected_dirty_limit_objects = vfs.max_dirty_bytes().div_ceil(block_size).saturating_add(1);
+
+    assert!(
+        expected_dirty_limit_objects > 1,
+        "setup should distinguish exact write reservation from dirty-limit reservation"
+    );
+    assert_eq!(vfs.writer_stack_object_upper_bound(0, 1).unwrap(), 1);
+    assert_eq!(
+        vfs.writer_stack_object_upper_bound(0, block_size + 1)
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
 fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-inflight");
@@ -2999,6 +3018,37 @@ fn write_fh_routes_mounted_write_through_writer_stack() {
         );
         let read = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
         assert_eq!(read.as_ref(), payload);
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn write_fh_does_not_allocate_object_ids_before_materialization() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-292-write-fh-no-object-ids");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-292-write-fh-no-object-ids.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let before = meta.next_object_ids(1).unwrap()[0];
+
+        vfs.write_fh(fh, ino, 0, b"buffered").await.unwrap();
+
+        let after = meta.next_object_ids(1).unwrap()[0];
+        assert_eq!(
+            after,
+            before + 1,
+            "foreground write_fh should not allocate payload object ids before materialization"
+        );
+
+        vfs.flush_fh(fh).await.unwrap();
+        let spans = meta.lookup_payload_slices(ino).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].1.object_id, before + 2);
 
         vfs.release_fh(fh).await.unwrap();
     });
