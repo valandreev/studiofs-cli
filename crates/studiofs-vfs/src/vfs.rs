@@ -6243,6 +6243,7 @@ impl StudioVfs {
         self.has_pending_local_dirty_payloads_for_inode(ino)
             || self.state.namespace.dirty_attrs.lock().contains_key(&ino)
             || self.inode_has_dirty_handle_writers(ino)
+            || self.state.writer_stack.has_dirty_writers(ino)
     }
 
     pub fn write_path_observability_snapshot(&self) -> VfsWritePathObservabilitySnapshot {

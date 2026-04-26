@@ -194,6 +194,33 @@ impl<'a> DataReader<'a> {
         let mut segments = Vec::new();
         let pending_upload_index = vfs.snapshot_pending_upload_index();
 
+        let writer_stack_spans = vfs
+            .state
+            .writer_stack
+            .snapshot_read_spans(ino, offset, length);
+        for dirty in writer_stack_spans {
+            if unresolved.is_empty() {
+                break;
+            }
+            let Some(dirty_range) = ReadRange::new(dirty.start, dirty.end) else {
+                continue;
+            };
+            Self::claim_unresolved_ranges(&mut unresolved, dirty_range, &mut claim_buffers);
+            for overlap in claim_buffers.claimed.iter().copied() {
+                let delta = overlap.start().saturating_sub(dirty.start);
+                let Some(block_offset) = dirty.block_offset.checked_add(delta) else {
+                    continue;
+                };
+                segments.push(ReadSegment {
+                    range: overlap,
+                    source: ReadSegmentSource::Dirty {
+                        data: dirty.data.clone(),
+                        block_offset,
+                    },
+                });
+            }
+        }
+
         let handle_spans = vfs.snapshot_handle_writer_read_spans(ino, offset, length);
         for dirty in handle_spans {
             if unresolved.is_empty() {

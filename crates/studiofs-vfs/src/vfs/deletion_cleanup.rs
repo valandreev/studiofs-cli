@@ -162,6 +162,7 @@ impl StudioVfs {
         // when no object IDs remain to evict.
         self.cancel_pending_uploads_for_inode(ino);
         self.state.handle_writers.clear_inode(ino);
+        self.state.writer_stack.clear_inode(ino);
         self.clear_pending_payloads_for_inode(ino);
         self.remove_live_extents_for_inode(ino);
         self.readahead.evict(ino);

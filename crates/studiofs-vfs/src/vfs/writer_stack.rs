@@ -246,6 +246,7 @@ impl MountedWriterStack {
                             page_size: self.config.page_size,
                             dirty_byte_limit: self.config.dirty_byte_limit,
                             max_buffer_bytes: self.config.max_buffer_bytes,
+                            submit_upload: false,
                         });
                     let result = writer.write_at(cursor, segment.as_ref())?;
                     let object_ids_used =
@@ -352,7 +353,6 @@ impl MountedWriterStack {
             chunk.slices.sort_by_key(|slice| slice.seq);
             for slice in &mut chunk.slices {
                 if !slice.finished.is_empty() {
-                    finished.extend(slice.finished.clone());
                     continue;
                 }
                 slice.frozen = true;
@@ -390,12 +390,42 @@ impl MountedWriterStack {
         }
     }
 
+    pub(super) fn clear_inode(&self, ino: Ino) {
+        let file = {
+            let mut shard = self.shards[Self::inode_shard_index(ino)].lock();
+            shard.handle_counts_by_ino.remove(&ino);
+            shard.files.remove(&ino)
+        };
+        if let Some(file) = file {
+            self.subtract_dirty(file.lock().dirty_bytes);
+        }
+    }
+
     pub(super) fn has_dirty_writers(&self, ino: Ino) -> bool {
+        self.dirty_bytes_for_inode(ino) > 0
+    }
+
+    pub(super) fn dirty_bytes_for_inode(&self, ino: Ino) -> usize {
         let file = {
             let shard = self.shards[Self::inode_shard_index(ino)].lock();
             shard.files.get(&ino).cloned()
         };
-        file.is_some_and(|file| file.lock().dirty_bytes > 0)
+        file.map(|file| file.lock().dirty_bytes).unwrap_or(0)
+    }
+
+    pub(super) fn snapshot_dirty_inodes_by_bytes(&self) -> Vec<Ino> {
+        let mut dirty = Vec::new();
+        for shard in self.shards.iter() {
+            let shard = shard.lock();
+            for (ino, file) in &shard.files {
+                let bytes = file.lock().dirty_bytes;
+                if bytes > 0 {
+                    dirty.push((*ino, bytes));
+                }
+            }
+        }
+        dirty.sort_unstable_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
+        dirty.into_iter().map(|(ino, _)| ino).collect()
     }
 
     pub(super) fn visible_len(&self, ino: Ino) -> Option<u64> {
