@@ -143,6 +143,28 @@ pub(crate) fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
         format_bytes(snapshot.tuning.sync_group_min_bytes)
     ));
     out.push_str(&format!(
+        "landing_zone: accepted_writes={} accepted_bytes={} recoverable_segments={}\n",
+        snapshot.landing_zone.accepted_writes,
+        format_bytes(snapshot.landing_zone.accepted_bytes),
+        snapshot.landing_zone.recoverable_segments
+    ));
+    out.push_str(&format!(
+        "drain_lag: current={} steady_quota={} soft_pacing_events={} soft_pacing_total_ms={} soft_pacing_max_ms={}\n",
+        format_bytes(
+            u64::try_from(snapshot.drain_lag.current_bytes)
+                .context("drain lag bytes does not fit in u64")
+                .unwrap_or(u64::MAX)
+        ),
+        format_bytes(
+            u64::try_from(snapshot.drain_lag.steady_quota_bytes)
+                .context("drain lag steady quota does not fit in u64")
+                .unwrap_or(u64::MAX)
+        ),
+        snapshot.drain_lag.soft_pacing_events,
+        snapshot.drain_lag.soft_pacing_total_ms,
+        snapshot.drain_lag.soft_pacing_max_ms
+    ));
+    out.push_str(&format!(
         "payload_burst_avg: {}\n",
         format_bytes(snapshot.payload_burst.avg_bytes_per_burst.round() as u64)
     ));
@@ -226,8 +248,8 @@ mod tests {
     use super::{collect_write_path_artifacts, render_write_path_summary};
     use crate::cli::test_cache_profile_types::ProfileArtifactKind;
     use studiofs_vfs::{
-        VfsWritePathObservabilitySnapshot, VfsWritePathWinfspCallbackStats,
-        VfsWritePathWinfspForegroundFlushStats,
+        VfsWritePathDrainLagStats, VfsWritePathLandingZoneStats, VfsWritePathObservabilitySnapshot,
+        VfsWritePathWinfspCallbackStats, VfsWritePathWinfspForegroundFlushStats,
     };
 
     #[test]
@@ -261,6 +283,34 @@ mod tests {
         ));
         assert!(summary.contains("winfsp_foreground_flushes: cleanup=0 cleanup_skipped_clean=0 flush=2 flush_skipped_clean=3 close=3 close_skipped_clean=4"));
         assert!(summary.contains("winfsp_validation: cleanup_non_delete=cleanup-deferred cleanup_non_delete_barriers=0 cleanup_non_delete_skipped_clean=0 cleanup_flush_fh=0 flush_barriers=2 close_barriers=3"));
+    }
+
+    #[test]
+    fn render_write_path_summary_includes_landing_and_drain_lag_evidence() {
+        let snapshot = VfsWritePathObservabilitySnapshot {
+            backend_tag: "local-payload-runtime".to_string(),
+            landing_zone: VfsWritePathLandingZoneStats {
+                accepted_writes: 12,
+                accepted_bytes: 48 * 1024 * 1024,
+                recoverable_segments: 5,
+            },
+            drain_lag: VfsWritePathDrainLagStats {
+                current_bytes: 20 * 1024 * 1024,
+                steady_quota_bytes: 4 * 1024 * 1024,
+                soft_pacing_events: 3,
+                soft_pacing_total_ms: 9,
+                soft_pacing_max_ms: 4,
+            },
+            ..Default::default()
+        };
+
+        let bytes = serde_json::to_vec(&snapshot).expect("serialize snapshot");
+        let summary = render_write_path_summary(&bytes).expect("render summary");
+
+        assert!(summary.contains(
+            "landing_zone: accepted_writes=12 accepted_bytes=48.0MiB recoverable_segments=5"
+        ));
+        assert!(summary.contains("drain_lag: current=20.0MiB steady_quota=4.0MiB soft_pacing_events=3 soft_pacing_total_ms=9 soft_pacing_max_ms=4"));
     }
 
     #[test]

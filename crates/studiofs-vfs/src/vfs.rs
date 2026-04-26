@@ -67,10 +67,11 @@ pub use metrics::{
     VfsNamespaceCacheSnapshot, VfsRuntimeEvent, VfsSynchronizationStateSnapshot,
     VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
     VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats,
-    VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
-    VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
-    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
-    VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
+    VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats,
+    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
+    VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
+    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
+    VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
     VfsWritePathWinfspForegroundFlushStats, VfsWritePathWinfspWritePathStats,
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
@@ -1738,6 +1739,9 @@ struct MetricsState {
     eager_flush_triggered: AtomicU64,
     eager_flush_skipped_empty: AtomicU64,
     eager_flush_skipped_below_threshold: AtomicU64,
+    drain_lag_pacing_events: AtomicU64,
+    drain_lag_pacing_total_ms: AtomicU64,
+    drain_lag_pacing_max_ms: AtomicU64,
     vfs_write_calls: AtomicU64,
     vfs_write_bytes: AtomicU64,
     vfs_write_record_handle_writer_state_calls: AtomicU64,
@@ -1843,6 +1847,9 @@ impl MetricsState {
             eager_flush_triggered: AtomicU64::new(0),
             eager_flush_skipped_empty: AtomicU64::new(0),
             eager_flush_skipped_below_threshold: AtomicU64::new(0),
+            drain_lag_pacing_events: AtomicU64::new(0),
+            drain_lag_pacing_total_ms: AtomicU64::new(0),
+            drain_lag_pacing_max_ms: AtomicU64::new(0),
             vfs_write_calls: AtomicU64::new(0),
             vfs_write_bytes: AtomicU64::new(0),
             vfs_write_record_handle_writer_state_calls: AtomicU64::new(0),
@@ -1945,6 +1952,9 @@ impl MetricsState {
             eager_flush_triggered,
             eager_flush_skipped_empty,
             eager_flush_skipped_below_threshold,
+            drain_lag_pacing_events,
+            drain_lag_pacing_total_ms,
+            drain_lag_pacing_max_ms,
             vfs_write_calls,
             vfs_write_bytes,
             vfs_write_record_handle_writer_state_calls,
@@ -2199,6 +2209,21 @@ fn soft_drain_lag_pacing_delay_ms(
     } else {
         SOFT_DRAIN_LAG_PACING_DELAY_LIGHT_MS
     })
+}
+
+fn drain_lag_pacing_attribution_ms(
+    waited_ms: u64,
+    requested_delay_ms: u64,
+    drain_lag_delay_ms: Option<u64>,
+) -> Option<u64> {
+    let drain_lag_delay_ms = drain_lag_delay_ms?;
+    if requested_delay_ms == 0 {
+        return Some(0);
+    }
+    let numerator = u128::from(waited_ms) * u128::from(drain_lag_delay_ms);
+    let denominator = u128::from(requested_delay_ms);
+    let attributed_ms = numerator.div_ceil(denominator);
+    Some(attributed_ms.min(u128::from(u64::MAX)) as u64)
 }
 
 fn warn_small_block_addressability(block_size: u32) {
@@ -6350,6 +6375,7 @@ impl StudioVfs {
             payload_burst_interval_histogram.bucket_counts.iter().sum();
 
         let landing_zone_stats = self.landing_zone.stats();
+        let drain_lag_current_bytes = self.total_landed_write_drain_lag_bytes();
 
         VfsWritePathObservabilitySnapshot {
             publisher_pid: std::process::id(),
@@ -6605,6 +6631,25 @@ impl StudioVfs {
                 accepted_writes: landing_zone_stats.accepted_writes,
                 accepted_bytes: landing_zone_stats.accepted_bytes,
                 recoverable_segments: landing_zone_stats.recoverable_segments,
+            },
+            drain_lag: VfsWritePathDrainLagStats {
+                current_bytes: drain_lag_current_bytes,
+                steady_quota_bytes: self.handle_writer_slice_flush_bytes(),
+                soft_pacing_events: self
+                    .state
+                    .metrics
+                    .drain_lag_pacing_events
+                    .load(Ordering::Relaxed),
+                soft_pacing_total_ms: self
+                    .state
+                    .metrics
+                    .drain_lag_pacing_total_ms
+                    .load(Ordering::Relaxed),
+                soft_pacing_max_ms: self
+                    .state
+                    .metrics
+                    .drain_lag_pacing_max_ms
+                    .load(Ordering::Relaxed),
             },
             winfsp_foreground_flushes: VfsWritePathWinfspForegroundFlushStats {
                 cleanup: self

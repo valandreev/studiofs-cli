@@ -78,6 +78,175 @@ const DEFAULT_AJA_MIN_THROUGHPUT_MIB_PER_SEC: f64 = 64.0;
 const MAX_AJA_SEQUENTIAL_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 const MAX_AJA_SEQUENTIAL_CHUNK_COUNT: usize = 128;
 const MAX_AJA_SEQUENTIAL_TOTAL_BYTES: usize = 512 * 1024 * 1024;
+const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
+const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+const AJA_CACHE_OFF_OPEN_OPTIONS_FLAGS: u32 = FILE_FLAG_WRITE_THROUGH | FILE_FLAG_NO_BUFFERING;
+const AJA_CACHE_OFF_ALIGNMENT_BYTES: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AjaCacheValidationMode {
+    CacheOn,
+    CacheOff,
+}
+
+impl AjaCacheValidationMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::CacheOn => "cache-on",
+            Self::CacheOff => "cache-off",
+        }
+    }
+
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::CacheOn => "aja-sequential-cache-on.bin",
+            Self::CacheOff => "aja-sequential-cache-off.bin",
+        }
+    }
+
+    fn open_options_custom_flags(self) -> u32 {
+        match self {
+            Self::CacheOn => 0,
+            Self::CacheOff => AJA_CACHE_OFF_OPEN_OPTIONS_FLAGS,
+        }
+    }
+
+    fn min_throughput_env_key(self) -> &'static str {
+        match self {
+            Self::CacheOn => "STUDIOFS_WINFSP_AJA_CACHE_ON_MIN_THROUGHPUT_MIB_PER_SEC",
+            Self::CacheOff => "STUDIOFS_WINFSP_AJA_CACHE_OFF_MIN_THROUGHPUT_MIB_PER_SEC",
+        }
+    }
+}
+
+struct AlignedChunk {
+    ptr: std::ptr::NonNull<u8>,
+    len: usize,
+    layout: std::alloc::Layout,
+}
+
+impl AlignedChunk {
+    fn new(len: usize) -> Result<Self, String> {
+        if !len.is_multiple_of(AJA_CACHE_OFF_ALIGNMENT_BYTES) {
+            return Err(format!(
+                "aligned chunk length {len} must be 4096-byte aligned for unbuffered I/O"
+            ));
+        }
+        let layout = std::alloc::Layout::from_size_align(len, AJA_CACHE_OFF_ALIGNMENT_BYTES)
+            .map_err(|err| format!("invalid aligned chunk layout for {len} bytes: {err}"))?;
+        // SAFETY: `layout` has non-zero alignment and the returned pointer is
+        // checked before it is stored. Drop deallocates with the same layout.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        let ptr = std::ptr::NonNull::new(ptr)
+            .ok_or_else(|| format!("failed to allocate {len} aligned bytes"))?;
+        Ok(Self { ptr, len, layout })
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `ptr` was allocated for `len` bytes and remains exclusively
+        // borrowed through `&mut self` for the duration of this slice.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for AlignedChunk {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` was allocated with `layout` in `AlignedChunk::new`.
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
+enum AjaSequentialChunk {
+    Cached(Vec<u8>),
+    Unbuffered(AlignedChunk),
+}
+
+impl AjaSequentialChunk {
+    fn new(mode: AjaCacheValidationMode, len: usize) -> Result<Self, String> {
+        match mode {
+            AjaCacheValidationMode::CacheOn => Ok(Self::Cached(vec![0; len])),
+            AjaCacheValidationMode::CacheOff => AlignedChunk::new(len).map(Self::Unbuffered),
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::Cached(chunk) => chunk.as_mut_slice(),
+            Self::Unbuffered(chunk) => chunk.as_mut_slice(),
+        }
+    }
+}
+
+fn write_aja_chunk(
+    writer: &mut impl std::io::Write,
+    mode: AjaCacheValidationMode,
+    chunk: &[u8],
+) -> std::io::Result<()> {
+    match mode {
+        AjaCacheValidationMode::CacheOn => writer.write_all(chunk),
+        AjaCacheValidationMode::CacheOff => {
+            let written = writer.write(chunk)?;
+            if written == chunk.len() {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    format!(
+                        "partial unbuffered AJA cache-off write: wrote {written} of {} bytes",
+                        chunk.len()
+                    ),
+                ))
+            }
+        }
+    }
+}
+
+fn aja_sequential_validation_modes(
+    value: Option<&str>,
+) -> Result<Vec<AjaCacheValidationMode>, String> {
+    let Some(value) = value else {
+        return Ok(vec![
+            AjaCacheValidationMode::CacheOn,
+            AjaCacheValidationMode::CacheOff,
+        ]);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("both") {
+        return Ok(vec![
+            AjaCacheValidationMode::CacheOn,
+            AjaCacheValidationMode::CacheOff,
+        ]);
+    }
+
+    let mut modes = Vec::new();
+    for raw_mode in trimmed.split(',') {
+        let mode = match raw_mode.trim().to_ascii_lowercase().as_str() {
+            "cache-on" | "on" | "cached" => AjaCacheValidationMode::CacheOn,
+            "cache-off" | "off" | "uncached" | "write-through" => AjaCacheValidationMode::CacheOff,
+            unsupported => {
+                return Err(format!(
+                    "STUDIOFS_WINFSP_AJA_CACHE_MODES contains unsupported mode '{unsupported}'; use cache-on, cache-off, or both"
+                ));
+            }
+        };
+        if !modes.contains(&mode) {
+            modes.push(mode);
+        }
+    }
+    if modes.is_empty() {
+        return Err("STUDIOFS_WINFSP_AJA_CACHE_MODES did not select any modes".to_string());
+    }
+    Ok(modes)
+}
+
+fn aja_sequential_validation_modes_from_env() -> Result<Vec<AjaCacheValidationMode>, String> {
+    load_test_env();
+    aja_sequential_validation_modes(
+        std::env::var("STUDIOFS_WINFSP_AJA_CACHE_MODES")
+            .ok()
+            .as_deref(),
+    )
+}
 
 fn test_mount_usize_env_var(key: &str, default: usize) -> usize {
     load_test_env();
@@ -131,6 +300,16 @@ fn aja_sequential_min_throughput_mib_per_sec() -> Result<f64, String> {
     )
 }
 
+fn aja_sequential_min_throughput_for_mode(mode: AjaCacheValidationMode) -> Result<f64, String> {
+    match std::env::var(mode.min_throughput_env_key()) {
+        Ok(value) if !value.trim().is_empty() => test_mount_f64_env_var(
+            mode.min_throughput_env_key(),
+            DEFAULT_AJA_MIN_THROUGHPUT_MIB_PER_SEC,
+        ),
+        _ => aja_sequential_min_throughput_mib_per_sec(),
+    }
+}
+
 fn validate_aja_sequential_workload(
     chunk_bytes: usize,
     chunk_count: usize,
@@ -166,8 +345,107 @@ fn validate_aja_sequential_workload(
     Ok((chunk_bytes, chunk_count))
 }
 
-fn aja_sequential_workload() -> Result<(usize, usize), String> {
-    validate_aja_sequential_workload(aja_sequential_chunk_bytes(), aja_sequential_chunk_count())
+fn validate_aja_sequential_workload_for_modes(
+    chunk_bytes: usize,
+    chunk_count: usize,
+    modes: &[AjaCacheValidationMode],
+) -> Result<(usize, usize), String> {
+    let workload = validate_aja_sequential_workload(chunk_bytes, chunk_count)?;
+    if modes.contains(&AjaCacheValidationMode::CacheOff)
+        && !chunk_bytes.is_multiple_of(AJA_CACHE_OFF_ALIGNMENT_BYTES)
+    {
+        return Err(format!(
+            "STUDIOFS_WINFSP_AJA_CHUNK_BYTES={chunk_bytes} must be 4096-byte aligned when cache-off validation is selected"
+        ));
+    }
+    Ok(workload)
+}
+
+#[test]
+fn aja_cache_validation_modes_default_to_cache_on_and_cache_off() {
+    let modes = aja_sequential_validation_modes(None).expect("default validation modes");
+    assert_eq!(
+        modes,
+        vec![
+            AjaCacheValidationMode::CacheOn,
+            AjaCacheValidationMode::CacheOff
+        ],
+        "default AJA validation should compare OS-cache-on and stricter cache-off-style writes"
+    );
+}
+
+#[test]
+fn aja_cache_off_validation_mode_uses_stricter_open_flags() {
+    assert_eq!(
+        AjaCacheValidationMode::CacheOn.open_options_custom_flags(),
+        0
+    );
+    assert_ne!(
+        AjaCacheValidationMode::CacheOff.open_options_custom_flags(),
+        0
+    );
+    assert!(
+        AjaCacheValidationMode::CacheOff.open_options_custom_flags()
+            & AJA_CACHE_OFF_OPEN_OPTIONS_FLAGS
+            == AJA_CACHE_OFF_OPEN_OPTIONS_FLAGS,
+        "cache-off validation should request the Windows no-intermediate-buffering/write-through path"
+    );
+}
+
+#[test]
+fn aja_cache_off_validation_rejects_unaligned_chunk_bytes() {
+    let err =
+        validate_aja_sequential_workload_for_modes(4097, 1, &[AjaCacheValidationMode::CacheOff])
+            .expect_err("cache-off validation should reject unaligned chunks");
+
+    assert!(err.contains("4096-byte aligned"), "unexpected error: {err}");
+}
+
+#[test]
+fn aligned_chunk_rejects_unaligned_lengths() {
+    let Err(err) = AlignedChunk::new(4097) else {
+        panic!("unaligned chunks should be rejected");
+    };
+
+    assert!(err.contains("4096-byte aligned"), "unexpected error: {err}");
+}
+
+#[test]
+fn aja_cache_on_chunk_allows_unaligned_lengths() {
+    let mut chunk = AjaSequentialChunk::new(AjaCacheValidationMode::CacheOn, 4097)
+        .expect("cache-on chunk allocation should not require unbuffered I/O alignment");
+
+    assert_eq!(chunk.as_mut_slice().len(), 4097);
+}
+
+#[test]
+fn aja_cache_off_write_rejects_partial_unbuffered_write() {
+    struct PartialWriter {
+        max_bytes: usize,
+    }
+
+    impl std::io::Write for PartialWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len().min(self.max_bytes))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let chunk = vec![0; AJA_CACHE_OFF_ALIGNMENT_BYTES];
+    let err = write_aja_chunk(
+        &mut PartialWriter { max_bytes: 2048 },
+        AjaCacheValidationMode::CacheOff,
+        &chunk,
+    )
+    .expect_err("cache-off unbuffered writes should reject partial chunks");
+
+    assert!(
+        err.to_string().contains("partial"),
+        "unexpected error: {err}"
+    );
 }
 
 fn validate_aja_sequential_throughput(
@@ -850,6 +1128,7 @@ fn winfsp_mount_callback_flush_and_cleanup_observability_smoke() {
 #[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
 fn winfsp_mount_aja_style_sequential_writer_validation_smoke() {
     use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
 
     if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
         return;
@@ -873,115 +1152,151 @@ fn winfsp_mount_aja_style_sequential_writer_validation_smoke() {
         "Local\\StudioFsAjaSequentialWriterSmoke-{}",
         std::process::id()
     );
-    let (chunk_bytes, chunk_count) = match aja_sequential_workload() {
+    let validation_modes = match aja_sequential_validation_modes_from_env() {
+        Ok(modes) => modes,
+        Err(reason) => {
+            eprintln!("Skipping WinFSP AJA-style sequential writer smoke test: {reason}");
+            return;
+        }
+    };
+    let (chunk_bytes, chunk_count) = match validate_aja_sequential_workload_for_modes(
+        aja_sequential_chunk_bytes(),
+        aja_sequential_chunk_count(),
+        &validation_modes,
+    ) {
         Ok(workload) => workload,
         Err(reason) => {
             eprintln!("Skipping WinFSP AJA-style sequential writer smoke test: {reason}");
             return;
         }
     };
-    let min_throughput_mib_per_sec = match aja_sequential_min_throughput_mib_per_sec() {
-        Ok(value) => value,
-        Err(reason) => {
-            eprintln!("Skipping WinFSP AJA-style sequential writer smoke test: {reason}");
-            return;
-        }
-    };
+    if let Err(reason) = aja_sequential_min_throughput_mib_per_sec() {
+        eprintln!("Skipping WinFSP AJA-style sequential writer smoke test: {reason}");
+        return;
+    }
 
     with_winfsp_mount(vfs, rt, mount_point, event_name, |drive_root| {
         // Approximate a media-style single-handle sequential writer: large
         // contiguous writes without explicit sync_all between chunks, then a
         // dirty handle close.
-        let snapshot_before = vfs_observer.write_path_observability_snapshot();
-        let sequential_file = std::path::PathBuf::from(drive_root).join("aja-sequential.bin");
-        let writer = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(true)
-            .open(&sequential_file)
-            .expect("open aja-style sequential writer file through WinFSP mount");
-        let mut writer = std::io::BufWriter::new(writer);
-        let mut chunk = Vec::new();
-        if let Err(err) = chunk.try_reserve_exact(chunk_bytes) {
-            eprintln!(
-                "Skipping WinFSP AJA-style sequential writer smoke test: failed to reserve {} bytes for the sequential chunk buffer: {err}",
-                chunk_bytes
-            );
-            return;
-        }
-        chunk.resize(chunk_bytes, 0u8);
-        let total_bytes = chunk_bytes * chunk_count;
-        let started_at = std::time::Instant::now();
-        for chunk_index in 0..chunk_count {
-            let fill = b'A' + (chunk_index % 26) as u8;
-            chunk.fill(fill);
-            writer
-                .write_all(&chunk)
-                .expect("write sequential chunk through WinFSP mount");
-        }
-        writer
-            .flush()
-            .expect("flush sequential writer buffer through WinFSP mount");
-        drop(writer);
-        let elapsed = started_at.elapsed();
-        let throughput_mib_per_sec =
-            validate_aja_sequential_throughput(total_bytes, elapsed, min_throughput_mib_per_sec)
-                .unwrap_or_else(|err| panic!("{err}"));
+        for mode in &validation_modes {
+            let snapshot_before = vfs_observer.write_path_observability_snapshot();
+            let sequential_file = std::path::PathBuf::from(drive_root).join(mode.file_name());
+            let mut writer = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(true)
+                .custom_flags(mode.open_options_custom_flags())
+                .open(&sequential_file)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "open AJA-style {} sequential writer file through WinFSP mount: {err}",
+                        mode.label()
+                    )
+                });
+            let mut chunk = AjaSequentialChunk::new(*mode, chunk_bytes).unwrap_or_else(|err| {
+                panic!(
+                    "allocate aligned AJA-style {} sequential chunk buffer: {err}",
+                    mode.label()
+                )
+            });
+            let total_bytes = chunk_bytes * chunk_count;
+            let started_at = std::time::Instant::now();
+            for chunk_index in 0..chunk_count {
+                let fill = b'A' + (chunk_index % 26) as u8;
+                chunk.as_mut_slice().fill(fill);
+                write_aja_chunk(&mut writer, *mode, chunk.as_mut_slice()).unwrap_or_else(|err| {
+                    panic!(
+                        "write AJA-style {} sequential chunk through WinFSP mount: {err}",
+                        mode.label()
+                    )
+                });
+            }
+            writer.flush().unwrap_or_else(|err| {
+                panic!(
+                    "flush AJA-style {} sequential writer through WinFSP mount: {err}",
+                    mode.label()
+                )
+            });
+            drop(writer);
+            let elapsed = started_at.elapsed();
+            let mode_min_throughput_mib_per_sec = aja_sequential_min_throughput_for_mode(*mode)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "resolve AJA-style {} minimum throughput: {err}",
+                        mode.label()
+                    )
+                });
+            let throughput_mib_per_sec = validate_aja_sequential_throughput(
+                total_bytes,
+                elapsed,
+                mode_min_throughput_mib_per_sec,
+            )
+            .unwrap_or_else(|err| panic!("{err}"));
 
-        let snapshot_after = vfs_observer.write_path_observability_snapshot();
-        assert!(
-            snapshot_after.winfsp_callbacks.write > snapshot_before.winfsp_callbacks.write,
-            "large sequential mounted writes should surface WinFSP write callbacks (measured {:.2} MiB/s)",
-            throughput_mib_per_sec
-        );
-        assert!(
-            snapshot_after.winfsp_callbacks.cleanup > snapshot_before.winfsp_callbacks.cleanup,
-            "dirty sequential writer close should still surface cleanup callbacks (measured {:.2} MiB/s)",
-            throughput_mib_per_sec
-        );
-        assert!(
-            snapshot_after.winfsp_callbacks.close > snapshot_before.winfsp_callbacks.close,
-            "dirty sequential writer close should still surface close callbacks (measured {:.2} MiB/s)",
-            throughput_mib_per_sec
-        );
-        assert_eq!(
-            snapshot_after.winfsp_foreground_flushes.cleanup,
-            snapshot_before.winfsp_foreground_flushes.cleanup,
-            "AJA-style sequential writer should not reintroduce non-delete cleanup barriers (measured {:.2} MiB/s)",
-            throughput_mib_per_sec
-        );
-        assert_eq!(
-            snapshot_after
-                .winfsp_foreground_flushes
-                .cleanup_skipped_clean,
-            snapshot_before
-                .winfsp_foreground_flushes
-                .cleanup_skipped_clean,
-            "AJA-style sequential writer should not attribute cleanup as a clean-skip barrier (measured {:.2} MiB/s)",
-            throughput_mib_per_sec
-        );
-        assert_eq!(
-            snapshot_after.winfsp_callbacks.cleanup_flush_fh,
-            snapshot_before.winfsp_callbacks.cleanup_flush_fh,
-            "AJA-style sequential writer should not route cleanup through flush_fh (measured {:.2} MiB/s)",
-            throughput_mib_per_sec
-        );
-        assert!(
-            snapshot_after.winfsp_foreground_flushes.close
-                > snapshot_before.winfsp_foreground_flushes.close,
-            "dirty sequential writer should attribute the fallback barrier to close/release_fh (measured {:.2} MiB/s, floor {:.2} MiB/s)",
-            throughput_mib_per_sec,
-            min_throughput_mib_per_sec
-        );
-        assert_eq!(
-            snapshot_after.winfsp_foreground_flushes.close_skipped_clean,
-            snapshot_before
-                .winfsp_foreground_flushes
-                .close_skipped_clean,
-            "dirty sequential writer should not look like a clean close (measured {:.2} MiB/s)",
-            throughput_mib_per_sec
-        );
+            let snapshot_after = vfs_observer.write_path_observability_snapshot();
+            assert!(
+                snapshot_after.winfsp_callbacks.write > snapshot_before.winfsp_callbacks.write,
+                "large sequential mounted writes should surface WinFSP write callbacks in {} mode (measured {:.2} MiB/s)",
+                mode.label(),
+                throughput_mib_per_sec
+            );
+            assert!(
+                snapshot_after.winfsp_callbacks.cleanup > snapshot_before.winfsp_callbacks.cleanup,
+                "dirty sequential writer close should still surface cleanup callbacks in {} mode (measured {:.2} MiB/s)",
+                mode.label(),
+                throughput_mib_per_sec
+            );
+            assert!(
+                snapshot_after.winfsp_callbacks.close > snapshot_before.winfsp_callbacks.close,
+                "dirty sequential writer close should still surface close callbacks in {} mode (measured {:.2} MiB/s)",
+                mode.label(),
+                throughput_mib_per_sec
+            );
+            assert_eq!(
+                snapshot_after.winfsp_foreground_flushes.cleanup,
+                snapshot_before.winfsp_foreground_flushes.cleanup,
+                "AJA-style {} sequential writer should not reintroduce non-delete cleanup barriers (measured {:.2} MiB/s)",
+                mode.label(),
+                throughput_mib_per_sec
+            );
+            assert_eq!(
+                snapshot_after
+                    .winfsp_foreground_flushes
+                    .cleanup_skipped_clean,
+                snapshot_before
+                    .winfsp_foreground_flushes
+                    .cleanup_skipped_clean,
+                "AJA-style {} sequential writer should not attribute cleanup as a clean-skip barrier (measured {:.2} MiB/s)",
+                mode.label(),
+                throughput_mib_per_sec
+            );
+            assert_eq!(
+                snapshot_after.winfsp_callbacks.cleanup_flush_fh,
+                snapshot_before.winfsp_callbacks.cleanup_flush_fh,
+                "AJA-style {} sequential writer should not route cleanup through flush_fh (measured {:.2} MiB/s)",
+                mode.label(),
+                throughput_mib_per_sec
+            );
+            assert!(
+                snapshot_after.winfsp_foreground_flushes.close
+                    > snapshot_before.winfsp_foreground_flushes.close,
+                "dirty sequential writer should attribute the fallback barrier to close/release_fh in {} mode (measured {:.2} MiB/s, floor {:.2} MiB/s)",
+                mode.label(),
+                throughput_mib_per_sec,
+                mode_min_throughput_mib_per_sec
+            );
+            assert_eq!(
+                snapshot_after.winfsp_foreground_flushes.close_skipped_clean,
+                snapshot_before
+                    .winfsp_foreground_flushes
+                    .close_skipped_clean,
+                "dirty sequential writer should not look like a clean close in {} mode (measured {:.2} MiB/s)",
+                mode.label(),
+                throughput_mib_per_sec
+            );
+        }
     });
 }
 

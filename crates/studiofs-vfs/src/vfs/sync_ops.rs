@@ -207,6 +207,22 @@ impl StudioVfs {
             .local_dirty
             .fast_backpressure_stall_max_ms
             .fetch_max(waited_ms, std::sync::atomic::Ordering::Relaxed);
+        if let Some(drain_lag_attribution_ms) =
+            super::drain_lag_pacing_attribution_ms(waited_ms, delay_ms, drain_lag_delay_ms)
+        {
+            self.state
+                .metrics
+                .drain_lag_pacing_events
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.state.metrics.drain_lag_pacing_total_ms.fetch_add(
+                drain_lag_attribution_ms,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.state.metrics.drain_lag_pacing_max_ms.fetch_max(
+                drain_lag_attribution_ms,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         true
     }
 

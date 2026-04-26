@@ -144,6 +144,15 @@ pub struct VfsWritePathLandingZoneStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsWritePathDrainLagStats {
+    pub current_bytes: usize,
+    pub steady_quota_bytes: usize,
+    pub soft_pacing_events: u64,
+    pub soft_pacing_total_ms: u64,
+    pub soft_pacing_max_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsWritePathWinfspForegroundFlushStats {
     pub cleanup: u64,
     pub flush: u64,
@@ -261,6 +270,8 @@ pub struct VfsWritePathObservabilitySnapshot {
     pub vfs_write_path: VfsWritePathVfsWriteStats,
     #[serde(default)]
     pub landing_zone: VfsWritePathLandingZoneStats,
+    #[serde(default)]
+    pub drain_lag: VfsWritePathDrainLagStats,
     #[serde(default)]
     pub winfsp_foreground_flushes: VfsWritePathWinfspForegroundFlushStats,
     pub write_backpressure: VfsWritePathBackpressureStats,
