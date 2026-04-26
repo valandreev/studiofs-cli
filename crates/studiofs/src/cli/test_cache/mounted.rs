@@ -315,6 +315,64 @@ async fn wait_for_pending_upload_target(
     }
 }
 
+struct UploadIdleReadDrain<'a> {
+    params: &'a TestCacheParams,
+    files: &'a [WorkFile],
+    order: &'a [usize],
+    size_class_bounds: SizeClassBounds,
+    metrics_path: Option<&'a Path>,
+    expected_publisher_pid: u32,
+    upload_dir: &'a Path,
+    timeout: Duration,
+}
+
+async fn wait_for_pending_upload_idle_with_unrecorded_reads(
+    drain: UploadIdleReadDrain<'_>,
+) -> Result<PendingUploadObservation> {
+    let start = Instant::now();
+    loop {
+        let pending_uploads = scan_pending_uploads(
+            drain.metrics_path,
+            drain.expected_publisher_pid,
+            Some(drain.upload_dir),
+        )
+        .await?;
+        if pending_uploads == 0 {
+            return Ok(PendingUploadObservation {
+                target: PendingUploadTarget::Idle,
+                observed: true,
+                required_pending_uploads: 0,
+                waited: start.elapsed(),
+                pending_uploads,
+            });
+        }
+        if start.elapsed() >= drain.timeout {
+            return Ok(PendingUploadObservation {
+                target: PendingUploadTarget::Idle,
+                observed: false,
+                required_pending_uploads: 0,
+                waited: start.elapsed(),
+                pending_uploads,
+            });
+        }
+
+        tracing::info!(
+            target: "studiofs.cache.profile",
+            run_id = %drain.params.run_id,
+            phase = "e2e-upload-drain-read",
+            pending_uploads,
+            "cache benchmark unrecorded read while waiting for upload idle"
+        );
+        let _ = run_mounted_read_phase(
+            drain.params,
+            drain.files,
+            drain.order,
+            drain.size_class_bounds,
+        )
+        .await?;
+    }
+}
+
 fn pending_upload_validation_message(observation: &PendingUploadObservation) -> Option<String> {
     if observation.observed {
         return None;
@@ -792,67 +850,6 @@ pub(super) async fn run_mounted_end_to_end(
         let cache_upload_dir = cache_path.map(|path| path.join("upload"));
         let write_path_observability_path =
             cache_path.map(|path| path.join(WRITE_PATH_OBSERVABILITY_FILE));
-        let mut baseline_local_first_read_phase = None;
-        if let Some(upload_dir) = cache_upload_dir.as_deref() {
-            let cache_path_for_log = upload_dir.parent().unwrap_or(upload_dir);
-            tracing::info!(
-                target: "studiofs.cache.profile",
-                run_id = %params.run_id,
-                phase = "e2e-baseline-seed-write",
-                cache_path = %cache_path_for_log.display(),
-                upload_dir = %upload_dir.display(),
-                "cache benchmark phase start"
-            );
-            let _ = run_mounted_write_phase(params, &files, &order, size_class_bounds).await?;
-            let _ = wait_for_pending_upload_target(
-                write_path_observability_path.as_deref(),
-                mount_pid,
-                Some(upload_dir),
-                PendingUploadTarget::Active,
-                params.during_upload_min_pending,
-                params.during_upload_timeout,
-            )
-            .await?;
-            let idle_before_baseline = wait_for_pending_upload_target(
-                write_path_observability_path.as_deref(),
-                mount_pid,
-                Some(upload_dir),
-                PendingUploadTarget::Idle,
-                0,
-                Duration::from_secs(60),
-            )
-            .await?;
-
-            tracing::info!(
-                target: "studiofs.cache.profile",
-                run_id = %params.run_id,
-                phase = "e2e-baseline-read",
-                cache_path = %cache_path_for_log.display(),
-                upload_dir = %upload_dir.display(),
-                "cache benchmark phase start"
-            );
-            let baseline_wall_start = Instant::now();
-            let (baseline_reads, _) =
-                run_mounted_read_phase(params, &files, &order, size_class_bounds).await?;
-            let baseline_wall = baseline_wall_start.elapsed();
-            baseline_local_first_read_phase = Some(MountedLocalFirstReadPhaseReport {
-                phase: "baseline-read".to_string(),
-                wait_target: idle_before_baseline.target.label().to_string(),
-                target_state_observed: idle_before_baseline.observed,
-                valid_for_target: idle_before_baseline.observed,
-                required_pending_uploads: idle_before_baseline.required_pending_uploads,
-                wait_ms: idle_before_baseline.waited.as_secs_f64() * 1000.0,
-                pending_uploads_before: idle_before_baseline.pending_uploads,
-                pending_uploads_after: scan_pending_uploads(
-                    write_path_observability_path.as_deref(),
-                    mount_pid,
-                    Some(upload_dir),
-                )
-                .await?,
-                validation_message: pending_upload_validation_message(&idle_before_baseline),
-                results: phase_telemetry_to_report(&baseline_reads, baseline_wall),
-            });
-        }
 
         let measured_write_path_before = match write_path_observability_path.as_deref() {
             Some(path) => read_write_path_observability_snapshot(path, mount_pid).await?,
@@ -973,12 +970,8 @@ pub(super) async fn run_mounted_end_to_end(
             artifacts: Vec::new(),
             warnings: Vec::new(),
         });
-        let local_first_read_comparison = match (
-            cache_path,
-            cache_upload_dir.as_deref(),
-            baseline_local_first_read_phase,
-        ) {
-            (Some(cache_path), Some(upload_dir), Some(baseline_phase)) => {
+        let local_first_read_comparison = match (cache_path, cache_upload_dir.as_deref()) {
+            (Some(cache_path), Some(upload_dir)) => {
                 let during_phase = MountedLocalFirstReadPhaseReport {
                     phase: "during-upload-read".to_string(),
                     wait_target: measured
@@ -1024,15 +1017,18 @@ pub(super) async fn run_mounted_end_to_end(
                     results: phase_telemetry_to_report(&measured.reads, measured.reads_wall),
                 };
 
-                let idle_before_post = wait_for_pending_upload_target(
-                    write_path_observability_path.as_deref(),
-                    mount_pid,
-                    Some(upload_dir),
-                    PendingUploadTarget::Idle,
-                    0,
-                    Duration::from_secs(60),
-                )
-                .await?;
+                let idle_before_post =
+                    wait_for_pending_upload_idle_with_unrecorded_reads(UploadIdleReadDrain {
+                        params,
+                        files: &files,
+                        order: &order,
+                        size_class_bounds,
+                        metrics_path: write_path_observability_path.as_deref(),
+                        expected_publisher_pid: mount_pid,
+                        upload_dir,
+                        timeout: Duration::from_secs(60),
+                    })
+                    .await?;
                 let cache_path_for_log = upload_dir.parent().unwrap_or(upload_dir);
                 tracing::info!(
                     target: "studiofs.cache.profile",
@@ -1067,7 +1063,7 @@ pub(super) async fn run_mounted_end_to_end(
                 Some(MountedLocalFirstReadComparisonReport {
                     cache_path: cache_path.display().to_string(),
                     upload_dir: upload_dir.display().to_string(),
-                    phases: vec![baseline_phase, during_phase, post_phase],
+                    phases: vec![during_phase, post_phase],
                 })
             }
             _ => None,

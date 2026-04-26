@@ -1,11 +1,14 @@
+use bytes::Bytes;
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const DATA_FILE: &str = "landing.data";
@@ -15,11 +18,11 @@ const MANIFEST_BACKUP_FILE: &str = "landing.manifest.bak";
 #[cfg(windows)]
 const LANDING_FILE_SHARE_MODE: u32 = 0x00000001 | 0x00000002 | 0x00000004;
 
-pub(super) struct LandingWrite<'a> {
+pub(super) struct LandingWrite {
     pub(super) ino: u64,
     pub(super) fh: u64,
     pub(super) offset: u64,
-    pub(super) data: &'a [u8],
+    pub(super) data: Bytes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,14 +111,19 @@ fn parse_manifest_u64(value: Option<&str>, field: &str) -> io::Result<u64> {
         })
 }
 
-#[derive(Debug)]
 pub(super) struct LandingZone {
     data_path: PathBuf,
     manifest_path: PathBuf,
     manifest_tmp_path: PathBuf,
     manifest_backup_path: PathBuf,
-    data_file: Mutex<File>,
-    manifest_file: Mutex<Option<File>>,
+    files: Arc<Mutex<LandingFiles>>,
+    writer: Mutex<Option<JoinHandle<()>>>,
+    writer_state: Arc<LandingWriterShared>,
+    counters: Arc<LandingZoneCounters>,
+}
+
+#[derive(Default)]
+struct LandingZoneCounters {
     accepted_writes: AtomicU64,
     accepted_bytes: AtomicU64,
     recoverable_segments: AtomicUsize,
@@ -126,6 +134,41 @@ pub(super) struct LandingZone {
     manifest_rewrites: AtomicU64,
     sync_total_ns: AtomicU64,
     sync_max_ns: AtomicU64,
+}
+
+struct LandingFiles {
+    data: File,
+    manifest: Option<File>,
+}
+
+struct QueuedLandingWrite {
+    ino: u64,
+    fh: u64,
+    offset: u64,
+    data: Bytes,
+}
+
+#[derive(Default)]
+struct LandingWriterState {
+    queue: VecDeque<QueuedLandingWrite>,
+    active: bool,
+    shutdown: bool,
+    error: Option<String>,
+}
+
+#[derive(Default)]
+struct LandingWriterShared {
+    state: Mutex<LandingWriterState>,
+    changed: Condvar,
+}
+
+impl std::fmt::Debug for LandingZone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LandingZone")
+            .field("data_path", &self.data_path)
+            .field("manifest_path", &self.manifest_path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LandingZone {
@@ -144,61 +187,69 @@ impl LandingZone {
         let data_file = open_landing_append_file(&data_path)?;
         let manifest_file = open_landing_append_file(&manifest_path)?;
         let recoverable_segments = Self::count_manifest_segments(&manifest_path)?;
+        let files = Arc::new(Mutex::new(LandingFiles {
+            data: data_file,
+            manifest: Some(manifest_file),
+        }));
+        let writer_state = Arc::new(LandingWriterShared::default());
+        let counters = Arc::new(LandingZoneCounters {
+            recoverable_segments: AtomicUsize::new(recoverable_segments),
+            ..LandingZoneCounters::default()
+        });
+        let writer = Some(Self::spawn_writer(
+            manifest_path.clone(),
+            files.clone(),
+            writer_state.clone(),
+            counters.clone(),
+        )?);
         Ok(Self {
             data_path,
             manifest_path,
             manifest_tmp_path,
             manifest_backup_path,
-            data_file: Mutex::new(data_file),
-            manifest_file: Mutex::new(Some(manifest_file)),
-            accepted_writes: AtomicU64::new(0),
-            accepted_bytes: AtomicU64::new(0),
-            recoverable_segments: AtomicUsize::new(recoverable_segments),
-            accept_total_ns: AtomicU64::new(0),
-            accept_max_ns: AtomicU64::new(0),
-            data_syncs: AtomicU64::new(0),
-            manifest_syncs: AtomicU64::new(0),
-            manifest_rewrites: AtomicU64::new(0),
-            sync_total_ns: AtomicU64::new(0),
-            sync_max_ns: AtomicU64::new(0),
+            files,
+            writer: Mutex::new(writer),
+            writer_state,
+            counters,
         })
     }
 
-    pub(super) fn accept(&self, write: LandingWrite<'_>) -> io::Result<RecoveredLandingSegment> {
+    pub(super) fn accept(&self, write: LandingWrite) -> io::Result<()> {
         let accept_started = Instant::now();
-        let mut data = self
-            .data_file
-            .lock()
-            .map_err(|_| io::Error::other("landing data lock poisoned"))?;
-        let mut manifest_guard = self
-            .manifest_file
-            .lock()
-            .map_err(|_| io::Error::other("landing manifest lock poisoned"))?;
-        let data_offset = data.seek(SeekFrom::End(0))?;
-        data.write_all(write.data)?;
-
         let len = u64::try_from(write.data.len()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "landing write length exceeds u64::MAX",
             )
         })?;
-        let segment = LandingSegment {
-            ino: write.ino,
-            fh: write.fh,
-            offset: write.offset,
-            len,
-            data_offset,
-        };
-        let manifest = Self::ensure_manifest_file(&self.manifest_path, &mut manifest_guard)?;
-        manifest.seek(SeekFrom::End(0))?;
-        manifest.write_all(segment.as_manifest_record().as_bytes())?;
+        {
+            let mut state = self
+                .writer_state
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("landing writer lock poisoned"))?;
+            if let Some(error) = state.error.as_ref() {
+                return Err(io::Error::other(format!(
+                    "landing writer previously failed: {error}"
+                )));
+            }
+            state.queue.push_back(QueuedLandingWrite {
+                ino: write.ino,
+                fh: write.fh,
+                offset: write.offset,
+                data: write.data,
+            });
+            self.writer_state.changed.notify_one();
+        }
 
-        self.accepted_writes.fetch_add(1, Ordering::Relaxed);
-        self.accepted_bytes.fetch_add(len, Ordering::Relaxed);
-        self.recoverable_segments.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .accepted_writes
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .accepted_bytes
+            .fetch_add(len, Ordering::Relaxed);
         self.record_accept_latency(accept_started.elapsed());
-        Ok(segment.into())
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -206,16 +257,13 @@ impl LandingZone {
         if len == 0 {
             return Ok(Vec::new());
         }
+        self.drain_pending()?;
         let requested_end = offset.saturating_add(len as u64);
         let mut result = vec![0; len];
-        let _data_guard = self
-            .data_file
+        let _files = self
+            .files
             .lock()
-            .map_err(|_| io::Error::other("landing data lock poisoned"))?;
-        let _manifest_guard = self
-            .manifest_file
-            .lock()
-            .map_err(|_| io::Error::other("landing manifest lock poisoned"))?;
+            .map_err(|_| io::Error::other("landing files lock poisoned"))?;
         let mut data = open_landing_read_file(&self.data_path)?;
         for segment in self.recover_segments_unlocked()? {
             if segment.ino != ino {
@@ -249,23 +297,21 @@ impl LandingZone {
 
     #[cfg(test)]
     pub(super) fn recover(&self) -> io::Result<Vec<RecoveredLandingSegment>> {
-        let _manifest_guard = self
-            .manifest_file
+        self.drain_pending()?;
+        let _files = self
+            .files
             .lock()
-            .map_err(|_| io::Error::other("landing manifest lock poisoned"))?;
+            .map_err(|_| io::Error::other("landing files lock poisoned"))?;
         self.recover_segments_unlocked()
             .map(|segments| segments.into_iter().map(Into::into).collect())
     }
 
     pub(super) fn recover_with_data(&self) -> io::Result<Vec<LandingRecoverySegment>> {
-        let _data_guard = self
-            .data_file
+        self.drain_pending()?;
+        let _files = self
+            .files
             .lock()
-            .map_err(|_| io::Error::other("landing data lock poisoned"))?;
-        let _manifest_guard = self
-            .manifest_file
-            .lock()
-            .map_err(|_| io::Error::other("landing manifest lock poisoned"))?;
+            .map_err(|_| io::Error::other("landing files lock poisoned"))?;
         let segments = self.recover_segments_unlocked()?;
         let mut data = open_landing_read_file(&self.data_path)?;
         segments
@@ -289,14 +335,11 @@ impl LandingZone {
     }
 
     pub(super) fn clear_inode(&self, ino: u64) -> io::Result<()> {
-        let data = self
-            .data_file
+        self.drain_pending()?;
+        let mut files = self
+            .files
             .lock()
-            .map_err(|_| io::Error::other("landing data lock poisoned"))?;
-        let mut manifest_guard = self
-            .manifest_file
-            .lock()
-            .map_err(|_| io::Error::other("landing manifest lock poisoned"))?;
+            .map_err(|_| io::Error::other("landing files lock poisoned"))?;
         let segments = self.recover_segments_unlocked()?;
         let retained: Vec<_> = segments
             .iter()
@@ -305,18 +348,18 @@ impl LandingZone {
             .collect();
         let retained_count = retained.len();
         if retained_count == segments.len() {
-            self.recoverable_segments
+            self.counters
+                .recoverable_segments
                 .store(retained_count, Ordering::Relaxed);
             return Ok(());
         }
-        self.sync_landing_unlocked(&data, manifest_guard.as_ref())
-            .map_err(|err| {
-                io::Error::new(
-                    err.kind(),
-                    format!("landing sync before retire failed: {err}"),
-                )
-            })?;
-        self.rewrite_manifest_unlocked(&retained, &mut manifest_guard)
+        self.sync_landing_unlocked(&files).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("landing sync before retire failed: {err}"),
+            )
+        })?;
+        self.rewrite_manifest_unlocked(&retained, &mut files.manifest)
             .map_err(|err| {
                 io::Error::new(
                     err.kind(),
@@ -324,11 +367,12 @@ impl LandingZone {
                 )
             })?;
         if retained.is_empty() {
-            data.set_len(0).map_err(|err| {
+            files.data.set_len(0).map_err(|err| {
                 io::Error::new(err.kind(), format!("landing data truncate failed: {err}"))
             })?;
         }
-        self.recoverable_segments
+        self.counters
+            .recoverable_segments
             .store(retained_count, Ordering::Relaxed);
         Ok(())
     }
@@ -337,14 +381,11 @@ impl LandingZone {
         if inos.is_empty() {
             return Ok(());
         }
-        let data = self
-            .data_file
+        self.drain_pending()?;
+        let mut files = self
+            .files
             .lock()
-            .map_err(|_| io::Error::other("landing data lock poisoned"))?;
-        let mut manifest_guard = self
-            .manifest_file
-            .lock()
-            .map_err(|_| io::Error::other("landing manifest lock poisoned"))?;
+            .map_err(|_| io::Error::other("landing files lock poisoned"))?;
         let segments = self.recover_segments_unlocked()?;
         let retained: Vec<_> = segments
             .iter()
@@ -353,18 +394,18 @@ impl LandingZone {
             .collect();
         let retained_count = retained.len();
         if retained_count == segments.len() {
-            self.recoverable_segments
+            self.counters
+                .recoverable_segments
                 .store(retained_count, Ordering::Relaxed);
             return Ok(());
         }
-        self.sync_landing_unlocked(&data, manifest_guard.as_ref())
-            .map_err(|err| {
-                io::Error::new(
-                    err.kind(),
-                    format!("landing sync before retire failed: {err}"),
-                )
-            })?;
-        self.rewrite_manifest_unlocked(&retained, &mut manifest_guard)
+        self.sync_landing_unlocked(&files).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("landing sync before retire failed: {err}"),
+            )
+        })?;
+        self.rewrite_manifest_unlocked(&retained, &mut files.manifest)
             .map_err(|err| {
                 io::Error::new(
                     err.kind(),
@@ -372,27 +413,28 @@ impl LandingZone {
                 )
             })?;
         if retained.is_empty() {
-            data.set_len(0).map_err(|err| {
+            files.data.set_len(0).map_err(|err| {
                 io::Error::new(err.kind(), format!("landing data truncate failed: {err}"))
             })?;
         }
-        self.recoverable_segments
+        self.counters
+            .recoverable_segments
             .store(retained_count, Ordering::Relaxed);
         Ok(())
     }
 
     pub(super) fn stats(&self) -> LandingZoneStats {
         LandingZoneStats {
-            accepted_writes: self.accepted_writes.load(Ordering::Relaxed),
-            accepted_bytes: self.accepted_bytes.load(Ordering::Relaxed),
-            recoverable_segments: self.recoverable_segments.load(Ordering::Relaxed),
-            accept_total_ns: self.accept_total_ns.load(Ordering::Relaxed),
-            accept_max_ns: self.accept_max_ns.load(Ordering::Relaxed),
-            data_syncs: self.data_syncs.load(Ordering::Relaxed),
-            manifest_syncs: self.manifest_syncs.load(Ordering::Relaxed),
-            manifest_rewrites: self.manifest_rewrites.load(Ordering::Relaxed),
-            sync_total_ns: self.sync_total_ns.load(Ordering::Relaxed),
-            sync_max_ns: self.sync_max_ns.load(Ordering::Relaxed),
+            accepted_writes: self.counters.accepted_writes.load(Ordering::Relaxed),
+            accepted_bytes: self.counters.accepted_bytes.load(Ordering::Relaxed),
+            recoverable_segments: self.counters.recoverable_segments.load(Ordering::Relaxed),
+            accept_total_ns: self.counters.accept_total_ns.load(Ordering::Relaxed),
+            accept_max_ns: self.counters.accept_max_ns.load(Ordering::Relaxed),
+            data_syncs: self.counters.data_syncs.load(Ordering::Relaxed),
+            manifest_syncs: self.counters.manifest_syncs.load(Ordering::Relaxed),
+            manifest_rewrites: self.counters.manifest_rewrites.load(Ordering::Relaxed),
+            sync_total_ns: self.counters.sync_total_ns.load(Ordering::Relaxed),
+            sync_max_ns: self.counters.sync_max_ns.load(Ordering::Relaxed),
         }
     }
 
@@ -408,15 +450,127 @@ impl LandingZone {
             .ok_or_else(|| io::Error::other("landing manifest handle unavailable"))
     }
 
-    fn sync_landing_unlocked(&self, data: &File, manifest: Option<&File>) -> io::Result<()> {
+    fn spawn_writer(
+        manifest_path: PathBuf,
+        files: Arc<Mutex<LandingFiles>>,
+        shared: Arc<LandingWriterShared>,
+        counters: Arc<LandingZoneCounters>,
+    ) -> io::Result<JoinHandle<()>> {
+        thread::Builder::new()
+            .name("studiofs-landing-writer".to_string())
+            .spawn(move || {
+                loop {
+                    let batch = {
+                        let mut state = match shared.state.lock() {
+                            Ok(state) => state,
+                            Err(_) => return,
+                        };
+                        loop {
+                            if let Some(queued) = state.queue.pop_front() {
+                                let mut batch = Vec::with_capacity(state.queue.len() + 1);
+                                batch.push(queued);
+                                batch.extend(state.queue.drain(..));
+                                state.active = true;
+                                break batch;
+                            }
+                            if state.shutdown {
+                                return;
+                            }
+                            state = match shared.changed.wait(state) {
+                                Ok(state) => state,
+                                Err(_) => return,
+                            };
+                        }
+                    };
+
+                    let result =
+                        Self::append_queued_writes(&manifest_path, &files, &counters, batch);
+                    let mut state = match shared.state.lock() {
+                        Ok(state) => state,
+                        Err(_) => return,
+                    };
+                    state.active = false;
+                    if let Err(error) = result {
+                        state.queue.clear();
+                        state.error = Some(error.to_string());
+                    }
+                    shared.changed.notify_all();
+                }
+            })
+            .map_err(|err| io::Error::new(err.kind(), format!("spawn landing writer: {err}")))
+    }
+
+    fn append_queued_writes(
+        manifest_path: &Path,
+        files: &Mutex<LandingFiles>,
+        counters: &LandingZoneCounters,
+        queued_writes: Vec<QueuedLandingWrite>,
+    ) -> io::Result<()> {
+        let mut files = files
+            .lock()
+            .map_err(|_| io::Error::other("landing files lock poisoned"))?;
+        let mut manifest_records = String::new();
+        let mut appended_count = 0usize;
+        for queued in queued_writes {
+            let data_offset = files.data.seek(SeekFrom::End(0))?;
+            files.data.write_all(queued.data.as_ref())?;
+            let len = u64::try_from(queued.data.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "landing write length exceeds u64::MAX",
+                )
+            })?;
+            let segment = LandingSegment {
+                ino: queued.ino,
+                fh: queued.fh,
+                offset: queued.offset,
+                len,
+                data_offset,
+            };
+            manifest_records.push_str(&segment.as_manifest_record());
+            appended_count = appended_count.saturating_add(1);
+        }
+        let manifest = Self::ensure_manifest_file(manifest_path, &mut files.manifest)?;
+        manifest.seek(SeekFrom::End(0))?;
+        manifest.write_all(manifest_records.as_bytes())?;
+        counters
+            .recoverable_segments
+            .fetch_add(appended_count, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn drain_pending(&self) -> io::Result<()> {
+        let mut state = self
+            .writer_state
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("landing writer lock poisoned"))?;
+        loop {
+            if let Some(error) = state.error.as_ref() {
+                return Err(io::Error::other(format!(
+                    "landing writer previously failed: {error}"
+                )));
+            }
+            if state.queue.is_empty() && !state.active {
+                return Ok(());
+            }
+            state = self
+                .writer_state
+                .changed
+                .wait(state)
+                .map_err(|_| io::Error::other("landing writer lock poisoned"))?;
+        }
+    }
+
+    fn sync_landing_unlocked(&self, files: &LandingFiles) -> io::Result<()> {
         let data_sync_started = Instant::now();
-        data.sync_data()?;
-        self.data_syncs.fetch_add(1, Ordering::Relaxed);
+        files.data.sync_data()?;
+        self.counters.data_syncs.fetch_add(1, Ordering::Relaxed);
         self.record_sync_latency(data_sync_started.elapsed());
-        if let Some(manifest) = manifest {
+        if let Some(manifest) = files.manifest.as_ref() {
             let manifest_sync_started = Instant::now();
             manifest.sync_data()?;
-            self.manifest_syncs.fetch_add(1, Ordering::Relaxed);
+            self.counters.manifest_syncs.fetch_add(1, Ordering::Relaxed);
             self.record_sync_latency(manifest_sync_started.elapsed());
         }
         Ok(())
@@ -458,7 +612,7 @@ impl LandingZone {
         manifest.flush()?;
         let sync_started = Instant::now();
         manifest.sync_data()?;
-        self.manifest_syncs.fetch_add(1, Ordering::Relaxed);
+        self.counters.manifest_syncs.fetch_add(1, Ordering::Relaxed);
         self.record_sync_latency(sync_started.elapsed());
         drop(manifest);
         remove_file_if_exists(&self.manifest_backup_path)?;
@@ -473,21 +627,30 @@ impl LandingZone {
         }
         remove_file_if_exists(&self.manifest_backup_path)?;
         *manifest_file = Some(open_landing_append_file(&self.manifest_path)?);
-        self.manifest_rewrites.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .manifest_rewrites
+            .fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     fn record_accept_latency(&self, duration: Duration) {
         let elapsed_ns = duration_ns_u64(duration);
-        self.accept_total_ns
+        self.counters
+            .accept_total_ns
             .fetch_add(elapsed_ns, Ordering::Relaxed);
-        self.accept_max_ns.fetch_max(elapsed_ns, Ordering::Relaxed);
+        self.counters
+            .accept_max_ns
+            .fetch_max(elapsed_ns, Ordering::Relaxed);
     }
 
     fn record_sync_latency(&self, duration: Duration) {
         let elapsed_ns = duration_ns_u64(duration);
-        self.sync_total_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
-        self.sync_max_ns.fetch_max(elapsed_ns, Ordering::Relaxed);
+        self.counters
+            .sync_total_ns
+            .fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.counters
+            .sync_max_ns
+            .fetch_max(elapsed_ns, Ordering::Relaxed);
     }
 
     fn repair_manifest_swap_files(
@@ -531,6 +694,20 @@ fn remove_file_if_exists(path: &Path) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+impl Drop for LandingZone {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.writer_state.state.lock() {
+            state.shutdown = true;
+            self.writer_state.changed.notify_all();
+        }
+        if let Ok(mut writer) = self.writer.lock()
+            && let Some(handle) = writer.take()
+        {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -592,14 +769,14 @@ mod tests {
             ino: 42,
             fh: 7,
             offset: 0,
-            data: b"hello".as_slice(),
+            data: Bytes::from_static(b"hello"),
         })
         .expect("accept first segment");
         zone.accept(LandingWrite {
             ino: 42,
             fh: 7,
             offset: 5,
-            data: b" world".as_slice(),
+            data: Bytes::from_static(b" world"),
         })
         .expect("accept second segment");
 
@@ -629,7 +806,7 @@ mod tests {
             ino: 42,
             fh: 7,
             offset: 0,
-            data: b"retire".as_slice(),
+            data: Bytes::from_static(b"retire"),
         })
         .expect("accept segment");
         zone.clear_inode(42).expect("clear inode");
@@ -653,7 +830,7 @@ mod tests {
                 ino: 42,
                 fh: 7,
                 offset: 0,
-                data: b"survives".as_slice(),
+                data: Bytes::from_static(b"survives"),
             })
             .expect("accept segment");
             std::fs::rename(&zone.manifest_path, &zone.manifest_backup_path)
@@ -678,14 +855,14 @@ mod tests {
             ino: 1,
             fh: 10,
             offset: 0,
-            data: b"clear-me".as_slice(),
+            data: Bytes::from_static(b"clear-me"),
         })
         .expect("accept cleared segment");
         zone.accept(LandingWrite {
             ino: 2,
             fh: 11,
             offset: 0,
-            data: b"keep-me".as_slice(),
+            data: Bytes::from_static(b"keep-me"),
         })
         .expect("accept retained segment");
 
@@ -707,9 +884,10 @@ mod tests {
             ino: 1,
             fh: 10,
             offset: 0,
-            data: b"valid".as_slice(),
+            data: Bytes::from_static(b"valid"),
         })
         .expect("accept valid segment");
+        zone.drain_pending().expect("durably append valid segment");
         {
             let mut manifest = OpenOptions::new()
                 .append(true)
@@ -734,16 +912,18 @@ mod tests {
             ino: 1,
             fh: 10,
             offset: 0,
-            data: b"one".as_slice(),
+            data: Bytes::from_static(b"one"),
         })
         .expect("accept first");
         zone.accept(LandingWrite {
             ino: 2,
             fh: 11,
             offset: 0,
-            data: b"two".as_slice(),
+            data: Bytes::from_static(b"two"),
         })
         .expect("accept second");
+        zone.drain_pending()
+            .expect("durably append accepted segments");
         assert_eq!(zone.stats().recoverable_segments, 2);
         zone.clear_inode(1).expect("clear one inode");
         assert_eq!(zone.stats().recoverable_segments, 1);
@@ -760,14 +940,14 @@ mod tests {
             ino: 1,
             fh: 10,
             offset: 0,
-            data: b"writeback".as_slice(),
+            data: Bytes::from_static(b"writeback"),
         })
         .expect("accept segment");
         zone.accept(LandingWrite {
             ino: 1,
             fh: 10,
             offset: 9,
-            data: b"-mode".as_slice(),
+            data: Bytes::from_static(b"-mode"),
         })
         .expect("accept second segment");
 
@@ -787,5 +967,35 @@ mod tests {
         assert!(retired.manifest_syncs > 0);
         assert_eq!(retired.manifest_rewrites, 1);
         assert_eq!(retired.recoverable_segments, 0);
+    }
+
+    #[test]
+    fn landing_zone_accept_enqueues_without_waiting_for_writer_file_lock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let zone = LandingZone::open(tmp.path()).expect("open landing zone");
+        let files_guard = zone.files.lock().expect("hold landing files lock");
+
+        zone.accept(LandingWrite {
+            ino: 7,
+            fh: 70,
+            offset: 0,
+            data: Bytes::from_static(b"queued"),
+        })
+        .expect("accept should only enqueue");
+
+        let accepted = zone.stats();
+        assert_eq!(accepted.accepted_writes, 1);
+        assert_eq!(accepted.accepted_bytes, 6);
+        assert_eq!(
+            accepted.recoverable_segments, 0,
+            "queued writes become recoverable only after the background writer appends manifest"
+        );
+
+        drop(files_guard);
+        assert_eq!(
+            zone.read(7, 0, 6).expect("read drained landing bytes"),
+            b"queued"
+        );
+        assert_eq!(zone.stats().recoverable_segments, 1);
     }
 }

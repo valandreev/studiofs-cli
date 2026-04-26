@@ -1,21 +1,20 @@
 # Canonical Local-First Validation Matrix
 
-This document is the validation entrypoint for `SFS-270` under the
-`SFS-263` production follow-up sprint.
+This document is the validation entrypoint for the canonical mounted-IO
+contract.
 
-Use it together with the canonical rewrite contract in
+Use it together with the canonical contract in
 [docs/juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
-The goal is to lock the 2026-04-19 Fast Local Authority contract with one
-obvious place to verify:
+The goal is one obvious place to verify:
 
-- fast/local contract gates that do not require live PostgreSQL or S3
+- JuiceFS-equivalent local writer/cache gates that do not require live
+  PostgreSQL or S3
 - local-offline replay and durability gates
 - infra-backed distributed visibility and lock-lease gates
 - platform bridge smoke checks when callback sequencing changes
 
-This is not a literal 1:1 JuiceFS parity checklist. It is the focused StudioFS
-contract matrix that should be consulted before future rewrites, semantics
-changes, or performance work.
+This is the focused StudioFS contract matrix that should be consulted before
+data-plane, semantics, or performance work.
 
 ## How To Use This Matrix
 
@@ -33,7 +32,7 @@ changes, or performance work.
 Ignored tests in this matrix should be run with `--test-threads=1` when they
 require live PostgreSQL, S3, or real mount drivers.
 
-## Fast / Local Contract Matrix
+## Local Writer / Cache Contract Matrix
 
 Some rows intentionally mix `studiofs-vfs` integration tests from
 `--test vfs_test` with fast unit tests from `src/`. Integration-test commands
@@ -42,7 +41,7 @@ use `--test vfs_test`; library unit-test commands run as plain
 
 | Scenario | Contract focus | Primary checks | Focused commands |
 |---|---|---|---|
-| Explicit `flush` and last-handle release barriers | `flush` is a local-durability barrier, and the last-handle release path owns the fallback barrier without pulling PG/S3 into the foreground | `flush_fh_enforces_strict_local_durability_in_single_mode`; `release_fh_enforces_strict_local_durability_on_last_handle`; `test_release_fh_with_outcome_reports_clean_skip_after_explicit_flush` | `cargo test -p studiofs-vfs flush_fh_enforces_strict_local_durability_in_single_mode -- --nocapture`<br>`cargo test -p studiofs-vfs release_fh_enforces_strict_local_durability_on_last_handle -- --nocapture`<br>`cargo test -p studiofs-vfs test_release_fh_with_outcome_reports_clean_skip_after_explicit_flush -- --nocapture` |
+| Explicit `flush` and last-handle release barriers | `flush` and last-handle release freeze/finish required writer slices through cached-store staging without pulling PG/S3 into the foreground | `flush_fh_enforces_strict_local_durability_in_single_mode`; `release_fh_enforces_strict_local_durability_on_last_handle`; `test_release_fh_with_outcome_reports_clean_skip_after_explicit_flush` | `cargo test -p studiofs-vfs flush_fh_enforces_strict_local_durability_in_single_mode -- --nocapture`<br>`cargo test -p studiofs-vfs release_fh_enforces_strict_local_durability_on_last_handle -- --nocapture`<br>`cargo test -p studiofs-vfs test_release_fh_with_outcome_reports_clean_skip_after_explicit_flush -- --nocapture` |
 | `fsync` as the strict caller-requested local crash-safe boundary | `fsync` must persist current local state without implying remote publication | `strict_local_sync_flushes_pending_group_commit_bytes`; `test_fsync_with_outcome_materializes_pending_inode_dirty_state`; `test_fsync_with_outcome_reports_handle_writer_file_data_barrier` | `cargo test -p studiofs-vfs strict_local_sync_flushes_pending_group_commit_bytes -- --nocapture`<br>`cargo test -p studiofs-vfs test_fsync_with_outcome_materializes_pending_inode_dirty_state -- --nocapture`<br>`cargo test -p studiofs-vfs test_fsync_with_outcome_reports_handle_writer_file_data_barrier -- --nocapture` |
 | Known foreign hard locks | peers may open read-only, grandfathered writers may finish, and new conflicting size / namespace mutations must block | `foreign_hard_lock_blocks_new_write_open_but_allows_readonly_open`; `existing_writer_handle_remains_usable_after_foreign_hard_lock_becomes_known`; `foreign_hard_lock_blocks_size_change_setattr_without_handle`; `foreign_hard_lock_blocks_unlink_and_rename` | `cargo test -p studiofs-vfs foreign_hard_lock_blocks_new_write_open_but_allows_readonly_open -- --nocapture`<br>`cargo test -p studiofs-vfs existing_writer_handle_remains_usable_after_foreign_hard_lock_becomes_known -- --nocapture`<br>`cargo test -p studiofs-vfs foreign_hard_lock_blocks_size_change_setattr_without_handle -- --nocapture`<br>`cargo test -p studiofs-vfs foreign_hard_lock_blocks_unlink_and_rename -- --nocapture` |
 | PG disconnect headroom exhaustion and read-only degradation | new mutations stop once local inode windows / block headroom are exhausted, while known readable state stays available | `read_only_metadata_authority_blocks_new_mutations_but_keeps_reads_open`; `next_inode_reports_read_only_headroom_once_windows_are_exhausted`; `open_with_persisted_slot_and_ranges_survives_pg_unavailable` | `cargo test -p studiofs-vfs read_only_metadata_authority_blocks_new_mutations_but_keeps_reads_open -- --nocapture`<br>`cargo test -p studiofs-meta next_inode_reports_read_only_headroom_once_windows_are_exhausted -- --nocapture`<br>`cargo test -p studiofs-meta open_with_persisted_slot_and_ranges_survives_pg_unavailable -- --nocapture` |
@@ -175,8 +174,8 @@ cargo run -p studiofs -- test-cache <mounted-path> \
 
 When the mounted runtime exposes upload-state metadata, inspect the human
 summary or JSON `local_first_read_comparison` section for the
-`baseline-read`, `during-upload-read`, and `post-upload-read` phases. When
-mounted process observability is available, inspect the `Mounted memory`
+`during-upload-read` and `post-upload-read` phases. When mounted process
+observability is available, inspect the `Mounted memory`
 terminal table or JSON `mounted_memory` section for `rss_bytes_peak`,
 `rss_bytes_steady_state`, `dirty_bytes_peak`, and `dirty_limit_bytes`. These
 fields are best-effort and may be omitted when the measured run does not expose
@@ -226,10 +225,10 @@ For a stricter regression gate on the same concern, pair the command above with:
 cargo test -p studiofs-vfs --test vfs_test sequential_foreground_read_throughput_during_upload_meets_minimum -- --ignored --nocapture --test-threads=1
 ```
 
-## StudioFS Vs JuiceFS: What To Compare And What Not To Compare
+## StudioFS Vs JuiceFS Parity Gate
 
-Use JuiceFS as a performance and architecture reference, not as a literal
-semantic oracle.
+Use the local JuiceFS mount as the reference for mounted data-plane IO
+economics.
 
 Compare directly:
 
@@ -240,31 +239,25 @@ Compare directly:
 - foreground read degradation while background upload/writeback is active
 - bridge-specific mounted sequential writer throughput on Windows when the
   workload shape is comparable
+- foreground callback latency
+- peak RSS and steady-state RSS
+- CPU during sustained writeback
 
-Do not treat these as parity failures:
+StudioFS-specific report fields such as `local_first_read_comparison`,
+`mounted_memory`, upload backlog, and cache-level counters are required
+diagnostics. They explain differences from the JuiceFS run; they do not relax
+the parity gate by themselves.
 
-- StudioFS same-mount accepted writes are intentionally visible immediately
-  through writer state and local unpublished state.
-- StudioFS `fsync` always confirms local durability; explicit `flush` and
-  last-handle `close` also confirm the newest local unpublished state when
-  dirty state remains, not remote publication.
-- StudioFS remote visibility flips at a file-version publish boundary after
-  upload plus publish; it is intentionally eventual rather than close-to-open.
-- StudioFS benchmark output may surface Local-First specific metadata such as
-  `local_first_read_comparison`, `mounted_memory`, or cache-level counters
-  that do not have a 1:1 JuiceFS label.
-
-When a JuiceFS reference comparison is useful, reuse the same workload shape
-(block size, read size, concurrency, access pattern, warm/cold setup) and
-compare throughput/latency trends, not identical callback timing or visibility
-semantics.
+Reuse the same workload shape on both filesystems: block size, read size,
+concurrency, access pattern, warm/cold setup, cache disk, metadata disk, and
+mount options.
 
 ### SFS-262 Mounted Default Gate
 
 For `SFS-262`, lock the default mounted benchmark recipe to a same-host
 StudioFS versus JuiceFS comparison:
 
-- Use default-mounted StudioFS and default-mounted JuiceFS unless the ticket is
+- Use mounted StudioFS and mounted JuiceFS unless the ticket is
   explicitly about a non-default tuning surface. If you override any knob,
   record every override in the benchmark notes.
 - Run the mounted sequential recipe above on both filesystems with the same
@@ -282,9 +275,8 @@ StudioFS versus JuiceFS comparison:
   `mounted_memory.dirty_bytes_peak`, and `mounted_memory.dirty_limit_bytes` as
   diagnostics when the peak-RSS gate fails; they help distinguish dirty-state
   pressure from other runtime memory growth when those samples are present.
-- Treat `local_first_read_comparison` and `mounted_memory` as StudioFS-only
-  diagnostics. They strengthen comparability, but they are not required to map
-  1:1 onto JuiceFS counters.
+- Treat `local_first_read_comparison` and `mounted_memory` as required
+  StudioFS-side diagnostics for explaining any parity miss.
 
 ## Larger Manual Validation After The Targeted Matrix Passes
 

@@ -1,18 +1,16 @@
 # Local Payload Object Runtime Layout and Safety
 
-This file documents the current local payload object runtime disk layout and safety
-rules for the in-tree implementation. It is not the canonical SFS-242 rewrite
-contract. The rewrite source of truth lives in
+This file documents the local payload object runtime disk layout and safety
+rules used by the cached-store pipeline. The mounted-IO contract lives in
 [juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
 
 ## Purpose
 
-Define the current local payload object runtime disk layout, detection rules, startup
+Define the local payload object runtime disk layout, detection rules, startup
 reconciliation behavior, and operator remediation for stale local cache state.
 
-This document is the source of truth only for the current implementation
-details and operator-facing safety expectations while the present runtime
-remains in service.
+This document is the source of truth for local runtime layout and
+operator-facing safety expectations.
 
 ## 1. Disk Layout (v1)
 
@@ -46,8 +44,8 @@ Notes:
 
 Detection is read-only and must not mutate cache state.
 
-- The current layout is detected from the runtime directories already present
-  under `<cache-root>`.
+- The layout is detected from the runtime directories already present under
+  `<cache-root>`.
 - If no local contract exists yet, bootstrap provisions the runtime root
   before opening the backend.
 - Non-contract files under `<cache-root>` are ignored by backend open logic.
@@ -73,8 +71,8 @@ supporting signals only.
   UUID-scoped cache root.
 - Cache roots with no existing local contract bootstrap the runtime root on
   first open.
-- Runtime read/write/open paths rely exclusively on runtime-root storage and index
-  state.
+- Runtime read/write/open paths rely exclusively on cached-store runtime-root
+  storage and index state.
 
 ## 5. Startup Reconciliation and Repair Behavior
 
@@ -106,5 +104,5 @@ When cache-root artifacts outside the runtime contract are discovered:
 1. Treat them as non-runtime artifacts.
 2. Use `studiofs status` for current runtime health and local counters.
 3. Archive or remove stale artifacts as part of local maintenance.
-4. Re-run mount; the current implementation reuses or provisions only the
-   UUID-scoped runtime root.
+4. Re-run mount; StudioFS reuses or provisions only the UUID-scoped runtime
+   root.

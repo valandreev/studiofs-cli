@@ -3794,7 +3794,7 @@ fn drain_lag_pacing_attribution_scales_drain_lag_share_to_actual_wait() {
 }
 
 #[test]
-fn write_path_observability_reports_landing_drain_lag_and_pacing() {
+fn write_path_observability_reports_landing_drain_lag_without_foreground_pacing() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-287-drain-lag-observability");
     let _guard = rt.enter();
@@ -3835,13 +3835,13 @@ fn write_path_observability_reports_landing_drain_lag_and_pacing() {
             snapshot.drain_lag.current_bytes >= snapshot.drain_lag.steady_quota_bytes,
             "three landed slices should exceed one steady drain quota"
         );
-        assert!(
-            snapshot.drain_lag.soft_pacing_events > 0,
-            "opportunistic writes should record whether drain-lag pacing engaged"
+        assert_eq!(
+            snapshot.drain_lag.soft_pacing_events, 0,
+            "opportunistic writeback must not sleep on foreground drain-lag pacing"
         );
-        assert!(
-            snapshot.drain_lag.soft_pacing_total_ms > 0,
-            "drain-lag pacing should surface accumulated wait time"
+        assert_eq!(
+            snapshot.drain_lag.soft_pacing_total_ms, 0,
+            "writeback callbacks should remain free of soft pacing wait time"
         );
 
         vfs.flush_fh(fh).await.unwrap();
@@ -3875,6 +3875,11 @@ fn reset_diagnostics_observability_clears_drain_lag_pacing_counters() {
             .await
             .unwrap();
         }
+
+        assert!(
+            vfs.apply_write_path_soft_pacing(ino).await,
+            "manual soft pacing should still record diagnostics when invoked"
+        );
 
         let before_reset = vfs.write_path_observability_snapshot();
         assert!(before_reset.drain_lag.soft_pacing_events > 0);

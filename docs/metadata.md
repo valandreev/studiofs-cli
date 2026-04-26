@@ -1,10 +1,8 @@
 # Metadata Engine
 
-This page is a current implementation snapshot for `studiofs-meta`. It is not
-the canonical SFS-242 rewrite contract. The rewrite source of truth lives in
+This page describes `studiofs-meta` under the canonical mounted-IO contract in
 [juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
-Historical terms such as `base` and `overlay` below describe current metadata
-internals, not the final operator-facing rewrite vocabulary.
+Terms such as `base` and `overlay` below are metadata-internal names.
 
 `studiofs-meta` exposes synchronous metadata operations through `MetaEngine`.
 `studiofs-vfs` consumes metadata through a typed async boundary:
@@ -77,7 +75,7 @@ Local embedded serving store.
 
 Distributed wrapper around `RedbMetaEngine`.
 
-Current behavior:
+Runtime behavior:
 - foreground ops (`create`, `rename`, `unlink`, `truncate`, block staging) mutate local `redb`
 - local mutations append to the local metadata event log
 - background flush projects remote-visible deltas into PostgreSQL `event_log`
@@ -344,14 +342,12 @@ Persisted in `FormatInfo`:
 - `data_prefix`
 - `block_size`
 - `metadata.postgres.url`
-  - PostgreSQL server DSN; StudioFS rewrites it to database `studiofs`
+  - PostgreSQL server DSN; StudioFS normalizes it to database `studiofs`
 - `metadata.postgres.volume_id`
 
 Not persisted in the volume format:
 - PG flush cadence / op thresholds
 - client-local metadata-cache defaults / invalidation cadence
-- legacy `chunk_size`
-- legacy per-volume format `version`
 
 ## Client Runtime Defaults
 
@@ -362,8 +358,7 @@ Not persisted in the volume format:
 
 ## Base + Overlay Design
 
-This document freezes the next metadata serving model for PostgreSQL-backed
-volumes.
+This document defines the metadata serving model for PostgreSQL-backed volumes.
 
 ## Goal
 
@@ -525,7 +520,7 @@ Resource-fork compatibility:
 - `com.apple.ResourceFork` may be stored in a compressed framed representation
   inside metadata tables when it is smaller than plain bytes
 - reads decode transparently before returning values to callers
-- legacy plain persisted values are still accepted and returned unchanged
+- plain persisted values are accepted and returned unchanged
 
 ## Write Rules
 
@@ -585,10 +580,11 @@ Destination side:
 - remove the local `xattrs` entry for that key
 - if the key exists in `base_xattrs`, write a tombstone
 
-Migration behavior:
+Update behavior:
 - no offline migration is required
 - existing plain `com.apple.ResourceFork` rows remain readable
-- rewrite-on-set progressively upgrades hot keys to compressed representation
+- setxattr progressively stores hot keys in compressed representation when it
+  wins on size
 
 ## Foreign PostgreSQL Apply
 
@@ -666,8 +662,8 @@ use a unified undo-recovery path with explicit intent records.
   - `kind`: `PendingCreate` / `DeferredDelete`
   - `phase`: `Started` / `Replaying` / `Completed`
 
-`phase` is serialized with a default (`Started`) so older persisted records
-without the field remain decodable.
+`phase` is serialized with a default (`Started`) so persisted records without
+the field remain decodable.
 
 ### Atomicity and recovery behavior
 

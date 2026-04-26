@@ -1,14 +1,13 @@
 # Architecture Overview
 
-For the SFS-242 rewrite, the canonical target contract lives in
+The canonical mounted-IO contract lives in
 [juicefs-local-first-rust-contract.md](./juicefs-local-first-rust-contract.md).
-This page is the implementation snapshot for the current tree; if it conflicts
-with the contract, the contract wins.
+This page summarizes the same architecture at system level.
 
 ## System Design
 
-StudioFS mounts S3-compatible object storage as a Local-First filesystem with a
-JuiceFS-inspired, Rust-native chunk/slice/payload-object data plane.
+StudioFS mounts S3-compatible object storage as a local-first filesystem with a
+JuiceFS-equivalent, Rust-native chunk/slice/payload-object data plane.
 
 Core principles:
 - Foreground metadata operations read and write local `redb`; the local `redb`
@@ -16,12 +15,12 @@ Core principles:
 - PostgreSQL is the bootstrap source, ordered replication bus, checkpoint
   store, and shared-lock authority when cross-client file locks are enabled.
 - File payloads live in immutable payload objects addressed by chunk-relative slices.
-- Runtime visibility is split into `writer state`, local authority view, and
+- Runtime visibility is split into writer state, the local metadata view, and
   asynchronously replicated shared state.
 - The UUID-scoped cache root itself is the runtime boundary of the current
   local cache backend.
-- Remote visibility switches atomically at the file-version boundary after peer
-  replay/apply, not on local `close()`.
+- Remote visibility switches atomically at the file-version boundary after
+  payload upload, metadata publication, and peer apply.
 
 ## Workspace Graph
 
@@ -37,7 +36,7 @@ studiofs (CLI)
 
 ## Metadata Architecture
 
-`PgMetaEngine` keeps a local authority view and a replication path:
+`PgMetaEngine` keeps a local metadata view and a replication path:
 
 - bootstrap loads the latest replicated checkpoint from `metadata_state`
 - steady-state sync exchanges ordered delta events through `event_log`
@@ -62,25 +61,25 @@ Core invariants:
 ## High-Level Mutation Flow
 
 1. App calls a VFS mutation.
-2. StudioFS updates local metadata in `redb`.
-3. Accepted bytes enter handle-owned writer state and become immediately
-   readable on the writing mount.
-4. `flush(ino)` / `close(ino)` / last-handle release materialize accepted bytes
-   into the local authority view through local backend + metadata commit.
-5. `CachedStore` queues committed payloads into the runtime upload queue.
-6. Background workers upload immutable payload objects to object storage.
-7. `fsync(ino)` is the explicit strict request for a crash-safe local sync
-   boundary.
-8. Epoch finalization publishes the new file version only after the referenced
-   objects and replication metadata line up.
-9. Other clients converge later through PostgreSQL invalidation/replay and
+2. Accepted bytes enter the file writer, chunk writer, and slice writer page
+   buffers.
+3. Same-mount reads observe the accepted bytes through writer state.
+4. Frozen slices finish through `CachedStore` staging and local slice metadata
+   commit.
+5. `flush(ino)`, `fsync(ino)`, and last-handle release force the required local
+   slice/cache boundary for the inode or handle.
+6. Background workers upload immutable payload objects from the cached-store
+   backlog to object storage.
+7. Publication emits the new file version only after the referenced objects and
+   metadata line up.
+8. Other clients converge later through PostgreSQL invalidation/replay and
    local apply into their own `redb`.
 
 ## Read Resolution
 
 Reads resolve data in this order:
 1. active writer state for the current mount/handle
-2. local authority view in `redb`
+2. local slice metadata in `redb`
 3. local cache / object-store fetches supplying the payload objects needed by
    the selected slice view
 4. zero-fill for holes
@@ -90,15 +89,14 @@ foreground read path.
 
 ## Cache and Upload Runtime
 
-- `studiofs-cache` provides the backend-agnostic local cache boundary plus the
-  `CachedStore` runtime for local-durable payload handling, the runtime
-  pending-upload queue, upload helpers, and pending-upload pinning.
+- `studiofs-cache` provides the single cached-store pipeline for writer pages,
+  local staging, cached reads, pending-upload queueing, upload helpers, and
+  pending-upload pinning.
 - The current disk layout lives directly under `<cache-root>/**`; the
   UUID-scoped cache root itself is the runtime boundary.
-- Upload is a background payload data plane seeded directly from local durable
-  commit and startup replay. Publication is a separate control-plane step that
-  flips remote visibility at file-version granularity once metadata lifecycle
-  reaches `PublishReady`.
+- Upload is a background payload data plane seeded from cached-store staging and
+  startup replay. Publication is a separate control-plane step that flips remote
+  visibility at file-version granularity after payload readiness is confirmed.
 
 ## Concurrency Model
 
@@ -106,5 +104,6 @@ foreground read path.
 - Local locks protect VFS/cache hot structures, with explicit lock ordering for
   shared subsystems.
 - PostgreSQL `batch_version` ordering drives cross-client metadata convergence.
-- Per-inode session coordination keeps write/flush/release barriers ordered
-  without forcing synchronous remote publication into the foreground path.
+- Per-file writer and per-inode session coordination keep
+  write/flush/fsync/release boundaries ordered without forcing synchronous
+  remote publication into the foreground path.
