@@ -785,7 +785,8 @@ impl CachedStoreWriterSlice {
             self.restore_staged_prefix(payload);
             return Err(CachedStoreWriterError::UploadStage { object_id, source });
         }
-        self.cache_hot_upload_if_enabled(object_id, payload.clone());
+        let copy_hot_upload_payload = !self.pages.is_empty();
+        self.cache_hot_upload_if_enabled(object_id, payload.clone(), copy_hot_upload_payload);
         self.next_object_id = self.next_object_id.saturating_add(1);
         self.store.metrics.materialize_batches.record_batch(
             1,
@@ -821,9 +822,14 @@ impl CachedStoreWriterSlice {
         self.pages = restored;
     }
 
-    fn cache_hot_upload_if_enabled(&self, object_id: ObjectId, payload: Bytes) {
+    fn cache_hot_upload_if_enabled(&self, object_id: ObjectId, payload: Bytes, copy_payload: bool) {
         let mut upload_hot = self.store.upload_hot.lock();
         if upload_hot.budget_bytes > 0 {
+            let payload = if copy_payload {
+                Bytes::copy_from_slice(payload.as_ref())
+            } else {
+                payload
+            };
             upload_hot.insert(object_id, payload);
         }
     }
@@ -1157,6 +1163,43 @@ mod tests {
             recorded[0].data.as_ptr(),
             hot.as_ptr(),
             "backend and hot upload cache should share the frozen staged bytes"
+        );
+    }
+
+    #[test]
+    fn writer_slice_hot_upload_copies_payload_when_dirty_tail_remains() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inner_backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
+                .expect("open backend")
+                .backend;
+        let backend = Arc::new(RecordingOwnedPayloadBackend::new(inner_backend));
+        let (cached_store, _rx) = CachedStore::open(
+            CachedStoreConfig::new(dir.path()).with_upload_hot_bytes(64),
+            backend.clone(),
+        )
+        .expect("open cached store");
+        let mut writer = cached_store.open_writer_slice(writer_config());
+
+        writer
+            .write_at(0, b"abcdefghijkl")
+            .expect("write block and tail");
+        let staged = writer.flush_to(8).expect("flush full block");
+
+        assert_eq!(staged.len(), 1);
+        assert_eq!(writer.dirty_bytes(), 4);
+        let recorded = backend.take_owned_puts();
+        assert_eq!(recorded.len(), 1);
+        let hot = cached_store
+            .get_hot_upload(staged[0].object_id)
+            .expect("hot upload payload");
+
+        assert_eq!(recorded[0].data.as_ref(), b"abcdefgh");
+        assert_eq!(hot.as_ref(), b"abcdefgh");
+        assert_ne!(
+            recorded[0].data.as_ptr(),
+            hot.as_ptr(),
+            "hot cache should not retain the writer allocation when dirty tail remains"
         );
     }
 
