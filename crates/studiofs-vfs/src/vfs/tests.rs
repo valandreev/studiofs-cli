@@ -5561,6 +5561,10 @@ fn flush_fh_materializes_opportunistic_handle_writer_state_into_overlay_slices()
             "flush_fh should materialize block-backed local unpublished slices: {spans:?}"
         );
         assert!(
+            !vfs.pending_uploads_for_inode(ino).is_empty(),
+            "flush_fh should enqueue writer-stack payloads for background upload after metadata commit"
+        );
+        assert!(
             !vfs.state.writer_stack.has_dirty_writers(ino),
             "flush_fh should drain writer-stack dirty state"
         );
@@ -5902,6 +5906,10 @@ fn release_fh_materializes_opportunistic_handle_writer_state() {
         assert!(
             spans.iter().any(|span| span.payload.is_some()),
             "last-handle release should materialize block-backed local unpublished slices: {spans:?}"
+        );
+        assert!(
+            !vfs.pending_uploads_for_inode(ino).is_empty(),
+            "last-handle release should enqueue writer-stack payloads for background upload after metadata commit"
         );
         assert!(
             !vfs.state.writer_stack.has_dirty_writers(ino),
