@@ -116,6 +116,9 @@ dirty local state for this inode
 Local durability notes:
 - Accepted bytes may live only in writer pages until a local boundary freezes
   and finishes the relevant slices.
+- When a barrier finishes multiple pending slices for one chunk, VFS commits
+  them in deterministic creation order, with chunk-local offset ordering as
+  the tie-breaker for equal creation sequence values.
 - `fsync()` requests the strict local sync boundary directly.
 - Explicit `flush()` and last-handle `close()` / `release()` also drain the
   writer state they own, without pulling remote publication into the foreground.

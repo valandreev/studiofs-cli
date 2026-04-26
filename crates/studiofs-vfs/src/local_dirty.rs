@@ -691,7 +691,14 @@ where
                     .map(|persisted| (persisted.block_index, persisted.len()))
                     .collect();
             for (chunk_id, mut slices) in dirty_chunk_slices {
-                slices.sort_by_key(|slice| slice.seq);
+                slices.sort_by_key(|slice| {
+                    (
+                        slice.seq,
+                        slice.range.start,
+                        slice.block_offset,
+                        slice.object_offset,
+                    )
+                });
                 for slice in slices {
                     if let Some(object_id) = slice.object_id {
                         let slice_len = slice.range.len();
@@ -3811,6 +3818,60 @@ mod tests {
         assert_eq!(
             second[0].payload.as_ref().expect("payload ref").length,
             1024 * 1024
+        );
+    }
+
+    #[test]
+    fn build_overlay_slice_records_orders_pending_slices_within_chunk() {
+        let events = EventLog::default();
+        let uploads = Arc::new(StdMutex::new(Vec::new()));
+        let observed_inodes = Arc::new(StdMutex::new(Vec::new()));
+        let drain = test_drain(events, false, false, None, uploads, observed_inodes);
+
+        let chunk_id = 7;
+        let mut dirty_chunk_slices = std::collections::BTreeMap::new();
+        dirty_chunk_slices.insert(
+            chunk_id,
+            vec![
+                PendingDirtySlice::persisted(
+                    studiofs_meta::schema::SliceRange::new(4096, 8192).expect("second range"),
+                    0,
+                    4096,
+                    42,
+                    7002,
+                    4096,
+                ),
+                PendingDirtySlice::persisted(
+                    studiofs_meta::schema::SliceRange::new(0, 4096).expect("first range"),
+                    0,
+                    0,
+                    42,
+                    7001,
+                    0,
+                ),
+            ],
+        );
+
+        let chunk_slices = drain
+            .build_overlay_slice_records(41, &[], dirty_chunk_slices)
+            .expect("dirty pending slices become overlay records");
+
+        let records = &chunk_slices[0].1;
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.range.start)
+                .collect::<Vec<_>>(),
+            vec![0, 4096],
+            "equal-seq slices should commit in chunk-local offset order"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.payload.as_ref().expect("payload").object_id)
+                .collect::<Vec<_>>(),
+            vec![7001, 7002],
+            "payload refs should follow the sorted chunk-local slice order"
         );
     }
 
