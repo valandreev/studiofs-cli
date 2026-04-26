@@ -159,6 +159,14 @@ impl StudioVfs {
         let Some(delay_ms) = dirty_budget_delay_ms.max(drain_lag_delay_ms) else {
             return false;
         };
+        let pacing_trigger = match (dirty_budget_delay_ms, drain_lag_delay_ms) {
+            (Some(dirty), Some(drain)) if dirty == drain => "dirty_budget_and_drain_lag",
+            (Some(dirty), Some(drain)) if dirty > drain => "dirty_budget",
+            (Some(_), Some(_)) => "drain_lag",
+            (Some(_), None) => "dirty_budget",
+            (None, Some(_)) => "drain_lag",
+            (None, None) => "none",
+        };
 
         self.spawn_deferred_materialization_if_needed(preferred_ino)
             .await;
@@ -173,7 +181,10 @@ impl StudioVfs {
                 "drain_lag_bytes": drain_lag_bytes,
                 "max_dirty_bytes": max_dirty,
                 "buffered_write_count": buffered_write_count,
+                "dirty_budget_delay_ms": dirty_budget_delay_ms,
+                "drain_lag_delay_ms": drain_lag_delay_ms,
                 "delay_ms": delay_ms,
+                "pacing_trigger": pacing_trigger,
             }),
         );
 
