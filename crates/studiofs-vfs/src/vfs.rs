@@ -4245,6 +4245,7 @@ impl StudioVfs {
     fn inode_has_unmaterialized_overlay_for_finalize(&self, ino: Ino) -> bool {
         if self.has_pending_local_dirty_payloads_for_inode(ino)
             || self.inode_has_dirty_handle_writers(ino)
+            || self.state.writer_stack.has_dirty_writers(ino)
             || self
                 .state
                 .deferred_materialize_inflight

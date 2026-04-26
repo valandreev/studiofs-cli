@@ -1374,6 +1374,38 @@ fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
 }
 
 #[test]
+fn epoch_finalizer_guard_observes_writer_stack_tail() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-writer-stack-tail");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"graph-finalizer-writer-stack-tail.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open writable handle");
+        let payload = b"writer-stack-only-tail";
+
+        vfs.write_fh_with_local_sync_policy(fh, ino, 0, payload, LocalSyncPolicy::Opportunistic)
+            .await
+            .expect("buffer writer-stack tail");
+
+        assert!(vfs.state.writer_stack.has_dirty_writers(ino));
+        assert!(!vfs.has_pending_local_dirty_payloads_for_inode(ino));
+        assert!(!vfs.inode_has_dirty_handle_writers(ino));
+        assert!(
+            vfs.inode_has_unmaterialized_overlay_for_finalize(ino),
+            "epoch finalization must defer while a mounted write is only buffered in the writer stack"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn epoch_finalizer_defers_while_deferred_materialization_is_inflight() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-inflight");
