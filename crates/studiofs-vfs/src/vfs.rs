@@ -195,6 +195,9 @@ const SOFT_DIRTY_PACING_DELAY_CRITICAL_MS: u64 = 10;
 const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_LIGHT: usize = 256;
 const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_HIGH: usize = 512;
 const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_CRITICAL: usize = 1024;
+const SOFT_DRAIN_LAG_PACING_DELAY_LIGHT_MS: u64 = 1;
+const SOFT_DRAIN_LAG_PACING_DELAY_MEDIUM_MS: u64 = 3;
+const SOFT_DRAIN_LAG_PACING_DELAY_HEAVY_MS: u64 = 6;
 const WRITE_BUFFER_POOL_MIN_BUFFERS: usize = 4;
 const WRITE_BUFFER_POOL_BUFFER_MULTIPLIER: usize = 2;
 
@@ -2177,6 +2180,25 @@ fn soft_dirty_budget_pacing_delay_ms(
     }
 
     (delay_ms > 0).then_some(delay_ms)
+}
+
+fn soft_drain_lag_pacing_delay_ms(
+    drain_lag_bytes: usize,
+    steady_drain_quota_bytes: usize,
+) -> Option<u64> {
+    if steady_drain_quota_bytes == 0 || drain_lag_bytes < steady_drain_quota_bytes {
+        return None;
+    }
+
+    let medium_threshold = steady_drain_quota_bytes.saturating_mul(2);
+    let heavy_threshold = steady_drain_quota_bytes.saturating_mul(4);
+    Some(if drain_lag_bytes >= heavy_threshold {
+        SOFT_DRAIN_LAG_PACING_DELAY_HEAVY_MS
+    } else if drain_lag_bytes >= medium_threshold {
+        SOFT_DRAIN_LAG_PACING_DELAY_MEDIUM_MS
+    } else {
+        SOFT_DRAIN_LAG_PACING_DELAY_LIGHT_MS
+    })
 }
 
 fn warn_small_block_addressability(block_size: u32) {

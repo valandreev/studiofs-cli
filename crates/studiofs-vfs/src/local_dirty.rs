@@ -1962,11 +1962,31 @@ impl StudioVfs {
             .unwrap_or(0)
     }
 
+    pub(super) fn total_pending_persisted_local_dirty_slice_bytes(&self) -> usize {
+        self.state
+            .local_dirty
+            .pending_chunk_slices
+            .lock()
+            .values()
+            .flat_map(|chunks| chunks.values())
+            .flat_map(|slices| slices.iter())
+            .filter(|slice| slice.is_persisted())
+            .map(|slice| slice.range.len() as usize)
+            .sum()
+    }
+
+    pub(super) fn total_landed_write_drain_lag_bytes(&self) -> usize {
+        self.state
+            .handle_writers
+            .total_dirty_bytes()
+            .saturating_add(self.total_pending_local_dirty_bytes())
+            .saturating_add(self.total_pending_persisted_local_dirty_slice_bytes())
+    }
+
     fn pending_slice_commit_wave_bytes(&self) -> usize {
         self.handle_writer_slice_flush_bytes()
-            .saturating_mul(2)
             .min(self.write_eager_flush_drain_chunk_bytes)
-            .max(self.handle_writer_slice_flush_bytes())
+            .max(1)
     }
 
     fn pending_slice_commit_hot_tail_bytes(&self) -> usize {
@@ -2013,7 +2033,7 @@ impl StudioVfs {
             .sum();
         let oldest_age = self.oldest_pending_persisted_local_dirty_slice_age(&pending_slices);
         let commit_wave_bytes = self.pending_slice_commit_wave_bytes();
-        if total_bytes < commit_wave_bytes
+        if total_bytes <= commit_wave_bytes
             && oldest_age.is_none_or(|age| age < PENDING_SLICE_COMMIT_MAX_AGE)
         {
             return std::collections::BTreeMap::new();
@@ -2038,7 +2058,12 @@ impl StudioVfs {
             )
         });
 
-        let mut retain_tail_bytes = self.pending_slice_commit_hot_tail_bytes();
+        let mut retain_tail_bytes =
+            if oldest_age.is_some_and(|age| age >= PENDING_SLICE_COMMIT_MAX_AGE) {
+                0
+            } else {
+                self.pending_slice_commit_hot_tail_bytes()
+            };
         let mut commit_candidates = Vec::<(u64, PendingDirtySlice)>::new();
         for (chunk_id, slice) in ordered_slices.iter().rev().copied() {
             let slice_len = slice.len();
@@ -2132,7 +2157,7 @@ impl StudioVfs {
             return true;
         }
 
-        pending_slice_bytes >= self.pending_slice_commit_wave_bytes()
+        pending_slice_bytes > self.pending_slice_commit_wave_bytes()
             || self
                 .oldest_pending_persisted_local_dirty_slice_age(&pending_slices)
                 .is_some_and(|age| age >= PENDING_SLICE_COMMIT_MAX_AGE)

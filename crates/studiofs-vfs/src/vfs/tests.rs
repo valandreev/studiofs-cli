@@ -3530,8 +3530,26 @@ fn background_flush_commits_persisted_slice_waves_and_keeps_latest_hot_tail_stag
             .unwrap();
         assert_eq!(
             vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            28 * 1024 * 1024,
+            "background flush should commit only one steady oldest slice quota first"
+        );
+
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
             24 * 1024 * 1024,
-            "background flush should commit only a small oldest slice wave first"
+            "subsequent background passes should continue draining old staged slices without touching the hot tail"
+        );
+
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            20 * 1024 * 1024,
+            "background flush should keep shrinking the staged backlog in small waves"
         );
 
         vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
@@ -3540,7 +3558,21 @@ fn background_flush_commits_persisted_slice_waves_and_keeps_latest_hot_tail_stag
         assert_eq!(
             vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
             16 * 1024 * 1024,
-            "subsequent background waves should continue draining old staged slices without touching the hot tail"
+            "steady draining should continue one quota at a time while the active tail remains dirty"
+        );
+
+        tokio::time::sleep(Duration::from_millis(125)).await;
+        assert!(
+            vfs.should_background_flush_pending_local_dirty_inode(ino),
+            "steady draining should continue while the staged backlog is above one quota"
+        );
+        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            12 * 1024 * 1024,
+            "steady draining should keep committing one quota per pass"
         );
 
         vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
@@ -3549,7 +3581,7 @@ fn background_flush_commits_persisted_slice_waves_and_keeps_latest_hot_tail_stag
         assert_eq!(
             vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
             8 * 1024 * 1024,
-            "background flush should keep shrinking the staged backlog in small waves"
+            "steady draining should not collapse the remaining backlog into a burst"
         );
 
         vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
@@ -3562,17 +3594,49 @@ fn background_flush_commits_persisted_slice_waves_and_keeps_latest_hot_tail_stag
         );
 
         tokio::time::sleep(Duration::from_millis(125)).await;
-        assert!(
-            vfs.should_background_flush_pending_local_dirty_inode(ino),
-            "once the hot staged slice ages out, the next background wave should be allowed"
-        );
         vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
             .await
             .unwrap();
         assert_eq!(
             vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
-            2 * 1024 * 1024,
-            "an aged-out wave should shrink to the final staged 2 MiB tail first"
+            0,
+            "an aged-out final staged slice should eventually drain"
+        );
+
+        vfs.flush_fh(fh).await.unwrap();
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn background_flush_commits_persisted_slices_at_steady_quota() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-286-steady-slice-quota");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-286-steady-slice-quota.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let slice_bytes = 2 * 1024 * 1024usize;
+
+        for index in 0..9u64 {
+            let payload = vec![0x40u8.saturating_add(index as u8); slice_bytes];
+            vfs.record_handle_writer_state(fh, ino, index * slice_bytes as u64, &payload)
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
+                .await
+                .unwrap(),
+            "opportunistic pass should stage persisted landed slices"
+        );
+        assert_eq!(
+            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            16 * 1024 * 1024
         );
 
         vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
@@ -3580,8 +3644,44 @@ fn background_flush_commits_persisted_slice_waves_and_keeps_latest_hot_tail_stag
             .unwrap();
         assert_eq!(
             vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
+            12 * 1024 * 1024,
+            "steady draining should commit one 4 MiB quota instead of an 8 MiB burst"
+        );
+
+        vfs.flush_fh(fh).await.unwrap();
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn soft_pacing_reacts_to_handle_writer_drain_lag_before_dirty_budget_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-286-lag-soft-pacing");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        vfs.set_max_dirty_bytes(128 * 1024 * 1024);
+        let attr = vfs
+            .create(1, b"sfs-286-lag-soft-pacing.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let slice_bytes = 2 * 1024 * 1024usize;
+
+        for index in 0..3u64 {
+            let payload = vec![0x50u8.saturating_add(index as u8); slice_bytes];
+            vfs.record_handle_writer_state(fh, ino, index * slice_bytes as u64, &payload)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            vfs.total_pending_local_dirty_bytes(),
             0,
-            "repeated aged-out waves should eventually drain the final staged slice"
+            "the lag signal should come from landed handle-writer bytes, not old dirty-memory pressure"
+        );
+        assert!(
+            vfs.apply_write_path_soft_pacing(ino).await,
+            "soft pressure should begin once landed writes outpace the background drain"
         );
 
         vfs.flush_fh(fh).await.unwrap();
