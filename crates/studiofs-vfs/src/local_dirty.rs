@@ -1975,6 +1975,7 @@ impl StudioVfs {
         self.state
             .handle_writers
             .total_dirty_bytes()
+            .saturating_add(self.state.writer_stack.total_dirty_bytes())
             .saturating_add(self.total_pending_local_dirty_bytes())
             .saturating_add(self.total_pending_persisted_local_dirty_slice_bytes())
     }

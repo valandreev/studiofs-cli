@@ -1191,6 +1191,7 @@ impl StudioVfs {
             .await
     }
 
+    #[allow(dead_code)]
     pub(super) async fn record_handle_writer_state_bytes(
         &self,
         fh: u64,

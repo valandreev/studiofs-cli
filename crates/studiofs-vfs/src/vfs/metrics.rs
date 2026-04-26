@@ -128,6 +128,8 @@ pub struct VfsWritePathVfsWriteStats {
     #[serde(default)]
     pub record_handle_writer_state: VfsWritePathStageLatencyStats,
     #[serde(default)]
+    pub record_writer_stack_state: VfsWritePathStageLatencyStats,
+    #[serde(default)]
     pub materialize_completed: VfsWritePathStageLatencyStats,
     #[serde(default)]
     pub materialize_strict: VfsWritePathStageLatencyStats,

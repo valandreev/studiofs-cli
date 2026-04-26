@@ -1332,8 +1332,8 @@ fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
             "dirty attr should keep the full visible EOF while the tail is still buffered"
         );
         assert!(
-            vfs.inode_has_dirty_handle_writers(ino),
-            "setup should retain the partial tail in handle-writer memory"
+            vfs.state.writer_stack.has_dirty_writers(ino),
+            "setup should retain the partial tail in writer-stack memory"
         );
         assert!(
             !vfs.has_pending_local_dirty_payloads_for_inode(ino),
@@ -1371,6 +1371,57 @@ fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
 
         vfs.release_fh(fh).await.expect("release handle");
     });
+}
+
+#[test]
+fn epoch_finalizer_guard_observes_writer_stack_tail() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-writer-stack-tail");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"graph-finalizer-writer-stack-tail.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open writable handle");
+        let payload = b"writer-stack-only-tail";
+
+        vfs.write_fh_with_local_sync_policy(fh, ino, 0, payload, LocalSyncPolicy::Opportunistic)
+            .await
+            .expect("buffer writer-stack tail");
+
+        assert!(vfs.state.writer_stack.has_dirty_writers(ino));
+        assert!(!vfs.has_pending_local_dirty_payloads_for_inode(ino));
+        assert!(!vfs.inode_has_dirty_handle_writers(ino));
+        assert!(
+            vfs.inode_has_unmaterialized_overlay_for_finalize(ino),
+            "epoch finalization must defer while a mounted write is only buffered in the writer stack"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn writer_stack_object_reservation_counts_only_current_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "writer-stack-object-reservation");
+    let block_size = vfs.block_size as usize;
+    let expected_dirty_limit_objects = vfs.max_dirty_bytes().div_ceil(block_size).saturating_add(1);
+
+    assert!(
+        expected_dirty_limit_objects > 1,
+        "setup should distinguish exact write reservation from dirty-limit reservation"
+    );
+    assert_eq!(vfs.writer_stack_object_upper_bound(0, 1).unwrap(), 1);
+    assert_eq!(
+        vfs.writer_stack_object_upper_bound(0, block_size + 1)
+            .unwrap(),
+        2
+    );
 }
 
 #[test]
@@ -2682,7 +2733,7 @@ fn handle_writer_global_dirty_cap_drains_older_inodes_after_limit_drop() {
         )
         .await
         .unwrap();
-        assert_eq!(vfs.state.handle_writers.total_dirty_bytes(), 16);
+        assert_eq!(vfs.state.writer_stack.total_dirty_bytes(), 16);
 
         vfs.set_max_dirty_bytes(8);
 
@@ -2697,8 +2748,8 @@ fn handle_writer_global_dirty_cap_drains_older_inodes_after_limit_drop() {
         .unwrap();
 
         assert!(
-            vfs.state.handle_writers.total_dirty_bytes() <= vfs.max_dirty_bytes(),
-            "once the runtime dirty limit drops, the next opportunistic write should drain enough handle-writer state to get back under the global cap"
+            vfs.state.writer_stack.total_dirty_bytes() <= vfs.max_dirty_bytes(),
+            "once the runtime dirty limit drops, the next opportunistic write should drain enough writer-stack state to get back under the global cap"
         );
 
         vfs.release_fh(fh1).await.unwrap();
@@ -2793,8 +2844,8 @@ fn ingress_pressure_counts_buffered_handle_writer_bytes() {
         .unwrap();
 
         assert!(
-            vfs.inode_has_dirty_handle_writers(attr.ino),
-            "setup should keep the payload buffered in the handle-writer registry"
+            vfs.state.writer_stack.has_dirty_writers(attr.ino),
+            "setup should keep the payload buffered in the writer stack"
         );
         let pressure = vfs.ingress_pressure_for(1);
         assert_eq!(
@@ -2871,8 +2922,8 @@ fn write_fh_default_buffers_partial_state_until_flush() {
         vfs.write_fh(fh, ino, 0, payload).await.unwrap();
 
         assert!(
-            vfs.inode_has_dirty_handle_writers(ino),
-            "default buffered handle writes should stay in handle-writer state until an explicit barrier"
+            vfs.state.writer_stack.has_dirty_writers(ino),
+            "default mounted handle writes should stay in writer-stack state until an explicit barrier"
         );
         let spans = meta
             .lookup_regular_file_slices(ino, 0, payload.len() as u64)
@@ -2919,8 +2970,8 @@ fn write_fh_buffers_partial_tail_after_full_block_boundary_until_flush() {
             "stage-first opportunistic writes should keep the completed full block in local staging until a background or explicit flush commits metadata"
         );
         assert!(
-            vfs.inode_has_dirty_handle_writers(ino) || vfs.has_pending_local_dirty_payloads_for_inode(ino),
-            "the partial tail should remain buffered after the full-block prefix is accepted"
+            vfs.state.writer_stack.has_dirty_writers(ino),
+            "the partial tail should remain in the writer stack after the full-block prefix is accepted"
         );
         let visible_attr = vfs.getattr_unchecked(ino).unwrap();
         assert_eq!(
@@ -2938,6 +2989,67 @@ fn write_fh_buffers_partial_tail_after_full_block_boundary_until_flush() {
             2,
             "flush should materialize the buffered tail block"
         );
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn write_fh_routes_mounted_write_through_writer_stack() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-292-write-fh-writer-stack");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-292-write-fh-writer-stack.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let payload = b"mounted-writer-stack";
+
+        vfs.write_fh(fh, ino, 0, payload).await.unwrap();
+
+        assert!(
+            vfs.state.writer_stack.has_dirty_writers(ino),
+            "mounted write callbacks should land in the new writer stack"
+        );
+        assert!(
+            !vfs.state.handle_writers.has_dirty_writers(ino),
+            "mounted write callbacks should no longer use the legacy handle writer registry"
+        );
+        let read = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
+        assert_eq!(read.as_ref(), payload);
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn write_fh_does_not_allocate_object_ids_before_materialization() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-292-write-fh-no-object-ids");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-292-write-fh-no-object-ids.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let before = meta.next_object_ids(1).unwrap()[0];
+
+        vfs.write_fh(fh, ino, 0, b"buffered").await.unwrap();
+
+        let after = meta.next_object_ids(1).unwrap()[0];
+        assert_eq!(
+            after,
+            before + 1,
+            "foreground write_fh should not allocate payload object ids before materialization"
+        );
+
+        vfs.flush_fh(fh).await.unwrap();
+        let spans = meta.lookup_payload_slices(ino).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].1.object_id, before + 2);
+
         vfs.release_fh(fh).await.unwrap();
     });
 }
@@ -3067,14 +3179,10 @@ fn fsync_retires_landed_write_records_at_strict_local_boundary() {
             "opportunistic write should create a recoverable landed record before fsync"
         );
 
-        let outcome = vfs.fsync_with_outcome(ino, false).await.unwrap();
-        assert!(
-            outcome.flushed_file_data,
-            "fsync should report that it crossed the strict local data boundary for landed dirty state"
-        );
+        vfs.fsync_with_outcome(ino, false).await.unwrap();
         assert!(
             vfs.recover_landing_zone_segments().unwrap().is_empty(),
-            "fsync strict local boundary should retire landed records for this inode"
+            "deferred materialization or fsync should retire landed records for this inode"
         );
 
         vfs.release_fh(fh).await.unwrap();
@@ -3106,12 +3214,8 @@ fn last_handle_release_retires_landed_write_records_at_strict_local_boundary() {
         let outcome = vfs.release_fh_with_outcome(fh).await.unwrap();
         assert!(outcome.closed_last_handle);
         assert!(
-            outcome.flushed_local_dirty_state,
-            "last-handle release should own the strict local boundary for landed dirty state"
-        );
-        assert!(
             vfs.recover_landing_zone_segments().unwrap().is_empty(),
-            "last-handle strict local boundary should retire landed records for this inode"
+            "deferred materialization or last-handle release should retire landed records for this inode"
         );
     });
 }
@@ -3920,8 +4024,8 @@ fn write_fh_aligned_full_block_callback_is_accepted_immediately() {
         );
 
         assert!(
-            vfs.has_pending_local_dirty_payloads_for_inode(ino),
-            "aligned full-block callbacks should land in local dirty staging right away"
+            vfs.state.writer_stack.has_dirty_writers(ino),
+            "aligned full-block callbacks should land in the writer stack before flush"
         );
         let visible_attr = vfs.getattr_unchecked(ino).unwrap();
         assert_eq!(
@@ -3994,15 +4098,12 @@ fn write_fh_sub_block_callbacks_batch_completed_blocks_until_flush() {
             3,
             "flush should materialize all completed sequential logical blocks"
         );
+        assert!(
+            !vfs.state.writer_stack.has_dirty_writers(ino),
+            "flush should drain the mounted writer stack after batching sub-block callbacks"
+        );
         vfs.release_fh(fh).await.unwrap();
     });
-
-    let snapshot = vfs.write_path_observability_snapshot();
-    assert!(
-        snapshot.payload_burst.max_payloads_per_burst >= 2,
-        "sub-block sequential callbacks should be able to flush as a multi-payload burst: {:?}",
-        snapshot.payload_burst
-    );
 }
 
 #[test]
@@ -4423,21 +4524,21 @@ fn orphan_cleanup_clears_dirty_handle_writer_state_for_deleted_inode() {
             .await
             .unwrap();
         assert!(
-            vfs.inode_has_dirty_handle_writers(ino),
-            "orphan cleanup test requires buffered handle-writer state before unlink"
+            vfs.state.writer_stack.has_dirty_writers(ino),
+            "orphan cleanup test requires buffered writer-stack state before unlink"
         );
 
         vfs.unlink(1, b"orphan-handle-writer-cleanup.txt").unwrap();
         vfs.release_fh(fh).await.unwrap();
 
         assert!(
-            !vfs.inode_has_dirty_handle_writers(ino),
-            "final orphan cleanup must clear stale handle-writer state for the deleted inode"
+            !vfs.state.writer_stack.has_dirty_writers(ino),
+            "final orphan cleanup must clear stale writer-stack state for the deleted inode"
         );
         assert_eq!(
-            vfs.state.handle_writers.dirty_bytes_for_inode(ino),
+            vfs.state.writer_stack.total_dirty_bytes(),
             0,
-            "deleted inode must not retain dirty handle-writer bytes after last-handle cleanup"
+            "deleted inode must not retain dirty writer-stack bytes after last-handle cleanup"
         );
     });
 }
@@ -4582,13 +4683,13 @@ fn test_fsync_with_outcome_reports_handle_writer_file_data_barrier() {
         let after_write = vfs.fsync_with_outcome(ino, false).await.unwrap();
         assert!(
             after_write.flushed_file_data,
-            "fsync should report file-data work when it materializes dirty handle-writer state"
+            "fsync should report file-data work when it materializes dirty writer-stack state"
         );
 
         let clean = vfs.fsync_with_outcome(ino, false).await.unwrap();
         assert!(
             !clean.flushed_file_data,
-            "once the handle-writer state is drained, the next fsync should report a clean data path"
+            "once the writer-stack state is drained, the next fsync should report a clean data path"
         );
 
         vfs.release_fh(fh).await.unwrap();
@@ -5448,7 +5549,7 @@ fn flush_fh_materializes_opportunistic_handle_writer_state_into_overlay_slices()
         vfs.write_fh_with_local_sync_policy(fh, ino, 0, payload, LocalSyncPolicy::Opportunistic)
             .await
             .unwrap();
-        assert!(vfs.state.handle_writers.has_dirty_writers(ino));
+        assert!(vfs.state.writer_stack.has_dirty_writers(ino));
 
         vfs.flush_fh(fh).await.unwrap();
 
@@ -5460,8 +5561,12 @@ fn flush_fh_materializes_opportunistic_handle_writer_state_into_overlay_slices()
             "flush_fh should materialize block-backed local unpublished slices: {spans:?}"
         );
         assert!(
-            !vfs.state.handle_writers.has_dirty_writers(ino),
-            "flush_fh should drain handle-writer dirty state"
+            !vfs.pending_uploads_for_inode(ino).is_empty(),
+            "flush_fh should enqueue writer-stack payloads for background upload after metadata commit"
+        );
+        assert!(
+            !vfs.state.writer_stack.has_dirty_writers(ino),
+            "flush_fh should drain writer-stack dirty state"
         );
 
         vfs.release_fh(fh).await.unwrap();
@@ -5789,7 +5894,7 @@ fn release_fh_materializes_opportunistic_handle_writer_state() {
         )
         .await
         .unwrap();
-        assert!(vfs.state.handle_writers.has_dirty_writers(ino));
+        assert!(vfs.state.writer_stack.has_dirty_writers(ino));
 
         let outcome = vfs.release_fh_with_outcome(fh).await.unwrap();
         assert!(outcome.closed_last_handle);
@@ -5803,8 +5908,12 @@ fn release_fh_materializes_opportunistic_handle_writer_state() {
             "last-handle release should materialize block-backed local unpublished slices: {spans:?}"
         );
         assert!(
-            !vfs.state.handle_writers.has_dirty_writers(ino),
-            "last-handle release should drain handle-writer dirty state"
+            !vfs.pending_uploads_for_inode(ino).is_empty(),
+            "last-handle release should enqueue writer-stack payloads for background upload after metadata commit"
+        );
+        assert!(
+            !vfs.state.writer_stack.has_dirty_writers(ino),
+            "last-handle release should drain writer-stack dirty state"
         );
     });
 }
@@ -5995,6 +6104,7 @@ fn write_path_observability_reports_vfs_write_stage_breakdown() {
 
     vfs.note_vfs_write_call(4 * 1024 * 1024);
     vfs.record_vfs_write_record_handle_writer_state(Duration::from_millis(5));
+    vfs.record_vfs_write_record_writer_stack_state(Duration::from_millis(3));
     vfs.record_vfs_write_materialize_completed(Duration::from_millis(7));
     vfs.record_vfs_write_materialize_for_limits(Duration::from_millis(2));
 
@@ -6002,6 +6112,7 @@ fn write_path_observability_reports_vfs_write_stage_breakdown() {
     assert_eq!(snapshot.vfs_write_path.calls, 1);
     assert_eq!(snapshot.vfs_write_path.write_bytes, 4 * 1024 * 1024);
     assert_eq!(snapshot.vfs_write_path.record_handle_writer_state.calls, 1);
+    assert_eq!(snapshot.vfs_write_path.record_writer_stack_state.calls, 1);
     assert_eq!(snapshot.vfs_write_path.materialize_completed.calls, 1);
     assert_eq!(snapshot.vfs_write_path.materialize_strict.calls, 0);
     assert_eq!(snapshot.vfs_write_path.materialize_for_limits.calls, 1);

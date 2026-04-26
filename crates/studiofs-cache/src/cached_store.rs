@@ -43,6 +43,7 @@ pub struct CachedStoreWriterConfig {
     pub page_size: usize,
     pub dirty_byte_limit: Option<usize>,
     pub max_buffer_bytes: Option<usize>,
+    pub submit_upload: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -768,6 +769,10 @@ impl CachedStoreWriterSlice {
         self.pages.len()
     }
 
+    pub fn set_next_object_id(&mut self, next_object_id: ObjectId) {
+        self.next_object_id = next_object_id;
+    }
+
     fn stage_prefix(&mut self, len: usize) -> Result<StagedSlice, CachedStoreWriterError> {
         let started_at = Instant::now();
         let payload = self.pages.split_to(len).freeze();
@@ -794,13 +799,15 @@ impl CachedStoreWriterSlice {
             started_at.elapsed(),
         );
         self.store.writer_counters.subtract_dirty_bytes(len);
-        self.store.submit_staged_upload(
-            self.config.ino,
-            self.active_start,
-            object_id,
-            self.config.content_epoch,
-            len,
-        );
+        if self.config.submit_upload {
+            self.store.submit_staged_upload(
+                self.config.ino,
+                self.active_start,
+                object_id,
+                self.config.content_epoch,
+                len,
+            );
+        }
 
         let staged = StagedSlice {
             ino: self.config.ino,
@@ -911,6 +918,7 @@ mod tests {
             page_size: 4,
             dirty_byte_limit: None,
             max_buffer_bytes: None,
+            submit_upload: true,
         }
     }
 
