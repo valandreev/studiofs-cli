@@ -3755,6 +3755,62 @@ fn soft_pacing_reacts_to_handle_writer_drain_lag_before_dirty_budget_limit() {
 }
 
 #[test]
+fn write_path_observability_reports_landing_drain_lag_and_pacing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-287-drain-lag-observability");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        vfs.set_max_dirty_bytes(128 * 1024 * 1024);
+        let attr = vfs
+            .create(1, b"sfs-287-drain-lag-observability.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let slice_bytes = 2 * 1024 * 1024usize;
+
+        for index in 0..3u64 {
+            let payload = vec![0x60u8.saturating_add(index as u8); slice_bytes];
+            vfs.write_fh_with_deferred_materialize(
+                fh,
+                ino,
+                index * slice_bytes as u64,
+                &payload,
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await
+            .unwrap();
+        }
+
+        let snapshot = vfs.write_path_observability_snapshot();
+        assert_eq!(snapshot.landing_zone.accepted_writes, 3);
+        assert_eq!(
+            snapshot.landing_zone.accepted_bytes,
+            (3 * slice_bytes) as u64
+        );
+        assert_eq!(
+            snapshot.drain_lag.current_bytes,
+            vfs.total_landed_write_drain_lag_bytes(),
+            "snapshot should expose the same lag signal used by soft pacing"
+        );
+        assert!(
+            snapshot.drain_lag.current_bytes >= snapshot.drain_lag.steady_quota_bytes,
+            "three landed slices should exceed one steady drain quota"
+        );
+        assert!(
+            snapshot.drain_lag.soft_pacing_events > 0,
+            "opportunistic writes should record whether drain-lag pacing engaged"
+        );
+        assert!(
+            snapshot.drain_lag.soft_pacing_total_ms > 0,
+            "drain-lag pacing should surface accumulated wait time"
+        );
+
+        vfs.flush_fh(fh).await.unwrap();
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn write_fh_aligned_full_block_callback_is_accepted_immediately() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-257-write-fh-aligned-full-block");
