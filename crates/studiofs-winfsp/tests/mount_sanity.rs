@@ -127,7 +127,7 @@ struct AlignedChunk {
 
 impl AlignedChunk {
     fn new(len: usize) -> Result<Self, String> {
-        if len % AJA_CACHE_OFF_ALIGNMENT_BYTES != 0 {
+        if !len.is_multiple_of(AJA_CACHE_OFF_ALIGNMENT_BYTES) {
             return Err(format!(
                 "aligned chunk length {len} must be 4096-byte aligned for unbuffered I/O"
             ));
@@ -307,7 +307,7 @@ fn validate_aja_sequential_workload_for_modes(
 ) -> Result<(usize, usize), String> {
     let workload = validate_aja_sequential_workload(chunk_bytes, chunk_count)?;
     if modes.contains(&AjaCacheValidationMode::CacheOff)
-        && chunk_bytes % AJA_CACHE_OFF_ALIGNMENT_BYTES != 0
+        && !chunk_bytes.is_multiple_of(AJA_CACHE_OFF_ALIGNMENT_BYTES)
     {
         return Err(format!(
             "STUDIOFS_WINFSP_AJA_CHUNK_BYTES={chunk_bytes} must be 4096-byte aligned when cache-off validation is selected"
