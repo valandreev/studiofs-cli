@@ -772,21 +772,21 @@ impl CachedStoreWriterSlice {
         let started_at = Instant::now();
         let payload = self.pages.split_to(len).freeze();
         let object_id = self.next_object_id;
-        self.next_object_id = self.next_object_id.saturating_add(1);
 
-        self.store
-            .local_payload_backend
-            .put_owned(LocalPayloadPut {
-                object_id,
-                data: payload.clone(),
-                evictable: false,
-            })
-            .map_err(|source| CachedStoreWriterError::LocalPayload { object_id, source })?;
-        self.store
-            .upload_stage_store
-            .link_payload(object_id)
-            .map_err(|source| CachedStoreWriterError::UploadStage { object_id, source })?;
+        if let Err(source) = self.store.local_payload_backend.put_owned(LocalPayloadPut {
+            object_id,
+            data: payload.clone(),
+            evictable: false,
+        }) {
+            self.restore_staged_prefix(payload);
+            return Err(CachedStoreWriterError::LocalPayload { object_id, source });
+        }
+        if let Err(source) = self.store.upload_stage_store.link_payload(object_id) {
+            self.restore_staged_prefix(payload);
+            return Err(CachedStoreWriterError::UploadStage { object_id, source });
+        }
         self.cache_hot_upload_if_enabled(object_id, payload.clone());
+        self.next_object_id = self.next_object_id.saturating_add(1);
         self.store.metrics.materialize_batches.record_batch(
             1,
             saturating_u64_from_usize(len),
@@ -810,6 +810,15 @@ impl CachedStoreWriterSlice {
         };
         self.active_start = self.active_start.saturating_add(len as u64);
         Ok(staged)
+    }
+
+    fn restore_staged_prefix(&mut self, payload: Bytes) {
+        let tail = std::mem::take(&mut self.pages);
+        let restored_len = payload.len().saturating_add(tail.len());
+        let mut restored = BytesMut::with_capacity(restored_len);
+        restored.extend_from_slice(payload.as_ref());
+        restored.extend_from_slice(tail.as_ref());
+        self.pages = restored;
     }
 
     fn cache_hot_upload_if_enabled(&self, object_id: ObjectId, payload: Bytes) {
@@ -910,6 +919,7 @@ mod tests {
     struct RecordingOwnedPayloadBackend {
         inner: Arc<dyn LocalPayloadBackend>,
         puts: Arc<Mutex<Vec<RecordedPayloadPut>>>,
+        fail_next_owned_put: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl RecordingOwnedPayloadBackend {
@@ -917,6 +927,15 @@ mod tests {
             Self {
                 inner,
                 puts: Arc::new(Mutex::new(Vec::new())),
+                fail_next_owned_put: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+
+        fn failing_next_owned_put(inner: Arc<dyn LocalPayloadBackend>) -> Self {
+            Self {
+                inner,
+                puts: Arc::new(Mutex::new(Vec::new())),
+                fail_next_owned_put: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             }
         }
 
@@ -969,6 +988,14 @@ mod tests {
             &self,
             put: LocalPayloadPut,
         ) -> Result<(), crate::local::LocalPayloadBackendError> {
+            if self
+                .fail_next_owned_put
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                return Err(crate::local::LocalPayloadBackendError::Other(Box::new(
+                    std::io::Error::other("injected owned put failure"),
+                )));
+            }
             self.puts.lock().push(RecordedPayloadPut {
                 object_id: put.object_id,
                 data: put.data.clone(),
@@ -1131,6 +1158,77 @@ mod tests {
             hot.as_ptr(),
             "backend and hot upload cache should share the frozen staged bytes"
         );
+    }
+
+    #[test]
+    fn writer_slice_keeps_dirty_prefix_retryable_after_owned_put_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inner_backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
+                .expect("open backend")
+                .backend;
+        let backend = Arc::new(RecordingOwnedPayloadBackend::failing_next_owned_put(
+            inner_backend,
+        ));
+        let (cached_store, _rx) =
+            CachedStore::open(CachedStoreConfig::new(dir.path()), backend).expect("open store");
+        let mut writer = cached_store.open_writer_slice(writer_config());
+
+        writer.write_at(0, b"abcdefgh").expect("write full block");
+        let err = writer.flush_to(8).expect_err("injected put failure");
+
+        assert!(matches!(err, CachedStoreWriterError::LocalPayload { .. }));
+        assert_eq!(writer.dirty_bytes(), 8);
+        assert_eq!(cached_store.snapshot_writer_counters().dirty_bytes, 8);
+
+        let mut accepted = [0_u8; 8];
+        assert_eq!(writer.read_accepted(0, &mut accepted), 8);
+        assert_eq!(&accepted, b"abcdefgh");
+
+        let staged = writer.flush_to(8).expect("retry flush");
+        assert_eq!(staged.len(), 1);
+        assert_eq!(
+            cached_store
+                .get_staged_for_upload(staged[0].object_id)
+                .expect("retry staged payload")
+                .as_ref(),
+            b"abcdefgh"
+        );
+        assert_eq!(writer.dirty_bytes(), 0);
+    }
+
+    #[test]
+    fn writer_slice_keeps_dirty_prefix_retryable_after_upload_stage_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        let mut writer = cached_store.open_writer_slice(writer_config());
+        let layout = LocalPayloadLayout::from_cache_root(dir.path());
+        let stage_path = layout.upload_stage_object_path(10_000);
+        let stage_parent = stage_path.parent().expect("stage parent");
+        std::fs::create_dir_all(stage_parent.parent().expect("stage grandparent"))
+            .expect("stage grandparent dir");
+        std::fs::File::create(stage_parent).expect("stage parent obstruction");
+
+        writer.write_at(0, b"abcdefgh").expect("write full block");
+        let err = writer.flush_to(8).expect_err("injected stage failure");
+
+        assert!(matches!(err, CachedStoreWriterError::UploadStage { .. }));
+        assert_eq!(writer.dirty_bytes(), 8);
+        assert_eq!(cached_store.snapshot_writer_counters().dirty_bytes, 8);
+
+        std::fs::remove_file(stage_parent).expect("remove stage obstruction");
+        let staged = writer.flush_to(8).expect("retry flush");
+
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].object_id, 10_000);
+        assert_eq!(
+            cached_store
+                .get_staged_for_upload(staged[0].object_id)
+                .expect("retry staged payload")
+                .as_ref(),
+            b"abcdefgh"
+        );
+        assert_eq!(writer.dirty_bytes(), 0);
     }
 
     #[test]
