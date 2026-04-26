@@ -3,6 +3,7 @@ use super::{
     HandleReleaseContext, Ino, LastHandleReleaseAction, LocalSyncBarrierOutcome, LocalSyncPolicy,
     OpenFile, OpenFlags, ReleaseFhOutcome, StickyErrorPolicy, StudioVfs, VfsResult,
 };
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
@@ -13,6 +14,37 @@ use crate::{VfsError, VfsMeta};
 use std::time::{Duration, Instant};
 
 impl StudioVfs {
+    pub(super) fn spawn_landing_zone_recovery_worker(self: &Arc<Self>) {
+        let vfs = self.clone();
+        self.track_background_task(tokio::spawn(async move {
+            if let Err(error) = vfs.recover_landing_zone_for_startup().await {
+                warn!(error = %error, "landing-zone startup recovery failed");
+            }
+        }));
+    }
+
+    async fn recover_landing_zone_for_startup(&self) -> VfsResult<()> {
+        let recovered = self
+            .landing_zone
+            .recover_with_data()
+            .map_err(VfsError::Io)?;
+        let mut replayed_inodes = BTreeSet::new();
+        for item in recovered {
+            self.write_with_local_sync_policy(
+                item.segment.ino,
+                item.segment.offset,
+                &item.data,
+                LocalSyncPolicy::Strict,
+            )
+            .await?;
+            replayed_inodes.insert(item.segment.ino);
+        }
+        for ino in replayed_inodes {
+            self.landing_zone.clear_inode(ino).map_err(VfsError::Io)?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(super) fn arm_fail_next_inline_dirty_attr_persist_for_test(&self) {
         self.fail_next_inline_dirty_attr_persist

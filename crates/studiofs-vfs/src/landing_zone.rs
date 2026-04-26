@@ -23,6 +23,12 @@ pub(super) struct RecoveredLandingSegment {
     pub(super) data_offset: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LandingRecoverySegment {
+    pub(super) segment: RecoveredLandingSegment,
+    pub(super) data: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct LandingZoneStats {
     pub(super) accepted_writes: u64,
@@ -91,8 +97,8 @@ pub(super) struct LandingZone {
     #[allow(dead_code)]
     data_path: PathBuf,
     manifest_path: PathBuf,
-    data: Mutex<File>,
-    manifest: Mutex<File>,
+    data_lock: Mutex<()>,
+    manifest_lock: Mutex<()>,
     accepted_writes: AtomicU64,
     accepted_bytes: AtomicU64,
 }
@@ -103,12 +109,12 @@ impl LandingZone {
         std::fs::create_dir_all(root)?;
         let data_path = root.join(DATA_FILE);
         let manifest_path = root.join(MANIFEST_FILE);
-        let data = OpenOptions::new()
+        OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
             .open(&data_path)?;
-        let manifest = OpenOptions::new()
+        OpenOptions::new()
             .create(true)
             .read(true)
             .append(true)
@@ -116,22 +122,26 @@ impl LandingZone {
         Ok(Self {
             data_path,
             manifest_path,
-            data: Mutex::new(data),
-            manifest: Mutex::new(manifest),
+            data_lock: Mutex::new(()),
+            manifest_lock: Mutex::new(()),
             accepted_writes: AtomicU64::new(0),
             accepted_bytes: AtomicU64::new(0),
         })
     }
 
     pub(super) fn accept(&self, write: LandingWrite<'_>) -> io::Result<RecoveredLandingSegment> {
-        let mut data = self
-            .data
+        let data_guard = self
+            .data_lock
             .lock()
             .map_err(|_| io::Error::other("landing data lock poisoned"))?;
+        let mut data = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&self.data_path)?;
         let data_offset = data.seek(SeekFrom::End(0))?;
         data.write_all(write.data)?;
         data.flush()?;
-        drop(data);
+        drop(data_guard);
 
         let len = u64::try_from(write.data.len()).map_err(|_| {
             io::Error::new(
@@ -146,10 +156,14 @@ impl LandingZone {
             len,
             data_offset,
         };
-        let mut manifest = self
-            .manifest
+        let _manifest_guard = self
+            .manifest_lock
             .lock()
             .map_err(|_| io::Error::other("landing manifest lock poisoned"))?;
+        let mut manifest = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&self.manifest_path)?;
         manifest.write_all(segment.as_manifest_record().as_bytes())?;
         manifest.flush()?;
 
@@ -201,6 +215,49 @@ impl LandingZone {
             .map(|segments| segments.into_iter().map(Into::into).collect())
     }
 
+    pub(super) fn recover_with_data(&self) -> io::Result<Vec<LandingRecoverySegment>> {
+        let segments = self.recover_segments()?;
+        let mut data = File::open(&self.data_path)?;
+        segments
+            .into_iter()
+            .map(|segment| {
+                let len = usize::try_from(segment.len).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "landing segment length overflow",
+                    )
+                })?;
+                let mut payload = vec![0; len];
+                data.seek(SeekFrom::Start(segment.data_offset))?;
+                data.read_exact(&mut payload)?;
+                Ok(LandingRecoverySegment {
+                    segment: segment.into(),
+                    data: payload,
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn clear_inode(&self, ino: u64) -> io::Result<()> {
+        let retained: Vec<_> = self
+            .recover_segments()?
+            .into_iter()
+            .filter(|segment| segment.ino != ino)
+            .collect();
+        self.rewrite_manifest(&retained)?;
+        if retained.is_empty() {
+            let _data_guard = self
+                .data_lock
+                .lock()
+                .map_err(|_| io::Error::other("landing data lock poisoned"))?;
+            OpenOptions::new()
+                .write(true)
+                .open(&self.data_path)?
+                .set_len(0)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn stats(&self) -> LandingZoneStats {
         LandingZoneStats {
             accepted_writes: self.accepted_writes.load(Ordering::Relaxed),
@@ -215,6 +272,21 @@ impl LandingZone {
             .filter(|line| !line.trim().is_empty())
             .map(LandingSegment::parse)
             .collect()
+    }
+
+    fn rewrite_manifest(&self, segments: &[LandingSegment]) -> io::Result<()> {
+        let _manifest_guard = self
+            .manifest_lock
+            .lock()
+            .map_err(|_| io::Error::other("landing manifest lock poisoned"))?;
+        let mut manifest = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.manifest_path)?;
+        for segment in segments {
+            manifest.write_all(segment.as_manifest_record().as_bytes())?;
+        }
+        manifest.flush()
     }
 }
 
@@ -269,5 +341,29 @@ mod tests {
         assert_eq!(recovered[0].len, 5);
         assert_eq!(recovered[1].offset, 5);
         assert_eq!(recovered[1].len, 6);
+    }
+
+    #[test]
+    fn landing_zone_clear_inode_retires_recovered_segments() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let zone = LandingZone::open(tmp.path()).expect("open landing zone");
+
+        zone.accept(LandingWrite {
+            ino: 42,
+            fh: 7,
+            offset: 0,
+            data: b"retire".as_slice(),
+        })
+        .expect("accept segment");
+        zone.clear_inode(42).expect("clear inode");
+
+        let reopened = LandingZone::open(tmp.path()).expect("reopen landing zone");
+        assert!(
+            reopened
+                .recover()
+                .expect("recover landed segments")
+                .is_empty(),
+            "cleared landed writes must not look recoverable after normal drain"
+        );
     }
 }

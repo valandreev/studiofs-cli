@@ -76,7 +76,7 @@ impl StudioVfs {
                     continue;
                 }
                 if let Err(error) = self
-                    .flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
+                    .flush_local_dirty_state_background(ino, LocalSyncPolicy::Opportunistic)
                     .await
                 {
                     warn!(

@@ -1274,12 +1274,18 @@ impl<'a> LocalDirtyFlushSession<'a> {
         Ok(outcome.persisted_blocks)
     }
 
-    async fn flush(&self, local_sync_policy: LocalSyncPolicy) -> VfsResult<()> {
-        self.vfs
-            .state
-            .metrics
-            .flush_barrier_calls
-            .fetch_add(1, Ordering::Relaxed);
+    async fn flush(
+        &self,
+        local_sync_policy: LocalSyncPolicy,
+        count_foreground_barrier: bool,
+    ) -> VfsResult<()> {
+        if count_foreground_barrier {
+            self.vfs
+                .state
+                .metrics
+                .flush_barrier_calls
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.vfs.enforce_access(self.ino, AccessLevel::ReadWrite)?;
         if self.vfs.ignored_entry_attr(self.ino).is_some() {
             return Ok(());
@@ -2868,8 +2874,22 @@ impl StudioVfs {
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<()> {
         self.local_dirty_flush_session(ino)
-            .flush(local_sync_policy)
-            .await
+            .flush(local_sync_policy, true)
+            .await?;
+        self.landing_zone.clear_inode(ino).map_err(VfsError::Io)?;
+        Ok(())
+    }
+
+    pub(super) async fn flush_local_dirty_state_background(
+        &self,
+        ino: Ino,
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<()> {
+        self.local_dirty_flush_session(ino)
+            .flush(local_sync_policy, false)
+            .await?;
+        self.landing_zone.clear_inode(ino).map_err(VfsError::Io)?;
+        Ok(())
     }
 
     pub(super) async fn flush_pending_payloads_for_shutdown(&self) {

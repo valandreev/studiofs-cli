@@ -3015,7 +3015,79 @@ fn opportunistic_write_fh_lands_before_deferred_materialization() {
         assert_eq!(recovered[0].len, payload.len() as u64);
 
         vfs.flush_fh(fh).await.unwrap();
+        assert!(
+            vfs.recover_landing_zone_segments().unwrap().is_empty(),
+            "strict local drain should retire landed records for this inode"
+        );
         vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn startup_replays_landed_write_after_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let volume_suffix = "sfs-284-landing-restart";
+    let payload = b"restart-visible-landed";
+
+    let ino = {
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, volume_suffix);
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"sfs-284-landing-restart.txt", 0, 0, 0o644)
+                .unwrap();
+            let ino = attr.ino;
+            let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+            vfs.write_fh_with_deferred_materialize(
+                fh,
+                ino,
+                0,
+                payload,
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await
+            .unwrap();
+            ino
+        })
+    };
+
+    let db_path = tmp.path().join("meta.redb");
+    let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("reopen RedbMetaEngine"));
+    let format_info = meta.get_format_info().expect("get format info");
+    let data_config = DataStoreConfig::from(&format_info);
+    let cache_dir = tmp.path().join("cache");
+    let rt = Arc::new(Runtime::new().expect("runtime"));
+    let _guard = rt.enter();
+    let vfs = StudioVfs::new(
+        meta,
+        &data_config,
+        cache_dir.to_str().expect("cache dir str"),
+        64 * 1024 * 1024,
+        32 * 1024 * 1024,
+        VfsConfig::default()
+            .try_into()
+            .expect("default VFS config should validate"),
+    )
+    .expect("reopen vfs");
+    vfs.start().expect("start recovery workers");
+
+    rt.block_on(async {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let read = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
+            if read.as_ref() == payload {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "landing-zone startup recovery did not make accepted bytes visible"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            vfs.recover_landing_zone_segments().unwrap().is_empty(),
+            "startup recovery should retire replayed landed records"
+        );
     });
 }
 
