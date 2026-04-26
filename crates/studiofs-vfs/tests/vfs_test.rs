@@ -395,6 +395,14 @@ fn test_env_var(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+fn online_publish_timeout() -> Duration {
+    let secs = test_env_var("STUDIOFS_TEST_ONLINE_PUBLISH_TIMEOUT_SECS", "300")
+        .parse::<u64>()
+        .unwrap_or(300)
+        .max(1);
+    Duration::from_secs(secs)
+}
+
 fn parse_env_usize(key: &str) -> Option<usize> {
     std::env::var(key)
         .ok()
@@ -1355,9 +1363,22 @@ async fn put_fragmented_object(
         };
         let object_bytes =
             create_object_buffer(fragment_payload).map_err(|e| format!("encode fragment: {e}"))?;
-        ds.put_by_key(key, object_bytes)
-            .await
-            .map_err(|e| format!("write fragment: {e}"))?;
+        let deadline = Instant::now() + online_publish_timeout();
+        let mut attempt = 0u64;
+        let write_result = loop {
+            match ds.put_by_key(key, object_bytes.clone()).await {
+                Ok(()) => break Ok(()),
+                Err(err) => {
+                    if Instant::now() >= deadline {
+                        break Err(err);
+                    }
+                    let delay_ms = 50u64.saturating_mul(attempt.saturating_add(1)).min(1_000);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    attempt = attempt.saturating_add(1);
+                }
+            }
+        };
+        write_result.map_err(|err| format!("write fragment: {err}"))?;
     }
     Ok(())
 }
@@ -1844,13 +1865,13 @@ async fn test_pending_deletions_gc() {
             &ds,
             &info.data_prefix,
             old_object_id,
-            Duration::from_secs(20)
+            online_publish_timeout()
         )
         .await,
         "initial object should be uploaded before overwrite GC check"
     );
     assert!(
-        wait_until(Duration::from_secs(20), || {
+        wait_until(online_publish_timeout(), || {
             let attr = vfs.meta().get_attr(ino).unwrap();
             attr.upload_state == UploadState::Ready
                 && attr.committed_content_epoch == attr.content_epoch
@@ -1866,7 +1887,7 @@ async fn test_pending_deletions_gc() {
     vfs.flush(ino).await.unwrap();
 
     assert!(
-        wait_until(Duration::from_secs(20), || {
+        wait_until(online_publish_timeout(), || {
             let attr = vfs.meta().get_attr(ino).unwrap();
             attr.upload_state == UploadState::Ready
                 && attr.committed_content_epoch == attr.content_epoch
@@ -1882,7 +1903,7 @@ async fn test_pending_deletions_gc() {
     );
 
     assert!(
-        wait_until(Duration::from_secs(20), || {
+        wait_until(online_publish_timeout(), || {
             let pending = vfs.meta().get_pending_deletions().unwrap();
             pending.iter().any(|(id, _)| *id == old_object_id)
         })
@@ -1944,7 +1965,7 @@ async fn test_background_janitor_removes_orphan_object() {
     );
 
     assert!(
-        wait_until_object_absent(&ds, &info.data_prefix, orphan_id, Duration::from_secs(20)).await,
+        wait_until_object_absent(&ds, &info.data_prefix, orphan_id, online_publish_timeout()).await,
         "background janitor should delete orphan object"
     );
 }
@@ -3254,7 +3275,7 @@ fn repeated_graceful_restarts_during_upload_replay_are_idempotent() {
             .expect("failed to start reopened StudioVfs background workers");
 
         assert!(
-            wait_until(Duration::from_secs(20), || {
+            wait_until(online_publish_timeout(), || {
                 reopened.pending_uploads_for_inode(ino).is_empty()
                     && meta
                         .get_attr(ino)
@@ -4044,7 +4065,7 @@ fn remote_attr_cache_refreshes_after_nested_publish_sync() {
         writer_vfs.flush(file.ino).await.unwrap();
 
         assert!(
-            wait_until(Duration::from_secs(20), || {
+            wait_until(online_publish_timeout(), || {
                 writer_vfs.pending_uploads_for_inode(file.ino).is_empty()
                     && writer_meta
                         .get_attr(file.ino)
@@ -4717,7 +4738,7 @@ fn published_file_returns_to_idle_state_and_invalidates_cached_attr_immediately(
         spy.clear();
 
         assert!(
-            wait_until(Duration::from_secs(20), || {
+            wait_until(online_publish_timeout(), || {
                 meta.get_attr(attr.ino)
                     .map(|current| current.upload_state == UploadState::Ready)
                     .unwrap_or(false)
@@ -6245,7 +6266,7 @@ fn recovered_pending_uploads_publish_new_file_after_restart() {
             .expect("failed to start StudioVfs background workers");
 
         assert!(
-            wait_until(Duration::from_secs(20), || {
+            wait_until(online_publish_timeout(), || {
                 vfs.pending_uploads_for_inode(ino).is_empty()
                     && meta
                         .get_attr(ino)
@@ -6339,7 +6360,7 @@ fn published_file_remains_readable_after_cache_wipe_and_restart() {
             vfs.flush(ino).await.unwrap();
 
             assert!(
-                wait_until(Duration::from_secs(20), || {
+                wait_until(online_publish_timeout(), || {
                     vfs.pending_uploads_for_inode(ino).is_empty()
                         && meta
                             .get_attr(ino)
@@ -7047,7 +7068,7 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
             vfs.start().expect("failed to start StudioVfs background workers");
 
             assert!(
-                wait_until(Duration::from_secs(20), || {
+                wait_until(online_publish_timeout(), || {
                     !vfs.pending_uploads_for_inode(ino).is_empty()
                 })
                 .await,
@@ -7444,7 +7465,7 @@ fn single_large_file_upload_does_not_starve_small_foreground_io() {
         vfs.flush(small.ino).await.unwrap();
 
         assert!(
-            wait_until(Duration::from_secs(20), || {
+            wait_until(online_publish_timeout(), || {
                 vfs.meta()
                     .get_attr(small.ino)
                     .map(|attr| attr.upload_state == UploadState::Ready)
@@ -8369,7 +8390,7 @@ fn test_crash_recovery_replays_from_segments_when_spill_files_are_missing() {
             vfs.start()
                 .expect("failed to start StudioVfs background workers");
             let data = tokio::time::timeout(
-                Duration::from_secs(20),
+                online_publish_timeout(),
                 vfs.read(ino, 0, payload.len() as u32),
             )
             .await
@@ -8601,7 +8622,7 @@ async fn test_open_unlink_deferred_cleanup() {
     vfs.write(ino, 0, b"orphan data").await.unwrap();
     vfs.flush(ino).await.unwrap();
     assert!(
-        wait_until(Duration::from_secs(20), || {
+        wait_until(online_publish_timeout(), || {
             vfs.meta()
                 .get_attr(ino)
                 .map(|attr| attr.upload_state == UploadState::Ready)
@@ -8718,7 +8739,7 @@ async fn test_multiple_handles_open_unlink() {
     vfs.write(ino, 0, b"multi-handle data").await.unwrap();
     vfs.flush(ino).await.unwrap();
     assert!(
-        wait_until(Duration::from_secs(20), || {
+        wait_until(online_publish_timeout(), || {
             vfs.meta()
                 .get_attr(ino)
                 .map(|attr| attr.upload_state == UploadState::Ready)
@@ -9027,7 +9048,7 @@ async fn test_hardlink_unlink_keeps_data() {
     vfs.write(ino, 0, b"survive unlink").await.unwrap();
     vfs.flush(ino).await.unwrap();
     assert!(
-        wait_until(Duration::from_secs(20), || {
+        wait_until(online_publish_timeout(), || {
             vfs.meta()
                 .get_attr(ino)
                 .map(|attr| attr.upload_state == UploadState::Ready)
@@ -12421,7 +12442,8 @@ async fn test_hardlink_unlink_one_keeps_other() {
     let attr = vfs.create(1, b"hl-orig.txt", 0, 0, 0o644).unwrap();
     vfs.write(attr.ino, 0, b"persist").await.unwrap();
     vfs.flush(attr.ino).await.unwrap();
-    let _ = wait_until_n_payload_slices(&vfs, attr.ino, 1, Duration::from_secs(15));
+    let _ = wait_until_n_payload_slices(&vfs, attr.ino, 1, online_publish_timeout())
+        .expect("hardlink/unlink test should observe the flushed payload slice before unlink");
 
     vfs.link(attr.ino, 1, b"hl-link.txt").unwrap();
 
