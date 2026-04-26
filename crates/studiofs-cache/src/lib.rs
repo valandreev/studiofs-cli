@@ -23,7 +23,10 @@ pub use benchmark_cache::{
     BenchmarkCache, BenchmarkCacheConfig, BenchmarkCacheStats, CacheReadLevel, CacheReadTrace,
     DEFAULT_MEMORY_CACHE_SIZE,
 };
-pub use cached_store::{CachedStore, CachedStoreConfig};
+pub use cached_store::{
+    CachedStore, CachedStoreConfig, CachedStoreWriterConfig, CachedStoreWriterCountersSnapshot,
+    CachedStoreWriterError, CachedStoreWriterSlice, StagedSlice, WriterWriteResult,
+};
 pub use runtime::{
     LocalPayloadBackendConfig as PersistentLocalPayloadBackendConfig, LocalPayloadBackendKind,
     LocalPayloadBackendOpenError as PersistentLocalPayloadBackendError,
