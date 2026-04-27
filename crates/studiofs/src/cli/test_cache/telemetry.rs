@@ -80,6 +80,7 @@ impl LatencySamples {
             p95_ms,
             p99_ms,
             throughput_bytes_per_sec,
+            latency_histogram: self.to_histogram_report(),
             operations_log: Vec::new(),
         }
     }

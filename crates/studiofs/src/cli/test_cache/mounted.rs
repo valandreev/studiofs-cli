@@ -18,17 +18,20 @@ use super::TestCacheParams;
 use super::profiling::{cpu_utilization_percent, process_cpu_time};
 use super::progress::{ProgressBar, ProgressCounter};
 use super::result::{
-    BenchmarkProfileReport, BenchmarkReport, CpuProfileReport,
-    MountedLocalFirstReadComparisonReport, MountedLocalFirstReadPhaseReport, MountedMemoryReport,
-    MountedWritePathWindowReport,
+    BenchmarkProfileReport, BenchmarkReport, CpuProfileReport, MountedBarrierReport,
+    MountedCachedStoreReport, MountedLocalFirstReadComparisonReport,
+    MountedLocalFirstReadPhaseReport, MountedMemoryReport, MountedObservabilityReport,
+    MountedPostUploadIdleReport, MountedProcessReport, MountedRuntimeReport, MountedUploadReport,
+    MountedWorkloadShapeReport, MountedWriteCallbackReport, MountedWritePathWindowReport,
+    MountedWriterStateReport,
 };
 use super::telemetry::{
     PhaseOperationLog, PhaseTelemetry, build_advanced_metrics, phase_telemetry_to_report,
     stream_reports_from_telemetry,
 };
 use super::workload::{
-    SizeClassBounds, WorkFile, build_access_sequence, build_file_worklist, build_work_sizes,
-    classify_size, deterministic_bytes, split_stream_segments,
+    SizeClassBounds, WorkFile, WorkloadPlan, build_access_sequence, build_file_worklist,
+    build_work_sizes, classify_size, deterministic_bytes, split_stream_segments,
 };
 
 #[derive(Clone, Copy)]
@@ -407,6 +410,163 @@ fn build_mounted_write_path_window(
         return None;
     }
     Some(MountedWritePathWindowReport { before, after })
+}
+
+fn mounted_bridge_type() -> &'static str {
+    #[cfg(windows)]
+    {
+        "winfsp"
+    }
+    #[cfg(not(windows))]
+    {
+        "fuse"
+    }
+}
+
+fn metadata_root_from_cache_path(cache_path: &Path) -> Option<String> {
+    let cache_base = cache_path.parent()?;
+    if cache_base.file_name().and_then(|name| name.to_str()) != Some("cache") {
+        return None;
+    }
+    cache_base.parent().map(|path| path.display().to_string())
+}
+
+fn build_mounted_runtime_report(
+    params: &TestCacheParams,
+    mount_point: &Path,
+    cache_path: Option<&Path>,
+    workload: &WorkloadPlan,
+) -> MountedRuntimeReport {
+    MountedRuntimeReport {
+        mounted_path: mount_point.display().to_string(),
+        cache_root: cache_path
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "unavailable".to_string()),
+        metadata_root: cache_path.and_then(metadata_root_from_cache_path),
+        block_size: params.block_size,
+        chunk_size: studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64,
+        read_size: params.read_size,
+        workload_shape: MountedWorkloadShapeReport {
+            sizes: workload.source.clone(),
+            repeat: params.workload_repeat,
+            files: workload.sizes.len(),
+            small_files: workload.small_files,
+            medium_files: workload.medium_files,
+            large_files: workload.large_files,
+            access_pattern: format!("{:?}", params.access_pattern).to_lowercase(),
+            concurrency: params.concurrency,
+            sequential_streams: params.sequential_streams,
+            io_depth: params.io_depth,
+        },
+        os: std::env::consts::OS.to_string(),
+        bridge_type: mounted_bridge_type().to_string(),
+    }
+}
+
+fn per_second_f64(value: u64, uptime_secs: f64) -> f64 {
+    if uptime_secs <= f64::EPSILON {
+        0.0
+    } else {
+        value as f64 / uptime_secs
+    }
+}
+
+fn mounted_post_upload_idle_report(
+    comparison: Option<&MountedLocalFirstReadComparisonReport>,
+) -> Option<MountedPostUploadIdleReport> {
+    let phase = comparison?
+        .phases
+        .iter()
+        .find(|phase| phase.phase == "post-upload-read")?;
+    Some(MountedPostUploadIdleReport {
+        observed: phase.target_state_observed,
+        timed_out: !phase.target_state_observed,
+        wait_ms: phase.wait_ms,
+        pending_uploads_before: phase.pending_uploads_before,
+        pending_uploads_after: phase.pending_uploads_after,
+        reason: phase.validation_message.clone(),
+    })
+}
+
+fn build_mounted_observability_report(
+    snapshot: Option<&VfsWritePathObservabilitySnapshot>,
+    mounted_memory: Option<&MountedMemoryReport>,
+    comparison: Option<&MountedLocalFirstReadComparisonReport>,
+) -> Option<MountedObservabilityReport> {
+    let post_upload_idle = mounted_post_upload_idle_report(comparison);
+    let process = mounted_memory.map(|memory| MountedProcessReport {
+        mount_pid: memory.mount_pid,
+        rss_bytes_steady_state: memory.rss_bytes_steady_state,
+        rss_bytes_peak: memory.rss_bytes_peak,
+    });
+    let Some(snapshot) = snapshot else {
+        if post_upload_idle.is_none() && process.is_none() {
+            return None;
+        }
+        return Some(MountedObservabilityReport {
+            write_callback: None,
+            writer: None,
+            cached_store: None,
+            upload: None,
+            process,
+            barriers: None,
+            post_upload_idle,
+        });
+    };
+
+    Some(MountedObservabilityReport {
+        write_callback: Some(MountedWriteCallbackReport {
+            callbacks: snapshot.winfsp_callbacks.write,
+            bytes: snapshot.winfsp_write_path.write_bytes,
+            throughput_bytes_per_sec: per_second_f64(
+                snapshot.winfsp_write_path.write_bytes,
+                snapshot.uptime_secs,
+            ),
+            latency: snapshot.winfsp_write_path.callback.clone(),
+        }),
+        writer: Some(MountedWriterStateReport {
+            dirty_bytes: snapshot.dirty_pressure.total_dirty_bytes,
+            dirty_slice_count: snapshot.dirty_pressure.dirty_slice_count,
+            frozen_slice_count: snapshot.dirty_pressure.frozen_slice_count,
+            staged_bytes: snapshot.dirty_pressure.pending_persisted_slice_bytes,
+            dirty_limit_bytes: snapshot.dirty_pressure.dirty_limit_bytes,
+        }),
+        cached_store: Some(MountedCachedStoreReport {
+            staging_bytes: snapshot.dirty_pressure.pending_persisted_slice_bytes,
+            staging_throughput_bytes_per_sec: per_second_f64(
+                snapshot.payload_burst.total_bytes,
+                snapshot.uptime_secs,
+            ),
+            staging_latency: snapshot.payload_persist.clone(),
+            local_cache_backend_latency: snapshot.local_cache_io.clone(),
+            cache_counters_available: false,
+            cache_counters_unavailable_reason: Some(
+                "mounted write-path snapshot does not expose read-cache hit/miss counters"
+                    .to_string(),
+            ),
+            cache_hits: None,
+            cache_misses: None,
+        }),
+        upload: Some(MountedUploadReport {
+            backlog_count: snapshot.upload.pending_uploads,
+            backlog_bytes: snapshot.upload.pending_upload_bytes,
+            throughput_bytes_per_sec: snapshot.upload.completed_upload_bytes_per_sec,
+            retry_count: snapshot.upload.pending_retry_count,
+            active_uploads: snapshot.upload.active_uploads,
+            completed_uploads: snapshot.upload.completed_uploads,
+            completed_upload_bytes: snapshot.upload.completed_upload_bytes,
+            raw: snapshot.upload.clone(),
+        }),
+        process,
+        barriers: Some(MountedBarrierReport {
+            flush_barrier_calls: snapshot.flush_barrier_calls,
+            cleanup_barrier_calls: snapshot.winfsp_foreground_flushes.cleanup,
+            fsync_barrier_calls: snapshot.payload_store_sync_data.calls,
+            close_barrier_calls: snapshot.winfsp_foreground_flushes.close,
+            flush_fsync_close_latency: snapshot.payload_store_sync_data.clone(),
+        }),
+        post_upload_idle,
+    })
 }
 
 async fn run_mounted_write_phase(
@@ -956,6 +1116,7 @@ pub(super) async fn run_mounted_end_to_end(
             Some(path) => read_write_path_observability_snapshot(path, mount_pid).await?,
             None => None,
         };
+        let measured_write_path_after_for_report = measured_write_path_after.clone();
         let mounted_write_path_window =
             build_mounted_write_path_window(measured_write_path_before, measured_write_path_after);
 
@@ -1095,6 +1256,17 @@ pub(super) async fn run_mounted_end_to_end(
             measured.writes_wall.as_secs_f64() * 1000.0,
             measured.reads_wall.as_secs_f64() * 1000.0,
         );
+        let mounted_runtime = Some(build_mounted_runtime_report(
+            params,
+            mount_point,
+            cache_path,
+            &workload,
+        ));
+        let mounted_observability = build_mounted_observability_report(
+            measured_write_path_after_for_report.as_ref(),
+            mounted_memory.as_ref(),
+            local_first_read_comparison.as_ref(),
+        );
 
         let _ = fs::remove_dir_all(work_root).await;
         let total_elapsed_ms = (Instant::now() - measured.started).as_secs_f64() * 1000.0;
@@ -1130,6 +1302,8 @@ pub(super) async fn run_mounted_end_to_end(
             advanced_metrics: Some(advanced_metrics),
             stream_results,
             mounted_memory,
+            mounted_runtime,
+            mounted_observability,
             mounted_write_path_window,
             local_first_read_comparison,
             writes: phase_telemetry_to_report(&measured.writes, measured.writes_wall),
@@ -1146,8 +1320,43 @@ pub(super) async fn run_mounted_end_to_end(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use studiofs_vfs::{VfsWritePathDirtyPressureStats, VfsWritePathObservabilitySnapshot};
+    use std::path::PathBuf;
+    use studiofs_vfs::{
+        VfsWritePathBurstStats, VfsWritePathDirtyPressureStats, VfsWritePathObservabilitySnapshot,
+    };
     use tempfile::tempdir;
+
+    fn test_cache_params_with_block_size(block_size: u64) -> TestCacheParams {
+        TestCacheParams {
+            target: PathBuf::from(r"Z:\"),
+            block_size,
+            read_size: 128 * 1024,
+            size_class_small_max: 10 * 1024,
+            size_class_medium_max: block_size,
+            workload_repeat: 1,
+            concurrency: 1,
+            sequential_streams: false,
+            io_depth: 1,
+            warmup_runs: 0,
+            sizes: super::super::workload::WorkloadSizeInput::ExplicitList(vec![4096]),
+            access_pattern: super::super::TestCacheAccessPattern::Sequential,
+            during_upload_min_pending: 1,
+            during_upload_timeout: Duration::from_secs(1),
+            l1_limit: 64 * 1024 * 1024,
+            profile: false,
+            run_id: "test-run".to_string(),
+        }
+    }
+
+    fn single_file_workload() -> WorkloadPlan {
+        WorkloadPlan {
+            sizes: vec![4096],
+            source: "explicit-list(1)".to_string(),
+            small_files: 1,
+            medium_files: 0,
+            large_files: 0,
+        }
+    }
 
     async fn write_snapshot(
         path: &Path,
@@ -1243,6 +1452,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn pending_upload_validation_message_explains_missing_idle_uploads() {
+        let observation = PendingUploadObservation {
+            target: PendingUploadTarget::Idle,
+            observed: false,
+            required_pending_uploads: 0,
+            waited: Duration::from_secs(60),
+            pending_uploads: 2,
+        };
+
+        assert_eq!(
+            pending_upload_validation_message(&observation).as_deref(),
+            Some("did not observe pending_uploads == 0 before timeout")
+        );
+    }
+
     #[tokio::test]
     async fn scan_pending_uploads_prefers_live_snapshot_pending_count() {
         let temp = tempdir().expect("tempdir");
@@ -1267,5 +1492,43 @@ mod tests {
     #[test]
     fn mounted_write_path_window_is_absent_when_both_snapshots_missing() {
         assert!(build_mounted_write_path_window(None, None).is_none());
+    }
+
+    #[test]
+    fn mounted_runtime_report_uses_schema_chunk_size_not_block_size() {
+        let block_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64 / 2;
+        let params = test_cache_params_with_block_size(block_size);
+        let workload = single_file_workload();
+
+        let report = build_mounted_runtime_report(&params, Path::new(r"Z:\"), None, &workload);
+
+        assert_eq!(report.block_size, block_size);
+        assert_eq!(
+            report.chunk_size,
+            studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64
+        );
+    }
+
+    #[test]
+    fn mounted_observability_staging_throughput_uses_cumulative_payload_bytes() {
+        let snapshot = VfsWritePathObservabilitySnapshot {
+            uptime_secs: 2.0,
+            dirty_pressure: VfsWritePathDirtyPressureStats {
+                pending_persisted_slice_bytes: 999,
+                ..Default::default()
+            },
+            payload_burst: VfsWritePathBurstStats {
+                total_bytes: 4096,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let report = build_mounted_observability_report(Some(&snapshot), None, None)
+            .expect("observability report");
+        let cached_store = report.cached_store.expect("cached store report");
+
+        assert_eq!(cached_store.staging_bytes, 999);
+        assert_eq!(cached_store.staging_throughput_bytes_per_sec, 2048.0);
     }
 }

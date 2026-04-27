@@ -217,6 +217,10 @@ pub struct VfsWritePathDirtyPressureStats {
     pub pending_local_dirty_bytes: usize,
     #[serde(default)]
     pub pending_persisted_slice_bytes: usize,
+    #[serde(default)]
+    pub dirty_slice_count: usize,
+    #[serde(default)]
+    pub frozen_slice_count: usize,
     pub handle_writer_dirty_bytes: usize,
     #[serde(default)]
     pub writer_stack_dirty_bytes: usize,
@@ -317,6 +321,8 @@ pub struct VfsWritePathObservabilitySnapshot {
     pub write_backpressure: VfsWritePathBackpressureStats,
     #[serde(default)]
     pub dirty_pressure: VfsWritePathDirtyPressureStats,
+    #[serde(default)]
+    pub upload: VfsUploadStats,
     #[serde(default)]
     pub payload_burst: VfsWritePathBurstStats,
     #[serde(default)]
@@ -570,4 +576,18 @@ pub struct VfsRuntimeEvent {
     pub title: String,
     #[serde(default)]
     pub fields: serde_json::Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dirty_pressure_serializes_slice_counts_for_mounted_reports() {
+        let serialized = serde_json::to_value(VfsWritePathDirtyPressureStats::default())
+            .expect("serialize dirty pressure");
+
+        assert!(serialized["dirty_slice_count"].is_number());
+        assert!(serialized["frozen_slice_count"].is_number());
+    }
 }

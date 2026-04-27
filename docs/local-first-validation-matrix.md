@@ -176,12 +176,36 @@ cargo run -p studiofs -- test-cache <mounted-path> \
 
 When the mounted runtime exposes upload-state metadata, inspect the human
 summary or JSON `local_first_read_comparison` section for the
-`during-upload-read` and `post-upload-read` phases. When mounted process
-observability is available, inspect the `Mounted memory`
-terminal table or JSON `mounted_memory` section for `rss_bytes_peak`,
-`rss_bytes_steady_state`, `dirty_bytes_peak`, `staged_bytes_peak`, and
-`dirty_limit_bytes`. These fields are best-effort and may be omitted when the
-measured run does not expose that signal.
+`during-upload-read` and `post-upload-read` phases. A `post-upload-read` phase
+is valid only when upload idle was observed first; otherwise the JSON report
+marks it invalid and records the timeout reason.
+
+For SFS-299 parity reports, prefer `studiofs test <mounted-path> --report
+<path>` or the equivalent `test-cache` command with `--report`. The JSON report
+must include:
+
+- `mounted_runtime`: mounted path, cache root, inferred metadata root when the
+  default `<meta-dir>/cache/<uuid>` layout is visible, block/chunk size, read
+  size, workload shape, OS, and bridge type.
+- `writes.latency_histogram` and `reads.latency_histogram` alongside throughput
+  and percentile fields.
+- `mounted_observability.writer`: dirty bytes, dirty slice count, frozen slice
+  count, staged bytes, and dirty limit.
+- `mounted_observability.cached_store`: staging latency/throughput and local
+  cache backend latency. Cache hit/miss counters are present when that signal is
+  available for the measured path.
+- `mounted_observability.upload`: backlog count/bytes, upload throughput,
+  retry count, active uploads, and completed upload bytes.
+- `mounted_observability.barriers`: flush/fsync/close/cleanup barrier counts
+  and the shared flush/fsync/close latency histogram.
+- `mounted_observability.post_upload_idle`: whether idle was observed or timed
+  out, wait duration, pending upload counts, and the invalid-read reason.
+
+When mounted process observability is available, inspect the `Mounted memory`
+terminal table or JSON `mounted_memory` / `mounted_observability.process`
+sections for `rss_bytes_peak`, `rss_bytes_steady_state`, `dirty_bytes_peak`,
+`staged_bytes_peak`, and `dirty_limit_bytes`. These fields are best-effort and
+may be omitted when the measured run does not expose that signal.
 
 ### Small-File Random I/O / Metadata-Sensitive Run
 

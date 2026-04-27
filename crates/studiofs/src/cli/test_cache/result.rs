@@ -1,7 +1,10 @@
 use crate::cli::test_cache_profile_types::ProfileArtifactKind;
 use serde::Serialize;
 use studiofs_cache::metrics::CachePipelineMetricsSnapshot;
-use studiofs_vfs::VfsWritePathObservabilitySnapshot;
+use studiofs_vfs::{
+    VfsUploadStats, VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats,
+    VfsWritePathSyncDataStats,
+};
 
 #[derive(Debug, Serialize)]
 pub(super) struct OpReport {
@@ -13,6 +16,7 @@ pub(super) struct OpReport {
     pub(super) p95_ms: f64,
     pub(super) p99_ms: f64,
     pub(super) throughput_bytes_per_sec: f64,
+    pub(super) latency_histogram: LatencyHistogramReport,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) operations_log: Vec<OperationLogReport>,
 }
@@ -72,9 +76,132 @@ pub(super) struct BenchmarkReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) mounted_memory: Option<MountedMemoryReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) mounted_runtime: Option<MountedRuntimeReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) mounted_observability: Option<MountedObservabilityReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) mounted_write_path_window: Option<MountedWritePathWindowReport>,
     pub(super) writes: OpReport,
     pub(super) reads: OpReport,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct MountedRuntimeReport {
+    pub(super) mounted_path: String,
+    pub(super) cache_root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) metadata_root: Option<String>,
+    pub(super) block_size: u64,
+    pub(super) chunk_size: u64,
+    pub(super) read_size: u64,
+    pub(super) workload_shape: MountedWorkloadShapeReport,
+    pub(super) os: String,
+    pub(super) bridge_type: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct MountedWorkloadShapeReport {
+    pub(super) sizes: String,
+    pub(super) repeat: usize,
+    pub(super) files: usize,
+    pub(super) small_files: usize,
+    pub(super) medium_files: usize,
+    pub(super) large_files: usize,
+    pub(super) access_pattern: String,
+    pub(super) concurrency: usize,
+    pub(super) sequential_streams: bool,
+    pub(super) io_depth: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct MountedObservabilityReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) write_callback: Option<MountedWriteCallbackReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) writer: Option<MountedWriterStateReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) cached_store: Option<MountedCachedStoreReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) upload: Option<MountedUploadReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) process: Option<MountedProcessReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) barriers: Option<MountedBarrierReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) post_upload_idle: Option<MountedPostUploadIdleReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct MountedWriteCallbackReport {
+    pub(super) callbacks: u64,
+    pub(super) bytes: u64,
+    pub(super) throughput_bytes_per_sec: f64,
+    pub(super) latency: VfsWritePathStageLatencyStats,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct MountedWriterStateReport {
+    pub(super) dirty_bytes: usize,
+    pub(super) dirty_slice_count: usize,
+    pub(super) frozen_slice_count: usize,
+    pub(super) staged_bytes: usize,
+    pub(super) dirty_limit_bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct MountedCachedStoreReport {
+    pub(super) staging_bytes: usize,
+    pub(super) staging_throughput_bytes_per_sec: f64,
+    pub(super) staging_latency: VfsWritePathStageLatencyStats,
+    pub(super) local_cache_backend_latency: studiofs_vfs::VfsWritePathLocalCacheIoStats,
+    pub(super) cache_counters_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) cache_counters_unavailable_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) cache_hits: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) cache_misses: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct MountedUploadReport {
+    pub(super) backlog_count: usize,
+    pub(super) backlog_bytes: u64,
+    pub(super) throughput_bytes_per_sec: f64,
+    pub(super) retry_count: u64,
+    pub(super) active_uploads: usize,
+    pub(super) completed_uploads: u64,
+    pub(super) completed_upload_bytes: u64,
+    pub(super) raw: VfsUploadStats,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct MountedProcessReport {
+    pub(super) mount_pid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) rss_bytes_steady_state: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) rss_bytes_peak: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct MountedBarrierReport {
+    pub(super) flush_barrier_calls: u64,
+    pub(super) cleanup_barrier_calls: u64,
+    pub(super) fsync_barrier_calls: u64,
+    pub(super) close_barrier_calls: u64,
+    pub(super) flush_fsync_close_latency: VfsWritePathSyncDataStats,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct MountedPostUploadIdleReport {
+    pub(super) observed: bool,
+    pub(super) timed_out: bool,
+    pub(super) wait_ms: f64,
+    pub(super) pending_uploads_before: usize,
+    pub(super) pending_uploads_after: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -360,7 +487,27 @@ impl From<CachePipelineMetricsSnapshot> for CachePipelineReport {
 #[cfg(test)]
 pub(crate) fn sample_report() -> BenchmarkReport {
     use super::workload::{DEFAULT_WORKLOAD_FILES, WORKLOAD_FILES_PER_TIER};
-    use studiofs_meta::DEFAULT_BLOCK_SIZE;
+    use studiofs_meta::{DEFAULT_BLOCK_SIZE, schema::DEFAULT_CHUNK_SIZE};
+
+    fn sample_latency_histogram() -> LatencyHistogramReport {
+        LatencyHistogramReport {
+            bucket_upper_bounds_ns: vec![50_000, 100_000, 250_000],
+            bucket_counts: vec![2, 8, 6, 0],
+        }
+    }
+
+    let workload_shape = MountedWorkloadShapeReport {
+        sizes: "default".to_string(),
+        repeat: 1,
+        files: DEFAULT_WORKLOAD_FILES,
+        small_files: WORKLOAD_FILES_PER_TIER,
+        medium_files: WORKLOAD_FILES_PER_TIER,
+        large_files: WORKLOAD_FILES_PER_TIER,
+        access_pattern: "sequential".to_string(),
+        concurrency: 1,
+        sequential_streams: false,
+        io_depth: 32,
+    };
 
     BenchmarkReport {
         run_id: "run-123".to_string(),
@@ -566,6 +713,114 @@ pub(crate) fn sample_report() -> BenchmarkReport {
         local_first_read_comparison: None,
         stream_results: None,
         mounted_memory: None,
+        mounted_runtime: Some(MountedRuntimeReport {
+            mounted_path: r"Z:\".to_string(),
+            cache_root: r"D:\test-cache\vol-123".to_string(),
+            metadata_root: Some(r"D:\test-cache".to_string()),
+            block_size: DEFAULT_BLOCK_SIZE as u64,
+            chunk_size: DEFAULT_CHUNK_SIZE as u64,
+            read_size: DEFAULT_BLOCK_SIZE as u64,
+            workload_shape,
+            os: std::env::consts::OS.to_string(),
+            bridge_type: "winfsp".to_string(),
+        }),
+        mounted_observability: Some(MountedObservabilityReport {
+            write_callback: Some(MountedWriteCallbackReport {
+                callbacks: 16,
+                bytes: 128 * 1024 * 1024,
+                throughput_bytes_per_sec: 1_024.0 * 1024.0 * 1024.0,
+                latency: VfsWritePathStageLatencyStats {
+                    calls: 16,
+                    calls_per_sec: 128.0,
+                    total_ms: 80.0,
+                    avg_ms: 5.0,
+                    max_ms: 9.0,
+                    latency_quantiles_ms: studiofs_vfs::VfsWritePathLatencyQuantilesMs {
+                        p50: 4.7,
+                        p95: 8.3,
+                        p99: 8.8,
+                    },
+                    latency_histogram: studiofs_vfs::VfsLatencyHistogramSnapshot {
+                        bucket_upper_bounds_ns: vec![50_000],
+                        bucket_counts: vec![16, 0],
+                    },
+                    ..Default::default()
+                },
+            }),
+            writer: Some(MountedWriterStateReport {
+                dirty_bytes: 4 * 1024 * 1024,
+                dirty_slice_count: 4,
+                frozen_slice_count: 2,
+                staged_bytes: 2 * 1024 * 1024,
+                dirty_limit_bytes: 2 * 1024 * 1024 * 1024,
+            }),
+            cached_store: Some(MountedCachedStoreReport {
+                staging_bytes: 2 * 1024 * 1024,
+                staging_throughput_bytes_per_sec: 256.0 * 1024.0 * 1024.0,
+                staging_latency: VfsWritePathStageLatencyStats {
+                    calls: 4,
+                    calls_per_sec: 32.0,
+                    total_ms: 12.0,
+                    avg_ms: 3.0,
+                    max_ms: 5.0,
+                    latency_histogram: studiofs_vfs::VfsLatencyHistogramSnapshot {
+                        bucket_upper_bounds_ns: vec![50_000],
+                        bucket_counts: vec![4, 0],
+                    },
+                    ..Default::default()
+                },
+                local_cache_backend_latency: Default::default(),
+                cache_counters_available: true,
+                cache_counters_unavailable_reason: None,
+                cache_hits: Some(9),
+                cache_misses: Some(7),
+            }),
+            upload: Some(MountedUploadReport {
+                backlog_count: 0,
+                backlog_bytes: 0,
+                throughput_bytes_per_sec: 512.0 * 1024.0 * 1024.0,
+                retry_count: 0,
+                active_uploads: 0,
+                completed_uploads: 16,
+                completed_upload_bytes: 128 * 1024 * 1024,
+                raw: VfsUploadStats {
+                    completed_uploads: 16,
+                    completed_upload_bytes: 128 * 1024 * 1024,
+                    completed_upload_bytes_per_sec: 512.0 * 1024.0 * 1024.0,
+                    ..Default::default()
+                },
+            }),
+            process: Some(MountedProcessReport {
+                mount_pid: 4242,
+                rss_bytes_steady_state: Some(1_400 * 1024 * 1024),
+                rss_bytes_peak: Some(1_650 * 1024 * 1024),
+            }),
+            barriers: Some(MountedBarrierReport {
+                flush_barrier_calls: 2,
+                cleanup_barrier_calls: 1,
+                fsync_barrier_calls: 1,
+                close_barrier_calls: 1,
+                flush_fsync_close_latency: VfsWritePathSyncDataStats {
+                    calls: 2,
+                    total_ms: 14.0,
+                    avg_ms: 7.0,
+                    max_ms: 9.0,
+                    latency_histogram: studiofs_vfs::VfsLatencyHistogramSnapshot {
+                        bucket_upper_bounds_ns: vec![50_000],
+                        bucket_counts: vec![2, 0],
+                    },
+                    ..Default::default()
+                },
+            }),
+            post_upload_idle: Some(MountedPostUploadIdleReport {
+                observed: true,
+                timed_out: false,
+                wait_ms: 240.0,
+                pending_uploads_before: 0,
+                pending_uploads_after: 0,
+                reason: None,
+            }),
+        }),
         mounted_write_path_window: None,
         writes: OpReport {
             operations: 16,
@@ -576,6 +831,7 @@ pub(crate) fn sample_report() -> BenchmarkReport {
             p95_ms: 8.3,
             p99_ms: 8.8,
             throughput_bytes_per_sec: 1_375.53 * 1024.0 * 1024.0,
+            latency_histogram: sample_latency_histogram(),
             operations_log: Vec::new(),
         },
         reads: OpReport {
@@ -587,6 +843,7 @@ pub(crate) fn sample_report() -> BenchmarkReport {
             p95_ms: 8.1,
             p99_ms: 8.6,
             throughput_bytes_per_sec: 1_375.53 * 1024.0 * 1024.0,
+            latency_histogram: sample_latency_histogram(),
             operations_log: Vec::new(),
         },
     }

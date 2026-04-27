@@ -614,6 +614,8 @@ pub(super) async fn run_direct(
         local_first_read_comparison: None,
         stream_results,
         mounted_memory: None,
+        mounted_runtime: None,
+        mounted_observability: None,
         mounted_write_path_window: None,
         work_root: None,
         writes: phase_telemetry_to_report(&writes, writes_wall),

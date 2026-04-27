@@ -63,6 +63,27 @@ studiofs internal diagnostics-complete-workflow <mount-point> --lease-id <lease>
 8. Review the generated report and workflow artifacts before deciding on
    comparison or hypothesis updates.
 
+## Mounted Benchmark Reports
+
+Use `studiofs test <mounted-path> --report <path>` when the goal is a
+shareable parity report rather than a screenshot. The command writes a JSON
+report with mounted runtime identity, workload shape, write/read latency
+histograms, writer dirty pressure, cached-store staging latency, upload backlog
+and retry counters, barrier latency, RSS samples where available, and explicit
+post-upload idle status.
+
+The read surface records two mounted phases:
+
+- `during-upload-read`, recorded after upload activity is observed or after the
+  configured active-upload wait times out.
+- `post-upload-read`, recorded after upload idle is observed. If idle is not
+  observed before timeout, the phase is marked invalid and includes the reason.
+
+Archive the JSON file next to any AJA or JuiceFS baseline notes. For StudioFS
+vs. JuiceFS comparisons, line up `mounted_runtime.workload_shape` first, then
+compare write/read throughput, latency histograms, RSS peak/steady state, upload
+backlog, and barrier latency.
+
 ### Validation expectation
 
 The scriptable portions of the workflow are covered by focused Rust tests. The

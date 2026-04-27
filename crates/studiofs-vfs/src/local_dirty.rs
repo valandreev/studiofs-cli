@@ -448,6 +448,8 @@ pub(super) struct LocalDirtyState {
     >,
     pub(super) pending_bytes: AtomicUsize,
     pending_persisted_slice_bytes: AtomicUsize,
+    pending_slice_count: AtomicUsize,
+    pending_persisted_slice_count: AtomicUsize,
     pub(super) write_backpressure_wait_ms: AtomicU64,
     pub(super) write_backpressure_events: AtomicU64,
     pub(super) fast_backpressure_wait_ms: AtomicU64,
@@ -466,6 +468,8 @@ impl LocalDirtyState {
             pending_chunk_slices: Mutex::new(std::collections::HashMap::new()),
             pending_bytes: AtomicUsize::new(0),
             pending_persisted_slice_bytes: AtomicUsize::new(0),
+            pending_slice_count: AtomicUsize::new(0),
+            pending_persisted_slice_count: AtomicUsize::new(0),
             write_backpressure_wait_ms: AtomicU64::new(0),
             write_backpressure_events: AtomicU64::new(0),
             fast_backpressure_wait_ms: AtomicU64::new(0),
@@ -1987,6 +1991,19 @@ impl StudioVfs {
             .load(Ordering::Relaxed)
     }
 
+    pub(super) fn pending_local_dirty_slice_counts(&self) -> (usize, usize) {
+        (
+            self.state
+                .local_dirty
+                .pending_slice_count
+                .load(Ordering::Relaxed),
+            self.state
+                .local_dirty
+                .pending_persisted_slice_count
+                .load(Ordering::Relaxed),
+        )
+    }
+
     pub(super) fn total_landed_write_drain_lag_bytes(&self) -> usize {
         self.state
             .handle_writers
@@ -2294,6 +2311,11 @@ impl StudioVfs {
             .filter(|(_, slice)| slice.is_persisted())
             .map(|(_, slice)| slice.len())
             .sum();
+        let added_slices = entries.len();
+        let added_persisted_slices = entries
+            .iter()
+            .filter(|(_, slice)| slice.is_persisted())
+            .count();
         let mut pending_chunk_slices = self.state.local_dirty.pending_chunk_slices.lock();
         let inode_chunks = pending_chunk_slices.entry(ino).or_default();
         for (chunk_id, slice) in entries {
@@ -2301,6 +2323,7 @@ impl StudioVfs {
         }
         drop(pending_chunk_slices);
         self.add_pending_persisted_slice_bytes(added_bytes);
+        self.add_pending_slice_counts(added_slices, added_persisted_slices);
     }
 
     pub(super) fn install_persisted_pending_local_dirty_slice(
@@ -2352,6 +2375,8 @@ impl StudioVfs {
             slices.sort_by_key(|slice| slice.order_key(*chunk_id));
         }
         let mut removed_bytes = 0usize;
+        let mut removed_slices = 0usize;
+        let mut removed_persisted_slices = 0usize;
         let mut pending_chunk_slices = self.state.local_dirty.pending_chunk_slices.lock();
         let Some(chunks) = pending_chunk_slices.get_mut(&ino) else {
             return;
@@ -2360,6 +2385,9 @@ impl StudioVfs {
             slices.retain_mut(|slice| {
                 if committed_entries.contains(&slice.commit_key(*chunk_id)) {
                     removed_bytes = removed_bytes.saturating_add(slice.len());
+                    removed_slices = removed_slices.saturating_add(1);
+                    removed_persisted_slices =
+                        removed_persisted_slices.saturating_add(usize::from(slice.is_persisted()));
                     return false;
                 }
                 let Some(committed_slices) = committed_by_chunk.get(chunk_id) else {
@@ -2372,6 +2400,9 @@ impl StudioVfs {
                     };
                     let Some(trimmed) = current.trim_prefix(committed_len) else {
                         removed_bytes = removed_bytes.saturating_add(current.len());
+                        removed_slices = removed_slices.saturating_add(1);
+                        removed_persisted_slices = removed_persisted_slices
+                            .saturating_add(usize::from(current.is_persisted()));
                         return false;
                     };
                     removed_bytes = removed_bytes.saturating_add(committed_len as usize);
@@ -2387,6 +2418,7 @@ impl StudioVfs {
         }
         drop(pending_chunk_slices);
         self.subtract_pending_persisted_slice_bytes(removed_bytes);
+        self.subtract_pending_slice_counts(removed_slices, removed_persisted_slices);
     }
 
     pub(super) fn clear_matching_dirty_attr_if_committed(&self, ino: Ino, attr: &InodeAttr) {
@@ -2448,6 +2480,50 @@ impl StudioVfs {
             });
     }
 
+    fn add_pending_slice_counts(&self, total: usize, persisted: usize) {
+        if total > 0 {
+            self.state
+                .local_dirty
+                .pending_slice_count
+                .fetch_add(total, Ordering::Relaxed);
+        }
+        if persisted > 0 {
+            self.state
+                .local_dirty
+                .pending_persisted_slice_count
+                .fetch_add(persisted, Ordering::Relaxed);
+        }
+    }
+
+    fn subtract_pending_slice_counts(&self, total: usize, persisted: usize) {
+        if total > 0 {
+            let _ = self.state.local_dirty.pending_slice_count.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |pending| {
+                    debug_assert!(
+                        pending >= total,
+                        "pending_slice_count underflow: pending={pending}, subtract={total}"
+                    );
+                    Some(pending.saturating_sub(total))
+                },
+            );
+        }
+        if persisted > 0 {
+            let _ = self
+                .state
+                .local_dirty
+                .pending_persisted_slice_count
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                    debug_assert!(
+                        pending >= persisted,
+                        "pending_persisted_slice_count underflow: pending={pending}, subtract={persisted}"
+                    );
+                    Some(pending.saturating_sub(persisted))
+                });
+        }
+    }
+
     fn replace_pending_local_dirty_payload(
         &self,
         ino: Ino,
@@ -2475,33 +2551,48 @@ impl StudioVfs {
     }
 
     fn clear_pending_dirty_slices_for_inode(&self, ino: Ino) {
-        let removed_bytes = self
+        let (removed_bytes, removed_slices, removed_persisted_slices) = self
             .state
             .local_dirty
             .pending_chunk_slices
             .lock()
             .remove(&ino)
             .map(|chunks| {
-                chunks
-                    .values()
-                    .flat_map(|slices| slices.iter())
-                    .filter(|slice| slice.is_persisted())
-                    .map(|slice| slice.len())
-                    .sum()
+                chunks.values().flat_map(|slices| slices.iter()).fold(
+                    (0usize, 0usize, 0usize),
+                    |(bytes, total, persisted), slice| {
+                        (
+                            bytes.saturating_add(if slice.is_persisted() {
+                                slice.len()
+                            } else {
+                                0
+                            }),
+                            total.saturating_add(1),
+                            persisted.saturating_add(usize::from(slice.is_persisted())),
+                        )
+                    },
+                )
             })
-            .unwrap_or(0);
+            .unwrap_or((0, 0, 0));
         self.subtract_pending_persisted_slice_bytes(removed_bytes);
+        self.subtract_pending_slice_counts(removed_slices, removed_persisted_slices);
     }
 
     fn clear_pending_dirty_slices_for_block(&self, ino: Ino, block_index: u32) {
         let mut removed_bytes = 0usize;
+        let mut removed_slices = 0usize;
+        let mut removed_persisted_slices = 0usize;
         let mut pending_chunk_slices = self.state.local_dirty.pending_chunk_slices.lock();
         if let Some(chunks) = pending_chunk_slices.get_mut(&ino) {
             chunks.retain(|_, slices| {
                 slices.retain(|slice| {
                     let remove = slice.block_index == block_index;
-                    if remove && slice.is_persisted() {
-                        removed_bytes = removed_bytes.saturating_add(slice.len());
+                    if remove {
+                        removed_slices = removed_slices.saturating_add(1);
+                        if slice.is_persisted() {
+                            removed_bytes = removed_bytes.saturating_add(slice.len());
+                            removed_persisted_slices = removed_persisted_slices.saturating_add(1);
+                        }
                     }
                     !remove
                 });
@@ -2513,6 +2604,7 @@ impl StudioVfs {
         }
         drop(pending_chunk_slices);
         self.subtract_pending_persisted_slice_bytes(removed_bytes);
+        self.subtract_pending_slice_counts(removed_slices, removed_persisted_slices);
     }
 
     fn clear_pending_dirty_slices_for_blocks(&self, ino: Ino, block_indexes: &[u32]) {
@@ -2522,13 +2614,19 @@ impl StudioVfs {
         let block_index_set: std::collections::HashSet<u32> =
             block_indexes.iter().copied().collect();
         let mut removed_bytes = 0usize;
+        let mut removed_slices = 0usize;
+        let mut removed_persisted_slices = 0usize;
         let mut pending_chunk_slices = self.state.local_dirty.pending_chunk_slices.lock();
         if let Some(chunks) = pending_chunk_slices.get_mut(&ino) {
             chunks.retain(|_, slices| {
                 slices.retain(|slice| {
                     let remove = block_index_set.contains(&slice.block_index);
-                    if remove && slice.is_persisted() {
-                        removed_bytes = removed_bytes.saturating_add(slice.len());
+                    if remove {
+                        removed_slices = removed_slices.saturating_add(1);
+                        if slice.is_persisted() {
+                            removed_bytes = removed_bytes.saturating_add(slice.len());
+                            removed_persisted_slices = removed_persisted_slices.saturating_add(1);
+                        }
                     }
                     !remove
                 });
@@ -2540,10 +2638,13 @@ impl StudioVfs {
         }
         drop(pending_chunk_slices);
         self.subtract_pending_persisted_slice_bytes(removed_bytes);
+        self.subtract_pending_slice_counts(removed_slices, removed_persisted_slices);
     }
 
     fn clear_pending_dirty_slices_exceeding_len(&self, ino: Ino, block_index: u32, new_len: usize) {
         let mut removed_bytes = 0usize;
+        let mut removed_slices = 0usize;
+        let mut removed_persisted_slices = 0usize;
         let mut pending_chunk_slices = self.state.local_dirty.pending_chunk_slices.lock();
         let Some(chunks) = pending_chunk_slices.get_mut(&ino) else {
             return;
@@ -2556,8 +2657,10 @@ impl StudioVfs {
                 }
                 let slice_len = slice.range.len() as usize;
                 if slice.block_offset as usize >= new_len {
+                    removed_slices = removed_slices.saturating_add(1);
                     if slice.is_persisted() {
                         removed_bytes = removed_bytes.saturating_add(slice_len);
+                        removed_persisted_slices = removed_persisted_slices.saturating_add(1);
                     }
                     return false;
                 }
@@ -2575,11 +2678,17 @@ impl StudioVfs {
                     new_len as u64,
                     studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64,
                 ) else {
+                    removed_slices = removed_slices.saturating_add(1);
+                    if slice.is_persisted() {
+                        removed_persisted_slices = removed_persisted_slices.saturating_add(1);
+                    }
                     return false;
                 };
                 let Some(new_end) = u32::try_from(trimmed.end()).ok() else {
+                    removed_slices = removed_slices.saturating_add(1);
                     if slice.is_persisted() {
                         removed_bytes = removed_bytes.saturating_add(slice_len);
+                        removed_persisted_slices = removed_persisted_slices.saturating_add(1);
                     }
                     return false;
                 };
@@ -2598,6 +2707,7 @@ impl StudioVfs {
         }
         drop(pending_chunk_slices);
         self.subtract_pending_persisted_slice_bytes(removed_bytes);
+        self.subtract_pending_slice_counts(removed_slices, removed_persisted_slices);
     }
 
     pub(super) fn clear_pending_payloads_for_inode(&self, ino: Ino) {
@@ -3217,6 +3327,80 @@ mod tests {
     }
 
     #[test]
+    fn pending_slice_counters_track_insert_commit_and_clear() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-slice-counters");
+        let ino = 81;
+        let chunk_id = 0;
+        let persisted = PendingDirtySlice::persisted(
+            studiofs_meta::schema::SliceRange::new(0, 4096).expect("slice range"),
+            3,
+            0,
+            11,
+            7001,
+            0,
+        );
+        let buffered = PendingDirtySlice {
+            range: studiofs_meta::schema::SliceRange::new(5000, 6000).expect("slice range"),
+            block_index: 3,
+            block_offset: 4096,
+            seq: 12,
+            object_id: None,
+            object_offset: 0,
+            created_at: Instant::now(),
+        };
+
+        vfs.insert_pending_local_dirty_slice_entries(
+            ino,
+            vec![(chunk_id, persisted), (chunk_id, buffered)],
+        );
+
+        assert_eq!(vfs.pending_local_dirty_slice_counts(), (2, 1));
+
+        let committed_prefix = persisted.prefix(1024).expect("prefix slice");
+        let committed = std::collections::BTreeMap::from([(chunk_id, vec![committed_prefix])]);
+        vfs.commit_pending_local_dirty_slices(ino, &committed);
+
+        assert_eq!(vfs.pending_local_dirty_slice_counts(), (2, 1));
+
+        let committed_rest = PendingDirtySlice::persisted(
+            studiofs_meta::schema::SliceRange::new(1024, 4096).expect("slice range"),
+            3,
+            1024,
+            11,
+            7001,
+            1024,
+        );
+        let committed = std::collections::BTreeMap::from([(chunk_id, vec![committed_rest])]);
+        vfs.commit_pending_local_dirty_slices(ino, &committed);
+
+        assert_eq!(vfs.pending_local_dirty_slice_counts(), (1, 0));
+
+        vfs.clear_pending_dirty_slices_for_inode(ino);
+
+        assert_eq!(vfs.pending_local_dirty_slice_counts(), (0, 0));
+    }
+
+    #[test]
+    #[should_panic(expected = "pending_slice_count underflow")]
+    fn pending_slice_counter_underflow_is_caught_in_debug_builds() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-slice-counter-underflow");
+
+        vfs.subtract_pending_slice_counts(1, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "pending_persisted_slice_count underflow")]
+    fn pending_persisted_slice_counter_underflow_is_caught_in_debug_builds() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (_rt, vfs, _meta) =
+            make_unstarted_test_vfs(&tmp, "pending-persisted-slice-counter-underflow");
+
+        vfs.subtract_pending_slice_counts(0, 1);
+    }
+
+    #[test]
     fn trim_local_payload_staging_trims_and_drops_pending_slices() {
         let tmp = TempDir::new().expect("tempdir");
         let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "trim-pending-slices");
@@ -3224,19 +3408,16 @@ mod tests {
         let block_index = 3;
         let chunk_id = 0;
 
-        vfs.state.local_dirty.pending_payloads.lock().insert(
-            (ino, block_index),
+        vfs.replace_pending_local_dirty_payload(
+            ino,
+            block_index,
             PendingPayload::buffered(BytesMut::from(&b"abcdefgh"[..]), None),
         );
-        vfs.state
-            .local_dirty
-            .pending_chunk_slices
-            .lock()
-            .entry(ino)
-            .or_default()
-            .insert(
-                chunk_id,
-                vec![
+        vfs.insert_pending_local_dirty_slice_entries(
+            ino,
+            vec![
+                (
+                    chunk_id,
                     PendingDirtySlice {
                         range: studiofs_meta::schema::SliceRange::new(100, 106)
                             .expect("slice range"),
@@ -3247,6 +3428,9 @@ mod tests {
                         object_offset: 0,
                         created_at: Instant::now(),
                     },
+                ),
+                (
+                    chunk_id,
                     PendingDirtySlice {
                         range: studiofs_meta::schema::SliceRange::new(200, 202)
                             .expect("slice range"),
@@ -3257,8 +3441,9 @@ mod tests {
                         object_offset: 0,
                         created_at: Instant::now(),
                     },
-                ],
-            );
+                ),
+            ],
+        );
 
         let changed = vfs
             .trim_local_payload_staging(ino, block_index, 5)
