@@ -444,7 +444,7 @@ fn build_mounted_runtime_report(
             .unwrap_or_else(|| "unavailable".to_string()),
         metadata_root: cache_path.and_then(metadata_root_from_cache_path),
         block_size: params.block_size,
-        chunk_size: params.block_size,
+        chunk_size: studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64,
         read_size: params.read_size,
         workload_shape: MountedWorkloadShapeReport {
             sizes: workload.source.clone(),
@@ -534,7 +534,7 @@ fn build_mounted_observability_report(
         cached_store: Some(MountedCachedStoreReport {
             staging_bytes: snapshot.dirty_pressure.pending_persisted_slice_bytes,
             staging_throughput_bytes_per_sec: per_second_f64(
-                snapshot.dirty_pressure.pending_persisted_slice_bytes as u64,
+                snapshot.payload_burst.total_bytes,
                 snapshot.uptime_secs,
             ),
             staging_latency: snapshot.payload_persist.clone(),
@@ -1320,8 +1320,43 @@ pub(super) async fn run_mounted_end_to_end(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use studiofs_vfs::{VfsWritePathDirtyPressureStats, VfsWritePathObservabilitySnapshot};
+    use std::path::PathBuf;
+    use studiofs_vfs::{
+        VfsWritePathBurstStats, VfsWritePathDirtyPressureStats, VfsWritePathObservabilitySnapshot,
+    };
     use tempfile::tempdir;
+
+    fn test_cache_params_with_block_size(block_size: u64) -> TestCacheParams {
+        TestCacheParams {
+            target: PathBuf::from(r"Z:\"),
+            block_size,
+            read_size: 128 * 1024,
+            size_class_small_max: 10 * 1024,
+            size_class_medium_max: block_size,
+            workload_repeat: 1,
+            concurrency: 1,
+            sequential_streams: false,
+            io_depth: 1,
+            warmup_runs: 0,
+            sizes: super::super::workload::WorkloadSizeInput::ExplicitList(vec![4096]),
+            access_pattern: super::super::TestCacheAccessPattern::Sequential,
+            during_upload_min_pending: 1,
+            during_upload_timeout: Duration::from_secs(1),
+            l1_limit: 64 * 1024 * 1024,
+            profile: false,
+            run_id: "test-run".to_string(),
+        }
+    }
+
+    fn single_file_workload() -> WorkloadPlan {
+        WorkloadPlan {
+            sizes: vec![4096],
+            source: "explicit-list(1)".to_string(),
+            small_files: 1,
+            medium_files: 0,
+            large_files: 0,
+        }
+    }
 
     async fn write_snapshot(
         path: &Path,
@@ -1457,5 +1492,43 @@ mod tests {
     #[test]
     fn mounted_write_path_window_is_absent_when_both_snapshots_missing() {
         assert!(build_mounted_write_path_window(None, None).is_none());
+    }
+
+    #[test]
+    fn mounted_runtime_report_uses_schema_chunk_size_not_block_size() {
+        let block_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64 / 2;
+        let params = test_cache_params_with_block_size(block_size);
+        let workload = single_file_workload();
+
+        let report = build_mounted_runtime_report(&params, Path::new(r"Z:\"), None, &workload);
+
+        assert_eq!(report.block_size, block_size);
+        assert_eq!(
+            report.chunk_size,
+            studiofs_meta::schema::DEFAULT_CHUNK_SIZE as u64
+        );
+    }
+
+    #[test]
+    fn mounted_observability_staging_throughput_uses_cumulative_payload_bytes() {
+        let snapshot = VfsWritePathObservabilitySnapshot {
+            uptime_secs: 2.0,
+            dirty_pressure: VfsWritePathDirtyPressureStats {
+                pending_persisted_slice_bytes: 999,
+                ..Default::default()
+            },
+            payload_burst: VfsWritePathBurstStats {
+                total_bytes: 4096,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let report = build_mounted_observability_report(Some(&snapshot), None, None)
+            .expect("observability report");
+        let cached_store = report.cached_store.expect("cached store report");
+
+        assert_eq!(cached_store.staging_bytes, 999);
+        assert_eq!(cached_store.staging_throughput_bytes_per_sec, 2048.0);
     }
 }

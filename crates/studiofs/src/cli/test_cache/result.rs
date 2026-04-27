@@ -487,7 +487,7 @@ impl From<CachePipelineMetricsSnapshot> for CachePipelineReport {
 #[cfg(test)]
 pub(crate) fn sample_report() -> BenchmarkReport {
     use super::workload::{DEFAULT_WORKLOAD_FILES, WORKLOAD_FILES_PER_TIER};
-    use studiofs_meta::DEFAULT_BLOCK_SIZE;
+    use studiofs_meta::{DEFAULT_BLOCK_SIZE, schema::DEFAULT_CHUNK_SIZE};
 
     fn sample_latency_histogram() -> LatencyHistogramReport {
         LatencyHistogramReport {
@@ -718,7 +718,7 @@ pub(crate) fn sample_report() -> BenchmarkReport {
             cache_root: r"D:\test-cache\vol-123".to_string(),
             metadata_root: Some(r"D:\test-cache".to_string()),
             block_size: DEFAULT_BLOCK_SIZE as u64,
-            chunk_size: DEFAULT_BLOCK_SIZE as u64,
+            chunk_size: DEFAULT_CHUNK_SIZE as u64,
             read_size: DEFAULT_BLOCK_SIZE as u64,
             workload_shape,
             os: std::env::consts::OS.to_string(),

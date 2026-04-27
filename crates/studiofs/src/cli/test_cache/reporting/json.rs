@@ -219,6 +219,10 @@ mod tests {
         assert!(parsed["mounted_runtime"]["os"].is_string());
         assert!(parsed["mounted_runtime"]["bridge_type"].is_string());
         assert!(parsed["mounted_runtime"]["workload_shape"].is_object());
+        assert_eq!(
+            parsed["mounted_runtime"]["chunk_size"],
+            studiofs_meta::schema::DEFAULT_CHUNK_SIZE
+        );
 
         let observability = &parsed["mounted_observability"];
         assert!(observability["writer"]["dirty_bytes"].is_number());
