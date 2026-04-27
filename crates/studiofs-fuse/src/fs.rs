@@ -26,8 +26,8 @@ use studiofs_meta::types::{SetattrArgs, TimeSpec};
 #[cfg(not(target_os = "macos"))]
 use studiofs_vfs::is_hidden_non_macos_root_metadata_name;
 use studiofs_vfs::{
-    BridgeVfsErrorKind, KernelInvalidator, LockKind, OpenFlags, StudioVfs, VfsError,
-    classify_vfs_error, normalize_attr_times,
+    BridgeVfsErrorKind, KernelInvalidator, LocalSyncPolicy, LockKind, OpenFlags, StudioVfs,
+    VfsError, classify_vfs_error, normalize_attr_times,
 };
 use tokio::runtime::Handle;
 use tracing::{debug, error, warn};
@@ -896,6 +896,8 @@ impl Filesystem for StudioFuseFs {
             return;
         }
 
+        // fuser's ReplyData API accepts an immutable reply slice instead of
+        // exposing a mutable kernel buffer, so FUSE needs this boundary buffer.
         let mut out = vec![0u8; clamped_size];
         match self
             .rt
@@ -937,7 +939,15 @@ impl Filesystem for StudioFuseFs {
                 return;
             }
         };
-        match self.rt.block_on(self.vfs.write_fh(fh, ino, offset, data)) {
+        match self
+            .rt
+            .block_on(self.vfs.write_fh_with_deferred_materialize(
+                fh,
+                ino,
+                offset,
+                data,
+                LocalSyncPolicy::Opportunistic,
+            )) {
             Ok(written) => reply.written(written),
             Err(e) => {
                 error!("write({ino}, off={offset}) -> {e}");

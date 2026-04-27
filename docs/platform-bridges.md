@@ -81,8 +81,8 @@ Implements `winfsp::filesystem::FileSystemContext` trait.
 | `get_security_by_name` | `NamespaceResolver::resolve_path()` |
 | `open` | `NamespaceResolver::resolve_path()` + `open()` |
 | `close` | `release()` |
-| `read` | `read_into_fh_sync_cached()` fast path, then `read_into_fh()` fallback |
-| `write` | `write_fh()` |
+| `read` | `read_into_fh()` |
+| `write` | `write_fh_with_deferred_materialize()` |
 | `cleanup` | observe callback; delete finalizes namespace mutation, non-delete file-handle cleanup defers barrier to `close` / `release_fh()` |
 | `flush` | `flush()` |
 | `get_file_info` | `getattr()` |
@@ -95,8 +95,8 @@ Implements `winfsp::filesystem::FileSystemContext` trait.
 | `cleanup` + delete flag | `unlink()` / `rmdir()` |
 
 I/O buffer behavior on Windows callbacks:
-- `read`: WinFSP first tries VFS synchronous cache-only fast path into caller buffer (`read_into_fh_sync_cached()`), then falls back to async `read_into_fh()` on miss; both paths avoid bridge-layer intermediate buffers/copies.
-- `write`: WinFSP-provided input buffer is forwarded directly to `write_fh()` (no intermediate `to_vec()` copy in `StudioFsContext`).
+- `read`: WinFSP-provided output buffers are forwarded directly to the VFS `read_into_fh()` data-reader path through a callback-scoped `SendMutBuffer`; `StudioFsContext` does not allocate an intermediate payload buffer for file data reads.
+- `write`: WinFSP-provided input buffers are forwarded directly to `write_fh_with_deferred_materialize()` through a callback-scoped `SendConstBuffer`; `StudioFsContext` does not allocate an intermediate payload buffer before the VFS writer accepts the bytes.
 - `read_directory`: per-entry UTF-16 conversion reuses a single `Vec<u16>` buffer and only falls back to lossy replacement semantics for invalid UTF-8 names.
 
 WinFSP callback barrier semantics:
@@ -256,8 +256,8 @@ Implements `fuser::Filesystem` trait.
 | `setattr` | `setattr()` |
 | `open` | `open()` |
 | `release` | `release()` |
-| `read` | `read()` |
-| `write` | `write()` |
+| `read` | `read_into_fh()` |
+| `write` | `write_fh_with_deferred_materialize()` |
 | `flush` | `flush()` |
 | `readdir` | `readdir()` |
 | `mkdir` | `mkdir()` |
@@ -279,6 +279,10 @@ FUSE callback barrier semantics:
 - `fsync` is inode-scoped. It persists local unpublished state for the inode, including dirty handle-writer state, but does not force remote publication.
 - `release` becomes the fallback strict local crash-safe durability barrier for the last handle when dirty unpublished state remains, but it must not force synchronous PG/S3 replication or upload completion. `fsync` remains the explicit caller-requested strict sync API even though it is no longer the only callback path that reaches local crash-safe durability.
 - Size-changing `setattr` / truncate paths commit the new local EOF before the callback returns.
+
+FUSE data-buffer behavior:
+- `write`: the kernel-provided `data: &[u8]` slice is forwarded directly to the shared deferred VFS handle writer path; the bridge does not allocate a second full payload buffer before VFS acceptance.
+- `read`: `fuser::ReplyData` exposes `reply.data(&[u8])` rather than a mutable caller buffer, so `StudioFuseFs` must allocate one reply-sized `Vec<u8>` for the callback, fill it through `read_into_fh()`, and pass the populated slice to `ReplyData`. This is the bridge-level exception to direct caller-buffer filling and is limited to the API boundary.
 
 **UID/GID remapping:** root-owned inodes (uid=0) are remapped to the mounting user's UID/GID.
 
