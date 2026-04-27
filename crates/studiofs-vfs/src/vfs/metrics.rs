@@ -362,9 +362,13 @@ pub struct VfsZeroIoStartupReplaySnapshot {
     pub generated_unix_ms: u64,
     pub replayed_epochs: u64,
     pub replayed_blocks: u64,
+    pub replayed_bytes: u64,
+    pub queued_uploads: u64,
     pub queued_publish_ready_epochs: u64,
     pub quarantined_inodes: u64,
     pub orphan_dirty_payloads_removed: u64,
+    pub unreferenced_local_payloads_removed: u64,
+    pub discarded_memory_only_bytes: u64,
     pub replay_failures: u64,
 }
 

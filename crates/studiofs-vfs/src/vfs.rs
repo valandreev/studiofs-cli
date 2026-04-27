@@ -2976,6 +2976,12 @@ impl<'a> StartupReplayCoordinator<'a> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        let replayed_bytes = replayed_object_ids
+            .iter()
+            .filter_map(|object_id| self.vfs.local_payload_backend.object_stats(*object_id))
+            .fold(0_u64, |total, stats| {
+                total.saturating_add(stats.payload_len)
+            });
         let replayed_epochs: BTreeSet<_> = self
             .replay_ops
             .iter()
@@ -3069,10 +3075,13 @@ impl<'a> StartupReplayCoordinator<'a> {
             serde_json::json!({
                 "replayed_epochs": replayed_epochs.len() as u64,
                 "replayed_blocks": replayed_blocks,
+                "replayed_bytes": replayed_bytes,
+                "queued_uploads": self.replay_ops.len() as u64,
                 "queued_publish_ready_epochs": self.queued_epoch_count() as u64,
                 "quarantined_inodes": self.quarantined_inodes.len() as u64,
                 "orphan_dirty_payloads_removed": self.orphan_dirty_payloads_removed,
                 "unreferenced_local_payloads_removed": self.unreferenced_local_payloads_removed,
+                "discarded_memory_only_bytes": 0_u64,
                 "replay_failures": self.replay_failures,
             }),
         );
@@ -3499,6 +3508,10 @@ impl StudioVfs {
                             .unwrap_or(0),
                         replayed_blocks: Self::zeroio_event_u64(&event.fields, "replayed_blocks")
                             .unwrap_or(0),
+                        replayed_bytes: Self::zeroio_event_u64(&event.fields, "replayed_bytes")
+                            .unwrap_or(0),
+                        queued_uploads: Self::zeroio_event_u64(&event.fields, "queued_uploads")
+                            .unwrap_or(0),
                         queued_publish_ready_epochs: Self::zeroio_event_u64(
                             &event.fields,
                             "queued_publish_ready_epochs",
@@ -3512,6 +3525,16 @@ impl StudioVfs {
                         orphan_dirty_payloads_removed: Self::zeroio_event_u64(
                             &event.fields,
                             "orphan_dirty_payloads_removed",
+                        )
+                        .unwrap_or(0),
+                        unreferenced_local_payloads_removed: Self::zeroio_event_u64(
+                            &event.fields,
+                            "unreferenced_local_payloads_removed",
+                        )
+                        .unwrap_or(0),
+                        discarded_memory_only_bytes: Self::zeroio_event_u64(
+                            &event.fields,
+                            "discarded_memory_only_bytes",
                         )
                         .unwrap_or(0),
                         replay_failures: Self::zeroio_event_u64(&event.fields, "replay_failures")

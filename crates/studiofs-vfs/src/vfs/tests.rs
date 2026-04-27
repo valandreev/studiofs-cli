@@ -589,6 +589,51 @@ fn startup_replay_rebuilds_runtime_pending_upload_index_from_persisted_state() {
 }
 
 #[test]
+fn startup_replay_summary_reports_recovered_bytes_and_queued_uploads() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-replay-summary-bytes");
+
+    let created = vfs
+        .create(1, b"startup-summary.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let ino = created.ino;
+    let object_id = 7_021;
+    let payload = vec![0xE1; 8192];
+
+    vfs.local_payload_backend()
+        .put(object_id, &payload, false)
+        .expect("persist local payload");
+    vfs.local_payload_backend()
+        .sync_data()
+        .expect("sync local payload");
+
+    let mut attr = meta.get_attr(ino).expect("load test attr");
+    attr.size = payload.len() as u64;
+    attr.committed_size = 0;
+    attr.content_epoch = 11;
+    attr.committed_content_epoch = 10;
+    attr.upload_state = MetaUploadState::Uploading;
+    meta.set_attr(&attr).expect("persist staged attr");
+    meta.stage_payload_slice(
+        ino,
+        0,
+        &PayloadRef::new_partial(object_id, payload.len() as u32),
+    )
+    .expect("persist current payload slice");
+
+    vfs.replay_dirty_uploads_from_local_backend(&[], &[attr]);
+
+    let summary = vfs
+        .zeroio_runtime_snapshot()
+        .startup_replay
+        .expect("startup replay summary should be visible");
+    assert_eq!(summary.replayed_blocks, 1);
+    assert_eq!(summary.replayed_bytes, payload.len() as u64);
+    assert_eq!(summary.queued_uploads, 1);
+    assert_eq!(summary.discarded_memory_only_bytes, 0);
+}
+
+#[test]
 fn flush_queues_runtime_upload_immediately_after_local_durability() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "flush-queues-runtime-upload");
@@ -979,6 +1024,11 @@ fn startup_replay_removes_unreferenced_warm_payloads_and_stage_links() {
         1,
         "startup replay should attribute warm orphan removal to stale-cache cleanup"
     );
+    let summary = vfs
+        .zeroio_runtime_snapshot()
+        .startup_replay
+        .expect("startup replay summary should be visible");
+    assert_eq!(summary.unreferenced_local_payloads_removed, 1);
 }
 
 #[test]
