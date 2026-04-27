@@ -221,30 +221,6 @@ impl<'a> DataReader<'a> {
             }
         }
 
-        let handle_spans = vfs.snapshot_handle_writer_read_spans(ino, offset, length);
-        for dirty in handle_spans {
-            if unresolved.is_empty() {
-                break;
-            }
-            let Some(dirty_range) = ReadRange::new(dirty.start, dirty.end) else {
-                continue;
-            };
-            Self::claim_unresolved_ranges(&mut unresolved, dirty_range, &mut claim_buffers);
-            for overlap in claim_buffers.claimed.iter().copied() {
-                let delta = overlap.start().saturating_sub(dirty.start);
-                let Some(block_offset) = dirty.block_offset.checked_add(delta) else {
-                    continue;
-                };
-                segments.push(ReadSegment {
-                    range: overlap,
-                    source: ReadSegmentSource::Dirty {
-                        data: dirty.data.clone(),
-                        block_offset,
-                    },
-                });
-            }
-        }
-
         let dirty_spans = vfs.snapshot_pending_dirty_slice_read_spans(ino, offset, length);
         for dirty in dirty_spans {
             if unresolved.is_empty() {
@@ -829,7 +805,6 @@ impl<'a> ReadMetadataResolver<'a> {
             && !self
                 .vfs
                 .has_pending_local_dirty_payloads_for_inode(self.ino)
-            && !self.vfs.inode_has_dirty_handle_writers(self.ino)
             && !self.vfs.inode_has_dirty_writer_stack(self.ino);
         if dirty_attr_present && !dirty_attr_cacheable {
             let ino = self.ino;
@@ -1834,11 +1809,6 @@ mod tests {
                 !vfs.has_pending_local_dirty_payloads_for_inode(ino),
                 "setup should leave no pending local payloads after flush"
             );
-            assert!(
-                !vfs.inode_has_dirty_handle_writers(ino),
-                "setup should leave no dirty handle-writer state after flush"
-            );
-
             let (_, first_slices) = vfs
                 .resolve_read_metadata_async(ino, 0, 64 * 1024)
                 .await
@@ -2464,67 +2434,6 @@ mod tests {
         assert!(
             counting_backend.read_into_calls() > 0,
             "materialized pending local reads should use direct partial read_into()"
-        );
-    }
-
-    #[test]
-    fn dirty_tail_read_does_not_load_unrelated_pending_slice_payloads() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let (rt, mut vfs, _meta) =
-            make_unstarted_test_vfs(&tmp, "pending-slice-tail-read-prunes-misses");
-        let inner = vfs.local_payload_backend.clone();
-        let counting_backend = Arc::new(CountingLocalPayloadBackend::new(inner));
-        Arc::get_mut(&mut vfs)
-            .expect("unstarted test VFS should be uniquely owned")
-            .local_payload_backend = counting_backend.clone();
-
-        rt.block_on(async {
-            let created = vfs
-                .create(ROOT_INO, b"pending-slice-tail-read.bin", 1000, 1000, 0o644)
-                .expect("create file");
-            let fh = vfs
-                .open_file(created.ino, OpenFlags::RDWR, false)
-                .expect("open file");
-            let slice_bytes = 2 * 1024 * 1024usize;
-            let first = vec![0x11; slice_bytes];
-            let second = vec![0x22; slice_bytes];
-            let third = vec![0x33; slice_bytes];
-
-            vfs.record_handle_writer_state(fh, created.ino, 0, &first)
-                .await
-                .expect("record first write");
-            vfs.record_handle_writer_state(fh, created.ino, slice_bytes as u64, &second)
-                .await
-                .expect("record second write");
-            vfs.record_handle_writer_state(fh, created.ino, (slice_bytes * 2) as u64, &third)
-                .await
-                .expect("record third write");
-
-            vfs.materialize_handle_writers_for_limits(created.ino, LocalSyncPolicy::Opportunistic)
-                .await
-                .expect("spill old handle slices");
-            assert!(
-                vfs.has_pending_local_dirty_payloads_for_inode(created.ino),
-                "old slices should be staged as pending local dirty state"
-            );
-            assert_eq!(
-                vfs.state.handle_writers.dirty_bytes_for_inode(created.ino),
-                slice_bytes,
-                "newest tail should remain in handle-writer memory"
-            );
-
-            counting_backend.reset_counters();
-            let read = vfs
-                .read(created.ino, (slice_bytes * 2) as u64, slice_bytes as u32)
-                .await
-                .expect("read active dirty tail");
-            assert_eq!(read.as_ref(), third.as_slice());
-        });
-
-        assert_eq!(
-            counting_backend.get_calls(),
-            0,
-            "tail reads covered by handle-writer state must not whole-load older pending slice objects"
         );
     }
 }

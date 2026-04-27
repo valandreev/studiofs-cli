@@ -129,8 +129,7 @@ impl StudioVfs {
             .enter_op(ino, FileSessionOperation::Flush)
             .await;
         let result: VfsResult<InodeAttr> = async {
-            self.materialize_handle_writers_for_inode(ino, LocalSyncPolicy::Strict)
-                .await?;
+            self.materialize_writer_stack_for_inode(ino).await?;
             self.flush_local_dirty_state(ino, LocalSyncPolicy::Strict)
                 .await?;
 
@@ -500,14 +499,16 @@ impl StudioVfs {
             return Err(error.into());
         }
 
+        let mut removed_block_count = 0usize;
         for object_idx in
             first_block_to_remove..=block_index_from_offset(old_size - 1, self.block_size)
         {
             self.clear_pending_payload(ino, object_idx);
             self.remove_live_extent(ino, object_idx);
-            if let Err(error) = self.fail_size_change_truncate_after_first_removed_block_for_test(
-                mutation.removed_objects.len(),
-            ) {
+            removed_block_count = removed_block_count.saturating_add(1);
+            if let Err(error) = self
+                .fail_size_change_truncate_after_first_removed_block_for_test(removed_block_count)
+            {
                 self.rollback_truncate_mutation(ino, restore_content_epoch, Some(&mutation))?;
                 return Err(error);
             }

@@ -107,26 +107,13 @@ impl StudioVfs {
         if self.handle_table.open_count(ino) != 0 {
             return false;
         }
-        self.state.handle_writers.clear_inode(ino);
         self.state.writer_stack.clear_inode(ino);
         self.state.namespace.dirty_attrs.lock().remove(&ino);
         true
     }
 
     fn should_continue_deferred_materialization(&self, ino: Ino) -> bool {
-        if self.state.writer_stack.has_dirty_writers(ino) {
-            return true;
-        }
-        let per_inode_dirty = self.state.handle_writers.dirty_bytes_for_inode(ino);
-        if per_inode_dirty == 0 {
-            return false;
-        }
-        per_inode_dirty > self.handle_writer_active_tail_bytes()
-            || per_inode_dirty >= self.write_eager_flush_batch_bytes
-            || self.state.handle_writers.total_dirty_bytes()
-                >= super::aggressive_materialization_threshold_bytes(self.max_dirty_bytes())
-            || self.state.handle_writers.total_buffered_write_count()
-                >= super::AGGRESSIVE_MATERIALIZATION_BUFFERED_WRITE_THRESHOLD
+        self.state.writer_stack.has_dirty_writers(ino)
     }
 
     fn should_linger_deferred_materialization(&self, ino: Ino) -> bool {
@@ -136,204 +123,7 @@ impl StudioVfs {
         if self.handle_table.open_count(ino) == 0 {
             return false;
         }
-        self.state.handle_writers.dirty_bytes_for_inode(ino) > 0
-            || self.state.writer_stack.has_dirty_writers(ino)
-    }
-
-    #[cfg(test)]
-    pub(super) async fn apply_write_path_soft_pacing(self: &Arc<Self>, preferred_ino: Ino) -> bool {
-        if self.shutdown_requested() {
-            return false;
-        }
-
-        let max_dirty = self.max_dirty_bytes();
-        let total_dirty_bytes = self.total_pending_write_buffer_bytes();
-        if total_dirty_bytes > max_dirty {
-            self.wait_for_soft_dirty_budget_relief(preferred_ino).await;
-            return true;
-        }
-
-        let buffered_write_count = self.state.handle_writers.total_buffered_write_count();
-        let dirty_budget_delay_ms = super::soft_dirty_budget_pacing_delay_ms(
-            total_dirty_bytes,
-            max_dirty,
-            buffered_write_count,
-        );
-        let drain_lag_bytes = self.total_landed_write_drain_lag_bytes();
-        let drain_lag_delay_ms = super::soft_drain_lag_pacing_delay_ms(
-            drain_lag_bytes,
-            self.handle_writer_slice_flush_bytes(),
-        );
-        let Some(delay_ms) = dirty_budget_delay_ms.max(drain_lag_delay_ms) else {
-            return false;
-        };
-        debug_assert!(
-            dirty_budget_delay_ms.is_some() || drain_lag_delay_ms.is_some(),
-            "delay_ms is present only when at least one pacing delay is present"
-        );
-        let pacing_trigger = match (dirty_budget_delay_ms, drain_lag_delay_ms) {
-            (Some(dirty), Some(drain)) if dirty == drain => "dirty_budget_and_drain_lag",
-            (Some(dirty), Some(drain)) if dirty > drain => "dirty_budget",
-            (Some(_), Some(_)) => "drain_lag",
-            (Some(_), None) => "dirty_budget",
-            (None, Some(_)) => "drain_lag",
-            (None, None) => unreachable!("delay_ms exists only when at least one delay exists"),
-        };
-
-        self.spawn_deferred_materialization_if_needed(preferred_ino)
-            .await;
-
-        self.debug_write_probe(
-            "H2",
-            "crates/studiofs-vfs/src/vfs/sync_ops.rs:86",
-            "soft write-path pacing applied",
-            serde_json::json!({
-                "preferred_ino": preferred_ino,
-                "total_dirty_bytes": total_dirty_bytes,
-                "drain_lag_bytes": drain_lag_bytes,
-                "max_dirty_bytes": max_dirty,
-                "buffered_write_count": buffered_write_count,
-                "dirty_budget_delay_ms": dirty_budget_delay_ms,
-                "drain_lag_delay_ms": drain_lag_delay_ms,
-                "delay_ms": delay_ms,
-                "pacing_trigger": pacing_trigger,
-            }),
-        );
-
-        let started = Instant::now();
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        let waited_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        self.state
-            .local_dirty
-            .fast_backpressure_events
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.state
-            .local_dirty
-            .fast_backpressure_wait_ms
-            .fetch_add(waited_ms, std::sync::atomic::Ordering::Relaxed);
-        self.state
-            .local_dirty
-            .fast_backpressure_stall_max_ms
-            .fetch_max(waited_ms, std::sync::atomic::Ordering::Relaxed);
-        if let Some(drain_lag_attribution_ms) =
-            super::drain_lag_pacing_attribution_ms(waited_ms, delay_ms, drain_lag_delay_ms)
-        {
-            self.state
-                .metrics
-                .drain_lag_pacing_events
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.state.metrics.drain_lag_pacing_total_ms.fetch_add(
-                drain_lag_attribution_ms,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            self.state.metrics.drain_lag_pacing_max_ms.fetch_max(
-                drain_lag_attribution_ms,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
-        true
-    }
-
-    #[cfg(test)]
-    pub(super) async fn wait_for_soft_dirty_budget_relief(self: &Arc<Self>, preferred_ino: Ino) {
-        if self.shutdown_requested() {
-            return;
-        }
-
-        let max_dirty = self.max_dirty_bytes();
-        loop {
-            let total_dirty_before = self.total_pending_write_buffer_bytes();
-            if total_dirty_before <= max_dirty {
-                return;
-            }
-
-            let mut dirty_inodes = self.state.handle_writers.snapshot_dirty_inodes_by_bytes();
-            if dirty_inodes.is_empty() {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                continue;
-            }
-            dirty_inodes.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1));
-
-            let target_ino = dirty_inodes
-                .iter()
-                .find_map(|(ino, _)| (*ino == preferred_ino).then_some(*ino))
-                .unwrap_or(dirty_inodes[0].0);
-            let target_dirty_bytes = dirty_inodes
-                .iter()
-                .find_map(|(ino, dirty_bytes)| (*ino == target_ino).then_some(*dirty_bytes))
-                .unwrap_or_default();
-
-            let existing_task_lock = {
-                self.state
-                    .deferred_materialize_inflight
-                    .lock()
-                    .get(&target_ino)
-                    .cloned()
-            };
-            let task_lock = match existing_task_lock {
-                Some(lock) => lock,
-                None => {
-                    self.spawn_deferred_materialization_if_needed(target_ino)
-                        .await;
-                    let Some(lock) = self
-                        .state
-                        .deferred_materialize_inflight
-                        .lock()
-                        .get(&target_ino)
-                        .cloned()
-                    else {
-                        return;
-                    };
-                    lock
-                }
-            };
-
-            // #region debug log
-            self.debug_write_probe(
-                "H2",
-                "crates/studiofs-vfs/src/vfs/sync_ops.rs:107",
-                "soft dirty-budget wait for deferred materialization",
-                serde_json::json!({
-                    "preferred_ino": preferred_ino,
-                    "target_ino": target_ino,
-                    "target_dirty_bytes": target_dirty_bytes,
-                    "total_dirty_bytes": total_dirty_before,
-                    "max_dirty_bytes": max_dirty,
-                }),
-            );
-            // #endregion debug log
-
-            let wait_started = Instant::now();
-            let wait_guard = task_lock.lock().await;
-            let waited = wait_started.elapsed();
-            drop(wait_guard);
-
-            let total_dirty_after = self.total_pending_write_buffer_bytes();
-            // #region debug log
-            self.debug_write_probe(
-                "H2",
-                "crates/studiofs-vfs/src/vfs/sync_ops.rs:128",
-                "soft dirty-budget wait finished",
-                serde_json::json!({
-                    "preferred_ino": preferred_ino,
-                    "target_ino": target_ino,
-                    "waited_ms": waited.as_millis().min(u128::from(u64::MAX)) as u64,
-                    "total_dirty_bytes_before": total_dirty_before,
-                    "total_dirty_bytes_after": total_dirty_after,
-                    "max_dirty_bytes": max_dirty,
-                }),
-            );
-            // #endregion debug log
-
-            if total_dirty_after <= max_dirty {
-                return;
-            }
-            if waited < std::time::Duration::from_millis(1)
-                && total_dirty_after >= total_dirty_before
-            {
-                return;
-            }
-        }
+        self.state.writer_stack.has_dirty_writers(ino)
     }
 
     pub(super) async fn spawn_deferred_materialization_if_needed(self: &Arc<Self>, ino: Ino) {
@@ -352,8 +142,8 @@ impl StudioVfs {
                         "deferred materialization already inflight",
                         serde_json::json!({
                             "ino": ino,
-                            "per_inode_dirty_bytes": self.state.handle_writers.dirty_bytes_for_inode(ino),
-                            "total_dirty_bytes": self.state.handle_writers.total_dirty_bytes(),
+                            "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
+                            "total_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),
                             "open_count": self.handle_table.open_count(ino),
                         }),
                     );
@@ -374,8 +164,8 @@ impl StudioVfs {
             "deferred materialization scheduled",
             serde_json::json!({
                 "ino": ino,
-                "per_inode_dirty_bytes": self.state.handle_writers.dirty_bytes_for_inode(ino),
-                "total_dirty_bytes": self.state.handle_writers.total_dirty_bytes(),
+                "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
+                "total_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),
                 "open_count": self.handle_table.open_count(ino),
             }),
         );
@@ -386,8 +176,7 @@ impl StudioVfs {
             let mut no_progress_retries = 0usize;
             loop {
                 let writer_stack_dirty_before = vfs.state.writer_stack.dirty_bytes_for_inode(ino);
-                let handle_dirty_before = vfs.state.handle_writers.dirty_bytes_for_inode(ino);
-                let dirty_before = writer_stack_dirty_before.saturating_add(handle_dirty_before);
+                let dirty_before = writer_stack_dirty_before;
                 let total_before = vfs.total_pending_write_buffer_bytes();
                 if dirty_before == 0 {
                     break;
@@ -412,70 +201,29 @@ impl StudioVfs {
                     materialize_writer_stack_started.elapsed(),
                 );
 
-                let materialize_completed_started = Instant::now();
-                let completed_materialized = match vfs
-                    .materialize_completed_handle_writer_blocks_for_inode(
-                        ino,
-                        LocalSyncPolicy::Opportunistic,
-                    )
-                    .await
-                {
-                    Ok(materialized) => materialized,
-                    Err(e) => {
-                        if !vfs.suppress_deleted_inode_materialization_error(ino, &e) {
-                            warn!(
-                                ino,
-                                error = %e,
-                                "deferred materialization (completed blocks) failed; will retry at next strict barrier"
-                            );
-                            // #region debug log
-                            vfs.debug_write_probe(
-                                "H1",
-                                "crates/studiofs-vfs/src/vfs/sync_ops.rs:114",
-                                "deferred materialization completed-blocks failure",
-                                serde_json::json!({
-                                    "ino": ino,
-                                    "error": e.to_string(),
-                                    "meta_exists": vfs.sync_meta().get_attr(ino).is_ok(),
-                                    "deleted_marker": vfs.state.upload.deleted_inodes.lock().contains(&ino),
-                                    "open_count": vfs.handle_table.open_count(ino),
-                                    "per_inode_dirty_bytes": vfs.state.handle_writers.dirty_bytes_for_inode(ino),
-                                    "dirty_attr_present": vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
-                                }),
-                            );
-                            // #endregion debug log
-                        }
-                        break;
-                    }
-                };
-                vfs.record_vfs_write_materialize_completed(materialize_completed_started.elapsed());
-
                 let materialize_for_limits_started = Instant::now();
-                let limits_materialized = match vfs
-                    .materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
-                    .await
-                {
-                    Ok(materialized) => materialized,
+                let limits_materialized = match vfs.materialize_writer_stack_for_limits(ino).await {
+                    Ok(materialized) => materialized > 0,
                     Err(e) => {
                         if !vfs.suppress_deleted_inode_materialization_error(ino, &e) {
                             warn!(
                                 ino,
                                 error = %e,
-                                "deferred materialization (budget enforcement) failed; will retry at next strict barrier"
+                                "deferred writer-stack budget materialization failed; will retry at next strict barrier"
                             );
                             // #region debug log
                             vfs.debug_write_probe(
                                 "H1",
                                 "crates/studiofs-vfs/src/vfs/sync_ops.rs:144",
-                                "deferred materialization limit-pass failure",
+                                "deferred writer-stack limit-pass failure",
                                 serde_json::json!({
                                     "ino": ino,
                                     "error": e.to_string(),
                                     "meta_exists": vfs.sync_meta().get_attr(ino).is_ok(),
                                     "deleted_marker": vfs.state.upload.deleted_inodes.lock().contains(&ino),
                                     "open_count": vfs.handle_table.open_count(ino),
-                                    "per_inode_dirty_bytes": vfs.state.handle_writers.dirty_bytes_for_inode(ino),
-                                    "total_dirty_bytes": vfs.state.handle_writers.total_dirty_bytes(),
+                                    "per_inode_dirty_bytes": vfs.state.writer_stack.dirty_bytes_for_inode(ino),
+                                    "total_dirty_bytes": vfs.state.writer_stack.total_dirty_bytes(),
                                 }),
                             );
                             // #endregion debug log
@@ -487,14 +235,9 @@ impl StudioVfs {
                     materialize_for_limits_started.elapsed(),
                 );
 
-                let dirty_after = vfs
-                    .state
-                    .writer_stack
-                    .dirty_bytes_for_inode(ino)
-                    .saturating_add(vfs.state.handle_writers.dirty_bytes_for_inode(ino));
+                let dirty_after = vfs.state.writer_stack.dirty_bytes_for_inode(ino);
                 let total_after = vfs.total_pending_write_buffer_bytes();
-                let made_progress = completed_materialized
-                    || writer_stack_materialized_bytes > 0
+                let made_progress = writer_stack_materialized_bytes > 0
                     || limits_materialized
                     || dirty_after < dirty_before
                     || total_after < total_before;
@@ -541,7 +284,6 @@ impl StudioVfs {
     }
 
     fn close_handle_for_release(&self, fh: u64) -> Option<HandleReleaseContext> {
-        self.state.handle_writers.mark_closed(fh);
         self.state.writer_stack.mark_closed(fh);
         let Some((open_file, remaining)) = self.handle_table.close(fh) else {
             debug!("release_fh: unknown fh={}", fh);
@@ -705,11 +447,7 @@ impl StudioVfs {
         }
 
         let materialized_writer_stack_bytes = self.materialize_writer_stack_for_inode(ino).await?;
-        let materialized_handle_writers = self
-            .materialize_handle_writers_for_inode(ino, local_sync_policy)
-            .await?;
         let flushed_file_data = materialized_writer_stack_bytes > 0
-            || materialized_handle_writers
             || self.has_pending_local_dirty_payloads_for_inode(ino);
         let residual_pending_local_payloads = self.has_pending_local_dirty_payloads_for_inode(ino);
         let dirty_attr_present = self.state.namespace.dirty_attrs.lock().contains_key(&ino);
@@ -722,7 +460,6 @@ impl StudioVfs {
         let residual_local_dirty_state =
             residual_pending_local_payloads || (dirty_attr_present && !persist_dirty_attr_inline);
         let had_local_dirty_state = materialized_writer_stack_bytes > 0
-            || materialized_handle_writers
             || residual_local_dirty_state
             || persist_dirty_attr_inline;
         let persisted_slice_bytes_before_flush =
@@ -1033,15 +770,6 @@ impl StudioVfs {
                     )
                     .await?;
                 }
-            } else {
-                let materialize_completed_started = Instant::now();
-                let completed_result = self
-                    .materialize_completed_handle_writer_blocks_for_inode(ino, local_sync_policy)
-                    .await;
-                self.record_vfs_write_materialize_completed(
-                    materialize_completed_started.elapsed(),
-                );
-                completed_result?;
             }
             let should_materialize_for_limits =
                 matches!(local_sync_policy, LocalSyncPolicy::Strict)
@@ -1117,7 +845,7 @@ impl StudioVfs {
                 "hard backpressure fallback engaged",
                 serde_json::json!({
                     "ino": ino,
-                    "per_inode_dirty_bytes": self.state.handle_writers.dirty_bytes_for_inode(ino),
+                    "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
                     "total_dirty_bytes": self.total_pending_write_buffer_bytes(),
                     "hard_threshold_bytes": hard_backpressure_threshold,
                     "max_dirty_bytes": self.max_dirty_bytes(),
@@ -1326,7 +1054,7 @@ impl StudioVfs {
             .map_err(|_| VfsError::Other("writer stack object reservation exceeds u32::MAX".into()))
     }
 
-    async fn materialize_writer_stack_for_inode(&self, ino: Ino) -> VfsResult<usize> {
+    pub(super) async fn materialize_writer_stack_for_inode(&self, ino: Ino) -> VfsResult<usize> {
         let object_count = self
             .state
             .writer_stack

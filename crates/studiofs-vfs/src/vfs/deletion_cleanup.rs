@@ -149,7 +149,7 @@ impl StudioVfs {
                 "removed_ids_len": removed_ids_len,
                 "open_count": self.handle_table.open_count(ino),
                 "deleted_marker": self.state.upload.deleted_inodes.lock().contains(&ino),
-                "dirty_handle_bytes": self.state.handle_writers.dirty_bytes_for_inode(ino),
+                "writer_stack_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
                 "has_pending_local_dirty_payloads": self.has_pending_local_dirty_payloads_for_inode(ino),
                 "has_inflight_materialization": self.state.deferred_materialize_inflight.lock().contains_key(&ino),
             }),
@@ -161,7 +161,6 @@ impl StudioVfs {
         // also clearing live extent identities and read-side runtime state even
         // when no object IDs remain to evict.
         self.cancel_pending_uploads_for_inode(ino);
-        self.state.handle_writers.clear_inode(ino);
         self.state.writer_stack.clear_inode(ino);
         self.clear_pending_payloads_for_inode(ino);
         self.remove_live_extents_for_inode(ino);

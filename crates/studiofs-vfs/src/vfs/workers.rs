@@ -27,24 +27,22 @@ impl StudioVfs {
                 continue;
             }
 
-            let mut dirty_inodes = self.state.handle_writers.snapshot_dirty_inodes_by_bytes();
+            let dirty_inodes = self.state.writer_stack.snapshot_dirty_inodes_by_bytes();
             // #region debug log
             self.debug_write_probe(
                 "H2",
                 "crates/studiofs-vfs/src/vfs/workers.rs:17",
                 "aggressive materialization tick",
                 serde_json::json!({
-                    "total_dirty_bytes": self.state.handle_writers.total_dirty_bytes(),
+                    "total_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),
                     "threshold_bytes": super::aggressive_materialization_threshold_bytes(self.max_dirty_bytes()),
                     "hard_threshold_bytes": super::hard_backpressure_threshold_bytes(self.max_dirty_bytes()),
-                    "buffered_write_count": self.state.handle_writers.total_buffered_write_count(),
                     "dirty_inode_count": dirty_inodes.len(),
                 }),
             );
             // #endregion debug log
-            dirty_inodes.sort_by_key(|(_, dirty_bytes)| std::cmp::Reverse(*dirty_bytes));
-            for (ino, dirty_bytes) in dirty_inodes {
-                if dirty_bytes == 0 || self.shutdown_requested() {
+            for ino in dirty_inodes {
+                if self.shutdown_requested() {
                     break;
                 }
                 self.spawn_deferred_materialization_if_needed(ino).await;
@@ -567,8 +565,7 @@ impl StudioVfs {
                         "pending_metadata_ops": pending_metadata_ops,
                         "inflight_metadata_ops": metadata_backlog.inflight_ops,
                         "local_backend_dirty_count": local_backend_dirty_count,
-                        "handle_writer_total_dirty_bytes": self.state.handle_writers.total_dirty_bytes(),
-                        "handle_writer_buffered_write_count": self.state.handle_writers.total_buffered_write_count(),
+                        "writer_stack_total_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),
                         "pending_epoch_finalizations": self.state.upload.pending_epoch_finalizations.lock().len(),
                         "upload_scheduler_penalty_ms": self.upload_scheduler.adaptive_penalty_ms(),
                         "dirty_mem_bytes": ingress.dirty_mem_bytes,

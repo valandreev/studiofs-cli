@@ -877,7 +877,7 @@ fn release_fh_materializes_fragmented_overlay_slice_graph_base() {
         assert_eq!(
             read.as_ref(),
             expected.as_slice(),
-            "handle-writer materialization should reuse fragmented overlay slice graph as its base payload"
+            "writer-stack materialization should reuse fragmented overlay slice graph as its base payload"
         );
     });
 }
@@ -1509,125 +1509,6 @@ fn nonzero_truncate_requeues_retained_overlay_uploads_with_new_epoch() {
 }
 
 #[test]
-fn epoch_finalizer_defers_while_handle_writer_tail_is_still_buffered() {
-    let tmp = TempDir::new().expect("tempdir");
-    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-buffered-tail");
-    let _guard = rt.enter();
-
-    rt.block_on(async {
-        let attr = vfs
-            .create(1, b"graph-finalizer-buffered-tail.bin", 0, 0, 0o644)
-            .expect("create test file");
-        let ino = attr.ino;
-        let fh = vfs
-            .open_file(ino, OpenFlags::RDWR, false)
-            .expect("open writable handle");
-        let block_size = vfs.block_size as usize;
-        let full_block = vec![0x41u8; block_size];
-        let tail = vec![0x42u8; block_size / 8];
-
-        vfs.write_fh_with_local_sync_policy(
-            fh,
-            ino,
-            0,
-            &full_block,
-            LocalSyncPolicy::Opportunistic,
-        )
-            .await
-            .expect("stage the initial full-block epoch");
-        vfs.flush_fh(fh)
-            .await
-            .expect("flush the initial full block into durable unpublished metadata");
-
-        assert_eq!(
-            meta.lookup_payload_slices(ino)
-                .expect("load flushed payload slices")
-                .len(),
-            1,
-            "setup should create a publishable durable prefix before buffering a newer tail"
-        );
-
-        let (content_epoch, _blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
-
-        vfs.write_fh_with_local_sync_policy(
-            fh,
-            ino,
-            block_size as u64,
-            &tail,
-            LocalSyncPolicy::Opportunistic,
-        )
-        .await
-        .expect("buffer a newer partial tail without flushing it");
-
-        assert_eq!(
-            meta.lookup_payload_slices(ino)
-                .expect("load durable payload slices")
-                .len(),
-            1,
-            "the newer tail should remain buffered and must not rewrite the durable prefix yet"
-        );
-        let unpublished_attr = meta.get_attr(ino).expect("load unpublished attr");
-        assert_eq!(
-            unpublished_attr.size,
-            block_size as u64,
-            "durable metadata should still reflect only the older flushed epoch while the newer tail is buffered"
-        );
-        let dirty_attr = vfs
-            .state
-            .namespace
-            .dirty_attrs
-            .lock()
-            .get(&ino)
-            .cloned()
-            .expect("dirty attr should preserve the buffered tail");
-        assert_eq!(
-            dirty_attr.size,
-            (block_size + tail.len()) as u64,
-            "dirty attr should keep the full visible EOF while the tail is still buffered"
-        );
-        assert!(
-            vfs.state.writer_stack.has_dirty_writers(ino),
-            "setup should retain the partial tail in writer-stack memory"
-        );
-        assert!(
-            !vfs.has_pending_local_dirty_payloads_for_inode(ino),
-            "setup should isolate the regression to a buffered handle-writer tail, not staged local_dirty payloads"
-        );
-
-        let status =
-            super::commit::CommitCoordinator::finalize_inode_epoch(&vfs, ino, content_epoch)
-                .await
-                .expect("finalize should defer while handle-writer tail is buffered");
-        assert!(
-            matches!(status, super::commit::EpochFinalizeStatus::Deferred),
-            "finalize must not publish or clear dirty attrs while a newer visible tail is still buffered"
-        );
-
-        let attr_after = meta.get_attr(ino).expect("load attr after deferred finalize");
-        assert_ne!(
-            attr_after.upload_state,
-            MetaUploadState::Ready,
-            "deferred finalize should leave the unpublished epoch unpublished"
-        );
-        let dirty_attr_after = vfs
-            .state
-            .namespace
-            .dirty_attrs
-            .lock()
-            .get(&ino)
-            .cloned()
-            .expect("dirty attr should survive deferred finalize");
-        assert_eq!(
-            dirty_attr_after.size,
-            (block_size + tail.len()) as u64,
-            "deferred finalize must preserve the larger visible EOF staged in dirty attrs"
-        );
-
-        vfs.release_fh(fh).await.expect("release handle");
-    });
-}
-
-#[test]
 fn epoch_finalizer_guard_observes_writer_stack_tail() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-writer-stack-tail");
@@ -1649,7 +1530,6 @@ fn epoch_finalizer_guard_observes_writer_stack_tail() {
 
         assert!(vfs.state.writer_stack.has_dirty_writers(ino));
         assert!(!vfs.has_pending_local_dirty_payloads_for_inode(ino));
-        assert!(!vfs.inode_has_dirty_handle_writers(ino));
         assert!(
             vfs.inode_has_unmaterialized_overlay_for_finalize(ino),
             "epoch finalization must defer while a mounted write is only buffered in the writer stack"
@@ -2927,13 +2807,13 @@ fn same_mount_read_keeps_opportunistic_handle_write_visible_after_local_dirty_cl
 }
 
 #[test]
-fn same_mount_read_prefers_newer_opportunistic_handle_writer_spans() {
+fn same_mount_read_prefers_newer_opportunistic_writer_stack_spans() {
     let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-overlapping-handle-writers");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-overlapping-writer-stack");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
-            .create(1, b"sfs-245-overlapping-handle-writers.txt", 0, 0, 0o644)
+            .create(1, b"sfs-245-overlapping-writer-stack.txt", 0, 0, 0o644)
             .unwrap();
         let ino = attr.ino;
         let fh1 = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
@@ -2957,9 +2837,9 @@ fn same_mount_read_prefers_newer_opportunistic_handle_writer_spans() {
 }
 
 #[test]
-fn handle_writer_global_dirty_cap_drains_older_inodes_after_limit_drop() {
+fn writer_stack_global_dirty_cap_drains_older_inodes_after_limit_drop() {
     let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-handle-writer-global-cap");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-writer-stack-global-cap");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr1 = vfs.create(1, b"cap-a.txt", 0, 0, 0o644).unwrap();
@@ -3013,54 +2893,6 @@ fn handle_writer_global_dirty_cap_drains_older_inodes_after_limit_drop() {
 }
 
 #[test]
-fn soft_dirty_budget_wait_observes_inflight_materialization() {
-    let tmp = TempDir::new().expect("tempdir");
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-soft-dirty-budget-wait");
-    let _guard = rt.enter();
-
-    rt.block_on(async {
-        let ino = 42;
-        let fh = 7;
-        vfs.set_max_dirty_bytes(1024);
-        vfs.state.handle_writers.open_writer_for_test(fh, ino, 0);
-        let payload = vec![0xAB; 2048];
-        vfs.state
-            .handle_writers
-            .write(fh, ino, 0, vfs.block_size, 0, &payload);
-
-        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
-        let task_guard = task_lock.clone().lock_owned().await;
-        vfs.state
-            .deferred_materialize_inflight
-            .lock()
-            .insert(ino, task_lock.clone());
-
-        let waiter_vfs = vfs.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            waiter_vfs.state.handle_writers.clear_inode(ino);
-            waiter_vfs
-                .state
-                .deferred_materialize_inflight
-                .lock()
-                .remove(&ino);
-            drop(task_guard);
-        });
-
-        let started = Instant::now();
-        vfs.wait_for_soft_dirty_budget_relief(ino).await;
-        assert!(
-            started.elapsed() >= Duration::from_millis(15),
-            "soft dirty-budget wait should block until the inflight drain completes"
-        );
-        assert!(
-            vfs.state.handle_writers.total_dirty_bytes() <= vfs.max_dirty_bytes(),
-            "soft dirty-budget wait should return only after dirty bytes are back under budget"
-        );
-    });
-}
-
-#[test]
 fn aggressive_materialization_threshold_is_half_of_dirty_budget() {
     assert_eq!(aggressive_materialization_threshold_bytes(0), 1);
     assert_eq!(aggressive_materialization_threshold_bytes(1), 1);
@@ -3069,13 +2901,13 @@ fn aggressive_materialization_threshold_is_half_of_dirty_budget() {
 }
 
 #[test]
-fn ingress_pressure_counts_buffered_handle_writer_bytes() {
+fn ingress_pressure_counts_buffered_writer_stack_bytes() {
     let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-ingress-pressure-handle-writers");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-ingress-pressure-writer-stack");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
-            .create(1, b"sfs-257-ingress-pressure-handle-writers.txt", 0, 0, 0o644)
+            .create(1, b"sfs-257-ingress-pressure-writer-stack.txt", 0, 0, 0o644)
             .unwrap();
         let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
         let payload = b"buffer-me";
@@ -3105,12 +2937,12 @@ fn ingress_pressure_counts_buffered_handle_writer_bytes() {
         assert_eq!(
             pressure.dirty_mem_bytes,
             payload.len(),
-            "ingress pressure should include buffered handle-writer bytes before they materialize into local_dirty"
+            "ingress pressure should include buffered writer-stack bytes before they materialize into local_dirty"
         );
         assert_eq!(
             pressure.lane,
             VfsIngressLane::Backpressure,
-            "once buffered handle-writer bytes consume the dirty budget, follow-up ingress should see backpressure"
+            "once buffered writer-stack bytes consume the dirty budget, follow-up ingress should see backpressure"
         );
 
         vfs.release_fh(fh).await.unwrap();
@@ -3265,10 +3097,6 @@ fn write_fh_routes_mounted_write_through_writer_stack() {
         assert!(
             vfs.state.writer_stack.has_dirty_writers(ino),
             "mounted write callbacks should land in the new writer stack"
-        );
-        assert!(
-            !vfs.state.handle_writers.has_dirty_writers(ino),
-            "mounted write callbacks should no longer use the legacy handle writer registry"
         );
         let read = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
         assert_eq!(read.as_ref(), payload);
@@ -3543,598 +3371,6 @@ fn startup_replays_landed_write_after_restart() {
 }
 
 #[test]
-fn opportunistic_completed_handle_writer_materialization_caps_burst_to_drain_chunk() {
-    let tmp = tempfile::tempdir().unwrap();
-    let cfg = VfsConfig {
-        write_eager_flush_batch_bytes: 16 * 1024 * 1024,
-        ..VfsConfig::default()
-    };
-    let (rt, vfs, meta) =
-        make_unstarted_test_vfs_with_config(&tmp, "sfs-257-write-fh-capped-burst", cfg);
-    let _guard = rt.enter();
-    rt.block_on(async {
-        let attr = vfs
-            .create(1, b"sfs-257-write-fh-capped-burst.txt", 0, 0, 0o644)
-            .unwrap();
-        let ino = attr.ino;
-        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-        let block_size = vfs.block_size as usize;
-        let first = vec![0x11; block_size];
-        let second = vec![0x22; block_size];
-        let third = vec![0x33; block_size];
-
-        vfs.record_handle_writer_state(fh, ino, 0, &first)
-            .await
-            .unwrap();
-        vfs.record_handle_writer_state(fh, ino, block_size as u64, &second)
-            .await
-            .unwrap();
-        vfs.record_handle_writer_state(fh, ino, (block_size * 2) as u64, &third)
-            .await
-            .unwrap();
-
-        assert!(
-            vfs.materialize_completed_handle_writer_blocks_for_inode(
-                ino,
-                LocalSyncPolicy::Opportunistic
-            )
-            .await
-            .unwrap(),
-            "opportunistic materialization should stage at least one capped burst"
-        );
-        assert_eq!(
-            meta.lookup_payload_slices(ino).unwrap().len(),
-            0,
-            "completed payload should stay in local staging until a later flush commits metadata"
-        );
-        assert_eq!(
-            vfs.total_pending_local_dirty_bytes(),
-            0,
-            "completed full logical block should be spilled out of hot RAM once durably staged locally"
-        );
-        assert!(
-            vfs.has_pending_local_dirty_payloads_for_inode(ino),
-            "payload-staged slices should remain locally visible until metadata commit catches up"
-        );
-        assert_eq!(
-            vfs.state.handle_writers.dirty_bytes_for_inode(ino),
-            block_size,
-            "the final completed block should stay buffered for the next opportunistic pass"
-        );
-        let read = vfs.read(ino, 0, (block_size * 3) as u32).await.unwrap();
-        assert_eq!(&read[..block_size], first.as_slice());
-        assert_eq!(&read[block_size..block_size * 2], second.as_slice());
-        assert_eq!(&read[block_size * 2..], third.as_slice());
-
-        vfs.flush_fh(fh).await.unwrap();
-        vfs.release_fh(fh).await.unwrap();
-    });
-}
-
-#[test]
-fn opportunistic_handle_writer_slice_spill_batches_adjacent_callbacks_into_single_object() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-257-write-fh-slice-batch");
-    let _guard = rt.enter();
-    rt.block_on(async {
-        let attr = vfs
-            .create(1, b"sfs-257-write-fh-slice-batch.txt", 0, 0, 0o644)
-            .unwrap();
-        let ino = attr.ino;
-        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-        let slice_bytes = 2 * 1024 * 1024usize;
-
-        let first = vec![0x11; slice_bytes];
-        let second = vec![0x22; slice_bytes];
-        let third = vec![0x33; slice_bytes];
-
-        vfs.record_handle_writer_state(fh, ino, 0, &first)
-            .await
-            .unwrap();
-        vfs.record_handle_writer_state(fh, ino, slice_bytes as u64, &second)
-            .await
-            .unwrap();
-        vfs.record_handle_writer_state(fh, ino, (slice_bytes * 2) as u64, &third)
-            .await
-            .unwrap();
-
-        assert!(
-            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
-                .await
-                .unwrap(),
-            "three sequential 2 MiB callbacks should spill the first 4 MiB as one staged slice object"
-        );
-
-        let dirty_object_ids = vfs.local_payload_backend().dirty_object_ids();
-        assert_eq!(
-            dirty_object_ids.len(),
-            1,
-            "adjacent slice spill should batch the first two callbacks into one staged object"
-        );
-        let staged = vfs
-            .local_payload_backend()
-            .get(dirty_object_ids[0])
-            .expect("staged slice payload should be readable locally");
-        assert_eq!(
-            staged.len(),
-            slice_bytes * 2,
-            "the staged slice object should carry a full 4 MiB batch instead of a single callback"
-        );
-        assert_eq!(
-            vfs.state.handle_writers.dirty_bytes_for_inode(ino),
-            slice_bytes,
-            "the newest callback should remain buffered as the active tail slice"
-        );
-
-        let read = vfs.read(ino, 0, (slice_bytes * 3) as u32).await.unwrap();
-        assert_eq!(&read[..slice_bytes], first.as_slice());
-        assert_eq!(&read[slice_bytes..slice_bytes * 2], second.as_slice());
-        assert_eq!(&read[slice_bytes * 2..], third.as_slice());
-
-        vfs.flush_fh(fh).await.unwrap();
-        vfs.release_fh(fh).await.unwrap();
-    });
-}
-
-#[test]
-fn opportunistic_handle_writer_slice_spill_drains_multiple_4mib_batches_per_pass() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-257-write-fh-slice-multi-batch");
-    let _guard = rt.enter();
-    rt.block_on(async {
-        let attr = vfs
-            .create(1, b"sfs-257-write-fh-slice-multi-batch.txt", 0, 0, 0o644)
-            .unwrap();
-        let ino = attr.ino;
-        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-        let slice_bytes = 2 * 1024 * 1024usize;
-
-        for index in 0..9u64 {
-            let payload = vec![0x40u8.saturating_add(index as u8); slice_bytes];
-            vfs.record_handle_writer_state(fh, ino, index * slice_bytes as u64, &payload)
-                .await
-                .unwrap();
-        }
-
-        assert!(
-            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
-                .await
-                .unwrap(),
-            "a single opportunistic drain pass should spill multiple 4 MiB batches when enough old callbacks are queued"
-        );
-
-        let dirty_object_ids = vfs.local_payload_backend().dirty_object_ids();
-        assert_eq!(
-            dirty_object_ids.len(),
-            4,
-            "eight older 2 MiB callbacks should become four staged 4 MiB slice objects in one pass"
-        );
-        for object_id in dirty_object_ids {
-            let staged = vfs
-                .local_payload_backend()
-                .get(object_id)
-                .expect("staged slice payload should be readable locally");
-            assert_eq!(staged.len(), 4 * 1024 * 1024);
-        }
-        assert_eq!(
-            vfs.state.handle_writers.dirty_bytes_for_inode(ino),
-            slice_bytes,
-            "the newest callback should remain buffered as the active tail slice"
-        );
-
-        vfs.flush_fh(fh).await.unwrap();
-        vfs.release_fh(fh).await.unwrap();
-    });
-}
-
-#[test]
-fn opportunistic_handle_writer_slice_spill_splits_large_current_callback_into_batched_slices() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) =
-        make_unstarted_test_vfs(&tmp, "sfs-257-write-fh-slice-large-current-callback");
-    let _guard = rt.enter();
-    rt.block_on(async {
-        let attr = vfs
-            .create(
-                1,
-                b"sfs-257-write-fh-slice-large-current-callback.txt",
-                0,
-                0,
-                0o644,
-            )
-            .unwrap();
-        let ino = attr.ino;
-        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-        let slice_bytes = 2 * 1024 * 1024usize;
-        let payload = vec![0x5Au8; slice_bytes * 5];
-
-        vfs.record_handle_writer_state(fh, ino, 0, &payload)
-            .await
-            .unwrap();
-
-        assert!(
-            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
-                .await
-                .unwrap(),
-            "a single large callback should spill all but the active hot tail into staged 4 MiB slice batches"
-        );
-
-        let dirty_object_ids = vfs.local_payload_backend().dirty_object_ids();
-        assert_eq!(
-            dirty_object_ids.len(),
-            2,
-            "an opportunistic spill should split a 10 MiB callback into two staged 4 MiB slice objects"
-        );
-        for object_id in dirty_object_ids {
-            let staged = vfs
-                .local_payload_backend()
-                .get(object_id)
-                .expect("staged slice payload should be readable locally");
-            assert_eq!(staged.len(), 4 * 1024 * 1024);
-        }
-        assert_eq!(
-            vfs.state.handle_writers.dirty_bytes_for_inode(ino),
-            slice_bytes,
-            "the newest 2 MiB hot tail should remain buffered after the spill"
-        );
-
-        let read = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
-        assert_eq!(read.as_ref(), payload.as_slice());
-
-        vfs.flush_fh(fh).await.unwrap();
-        vfs.release_fh(fh).await.unwrap();
-    });
-}
-
-#[test]
-fn opportunistic_handle_writer_spill_does_not_split_single_write_and_drop_hot_tail() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-282-spill-keeps-hot-tail");
-    let _guard = rt.enter();
-    rt.block_on(async {
-        let attr = vfs
-            .create(1, b"sfs-282-spill-keeps-hot-tail.txt", 0, 0, 0o644)
-            .unwrap();
-        let ino = attr.ino;
-        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-        let payload = vec![0x6Du8; 3 * 1024 * 1024];
-
-        vfs.record_handle_writer_state(fh, ino, 0, &payload)
-            .await
-            .unwrap();
-        vfs.set_max_dirty_bytes(1);
-
-        assert!(
-            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
-                .await
-                .unwrap(),
-            "limit pressure should still make progress without partially spilling a single write"
-        );
-
-        let read = vfs.read(ino, 0, payload.len() as u32).await.unwrap();
-        assert_eq!(read.as_ref(), payload.as_slice());
-
-        vfs.flush_fh(fh).await.unwrap();
-        vfs.release_fh(fh).await.unwrap();
-    });
-}
-
-#[test]
-fn background_flush_defers_active_persisted_slice_batches_until_commit_window() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-257-background-flush-defers-slices");
-    let _guard = rt.enter();
-    rt.block_on(async {
-        let attr = vfs
-            .create(1, b"sfs-257-background-flush-defers-slices.txt", 0, 0, 0o644)
-            .unwrap();
-        let ino = attr.ino;
-        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-        let slice_bytes = 2 * 1024 * 1024usize;
-
-        for index in 0..3u64 {
-            let payload = vec![0x70u8.saturating_add(index as u8); slice_bytes];
-            vfs.record_handle_writer_state(fh, ino, index * slice_bytes as u64, &payload)
-                .await
-                .unwrap();
-        }
-
-        assert!(
-            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
-                .await
-                .unwrap(),
-            "first opportunistic spill should stage the older 4 MiB batch"
-        );
-
-        assert_eq!(
-            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
-            4 * 1024 * 1024,
-            "the first spilled slice batch should remain locally staged"
-        );
-        assert!(
-            !vfs.should_background_flush_pending_local_dirty_inode(ino),
-            "background local-dirty flush should not immediately commit staged slices while the file still has an active dirty tail"
-        );
-
-        vfs.flush_fh(fh).await.unwrap();
-        vfs.release_fh(fh).await.unwrap();
-    });
-}
-
-#[test]
-fn background_flush_commits_persisted_slice_waves_and_keeps_latest_hot_tail_staged() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-257-background-flush-slice-waves");
-    let _guard = rt.enter();
-    rt.block_on(async {
-        let attr = vfs
-            .create(1, b"sfs-257-background-flush-slice-waves.txt", 0, 0, 0o644)
-            .unwrap();
-        let ino = attr.ino;
-        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-        let slice_bytes = 2 * 1024 * 1024usize;
-
-        for index in 0..17u64 {
-            let payload = vec![0x20u8.saturating_add(index as u8); slice_bytes];
-            vfs.record_handle_writer_state(fh, ino, index * slice_bytes as u64, &payload)
-                .await
-                .unwrap();
-        }
-
-        assert!(
-            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
-                .await
-                .unwrap(),
-            "first opportunistic pass should spill the oldest staged slice wave while retaining a small active hot tail"
-        );
-        assert!(
-            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
-                .await
-                .unwrap(),
-            "second opportunistic pass should spill the next staged slice wave"
-        );
-
-        assert_eq!(
-            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
-            32 * 1024 * 1024,
-            "two opportunistic spill passes should stage 32 MiB of persisted slice payloads"
-        );
-        assert_eq!(
-            vfs.state.handle_writers.dirty_bytes_for_inode(ino),
-            slice_bytes,
-            "the newest callback should remain buffered as the active dirty tail"
-        );
-
-        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
-            .await
-            .unwrap();
-        assert_eq!(
-            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
-            28 * 1024 * 1024,
-            "background flush should commit only one steady oldest slice quota first"
-        );
-
-        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
-            .await
-            .unwrap();
-        assert_eq!(
-            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
-            24 * 1024 * 1024,
-            "subsequent background passes should continue draining old staged slices without touching the hot tail"
-        );
-
-        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
-            .await
-            .unwrap();
-        assert_eq!(
-            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
-            20 * 1024 * 1024,
-            "background flush should keep shrinking the staged backlog in small waves"
-        );
-
-        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
-            .await
-            .unwrap();
-        assert_eq!(
-            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
-            16 * 1024 * 1024,
-            "steady draining should continue one quota at a time while the active tail remains dirty"
-        );
-
-        tokio::time::sleep(Duration::from_millis(125)).await;
-        assert!(
-            vfs.should_background_flush_pending_local_dirty_inode(ino),
-            "steady draining should continue while the staged backlog is above one quota"
-        );
-        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
-            .await
-            .unwrap();
-        assert_eq!(
-            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
-            12 * 1024 * 1024,
-            "steady draining should keep committing one quota per pass"
-        );
-
-        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
-            .await
-            .unwrap();
-        assert_eq!(
-            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
-            8 * 1024 * 1024,
-            "steady draining should not collapse the remaining backlog into a burst"
-        );
-
-        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
-            .await
-            .unwrap();
-        assert_eq!(
-            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
-            4 * 1024 * 1024,
-            "the newest persisted slice should remain staged as the hot tail"
-        );
-
-        tokio::time::sleep(Duration::from_millis(125)).await;
-        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
-            .await
-            .unwrap();
-        assert_eq!(
-            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
-            0,
-            "an aged-out final staged slice should eventually drain"
-        );
-
-        vfs.flush_fh(fh).await.unwrap();
-        vfs.release_fh(fh).await.unwrap();
-    });
-}
-
-#[test]
-fn background_flush_commits_persisted_slices_at_steady_quota() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-286-steady-slice-quota");
-    let _guard = rt.enter();
-    rt.block_on(async {
-        let attr = vfs
-            .create(1, b"sfs-286-steady-slice-quota.txt", 0, 0, 0o644)
-            .unwrap();
-        let ino = attr.ino;
-        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-        let slice_bytes = 2 * 1024 * 1024usize;
-
-        for index in 0..9u64 {
-            let payload = vec![0x40u8.saturating_add(index as u8); slice_bytes];
-            vfs.record_handle_writer_state(fh, ino, index * slice_bytes as u64, &payload)
-                .await
-                .unwrap();
-        }
-
-        assert!(
-            vfs.materialize_handle_writers_for_limits(ino, LocalSyncPolicy::Opportunistic)
-                .await
-                .unwrap(),
-            "opportunistic pass should stage persisted landed slices"
-        );
-        assert_eq!(
-            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
-            16 * 1024 * 1024
-        );
-
-        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
-            .await
-            .unwrap();
-        assert_eq!(
-            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
-            12 * 1024 * 1024,
-            "steady draining should commit one 4 MiB quota instead of an 8 MiB burst"
-        );
-
-        vfs.flush_fh(fh).await.unwrap();
-        vfs.release_fh(fh).await.unwrap();
-    });
-}
-
-#[test]
-fn aged_slice_catchup_keeps_fresh_staged_tail_protected() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-286-aged-fresh-tail");
-    let _guard = rt.enter();
-    rt.block_on(async {
-        let attr = vfs
-            .create(1, b"sfs-286-aged-fresh-tail.txt", 0, 0, 0o644)
-            .unwrap();
-        let ino = attr.ino;
-        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-        let slice_bytes = 2 * 1024 * 1024usize;
-
-        let active_tail = vec![0x60u8; slice_bytes];
-        vfs.record_handle_writer_state(fh, ino, 4 * 1024 * 1024, &active_tail)
-            .await
-            .unwrap();
-        vfs.install_persisted_pending_local_dirty_slice(
-            ino,
-            local_dirty::PersistedPendingLocalDirtySliceSpec {
-                block_index: 0,
-                file_offset: 0,
-                len: slice_bytes,
-                seq: 900,
-                object_id: 900,
-                initial_object_offset: 0,
-            },
-        );
-        assert_eq!(
-            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
-            slice_bytes
-        );
-
-        tokio::time::sleep(Duration::from_millis(125)).await;
-
-        vfs.install_persisted_pending_local_dirty_slice(
-            ino,
-            local_dirty::PersistedPendingLocalDirtySliceSpec {
-                block_index: 0,
-                file_offset: slice_bytes as u64,
-                len: slice_bytes,
-                seq: 901,
-                object_id: 901,
-                initial_object_offset: 0,
-            },
-        );
-        assert_eq!(
-            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
-            2 * slice_bytes
-        );
-
-        vfs.flush_local_dirty_state(ino, LocalSyncPolicy::Opportunistic)
-            .await
-            .unwrap();
-        assert_eq!(
-            vfs.pending_persisted_local_dirty_slice_bytes_for_inode(ino),
-            slice_bytes,
-            "aged catch-up should commit old staged slices without draining the fresh staged tail"
-        );
-
-        vfs.flush_fh(fh).await.unwrap();
-        vfs.release_fh(fh).await.unwrap();
-    });
-}
-
-#[test]
-fn soft_pacing_reacts_to_handle_writer_drain_lag_before_dirty_budget_limit() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-286-lag-soft-pacing");
-    let _guard = rt.enter();
-    rt.block_on(async {
-        vfs.set_max_dirty_bytes(128 * 1024 * 1024);
-        let attr = vfs
-            .create(1, b"sfs-286-lag-soft-pacing.txt", 0, 0, 0o644)
-            .unwrap();
-        let ino = attr.ino;
-        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-        let slice_bytes = 2 * 1024 * 1024usize;
-
-        for index in 0..3u64 {
-            let payload = vec![0x50u8.saturating_add(index as u8); slice_bytes];
-            vfs.record_handle_writer_state(fh, ino, index * slice_bytes as u64, &payload)
-                .await
-                .unwrap();
-        }
-
-        assert_eq!(
-            vfs.total_pending_local_dirty_bytes(),
-            0,
-            "the lag signal should come from landed handle-writer bytes, not old dirty-memory pressure"
-        );
-        assert!(
-            vfs.apply_write_path_soft_pacing(ino).await,
-            "soft pressure should begin once landed writes outpace the background drain"
-        );
-
-        vfs.flush_fh(fh).await.unwrap();
-        vfs.release_fh(fh).await.unwrap();
-    });
-}
-
-#[test]
 fn drain_lag_pacing_attribution_scales_drain_lag_share_to_actual_wait() {
     assert_eq!(
         super::drain_lag_pacing_attribution_ms(12, 12, Some(4)),
@@ -4204,189 +3440,6 @@ fn write_path_observability_reports_landing_drain_lag_without_foreground_pacing(
 
         vfs.flush_fh(fh).await.unwrap();
         vfs.release_fh(fh).await.unwrap();
-    });
-}
-
-#[test]
-fn write_path_dirty_pressure_reports_staged_bytes_and_hard_backpressure() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-297-dirty-pressure");
-    let _guard = rt.enter();
-    rt.block_on(async {
-        vfs.set_max_dirty_bytes(8);
-        let attr1 = vfs
-            .create(1, b"sfs-297-seeded-pressure.bin", 0, 0, 0o644)
-            .unwrap();
-        let attr2 = vfs
-            .create(1, b"sfs-297-hard-pressure.bin", 0, 0, 0o644)
-            .unwrap();
-        let fh1 = 77;
-        let fh2 = vfs.open_file(attr2.ino, OpenFlags::RDWR, false).unwrap();
-
-        vfs.state
-            .handle_writers
-            .open_writer_for_test(fh1, attr1.ino, 0);
-        vfs.state
-            .handle_writers
-            .write(fh1, attr1.ino, 0, vfs.block_size, 0, &[0xAB; 32]);
-
-        vfs.write_fh_with_deferred_materialize(
-            fh2,
-            attr2.ino,
-            0,
-            b"x",
-            LocalSyncPolicy::Opportunistic,
-        )
-        .await
-        .unwrap();
-
-        let hard_snapshot = vfs.write_path_observability_snapshot();
-        assert_eq!(
-            hard_snapshot.write_backpressure.hard_events, 1,
-            "hard backpressure fallback should be counted separately from soft throttle sleeps"
-        );
-
-        let attr3 = vfs
-            .create(1, b"sfs-297-staged-pressure.bin", 0, 0, 0o644)
-            .unwrap();
-        let fh3 = vfs.open_file(attr3.ino, OpenFlags::RDWR, false).unwrap();
-        let slice_bytes = 2 * 1024 * 1024usize;
-        for index in 0..3u64 {
-            let payload = vec![0x50u8.saturating_add(index as u8); slice_bytes];
-            vfs.record_handle_writer_state(fh3, attr3.ino, index * slice_bytes as u64, &payload)
-                .await
-                .unwrap();
-        }
-        assert!(
-            vfs.materialize_handle_writers_for_limits(attr3.ino, LocalSyncPolicy::Opportunistic)
-                .await
-                .unwrap(),
-            "setup should stage older dirty slices without committing them to metadata yet"
-        );
-
-        let upload = vfs.upload_stats();
-        let snapshot = vfs.write_path_observability_snapshot();
-        assert!(
-            snapshot.dirty_pressure.pending_persisted_slice_bytes >= 2 * slice_bytes,
-            "staged-but-not-metadata-committed slices must remain visible in dirty pressure"
-        );
-        assert_eq!(
-            snapshot.dirty_pressure.pending_upload_bytes, upload.pending_upload_bytes as usize,
-            "upload backlog bytes should be reported without being folded into hot dirty bytes"
-        );
-        assert!(
-            snapshot.dirty_pressure.staged_peak_bytes >= 2 * slice_bytes,
-            "status/test reports need a staged-byte peak for pressure regressions"
-        );
-        assert!(
-            snapshot.dirty_pressure.total_accounted_bytes
-                >= snapshot
-                    .dirty_pressure
-                    .total_dirty_bytes
-                    .saturating_add(snapshot.dirty_pressure.pending_persisted_slice_bytes),
-            "total pressure accounting should include hot dirty bytes plus staged slices"
-        );
-
-        vfs.flush_fh(fh2).await.unwrap();
-        vfs.release_fh(fh2).await.unwrap();
-        vfs.flush_fh(fh3).await.unwrap();
-        vfs.release_fh(fh3).await.unwrap();
-    });
-}
-
-#[test]
-fn reset_diagnostics_observability_clears_drain_lag_pacing_counters() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-287-reset-drain-lag-counters");
-    let _guard = rt.enter();
-    rt.block_on(async {
-        vfs.set_max_dirty_bytes(128 * 1024 * 1024);
-        let attr = vfs
-            .create(1, b"sfs-287-reset-drain-lag-counters.txt", 0, 0, 0o644)
-            .unwrap();
-        let ino = attr.ino;
-        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-        let slice_bytes = 2 * 1024 * 1024usize;
-
-        for index in 0..3u64 {
-            let payload = vec![0x70u8.saturating_add(index as u8); slice_bytes];
-            vfs.write_fh_with_deferred_materialize(
-                fh,
-                ino,
-                index * slice_bytes as u64,
-                &payload,
-                LocalSyncPolicy::Opportunistic,
-            )
-            .await
-            .unwrap();
-        }
-
-        assert!(
-            vfs.apply_write_path_soft_pacing(ino).await,
-            "manual soft pacing should still record diagnostics when invoked"
-        );
-
-        let before_reset = vfs.write_path_observability_snapshot();
-        assert!(before_reset.drain_lag.soft_pacing_events > 0);
-        assert!(before_reset.drain_lag.soft_pacing_total_ms > 0);
-
-        vfs.reset_diagnostics_observability();
-
-        let after_reset = vfs.write_path_observability_snapshot();
-        assert_eq!(after_reset.drain_lag.soft_pacing_events, 0);
-        assert_eq!(after_reset.drain_lag.soft_pacing_total_ms, 0);
-        assert_eq!(after_reset.drain_lag.soft_pacing_max_ms, 0);
-
-        vfs.flush_fh(fh).await.unwrap();
-        vfs.release_fh(fh).await.unwrap();
-    });
-}
-
-#[test]
-fn reset_diagnostics_observability_clears_hard_backpressure_events() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-297-reset-hard-backpressure");
-    let _guard = rt.enter();
-    rt.block_on(async {
-        vfs.set_max_dirty_bytes(8);
-        let seed_attr = vfs
-            .create(1, b"sfs-297-reset-hard-backpressure-seed.bin", 0, 0, 0o644)
-            .unwrap();
-        let write_attr = vfs
-            .create(1, b"sfs-297-reset-hard-backpressure-write.bin", 0, 0, 0o644)
-            .unwrap();
-        let seed_fh = 77;
-        let write_fh = vfs
-            .open_file(write_attr.ino, OpenFlags::RDWR, false)
-            .unwrap();
-
-        vfs.state
-            .handle_writers
-            .open_writer_for_test(seed_fh, seed_attr.ino, 0);
-        vfs.state
-            .handle_writers
-            .write(seed_fh, seed_attr.ino, 0, vfs.block_size, 0, &[0xAB; 32]);
-
-        vfs.write_fh_with_deferred_materialize(
-            write_fh,
-            write_attr.ino,
-            0,
-            b"x",
-            LocalSyncPolicy::Opportunistic,
-        )
-        .await
-        .unwrap();
-
-        let before_reset = vfs.write_path_observability_snapshot();
-        assert_eq!(before_reset.write_backpressure.hard_events, 1);
-
-        vfs.reset_diagnostics_observability();
-
-        let after_reset = vfs.write_path_observability_snapshot();
-        assert_eq!(after_reset.write_backpressure.hard_events, 0);
-
-        vfs.flush_fh(write_fh).await.unwrap();
-        vfs.release_fh(write_fh).await.unwrap();
     });
 }
 
@@ -4898,13 +3951,13 @@ fn test_rename_over_existing_target_discards_pending_local_state() {
 }
 
 #[test]
-fn orphan_cleanup_clears_dirty_handle_writer_state_for_deleted_inode() {
+fn orphan_cleanup_clears_dirty_writer_stack_state_for_deleted_inode() {
     let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "orphan-handle-writer-cleanup");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "orphan-writer-stack-cleanup");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
-            .create(1, b"orphan-handle-writer-cleanup.txt", 0, 0, 0o644)
+            .create(1, b"orphan-writer-stack-cleanup.txt", 0, 0, 0o644)
             .unwrap();
         let ino = attr.ino;
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
@@ -4917,7 +3970,7 @@ fn orphan_cleanup_clears_dirty_handle_writer_state_for_deleted_inode() {
             "orphan cleanup test requires buffered writer-stack state before unlink"
         );
 
-        vfs.unlink(1, b"orphan-handle-writer-cleanup.txt").unwrap();
+        vfs.unlink(1, b"orphan-writer-stack-cleanup.txt").unwrap();
         vfs.release_fh(fh).await.unwrap();
 
         assert!(
@@ -5054,13 +4107,13 @@ fn test_fsync_with_outcome_materializes_pending_inode_dirty_state() {
 }
 
 #[test]
-fn test_fsync_with_outcome_reports_handle_writer_file_data_barrier() {
+fn test_fsync_with_outcome_reports_writer_stack_file_data_barrier() {
     let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) = make_test_vfs(&tmp, "fsync-outcome-handle-writer");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "fsync-outcome-writer-stack");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
-            .create(1, b"fsync-outcome-handle-writer.txt", 0, 0, 0o644)
+            .create(1, b"fsync-outcome-writer-stack.txt", 0, 0, 0o644)
             .unwrap();
         let ino = attr.ino;
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
@@ -5923,13 +4976,13 @@ fn flush_fh_default_config_enforces_strict_local_durability() {
 }
 
 #[test]
-fn flush_fh_materializes_opportunistic_handle_writer_state_into_overlay_slices() {
+fn flush_fh_materializes_opportunistic_writer_stack_state_into_overlay_slices() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-flush-handle-writer");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-flush-writer-stack");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
-            .create(1, b"sfs-245-flush-handle-writer.txt", 0, 0, 0o644)
+            .create(1, b"sfs-245-flush-writer-stack.txt", 0, 0, 0o644)
             .unwrap();
         let ino = attr.ino;
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
@@ -5963,7 +5016,7 @@ fn flush_fh_materializes_opportunistic_handle_writer_state_into_overlay_slices()
 }
 
 #[test]
-fn flush_fh_materializes_handle_writer_state_through_strict_local_barrier() {
+fn flush_fh_materializes_writer_stack_state_through_strict_local_barrier() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-245-flush-without-ordered-flush");
     let _guard = rt.enter();
@@ -6000,7 +5053,7 @@ fn flush_fh_materializes_handle_writer_state_through_strict_local_barrier() {
         assert_eq!(
             ordered_flushes_after,
             ordered_flushes_before + 1,
-            "slice-first handle-writer flush should route through one strict local barrier to commit staged slices"
+            "slice-first writer-stack flush should route through one strict local barrier to commit staged slices"
         );
 
         vfs.release_fh(fh).await.unwrap();
@@ -6008,7 +5061,7 @@ fn flush_fh_materializes_handle_writer_state_through_strict_local_barrier() {
 }
 
 #[test]
-fn write_fh_empty_payload_is_a_noop_for_handle_writer_state() {
+fn write_fh_empty_payload_is_a_noop_for_writer_stack_state() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-empty-handle-write");
     let _guard = rt.enter();
@@ -6026,8 +5079,8 @@ fn write_fh_empty_payload_is_a_noop_for_handle_writer_state() {
 
         assert_eq!(written, 0);
         assert!(
-            !vfs.state.handle_writers.has_dirty_writers(ino),
-            "empty handle writes should not create dirty writer state"
+            !vfs.state.writer_stack.has_dirty_writers(ino),
+            "empty handle writes should not create dirty writer-stack state"
         );
         assert!(
             !vfs.state.namespace.dirty_attrs.lock().contains_key(&ino),
@@ -6039,7 +5092,7 @@ fn write_fh_empty_payload_is_a_noop_for_handle_writer_state() {
 }
 
 #[test]
-fn handle_writer_dirty_attrs_keep_nanos_timestamps() {
+fn writer_stack_dirty_attrs_keep_nanos_timestamps() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-245-handle-write-nanos");
     let _guard = rt.enter();
@@ -6071,19 +5124,19 @@ fn handle_writer_dirty_attrs_keep_nanos_timestamps() {
             .expect("dirty attr");
         assert!(
             dirty_attr.mtime >= before.mtime,
-            "handle-writer mtime should not go backwards"
+            "writer-stack mtime should not go backwards"
         );
         assert!(
             dirty_attr.ctime >= before.ctime,
-            "handle-writer ctime should not go backwards"
+            "writer-stack ctime should not go backwards"
         );
         assert!(
             dirty_attr.mtime > 1_000_000_000_000,
-            "handle-writer timestamps should remain in nanoseconds"
+            "writer-stack timestamps should remain in nanoseconds"
         );
         assert!(
             dirty_attr.ctime > 1_000_000_000_000,
-            "handle-writer timestamps should remain in nanoseconds"
+            "writer-stack timestamps should remain in nanoseconds"
         );
 
         vfs.release_fh(fh).await.unwrap();
@@ -6262,13 +5315,13 @@ fn release_fh_default_config_enforces_strict_local_durability() {
 }
 
 #[test]
-fn release_fh_materializes_opportunistic_handle_writer_state() {
+fn release_fh_materializes_opportunistic_writer_stack_state() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-release-handle-writer");
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-release-writer-stack");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
-            .create(1, b"sfs-245-release-handle-writer.txt", 0, 0, 0o644)
+            .create(1, b"sfs-245-release-writer-stack.txt", 0, 0, 0o644)
             .unwrap();
         let ino = attr.ino;
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
@@ -6492,7 +5545,6 @@ fn write_path_observability_reports_vfs_write_stage_breakdown() {
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-vfs-breakdown");
 
     vfs.note_vfs_write_call(4 * 1024 * 1024);
-    vfs.record_vfs_write_record_handle_writer_state(Duration::from_millis(5));
     vfs.record_vfs_write_record_writer_stack_state(Duration::from_millis(3));
     vfs.record_vfs_write_materialize_completed(Duration::from_millis(7));
     vfs.record_vfs_write_materialize_for_limits(Duration::from_millis(2));
@@ -6500,7 +5552,6 @@ fn write_path_observability_reports_vfs_write_stage_breakdown() {
     let snapshot = vfs.write_path_observability_snapshot();
     assert_eq!(snapshot.vfs_write_path.calls, 1);
     assert_eq!(snapshot.vfs_write_path.write_bytes, 4 * 1024 * 1024);
-    assert_eq!(snapshot.vfs_write_path.record_handle_writer_state.calls, 1);
     assert_eq!(snapshot.vfs_write_path.record_writer_stack_state.calls, 1);
     assert_eq!(snapshot.vfs_write_path.materialize_completed.calls, 1);
     assert_eq!(snapshot.vfs_write_path.materialize_strict.calls, 0);
