@@ -222,7 +222,6 @@ impl MountedWriterStack {
                 });
                 if let Some(slice) = chunk.slices.last_mut().filter(|slice| {
                     !slice.frozen
-                        && slice.finished.is_empty()
                         && slice.end == cursor
                         && slice.content_epoch == spec.content_epoch
                 }) {
@@ -376,7 +375,7 @@ impl MountedWriterStack {
         let mut object_count = 0u64;
         for chunk in file.chunks.values_mut() {
             for slice in &mut chunk.slices {
-                if slice.finished.is_empty() {
+                if !slice.frozen && slice.writer.dirty_bytes() > 0 {
                     slice.frozen = true;
                     object_count = object_count.saturating_add(staged_object_count(
                         slice.writer.dirty_bytes(),
@@ -419,10 +418,10 @@ impl MountedWriterStack {
         for chunk in file.chunks.values_mut() {
             chunk.slices.sort_by_key(|slice| slice.seq);
             for slice in &mut chunk.slices {
-                if !slice.finished.is_empty() {
+                if !slice.frozen {
                     continue;
                 }
-                if !slice.frozen {
+                if slice.writer.dirty_bytes() == 0 {
                     continue;
                 }
                 if let Some(object_id) = next_object_id {
@@ -456,6 +455,103 @@ impl MountedWriterStack {
                 .remove(&ino);
         }
         if clean {
+            self.remove_file_if_clean_and_closed(ino);
+        }
+        Ok(finished)
+    }
+
+    pub(super) fn completed_block_count_for_inode(
+        &self,
+        ino: Ino,
+    ) -> Result<u32, WriterStackError> {
+        let file = {
+            let shard = self.shards[Self::inode_shard_index(ino)].lock();
+            let Some(file) = shard.files.get(&ino) else {
+                return Ok(0);
+            };
+            Arc::clone(file)
+        };
+        let file = file.lock();
+        if file.ino != ino {
+            return Ok(0);
+        };
+        let mut object_count = 0usize;
+        for chunk in file.chunks.values() {
+            for slice in &chunk.slices {
+                if slice.frozen {
+                    continue;
+                }
+                object_count = object_count
+                    .checked_add(slice.writer.completed_block_count())
+                    .ok_or(WriterStackError::ObjectReservationTooLarge)?;
+            }
+        }
+        u32::try_from(object_count).map_err(|_| WriterStackError::ObjectReservationTooLarge)
+    }
+
+    pub(super) fn flush_completed_blocks_for_inode(
+        &self,
+        ino: Ino,
+        first_object_id: u64,
+        max_blocks: usize,
+    ) -> Result<Vec<FinishedWriterSlice>, WriterStackError> {
+        if max_blocks == 0 {
+            return Ok(Vec::new());
+        }
+        let file = {
+            let shard = self.shards[Self::inode_shard_index(ino)].lock();
+            let Some(file) = shard.files.get(&ino) else {
+                return Ok(Vec::new());
+            };
+            Arc::clone(file)
+        };
+        let mut file = file.lock();
+        if file.ino != ino {
+            return Ok(Vec::new());
+        };
+
+        let mut finished = Vec::new();
+        let mut staged_dirty_bytes = 0usize;
+        let chunk_size = self.config.chunk_size;
+        let mut next_object_id = first_object_id;
+        let mut remaining_blocks = max_blocks;
+        for chunk in file.chunks.values_mut() {
+            chunk.slices.sort_by_key(|slice| slice.seq);
+            for slice in &mut chunk.slices {
+                if remaining_blocks == 0 {
+                    break;
+                }
+                if slice.frozen || slice.writer.completed_block_count() == 0 {
+                    continue;
+                }
+                slice.writer.set_next_object_id(next_object_id);
+                let staged = slice.writer.flush_completed_blocks(remaining_blocks)?;
+                if staged.is_empty() {
+                    continue;
+                }
+                remaining_blocks = remaining_blocks.saturating_sub(staged.len());
+                next_object_id = next_object_id.saturating_add(staged.len() as u64);
+                let converted = staged
+                    .into_iter()
+                    .map(|staged| {
+                        finished_slice_from_staged(chunk.chunk_id, chunk_size, slice, staged)
+                    })
+                    .collect::<Vec<_>>();
+                let staged_len: usize = converted.iter().map(|slice| slice.len as usize).sum();
+                staged_dirty_bytes = staged_dirty_bytes.saturating_add(staged_len);
+                slice.finished.extend(converted.clone());
+                finished.extend(converted);
+            }
+        }
+        file.dirty_bytes = file.dirty_bytes.saturating_sub(staged_dirty_bytes);
+        let clean = file.dirty_bytes == 0;
+        drop(file);
+        self.subtract_dirty(staged_dirty_bytes);
+        if clean {
+            self.shards[Self::inode_shard_index(ino)]
+                .lock()
+                .dirty_inodes
+                .remove(&ino);
             self.remove_file_if_clean_and_closed(ino);
         }
         Ok(finished)
@@ -1014,6 +1110,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![600, 601, 602]
         );
+    }
+
+    #[test]
+    fn writer_stack_flush_completed_blocks_leaves_partial_tail_buffered() {
+        let (_dir, stack, _rx) = temp_stack(64, 8);
+
+        stack
+            .write_bytes(
+                write_spec(1, 7, 0, 500),
+                Bytes::from_static(b"abcdefghijkl"),
+            )
+            .expect("write full block and tail");
+
+        let finished = stack
+            .flush_completed_blocks_for_inode(7, 900, usize::MAX)
+            .expect("flush completed blocks");
+
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].object_id, 900);
+        assert_eq!(finished[0].chunk_offset, 0);
+        assert_eq!(finished[0].len, 8);
+        assert_eq!(stack.dirty_bytes_for_inode(7), 4);
+        let spans = stack.snapshot_read_spans(7, 8, 4);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].data.as_ref(), b"ijkl");
     }
 
     #[test]
