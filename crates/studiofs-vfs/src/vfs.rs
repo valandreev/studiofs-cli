@@ -2655,16 +2655,7 @@ impl<'a> StartupReplayCoordinator<'a> {
 
         if self.has_dirty_or_recovered_objects() {
             for graph_object in &graph_objects {
-                if self.take_dirty_object(graph_object.object_id) {
-                    self.recovered_dirty_object_ids
-                        .insert(graph_object.object_id);
-                    self.record_replayed_graph_object(ino, graph_object, attr.content_epoch);
-                } else if self
-                    .recovered_dirty_object_ids
-                    .contains(&graph_object.object_id)
-                {
-                    self.record_recovered_live_extent(ino, graph_object, attr.content_epoch);
-                }
+                self.record_recovered_graph_object_if_local(ino, graph_object, attr.content_epoch);
             }
         }
 
@@ -2738,6 +2729,24 @@ impl<'a> StartupReplayCoordinator<'a> {
             content_epoch,
         );
         self.restored_live_extents = self.restored_live_extents.saturating_add(1);
+    }
+
+    fn record_recovered_graph_object_if_local(
+        &mut self,
+        ino: Ino,
+        graph_object: &StartupGraphObject,
+        content_epoch: u64,
+    ) {
+        if self.take_dirty_object(graph_object.object_id) {
+            self.recovered_dirty_object_ids
+                .insert(graph_object.object_id);
+            self.record_replayed_graph_object(ino, graph_object, content_epoch);
+        } else if self
+            .recovered_dirty_object_ids
+            .contains(&graph_object.object_id)
+        {
+            self.record_recovered_live_extent(ino, graph_object, content_epoch);
+        }
     }
 
     fn record_recovered_live_extent(
@@ -2905,15 +2914,10 @@ impl<'a> StartupReplayCoordinator<'a> {
 
     fn cleanup_unreferenced_local_payloads(
         &mut self,
+        local_object_ids: BTreeSet<u64>,
         protected_object_ids: &HashSet<u64>,
         reachable_object_ids: Option<&HashSet<u64>>,
     ) {
-        let local_object_ids: BTreeSet<_> = self
-            .vfs
-            .local_payload_backend
-            .object_ids()
-            .into_iter()
-            .collect();
         if local_object_ids.is_empty() {
             return;
         }
@@ -2987,7 +2991,7 @@ impl<'a> StartupReplayCoordinator<'a> {
     fn finish(mut self) {
         self.discard_quarantined_dirty_objects();
         self.merge_pending_live_extents();
-        let replayed_blocks = self.replay_ops.len() as u64;
+        let replayed_blocks = self.restored_live_extents as u64;
         let replayed_object_ids: Vec<_> = self
             .replay_ops
             .iter()
@@ -3079,7 +3083,17 @@ impl<'a> StartupReplayCoordinator<'a> {
                 }),
             );
         }
-        let reachable_object_ids = self.metadata_reachable_object_ids();
+        let local_object_ids: BTreeSet<_> = self
+            .vfs
+            .local_payload_backend
+            .object_ids()
+            .into_iter()
+            .collect();
+        let reachable_object_ids = if self.dirty_set.is_empty() && local_object_ids.is_empty() {
+            None
+        } else {
+            self.metadata_reachable_object_ids()
+        };
         self.cleanup_orphan_dirty_payloads(reachable_object_ids.as_ref());
         let protected_object_ids: HashSet<_> = replayed_object_ids
             .iter()
@@ -3087,6 +3101,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             .chain(self.dirty_set.iter().copied())
             .collect();
         self.cleanup_unreferenced_local_payloads(
+            local_object_ids,
             &protected_object_ids,
             reachable_object_ids.as_ref(),
         );

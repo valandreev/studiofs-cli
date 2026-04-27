@@ -741,6 +741,18 @@ fn startup_replay_restores_all_block_extents_when_one_file_reuses_dirty_object_i
         1,
         "one physical dirty object should still map to one upload submission"
     );
+    let summary = vfs
+        .zeroio_runtime_snapshot()
+        .startup_replay
+        .expect("startup replay summary should be visible");
+    assert_eq!(
+        summary.replayed_blocks, 2,
+        "replayed_blocks should count restored logical extents, not deduped upload ops"
+    );
+    assert_eq!(
+        summary.queued_uploads, 1,
+        "queued_uploads should stay deduped to one physical upload op"
+    );
 }
 
 #[test]
