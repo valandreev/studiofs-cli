@@ -1,7 +1,7 @@
 use crate::cli::utils::{format_bytes, format_throughput};
 use std::fmt::Write as _;
 
-use super::super::result::BenchmarkReport;
+use super::super::result::{BenchmarkReport, MountedObservabilityReport, MountedRuntimeReport};
 
 fn format_duration_ms(ms: f64) -> String {
     if ms >= 1000.0 {
@@ -54,6 +54,92 @@ fn format_table(headers: &[&str], rows: &[Vec<String>]) -> String {
     }
     write_border(&mut out);
     out
+}
+
+fn render_mounted_runtime(out: &mut String, runtime: &MountedRuntimeReport) {
+    out.push('\n');
+    let _ = writeln!(out, "Mounted runtime");
+    let _ = writeln!(out, "Mounted path:  {}", runtime.mounted_path);
+    let _ = writeln!(out, "Cache root:    {}", runtime.cache_root);
+    let _ = writeln!(
+        out,
+        "Metadata root: {}",
+        runtime.metadata_root.as_deref().unwrap_or("n/a")
+    );
+    let _ = writeln!(
+        out,
+        "Platform:      {} / {}",
+        runtime.os, runtime.bridge_type
+    );
+    let _ = writeln!(
+        out,
+        "Block/chunk/read: {}/{}/{}",
+        format_bytes(runtime.block_size),
+        format_bytes(runtime.chunk_size),
+        format_bytes(runtime.read_size),
+    );
+}
+
+fn render_mounted_observability(out: &mut String, observability: &MountedObservabilityReport) {
+    out.push('\n');
+    let _ = writeln!(out, "Mounted observability");
+    if let Some(writer) = &observability.writer {
+        let _ = writeln!(
+            out,
+            "Writer dirty: {}, slices {}, frozen {}, staged {}, limit {}",
+            format_bytes(writer.dirty_bytes as u64),
+            writer.dirty_slice_count,
+            writer.frozen_slice_count,
+            format_bytes(writer.staged_bytes as u64),
+            format_bytes(writer.dirty_limit_bytes as u64),
+        );
+    }
+    if let Some(cached_store) = &observability.cached_store
+        && !cached_store.cache_counters_available
+        && let Some(reason) = &cached_store.cache_counters_unavailable_reason
+    {
+        let _ = writeln!(out, "Cache counters: n/a ({reason})");
+    }
+    if let Some(upload) = &observability.upload {
+        let _ = writeln!(
+            out,
+            "Upload: backlog {} ({}), active {}, completed {} ({}), throughput {}, retries {}",
+            upload.backlog_count,
+            format_bytes(upload.backlog_bytes),
+            upload.active_uploads,
+            upload.completed_uploads,
+            format_bytes(upload.completed_upload_bytes),
+            format_throughput(upload.throughput_bytes_per_sec),
+            upload.retry_count,
+        );
+    }
+    if let Some(barriers) = &observability.barriers {
+        let _ = writeln!(
+            out,
+            "Barriers: flush {}, fsync {}, close {}, cleanup {}, avg {} p95 {}",
+            barriers.flush_barrier_calls,
+            barriers.fsync_barrier_calls,
+            barriers.close_barrier_calls,
+            barriers.cleanup_barrier_calls,
+            format_duration_ms(barriers.flush_fsync_close_latency.avg_ms),
+            format_duration_ms(barriers.flush_fsync_close_latency.latency_quantiles_ms.p95),
+        );
+    }
+    if let Some(idle) = &observability.post_upload_idle {
+        let _ = writeln!(
+            out,
+            "Post-upload idle: observed {}, timed out {}, wait {}, pending {}/{}{}",
+            if idle.observed { "yes" } else { "no" },
+            if idle.timed_out { "yes" } else { "no" },
+            format_duration_ms(idle.wait_ms),
+            idle.pending_uploads_before,
+            idle.pending_uploads_after,
+            idle.reason
+                .as_ref()
+                .map(|reason| format!(", reason: {reason}"))
+                .unwrap_or_default(),
+        );
+    }
 }
 
 pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
@@ -130,82 +216,10 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
         );
     }
     if let Some(runtime) = &report.mounted_runtime {
-        out.push('\n');
-        let _ = writeln!(&mut out, "Mounted runtime");
-        let _ = writeln!(&mut out, "Mounted path:  {}", runtime.mounted_path);
-        let _ = writeln!(&mut out, "Cache root:    {}", runtime.cache_root);
-        let _ = writeln!(
-            &mut out,
-            "Metadata root: {}",
-            runtime.metadata_root.as_deref().unwrap_or("n/a")
-        );
-        let _ = writeln!(
-            &mut out,
-            "Platform:      {} / {}",
-            runtime.os, runtime.bridge_type
-        );
-        let _ = writeln!(
-            &mut out,
-            "Block/chunk/read: {}/{}/{}",
-            format_bytes(runtime.block_size),
-            format_bytes(runtime.chunk_size),
-            format_bytes(runtime.read_size),
-        );
+        render_mounted_runtime(&mut out, runtime);
     }
     if let Some(observability) = &report.mounted_observability {
-        out.push('\n');
-        let _ = writeln!(&mut out, "Mounted observability");
-        if let Some(writer) = &observability.writer {
-            let _ = writeln!(
-                &mut out,
-                "Writer dirty: {}, slices {}, frozen {}, staged {}, limit {}",
-                format_bytes(writer.dirty_bytes as u64),
-                writer.dirty_slice_count,
-                writer.frozen_slice_count,
-                format_bytes(writer.staged_bytes as u64),
-                format_bytes(writer.dirty_limit_bytes as u64),
-            );
-        }
-        if let Some(upload) = &observability.upload {
-            let _ = writeln!(
-                &mut out,
-                "Upload: backlog {} ({}), active {}, completed {} ({}), throughput {}, retries {}",
-                upload.backlog_count,
-                format_bytes(upload.backlog_bytes),
-                upload.active_uploads,
-                upload.completed_uploads,
-                format_bytes(upload.completed_upload_bytes),
-                format_throughput(upload.throughput_bytes_per_sec),
-                upload.retry_count,
-            );
-        }
-        if let Some(barriers) = &observability.barriers {
-            let _ = writeln!(
-                &mut out,
-                "Barriers: flush {}, fsync {}, close {}, cleanup {}, avg {} p95 {}",
-                barriers.flush_barrier_calls,
-                barriers.fsync_barrier_calls,
-                barriers.close_barrier_calls,
-                barriers.cleanup_barrier_calls,
-                format_duration_ms(barriers.flush_fsync_close_latency.avg_ms),
-                format_duration_ms(barriers.flush_fsync_close_latency.latency_quantiles_ms.p95),
-            );
-        }
-        if let Some(idle) = &observability.post_upload_idle {
-            let _ = writeln!(
-                &mut out,
-                "Post-upload idle: observed {}, timed out {}, wait {}, pending {}/{}{}",
-                if idle.observed { "yes" } else { "no" },
-                if idle.timed_out { "yes" } else { "no" },
-                format_duration_ms(idle.wait_ms),
-                idle.pending_uploads_before,
-                idle.pending_uploads_after,
-                idle.reason
-                    .as_ref()
-                    .map(|reason| format!(", reason: {reason}"))
-                    .unwrap_or_default(),
-            );
-        }
+        render_mounted_observability(&mut out, observability);
     }
     out.push('\n');
     let _ = writeln!(&mut out, "Operation results");

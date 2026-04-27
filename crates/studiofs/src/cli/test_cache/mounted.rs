@@ -539,6 +539,11 @@ fn build_mounted_observability_report(
             ),
             staging_latency: snapshot.payload_persist.clone(),
             local_cache_backend_latency: snapshot.local_cache_io.clone(),
+            cache_counters_available: false,
+            cache_counters_unavailable_reason: Some(
+                "mounted write-path snapshot does not expose read-cache hit/miss counters"
+                    .to_string(),
+            ),
             cache_hits: None,
             cache_misses: None,
         }),

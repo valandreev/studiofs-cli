@@ -154,6 +154,9 @@ pub(super) struct MountedCachedStoreReport {
     pub(super) staging_throughput_bytes_per_sec: f64,
     pub(super) staging_latency: VfsWritePathStageLatencyStats,
     pub(super) local_cache_backend_latency: studiofs_vfs::VfsWritePathLocalCacheIoStats,
+    pub(super) cache_counters_available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) cache_counters_unavailable_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) cache_hits: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -767,6 +770,8 @@ pub(crate) fn sample_report() -> BenchmarkReport {
                     ..Default::default()
                 },
                 local_cache_backend_latency: Default::default(),
+                cache_counters_available: true,
+                cache_counters_unavailable_reason: None,
                 cache_hits: Some(9),
                 cache_misses: Some(7),
             }),
