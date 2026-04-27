@@ -25,7 +25,8 @@ pub use benchmark_cache::{
 };
 pub use cached_store::{
     CachedStore, CachedStoreConfig, CachedStoreWriterConfig, CachedStoreWriterCountersSnapshot,
-    CachedStoreWriterError, CachedStoreWriterSlice, StagedSlice, WriterWriteResult,
+    CachedStoreWriterError, CachedStoreWriterSlice, DetachedStagedSlice, StagedSlice,
+    WriterWriteResult,
 };
 pub use runtime::{
     LocalPayloadBackendConfig as PersistentLocalPayloadBackendConfig, LocalPayloadBackendKind,

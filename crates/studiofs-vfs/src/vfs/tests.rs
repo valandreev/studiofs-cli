@@ -15,6 +15,23 @@ use studiofs_meta::{
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
+#[derive(Default)]
+struct RecordingKernelInvalidator {
+    seen: parking_lot::Mutex<Vec<Ino>>,
+}
+
+impl RecordingKernelInvalidator {
+    fn snapshot(&self) -> Vec<Ino> {
+        self.seen.lock().clone()
+    }
+}
+
+impl KernelInvalidator for RecordingKernelInvalidator {
+    fn inval_inode(&self, ino: Ino) {
+        self.seen.lock().push(ino);
+    }
+}
+
 fn test_format_info(volume_suffix: &str) -> FormatInfo {
     let volume_name = format!("namespace-resolver-{volume_suffix}-{}", std::process::id());
     FormatInfo {
@@ -1879,7 +1896,9 @@ fn cache_runtime_tuning_defaults_match_juicefs_sized_windows() {
     let derived =
         derive_cache_runtime_tuning(100 * 1024 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024);
 
-    assert_eq!(derived.max_dirty_bytes, DEFAULT_MAX_DIRTY_BYTES);
+    assert_eq!(DEFAULT_MAX_DIRTY_BYTES, 300 * 1024 * 1024);
+    assert_eq!(derived.max_dirty_bytes, 300 * 1024 * 1024);
+    assert_eq!(derived.write_eager_flush_batch_bytes, 64 * 1024 * 1024);
     assert_eq!(derived.transit_memory_budget_bytes, 300 * 1024 * 1024);
 }
 
@@ -2901,6 +2920,48 @@ fn aggressive_materialization_threshold_is_half_of_dirty_budget() {
 }
 
 #[test]
+fn completed_block_materialization_respects_eager_batch_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = VfsConfig {
+        write_eager_flush_batch_bytes: 8 * 1024 * 1024,
+        ..VfsConfig::default()
+    };
+    let (rt, vfs, _meta) =
+        make_unstarted_test_vfs_with_config(&tmp, "writer-stack-completed-batch-cap", cfg);
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"writer-stack-completed-batch-cap.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        let block_size = vfs.block_size as usize;
+        let payload = vec![0x5Au8; block_size * 3];
+
+        vfs.record_writer_stack_state_bytes(fh, attr.ino, 0, &payload)
+            .await
+            .unwrap();
+        let materialized = vfs
+            .materialize_writer_stack_completed_blocks_for_inode(attr.ino)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            materialized,
+            block_size * 2,
+            "one completed-block pass should not detach more than the eager batch limit"
+        );
+        assert_eq!(
+            vfs.state
+                .writer_stack
+                .completed_block_count_for_inode(attr.ino)
+                .unwrap(),
+            1,
+            "blocks beyond the batch cap should remain buffered for the next drain pass"
+        );
+    });
+}
+
+#[test]
 fn ingress_pressure_counts_buffered_writer_stack_bytes() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-ingress-pressure-writer-stack");
@@ -3112,6 +3173,58 @@ fn deferred_write_keeps_writeback_path_when_soft_dirty_budget_is_full() {
 
         vfs.release_fh(fh).await.unwrap();
         vfs.release_fh(pressure_fh).await.unwrap();
+    });
+}
+
+#[test]
+fn writer_stack_write_invalidates_attr_and_kernel_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "writer-stack-write-invalidation");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"writer-stack-write-invalidation.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.getattr_async(attr.ino).await.unwrap();
+        assert!(
+            vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(attr.ino),
+            "setup should populate the attr read cache before the write"
+        );
+
+        let invalidator = Arc::new(RecordingKernelInvalidator::default());
+        vfs.set_kernel_invalidator(invalidator.clone());
+
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            attr.ino,
+            0,
+            b"juicefs-style-invalidate",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(attr.ino),
+            "accepted local writes should evict stale attr cache entries"
+        );
+        assert_eq!(
+            invalidator.snapshot(),
+            vec![attr.ino],
+            "accepted local writes should notify the kernel cache invalidator"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
     });
 }
 

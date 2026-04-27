@@ -3,7 +3,7 @@ use crate::utils::{IntervalRange, trim_range_to_available_len};
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::time::{Duration, Instant};
 
-const PENDING_SLICE_COMMIT_MAX_AGE: Duration = Duration::from_millis(100);
+const PENDING_SLICE_COMMIT_MAX_AGE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub(super) struct PendingPayload {
@@ -1968,8 +1968,8 @@ impl StudioVfs {
     }
 
     fn pending_slice_commit_wave_bytes(&self) -> usize {
-        self.writer_stack_steady_drain_quota_bytes()
-            .min(self.write_eager_flush_drain_chunk_bytes)
+        (studiofs_meta::schema::DEFAULT_CHUNK_SIZE as usize)
+            .max(self.block_size as usize)
             .max(1)
     }
 
@@ -2017,7 +2017,7 @@ impl StudioVfs {
             .sum();
         let oldest_age = self.oldest_pending_persisted_local_dirty_slice_age(&pending_slices);
         let commit_wave_bytes = self.pending_slice_commit_wave_bytes();
-        if total_bytes <= commit_wave_bytes
+        if total_bytes < commit_wave_bytes
             && oldest_age.is_none_or(|age| age < PENDING_SLICE_COMMIT_MAX_AGE)
         {
             return std::collections::BTreeMap::new();
@@ -2032,7 +2032,9 @@ impl StudioVfs {
         ordered_slices.sort_by_key(|(chunk_id, slice)| slice.order_key(*chunk_id));
 
         let now = Instant::now();
-        let mut retain_tail_bytes = self.pending_slice_commit_hot_tail_bytes();
+        let mut retain_tail_bytes = self
+            .pending_slice_commit_hot_tail_bytes()
+            .min(total_bytes.saturating_sub(commit_wave_bytes));
         let mut commit_candidates = Vec::<(u64, PendingDirtySlice)>::new();
         for (chunk_id, slice) in ordered_slices.iter().rev().copied() {
             let slice_len = slice.len();
@@ -2128,7 +2130,7 @@ impl StudioVfs {
             return true;
         }
 
-        pending_slice_bytes > self.pending_slice_commit_wave_bytes()
+        pending_slice_bytes >= self.pending_slice_commit_wave_bytes()
             || self
                 .oldest_pending_persisted_local_dirty_slice_age(&pending_slices)
                 .is_some_and(|age| age >= PENDING_SLICE_COMMIT_MAX_AGE)
@@ -3333,6 +3335,86 @@ mod tests {
         vfs.clear_pending_dirty_slices_for_inode(ino);
 
         assert_eq!(vfs.pending_local_dirty_slice_counts(), (0, 0));
+    }
+
+    #[test]
+    fn opportunistic_pending_slice_commit_waits_for_chunk_sized_wave_while_tail_is_open() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-slice-chunk-wave");
+        let _guard = rt.enter();
+        let ino = rt.block_on(async {
+            let attr = vfs
+                .create(1, b"pending-slice-chunk-wave.txt", 0, 0, 0o644)
+                .expect("create file");
+            let fh = vfs
+                .open_file(attr.ino, OpenFlags::RDWR, false)
+                .expect("open file");
+            vfs.write_fh(fh, attr.ino, 0, b"tail")
+                .await
+                .expect("seed open writer tail");
+            attr.ino
+        });
+
+        let block_size = vfs.block_size as usize;
+        let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as usize;
+        let blocks_per_chunk = chunk_size / block_size;
+        let moderately_aged_created_at = Instant::now()
+            .checked_sub(Duration::from_millis(250))
+            .expect("old instant");
+        let mut persisted = std::collections::BTreeMap::<u64, Vec<PendingDirtySlice>>::new();
+        for block in 0..blocks_per_chunk.saturating_sub(1) {
+            let start = u32::try_from(block * block_size).expect("slice start");
+            let end = start.saturating_add(vfs.block_size);
+            persisted.entry(0).or_default().push(PendingDirtySlice {
+                range: studiofs_meta::schema::SliceRange::new(start, end).expect("slice range"),
+                block_index: block as u32,
+                block_offset: 0,
+                seq: block as u64 + 1,
+                object_id: Some(10_000 + block as u64),
+                object_offset: 0,
+                created_at: moderately_aged_created_at,
+            });
+        }
+
+        let selected = vfs.select_pending_persisted_local_dirty_slice_commit_wave(
+            ino,
+            persisted.clone(),
+            LocalSyncPolicy::Opportunistic,
+        );
+        assert!(
+            selected.is_empty(),
+            "sub-chunk persisted blocks should wait for a JuiceFS-style chunk-sized metadata wave while an open writer tail remains"
+        );
+
+        let start = u32::try_from((blocks_per_chunk - 1) * block_size).expect("slice start");
+        persisted.entry(0).or_default().push(PendingDirtySlice {
+            range: studiofs_meta::schema::SliceRange::new(
+                start,
+                start.saturating_add(vfs.block_size),
+            )
+            .expect("slice range"),
+            block_index: (blocks_per_chunk - 1) as u32,
+            block_offset: 0,
+            seq: blocks_per_chunk as u64,
+            object_id: Some(10_000 + blocks_per_chunk as u64),
+            object_offset: 0,
+            created_at: moderately_aged_created_at,
+        });
+
+        let selected = vfs.select_pending_persisted_local_dirty_slice_commit_wave(
+            ino,
+            persisted,
+            LocalSyncPolicy::Opportunistic,
+        );
+        let selected_bytes: usize = selected
+            .values()
+            .flat_map(|slices| slices.iter())
+            .map(|slice| slice.len())
+            .sum();
+        assert_eq!(
+            selected_bytes, chunk_size,
+            "a full 64MiB chunk worth of persisted 4MiB blocks should commit in one metadata wave"
+        );
     }
 
     #[test]

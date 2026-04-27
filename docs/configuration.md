@@ -426,11 +426,11 @@ Operator stance:
 | `--prefetch` | `1` | Prefetch concurrency budget |
 | `--principal` / `STUDIOFS_PRINCIPAL` | `*` | Principal used for ACL checks |
 
-The writeback dirty-buffer default is hardcoded to `1200MB` (`max_dirty_bytes`) to give
-long sequential writers a slightly wider smoothing window before hard backpressure.
-StudioFS derives the soft throttle window and hard safety threshold from that
-single dirty budget. Upload backlog bytes are reported separately and do not by
-themselves stall ordinary writes while local cache headroom remains available.
+The writeback dirty-buffer default is `300MB` (`max_dirty_bytes`), matching the
+JuiceFS default read/write buffer size. StudioFS derives the soft throttle window
+and hard safety threshold from that single dirty budget. Upload backlog bytes are
+reported separately and do not by themselves stall ordinary writes while local
+cache headroom remains available.
 
 ### Expert overrides
 

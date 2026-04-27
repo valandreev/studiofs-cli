@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use studiofs_cache::{
     CachedStore, CachedStoreWriterConfig, CachedStoreWriterError, CachedStoreWriterSlice,
-    StagedSlice,
+    DetachedStagedSlice, StagedSlice,
 };
 use studiofs_meta::schema::{ChunkId, chunk_id_from_offset, chunk_start_offset};
 use studiofs_meta::types::Ino;
@@ -30,6 +30,15 @@ pub(super) struct FinishedWriterSlice {
     pub(super) object_offset: u32,
     pub(super) seq: u64,
     pub(super) content_epoch: u64,
+}
+
+#[derive(Debug, Clone)]
+struct MaterializingReadSpan {
+    start: u64,
+    end: u64,
+    object_id: u64,
+    seq: u64,
+    data: Bytes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +99,12 @@ struct SliceWriter {
     writer: CachedStoreWriterSlice,
     frozen: bool,
     finished: Vec<FinishedWriterSlice>,
+    materializing: Vec<MaterializingReadSpan>,
+}
+
+struct DetachedFinishedWriterSlice {
+    finished: FinishedWriterSlice,
+    detached: DetachedStagedSlice,
 }
 
 #[allow(dead_code)]
@@ -151,12 +166,16 @@ impl MountedWriterStack {
         }
     }
 
-    pub(super) fn write_bytes(
+    pub(super) fn write_bytes<D>(
         &self,
         spec: WriterWriteSpec,
-        data: Bytes,
-    ) -> Result<WriterAccept, WriterStackError> {
+        data: D,
+    ) -> Result<WriterAccept, WriterStackError>
+    where
+        D: AsRef<[u8]>,
+    {
         self.validate_geometry()?;
+        let data = data.as_ref();
         if data.is_empty() {
             let next_object_id =
                 self.next_object_id_for_empty_write(spec.ino, spec.first_object_id);
@@ -211,7 +230,7 @@ impl MountedWriterStack {
             let chunk_start = chunk_start_offset(chunk_id, self.config.chunk_size);
             let chunk_end = chunk_start.saturating_add(u64::from(self.config.chunk_size));
             let take = (chunk_end - cursor).min((data.len() - data_offset) as u64) as usize;
-            let segment = data.slice(data_offset..data_offset + take);
+            let segment = &data[data_offset..data_offset + take];
             let end = cursor
                 .checked_add(take as u64)
                 .ok_or(WriterStackError::OffsetOverflow)?;
@@ -227,7 +246,7 @@ impl MountedWriterStack {
                 }) {
                     let before_objects =
                         staged_object_count(slice.writer.dirty_bytes(), self.config.block_size);
-                    let result = slice.writer.write_at(cursor, segment.as_ref())?;
+                    let result = slice.writer.write_at(cursor, segment)?;
                     let after_objects =
                         staged_object_count(result.dirty_bytes, self.config.block_size);
                     slice.end = end;
@@ -251,7 +270,7 @@ impl MountedWriterStack {
                             max_buffer_bytes: self.config.max_buffer_bytes,
                             submit_upload: false,
                         });
-                    let result = writer.write_at(cursor, segment.as_ref())?;
+                    let result = writer.write_at(cursor, segment)?;
                     let object_ids_used =
                         staged_object_count(result.dirty_bytes, self.config.block_size);
                     chunk.slices.push(SliceWriter {
@@ -263,6 +282,7 @@ impl MountedWriterStack {
                         writer,
                         frozen: false,
                         finished: Vec::new(),
+                        materializing: Vec::new(),
                     });
                     (result.accepted_bytes, object_ids_used, result.throttled)
                 }
@@ -327,6 +347,20 @@ impl MountedWriterStack {
             .map(|(_, chunk)| chunk)
         {
             for slice in &chunk.slices {
+                for materializing in &slice.materializing {
+                    let start = materializing.start.max(offset);
+                    let stop = materializing.end.min(end);
+                    if start >= stop {
+                        continue;
+                    }
+                    spans.push(WriterStackReadSpan {
+                        start,
+                        end: stop,
+                        block_offset: start.saturating_sub(materializing.start),
+                        seq: materializing.seq,
+                        data: materializing.data.clone(),
+                    });
+                }
                 let start = slice.start.max(offset);
                 let stop = slice.end.min(end);
                 if start >= stop {
@@ -342,7 +376,7 @@ impl MountedWriterStack {
                 spans.push(WriterStackReadSpan {
                     start,
                     end: start.saturating_add(read as u64),
-                    block_offset: start.saturating_sub(slice.start),
+                    block_offset: 0,
                     seq: slice.seq,
                     data: Bytes::from(data),
                 });
@@ -357,7 +391,13 @@ impl MountedWriterStack {
         ino: Ino,
     ) -> Result<Vec<FinishedWriterSlice>, WriterStackError> {
         self.prepare_finish_inode(ino)?;
-        self.finish_prepared_inode_with_object_ids(ino, None)
+        let finished = self.finish_prepared_inode_with_object_ids(ino, None)?;
+        let object_ids = finished
+            .iter()
+            .map(|slice| slice.object_id)
+            .collect::<Vec<_>>();
+        self.clear_materializing_object_ids(ino, &object_ids);
+        Ok(finished)
     }
 
     pub(super) fn prepare_finish_inode(&self, ino: Ino) -> Result<u32, WriterStackError> {
@@ -412,6 +452,7 @@ impl MountedWriterStack {
             return Ok(Vec::new());
         };
         let mut finished = Vec::new();
+        let mut detached_finished = Vec::new();
         let mut staged_dirty_bytes = 0usize;
         let chunk_size = self.config.chunk_size;
         let mut next_object_id = first_object_id;
@@ -431,17 +472,34 @@ impl MountedWriterStack {
                     next_object_id = Some(object_id.saturating_add(object_count));
                 }
                 slice.frozen = true;
-                let staged = slice.writer.finish()?;
-                let converted = staged
+                let detached = slice.writer.detach_finish()?;
+                let converted = detached
                     .into_iter()
-                    .map(|staged| {
-                        finished_slice_from_staged(chunk.chunk_id, chunk_size, slice, staged)
+                    .map(|detached| DetachedFinishedWriterSlice {
+                        finished: finished_slice_from_staged(
+                            chunk.chunk_id,
+                            chunk_size,
+                            slice,
+                            &detached.staged,
+                        ),
+                        detached,
                     })
                     .collect::<Vec<_>>();
-                let staged_len: usize = converted.iter().map(|slice| slice.len as usize).sum();
+                slice.materializing.extend(converted.iter().map(|entry| {
+                    materializing_read_span_from_detached(slice.seq, &entry.detached)
+                }));
+                let staged_len: usize = converted
+                    .iter()
+                    .map(|entry| entry.finished.len as usize)
+                    .sum();
                 staged_dirty_bytes = staged_dirty_bytes.saturating_add(staged_len);
-                slice.finished = converted.clone();
-                finished.extend(converted);
+                let converted_finished = converted
+                    .iter()
+                    .map(|entry| entry.finished.clone())
+                    .collect::<Vec<_>>();
+                slice.finished = converted_finished.clone();
+                finished.extend(converted_finished);
+                detached_finished.extend(converted);
             }
         }
         file.dirty_bytes = file.dirty_bytes.saturating_sub(staged_dirty_bytes);
@@ -457,6 +515,7 @@ impl MountedWriterStack {
         if clean {
             self.remove_file_if_clean_and_closed(ino);
         }
+        self.persist_detached_finished_slices(ino, detached_finished)?;
         Ok(finished)
     }
 
@@ -511,6 +570,7 @@ impl MountedWriterStack {
         };
 
         let mut finished = Vec::new();
+        let mut detached_finished = Vec::new();
         let mut staged_dirty_bytes = 0usize;
         let chunk_size = self.config.chunk_size;
         let mut next_object_id = first_object_id;
@@ -525,22 +585,39 @@ impl MountedWriterStack {
                     continue;
                 }
                 slice.writer.set_next_object_id(next_object_id);
-                let staged = slice.writer.flush_completed_blocks(remaining_blocks)?;
-                if staged.is_empty() {
+                let detached = slice.writer.detach_completed_blocks(remaining_blocks)?;
+                if detached.is_empty() {
                     continue;
                 }
-                remaining_blocks = remaining_blocks.saturating_sub(staged.len());
-                next_object_id = next_object_id.saturating_add(staged.len() as u64);
-                let converted = staged
+                remaining_blocks = remaining_blocks.saturating_sub(detached.len());
+                next_object_id = next_object_id.saturating_add(detached.len() as u64);
+                let converted = detached
                     .into_iter()
-                    .map(|staged| {
-                        finished_slice_from_staged(chunk.chunk_id, chunk_size, slice, staged)
+                    .map(|detached| DetachedFinishedWriterSlice {
+                        finished: finished_slice_from_staged(
+                            chunk.chunk_id,
+                            chunk_size,
+                            slice,
+                            &detached.staged,
+                        ),
+                        detached,
                     })
                     .collect::<Vec<_>>();
-                let staged_len: usize = converted.iter().map(|slice| slice.len as usize).sum();
+                slice.materializing.extend(converted.iter().map(|entry| {
+                    materializing_read_span_from_detached(slice.seq, &entry.detached)
+                }));
+                let staged_len: usize = converted
+                    .iter()
+                    .map(|entry| entry.finished.len as usize)
+                    .sum();
                 staged_dirty_bytes = staged_dirty_bytes.saturating_add(staged_len);
-                slice.finished.extend(converted.clone());
-                finished.extend(converted);
+                let converted_finished = converted
+                    .iter()
+                    .map(|entry| entry.finished.clone())
+                    .collect::<Vec<_>>();
+                slice.finished.extend(converted_finished.clone());
+                finished.extend(converted_finished);
+                detached_finished.extend(converted);
             }
         }
         file.dirty_bytes = file.dirty_bytes.saturating_sub(staged_dirty_bytes);
@@ -554,6 +631,7 @@ impl MountedWriterStack {
                 .remove(&ino);
             self.remove_file_if_clean_and_closed(ino);
         }
+        self.persist_detached_finished_slices(ino, detached_finished)?;
         Ok(finished)
     }
 
@@ -590,6 +668,30 @@ impl MountedWriterStack {
             shard.files.get(&ino).cloned()
         };
         file.map(|file| file.lock().dirty_bytes).unwrap_or(0)
+    }
+
+    pub(super) fn clear_materializing_object_ids(&self, ino: Ino, object_ids: &[u64]) {
+        if object_ids.is_empty() {
+            return;
+        }
+        let file = {
+            let shard = self.shards[Self::inode_shard_index(ino)].lock();
+            shard.files.get(&ino).cloned()
+        };
+        let Some(file) = file else {
+            return;
+        };
+        {
+            let mut file = file.lock();
+            for chunk in file.chunks.values_mut() {
+                for slice in &mut chunk.slices {
+                    slice
+                        .materializing
+                        .retain(|span| !object_ids.contains(&span.object_id));
+                }
+            }
+        }
+        self.remove_file_if_clean_and_closed(ino);
     }
 
     pub(super) fn snapshot_dirty_inodes_by_bytes(&self) -> Vec<Ino> {
@@ -648,6 +750,35 @@ impl MountedWriterStack {
             });
     }
 
+    fn persist_detached_finished_slices(
+        &self,
+        ino: Ino,
+        detached_finished: Vec<DetachedFinishedWriterSlice>,
+    ) -> Result<(), WriterStackError> {
+        let detached = detached_finished
+            .into_iter()
+            .map(|entry| entry.detached)
+            .collect::<Vec<_>>();
+        if detached.is_empty() {
+            return Ok(());
+        }
+        if let Err(error) = self.cached_store.persist_detached_staged_slices(detached) {
+            self.set_sticky_error(ino, format!("writer stack materialization failed: {error}"));
+            return Err(WriterStackError::CachedStore(error));
+        }
+        Ok(())
+    }
+
+    fn set_sticky_error(&self, ino: Ino, message: impl Into<String>) {
+        let file = {
+            let shard = self.shards[Self::inode_shard_index(ino)].lock();
+            shard.files.get(&ino).cloned()
+        };
+        if let Some(file) = file {
+            file.lock().sticky_error = Some(message.into());
+        }
+    }
+
     fn validate_geometry(&self) -> Result<(), WriterStackError> {
         if self.config.block_size == 0 || self.config.chunk_size == 0 || self.config.page_size == 0
         {
@@ -690,7 +821,7 @@ impl MountedWriterStack {
                 if shard
                     .files
                     .get(&ino)
-                    .is_some_and(|file| file.lock().dirty_bytes == 0)
+                    .is_some_and(|file| file_is_clean_and_materialized(&file.lock()))
                 {
                     shard.files.remove(&ino);
                 }
@@ -715,7 +846,7 @@ impl MountedWriterStack {
         if shard
             .files
             .get(&ino)
-            .is_some_and(|file| file.lock().dirty_bytes == 0)
+            .is_some_and(|file| file_is_clean_and_materialized(&file.lock()))
         {
             shard.dirty_inodes.remove(&ino);
             shard.files.remove(&ino);
@@ -738,12 +869,42 @@ fn staged_object_count(len: usize, block_size: u32) -> u64 {
     len.div_ceil(block_size) as u64
 }
 
+fn saturating_u64_from_usize(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn file_is_clean_and_materialized(file: &FileWriter) -> bool {
+    file.dirty_bytes == 0
+        && file.chunks.values().all(|chunk| {
+            chunk
+                .slices
+                .iter()
+                .all(|slice| slice.materializing.is_empty())
+        })
+}
+
+fn materializing_read_span_from_detached(
+    seq: u64,
+    detached: &DetachedStagedSlice,
+) -> MaterializingReadSpan {
+    MaterializingReadSpan {
+        start: detached.staged.offset,
+        end: detached
+            .staged
+            .offset
+            .saturating_add(saturating_u64_from_usize(detached.staged.len)),
+        object_id: detached.staged.object_id,
+        seq,
+        data: detached.payload.clone(),
+    }
+}
+
 #[allow(dead_code)]
 fn finished_slice_from_staged(
     chunk_id: ChunkId,
     chunk_size: u32,
     slice: &SliceWriter,
-    staged: StagedSlice,
+    staged: &StagedSlice,
 ) -> FinishedWriterSlice {
     let chunk_start = chunk_start_offset(chunk_id, chunk_size);
     let staged_delta = staged.offset.saturating_sub(chunk_start);
@@ -1014,6 +1175,42 @@ mod tests {
         assert_eq!(spans[0].end, 4);
         assert_eq!(spans[0].data.as_ref(), b"XY");
         assert!(spans[0].seq > spans[1].seq);
+    }
+
+    #[test]
+    fn writer_stack_copies_from_borrowed_input_without_retaining_source() {
+        let (_dir, stack, _rx) = temp_stack(64, 8);
+        let mut payload = b"borrowed-input".to_vec();
+
+        stack
+            .write_bytes(write_spec(1, 7, 0, 100), payload.as_slice())
+            .expect("borrowed write");
+        payload.fill(b'X');
+
+        let spans = stack.snapshot_read_spans(7, 0, 14);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].data.as_ref(), b"borrowed-input");
+    }
+
+    #[test]
+    fn writer_stack_read_span_offsets_are_relative_to_returned_data() {
+        let (_dir, stack, _rx) = temp_stack(64, 8);
+        let payload = Bytes::from_static(b"abcdefghijklmnopqrstuvwxyz0123456789");
+
+        stack
+            .write_bytes(write_spec(1, 7, 0, 100), payload.clone())
+            .expect("dirty write");
+
+        let spans = stack.snapshot_read_spans(7, 30, 6);
+
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].start, 30);
+        assert_eq!(spans[0].end, 36);
+        assert_eq!(spans[0].data.as_ref(), b"456789");
+        assert_eq!(
+            spans[0].block_offset, 0,
+            "returned dirty data is already clipped to the span, so assembler offset must be data-relative"
+        );
     }
 
     #[test]
@@ -1295,6 +1492,105 @@ mod tests {
         unrelated_write
             .expect("unrelated inode in the same shard should not wait for staging")
             .expect("write unrelated inode");
+    }
+
+    #[test]
+    fn writer_stack_finish_does_not_hold_file_lock_during_staging() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000291")
+                .expect("open backend")
+                .backend;
+        let (entered_tx, entered_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let slow_backend = Arc::new(SlowPutBackend::new(backend, entered_tx, release_rx));
+        let (store, _rx) = CachedStore::open(CachedStoreConfig::new(dir.path()), slow_backend)
+            .expect("open store");
+        let stack = Arc::new(MountedWriterStack::new(
+            store,
+            WriterStackConfig {
+                block_size: 4,
+                chunk_size: 16,
+                page_size: 4,
+                dirty_byte_limit: None,
+                max_buffer_bytes: None,
+            },
+        ));
+
+        stack
+            .write_bytes(write_spec(1, 7, 0, 700), Bytes::from_static(b"slow"))
+            .expect("write slow file");
+        let finishing = Arc::clone(&stack);
+        let finish_thread = std::thread::spawn(move || finishing.finish_inode(7));
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("finish should enter backend put");
+
+        let writing = Arc::clone(&stack);
+        let (done_tx, done_rx) = std_mpsc::channel();
+        let write_thread = std::thread::spawn(move || {
+            let result = writing.write_bytes(write_spec(2, 7, 4, 800), Bytes::from_static(b"fast"));
+            done_tx.send(result).expect("send write result");
+        });
+
+        let same_inode_write = done_rx.recv_timeout(Duration::from_millis(100));
+        release_tx.send(()).expect("release slow put");
+        finish_thread
+            .join()
+            .expect("finish thread")
+            .expect("finish inode");
+        write_thread.join().expect("write thread");
+        same_inode_write
+            .expect("same inode write should not wait for staging")
+            .expect("write same inode");
+    }
+
+    #[test]
+    fn writer_stack_detached_completed_block_remains_readable_while_staging() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000292")
+                .expect("open backend")
+                .backend;
+        let (entered_tx, entered_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let slow_backend = Arc::new(SlowPutBackend::new(backend, entered_tx, release_rx));
+        let (store, _rx) = CachedStore::open(CachedStoreConfig::new(dir.path()), slow_backend)
+            .expect("open store");
+        let stack = Arc::new(MountedWriterStack::new(
+            store,
+            WriterStackConfig {
+                block_size: 4,
+                chunk_size: 16,
+                page_size: 4,
+                dirty_byte_limit: None,
+                max_buffer_bytes: None,
+            },
+        ));
+
+        stack
+            .write_bytes(write_spec(1, 7, 0, 700), Bytes::from_static(b"slow"))
+            .expect("write slow file");
+        let staging = Arc::clone(&stack);
+        let staging_thread =
+            std::thread::spawn(move || staging.flush_completed_blocks_for_inode(7, 900, 1));
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("flush should enter backend put");
+
+        let spans = stack.snapshot_read_spans(7, 0, 4);
+
+        release_tx.send(()).expect("release slow put");
+        staging_thread
+            .join()
+            .expect("staging thread")
+            .expect("flush completed block");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            spans[0].data.as_ref(),
+            b"slow",
+            "detached-but-not-yet-installed bytes must remain visible to same-mount reads"
+        );
     }
 
     #[test]

@@ -63,6 +63,13 @@ pub struct StagedSlice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetachedStagedSlice {
+    pub staged: StagedSlice,
+    pub payload: Bytes,
+    pub submit_upload: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedStoreWriterCountersSnapshot {
     /// Writer-owned bytes retained by the cached-store slice writer, including
     /// zero-filled sparse gaps that will be staged locally.
@@ -486,6 +493,71 @@ impl CachedStore {
         }
     }
 
+    pub fn persist_detached_staged_slices(
+        &self,
+        entries: Vec<DetachedStagedSlice>,
+    ) -> Result<(), CachedStoreWriterError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let started_at = Instant::now();
+        let object_ids = entries
+            .iter()
+            .map(|entry| entry.staged.object_id)
+            .collect::<Vec<_>>();
+        let first_object_id = object_ids[0];
+        let puts = entries
+            .iter()
+            .map(|entry| LocalPayloadPut {
+                object_id: entry.staged.object_id,
+                data: entry.payload.clone(),
+                evictable: false,
+            })
+            .collect::<Vec<_>>();
+        if let Err(source) = self.local_payload_backend.put_batch(&puts) {
+            self.local_payload_backend.remove_batch(&object_ids);
+            return Err(CachedStoreWriterError::LocalPayload {
+                object_id: first_object_id,
+                source,
+            });
+        }
+        if let Err(source) = self.upload_stage_store.link_payload_batch(&object_ids) {
+            self.upload_stage_store.remove_batch(&object_ids);
+            self.local_payload_backend.remove_batch(&object_ids);
+            return Err(CachedStoreWriterError::UploadStage {
+                object_id: first_object_id,
+                source,
+            });
+        }
+        {
+            let mut upload_hot = self.upload_hot.lock();
+            for put in &puts {
+                upload_hot.insert(put.object_id, Bytes::copy_from_slice(put.data.as_ref()));
+            }
+        }
+        let mut total_bytes = 0u64;
+        for entry in &entries {
+            total_bytes = total_bytes.saturating_add(saturating_u64_from_usize(entry.staged.len));
+            self.writer_counters.record_staged(entry.staged.len);
+            if entry.submit_upload {
+                self.submit_staged_upload(
+                    entry.staged.ino,
+                    entry.staged.offset,
+                    entry.staged.object_id,
+                    entry.staged.content_epoch,
+                    entry.staged.len,
+                );
+            }
+        }
+        self.metrics.materialize_batches.record_batch(
+            saturating_u64_from_usize(entries.len()),
+            total_bytes,
+            started_at.elapsed(),
+        );
+        Ok(())
+    }
+
     pub fn remove_staged_upload(&self, object_id: ObjectId) {
         self.upload_stage_store.remove(object_id);
     }
@@ -757,12 +829,36 @@ impl CachedStoreWriterSlice {
         self.flush_to(target_offset)
     }
 
+    pub fn detach_completed_blocks(
+        &mut self,
+        max_blocks: usize,
+    ) -> Result<Vec<DetachedStagedSlice>, CachedStoreWriterError> {
+        self.validate_geometry()?;
+        let blocks = self.completed_block_count().min(max_blocks);
+        if blocks == 0 {
+            return Ok(Vec::new());
+        }
+        let bytes = blocks.saturating_mul(self.config.block_size);
+        let target_offset = self.active_start.saturating_add(bytes as u64);
+        self.detach_to(target_offset)
+    }
+
     pub fn finish(&mut self) -> Result<Vec<StagedSlice>, CachedStoreWriterError> {
         self.validate_geometry()?;
         let mut staged = Vec::new();
         while self.dirty_bytes() > 0 {
             let len = self.dirty_bytes().min(self.config.block_size);
             staged.push(self.stage_prefix(len)?);
+        }
+        Ok(staged)
+    }
+
+    pub fn detach_finish(&mut self) -> Result<Vec<DetachedStagedSlice>, CachedStoreWriterError> {
+        self.validate_geometry()?;
+        let mut staged = Vec::new();
+        while self.dirty_bytes() > 0 {
+            let len = self.dirty_bytes().min(self.config.block_size);
+            staged.push(self.detach_prefix(len)?);
         }
         Ok(staged)
     }
@@ -845,6 +941,44 @@ impl CachedStoreWriterSlice {
         };
         self.active_start = self.active_start.saturating_add(len as u64);
         Ok(staged)
+    }
+
+    fn detach_to(
+        &mut self,
+        target_offset: u64,
+    ) -> Result<Vec<DetachedStagedSlice>, CachedStoreWriterError> {
+        self.validate_geometry()?;
+        let mut staged = Vec::new();
+        while self.dirty_bytes() >= self.config.block_size
+            && self
+                .active_start
+                .saturating_add(self.config.block_size as u64)
+                <= target_offset
+        {
+            staged.push(self.detach_prefix(self.config.block_size)?);
+        }
+        Ok(staged)
+    }
+
+    fn detach_prefix(&mut self, len: usize) -> Result<DetachedStagedSlice, CachedStoreWriterError> {
+        self.validate_geometry()?;
+        let payload = self.take_prefix(len);
+        let object_id = self.next_object_id;
+        let staged = StagedSlice {
+            ino: self.config.ino,
+            offset: self.active_start,
+            object_id,
+            len,
+            content_epoch: self.config.content_epoch,
+        };
+        self.next_object_id = self.next_object_id.saturating_add(1);
+        self.store.writer_counters.subtract_dirty_bytes(len);
+        self.active_start = self.active_start.saturating_add(len as u64);
+        Ok(DetachedStagedSlice {
+            staged,
+            payload,
+            submit_upload: self.config.submit_upload,
+        })
     }
 
     fn restore_staged_prefix(&mut self, payload: Bytes) {

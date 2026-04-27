@@ -1,8 +1,8 @@
 use super::{
-    AccessLevel, Bytes, DirtyAttrPersistPolicy, ExplicitFlushOutcome, FileSessionOperation,
-    FileType, FsyncOutcome, HandleReleaseContext, Ino, LastHandleReleaseAction,
-    LocalSyncBarrierOutcome, LocalSyncPolicy, OpenFile, OpenFlags, ReleaseFhOutcome,
-    StickyErrorPolicy, StudioVfs, VfsResult,
+    AccessLevel, DirtyAttrPersistPolicy, ExplicitFlushOutcome, FileSessionOperation, FileType,
+    FsyncOutcome, HandleReleaseContext, Ino, LastHandleReleaseAction, LocalSyncBarrierOutcome,
+    LocalSyncPolicy, OpenFile, OpenFlags, ReleaseFhOutcome, StickyErrorPolicy, StudioVfs,
+    VfsResult,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -724,11 +724,10 @@ impl StudioVfs {
                 return Ok(data.len() as u32);
             }
             self.note_vfs_write_call(data.len());
-            let shared_data = Bytes::copy_from_slice(data);
 
             let record_writer_stack_started = Instant::now();
             let written = self
-                .record_writer_stack_state_bytes(fh, ino, offset, shared_data)
+                .record_writer_stack_state_bytes(fh, ino, offset, data)
                 .await?;
             self.record_vfs_write_record_writer_stack_state(record_writer_stack_started.elapsed());
 
@@ -901,11 +900,10 @@ impl StudioVfs {
                 return Ok(data.len() as u32);
             }
             self.note_vfs_write_call(data.len());
-            let shared_data = Bytes::copy_from_slice(data);
 
             let record_writer_stack_started = Instant::now();
             let written = self
-                .record_writer_stack_state_bytes(fh, ino, offset, shared_data)
+                .record_writer_stack_state_bytes(fh, ino, offset, data)
                 .await;
             self.record_vfs_write_record_writer_stack_state(record_writer_stack_started.elapsed());
             written
@@ -971,12 +969,12 @@ impl StudioVfs {
         result
     }
 
-    async fn record_writer_stack_state_bytes(
+    pub(super) async fn record_writer_stack_state_bytes(
         &self,
         fh: u64,
         ino: Ino,
         offset: u64,
-        data: Bytes,
+        data: &[u8],
     ) -> VfsResult<u32> {
         let mut base_attr;
         if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino).cloned() {
@@ -1013,6 +1011,8 @@ impl StudioVfs {
             attr.touch_mtime();
             self.update_pending_incarnation_size(ino, attr.size);
         }
+        self.invalidate_attr_read_cache([ino]);
+        self.invalidate_kernel_inodes([ino]);
         Ok(accepted.accepted_bytes)
     }
 
@@ -1082,10 +1082,18 @@ impl StudioVfs {
         if finished.is_empty() {
             return Ok(0);
         }
-        Ok(self.install_finished_writer_stack_slices(ino, finished))
+        let installed_object_ids = finished
+            .iter()
+            .map(|slice| slice.object_id)
+            .collect::<Vec<_>>();
+        let materialized_bytes = self.install_finished_writer_stack_slices(ino, finished);
+        self.state
+            .writer_stack
+            .clear_materializing_object_ids(ino, &installed_object_ids);
+        Ok(materialized_bytes)
     }
 
-    async fn materialize_writer_stack_completed_blocks_for_inode(
+    pub(super) async fn materialize_writer_stack_completed_blocks_for_inode(
         &self,
         ino: Ino,
     ) -> VfsResult<usize> {
@@ -1099,6 +1107,7 @@ impl StudioVfs {
         if object_count == 0 {
             return Ok(0);
         }
+        let object_count = self.completed_block_materialization_batch_blocks(object_count);
         let first_object_id = self
             .reserve_writer_stack_object_ids_by_count(object_count)
             .await?;
@@ -1112,7 +1121,26 @@ impl StudioVfs {
         if finished.is_empty() {
             return Ok(0);
         }
-        Ok(self.install_finished_writer_stack_slices(ino, finished))
+        let installed_object_ids = finished
+            .iter()
+            .map(|slice| slice.object_id)
+            .collect::<Vec<_>>();
+        let materialized_bytes = self.install_finished_writer_stack_slices(ino, finished);
+        self.state
+            .writer_stack
+            .clear_materializing_object_ids(ino, &installed_object_ids);
+        Ok(materialized_bytes)
+    }
+
+    fn completed_block_materialization_batch_blocks(&self, available_blocks: u32) -> u32 {
+        if available_blocks == 0 {
+            return 0;
+        }
+        let block_size = self.block_size.max(1) as usize;
+        let target_bytes = self.write_eager_flush_batch_bytes.max(block_size);
+        let max_blocks = target_bytes.div_ceil(block_size).max(1);
+        let max_blocks = u32::try_from(max_blocks).unwrap_or(u32::MAX);
+        available_blocks.min(max_blocks)
     }
 
     fn install_finished_writer_stack_slices(

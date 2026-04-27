@@ -1,5 +1,5 @@
 use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::Path;
@@ -1021,9 +1021,23 @@ struct MountedReadPlan {
 }
 
 #[derive(Clone, Copy)]
+struct MountedWriteOptions {
+    chunk_size: usize,
+    run_seed: u64,
+}
+
+#[derive(Clone, Copy)]
+struct MountedReadValidation {
+    seed: u64,
+    write_chunk_size: usize,
+}
+
+#[derive(Clone, Copy)]
 struct MountedReadOptions {
     read_size: u64,
     full_file_reads: bool,
+    write_chunk_size: usize,
+    run_seed: u64,
 }
 
 fn mounted_read_plan(file_size: u64, read_size: u64, full_file_read: bool) -> MountedReadPlan {
@@ -1049,6 +1063,22 @@ fn deterministic_write_chunks(total_size: u64, max_chunk_size: usize) -> Vec<(u6
     chunks
 }
 
+fn deterministic_run_seed(run_id: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in run_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn deterministic_write_seed(item: &WorkFile, run_seed: u64, stream_id: Option<usize>) -> u64 {
+    run_seed
+        .wrapping_add(item.index as u64)
+        .wrapping_add(123)
+        .wrapping_add(stream_id.unwrap_or_default() as u64)
+}
+
 async fn write_deterministic_file(
     path: &Path,
     total_size: u64,
@@ -1070,7 +1100,50 @@ async fn write_deterministic_file(
     Ok(())
 }
 
-async fn read_file_with_plan(path: &Path, plan: MountedReadPlan) -> Result<u64> {
+fn validate_deterministic_read_chunk(
+    path: &Path,
+    actual: &[u8],
+    file_offset: u64,
+    expected_cycle: &[u8],
+) -> Result<()> {
+    if actual.is_empty() || expected_cycle.is_empty() {
+        return Ok(());
+    }
+
+    let mut checked = 0usize;
+    while checked < actual.len() {
+        let cycle_offset = ((file_offset as usize).wrapping_add(checked)) % expected_cycle.len();
+        let take = (actual.len() - checked).min(expected_cycle.len() - cycle_offset);
+        let actual_part = &actual[checked..checked + take];
+        let expected_part = &expected_cycle[cycle_offset..cycle_offset + take];
+        if actual_part != expected_part {
+            let mismatch = actual_part
+                .iter()
+                .zip(expected_part)
+                .position(|(actual, expected)| actual != expected)
+                .unwrap_or(0);
+            let absolute_offset = file_offset
+                .saturating_add(checked as u64)
+                .saturating_add(mismatch as u64);
+            bail!(
+                "deterministic content mismatch reading {} at offset {}: expected 0x{:02x}, got 0x{:02x}",
+                path.display(),
+                absolute_offset,
+                expected_part[mismatch],
+                actual_part[mismatch]
+            );
+        }
+        checked += take;
+    }
+
+    Ok(())
+}
+
+async fn read_file_with_plan(
+    path: &Path,
+    plan: MountedReadPlan,
+    validation: MountedReadValidation,
+) -> Result<u64> {
     let mut input = fs::File::open(path)
         .await
         .with_context(|| format!("open {}", path.display()))?;
@@ -1079,14 +1152,18 @@ async fn read_file_with_plan(path: &Path, plan: MountedReadPlan) -> Result<u64> 
     }
 
     let mut buffer = vec![0u8; plan.chunk_size];
+    let expected_cycle = deterministic_bytes(validation.write_chunk_size.max(1), validation.seed);
     let mut remaining = plan.bytes_to_read;
+    let mut offset = 0u64;
     while remaining > 0 {
         let len = remaining.min(plan.chunk_size as u64) as usize;
         input
             .read_exact(&mut buffer[..len])
             .await
             .with_context(|| format!("read {}", path.display()))?;
+        validate_deterministic_read_chunk(path, &buffer[..len], offset, &expected_cycle)?;
         remaining -= len as u64;
+        offset = offset.saturating_add(len as u64);
     }
     Ok(plan.bytes_to_read)
 }
@@ -1099,14 +1176,17 @@ async fn run_mounted_write_phase(
 ) -> Result<(PhaseTelemetry, Vec<PhaseTelemetry>)> {
     let progress = ProgressBar::start("StudioFS test write", order.len());
     let counter = progress.counter();
-    let write_chunk_size = mounted_write_chunk_size(params.block_size);
+    let write_options = MountedWriteOptions {
+        chunk_size: mounted_write_chunk_size(params.block_size),
+        run_seed: deterministic_run_seed(&params.run_id),
+    };
     if params.sequential_streams {
         let writes_by_stream = run_filesystem_writes_sequential_streams(
             files,
             order,
             params.concurrency,
             params.io_depth,
-            write_chunk_size,
+            write_options,
             size_class_bounds,
             counter,
         )
@@ -1124,7 +1204,7 @@ async fn run_mounted_write_phase(
             order,
             params.io_depth,
             params.concurrency,
-            write_chunk_size,
+            write_options,
             size_class_bounds,
             counter,
         )
@@ -1145,6 +1225,8 @@ async fn run_mounted_read_phase(
     let read_options = MountedReadOptions {
         read_size: params.read_size,
         full_file_reads: params.full_file_reads,
+        write_chunk_size: mounted_write_chunk_size(params.block_size),
+        run_seed: deterministic_run_seed(&params.run_id),
     };
     if params.sequential_streams {
         let reads_by_stream = run_filesystem_reads_sequential_streams(
@@ -1185,7 +1267,7 @@ async fn run_filesystem_writes(
     order: &[usize],
     io_depth: usize,
     concurrency: usize,
-    write_chunk_size: usize,
+    write_options: MountedWriteOptions,
     size_class_bounds: SizeClassBounds,
     progress: ProgressCounter,
 ) -> Result<PhaseTelemetry> {
@@ -1223,8 +1305,8 @@ async fn run_filesystem_writes(
                 write_deterministic_file(
                     &item.path,
                     item.size,
-                    item.index as u64 + 123,
-                    write_chunk_size,
+                    deterministic_write_seed(item, write_options.run_seed, None),
+                    write_options.chunk_size,
                 )
                 .await
                 .with_context(|| format!("write {}", item.path.display()))?;
@@ -1311,8 +1393,12 @@ async fn run_filesystem_reads(
                     .map_err(|e| anyhow!("filesystem read semaphore closed: {e}"))?;
                 let _permit = permit;
 
+                let validation = MountedReadValidation {
+                    seed: deterministic_write_seed(item, read_options.run_seed, None),
+                    write_chunk_size: read_options.write_chunk_size,
+                };
                 let start = Instant::now();
-                let bytes_read = read_file_with_plan(&item.path, read_plan)
+                let bytes_read = read_file_with_plan(&item.path, read_plan, validation)
                     .await
                     .with_context(|| format!("read {}", item.path.display()))?;
                 let elapsed = start.elapsed();
@@ -1357,7 +1443,7 @@ async fn run_filesystem_writes_sequential_streams(
     order: &[usize],
     stream_count: usize,
     io_depth: usize,
-    write_chunk_size: usize,
+    write_options: MountedWriteOptions,
     size_class_bounds: SizeClassBounds,
     progress: ProgressCounter,
 ) -> Result<Vec<PhaseTelemetry>> {
@@ -1384,8 +1470,8 @@ async fn run_filesystem_writes_sequential_streams(
                 write_deterministic_file(
                     &item.path,
                     item.size,
-                    item.index as u64 + 123 + stream_id as u64,
-                    write_chunk_size,
+                    deterministic_write_seed(item, write_options.run_seed, Some(stream_id)),
+                    write_options.chunk_size,
                 )
                 .await
                 .with_context(|| format!("write {}", item.path.display()))?;
@@ -1454,8 +1540,12 @@ async fn run_filesystem_reads_sequential_streams(
                     .await
                     .map_err(|e| anyhow!("filesystem sequential read semaphore closed: {e}"))?;
                 let _permit = permit;
+                let validation = MountedReadValidation {
+                    seed: deterministic_write_seed(item, read_options.run_seed, Some(stream_id)),
+                    write_chunk_size: read_options.write_chunk_size,
+                };
                 let start = Instant::now();
-                let bytes_read = read_file_with_plan(&item.path, read_plan)
+                let bytes_read = read_file_with_plan(&item.path, read_plan, validation)
                     .await
                     .with_context(|| format!("read {}", item.path.display()))?;
                 let elapsed = start.elapsed();
@@ -2004,6 +2094,53 @@ mod tests {
         assert_eq!(mounted_memory.dirty_bytes_peak, Some(256));
         assert_eq!(mounted_memory.staged_bytes_peak, Some(512));
         assert_eq!(mounted_memory.dirty_limit_bytes, Some(1024));
+    }
+
+    #[tokio::test]
+    async fn read_file_with_plan_rejects_corrupt_deterministic_payload() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("test_cache_file_000000.bin");
+        fs::write(&path, vec![0xAA; 4096])
+            .await
+            .expect("write corrupt test payload");
+
+        let plan = mounted_read_plan(4096, 1024, true);
+        let result = read_file_with_plan(
+            &path,
+            plan,
+            MountedReadValidation {
+                seed: 123,
+                write_chunk_size: 1024,
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "mounted reads should validate deterministic workload contents, not just byte counts"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_with_plan_accepts_deterministic_payload_across_write_chunks() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("test_cache_file_000000.bin");
+        write_deterministic_file(&path, 4096 + 257, 123, 1024)
+            .await
+            .expect("write deterministic test payload");
+
+        let bytes_read = read_file_with_plan(
+            &path,
+            mounted_read_plan(4096 + 257, 1536, true),
+            MountedReadValidation {
+                seed: 123,
+                write_chunk_size: 1024,
+            },
+        )
+        .await
+        .expect("read deterministic test payload");
+
+        assert_eq!(bytes_read, 4096 + 257);
     }
 
     #[tokio::test]
