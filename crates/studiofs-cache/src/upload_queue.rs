@@ -122,6 +122,9 @@ impl UploadQueue {
 
     /// Requeue a failed upload for retry (does not increment pending count).
     pub fn requeue(&self, op: PendingUpload) -> bool {
+        if !self.update_pending_if_matches(&op) {
+            return false;
+        }
         self.sender.send(op).is_ok()
     }
 
@@ -259,6 +262,21 @@ impl UploadQueue {
         }
         false
     }
+
+    fn update_pending_if_matches(&self, op: &PendingUpload) -> bool {
+        let mut state = self.pending_state.lock();
+        let Some(current) = state.by_object.get_mut(&op.object_id) else {
+            return false;
+        };
+        if current.ino != op.ino
+            || current.offset != op.offset
+            || current.content_epoch != op.content_epoch
+        {
+            return false;
+        }
+        *current = op.clone();
+        true
+    }
 }
 
 fn now_unix_ms() -> u64 {
@@ -357,6 +375,25 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].object_id, 100);
         assert_eq!(pending[0].content_epoch, 2);
+    }
+
+    #[tokio::test]
+    async fn requeue_updates_pending_snapshot_retry_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        queue.submit(10, 0, 100, 1);
+        let mut retry = rx.recv().await.unwrap();
+        retry.retry_count = 2;
+        retry.not_before_unix_ms = now_unix_ms().saturating_add(1_000);
+
+        assert!(queue.requeue(retry.clone()));
+
+        let pending = queue.snapshot_pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].object_id, 100);
+        assert_eq!(pending[0].retry_count, 2);
+        assert_eq!(pending[0].not_before_unix_ms, retry.not_before_unix_ms);
     }
 
     #[tokio::test]

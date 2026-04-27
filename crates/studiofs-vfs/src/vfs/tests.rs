@@ -779,6 +779,15 @@ fn upload_stats_report_backlog_bytes_age_retries_active_and_completion_rate() {
     assert_eq!(stats.completed_uploads_per_sec, 0.0);
     assert_eq!(stats.completed_upload_bytes_per_sec, 0.0);
 
+    let mut retry = pending[0].clone();
+    retry.retry_count = 3;
+    retry.not_before_unix_ms = retry.created_unix_ms.saturating_add(1_000);
+    assert!(vfs.cached_store().requeue_upload(retry));
+    let retry_stats = vfs.upload_stats();
+    assert_eq!(retry_stats.pending_uploads, 1);
+    assert_eq!(retry_stats.pending_retry_count, 3);
+    assert_eq!(retry_stats.max_pending_retry_count, 3);
+
     vfs.cached_store().complete_upload(&pending[0]);
 
     let completed = vfs.upload_stats();
