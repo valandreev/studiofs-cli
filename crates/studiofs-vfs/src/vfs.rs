@@ -3991,6 +3991,10 @@ impl StudioVfs {
 
     pub fn reset_diagnostics_observability(&self) {
         self.state.metrics.reset_diagnostics_observability();
+        self.state
+            .local_dirty
+            .hard_backpressure_events
+            .store(0, Ordering::Relaxed);
         self.state.upload.startup_replay_counts.lock().clear();
         self.cached_store.reset_diagnostics_metrics();
     }

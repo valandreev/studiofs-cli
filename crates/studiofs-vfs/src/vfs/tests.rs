@@ -4343,6 +4343,54 @@ fn reset_diagnostics_observability_clears_drain_lag_pacing_counters() {
 }
 
 #[test]
+fn reset_diagnostics_observability_clears_hard_backpressure_events() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-297-reset-hard-backpressure");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        vfs.set_max_dirty_bytes(8);
+        let seed_attr = vfs
+            .create(1, b"sfs-297-reset-hard-backpressure-seed.bin", 0, 0, 0o644)
+            .unwrap();
+        let write_attr = vfs
+            .create(1, b"sfs-297-reset-hard-backpressure-write.bin", 0, 0, 0o644)
+            .unwrap();
+        let seed_fh = 77;
+        let write_fh = vfs
+            .open_file(write_attr.ino, OpenFlags::RDWR, false)
+            .unwrap();
+
+        vfs.state
+            .handle_writers
+            .open_writer_for_test(seed_fh, seed_attr.ino, 0);
+        vfs.state
+            .handle_writers
+            .write(seed_fh, seed_attr.ino, 0, vfs.block_size, 0, &[0xAB; 32]);
+
+        vfs.write_fh_with_deferred_materialize(
+            write_fh,
+            write_attr.ino,
+            0,
+            b"x",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        let before_reset = vfs.write_path_observability_snapshot();
+        assert_eq!(before_reset.write_backpressure.hard_events, 1);
+
+        vfs.reset_diagnostics_observability();
+
+        let after_reset = vfs.write_path_observability_snapshot();
+        assert_eq!(after_reset.write_backpressure.hard_events, 0);
+
+        vfs.flush_fh(write_fh).await.unwrap();
+        vfs.release_fh(write_fh).await.unwrap();
+    });
+}
+
+#[test]
 fn write_fh_aligned_full_block_callback_is_accepted_immediately() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-257-write-fh-aligned-full-block");
