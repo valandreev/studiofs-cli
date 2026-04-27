@@ -31,7 +31,6 @@ mod deletion_cleanup;
 mod file_session;
 mod handle_drain_barrier;
 mod handle_table;
-mod handle_writer;
 mod ignored_entries;
 mod io_ops;
 #[path = "local_dirty.rs"]
@@ -95,7 +94,6 @@ use config::{
 };
 use file_session::{FileSessionOperation, FileSessionState};
 use handle_table::HandleTable;
-use handle_writer::HandleWriterRegistry;
 use ignored_entries::IgnoredEntryRegistry;
 use locking::{DistributedFlock, FileLockState};
 use namespace::{DentryCacheValue, NamespaceState};
@@ -178,10 +176,10 @@ pub(crate) const ZEROIO_RUNTIME_STATE_DIR: &str = "runtime";
 const ZEROIO_LAST_SHUTDOWN_SNAPSHOT_FILE: &str = "zeroio-last-shutdown.json";
 const HARD_BACKPRESSURE_DIRTY_MULTIPLIER: usize = 2;
 const AGGRESSIVE_MATERIALIZATION_DIRTY_DIVISOR: usize = 2;
-const AGGRESSIVE_MATERIALIZATION_BUFFERED_WRITE_THRESHOLD: usize = 64;
 const AGGRESSIVE_MATERIALIZATION_INTERVAL: Duration = Duration::from_millis(25);
 const LOCAL_DIRTY_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
 const DEFERRED_MATERIALIZATION_LINGER_WAIT_MS: u64 = 5;
+const WRITER_STACK_STEADY_DRAIN_QUOTA_BYTES: usize = 4 * 1024 * 1024;
 const DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES: usize = 6;
 #[cfg(test)]
 const SOFT_DIRTY_PACING_START_NUMERATOR: usize = 9;
@@ -213,12 +211,6 @@ const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_LIGHT: usize = 256;
 const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_HIGH: usize = 512;
 #[cfg(test)]
 const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_CRITICAL: usize = 1024;
-#[cfg(test)]
-const SOFT_DRAIN_LAG_PACING_DELAY_LIGHT_MS: u64 = 1;
-#[cfg(test)]
-const SOFT_DRAIN_LAG_PACING_DELAY_MEDIUM_MS: u64 = 3;
-#[cfg(test)]
-const SOFT_DRAIN_LAG_PACING_DELAY_HEAVY_MS: u64 = 6;
 const WRITE_BUFFER_POOL_MIN_BUFFERS: usize = 4;
 const WRITE_BUFFER_POOL_BUFFER_MULTIPLIER: usize = 2;
 
@@ -1766,10 +1758,6 @@ struct MetricsState {
     staged_pressure_peak_bytes: AtomicU64,
     vfs_write_calls: AtomicU64,
     vfs_write_bytes: AtomicU64,
-    vfs_write_record_handle_writer_state_calls: AtomicU64,
-    vfs_write_record_handle_writer_state_total_ns: AtomicU64,
-    vfs_write_record_handle_writer_state_max_ns: AtomicU64,
-    vfs_write_record_handle_writer_state_histogram: LatencyHistogram,
     vfs_write_record_writer_stack_state_calls: AtomicU64,
     vfs_write_record_writer_stack_state_total_ns: AtomicU64,
     vfs_write_record_writer_stack_state_max_ns: AtomicU64,
@@ -1880,10 +1868,6 @@ impl MetricsState {
             staged_pressure_peak_bytes: AtomicU64::new(0),
             vfs_write_calls: AtomicU64::new(0),
             vfs_write_bytes: AtomicU64::new(0),
-            vfs_write_record_handle_writer_state_calls: AtomicU64::new(0),
-            vfs_write_record_handle_writer_state_total_ns: AtomicU64::new(0),
-            vfs_write_record_handle_writer_state_max_ns: AtomicU64::new(0),
-            vfs_write_record_handle_writer_state_histogram: LatencyHistogram::default(),
             vfs_write_record_writer_stack_state_calls: AtomicU64::new(0),
             vfs_write_record_writer_stack_state_total_ns: AtomicU64::new(0),
             vfs_write_record_writer_stack_state_max_ns: AtomicU64::new(0),
@@ -1991,9 +1975,6 @@ impl MetricsState {
             staged_pressure_peak_bytes,
             vfs_write_calls,
             vfs_write_bytes,
-            vfs_write_record_handle_writer_state_calls,
-            vfs_write_record_handle_writer_state_total_ns,
-            vfs_write_record_handle_writer_state_max_ns,
             vfs_write_record_writer_stack_state_calls,
             vfs_write_record_writer_stack_state_total_ns,
             vfs_write_record_writer_stack_state_max_ns,
@@ -2038,7 +2019,6 @@ impl MetricsState {
         self.payload_burst_interval_histogram.reset();
         self.metadata_commit_histogram.reset();
         self.metadata_commit_interval_histogram.reset();
-        self.vfs_write_record_handle_writer_state_histogram.reset();
         self.vfs_write_record_writer_stack_state_histogram.reset();
         self.vfs_write_materialize_completed_histogram.reset();
         self.vfs_write_materialize_strict_histogram.reset();
@@ -2074,7 +2054,6 @@ impl VfsState {
             ),
             acl: AclState::new(),
             incarnation: IncarnationState::new(),
-            handle_writers: HandleWriterRegistry::new(),
             writer_stack: MountedWriterStack::new(
                 cached_store,
                 WriterStackConfig {
@@ -2101,7 +2080,6 @@ struct VfsState {
     namespace: NamespaceState,
     acl: AclState,
     incarnation: IncarnationState,
-    handle_writers: HandleWriterRegistry,
     writer_stack: MountedWriterStack,
     local_dirty: LocalDirtyState,
     read: ReadState,
@@ -2245,26 +2223,6 @@ fn soft_dirty_budget_pacing_delay_ms(
     }
 
     (delay_ms > 0).then_some(delay_ms)
-}
-
-#[cfg(test)]
-fn soft_drain_lag_pacing_delay_ms(
-    drain_lag_bytes: usize,
-    steady_drain_quota_bytes: usize,
-) -> Option<u64> {
-    if steady_drain_quota_bytes == 0 || drain_lag_bytes < steady_drain_quota_bytes {
-        return None;
-    }
-
-    let medium_threshold = steady_drain_quota_bytes.saturating_mul(2);
-    let heavy_threshold = steady_drain_quota_bytes.saturating_mul(4);
-    Some(if drain_lag_bytes >= heavy_threshold {
-        SOFT_DRAIN_LAG_PACING_DELAY_HEAVY_MS
-    } else if drain_lag_bytes >= medium_threshold {
-        SOFT_DRAIN_LAG_PACING_DELAY_MEDIUM_MS
-    } else {
-        SOFT_DRAIN_LAG_PACING_DELAY_LIGHT_MS
-    })
 }
 
 #[cfg(test)]
@@ -3202,13 +3160,11 @@ impl StudioVfs {
     // #endregion debug log
 
     fn aggressive_materialization_should_run(&self) -> bool {
-        let total_dirty_bytes = self.state.handle_writers.total_dirty_bytes();
+        let total_dirty_bytes = self.state.writer_stack.total_dirty_bytes();
         if total_dirty_bytes == 0 {
             return false;
         }
         total_dirty_bytes >= aggressive_materialization_threshold_bytes(self.max_dirty_bytes())
-            || self.state.handle_writers.total_buffered_write_count()
-                >= AGGRESSIVE_MATERIALIZATION_BUFFERED_WRITE_THRESHOLD
     }
 
     fn clone_into_write_buffer(&self, data: &[u8]) -> BytesMut {
@@ -4327,7 +4283,6 @@ impl StudioVfs {
 
     fn inode_has_unmaterialized_overlay_for_finalize(&self, ino: Ino) -> bool {
         if self.has_pending_local_dirty_payloads_for_inode(ino)
-            || self.inode_has_dirty_handle_writers(ino)
             || self.state.writer_stack.has_dirty_writers(ino)
             || self
                 .state
@@ -5778,8 +5733,13 @@ impl StudioVfs {
 
     fn total_pending_write_buffer_bytes(&self) -> usize {
         self.total_pending_local_dirty_bytes()
-            .saturating_add(self.state.handle_writers.total_dirty_bytes())
             .saturating_add(self.state.writer_stack.total_dirty_bytes())
+    }
+
+    fn writer_stack_steady_drain_quota_bytes(&self) -> usize {
+        WRITER_STACK_STEADY_DRAIN_QUOTA_BYTES
+            .min(self.block_size as usize)
+            .max(1)
     }
 
     fn per_second(total: u64, elapsed: Duration) -> f64 {
@@ -6245,18 +6205,6 @@ impl StudioVfs {
             .fetch_add(write_bytes as u64, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
-    pub(super) fn record_vfs_write_record_handle_writer_state(&self, elapsed: Duration) {
-        let metrics = &self.state.metrics;
-        Self::observe_latency_counter(
-            &metrics.vfs_write_record_handle_writer_state_calls,
-            &metrics.vfs_write_record_handle_writer_state_total_ns,
-            &metrics.vfs_write_record_handle_writer_state_max_ns,
-            &metrics.vfs_write_record_handle_writer_state_histogram,
-            Self::duration_ns_u64(elapsed),
-        );
-    }
-
     pub(super) fn record_vfs_write_record_writer_stack_state(&self, elapsed: Duration) {
         let metrics = &self.state.metrics;
         Self::observe_latency_counter(
@@ -6377,7 +6325,6 @@ impl StudioVfs {
     pub fn inode_has_local_dirty_state(&self, ino: Ino) -> bool {
         self.has_pending_local_dirty_payloads_for_inode(ino)
             || self.state.namespace.dirty_attrs.lock().contains_key(&ino)
-            || self.inode_has_dirty_handle_writers(ino)
             || self.state.writer_stack.has_dirty_writers(ino)
     }
 
@@ -6402,9 +6349,6 @@ impl StudioVfs {
             local_cache_backend_max_ns: local_cache_io_backend_max_ns,
             vfs_write_calls: vfs_write_calls,
             vfs_write_bytes: vfs_write_bytes,
-            vfs_write_record_handle_writer_state_calls: vfs_write_record_handle_writer_state_calls,
-            vfs_write_record_handle_writer_state_total_ns: vfs_write_record_handle_writer_state_total_ns,
-            vfs_write_record_handle_writer_state_max_ns: vfs_write_record_handle_writer_state_max_ns,
             vfs_write_record_writer_stack_state_calls: vfs_write_record_writer_stack_state_calls,
             vfs_write_record_writer_stack_state_total_ns: vfs_write_record_writer_stack_state_total_ns,
             vfs_write_record_writer_stack_state_max_ns: vfs_write_record_writer_stack_state_max_ns,
@@ -6479,11 +6423,6 @@ impl StudioVfs {
             .state
             .metrics
             .payload_store_sync_data_interval_histogram
-            .snapshot();
-        let vfs_write_record_handle_writer_state_histogram = self
-            .state
-            .metrics
-            .vfs_write_record_handle_writer_state_histogram
             .snapshot();
         let vfs_write_record_writer_stack_state_histogram = self
             .state
@@ -6566,11 +6505,8 @@ impl StudioVfs {
         let pending_local_dirty_bytes = self.total_pending_local_dirty_bytes();
         let pending_persisted_slice_bytes = self.total_pending_persisted_local_dirty_slice_bytes();
         let (dirty_slice_count, frozen_slice_count) = self.pending_local_dirty_slice_counts();
-        let handle_writer_dirty_bytes = self.state.handle_writers.total_dirty_bytes();
         let writer_stack_dirty_bytes = self.state.writer_stack.total_dirty_bytes();
-        let total_dirty_bytes = pending_local_dirty_bytes
-            .saturating_add(handle_writer_dirty_bytes)
-            .saturating_add(writer_stack_dirty_bytes);
+        let total_dirty_bytes = pending_local_dirty_bytes.saturating_add(writer_stack_dirty_bytes);
         let upload_stats = self.upload_stats();
         let pending_upload_bytes =
             usize::try_from(upload_stats.pending_upload_bytes).unwrap_or(usize::MAX);
@@ -6824,13 +6760,6 @@ impl StudioVfs {
                 } else {
                     vfs_write_bytes as f64 / vfs_write_calls as f64
                 },
-                record_handle_writer_state: Self::build_stage_latency_stats(
-                    vfs_write_record_handle_writer_state_calls,
-                    vfs_write_record_handle_writer_state_total_ns,
-                    vfs_write_record_handle_writer_state_max_ns,
-                    vfs_write_record_handle_writer_state_histogram,
-                    elapsed,
-                ),
                 record_writer_stack_state: Self::build_stage_latency_stats(
                     vfs_write_record_writer_stack_state_calls,
                     vfs_write_record_writer_stack_state_total_ns,
@@ -6889,7 +6818,7 @@ impl StudioVfs {
             },
             drain_lag: VfsWritePathDrainLagStats {
                 current_bytes: drain_lag_current_bytes,
-                steady_quota_bytes: self.handle_writer_slice_flush_bytes(),
+                steady_quota_bytes: self.writer_stack_steady_drain_quota_bytes(),
                 soft_pacing_events: self
                     .state
                     .metrics
@@ -6970,7 +6899,6 @@ impl StudioVfs {
                 pending_persisted_slice_bytes,
                 dirty_slice_count,
                 frozen_slice_count,
-                handle_writer_dirty_bytes,
                 writer_stack_dirty_bytes,
                 total_dirty_bytes,
                 dirty_limit_bytes: self.max_dirty_bytes(),

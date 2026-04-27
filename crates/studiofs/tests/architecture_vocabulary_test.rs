@@ -715,3 +715,39 @@ fn active_code_drops_flat_block_contract_vocabulary() {
         hits.join("\n")
     );
 }
+
+#[test]
+fn active_vfs_code_drops_legacy_handle_writer_data_plane() {
+    let files = [
+        "crates/studiofs-vfs/src/local_dirty.rs",
+        "crates/studiofs-vfs/src/vfs.rs",
+        "crates/studiofs-vfs/src/vfs",
+        "crates/studiofs-vfs/tests",
+    ];
+    let forbidden_terms = [
+        "HandleWriterRegistry",
+        "handle_writers",
+        "handle writer registry",
+        "snapshot_handle_writer",
+        "record_handle_writer",
+        "materialize_handle_writer",
+        "spill_handle_writer",
+    ];
+
+    let hits: Vec<_> = files
+        .iter()
+        .flat_map(|path| {
+            if repo_root().join(path).is_dir() {
+                collect_term_hits_recursively(path, &forbidden_terms)
+            } else {
+                collect_term_hits(path, &forbidden_terms)
+            }
+        })
+        .collect();
+
+    assert!(
+        hits.is_empty(),
+        "active VFS still exposes the removed handle-writer mounted data plane:\n{}",
+        hits.join("\n")
+    );
+}

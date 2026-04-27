@@ -126,8 +126,6 @@ pub struct VfsWritePathVfsWriteStats {
     pub write_bytes: u64,
     pub avg_write_bytes: f64,
     #[serde(default)]
-    pub record_handle_writer_state: VfsWritePathStageLatencyStats,
-    #[serde(default)]
     pub record_writer_stack_state: VfsWritePathStageLatencyStats,
     #[serde(default)]
     pub materialize_completed: VfsWritePathStageLatencyStats,
@@ -221,8 +219,6 @@ pub struct VfsWritePathDirtyPressureStats {
     pub dirty_slice_count: usize,
     #[serde(default)]
     pub frozen_slice_count: usize,
-    pub handle_writer_dirty_bytes: usize,
-    #[serde(default)]
     pub writer_stack_dirty_bytes: usize,
     pub total_dirty_bytes: usize,
     pub dirty_limit_bytes: usize,

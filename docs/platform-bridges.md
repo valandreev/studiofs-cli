@@ -276,12 +276,12 @@ background local-I/O pool.
 
 FUSE callback barrier semantics:
 - `flush` is a handle-backed explicit local-durability barrier and routes through the shared handle-drain barrier path.
-- `fsync` is inode-scoped. It persists local unpublished state for the inode, including dirty handle-writer state, but does not force remote publication.
+- `fsync` is inode-scoped. It persists local unpublished state for the inode, including dirty writer-stack state, but does not force remote publication.
 - `release` becomes the fallback strict local crash-safe durability barrier for the last handle when dirty unpublished state remains, but it must not force synchronous PG/S3 replication or upload completion. `fsync` remains the explicit caller-requested strict sync API even though it is no longer the only callback path that reaches local crash-safe durability.
 - Size-changing `setattr` / truncate paths commit the new local EOF before the callback returns.
 
 FUSE data-buffer behavior:
-- `write`: the kernel-provided `data: &[u8]` slice is forwarded directly to the shared deferred VFS handle writer path; the bridge does not allocate a second full payload buffer before VFS acceptance.
+- `write`: the kernel-provided `data: &[u8]` slice is forwarded directly to the shared deferred VFS writer-stack path; the bridge does not allocate a second full payload buffer before VFS acceptance.
 - `read`: `fuser::ReplyData` exposes `reply.data(&[u8])` rather than a mutable caller buffer, so `StudioFuseFs` must allocate one reply-sized `Vec<u8>` for the callback, fill it through `read_into_fh()`, and pass the populated slice to `ReplyData`. This is the bridge-level exception to direct caller-buffer filling and is limited to the API boundary.
 
 **UID/GID remapping:** root-owned inodes (uid=0) are remapped to the mounting user's UID/GID.

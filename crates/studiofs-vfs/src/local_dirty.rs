@@ -1553,7 +1553,7 @@ impl StudioVfs {
             return Vec::new();
         }
 
-        let spill_bytes_cap = self.handle_writer_slice_flush_bytes();
+        let spill_bytes_cap = self.writer_stack_steady_drain_quota_bytes();
         let mut ordered_blocks: Vec<&DirtyWriteSnapshot> = blocks.iter().collect();
         ordered_blocks.sort_unstable_by_key(|block| block.block_index);
 
@@ -1773,33 +1773,6 @@ impl StudioVfs {
         .await
     }
 
-    pub(super) async fn derive_opportunistic_prefix_attr(
-        &self,
-        ino: Ino,
-        dirty_attr: Option<&InodeAttr>,
-        completed_blocks: &[DirtyWriteSnapshot],
-    ) -> VfsResult<Option<InodeAttr>> {
-        let Some(max_completed_end) = completed_blocks
-            .iter()
-            .map(|block| {
-                (u64::from(block.block_index) + 1).saturating_mul(u64::from(self.block_size))
-            })
-            .max()
-        else {
-            return Ok(None);
-        };
-
-        let persisted_attr = run_meta(self.meta.clone(), move |engine: Arc<dyn VfsMeta>| {
-            engine.get_attr(ino)
-        })
-        .await?;
-        let mut attr = dirty_attr
-            .cloned()
-            .unwrap_or_else(|| persisted_attr.clone());
-        attr.size = persisted_attr.size.max(max_completed_end);
-        Ok(Some(attr))
-    }
-
     pub(super) async fn persist_dirty_write_snapshots_direct(
         &self,
         ino: Ino,
@@ -1966,24 +1939,6 @@ impl StudioVfs {
         inos_with_bytes.into_iter().map(|(ino, _)| ino).collect()
     }
 
-    #[cfg(test)]
-    pub(super) fn pending_persisted_local_dirty_slice_bytes_for_inode(&self, ino: Ino) -> usize {
-        self.state
-            .local_dirty
-            .pending_chunk_slices
-            .lock()
-            .get(&ino)
-            .map(|chunks| {
-                chunks
-                    .values()
-                    .flat_map(|slices| slices.iter())
-                    .filter(|slice| slice.is_persisted())
-                    .map(|slice| slice.range.len() as usize)
-                    .sum()
-            })
-            .unwrap_or(0)
-    }
-
     pub(super) fn total_pending_persisted_local_dirty_slice_bytes(&self) -> usize {
         self.state
             .local_dirty
@@ -2006,21 +1961,20 @@ impl StudioVfs {
 
     pub(super) fn total_landed_write_drain_lag_bytes(&self) -> usize {
         self.state
-            .handle_writers
+            .writer_stack
             .total_dirty_bytes()
-            .saturating_add(self.state.writer_stack.total_dirty_bytes())
             .saturating_add(self.total_pending_local_dirty_bytes())
             .saturating_add(self.total_pending_persisted_local_dirty_slice_bytes())
     }
 
     fn pending_slice_commit_wave_bytes(&self) -> usize {
-        self.handle_writer_slice_flush_bytes()
+        self.writer_stack_steady_drain_quota_bytes()
             .min(self.write_eager_flush_drain_chunk_bytes)
             .max(1)
     }
 
     fn pending_slice_commit_hot_tail_bytes(&self) -> usize {
-        self.handle_writer_slice_flush_bytes()
+        self.writer_stack_steady_drain_quota_bytes()
     }
 
     fn oldest_pending_persisted_local_dirty_slice_age(
@@ -2051,7 +2005,7 @@ impl StudioVfs {
             return pending_slices;
         }
 
-        let has_dirty_tail = self.state.handle_writers.dirty_bytes_for_inode(ino) > 0;
+        let has_dirty_tail = self.state.writer_stack.dirty_bytes_for_inode(ino) > 0;
         if !has_dirty_tail {
             return pending_slices;
         }
@@ -2170,7 +2124,7 @@ impl StudioVfs {
             return true;
         }
 
-        if self.state.handle_writers.dirty_bytes_for_inode(ino) == 0 {
+        if self.state.writer_stack.dirty_bytes_for_inode(ino) == 0 {
             return true;
         }
 
@@ -3379,6 +3333,31 @@ mod tests {
         vfs.clear_pending_dirty_slices_for_inode(ino);
 
         assert_eq!(vfs.pending_local_dirty_slice_counts(), (0, 0));
+    }
+
+    #[test]
+    fn buffered_write_spill_batches_preserve_cloud_object_boundaries() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "spill-object-boundaries");
+        let block_size = vfs.block_size as usize;
+        let blocks = vec![
+            DirtyWriteSnapshot::from_shared(0, Bytes::from(vec![0xA1; block_size])),
+            DirtyWriteSnapshot::from_shared(1, Bytes::from(vec![0xB2; block_size])),
+        ];
+
+        let batches = vfs.build_dirty_write_snapshot_slice_spill_batches(&blocks);
+
+        assert_eq!(
+            batches.len(),
+            2,
+            "each full logical block needs its own uploadable cloud object"
+        );
+        for (block_index, batch) in batches.iter().enumerate() {
+            assert_eq!(batch.payload.len(), block_size);
+            assert_eq!(batch.segments.len(), 1);
+            assert_eq!(batch.segments[0].block_index, block_index as u32);
+            assert_eq!(batch.segments[0].object_offset, 0);
+        }
     }
 
     #[test]
