@@ -107,6 +107,18 @@ fn format_quantile_ms(value: f64, saturated: bool) -> String {
     }
 }
 
+fn format_staged_upload_cache_pressure_line(
+    snapshot: &VfsWritePathObservabilitySnapshot,
+) -> String {
+    format!(
+        "  Staged current/peak/upload/cache pressure: {}/{}/{}/{}",
+        format_bytes(snapshot.dirty_pressure.pending_persisted_slice_bytes as u64),
+        format_bytes(snapshot.dirty_pressure.staged_peak_bytes as u64),
+        format_bytes(snapshot.dirty_pressure.pending_upload_bytes as u64),
+        format_bytes(snapshot.dirty_pressure.cache_pressure_bytes as u64)
+    )
+}
+
 fn read_write_path_observability(
     cache_path: &Path,
 ) -> Option<(PathBuf, VfsWritePathObservabilitySnapshot)> {
@@ -716,12 +728,7 @@ pub fn run(
                 format_bytes(snapshot.dirty_pressure.dirty_peak_bytes as u64),
                 format_bytes(snapshot.dirty_pressure.dirty_limit_bytes as u64)
             );
-            println!(
-                "  Staged/upload/cache pressure: {}/{}/{}",
-                format_bytes(snapshot.dirty_pressure.staged_peak_bytes as u64),
-                format_bytes(snapshot.dirty_pressure.pending_upload_bytes as u64),
-                format_bytes(snapshot.dirty_pressure.cache_pressure_bytes as u64)
-            );
+            println!("{}", format_staged_upload_cache_pressure_line(&snapshot));
             println!(
                 "  Soft throttle / hard backpressure: {}/{}",
                 snapshot.write_backpressure.soft_throttle_events,
@@ -876,6 +883,20 @@ mod tests {
         assert_eq!(loaded.0, metrics_path);
         assert_eq!(loaded.1.backend_tag, "local-payload-runtime");
         assert_eq!(loaded.1.flush_barrier_calls, 11);
+    }
+
+    #[test]
+    fn mounted_status_labels_staged_current_and_peak_pressure() {
+        let mut snapshot = VfsWritePathObservabilitySnapshot::default();
+        snapshot.dirty_pressure.pending_persisted_slice_bytes = 512;
+        snapshot.dirty_pressure.staged_peak_bytes = 1024;
+        snapshot.dirty_pressure.pending_upload_bytes = 2048;
+        snapshot.dirty_pressure.cache_pressure_bytes = 4096;
+
+        assert_eq!(
+            format_staged_upload_cache_pressure_line(&snapshot),
+            "  Staged current/peak/upload/cache pressure: 512B/1.0KiB/2.0KiB/4.0KiB"
+        );
     }
 
     #[test]

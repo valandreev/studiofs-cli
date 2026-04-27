@@ -480,7 +480,11 @@ Internal metadata-cache defaults:
 - If these values need to move, change them as a code change with supporting
   reasoning rather than treating them as routine mount-time tuning.
 
-Metadata cache observability is emitted through the existing `upload pipeline` / `upload pipeline counters` log events and includes:
+Metadata cache observability is split between runtime log events and the mounted
+write-path observability snapshot used by `studiofs status --verbose` and cache
+test reports.
+
+The existing `upload pipeline` / `upload pipeline counters` log events include:
 
 - dentry cache, full-path shortcut cache, and attr read cache metrics: hits/misses/evictions, occupancy, protected-tier (hotset) occupancy, and hot-hit contribution
 - writer/cache recovery counters and checkpoint stats
@@ -488,11 +492,16 @@ Metadata cache observability is emitted through the existing `upload pipeline` /
 - cache shim read/write throughput and latency histograms
 - VFS synchronous read fast-path counters (`vfs_read_sync_fast_path_hits`, `vfs_read_sync_fast_path_misses`)
 - queue depth/backpressure metrics (`upload_queue_depth`, `upload_queue_depth_peak`, `write_backpressure_wait_ms`, `write_backpressure_events`)
-- writer/cache backpressure metrics (`fast_backpressure_wait_ms`, `fast_backpressure_events`, `fast_backpressure_stall_max_ms`, `soft_throttle_events`, `hard_events`)
-- dirty-pressure metrics (`total_dirty_bytes`, `dirty_peak_bytes`, `dirty_limit_bytes`, `pending_persisted_slice_bytes`, `staged_peak_bytes`, `pending_upload_bytes`, `cache_pressure_bytes`)
+- writer/cache backpressure metrics (`fast_backpressure_wait_ms`, `fast_backpressure_events`, `fast_backpressure_stall_max_ms`)
 - upload local payload-read metrics (`upload_local_payload_reads`, `upload_local_payload_read_bytes`, `upload_fallback_deferrals`, `upload_fallback_rereads`, `upload_fallback_reread_bytes`, `upload_fallback_reread_cache_misses`, `upload_fallback_wait_ms`, `upload_fallback_wait_max_ms`, `upload_fallback_read_ms`, `upload_fallback_read_max_ms`)
 - transit-memory budget metrics (`transit_memory_budget_bytes`, `transit_memory_used_bytes`, `transit_memory_available_bytes`, `transit_memory_waiting_foreground`, `transit_memory_waiting_background`)
 - foreground access-policy metrics (`dominant_access_class`, `dominant_prefetch_enabled`, `dominant_cache_promotion_on_read`, `dominant_readahead_base_width`, `dominant_readahead_max_width`, `dominant_readahead_min_prefetch`, `dominant_upload_pressure_boost`, `active_sequential_media_reads`, `active_random_interactive_reads`, `active_sequential_writers`, `active_random_writers`)
+
+The mounted write-path observability snapshot additionally reports soft/hard
+write-path events (`soft_throttle_events`, `hard_events`) and dirty-pressure
+fields (`total_dirty_bytes`, `dirty_peak_bytes`, `dirty_limit_bytes`,
+`pending_persisted_slice_bytes`, `staged_peak_bytes`, `pending_upload_bytes`,
+`cache_pressure_bytes`).
 
 Dentry/path shortcut logs also include negative-hit ratio. The summary `upload pipeline` line is emitted while uploads or metadata replication are active and then once more with `pending_uploads=0` and `pending_metadata_ops=0` after the pipeline fully drains. Its `pending_uploads` field reports the queued upload volume in a human-readable size (`1904MB`, `1.9GB`) instead of a block count.
 Local backend read/write throughput metrics are lifetime averages since the current backend instance was opened (not short-window/EMA samples).
