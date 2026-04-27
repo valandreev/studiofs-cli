@@ -634,6 +634,116 @@ fn startup_replay_summary_reports_recovered_bytes_and_queued_uploads() {
 }
 
 #[test]
+fn startup_replay_restores_live_extents_for_duplicate_dirty_object_references() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-replay-duplicate-object");
+
+    let first = vfs
+        .create(1, b"duplicate-object-a.bin", 0, 0, 0o644)
+        .expect("create first file");
+    let second = vfs
+        .create(1, b"duplicate-object-b.bin", 0, 0, 0o644)
+        .expect("create second file");
+    let object_id = 7_031;
+    let payload = vec![0xC7; 4096];
+
+    vfs.local_payload_backend()
+        .put(object_id, &payload, false)
+        .expect("persist shared dirty payload");
+    vfs.local_payload_backend()
+        .sync_data()
+        .expect("sync shared dirty payload");
+
+    let mut attrs = Vec::new();
+    for ino in [first.ino, second.ino] {
+        let mut attr = meta.get_attr(ino).expect("load attr");
+        attr.size = payload.len() as u64;
+        attr.committed_size = 0;
+        attr.content_epoch = 12;
+        attr.committed_content_epoch = 11;
+        attr.upload_state = MetaUploadState::Uploading;
+        meta.set_attr(&attr).expect("persist staged attr");
+        meta.stage_payload_slice(
+            ino,
+            0,
+            &PayloadRef::new_partial(object_id, payload.len() as u32),
+        )
+        .expect("persist duplicate object reference");
+        attrs.push(attr);
+    }
+
+    vfs.replay_dirty_uploads_from_local_backend(&[], &attrs);
+
+    assert_eq!(
+        vfs.live_extent_records_for_inode(first.ino),
+        vec![(0, object_id, 12)],
+        "first file should recover a live extent for the shared dirty object"
+    );
+    assert_eq!(
+        vfs.live_extent_records_for_inode(second.ino),
+        vec![(0, object_id, 12)],
+        "second file should also recover a live extent even though upload replay is object-deduped"
+    );
+    assert_eq!(
+        vfs.cached_store().snapshot_pending_uploads().len(),
+        1,
+        "startup replay should still submit only one upload for one dirty object"
+    );
+}
+
+#[test]
+fn startup_replay_restores_all_block_extents_when_one_file_reuses_dirty_object_id() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "startup-replay-duplicate-blocks");
+
+    let created = vfs
+        .create(1, b"duplicate-blocks.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let object_id = 7_032;
+    let block_len = vfs.block_size;
+
+    vfs.local_payload_backend()
+        .put(object_id, &vec![0xD4; block_len as usize], false)
+        .expect("persist shared dirty payload");
+    vfs.local_payload_backend()
+        .sync_data()
+        .expect("sync shared dirty payload");
+
+    let mut attr = meta.get_attr(created.ino).expect("load attr");
+    attr.size = u64::from(block_len) * 2;
+    attr.committed_size = 0;
+    attr.content_epoch = 13;
+    attr.committed_content_epoch = 12;
+    attr.upload_state = MetaUploadState::Uploading;
+    meta.set_attr(&attr).expect("persist staged attr");
+    meta.stage_payload_slice(
+        created.ino,
+        0,
+        &PayloadRef::new_partial(object_id, block_len),
+    )
+    .expect("persist first duplicate object reference");
+    meta.stage_payload_slice(
+        created.ino,
+        1,
+        &PayloadRef::new_partial(object_id, block_len),
+    )
+    .expect("persist second duplicate object reference");
+
+    vfs.replay_dirty_uploads_from_local_backend(&[], &[attr]);
+
+    assert_eq!(
+        vfs.live_extent_records_for_inode(created.ino),
+        vec![(0, object_id, 13), (1, object_id, 13)],
+        "startup replay should restore every logical block covered by the reused dirty object"
+    );
+    assert_eq!(
+        vfs.cached_store().snapshot_pending_uploads().len(),
+        1,
+        "one physical dirty object should still map to one upload submission"
+    );
+}
+
+#[test]
 fn flush_queues_runtime_upload_immediately_after_local_durability() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "flush-queues-runtime-upload");
