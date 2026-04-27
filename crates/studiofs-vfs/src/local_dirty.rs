@@ -3408,19 +3408,16 @@ mod tests {
         let block_index = 3;
         let chunk_id = 0;
 
-        vfs.state.local_dirty.pending_payloads.lock().insert(
-            (ino, block_index),
+        vfs.replace_pending_local_dirty_payload(
+            ino,
+            block_index,
             PendingPayload::buffered(BytesMut::from(&b"abcdefgh"[..]), None),
         );
-        vfs.state
-            .local_dirty
-            .pending_chunk_slices
-            .lock()
-            .entry(ino)
-            .or_default()
-            .insert(
-                chunk_id,
-                vec![
+        vfs.insert_pending_local_dirty_slice_entries(
+            ino,
+            vec![
+                (
+                    chunk_id,
                     PendingDirtySlice {
                         range: studiofs_meta::schema::SliceRange::new(100, 106)
                             .expect("slice range"),
@@ -3431,6 +3428,9 @@ mod tests {
                         object_offset: 0,
                         created_at: Instant::now(),
                     },
+                ),
+                (
+                    chunk_id,
                     PendingDirtySlice {
                         range: studiofs_meta::schema::SliceRange::new(200, 202)
                             .expect("slice range"),
@@ -3441,8 +3441,9 @@ mod tests {
                         object_offset: 0,
                         created_at: Instant::now(),
                     },
-                ],
-            );
+                ),
+            ],
+        );
 
         let changed = vfs
             .trim_local_payload_staging(ino, block_index, 5)
