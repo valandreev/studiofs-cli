@@ -6,6 +6,7 @@ use studiofs_vfs::{
     HandleDrainBarrier, HandleDrainDeleteRequest, HandleDrainRequest, HandleReleasePort,
     LocalSyncBarrierPort,
 };
+use tracing::{debug, error, trace};
 
 pub(super) struct FuseHandleDrainFacade<'a> {
     fs: &'a StudioFuseFs,
@@ -134,26 +135,45 @@ impl DeleteCleanupPort for FuseDeleteCleanupPort {
 impl BarrierObservabilityPort for FuseBarrierObservabilityPort {
     fn note_cleanup_callback(&self) {}
 
-    fn note_flush_callback(&self) {}
+    fn note_flush_callback(&self) {
+        trace!("FUSE flush callback entered handle-drain barrier");
+    }
 
-    fn note_flush_barrier_outcome(&self, _flushed_local_dirty_state: bool) {}
+    fn note_flush_barrier_outcome(&self, flushed_local_dirty_state: bool) {
+        debug!(flushed_local_dirty_state, "FUSE flush barrier completed");
+    }
 
     fn note_close_callback(&self) {}
 
     fn note_release_success(
         &self,
-        _request: HandleDrainRequest,
-        _hint_was_taken: bool,
-        _outcome: ReleaseFhOutcome,
+        request: HandleDrainRequest,
+        hint_was_taken: bool,
+        outcome: ReleaseFhOutcome,
     ) {
+        debug!(
+            ino = request.ino,
+            fh = request.fh,
+            hint_was_taken,
+            closed_last_handle = outcome.closed_last_handle,
+            flushed_local_dirty_state = outcome.flushed_local_dirty_state,
+            "FUSE release barrier completed"
+        );
     }
 
     fn note_release_error(
         &self,
-        _request: HandleDrainRequest,
-        _cleanup_deferred_hint: bool,
-        _error: &studiofs_vfs::VfsError,
+        request: HandleDrainRequest,
+        cleanup_deferred_hint: bool,
+        error: &studiofs_vfs::VfsError,
     ) {
+        error!(
+            ino = request.ino,
+            fh = request.fh,
+            cleanup_deferred_hint,
+            "FUSE release barrier failed: {:?}",
+            error
+        );
     }
 }
 

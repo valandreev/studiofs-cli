@@ -15,6 +15,8 @@ use super::{
     Ino, StudioFileHandle, StudioFsContext, is_benign_cleanup_delete_error, resolve_parent,
 };
 
+const FSP_CLEANUP_DELETE: u32 = 0x01;
+
 pub(super) struct CallbackBarrierState {
     flush_gates: FlushGateRegistry,
     deferred_cleanup_hints: DeferredCleanupHints,
@@ -144,7 +146,7 @@ impl<'a> WinfspHandleDrainFacade<'a> {
         file_name: Option<&U16CStr>,
         flags: u32,
     ) -> CleanupCallbackAction {
-        if flags & 0x01 == 0 {
+        if flags & FSP_CLEANUP_DELETE == 0 {
             return CleanupCallbackAction::NonDelete {
                 ino: context.ino,
                 fh: context.fh,
