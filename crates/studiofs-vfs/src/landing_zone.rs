@@ -20,6 +20,7 @@ const DEFAULT_MAX_QUEUED_BYTES: usize = 256 * 1024 * 1024;
 #[cfg(windows)]
 const LANDING_FILE_SHARE_MODE: u32 = 0x00000001 | 0x00000002 | 0x00000004;
 
+#[allow(dead_code)]
 pub(super) struct LandingWrite {
     pub(super) ino: u64,
     pub(super) fh: u64,
@@ -124,6 +125,7 @@ pub(super) struct LandingZone {
     writer: Mutex<Option<JoinHandle<()>>>,
     writer_state: Arc<LandingWriterShared>,
     counters: Arc<LandingZoneCounters>,
+    #[allow(dead_code)]
     queue_limits: LandingQueueLimits,
 }
 
@@ -151,7 +153,9 @@ struct LandingFiles {
 
 #[derive(Debug, Clone, Copy)]
 struct LandingQueueLimits {
+    #[allow(dead_code)]
     max_writes: usize,
+    #[allow(dead_code)]
     max_bytes: usize,
 }
 
@@ -187,6 +191,7 @@ struct LandingWriterState {
 }
 
 impl LandingWriterState {
+    #[allow(dead_code)]
     fn can_accept(&self, write_len: usize, limits: LandingQueueLimits) -> bool {
         if self.queue.len() >= limits.max_writes.max(1) {
             return false;
@@ -197,6 +202,7 @@ impl LandingWriterState {
             || self.queue.is_empty()
     }
 
+    #[allow(dead_code)]
     fn push_queued(&mut self, write: QueuedLandingWrite) {
         self.queued_bytes = self.queued_bytes.saturating_add(write.len());
         self.queue.push_back(write);
@@ -292,6 +298,7 @@ impl LandingZone {
         })
     }
 
+    #[allow(dead_code)]
     pub(super) fn accept(&self, write: LandingWrite) -> io::Result<()> {
         let accept_started = Instant::now();
         let write_len = write.data.len();
@@ -756,6 +763,7 @@ impl LandingZone {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn record_accept_latency(&self, duration: Duration) {
         let elapsed_ns = duration_ns_u64(duration);
         self.counters

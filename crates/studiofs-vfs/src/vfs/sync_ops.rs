@@ -8,7 +8,6 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
-use crate::landing_zone::LandingWrite;
 use crate::runtime::run_meta;
 use crate::{VfsError, VfsMeta};
 
@@ -44,27 +43,6 @@ impl StudioVfs {
         self.landing_zone
             .clear_inodes(&replayed_inodes)
             .map_err(VfsError::Io)?;
-        Ok(())
-    }
-
-    fn land_opportunistic_write(
-        &self,
-        ino: Ino,
-        fh: u64,
-        offset: u64,
-        data: Bytes,
-        local_sync_policy: LocalSyncPolicy,
-    ) -> VfsResult<()> {
-        if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
-            self.landing_zone
-                .accept(LandingWrite {
-                    ino,
-                    fh,
-                    offset,
-                    data,
-                })
-                .map_err(VfsError::Io)?;
-        }
         Ok(())
     }
 
@@ -739,7 +717,6 @@ impl StudioVfs {
             self.note_vfs_write_call(data.len());
             let shared_data = Bytes::copy_from_slice(data);
 
-            self.land_opportunistic_write(ino, fh, offset, shared_data.clone(), local_sync_policy)?;
             let record_writer_stack_started = Instant::now();
             let written = self
                 .record_writer_stack_state_bytes(fh, ino, offset, shared_data)
@@ -856,7 +833,6 @@ impl StudioVfs {
                 .write_fh_with_local_sync_policy(fh, ino, offset, data, local_sync_policy)
                 .await;
         }
-
         // ── Acquire per-inode write gate ─────────────────────────────────
         let mut session = Some(
             self.state
@@ -872,7 +848,31 @@ impl StudioVfs {
             data.len(),
             self.access_tracker,
         );
-
+        if self.total_pending_write_buffer_bytes() > hard_backpressure_threshold {
+            self.state
+                .local_dirty
+                .hard_backpressure_events
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // #region debug log
+            self.debug_write_probe(
+                "H2",
+                "crates/studiofs-vfs/src/vfs/sync_ops.rs:866",
+                "hard backpressure fallback engaged after inode gate wait",
+                serde_json::json!({
+                    "ino": ino,
+                    "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
+                    "total_dirty_bytes": self.total_pending_write_buffer_bytes(),
+                    "hard_threshold_bytes": hard_backpressure_threshold,
+                    "max_dirty_bytes": self.max_dirty_bytes(),
+                }),
+            );
+            // #endregion debug log
+            drop(session);
+            self.state.file_session.gc_if_idle(ino);
+            return self
+                .write_fh_with_local_sync_policy(fh, ino, offset, data, local_sync_policy)
+                .await;
+        }
         // ── Buffer phase (fast: ~0.1 ms) ────────────────────────────────
         let result = async {
             self.enforce_access(ino, AccessLevel::ReadWrite)?;
@@ -894,7 +894,6 @@ impl StudioVfs {
             self.note_vfs_write_call(data.len());
             let shared_data = Bytes::copy_from_slice(data);
 
-            self.land_opportunistic_write(ino, fh, offset, shared_data.clone(), local_sync_policy)?;
             let record_writer_stack_started = Instant::now();
             let written = self
                 .record_writer_stack_state_bytes(fh, ino, offset, shared_data)
