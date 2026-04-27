@@ -328,8 +328,18 @@ pub struct VfsIngressPressure {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VfsUploadStats {
     pub pending_uploads: usize,
+    pub pending_upload_bytes: u64,
+    pub oldest_pending_upload_age_ms: u64,
+    pub active_uploads: usize,
+    pub pending_retry_count: u64,
+    pub max_pending_retry_count: u32,
+    pub completed_uploads: u64,
+    pub completed_upload_bytes: u64,
+    pub completed_uploads_per_sec: f64,
+    pub completed_upload_bytes_per_sec: f64,
     pub upload_requeues: u64,
     pub canceled_deleted: u64,
     pub canceled_stale: u64,

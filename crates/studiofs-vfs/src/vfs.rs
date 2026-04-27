@@ -5256,8 +5256,47 @@ impl StudioVfs {
     }
 
     pub fn upload_stats(&self) -> VfsUploadStats {
+        let pending_uploads = self.pending_uploads_snapshot();
+        let now_ms = now_unix_millis();
+        let (
+            pending_upload_bytes,
+            oldest_pending_upload_age_ms,
+            pending_retry_count,
+            max_pending_retry_count,
+        ) = pending_uploads.iter().fold(
+            (0u64, 0u64, 0u64, 0u32),
+            |(bytes, oldest_age, retries, max_retries), op| {
+                let payload_len = self
+                    .local_payload_backend
+                    .object_stats(op.object_id)
+                    .map(|stats| stats.payload_len)
+                    .unwrap_or(u64::from(self.block_size));
+                (
+                    bytes.saturating_add(payload_len),
+                    oldest_age.max(now_ms.saturating_sub(op.created_unix_ms)),
+                    retries.saturating_add(u64::from(op.retry_count)),
+                    max_retries.max(op.retry_count),
+                )
+            },
+        );
+        let cache_metrics = self.cached_store.cache_pipeline_metrics();
+        let completed_uploads = cache_metrics.upload_queue.completed;
+        let completed_upload_bytes = cache_metrics.upload_queue.completed_bytes;
+        let elapsed = self.write_path_started_at.elapsed();
+        let completed_uploads_per_sec = Self::per_second(completed_uploads, elapsed);
+        let completed_upload_bytes_per_sec = Self::per_second(completed_upload_bytes, elapsed);
+
         VfsUploadStats {
-            pending_uploads: self.pending_upload_count(),
+            pending_uploads: pending_uploads.len(),
+            pending_upload_bytes,
+            oldest_pending_upload_age_ms,
+            active_uploads: self.upload_scheduler.in_flight(),
+            pending_retry_count,
+            max_pending_retry_count,
+            completed_uploads,
+            completed_upload_bytes,
+            completed_uploads_per_sec,
+            completed_upload_bytes_per_sec,
             upload_requeues: self.state.upload.upload_requeues.load(Ordering::Relaxed),
             canceled_deleted: self
                 .state

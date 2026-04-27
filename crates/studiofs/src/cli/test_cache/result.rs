@@ -201,6 +201,7 @@ pub(super) struct UploadQueueStatsReport {
     pub(super) pending_depth_peak: usize,
     pub(super) submitted: u64,
     pub(super) completed: u64,
+    pub(super) completed_bytes: u64,
     pub(super) requeued: u64,
     pub(super) canceled: u64,
 }
@@ -302,6 +303,7 @@ impl From<studiofs_cache::metrics::UploadQueueStatsSnapshot> for UploadQueueStat
             pending_depth_peak: snapshot.pending_depth_peak,
             submitted: snapshot.submitted,
             completed: snapshot.completed,
+            completed_bytes: snapshot.completed_bytes,
             requeued: snapshot.requeued,
             canceled: snapshot.canceled,
         }
@@ -400,6 +402,7 @@ pub(crate) fn sample_report() -> BenchmarkReport {
                 pending_depth_peak: 3,
                 submitted: 16,
                 completed: 16,
+                completed_bytes: 128 * 1024 * 1024,
                 requeued: 0,
                 canceled: 0,
             },

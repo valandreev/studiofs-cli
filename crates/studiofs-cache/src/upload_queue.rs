@@ -111,21 +111,45 @@ impl UploadQueue {
     }
 
     /// Mark an upload as complete.
-    pub fn complete(&self, op: &PendingUpload) {
+    ///
+    /// Returns `true` when the pending entry matched and was removed; `false`
+    /// means the op was already terminal or stale.
+    pub fn complete(&self, op: &PendingUpload) -> bool {
         if self.remove_pending_if_matches(op) {
             self.mark_done();
+            true
+        } else {
+            false
         }
     }
 
     /// Requeue a failed upload for retry (does not increment pending count).
+    ///
+    /// Returns `true` when the pending entry matched, was updated, and was
+    /// sent for retry; `false` means the op was already terminal, stale, or
+    /// the worker channel is closed.
     pub fn requeue(&self, op: PendingUpload) -> bool {
-        self.sender.send(op).is_ok()
+        let Some(previous) = self.update_pending_if_matches(&op) else {
+            return false;
+        };
+        if self.sender.send(op.clone()).is_ok() {
+            true
+        } else {
+            self.restore_pending_if_current_matches(&op, previous);
+            false
+        }
     }
 
     /// Cancel a pending upload and decrement pending count.
-    pub fn cancel(&self, op: &PendingUpload) {
+    ///
+    /// Returns `true` when the pending entry matched and was removed; `false`
+    /// means the op was already terminal or stale.
+    pub fn cancel(&self, op: &PendingUpload) -> bool {
         if self.remove_pending_if_matches(op) {
             self.mark_done();
+            true
+        } else {
+            false
         }
     }
 
@@ -253,6 +277,39 @@ impl UploadQueue {
         }
         false
     }
+
+    fn update_pending_if_matches(&self, op: &PendingUpload) -> Option<PendingUpload> {
+        let mut state = self.pending_state.lock();
+        let current = state.by_object.get_mut(&op.object_id)?;
+        if current.ino != op.ino
+            || current.offset != op.offset
+            || current.content_epoch != op.content_epoch
+        {
+            return None;
+        }
+        let previous = current.clone();
+        *current = op.clone();
+        Some(previous)
+    }
+
+    fn restore_pending_if_current_matches(
+        &self,
+        failed_op: &PendingUpload,
+        previous: PendingUpload,
+    ) {
+        let mut state = self.pending_state.lock();
+        let Some(current) = state.by_object.get_mut(&failed_op.object_id) else {
+            return;
+        };
+        if current.ino == failed_op.ino
+            && current.offset == failed_op.offset
+            && current.content_epoch == failed_op.content_epoch
+            && current.retry_count == failed_op.retry_count
+            && current.not_before_unix_ms == failed_op.not_before_unix_ms
+        {
+            *current = previous;
+        }
+    }
 }
 
 fn now_unix_ms() -> u64 {
@@ -351,6 +408,45 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].object_id, 100);
         assert_eq!(pending[0].content_epoch, 2);
+    }
+
+    #[tokio::test]
+    async fn requeue_updates_pending_snapshot_retry_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        queue.submit(10, 0, 100, 1);
+        let mut retry = rx.recv().await.unwrap();
+        retry.retry_count = 2;
+        retry.not_before_unix_ms = now_unix_ms().saturating_add(1_000);
+
+        assert!(queue.requeue(retry.clone()));
+
+        let pending = queue.snapshot_pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].object_id, 100);
+        assert_eq!(pending[0].retry_count, 2);
+        assert_eq!(pending[0].not_before_unix_ms, retry.not_before_unix_ms);
+    }
+
+    #[tokio::test]
+    async fn failed_requeue_does_not_mutate_pending_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (queue, mut rx) = UploadQueue::new(dir.path());
+
+        queue.submit(10, 0, 100, 1);
+        let mut retry = rx.recv().await.unwrap();
+        drop(rx);
+        retry.retry_count = 2;
+        retry.not_before_unix_ms = now_unix_ms().saturating_add(1_000);
+
+        assert!(!queue.requeue(retry));
+
+        let pending = queue.snapshot_pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].object_id, 100);
+        assert_eq!(pending[0].retry_count, 0);
+        assert_eq!(pending[0].not_before_unix_ms, 0);
     }
 
     #[tokio::test]

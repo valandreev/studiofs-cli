@@ -574,10 +574,18 @@ impl CachedStore {
     }
 
     pub fn complete_upload(&self, op: &PendingUpload) {
-        self.upload_queue.complete(op);
-        self.record_upload_terminal(op.object_id);
-        self.unpin(op.object_id);
-        self.metrics.upload_queue.record_complete();
+        if self.upload_queue.complete(op) {
+            let mut bytes = self.record_upload_terminal(op.object_id);
+            if bytes == 0 {
+                bytes = self
+                    .local_payload_backend
+                    .object_stats(op.object_id)
+                    .map(|stats| stats.payload_len)
+                    .unwrap_or(0);
+            }
+            self.unpin(op.object_id);
+            self.metrics.upload_queue.record_complete(bytes);
+        }
     }
 
     pub fn requeue_upload(&self, op: PendingUpload) -> bool {
@@ -589,10 +597,11 @@ impl CachedStore {
     }
 
     pub fn cancel_upload(&self, op: &PendingUpload) {
-        self.upload_queue.cancel(op);
-        self.record_upload_terminal(op.object_id);
-        self.unpin(op.object_id);
-        self.metrics.upload_queue.record_cancel();
+        if self.upload_queue.cancel(op) {
+            self.record_upload_terminal(op.object_id);
+            self.unpin(op.object_id);
+            self.metrics.upload_queue.record_cancel();
+        }
     }
 
     pub fn pending_upload_count(&self) -> usize {
@@ -647,13 +656,16 @@ impl CachedStore {
         self.submit_upload(ino, offset, object_id, content_epoch);
     }
 
-    fn record_upload_terminal(&self, object_id: ObjectId) {
+    fn record_upload_terminal(&self, object_id: ObjectId) -> u64 {
         if let Some(bytes) = self
             .pending_upload_bytes_by_object
             .lock()
             .remove(&object_id)
         {
             self.writer_counters.record_upload_terminal(bytes);
+            bytes
+        } else {
+            0
         }
     }
 }
