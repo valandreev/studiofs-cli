@@ -870,6 +870,7 @@ mod tests {
             winfsp_foreground_flushes: Default::default(),
             write_backpressure: Default::default(),
             dirty_pressure: Default::default(),
+            upload: Default::default(),
             payload_burst: Default::default(),
             payload_persist: Default::default(),
             metadata_commit: Default::default(),

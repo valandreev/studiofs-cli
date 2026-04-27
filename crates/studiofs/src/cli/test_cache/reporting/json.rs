@@ -196,6 +196,46 @@ mod tests {
     }
 
     #[test]
+    fn save_benchmark_report_includes_sfs299_mounted_observability_surface() {
+        let temp = tempdir().unwrap();
+        let report = sample_report();
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 19, 15, 12, 55)
+            .single()
+            .unwrap();
+
+        let saved =
+            save_benchmark_report_in(&report, Some(Path::new("cache-run.json")), temp.path(), now)
+                .unwrap();
+
+        let content = std::fs::read_to_string(saved).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        assert!(parsed["writes"]["latency_histogram"].is_object());
+        assert!(parsed["reads"]["latency_histogram"].is_object());
+        assert!(parsed["mounted_runtime"]["mounted_path"].is_string());
+        assert!(parsed["mounted_runtime"]["cache_root"].is_string());
+        assert!(parsed["mounted_runtime"]["metadata_root"].is_string());
+        assert!(parsed["mounted_runtime"]["os"].is_string());
+        assert!(parsed["mounted_runtime"]["bridge_type"].is_string());
+        assert!(parsed["mounted_runtime"]["workload_shape"].is_object());
+
+        let observability = &parsed["mounted_observability"];
+        assert!(observability["writer"]["dirty_bytes"].is_number());
+        assert!(observability["writer"]["dirty_slice_count"].is_number());
+        assert!(observability["writer"]["frozen_slice_count"].is_number());
+        assert!(observability["writer"]["staged_bytes"].is_number());
+        assert!(observability["writer"]["dirty_limit_bytes"].is_number());
+        assert!(observability["upload"]["backlog_count"].is_number());
+        assert!(observability["upload"]["backlog_bytes"].is_number());
+        assert!(observability["upload"]["throughput_bytes_per_sec"].is_number());
+        assert!(observability["upload"]["retry_count"].is_number());
+        assert!(observability["post_upload_idle"]["observed"].is_boolean());
+        assert!(observability["post_upload_idle"]["timed_out"].is_boolean());
+        assert!(observability["barriers"]["flush_fsync_close_latency"].is_object());
+    }
+
+    #[test]
     fn save_benchmark_report_omits_unavailable_dirty_pressure_fields() {
         let temp = tempdir().unwrap();
         let mut report = sample_report();

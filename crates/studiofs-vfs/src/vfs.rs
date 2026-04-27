@@ -6565,6 +6565,7 @@ impl StudioVfs {
             .saturating_add(landing_zone_stats.manifest_syncs);
         let pending_local_dirty_bytes = self.total_pending_local_dirty_bytes();
         let pending_persisted_slice_bytes = self.total_pending_persisted_local_dirty_slice_bytes();
+        let (dirty_slice_count, frozen_slice_count) = self.pending_local_dirty_slice_counts();
         let handle_writer_dirty_bytes = self.state.handle_writers.total_dirty_bytes();
         let writer_stack_dirty_bytes = self.state.writer_stack.total_dirty_bytes();
         let total_dirty_bytes = pending_local_dirty_bytes
@@ -6967,6 +6968,8 @@ impl StudioVfs {
             dirty_pressure: VfsWritePathDirtyPressureStats {
                 pending_local_dirty_bytes,
                 pending_persisted_slice_bytes,
+                dirty_slice_count,
+                frozen_slice_count,
                 handle_writer_dirty_bytes,
                 writer_stack_dirty_bytes,
                 total_dirty_bytes,
@@ -6977,6 +6980,7 @@ impl StudioVfs {
                 dirty_peak_bytes,
                 staged_peak_bytes,
             },
+            upload: upload_stats,
             payload_burst: VfsWritePathBurstStats {
                 bursts: payload_burst_count,
                 bursts_per_sec: Self::per_second(payload_burst_count, elapsed),

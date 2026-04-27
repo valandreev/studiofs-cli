@@ -1987,6 +1987,20 @@ impl StudioVfs {
             .load(Ordering::Relaxed)
     }
 
+    pub(super) fn pending_local_dirty_slice_counts(&self) -> (usize, usize) {
+        let pending_chunk_slices = self.state.local_dirty.pending_chunk_slices.lock();
+        pending_chunk_slices
+            .values()
+            .flat_map(|chunks| chunks.values())
+            .flat_map(|slices| slices.iter())
+            .fold((0usize, 0usize), |(dirty, frozen), slice| {
+                (
+                    dirty.saturating_add(1),
+                    frozen.saturating_add(usize::from(slice.is_persisted())),
+                )
+            })
+    }
+
     pub(super) fn total_landed_write_drain_lag_bytes(&self) -> usize {
         self.state
             .handle_writers
