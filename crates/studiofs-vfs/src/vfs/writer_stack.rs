@@ -856,6 +856,28 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_dirty_inodes_by_bytes_orders_largest_first() {
+        let (_dir, stack, _rx) = temp_stack(64, 16);
+
+        stack
+            .write_bytes(write_spec(1, 11, 0, 100), Bytes::from_static(b"small"))
+            .expect("small write");
+        stack
+            .write_bytes(
+                write_spec(2, 22, 0, 200),
+                Bytes::from_static(b"larger dirty inode"),
+            )
+            .expect("large write");
+        stack
+            .write_bytes(write_spec(3, 33, 0, 300), Bytes::from_static(b"medium"))
+            .expect("medium write");
+
+        let dirty = stack.snapshot_dirty_inodes_by_bytes();
+
+        assert_eq!(dirty, vec![22, 33, 11]);
+    }
+
+    #[test]
     fn writer_stack_splits_writes_at_chunk_boundaries() {
         let (_dir, stack, _rx) = temp_stack(8, 4);
 

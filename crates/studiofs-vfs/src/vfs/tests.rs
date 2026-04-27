@@ -5016,6 +5016,62 @@ fn flush_fh_materializes_opportunistic_writer_stack_state_into_overlay_slices() 
 }
 
 #[test]
+fn size_changing_setattr_syncs_materialized_writer_stack_payloads() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "setattr-syncs-writer-stack");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"setattr-syncs-writer-stack.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let payload = b"setattr-writer-stack-local-durability";
+
+        vfs.write_fh(fh, ino, 0, payload).await.unwrap();
+        assert!(
+            vfs.state.writer_stack.has_dirty_writers(ino),
+            "setup should leave payload bytes in the writer stack"
+        );
+
+        let calls_before = vfs
+            .state
+            .metrics
+            .payload_store_sync_data_calls
+            .load(Ordering::Relaxed);
+        let synced_before = vfs
+            .state
+            .metrics
+            .payload_store_sync_data_synced_bytes
+            .load(Ordering::Relaxed);
+
+        vfs.setattr(ino, SetattrArgs::size_only(8))
+            .expect("truncate through size-changing setattr");
+
+        let calls_after = vfs
+            .state
+            .metrics
+            .payload_store_sync_data_calls
+            .load(Ordering::Relaxed);
+        let synced_after = vfs
+            .state
+            .metrics
+            .payload_store_sync_data_synced_bytes
+            .load(Ordering::Relaxed);
+        assert!(
+            calls_after > calls_before,
+            "size-changing setattr must force a strict payload-store sync"
+        );
+        assert!(
+            synced_after >= synced_before + payload.len() as u64,
+            "strict sync should account for materialized writer-stack bytes"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn flush_fh_materializes_writer_stack_state_through_strict_local_barrier() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-245-flush-without-ordered-flush");

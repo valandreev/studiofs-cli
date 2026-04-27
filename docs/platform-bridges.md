@@ -281,7 +281,7 @@ FUSE callback barrier semantics:
 - Size-changing `setattr` / truncate paths commit the new local EOF before the callback returns.
 
 FUSE data-buffer behavior:
-- `write`: the kernel-provided `data: &[u8]` slice is forwarded directly to the shared deferred VFS handle writer path; the bridge does not allocate a second full payload buffer before VFS acceptance.
+- `write`: the kernel-provided `data: &[u8]` slice is forwarded directly to the shared deferred VFS writer-stack path; the bridge does not allocate a second full payload buffer before VFS acceptance.
 - `read`: `fuser::ReplyData` exposes `reply.data(&[u8])` rather than a mutable caller buffer, so `StudioFuseFs` must allocate one reply-sized `Vec<u8>` for the callback, fill it through `read_into_fh()`, and pass the populated slice to `ReplyData`. This is the bridge-level exception to direct caller-buffer filling and is limited to the API boundary.
 
 **UID/GID remapping:** root-owned inodes (uid=0) are remapped to the mounting user's UID/GID.

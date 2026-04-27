@@ -129,9 +129,18 @@ impl StudioVfs {
             .enter_op(ino, FileSessionOperation::Flush)
             .await;
         let result: VfsResult<InodeAttr> = async {
-            self.materialize_writer_stack_for_inode(ino).await?;
+            let persisted_slice_bytes_before_flush =
+                self.total_pending_persisted_local_dirty_slice_bytes();
+            let materialized_writer_stack_bytes =
+                self.materialize_writer_stack_for_inode(ino).await?;
             self.flush_local_dirty_state(ino, LocalSyncPolicy::Strict)
                 .await?;
+            self.maybe_payload_store_sync_data_async(
+                materialized_writer_stack_bytes.saturating_add(persisted_slice_bytes_before_flush)
+                    as u64,
+                LocalSyncPolicy::Strict,
+            )
+            .await?;
 
             let old_attr = self.getattr_async(ino).await?;
             let mut attr = old_attr.clone();
