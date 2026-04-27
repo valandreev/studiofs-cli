@@ -830,7 +830,7 @@ impl<'a> ReadMetadataResolver<'a> {
                 .vfs
                 .has_pending_local_dirty_payloads_for_inode(self.ino)
             && !self.vfs.inode_has_dirty_handle_writers(self.ino)
-            && !self.vfs.state.writer_stack.has_dirty_writers(self.ino);
+            && !self.vfs.inode_has_dirty_writer_stack(self.ino);
         if dirty_attr_present && !dirty_attr_cacheable {
             let ino = self.ino;
             let meta = self.vfs.meta.clone();
