@@ -627,6 +627,12 @@ impl MountedWriterStack {
     }
 }
 
+impl super::StudioVfs {
+    pub(super) fn inode_has_dirty_writer_stack(&self, ino: Ino) -> bool {
+        self.state.writer_stack.has_dirty_writers(ino)
+    }
+}
+
 #[allow(dead_code)]
 fn staged_object_count(len: usize, block_size: u32) -> u64 {
     let block_size = block_size as usize;

@@ -829,7 +829,8 @@ impl<'a> ReadMetadataResolver<'a> {
             && !self
                 .vfs
                 .has_pending_local_dirty_payloads_for_inode(self.ino)
-            && !self.vfs.inode_has_dirty_handle_writers(self.ino);
+            && !self.vfs.inode_has_dirty_handle_writers(self.ino)
+            && !self.vfs.inode_has_dirty_writer_stack(self.ino);
         if dirty_attr_present && !dirty_attr_cacheable {
             let ino = self.ino;
             let meta = self.vfs.meta.clone();
@@ -1923,6 +1924,78 @@ mod tests {
                 !Arc::ptr_eq(&cached_slices, &bypassed_slices),
                 "active local dirty payloads must bypass the dirty-attr read-plan cache"
             );
+        });
+    }
+
+    #[test]
+    fn resolve_read_metadata_async_bypasses_dirty_attr_read_plan_when_writer_stack_exists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "read-metadata-writer-stack-plan-cache-bypass");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"writer-stack-read-plan-cache-bypass.txt",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create file");
+            let ino = created.ino;
+            let payload = vec![0x53_u8; 512 * 1024];
+
+            vfs.write(ino, 0, &payload).await.expect("write payload");
+            vfs.flush(ino).await.expect("flush durable local payload");
+
+            let (content_epoch, blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+            publish_current_file_graph(&meta, ino, content_epoch, &blocks);
+            vfs.state.namespace.attr_read_cache.lock().remove(ino);
+
+            let mut dirty_attr = meta.get_attr(ino).expect("load published attr");
+            dirty_attr.upload_state = MetaUploadState::Updating;
+            dirty_attr.content_epoch = dirty_attr.content_epoch.saturating_add(1);
+            vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .insert(ino, dirty_attr.clone());
+
+            let (_, cached_slices) = vfs
+                .resolve_read_metadata_async(ino, 0, 64 * 1024)
+                .await
+                .expect("resolve cached read plan");
+
+            let fh = vfs
+                .open_file(ino, OpenFlags::RDWR, false)
+                .expect("open file");
+            vfs.write_fh(fh, ino, 64 * 1024, b"writer-stack-dirty")
+                .await
+                .expect("stage writer-stack dirty bytes");
+
+            dirty_attr.size = dirty_attr.size.max(64 * 1024 + 18);
+            vfs.state
+                .namespace
+                .dirty_attrs
+                .lock()
+                .insert(ino, dirty_attr);
+
+            assert!(
+                vfs.state.writer_stack.has_dirty_writers(ino),
+                "setup should leave active writer-stack state"
+            );
+
+            let (_, bypassed_slices) = vfs
+                .resolve_read_metadata_async(ino, 64 * 1024, 64 * 1024)
+                .await
+                .expect("resolve while writer-stack state is active");
+
+            assert!(
+                !Arc::ptr_eq(&cached_slices, &bypassed_slices),
+                "active writer-stack state must bypass the dirty-attr read-plan cache"
+            );
+
+            vfs.release_fh(fh).await.expect("release file handle");
         });
     }
 
