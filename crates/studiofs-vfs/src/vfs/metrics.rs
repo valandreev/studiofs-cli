@@ -328,6 +328,7 @@ pub struct VfsIngressPressure {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VfsUploadStats {
     pub pending_uploads: usize,
     pub pending_upload_bytes: u64,

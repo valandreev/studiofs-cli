@@ -5258,29 +5258,27 @@ impl StudioVfs {
     pub fn upload_stats(&self) -> VfsUploadStats {
         let pending_uploads = self.pending_uploads_snapshot();
         let now_ms = now_unix_millis();
-        let pending_upload_bytes = pending_uploads
-            .iter()
-            .map(|op| {
-                self.local_payload_backend
+        let (
+            pending_upload_bytes,
+            oldest_pending_upload_age_ms,
+            pending_retry_count,
+            max_pending_retry_count,
+        ) = pending_uploads.iter().fold(
+            (0u64, 0u64, 0u64, 0u32),
+            |(bytes, oldest_age, retries, max_retries), op| {
+                let payload_len = self
+                    .local_payload_backend
                     .object_stats(op.object_id)
                     .map(|stats| stats.payload_len)
-                    .unwrap_or(u64::from(self.block_size))
-            })
-            .sum::<u64>();
-        let oldest_pending_upload_age_ms = pending_uploads
-            .iter()
-            .map(|op| now_ms.saturating_sub(op.created_unix_ms))
-            .max()
-            .unwrap_or(0);
-        let pending_retry_count = pending_uploads
-            .iter()
-            .map(|op| u64::from(op.retry_count))
-            .sum::<u64>();
-        let max_pending_retry_count = pending_uploads
-            .iter()
-            .map(|op| op.retry_count)
-            .max()
-            .unwrap_or(0);
+                    .unwrap_or(u64::from(self.block_size));
+                (
+                    bytes.saturating_add(payload_len),
+                    oldest_age.max(now_ms.saturating_sub(op.created_unix_ms)),
+                    retries.saturating_add(u64::from(op.retry_count)),
+                    max_retries.max(op.retry_count),
+                )
+            },
+        );
         let cache_metrics = self.cached_store.cache_pipeline_metrics();
         let completed_uploads = cache_metrics.upload_queue.completed;
         let completed_upload_bytes = cache_metrics.upload_queue.completed_bytes;

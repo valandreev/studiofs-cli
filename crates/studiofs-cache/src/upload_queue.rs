@@ -111,6 +111,9 @@ impl UploadQueue {
     }
 
     /// Mark an upload as complete.
+    ///
+    /// Returns `true` when the pending entry matched and was removed; `false`
+    /// means the op was already terminal or stale.
     pub fn complete(&self, op: &PendingUpload) -> bool {
         if self.remove_pending_if_matches(op) {
             self.mark_done();
@@ -121,6 +124,10 @@ impl UploadQueue {
     }
 
     /// Requeue a failed upload for retry (does not increment pending count).
+    ///
+    /// Returns `true` when the pending entry matched, was updated, and was
+    /// sent for retry; `false` means the op was already terminal, stale, or
+    /// the worker channel is closed.
     pub fn requeue(&self, op: PendingUpload) -> bool {
         if !self.update_pending_if_matches(&op) {
             return false;
@@ -129,6 +136,9 @@ impl UploadQueue {
     }
 
     /// Cancel a pending upload and decrement pending count.
+    ///
+    /// Returns `true` when the pending entry matched and was removed; `false`
+    /// means the op was already terminal or stale.
     pub fn cancel(&self, op: &PendingUpload) -> bool {
         if self.remove_pending_if_matches(op) {
             self.mark_done();

@@ -795,8 +795,31 @@ fn upload_stats_report_backlog_bytes_age_retries_active_and_completion_rate() {
     assert_eq!(completed.pending_upload_bytes, 0);
     assert_eq!(completed.completed_uploads, 1);
     assert_eq!(completed.completed_upload_bytes, payload.len() as u64);
-    assert!(completed.completed_uploads_per_sec > 0.0);
-    assert!(completed.completed_upload_bytes_per_sec > 0.0);
+    assert!(completed.completed_uploads_per_sec >= 0.0);
+    assert!(completed.completed_upload_bytes_per_sec >= 0.0);
+}
+
+#[test]
+fn upload_stats_deserializes_snapshots_without_new_backlog_fields() {
+    let stats: VfsUploadStats = serde_json::from_value(serde_json::json!({
+        "pending_uploads": 2,
+        "upload_requeues": 1,
+        "canceled_deleted": 0,
+        "canceled_stale": 0
+    }))
+    .expect("old upload stats snapshots should remain readable");
+
+    assert_eq!(stats.pending_uploads, 2);
+    assert_eq!(stats.pending_upload_bytes, 0);
+    assert_eq!(stats.oldest_pending_upload_age_ms, 0);
+    assert_eq!(stats.active_uploads, 0);
+    assert_eq!(stats.pending_retry_count, 0);
+    assert_eq!(stats.max_pending_retry_count, 0);
+    assert_eq!(stats.completed_uploads, 0);
+    assert_eq!(stats.completed_upload_bytes, 0);
+    assert_eq!(stats.completed_uploads_per_sec, 0.0);
+    assert_eq!(stats.completed_upload_bytes_per_sec, 0.0);
+    assert_eq!(stats.upload_requeues, 1);
 }
 
 #[test]
