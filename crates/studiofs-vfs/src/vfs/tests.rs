@@ -741,6 +741,56 @@ fn wait_for_uploads_idle_observes_runtime_upload_queue() {
 }
 
 #[test]
+fn upload_stats_report_backlog_bytes_age_retries_active_and_completion_rate() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "upload-stats-backlog");
+    let _guard = rt.enter();
+
+    let created = vfs
+        .create(1, b"upload-stats.bin", 0, 0, 0o644)
+        .expect("create test file");
+    let payload = vec![0x44u8; vfs.block_size as usize];
+
+    rt.block_on(async {
+        vfs.write(created.ino, 0, &payload)
+            .await
+            .expect("write test payload");
+        vfs.flush(created.ino)
+            .await
+            .expect("flush durable local payload");
+    });
+
+    let pending = vfs.cached_store().snapshot_pending_uploads();
+    assert_eq!(pending.len(), 1, "test should stage one upload object");
+
+    let stats = vfs.upload_stats();
+    assert_eq!(stats.pending_uploads, 1);
+    assert_eq!(stats.pending_upload_bytes, payload.len() as u64);
+    assert!(
+        stats.oldest_pending_upload_age_ms < 5_000,
+        "newly staged upload should report a fresh backlog age, got {} ms",
+        stats.oldest_pending_upload_age_ms
+    );
+    assert_eq!(stats.active_uploads, 0);
+    assert_eq!(stats.pending_retry_count, 0);
+    assert_eq!(stats.max_pending_retry_count, 0);
+    assert_eq!(stats.completed_uploads, 0);
+    assert_eq!(stats.completed_upload_bytes, 0);
+    assert_eq!(stats.completed_uploads_per_sec, 0.0);
+    assert_eq!(stats.completed_upload_bytes_per_sec, 0.0);
+
+    vfs.cached_store().complete_upload(&pending[0]);
+
+    let completed = vfs.upload_stats();
+    assert_eq!(completed.pending_uploads, 0);
+    assert_eq!(completed.pending_upload_bytes, 0);
+    assert_eq!(completed.completed_uploads, 1);
+    assert_eq!(completed.completed_upload_bytes, payload.len() as u64);
+    assert!(completed.completed_uploads_per_sec > 0.0);
+    assert!(completed.completed_upload_bytes_per_sec > 0.0);
+}
+
+#[test]
 fn pending_upload_truth_ignores_deleted_inode_local_payloads() {
     let tmp = TempDir::new().expect("tempdir");
     let (_rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-views-deleted-inode");

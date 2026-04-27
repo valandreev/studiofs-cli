@@ -149,6 +149,7 @@ pub struct UploadQueueStatsSnapshot {
     pub pending_depth_peak: usize,
     pub submitted: u64,
     pub completed: u64,
+    pub completed_bytes: u64,
     pub requeued: u64,
     pub canceled: u64,
 }
@@ -158,6 +159,7 @@ pub struct UploadQueueStats {
     pending_depth_peak: AtomicUsize,
     submitted: AtomicU64,
     completed: AtomicU64,
+    completed_bytes: AtomicU64,
     requeued: AtomicU64,
     canceled: AtomicU64,
 }
@@ -168,8 +170,9 @@ impl UploadQueueStats {
         update_peak(&self.pending_depth_peak, pending_depth);
     }
 
-    pub fn record_complete(&self) {
+    pub fn record_complete(&self, bytes: u64) {
         self.completed.fetch_add(1, Ordering::Relaxed);
+        self.completed_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     pub fn record_requeue(&self) {
@@ -186,6 +189,7 @@ impl UploadQueueStats {
             pending_depth_peak: self.pending_depth_peak.load(Ordering::Relaxed),
             submitted: self.submitted.load(Ordering::Relaxed),
             completed: self.completed.load(Ordering::Relaxed),
+            completed_bytes: self.completed_bytes.load(Ordering::Relaxed),
             requeued: self.requeued.load(Ordering::Relaxed),
             canceled: self.canceled.load(Ordering::Relaxed),
         }
@@ -195,6 +199,7 @@ impl UploadQueueStats {
         self.pending_depth_peak.store(0, Ordering::Relaxed);
         self.submitted.store(0, Ordering::Relaxed);
         self.completed.store(0, Ordering::Relaxed);
+        self.completed_bytes.store(0, Ordering::Relaxed);
         self.requeued.store(0, Ordering::Relaxed);
         self.canceled.store(0, Ordering::Relaxed);
     }

@@ -111,9 +111,12 @@ impl UploadQueue {
     }
 
     /// Mark an upload as complete.
-    pub fn complete(&self, op: &PendingUpload) {
+    pub fn complete(&self, op: &PendingUpload) -> bool {
         if self.remove_pending_if_matches(op) {
             self.mark_done();
+            true
+        } else {
+            false
         }
     }
 
@@ -123,9 +126,12 @@ impl UploadQueue {
     }
 
     /// Cancel a pending upload and decrement pending count.
-    pub fn cancel(&self, op: &PendingUpload) {
+    pub fn cancel(&self, op: &PendingUpload) -> bool {
         if self.remove_pending_if_matches(op) {
             self.mark_done();
+            true
+        } else {
+            false
         }
     }
 
