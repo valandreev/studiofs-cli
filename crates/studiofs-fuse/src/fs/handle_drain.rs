@@ -171,8 +171,8 @@ impl BarrierObservabilityPort for FuseBarrierObservabilityPort {
             ino = request.ino,
             fh = request.fh,
             cleanup_deferred_hint,
-            "FUSE release barrier failed: {:?}",
-            error
+            error = ?error,
+            "FUSE release barrier failed"
         );
     }
 }
