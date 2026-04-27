@@ -69,8 +69,9 @@ Use `studiofs test <mounted-path> --report <path>` when the goal is a
 shareable parity report rather than a screenshot. The command writes a JSON
 report with mounted runtime identity, workload shape, write/read latency
 histograms, writer dirty pressure, cached-store staging latency, upload backlog
-and retry counters, barrier latency, RSS samples where available, and explicit
-post-upload idle status.
+and retry counters, barrier latency, RSS samples where available,
+cross-platform `mounted_portable_profile` process/allocator telemetry,
+`mounted_write_diagnostics` gate metrics, and explicit post-upload idle status.
 
 The read surface records two mounted phases:
 
@@ -82,7 +83,9 @@ The read surface records two mounted phases:
 Archive the JSON file next to any AJA or JuiceFS baseline notes. For StudioFS
 vs. JuiceFS comparisons, line up `mounted_runtime.workload_shape` first, then
 compare write/read throughput, latency histograms, RSS peak/steady state, upload
-backlog, and barrier latency.
+backlog, barrier latency, `known_local_write_amplification`, portable heap peak
+vs. process RSS, dirty/cache pressure, pending upload bytes, and any `blockers` listed in
+`mounted_write_diagnostics`.
 
 ### Validation expectation
 

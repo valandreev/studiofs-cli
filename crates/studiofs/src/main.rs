@@ -1,7 +1,10 @@
 //! StudioFS CLI — FUSE mount tool for S3-backed virtual filesystems.
 
+mod allocator_telemetry;
+
 #[global_allocator]
-static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL_ALLOCATOR: allocator_telemetry::TrackingMiMalloc =
+    allocator_telemetry::TrackingMiMalloc;
 
 use chrono::{Duration, NaiveDate, Utc};
 #[cfg(test)]

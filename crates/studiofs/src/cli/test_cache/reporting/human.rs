@@ -1,7 +1,10 @@
 use crate::cli::utils::{format_bytes, format_throughput};
 use std::fmt::Write as _;
 
-use super::super::result::{BenchmarkReport, MountedObservabilityReport, MountedRuntimeReport};
+use super::super::result::{
+    BenchmarkReport, MountedObservabilityReport, MountedPortableProfileReport,
+    MountedRuntimeReport, MountedWriteDiagnosticsReport,
+};
 
 fn format_duration_ms(ms: f64) -> String {
     if ms >= 1000.0 {
@@ -142,6 +145,119 @@ fn render_mounted_observability(out: &mut String, observability: &MountedObserva
     }
 }
 
+fn render_mounted_write_diagnostics(out: &mut String, diagnostics: &MountedWriteDiagnosticsReport) {
+    out.push('\n');
+    let _ = writeln!(out, "Mounted write diagnostics");
+    let _ = writeln!(
+        out,
+        "Gate: {} (write {:.2} MiB/s, RSS peak {}, amplification {})",
+        if diagnostics.pass { "pass" } else { "fail" },
+        diagnostics.write_throughput_mib_per_sec,
+        format_optional_bytes(diagnostics.rss_bytes_peak),
+        diagnostics
+            .known_local_write_amplification
+            .map(|value| format!("{value:.2}x"))
+            .unwrap_or_else(|| "n/a".to_string()),
+    );
+    let _ = writeln!(
+        out,
+        "Write path delta: logical {}, WinFSP {}, VFS {}, payload {}, landing {}",
+        format_bytes(diagnostics.logical_write_bytes),
+        format_bytes(diagnostics.winfsp_write_bytes_delta),
+        format_bytes(diagnostics.vfs_write_bytes_delta),
+        format_bytes(diagnostics.payload_accounted_bytes_delta),
+        format_bytes(diagnostics.landing_accepted_bytes_delta),
+    );
+    let _ = writeln!(
+        out,
+        "Accounted after: writer {}, staged {}, pending upload {}, cache pressure {}, total {}",
+        format_optional_bytes(diagnostics.writer_stack_dirty_bytes_after),
+        format_optional_bytes(diagnostics.pending_persisted_slice_bytes_after),
+        format_optional_bytes(diagnostics.pending_upload_bytes_after),
+        format_optional_bytes(diagnostics.cache_pressure_bytes_after),
+        format_optional_bytes(diagnostics.total_accounted_bytes_after),
+    );
+    if !diagnostics.blockers.is_empty() {
+        let _ = writeln!(out, "Blockers: {}", diagnostics.blockers.join("; "));
+    }
+}
+
+fn render_mounted_portable_profile(out: &mut String, profile: &MountedPortableProfileReport) {
+    out.push('\n');
+    let _ = writeln!(out, "Mounted portable profile");
+    let _ = writeln!(
+        out,
+        "Process: samples {}, RSS peak {}, virtual peak {}, CPU avg/peak {}/{}, disk read/write {}/{}",
+        profile.process.sample_count,
+        format_optional_bytes(profile.process.rss_bytes_peak),
+        format_optional_bytes(profile.process.virtual_memory_bytes_peak),
+        profile
+            .process
+            .cpu_usage_percent_avg
+            .map(|value| format!("{value:.2}%"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        profile
+            .process
+            .cpu_usage_percent_peak
+            .map(|value| format!("{value:.2}%"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        format_optional_bytes(profile.process.disk_read_bytes_delta),
+        format_optional_bytes(profile.process.disk_write_bytes_delta),
+    );
+    if let Some(allocator) = &profile.allocator {
+        let _ = writeln!(
+            out,
+            "Allocator: current {}, peak {}, allocated {}, deallocated {}, alloc/dealloc/realloc {}/{}/{}",
+            format_bytes(allocator.current_bytes),
+            format_bytes(allocator.peak_bytes),
+            format_bytes(allocator.allocated_total_bytes),
+            format_bytes(allocator.deallocated_total_bytes),
+            allocator.allocation_count,
+            allocator.deallocation_count,
+            allocator.reallocation_count,
+        );
+    }
+    if !profile.phases.is_empty() {
+        let rows: Vec<Vec<String>> = profile
+            .phases
+            .iter()
+            .map(|phase| {
+                vec![
+                    phase.phase.clone(),
+                    phase.process.sample_count.to_string(),
+                    format_optional_bytes(phase.process.rss_bytes_peak),
+                    phase
+                        .process
+                        .cpu_usage_percent_avg
+                        .map(|value| format!("{value:.2}%"))
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    phase
+                        .allocator
+                        .as_ref()
+                        .map(|allocator| format_bytes(allocator.peak_bytes))
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    format_optional_bytes(phase.process.disk_write_bytes_delta),
+                ]
+            })
+            .collect();
+        let _ = write!(
+            out,
+            "{}",
+            format_table(
+                &[
+                    "Phase",
+                    "Samples",
+                    "RSS peak",
+                    "CPU avg",
+                    "Heap peak",
+                    "Disk write"
+                ],
+                &rows,
+            )
+        );
+    }
+}
+
 pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
     let mut out = String::new();
     let target_label = if report.mode == "direct-shim" {
@@ -220,6 +336,12 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
     }
     if let Some(observability) = &report.mounted_observability {
         render_mounted_observability(&mut out, observability);
+    }
+    if let Some(diagnostics) = &report.mounted_write_diagnostics {
+        render_mounted_write_diagnostics(&mut out, diagnostics);
+    }
+    if let Some(portable_profile) = &report.mounted_portable_profile {
+        render_mounted_portable_profile(&mut out, portable_profile);
     }
     out.push('\n');
     let _ = writeln!(&mut out, "Operation results");

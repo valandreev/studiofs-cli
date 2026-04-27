@@ -113,8 +113,8 @@ impl AjaCacheValidationMode {
 
     fn min_throughput_env_key(self) -> &'static str {
         match self {
-            Self::CacheOn => "STUDIOFS_WINFSP_AJA_CACHE_ON_MIN_THROUGHPUT_MIB_PER_SEC",
-            Self::CacheOff => "STUDIOFS_WINFSP_AJA_CACHE_OFF_MIN_THROUGHPUT_MIB_PER_SEC",
+            Self::CacheOn => "STUDIOFS_WINFSP_WRITE_CACHE_ON_MIN_THROUGHPUT_MIB_PER_SEC",
+            Self::CacheOff => "STUDIOFS_WINFSP_WRITE_CACHE_OFF_MIN_THROUGHPUT_MIB_PER_SEC",
         }
     }
 }
@@ -225,7 +225,7 @@ fn aja_sequential_validation_modes(
             "cache-off" | "off" | "uncached" | "write-through" => AjaCacheValidationMode::CacheOff,
             unsupported => {
                 return Err(format!(
-                    "STUDIOFS_WINFSP_AJA_CACHE_MODES contains unsupported mode '{unsupported}'; use cache-on, cache-off, or both"
+                    "STUDIOFS_WINFSP_WRITE_CACHE_MODES contains unsupported mode '{unsupported}'; use cache-on, cache-off, or both"
                 ));
             }
         };
@@ -234,7 +234,7 @@ fn aja_sequential_validation_modes(
         }
     }
     if modes.is_empty() {
-        return Err("STUDIOFS_WINFSP_AJA_CACHE_MODES did not select any modes".to_string());
+        return Err("STUDIOFS_WINFSP_WRITE_CACHE_MODES did not select any modes".to_string());
     }
     Ok(modes)
 }
@@ -242,7 +242,7 @@ fn aja_sequential_validation_modes(
 fn aja_sequential_validation_modes_from_env() -> Result<Vec<AjaCacheValidationMode>, String> {
     load_test_env();
     aja_sequential_validation_modes(
-        std::env::var("STUDIOFS_WINFSP_AJA_CACHE_MODES")
+        std::env::var("STUDIOFS_WINFSP_WRITE_CACHE_MODES")
             .ok()
             .as_deref(),
     )
@@ -281,21 +281,21 @@ fn test_mount_f64_env_var(key: &str, default: f64) -> Result<f64, String> {
 
 fn aja_sequential_chunk_bytes() -> usize {
     test_mount_usize_env_var(
-        "STUDIOFS_WINFSP_AJA_CHUNK_BYTES",
+        "STUDIOFS_WINFSP_WRITE_CHUNK_BYTES",
         DEFAULT_AJA_SEQUENTIAL_CHUNK_BYTES,
     )
 }
 
 fn aja_sequential_chunk_count() -> usize {
     test_mount_usize_env_var(
-        "STUDIOFS_WINFSP_AJA_CHUNK_COUNT",
+        "STUDIOFS_WINFSP_WRITE_CHUNK_COUNT",
         DEFAULT_AJA_SEQUENTIAL_CHUNK_COUNT,
     )
 }
 
 fn aja_sequential_min_throughput_mib_per_sec() -> Result<f64, String> {
     test_mount_f64_env_var(
-        "STUDIOFS_WINFSP_AJA_MIN_THROUGHPUT_MIB_PER_SEC",
+        "STUDIOFS_WINFSP_WRITE_MIN_THROUGHPUT_MIB_PER_SEC",
         DEFAULT_AJA_MIN_THROUGHPUT_MIB_PER_SEC,
     )
 }
@@ -315,20 +315,20 @@ fn validate_aja_sequential_workload(
     chunk_count: usize,
 ) -> Result<(usize, usize), String> {
     if chunk_bytes == 0 {
-        return Err("STUDIOFS_WINFSP_AJA_CHUNK_BYTES must be greater than 0".to_string());
+        return Err("STUDIOFS_WINFSP_WRITE_CHUNK_BYTES must be greater than 0".to_string());
     }
     if chunk_bytes > MAX_AJA_SEQUENTIAL_CHUNK_BYTES {
         return Err(format!(
-            "STUDIOFS_WINFSP_AJA_CHUNK_BYTES={} exceeds the supported max {}; reduce the chunk size for the mounted AJA-style smoke test",
+            "STUDIOFS_WINFSP_WRITE_CHUNK_BYTES={} exceeds the supported max {}; reduce the chunk size for the mounted sequential writer smoke test",
             chunk_bytes, MAX_AJA_SEQUENTIAL_CHUNK_BYTES
         ));
     }
     if chunk_count == 0 {
-        return Err("STUDIOFS_WINFSP_AJA_CHUNK_COUNT must be greater than 0".to_string());
+        return Err("STUDIOFS_WINFSP_WRITE_CHUNK_COUNT must be greater than 0".to_string());
     }
     if chunk_count > MAX_AJA_SEQUENTIAL_CHUNK_COUNT {
         return Err(format!(
-            "STUDIOFS_WINFSP_AJA_CHUNK_COUNT={} exceeds the supported max {}; reduce the chunk count for the mounted AJA-style smoke test",
+            "STUDIOFS_WINFSP_WRITE_CHUNK_COUNT={} exceeds the supported max {}; reduce the chunk count for the mounted sequential writer smoke test",
             chunk_count, MAX_AJA_SEQUENTIAL_CHUNK_COUNT
         ));
     }
@@ -337,7 +337,7 @@ fn validate_aja_sequential_workload(
     })?;
     if total_bytes > MAX_AJA_SEQUENTIAL_TOTAL_BYTES {
         return Err(format!(
-            "AJA-style mounted smoke workload would write {} bytes, exceeding the supported max {}; lower STUDIOFS_WINFSP_AJA_CHUNK_BYTES or STUDIOFS_WINFSP_AJA_CHUNK_COUNT",
+            "mounted sequential writer smoke workload would write {} bytes, exceeding the supported max {}; lower STUDIOFS_WINFSP_WRITE_CHUNK_BYTES or STUDIOFS_WINFSP_WRITE_CHUNK_COUNT",
             total_bytes, MAX_AJA_SEQUENTIAL_TOTAL_BYTES
         ));
     }
@@ -355,7 +355,7 @@ fn validate_aja_sequential_workload_for_modes(
         && !chunk_bytes.is_multiple_of(AJA_CACHE_OFF_ALIGNMENT_BYTES)
     {
         return Err(format!(
-            "STUDIOFS_WINFSP_AJA_CHUNK_BYTES={chunk_bytes} must be 4096-byte aligned when cache-off validation is selected"
+            "STUDIOFS_WINFSP_WRITE_CHUNK_BYTES={chunk_bytes} must be 4096-byte aligned when cache-off validation is selected"
         ));
     }
     Ok(workload)
@@ -925,7 +925,7 @@ fn validate_aja_sequential_workload_rejects_oversized_chunk_bytes() {
     let err = validate_aja_sequential_workload(MAX_AJA_SEQUENTIAL_CHUNK_BYTES + 1, 1)
         .expect_err("oversized chunk bytes should be rejected");
     assert!(
-        err.contains("STUDIOFS_WINFSP_AJA_CHUNK_BYTES"),
+        err.contains("STUDIOFS_WINFSP_WRITE_CHUNK_BYTES"),
         "error should point at the chunk-bytes env var: {err}"
     );
 }
@@ -935,7 +935,9 @@ fn validate_aja_sequential_workload_rejects_excessive_total_bytes() {
     let err = validate_aja_sequential_workload(MAX_AJA_SEQUENTIAL_CHUNK_BYTES, 16)
         .expect_err("oversized total workload should be rejected");
     assert!(
-        err.contains("lower STUDIOFS_WINFSP_AJA_CHUNK_BYTES or STUDIOFS_WINFSP_AJA_CHUNK_COUNT"),
+        err.contains(
+            "lower STUDIOFS_WINFSP_WRITE_CHUNK_BYTES or STUDIOFS_WINFSP_WRITE_CHUNK_COUNT"
+        ),
         "error should explain how to lower the mounted workload: {err}"
     );
 }

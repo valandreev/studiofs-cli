@@ -877,6 +877,7 @@ mod tests {
             metadata_commit_cadence: Default::default(),
             eager_flush: Default::default(),
             tuning: Default::default(),
+            allocator: None,
         };
         std::fs::write(&metrics_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
 

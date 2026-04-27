@@ -1,5 +1,6 @@
 use crate::cli::WRITE_PATH_OBSERVABILITY_FILE;
 use anyhow::{Context, Result, anyhow};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::Path;
 use std::sync::{
@@ -21,9 +22,11 @@ use super::result::{
     BenchmarkProfileReport, BenchmarkReport, CpuProfileReport, MountedBarrierReport,
     MountedCachedStoreReport, MountedLocalFirstReadComparisonReport,
     MountedLocalFirstReadPhaseReport, MountedMemoryReport, MountedObservabilityReport,
-    MountedPostUploadIdleReport, MountedProcessReport, MountedRuntimeReport, MountedUploadReport,
-    MountedWorkloadShapeReport, MountedWriteCallbackReport, MountedWritePathWindowReport,
-    MountedWriterStateReport,
+    MountedPortableAllocatorReport, MountedPortablePhaseProfileReport,
+    MountedPortableProcessReport, MountedPortableProfileReport, MountedPostUploadIdleReport,
+    MountedProcessReport, MountedRuntimeReport, MountedUploadReport, MountedWorkloadShapeReport,
+    MountedWriteCallbackReport, MountedWriteDiagnosticsReport, MountedWritePathWindowReport,
+    MountedWriterStateReport, OpReport,
 };
 use super::telemetry::{
     PhaseOperationLog, PhaseTelemetry, build_advanced_metrics, phase_telemetry_to_report,
@@ -33,6 +36,7 @@ use super::workload::{
     SizeClassBounds, WorkFile, WorkloadPlan, build_access_sequence, build_file_worklist,
     build_work_sizes, classify_size, deterministic_bytes, split_stream_segments,
 };
+use studiofs_vfs::VfsPortableAllocatorStats;
 
 #[derive(Clone, Copy)]
 enum PendingUploadTarget {
@@ -65,6 +69,10 @@ struct PendingUploadObservation {
 }
 
 const MOUNTED_MEMORY_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+const OPERATOR_WRITE_THROUGHPUT_TARGET_BYTES_PER_SEC: f64 = 1_000.0 * 1024.0 * 1024.0;
+const OPERATOR_RSS_PEAK_TARGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const OPERATOR_KNOWN_WRITE_AMPLIFICATION_TARGET: f64 = 1.20;
+const MAX_TEST_WRITE_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 
 struct MeasuredMountedPhaseResult {
     started: Instant,
@@ -138,13 +146,259 @@ impl MountedMemoryAccumulator {
     }
 }
 
-fn sample_mount_process_rss(system: &mut System, pid: Pid) -> Option<u64> {
+#[derive(Clone)]
+struct MountedPortablePhaseControl {
+    phase_tx: watch::Sender<String>,
+}
+
+impl MountedPortablePhaseControl {
+    fn set_phase(&self, phase: &str) {
+        let _ = self.phase_tx.send(phase.to_string());
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MountedProcessTelemetrySample {
+    rss_bytes: u64,
+    virtual_memory_bytes: u64,
+    cpu_usage_percent: f64,
+    cpu_time_ms: u64,
+    disk_read_bytes_total: u64,
+    disk_write_bytes_total: u64,
+}
+
+#[derive(Default)]
+struct MountedPortableProcessAccumulator {
+    mount_pid: u32,
+    sample_count: u64,
+    rss_bytes_steady_state: Option<u64>,
+    rss_bytes_peak: u64,
+    virtual_memory_bytes_peak: u64,
+    cpu_usage_percent_sum: f64,
+    cpu_usage_percent_peak: f64,
+    first_cpu_time_ms: Option<u64>,
+    last_cpu_time_ms: Option<u64>,
+    first_disk_read_bytes_total: Option<u64>,
+    last_disk_read_bytes_total: Option<u64>,
+    first_disk_write_bytes_total: Option<u64>,
+    last_disk_write_bytes_total: Option<u64>,
+}
+
+impl MountedPortableProcessAccumulator {
+    fn new(mount_pid: u32) -> Self {
+        Self {
+            mount_pid,
+            ..Self::default()
+        }
+    }
+
+    fn observe(&mut self, sample: &MountedProcessTelemetrySample) {
+        self.sample_count = self.sample_count.saturating_add(1);
+        self.rss_bytes_steady_state = Some(sample.rss_bytes);
+        self.rss_bytes_peak = self.rss_bytes_peak.max(sample.rss_bytes);
+        self.virtual_memory_bytes_peak = self
+            .virtual_memory_bytes_peak
+            .max(sample.virtual_memory_bytes);
+        self.cpu_usage_percent_sum += sample.cpu_usage_percent;
+        self.cpu_usage_percent_peak = self.cpu_usage_percent_peak.max(sample.cpu_usage_percent);
+        self.first_cpu_time_ms.get_or_insert(sample.cpu_time_ms);
+        self.last_cpu_time_ms = Some(sample.cpu_time_ms);
+        self.first_disk_read_bytes_total
+            .get_or_insert(sample.disk_read_bytes_total);
+        self.last_disk_read_bytes_total = Some(sample.disk_read_bytes_total);
+        self.first_disk_write_bytes_total
+            .get_or_insert(sample.disk_write_bytes_total);
+        self.last_disk_write_bytes_total = Some(sample.disk_write_bytes_total);
+    }
+
+    fn into_report(self) -> Option<MountedPortableProcessReport> {
+        if self.sample_count == 0 {
+            return None;
+        }
+        Some(MountedPortableProcessReport {
+            mount_pid: self.mount_pid,
+            sample_count: self.sample_count,
+            rss_bytes_steady_state: self.rss_bytes_steady_state,
+            rss_bytes_peak: self.rss_bytes_steady_state.map(|_| self.rss_bytes_peak),
+            virtual_memory_bytes_peak: Some(self.virtual_memory_bytes_peak),
+            cpu_usage_percent_avg: Some(self.cpu_usage_percent_sum / self.sample_count as f64),
+            cpu_usage_percent_peak: Some(self.cpu_usage_percent_peak),
+            cpu_time_ms_delta: match (self.first_cpu_time_ms, self.last_cpu_time_ms) {
+                (Some(first), Some(last)) => Some(last.saturating_sub(first)),
+                _ => None,
+            },
+            disk_read_bytes_delta: match (
+                self.first_disk_read_bytes_total,
+                self.last_disk_read_bytes_total,
+            ) {
+                (Some(first), Some(last)) => Some(last.saturating_sub(first)),
+                _ => None,
+            },
+            disk_write_bytes_delta: match (
+                self.first_disk_write_bytes_total,
+                self.last_disk_write_bytes_total,
+            ) {
+                (Some(first), Some(last)) => Some(last.saturating_sub(first)),
+                _ => None,
+            },
+        })
+    }
+}
+
+#[derive(Default)]
+struct MountedPortableAllocatorAccumulator {
+    latest: Option<VfsPortableAllocatorStats>,
+    peak_bytes: u64,
+}
+
+impl MountedPortableAllocatorAccumulator {
+    fn observe(&mut self, stats: &VfsPortableAllocatorStats) {
+        self.peak_bytes = self.peak_bytes.max(stats.peak_bytes);
+        self.latest = Some(stats.clone());
+    }
+
+    fn into_report(self) -> Option<MountedPortableAllocatorReport> {
+        self.latest.map(|latest| MountedPortableAllocatorReport {
+            current_bytes: latest.current_bytes,
+            peak_bytes: latest.peak_bytes.max(self.peak_bytes),
+            allocated_total_bytes: latest.allocated_total_bytes,
+            deallocated_total_bytes: latest.deallocated_total_bytes,
+            allocation_count: latest.allocation_count,
+            deallocation_count: latest.deallocation_count,
+            reallocation_count: latest.reallocation_count,
+        })
+    }
+}
+
+#[derive(Default)]
+struct MountedPortablePhaseAccumulator {
+    process: MountedPortableProcessAccumulator,
+    allocator: MountedPortableAllocatorAccumulator,
+}
+
+impl MountedPortablePhaseAccumulator {
+    fn new(mount_pid: u32) -> Self {
+        Self {
+            process: MountedPortableProcessAccumulator::new(mount_pid),
+            allocator: MountedPortableAllocatorAccumulator::default(),
+        }
+    }
+}
+
+struct MountedPortableTelemetryAccumulator {
+    process: MountedPortableProcessAccumulator,
+    allocator: MountedPortableAllocatorAccumulator,
+    phases: BTreeMap<String, MountedPortablePhaseAccumulator>,
+}
+
+impl MountedPortableTelemetryAccumulator {
+    fn new(mount_pid: u32) -> Self {
+        Self {
+            process: MountedPortableProcessAccumulator::new(mount_pid),
+            allocator: MountedPortableAllocatorAccumulator::default(),
+            phases: BTreeMap::new(),
+        }
+    }
+
+    fn observe_process(&mut self, phase: &str, sample: &MountedProcessTelemetrySample) {
+        self.process.observe(sample);
+        self.phases
+            .entry(phase.to_string())
+            .or_insert_with(|| MountedPortablePhaseAccumulator::new(self.process.mount_pid))
+            .process
+            .observe(sample);
+    }
+
+    fn observe_allocator(&mut self, phase: &str, stats: &VfsPortableAllocatorStats) {
+        self.allocator.observe(stats);
+        self.phases
+            .entry(phase.to_string())
+            .or_insert_with(|| MountedPortablePhaseAccumulator::new(self.process.mount_pid))
+            .allocator
+            .observe(stats);
+    }
+
+    fn into_report(self) -> Option<MountedPortableProfileReport> {
+        let process = self.process.into_report()?;
+        let phases = self
+            .phases
+            .into_iter()
+            .filter_map(|(phase, accumulator)| {
+                let process = accumulator.process.into_report()?;
+                Some(MountedPortablePhaseProfileReport {
+                    phase,
+                    process,
+                    allocator: accumulator.allocator.into_report(),
+                })
+            })
+            .collect();
+        Some(MountedPortableProfileReport {
+            process,
+            allocator: self.allocator.into_report(),
+            phases,
+        })
+    }
+}
+
+struct MountedProfileAccumulator {
+    memory: MountedMemoryAccumulator,
+    portable: MountedPortableTelemetryAccumulator,
+}
+
+impl MountedProfileAccumulator {
+    fn new(mount_pid: u32) -> Self {
+        Self {
+            memory: MountedMemoryAccumulator::new(mount_pid),
+            portable: MountedPortableTelemetryAccumulator::new(mount_pid),
+        }
+    }
+
+    fn observe_process(&mut self, phase: &str, sample: &MountedProcessTelemetrySample) {
+        self.memory.observe_rss(sample.rss_bytes);
+        self.portable.observe_process(phase, sample);
+    }
+
+    fn observe_snapshot(&mut self, phase: &str, snapshot: &VfsWritePathObservabilitySnapshot) {
+        self.memory.observe_dirty_pressure(
+            snapshot.dirty_pressure.total_dirty_bytes as u64,
+            snapshot.dirty_pressure.dirty_limit_bytes as u64,
+            snapshot.dirty_pressure.staged_peak_bytes as u64,
+        );
+        if let Some(allocator) = &snapshot.allocator {
+            self.portable.observe_allocator(phase, allocator);
+        }
+    }
+
+    fn into_reports(
+        self,
+    ) -> (
+        Option<MountedMemoryReport>,
+        Option<MountedPortableProfileReport>,
+    ) {
+        (self.memory.into_report(), self.portable.into_report())
+    }
+}
+
+fn sample_mount_process(system: &mut System, pid: Pid) -> Option<MountedProcessTelemetrySample> {
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[pid]),
         true,
-        ProcessRefreshKind::nothing().with_memory(),
+        ProcessRefreshKind::nothing()
+            .with_memory()
+            .with_cpu()
+            .with_disk_usage(),
     );
-    system.process(pid).map(|process| process.memory())
+    system.process(pid).map(|process| {
+        let disk_usage = process.disk_usage();
+        MountedProcessTelemetrySample {
+            rss_bytes: process.memory(),
+            virtual_memory_bytes: process.virtual_memory(),
+            cpu_usage_percent: process.cpu_usage() as f64,
+            cpu_time_ms: process.accumulated_cpu_time(),
+            disk_read_bytes_total: disk_usage.total_read_bytes,
+            disk_write_bytes_total: disk_usage.total_written_bytes,
+        }
+    })
 }
 
 async fn read_write_path_observability_snapshot(
@@ -165,6 +419,7 @@ async fn read_write_path_observability_snapshot(
     }
 }
 
+#[cfg(test)]
 fn spawn_mounted_memory_sampler(
     mount_pid: u32,
     metrics_path: Option<&Path>,
@@ -172,25 +427,42 @@ fn spawn_mounted_memory_sampler(
     watch::Sender<bool>,
     tokio::task::JoinHandle<MountedMemoryAccumulator>,
 ) {
+    let (stop_tx, _phase_control, handle) = spawn_mounted_profile_sampler(mount_pid, metrics_path);
+    let handle = tokio::spawn(async move {
+        let accumulator = handle
+            .await
+            .expect("mounted profile sampler task should not panic");
+        accumulator.memory
+    });
+    (stop_tx, handle)
+}
+
+fn spawn_mounted_profile_sampler(
+    mount_pid: u32,
+    metrics_path: Option<&Path>,
+) -> (
+    watch::Sender<bool>,
+    MountedPortablePhaseControl,
+    tokio::task::JoinHandle<MountedProfileAccumulator>,
+) {
     let pid = Pid::from_u32(mount_pid);
     let metrics_path = metrics_path.map(Path::to_path_buf);
     let (stop_tx, mut stop_rx) = watch::channel(false);
+    let (phase_tx, phase_rx) = watch::channel("measured".to_string());
+    let phase_control = MountedPortablePhaseControl { phase_tx };
     let handle = tokio::spawn(async move {
         let mut system = System::new();
-        let mut accumulator = MountedMemoryAccumulator::new(mount_pid);
+        let mut accumulator = MountedProfileAccumulator::new(mount_pid);
         let mut warned_metrics_error = false;
 
         loop {
-            if let Some(rss_bytes) = sample_mount_process_rss(&mut system, pid) {
-                accumulator.observe_rss(rss_bytes);
+            let phase = phase_rx.borrow().clone();
+            if let Some(process_sample) = sample_mount_process(&mut system, pid) {
+                accumulator.observe_process(&phase, &process_sample);
             }
             if let Some(metrics_path) = metrics_path.as_deref() {
                 match read_write_path_observability_snapshot(metrics_path, mount_pid).await {
-                    Ok(Some(snapshot)) => accumulator.observe_dirty_pressure(
-                        snapshot.dirty_pressure.total_dirty_bytes as u64,
-                        snapshot.dirty_pressure.dirty_limit_bytes as u64,
-                        snapshot.dirty_pressure.staged_peak_bytes as u64,
-                    ),
+                    Ok(Some(snapshot)) => accumulator.observe_snapshot(&phase, &snapshot),
                     Ok(None) => {}
                     Err(error) => {
                         if !warned_metrics_error {
@@ -217,25 +489,23 @@ fn spawn_mounted_memory_sampler(
             }
         }
 
-        if let Some(rss_bytes) = sample_mount_process_rss(&mut system, pid) {
-            accumulator.observe_rss(rss_bytes);
+        let phase = phase_rx.borrow().clone();
+        if let Some(process_sample) = sample_mount_process(&mut system, pid) {
+            accumulator.observe_process(&phase, &process_sample);
         }
         if let Some(metrics_path) = metrics_path.as_deref()
             && let Ok(Some(snapshot)) =
                 read_write_path_observability_snapshot(metrics_path, mount_pid).await
         {
-            accumulator.observe_dirty_pressure(
-                snapshot.dirty_pressure.total_dirty_bytes as u64,
-                snapshot.dirty_pressure.dirty_limit_bytes as u64,
-                snapshot.dirty_pressure.staged_peak_bytes as u64,
-            );
+            accumulator.observe_snapshot(&phase, &snapshot);
         }
 
         accumulator
     });
-    (stop_tx, handle)
+    (stop_tx, phase_control, handle)
 }
 
+#[cfg(test)]
 async fn sample_mounted_memory_during<F, Fut, T>(
     mount_pid: u32,
     metrics_path: Option<&Path>,
@@ -254,6 +524,30 @@ where
         .map_err(|error| anyhow!("mounted memory sampler panicked: {error}"))?
         .into_report();
     result.map(|value| (value, mounted_memory))
+}
+
+async fn sample_mounted_profile_during<F, Fut, T>(
+    mount_pid: u32,
+    metrics_path: Option<&Path>,
+    work: F,
+) -> Result<(
+    T,
+    Option<MountedMemoryReport>,
+    Option<MountedPortableProfileReport>,
+)>
+where
+    F: FnOnce(MountedPortablePhaseControl) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let (mounted_profile_stop, phase_control, mounted_profile_handle) =
+        spawn_mounted_profile_sampler(mount_pid, metrics_path);
+    let result = work(phase_control).await;
+    let _ = mounted_profile_stop.send(true);
+    let (mounted_memory, mounted_portable_profile) = mounted_profile_handle
+        .await
+        .map_err(|error| anyhow!("mounted profile sampler panicked: {error}"))?
+        .into_reports();
+    result.map(|value| (value, mounted_memory, mounted_portable_profile))
 }
 
 async fn scan_legacy_pending_upload_artifacts(upload_dir: &Path) -> Result<usize> {
@@ -410,6 +704,145 @@ fn build_mounted_write_path_window(
         return None;
     }
     Some(MountedWritePathWindowReport { before, after })
+}
+
+fn snapshot_delta_u64(
+    before: Option<&VfsWritePathObservabilitySnapshot>,
+    after: Option<&VfsWritePathObservabilitySnapshot>,
+    get: impl Fn(&VfsWritePathObservabilitySnapshot) -> u64,
+) -> u64 {
+    let before = before.map(&get).unwrap_or_default();
+    let after = after.map(&get).unwrap_or_default();
+    after.saturating_sub(before)
+}
+
+fn snapshot_delta_f64(
+    before: Option<&VfsWritePathObservabilitySnapshot>,
+    after: Option<&VfsWritePathObservabilitySnapshot>,
+    get: impl Fn(&VfsWritePathObservabilitySnapshot) -> f64,
+) -> f64 {
+    let before = before.map(&get).unwrap_or_default();
+    let after = after.map(&get).unwrap_or_default();
+    (after - before).max(0.0)
+}
+
+fn after_dirty_pressure_u64(
+    after: Option<&VfsWritePathObservabilitySnapshot>,
+    get: impl Fn(&studiofs_vfs::VfsWritePathDirtyPressureStats) -> usize,
+) -> Option<u64> {
+    after.map(|snapshot| get(&snapshot.dirty_pressure) as u64)
+}
+
+fn build_mounted_write_diagnostics_report(
+    writes: &OpReport,
+    mounted_memory: Option<&MountedMemoryReport>,
+    before: Option<&VfsWritePathObservabilitySnapshot>,
+    after: Option<&VfsWritePathObservabilitySnapshot>,
+) -> MountedWriteDiagnosticsReport {
+    let winfsp_write_bytes_delta = snapshot_delta_u64(before, after, |snapshot| {
+        snapshot.winfsp_write_path.write_bytes
+    });
+    let vfs_write_bytes_delta = snapshot_delta_u64(before, after, |snapshot| {
+        snapshot.vfs_write_path.write_bytes
+    });
+    let payload_persisted_bytes_delta =
+        snapshot_delta_u64(before, after, |snapshot| snapshot.payload_burst.total_bytes);
+    let upload_accounted_bytes_delta = snapshot_delta_u64(before, after, |snapshot| {
+        snapshot
+            .upload
+            .completed_upload_bytes
+            .saturating_add(snapshot.upload.pending_upload_bytes)
+    });
+    let payload_accounted_bytes_delta = if payload_persisted_bytes_delta > 0 {
+        payload_persisted_bytes_delta
+    } else {
+        upload_accounted_bytes_delta
+    };
+    let landing_accepted_bytes_delta = snapshot_delta_u64(before, after, |snapshot| {
+        snapshot.landing_zone.accepted_bytes
+    });
+    let payload_persist_calls_delta =
+        snapshot_delta_u64(before, after, |snapshot| snapshot.payload_persist.calls);
+    let local_cache_io_calls_delta =
+        snapshot_delta_u64(before, after, |snapshot| snapshot.local_cache_io.calls);
+    let local_cache_backend_io_total_ms_delta = snapshot_delta_f64(before, after, |snapshot| {
+        snapshot.local_cache_io.backend_io_total_ms
+    });
+    let hard_backpressure_events_delta = snapshot_delta_u64(before, after, |snapshot| {
+        snapshot.write_backpressure.hard_events
+    });
+    let soft_throttle_events_delta = snapshot_delta_u64(before, after, |snapshot| {
+        snapshot.write_backpressure.soft_throttle_events
+    });
+    let known_local_write_amplification = (writes.bytes > 0).then(|| {
+        (payload_accounted_bytes_delta + landing_accepted_bytes_delta) as f64 / writes.bytes as f64
+    });
+    let write_throughput_target_met =
+        writes.throughput_bytes_per_sec >= OPERATOR_WRITE_THROUGHPUT_TARGET_BYTES_PER_SEC;
+    let rss_bytes_peak = mounted_memory.and_then(|memory| memory.rss_bytes_peak);
+    let rss_target_met = rss_bytes_peak.map(|rss| rss <= OPERATOR_RSS_PEAK_TARGET_BYTES);
+    let landing_journal_active = landing_accepted_bytes_delta > 0;
+
+    let mut blockers = Vec::new();
+    if !write_throughput_target_met {
+        blockers.push("write throughput below 1000 MiB/s target".to_string());
+    }
+    match rss_target_met {
+        Some(true) => {}
+        Some(false) => blockers.push("peak RSS exceeded 2 GiB target".to_string()),
+        None => blockers.push("peak RSS unavailable".to_string()),
+    }
+    if landing_journal_active {
+        blockers.push("landing journal accepted bytes during mounted write".to_string());
+    }
+    match known_local_write_amplification {
+        Some(amplification) if amplification <= OPERATOR_KNOWN_WRITE_AMPLIFICATION_TARGET => {}
+        Some(_) => blockers.push("known local write amplification exceeded 1.20x".to_string()),
+        None => blockers.push("known local write amplification unavailable".to_string()),
+    }
+
+    MountedWriteDiagnosticsReport {
+        pass: blockers.is_empty(),
+        blockers,
+        write_throughput_target_bytes_per_sec: OPERATOR_WRITE_THROUGHPUT_TARGET_BYTES_PER_SEC,
+        write_throughput_bytes_per_sec: writes.throughput_bytes_per_sec,
+        write_throughput_mib_per_sec: writes.throughput_bytes_per_sec / (1024.0 * 1024.0),
+        write_throughput_target_met,
+        rss_peak_target_bytes: OPERATOR_RSS_PEAK_TARGET_BYTES,
+        rss_bytes_peak,
+        rss_target_met,
+        logical_write_bytes: writes.bytes,
+        winfsp_write_bytes_delta,
+        vfs_write_bytes_delta,
+        payload_persisted_bytes_delta,
+        payload_accounted_bytes_delta,
+        landing_accepted_bytes_delta,
+        known_local_write_amplification,
+        landing_journal_active,
+        dirty_bytes_peak: mounted_memory.and_then(|memory| memory.dirty_bytes_peak),
+        staged_bytes_peak: mounted_memory.and_then(|memory| memory.staged_bytes_peak),
+        dirty_limit_bytes: mounted_memory.and_then(|memory| memory.dirty_limit_bytes),
+        writer_stack_dirty_bytes_after: after_dirty_pressure_u64(after, |pressure| {
+            pressure.writer_stack_dirty_bytes
+        }),
+        pending_persisted_slice_bytes_after: after_dirty_pressure_u64(after, |pressure| {
+            pressure.pending_persisted_slice_bytes
+        }),
+        pending_upload_bytes_after: after_dirty_pressure_u64(after, |pressure| {
+            pressure.pending_upload_bytes
+        }),
+        cache_pressure_bytes_after: after_dirty_pressure_u64(after, |pressure| {
+            pressure.cache_pressure_bytes
+        }),
+        total_accounted_bytes_after: after_dirty_pressure_u64(after, |pressure| {
+            pressure.total_accounted_bytes
+        }),
+        payload_persist_calls_delta,
+        local_cache_io_calls_delta,
+        local_cache_backend_io_total_ms_delta,
+        hard_backpressure_events_delta,
+        soft_throttle_events_delta,
+    }
 }
 
 fn mounted_bridge_type() -> &'static str {
@@ -569,6 +1002,95 @@ fn build_mounted_observability_report(
     })
 }
 
+fn mounted_write_chunk_size(block_size: u64) -> usize {
+    usize::try_from(block_size)
+        .unwrap_or(MAX_TEST_WRITE_CHUNK_BYTES)
+        .clamp(1, MAX_TEST_WRITE_CHUNK_BYTES)
+}
+
+fn mounted_read_chunk_size(read_size: u64) -> usize {
+    usize::try_from(read_size)
+        .unwrap_or(MAX_TEST_WRITE_CHUNK_BYTES)
+        .clamp(1, MAX_TEST_WRITE_CHUNK_BYTES)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MountedReadPlan {
+    bytes_to_read: u64,
+    chunk_size: usize,
+}
+
+#[derive(Clone, Copy)]
+struct MountedReadOptions {
+    read_size: u64,
+    full_file_reads: bool,
+}
+
+fn mounted_read_plan(file_size: u64, read_size: u64, full_file_read: bool) -> MountedReadPlan {
+    MountedReadPlan {
+        bytes_to_read: if full_file_read {
+            file_size
+        } else {
+            read_size.min(file_size).max(1)
+        },
+        chunk_size: mounted_read_chunk_size(read_size),
+    }
+}
+
+fn deterministic_write_chunks(total_size: u64, max_chunk_size: usize) -> Vec<(u64, usize)> {
+    let max_chunk_size = max_chunk_size.max(1) as u64;
+    let mut chunks = Vec::new();
+    let mut offset = 0u64;
+    while offset < total_size {
+        let len = (total_size - offset).min(max_chunk_size) as usize;
+        chunks.push((offset, len));
+        offset += len as u64;
+    }
+    chunks
+}
+
+async fn write_deterministic_file(
+    path: &Path,
+    total_size: u64,
+    seed: u64,
+    max_chunk_size: usize,
+) -> Result<()> {
+    let chunks = deterministic_write_chunks(total_size, max_chunk_size);
+    let max_len = chunks.iter().map(|(_, len)| *len).max().unwrap_or_default();
+    let buffer = deterministic_bytes(max_len, seed);
+    let mut out = fs::File::create(path)
+        .await
+        .with_context(|| format!("create {}", path.display()))?;
+    for (_, len) in chunks {
+        out.write_all(&buffer[..len])
+            .await
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    out.flush().await?;
+    Ok(())
+}
+
+async fn read_file_with_plan(path: &Path, plan: MountedReadPlan) -> Result<u64> {
+    let mut input = fs::File::open(path)
+        .await
+        .with_context(|| format!("open {}", path.display()))?;
+    if plan.bytes_to_read == 0 {
+        return Ok(0);
+    }
+
+    let mut buffer = vec![0u8; plan.chunk_size];
+    let mut remaining = plan.bytes_to_read;
+    while remaining > 0 {
+        let len = remaining.min(plan.chunk_size as u64) as usize;
+        input
+            .read_exact(&mut buffer[..len])
+            .await
+            .with_context(|| format!("read {}", path.display()))?;
+        remaining -= len as u64;
+    }
+    Ok(plan.bytes_to_read)
+}
+
 async fn run_mounted_write_phase(
     params: &TestCacheParams,
     files: &[WorkFile],
@@ -577,12 +1099,14 @@ async fn run_mounted_write_phase(
 ) -> Result<(PhaseTelemetry, Vec<PhaseTelemetry>)> {
     let progress = ProgressBar::start("StudioFS test write", order.len());
     let counter = progress.counter();
+    let write_chunk_size = mounted_write_chunk_size(params.block_size);
     if params.sequential_streams {
         let writes_by_stream = run_filesystem_writes_sequential_streams(
             files,
             order,
             params.concurrency,
             params.io_depth,
+            write_chunk_size,
             size_class_bounds,
             counter,
         )
@@ -600,6 +1124,7 @@ async fn run_mounted_write_phase(
             order,
             params.io_depth,
             params.concurrency,
+            write_chunk_size,
             size_class_bounds,
             counter,
         )
@@ -617,13 +1142,17 @@ async fn run_mounted_read_phase(
 ) -> Result<(PhaseTelemetry, Vec<PhaseTelemetry>)> {
     let progress = ProgressBar::start("StudioFS test read", order.len());
     let counter = progress.counter();
+    let read_options = MountedReadOptions {
+        read_size: params.read_size,
+        full_file_reads: params.full_file_reads,
+    };
     if params.sequential_streams {
         let reads_by_stream = run_filesystem_reads_sequential_streams(
             files,
             order,
             params.concurrency,
             params.io_depth,
-            params.read_size,
+            read_options,
             size_class_bounds,
             counter,
         )
@@ -641,7 +1170,7 @@ async fn run_mounted_read_phase(
             order,
             params.io_depth,
             params.concurrency,
-            params.read_size,
+            read_options,
             size_class_bounds,
             counter,
         )
@@ -656,6 +1185,7 @@ async fn run_filesystem_writes(
     order: &[usize],
     io_depth: usize,
     concurrency: usize,
+    write_chunk_size: usize,
     size_class_bounds: SizeClassBounds,
     progress: ProgressCounter,
 ) -> Result<PhaseTelemetry> {
@@ -689,19 +1219,15 @@ async fn run_filesystem_writes(
                     .await
                     .map_err(|e| anyhow!("filesystem write semaphore closed: {e}"))?;
                 let _permit = permit;
-                let data = deterministic_bytes(
-                    usize::try_from(item.size).context("file write size overflow")?,
-                    item.index as u64 + 123,
-                );
-
                 let start = Instant::now();
-                let mut out = fs::File::create(&item.path)
-                    .await
-                    .with_context(|| format!("create {}", item.path.display()))?;
-                out.write_all(&data)
-                    .await
-                    .with_context(|| format!("write {}", item.path.display()))?;
-                out.flush().await?;
+                write_deterministic_file(
+                    &item.path,
+                    item.size,
+                    item.index as u64 + 123,
+                    write_chunk_size,
+                )
+                .await
+                .with_context(|| format!("write {}", item.path.display()))?;
 
                 let elapsed = start.elapsed();
                 let class = classify_size(
@@ -744,7 +1270,7 @@ async fn run_filesystem_reads(
     order: &[usize],
     io_depth: usize,
     concurrency: usize,
-    read_size: u64,
+    read_options: MountedReadOptions,
     size_class_bounds: SizeClassBounds,
     progress: ProgressCounter,
 ) -> Result<PhaseTelemetry> {
@@ -773,7 +1299,11 @@ async fn run_filesystem_reads(
                 }
                 let work_index = order[op_index];
                 let item = &files[work_index];
-                let read_len = read_size.min(item.size).max(1) as usize;
+                let read_plan = mounted_read_plan(
+                    item.size,
+                    read_options.read_size,
+                    read_options.full_file_reads,
+                );
 
                 let permit = sem
                     .acquire()
@@ -782,11 +1312,7 @@ async fn run_filesystem_reads(
                 let _permit = permit;
 
                 let start = Instant::now();
-                let mut in_f = fs::File::open(&item.path)
-                    .await
-                    .with_context(|| format!("open {}", item.path.display()))?;
-                let mut buf = vec![0u8; read_len];
-                in_f.read_exact(&mut buf)
+                let bytes_read = read_file_with_plan(&item.path, read_plan)
                     .await
                     .with_context(|| format!("read {}", item.path.display()))?;
                 let elapsed = start.elapsed();
@@ -805,7 +1331,7 @@ async fn run_filesystem_reads(
                     worker_id,
                     target: item.path.display().to_string(),
                     size_class: class,
-                    bytes: read_len as u64,
+                    bytes: bytes_read,
                     elapsed,
                 });
                 progress.inc();
@@ -831,6 +1357,7 @@ async fn run_filesystem_writes_sequential_streams(
     order: &[usize],
     stream_count: usize,
     io_depth: usize,
+    write_chunk_size: usize,
     size_class_bounds: SizeClassBounds,
     progress: ProgressCounter,
 ) -> Result<Vec<PhaseTelemetry>> {
@@ -853,18 +1380,15 @@ async fn run_filesystem_writes_sequential_streams(
                     .await
                     .map_err(|e| anyhow!("filesystem sequential write semaphore closed: {e}"))?;
                 let _permit = permit;
-                let data = deterministic_bytes(
-                    usize::try_from(item.size).context("sequential file write size overflow")?,
-                    item.index as u64 + 123 + stream_id as u64,
-                );
                 let start = Instant::now();
-                let mut out = fs::File::create(&item.path)
-                    .await
-                    .with_context(|| format!("create {}", item.path.display()))?;
-                out.write_all(&data)
-                    .await
-                    .with_context(|| format!("write {}", item.path.display()))?;
-                out.flush().await?;
+                write_deterministic_file(
+                    &item.path,
+                    item.size,
+                    item.index as u64 + 123 + stream_id as u64,
+                    write_chunk_size,
+                )
+                .await
+                .with_context(|| format!("write {}", item.path.display()))?;
                 let elapsed = start.elapsed();
                 let class = classify_size(
                     item.size,
@@ -902,7 +1426,7 @@ async fn run_filesystem_reads_sequential_streams(
     order: &[usize],
     stream_count: usize,
     io_depth: usize,
-    read_size: u64,
+    read_options: MountedReadOptions,
     size_class_bounds: SizeClassBounds,
     progress: ProgressCounter,
 ) -> Result<Vec<PhaseTelemetry>> {
@@ -920,18 +1444,18 @@ async fn run_filesystem_reads_sequential_streams(
             let mut telemetry = PhaseTelemetry::default();
             for work_index in segment {
                 let item = &files[work_index];
-                let read_len = read_size.min(item.size).max(1) as usize;
+                let read_plan = mounted_read_plan(
+                    item.size,
+                    read_options.read_size,
+                    read_options.full_file_reads,
+                );
                 let permit = sem
                     .acquire()
                     .await
                     .map_err(|e| anyhow!("filesystem sequential read semaphore closed: {e}"))?;
                 let _permit = permit;
                 let start = Instant::now();
-                let mut in_f = fs::File::open(&item.path)
-                    .await
-                    .with_context(|| format!("open {}", item.path.display()))?;
-                let mut buf = vec![0u8; read_len];
-                in_f.read_exact(&mut buf)
+                let bytes_read = read_file_with_plan(&item.path, read_plan)
                     .await
                     .with_context(|| format!("read {}", item.path.display()))?;
                 let elapsed = start.elapsed();
@@ -946,7 +1470,7 @@ async fn run_filesystem_reads_sequential_streams(
                     worker_id: stream_id,
                     target: item.path.display().to_string(),
                     size_class: class,
-                    bytes: read_len as u64,
+                    bytes: bytes_read,
                     elapsed,
                 });
                 progress.inc();
@@ -1027,10 +1551,15 @@ pub(super) async fn run_mounted_end_to_end(
             Some(path) => read_write_path_observability_snapshot(path, mount_pid).await?,
             None => None,
         };
-        let (measured, mounted_memory) = sample_mounted_memory_during(
+        let measured_write_path_before_for_report = measured_write_path_before.clone();
+        let files_ref = &files;
+        let order_ref = &order;
+        let cache_upload_dir_ref = &cache_upload_dir;
+        let write_path_observability_path_ref = &write_path_observability_path;
+        let (measured, mounted_memory, mounted_portable_profile) = sample_mounted_profile_during(
             mount_pid,
             write_path_observability_path.as_deref(),
-            || async {
+            move |portable_profile| async move {
                 let started = Instant::now();
                 let started_cpu = process_cpu_time();
                 let started_at =
@@ -1042,10 +1571,12 @@ pub(super) async fn run_mounted_end_to_end(
                     phase = "e2e-write",
                     "cache benchmark phase start"
                 );
+                portable_profile.set_phase("write");
                 let writes_wall_start = Instant::now();
                 let writes_cpu_start = process_cpu_time();
                 let (writes, writes_by_stream) =
-                    run_mounted_write_phase(params, &files, &order, size_class_bounds).await?;
+                    run_mounted_write_phase(params, files_ref, order_ref, size_class_bounds)
+                        .await?;
                 let writes_wall = writes_wall_start.elapsed();
                 let writes_cpu = writes_cpu_start
                     .and_then(|start_cpu| {
@@ -1054,10 +1585,10 @@ pub(super) async fn run_mounted_end_to_end(
                     .unwrap_or_default();
 
                 let during_upload_observation =
-                    if let Some(upload_dir) = cache_upload_dir.as_deref() {
+                    if let Some(upload_dir) = cache_upload_dir_ref.as_deref() {
                         Some(
                             wait_for_pending_upload_target(
-                                write_path_observability_path.as_deref(),
+                                write_path_observability_path_ref.as_deref(),
                                 mount_pid,
                                 Some(upload_dir),
                                 PendingUploadTarget::Active,
@@ -1076,10 +1607,11 @@ pub(super) async fn run_mounted_end_to_end(
                     phase = "e2e-read",
                     "cache benchmark phase start"
                 );
+                portable_profile.set_phase("during-upload-read");
                 let reads_wall_start = Instant::now();
                 let reads_cpu_start = process_cpu_time();
                 let (reads, reads_by_stream) =
-                    run_mounted_read_phase(params, &files, &order, size_class_bounds).await?;
+                    run_mounted_read_phase(params, files_ref, order_ref, size_class_bounds).await?;
                 let reads_wall = reads_wall_start.elapsed();
                 let reads_cpu = reads_cpu_start
                     .and_then(|start_cpu| {
@@ -1267,6 +1799,14 @@ pub(super) async fn run_mounted_end_to_end(
             mounted_memory.as_ref(),
             local_first_read_comparison.as_ref(),
         );
+        let writes_report = phase_telemetry_to_report(&measured.writes, measured.writes_wall);
+        let reads_report = phase_telemetry_to_report(&measured.reads, measured.reads_wall);
+        let mounted_write_diagnostics = Some(build_mounted_write_diagnostics_report(
+            &writes_report,
+            mounted_memory.as_ref(),
+            measured_write_path_before_for_report.as_ref(),
+            measured_write_path_after_for_report.as_ref(),
+        ));
 
         let _ = fs::remove_dir_all(work_root).await;
         let total_elapsed_ms = (Instant::now() - measured.started).as_secs_f64() * 1000.0;
@@ -1305,9 +1845,11 @@ pub(super) async fn run_mounted_end_to_end(
             mounted_runtime,
             mounted_observability,
             mounted_write_path_window,
+            mounted_write_diagnostics,
+            mounted_portable_profile,
             local_first_read_comparison,
-            writes: phase_telemetry_to_report(&measured.writes, measured.writes_wall),
-            reads: phase_telemetry_to_report(&measured.reads, measured.reads_wall),
+            writes: writes_report,
+            reads: reads_report,
         })
     }
     .await;
@@ -1321,8 +1863,12 @@ pub(super) async fn run_mounted_end_to_end(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use studiofs_vfs::vfs::{VfsWritePathVfsWriteStats, VfsWritePathWinfspWritePathStats};
     use studiofs_vfs::{
-        VfsWritePathBurstStats, VfsWritePathDirtyPressureStats, VfsWritePathObservabilitySnapshot,
+        VfsPortableAllocatorStats, VfsWritePathBackpressureStats, VfsWritePathBurstStats,
+        VfsWritePathDirtyPressureStats, VfsWritePathLandingZoneStats,
+        VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
+        VfsWritePathStageLatencyStats,
     };
     use tempfile::tempdir;
 
@@ -1344,6 +1890,7 @@ mod tests {
             during_upload_timeout: Duration::from_secs(1),
             l1_limit: 64 * 1024 * 1024,
             profile: false,
+            full_file_reads: false,
             run_id: "test-run".to_string(),
         }
     }
@@ -1398,6 +1945,29 @@ mod tests {
         fs::write(path, bytes).await.expect("write snapshot");
     }
 
+    async fn write_snapshot_with_allocator(
+        path: &Path,
+        publisher_pid: u32,
+        current_bytes: u64,
+        peak_bytes: u64,
+    ) {
+        let snapshot = VfsWritePathObservabilitySnapshot {
+            publisher_pid,
+            allocator: Some(VfsPortableAllocatorStats {
+                current_bytes,
+                peak_bytes,
+                allocated_total_bytes: peak_bytes,
+                deallocated_total_bytes: peak_bytes.saturating_sub(current_bytes),
+                allocation_count: 7,
+                deallocation_count: 3,
+                reallocation_count: 1,
+            }),
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&snapshot).expect("serialize snapshot");
+        fs::write(path, bytes).await.expect("write snapshot");
+    }
+
     #[tokio::test]
     async fn read_write_path_observability_snapshot_ignores_mismatched_publisher_pid() {
         let temp = tempdir().expect("tempdir");
@@ -1434,6 +2004,52 @@ mod tests {
         assert_eq!(mounted_memory.dirty_bytes_peak, Some(256));
         assert_eq!(mounted_memory.staged_bytes_peak, Some(512));
         assert_eq!(mounted_memory.dirty_limit_bytes, Some(1024));
+    }
+
+    #[tokio::test]
+    async fn sample_mounted_profile_during_tracks_phase_and_allocator_peaks() {
+        let temp = tempdir().expect("tempdir");
+        let metrics_path = temp.path().join("write_path_observability.json");
+        let mount_pid = std::process::id();
+
+        write_snapshot_with_allocator(&metrics_path, mount_pid, 64, 128).await;
+        let metrics_path_ref = &metrics_path;
+        let (_, mounted_memory, portable_profile) = sample_mounted_profile_during(
+            mount_pid,
+            Some(&metrics_path),
+            move |profile| async move {
+                profile.set_phase("write");
+                write_snapshot_with_allocator(metrics_path_ref, mount_pid, 256, 512).await;
+                tokio::time::sleep(MOUNTED_MEMORY_SAMPLE_INTERVAL * 2).await;
+                profile.set_phase("during-upload-read");
+                write_snapshot_with_allocator(metrics_path_ref, mount_pid, 128, 1024).await;
+                tokio::time::sleep(MOUNTED_MEMORY_SAMPLE_INTERVAL * 2).await;
+                Ok::<_, anyhow::Error>(())
+            },
+        )
+        .await
+        .expect("sample mounted profile");
+
+        assert!(mounted_memory.is_some());
+        let portable_profile = portable_profile.expect("portable profile");
+        assert_eq!(
+            portable_profile.allocator.as_ref().unwrap().peak_bytes,
+            1024
+        );
+        assert!(
+            portable_profile
+                .phases
+                .iter()
+                .any(|phase| phase.phase == "write"
+                    && phase.allocator.as_ref().unwrap().peak_bytes == 512)
+        );
+        assert!(
+            portable_profile
+                .phases
+                .iter()
+                .any(|phase| phase.phase == "during-upload-read"
+                    && phase.allocator.as_ref().unwrap().peak_bytes == 1024)
+        );
     }
 
     #[test]
@@ -1530,5 +2146,197 @@ mod tests {
 
         assert_eq!(cached_store.staging_bytes, 999);
         assert_eq!(cached_store.staging_throughput_bytes_per_sec, 2048.0);
+    }
+
+    #[test]
+    fn deterministic_write_chunks_cover_file_without_full_file_buffer() {
+        let chunks = deterministic_write_chunks(10, 4);
+
+        assert_eq!(chunks, vec![(0, 4), (4, 4), (8, 2)]);
+        assert!(chunks.iter().all(|(_, len)| *len <= 4));
+    }
+
+    #[test]
+    fn mounted_operator_read_plan_reads_full_file_in_read_size_chunks() {
+        let plan = mounted_read_plan(8 * 1024 * 1024 * 1024, 4 * 1024 * 1024, true);
+
+        assert_eq!(plan.bytes_to_read, 8 * 1024 * 1024 * 1024);
+        assert_eq!(plan.chunk_size, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn mounted_test_cache_read_plan_keeps_single_sample_read() {
+        let plan = mounted_read_plan(8 * 1024 * 1024 * 1024, 4 * 1024 * 1024, false);
+
+        assert_eq!(plan.bytes_to_read, 4 * 1024 * 1024);
+        assert_eq!(plan.chunk_size, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn mounted_write_diagnostics_uses_upload_accounting_when_payload_burst_is_unavailable() {
+        let after = VfsWritePathObservabilitySnapshot {
+            winfsp_write_path: VfsWritePathWinfspWritePathStats {
+                write_bytes: 1024,
+                ..Default::default()
+            },
+            upload: studiofs_vfs::VfsUploadStats {
+                pending_upload_bytes: 400,
+                completed_upload_bytes: 624,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let memory = MountedMemoryReport {
+            mount_pid: 4242,
+            rss_bytes_steady_state: Some(512),
+            rss_bytes_peak: Some(512),
+            dirty_bytes_steady_state: Some(0),
+            dirty_bytes_peak: Some(0),
+            staged_bytes_peak: Some(0),
+            dirty_limit_bytes: Some(2 * 1024 * 1024 * 1024),
+        };
+        let writes = super::super::result::OpReport {
+            operations: 1,
+            bytes: 1024,
+            elapsed_ms: 1.0,
+            avg_latency_ms: 1.0,
+            p50_ms: 1.0,
+            p95_ms: 1.0,
+            p99_ms: 1.0,
+            throughput_bytes_per_sec: 1_200.0 * 1024.0 * 1024.0,
+            latency_histogram: super::super::result::LatencyHistogramReport {
+                bucket_upper_bounds_ns: vec![50_000],
+                bucket_counts: vec![1, 0],
+            },
+            operations_log: Vec::new(),
+        };
+
+        let diagnostics =
+            build_mounted_write_diagnostics_report(&writes, Some(&memory), None, Some(&after));
+
+        assert_eq!(diagnostics.payload_accounted_bytes_delta, 1024);
+        assert_eq!(diagnostics.known_local_write_amplification, Some(1.0));
+        assert!(diagnostics.pass);
+    }
+
+    #[test]
+    fn mounted_write_diagnostics_reports_gate_metrics_from_write_path_window() {
+        let before = VfsWritePathObservabilitySnapshot {
+            winfsp_write_path: VfsWritePathWinfspWritePathStats {
+                write_bytes: 100,
+                ..Default::default()
+            },
+            vfs_write_path: VfsWritePathVfsWriteStats {
+                write_bytes: 100,
+                ..Default::default()
+            },
+            payload_burst: VfsWritePathBurstStats {
+                total_bytes: 100,
+                ..Default::default()
+            },
+            landing_zone: VfsWritePathLandingZoneStats {
+                accepted_bytes: 0,
+                ..Default::default()
+            },
+            payload_persist: VfsWritePathStageLatencyStats {
+                calls: 2,
+                ..Default::default()
+            },
+            local_cache_io: VfsWritePathLocalCacheIoStats {
+                calls: 4,
+                backend_io_total_ms: 11.0,
+                ..Default::default()
+            },
+            write_backpressure: VfsWritePathBackpressureStats {
+                hard_events: 1,
+                soft_throttle_events: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let after = VfsWritePathObservabilitySnapshot {
+            winfsp_write_path: VfsWritePathWinfspWritePathStats {
+                write_bytes: 1124,
+                ..Default::default()
+            },
+            vfs_write_path: VfsWritePathVfsWriteStats {
+                write_bytes: 1124,
+                ..Default::default()
+            },
+            payload_burst: VfsWritePathBurstStats {
+                total_bytes: 1124,
+                ..Default::default()
+            },
+            landing_zone: VfsWritePathLandingZoneStats {
+                accepted_bytes: 0,
+                ..Default::default()
+            },
+            payload_persist: VfsWritePathStageLatencyStats {
+                calls: 10,
+                ..Default::default()
+            },
+            local_cache_io: VfsWritePathLocalCacheIoStats {
+                calls: 14,
+                backend_io_total_ms: 51.0,
+                ..Default::default()
+            },
+            write_backpressure: VfsWritePathBackpressureStats {
+                hard_events: 3,
+                soft_throttle_events: 7,
+                ..Default::default()
+            },
+            dirty_pressure: VfsWritePathDirtyPressureStats {
+                writer_stack_dirty_bytes: 64,
+                pending_persisted_slice_bytes: 128,
+                pending_upload_bytes: 256,
+                cache_pressure_bytes: 384,
+                total_accounted_bytes: 512,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let memory = MountedMemoryReport {
+            mount_pid: 4242,
+            rss_bytes_steady_state: Some(768 * 1024 * 1024),
+            rss_bytes_peak: Some(1024 * 1024 * 1024),
+            dirty_bytes_steady_state: Some(128),
+            dirty_bytes_peak: Some(256),
+            staged_bytes_peak: Some(512),
+            dirty_limit_bytes: Some(2 * 1024 * 1024 * 1024),
+        };
+        let writes = super::super::result::OpReport {
+            operations: 1,
+            bytes: 1024,
+            elapsed_ms: 1.0,
+            avg_latency_ms: 1.0,
+            p50_ms: 1.0,
+            p95_ms: 1.0,
+            p99_ms: 1.0,
+            throughput_bytes_per_sec: 1_200.0 * 1024.0 * 1024.0,
+            latency_histogram: super::super::result::LatencyHistogramReport {
+                bucket_upper_bounds_ns: vec![50_000],
+                bucket_counts: vec![1, 0],
+            },
+            operations_log: Vec::new(),
+        };
+
+        let diagnostics = build_mounted_write_diagnostics_report(
+            &writes,
+            Some(&memory),
+            Some(&before),
+            Some(&after),
+        );
+
+        assert!(diagnostics.pass);
+        assert!(diagnostics.write_throughput_target_met);
+        assert_eq!(diagnostics.rss_target_met, Some(true));
+        assert_eq!(diagnostics.payload_persisted_bytes_delta, 1024);
+        assert_eq!(diagnostics.landing_accepted_bytes_delta, 0);
+        assert_eq!(diagnostics.known_local_write_amplification, Some(1.0));
+        assert!(!diagnostics.landing_journal_active);
+        assert_eq!(diagnostics.total_accounted_bytes_after, Some(512));
+        assert_eq!(diagnostics.hard_backpressure_events_delta, 2);
+        assert_eq!(diagnostics.soft_throttle_events_delta, 5);
+        assert!(diagnostics.blockers.is_empty());
     }
 }

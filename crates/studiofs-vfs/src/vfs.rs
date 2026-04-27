@@ -64,14 +64,14 @@ pub use locking::LockKind;
 pub use metrics::{
     StatFs, VfsAttrReadCacheSnapshot, VfsCacheStateSnapshot, VfsForegroundReadProtectionStats,
     VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot,
-    VfsNamespaceCacheSnapshot, VfsRuntimeEvent, VfsSynchronizationStateSnapshot,
-    VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
-    VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats,
-    VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats,
-    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
-    VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
-    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
-    VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
+    VfsNamespaceCacheSnapshot, VfsPortableAllocatorStats, VfsRuntimeEvent,
+    VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
+    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
+    VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
+    VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
+    VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
+    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
+    VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
     VfsWritePathWinfspForegroundFlushStats, VfsWritePathWinfspWritePathStats,
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
@@ -6967,6 +6967,7 @@ impl StudioVfs {
                 payload_put_concurrency: self.payload_put_concurrency,
                 sync_group_min_bytes: self.local_sync_group_min_bytes,
             },
+            allocator: None,
         }
     }
 

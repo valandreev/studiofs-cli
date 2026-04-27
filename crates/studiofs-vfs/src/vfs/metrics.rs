@@ -290,6 +290,17 @@ pub struct VfsWritePathTuningStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsPortableAllocatorStats {
+    pub current_bytes: u64,
+    pub peak_bytes: u64,
+    pub allocated_total_bytes: u64,
+    pub deallocated_total_bytes: u64,
+    pub allocation_count: u64,
+    pub deallocation_count: u64,
+    pub reallocation_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsWritePathObservabilitySnapshot {
     #[serde(default)]
     pub publisher_pid: u32,
@@ -331,6 +342,8 @@ pub struct VfsWritePathObservabilitySnapshot {
     pub eager_flush: VfsWritePathEagerFlushStats,
     #[serde(default)]
     pub tuning: VfsWritePathTuningStats,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocator: Option<VfsPortableAllocatorStats>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

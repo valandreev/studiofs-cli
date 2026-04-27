@@ -76,11 +76,15 @@ pub(super) struct BenchmarkReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) mounted_memory: Option<MountedMemoryReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) mounted_portable_profile: Option<MountedPortableProfileReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) mounted_runtime: Option<MountedRuntimeReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) mounted_observability: Option<MountedObservabilityReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) mounted_write_path_window: Option<MountedWritePathWindowReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) mounted_write_diagnostics: Option<MountedWriteDiagnosticsReport>,
     pub(super) writes: OpReport,
     pub(super) reads: OpReport,
 }
@@ -221,6 +225,56 @@ pub(super) struct MountedMemoryReport {
     pub(super) dirty_limit_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct MountedPortableProfileReport {
+    pub(super) process: MountedPortableProcessReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) allocator: Option<MountedPortableAllocatorReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) phases: Vec<MountedPortablePhaseProfileReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct MountedPortablePhaseProfileReport {
+    pub(super) phase: String,
+    pub(super) process: MountedPortableProcessReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) allocator: Option<MountedPortableAllocatorReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct MountedPortableProcessReport {
+    pub(super) mount_pid: u32,
+    pub(super) sample_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) rss_bytes_steady_state: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) rss_bytes_peak: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) virtual_memory_bytes_peak: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) cpu_usage_percent_avg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) cpu_usage_percent_peak: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) cpu_time_ms_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) disk_read_bytes_delta: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) disk_write_bytes_delta: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct MountedPortableAllocatorReport {
+    pub(super) current_bytes: u64,
+    pub(super) peak_bytes: u64,
+    pub(super) allocated_total_bytes: u64,
+    pub(super) deallocated_total_bytes: u64,
+    pub(super) allocation_count: u64,
+    pub(super) deallocation_count: u64,
+    pub(super) reallocation_count: u64,
+}
+
 #[derive(Debug, Serialize)]
 pub(super) struct MountedLocalFirstReadComparisonReport {
     pub(super) cache_path: String,
@@ -234,6 +288,52 @@ pub(super) struct MountedWritePathWindowReport {
     pub(super) before: Option<VfsWritePathObservabilitySnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) after: Option<VfsWritePathObservabilitySnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct MountedWriteDiagnosticsReport {
+    pub(super) pass: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) blockers: Vec<String>,
+    pub(super) write_throughput_target_bytes_per_sec: f64,
+    pub(super) write_throughput_bytes_per_sec: f64,
+    pub(super) write_throughput_mib_per_sec: f64,
+    pub(super) write_throughput_target_met: bool,
+    pub(super) rss_peak_target_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) rss_bytes_peak: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) rss_target_met: Option<bool>,
+    pub(super) logical_write_bytes: u64,
+    pub(super) winfsp_write_bytes_delta: u64,
+    pub(super) vfs_write_bytes_delta: u64,
+    pub(super) payload_persisted_bytes_delta: u64,
+    pub(super) payload_accounted_bytes_delta: u64,
+    pub(super) landing_accepted_bytes_delta: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) known_local_write_amplification: Option<f64>,
+    pub(super) landing_journal_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) dirty_bytes_peak: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) staged_bytes_peak: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) dirty_limit_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) writer_stack_dirty_bytes_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) pending_persisted_slice_bytes_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) pending_upload_bytes_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) cache_pressure_bytes_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) total_accounted_bytes_after: Option<u64>,
+    pub(super) payload_persist_calls_delta: u64,
+    pub(super) local_cache_io_calls_delta: u64,
+    pub(super) local_cache_backend_io_total_ms_delta: f64,
+    pub(super) hard_backpressure_events_delta: u64,
+    pub(super) soft_throttle_events_delta: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -713,6 +813,7 @@ pub(crate) fn sample_report() -> BenchmarkReport {
         local_first_read_comparison: None,
         stream_results: None,
         mounted_memory: None,
+        mounted_portable_profile: None,
         mounted_runtime: Some(MountedRuntimeReport {
             mounted_path: r"Z:\".to_string(),
             cache_root: r"D:\test-cache\vol-123".to_string(),
@@ -822,6 +923,7 @@ pub(crate) fn sample_report() -> BenchmarkReport {
             }),
         }),
         mounted_write_path_window: None,
+        mounted_write_diagnostics: None,
         writes: OpReport {
             operations: 16,
             bytes: 128 * 1024 * 1024,

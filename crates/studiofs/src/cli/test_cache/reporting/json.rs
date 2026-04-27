@@ -142,7 +142,11 @@ pub(crate) fn save_benchmark_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::test_cache::result::{MountedMemoryReport, sample_report};
+    use crate::cli::test_cache::result::{
+        MountedMemoryReport, MountedPortableAllocatorReport, MountedPortablePhaseProfileReport,
+        MountedPortableProcessReport, MountedPortableProfileReport, MountedWriteDiagnosticsReport,
+        sample_report,
+    };
     use chrono::TimeZone;
     use tempfile::tempdir;
 
@@ -237,6 +241,136 @@ mod tests {
         assert!(observability["post_upload_idle"]["observed"].is_boolean());
         assert!(observability["post_upload_idle"]["timed_out"].is_boolean());
         assert!(observability["barriers"]["flush_fsync_close_latency"].is_object());
+    }
+
+    #[test]
+    fn save_benchmark_report_includes_mounted_write_diagnostics_surface() {
+        let temp = tempdir().unwrap();
+        let mut report = sample_report();
+        report.mode = "e2e".to_string();
+        report.mounted_write_diagnostics = Some(MountedWriteDiagnosticsReport {
+            pass: true,
+            blockers: Vec::new(),
+            write_throughput_target_bytes_per_sec: 1_000.0 * 1024.0 * 1024.0,
+            write_throughput_bytes_per_sec: 1_200.0 * 1024.0 * 1024.0,
+            write_throughput_mib_per_sec: 1_200.0,
+            write_throughput_target_met: true,
+            rss_peak_target_bytes: 2 * 1024 * 1024 * 1024,
+            rss_bytes_peak: Some(1024 * 1024 * 1024),
+            rss_target_met: Some(true),
+            logical_write_bytes: 1024,
+            winfsp_write_bytes_delta: 1024,
+            vfs_write_bytes_delta: 1024,
+            payload_persisted_bytes_delta: 1024,
+            payload_accounted_bytes_delta: 1024,
+            landing_accepted_bytes_delta: 0,
+            known_local_write_amplification: Some(1.0),
+            landing_journal_active: false,
+            dirty_bytes_peak: Some(256),
+            staged_bytes_peak: Some(512),
+            dirty_limit_bytes: Some(2 * 1024 * 1024 * 1024),
+            writer_stack_dirty_bytes_after: Some(64),
+            pending_persisted_slice_bytes_after: Some(128),
+            pending_upload_bytes_after: Some(256),
+            cache_pressure_bytes_after: Some(384),
+            total_accounted_bytes_after: Some(512),
+            payload_persist_calls_delta: 8,
+            local_cache_io_calls_delta: 10,
+            local_cache_backend_io_total_ms_delta: 40.0,
+            hard_backpressure_events_delta: 2,
+            soft_throttle_events_delta: 5,
+        });
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 19, 15, 12, 55)
+            .single()
+            .unwrap();
+
+        let saved =
+            save_benchmark_report_in(&report, Some(Path::new("cache-run.json")), temp.path(), now)
+                .unwrap();
+
+        let content = std::fs::read_to_string(saved).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let diagnostics = &parsed["mounted_write_diagnostics"];
+        assert_eq!(diagnostics["pass"], true);
+        assert_eq!(diagnostics["write_throughput_target_met"], true);
+        assert_eq!(diagnostics["rss_target_met"], true);
+        assert_eq!(diagnostics["known_local_write_amplification"], 1.0);
+        assert_eq!(diagnostics["payload_persisted_bytes_delta"], 1024);
+        assert_eq!(diagnostics["landing_accepted_bytes_delta"], 0);
+        assert_eq!(diagnostics["total_accounted_bytes_after"], 512);
+    }
+
+    #[test]
+    fn save_benchmark_report_includes_portable_profile_surface() {
+        let temp = tempdir().unwrap();
+        let mut report = sample_report();
+        report.mode = "e2e".to_string();
+        report.mounted_portable_profile = Some(MountedPortableProfileReport {
+            process: MountedPortableProcessReport {
+                mount_pid: 42,
+                sample_count: 3,
+                rss_bytes_steady_state: Some(256),
+                rss_bytes_peak: Some(512),
+                virtual_memory_bytes_peak: Some(1024),
+                cpu_usage_percent_avg: Some(12.5),
+                cpu_usage_percent_peak: Some(25.0),
+                cpu_time_ms_delta: Some(140),
+                disk_read_bytes_delta: Some(2048),
+                disk_write_bytes_delta: Some(4096),
+            },
+            allocator: Some(MountedPortableAllocatorReport {
+                current_bytes: 128,
+                peak_bytes: 512,
+                allocated_total_bytes: 2048,
+                deallocated_total_bytes: 1920,
+                allocation_count: 7,
+                deallocation_count: 3,
+                reallocation_count: 1,
+            }),
+            phases: vec![MountedPortablePhaseProfileReport {
+                phase: "write".to_string(),
+                process: MountedPortableProcessReport {
+                    mount_pid: 42,
+                    sample_count: 2,
+                    rss_bytes_steady_state: Some(256),
+                    rss_bytes_peak: Some(512),
+                    virtual_memory_bytes_peak: Some(1024),
+                    cpu_usage_percent_avg: Some(10.0),
+                    cpu_usage_percent_peak: Some(20.0),
+                    cpu_time_ms_delta: Some(100),
+                    disk_read_bytes_delta: Some(0),
+                    disk_write_bytes_delta: Some(4096),
+                },
+                allocator: Some(MountedPortableAllocatorReport {
+                    current_bytes: 128,
+                    peak_bytes: 512,
+                    allocated_total_bytes: 2048,
+                    deallocated_total_bytes: 1920,
+                    allocation_count: 7,
+                    deallocation_count: 3,
+                    reallocation_count: 1,
+                }),
+            }],
+        });
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 19, 15, 12, 55)
+            .single()
+            .unwrap();
+
+        let saved =
+            save_benchmark_report_in(&report, Some(Path::new("cache-run.json")), temp.path(), now)
+                .unwrap();
+
+        let content = std::fs::read_to_string(saved).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let portable = &parsed["mounted_portable_profile"];
+        assert_eq!(portable["process"]["mount_pid"], 42);
+        assert_eq!(portable["process"]["rss_bytes_peak"], 512);
+        assert_eq!(portable["process"]["disk_write_bytes_delta"], 4096);
+        assert_eq!(portable["allocator"]["peak_bytes"], 512);
+        assert_eq!(portable["phases"][0]["phase"], "write");
+        assert_eq!(portable["phases"][0]["allocator"]["peak_bytes"], 512);
     }
 
     #[test]

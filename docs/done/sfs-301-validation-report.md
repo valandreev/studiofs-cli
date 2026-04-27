@@ -48,20 +48,15 @@ files after write and 901 after read. The queue drained to zero after the run.
 
 ## StudioFS Native Mounted Report
 
-Command shape:
+Current command shape for repeating this mounted report:
 
 ```powershell
-.\target\release\studiofs.exe test-cache Z:\ `
-  --block-size 4MB `
-  --read-size 4MB `
-  --sizes 8GB `
-  --concurrency 1 `
-  --io-depth 32 `
-  --warmup-runs 0 `
-  --access-pattern sequential `
-  --during-upload-timeout-ms 240000 `
-  --json-output D:\reports\sfs-301-studiofs-test-cache-8g-4m-final.json
+.\target\release\studiofs.exe test Z:\ `
+  --report D:\reports\sfs-301-studiofs-test-8g-4m.json
 ```
+
+The historical report below was captured before the `studiofs test` operator
+wrapper owned this workload.
 
 Report `eb5493ad-b02f-4785-bcac-ec2a8a0a27e6`:
 
