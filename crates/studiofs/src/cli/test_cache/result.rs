@@ -89,6 +89,8 @@ pub(super) struct MountedMemoryReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) dirty_bytes_peak: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) staged_bytes_peak: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) dirty_limit_bytes: Option<u64>,
 }
 

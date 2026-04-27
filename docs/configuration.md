@@ -302,7 +302,7 @@ Notes:
 - When the mounted runtime exposes process and write-path observability, `e2e`
   JSON output also includes `mounted_memory` with `mount_pid`,
   `rss_bytes_steady_state`, `rss_bytes_peak`, `dirty_bytes_steady_state`,
-  `dirty_bytes_peak`, and `dirty_limit_bytes`.
+  `dirty_bytes_peak`, `staged_bytes_peak`, and `dirty_limit_bytes`.
   RSS and dirty-pressure fields are best-effort samples and may be omitted when
   StudioFS cannot observe that signal for the measured run.
 - The terminal summary prints the same `Local-First read comparison` table
@@ -427,6 +427,9 @@ Operator stance:
 
 The writeback dirty-buffer default is hardcoded to `1200MB` (`max_dirty_bytes`) to give
 long sequential writers a slightly wider smoothing window before hard backpressure.
+StudioFS derives the soft throttle window and hard safety threshold from that
+single dirty budget. Upload backlog bytes are reported separately and do not by
+themselves stall ordinary writes while local cache headroom remains available.
 
 ### Expert overrides
 
@@ -485,7 +488,8 @@ Metadata cache observability is emitted through the existing `upload pipeline` /
 - cache shim read/write throughput and latency histograms
 - VFS synchronous read fast-path counters (`vfs_read_sync_fast_path_hits`, `vfs_read_sync_fast_path_misses`)
 - queue depth/backpressure metrics (`upload_queue_depth`, `upload_queue_depth_peak`, `write_backpressure_wait_ms`, `write_backpressure_events`)
-- writer/cache backpressure metrics (`fast_backpressure_wait_ms`, `fast_backpressure_events`, `fast_backpressure_stall_max_ms`)
+- writer/cache backpressure metrics (`fast_backpressure_wait_ms`, `fast_backpressure_events`, `fast_backpressure_stall_max_ms`, `soft_throttle_events`, `hard_events`)
+- dirty-pressure metrics (`total_dirty_bytes`, `dirty_peak_bytes`, `dirty_limit_bytes`, `pending_persisted_slice_bytes`, `staged_peak_bytes`, `pending_upload_bytes`, `cache_pressure_bytes`)
 - upload local payload-read metrics (`upload_local_payload_reads`, `upload_local_payload_read_bytes`, `upload_fallback_deferrals`, `upload_fallback_rereads`, `upload_fallback_reread_bytes`, `upload_fallback_reread_cache_misses`, `upload_fallback_wait_ms`, `upload_fallback_wait_max_ms`, `upload_fallback_read_ms`, `upload_fallback_read_max_ms`)
 - transit-memory budget metrics (`transit_memory_budget_bytes`, `transit_memory_used_bytes`, `transit_memory_available_bytes`, `transit_memory_waiting_foreground`, `transit_memory_waiting_background`)
 - foreground access-policy metrics (`dominant_access_class`, `dominant_prefetch_enabled`, `dominant_cache_promotion_on_read`, `dominant_readahead_base_width`, `dominant_readahead_max_width`, `dominant_readahead_min_prefetch`, `dominant_upload_pressure_boost`, `active_sequential_media_reads`, `active_random_interactive_reads`, `active_sequential_writers`, `active_random_writers`)

@@ -86,6 +86,7 @@ struct MountedMemoryAccumulator {
     rss_bytes_peak: u64,
     dirty_bytes_steady_state: Option<u64>,
     dirty_bytes_peak: u64,
+    staged_bytes_peak: u64,
     dirty_limit_bytes: u64,
 }
 
@@ -102,9 +103,15 @@ impl MountedMemoryAccumulator {
         self.rss_bytes_peak = self.rss_bytes_peak.max(rss_bytes);
     }
 
-    fn observe_dirty_pressure(&mut self, dirty_bytes: u64, dirty_limit_bytes: u64) {
+    fn observe_dirty_pressure(
+        &mut self,
+        dirty_bytes: u64,
+        dirty_limit_bytes: u64,
+        staged_peak_bytes: u64,
+    ) {
         self.dirty_bytes_steady_state = Some(dirty_bytes);
         self.dirty_bytes_peak = self.dirty_bytes_peak.max(dirty_bytes);
+        self.staged_bytes_peak = self.staged_bytes_peak.max(staged_peak_bytes);
         self.dirty_limit_bytes = self.dirty_limit_bytes.max(dirty_limit_bytes);
     }
 
@@ -118,6 +125,9 @@ impl MountedMemoryAccumulator {
             rss_bytes_peak: self.rss_bytes_steady_state.map(|_| self.rss_bytes_peak),
             dirty_bytes_steady_state: self.dirty_bytes_steady_state,
             dirty_bytes_peak: self.dirty_bytes_steady_state.map(|_| self.dirty_bytes_peak),
+            staged_bytes_peak: self
+                .dirty_bytes_steady_state
+                .map(|_| self.staged_bytes_peak),
             dirty_limit_bytes: self
                 .dirty_bytes_steady_state
                 .map(|_| self.dirty_limit_bytes),
@@ -176,6 +186,7 @@ fn spawn_mounted_memory_sampler(
                     Ok(Some(snapshot)) => accumulator.observe_dirty_pressure(
                         snapshot.dirty_pressure.total_dirty_bytes as u64,
                         snapshot.dirty_pressure.dirty_limit_bytes as u64,
+                        snapshot.dirty_pressure.staged_peak_bytes as u64,
                     ),
                     Ok(None) => {}
                     Err(error) => {
@@ -213,6 +224,7 @@ fn spawn_mounted_memory_sampler(
             accumulator.observe_dirty_pressure(
                 snapshot.dirty_pressure.total_dirty_bytes as u64,
                 snapshot.dirty_pressure.dirty_limit_bytes as u64,
+                snapshot.dirty_pressure.staged_peak_bytes as u64,
             );
         }
 
@@ -1143,22 +1155,31 @@ mod tests {
         total_dirty_bytes: usize,
         dirty_limit_bytes: usize,
     ) {
-        write_snapshot_with_pending(path, publisher_pid, total_dirty_bytes, dirty_limit_bytes, 0)
-            .await;
+        write_snapshot_with_pressure(
+            path,
+            publisher_pid,
+            total_dirty_bytes,
+            dirty_limit_bytes,
+            0,
+            0,
+        )
+        .await;
     }
 
-    async fn write_snapshot_with_pending(
+    async fn write_snapshot_with_pressure(
         path: &Path,
         publisher_pid: u32,
         total_dirty_bytes: usize,
         dirty_limit_bytes: usize,
         pending_uploads: usize,
+        staged_peak_bytes: usize,
     ) {
         let snapshot = VfsWritePathObservabilitySnapshot {
             publisher_pid,
             dirty_pressure: VfsWritePathDirtyPressureStats {
                 total_dirty_bytes,
                 dirty_limit_bytes,
+                staged_peak_bytes,
                 ..Default::default()
             },
             pending_uploads,
@@ -1190,7 +1211,7 @@ mod tests {
         write_snapshot(&metrics_path, mount_pid, 64, 1024).await;
         let (_, mounted_memory) =
             sample_mounted_memory_during(mount_pid, Some(&metrics_path), || async {
-                write_snapshot(&metrics_path, mount_pid, 256, 1024).await;
+                write_snapshot_with_pressure(&metrics_path, mount_pid, 256, 1024, 0, 512).await;
                 tokio::time::sleep(MOUNTED_MEMORY_SAMPLE_INTERVAL * 2).await;
                 Ok::<_, anyhow::Error>(())
             })
@@ -1202,6 +1223,7 @@ mod tests {
 
         let mounted_memory = mounted_memory.expect("mounted memory");
         assert_eq!(mounted_memory.dirty_bytes_peak, Some(256));
+        assert_eq!(mounted_memory.staged_bytes_peak, Some(512));
         assert_eq!(mounted_memory.dirty_limit_bytes, Some(1024));
     }
 
@@ -1232,7 +1254,7 @@ mod tests {
         fs::write(upload_dir.join("legacy.pending"), b"legacy")
             .await
             .expect("write legacy pending artifact");
-        write_snapshot_with_pending(&metrics_path, 42, 0, 1024, 7).await;
+        write_snapshot_with_pressure(&metrics_path, 42, 0, 1024, 7, 0).await;
 
         assert_eq!(
             scan_pending_uploads(Some(&metrics_path), 42, Some(&upload_dir))

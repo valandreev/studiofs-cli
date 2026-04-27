@@ -710,6 +710,23 @@ pub fn run(
                 snapshot.write_backpressure.wait_total_ms,
                 snapshot.write_backpressure.stall_max_ms
             );
+            println!(
+                "  Dirty pressure current/peak/limit: {}/{}/{}",
+                format_bytes(snapshot.dirty_pressure.total_dirty_bytes as u64),
+                format_bytes(snapshot.dirty_pressure.dirty_peak_bytes as u64),
+                format_bytes(snapshot.dirty_pressure.dirty_limit_bytes as u64)
+            );
+            println!(
+                "  Staged/upload/cache pressure: {}/{}/{}",
+                format_bytes(snapshot.dirty_pressure.staged_peak_bytes as u64),
+                format_bytes(snapshot.dirty_pressure.pending_upload_bytes as u64),
+                format_bytes(snapshot.dirty_pressure.cache_pressure_bytes as u64)
+            );
+            println!(
+                "  Soft throttle / hard backpressure: {}/{}",
+                snapshot.write_backpressure.soft_throttle_events,
+                snapshot.write_backpressure.hard_events
+            );
         } else {
             println!("  Metrics file:              unavailable");
             println!("  Hint:                      mount the volume and rerun with --verbose");

@@ -206,14 +206,32 @@ pub struct VfsWritePathBackpressureStats {
     pub events: u64,
     pub wait_total_ms: u64,
     pub stall_max_ms: u64,
+    #[serde(default)]
+    pub soft_throttle_events: u64,
+    #[serde(default)]
+    pub hard_events: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsWritePathDirtyPressureStats {
     pub pending_local_dirty_bytes: usize,
+    #[serde(default)]
+    pub pending_persisted_slice_bytes: usize,
     pub handle_writer_dirty_bytes: usize,
+    #[serde(default)]
+    pub writer_stack_dirty_bytes: usize,
     pub total_dirty_bytes: usize,
     pub dirty_limit_bytes: usize,
+    #[serde(default)]
+    pub pending_upload_bytes: usize,
+    #[serde(default)]
+    pub cache_pressure_bytes: usize,
+    #[serde(default)]
+    pub total_accounted_bytes: usize,
+    #[serde(default)]
+    pub dirty_peak_bytes: usize,
+    #[serde(default)]
+    pub staged_peak_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

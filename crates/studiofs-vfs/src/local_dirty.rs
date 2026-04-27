@@ -453,6 +453,7 @@ pub(super) struct LocalDirtyState {
     pub(super) fast_backpressure_wait_ms: AtomicU64,
     pub(super) fast_backpressure_events: AtomicU64,
     pub(super) fast_backpressure_stall_max_ms: AtomicU64,
+    pub(super) hard_backpressure_events: AtomicU64,
     pub(super) local_sync_group: tokio::sync::Mutex<LocalSyncGroupState>,
     pub(super) local_sync_gate: tokio::sync::Mutex<()>,
 }
@@ -470,6 +471,7 @@ impl LocalDirtyState {
             fast_backpressure_wait_ms: AtomicU64::new(0),
             fast_backpressure_events: AtomicU64::new(0),
             fast_backpressure_stall_max_ms: AtomicU64::new(0),
+            hard_backpressure_events: AtomicU64::new(0),
             local_sync_group: tokio::sync::Mutex::new(LocalSyncGroupState {
                 pending_bytes: 0,
                 last_sync_at: Instant::now(),

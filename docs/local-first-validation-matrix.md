@@ -47,6 +47,7 @@ use `--test vfs_test`; library unit-test commands run as plain
 | PG disconnect headroom exhaustion and read-only degradation | new mutations stop once local inode windows / block headroom are exhausted, while known readable state stays available | `read_only_metadata_authority_blocks_new_mutations_but_keeps_reads_open`; `next_inode_reports_read_only_headroom_once_windows_are_exhausted`; `open_with_persisted_slot_and_ranges_survives_pg_unavailable` | `cargo test -p studiofs-vfs read_only_metadata_authority_blocks_new_mutations_but_keeps_reads_open -- --nocapture`<br>`cargo test -p studiofs-meta next_inode_reports_read_only_headroom_once_windows_are_exhausted -- --nocapture`<br>`cargo test -p studiofs-meta open_with_persisted_slot_and_ranges_survives_pg_unavailable -- --nocapture` |
 | Local-only durability and replay while S3 is unavailable | accepted bytes stay readable locally, queued uploads replay after restart, and reconnect replay keeps only the live state | `flush_with_offline_s3_keeps_data_locally_committed_and_queued`; `offline_s3_does_not_break_local_read_after_write`; `recovery_after_offline_s3_preserves_local_accepted_view`; `repeated_graceful_restarts_during_upload_replay_are_idempotent`; `restart_replays_only_live_pending_extents` | `cargo test -p studiofs-vfs --test vfs_test flush_with_offline_s3_keeps_data_locally_committed_and_queued -- --nocapture`<br>`cargo test -p studiofs-vfs --test vfs_test offline_s3_does_not_break_local_read_after_write -- --nocapture`<br>`cargo test -p studiofs-vfs --test vfs_test recovery_after_offline_s3_preserves_local_accepted_view -- --ignored --nocapture --test-threads=1`<br>`cargo test -p studiofs-vfs --test vfs_test repeated_graceful_restarts_during_upload_replay_are_idempotent -- --ignored --nocapture --test-threads=1`<br>`cargo test -p studiofs-vfs --test vfs_test restart_replays_only_live_pending_extents -- --nocapture` |
 | Startup replay diagnostics | restart recovery status identifies recovered staged bytes, rebuilt upload queue entries, memory-only bytes outside the durability boundary, and orphan cleanup | `startup_replay_summary_reports_recovered_bytes_and_queued_uploads`; `startup_replay_removes_unreferenced_warm_payloads_and_stage_links`; `startup_replay_removes_orphan_dirty_payloads_and_clears_pending_evictions` | `cargo test -p studiofs-vfs startup_replay_summary_reports_recovered_bytes_and_queued_uploads --lib -- --nocapture`<br>`cargo test -p studiofs-vfs startup_replay_removes_unreferenced_warm_payloads_and_stage_links --lib -- --nocapture`<br>`cargo test -p studiofs-vfs startup_replay_removes_orphan_dirty_payloads_and_clears_pending_evictions --lib -- --nocapture` |
+| Dirty-byte pressure and reporting | writer pages, staged local slices, upload backlog bytes, hard backpressure, and cache pressure remain separately observable without making upload backlog alone stall writes | `write_path_dirty_pressure_reports_staged_bytes_and_hard_backpressure`; `upload_backlog_does_not_create_local_backpressure_after_write_commit`; `sample_mounted_memory_during_scopes_collection_to_measured_run` | `cargo test -p studiofs-vfs write_path_dirty_pressure_reports_staged_bytes_and_hard_backpressure -- --nocapture`<br>`cargo test -p studiofs-vfs --test vfs_test upload_backlog_does_not_create_local_backpressure_after_write_commit -- --nocapture`<br>`cargo test -p studiofs sample_mounted_memory_during_scopes_collection_to_measured_run -- --nocapture` |
 | Delete-before-publish orphan cleanup | unpublished deletes stay local, and orphaned payload is surfaced for later janitor cleanup instead of becoming peer-visible state | `zeroio_snapshot_reports_delete_before_publish_cleanup_visibility`; `zeroio_delete_before_publish_persists_tombstone_lifecycle` | `cargo test -p studiofs-vfs zeroio_snapshot_reports_delete_before_publish_cleanup_visibility -- --nocapture`<br>`cargo test -p studiofs-meta zeroio_delete_before_publish_persists_tombstone_lifecycle -- --nocapture` |
 
 ## Infra-Backed Distributed Contract Matrix
@@ -178,9 +179,9 @@ summary or JSON `local_first_read_comparison` section for the
 `during-upload-read` and `post-upload-read` phases. When mounted process
 observability is available, inspect the `Mounted memory`
 terminal table or JSON `mounted_memory` section for `rss_bytes_peak`,
-`rss_bytes_steady_state`, `dirty_bytes_peak`, and `dirty_limit_bytes`. These
-fields are best-effort and may be omitted when the measured run does not expose
-that signal.
+`rss_bytes_steady_state`, `dirty_bytes_peak`, `staged_bytes_peak`, and
+`dirty_limit_bytes`. These fields are best-effort and may be omitted when the
+measured run does not expose that signal.
 
 ### Small-File Random I/O / Metadata-Sensitive Run
 
@@ -273,9 +274,10 @@ StudioFS versus JuiceFS comparison:
 - Treat the mounted memory gate as
   `mounted_memory.rss_bytes_peak <= min(2 GiB, juicefs_peak_rss * 1.15)`.
 - Use `mounted_memory.rss_bytes_steady_state`,
-  `mounted_memory.dirty_bytes_peak`, and `mounted_memory.dirty_limit_bytes` as
-  diagnostics when the peak-RSS gate fails; they help distinguish dirty-state
-  pressure from other runtime memory growth when those samples are present.
+  `mounted_memory.dirty_bytes_peak`, `mounted_memory.staged_bytes_peak`, and
+  `mounted_memory.dirty_limit_bytes` as diagnostics when the peak-RSS gate
+  fails; they help distinguish hot dirty-state pressure, staged payload
+  pressure, and other runtime memory growth when those samples are present.
 - Treat `local_first_read_comparison` and `mounted_memory` as required
   StudioFS-side diagnostics for explaining any parity miss.
 

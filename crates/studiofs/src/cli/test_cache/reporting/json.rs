@@ -206,6 +206,7 @@ mod tests {
             rss_bytes_peak: Some(1_650 * 1024 * 1024),
             dirty_bytes_steady_state: None,
             dirty_bytes_peak: None,
+            staged_bytes_peak: None,
             dirty_limit_bytes: None,
         });
         let now = Utc
