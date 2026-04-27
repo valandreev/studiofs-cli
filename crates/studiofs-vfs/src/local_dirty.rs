@@ -2500,7 +2500,13 @@ impl StudioVfs {
             let _ = self.state.local_dirty.pending_slice_count.fetch_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
-                |pending| Some(pending.saturating_sub(total)),
+                |pending| {
+                    debug_assert!(
+                        pending >= total,
+                        "pending_slice_count underflow: pending={pending}, subtract={total}"
+                    );
+                    Some(pending.saturating_sub(total))
+                },
             );
         }
         if persisted > 0 {
@@ -2509,6 +2515,10 @@ impl StudioVfs {
                 .local_dirty
                 .pending_persisted_slice_count
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                    debug_assert!(
+                        pending >= persisted,
+                        "pending_persisted_slice_count underflow: pending={pending}, subtract={persisted}"
+                    );
                     Some(pending.saturating_sub(persisted))
                 });
         }
@@ -3369,6 +3379,25 @@ mod tests {
         vfs.clear_pending_dirty_slices_for_inode(ino);
 
         assert_eq!(vfs.pending_local_dirty_slice_counts(), (0, 0));
+    }
+
+    #[test]
+    #[should_panic(expected = "pending_slice_count underflow")]
+    fn pending_slice_counter_underflow_is_caught_in_debug_builds() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-slice-counter-underflow");
+
+        vfs.subtract_pending_slice_counts(1, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "pending_persisted_slice_count underflow")]
+    fn pending_persisted_slice_counter_underflow_is_caught_in_debug_builds() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (_rt, vfs, _meta) =
+            make_unstarted_test_vfs(&tmp, "pending-persisted-slice-counter-underflow");
+
+        vfs.subtract_pending_slice_counts(0, 1);
     }
 
     #[test]
