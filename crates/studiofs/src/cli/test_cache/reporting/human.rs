@@ -249,6 +249,7 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
             format_optional_bytes(memory.rss_bytes_peak),
             format_optional_bytes(memory.dirty_bytes_steady_state),
             format_optional_bytes(memory.dirty_bytes_peak),
+            format_optional_bytes(memory.staged_bytes_peak),
             format_optional_bytes(memory.dirty_limit_bytes),
         ]];
         let _ = write!(
@@ -261,6 +262,7 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
                     "Peak RSS",
                     "Steady dirty",
                     "Peak dirty",
+                    "Peak staged",
                     "Dirty limit",
                 ],
                 &rows,
@@ -575,6 +577,7 @@ mod tests {
             rss_bytes_peak: Some(1_650 * 1024 * 1024),
             dirty_bytes_steady_state: Some(512 * 1024 * 1024),
             dirty_bytes_peak: Some(768 * 1024 * 1024),
+            staged_bytes_peak: Some(256 * 1024 * 1024),
             dirty_limit_bytes: Some(2 * 1024 * 1024 * 1024),
         });
 
@@ -585,6 +588,7 @@ mod tests {
         assert!(summary.contains("Steady RSS"));
         assert!(summary.contains("Peak RSS"));
         assert!(summary.contains("Steady dirty"));
+        assert!(summary.contains("Peak staged"));
         assert!(summary.contains("Dirty limit"));
     }
 
@@ -598,6 +602,7 @@ mod tests {
             rss_bytes_peak: Some(1_650 * 1024 * 1024),
             dirty_bytes_steady_state: None,
             dirty_bytes_peak: None,
+            staged_bytes_peak: None,
             dirty_limit_bytes: None,
         });
 

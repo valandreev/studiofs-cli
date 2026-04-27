@@ -4208,6 +4208,93 @@ fn write_path_observability_reports_landing_drain_lag_without_foreground_pacing(
 }
 
 #[test]
+fn write_path_dirty_pressure_reports_staged_bytes_and_hard_backpressure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-297-dirty-pressure");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        vfs.set_max_dirty_bytes(8);
+        let attr1 = vfs
+            .create(1, b"sfs-297-seeded-pressure.bin", 0, 0, 0o644)
+            .unwrap();
+        let attr2 = vfs
+            .create(1, b"sfs-297-hard-pressure.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh1 = 77;
+        let fh2 = vfs.open_file(attr2.ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.state
+            .handle_writers
+            .open_writer_for_test(fh1, attr1.ino, 0);
+        vfs.state
+            .handle_writers
+            .write(fh1, attr1.ino, 0, vfs.block_size, 0, &[0xAB; 32]);
+
+        vfs.write_fh_with_deferred_materialize(
+            fh2,
+            attr2.ino,
+            0,
+            b"x",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        let hard_snapshot = vfs.write_path_observability_snapshot();
+        assert_eq!(
+            hard_snapshot.write_backpressure.hard_events, 1,
+            "hard backpressure fallback should be counted separately from soft throttle sleeps"
+        );
+
+        let attr3 = vfs
+            .create(1, b"sfs-297-staged-pressure.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh3 = vfs.open_file(attr3.ino, OpenFlags::RDWR, false).unwrap();
+        let slice_bytes = 2 * 1024 * 1024usize;
+        for index in 0..3u64 {
+            let payload = vec![0x50u8.saturating_add(index as u8); slice_bytes];
+            vfs.record_handle_writer_state(fh3, attr3.ino, index * slice_bytes as u64, &payload)
+                .await
+                .unwrap();
+        }
+        assert!(
+            vfs.materialize_handle_writers_for_limits(attr3.ino, LocalSyncPolicy::Opportunistic)
+                .await
+                .unwrap(),
+            "setup should stage older dirty slices without committing them to metadata yet"
+        );
+
+        let upload = vfs.upload_stats();
+        let snapshot = vfs.write_path_observability_snapshot();
+        assert!(
+            snapshot.dirty_pressure.pending_persisted_slice_bytes >= 2 * slice_bytes,
+            "staged-but-not-metadata-committed slices must remain visible in dirty pressure"
+        );
+        assert_eq!(
+            snapshot.dirty_pressure.pending_upload_bytes, upload.pending_upload_bytes as usize,
+            "upload backlog bytes should be reported without being folded into hot dirty bytes"
+        );
+        assert!(
+            snapshot.dirty_pressure.staged_peak_bytes >= 2 * slice_bytes,
+            "status/test reports need a staged-byte peak for pressure regressions"
+        );
+        assert!(
+            snapshot.dirty_pressure.total_accounted_bytes
+                >= snapshot
+                    .dirty_pressure
+                    .total_dirty_bytes
+                    .saturating_add(snapshot.dirty_pressure.pending_persisted_slice_bytes),
+            "total pressure accounting should include hot dirty bytes plus staged slices"
+        );
+
+        vfs.flush_fh(fh2).await.unwrap();
+        vfs.release_fh(fh2).await.unwrap();
+        vfs.flush_fh(fh3).await.unwrap();
+        vfs.release_fh(fh3).await.unwrap();
+    });
+}
+
+#[test]
 fn reset_diagnostics_observability_clears_drain_lag_pacing_counters() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-287-reset-drain-lag-counters");
@@ -4252,6 +4339,54 @@ fn reset_diagnostics_observability_clears_drain_lag_pacing_counters() {
 
         vfs.flush_fh(fh).await.unwrap();
         vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn reset_diagnostics_observability_clears_hard_backpressure_events() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-297-reset-hard-backpressure");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        vfs.set_max_dirty_bytes(8);
+        let seed_attr = vfs
+            .create(1, b"sfs-297-reset-hard-backpressure-seed.bin", 0, 0, 0o644)
+            .unwrap();
+        let write_attr = vfs
+            .create(1, b"sfs-297-reset-hard-backpressure-write.bin", 0, 0, 0o644)
+            .unwrap();
+        let seed_fh = 77;
+        let write_fh = vfs
+            .open_file(write_attr.ino, OpenFlags::RDWR, false)
+            .unwrap();
+
+        vfs.state
+            .handle_writers
+            .open_writer_for_test(seed_fh, seed_attr.ino, 0);
+        vfs.state
+            .handle_writers
+            .write(seed_fh, seed_attr.ino, 0, vfs.block_size, 0, &[0xAB; 32]);
+
+        vfs.write_fh_with_deferred_materialize(
+            write_fh,
+            write_attr.ino,
+            0,
+            b"x",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        let before_reset = vfs.write_path_observability_snapshot();
+        assert_eq!(before_reset.write_backpressure.hard_events, 1);
+
+        vfs.reset_diagnostics_observability();
+
+        let after_reset = vfs.write_path_observability_snapshot();
+        assert_eq!(after_reset.write_backpressure.hard_events, 0);
+
+        vfs.flush_fh(write_fh).await.unwrap();
+        vfs.release_fh(write_fh).await.unwrap();
     });
 }
 

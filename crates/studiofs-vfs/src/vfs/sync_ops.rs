@@ -1106,6 +1106,10 @@ impl StudioVfs {
         let hard_backpressure_threshold =
             super::hard_backpressure_threshold_bytes(self.max_dirty_bytes());
         if self.total_pending_write_buffer_bytes() > hard_backpressure_threshold {
+            self.state
+                .local_dirty
+                .hard_backpressure_events
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // #region debug log
             self.debug_write_probe(
                 "H2",

@@ -1762,6 +1762,8 @@ struct MetricsState {
     drain_lag_pacing_events: AtomicU64,
     drain_lag_pacing_total_ms: AtomicU64,
     drain_lag_pacing_max_ms: AtomicU64,
+    dirty_pressure_peak_bytes: AtomicU64,
+    staged_pressure_peak_bytes: AtomicU64,
     vfs_write_calls: AtomicU64,
     vfs_write_bytes: AtomicU64,
     vfs_write_record_handle_writer_state_calls: AtomicU64,
@@ -1874,6 +1876,8 @@ impl MetricsState {
             drain_lag_pacing_events: AtomicU64::new(0),
             drain_lag_pacing_total_ms: AtomicU64::new(0),
             drain_lag_pacing_max_ms: AtomicU64::new(0),
+            dirty_pressure_peak_bytes: AtomicU64::new(0),
+            staged_pressure_peak_bytes: AtomicU64::new(0),
             vfs_write_calls: AtomicU64::new(0),
             vfs_write_bytes: AtomicU64::new(0),
             vfs_write_record_handle_writer_state_calls: AtomicU64::new(0),
@@ -1983,6 +1987,8 @@ impl MetricsState {
             drain_lag_pacing_events,
             drain_lag_pacing_total_ms,
             drain_lag_pacing_max_ms,
+            dirty_pressure_peak_bytes,
+            staged_pressure_peak_bytes,
             vfs_write_calls,
             vfs_write_bytes,
             vfs_write_record_handle_writer_state_calls,
@@ -3985,6 +3991,10 @@ impl StudioVfs {
 
     pub fn reset_diagnostics_observability(&self) {
         self.state.metrics.reset_diagnostics_observability();
+        self.state
+            .local_dirty
+            .hard_backpressure_events
+            .store(0, Ordering::Relaxed);
         self.state.upload.startup_replay_counts.lock().clear();
         self.cached_store.reset_diagnostics_metrics();
     }
@@ -6553,6 +6563,44 @@ impl StudioVfs {
         let landing_zone_syncs = landing_zone_stats
             .data_syncs
             .saturating_add(landing_zone_stats.manifest_syncs);
+        let pending_local_dirty_bytes = self.total_pending_local_dirty_bytes();
+        let pending_persisted_slice_bytes = self.total_pending_persisted_local_dirty_slice_bytes();
+        let handle_writer_dirty_bytes = self.state.handle_writers.total_dirty_bytes();
+        let writer_stack_dirty_bytes = self.state.writer_stack.total_dirty_bytes();
+        let total_dirty_bytes = pending_local_dirty_bytes
+            .saturating_add(handle_writer_dirty_bytes)
+            .saturating_add(writer_stack_dirty_bytes);
+        let upload_stats = self.upload_stats();
+        let pending_upload_bytes =
+            usize::try_from(upload_stats.pending_upload_bytes).unwrap_or(usize::MAX);
+        let storage_stats = self.local_payload_backend.storage_stats();
+        let cache_pressure_bytes = usize::try_from(
+            storage_stats
+                .current_bytes
+                .saturating_sub(storage_stats.evictable_bytes),
+        )
+        .unwrap_or(usize::MAX);
+        let total_accounted_bytes = total_dirty_bytes
+            .saturating_add(pending_persisted_slice_bytes)
+            .saturating_add(pending_upload_bytes);
+        let dirty_peak_bytes = {
+            let current = total_dirty_bytes as u64;
+            let previous = self
+                .state
+                .metrics
+                .dirty_pressure_peak_bytes
+                .fetch_max(current, Ordering::Relaxed);
+            usize::try_from(previous.max(current)).unwrap_or(usize::MAX)
+        };
+        let staged_peak_bytes = {
+            let current = pending_persisted_slice_bytes as u64;
+            let previous = self
+                .state
+                .metrics
+                .staged_pressure_peak_bytes
+                .fetch_max(current, Ordering::Relaxed);
+            usize::try_from(previous.max(current)).unwrap_or(usize::MAX)
+        };
 
         VfsWritePathObservabilitySnapshot {
             publisher_pid: std::process::id(),
@@ -6905,12 +6953,29 @@ impl StudioVfs {
                     .local_dirty
                     .fast_backpressure_stall_max_ms
                     .load(Ordering::Relaxed),
+                soft_throttle_events: self
+                    .state
+                    .local_dirty
+                    .fast_backpressure_events
+                    .load(Ordering::Relaxed),
+                hard_events: self
+                    .state
+                    .local_dirty
+                    .hard_backpressure_events
+                    .load(Ordering::Relaxed),
             },
             dirty_pressure: VfsWritePathDirtyPressureStats {
-                pending_local_dirty_bytes: self.total_pending_local_dirty_bytes(),
-                handle_writer_dirty_bytes: self.state.handle_writers.total_dirty_bytes(),
-                total_dirty_bytes: self.total_pending_write_buffer_bytes(),
+                pending_local_dirty_bytes,
+                pending_persisted_slice_bytes,
+                handle_writer_dirty_bytes,
+                writer_stack_dirty_bytes,
+                total_dirty_bytes,
                 dirty_limit_bytes: self.max_dirty_bytes(),
+                pending_upload_bytes,
+                cache_pressure_bytes,
+                total_accounted_bytes,
+                dirty_peak_bytes,
+                staged_peak_bytes,
             },
             payload_burst: VfsWritePathBurstStats {
                 bursts: payload_burst_count,
