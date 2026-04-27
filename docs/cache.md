@@ -59,9 +59,23 @@ On backend startup, reconciliation runs before serving reads/writes:
    and prunes dirty/uploading index rows that point to missing payload files.
 2. Optional full sweep (`STUDIOFS_CACHE_V3_STARTUP_RECONCILE_MODE=full`)
    additionally removes stale index rows and orphan payload files.
+3. VFS startup replay scans local metadata and durable local payload state,
+   restores upload-stage links for live unpublished objects, and rebuilds the
+   runtime pending-upload queue.
 
 Reconciliation is scoped to the runtime root and does not mutate unrelated
 files under `<cache-root>`.
+
+Recovery is deliberately bounded by the local durability boundary. Bytes that
+only lived in writer memory before `flush`, `fsync`, close/release, or another
+local-sync barrier may be discarded by a crash. Bytes already staged into the
+local payload backend plus metadata graph remain locally readable and can be
+uploaded/published later without requiring PostgreSQL or object storage to be
+available during local recovery.
+
+The zero-IO status snapshot reports startup recovery with counters for
+replayed staged bytes, queued uploads, discarded memory-only bytes, orphan dirty
+payload cleanup, and unreferenced warm-payload cleanup.
 
 ## CachedStore Responsibilities
 
@@ -85,7 +99,9 @@ mount must not create a second foreground payload pipeline.
 
 - Runtime local payload durability and lifecycle state come from cached-store
   staging, backend persistence, and index state.
-- Upload intent is seeded from staged payloads and startup replay.
+- Upload intent is seeded from staged payloads and startup replay; the
+  in-memory upload queue is intentionally rebuilt from durable cache and
+  metadata state after restart.
 - Upload workers read committed payloads through `CachedStore` local payload
   sources: hot upload buffer, upload helpers, or local backend fallback.
 - `studiofs status` reports local cache layout/index/payload health and the

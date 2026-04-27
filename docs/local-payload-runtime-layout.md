@@ -96,6 +96,24 @@ Safety rules:
 - Reconciliation must not mutate unrelated files under `<cache-root>`.
 - Any unrecoverable reconciliation failure aborts backend startup rather than
   proceeding with ambiguous state.
+- Writer bytes accepted only in process memory before a local durability
+  boundary are not part of the runtime layout and are not promised after a
+  crash.
+- Payloads that reached the local payload backend and metadata graph are
+  replayable without contacting PostgreSQL or object storage. Startup replay
+  rebuilds the in-memory upload queue from the UUID-scoped payload backend and
+  local metadata.
+- Staged upload hardlinks under `upload/objects/**` are best-effort upload
+  helpers. Startup replay can rebuild them from durable payload objects when a
+  queued upload is recovered.
+- Uploaded-but-unpublished payloads remain non-visible to peers until the
+  metadata publish/finalization path resumes. Delete-before-publish tombstones
+  keep unpublished versions local and defer cleanup of already uploaded
+  objects.
+- Startup status surfaces replay and cleanup explicitly through the zero-IO
+  diagnostics snapshot: `replayed_bytes`, `queued_uploads`,
+  `discarded_memory_only_bytes`, `orphan_dirty_payloads_removed`, and
+  `unreferenced_local_payloads_removed`.
 
 ## 6. Remediation Flow for Stale Local Artifacts
 

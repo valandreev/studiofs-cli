@@ -2568,6 +2568,7 @@ struct StartupReplayCoordinator<'a> {
     vfs: &'a StudioVfs,
     pending_catalog: PendingUploadCatalog,
     dirty_set: HashSet<u64>,
+    recovered_dirty_object_ids: HashSet<u64>,
     quarantined_inodes: HashSet<Ino>,
     quarantined_object_ids: HashSet<u64>,
     replay_ops: Vec<(u64, u64, u64, u64)>,
@@ -2612,6 +2613,7 @@ impl<'a> StartupReplayCoordinator<'a> {
                 .dirty_object_ids()
                 .into_iter()
                 .collect(),
+            recovered_dirty_object_ids: HashSet::new(),
             quarantined_inodes: HashSet::new(),
             quarantined_object_ids: HashSet::new(),
             replay_ops: Vec::new(),
@@ -2651,13 +2653,9 @@ impl<'a> StartupReplayCoordinator<'a> {
             }
         };
 
-        if self.has_dirty_objects() {
+        if self.has_dirty_or_recovered_objects() {
             for graph_object in &graph_objects {
-                if !self.take_dirty_object(graph_object.object_id) {
-                    continue;
-                }
-
-                self.record_replayed_graph_object(ino, graph_object, attr.content_epoch);
+                self.record_recovered_graph_object_if_local(ino, graph_object, attr.content_epoch);
             }
         }
 
@@ -2674,15 +2672,11 @@ impl<'a> StartupReplayCoordinator<'a> {
             .vfs
             .sync_meta()
             .lookup_regular_file_slices(attr.ino, 0, attr.size)?;
-        let mut seen = HashSet::new();
         let mut objects = Vec::new();
         for span in spans {
             let Some(block) = span.payload else {
                 continue;
             };
-            if !seen.insert(block.object_id) {
-                continue;
-            }
             let chunk_base = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE);
             let absolute_offset = chunk_base.saturating_add(span.range.start as u64);
             objects.push(StartupGraphObject {
@@ -2695,11 +2689,13 @@ impl<'a> StartupReplayCoordinator<'a> {
     }
 
     fn needs_scan(&self, attr: &InodeAttr) -> bool {
-        !self.dirty_set.is_empty() || StudioVfs::needs_epoch_finalization(attr)
+        !self.dirty_set.is_empty()
+            || !self.recovered_dirty_object_ids.is_empty()
+            || StudioVfs::needs_epoch_finalization(attr)
     }
 
-    fn has_dirty_objects(&self) -> bool {
-        !self.dirty_set.is_empty()
+    fn has_dirty_or_recovered_objects(&self) -> bool {
+        !self.dirty_set.is_empty() || !self.recovered_dirty_object_ids.is_empty()
     }
 
     fn take_dirty_object(&mut self, object_id: u64) -> bool {
@@ -2726,6 +2722,39 @@ impl<'a> StartupReplayCoordinator<'a> {
             graph_object.object_id,
             content_epoch,
         ));
+        self.record_live_extent(
+            ino,
+            graph_object.block_index,
+            graph_object.object_id,
+            content_epoch,
+        );
+        self.restored_live_extents = self.restored_live_extents.saturating_add(1);
+    }
+
+    fn record_recovered_graph_object_if_local(
+        &mut self,
+        ino: Ino,
+        graph_object: &StartupGraphObject,
+        content_epoch: u64,
+    ) {
+        if self.take_dirty_object(graph_object.object_id) {
+            self.recovered_dirty_object_ids
+                .insert(graph_object.object_id);
+            self.record_replayed_graph_object(ino, graph_object, content_epoch);
+        } else if self
+            .recovered_dirty_object_ids
+            .contains(&graph_object.object_id)
+        {
+            self.record_recovered_live_extent(ino, graph_object, content_epoch);
+        }
+    }
+
+    fn record_recovered_live_extent(
+        &mut self,
+        ino: Ino,
+        graph_object: &StartupGraphObject,
+        content_epoch: u64,
+    ) {
         self.record_live_extent(
             ino,
             graph_object.block_index,
@@ -2823,7 +2852,7 @@ impl<'a> StartupReplayCoordinator<'a> {
         }
     }
 
-    fn cleanup_orphan_dirty_payloads(&mut self) {
+    fn cleanup_orphan_dirty_payloads(&mut self, reachable_object_ids: Option<&HashSet<u64>>) {
         if self.dirty_set.is_empty() {
             return;
         }
@@ -2831,26 +2860,16 @@ impl<'a> StartupReplayCoordinator<'a> {
             self.warn_orphan_dirty_payloads();
             return;
         }
-        if !self.retain_non_metadata_reachable_dirty_payloads() {
+        if !self.retain_non_metadata_reachable_dirty_payloads(reachable_object_ids) {
             return;
         }
         self.remove_orphan_dirty_payloads();
     }
 
-    fn retain_non_metadata_reachable_dirty_payloads(&mut self) -> bool {
-        // Cache the sync handle once so the recovery error path does
-        // not re-enter metadata lookup while we are already cleaning up.
-        let meta = self.vfs.sync_meta();
-        let reachable_object_ids = match meta.get_referenced_object_ids() {
-            Ok(ids) => Some(ids),
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "failed to enumerate metadata reachability during startup recovery; preserving dirty payload objects"
-                );
-                None
-            }
-        };
+    fn retain_non_metadata_reachable_dirty_payloads(
+        &mut self,
+        reachable_object_ids: Option<&HashSet<u64>>,
+    ) -> bool {
         if let Some(reachable_object_ids) = reachable_object_ids {
             self.dirty_set
                 .retain(|object_id| !reachable_object_ids.contains(object_id));
@@ -2893,27 +2912,18 @@ impl<'a> StartupReplayCoordinator<'a> {
         );
     }
 
-    fn cleanup_unreferenced_local_payloads(&mut self, protected_object_ids: &HashSet<u64>) {
-        let local_object_ids: BTreeSet<_> = self
-            .vfs
-            .local_payload_backend
-            .object_ids()
-            .into_iter()
-            .collect();
+    fn cleanup_unreferenced_local_payloads(
+        &mut self,
+        local_object_ids: BTreeSet<u64>,
+        protected_object_ids: &HashSet<u64>,
+        reachable_object_ids: Option<&HashSet<u64>>,
+    ) {
         if local_object_ids.is_empty() {
             return;
         }
 
-        let meta = self.vfs.sync_meta();
-        let reachable_object_ids = match meta.get_referenced_object_ids() {
-            Ok(ids) => ids,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    "failed to enumerate metadata reachability during startup cache cleanup; preserving local payload objects"
-                );
-                return;
-            }
+        let Some(reachable_object_ids) = reachable_object_ids else {
+            return;
         };
 
         let stale_object_ids: Vec<_> = local_object_ids
@@ -2957,6 +2967,19 @@ impl<'a> StartupReplayCoordinator<'a> {
         );
     }
 
+    fn metadata_reachable_object_ids(&self) -> Option<HashSet<u64>> {
+        match self.vfs.sync_meta().get_referenced_object_ids() {
+            Ok(ids) => Some(ids),
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "failed to enumerate metadata reachability during startup recovery; preserving local payload objects"
+                );
+                None
+            }
+        }
+    }
+
     fn warn_orphan_dirty_payloads(&self) {
         warn!(
             quarantined_inodes = self.quarantined_inodes.len(),
@@ -2968,7 +2991,7 @@ impl<'a> StartupReplayCoordinator<'a> {
     fn finish(mut self) {
         self.discard_quarantined_dirty_objects();
         self.merge_pending_live_extents();
-        let replayed_blocks = self.replay_ops.len() as u64;
+        let replayed_blocks = self.restored_live_extents as u64;
         let replayed_object_ids: Vec<_> = self
             .replay_ops
             .iter()
@@ -2976,6 +2999,12 @@ impl<'a> StartupReplayCoordinator<'a> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        let replayed_bytes = replayed_object_ids
+            .iter()
+            .filter_map(|object_id| self.vfs.local_payload_backend.object_stats(*object_id))
+            .fold(0_u64, |total, stats| {
+                total.saturating_add(stats.payload_len)
+            });
         let replayed_epochs: BTreeSet<_> = self
             .replay_ops
             .iter()
@@ -3054,13 +3083,28 @@ impl<'a> StartupReplayCoordinator<'a> {
                 }),
             );
         }
-        self.cleanup_orphan_dirty_payloads();
+        let local_object_ids: BTreeSet<_> = self
+            .vfs
+            .local_payload_backend
+            .object_ids()
+            .into_iter()
+            .collect();
+        let reachable_object_ids = if self.dirty_set.is_empty() && local_object_ids.is_empty() {
+            None
+        } else {
+            self.metadata_reachable_object_ids()
+        };
+        self.cleanup_orphan_dirty_payloads(reachable_object_ids.as_ref());
         let protected_object_ids: HashSet<_> = replayed_object_ids
             .iter()
             .copied()
             .chain(self.dirty_set.iter().copied())
             .collect();
-        self.cleanup_unreferenced_local_payloads(&protected_object_ids);
+        self.cleanup_unreferenced_local_payloads(
+            local_object_ids,
+            &protected_object_ids,
+            reachable_object_ids.as_ref(),
+        );
 
         self.vfs.record_runtime_event(
             "zeroio",
@@ -3069,10 +3113,13 @@ impl<'a> StartupReplayCoordinator<'a> {
             serde_json::json!({
                 "replayed_epochs": replayed_epochs.len() as u64,
                 "replayed_blocks": replayed_blocks,
+                "replayed_bytes": replayed_bytes,
+                "queued_uploads": self.replay_ops.len() as u64,
                 "queued_publish_ready_epochs": self.queued_epoch_count() as u64,
                 "quarantined_inodes": self.quarantined_inodes.len() as u64,
                 "orphan_dirty_payloads_removed": self.orphan_dirty_payloads_removed,
                 "unreferenced_local_payloads_removed": self.unreferenced_local_payloads_removed,
+                "discarded_memory_only_bytes": 0_u64,
                 "replay_failures": self.replay_failures,
             }),
         );
@@ -3499,6 +3546,10 @@ impl StudioVfs {
                             .unwrap_or(0),
                         replayed_blocks: Self::zeroio_event_u64(&event.fields, "replayed_blocks")
                             .unwrap_or(0),
+                        replayed_bytes: Self::zeroio_event_u64(&event.fields, "replayed_bytes")
+                            .unwrap_or(0),
+                        queued_uploads: Self::zeroio_event_u64(&event.fields, "queued_uploads")
+                            .unwrap_or(0),
                         queued_publish_ready_epochs: Self::zeroio_event_u64(
                             &event.fields,
                             "queued_publish_ready_epochs",
@@ -3512,6 +3563,16 @@ impl StudioVfs {
                         orphan_dirty_payloads_removed: Self::zeroio_event_u64(
                             &event.fields,
                             "orphan_dirty_payloads_removed",
+                        )
+                        .unwrap_or(0),
+                        unreferenced_local_payloads_removed: Self::zeroio_event_u64(
+                            &event.fields,
+                            "unreferenced_local_payloads_removed",
+                        )
+                        .unwrap_or(0),
+                        discarded_memory_only_bytes: Self::zeroio_event_u64(
+                            &event.fields,
+                            "discarded_memory_only_bytes",
                         )
                         .unwrap_or(0),
                         replay_failures: Self::zeroio_event_u64(&event.fields, "replay_failures")
