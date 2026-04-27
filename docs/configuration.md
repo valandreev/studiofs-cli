@@ -56,8 +56,7 @@ studiofs init <name> \
   --access-key <s3-access-key> \
   --secret-key <s3-secret-key> \
   --meta <postgres-server-dsn> \
-  [--region <region>] \
-  [--block-size <e.g. 16MB>]
+  [--region <region>]
 ```
 
 Important:
@@ -65,6 +64,8 @@ Important:
 - StudioFS always uses database `studiofs` and will create it during `init` when permissions allow.
 - `init` validates data bucket access (connect/read/write/delete where needed) and PostgreSQL connectivity before creating local metadata.
 - `init` no longer performs conditional-write CAS checks (`If-Match` / `If-None-Match`) during initialization.
+- The current CLI does not expose a public block-size flag on `init`; newly
+  initialized volumes report the canonical 4 MiB block size.
 
 ### `discover`
 

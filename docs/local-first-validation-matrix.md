@@ -278,6 +278,35 @@ Reuse the same workload shape on both filesystems: block size, read size,
 concurrency, access pattern, warm/cold setup, cache disk, metadata disk, and
 mount options.
 
+### SFS-301 Final Mounted Parity Notes
+
+For `SFS-301`, initialize a fresh StudioFS validation volume with the current
+`studiofs init` CLI and record the reported block size from the command output.
+The current public `init` surface does not accept a `--block-size` flag; new
+volumes report the canonical 4 MiB block size.
+
+Use `studiofs test-cache` for the StudioFS-native mounted report and the
+`local_first_read_comparison` diagnostics:
+
+```powershell
+.\target\release\studiofs.exe test-cache Z:\ `
+  --block-size 4MB `
+  --read-size 4MB `
+  --sizes 8GB `
+  --concurrency 1 `
+  --io-depth 32 `
+  --warmup-runs 0 `
+  --access-pattern sequential `
+  --during-upload-timeout-ms 240000 `
+  --json-output D:\reports\sfs-301-studiofs-test-cache-8g-4m-final.json
+```
+
+Because `test-cache --sizes 8GB --read-size 4MB` currently samples one 4 MiB
+read operation from the large file, use a separate mounted full-file sequential
+probe for the 8 GiB StudioFS-vs-JuiceFS read-throughput parity number. Keep the
+probe shape identical on both mounts: one 8 GiB file, 4 MiB IO buffers, same
+machine, same cache disk class, and WMI process CPU/RSS sampling on Windows.
+
 ### SFS-262 Mounted Default Gate
 
 For `SFS-262`, lock the default mounted benchmark recipe to a same-host
