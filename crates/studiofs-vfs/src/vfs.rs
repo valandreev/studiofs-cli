@@ -4462,8 +4462,34 @@ impl StudioVfs {
         ino: Ino,
         attr: &InodeAttr,
     ) -> InodeIncarnationState {
-        let has_local_overlay = self.inode_has_local_overlay(ino);
         let has_pending_uploads = self.inode_has_pending_uploads(ino);
+        if Self::is_fully_published_regular_file(attr)
+            && !has_pending_uploads
+            && !self.has_pending_local_dirty_payloads_for_inode(ino)
+            && !self.state.writer_stack.has_dirty_writers(ino)
+            && !self
+                .state
+                .deferred_materialize_inflight
+                .lock()
+                .contains_key(&ino)
+        {
+            self.remove_live_extents_for_inode(ino);
+            self.remove_pending_epoch_finalizations_for_inode(ino);
+            self.clear_matching_dirty_attr_if_committed(ino, attr);
+            let next_state = InodeIncarnationState {
+                committed_incarnation: self.derive_committed_incarnation_from_attr(attr),
+                pending_incarnation: None,
+                upload_state: VfsUploadState::Idle,
+            };
+            self.state
+                .incarnation
+                .inode_incarnations
+                .lock()
+                .insert(ino, next_state.clone());
+            return next_state;
+        }
+
+        let has_local_overlay = self.inode_has_local_overlay(ino);
 
         let mut states = self.state.incarnation.inode_incarnations.lock();
         let previous = states
@@ -4734,6 +4760,13 @@ impl StudioVfs {
             && attr.upload_state != MetaUploadState::Ready
             && (attr.content_epoch != attr.committed_content_epoch
                 || attr.size != attr.committed_size)
+    }
+
+    fn is_fully_published_regular_file(attr: &InodeAttr) -> bool {
+        attr.kind == FileType::RegularFile
+            && attr.upload_state == MetaUploadState::Ready
+            && attr.content_epoch == attr.committed_content_epoch
+            && attr.size == attr.committed_size
     }
 
     fn queue_epoch_finalization(&self, ino: Ino, content_epoch: u64) {

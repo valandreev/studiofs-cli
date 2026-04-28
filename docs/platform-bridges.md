@@ -42,7 +42,7 @@ Path walks are centralized in VFS `NamespaceResolver`:
 | Sector size | `4096` bytes by default. Override: `STUDIOFS_WINFSP_SECTOR_SIZE` |
 | Allocation unit size | `1048576` bytes by default. Override: `STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE` |
 | Max component length | 255 |
-| File info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
+| File info timeout | WinFSP cache-manager mode (`-1`/`max`) by default. Override: `STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS` |
 | Dir info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
 | Volume info timeout | `1000 ms` by default. Override: `STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS` (`-1`/`max` supported) |
 | Allow open in kernel mode | Enabled by default. Override: `STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE` |

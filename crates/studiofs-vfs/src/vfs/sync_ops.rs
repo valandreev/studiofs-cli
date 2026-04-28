@@ -1012,7 +1012,6 @@ impl StudioVfs {
             self.update_pending_incarnation_size(ino, attr.size);
         }
         self.invalidate_attr_read_cache([ino]);
-        self.invalidate_kernel_inodes([ino]);
         Ok(accepted.accepted_bytes)
     }
 

@@ -1394,6 +1394,9 @@ fn epoch_finalizer_publishes_slice_graph_zero_length_epoch() {
             "regression setup should not require remote object visibility checks"
         );
 
+        let invalidator = Arc::new(RecordingKernelInvalidator::default());
+        vfs.set_kernel_invalidator(invalidator.clone());
+
         let status = super::commit::CommitCoordinator::finalize_inode_epoch(
             &vfs,
             attr.ino,
@@ -1413,6 +1416,11 @@ fn epoch_finalizer_publishes_slice_graph_zero_length_epoch() {
         assert_eq!(
             published_attr.committed_content_epoch,
             published_attr.content_epoch
+        );
+        assert_eq!(
+            invalidator.snapshot(),
+            Vec::<Ino>::new(),
+            "local epoch publication should not emit a kernel invalidation; the writer already owns the fresh file state, matching JuiceFS"
         );
     });
 }
@@ -3177,7 +3185,7 @@ fn deferred_write_keeps_writeback_path_when_soft_dirty_budget_is_full() {
 }
 
 #[test]
-fn writer_stack_write_invalidates_attr_and_kernel_cache() {
+fn writer_stack_write_invalidates_attr_cache_without_kernel_notify() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "writer-stack-write-invalidation");
     let _guard = rt.enter();
@@ -3220,8 +3228,8 @@ fn writer_stack_write_invalidates_attr_and_kernel_cache() {
         );
         assert_eq!(
             invalidator.snapshot(),
-            vec![attr.ino],
-            "accepted local writes should notify the kernel cache invalidator"
+            Vec::<Ino>::new(),
+            "accepted local writes should not notify the kernel cache invalidator; the write reply already carries fresh file info for the writer, matching JuiceFS"
         );
 
         vfs.release_fh(fh).await.unwrap();
@@ -3865,6 +3873,45 @@ fn inode_write_overwrite_updates_current_slice_graph_over_published_base() {
                 .object_id,
             current_blocks[0].1.object_id,
             "regular-file slice lookup and payload helper must agree on the current unpublished payload"
+        );
+    });
+}
+
+#[test]
+fn ready_inode_refresh_prunes_stale_live_extents_like_remount() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "ready-refresh-prunes-live-extents");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"ready-refresh-prunes-live-extents.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let payload = vec![0x5Au8; vfs.block_size as usize];
+
+        vfs.write(ino, 0, &payload).await.unwrap();
+        vfs.flush(ino).await.unwrap();
+        let (published_epoch, published_blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, published_epoch, &published_blocks);
+        vfs.cancel_pending_uploads_for_inode(ino);
+        assert!(
+            !vfs.live_extent_records_for_inode(ino).is_empty(),
+            "setup should model the pre-remount process state with live extents still resident"
+        );
+
+        let published_attr = meta.get_attr(ino).unwrap();
+        assert_eq!(published_attr.upload_state, MetaUploadState::Ready);
+        assert_eq!(published_attr.content_epoch, published_attr.committed_content_epoch);
+        assert_eq!(published_attr.size, published_attr.committed_size);
+
+        let state = vfs.refresh_inode_incarnation_state_from_attr(ino, &published_attr);
+        assert!(
+            state.pending_incarnation.is_none(),
+            "a fully published inode should refresh to the same idle state a remount would see"
+        );
+        assert!(
+            vfs.live_extent_records_for_inode(ino).is_empty(),
+            "fully published inode refresh should prune stale live extents so reads stop using the pending overlay path"
         );
     });
 }

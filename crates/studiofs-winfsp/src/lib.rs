@@ -14,7 +14,7 @@ pub use context::{StudioFsContext, WinfspKernelInvalidator};
 use thiserror::Error;
 use windows::Win32::System::LibraryLoader::LoadLibraryW;
 
-const DEFAULT_FILE_INFO_TIMEOUT_MS: u32 = 1000;
+const DEFAULT_FILE_INFO_TIMEOUT_MS: u32 = u32::MAX;
 const DEFAULT_DIR_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_VOLUME_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_SECTOR_SIZE: u16 = 4096;
@@ -658,6 +658,9 @@ mod tests {
         // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
         // process environment variables for deterministic parsing behavior.
         unsafe {
+            std::env::remove_var("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
+            std::env::remove_var("STUDIOFS_WINFSP_DIR_INFO_TIMEOUT_MS");
+            std::env::remove_var("STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS");
             std::env::remove_var("STUDIOFS_WINFSP_SECTOR_SIZE");
             std::env::remove_var("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE");
         }
@@ -675,6 +678,19 @@ mod tests {
             opts.allow_open_in_kernel_mode,
             DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE
         );
+    }
+
+    #[test]
+    fn parse_mount_options_defaults_to_winfsp_cache_manager_file_info_timeout() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
+        // process environment variables for deterministic parsing behavior.
+        unsafe {
+            std::env::remove_var("STUDIOFS_WINFSP_FILE_INFO_TIMEOUT_MS");
+        }
+
+        let opts = parse_mount_options("StudioFS").expect("options");
+        assert_eq!(opts.file_info_timeout_ms, u32::MAX);
     }
 
     #[test]

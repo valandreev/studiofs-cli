@@ -142,11 +142,8 @@ impl CommitCoordinator {
         // subsequent flush_local_dirty_state finds this dirty_attr and the local dirty state is
         // empty it will call engine.set_attr with committed_epoch=0, reverting
         // INODES_TABLE back to {Uploading}. That triggers a second spurious
-        // finalize_inode_epoch which (a) emits a garbage published-base event to
-        // PG — corrupting remote nodes' regular-file base graph — and (b) fires
-        // invalidate_kernel_inodes a
-        // second time, sending a file-change notification that can cause readers
-        // (e.g. media players) to abort an in-progress read.
+        // finalize_inode_epoch and emits a garbage published-base event to PG,
+        // corrupting remote nodes' regular-file base graph.
         //
         // Only remove the entry when content_epoch matches to avoid dropping a
         // dirty_attr that was written by a concurrent new write or setattr after
@@ -171,7 +168,6 @@ impl CommitCoordinator {
             vfs.clear_inode_incarnation(ino);
         }
         vfs.invalidate_attr_read_cache([ino]);
-        vfs.invalidate_kernel_inodes([ino]);
 
         Ok(EpochFinalizeStatus::Published)
     }
