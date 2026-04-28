@@ -86,8 +86,8 @@ pub(crate) fn run_operator_test(target: PathBuf, report: PathBuf) -> Result<()> 
     );
     run(TestCacheRunRequest {
         target,
-        block_size: None,
-        read_size: None,
+        block_size: Some("4MB".to_string()),
+        read_size: Some("4MB".to_string()),
         small_max: None,
         medium_max: None,
         workload_repeat: 1,
@@ -95,13 +95,14 @@ pub(crate) fn run_operator_test(target: PathBuf, report: PathBuf) -> Result<()> 
         sequential_streams: false,
         io_depth: 32,
         warmup_runs: 0,
-        sizes: None,
+        sizes: Some("8GB".to_string()),
         access_pattern: TestCacheAccessPattern::Sequential,
         during_upload_min_pending: 1,
-        during_upload_timeout_ms: 10_000,
+        during_upload_timeout_ms: 120_000,
         l1_limit: None,
         profile: Some(TestCacheProfileMode::Pyroscope),
         json_output: Some(report),
+        full_file_reads: true,
     })
 }
 
@@ -123,6 +124,7 @@ struct TestCacheParams {
     during_upload_timeout: std::time::Duration,
     l1_limit: u64,
     profile: bool,
+    full_file_reads: bool,
     run_id: String,
 }
 
@@ -159,6 +161,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
         l1_limit,
         profile,
         json_output,
+        full_file_reads,
     } = request;
     if io_depth == 0 {
         return Err(anyhow!("--io-depth must be >= 1"));
@@ -254,6 +257,7 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
         during_upload_timeout: std::time::Duration::from_millis(during_upload_timeout_ms),
         l1_limit,
         profile: profile.is_some(),
+        full_file_reads,
         run_id: run_id.clone(),
     };
 

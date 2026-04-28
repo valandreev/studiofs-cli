@@ -351,11 +351,18 @@ impl StudioVfs {
         }
     }
 
-    pub(super) fn invalidate_attr_read_cache(&self, inodes: impl IntoIterator<Item = Ino>) {
+    pub(super) fn invalidate_attr_read_cache(
+        &self,
+        inodes: impl IntoIterator<Item = Ino>,
+    ) -> Vec<Ino> {
         let mut cache = self.state.namespace.attr_read_cache.lock();
+        let mut removed = Vec::new();
         for ino in inodes {
-            cache.remove(ino);
+            if cache.remove(ino) {
+                removed.push(ino);
+            }
         }
+        removed
     }
 
     pub(super) async fn background_metadata_invalidation(self: Arc<Self>, interval: Duration) {
@@ -485,8 +492,13 @@ impl StudioVfs {
                 .sum::<u64>();
             let metadata_backlog = self.sync_meta().replication_backlog();
             let pending_metadata_ops = metadata_backlog.total_ops();
-
-            let is_active = Self::upload_pipeline_summary_is_active(pending, pending_metadata_ops);
+            let active_uploads = self.upload_scheduler.in_flight();
+            let upload_queue = self.cached_store.cache_pipeline_metrics().upload_queue;
+            let is_active = Self::upload_pipeline_summary_is_active(
+                pending,
+                active_uploads,
+                pending_metadata_ops,
+            );
             let activity_started = is_active && !upload_pipeline_summary_was_active;
 
             let should_log = if activity_started {
@@ -515,7 +527,6 @@ impl StudioVfs {
             let (p95_ms, max_ms) = self.pending_age_stats_ms(&pending_uploads);
             let ingress = self.ingress_stats();
             let materialize_batches = self.state.metrics.materialize_batch_stats.snapshot();
-            let upload_queue = self.cached_store.cache_pipeline_metrics().upload_queue;
             let foreground_read_protection = self.foreground_read_protection_stats();
             self.adjust_upload_backpressure_from_metrics(
                 foreground_read_protection.p90_latency_ns,
@@ -544,6 +555,7 @@ impl StudioVfs {
                             "pending_uploads": pending,
                             "pending_upload_bytes": pending_upload_bytes,
                             "pending_uploads_human": pending_uploads,
+                            "active_uploads": active_uploads,
                             "pending_metadata_ops": pending_metadata_ops,
                             "inflight_metadata_ops": metadata_backlog.inflight_ops,
                             "dirty_mem_blocks": ingress.dirty_mem_blocks,
@@ -562,6 +574,7 @@ impl StudioVfs {
                     serde_json::json!({
                         "pending_uploads": pending,
                         "pending_upload_bytes": pending_upload_bytes,
+                        "active_uploads": active_uploads,
                         "pending_metadata_ops": pending_metadata_ops,
                         "inflight_metadata_ops": metadata_backlog.inflight_ops,
                         "local_backend_dirty_count": local_backend_dirty_count,
@@ -578,6 +591,7 @@ impl StudioVfs {
                 // #endregion debug log
                 info!(
                     pending_uploads = %pending_uploads,
+                    active_uploads,
                     pending_metadata_ops,
                     "upload pipeline"
                 );

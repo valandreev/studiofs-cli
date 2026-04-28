@@ -213,9 +213,12 @@ impl StudioVfs {
 
     pub(super) fn upload_pipeline_summary_is_active(
         pending_uploads: usize,
+        active_uploads: usize,
         pending_metadata_ops: u32,
     ) -> bool {
-        pending_uploads != 0 || (pending_metadata_ops != 0 && pending_metadata_ops >= 10)
+        pending_uploads != 0
+            || active_uploads != 0
+            || (pending_metadata_ops != 0 && pending_metadata_ops >= 10)
     }
 
     pub(super) fn format_upload_pipeline_pending_uploads(pending_upload_bytes: u64) -> String {

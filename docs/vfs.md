@@ -66,7 +66,7 @@ inode toward root; no match defaults to `rw`.
 | `block_size` | 16 MiB | Chunk size (cloud transfer currently uses 4x4 MiB fragments) |
 | `max_concurrent_uploads` | 4 | Upload worker concurrency |
 | `readahead_width` | 18 | Base prefetch depth |
-| `max_dirty_bytes` | 1200 MiB | Writer/cache dirty-byte limit before backpressure |
+| `max_dirty_bytes` | 300 MiB | JuiceFS-sized writer/cache dirty-byte limit before backpressure |
 | `upload_stats_interval_secs` | 1 | Upload control-loop tick interval |
 | `upload_fg_read_latency_target_ms` | 35 | Foreground-read P90 target for upload throttling |
 | `upload_fg_read_latency_window_ms` | 1500 | Foreground-read speedometer sliding window |

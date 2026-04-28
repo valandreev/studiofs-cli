@@ -204,7 +204,8 @@ fn persist_mount_path_snapshot(vfs: &StudioVfs, output_path: &Path) -> std::io::
         std::fs::create_dir_all(parent)?;
     }
 
-    let snapshot = vfs.write_path_observability_snapshot();
+    let mut snapshot = vfs.write_path_observability_snapshot();
+    snapshot.allocator = Some(crate::allocator_telemetry::snapshot());
     let payload = serde_json::to_vec(&snapshot)
         .map_err(|error| std::io::Error::other(format!("serialize metrics failed: {error}")))?;
     let tmp_path = output_path.with_extension("json.tmp");

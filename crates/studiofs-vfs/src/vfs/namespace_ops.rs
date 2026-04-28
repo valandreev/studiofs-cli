@@ -17,6 +17,17 @@ struct TruncateMutation {
 type ChunkSliceBatch = Vec<(ChunkId, Vec<SliceRecord>)>;
 type RemovedObjectList = Vec<(u32, u64)>;
 
+fn setattr_args_are_size_only(args: &SetattrArgs) -> bool {
+    args.size.is_some()
+        && args.mode.is_none()
+        && args.uid.is_none()
+        && args.gid.is_none()
+        && args.atime.resolve().is_none()
+        && args.mtime.resolve().is_none()
+        && args.crtime.resolve().is_none()
+        && args.win_attrs.is_none()
+}
+
 impl StudioVfs {
     pub fn setattr(&self, ino: Ino, args: SetattrArgs) -> VfsResult<InodeAttr> {
         self.setattr_with_handle(None, ino, args)
@@ -61,13 +72,21 @@ impl StudioVfs {
         }
 
         let mut attr = self.getattr(ino)?;
-        if args.size.is_some_and(|new_size| new_size != attr.size) {
+        if let Some(new_size) = args.size
+            && new_size != attr.size
+        {
             if let Some(handle) = fh {
                 self.enforce_mutating_handle_access(handle, ino)?;
             } else {
                 self.enforce_no_known_foreign_hard_lock(ino)?;
             }
-            return Self::run_sync_future(self.setattr_with_size_change(ino, args.clone()));
+            let defer_handle_growth_flush =
+                fh.is_some() && new_size > attr.size && setattr_args_are_size_only(&args);
+            return Self::run_sync_future(self.setattr_with_size_change(
+                ino,
+                args.clone(),
+                defer_handle_growth_flush,
+            ));
         }
 
         let mut changed = false;
@@ -122,41 +141,65 @@ impl StudioVfs {
         Ok(attr)
     }
 
-    async fn setattr_with_size_change(&self, ino: Ino, args: SetattrArgs) -> VfsResult<InodeAttr> {
+    async fn setattr_with_size_change(
+        &self,
+        ino: Ino,
+        args: SetattrArgs,
+        defer_handle_growth_flush: bool,
+    ) -> VfsResult<InodeAttr> {
         let session = self
             .state
             .file_session
             .enter_op(ino, FileSessionOperation::Flush)
             .await;
         let result: VfsResult<InodeAttr> = async {
-            let persisted_slice_bytes_before_flush =
-                self.total_pending_persisted_local_dirty_slice_bytes();
-            let materialized_writer_stack_bytes =
-                self.materialize_writer_stack_for_inode(ino).await?;
-            self.flush_local_dirty_state(ino, LocalSyncPolicy::Strict)
+            let candidate_old_attr = if defer_handle_growth_flush {
+                Some(self.getattr_async(ino).await?)
+            } else {
+                None
+            };
+            let defer_strict_flush_for_growth =
+                candidate_old_attr.as_ref().is_some_and(|old_attr| {
+                    args.size.is_some_and(|new_size| new_size > old_attr.size)
+                        && setattr_args_are_size_only(&args)
+                });
+            let old_attr = if defer_strict_flush_for_growth {
+                candidate_old_attr.expect("candidate attr present for deferred growth")
+            } else {
+                let persisted_slice_bytes_before_flush =
+                    self.total_pending_persisted_local_dirty_slice_bytes();
+                let materialized_writer_stack_bytes =
+                    self.materialize_writer_stack_for_inode(ino).await?;
+                self.flush_local_dirty_state(ino, LocalSyncPolicy::Strict)
+                    .await?;
+                self.maybe_payload_store_sync_data_async(
+                    materialized_writer_stack_bytes
+                        .saturating_add(persisted_slice_bytes_before_flush)
+                        as u64,
+                    LocalSyncPolicy::Strict,
+                )
                 .await?;
-            self.maybe_payload_store_sync_data_async(
-                materialized_writer_stack_bytes.saturating_add(persisted_slice_bytes_before_flush)
-                    as u64,
-                LocalSyncPolicy::Strict,
-            )
-            .await?;
 
-            let old_attr = self.getattr_async(ino).await?;
+                self.getattr_async(ino).await?
+            };
             let mut attr = old_attr.clone();
             let mut truncate_mutation = None;
+            let mut requeue_retained_uploads = false;
 
             if let Some(new_size) = args.size
                 && new_size != attr.size
             {
-                self.begin_size_change_incarnation(ino, &mut attr);
                 if new_size < attr.size {
+                    self.begin_size_change_incarnation(ino, &mut attr);
                     truncate_mutation = Some(self.truncate_blocks(
                         ino,
                         new_size,
                         attr.size,
                         old_attr.content_epoch,
                     )?);
+                    requeue_retained_uploads = true;
+                } else {
+                    self.begin_pending_incarnation(ino, &mut attr);
                 }
                 attr.size = new_size;
                 self.update_pending_incarnation_size(ino, attr.size);
@@ -198,27 +241,31 @@ impl StudioVfs {
                 .insert(ino, attr.clone());
             self.state.namespace.attr_read_cache.lock().remove(ino);
 
-            let flush_result = match self.fail_size_change_setattr_before_flush_for_test() {
-                Ok(()) => {
-                    self.flush_local_dirty_state(ino, LocalSyncPolicy::Strict)
-                        .await
+            if !defer_strict_flush_for_growth {
+                let flush_result = match self.fail_size_change_setattr_before_flush_for_test() {
+                    Ok(()) => {
+                        self.flush_local_dirty_state(ino, LocalSyncPolicy::Strict)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = flush_result {
+                    self.rollback_failed_size_change_setattr(
+                        ino,
+                        &old_attr,
+                        truncate_mutation.as_ref(),
+                    )?;
+                    return Err(error);
                 }
-                Err(error) => Err(error),
-            };
-            if let Err(error) = flush_result {
-                self.rollback_failed_size_change_setattr(
-                    ino,
-                    &old_attr,
-                    truncate_mutation.as_ref(),
-                )?;
-                return Err(error);
             }
 
-            self.requeue_retained_overlay_uploads_for_size_change(
-                ino,
-                attr.size,
-                attr.content_epoch,
-            );
+            if requeue_retained_uploads {
+                self.requeue_retained_overlay_uploads_for_size_change(
+                    ino,
+                    attr.size,
+                    attr.content_epoch,
+                );
+            }
             self.finalize_truncate_cleanup(ino, truncate_mutation.as_ref());
             self.refresh_inode_incarnation_state_from_attr(ino, &attr);
             Ok(attr)
@@ -674,14 +721,14 @@ impl StudioVfs {
         if let Some(cached) = self.dentry_cache_lookup(parent, name) {
             match cached {
                 super::DentryCacheValue::Positive(child_ino) => {
-                    match self.sync_meta().get_attr(child_ino) {
+                    match self.getattr_unchecked(child_ino) {
                         Ok(attr) => return Ok(attr),
-                        Err(MetaError::InodeNotFound(_)) => {
+                        Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
                             self.dentry_cache_invalidate(parent, name);
                             self.heal_orphaned_dentry(parent, name, Some(child_ino));
                             return Err(Self::ignored_entry_not_found(parent, name));
                         }
-                        Err(err) => return Err(VfsError::Meta(err)),
+                        Err(err) => return Err(err),
                     }
                 }
                 super::DentryCacheValue::Negative => {
@@ -847,7 +894,7 @@ impl StudioVfs {
         parent: Ino,
         name: &[u8],
         target: UnlinkTarget,
-    ) -> VfsResult<Option<Ino>> {
+    ) -> VfsResult<Option<InodeAttr>> {
         let attr = match meta.unlink_open_handle(parent, name) {
             Ok(attr) => attr,
             Err(MetaError::InodeNotFound(_)) => {
@@ -868,7 +915,7 @@ impl StudioVfs {
             "unlink ino={}: {} open handles, deferred cleanup (orphan)",
             target.ino, target.open_handles
         );
-        Ok(Some(target.ino))
+        Ok(Some(attr))
     }
 
     async fn unlink_without_open_handles(
@@ -877,7 +924,7 @@ impl StudioVfs {
         parent: Ino,
         name: &[u8],
         target: UnlinkTarget,
-    ) -> VfsResult<Option<Ino>> {
+    ) -> VfsResult<Option<InodeAttr>> {
         let pre_unlink_object_ids = self
             .regular_file_graph_usage(meta, target.ino)
             .map(|usage| usage.object_ids)
@@ -907,7 +954,7 @@ impl StudioVfs {
             );
         }
 
-        Ok(Some(attr.ino))
+        Ok(Some(attr))
     }
 
     pub fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> VfsResult<InodeAttr> {
@@ -1054,7 +1101,7 @@ impl StudioVfs {
         let meta = self.sync_meta();
         let unlink_target = self.resolve_unlink_target(&meta, parent, name)?;
         self.enforce_no_known_foreign_hard_lock(unlink_target.ino)?;
-        let Some(removed_ino) = (if unlink_target.open_handles > 0 {
+        let Some(unlinked_attr) = (if unlink_target.open_handles > 0 {
             self.unlink_with_open_handles(&meta, parent, name, unlink_target)?
         } else {
             self.unlink_without_open_handles(&meta, parent, name, unlink_target)
@@ -1063,7 +1110,15 @@ impl StudioVfs {
             return Ok(());
         };
 
-        namespace_mutations.record_removal(parent, name, [removed_ino]);
+        namespace_mutations.record_removal(parent, name, [unlinked_attr.ino]);
+        if unlinked_attr.nlink > 0 {
+            self.state.namespace.attr_read_cache.lock().put(
+                unlinked_attr.ino,
+                unlinked_attr,
+                ATTR_CACHE_TTL,
+                Instant::now(),
+            );
+        }
         meta.request_eager_flush();
         Ok(())
     }

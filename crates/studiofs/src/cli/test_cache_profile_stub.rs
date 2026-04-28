@@ -26,7 +26,7 @@ impl TestCacheProfileSession {
             benchmark_mode: benchmark_mode.to_string(),
             write_path_observability_path,
             warnings: vec![
-                "CPU and memory profiling are not supported on Windows; exporting write-path observability artifacts only.".to_string(),
+                "Native CPU and memory pprof are not supported on Windows; portable process and allocator telemetry are captured in mounted_portable_profile.".to_string(),
             ],
         }))
     }
@@ -104,9 +104,9 @@ mod tests {
         );
         assert!(
             result.warnings.iter().any(|warning| {
-                warning.contains("CPU and memory profiling are not supported on Windows")
+                warning.contains("Native CPU and memory pprof are not supported on Windows")
             }),
-            "Windows stub should explain why only write-path artifacts were exported: {:?}",
+            "Windows stub should explain that portable telemetry replaces native pprof: {:?}",
             result.warnings
         );
 

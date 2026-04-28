@@ -56,8 +56,7 @@ studiofs init <name> \
   --access-key <s3-access-key> \
   --secret-key <s3-secret-key> \
   --meta <postgres-server-dsn> \
-  [--region <region>] \
-  [--block-size <e.g. 16MB>]
+  [--region <region>]
 ```
 
 Important:
@@ -65,6 +64,8 @@ Important:
 - StudioFS always uses database `studiofs` and will create it during `init` when permissions allow.
 - `init` validates data bucket access (connect/read/write/delete where needed) and PostgreSQL connectivity before creating local metadata.
 - `init` no longer performs conditional-write CAS checks (`If-Match` / `If-None-Match`) during initialization.
+- The current CLI does not expose a public block-size flag on `init`; newly
+  initialized volumes report the canonical 4 MiB block size.
 
 ### `discover`
 
@@ -113,6 +114,7 @@ Notes:
 - On Windows, `studiofs mount` now performs a one-time bootstrap: if `MountUseMountmgrFromFSD=1` is missing, StudioFS requests UAC elevation once to set it automatically. After that, regular mounts can run from non-elevated terminals.
 - In non-interactive Windows sessions (for example CI/background services), UAC cannot be confirmed; preconfigure `MountUseMountmgrFromFSD=1` manually before running `studiofs mount`.
 - If mount still fails after the registry setup, especially immediately after a WinFSP install or upgrade, refresh the WinFSP runtime state before retrying. Restart the WinFSP service stack or reboot Windows if needed.
+- On Windows, WinFSP `FlushAndPurgeOnCleanup` is enabled by default to match JuiceFS and force cached writer dirty pages through the filesystem at handle cleanup. Set `STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP=0` only for targeted regression experiments.
 - `STUDIOFS_DAEMON_MOUNT_POINT` is not used for Windows mounts.
 - `--detach` runs the mount as a background daemon.
 - `--foreground` and `--detach` are mutually exclusive; providing both returns a CLI argument conflict error.
@@ -425,11 +427,11 @@ Operator stance:
 | `--prefetch` | `1` | Prefetch concurrency budget |
 | `--principal` / `STUDIOFS_PRINCIPAL` | `*` | Principal used for ACL checks |
 
-The writeback dirty-buffer default is hardcoded to `1200MB` (`max_dirty_bytes`) to give
-long sequential writers a slightly wider smoothing window before hard backpressure.
-StudioFS derives the soft throttle window and hard safety threshold from that
-single dirty budget. Upload backlog bytes are reported separately and do not by
-themselves stall ordinary writes while local cache headroom remains available.
+The writeback dirty-buffer default is `300MB` (`max_dirty_bytes`), matching the
+JuiceFS default read/write buffer size. StudioFS derives the soft throttle window
+and hard safety threshold from that single dirty budget. Upload backlog bytes are
+reported separately and do not by themselves stall ordinary writes while local
+cache headroom remains available.
 
 ### Expert overrides
 

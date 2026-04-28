@@ -1767,24 +1767,6 @@ mod tests {
             .winfsp_foreground_flushes
     }
 
-    fn wait_for_landing_recoverable_segments(vfs: &StudioVfs, expected: usize) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        loop {
-            let actual = vfs
-                .write_path_observability_snapshot()
-                .landing_zone
-                .recoverable_segments;
-            if actual == expected {
-                return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for landing recoverable_segments == {expected}; last={actual}"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-    }
-
     #[test]
     fn cleanup_delete_not_found_is_benign() {
         let err = VfsError::Meta(MetaError::EntryNotFound {
@@ -2458,10 +2440,10 @@ mod tests {
     }
 
     #[test]
-    fn landed_write_cleanup_stays_observational_until_explicit_flush() {
-        let (_tmp, vfs, ctx, _queue) = make_test_context("sfs-285-landing-cleanup-flush");
+    fn buffered_write_cleanup_stays_observational_until_explicit_flush() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("sfs-285-buffered-cleanup-flush");
         let attr = vfs
-            .create(ROOT_INO, b"sfs-285-landing-cleanup-flush.txt", 0, 0, 0o644)
+            .create(ROOT_INO, b"sfs-285-buffered-cleanup-flush.txt", 0, 0, 0o644)
             .expect("create");
         let fh = vfs
             .open_file(attr.ino, OpenFlags::RDWR, false)
@@ -2470,18 +2452,30 @@ mod tests {
         let mut file_info = winfsp::filesystem::FileInfo::default();
         let callbacks_before = winfsp_callbacks(&vfs);
         let barriers_before = winfsp_foreground_flushes(&vfs);
+        let flush_calls_before = flush_barrier_calls(&vfs);
+        let sync_calls_before = sync_data_calls(&vfs);
 
         <StudioFsContext as FileSystemContext>::write(
             &ctx,
             &handle,
-            b"landed-cleanup-flush",
+            b"buffered-cleanup-flush",
             0,
             false,
             false,
             &mut file_info,
         )
         .expect("write callback");
-        wait_for_landing_recoverable_segments(&vfs, 1);
+        assert!(
+            vfs.inode_has_local_dirty_state(attr.ino),
+            "ordinary buffered WinFSP writes should leave local dirty state before cleanup"
+        );
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .landing_zone
+                .recoverable_segments,
+            0,
+            "ordinary writeback should not create recoverable landing records"
+        );
 
         ctx.run_cleanup_non_delete_callback(attr.ino, fh)
             .expect("cleanup callback");
@@ -2490,11 +2484,11 @@ mod tests {
         assert_eq!(
             after_cleanup_callbacks.cleanup,
             callbacks_before.cleanup + 1,
-            "non-delete cleanup should still be observable for landed writes"
+            "non-delete cleanup should still be observable for buffered writes"
         );
         assert_eq!(
             after_cleanup_barriers.cleanup, barriers_before.cleanup,
-            "non-delete cleanup must not reclaim foreground barrier ownership for landed writes"
+            "non-delete cleanup must not reclaim foreground barrier ownership for buffered writes"
         );
         assert_eq!(
             after_cleanup_barriers.cleanup_skipped_clean, barriers_before.cleanup_skipped_clean,
@@ -2502,27 +2496,40 @@ mod tests {
         );
         assert!(
             ctx.has_deferred_cleanup_hint(attr.ino),
-            "cleanup should defer landed dirty state to explicit flush or last close"
+            "cleanup should defer buffered dirty state to explicit flush or last close"
         );
-        wait_for_landing_recoverable_segments(&vfs, 1);
 
         ctx.run_flush_callback(attr.ino, fh)
             .expect("explicit flush callback");
         let after_flush_barriers = winfsp_foreground_flushes(&vfs);
+        let flush_calls_after = flush_barrier_calls(&vfs);
+        let sync_calls_after = sync_data_calls(&vfs);
         assert!(
             after_flush_barriers.flush >= barriers_before.flush,
-            "explicit flush should not lose foreground flush accounting for landed dirty state"
+            "explicit flush should not lose foreground flush accounting for buffered dirty state"
+        );
+        assert!(
+            sync_calls_after > sync_calls_before,
+            "explicit flush should force local payload sync after buffered writes"
+        );
+        assert!(
+            flush_calls_after > flush_calls_before,
+            "explicit flush should commit buffered dirty state through the metadata barrier"
         );
         assert!(
             !ctx.has_deferred_cleanup_hint(attr.ino),
             "explicit flush should clear the deferred cleanup hint"
+        );
+        assert!(
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "explicit flush should drain buffered local dirty state"
         );
         assert_eq!(
             vfs.write_path_observability_snapshot()
                 .landing_zone
                 .recoverable_segments,
             0,
-            "explicit flush should retire landed records"
+            "explicit flush should not invent landing records"
         );
 
         ctx.spawn_wait({
@@ -2533,10 +2540,10 @@ mod tests {
     }
 
     #[test]
-    fn landed_write_last_handle_close_owns_fallback_barrier_after_cleanup() {
-        let (_tmp, vfs, ctx, _queue) = make_test_context("sfs-285-landing-cleanup-close");
+    fn buffered_write_last_handle_close_owns_fallback_barrier_after_cleanup() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("sfs-285-buffered-cleanup-close");
         let attr = vfs
-            .create(ROOT_INO, b"sfs-285-landing-cleanup-close.txt", 0, 0, 0o644)
+            .create(ROOT_INO, b"sfs-285-buffered-cleanup-close.txt", 0, 0, 0o644)
             .expect("create");
         let fh = vfs
             .open_file(attr.ino, OpenFlags::RDWR, false)
@@ -2549,38 +2556,55 @@ mod tests {
         <StudioFsContext as FileSystemContext>::write(
             &ctx,
             &handle,
-            b"landed-cleanup-close",
+            b"buffered-cleanup-close",
             0,
             false,
             false,
             &mut file_info,
         )
         .expect("write callback");
-        wait_for_landing_recoverable_segments(&vfs, 1);
-        ctx.run_cleanup_non_delete_callback(attr.ino, fh)
-            .expect("cleanup callback");
-        wait_for_landing_recoverable_segments(&vfs, 1);
-
-        ctx.run_close_callback(attr.ino, fh);
-        let after_close_barriers = winfsp_foreground_flushes(&vfs);
-        assert_eq!(
-            after_close_barriers.cleanup, barriers_before.cleanup,
-            "cleanup should remain observational before landed-write close fallback"
-        );
         assert!(
-            after_close_barriers.close >= barriers_before.close,
-            "last-handle close should not lose foreground close accounting for landed dirty state"
-        );
-        assert!(
-            flush_barrier_calls(&vfs) >= flush_calls_before,
-            "deferred writer-stack drain or last-handle close should keep local barrier accounting monotonic"
+            vfs.inode_has_local_dirty_state(attr.ino),
+            "ordinary buffered WinFSP writes should leave local dirty state before cleanup"
         );
         assert_eq!(
             vfs.write_path_observability_snapshot()
                 .landing_zone
                 .recoverable_segments,
             0,
-            "last-handle close should retire landed records"
+            "ordinary writeback should not create recoverable landing records"
+        );
+        ctx.run_cleanup_non_delete_callback(attr.ino, fh)
+            .expect("cleanup callback");
+        assert!(
+            ctx.has_deferred_cleanup_hint(attr.ino),
+            "cleanup should defer buffered dirty state to last close"
+        );
+
+        ctx.run_close_callback(attr.ino, fh);
+        let after_close_barriers = winfsp_foreground_flushes(&vfs);
+        assert_eq!(
+            after_close_barriers.cleanup, barriers_before.cleanup,
+            "cleanup should remain observational before buffered-write close fallback"
+        );
+        assert!(
+            after_close_barriers.close >= barriers_before.close,
+            "last-handle close should not lose foreground close accounting for buffered dirty state"
+        );
+        assert!(
+            flush_barrier_calls(&vfs) >= flush_calls_before,
+            "deferred writer-stack drain or last-handle close should keep local barrier accounting monotonic"
+        );
+        assert!(
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "last-handle close should drain buffered local dirty state"
+        );
+        assert_eq!(
+            vfs.write_path_observability_snapshot()
+                .landing_zone
+                .recoverable_segments,
+            0,
+            "last-handle close should not invent landing records"
         );
         assert_eq!(
             vfs.open_count(attr.ino),

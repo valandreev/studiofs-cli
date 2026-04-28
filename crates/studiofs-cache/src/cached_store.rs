@@ -63,6 +63,13 @@ pub struct StagedSlice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetachedStagedSlice {
+    pub staged: StagedSlice,
+    pub payload: Bytes,
+    pub submit_upload: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedStoreWriterCountersSnapshot {
     /// Writer-owned bytes retained by the cached-store slice writer, including
     /// zero-filled sparse gaps that will be staged locally.
@@ -108,11 +115,14 @@ impl CachedStoreWriterCounters {
     fn record_staged(&self, bytes: usize) {
         let bytes = saturating_u64_from_usize(bytes);
         self.staged_bytes.fetch_add(bytes, Ordering::Relaxed);
-        self.pending_upload_bytes
-            .fetch_add(bytes, Ordering::Relaxed);
         self.staged_slices.fetch_add(1, Ordering::Relaxed);
         self.staging_latency_observations
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_pending_upload(&self, bytes: usize) {
+        self.pending_upload_bytes
+            .fetch_add(saturating_u64_from_usize(bytes), Ordering::Relaxed);
     }
 
     fn record_upload_terminal(&self, bytes: u64) {
@@ -164,7 +174,8 @@ pub struct CachedStoreWriterSlice {
     active_start: u64,
     next_object_id: ObjectId,
     created_at: Instant,
-    pages: BytesMut,
+    pages: VecDeque<BytesMut>,
+    dirty_len: usize,
 }
 
 impl CachedStoreConfig {
@@ -369,7 +380,8 @@ impl CachedStore {
             created_at: Instant::now(),
             store: Arc::clone(self),
             config,
-            pages: BytesMut::new(),
+            pages: VecDeque::new(),
+            dirty_len: 0,
         }
     }
 
@@ -482,6 +494,72 @@ impl CachedStore {
         for entry in entries {
             upload_hot.insert(entry.object_id, entry.data.clone());
         }
+    }
+
+    pub fn persist_detached_staged_slices(
+        &self,
+        entries: Vec<DetachedStagedSlice>,
+    ) -> Result<(), CachedStoreWriterError> {
+        let Some(first_entry) = entries.first() else {
+            return Ok(());
+        };
+
+        let started_at = Instant::now();
+        let object_ids = entries
+            .iter()
+            .map(|entry| entry.staged.object_id)
+            .collect::<Vec<_>>();
+        let first_object_id = first_entry.staged.object_id;
+        let puts = entries
+            .iter()
+            .map(|entry| LocalPayloadPut {
+                object_id: entry.staged.object_id,
+                data: entry.payload.clone(),
+                evictable: false,
+            })
+            .collect::<Vec<_>>();
+        if let Err(source) = self.local_payload_backend.put_batch(&puts) {
+            self.local_payload_backend.remove_batch(&object_ids);
+            return Err(CachedStoreWriterError::LocalPayload {
+                object_id: first_object_id,
+                source,
+            });
+        }
+        if let Err(source) = self.upload_stage_store.link_payload_batch(&object_ids) {
+            self.upload_stage_store.remove_batch(&object_ids);
+            self.local_payload_backend.remove_batch(&object_ids);
+            return Err(CachedStoreWriterError::UploadStage {
+                object_id: first_object_id,
+                source,
+            });
+        }
+        {
+            let mut upload_hot = self.upload_hot.lock();
+            for put in &puts {
+                upload_hot.insert(put.object_id, Bytes::copy_from_slice(put.data.as_ref()));
+            }
+        }
+        let mut total_bytes = 0u64;
+        for entry in &entries {
+            total_bytes = total_bytes.saturating_add(saturating_u64_from_usize(entry.staged.len));
+            if entry.submit_upload {
+                self.submit_staged_upload(
+                    entry.staged.ino,
+                    entry.staged.offset,
+                    entry.staged.object_id,
+                    entry.staged.content_epoch,
+                    entry.staged.len,
+                );
+            } else {
+                self.writer_counters.record_staged(entry.staged.len);
+            }
+        }
+        self.metrics.materialize_batches.record_batch(
+            saturating_u64_from_usize(entries.len()),
+            total_bytes,
+            started_at.elapsed(),
+        );
+        Ok(())
     }
 
     pub fn remove_staged_upload(&self, object_id: ObjectId) {
@@ -653,6 +731,7 @@ impl CachedStore {
             .lock()
             .insert(object_id, saturating_u64_from_usize(payload_len));
         self.writer_counters.record_staged(payload_len);
+        self.writer_counters.record_pending_upload(payload_len);
         self.submit_upload(ino, offset, object_id, content_epoch);
     }
 
@@ -693,15 +772,9 @@ impl CachedStoreWriterSlice {
         let absolute_end = end;
         let target_capacity = round_up_to_page(absolute_end, self.config.page_size);
         self.validate_buffer_limit(target_capacity)?;
-        if self.pages.len() < absolute_end {
-            if self.pages.capacity() < target_capacity {
-                self.pages
-                    .reserve(target_capacity.saturating_sub(self.pages.capacity()));
-            }
-            self.pages.resize(absolute_end, 0);
-        }
+        self.ensure_len(absolute_end);
         let write_start = relative;
-        self.pages[write_start..absolute_end].copy_from_slice(data);
+        self.copy_into_dirty(write_start, data);
 
         let dirty_delta = end.saturating_sub(old_len);
         if dirty_delta > 0 {
@@ -740,12 +813,57 @@ impl CachedStoreWriterSlice {
         Ok(staged)
     }
 
+    pub fn completed_block_count(&self) -> usize {
+        if self.config.block_size == 0 {
+            return 0;
+        }
+        self.dirty_bytes() / self.config.block_size
+    }
+
+    pub fn flush_completed_blocks(
+        &mut self,
+        max_blocks: usize,
+    ) -> Result<Vec<StagedSlice>, CachedStoreWriterError> {
+        self.validate_geometry()?;
+        let blocks = self.completed_block_count().min(max_blocks);
+        if blocks == 0 {
+            return Ok(Vec::new());
+        }
+        let bytes = blocks.saturating_mul(self.config.block_size);
+        let target_offset = self.active_start.saturating_add(bytes as u64);
+        self.flush_to(target_offset)
+    }
+
+    pub fn detach_completed_blocks(
+        &mut self,
+        max_blocks: usize,
+    ) -> Result<Vec<DetachedStagedSlice>, CachedStoreWriterError> {
+        self.validate_geometry()?;
+        let blocks = self.completed_block_count().min(max_blocks);
+        if blocks == 0 {
+            return Ok(Vec::new());
+        }
+        let bytes = blocks.saturating_mul(self.config.block_size);
+        let target_offset = self.active_start.saturating_add(bytes as u64);
+        self.detach_to(target_offset)
+    }
+
     pub fn finish(&mut self) -> Result<Vec<StagedSlice>, CachedStoreWriterError> {
         self.validate_geometry()?;
         let mut staged = Vec::new();
         while self.dirty_bytes() > 0 {
             let len = self.dirty_bytes().min(self.config.block_size);
             staged.push(self.stage_prefix(len)?);
+        }
+        Ok(staged)
+    }
+
+    pub fn detach_finish(&mut self) -> Result<Vec<DetachedStagedSlice>, CachedStoreWriterError> {
+        self.validate_geometry()?;
+        let mut staged = Vec::new();
+        while self.dirty_bytes() > 0 {
+            let len = self.dirty_bytes().min(self.config.block_size);
+            staged.push(self.detach_prefix(len)?);
         }
         Ok(staged)
     }
@@ -772,13 +890,12 @@ impl CachedStoreWriterSlice {
             return 0;
         }
         let len = out.len().min(dirty_bytes - relative);
-        let start = relative;
-        out[..len].copy_from_slice(&self.pages[start..start + len]);
+        self.copy_dirty_into(relative, &mut out[..len]);
         len
     }
 
     pub fn dirty_bytes(&self) -> usize {
-        self.pages.len()
+        self.dirty_len
     }
 
     pub fn set_next_object_id(&mut self, next_object_id: ObjectId) {
@@ -787,7 +904,7 @@ impl CachedStoreWriterSlice {
 
     fn stage_prefix(&mut self, len: usize) -> Result<StagedSlice, CachedStoreWriterError> {
         let started_at = Instant::now();
-        let payload = self.pages.split_to(len).freeze();
+        let payload = self.take_prefix(len);
         let object_id = self.next_object_id;
 
         if let Err(source) = self.store.local_payload_backend.put_owned(LocalPayloadPut {
@@ -802,8 +919,7 @@ impl CachedStoreWriterSlice {
             self.restore_staged_prefix(payload);
             return Err(CachedStoreWriterError::UploadStage { object_id, source });
         }
-        let copy_hot_upload_payload = !self.pages.is_empty();
-        self.cache_hot_upload_if_enabled(object_id, payload.clone(), copy_hot_upload_payload);
+        self.cache_hot_upload_if_enabled(object_id, &payload);
         self.next_object_id = self.next_object_id.saturating_add(1);
         self.store.metrics.materialize_batches.record_batch(
             1,
@@ -832,25 +948,196 @@ impl CachedStoreWriterSlice {
         Ok(staged)
     }
 
-    fn restore_staged_prefix(&mut self, payload: Bytes) {
-        let tail = std::mem::take(&mut self.pages);
-        let restored_len = payload.len().saturating_add(tail.len());
-        let mut restored = BytesMut::with_capacity(restored_len);
-        restored.extend_from_slice(payload.as_ref());
-        restored.extend_from_slice(tail.as_ref());
-        self.pages = restored;
+    fn detach_to(
+        &mut self,
+        target_offset: u64,
+    ) -> Result<Vec<DetachedStagedSlice>, CachedStoreWriterError> {
+        self.validate_geometry()?;
+        let mut staged = Vec::new();
+        while self.dirty_bytes() >= self.config.block_size
+            && self
+                .active_start
+                .saturating_add(self.config.block_size as u64)
+                <= target_offset
+        {
+            staged.push(self.detach_prefix(self.config.block_size)?);
+        }
+        Ok(staged)
     }
 
-    fn cache_hot_upload_if_enabled(&self, object_id: ObjectId, payload: Bytes, copy_payload: bool) {
+    fn detach_prefix(&mut self, len: usize) -> Result<DetachedStagedSlice, CachedStoreWriterError> {
+        self.validate_geometry()?;
+        let payload = self.take_prefix(len);
+        let object_id = self.next_object_id;
+        let staged = StagedSlice {
+            ino: self.config.ino,
+            offset: self.active_start,
+            object_id,
+            len,
+            content_epoch: self.config.content_epoch,
+        };
+        self.next_object_id = self.next_object_id.saturating_add(1);
+        self.store.writer_counters.subtract_dirty_bytes(len);
+        self.active_start = self.active_start.saturating_add(len as u64);
+        Ok(DetachedStagedSlice {
+            staged,
+            payload,
+            submit_upload: self.config.submit_upload,
+        })
+    }
+
+    fn restore_staged_prefix(&mut self, payload: Bytes) {
+        if payload.is_empty() {
+            return;
+        }
+        let mut restored = VecDeque::new();
+        let mut copied = 0usize;
+        while copied < payload.len() {
+            let take = (payload.len() - copied).min(self.config.page_size);
+            restored.push_back(BytesMut::from(&payload[copied..copied + take]));
+            copied += take;
+        }
+        restored.append(&mut self.pages);
+        self.pages = restored;
+        self.dirty_len = self.dirty_len.saturating_add(payload.len());
+    }
+
+    fn cache_hot_upload_if_enabled(&self, object_id: ObjectId, payload: &Bytes) {
         let mut upload_hot = self.store.upload_hot.lock();
         if upload_hot.budget_bytes > 0 {
-            let payload = if copy_payload {
-                Bytes::copy_from_slice(payload.as_ref())
-            } else {
-                payload
-            };
+            let payload = Bytes::copy_from_slice(payload.as_ref());
             upload_hot.insert(object_id, payload);
         }
+    }
+
+    fn ensure_len(&mut self, target_len: usize) {
+        while self.dirty_len < target_len {
+            if self
+                .pages
+                .back()
+                .is_none_or(|page| page.len() >= self.config.page_size)
+            {
+                let remaining = target_len - self.dirty_len;
+                self.pages.push_back(BytesMut::with_capacity(
+                    remaining.min(self.config.page_size),
+                ));
+            }
+            let page = self.pages.back_mut().expect("page exists after push");
+            let remaining = target_len - self.dirty_len;
+            let append = remaining.min(self.config.page_size - page.len());
+            page.resize(page.len() + append, 0);
+            self.dirty_len += append;
+        }
+    }
+
+    fn copy_into_dirty(&mut self, relative: usize, data: &[u8]) {
+        let mut write_pos = relative;
+        let mut copied = 0usize;
+        let mut page_base = 0usize;
+        for page in &mut self.pages {
+            let page_end = page_base + page.len();
+            if write_pos >= page_end {
+                page_base = page_end;
+                continue;
+            }
+            let start = write_pos.saturating_sub(page_base);
+            let take = (page.len() - start).min(data.len() - copied);
+            page[start..start + take].copy_from_slice(&data[copied..copied + take]);
+            copied += take;
+            write_pos += take;
+            if copied == data.len() {
+                return;
+            }
+            page_base = page_end;
+        }
+        debug_assert_eq!(copied, data.len());
+    }
+
+    fn copy_dirty_into(&self, relative: usize, out: &mut [u8]) {
+        let mut read_pos = relative;
+        let mut copied = 0usize;
+        let mut page_base = 0usize;
+        for page in &self.pages {
+            let page_end = page_base + page.len();
+            if read_pos >= page_end {
+                page_base = page_end;
+                continue;
+            }
+            let start = read_pos.saturating_sub(page_base);
+            let take = (page.len() - start).min(out.len() - copied);
+            out[copied..copied + take].copy_from_slice(&page[start..start + take]);
+            copied += take;
+            read_pos += take;
+            if copied == out.len() {
+                return;
+            }
+            page_base = page_end;
+        }
+        debug_assert_eq!(copied, out.len());
+    }
+
+    fn copy_prefix_to_bytes(&self, len: usize) -> Bytes {
+        let mut payload = BytesMut::with_capacity(len);
+        let mut remaining = len;
+        for page in &self.pages {
+            let take = remaining.min(page.len());
+            payload.extend_from_slice(&page[..take]);
+            remaining -= take;
+            if remaining == 0 {
+                break;
+            }
+        }
+        debug_assert_eq!(remaining, 0);
+        payload.freeze()
+    }
+
+    fn drop_prefix(&mut self, mut len: usize) {
+        while len > 0 {
+            let Some(front_len) = self.pages.front().map(BytesMut::len) else {
+                break;
+            };
+            if len < front_len {
+                let _ = self
+                    .pages
+                    .front_mut()
+                    .expect("front page exists")
+                    .split_to(len);
+                break;
+            }
+            self.pages.pop_front();
+            len -= front_len;
+        }
+        while self.pages.front().is_some_and(BytesMut::is_empty) {
+            self.pages.pop_front();
+        }
+    }
+
+    fn take_prefix(&mut self, len: usize) -> Bytes {
+        debug_assert!(len <= self.dirty_len);
+        if len == 0 {
+            return Bytes::new();
+        }
+        let payload = match self.pages.front().map(BytesMut::len) {
+            Some(front_len) if len == front_len => {
+                self.pages.pop_front().expect("front page exists").freeze()
+            }
+            Some(front_len) if len < front_len => self
+                .pages
+                .front_mut()
+                .expect("front page exists")
+                .split_to(len)
+                .freeze(),
+            _ => {
+                let payload = self.copy_prefix_to_bytes(len);
+                self.drop_prefix(len);
+                payload
+            }
+        };
+        while self.pages.front().is_some_and(BytesMut::is_empty) {
+            self.pages.pop_front();
+        }
+        self.dirty_len = self.dirty_len.saturating_sub(len);
+        payload
     }
 
     fn validate_buffer_limit(&self, requested: usize) -> Result<(), CachedStoreWriterError> {
@@ -1148,7 +1435,53 @@ mod tests {
     }
 
     #[test]
-    fn writer_slice_full_block_flush_uses_owned_payload_for_backend_and_hot_cache() {
+    fn detached_persist_without_upload_does_not_report_pending_upload_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, mut rx) = temp_cached_store(&dir);
+        let mut config = writer_config();
+        config.submit_upload = false;
+        let mut writer = cached_store.open_writer_slice(config);
+
+        writer.write_at(0, b"abcdefgh").expect("write full block");
+        let detached = writer
+            .detach_completed_blocks(1)
+            .expect("detach completed block");
+        cached_store
+            .persist_detached_staged_slices(detached)
+            .expect("persist detached block");
+
+        let counters = cached_store.snapshot_writer_counters();
+        assert_eq!(counters.staged_bytes, 8);
+        assert_eq!(counters.staged_slices, 1);
+        assert_eq!(counters.pending_upload_bytes, 0);
+        assert_eq!(cached_store.pending_upload_count(), 0);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn detached_persist_with_upload_counts_pending_bytes_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, mut rx) = temp_cached_store(&dir);
+        let mut writer = cached_store.open_writer_slice(writer_config());
+
+        writer.write_at(0, b"abcdefgh").expect("write full block");
+        let detached = writer
+            .detach_completed_blocks(1)
+            .expect("detach completed block");
+        cached_store
+            .persist_detached_staged_slices(detached)
+            .expect("persist detached block");
+
+        let counters = cached_store.snapshot_writer_counters();
+        assert_eq!(counters.staged_bytes, 8);
+        assert_eq!(counters.staged_slices, 1);
+        assert_eq!(counters.pending_upload_bytes, 8);
+        let op = rx.try_recv().expect("pending upload");
+        assert_eq!(op.object_id, 10_000);
+    }
+
+    #[test]
+    fn writer_slice_full_block_flush_uses_compact_hot_upload_payload() {
         let dir = tempfile::tempdir().expect("tempdir");
         let inner_backend =
             open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000001")
@@ -1179,10 +1512,10 @@ mod tests {
             .get_hot_upload(staged[0].object_id)
             .expect("hot upload payload");
         assert_eq!(hot.as_ref(), b"abcdefgh");
-        assert_eq!(
+        assert_ne!(
             recorded[0].data.as_ptr(),
             hot.as_ptr(),
-            "backend and hot upload cache should share the frozen staged bytes"
+            "hot upload cache should keep a compact payload instead of retaining writer backing memory"
         );
     }
 
@@ -1292,6 +1625,28 @@ mod tests {
             b"abcdefgh"
         );
         assert_eq!(writer.dirty_bytes(), 0);
+    }
+
+    #[test]
+    fn writer_slice_flush_completed_blocks_leaves_partial_tail_buffered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, _rx) = temp_cached_store(&dir);
+        let mut writer = cached_store.open_writer_slice(writer_config());
+
+        writer
+            .write_at(0, b"abcdefghijkl")
+            .expect("write one full block and one partial tail");
+        let staged = writer
+            .flush_completed_blocks(usize::MAX)
+            .expect("flush completed blocks");
+
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].offset, 0);
+        assert_eq!(staged[0].len, 8);
+        assert_eq!(writer.dirty_bytes(), 4);
+        let mut tail = [0_u8; 4];
+        assert_eq!(writer.read_accepted(8, &mut tail), 4);
+        assert_eq!(&tail, b"ijkl");
     }
 
     #[test]

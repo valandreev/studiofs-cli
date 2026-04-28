@@ -89,7 +89,7 @@ real mounted I/O behavior.
 |---|---|---|---|
 | Unix FUSE | mounted create/write/read/readdir/delete/unmount lifecycle | `fuse_mount_write_read_unmount_smoke` | `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity fuse_mount_write_read_unmount_smoke -- --ignored --nocapture --test-threads=1` |
 | Windows WinFSP | mounted create/write/read/readdir/delete/unmount lifecycle | `winfsp_mount_write_read_unmount_smoke` | `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_write_read_unmount_smoke -- --ignored --nocapture --test-threads=1` |
-| Windows WinFSP sequential writer | AJA-style large sequential writer must keep cleanup observational and preserve close-side barrier ownership | `winfsp_mount_aja_style_sequential_writer_validation_smoke` | `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_aja_style_sequential_writer_validation_smoke -- --ignored --nocapture --test-threads=1` |
+| Windows WinFSP sequential writer | AJA-style large sequential writer must use WinFSP cleanup flush/purge while keeping StudioFS non-delete cleanup callback handling observational | `winfsp_mount_aja_style_sequential_writer_validation_smoke` | `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity winfsp_mount_aja_style_sequential_writer_validation_smoke -- --ignored --nocapture --test-threads=1` |
 
 ## Focused Benchmark Recipes
 
@@ -202,10 +202,12 @@ must include:
   out, wait duration, pending upload counts, and the invalid-read reason.
 
 When mounted process observability is available, inspect the `Mounted memory`
-terminal table or JSON `mounted_memory` / `mounted_observability.process`
-sections for `rss_bytes_peak`, `rss_bytes_steady_state`, `dirty_bytes_peak`,
-`staged_bytes_peak`, and `dirty_limit_bytes`. These fields are best-effort and
-may be omitted when the measured run does not expose that signal.
+terminal table or JSON `mounted_memory`, `mounted_observability.process`, and
+`mounted_portable_profile` sections for `rss_bytes_peak`,
+`rss_bytes_steady_state`, `virtual_memory_bytes_peak`, CPU average/peak,
+process disk IO deltas, allocator `current_bytes` / `peak_bytes`, dirty bytes,
+staged bytes, and dirty limits. These fields are best-effort and may be omitted
+when the measured run does not expose that signal.
 
 ### Small-File Random I/O / Metadata-Sensitive Run
 
@@ -278,6 +280,34 @@ Reuse the same workload shape on both filesystems: block size, read size,
 concurrency, access pattern, warm/cold setup, cache disk, metadata disk, and
 mount options.
 
+### SFS-301 Final Mounted Parity Notes
+
+For `SFS-301`, initialize a fresh StudioFS validation volume with the current
+`studiofs init` CLI and record the reported block size from the command output.
+The current public `init` surface does not accept a `--block-size` flag; new
+volumes report the canonical 4 MiB block size.
+
+Use `studiofs test` for the StudioFS-native mounted report. The operator test
+locks the mounted parity workload to the canonical 4 MiB chunk/read shape,
+streams the 8 GiB write without allocating the full file in the test process,
+and emits the `mounted_write_diagnostics` gate plus `mounted_portable_profile`
+for throughput, peak RSS, portable CPU/disk samples, allocator heap pressure,
+known local write amplification, landing-zone use, dirty pressure, cache
+pressure, pending upload bytes, and write-path backpressure:
+
+```powershell
+.\target\release\studiofs.exe test Z:\ `
+  --report D:\reports\sfs-301-studiofs-test-8g-4m.json
+```
+
+For `SFS-301`, treat the StudioFS side as solved when
+`mounted_write_diagnostics.write_throughput_mib_per_sec >= 1000`,
+`mounted_write_diagnostics.rss_target_met == true`, and
+`mounted_write_diagnostics.known_local_write_amplification <= 1.20`.
+Keep a JuiceFS comparison run with the same one-file 8 GiB / 4 MiB IO shape,
+same machine, same cache disk class, and WMI process CPU/RSS sampling on
+Windows.
+
 ### SFS-262 Mounted Default Gate
 
 For `SFS-262`, lock the default mounted benchmark recipe to a same-host
@@ -298,10 +328,11 @@ StudioFS versus JuiceFS comparison:
 - Treat the mounted memory gate as
   `mounted_memory.rss_bytes_peak <= min(2 GiB, juicefs_peak_rss * 1.15)`.
 - Use `mounted_memory.rss_bytes_steady_state`,
-  `mounted_memory.dirty_bytes_peak`, `mounted_memory.staged_bytes_peak`, and
-  `mounted_memory.dirty_limit_bytes` as diagnostics when the peak-RSS gate
-  fails; they help distinguish hot dirty-state pressure, staged payload
-  pressure, and other runtime memory growth when those samples are present.
+  `mounted_memory.dirty_bytes_peak`, `mounted_memory.staged_bytes_peak`,
+  `mounted_memory.dirty_limit_bytes`, and `mounted_portable_profile` phase /
+  allocator metrics as diagnostics when the peak-RSS gate fails; they help
+  distinguish hot dirty-state pressure, staged payload pressure, Rust heap
+  growth, and other runtime memory growth when those samples are present.
 - Treat `local_first_read_comparison` and `mounted_memory` as required
   StudioFS-side diagnostics for explaining any parity miss.
 

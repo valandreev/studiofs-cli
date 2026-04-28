@@ -21,6 +21,7 @@ pub(crate) struct TestCacheRunRequest {
     pub(super) l1_limit: Option<String>,
     pub(super) profile: Option<TestCacheProfileMode>,
     pub(super) json_output: Option<PathBuf>,
+    pub(super) full_file_reads: bool,
 }
 
 impl From<TestCacheArgs> for TestCacheRunRequest {
@@ -43,6 +44,7 @@ impl From<TestCacheArgs> for TestCacheRunRequest {
             l1_limit: args.l1_limit,
             profile: args.profile,
             json_output: args.json_output,
+            full_file_reads: false,
         }
     }
 }

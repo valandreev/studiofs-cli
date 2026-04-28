@@ -107,8 +107,12 @@ Higher priority (lower tier number) must be acquired first:
   pipeline.
 - `fsync` is the strict caller-requested local sync API and must not imply remote publication.
 - WinFSP `cleanup`:
+  - WinFSP `FlushAndPurgeOnCleanup` is enabled by default to match JuiceFS and
+    prevent cached Windows writers from leaving a lazy-write tail after handle
+    cleanup.
   - delete + `FspCleanupDelete` finalizes deletion.
-  - non-delete cleanup is observational; it should not be the ownership point for dirty local persistence.
+  - non-delete StudioFS cleanup callback handling is observational; it should
+    not be the ownership point for dirty local persistence.
 - `overwrite`, WinFSP `set_file_size`, and size-changing FUSE paths must persist new EOF/attrs before returning.
 - `release` (FUSE) and `close`/`release_fh` (WinFSP) are release-path checks; they drain remaining local writer state when required without moving remote publication to the foreground.
 - Treat repeated/non-delete cleanup foreground barriers in sequential-write Windows validation (`cleanup_skipped_clean`, `cleanup_flush_fh`) as signs of avoidable callback work (SFS-192 follow-up signal).

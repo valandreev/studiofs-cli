@@ -15,6 +15,23 @@ use studiofs_meta::{
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 
+#[derive(Default)]
+struct RecordingKernelInvalidator {
+    seen: parking_lot::Mutex<Vec<Ino>>,
+}
+
+impl RecordingKernelInvalidator {
+    fn snapshot(&self) -> Vec<Ino> {
+        self.seen.lock().clone()
+    }
+}
+
+impl KernelInvalidator for RecordingKernelInvalidator {
+    fn inval_inode(&self, ino: Ino) {
+        self.seen.lock().push(ino);
+    }
+}
+
 fn test_format_info(volume_suffix: &str) -> FormatInfo {
     let volume_name = format!("namespace-resolver-{volume_suffix}-{}", std::process::id());
     FormatInfo {
@@ -1377,6 +1394,9 @@ fn epoch_finalizer_publishes_slice_graph_zero_length_epoch() {
             "regression setup should not require remote object visibility checks"
         );
 
+        let invalidator = Arc::new(RecordingKernelInvalidator::default());
+        vfs.set_kernel_invalidator(invalidator.clone());
+
         let status = super::commit::CommitCoordinator::finalize_inode_epoch(
             &vfs,
             attr.ino,
@@ -1396,6 +1416,11 @@ fn epoch_finalizer_publishes_slice_graph_zero_length_epoch() {
         assert_eq!(
             published_attr.committed_content_epoch,
             published_attr.content_epoch
+        );
+        assert_eq!(
+            invalidator.snapshot(),
+            Vec::<Ino>::new(),
+            "local epoch publication should not emit a kernel invalidation; the writer already owns the fresh file state, matching JuiceFS"
         );
     });
 }
@@ -1505,6 +1530,97 @@ fn nonzero_truncate_requeues_retained_overlay_uploads_with_new_epoch() {
                 .all(|(_, _, content_epoch)| *content_epoch == truncated_attr.content_epoch),
             "retained payload uploads must be queued under the new content epoch"
         );
+    });
+}
+
+#[test]
+fn nonzero_extend_keeps_retained_overlay_uploads_on_current_epoch() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "extend-keeps-retained");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"extend-keeps-retained.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let payload = vec![0x7Bu8; 8192];
+
+        vfs.write(ino, 0, &payload).await.expect("write payload");
+        vfs.flush(ino).await.expect("flush first unpublished epoch");
+
+        let pending_before = vfs.pending_uploads_for_inode(ino);
+        assert!(
+            !pending_before.is_empty(),
+            "setup should queue uploads before the logical-size extension"
+        );
+
+        vfs.setattr(ino, SetattrArgs::size_only(16 * 1024))
+            .expect("extend while retaining existing overlay payloads");
+
+        let pending_after = vfs.pending_uploads_for_inode(ino);
+        assert_eq!(
+            pending_after, pending_before,
+            "logical-size growth must not cancel/requeue retained overlay uploads"
+        );
+    });
+}
+
+#[test]
+fn handle_backed_extend_keeps_writer_stack_buffered_without_strict_sync() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "handle-extend-no-strict-sync");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"handle-extend-no-strict-sync.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open writable handle");
+        let payload = b"handle-backed-extend";
+
+        vfs.write_fh_with_local_sync_policy(fh, ino, 0, payload, LocalSyncPolicy::Opportunistic)
+            .await
+            .expect("buffer writer-stack payload");
+        assert!(vfs.state.writer_stack.has_dirty_writers(ino));
+
+        let sync_calls_before = vfs
+            .state
+            .metrics
+            .payload_store_sync_data_calls
+            .load(Ordering::Relaxed);
+
+        let extended = vfs
+            .setattr_with_handle(
+                Some(fh),
+                ino,
+                SetattrArgs::size_only((payload.len() + 4096) as u64),
+            )
+            .expect("handle-backed logical-size growth");
+
+        let sync_calls_after = vfs
+            .state
+            .metrics
+            .payload_store_sync_data_calls
+            .load(Ordering::Relaxed);
+        assert_eq!(
+            sync_calls_after, sync_calls_before,
+            "handle-backed logical-size growth must not force strict sync_data"
+        );
+        assert_eq!(extended.size, (payload.len() + 4096) as u64);
+        assert!(
+            vfs.state.writer_stack.has_dirty_writers(ino),
+            "logical-size growth should leave foreground write data buffered"
+        );
+        assert!(
+            vfs.pending_uploads_for_inode(ino).is_empty(),
+            "logical-size growth should not materialize or enqueue uploads"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
     });
 }
 
@@ -1879,7 +1995,10 @@ fn cache_runtime_tuning_defaults_match_juicefs_sized_windows() {
     let derived =
         derive_cache_runtime_tuning(100 * 1024 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024);
 
-    assert_eq!(derived.max_dirty_bytes, DEFAULT_MAX_DIRTY_BYTES);
+    assert_eq!(DEFAULT_MAX_DIRTY_BYTES, 300 * 1024 * 1024);
+    assert_eq!(DEFAULT_WRITE_EAGER_FLUSH_BATCH_BYTES, 64 * 1024 * 1024);
+    assert_eq!(derived.max_dirty_bytes, 300 * 1024 * 1024);
+    assert_eq!(derived.write_eager_flush_batch_bytes, 64 * 1024 * 1024);
     assert_eq!(derived.transit_memory_budget_bytes, 300 * 1024 * 1024);
 }
 
@@ -2015,17 +2134,19 @@ fn vfs_config_raw_validate_clamps_and_normalizes() {
 
 #[test]
 fn upload_pipeline_summary_logs_only_when_pending_work_exists() {
-    assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 0));
-    assert!(StudioVfs::upload_pipeline_summary_is_active(1, 0));
-    assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 1)); // < 10 threshold
-    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 10));
+    assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 0, 0));
+    assert!(StudioVfs::upload_pipeline_summary_is_active(1, 0, 0));
+    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 1, 0));
+    assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 0, 1)); // < 10 threshold
+    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 0, 10));
 }
 
 #[test]
 fn upload_pipeline_summary_is_active_checks() {
-    assert!(StudioVfs::upload_pipeline_summary_is_active(256, 0));
-    assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 9));
-    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 11));
+    assert!(StudioVfs::upload_pipeline_summary_is_active(256, 0, 0));
+    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 4, 0));
+    assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 0, 9));
+    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 0, 11));
 }
 
 #[test]
@@ -2901,6 +3022,48 @@ fn aggressive_materialization_threshold_is_half_of_dirty_budget() {
 }
 
 #[test]
+fn completed_block_materialization_respects_eager_batch_limit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = VfsConfig {
+        write_eager_flush_batch_bytes: 8 * 1024 * 1024,
+        ..VfsConfig::default()
+    };
+    let (rt, vfs, _meta) =
+        make_unstarted_test_vfs_with_config(&tmp, "writer-stack-completed-batch-cap", cfg);
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"writer-stack-completed-batch-cap.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        let block_size = vfs.block_size as usize;
+        let payload = vec![0x5Au8; block_size * 3];
+
+        vfs.record_writer_stack_state_bytes(fh, attr.ino, 0, &payload)
+            .await
+            .unwrap();
+        let materialized = vfs
+            .materialize_writer_stack_completed_blocks_for_inode(attr.ino)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            materialized,
+            block_size * 2,
+            "one completed-block pass should not detach more than the eager batch limit"
+        );
+        assert_eq!(
+            vfs.state
+                .writer_stack
+                .completed_block_count_for_inode(attr.ino)
+                .unwrap(),
+            1,
+            "blocks beyond the batch cap should remain buffered for the next drain pass"
+        );
+    });
+}
+
+#[test]
 fn ingress_pressure_counts_buffered_writer_stack_bytes() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-257-ingress-pressure-writer-stack");
@@ -2943,6 +3106,224 @@ fn ingress_pressure_counts_buffered_writer_stack_bytes() {
             pressure.lane,
             VfsIngressLane::Backpressure,
             "once buffered writer-stack bytes consume the dirty budget, follow-up ingress should see backpressure"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn deferred_write_rechecks_hard_backpressure_after_waiting_for_inode_gate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-305-deferred-backpressure-recheck");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-305-deferred-backpressure-recheck.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        let pressure_attr = vfs
+            .create(1, b"sfs-305-existing-pressure.txt", 0, 0, 0o644)
+            .unwrap();
+        let pressure_fh = vfs
+            .open_file(pressure_attr.ino, OpenFlags::RDWR, false)
+            .unwrap();
+
+        vfs.set_max_dirty_bytes(8);
+        let held_gate = vfs
+            .state
+            .file_session
+            .enter_op(ino, FileSessionOperation::Write)
+            .await;
+        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+        vfs.state
+            .deferred_materialize_inflight
+            .lock()
+            .insert(ino, Arc::clone(&task_lock));
+
+        let queued_vfs = Arc::clone(&vfs);
+        let queued_write = tokio::spawn(async move {
+            queued_vfs
+                .write_fh_with_deferred_materialize(
+                    fh,
+                    ino,
+                    0,
+                    b"x",
+                    LocalSyncPolicy::Opportunistic,
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if vfs.file_session_stats().queued_ops >= 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred write should queue behind the held inode gate");
+
+        vfs.state
+            .writer_stack
+            .write_bytes(
+                super::writer_stack::WriterWriteSpec {
+                    fh: pressure_fh,
+                    ino: pressure_attr.ino,
+                    current_size: 0,
+                    content_epoch: pressure_attr.content_epoch,
+                    first_object_id: 0,
+                    offset: 0,
+                },
+                Bytes::from(vec![0xAB; 17]),
+            )
+            .expect("seed writer-stack pressure above the hard threshold");
+        assert!(
+            vfs.total_pending_write_buffer_bytes() > super::hard_backpressure_threshold_bytes(8),
+            "setup should exceed the hard threshold while the deferred write is still waiting"
+        );
+
+        drop(held_gate);
+        queued_write
+            .await
+            .expect("queued write task should not panic")
+            .expect("queued write should fall back and complete");
+        vfs.state.deferred_materialize_inflight.lock().remove(&ino);
+
+        let snapshot = vfs.write_path_observability_snapshot();
+        assert_eq!(
+            snapshot.write_backpressure.hard_events, 1,
+            "deferred write must re-check hard backpressure after waiting on the inode gate"
+        );
+        assert!(
+            !vfs.state.writer_stack.has_dirty_writers(ino),
+            "hard fallback should materialize this write inline instead of extending the buffered writer stack"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+        vfs.release_fh(pressure_fh).await.unwrap();
+    });
+}
+
+#[test]
+fn deferred_write_keeps_writeback_path_when_soft_dirty_budget_is_full() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-305-deferred-soft-writeback");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-305-deferred-soft-writeback.txt", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        let pressure_attr = vfs
+            .create(1, b"sfs-305-existing-soft-writeback-pressure.txt", 0, 0, 0o644)
+            .unwrap();
+        let pressure_fh = vfs
+            .open_file(pressure_attr.ino, OpenFlags::RDWR, false)
+            .unwrap();
+
+        vfs.set_max_dirty_bytes(8);
+        vfs.state
+            .deferred_materialize_inflight
+            .lock()
+            .insert(ino, Arc::new(tokio::sync::Mutex::new(())));
+        vfs.state
+            .writer_stack
+            .write_bytes(
+                super::writer_stack::WriterWriteSpec {
+                    fh: pressure_fh,
+                    ino: pressure_attr.ino,
+                    current_size: 0,
+                    content_epoch: pressure_attr.content_epoch,
+                    first_object_id: 0,
+                    offset: 0,
+                },
+                Bytes::from(vec![0xCD; 9]),
+            )
+            .expect("seed writer-stack pressure above the soft dirty budget");
+        assert_eq!(
+            vfs.ingress_pressure_for(1).lane,
+            VfsIngressLane::Backpressure,
+            "setup should be over the soft dirty budget but below hard backpressure"
+        );
+
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            b"x",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .expect("soft dirty budget should not force a synchronous writeback fallback");
+        vfs.state.deferred_materialize_inflight.lock().remove(&ino);
+
+        let snapshot = vfs.write_path_observability_snapshot();
+        assert_eq!(
+            snapshot.write_backpressure.hard_events, 0,
+            "soft dirty-budget pressure should not be counted as hard backpressure"
+        );
+        assert!(
+            vfs.state.writer_stack.has_dirty_writers(ino),
+            "soft dirty-budget pressure should preserve JuiceFS-like writeback acceptance instead of forcing inline sync materialization"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+        vfs.release_fh(pressure_fh).await.unwrap();
+    });
+}
+
+#[test]
+fn writer_stack_write_invalidates_attr_cache_without_kernel_notify() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "writer-stack-write-invalidation");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"writer-stack-write-invalidation.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.getattr_async(attr.ino).await.unwrap();
+        assert!(
+            vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(attr.ino),
+            "setup should populate the attr read cache before the write"
+        );
+
+        let invalidator = Arc::new(RecordingKernelInvalidator::default());
+        vfs.set_kernel_invalidator(invalidator.clone());
+
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            attr.ino,
+            0,
+            b"juicefs-style-invalidate",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !vfs.state
+                .namespace
+                .attr_read_cache
+                .lock()
+                .contains(attr.ino),
+            "accepted local writes should evict stale attr cache entries"
+        );
+        assert_eq!(
+            invalidator.snapshot(),
+            Vec::<Ino>::new(),
+            "accepted local writes should not notify the kernel cache invalidator; the write reply already carries fresh file info for the writer, matching JuiceFS"
         );
 
         vfs.release_fh(fh).await.unwrap();
@@ -3179,17 +3560,17 @@ fn write_fh_full_block_callbacks_persist_in_small_foreground_waves() {
 }
 
 #[test]
-fn opportunistic_write_fh_lands_before_deferred_materialization() {
+fn opportunistic_write_fh_uses_writer_cache_without_landing_journal() {
     let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-284-landing-zone");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-284-no-landing-zone");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
-            .create(1, b"sfs-284-landing-zone.txt", 0, 0, 0o644)
+            .create(1, b"sfs-284-no-landing-zone.txt", 0, 0, 0o644)
             .unwrap();
         let ino = attr.ino;
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-        let payload = b"landing-zone-visible";
+        let payload = b"writer-cache-visible";
 
         vfs.write_fh_with_deferred_materialize(fh, ino, 0, payload, LocalSyncPolicy::Opportunistic)
             .await
@@ -3199,66 +3580,54 @@ fn opportunistic_write_fh_lands_before_deferred_materialization() {
         assert_eq!(read.as_ref(), payload);
 
         let snapshot = vfs.write_path_observability_snapshot();
-        assert_eq!(snapshot.landing_zone.accepted_writes, 1);
-        assert_eq!(snapshot.landing_zone.accepted_bytes, payload.len() as u64);
         assert_eq!(
-            snapshot.landing_zone.data_syncs, 0,
-            "opportunistic writeback accept must not issue a foreground landing data sync"
+            snapshot.landing_zone.accepted_writes, 0,
+            "ordinary mounted writeback must not duplicate caller bytes into the landing journal"
         );
         assert_eq!(
-            snapshot.landing_zone.manifest_syncs, 0,
-            "opportunistic writeback accept must not issue a foreground landing manifest sync"
-        );
-        assert!(
-            snapshot.landing_zone.accept_avg_ms >= 0.0,
-            "landing accept latency should be exported for AJA evidence"
+            snapshot.landing_zone.accepted_bytes, 0,
+            "the cached-store writer is the only payload acceptance pipeline"
         );
 
         let recovered = vfs.recover_landing_zone_segments().unwrap();
-        assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].ino, ino);
-        assert_eq!(recovered[0].offset, 0);
-        assert_eq!(recovered[0].len, payload.len() as u64);
+        assert!(
+            recovered.is_empty(),
+            "ordinary writeback no longer creates a second recoverable payload copy before a durability boundary"
+        );
 
         vfs.flush_fh(fh).await.unwrap();
         assert!(
             vfs.recover_landing_zone_segments().unwrap().is_empty(),
-            "strict local drain should retire landed records for this inode"
+            "strict local drain should not invent landing records"
         );
         let drained_snapshot = vfs.write_path_observability_snapshot();
-        assert!(
-            drained_snapshot.landing_zone.data_syncs > 0,
-            "strict local boundary should group landing data sync with landed-record retirement"
-        );
-        assert!(
-            drained_snapshot.landing_zone.manifest_syncs > 0,
-            "strict local boundary should group landing manifest sync with landed-record retirement"
-        );
-        assert_eq!(drained_snapshot.landing_zone.manifest_rewrites, 1);
+        assert_eq!(drained_snapshot.landing_zone.data_syncs, 0);
+        assert_eq!(drained_snapshot.landing_zone.manifest_syncs, 0);
+        assert_eq!(drained_snapshot.landing_zone.manifest_rewrites, 0);
         vfs.release_fh(fh).await.unwrap();
     });
 }
 
 #[test]
-fn fsync_retires_landed_write_records_at_strict_local_boundary() {
+fn fsync_does_not_use_landing_journal_for_ordinary_writeback() {
     let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-285-landing-fsync");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-285-no-landing-fsync");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
-            .create(1, b"sfs-285-landing-fsync.txt", 0, 0, 0o644)
+            .create(1, b"sfs-285-no-landing-fsync.txt", 0, 0, 0o644)
             .unwrap();
         let ino = attr.ino;
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-        let payload = b"landed-fsync-boundary";
+        let payload = b"writer-cache-fsync-boundary";
 
         vfs.write_fh_with_deferred_materialize(fh, ino, 0, payload, LocalSyncPolicy::Opportunistic)
             .await
             .unwrap();
         assert_eq!(
             vfs.recover_landing_zone_segments().unwrap().len(),
-            1,
-            "opportunistic write should create a recoverable landed record before fsync"
+            0,
+            "ordinary writeback should not create a recoverable landing record before fsync"
         );
 
         vfs.fsync_with_outcome(ino, false).await.unwrap();
@@ -3272,25 +3641,25 @@ fn fsync_retires_landed_write_records_at_strict_local_boundary() {
 }
 
 #[test]
-fn last_handle_release_retires_landed_write_records_at_strict_local_boundary() {
+fn last_handle_release_does_not_use_landing_journal_for_ordinary_writeback() {
     let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-285-landing-release");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-285-no-landing-release");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
-            .create(1, b"sfs-285-landing-release.txt", 0, 0, 0o644)
+            .create(1, b"sfs-285-no-landing-release.txt", 0, 0, 0o644)
             .unwrap();
         let ino = attr.ino;
         let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-        let payload = b"landed-release-boundary";
+        let payload = b"writer-cache-release-boundary";
 
         vfs.write_fh_with_deferred_materialize(fh, ino, 0, payload, LocalSyncPolicy::Opportunistic)
             .await
             .unwrap();
         assert_eq!(
             vfs.recover_landing_zone_segments().unwrap().len(),
-            1,
-            "opportunistic write should create a recoverable landed record before last close"
+            0,
+            "ordinary writeback should not create a recoverable landing record before last close"
         );
 
         let outcome = vfs.release_fh_with_outcome(fh).await.unwrap();
@@ -3303,7 +3672,7 @@ fn last_handle_release_retires_landed_write_records_at_strict_local_boundary() {
 }
 
 #[test]
-fn startup_replays_landed_write_after_restart() {
+fn startup_replays_legacy_landed_write_after_restart() {
     let tmp = tempfile::tempdir().unwrap();
     let volume_suffix = "sfs-284-landing-restart";
     let payload = b"restart-visible-landed";
@@ -3317,15 +3686,14 @@ fn startup_replays_landed_write_after_restart() {
                 .unwrap();
             let ino = attr.ino;
             let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
-            vfs.write_fh_with_deferred_materialize(
-                fh,
-                ino,
-                0,
-                payload,
-                LocalSyncPolicy::Opportunistic,
-            )
-            .await
-            .unwrap();
+            vfs.landing_zone
+                .accept(crate::landing_zone::LandingWrite {
+                    ino,
+                    fh,
+                    offset: 0,
+                    data: Bytes::copy_from_slice(payload),
+                })
+                .unwrap();
             ino
         })
     };
@@ -3388,7 +3756,7 @@ fn drain_lag_pacing_attribution_scales_drain_lag_share_to_actual_wait() {
 }
 
 #[test]
-fn write_path_observability_reports_landing_drain_lag_without_foreground_pacing() {
+fn write_path_observability_reports_writer_cache_drain_lag_without_landing_journal() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-287-drain-lag-observability");
     let _guard = rt.enter();
@@ -3415,10 +3783,13 @@ fn write_path_observability_reports_landing_drain_lag_without_foreground_pacing(
         }
 
         let snapshot = vfs.write_path_observability_snapshot();
-        assert_eq!(snapshot.landing_zone.accepted_writes, 3);
         assert_eq!(
-            snapshot.landing_zone.accepted_bytes,
-            (3 * slice_bytes) as u64
+            snapshot.landing_zone.accepted_writes, 0,
+            "ordinary mounted writeback should not enqueue duplicate landing-zone writes"
+        );
+        assert_eq!(
+            snapshot.landing_zone.accepted_bytes, 0,
+            "writer/cache dirty state is the only accepted-byte pipeline for this path"
         );
         assert_eq!(
             snapshot.drain_lag.current_bytes,
@@ -3427,7 +3798,7 @@ fn write_path_observability_reports_landing_drain_lag_without_foreground_pacing(
         );
         assert!(
             snapshot.drain_lag.current_bytes >= snapshot.drain_lag.steady_quota_bytes,
-            "three landed slices should exceed one steady drain quota"
+            "three writer-cache slices should exceed one steady drain quota"
         );
         assert_eq!(
             snapshot.drain_lag.soft_pacing_events, 0,
@@ -3596,6 +3967,45 @@ fn inode_write_overwrite_updates_current_slice_graph_over_published_base() {
                 .object_id,
             current_blocks[0].1.object_id,
             "regular-file slice lookup and payload helper must agree on the current unpublished payload"
+        );
+    });
+}
+
+#[test]
+fn ready_inode_refresh_prunes_stale_live_extents_like_remount() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, meta) = make_test_vfs(&tmp, "ready-refresh-prunes-live-extents");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"ready-refresh-prunes-live-extents.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let payload = vec![0x5Au8; vfs.block_size as usize];
+
+        vfs.write(ino, 0, &payload).await.unwrap();
+        vfs.flush(ino).await.unwrap();
+        let (published_epoch, published_blocks) = mark_all_overlay_objects_uploaded(&vfs, &meta, ino);
+        publish_current_file_graph(&meta, ino, published_epoch, &published_blocks);
+        vfs.cancel_pending_uploads_for_inode(ino);
+        assert!(
+            !vfs.live_extent_records_for_inode(ino).is_empty(),
+            "setup should model the pre-remount process state with live extents still resident"
+        );
+
+        let published_attr = meta.get_attr(ino).unwrap();
+        assert_eq!(published_attr.upload_state, MetaUploadState::Ready);
+        assert_eq!(published_attr.content_epoch, published_attr.committed_content_epoch);
+        assert_eq!(published_attr.size, published_attr.committed_size);
+
+        let state = vfs.refresh_inode_incarnation_state_from_attr(ino, &published_attr);
+        assert!(
+            state.pending_incarnation.is_none(),
+            "a fully published inode should refresh to the same idle state a remount would see"
+        );
+        assert!(
+            vfs.live_extent_records_for_inode(ino).is_empty(),
+            "fully published inode refresh should prune stale live extents so reads stop using the pending overlay path"
         );
     });
 }
@@ -5417,6 +5827,223 @@ fn release_fh_materializes_opportunistic_writer_stack_state() {
 }
 
 #[test]
+fn release_fh_drains_tail_after_deferred_completed_block_materialization() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-301-release-deferred-tail");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-301-release-deferred-tail.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let block_size = vfs.block_size as usize;
+        let tail_size = block_size / 3;
+        let mut payload = vec![0xC3; block_size];
+        payload.extend(std::iter::repeat_n(0x7E, tail_size));
+
+        vfs.write_fh_with_local_sync_policy(fh, ino, 0, &payload, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        vfs.materialize_writer_stack_completed_blocks_for_inode(ino)
+            .await
+            .unwrap();
+        assert_eq!(
+            vfs.total_pending_persisted_local_dirty_slice_bytes(),
+            block_size,
+            "setup should persist the completed block locally before release"
+        );
+        assert_eq!(
+            vfs.state.writer_stack.dirty_bytes_for_inode(ino),
+            tail_size,
+            "setup should leave only the partial tail in the writer stack"
+        );
+
+        let outcome = vfs.release_fh_with_outcome(fh).await.unwrap();
+
+        assert!(outcome.closed_last_handle);
+        assert!(
+            outcome.flushed_local_dirty_state,
+            "last-handle release must report the deferred tail drain"
+        );
+        assert_eq!(
+            vfs.state.writer_stack.dirty_bytes_for_inode(ino),
+            0,
+            "last-handle release must not leave a writer-stack tail for a closed file"
+        );
+        assert_eq!(
+            vfs.total_landed_write_drain_lag_bytes(),
+            0,
+            "closed file should have no landed-write drain lag after release"
+        );
+        let spans = meta
+            .lookup_regular_file_slices(ino, 0, payload.len() as u64)
+            .unwrap();
+        assert!(
+            spans.iter().any(|span| span.payload.is_some()),
+            "release should commit materialized payload slices"
+        );
+    });
+}
+
+#[test]
+fn deferred_materialization_drains_idle_tail_before_close() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-301-idle-tail-before-close");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-301-idle-tail-before-close.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let block_size = vfs.block_size as usize;
+        let tail_size = block_size / 3;
+        let mut payload = vec![0xA1; block_size];
+        payload.extend(std::iter::repeat_n(0xB2, tail_size));
+
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            &payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if vfs.state.writer_stack.dirty_bytes_for_inode(ino) == 0
+                    && vfs.total_pending_persisted_local_dirty_slice_bytes() == 0
+                    && !vfs.pending_uploads_for_inode(ino).is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("idle deferred tail should materialize and enter upload before close");
+
+        assert_eq!(
+            vfs.open_count(ino),
+            1,
+            "setup keeps the writer handle open to exercise background idle-tail drain"
+        );
+        assert_eq!(
+            vfs.state.writer_stack.dirty_bytes_for_inode(ino),
+            0,
+            "background materialization should not wait for last-handle release"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn deferred_materialization_reschedules_write_that_arrives_while_inflight_finishes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-301-inflight-reschedule-tail");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-301-inflight-reschedule-tail.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+        vfs.state
+            .deferred_materialize_inflight
+            .lock()
+            .insert(ino, task_lock);
+
+        let payload = vec![0xD4; vfs.block_size as usize];
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            &payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        assert!(
+            vfs.pending_uploads_for_inode(ino).is_empty(),
+            "occupied in-flight slot should suppress immediate upload scheduling"
+        );
+        assert!(
+            vfs.state.writer_stack.dirty_bytes_for_inode(ino) > 0,
+            "write should remain buffered until the finishing materializer reschedules"
+        );
+
+        vfs.finish_deferred_materialization_task(ino, true);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if vfs.state.writer_stack.dirty_bytes_for_inode(ino) == 0
+                    && !vfs.pending_uploads_for_inode(ino).is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("finishing materializer should reschedule dirty writer-stack state");
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
+fn strict_deferred_write_waits_for_inflight_materialization() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-301-strict-waits-inflight");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-301-strict-waits-inflight.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = task_lock.clone().lock_owned().await;
+        vfs.state
+            .deferred_materialize_inflight
+            .lock()
+            .insert(ino, task_lock);
+
+        let strict_vfs = Arc::clone(&vfs);
+        let strict_write = tokio::spawn(async move {
+            strict_vfs
+                .write_fh_with_deferred_materialize(
+                    fh,
+                    ino,
+                    0,
+                    b"strict",
+                    LocalSyncPolicy::Strict,
+                )
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !strict_write.is_finished(),
+            "strict writes must wait until earlier deferred materialization leaves the inflight slot"
+        );
+
+        drop(guard);
+        strict_write
+            .await
+            .expect("strict write task should not panic")
+            .expect("strict write should complete after inflight materialization drains");
+        vfs.state.deferred_materialize_inflight.lock().remove(&ino);
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn write_path_observability_tracks_burst_shape_and_metadata_commit_stalls() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "write-path-observability-bursts");
@@ -5533,6 +6160,36 @@ fn write_path_observability_reports_active_tuning_knobs() {
         snapshot.tuning.sync_group_min_bytes, vfs.local_sync_group_min_bytes,
         "observability should report the active sync-data group minimum"
     );
+}
+
+#[test]
+fn write_path_observability_reports_fetch_counters() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-fetch");
+
+    vfs.fetch_scheduler
+        .metrics
+        .cache_hits
+        .store(13, Ordering::Relaxed);
+    vfs.fetch_scheduler
+        .metrics
+        .s3_fetches
+        .store(5, Ordering::Relaxed);
+    vfs.fetch_scheduler
+        .metrics
+        .singleflight_joins
+        .store(3, Ordering::Relaxed);
+    vfs.fetch_scheduler
+        .metrics
+        .bytes_downloaded
+        .store(20 * 1024 * 1024, Ordering::Relaxed);
+
+    let snapshot = vfs.write_path_observability_snapshot();
+
+    assert_eq!(snapshot.fetch.cache_hits, 13);
+    assert_eq!(snapshot.fetch.s3_fetches, 5);
+    assert_eq!(snapshot.fetch.singleflight_joins, 3);
+    assert_eq!(snapshot.fetch.bytes_downloaded, 20 * 1024 * 1024);
 }
 
 #[test]

@@ -189,6 +189,23 @@ pub(crate) fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
         format_bytes(snapshot.payload_burst.max_bytes_per_burst)
     ));
     out.push_str(&format!(
+        "upload_stale: total={} before_put={} after_put={} after_put_bytes={}\n",
+        snapshot.upload.canceled_stale,
+        snapshot.upload.canceled_stale_before_put,
+        snapshot.upload.canceled_stale_after_put,
+        format_bytes(snapshot.upload.canceled_stale_after_put_bytes)
+    ));
+    out.push_str(&format!(
+        "fetch: cache_hits={} s3_fetches={} s3_errors={} singleflight={} retries={} bytes_downloaded={} prefetch_skips={}\n",
+        snapshot.fetch.cache_hits,
+        snapshot.fetch.s3_fetches,
+        snapshot.fetch.s3_errors,
+        snapshot.fetch.singleflight_joins,
+        snapshot.fetch.retries,
+        format_bytes(snapshot.fetch.bytes_downloaded),
+        snapshot.fetch.prefetch_skips
+    ));
+    out.push_str(&format!(
         "payload_persist_p95_ms: {:.2}\n",
         snapshot.payload_persist.latency_quantiles_ms.p95
     ));
@@ -264,8 +281,9 @@ mod tests {
     use super::{collect_write_path_artifacts, render_write_path_summary};
     use crate::cli::test_cache_profile_types::ProfileArtifactKind;
     use studiofs_vfs::{
-        VfsWritePathDrainLagStats, VfsWritePathLandingZoneStats, VfsWritePathObservabilitySnapshot,
-        VfsWritePathWinfspCallbackStats, VfsWritePathWinfspForegroundFlushStats,
+        VfsFetchStats, VfsUploadStats, VfsWritePathDrainLagStats, VfsWritePathLandingZoneStats,
+        VfsWritePathObservabilitySnapshot, VfsWritePathWinfspCallbackStats,
+        VfsWritePathWinfspForegroundFlushStats,
     };
 
     #[test]
@@ -299,6 +317,42 @@ mod tests {
         ));
         assert!(summary.contains("winfsp_foreground_flushes: cleanup=0 cleanup_skipped_clean=0 flush=2 flush_skipped_clean=3 close=3 close_skipped_clean=4"));
         assert!(summary.contains("winfsp_validation: cleanup_non_delete=cleanup-deferred cleanup_non_delete_barriers=0 cleanup_non_delete_skipped_clean=0 cleanup_flush_fh=0 flush_barriers=2 close_barriers=3"));
+    }
+
+    #[test]
+    fn render_write_path_summary_includes_stale_upload_and_fetch_counters() {
+        let snapshot = VfsWritePathObservabilitySnapshot {
+            backend_tag: "local-payload-runtime".to_string(),
+            upload: VfsUploadStats {
+                canceled_stale: 7,
+                canceled_stale_before_put: 4,
+                canceled_stale_after_put: 3,
+                canceled_stale_after_put_bytes: 12 * 1024 * 1024,
+                ..Default::default()
+            },
+            fetch: VfsFetchStats {
+                cache_hits: 11,
+                s3_fetches: 5,
+                s3_errors: 1,
+                singleflight_joins: 2,
+                retries: 1,
+                bytes_downloaded: 20 * 1024 * 1024,
+                prefetch_skips: 9,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let bytes = serde_json::to_vec(&snapshot).expect("serialize snapshot");
+        let summary = render_write_path_summary(&bytes).expect("render summary");
+
+        assert!(
+            summary
+                .contains("upload_stale: total=7 before_put=4 after_put=3 after_put_bytes=12.0MiB")
+        );
+        assert!(summary.contains(
+            "fetch: cache_hits=11 s3_fetches=5 s3_errors=1 singleflight=2 retries=1 bytes_downloaded=20.0MiB prefetch_skips=9"
+        ));
     }
 
     #[test]

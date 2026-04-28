@@ -1,14 +1,13 @@
 use super::{
-    AccessLevel, Bytes, DirtyAttrPersistPolicy, ExplicitFlushOutcome, FileSessionOperation,
-    FileType, FsyncOutcome, HandleReleaseContext, Ino, LastHandleReleaseAction,
-    LocalSyncBarrierOutcome, LocalSyncPolicy, OpenFile, OpenFlags, ReleaseFhOutcome,
-    StickyErrorPolicy, StudioVfs, VfsResult,
+    AccessLevel, DirtyAttrPersistPolicy, ExplicitFlushOutcome, FileSessionOperation, FileType,
+    FsyncOutcome, HandleReleaseContext, Ino, LastHandleReleaseAction, LocalSyncBarrierOutcome,
+    LocalSyncPolicy, OpenFile, OpenFlags, ReleaseFhOutcome, StickyErrorPolicy, StudioVfs,
+    VfsResult,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
-use crate::landing_zone::LandingWrite;
 use crate::runtime::run_meta;
 use crate::{VfsError, VfsMeta};
 
@@ -44,27 +43,6 @@ impl StudioVfs {
         self.landing_zone
             .clear_inodes(&replayed_inodes)
             .map_err(VfsError::Io)?;
-        Ok(())
-    }
-
-    fn land_opportunistic_write(
-        &self,
-        ino: Ino,
-        fh: u64,
-        offset: u64,
-        data: Bytes,
-        local_sync_policy: LocalSyncPolicy,
-    ) -> VfsResult<()> {
-        if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
-            self.landing_zone
-                .accept(LandingWrite {
-                    ino,
-                    fh,
-                    offset,
-                    data,
-                })
-                .map_err(VfsError::Io)?;
-        }
         Ok(())
     }
 
@@ -113,7 +91,10 @@ impl StudioVfs {
     }
 
     fn should_continue_deferred_materialization(&self, ino: Ino) -> bool {
-        self.state.writer_stack.has_dirty_writers(ino)
+        self.state
+            .writer_stack
+            .completed_block_count_for_inode(ino)
+            .is_ok_and(|count| count > 0)
     }
 
     fn should_linger_deferred_materialization(&self, ino: Ino) -> bool {
@@ -123,7 +104,33 @@ impl StudioVfs {
         if self.handle_table.open_count(ino) == 0 {
             return false;
         }
-        self.state.writer_stack.has_dirty_writers(ino)
+        self.should_continue_deferred_materialization(ino)
+    }
+
+    fn should_linger_deferred_tail_materialization(&self, ino: Ino) -> bool {
+        !self.shutdown_requested()
+            && self.handle_table.open_count(ino) > 0
+            && self.state.writer_stack.dirty_bytes_for_inode(ino) > 0
+    }
+
+    fn deferred_materialization_linger_duration() -> Duration {
+        Duration::from_millis(
+            super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS
+                * super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES as u64,
+        )
+    }
+
+    async fn wait_for_deferred_materialization_inflight(&self, ino: Ino) {
+        let task_lock = {
+            self.state
+                .deferred_materialize_inflight
+                .lock()
+                .get(&ino)
+                .cloned()
+        };
+        if let Some(task_lock) = task_lock {
+            let _guard = task_lock.lock().await;
+        }
     }
 
     pub(super) async fn spawn_deferred_materialization_if_needed(self: &Arc<Self>, ino: Ino) {
@@ -135,6 +142,12 @@ impl StudioVfs {
             let mut inflight = self.state.deferred_materialize_inflight.lock();
             match inflight.entry(ino) {
                 std::collections::hash_map::Entry::Occupied(_) => {
+                    if self.state.writer_stack.dirty_bytes_for_inode(ino) > 0 {
+                        self.state
+                            .deferred_materialize_reschedule_needed
+                            .lock()
+                            .insert(ino);
+                    }
                     // #region debug log
                     self.debug_write_probe(
                         "H2",
@@ -170,9 +183,21 @@ impl StudioVfs {
             }),
         );
         // #endregion debug log
-        let guard = task_lock.clone().lock_owned().await;
+        self.start_deferred_materialization_task(ino, task_lock);
+    }
+
+    fn start_deferred_materialization_task(
+        self: &Arc<Self>,
+        ino: Ino,
+        task_lock: Arc<tokio::sync::Mutex<()>>,
+    ) {
+        let guard = task_lock
+            .clone()
+            .try_lock_owned()
+            .expect("new deferred materialization task lock should be uncontended");
         let vfs = Arc::clone(self);
         self.track_background_task(tokio::spawn(async move {
+            let mut allow_reschedule_on_exit = true;
             let mut no_progress_retries = 0usize;
             loop {
                 let writer_stack_dirty_before = vfs.state.writer_stack.dirty_bytes_for_inode(ino);
@@ -184,9 +209,13 @@ impl StudioVfs {
 
                 let materialize_writer_stack_started = Instant::now();
                 let writer_stack_materialized_bytes =
-                    match vfs.materialize_writer_stack_for_inode(ino).await {
+                    match vfs
+                        .materialize_writer_stack_completed_blocks_for_inode(ino)
+                        .await
+                    {
                     Ok(materialized_bytes) => materialized_bytes,
                     Err(e) => {
+                        allow_reschedule_on_exit = false;
                         if !vfs.suppress_deleted_inode_materialization_error(ino, &e) {
                             warn!(
                                 ino,
@@ -202,9 +231,13 @@ impl StudioVfs {
                 );
 
                 let materialize_for_limits_started = Instant::now();
-                let limits_materialized = match vfs.materialize_writer_stack_for_limits(ino).await {
+                let limits_materialized = match vfs
+                    .materialize_writer_stack_completed_blocks_for_limits(ino)
+                    .await
+                {
                     Ok(materialized) => materialized > 0,
                     Err(e) => {
+                        allow_reschedule_on_exit = false;
                         if !vfs.suppress_deleted_inode_materialization_error(ino, &e) {
                             warn!(
                                 ino,
@@ -237,10 +270,56 @@ impl StudioVfs {
 
                 let dirty_after = vfs.state.writer_stack.dirty_bytes_for_inode(ino);
                 let total_after = vfs.total_pending_write_buffer_bytes();
+                let completed_blocks_remain = vfs.should_continue_deferred_materialization(ino);
                 let made_progress = writer_stack_materialized_bytes > 0
                     || limits_materialized
                     || dirty_after < dirty_before
                     || total_after < total_before;
+
+                if dirty_after > 0
+                    && !completed_blocks_remain
+                    && vfs.should_linger_deferred_tail_materialization(ino)
+                {
+                    if no_progress_retries >= super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES {
+                        let idle_tail_started = Instant::now();
+                        let idle_tail_materialized = match vfs
+                            .materialize_writer_stack_idle_tail_for_inode(
+                                ino,
+                                Self::deferred_materialization_linger_duration(),
+                            )
+                            .await
+                        {
+                            Ok(materialized_bytes) => materialized_bytes,
+                            Err(e) => {
+                                allow_reschedule_on_exit = false;
+                                if !vfs.suppress_deleted_inode_materialization_error(ino, &e) {
+                                    warn!(
+                                        ino,
+                                        error = %e,
+                                        "deferred writer-stack idle-tail materialization failed; will retry at next strict barrier"
+                                    );
+                                }
+                                break;
+                            }
+                        };
+                        vfs.record_vfs_write_materialize_completed(idle_tail_started.elapsed());
+                        if idle_tail_materialized > 0 {
+                            no_progress_retries = 0;
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                    }
+
+                    no_progress_retries = no_progress_retries
+                        .saturating_add(1)
+                        .min(super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES);
+                    tokio::time::sleep(Duration::from_millis(
+                        super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS,
+                    ))
+                    .await;
+                    continue;
+                }
+
                 if made_progress {
                     no_progress_retries = 0;
                 } else if no_progress_retries < super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES
@@ -253,15 +332,46 @@ impl StudioVfs {
                     .await;
                     continue;
                 }
-                if !made_progress || !vfs.should_continue_deferred_materialization(ino) {
+                if !made_progress || !completed_blocks_remain {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
 
             drop(guard);
-            vfs.state.deferred_materialize_inflight.lock().remove(&ino);
+            vfs.finish_deferred_materialization_task(ino, allow_reschedule_on_exit);
         }));
+    }
+
+    pub(super) fn finish_deferred_materialization_task(
+        self: &Arc<Self>,
+        ino: Ino,
+        allow_reschedule: bool,
+    ) {
+        self.state.deferred_materialize_inflight.lock().remove(&ino);
+        let reschedule_needed = self
+            .state
+            .deferred_materialize_reschedule_needed
+            .lock()
+            .remove(&ino);
+        if !allow_reschedule || !reschedule_needed || self.shutdown_requested() {
+            return;
+        }
+        if self.state.writer_stack.dirty_bytes_for_inode(ino) == 0 {
+            return;
+        }
+        let task_lock = {
+            let mut inflight = self.state.deferred_materialize_inflight.lock();
+            match inflight.entry(ino) {
+                std::collections::hash_map::Entry::Occupied(_) => return,
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+                    entry.insert(Arc::clone(&task_lock));
+                    task_lock
+                }
+            }
+        };
+        self.start_deferred_materialization_task(ino, task_lock);
     }
 
     /// Release a file handle.
@@ -435,16 +545,7 @@ impl StudioVfs {
         // The parking_lot lock is scoped so the MutexGuard (which is !Send)
         // is dropped before the .await point.  We then acquire the
         // tokio::sync::Mutex which blocks until the background task releases it.
-        let task_lock = {
-            self.state
-                .deferred_materialize_inflight
-                .lock()
-                .get(&ino)
-                .cloned()
-        };
-        if let Some(task_lock) = task_lock {
-            let _guard = task_lock.lock().await;
-        }
+        self.wait_for_deferred_materialization_inflight(ino).await;
 
         let materialized_writer_stack_bytes = self.materialize_writer_stack_for_inode(ino).await?;
         let flushed_file_data = materialized_writer_stack_bytes > 0
@@ -737,12 +838,10 @@ impl StudioVfs {
                 return Ok(data.len() as u32);
             }
             self.note_vfs_write_call(data.len());
-            let shared_data = Bytes::copy_from_slice(data);
 
-            self.land_opportunistic_write(ino, fh, offset, shared_data.clone(), local_sync_policy)?;
             let record_writer_stack_started = Instant::now();
             let written = self
-                .record_writer_stack_state_bytes(fh, ino, offset, shared_data)
+                .record_writer_stack_state_bytes(fh, ino, offset, data)
                 .await?;
             self.record_vfs_write_record_writer_stack_state(record_writer_stack_started.elapsed());
 
@@ -759,6 +858,7 @@ impl StudioVfs {
             }
 
             if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
+                self.wait_for_deferred_materialization_inflight(ino).await;
                 let materialize_strict_started = Instant::now();
                 let strict_result = self.materialize_writer_stack_for_inode(ino).await;
                 self.record_vfs_write_materialize_strict(materialize_strict_started.elapsed());
@@ -856,7 +956,6 @@ impl StudioVfs {
                 .write_fh_with_local_sync_policy(fh, ino, offset, data, local_sync_policy)
                 .await;
         }
-
         // ── Acquire per-inode write gate ─────────────────────────────────
         let mut session = Some(
             self.state
@@ -872,7 +971,31 @@ impl StudioVfs {
             data.len(),
             self.access_tracker,
         );
-
+        if self.total_pending_write_buffer_bytes() > hard_backpressure_threshold {
+            self.state
+                .local_dirty
+                .hard_backpressure_events
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // #region debug log
+            self.debug_write_probe(
+                "H2",
+                "crates/studiofs-vfs/src/vfs/sync_ops.rs:866",
+                "hard backpressure fallback engaged after inode gate wait",
+                serde_json::json!({
+                    "ino": ino,
+                    "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
+                    "total_dirty_bytes": self.total_pending_write_buffer_bytes(),
+                    "hard_threshold_bytes": hard_backpressure_threshold,
+                    "max_dirty_bytes": self.max_dirty_bytes(),
+                }),
+            );
+            // #endregion debug log
+            drop(session);
+            self.state.file_session.gc_if_idle(ino);
+            return self
+                .write_fh_with_local_sync_policy(fh, ino, offset, data, local_sync_policy)
+                .await;
+        }
         // ── Buffer phase (fast: ~0.1 ms) ────────────────────────────────
         let result = async {
             self.enforce_access(ino, AccessLevel::ReadWrite)?;
@@ -892,12 +1015,10 @@ impl StudioVfs {
                 return Ok(data.len() as u32);
             }
             self.note_vfs_write_call(data.len());
-            let shared_data = Bytes::copy_from_slice(data);
 
-            self.land_opportunistic_write(ino, fh, offset, shared_data.clone(), local_sync_policy)?;
             let record_writer_stack_started = Instant::now();
             let written = self
-                .record_writer_stack_state_bytes(fh, ino, offset, shared_data)
+                .record_writer_stack_state_bytes(fh, ino, offset, data)
                 .await;
             self.record_vfs_write_record_writer_stack_state(record_writer_stack_started.elapsed());
             written
@@ -916,6 +1037,7 @@ impl StudioVfs {
             }
             (Ok(_), LocalSyncPolicy::Strict) => {
                 // Strict: await writer-stack materialization inline.
+                self.wait_for_deferred_materialization_inflight(ino).await;
                 let materialize_strict_started = Instant::now();
                 let materialized_bytes = match self.materialize_writer_stack_for_limits(ino).await {
                     Ok(materialized_bytes) => materialized_bytes,
@@ -963,12 +1085,12 @@ impl StudioVfs {
         result
     }
 
-    async fn record_writer_stack_state_bytes(
+    pub(super) async fn record_writer_stack_state_bytes(
         &self,
         fh: u64,
         ino: Ino,
         offset: u64,
-        data: Bytes,
+        data: &[u8],
     ) -> VfsResult<u32> {
         let mut base_attr;
         if let Some(attr) = self.state.namespace.dirty_attrs.lock().get(&ino).cloned() {
@@ -1005,6 +1127,7 @@ impl StudioVfs {
             attr.touch_mtime();
             self.update_pending_incarnation_size(ino, attr.size);
         }
+        self.invalidate_attr_read_cache([ino]);
         Ok(accepted.accepted_bytes)
     }
 
@@ -1074,6 +1197,107 @@ impl StudioVfs {
         if finished.is_empty() {
             return Ok(0);
         }
+        let installed_object_ids = finished
+            .iter()
+            .map(|slice| slice.object_id)
+            .collect::<Vec<_>>();
+        let materialized_bytes = self.install_finished_writer_stack_slices(ino, finished);
+        self.state
+            .writer_stack
+            .clear_materializing_object_ids(ino, &installed_object_ids);
+        Ok(materialized_bytes)
+    }
+
+    pub(super) async fn materialize_writer_stack_idle_tail_for_inode(
+        &self,
+        ino: Ino,
+        min_idle: Duration,
+    ) -> VfsResult<usize> {
+        let object_count = self
+            .state
+            .writer_stack
+            .prepare_finish_inode_if_idle(ino, min_idle)
+            .map_err(|err| VfsError::Other(format!("writer stack idle finish failed: {err}")))?;
+        if object_count == 0 {
+            return Ok(0);
+        }
+        let first_object_id = self
+            .reserve_writer_stack_object_ids_by_count(object_count)
+            .await?;
+        let finished = self
+            .state
+            .writer_stack
+            .finish_prepared_inode(ino, first_object_id)
+            .map_err(|err| VfsError::Other(format!("writer stack idle finish failed: {err}")))?;
+        if finished.is_empty() {
+            return Ok(0);
+        }
+        let installed_object_ids = finished
+            .iter()
+            .map(|slice| slice.object_id)
+            .collect::<Vec<_>>();
+        let materialized_bytes = self.install_finished_writer_stack_slices(ino, finished);
+        self.state
+            .writer_stack
+            .clear_materializing_object_ids(ino, &installed_object_ids);
+        Ok(materialized_bytes)
+    }
+
+    pub(super) async fn materialize_writer_stack_completed_blocks_for_inode(
+        &self,
+        ino: Ino,
+    ) -> VfsResult<usize> {
+        let object_count = self
+            .state
+            .writer_stack
+            .completed_block_count_for_inode(ino)
+            .map_err(|err| {
+                VfsError::Other(format!("writer stack completed block count failed: {err}"))
+            })?;
+        if object_count == 0 {
+            return Ok(0);
+        }
+        let object_count = self.completed_block_materialization_batch_blocks(object_count);
+        let first_object_id = self
+            .reserve_writer_stack_object_ids_by_count(object_count)
+            .await?;
+        let finished = self
+            .state
+            .writer_stack
+            .flush_completed_blocks_for_inode(ino, first_object_id, object_count as usize)
+            .map_err(|err| {
+                VfsError::Other(format!("writer stack completed block flush failed: {err}"))
+            })?;
+        if finished.is_empty() {
+            return Ok(0);
+        }
+        let installed_object_ids = finished
+            .iter()
+            .map(|slice| slice.object_id)
+            .collect::<Vec<_>>();
+        let materialized_bytes = self.install_finished_writer_stack_slices(ino, finished);
+        self.state
+            .writer_stack
+            .clear_materializing_object_ids(ino, &installed_object_ids);
+        Ok(materialized_bytes)
+    }
+
+    fn completed_block_materialization_batch_blocks(&self, available_blocks: u32) -> u32 {
+        if available_blocks == 0 {
+            return 0;
+        }
+        let block_size = self.block_size.max(1) as usize;
+        let target_bytes = self.write_eager_flush_batch_bytes.max(block_size);
+        let max_blocks = target_bytes.div_ceil(block_size).max(1);
+        let max_blocks = u32::try_from(max_blocks).unwrap_or(u32::MAX);
+        available_blocks.min(max_blocks)
+    }
+
+    fn install_finished_writer_stack_slices(
+        &self,
+        ino: Ino,
+        finished: Vec<super::writer_stack::FinishedWriterSlice>,
+    ) -> usize {
         let materialized_bytes = finished.iter().map(|slice| slice.len as usize).sum();
         for slice in finished {
             let file_offset = studiofs_meta::schema::chunk_start_offset(
@@ -1093,7 +1317,7 @@ impl StudioVfs {
                 },
             );
         }
-        Ok(materialized_bytes)
+        materialized_bytes
     }
 
     async fn materialize_writer_stack_for_limits(&self, preferred_ino: Ino) -> VfsResult<usize> {
@@ -1109,6 +1333,32 @@ impl StudioVfs {
                 continue;
             }
             let materialized = self.materialize_writer_stack_for_inode(ino).await?;
+            if materialized == 0 {
+                continue;
+            }
+            materialized_bytes = materialized_bytes.saturating_add(materialized);
+        }
+        Ok(materialized_bytes)
+    }
+
+    async fn materialize_writer_stack_completed_blocks_for_limits(
+        &self,
+        preferred_ino: Ino,
+    ) -> VfsResult<usize> {
+        let mut materialized_bytes = self
+            .materialize_writer_stack_completed_blocks_for_inode(preferred_ino)
+            .await?;
+        let dirty_inodes = self.state.writer_stack.snapshot_dirty_inodes_by_bytes();
+        for ino in dirty_inodes {
+            if self.state.writer_stack.total_dirty_bytes() <= self.max_dirty_bytes() {
+                break;
+            }
+            if ino == preferred_ino {
+                continue;
+            }
+            let materialized = self
+                .materialize_writer_stack_completed_blocks_for_inode(ino)
+                .await?;
             if materialized == 0 {
                 continue;
             }

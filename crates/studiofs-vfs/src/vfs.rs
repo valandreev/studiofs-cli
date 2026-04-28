@@ -62,16 +62,16 @@ pub use handle_drain_barrier::{
 };
 pub use locking::LockKind;
 pub use metrics::{
-    StatFs, VfsAttrReadCacheSnapshot, VfsCacheStateSnapshot, VfsForegroundReadProtectionStats,
-    VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot,
-    VfsNamespaceCacheSnapshot, VfsRuntimeEvent, VfsSynchronizationStateSnapshot,
-    VfsTransitMemorySnapshot, VfsUploadStats, VfsWritePathBackpressureStats,
-    VfsWritePathBurstStats, VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats,
-    VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats,
-    VfsWritePathLatencyQuantilesMs, VfsWritePathLatencyQuantilesSaturated,
-    VfsWritePathLocalCacheIoStats, VfsWritePathObservabilitySnapshot,
-    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats, VfsWritePathTuningStats,
-    VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
+    StatFs, VfsAttrReadCacheSnapshot, VfsCacheStateSnapshot, VfsFetchStats,
+    VfsForegroundReadProtectionStats, VfsIngressLane, VfsIngressPressure, VfsIngressStats,
+    VfsLatencyHistogramSnapshot, VfsNamespaceCacheSnapshot, VfsPortableAllocatorStats,
+    VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
+    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
+    VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
+    VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
+    VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
+    VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
+    VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
     VfsWritePathWinfspForegroundFlushStats, VfsWritePathWinfspWritePathStats,
     VfsZeroIoCacheBytesSnapshot, VfsZeroIoDrilldownEntry, VfsZeroIoHealthSignal,
     VfsZeroIoRuntimeSnapshot, VfsZeroIoShutdownSnapshot, VfsZeroIoStartupReplaySnapshot,
@@ -372,8 +372,8 @@ const DEFAULT_UPLOAD_USER_IDLE_GRACE_MS: u64 = 500;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_TARGET_MS: u64 = 35;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_WINDOW_MS: u64 = 1_500;
 const DEFAULT_UPLOAD_FG_READ_LATENCY_STICKY_WINDOWS: u64 = 2;
-const DEFAULT_MAX_DIRTY_BYTES: usize = 1_200 * 1024 * 1024;
-const DEFAULT_WRITE_EAGER_FLUSH_BATCH_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_MAX_DIRTY_BYTES: usize = 300 * 1024 * 1024;
+const DEFAULT_WRITE_EAGER_FLUSH_BATCH_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_FETCH_INITIAL_WINDOW: f64 = 0.0;
 const DEFAULT_FETCH_MIN_WINDOW: f64 = 1.0;
 const DEFAULT_FETCH_MAX_WINDOW: f64 = 0.0;
@@ -434,8 +434,8 @@ const DEFAULT_METADATA_INVALIDATION_SYNC_INTERVAL_MS: u64 = 5 * 60 * 1000;
 const DEFAULT_LOCK_LEASE_TTL: Duration = Duration::from_secs(120);
 const DEFAULT_LOCK_RETRY_BASE_MS: u64 = 25;
 const DEFAULT_LOCK_RETRY_MAX_MS: u64 = 500;
-const CACHE_RUNTIME_MIN_DIRTY_BYTES: usize = 1_200 * 1024 * 1024;
-const CACHE_RUNTIME_MAX_DIRTY_BYTES_BASE: usize = 1_200 * 1024 * 1024;
+const CACHE_RUNTIME_MIN_DIRTY_BYTES: usize = 300 * 1024 * 1024;
+const CACHE_RUNTIME_MAX_DIRTY_BYTES_BASE: usize = 300 * 1024 * 1024;
 const DEBUG_PENDING_PATH_SUFFIX_ENV: &str = "STUDIOFS_DEBUG_PENDING_PATH_SUFFIX";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TwoTierSegment {
@@ -1007,6 +1007,9 @@ struct UploadState {
     upload_requeues: AtomicU64,
     upload_canceled_deleted: AtomicU64,
     upload_canceled_stale: AtomicU64,
+    upload_canceled_stale_before_put: AtomicU64,
+    upload_canceled_stale_after_put: AtomicU64,
+    upload_canceled_stale_after_put_bytes: AtomicU64,
     upload_local_payload_reads: AtomicU64,
     upload_local_payload_read_bytes: AtomicU64,
     upload_fallback_deferrals: AtomicU64,
@@ -1209,6 +1212,9 @@ impl UploadState {
             upload_requeues: AtomicU64::new(0),
             upload_canceled_deleted: AtomicU64::new(0),
             upload_canceled_stale: AtomicU64::new(0),
+            upload_canceled_stale_before_put: AtomicU64::new(0),
+            upload_canceled_stale_after_put: AtomicU64::new(0),
+            upload_canceled_stale_after_put_bytes: AtomicU64::new(0),
             upload_local_payload_reads: AtomicU64::new(0),
             upload_local_payload_read_bytes: AtomicU64::new(0),
             upload_fallback_deferrals: AtomicU64::new(0),
@@ -2070,6 +2076,7 @@ impl VfsState {
             shutdown: ShutdownState::new(),
             metrics: MetricsState::new(),
             deferred_materialize_inflight: Mutex::new(HashMap::new()),
+            deferred_materialize_reschedule_needed: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -2093,6 +2100,10 @@ struct VfsState {
     /// is held by the background task while it runs; the flush / close path
     /// acquires the same lock to wait for completion — no TOCTOU races.
     deferred_materialize_inflight: Mutex<HashMap<Ino, Arc<tokio::sync::Mutex<()>>>>,
+    /// Inodes that received another write while their materializer was already
+    /// in-flight. The finishing task consumes this flag and schedules one more
+    /// pass if dirty writer-stack bytes remain.
+    deferred_materialize_reschedule_needed: Mutex<HashSet<Ino>>,
 }
 
 #[derive(Clone)]
@@ -4462,8 +4473,34 @@ impl StudioVfs {
         ino: Ino,
         attr: &InodeAttr,
     ) -> InodeIncarnationState {
-        let has_local_overlay = self.inode_has_local_overlay(ino);
         let has_pending_uploads = self.inode_has_pending_uploads(ino);
+        if Self::is_fully_published_regular_file(attr)
+            && !has_pending_uploads
+            && !self.has_pending_local_dirty_payloads_for_inode(ino)
+            && !self.state.writer_stack.has_dirty_writers(ino)
+            && !self
+                .state
+                .deferred_materialize_inflight
+                .lock()
+                .contains_key(&ino)
+        {
+            self.remove_live_extents_for_inode(ino);
+            self.remove_pending_epoch_finalizations_for_inode(ino);
+            self.clear_matching_dirty_attr_if_committed(ino, attr);
+            let next_state = InodeIncarnationState {
+                committed_incarnation: self.derive_committed_incarnation_from_attr(attr),
+                pending_incarnation: None,
+                upload_state: VfsUploadState::Idle,
+            };
+            self.state
+                .incarnation
+                .inode_incarnations
+                .lock()
+                .insert(ino, next_state.clone());
+            return next_state;
+        }
+
+        let has_local_overlay = self.inode_has_local_overlay(ino);
 
         let mut states = self.state.incarnation.inode_incarnations.lock();
         let previous = states
@@ -4734,6 +4771,13 @@ impl StudioVfs {
             && attr.upload_state != MetaUploadState::Ready
             && (attr.content_epoch != attr.committed_content_epoch
                 || attr.size != attr.committed_size)
+    }
+
+    fn is_fully_published_regular_file(attr: &InodeAttr) -> bool {
+        attr.kind == FileType::RegularFile
+            && attr.upload_state == MetaUploadState::Ready
+            && attr.content_epoch == attr.committed_content_epoch
+            && attr.size == attr.committed_size
     }
 
     fn queue_epoch_finalization(&self, ino: Ino, content_epoch: u64) {
@@ -5333,6 +5377,21 @@ impl StudioVfs {
                 .state
                 .upload
                 .upload_canceled_stale
+                .load(Ordering::Relaxed),
+            canceled_stale_before_put: self
+                .state
+                .upload
+                .upload_canceled_stale_before_put
+                .load(Ordering::Relaxed),
+            canceled_stale_after_put: self
+                .state
+                .upload
+                .upload_canceled_stale_after_put
+                .load(Ordering::Relaxed),
+            canceled_stale_after_put_bytes: self
+                .state
+                .upload
+                .upload_canceled_stale_after_put_bytes
                 .load(Ordering::Relaxed),
         }
     }
@@ -6508,6 +6567,27 @@ impl StudioVfs {
         let writer_stack_dirty_bytes = self.state.writer_stack.total_dirty_bytes();
         let total_dirty_bytes = pending_local_dirty_bytes.saturating_add(writer_stack_dirty_bytes);
         let upload_stats = self.upload_stats();
+        let fetch_metrics = &self.fetch_scheduler.metrics;
+        let fetch_cache_hits = fetch_metrics.cache_hits.load(Ordering::Relaxed);
+        let fetch_s3_fetches = fetch_metrics.s3_fetches.load(Ordering::Relaxed);
+        let fetch_s3_errors = fetch_metrics.s3_errors.load(Ordering::Relaxed);
+        let fetch_singleflight_joins = fetch_metrics.singleflight_joins.load(Ordering::Relaxed);
+        let fetch_retries = fetch_metrics.retries.load(Ordering::Relaxed);
+        let fetch_bytes_downloaded = fetch_metrics.bytes_downloaded.load(Ordering::Relaxed);
+        let fetch_prefetch_skips = fetch_metrics.prefetch_skips.load(Ordering::Relaxed);
+        let fetch_local_cache_io_calls = fetch_metrics.local_cache_io_calls.load(Ordering::Relaxed);
+        let fetch_local_cache_handoff_total_ns = fetch_metrics
+            .local_cache_io_handoff_total_ns
+            .load(Ordering::Relaxed);
+        let fetch_local_cache_handoff_max_ns = fetch_metrics
+            .local_cache_io_handoff_max_ns
+            .load(Ordering::Relaxed);
+        let fetch_local_cache_backend_total_ns = fetch_metrics
+            .local_cache_io_backend_total_ns
+            .load(Ordering::Relaxed);
+        let fetch_local_cache_backend_max_ns = fetch_metrics
+            .local_cache_io_backend_max_ns
+            .load(Ordering::Relaxed);
         let pending_upload_bytes =
             usize::try_from(upload_stats.pending_upload_bytes).unwrap_or(usize::MAX);
         let storage_stats = self.local_payload_backend.storage_stats();
@@ -6909,6 +6989,35 @@ impl StudioVfs {
                 staged_peak_bytes,
             },
             upload: upload_stats,
+            fetch: VfsFetchStats {
+                cache_hits: fetch_cache_hits,
+                s3_fetches: fetch_s3_fetches,
+                s3_errors: fetch_s3_errors,
+                singleflight_joins: fetch_singleflight_joins,
+                retries: fetch_retries,
+                bytes_downloaded: fetch_bytes_downloaded,
+                prefetch_skips: fetch_prefetch_skips,
+                local_cache_io_calls: fetch_local_cache_io_calls,
+                local_cache_handoff_total_ms: fetch_local_cache_handoff_total_ns as f64
+                    / 1_000_000.0,
+                local_cache_handoff_avg_ms: if fetch_local_cache_io_calls == 0 {
+                    0.0
+                } else {
+                    (fetch_local_cache_handoff_total_ns as f64 / fetch_local_cache_io_calls as f64)
+                        / 1_000_000.0
+                },
+                local_cache_handoff_max_ms: fetch_local_cache_handoff_max_ns as f64 / 1_000_000.0,
+                local_cache_backend_io_total_ms: fetch_local_cache_backend_total_ns as f64
+                    / 1_000_000.0,
+                local_cache_backend_io_avg_ms: if fetch_local_cache_io_calls == 0 {
+                    0.0
+                } else {
+                    (fetch_local_cache_backend_total_ns as f64 / fetch_local_cache_io_calls as f64)
+                        / 1_000_000.0
+                },
+                local_cache_backend_io_max_ms: fetch_local_cache_backend_max_ns as f64
+                    / 1_000_000.0,
+            },
             payload_burst: VfsWritePathBurstStats {
                 bursts: payload_burst_count,
                 bursts_per_sec: Self::per_second(payload_burst_count, elapsed),
@@ -6967,6 +7076,7 @@ impl StudioVfs {
                 payload_put_concurrency: self.payload_put_concurrency,
                 sync_group_min_bytes: self.local_sync_group_min_bytes,
             },
+            allocator: None,
         }
     }
 
