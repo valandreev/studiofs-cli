@@ -721,14 +721,14 @@ impl StudioVfs {
         if let Some(cached) = self.dentry_cache_lookup(parent, name) {
             match cached {
                 super::DentryCacheValue::Positive(child_ino) => {
-                    match self.sync_meta().get_attr(child_ino) {
+                    match self.getattr_unchecked(child_ino) {
                         Ok(attr) => return Ok(attr),
-                        Err(MetaError::InodeNotFound(_)) => {
+                        Err(VfsError::Meta(MetaError::InodeNotFound(_))) => {
                             self.dentry_cache_invalidate(parent, name);
                             self.heal_orphaned_dentry(parent, name, Some(child_ino));
                             return Err(Self::ignored_entry_not_found(parent, name));
                         }
-                        Err(err) => return Err(VfsError::Meta(err)),
+                        Err(err) => return Err(err),
                     }
                 }
                 super::DentryCacheValue::Negative => {
@@ -894,7 +894,7 @@ impl StudioVfs {
         parent: Ino,
         name: &[u8],
         target: UnlinkTarget,
-    ) -> VfsResult<Option<Ino>> {
+    ) -> VfsResult<Option<InodeAttr>> {
         let attr = match meta.unlink_open_handle(parent, name) {
             Ok(attr) => attr,
             Err(MetaError::InodeNotFound(_)) => {
@@ -915,7 +915,7 @@ impl StudioVfs {
             "unlink ino={}: {} open handles, deferred cleanup (orphan)",
             target.ino, target.open_handles
         );
-        Ok(Some(target.ino))
+        Ok(Some(attr))
     }
 
     async fn unlink_without_open_handles(
@@ -924,7 +924,7 @@ impl StudioVfs {
         parent: Ino,
         name: &[u8],
         target: UnlinkTarget,
-    ) -> VfsResult<Option<Ino>> {
+    ) -> VfsResult<Option<InodeAttr>> {
         let pre_unlink_object_ids = self
             .regular_file_graph_usage(meta, target.ino)
             .map(|usage| usage.object_ids)
@@ -954,7 +954,7 @@ impl StudioVfs {
             );
         }
 
-        Ok(Some(attr.ino))
+        Ok(Some(attr))
     }
 
     pub fn link(&self, ino: Ino, new_parent: Ino, new_name: &[u8]) -> VfsResult<InodeAttr> {
@@ -1101,7 +1101,7 @@ impl StudioVfs {
         let meta = self.sync_meta();
         let unlink_target = self.resolve_unlink_target(&meta, parent, name)?;
         self.enforce_no_known_foreign_hard_lock(unlink_target.ino)?;
-        let Some(removed_ino) = (if unlink_target.open_handles > 0 {
+        let Some(unlinked_attr) = (if unlink_target.open_handles > 0 {
             self.unlink_with_open_handles(&meta, parent, name, unlink_target)?
         } else {
             self.unlink_without_open_handles(&meta, parent, name, unlink_target)
@@ -1110,7 +1110,15 @@ impl StudioVfs {
             return Ok(());
         };
 
-        namespace_mutations.record_removal(parent, name, [removed_ino]);
+        namespace_mutations.record_removal(parent, name, [unlinked_attr.ino]);
+        if unlinked_attr.nlink > 0 {
+            self.state.namespace.attr_read_cache.lock().put(
+                unlinked_attr.ino,
+                unlinked_attr,
+                ATTR_CACHE_TTL,
+                Instant::now(),
+            );
+        }
         meta.request_eager_flush();
         Ok(())
     }
