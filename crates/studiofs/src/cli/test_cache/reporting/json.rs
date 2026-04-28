@@ -330,7 +330,7 @@ mod tests {
                 materialization_total_ms_delta: 44.0,
                 local_cache_io_calls_delta: 8,
                 local_cache_backend_io_total_ms_delta: 40.0,
-                local_cache_backend_io_max_ms: 12.0,
+                local_cache_backend_io_cumulative_max_ms: 12.0,
             }],
         });
         let now = Utc
@@ -355,6 +355,14 @@ mod tests {
         assert_eq!(
             timeline["samples"][0]["local_cache_backend_io_total_ms_delta"],
             40.0
+        );
+        assert_eq!(
+            timeline["samples"][0]["local_cache_backend_io_cumulative_max_ms"],
+            12.0
+        );
+        assert!(
+            timeline["samples"][0]["local_cache_backend_io_max_ms"].is_null(),
+            "bucket-local max should not be serialized from the cumulative VFS max"
         );
     }
 

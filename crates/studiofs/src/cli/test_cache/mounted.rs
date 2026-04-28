@@ -475,7 +475,7 @@ struct MountedWritebackTimelineBucket {
     materialization_total_ms_delta: f64,
     local_cache_io_calls_delta: u64,
     local_cache_backend_io_total_ms_delta: f64,
-    local_cache_backend_io_max_ms: f64,
+    local_cache_backend_io_cumulative_max_ms: f64,
 }
 
 impl MountedWritebackTimelineBucket {
@@ -500,7 +500,7 @@ impl MountedWritebackTimelineBucket {
             materialization_total_ms_delta: 0.0,
             local_cache_io_calls_delta: 0,
             local_cache_backend_io_total_ms_delta: 0.0,
-            local_cache_backend_io_max_ms: 0.0,
+            local_cache_backend_io_cumulative_max_ms: 0.0,
         }
     }
 
@@ -578,9 +578,7 @@ impl MountedWritebackTimelineBucket {
         self.local_cache_backend_io_total_ms_delta += (after.local_cache_io.backend_io_total_ms
             - before.local_cache_io.backend_io_total_ms)
             .max(0.0);
-        self.local_cache_backend_io_max_ms = self
-            .local_cache_backend_io_max_ms
-            .max(after.local_cache_io.backend_io_max_ms);
+        self.local_cache_backend_io_cumulative_max_ms = after.local_cache_io.backend_io_max_ms;
     }
 
     fn bytes_per_sec(bytes: u64, duration_ms: u64) -> f64 {
@@ -620,7 +618,7 @@ impl MountedWritebackTimelineBucket {
             materialization_total_ms_delta: self.materialization_total_ms_delta,
             local_cache_io_calls_delta: self.local_cache_io_calls_delta,
             local_cache_backend_io_total_ms_delta: self.local_cache_backend_io_total_ms_delta,
-            local_cache_backend_io_max_ms: self.local_cache_backend_io_max_ms,
+            local_cache_backend_io_cumulative_max_ms: self.local_cache_backend_io_cumulative_max_ms,
         }
     }
 }
@@ -2724,7 +2722,7 @@ mod tests {
         assert_eq!(sample.materialization_total_ms_delta, 44.0);
         assert_eq!(sample.local_cache_io_calls_delta, 9);
         assert_eq!(sample.local_cache_backend_io_total_ms_delta, 40.0);
-        assert_eq!(sample.local_cache_backend_io_max_ms, 12.0);
+        assert_eq!(sample.local_cache_backend_io_cumulative_max_ms, 12.0);
     }
 
     #[test]

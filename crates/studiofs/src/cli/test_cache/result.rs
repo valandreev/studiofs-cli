@@ -333,7 +333,7 @@ pub(super) struct MountedWritebackTimelineSampleReport {
     pub(super) materialization_total_ms_delta: f64,
     pub(super) local_cache_io_calls_delta: u64,
     pub(super) local_cache_backend_io_total_ms_delta: f64,
-    pub(super) local_cache_backend_io_max_ms: f64,
+    pub(super) local_cache_backend_io_cumulative_max_ms: f64,
 }
 
 #[derive(Debug, Serialize)]

@@ -229,7 +229,7 @@ fn render_mounted_writeback_timeline(out: &mut String, timeline: &MountedWriteba
         .fold(0.0, f64::max);
     let _ = writeln!(
         out,
-        "Last {} ms [{}]: fg {}, payload {}, upload {}, writer {}, staged {}, pending upload {}",
+        "At T+{} ms [{}]: fg {}, payload {}, upload {}, writer {}, staged {}, pending upload {}",
         last.elapsed_ms,
         last.phase,
         format_throughput(last.foreground_write_bytes_per_sec),
@@ -915,13 +915,15 @@ mod tests {
                 materialization_total_ms_delta: 44.0,
                 local_cache_io_calls_delta: 8,
                 local_cache_backend_io_total_ms_delta: 40.0,
-                local_cache_backend_io_max_ms: 12.0,
+                local_cache_backend_io_cumulative_max_ms: 12.0,
             }],
         });
 
         let summary = render_human_summary(&report);
 
         assert!(summary.contains("Mounted writeback timeline"));
+        assert!(summary.contains("At T+1000 ms"));
+        assert!(!summary.contains("Last 1000 ms"));
         assert!(summary.contains("Backpressure:"));
         assert!(summary.contains("local cache IO"));
     }
