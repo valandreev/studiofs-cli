@@ -1042,10 +1042,7 @@ mod tests {
                 .is_ok();
             if failed {
                 return Err(LocalPayloadBackendError::Other(Box::new(
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        "transient local payload failure",
-                    ),
+                    std::io::Error::other("transient local payload failure"),
                 )));
             }
             Ok(())
