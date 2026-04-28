@@ -1996,6 +1996,7 @@ fn cache_runtime_tuning_defaults_match_juicefs_sized_windows() {
         derive_cache_runtime_tuning(100 * 1024 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024);
 
     assert_eq!(DEFAULT_MAX_DIRTY_BYTES, 300 * 1024 * 1024);
+    assert_eq!(DEFAULT_WRITE_EAGER_FLUSH_BATCH_BYTES, 64 * 1024 * 1024);
     assert_eq!(derived.max_dirty_bytes, 300 * 1024 * 1024);
     assert_eq!(derived.write_eager_flush_batch_bytes, 64 * 1024 * 1024);
     assert_eq!(derived.transit_memory_budget_bytes, 300 * 1024 * 1024);

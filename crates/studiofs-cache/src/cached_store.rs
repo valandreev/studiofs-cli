@@ -500,16 +500,16 @@ impl CachedStore {
         &self,
         entries: Vec<DetachedStagedSlice>,
     ) -> Result<(), CachedStoreWriterError> {
-        if entries.is_empty() {
+        let Some(first_entry) = entries.first() else {
             return Ok(());
-        }
+        };
 
         let started_at = Instant::now();
         let object_ids = entries
             .iter()
             .map(|entry| entry.staged.object_id)
             .collect::<Vec<_>>();
-        let first_object_id = object_ids[0];
+        let first_object_id = first_entry.staged.object_id;
         let puts = entries
             .iter()
             .map(|entry| LocalPayloadPut {

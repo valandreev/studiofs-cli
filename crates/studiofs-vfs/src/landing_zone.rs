@@ -15,12 +15,14 @@ const DATA_FILE: &str = "landing.data";
 const MANIFEST_FILE: &str = "landing.manifest";
 const MANIFEST_TMP_FILE: &str = "landing.manifest.tmp";
 const MANIFEST_BACKUP_FILE: &str = "landing.manifest.bak";
+#[cfg(test)]
 const DEFAULT_MAX_QUEUED_WRITES: usize = 1024;
+#[cfg(test)]
 const DEFAULT_MAX_QUEUED_BYTES: usize = 256 * 1024 * 1024;
 #[cfg(windows)]
 const LANDING_FILE_SHARE_MODE: u32 = 0x00000001 | 0x00000002 | 0x00000004;
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(super) struct LandingWrite {
     pub(super) ino: u64,
     pub(super) fh: u64,
@@ -125,7 +127,7 @@ pub(super) struct LandingZone {
     writer: Mutex<Option<JoinHandle<()>>>,
     writer_state: Arc<LandingWriterShared>,
     counters: Arc<LandingZoneCounters>,
-    #[allow(dead_code)]
+    #[cfg(test)]
     queue_limits: LandingQueueLimits,
 }
 
@@ -151,14 +153,14 @@ struct LandingFiles {
     segments: Vec<LandingSegment>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct LandingQueueLimits {
-    #[allow(dead_code)]
     max_writes: usize,
-    #[allow(dead_code)]
     max_bytes: usize,
 }
 
+#[cfg(test)]
 impl Default for LandingQueueLimits {
     fn default() -> Self {
         Self {
@@ -191,7 +193,7 @@ struct LandingWriterState {
 }
 
 impl LandingWriterState {
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn can_accept(&self, write_len: usize, limits: LandingQueueLimits) -> bool {
         if self.queue.len() >= limits.max_writes.max(1) {
             return false;
@@ -202,7 +204,7 @@ impl LandingWriterState {
             || self.queue.is_empty()
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn push_queued(&mut self, write: QueuedLandingWrite) {
         self.queued_bytes = self.queued_bytes.saturating_add(write.len());
         self.queue.push_back(write);
@@ -247,13 +249,20 @@ impl std::fmt::Debug for LandingZone {
 
 impl LandingZone {
     pub(super) fn open(root: impl AsRef<Path>) -> io::Result<Self> {
-        Self::open_with_queue_limits(root, LandingQueueLimits::default())
+        Self::open_inner(root)
     }
 
+    #[cfg(test)]
     fn open_with_queue_limits(
         root: impl AsRef<Path>,
         queue_limits: LandingQueueLimits,
     ) -> io::Result<Self> {
+        let mut zone = Self::open_inner(root)?;
+        zone.queue_limits = queue_limits;
+        Ok(zone)
+    }
+
+    fn open_inner(root: impl AsRef<Path>) -> io::Result<Self> {
         let root = root.as_ref();
         std::fs::create_dir_all(root)?;
         let data_path = root.join(DATA_FILE);
@@ -294,11 +303,12 @@ impl LandingZone {
             writer: Mutex::new(writer),
             writer_state,
             counters,
-            queue_limits,
+            #[cfg(test)]
+            queue_limits: LandingQueueLimits::default(),
         })
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(super) fn accept(&self, write: LandingWrite) -> io::Result<()> {
         let accept_started = Instant::now();
         let write_len = write.data.len();
@@ -350,7 +360,7 @@ impl LandingZone {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(super) fn read(&self, ino: u64, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         if len == 0 {
             return Ok(Vec::new());
@@ -763,7 +773,7 @@ impl LandingZone {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn record_accept_latency(&self, duration: Duration) {
         let elapsed_ns = duration_ns_u64(duration);
         self.counters
