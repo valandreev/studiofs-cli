@@ -1567,6 +1567,64 @@ fn nonzero_extend_keeps_retained_overlay_uploads_on_current_epoch() {
 }
 
 #[test]
+fn handle_backed_extend_keeps_writer_stack_buffered_without_strict_sync() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "handle-extend-no-strict-sync");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"handle-extend-no-strict-sync.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let fh = vfs
+            .open_file(ino, OpenFlags::RDWR, false)
+            .expect("open writable handle");
+        let payload = b"handle-backed-extend";
+
+        vfs.write_fh_with_local_sync_policy(fh, ino, 0, payload, LocalSyncPolicy::Opportunistic)
+            .await
+            .expect("buffer writer-stack payload");
+        assert!(vfs.state.writer_stack.has_dirty_writers(ino));
+
+        let sync_calls_before = vfs
+            .state
+            .metrics
+            .payload_store_sync_data_calls
+            .load(Ordering::Relaxed);
+
+        let extended = vfs
+            .setattr_with_handle(
+                Some(fh),
+                ino,
+                SetattrArgs::size_only((payload.len() + 4096) as u64),
+            )
+            .expect("handle-backed logical-size growth");
+
+        let sync_calls_after = vfs
+            .state
+            .metrics
+            .payload_store_sync_data_calls
+            .load(Ordering::Relaxed);
+        assert_eq!(
+            sync_calls_after, sync_calls_before,
+            "handle-backed logical-size growth must not force strict sync_data"
+        );
+        assert_eq!(extended.size, (payload.len() + 4096) as u64);
+        assert!(
+            vfs.state.writer_stack.has_dirty_writers(ino),
+            "logical-size growth should leave foreground write data buffered"
+        );
+        assert!(
+            vfs.pending_uploads_for_inode(ino).is_empty(),
+            "logical-size growth should not materialize or enqueue uploads"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn epoch_finalizer_guard_observes_writer_stack_tail() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-writer-stack-tail");
@@ -5762,6 +5820,121 @@ fn release_fh_materializes_opportunistic_writer_stack_state() {
             !vfs.state.writer_stack.has_dirty_writers(ino),
             "last-handle release should drain writer-stack dirty state"
         );
+    });
+}
+
+#[test]
+fn release_fh_drains_tail_after_deferred_completed_block_materialization() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-301-release-deferred-tail");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-301-release-deferred-tail.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let block_size = vfs.block_size as usize;
+        let tail_size = block_size / 3;
+        let mut payload = vec![0xC3; block_size];
+        payload.extend(std::iter::repeat_n(0x7E, tail_size));
+
+        vfs.write_fh_with_local_sync_policy(fh, ino, 0, &payload, LocalSyncPolicy::Opportunistic)
+            .await
+            .unwrap();
+        vfs.materialize_writer_stack_completed_blocks_for_inode(ino)
+            .await
+            .unwrap();
+        assert_eq!(
+            vfs.total_pending_persisted_local_dirty_slice_bytes(),
+            block_size,
+            "setup should persist the completed block locally before release"
+        );
+        assert_eq!(
+            vfs.state.writer_stack.dirty_bytes_for_inode(ino),
+            tail_size,
+            "setup should leave only the partial tail in the writer stack"
+        );
+
+        let outcome = vfs.release_fh_with_outcome(fh).await.unwrap();
+
+        assert!(outcome.closed_last_handle);
+        assert!(
+            outcome.flushed_local_dirty_state,
+            "last-handle release must report the deferred tail drain"
+        );
+        assert_eq!(
+            vfs.state.writer_stack.dirty_bytes_for_inode(ino),
+            0,
+            "last-handle release must not leave a writer-stack tail for a closed file"
+        );
+        assert_eq!(
+            vfs.total_landed_write_drain_lag_bytes(),
+            0,
+            "closed file should have no landed-write drain lag after release"
+        );
+        let spans = meta
+            .lookup_regular_file_slices(ino, 0, payload.len() as u64)
+            .unwrap();
+        assert!(
+            spans.iter().any(|span| span.payload.is_some()),
+            "release should commit materialized payload slices"
+        );
+    });
+}
+
+#[test]
+fn deferred_materialization_drains_idle_tail_before_close() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-301-idle-tail-before-close");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-301-idle-tail-before-close.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let block_size = vfs.block_size as usize;
+        let tail_size = block_size / 3;
+        let mut payload = vec![0xA1; block_size];
+        payload.extend(std::iter::repeat_n(0xB2, tail_size));
+
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            &payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if vfs.state.writer_stack.dirty_bytes_for_inode(ino) == 0
+                    && vfs.total_pending_persisted_local_dirty_slice_bytes() == 0
+                    && !vfs.pending_uploads_for_inode(ino).is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("idle deferred tail should materialize and enter upload before close");
+
+        assert_eq!(
+            vfs.open_count(ino),
+            1,
+            "setup keeps the writer handle open to exercise background idle-tail drain"
+        );
+        assert_eq!(
+            vfs.state.writer_stack.dirty_bytes_for_inode(ino),
+            0,
+            "background materialization should not wait for last-handle release"
+        );
+
+        vfs.release_fh(fh).await.unwrap();
     });
 }
 

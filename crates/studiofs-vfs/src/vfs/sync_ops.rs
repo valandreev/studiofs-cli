@@ -107,6 +107,19 @@ impl StudioVfs {
         self.should_continue_deferred_materialization(ino)
     }
 
+    fn should_linger_deferred_tail_materialization(&self, ino: Ino) -> bool {
+        !self.shutdown_requested()
+            && self.handle_table.open_count(ino) > 0
+            && self.state.writer_stack.dirty_bytes_for_inode(ino) > 0
+    }
+
+    fn deferred_materialization_linger_duration() -> Duration {
+        Duration::from_millis(
+            super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS
+                * super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES as u64,
+        )
+    }
+
     pub(super) async fn spawn_deferred_materialization_if_needed(self: &Arc<Self>, ino: Ino) {
         if self.shutdown_requested() {
             return;
@@ -224,10 +237,55 @@ impl StudioVfs {
 
                 let dirty_after = vfs.state.writer_stack.dirty_bytes_for_inode(ino);
                 let total_after = vfs.total_pending_write_buffer_bytes();
+                let completed_blocks_remain = vfs.should_continue_deferred_materialization(ino);
                 let made_progress = writer_stack_materialized_bytes > 0
                     || limits_materialized
                     || dirty_after < dirty_before
                     || total_after < total_before;
+
+                if dirty_after > 0
+                    && !completed_blocks_remain
+                    && vfs.should_linger_deferred_tail_materialization(ino)
+                {
+                    if no_progress_retries >= super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES {
+                        let idle_tail_started = Instant::now();
+                        let idle_tail_materialized = match vfs
+                            .materialize_writer_stack_idle_tail_for_inode(
+                                ino,
+                                Self::deferred_materialization_linger_duration(),
+                            )
+                            .await
+                        {
+                            Ok(materialized_bytes) => materialized_bytes,
+                            Err(e) => {
+                                if !vfs.suppress_deleted_inode_materialization_error(ino, &e) {
+                                    warn!(
+                                        ino,
+                                        error = %e,
+                                        "deferred writer-stack idle-tail materialization failed; will retry at next strict barrier"
+                                    );
+                                }
+                                break;
+                            }
+                        };
+                        vfs.record_vfs_write_materialize_completed(idle_tail_started.elapsed());
+                        if idle_tail_materialized > 0 {
+                            no_progress_retries = 0;
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                    }
+
+                    no_progress_retries = no_progress_retries
+                        .saturating_add(1)
+                        .min(super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES);
+                    tokio::time::sleep(Duration::from_millis(
+                        super::DEFERRED_MATERIALIZATION_LINGER_WAIT_MS,
+                    ))
+                    .await;
+                    continue;
+                }
+
                 if made_progress {
                     no_progress_retries = 0;
                 } else if no_progress_retries < super::DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES
@@ -240,7 +298,7 @@ impl StudioVfs {
                     .await;
                     continue;
                 }
-                if !made_progress || !vfs.should_continue_deferred_materialization(ino) {
+                if !made_progress || !completed_blocks_remain {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -1078,6 +1136,41 @@ impl StudioVfs {
             .writer_stack
             .finish_prepared_inode(ino, first_object_id)
             .map_err(|err| VfsError::Other(format!("writer stack finish failed: {err}")))?;
+        if finished.is_empty() {
+            return Ok(0);
+        }
+        let installed_object_ids = finished
+            .iter()
+            .map(|slice| slice.object_id)
+            .collect::<Vec<_>>();
+        let materialized_bytes = self.install_finished_writer_stack_slices(ino, finished);
+        self.state
+            .writer_stack
+            .clear_materializing_object_ids(ino, &installed_object_ids);
+        Ok(materialized_bytes)
+    }
+
+    pub(super) async fn materialize_writer_stack_idle_tail_for_inode(
+        &self,
+        ino: Ino,
+        min_idle: Duration,
+    ) -> VfsResult<usize> {
+        let object_count = self
+            .state
+            .writer_stack
+            .prepare_finish_inode_if_idle(ino, min_idle)
+            .map_err(|err| VfsError::Other(format!("writer stack idle finish failed: {err}")))?;
+        if object_count == 0 {
+            return Ok(0);
+        }
+        let first_object_id = self
+            .reserve_writer_stack_object_ids_by_count(object_count)
+            .await?;
+        let finished = self
+            .state
+            .writer_stack
+            .finish_prepared_inode(ino, first_object_id)
+            .map_err(|err| VfsError::Other(format!("writer stack idle finish failed: {err}")))?;
         if finished.is_empty() {
             return Ok(0);
         }

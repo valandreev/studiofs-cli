@@ -17,6 +17,17 @@ struct TruncateMutation {
 type ChunkSliceBatch = Vec<(ChunkId, Vec<SliceRecord>)>;
 type RemovedObjectList = Vec<(u32, u64)>;
 
+fn setattr_args_are_size_only(args: &SetattrArgs) -> bool {
+    args.size.is_some()
+        && args.mode.is_none()
+        && args.uid.is_none()
+        && args.gid.is_none()
+        && args.atime.resolve().is_none()
+        && args.mtime.resolve().is_none()
+        && args.crtime.resolve().is_none()
+        && args.win_attrs.is_none()
+}
+
 impl StudioVfs {
     pub fn setattr(&self, ino: Ino, args: SetattrArgs) -> VfsResult<InodeAttr> {
         self.setattr_with_handle(None, ino, args)
@@ -61,13 +72,21 @@ impl StudioVfs {
         }
 
         let mut attr = self.getattr(ino)?;
-        if args.size.is_some_and(|new_size| new_size != attr.size) {
+        if let Some(new_size) = args.size
+            && new_size != attr.size
+        {
             if let Some(handle) = fh {
                 self.enforce_mutating_handle_access(handle, ino)?;
             } else {
                 self.enforce_no_known_foreign_hard_lock(ino)?;
             }
-            return Self::run_sync_future(self.setattr_with_size_change(ino, args.clone()));
+            let defer_handle_growth_flush =
+                fh.is_some() && new_size > attr.size && setattr_args_are_size_only(&args);
+            return Self::run_sync_future(self.setattr_with_size_change(
+                ino,
+                args.clone(),
+                defer_handle_growth_flush,
+            ));
         }
 
         let mut changed = false;
@@ -122,27 +141,47 @@ impl StudioVfs {
         Ok(attr)
     }
 
-    async fn setattr_with_size_change(&self, ino: Ino, args: SetattrArgs) -> VfsResult<InodeAttr> {
+    async fn setattr_with_size_change(
+        &self,
+        ino: Ino,
+        args: SetattrArgs,
+        defer_handle_growth_flush: bool,
+    ) -> VfsResult<InodeAttr> {
         let session = self
             .state
             .file_session
             .enter_op(ino, FileSessionOperation::Flush)
             .await;
         let result: VfsResult<InodeAttr> = async {
-            let persisted_slice_bytes_before_flush =
-                self.total_pending_persisted_local_dirty_slice_bytes();
-            let materialized_writer_stack_bytes =
-                self.materialize_writer_stack_for_inode(ino).await?;
-            self.flush_local_dirty_state(ino, LocalSyncPolicy::Strict)
+            let candidate_old_attr = if defer_handle_growth_flush {
+                Some(self.getattr_async(ino).await?)
+            } else {
+                None
+            };
+            let defer_strict_flush_for_growth =
+                candidate_old_attr.as_ref().is_some_and(|old_attr| {
+                    args.size.is_some_and(|new_size| new_size > old_attr.size)
+                        && setattr_args_are_size_only(&args)
+                });
+            let old_attr = if defer_strict_flush_for_growth {
+                candidate_old_attr.expect("candidate attr present for deferred growth")
+            } else {
+                let persisted_slice_bytes_before_flush =
+                    self.total_pending_persisted_local_dirty_slice_bytes();
+                let materialized_writer_stack_bytes =
+                    self.materialize_writer_stack_for_inode(ino).await?;
+                self.flush_local_dirty_state(ino, LocalSyncPolicy::Strict)
+                    .await?;
+                self.maybe_payload_store_sync_data_async(
+                    materialized_writer_stack_bytes
+                        .saturating_add(persisted_slice_bytes_before_flush)
+                        as u64,
+                    LocalSyncPolicy::Strict,
+                )
                 .await?;
-            self.maybe_payload_store_sync_data_async(
-                materialized_writer_stack_bytes.saturating_add(persisted_slice_bytes_before_flush)
-                    as u64,
-                LocalSyncPolicy::Strict,
-            )
-            .await?;
 
-            let old_attr = self.getattr_async(ino).await?;
+                self.getattr_async(ino).await?
+            };
             let mut attr = old_attr.clone();
             let mut truncate_mutation = None;
             let mut requeue_retained_uploads = false;
@@ -202,20 +241,22 @@ impl StudioVfs {
                 .insert(ino, attr.clone());
             self.state.namespace.attr_read_cache.lock().remove(ino);
 
-            let flush_result = match self.fail_size_change_setattr_before_flush_for_test() {
-                Ok(()) => {
-                    self.flush_local_dirty_state(ino, LocalSyncPolicy::Strict)
-                        .await
+            if !defer_strict_flush_for_growth {
+                let flush_result = match self.fail_size_change_setattr_before_flush_for_test() {
+                    Ok(()) => {
+                        self.flush_local_dirty_state(ino, LocalSyncPolicy::Strict)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = flush_result {
+                    self.rollback_failed_size_change_setattr(
+                        ino,
+                        &old_attr,
+                        truncate_mutation.as_ref(),
+                    )?;
+                    return Err(error);
                 }
-                Err(error) => Err(error),
-            };
-            if let Err(error) = flush_result {
-                self.rollback_failed_size_change_setattr(
-                    ino,
-                    &old_attr,
-                    truncate_mutation.as_ref(),
-                )?;
-                return Err(error);
             }
 
             if requeue_retained_uploads {

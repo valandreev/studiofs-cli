@@ -3,6 +3,7 @@ use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use studiofs_cache::{
     CachedStore, CachedStoreWriterConfig, CachedStoreWriterError, CachedStoreWriterSlice,
     DetachedStagedSlice, StagedSlice,
@@ -120,6 +121,7 @@ struct FileWriter {
     next_object_id: u64,
     chunks: BTreeMap<ChunkId, ChunkWriter>,
     dirty_bytes: usize,
+    last_write: Instant,
     sticky_error: Option<String>,
 }
 
@@ -204,6 +206,7 @@ impl MountedWriterStack {
                     next_object_id: spec.first_object_id,
                     chunks: BTreeMap::new(),
                     dirty_bytes: 0,
+                    last_write: Instant::now(),
                     sticky_error: None,
                 }))
             }))
@@ -296,6 +299,9 @@ impl MountedWriterStack {
             data_offset += take;
             next_object_id = next_object_id.saturating_add(object_ids_used);
             file.next_object_id = next_object_id;
+        }
+        if accepted_dirty_bytes > 0 {
+            file.last_write = Instant::now();
         }
         let visible_len = file.visible_len;
         drop(file);
@@ -401,6 +407,22 @@ impl MountedWriterStack {
     }
 
     pub(super) fn prepare_finish_inode(&self, ino: Ino) -> Result<u32, WriterStackError> {
+        self.prepare_finish_inode_with_idle_guard(ino, None)
+    }
+
+    pub(super) fn prepare_finish_inode_if_idle(
+        &self,
+        ino: Ino,
+        min_idle: Duration,
+    ) -> Result<u32, WriterStackError> {
+        self.prepare_finish_inode_with_idle_guard(ino, Some(min_idle))
+    }
+
+    fn prepare_finish_inode_with_idle_guard(
+        &self,
+        ino: Ino,
+        min_idle: Option<Duration>,
+    ) -> Result<u32, WriterStackError> {
         let file = {
             let shard = self.shards[Self::inode_shard_index(ino)].lock();
             let Some(file) = shard.files.get(&ino) else {
@@ -412,6 +434,9 @@ impl MountedWriterStack {
         if file.ino != ino {
             return Ok(0);
         };
+        if min_idle.is_some_and(|idle| file.last_write.elapsed() < idle) {
+            return Ok(0);
+        }
         let mut object_count = 0u64;
         for chunk in file.chunks.values_mut() {
             for slice in &mut chunk.slices {
@@ -730,6 +755,7 @@ impl MountedWriterStack {
                     next_object_id: 0,
                     chunks: BTreeMap::new(),
                     dirty_bytes: 0,
+                    last_write: Instant::now(),
                     sticky_error: None,
                 }))
             }))
