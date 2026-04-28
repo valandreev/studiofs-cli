@@ -1534,6 +1534,39 @@ fn nonzero_truncate_requeues_retained_overlay_uploads_with_new_epoch() {
 }
 
 #[test]
+fn nonzero_extend_keeps_retained_overlay_uploads_on_current_epoch() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "extend-keeps-retained");
+    let _guard = rt.enter();
+
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"extend-keeps-retained.bin", 0, 0, 0o644)
+            .expect("create test file");
+        let ino = attr.ino;
+        let payload = vec![0x7Bu8; 8192];
+
+        vfs.write(ino, 0, &payload).await.expect("write payload");
+        vfs.flush(ino).await.expect("flush first unpublished epoch");
+
+        let pending_before = vfs.pending_uploads_for_inode(ino);
+        assert!(
+            !pending_before.is_empty(),
+            "setup should queue uploads before the logical-size extension"
+        );
+
+        vfs.setattr(ino, SetattrArgs::size_only(16 * 1024))
+            .expect("extend while retaining existing overlay payloads");
+
+        let pending_after = vfs.pending_uploads_for_inode(ino);
+        assert_eq!(
+            pending_after, pending_before,
+            "logical-size growth must not cancel/requeue retained overlay uploads"
+        );
+    });
+}
+
+#[test]
 fn epoch_finalizer_guard_observes_writer_stack_tail() {
     let tmp = TempDir::new().expect("tempdir");
     let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "graph-finalizer-writer-stack-tail");

@@ -145,18 +145,22 @@ impl StudioVfs {
             let old_attr = self.getattr_async(ino).await?;
             let mut attr = old_attr.clone();
             let mut truncate_mutation = None;
+            let mut requeue_retained_uploads = false;
 
             if let Some(new_size) = args.size
                 && new_size != attr.size
             {
-                self.begin_size_change_incarnation(ino, &mut attr);
                 if new_size < attr.size {
+                    self.begin_size_change_incarnation(ino, &mut attr);
                     truncate_mutation = Some(self.truncate_blocks(
                         ino,
                         new_size,
                         attr.size,
                         old_attr.content_epoch,
                     )?);
+                    requeue_retained_uploads = true;
+                } else {
+                    self.begin_pending_incarnation(ino, &mut attr);
                 }
                 attr.size = new_size;
                 self.update_pending_incarnation_size(ino, attr.size);
@@ -214,11 +218,13 @@ impl StudioVfs {
                 return Err(error);
             }
 
-            self.requeue_retained_overlay_uploads_for_size_change(
-                ino,
-                attr.size,
-                attr.content_epoch,
-            );
+            if requeue_retained_uploads {
+                self.requeue_retained_overlay_uploads_for_size_change(
+                    ino,
+                    attr.size,
+                    attr.content_epoch,
+                );
+            }
             self.finalize_truncate_cleanup(ino, truncate_mutation.as_ref());
             self.refresh_inode_incarnation_state_from_attr(ino, &attr);
             Ok(attr)
