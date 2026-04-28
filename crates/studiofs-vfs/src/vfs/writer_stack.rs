@@ -101,8 +101,10 @@ struct SliceWriter {
     frozen: bool,
     finished: Vec<FinishedWriterSlice>,
     materializing: Vec<MaterializingReadSpan>,
+    pending_materialization: Vec<DetachedFinishedWriterSlice>,
 }
 
+#[derive(Clone)]
 struct DetachedFinishedWriterSlice {
     finished: FinishedWriterSlice,
     detached: DetachedStagedSlice,
@@ -286,6 +288,7 @@ impl MountedWriterStack {
                         frozen: false,
                         finished: Vec::new(),
                         materializing: Vec::new(),
+                        pending_materialization: Vec::new(),
                     });
                     (result.accepted_bytes, object_ids_used, result.throttled)
                 }
@@ -484,6 +487,11 @@ impl MountedWriterStack {
         for chunk in file.chunks.values_mut() {
             chunk.slices.sort_by_key(|slice| slice.seq);
             for slice in &mut chunk.slices {
+                if !slice.pending_materialization.is_empty() {
+                    let pending = slice.pending_materialization.clone();
+                    finished.extend(pending.iter().map(|entry| entry.finished.clone()));
+                    detached_finished.extend(pending);
+                }
                 if !slice.frozen {
                     continue;
                 }
@@ -523,6 +531,7 @@ impl MountedWriterStack {
                     .map(|entry| entry.finished.clone())
                     .collect::<Vec<_>>();
                 slice.finished = converted_finished.clone();
+                slice.pending_materialization.extend(converted.clone());
                 finished.extend(converted_finished);
                 detached_finished.extend(converted);
             }
@@ -603,6 +612,11 @@ impl MountedWriterStack {
         for chunk in file.chunks.values_mut() {
             chunk.slices.sort_by_key(|slice| slice.seq);
             for slice in &mut chunk.slices {
+                if !slice.pending_materialization.is_empty() {
+                    let pending = slice.pending_materialization.clone();
+                    finished.extend(pending.iter().map(|entry| entry.finished.clone()));
+                    detached_finished.extend(pending);
+                }
                 if remaining_blocks == 0 {
                     break;
                 }
@@ -641,6 +655,7 @@ impl MountedWriterStack {
                     .map(|entry| entry.finished.clone())
                     .collect::<Vec<_>>();
                 slice.finished.extend(converted_finished.clone());
+                slice.pending_materialization.extend(converted.clone());
                 finished.extend(converted_finished);
                 detached_finished.extend(converted);
             }
@@ -781,6 +796,10 @@ impl MountedWriterStack {
         ino: Ino,
         detached_finished: Vec<DetachedFinishedWriterSlice>,
     ) -> Result<(), WriterStackError> {
+        let object_ids = detached_finished
+            .iter()
+            .map(|entry| entry.finished.object_id)
+            .collect::<Vec<_>>();
         let detached = detached_finished
             .into_iter()
             .map(|entry| entry.detached)
@@ -792,7 +811,41 @@ impl MountedWriterStack {
             self.set_sticky_error(ino, format!("writer stack materialization failed: {error}"));
             return Err(WriterStackError::CachedStore(error));
         }
+        self.clear_pending_materialization_object_ids(ino, &object_ids);
         Ok(())
+    }
+
+    fn clear_pending_materialization_object_ids(&self, ino: Ino, object_ids: &[u64]) {
+        if object_ids.is_empty() {
+            return;
+        }
+        let file = {
+            let shard = self.shards[Self::inode_shard_index(ino)].lock();
+            shard.files.get(&ino).cloned()
+        };
+        let Some(file) = file else {
+            return;
+        };
+        {
+            let mut file = file.lock();
+            for chunk in file.chunks.values_mut() {
+                for slice in &mut chunk.slices {
+                    slice
+                        .pending_materialization
+                        .retain(|entry| !object_ids.contains(&entry.finished.object_id));
+                }
+            }
+            let has_pending_materialization = file.chunks.values().any(|chunk| {
+                chunk
+                    .slices
+                    .iter()
+                    .any(|slice| !slice.pending_materialization.is_empty())
+            });
+            if !has_pending_materialization {
+                file.sticky_error = None;
+            }
+        }
+        self.remove_file_if_clean_and_closed(ino);
     }
 
     fn set_sticky_error(&self, ino: Ino, message: impl Into<String>) {
@@ -953,7 +1006,7 @@ mod tests {
     use std::sync::mpsc as std_mpsc;
     use std::time::Duration;
     use studiofs_cache::local::{
-        LocalPayloadBackend, LocalPayloadBackendError, LocalPayloadLifecycleState,
+        LocalPayloadBackend, LocalPayloadBackendError, LocalPayloadLifecycleState, LocalPayloadPut,
         LocalPayloadStorageStats,
     };
     use studiofs_cache::{
@@ -965,6 +1018,38 @@ mod tests {
         inner: Arc<dyn LocalPayloadBackend>,
         entered_tx: std_mpsc::Sender<()>,
         release_rx: Mutex<std_mpsc::Receiver<()>>,
+    }
+
+    struct TransientFailingPutBackend {
+        inner: Arc<dyn LocalPayloadBackend>,
+        failures_remaining: AtomicUsize,
+    }
+
+    impl TransientFailingPutBackend {
+        fn new(inner: Arc<dyn LocalPayloadBackend>, failures: usize) -> Self {
+            Self {
+                inner,
+                failures_remaining: AtomicUsize::new(failures),
+            }
+        }
+
+        fn maybe_fail(&self) -> Result<(), LocalPayloadBackendError> {
+            let failed = self
+                .failures_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    (remaining > 0).then(|| remaining - 1)
+                })
+                .is_ok();
+            if failed {
+                return Err(LocalPayloadBackendError::Other(Box::new(
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "transient local payload failure",
+                    ),
+                )));
+            }
+            Ok(())
+        }
     }
 
     impl SlowPutBackend {
@@ -1015,6 +1100,110 @@ mod tests {
             let _ = self.entered_tx.send(());
             let _ = self.release_rx.lock().recv();
             self.inner.put(object_id, data, evictable)
+        }
+
+        fn sync_data(&self) -> Result<(), LocalPayloadBackendError> {
+            self.inner.sync_data()
+        }
+
+        fn run_pressure_maintenance(&self) -> Result<(), LocalPayloadBackendError> {
+            self.inner.run_pressure_maintenance()
+        }
+
+        fn mark_uploading(&self, object_id: u64) {
+            self.inner.mark_uploading(object_id);
+        }
+
+        fn mark_upload_failed(&self, object_id: u64) {
+            self.inner.mark_upload_failed(object_id);
+        }
+
+        fn mark_uploaded(&self, object_id: u64) {
+            self.inner.mark_uploaded(object_id);
+        }
+
+        fn pin(&self, object_id: u64) {
+            self.inner.pin(object_id);
+        }
+
+        fn unpin(&self, object_id: u64) {
+            self.inner.unpin(object_id);
+        }
+
+        fn remove(&self, object_id: u64) {
+            self.inner.remove(object_id);
+        }
+
+        fn remove_batch(&self, object_ids: &[u64]) {
+            self.inner.remove_batch(object_ids);
+        }
+
+        fn dirty_object_ids(&self) -> Vec<u64> {
+            self.inner.dirty_object_ids()
+        }
+
+        fn lifecycle_state(&self, object_id: u64) -> LocalPayloadLifecycleState {
+            self.inner.lifecycle_state(object_id)
+        }
+
+        fn is_evictable(&self, object_id: u64) -> bool {
+            self.inner.is_evictable(object_id)
+        }
+
+        fn storage_stats(&self) -> LocalPayloadStorageStats {
+            self.inner.storage_stats()
+        }
+
+        fn object_stats(
+            &self,
+            object_id: u64,
+        ) -> Option<studiofs_cache::local::LocalPayloadObjectStats> {
+            self.inner.object_stats(object_id)
+        }
+
+        fn object_ids(&self) -> Vec<u64> {
+            self.inner.object_ids()
+        }
+    }
+
+    impl LocalPayloadBackend for TransientFailingPutBackend {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn get(&self, object_id: u64) -> Option<Bytes> {
+            self.inner.get(object_id)
+        }
+
+        fn read_into(&self, object_id: u64, data_offset: usize, out: &mut [u8]) -> Option<usize> {
+            self.inner.read_into(object_id, data_offset, out)
+        }
+
+        fn get_for_upload(&self, object_id: u64) -> Option<Bytes> {
+            self.inner.get_for_upload(object_id)
+        }
+
+        fn contains(&self, object_id: u64) -> bool {
+            self.inner.contains(object_id)
+        }
+
+        fn advise_will_need(&self, object_id: u64) {
+            self.inner.advise_will_need(object_id);
+        }
+
+        fn put(
+            &self,
+            object_id: u64,
+            data: &[u8],
+            evictable: bool,
+        ) -> Result<(), LocalPayloadBackendError> {
+            self.maybe_fail()?;
+            self.inner.put(object_id, data, evictable)
+        }
+
+        fn put_batch(&self, entries: &[LocalPayloadPut]) -> Result<(), LocalPayloadBackendError> {
+            self.maybe_fail()?;
+            self.inner.put_batch(entries)
         }
 
         fn sync_data(&self) -> Result<(), LocalPayloadBackendError> {
@@ -1647,5 +1836,44 @@ mod tests {
             .write_bytes(write_spec(1, 7, 0, 900), Bytes::from_static(b"data"))
             .expect_err("sticky error");
         assert!(matches!(err, WriterStackError::Sticky { ino: 7, .. }));
+    }
+
+    #[test]
+    fn writer_stack_retries_transient_materialization_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backend =
+            open_local_payload_backend(dir.path(), "00000000-0000-0000-0000-000000000293")
+                .expect("open backend")
+                .backend;
+        let failing_backend = Arc::new(TransientFailingPutBackend::new(backend, 1));
+        let (store, _rx) = CachedStore::open(CachedStoreConfig::new(dir.path()), failing_backend)
+            .expect("open store");
+        let stack = MountedWriterStack::new(
+            store,
+            WriterStackConfig {
+                block_size: 4,
+                chunk_size: 16,
+                page_size: 4,
+                dirty_byte_limit: None,
+                max_buffer_bytes: None,
+            },
+        );
+
+        stack
+            .write_bytes(write_spec(1, 7, 0, 700), Bytes::from_static(b"data"))
+            .expect("write initial block");
+        stack
+            .finish_inode(7)
+            .expect_err("first materialization fails");
+
+        let retried = stack
+            .finish_inode(7)
+            .expect("second materialization retries detached payload");
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].object_id, 700);
+
+        stack
+            .write_bytes(write_spec(1, 7, 4, 701), Bytes::from_static(b"more"))
+            .expect("successful retry clears sticky writer error");
     }
 }

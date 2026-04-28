@@ -2191,13 +2191,13 @@ impl PgMetaEngine {
             | MetaEvent::RemoveEntry { .. }
             | MetaEvent::RenameEntry { .. }
             | MetaEvent::PublishRegularFileBaseSlices { .. }
-            | MetaEvent::SetSymlinkTarget { .. }
+            | MetaEvent::CreateSnapshot { .. }
+            | MetaEvent::UpdateSnapshotState { .. } => true,
+            MetaEvent::SetSymlinkTarget { .. }
             | MetaEvent::SetXattr { .. }
             | MetaEvent::RemoveXattr { .. }
             | MetaEvent::SetAclRule { .. }
-            | MetaEvent::RemoveAclRule { .. }
-            | MetaEvent::CreateSnapshot { .. }
-            | MetaEvent::UpdateSnapshotState { .. } => true,
+            | MetaEvent::RemoveAclRule { .. } => false,
         })
     }
 
@@ -3234,13 +3234,13 @@ impl PgMetaEngine {
     }
 
     fn flush_due_pending(&self) -> MetaResult<()> {
-        let Some(batch) = self.claim_pending_batch(false) else {
-            return Ok(());
-        };
         let _guard = self
             .replication_lock
             .lock()
             .map_err(|_| MetaError::Storage("pg replication lock poisoned".to_string()))?;
+        let Some(batch) = self.claim_pending_batch(false) else {
+            return Ok(());
+        };
         let recent_flush = self.flush_pending_claimed_batch_with_restore(batch)?;
         let _ = self.pull_foreign_events_locked(recent_flush.as_ref())?;
         Ok(())
@@ -6512,6 +6512,41 @@ mod tests {
         assert!(
             *wakeup_lock.lock().expect("poll wakeup lock"),
             "settled file metadata changes should wake the metadata poll worker"
+        );
+    }
+
+    #[test]
+    fn xattr_change_batches_without_pg_poll_wakeup() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = pg
+            .create_file(ROOT_INO, b"xattr-batch-wakeup.bin", 0, 0, 0o644)
+            .expect("create file");
+        let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+        pg.persist_flushed_event_seq(setup_end)
+            .expect("ack setup events");
+        {
+            let mut state = pg.pending_state.lock().expect("pending_state");
+            PgMetaEngine::clear_pending_state(&mut state);
+        }
+
+        let (wakeup_lock, _) = &*pg.poll_wakeup;
+        {
+            let mut wakeup = wakeup_lock.lock().expect("poll wakeup lock");
+            *wakeup = false;
+        }
+
+        pg.set_xattr(file.ino, b"user.color", b"blue", 0)
+            .expect("set xattr");
+
+        assert_eq!(
+            pg.replication_backlog().pending_ops,
+            1,
+            "xattr changes remain remote-visible metadata"
+        );
+        assert!(
+            !*wakeup_lock.lock().expect("poll wakeup lock"),
+            "xattr overlay changes should batch instead of waking PG before an explicit flush"
         );
     }
 
