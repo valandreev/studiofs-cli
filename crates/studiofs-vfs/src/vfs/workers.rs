@@ -351,11 +351,18 @@ impl StudioVfs {
         }
     }
 
-    pub(super) fn invalidate_attr_read_cache(&self, inodes: impl IntoIterator<Item = Ino>) {
+    pub(super) fn invalidate_attr_read_cache(
+        &self,
+        inodes: impl IntoIterator<Item = Ino>,
+    ) -> Vec<Ino> {
         let mut cache = self.state.namespace.attr_read_cache.lock();
+        let mut removed = Vec::new();
         for ino in inodes {
-            cache.remove(ino);
+            if cache.remove(ino) {
+                removed.push(ino);
+            }
         }
+        removed
     }
 
     pub(super) async fn background_metadata_invalidation(self: Arc<Self>, interval: Duration) {

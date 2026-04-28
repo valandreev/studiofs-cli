@@ -115,11 +115,14 @@ impl CachedStoreWriterCounters {
     fn record_staged(&self, bytes: usize) {
         let bytes = saturating_u64_from_usize(bytes);
         self.staged_bytes.fetch_add(bytes, Ordering::Relaxed);
-        self.pending_upload_bytes
-            .fetch_add(bytes, Ordering::Relaxed);
         self.staged_slices.fetch_add(1, Ordering::Relaxed);
         self.staging_latency_observations
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_pending_upload(&self, bytes: usize) {
+        self.pending_upload_bytes
+            .fetch_add(saturating_u64_from_usize(bytes), Ordering::Relaxed);
     }
 
     fn record_upload_terminal(&self, bytes: u64) {
@@ -539,7 +542,6 @@ impl CachedStore {
         let mut total_bytes = 0u64;
         for entry in &entries {
             total_bytes = total_bytes.saturating_add(saturating_u64_from_usize(entry.staged.len));
-            self.writer_counters.record_staged(entry.staged.len);
             if entry.submit_upload {
                 self.submit_staged_upload(
                     entry.staged.ino,
@@ -548,6 +550,8 @@ impl CachedStore {
                     entry.staged.content_epoch,
                     entry.staged.len,
                 );
+            } else {
+                self.writer_counters.record_staged(entry.staged.len);
             }
         }
         self.metrics.materialize_batches.record_batch(
@@ -727,6 +731,7 @@ impl CachedStore {
             .lock()
             .insert(object_id, saturating_u64_from_usize(payload_len));
         self.writer_counters.record_staged(payload_len);
+        self.writer_counters.record_pending_upload(payload_len);
         self.submit_upload(ino, offset, object_id, content_epoch);
     }
 
@@ -1427,6 +1432,52 @@ mod tests {
         assert_eq!(op.object_id, staged[0].object_id);
         assert_eq!(op.ino, 7);
         assert_eq!(op.offset, 0);
+    }
+
+    #[test]
+    fn detached_persist_without_upload_does_not_report_pending_upload_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, mut rx) = temp_cached_store(&dir);
+        let mut config = writer_config();
+        config.submit_upload = false;
+        let mut writer = cached_store.open_writer_slice(config);
+
+        writer.write_at(0, b"abcdefgh").expect("write full block");
+        let detached = writer
+            .detach_completed_blocks(1)
+            .expect("detach completed block");
+        cached_store
+            .persist_detached_staged_slices(detached)
+            .expect("persist detached block");
+
+        let counters = cached_store.snapshot_writer_counters();
+        assert_eq!(counters.staged_bytes, 8);
+        assert_eq!(counters.staged_slices, 1);
+        assert_eq!(counters.pending_upload_bytes, 0);
+        assert_eq!(cached_store.pending_upload_count(), 0);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn detached_persist_with_upload_counts_pending_bytes_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cached_store, mut rx) = temp_cached_store(&dir);
+        let mut writer = cached_store.open_writer_slice(writer_config());
+
+        writer.write_at(0, b"abcdefgh").expect("write full block");
+        let detached = writer
+            .detach_completed_blocks(1)
+            .expect("detach completed block");
+        cached_store
+            .persist_detached_staged_slices(detached)
+            .expect("persist detached block");
+
+        let counters = cached_store.snapshot_writer_counters();
+        assert_eq!(counters.staged_bytes, 8);
+        assert_eq!(counters.staged_slices, 1);
+        assert_eq!(counters.pending_upload_bytes, 8);
+        let op = rx.try_recv().expect("pending upload");
+        assert_eq!(op.object_id, 10_000);
     }
 
     #[test]

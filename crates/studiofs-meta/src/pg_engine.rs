@@ -2582,19 +2582,29 @@ impl PgMetaEngine {
         }
 
         let local_events = self.local.read_events_range(start, end)?;
-        if local_events.len() < batch_events.len() {
+        let mut projected_prefix = Vec::with_capacity(batch_events.len());
+        let mut consumed_events = 0usize;
+        for event in &local_events {
+            consumed_events = consumed_events.saturating_add(1);
+            let projected = Self::project_remote_events(std::slice::from_ref(event));
+            projected_prefix.extend(projected);
+            if projected_prefix.len() >= batch_events.len() {
+                break;
+            }
+        }
+        if projected_prefix.len() != batch_events.len() {
             return Ok(());
         }
 
-        let matches_prefix = local_events
-            .iter()
-            .zip(batch_events.iter())
-            .take(batch_events.len())
-            .all(|(local, remote)| {
-                Self::encode_postcard(local).ok() == Self::encode_postcard(remote).ok()
-            });
+        let matches_prefix =
+            projected_prefix
+                .iter()
+                .zip(batch_events.iter())
+                .all(|(local, remote)| {
+                    Self::encode_postcard(local).ok() == Self::encode_postcard(remote).ok()
+                });
         if matches_prefix {
-            let next_seq = start.max(1).saturating_add(batch_events.len() as u64);
+            let next_seq = start.max(1).saturating_add(consumed_events as u64);
             self.persist_flushed_event_seq(next_seq)?;
         }
         Ok(())
@@ -4768,6 +4778,53 @@ mod tests {
             projected.first(),
             Some(MetaEvent::PublishRegularFileBaseSlices { ino: 42, .. })
         ));
+    }
+
+    #[test]
+    fn self_batch_acknowledges_projected_prefix_with_filtered_overlay_events() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+        let file = pg
+            .create_file(ROOT_INO, b"projected-self-ack.bin", 0, 0, 0o644)
+            .expect("create file");
+        set_file_state(&pg, file.ino, 4096, 1);
+        let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+        pg.persist_flushed_event_seq(setup_end)
+            .expect("ack setup events");
+
+        let payload = PayloadRef::new_partial(77_004, 4096);
+        let start = pg.flushed_event_seq.load(Ordering::SeqCst);
+        pg.stage_payload_slice(file.ino, 0, &payload)
+            .expect("stage local overlay");
+        assert!(
+            pg.mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 1, payload.object_id)
+                .expect("mark uploaded"),
+            "upload marker must update the local overlay"
+        );
+        assert!(
+            pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+                .expect("publish base graph"),
+            "base graph publish must succeed"
+        );
+        let end = pg.local.get_counter("nextEventSeq").expect("event end");
+        let events = pg
+            .local
+            .read_events_range(start, end)
+            .expect("read local events");
+        let projected = PgMetaEngine::project_remote_events(&events);
+        assert!(
+            events.len() > projected.len(),
+            "setup should include local-only overlay events before the remote-visible publish"
+        );
+
+        pg.flushed_event_seq.store(start, Ordering::SeqCst);
+        pg.acknowledge_local_prefix_from_self_batch(&projected)
+            .expect("ack projected self batch");
+
+        assert_eq!(
+            pg.flushed_event_seq.load(Ordering::SeqCst),
+            end,
+            "self-batch ack must advance over the raw local events that produced the projected batch"
+        );
     }
 
     fn set_file_state(engine: &PgMetaEngine, ino: Ino, size: u64, content_epoch: u64) {

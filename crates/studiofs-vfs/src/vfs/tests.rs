@@ -5996,6 +5996,53 @@ fn deferred_materialization_reschedules_write_that_arrives_while_inflight_finish
 }
 
 #[test]
+fn strict_deferred_write_waits_for_inflight_materialization() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-301-strict-waits-inflight");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-301-strict-waits-inflight.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = task_lock.clone().lock_owned().await;
+        vfs.state
+            .deferred_materialize_inflight
+            .lock()
+            .insert(ino, task_lock);
+
+        let strict_vfs = Arc::clone(&vfs);
+        let strict_write = tokio::spawn(async move {
+            strict_vfs
+                .write_fh_with_deferred_materialize(
+                    fh,
+                    ino,
+                    0,
+                    b"strict",
+                    LocalSyncPolicy::Strict,
+                )
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !strict_write.is_finished(),
+            "strict writes must wait until earlier deferred materialization leaves the inflight slot"
+        );
+
+        drop(guard);
+        strict_write
+            .await
+            .expect("strict write task should not panic")
+            .expect("strict write should complete after inflight materialization drains");
+        vfs.state.deferred_materialize_inflight.lock().remove(&ino);
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn write_path_observability_tracks_burst_shape_and_metadata_commit_stalls() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "write-path-observability-bursts");

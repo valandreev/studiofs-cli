@@ -167,7 +167,10 @@ impl CommitCoordinator {
         } else {
             vfs.clear_inode_incarnation(ino);
         }
-        vfs.invalidate_attr_read_cache([ino]);
+        let removed_cached_attrs = vfs.invalidate_attr_read_cache([ino]);
+        if !removed_cached_attrs.is_empty() {
+            vfs.invalidate_kernel_inodes(removed_cached_attrs);
+        }
 
         Ok(EpochFinalizeStatus::Published)
     }

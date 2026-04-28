@@ -120,6 +120,19 @@ impl StudioVfs {
         )
     }
 
+    async fn wait_for_deferred_materialization_inflight(&self, ino: Ino) {
+        let task_lock = {
+            self.state
+                .deferred_materialize_inflight
+                .lock()
+                .get(&ino)
+                .cloned()
+        };
+        if let Some(task_lock) = task_lock {
+            let _guard = task_lock.lock().await;
+        }
+    }
+
     pub(super) async fn spawn_deferred_materialization_if_needed(self: &Arc<Self>, ino: Ino) {
         if self.shutdown_requested() {
             return;
@@ -532,16 +545,7 @@ impl StudioVfs {
         // The parking_lot lock is scoped so the MutexGuard (which is !Send)
         // is dropped before the .await point.  We then acquire the
         // tokio::sync::Mutex which blocks until the background task releases it.
-        let task_lock = {
-            self.state
-                .deferred_materialize_inflight
-                .lock()
-                .get(&ino)
-                .cloned()
-        };
-        if let Some(task_lock) = task_lock {
-            let _guard = task_lock.lock().await;
-        }
+        self.wait_for_deferred_materialization_inflight(ino).await;
 
         let materialized_writer_stack_bytes = self.materialize_writer_stack_for_inode(ino).await?;
         let flushed_file_data = materialized_writer_stack_bytes > 0
@@ -854,6 +858,7 @@ impl StudioVfs {
             }
 
             if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
+                self.wait_for_deferred_materialization_inflight(ino).await;
                 let materialize_strict_started = Instant::now();
                 let strict_result = self.materialize_writer_stack_for_inode(ino).await;
                 self.record_vfs_write_materialize_strict(materialize_strict_started.elapsed());
@@ -1032,6 +1037,7 @@ impl StudioVfs {
             }
             (Ok(_), LocalSyncPolicy::Strict) => {
                 // Strict: await writer-stack materialization inline.
+                self.wait_for_deferred_materialization_inflight(ino).await;
                 let materialize_strict_started = Instant::now();
                 let materialized_bytes = match self.materialize_writer_stack_for_limits(ino).await {
                     Ok(materialized_bytes) => materialized_bytes,
