@@ -1127,12 +1127,6 @@ impl UploadSubmissionPort for VfsUploadSubmitter<'_> {
         }
         self.vfs.record_live_extents(&live_extents);
         if !submit_ops.is_empty() {
-            self.vfs.log_upload_submission_batch(
-                "deferred_materialize",
-                ino,
-                content_epoch,
-                &submit_ops,
-            );
             self.vfs.cached_store.submit_uploads_batch(&submit_ops);
             self.vfs.state.file_session.note_background_transition(
                 ino,
@@ -1227,12 +1221,6 @@ impl<'a> LocalDirtyFlushSession<'a> {
                 })
                 .collect();
             self.vfs.record_live_extents(&live_extents);
-            self.vfs.log_upload_submission_batch(
-                "local_dirty_flush",
-                self.ino,
-                content_epoch,
-                &upload_ops,
-            );
             self.vfs.cached_store.submit_uploads_batch(&upload_ops);
             self.vfs.state.file_session.note_background_transition(
                 self.ino,

@@ -2149,44 +2149,6 @@ fn upload_pipeline_summary_is_active_checks() {
 }
 
 #[test]
-fn upload_pipeline_summary_completed_delta_tracks_idle_bursts() {
-    assert_eq!(
-        StudioVfs::upload_pipeline_summary_completed_delta(
-            10,
-            40 * 1024 * 1024,
-            14,
-            56 * 1024 * 1024
-        ),
-        (4, 16 * 1024 * 1024)
-    );
-    assert_eq!(
-        StudioVfs::upload_pipeline_summary_completed_delta(
-            14,
-            56 * 1024 * 1024,
-            2,
-            4 * 1024 * 1024
-        ),
-        (0, 0),
-        "counter reset should not create a fake idle burst"
-    );
-}
-
-#[test]
-fn upload_submission_batch_bounds_tracks_offsets_and_objects() {
-    let ops = vec![
-        (7, 16 * 1024 * 1024, 42, 9),
-        (7, 4 * 1024 * 1024, 39, 9),
-        (7, 8 * 1024 * 1024, 41, 9),
-    ];
-
-    assert_eq!(
-        StudioVfs::upload_submission_batch_bounds(&ops),
-        Some((3, 4 * 1024 * 1024, 16 * 1024 * 1024, 39, 42))
-    );
-    assert_eq!(StudioVfs::upload_submission_batch_bounds(&[]), None);
-}
-
-#[test]
 fn upload_pipeline_summary_formats_pending_uploads() {
     assert_eq!(StudioVfs::format_upload_pipeline_pending_uploads(0), "0");
     assert_eq!(

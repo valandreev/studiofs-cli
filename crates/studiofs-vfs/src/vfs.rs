@@ -3016,8 +3016,6 @@ impl<'a> StartupReplayCoordinator<'a> {
                     "startup replay failed to restore upload links for runtime pending uploads"
                 );
             }
-            self.vfs
-                .log_upload_submission_batch("startup_replay", 0, 0, &self.replay_ops);
             self.vfs.cached_store.submit_uploads_batch(&self.replay_ops);
             for (ino, _) in replayed_epochs.iter().copied() {
                 self.vfs.state.file_session.note_background_transition(
