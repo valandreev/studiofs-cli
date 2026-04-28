@@ -238,6 +238,9 @@ mod tests {
         assert!(observability["upload"]["backlog_bytes"].is_number());
         assert!(observability["upload"]["throughput_bytes_per_sec"].is_number());
         assert!(observability["upload"]["retry_count"].is_number());
+        assert!(observability["fetch"]["cache_hits"].is_number());
+        assert!(observability["fetch"]["s3_fetches"].is_number());
+        assert!(observability["fetch"]["bytes_downloaded"].is_number());
         assert!(observability["post_upload_idle"]["observed"].is_boolean());
         assert!(observability["post_upload_idle"]["timed_out"].is_boolean());
         assert!(observability["barriers"]["flush_fsync_close_latency"].is_object());

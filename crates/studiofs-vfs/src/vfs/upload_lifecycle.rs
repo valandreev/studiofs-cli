@@ -213,9 +213,95 @@ impl StudioVfs {
 
     pub(super) fn upload_pipeline_summary_is_active(
         pending_uploads: usize,
+        active_uploads: usize,
         pending_metadata_ops: u32,
     ) -> bool {
-        pending_uploads != 0 || (pending_metadata_ops != 0 && pending_metadata_ops >= 10)
+        pending_uploads != 0
+            || active_uploads != 0
+            || (pending_metadata_ops != 0 && pending_metadata_ops >= 10)
+    }
+
+    pub(super) fn upload_pipeline_summary_completed_delta(
+        previous_uploads: u64,
+        previous_bytes: u64,
+        current_uploads: u64,
+        current_bytes: u64,
+    ) -> (u64, u64) {
+        if current_uploads < previous_uploads || current_bytes < previous_bytes {
+            return (0, 0);
+        }
+        (
+            current_uploads.saturating_sub(previous_uploads),
+            current_bytes.saturating_sub(previous_bytes),
+        )
+    }
+
+    pub(super) fn upload_submission_batch_bounds(
+        ops: &[(u64, u64, u64, u64)],
+    ) -> Option<(usize, u64, u64, u64, u64)> {
+        let first = ops.first()?;
+        let mut min_offset = first.1;
+        let mut max_offset = first.1;
+        let mut min_object_id = first.2;
+        let mut max_object_id = first.2;
+        for (_, offset, object_id, _) in ops.iter().skip(1) {
+            min_offset = min_offset.min(*offset);
+            max_offset = max_offset.max(*offset);
+            min_object_id = min_object_id.min(*object_id);
+            max_object_id = max_object_id.max(*object_id);
+        }
+        Some((
+            ops.len(),
+            min_offset,
+            max_offset,
+            min_object_id,
+            max_object_id,
+        ))
+    }
+
+    pub(super) fn log_upload_submission_batch(
+        &self,
+        source: &'static str,
+        ino: Ino,
+        content_epoch: u64,
+        ops: &[(u64, u64, u64, u64)],
+    ) {
+        let Some((op_count, first_offset, last_offset, first_object_id, last_object_id)) =
+            Self::upload_submission_batch_bounds(ops)
+        else {
+            return;
+        };
+        let pending_before = self.cached_store.pending_upload_count();
+        let active_before = self.upload_scheduler.in_flight();
+        if pending_before != 0 || active_before != 0 {
+            return;
+        }
+
+        let batch_bytes = ops.iter().fold(0u64, |bytes, (_, _, object_id, _)| {
+            bytes.saturating_add(
+                self.local_payload_backend
+                    .object_stats(*object_id)
+                    .map(|stats| stats.payload_len)
+                    .unwrap_or(u64::from(self.block_size)),
+            )
+        });
+        let metadata_backlog = self.sync_meta().replication_backlog();
+        info!(
+            source,
+            ino,
+            content_epoch,
+            op_count,
+            batch_bytes = %Self::format_upload_pipeline_pending_uploads(batch_bytes),
+            first_offset,
+            last_offset,
+            first_object_id,
+            last_object_id,
+            pending_before,
+            active_before,
+            pending_metadata_ops = metadata_backlog.total_ops(),
+            inflight_metadata_ops = metadata_backlog.inflight_ops,
+            "upload submission queued while pipeline idle"
+        );
     }
 
     pub(super) fn format_upload_pipeline_pending_uploads(pending_upload_bytes: u64) -> String {

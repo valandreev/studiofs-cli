@@ -129,6 +129,12 @@ impl StudioVfs {
             let mut inflight = self.state.deferred_materialize_inflight.lock();
             match inflight.entry(ino) {
                 std::collections::hash_map::Entry::Occupied(_) => {
+                    if self.state.writer_stack.dirty_bytes_for_inode(ino) > 0 {
+                        self.state
+                            .deferred_materialize_reschedule_needed
+                            .lock()
+                            .insert(ino);
+                    }
                     // #region debug log
                     self.debug_write_probe(
                         "H2",
@@ -164,9 +170,21 @@ impl StudioVfs {
             }),
         );
         // #endregion debug log
-        let guard = task_lock.clone().lock_owned().await;
+        self.start_deferred_materialization_task(ino, task_lock);
+    }
+
+    fn start_deferred_materialization_task(
+        self: &Arc<Self>,
+        ino: Ino,
+        task_lock: Arc<tokio::sync::Mutex<()>>,
+    ) {
+        let guard = task_lock
+            .clone()
+            .try_lock_owned()
+            .expect("new deferred materialization task lock should be uncontended");
         let vfs = Arc::clone(self);
         self.track_background_task(tokio::spawn(async move {
+            let mut allow_reschedule_on_exit = true;
             let mut no_progress_retries = 0usize;
             loop {
                 let writer_stack_dirty_before = vfs.state.writer_stack.dirty_bytes_for_inode(ino);
@@ -184,6 +202,7 @@ impl StudioVfs {
                     {
                     Ok(materialized_bytes) => materialized_bytes,
                     Err(e) => {
+                        allow_reschedule_on_exit = false;
                         if !vfs.suppress_deleted_inode_materialization_error(ino, &e) {
                             warn!(
                                 ino,
@@ -205,6 +224,7 @@ impl StudioVfs {
                 {
                     Ok(materialized) => materialized > 0,
                     Err(e) => {
+                        allow_reschedule_on_exit = false;
                         if !vfs.suppress_deleted_inode_materialization_error(ino, &e) {
                             warn!(
                                 ino,
@@ -258,6 +278,7 @@ impl StudioVfs {
                         {
                             Ok(materialized_bytes) => materialized_bytes,
                             Err(e) => {
+                                allow_reschedule_on_exit = false;
                                 if !vfs.suppress_deleted_inode_materialization_error(ino, &e) {
                                     warn!(
                                         ino,
@@ -305,8 +326,39 @@ impl StudioVfs {
             }
 
             drop(guard);
-            vfs.state.deferred_materialize_inflight.lock().remove(&ino);
+            vfs.finish_deferred_materialization_task(ino, allow_reschedule_on_exit);
         }));
+    }
+
+    pub(super) fn finish_deferred_materialization_task(
+        self: &Arc<Self>,
+        ino: Ino,
+        allow_reschedule: bool,
+    ) {
+        self.state.deferred_materialize_inflight.lock().remove(&ino);
+        let reschedule_needed = self
+            .state
+            .deferred_materialize_reschedule_needed
+            .lock()
+            .remove(&ino);
+        if !allow_reschedule || !reschedule_needed || self.shutdown_requested() {
+            return;
+        }
+        if self.state.writer_stack.dirty_bytes_for_inode(ino) == 0 {
+            return;
+        }
+        let task_lock = {
+            let mut inflight = self.state.deferred_materialize_inflight.lock();
+            match inflight.entry(ino) {
+                std::collections::hash_map::Entry::Occupied(_) => return,
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+                    entry.insert(Arc::clone(&task_lock));
+                    task_lock
+                }
+            }
+        };
+        self.start_deferred_materialization_task(ino, task_lock);
     }
 
     /// Release a file handle.

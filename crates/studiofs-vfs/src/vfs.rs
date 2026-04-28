@@ -62,10 +62,10 @@ pub use handle_drain_barrier::{
 };
 pub use locking::LockKind;
 pub use metrics::{
-    StatFs, VfsAttrReadCacheSnapshot, VfsCacheStateSnapshot, VfsForegroundReadProtectionStats,
-    VfsIngressLane, VfsIngressPressure, VfsIngressStats, VfsLatencyHistogramSnapshot,
-    VfsNamespaceCacheSnapshot, VfsPortableAllocatorStats, VfsRuntimeEvent,
-    VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
+    StatFs, VfsAttrReadCacheSnapshot, VfsCacheStateSnapshot, VfsFetchStats,
+    VfsForegroundReadProtectionStats, VfsIngressLane, VfsIngressPressure, VfsIngressStats,
+    VfsLatencyHistogramSnapshot, VfsNamespaceCacheSnapshot, VfsPortableAllocatorStats,
+    VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
     VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
     VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
     VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
@@ -1007,6 +1007,9 @@ struct UploadState {
     upload_requeues: AtomicU64,
     upload_canceled_deleted: AtomicU64,
     upload_canceled_stale: AtomicU64,
+    upload_canceled_stale_before_put: AtomicU64,
+    upload_canceled_stale_after_put: AtomicU64,
+    upload_canceled_stale_after_put_bytes: AtomicU64,
     upload_local_payload_reads: AtomicU64,
     upload_local_payload_read_bytes: AtomicU64,
     upload_fallback_deferrals: AtomicU64,
@@ -1209,6 +1212,9 @@ impl UploadState {
             upload_requeues: AtomicU64::new(0),
             upload_canceled_deleted: AtomicU64::new(0),
             upload_canceled_stale: AtomicU64::new(0),
+            upload_canceled_stale_before_put: AtomicU64::new(0),
+            upload_canceled_stale_after_put: AtomicU64::new(0),
+            upload_canceled_stale_after_put_bytes: AtomicU64::new(0),
             upload_local_payload_reads: AtomicU64::new(0),
             upload_local_payload_read_bytes: AtomicU64::new(0),
             upload_fallback_deferrals: AtomicU64::new(0),
@@ -2070,6 +2076,7 @@ impl VfsState {
             shutdown: ShutdownState::new(),
             metrics: MetricsState::new(),
             deferred_materialize_inflight: Mutex::new(HashMap::new()),
+            deferred_materialize_reschedule_needed: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -2093,6 +2100,10 @@ struct VfsState {
     /// is held by the background task while it runs; the flush / close path
     /// acquires the same lock to wait for completion — no TOCTOU races.
     deferred_materialize_inflight: Mutex<HashMap<Ino, Arc<tokio::sync::Mutex<()>>>>,
+    /// Inodes that received another write while their materializer was already
+    /// in-flight. The finishing task consumes this flag and schedules one more
+    /// pass if dirty writer-stack bytes remain.
+    deferred_materialize_reschedule_needed: Mutex<HashSet<Ino>>,
 }
 
 #[derive(Clone)]
@@ -3005,6 +3016,8 @@ impl<'a> StartupReplayCoordinator<'a> {
                     "startup replay failed to restore upload links for runtime pending uploads"
                 );
             }
+            self.vfs
+                .log_upload_submission_batch("startup_replay", 0, 0, &self.replay_ops);
             self.vfs.cached_store.submit_uploads_batch(&self.replay_ops);
             for (ino, _) in replayed_epochs.iter().copied() {
                 self.vfs.state.file_session.note_background_transition(
@@ -5367,6 +5380,21 @@ impl StudioVfs {
                 .upload
                 .upload_canceled_stale
                 .load(Ordering::Relaxed),
+            canceled_stale_before_put: self
+                .state
+                .upload
+                .upload_canceled_stale_before_put
+                .load(Ordering::Relaxed),
+            canceled_stale_after_put: self
+                .state
+                .upload
+                .upload_canceled_stale_after_put
+                .load(Ordering::Relaxed),
+            canceled_stale_after_put_bytes: self
+                .state
+                .upload
+                .upload_canceled_stale_after_put_bytes
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -6541,6 +6569,27 @@ impl StudioVfs {
         let writer_stack_dirty_bytes = self.state.writer_stack.total_dirty_bytes();
         let total_dirty_bytes = pending_local_dirty_bytes.saturating_add(writer_stack_dirty_bytes);
         let upload_stats = self.upload_stats();
+        let fetch_metrics = &self.fetch_scheduler.metrics;
+        let fetch_cache_hits = fetch_metrics.cache_hits.load(Ordering::Relaxed);
+        let fetch_s3_fetches = fetch_metrics.s3_fetches.load(Ordering::Relaxed);
+        let fetch_s3_errors = fetch_metrics.s3_errors.load(Ordering::Relaxed);
+        let fetch_singleflight_joins = fetch_metrics.singleflight_joins.load(Ordering::Relaxed);
+        let fetch_retries = fetch_metrics.retries.load(Ordering::Relaxed);
+        let fetch_bytes_downloaded = fetch_metrics.bytes_downloaded.load(Ordering::Relaxed);
+        let fetch_prefetch_skips = fetch_metrics.prefetch_skips.load(Ordering::Relaxed);
+        let fetch_local_cache_io_calls = fetch_metrics.local_cache_io_calls.load(Ordering::Relaxed);
+        let fetch_local_cache_handoff_total_ns = fetch_metrics
+            .local_cache_io_handoff_total_ns
+            .load(Ordering::Relaxed);
+        let fetch_local_cache_handoff_max_ns = fetch_metrics
+            .local_cache_io_handoff_max_ns
+            .load(Ordering::Relaxed);
+        let fetch_local_cache_backend_total_ns = fetch_metrics
+            .local_cache_io_backend_total_ns
+            .load(Ordering::Relaxed);
+        let fetch_local_cache_backend_max_ns = fetch_metrics
+            .local_cache_io_backend_max_ns
+            .load(Ordering::Relaxed);
         let pending_upload_bytes =
             usize::try_from(upload_stats.pending_upload_bytes).unwrap_or(usize::MAX);
         let storage_stats = self.local_payload_backend.storage_stats();
@@ -6942,6 +6991,35 @@ impl StudioVfs {
                 staged_peak_bytes,
             },
             upload: upload_stats,
+            fetch: VfsFetchStats {
+                cache_hits: fetch_cache_hits,
+                s3_fetches: fetch_s3_fetches,
+                s3_errors: fetch_s3_errors,
+                singleflight_joins: fetch_singleflight_joins,
+                retries: fetch_retries,
+                bytes_downloaded: fetch_bytes_downloaded,
+                prefetch_skips: fetch_prefetch_skips,
+                local_cache_io_calls: fetch_local_cache_io_calls,
+                local_cache_handoff_total_ms: fetch_local_cache_handoff_total_ns as f64
+                    / 1_000_000.0,
+                local_cache_handoff_avg_ms: if fetch_local_cache_io_calls == 0 {
+                    0.0
+                } else {
+                    (fetch_local_cache_handoff_total_ns as f64 / fetch_local_cache_io_calls as f64)
+                        / 1_000_000.0
+                },
+                local_cache_handoff_max_ms: fetch_local_cache_handoff_max_ns as f64 / 1_000_000.0,
+                local_cache_backend_io_total_ms: fetch_local_cache_backend_total_ns as f64
+                    / 1_000_000.0,
+                local_cache_backend_io_avg_ms: if fetch_local_cache_io_calls == 0 {
+                    0.0
+                } else {
+                    (fetch_local_cache_backend_total_ns as f64 / fetch_local_cache_io_calls as f64)
+                        / 1_000_000.0
+                },
+                local_cache_backend_io_max_ms: fetch_local_cache_backend_max_ns as f64
+                    / 1_000_000.0,
+            },
             payload_burst: VfsWritePathBurstStats {
                 bursts: payload_burst_count,
                 bursts_per_sec: Self::per_second(payload_burst_count, elapsed),

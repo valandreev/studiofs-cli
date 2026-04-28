@@ -428,6 +428,12 @@ impl StudioVfs {
             .map(|(object_id, (_, block_index))| (ino, block_index, object_id, content_epoch))
             .collect();
         self.record_live_extents(&live_extents);
+        self.log_upload_submission_batch(
+            "retained_overlay_size_change",
+            ino,
+            content_epoch,
+            &upload_ops,
+        );
         self.cached_store.submit_uploads_batch(&upload_ops);
         self.state.file_session.note_background_transition(
             ino,

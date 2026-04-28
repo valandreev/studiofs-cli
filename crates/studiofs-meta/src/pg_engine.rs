@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::RuntimeFlavor;
 use tokio_util::sync::CancellationToken;
@@ -81,6 +81,8 @@ pub struct PgMetaEngine {
     lock_worker_start_lock: Mutex<()>,
     /// Signals the background poll thread to exit.
     poll_shutdown: Arc<AtomicBool>,
+    /// Wakes the background poll thread before the regular polling interval.
+    poll_wakeup: Arc<(Mutex<bool>, Condvar)>,
     /// Cancels the lock-notify listener async future immediately, even mid-await.
     lock_notify_cancel: CancellationToken,
     /// Handle to the background poll thread, used by `prepare_for_close()`
@@ -1926,6 +1928,7 @@ impl PgMetaEngine {
                 restored_flushed_event_seq
             };
         let poll_shutdown = Arc::new(AtomicBool::new(false));
+        let poll_wakeup = Arc::new((Mutex::new(false), Condvar::new()));
         let engine = Arc::new(Self {
             local,
             postgres_url: pg.url,
@@ -1959,6 +1962,7 @@ impl PgMetaEngine {
             lock_workers_enabled: options.background_poll,
             lock_worker_start_lock: Mutex::new(()),
             poll_shutdown: poll_shutdown.clone(),
+            poll_wakeup: poll_wakeup.clone(),
             lock_notify_cancel: CancellationToken::new(),
             poll_handle: Mutex::new(None),
             lock_notify_handle: Mutex::new(None),
@@ -1979,6 +1983,7 @@ impl PgMetaEngine {
                 Arc::downgrade(&engine),
                 engine.poll_interval,
                 poll_shutdown,
+                poll_wakeup,
             )?;
             *engine.poll_handle.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
         }
@@ -2031,6 +2036,7 @@ impl PgMetaEngine {
         engine: std::sync::Weak<Self>,
         interval: Duration,
         shutdown: Arc<AtomicBool>,
+        wakeup: Arc<(Mutex<bool>, Condvar)>,
     ) -> MetaResult<std::thread::JoinHandle<()>> {
         std::thread::Builder::new()
             .name("pg-meta-poll".into())
@@ -2039,17 +2045,30 @@ impl PgMetaEngine {
                     if shutdown.load(Ordering::Acquire) {
                         break;
                     }
-                    // Sleep in short increments so we notice the shutdown flag
-                    // promptly instead of blocking for the full poll interval.
-                    let step = Duration::from_millis(250);
-                    let mut remaining = interval;
-                    while remaining > Duration::ZERO {
-                        let nap = remaining.min(step);
-                        std::thread::sleep(nap);
-                        remaining = remaining.saturating_sub(nap);
+                    let (wakeup_lock, wakeup_cv) = &*wakeup;
+                    let mut wakeup_guard = wakeup_lock
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let deadline = Instant::now() + interval;
+                    while !*wakeup_guard {
                         if shutdown.load(Ordering::Acquire) {
                             return;
                         }
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining == Duration::ZERO {
+                            break;
+                        }
+                        let nap = remaining.min(Duration::from_millis(250));
+                        let wait_result = wakeup_cv.wait_timeout(wakeup_guard, nap);
+                        wakeup_guard = match wait_result {
+                            Ok((guard, _)) => guard,
+                            Err(poisoned) => poisoned.into_inner().0,
+                        };
+                    }
+                    *wakeup_guard = false;
+                    drop(wakeup_guard);
+                    if shutdown.load(Ordering::Acquire) {
+                        return;
                     }
                     let Some(engine) = engine.upgrade() else {
                         break;
@@ -2150,6 +2169,36 @@ impl PgMetaEngine {
             }
         }
         out
+    }
+
+    fn remote_visible_event_count(events: &[MetaEvent]) -> u32 {
+        let count = Self::project_remote_events(events).len();
+        u32::try_from(count).unwrap_or(u32::MAX)
+    }
+
+    fn remote_events_need_eager_flush(events: &[MetaEvent]) -> bool {
+        events.iter().any(|event| match event {
+            MetaEvent::SetRegularFileOverlaySlices { .. }
+            | MetaEvent::RemoveRegularFileGraph { .. }
+            | MetaEvent::AddPendingDeletion { .. }
+            | MetaEvent::RemovePendingDeletion { .. } => false,
+            MetaEvent::SetAttr { attr } if attr.kind == FileType::RegularFile => {
+                attr.upload_state == UploadState::Ready
+            }
+            MetaEvent::SetAttr { .. }
+            | MetaEvent::RemoveAttr { .. }
+            | MetaEvent::AddEntry { .. }
+            | MetaEvent::RemoveEntry { .. }
+            | MetaEvent::RenameEntry { .. }
+            | MetaEvent::PublishRegularFileBaseSlices { .. }
+            | MetaEvent::SetSymlinkTarget { .. }
+            | MetaEvent::SetXattr { .. }
+            | MetaEvent::RemoveXattr { .. }
+            | MetaEvent::SetAclRule { .. }
+            | MetaEvent::RemoveAclRule { .. }
+            | MetaEvent::CreateSnapshot { .. }
+            | MetaEvent::UpdateSnapshotState { .. } => true,
+        })
     }
 
     fn aux_event_conflicts_with_overlay(
@@ -2978,9 +3027,17 @@ impl PgMetaEngine {
             return Ok(());
         }
 
+        let pending_events = self.local.read_events_range(event_start, event_end)?;
+        let remote_visible_ops = Self::remote_visible_event_count(&pending_events);
+        if remote_visible_ops == 0 {
+            Self::clear_pending_state(&mut state);
+            drop(state);
+            self.persist_flushed_event_seq(event_end)?;
+            return Ok(());
+        }
+
         let now = Instant::now();
-        let pending_events = event_end.saturating_sub(event_start);
-        state.ops = u32::try_from(pending_events).unwrap_or(u32::MAX);
+        state.ops = remote_visible_ops;
         state.force_flush = true;
         state.event_start = Some(event_start);
         state.event_end = event_end;
@@ -2989,30 +3046,60 @@ impl PgMetaEngine {
         Ok(())
     }
 
-    fn mark_pending_after_mutation(&self, before_seq: u64, after_seq: u64) {
+    fn mark_pending_after_mutation(&self, before_seq: u64, after_seq: u64) -> MetaResult<bool> {
+        if after_seq <= before_seq {
+            return Ok(false);
+        }
+        let events = self.local.read_events_range(before_seq, after_seq)?;
+        let remote_events = Self::project_remote_events(&events);
+        let remote_visible_ops = u32::try_from(remote_events.len()).unwrap_or(u32::MAX);
+        let needs_eager_flush = Self::remote_events_need_eager_flush(&remote_events);
         let now = Instant::now();
-        if let Ok(mut state) = self.pending_state.lock() {
+        let mut state = self
+            .pending_state
+            .lock()
+            .map_err(|_| MetaError::Storage("pg pending state lock poisoned".to_string()))?;
+        if remote_visible_ops == 0 {
             if state.ops == 0 {
-                state.started_at = Some(now);
-            }
-            state.ops = state.ops.saturating_add(1);
-            state.last_mutation_at = Some(now);
-            if after_seq > before_seq {
+                Self::clear_pending_state(&mut state);
+                drop(state);
+                self.persist_flushed_event_seq(after_seq)?;
+            } else {
                 if state.event_start.is_none() {
                     state.event_start = Some(before_seq);
                 }
                 state.event_end = state.event_end.max(after_seq);
             }
-            if state.ops >= self.flush_ops_threshold {
-                state.force_flush = true;
-            }
+            return Ok(false);
         }
+        if state.ops == 0 {
+            state.started_at = Some(now);
+        }
+        state.ops = state.ops.saturating_add(remote_visible_ops);
+        state.last_mutation_at = Some(now);
+        if state.event_start.is_none() {
+            state.event_start = Some(before_seq);
+        }
+        state.event_end = state.event_end.max(after_seq);
+        if needs_eager_flush || state.ops >= self.flush_ops_threshold {
+            state.force_flush = true;
+        }
+        Ok(needs_eager_flush)
     }
 
     fn request_pending_flush(&self) {
         if let Ok(mut state) = self.pending_state.lock() {
             state.force_flush = true;
         }
+    }
+
+    fn signal_poll_wakeup(&self) {
+        let (wakeup_lock, wakeup_cv) = &*self.poll_wakeup;
+        let mut wakeup_guard = wakeup_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *wakeup_guard = true;
+        wakeup_cv.notify_one();
     }
 
     fn should_flush_due_interval(
@@ -3095,15 +3182,20 @@ impl PgMetaEngine {
         if events.is_empty() {
             return Ok(None);
         }
+        let remote_events = Self::project_remote_events(&events);
+        if remote_events.is_empty() {
+            self.persist_flushed_event_seq(batch.event_end)?;
+            return Ok(None);
+        }
         let batch_version = self.push_event_log_batch_locked(&events)?;
         // Do not advance `local_version` here. The writer may have published a
         // newer batch_version while still missing earlier foreign batches.
         // `pull_foreign_events_locked()` must remain able to read the full gap.
-        self.apply_visible_self_batch(&events)?;
+        self.apply_visible_self_batch(&remote_events)?;
         self.persist_flushed_event_seq(batch.event_end)?;
         Ok(Some(RecentFlush {
             batch_version,
-            overlay: Self::overlay_conflicts_for_events(&events),
+            overlay: Self::overlay_conflicts_for_events(&remote_events),
         }))
     }
 
@@ -3154,7 +3246,9 @@ impl PgMetaEngine {
         let before_seq = self.local.get_counter("nextEventSeq")?;
         let result = f(&self.local)?;
         let after_seq = self.local.get_counter("nextEventSeq")?;
-        self.mark_pending_after_mutation(before_seq, after_seq);
+        if self.mark_pending_after_mutation(before_seq, after_seq)? {
+            self.signal_poll_wakeup();
+        }
         Ok(result)
     }
 }
@@ -3942,7 +4036,7 @@ impl MetaPayloadObjects for PgMetaEngine {
             local.publish_regular_file_overlay_to_base_if_matches(ino, expected_epoch)
         });
         if matches!(result, Ok(true)) {
-            self.request_pending_flush();
+            self.request_eager_flush();
         }
         result
     }
@@ -4089,6 +4183,7 @@ impl MetaReplication for PgMetaEngine {
 
     fn request_eager_flush(&self) {
         self.request_pending_flush();
+        self.signal_poll_wakeup();
     }
 
     fn sync_metadata(&self) -> MetaResult<()> {
@@ -4194,6 +4289,7 @@ impl MetaReplication for PgMetaEngine {
         // interrupted immediately rather than waiting up to command_timeout.
         self.lock_notify_cancel.cancel();
         self.poll_shutdown.store(true, Ordering::Release);
+        self.signal_poll_wakeup();
         let join_timeout = Self::default_prepare_for_close_join_timeout();
         if let Ok(mut guard) = self.poll_handle.lock()
             && let Some(handle) = guard.take()
@@ -4751,6 +4847,7 @@ mod tests {
             lock_workers_enabled: false,
             lock_worker_start_lock: Mutex::new(()),
             poll_shutdown: Arc::new(AtomicBool::new(false)),
+            poll_wakeup: Arc::new((Mutex::new(false), Condvar::new())),
             lock_notify_cancel: CancellationToken::new(),
             poll_handle: Mutex::new(None),
             lock_notify_handle: Mutex::new(None),
@@ -6177,6 +6274,227 @@ mod tests {
         assert_eq!(backlog.pending_ops, 7);
         assert_eq!(backlog.inflight_ops, 3);
         assert_eq!(backlog.total_ops(), 10);
+    }
+
+    #[test]
+    fn upload_progress_only_mutation_does_not_create_pg_replication_backlog() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = pg
+            .create_file(ROOT_INO, b"upload-progress-only.bin", 0, 0, 0o644)
+            .expect("create file");
+        set_file_state(&pg, file.ino, 4096, 1);
+        let payload = PayloadRef::new_partial(77_001, 4096);
+        pg.stage_payload_slice(file.ino, 0, &payload)
+            .expect("stage local overlay");
+
+        let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+        pg.persist_flushed_event_seq(setup_end)
+            .expect("ack setup events");
+        {
+            let mut state = pg.pending_state.lock().expect("pending_state");
+            PgMetaEngine::clear_pending_state(&mut state);
+        }
+        let (wakeup_lock, _) = &*pg.poll_wakeup;
+        {
+            let mut wakeup = wakeup_lock.lock().expect("poll wakeup lock");
+            *wakeup = false;
+        }
+
+        assert!(
+            pg.mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 1, payload.object_id)
+                .expect("mark uploaded"),
+            "upload marker must update the local overlay"
+        );
+        let after_upload_progress = pg
+            .local
+            .get_counter("nextEventSeq")
+            .expect("after upload progress");
+
+        let backlog = pg.replication_backlog();
+        assert_eq!(
+            backlog.total_ops(),
+            0,
+            "local-only upload progress must not appear as remote metadata backlog"
+        );
+        assert_eq!(
+            pg.flushed_event_seq.load(Ordering::SeqCst),
+            after_upload_progress,
+            "the local-only event cursor should be acknowledged so reopen does not rebuild backlog"
+        );
+        assert!(
+            !*wakeup_lock.lock().expect("poll wakeup lock"),
+            "local-only upload progress must not wake the metadata poll worker"
+        );
+    }
+
+    #[test]
+    fn published_unlink_creates_remote_visible_pg_replication_backlog() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        create_published_small_file(&pg, ROOT_INO, b"published-delete.bin", 77_002);
+        let published_end = pg.local.get_counter("nextEventSeq").expect("published end");
+        pg.persist_flushed_event_seq(published_end)
+            .expect("ack published setup");
+        {
+            let mut state = pg.pending_state.lock().expect("pending_state");
+            PgMetaEngine::clear_pending_state(&mut state);
+        }
+
+        pg.unlink(ROOT_INO, b"published-delete.bin")
+            .expect("unlink published file");
+        pg.request_eager_flush();
+
+        let backlog = pg.replication_backlog();
+        assert!(
+            backlog.total_ops() > 0,
+            "published unlink must create remote-visible metadata backlog"
+        );
+        let batch = pg
+            .claim_pending_batch(false)
+            .expect("published unlink should be claimable after eager flush request");
+        let events = pg
+            .local
+            .read_events_range(batch.event_start, batch.event_end)
+            .expect("read unlink events");
+        let projected = PgMetaEngine::project_remote_events(&events);
+        assert!(
+            projected
+                .iter()
+                .any(|event| matches!(event, MetaEvent::RemoveEntry { .. })),
+            "published unlink must project a remote RemoveEntry"
+        );
+        assert!(
+            projected
+                .iter()
+                .any(|event| matches!(event, MetaEvent::RemoveAttr { .. })),
+            "published unlink must project a remote RemoveAttr"
+        );
+    }
+
+    #[test]
+    fn request_eager_flush_wakes_pg_poll_worker() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        pg.request_pending_flush();
+        let (wakeup_lock, _) = &*pg.poll_wakeup;
+        assert!(
+            !*wakeup_lock.lock().expect("poll wakeup lock"),
+            "regular upload-pipeline flush requests should not wake the metadata poll worker"
+        );
+
+        pg.request_eager_flush();
+
+        assert!(
+            *wakeup_lock.lock().expect("poll wakeup lock"),
+            "namespace eager flush requests should wake the metadata poll worker"
+        );
+    }
+
+    #[test]
+    fn published_base_graph_wakes_pg_poll_worker() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = pg
+            .create_file(ROOT_INO, b"publish-wakeup.bin", 0, 0, 0o644)
+            .expect("create file");
+        set_file_state(&pg, file.ino, 4096, 1);
+        let payload = PayloadRef::new_partial(77_003, 4096);
+        pg.stage_payload_slice(file.ino, 0, &payload)
+            .expect("stage local overlay");
+        assert!(
+            pg.mark_regular_file_overlay_object_uploaded_if_matches(file.ino, 1, payload.object_id)
+                .expect("mark uploaded"),
+            "upload marker must update the local overlay"
+        );
+
+        let (wakeup_lock, _) = &*pg.poll_wakeup;
+        {
+            let mut wakeup = wakeup_lock.lock().expect("poll wakeup lock");
+            *wakeup = false;
+        }
+
+        assert!(
+            pg.publish_regular_file_overlay_to_base_if_matches(file.ino, 1)
+                .expect("publish base graph"),
+            "base graph publish must succeed"
+        );
+
+        assert!(
+            *wakeup_lock.lock().expect("poll wakeup lock"),
+            "publishing a remote-visible base graph should wake the metadata poll worker"
+        );
+    }
+
+    #[test]
+    fn ready_file_attr_change_wakes_pg_poll_worker() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = pg
+            .create_file(ROOT_INO, b"ready-attr-wakeup.bin", 0, 0, 0o644)
+            .expect("create file");
+        let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+        pg.persist_flushed_event_seq(setup_end)
+            .expect("ack setup events");
+        {
+            let mut state = pg.pending_state.lock().expect("pending_state");
+            PgMetaEngine::clear_pending_state(&mut state);
+        }
+
+        let (wakeup_lock, _) = &*pg.poll_wakeup;
+        {
+            let mut wakeup = wakeup_lock.lock().expect("poll wakeup lock");
+            *wakeup = false;
+        }
+
+        let mut attr = pg.get_attr(file.ino).expect("get attr");
+        attr.mtime = attr.mtime.saturating_add(1);
+        attr.touch_ctime();
+        pg.set_attr(&attr).expect("set ready attr");
+
+        assert!(
+            *wakeup_lock.lock().expect("poll wakeup lock"),
+            "settled file metadata changes should wake the metadata poll worker"
+        );
+    }
+
+    #[test]
+    fn uploading_file_attr_change_batches_without_pg_poll_wakeup() {
+        let (_dir, pg) = temp_pg_engine_for_unit();
+
+        let file = pg
+            .create_file(ROOT_INO, b"uploading-attr-batch.bin", 0, 0, 0o644)
+            .expect("create file");
+        let setup_end = pg.local.get_counter("nextEventSeq").expect("setup end");
+        pg.persist_flushed_event_seq(setup_end)
+            .expect("ack setup events");
+        {
+            let mut state = pg.pending_state.lock().expect("pending_state");
+            PgMetaEngine::clear_pending_state(&mut state);
+        }
+
+        let (wakeup_lock, _) = &*pg.poll_wakeup;
+        {
+            let mut wakeup = wakeup_lock.lock().expect("poll wakeup lock");
+            *wakeup = false;
+        }
+
+        let mut attr = pg.get_attr(file.ino).expect("get attr");
+        attr.size = 4096;
+        attr.committed_size = 0;
+        attr.upload_state = UploadState::Uploading;
+        attr.touch_ctime();
+        pg.set_attr(&attr).expect("set uploading attr");
+
+        assert_eq!(
+            pg.replication_backlog().pending_ops,
+            1,
+            "uploading attrs remain remote-visible metadata"
+        );
+        assert!(
+            !*wakeup_lock.lock().expect("poll wakeup lock"),
+            "upload-progress attrs should batch instead of waking PG on the hot write path"
+        );
     }
 
     #[test]

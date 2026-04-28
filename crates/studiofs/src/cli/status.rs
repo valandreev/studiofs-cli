@@ -711,6 +711,15 @@ pub fn run(
                 format_ms(snapshot.local_cache_io.backend_io_max_ms)
             );
             println!(
+                "  fetch cache_hits/s3/s3_errors/singleflight/bytes/prefetch_skips: {}/{}/{}/{}/{}/{}",
+                snapshot.fetch.cache_hits,
+                snapshot.fetch.s3_fetches,
+                snapshot.fetch.s3_errors,
+                snapshot.fetch.singleflight_joins,
+                format_bytes(snapshot.fetch.bytes_downloaded),
+                snapshot.fetch.prefetch_skips
+            );
+            println!(
                 "  WinFSP callbacks write/flush/cleanup->flush_fh: {}/{}/{}",
                 snapshot.winfsp_callbacks.write,
                 snapshot.winfsp_callbacks.flush,
@@ -871,6 +880,7 @@ mod tests {
             write_backpressure: Default::default(),
             dirty_pressure: Default::default(),
             upload: Default::default(),
+            fetch: Default::default(),
             payload_burst: Default::default(),
             payload_persist: Default::default(),
             metadata_commit: Default::default(),

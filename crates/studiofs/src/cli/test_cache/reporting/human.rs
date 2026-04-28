@@ -115,6 +115,27 @@ fn render_mounted_observability(out: &mut String, observability: &MountedObserva
             format_throughput(upload.throughput_bytes_per_sec),
             upload.retry_count,
         );
+        if upload.raw.canceled_stale > 0 {
+            let _ = writeln!(
+                out,
+                "Upload stale: total {}, before PUT {}, after PUT {} ({})",
+                upload.raw.canceled_stale,
+                upload.raw.canceled_stale_before_put,
+                upload.raw.canceled_stale_after_put,
+                format_bytes(upload.raw.canceled_stale_after_put_bytes),
+            );
+        }
+    }
+    if let Some(fetch) = &observability.fetch {
+        let _ = writeln!(
+            out,
+            "Fetch: cache hits {}, S3 GETs {}, downloaded {}, singleflight {}, prefetch skips {}",
+            fetch.cache_hits,
+            fetch.s3_fetches,
+            format_bytes(fetch.bytes_downloaded),
+            fetch.singleflight_joins,
+            fetch.prefetch_skips,
+        );
     }
     if let Some(barriers) = &observability.barriers {
         let _ = writeln!(

@@ -2,8 +2,8 @@ use crate::cli::test_cache_profile_types::ProfileArtifactKind;
 use serde::Serialize;
 use studiofs_cache::metrics::CachePipelineMetricsSnapshot;
 use studiofs_vfs::{
-    VfsUploadStats, VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats,
-    VfsWritePathSyncDataStats,
+    VfsFetchStats, VfsUploadStats, VfsWritePathObservabilitySnapshot,
+    VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
 };
 
 #[derive(Debug, Serialize)]
@@ -128,6 +128,8 @@ pub(super) struct MountedObservabilityReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) upload: Option<MountedUploadReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) fetch: Option<MountedFetchReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) process: Option<MountedProcessReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) barriers: Option<MountedBarrierReport>,
@@ -177,6 +179,18 @@ pub(super) struct MountedUploadReport {
     pub(super) completed_uploads: u64,
     pub(super) completed_upload_bytes: u64,
     pub(super) raw: VfsUploadStats,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct MountedFetchReport {
+    pub(super) cache_hits: u64,
+    pub(super) s3_fetches: u64,
+    pub(super) s3_errors: u64,
+    pub(super) singleflight_joins: u64,
+    pub(super) retries: u64,
+    pub(super) bytes_downloaded: u64,
+    pub(super) prefetch_skips: u64,
+    pub(super) raw: VfsFetchStats,
 }
 
 #[derive(Debug, Serialize)]
@@ -888,6 +902,23 @@ pub(crate) fn sample_report() -> BenchmarkReport {
                     completed_uploads: 16,
                     completed_upload_bytes: 128 * 1024 * 1024,
                     completed_upload_bytes_per_sec: 512.0 * 1024.0 * 1024.0,
+                    ..Default::default()
+                },
+            }),
+            fetch: Some(MountedFetchReport {
+                cache_hits: 12,
+                s3_fetches: 3,
+                s3_errors: 0,
+                singleflight_joins: 1,
+                retries: 0,
+                bytes_downloaded: 12 * 1024 * 1024,
+                prefetch_skips: 2,
+                raw: VfsFetchStats {
+                    cache_hits: 12,
+                    s3_fetches: 3,
+                    singleflight_joins: 1,
+                    bytes_downloaded: 12 * 1024 * 1024,
+                    prefetch_skips: 2,
                     ..Default::default()
                 },
             }),

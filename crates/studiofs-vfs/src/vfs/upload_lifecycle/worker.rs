@@ -220,6 +220,7 @@ trait UploadShutdownPort: Clone + Send + Sync + 'static {
     fn maybe_clear_deleted_inode_marker(&self, ino: Ino);
     fn record_canceled_deleted(&self);
     fn record_canceled_stale(&self);
+    fn record_canceled_stale_after_put(&self, bytes_uploaded: u64);
     fn record_requeue(&self);
 }
 
@@ -520,6 +521,7 @@ where
             }
         };
 
+        let payload_len = raw_payload.len() as u64;
         if !remote_object_visible {
             match self
                 .remote
@@ -561,6 +563,7 @@ where
                 )
                 .await?
         } else {
+            self.shutdown.record_canceled_stale_after_put(payload_len);
             self.meta
                 .add_pending_deletion(op.object_id, timestamp)
                 .await?;
@@ -1206,6 +1209,29 @@ impl UploadShutdownPort for VfsUploadShutdownPort {
             .upload
             .upload_canceled_stale
             .fetch_add(1, Ordering::Relaxed);
+        self.vfs
+            .state
+            .upload
+            .upload_canceled_stale_before_put
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_canceled_stale_after_put(&self, bytes_uploaded: u64) {
+        self.vfs
+            .state
+            .upload
+            .upload_canceled_stale
+            .fetch_add(1, Ordering::Relaxed);
+        self.vfs
+            .state
+            .upload
+            .upload_canceled_stale_after_put
+            .fetch_add(1, Ordering::Relaxed);
+        self.vfs
+            .state
+            .upload
+            .upload_canceled_stale_after_put_bytes
+            .fetch_add(bytes_uploaded, Ordering::Relaxed);
     }
 
     fn record_requeue(&self) {
@@ -1695,6 +1721,7 @@ mod tests {
         adaptive_penalty_ms: u64,
         visibility: Arc<Mutex<RemoteVisibility>>,
         upload_result: Arc<Mutex<Option<UploadPutOutcome>>>,
+        remove_overlay_after_upload: Arc<Mutex<Option<(FakeMeta, Ino, u64)>>>,
     }
 
     impl Default for FakeRemote {
@@ -1703,6 +1730,7 @@ mod tests {
                 adaptive_penalty_ms: 0,
                 visibility: Arc::new(Mutex::new(RemoteVisibility::NotVisible)),
                 upload_result: Arc::new(Mutex::new(Some(UploadPutOutcome::Uploaded))),
+                remove_overlay_after_upload: Arc::new(Mutex::new(None)),
             }
         }
     }
@@ -1733,10 +1761,18 @@ mod tests {
             _fragment_keys: &[String],
             _cancel_token: &CancellationToken,
         ) -> UploadPutOutcome {
-            self.upload_result
+            let outcome = self
+                .upload_result
                 .lock()
                 .take()
-                .unwrap_or(UploadPutOutcome::Uploaded)
+                .unwrap_or(UploadPutOutcome::Uploaded);
+            if matches!(outcome, UploadPutOutcome::Uploaded)
+                && let Some((meta, ino, object_id)) = self.remove_overlay_after_upload.lock().take()
+                && let Some(objects) = meta.overlay_objects.lock().get_mut(&ino)
+            {
+                objects.remove(&object_id);
+            }
+            outcome
         }
     }
 
@@ -1749,6 +1785,8 @@ mod tests {
         released_tokens: Arc<Mutex<Vec<Ino>>>,
         canceled_deleted: Arc<AtomicU64>,
         canceled_stale: Arc<AtomicU64>,
+        canceled_stale_after_put: Arc<AtomicU64>,
+        canceled_stale_after_put_bytes: Arc<AtomicU64>,
         requeues: Arc<AtomicU64>,
         shutdown_token: CancellationToken,
     }
@@ -1763,6 +1801,8 @@ mod tests {
                 released_tokens: Arc::new(Mutex::new(Vec::new())),
                 canceled_deleted: Arc::new(AtomicU64::new(0)),
                 canceled_stale: Arc::new(AtomicU64::new(0)),
+                canceled_stale_after_put: Arc::new(AtomicU64::new(0)),
+                canceled_stale_after_put_bytes: Arc::new(AtomicU64::new(0)),
                 requeues: Arc::new(AtomicU64::new(0)),
                 shutdown_token: CancellationToken::new(),
             }
@@ -1803,6 +1843,14 @@ mod tests {
 
         fn record_canceled_stale(&self) {
             self.canceled_stale.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn record_canceled_stale_after_put(&self, bytes_uploaded: u64) {
+            self.canceled_stale.fetch_add(1, Ordering::Relaxed);
+            self.canceled_stale_after_put
+                .fetch_add(1, Ordering::Relaxed);
+            self.canceled_stale_after_put_bytes
+                .fetch_add(bytes_uploaded, Ordering::Relaxed);
         }
 
         fn record_requeue(&self) {
@@ -2035,6 +2083,46 @@ mod tests {
             "current fragmented overlay object should stay in the local backend"
         );
         assert_eq!(policy.refreshed.lock().as_slice(), &[11]);
+    }
+
+    #[tokio::test]
+    async fn process_upload_counts_stale_discovered_after_remote_put() {
+        let (processor, coordinator, local_payloads, meta, remote, shutdown, policy) =
+            processor_fixture();
+        let op = make_pending_upload();
+        coordinator.pending_inodes.lock().insert(op.ino);
+        meta.attrs
+            .lock()
+            .insert(op.ino, Some(make_attr(op.ino, op.content_epoch)));
+        meta.overlay_objects
+            .lock()
+            .insert(op.ino, HashSet::from([op.object_id]));
+        local_payloads.upload_reads.lock().insert(
+            op.object_id,
+            Some(Bytes::from_static(b"remote stale payload")),
+        );
+        *remote.remove_overlay_after_upload.lock() = Some((meta.clone(), op.ino, op.object_id));
+
+        let outcome = processor.process_upload(op).await;
+
+        assert_eq!(outcome, UploadOutcome::Completed);
+        assert_eq!(coordinator.completed.lock().as_slice(), &[77]);
+        assert_eq!(meta.pending_deletions.lock().as_slice(), &[77]);
+        assert_eq!(local_payloads.removed.lock().as_slice(), &[77]);
+        assert!(local_payloads.uploaded.lock().is_empty());
+        assert!(policy.quarantines.lock().is_empty());
+        assert_eq!(
+            shutdown.canceled_stale.load(Ordering::Relaxed),
+            1,
+            "stale objects discovered only after PUT must be counted as stale remote traffic"
+        );
+        assert_eq!(shutdown.canceled_stale_after_put.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            shutdown
+                .canceled_stale_after_put_bytes
+                .load(Ordering::Relaxed),
+            "remote stale payload".len() as u64
+        );
     }
 
     #[tokio::test]

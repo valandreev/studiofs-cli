@@ -1127,6 +1127,12 @@ impl UploadSubmissionPort for VfsUploadSubmitter<'_> {
         }
         self.vfs.record_live_extents(&live_extents);
         if !submit_ops.is_empty() {
+            self.vfs.log_upload_submission_batch(
+                "deferred_materialize",
+                ino,
+                content_epoch,
+                &submit_ops,
+            );
             self.vfs.cached_store.submit_uploads_batch(&submit_ops);
             self.vfs.state.file_session.note_background_transition(
                 ino,
@@ -1221,6 +1227,12 @@ impl<'a> LocalDirtyFlushSession<'a> {
                 })
                 .collect();
             self.vfs.record_live_extents(&live_extents);
+            self.vfs.log_upload_submission_batch(
+                "local_dirty_flush",
+                self.ino,
+                content_epoch,
+                &upload_ops,
+            );
             self.vfs.cached_store.submit_uploads_batch(&upload_ops);
             self.vfs.state.file_session.note_background_transition(
                 self.ino,
@@ -2021,6 +2033,12 @@ impl StudioVfs {
             && oldest_age.is_none_or(|age| age < PENDING_SLICE_COMMIT_MAX_AGE)
         {
             return std::collections::BTreeMap::new();
+        }
+        let upload_pipeline_idle =
+            self.cached_store.pending_upload_count() == 0 && self.upload_scheduler.in_flight() == 0;
+        if upload_pipeline_idle && oldest_age.is_some_and(|age| age >= PENDING_SLICE_COMMIT_MAX_AGE)
+        {
+            return pending_slices;
         }
 
         let mut ordered_slices = Vec::<(u64, PendingDirtySlice)>::new();
@@ -3414,6 +3432,71 @@ mod tests {
         assert_eq!(
             selected_bytes, chunk_size,
             "a full 64MiB chunk worth of persisted 4MiB blocks should commit in one metadata wave"
+        );
+    }
+
+    #[test]
+    fn opportunistic_pending_slice_commit_drains_aged_tail_when_upload_pipeline_is_idle() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-slice-idle-tail");
+        let _guard = rt.enter();
+        let ino = rt.block_on(async {
+            let attr = vfs
+                .create(1, b"pending-slice-idle-tail.txt", 0, 0, 0o644)
+                .expect("create file");
+            let fh = vfs
+                .open_file(attr.ino, OpenFlags::RDWR, false)
+                .expect("open file");
+            vfs.write_fh(fh, attr.ino, 0, b"tail")
+                .await
+                .expect("seed open writer tail");
+            attr.ino
+        });
+
+        let block_size = vfs.block_size as usize;
+        let chunk_size = studiofs_meta::schema::DEFAULT_CHUNK_SIZE as usize;
+        let aged_created_at = Instant::now()
+            .checked_sub(PENDING_SLICE_COMMIT_MAX_AGE + Duration::from_secs(1))
+            .expect("old instant");
+        let mut persisted = std::collections::BTreeMap::<u64, Vec<PendingDirtySlice>>::new();
+        let blocks = (chunk_size + (chunk_size / 2)) / block_size;
+        for block in 0..blocks {
+            let absolute_offset = block * block_size;
+            let chunk_id = (absolute_offset / chunk_size) as u64;
+            let start = u32::try_from(absolute_offset % chunk_size).expect("slice start");
+            persisted
+                .entry(chunk_id)
+                .or_default()
+                .push(PendingDirtySlice {
+                    range: studiofs_meta::schema::SliceRange::new(
+                        start,
+                        start.saturating_add(vfs.block_size),
+                    )
+                    .expect("slice range"),
+                    block_index: block as u32,
+                    block_offset: 0,
+                    seq: block as u64 + 1,
+                    object_id: Some(20_000 + block as u64),
+                    object_offset: 0,
+                    created_at: aged_created_at,
+                });
+        }
+
+        let selected = vfs.select_pending_persisted_local_dirty_slice_commit_wave(
+            ino,
+            persisted,
+            LocalSyncPolicy::Opportunistic,
+        );
+        let selected_bytes: usize = selected
+            .values()
+            .flat_map(|slices| slices.iter())
+            .map(|slice| slice.len())
+            .sum();
+
+        assert_eq!(
+            selected_bytes,
+            chunk_size + (chunk_size / 2),
+            "aged persisted tail should drain in one wave once uploads are idle"
         );
     }
 

@@ -2133,17 +2133,57 @@ fn vfs_config_raw_validate_clamps_and_normalizes() {
 
 #[test]
 fn upload_pipeline_summary_logs_only_when_pending_work_exists() {
-    assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 0));
-    assert!(StudioVfs::upload_pipeline_summary_is_active(1, 0));
-    assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 1)); // < 10 threshold
-    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 10));
+    assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 0, 0));
+    assert!(StudioVfs::upload_pipeline_summary_is_active(1, 0, 0));
+    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 1, 0));
+    assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 0, 1)); // < 10 threshold
+    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 0, 10));
 }
 
 #[test]
 fn upload_pipeline_summary_is_active_checks() {
-    assert!(StudioVfs::upload_pipeline_summary_is_active(256, 0));
-    assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 9));
-    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 11));
+    assert!(StudioVfs::upload_pipeline_summary_is_active(256, 0, 0));
+    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 4, 0));
+    assert!(!StudioVfs::upload_pipeline_summary_is_active(0, 0, 9));
+    assert!(StudioVfs::upload_pipeline_summary_is_active(0, 0, 11));
+}
+
+#[test]
+fn upload_pipeline_summary_completed_delta_tracks_idle_bursts() {
+    assert_eq!(
+        StudioVfs::upload_pipeline_summary_completed_delta(
+            10,
+            40 * 1024 * 1024,
+            14,
+            56 * 1024 * 1024
+        ),
+        (4, 16 * 1024 * 1024)
+    );
+    assert_eq!(
+        StudioVfs::upload_pipeline_summary_completed_delta(
+            14,
+            56 * 1024 * 1024,
+            2,
+            4 * 1024 * 1024
+        ),
+        (0, 0),
+        "counter reset should not create a fake idle burst"
+    );
+}
+
+#[test]
+fn upload_submission_batch_bounds_tracks_offsets_and_objects() {
+    let ops = vec![
+        (7, 16 * 1024 * 1024, 42, 9),
+        (7, 4 * 1024 * 1024, 39, 9),
+        (7, 8 * 1024 * 1024, 41, 9),
+    ];
+
+    assert_eq!(
+        StudioVfs::upload_submission_batch_bounds(&ops),
+        Some((3, 4 * 1024 * 1024, 16 * 1024 * 1024, 39, 42))
+    );
+    assert_eq!(StudioVfs::upload_submission_batch_bounds(&[]), None);
 }
 
 #[test]
@@ -5939,6 +5979,61 @@ fn deferred_materialization_drains_idle_tail_before_close() {
 }
 
 #[test]
+fn deferred_materialization_reschedules_write_that_arrives_while_inflight_finishes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "sfs-301-inflight-reschedule-tail");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-301-inflight-reschedule-tail.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+        let task_lock = Arc::new(tokio::sync::Mutex::new(()));
+        vfs.state
+            .deferred_materialize_inflight
+            .lock()
+            .insert(ino, task_lock);
+
+        let payload = vec![0xD4; vfs.block_size as usize];
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            0,
+            &payload,
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+        assert!(
+            vfs.pending_uploads_for_inode(ino).is_empty(),
+            "occupied in-flight slot should suppress immediate upload scheduling"
+        );
+        assert!(
+            vfs.state.writer_stack.dirty_bytes_for_inode(ino) > 0,
+            "write should remain buffered until the finishing materializer reschedules"
+        );
+
+        vfs.finish_deferred_materialization_task(ino, true);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if vfs.state.writer_stack.dirty_bytes_for_inode(ino) == 0
+                    && !vfs.pending_uploads_for_inode(ino).is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("finishing materializer should reschedule dirty writer-stack state");
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn write_path_observability_tracks_burst_shape_and_metadata_commit_stalls() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, meta) = make_test_vfs(&tmp, "write-path-observability-bursts");
@@ -6055,6 +6150,36 @@ fn write_path_observability_reports_active_tuning_knobs() {
         snapshot.tuning.sync_group_min_bytes, vfs.local_sync_group_min_bytes,
         "observability should report the active sync-data group minimum"
     );
+}
+
+#[test]
+fn write_path_observability_reports_fetch_counters() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-fetch");
+
+    vfs.fetch_scheduler
+        .metrics
+        .cache_hits
+        .store(13, Ordering::Relaxed);
+    vfs.fetch_scheduler
+        .metrics
+        .s3_fetches
+        .store(5, Ordering::Relaxed);
+    vfs.fetch_scheduler
+        .metrics
+        .singleflight_joins
+        .store(3, Ordering::Relaxed);
+    vfs.fetch_scheduler
+        .metrics
+        .bytes_downloaded
+        .store(20 * 1024 * 1024, Ordering::Relaxed);
+
+    let snapshot = vfs.write_path_observability_snapshot();
+
+    assert_eq!(snapshot.fetch.cache_hits, 13);
+    assert_eq!(snapshot.fetch.s3_fetches, 5);
+    assert_eq!(snapshot.fetch.singleflight_joins, 3);
+    assert_eq!(snapshot.fetch.bytes_downloaded, 20 * 1024 * 1024);
 }
 
 #[test]

@@ -459,6 +459,9 @@ impl StudioVfs {
         let mut upload_pipeline_summary_was_active = false;
         let mut ticks_since_last_log = 0u64;
         let mut zero_log_counter = 0u8;
+        let mut last_completed_uploads = 0u64;
+        let mut last_completed_upload_bytes = 0u64;
+        let mut completed_counters_initialized = false;
         const ZERO_LOG_TARGET: u8 = 3;
 
         loop {
@@ -485,13 +488,39 @@ impl StudioVfs {
                 .sum::<u64>();
             let metadata_backlog = self.sync_meta().replication_backlog();
             let pending_metadata_ops = metadata_backlog.total_ops();
+            let active_uploads = self.upload_scheduler.in_flight();
+            let upload_queue = self.cached_store.cache_pipeline_metrics().upload_queue;
+            let (completed_uploads_delta, completed_upload_bytes_delta) =
+                if completed_counters_initialized {
+                    Self::upload_pipeline_summary_completed_delta(
+                        last_completed_uploads,
+                        last_completed_upload_bytes,
+                        upload_queue.completed,
+                        upload_queue.completed_bytes,
+                    )
+                } else {
+                    completed_counters_initialized = true;
+                    (0, 0)
+                };
+            last_completed_uploads = upload_queue.completed;
+            last_completed_upload_bytes = upload_queue.completed_bytes;
+            let completed_between_samples =
+                completed_uploads_delta != 0 || completed_upload_bytes_delta != 0;
 
-            let is_active = Self::upload_pipeline_summary_is_active(pending, pending_metadata_ops);
+            let is_active = Self::upload_pipeline_summary_is_active(
+                pending,
+                active_uploads,
+                pending_metadata_ops,
+            );
             let activity_started = is_active && !upload_pipeline_summary_was_active;
 
             let should_log = if activity_started {
                 ticks_since_last_log = 0;
                 zero_log_counter = 0;
+                true
+            } else if !is_active && completed_between_samples {
+                ticks_since_last_log = 0;
+                zero_log_counter = 1;
                 true
             } else if is_active {
                 ticks_since_last_log += 1;
@@ -515,7 +544,6 @@ impl StudioVfs {
             let (p95_ms, max_ms) = self.pending_age_stats_ms(&pending_uploads);
             let ingress = self.ingress_stats();
             let materialize_batches = self.state.metrics.materialize_batch_stats.snapshot();
-            let upload_queue = self.cached_store.cache_pipeline_metrics().upload_queue;
             let foreground_read_protection = self.foreground_read_protection_stats();
             self.adjust_upload_backpressure_from_metrics(
                 foreground_read_protection.p90_latency_ns,
@@ -544,6 +572,9 @@ impl StudioVfs {
                             "pending_uploads": pending,
                             "pending_upload_bytes": pending_upload_bytes,
                             "pending_uploads_human": pending_uploads,
+                            "active_uploads": active_uploads,
+                            "completed_uploads_delta": completed_uploads_delta,
+                            "completed_upload_bytes_delta": completed_upload_bytes_delta,
                             "pending_metadata_ops": pending_metadata_ops,
                             "inflight_metadata_ops": metadata_backlog.inflight_ops,
                             "dirty_mem_blocks": ingress.dirty_mem_blocks,
@@ -562,6 +593,9 @@ impl StudioVfs {
                     serde_json::json!({
                         "pending_uploads": pending,
                         "pending_upload_bytes": pending_upload_bytes,
+                        "active_uploads": active_uploads,
+                        "completed_uploads_delta": completed_uploads_delta,
+                        "completed_upload_bytes_delta": completed_upload_bytes_delta,
                         "pending_metadata_ops": pending_metadata_ops,
                         "inflight_metadata_ops": metadata_backlog.inflight_ops,
                         "local_backend_dirty_count": local_backend_dirty_count,
@@ -578,6 +612,11 @@ impl StudioVfs {
                 // #endregion debug log
                 info!(
                     pending_uploads = %pending_uploads,
+                    active_uploads,
+                    completed_uploads_delta,
+                    completed_bytes_delta = %Self::format_upload_pipeline_pending_uploads(
+                        completed_upload_bytes_delta
+                    ),
                     pending_metadata_ops,
                     "upload pipeline"
                 );

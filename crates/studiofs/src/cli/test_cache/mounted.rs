@@ -20,7 +20,7 @@ use super::profiling::{cpu_utilization_percent, process_cpu_time};
 use super::progress::{ProgressBar, ProgressCounter};
 use super::result::{
     BenchmarkProfileReport, BenchmarkReport, CpuProfileReport, MountedBarrierReport,
-    MountedCachedStoreReport, MountedLocalFirstReadComparisonReport,
+    MountedCachedStoreReport, MountedFetchReport, MountedLocalFirstReadComparisonReport,
     MountedLocalFirstReadPhaseReport, MountedMemoryReport, MountedObservabilityReport,
     MountedPortableAllocatorReport, MountedPortablePhaseProfileReport,
     MountedPortableProcessReport, MountedPortableProfileReport, MountedPostUploadIdleReport,
@@ -635,10 +635,20 @@ struct UploadIdleReadDrain<'a> {
     timeout: Duration,
 }
 
+struct UploadIdleReadDrainOutcome {
+    observation: PendingUploadObservation,
+    pending_uploads_before: usize,
+    reads: PhaseTelemetry,
+    read_wall: Duration,
+}
+
 async fn wait_for_pending_upload_idle_with_unrecorded_reads(
     drain: UploadIdleReadDrain<'_>,
-) -> Result<PendingUploadObservation> {
+) -> Result<UploadIdleReadDrainOutcome> {
     let start = Instant::now();
+    let mut pending_uploads_before = None;
+    let mut reads = PhaseTelemetry::default();
+    let mut read_wall = Duration::ZERO;
     loop {
         let pending_uploads = scan_pending_uploads(
             drain.metrics_path,
@@ -646,22 +656,33 @@ async fn wait_for_pending_upload_idle_with_unrecorded_reads(
             Some(drain.upload_dir),
         )
         .await?;
+        pending_uploads_before.get_or_insert(pending_uploads);
         if pending_uploads == 0 {
-            return Ok(PendingUploadObservation {
-                target: PendingUploadTarget::Idle,
-                observed: true,
-                required_pending_uploads: 0,
-                waited: start.elapsed(),
-                pending_uploads,
+            return Ok(UploadIdleReadDrainOutcome {
+                observation: PendingUploadObservation {
+                    target: PendingUploadTarget::Idle,
+                    observed: true,
+                    required_pending_uploads: 0,
+                    waited: start.elapsed(),
+                    pending_uploads,
+                },
+                pending_uploads_before: pending_uploads_before.unwrap_or(pending_uploads),
+                reads,
+                read_wall,
             });
         }
         if start.elapsed() >= drain.timeout {
-            return Ok(PendingUploadObservation {
-                target: PendingUploadTarget::Idle,
-                observed: false,
-                required_pending_uploads: 0,
-                waited: start.elapsed(),
-                pending_uploads,
+            return Ok(UploadIdleReadDrainOutcome {
+                observation: PendingUploadObservation {
+                    target: PendingUploadTarget::Idle,
+                    observed: false,
+                    required_pending_uploads: 0,
+                    waited: start.elapsed(),
+                    pending_uploads,
+                },
+                pending_uploads_before: pending_uploads_before.unwrap_or(pending_uploads),
+                reads,
+                read_wall,
             });
         }
 
@@ -672,13 +693,16 @@ async fn wait_for_pending_upload_idle_with_unrecorded_reads(
             pending_uploads,
             "cache benchmark unrecorded read while waiting for upload idle"
         );
-        let _ = run_mounted_read_phase(
+        let read_started = Instant::now();
+        let (drain_reads, _) = run_mounted_read_phase(
             drain.params,
             drain.files,
             drain.order,
             drain.size_class_bounds,
         )
         .await?;
+        read_wall = read_wall.saturating_add(read_started.elapsed());
+        reads.merge_from_ref(&drain_reads);
     }
 }
 
@@ -907,10 +931,17 @@ fn per_second_f64(value: u64, uptime_secs: f64) -> f64 {
 fn mounted_post_upload_idle_report(
     comparison: Option<&MountedLocalFirstReadComparisonReport>,
 ) -> Option<MountedPostUploadIdleReport> {
-    let phase = comparison?
+    let comparison = comparison?;
+    let phase = comparison
         .phases
         .iter()
-        .find(|phase| phase.phase == "post-upload-read")?;
+        .find(|phase| phase.phase == "upload-drain-read")
+        .or_else(|| {
+            comparison
+                .phases
+                .iter()
+                .find(|phase| phase.phase == "post-upload-read")
+        })?;
     Some(MountedPostUploadIdleReport {
         observed: phase.target_state_observed,
         timed_out: !phase.target_state_observed,
@@ -941,6 +972,7 @@ fn build_mounted_observability_report(
             writer: None,
             cached_store: None,
             upload: None,
+            fetch: None,
             process,
             barriers: None,
             post_upload_idle,
@@ -989,6 +1021,16 @@ fn build_mounted_observability_report(
             completed_uploads: snapshot.upload.completed_uploads,
             completed_upload_bytes: snapshot.upload.completed_upload_bytes,
             raw: snapshot.upload.clone(),
+        }),
+        fetch: Some(MountedFetchReport {
+            cache_hits: snapshot.fetch.cache_hits,
+            s3_fetches: snapshot.fetch.s3_fetches,
+            s3_errors: snapshot.fetch.s3_errors,
+            singleflight_joins: snapshot.fetch.singleflight_joins,
+            retries: snapshot.fetch.retries,
+            bytes_downloaded: snapshot.fetch.bytes_downloaded,
+            prefetch_skips: snapshot.fetch.prefetch_skips,
+            raw: snapshot.fetch.clone(),
         }),
         process,
         barriers: Some(MountedBarrierReport {
@@ -1824,6 +1866,22 @@ pub(super) async fn run_mounted_end_to_end(
                         timeout: Duration::from_secs(60),
                     })
                     .await?;
+                let idle_observation = &idle_before_post.observation;
+                let drain_results =
+                    phase_telemetry_to_report(&idle_before_post.reads, idle_before_post.read_wall);
+                let drain_phase =
+                    (drain_results.operations > 0).then(|| MountedLocalFirstReadPhaseReport {
+                        phase: "upload-drain-read".to_string(),
+                        wait_target: idle_observation.target.label().to_string(),
+                        target_state_observed: idle_observation.observed,
+                        valid_for_target: idle_observation.observed,
+                        required_pending_uploads: idle_observation.required_pending_uploads,
+                        wait_ms: idle_observation.waited.as_secs_f64() * 1000.0,
+                        pending_uploads_before: idle_before_post.pending_uploads_before,
+                        pending_uploads_after: idle_observation.pending_uploads,
+                        validation_message: pending_upload_validation_message(idle_observation),
+                        results: drain_results,
+                    });
                 let cache_path_for_log = upload_dir.parent().unwrap_or(upload_dir);
                 tracing::info!(
                     target: "studiofs.cache.profile",
@@ -1839,26 +1897,40 @@ pub(super) async fn run_mounted_end_to_end(
                 let post_wall = post_wall_start.elapsed();
                 let post_phase = MountedLocalFirstReadPhaseReport {
                     phase: "post-upload-read".to_string(),
-                    wait_target: idle_before_post.target.label().to_string(),
-                    target_state_observed: idle_before_post.observed,
-                    valid_for_target: idle_before_post.observed,
-                    required_pending_uploads: idle_before_post.required_pending_uploads,
-                    wait_ms: idle_before_post.waited.as_secs_f64() * 1000.0,
-                    pending_uploads_before: idle_before_post.pending_uploads,
+                    wait_target: idle_observation.target.label().to_string(),
+                    target_state_observed: idle_observation.observed,
+                    valid_for_target: idle_observation.observed,
+                    required_pending_uploads: idle_observation.required_pending_uploads,
+                    wait_ms: if drain_phase.is_some() {
+                        0.0
+                    } else {
+                        idle_observation.waited.as_secs_f64() * 1000.0
+                    },
+                    pending_uploads_before: idle_observation.pending_uploads,
                     pending_uploads_after: scan_pending_uploads(
                         write_path_observability_path.as_deref(),
                         mount_pid,
                         Some(upload_dir),
                     )
                     .await?,
-                    validation_message: pending_upload_validation_message(&idle_before_post),
+                    validation_message: if drain_phase.is_some() {
+                        None
+                    } else {
+                        pending_upload_validation_message(idle_observation)
+                    },
                     results: phase_telemetry_to_report(&post_reads, post_wall),
                 };
+
+                let mut phases = vec![during_phase];
+                if let Some(drain_phase) = drain_phase {
+                    phases.push(drain_phase);
+                }
+                phases.push(post_phase);
 
                 Some(MountedLocalFirstReadComparisonReport {
                     cache_path: cache_path.display().to_string(),
                     upload_dir: upload_dir.display().to_string(),
-                    phases: vec![during_phase, post_phase],
+                    phases,
                 })
             }
             _ => None,
@@ -2283,6 +2355,74 @@ mod tests {
 
         assert_eq!(cached_store.staging_bytes, 999);
         assert_eq!(cached_store.staging_throughput_bytes_per_sec, 2048.0);
+    }
+
+    #[test]
+    fn post_upload_idle_report_uses_visible_upload_drain_read_phase() {
+        let comparison = MountedLocalFirstReadComparisonReport {
+            cache_path: r"D:\cache".to_string(),
+            upload_dir: r"D:\cache\upload".to_string(),
+            phases: vec![
+                MountedLocalFirstReadPhaseReport {
+                    phase: "upload-drain-read".to_string(),
+                    wait_target: "idle".to_string(),
+                    target_state_observed: true,
+                    valid_for_target: true,
+                    required_pending_uploads: 0,
+                    wait_ms: 1234.0,
+                    pending_uploads_before: 9,
+                    pending_uploads_after: 0,
+                    validation_message: None,
+                    results: super::super::result::OpReport {
+                        operations: 2,
+                        bytes: 8 * 1024 * 1024,
+                        elapsed_ms: 100.0,
+                        avg_latency_ms: 50.0,
+                        p50_ms: 50.0,
+                        p95_ms: 50.0,
+                        p99_ms: 50.0,
+                        throughput_bytes_per_sec: 80.0 * 1024.0 * 1024.0,
+                        latency_histogram: super::super::result::LatencyHistogramReport {
+                            bucket_upper_bounds_ns: vec![50_000],
+                            bucket_counts: vec![2, 0],
+                        },
+                        operations_log: Vec::new(),
+                    },
+                },
+                MountedLocalFirstReadPhaseReport {
+                    phase: "post-upload-read".to_string(),
+                    wait_target: "idle".to_string(),
+                    target_state_observed: true,
+                    valid_for_target: true,
+                    required_pending_uploads: 0,
+                    wait_ms: 0.0,
+                    pending_uploads_before: 0,
+                    pending_uploads_after: 0,
+                    validation_message: None,
+                    results: super::super::result::OpReport {
+                        operations: 1,
+                        bytes: 8 * 1024 * 1024,
+                        elapsed_ms: 50.0,
+                        avg_latency_ms: 50.0,
+                        p50_ms: 50.0,
+                        p95_ms: 50.0,
+                        p99_ms: 50.0,
+                        throughput_bytes_per_sec: 160.0 * 1024.0 * 1024.0,
+                        latency_histogram: super::super::result::LatencyHistogramReport {
+                            bucket_upper_bounds_ns: vec![50_000],
+                            bucket_counts: vec![1, 0],
+                        },
+                        operations_log: Vec::new(),
+                    },
+                },
+            ],
+        };
+
+        let report = mounted_post_upload_idle_report(Some(&comparison)).expect("idle report");
+
+        assert_eq!(report.wait_ms, 1234.0);
+        assert_eq!(report.pending_uploads_before, 9);
+        assert_eq!(report.pending_uploads_after, 0);
     }
 
     #[test]

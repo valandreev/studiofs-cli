@@ -290,6 +290,24 @@ pub struct VfsWritePathTuningStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsFetchStats {
+    pub cache_hits: u64,
+    pub s3_fetches: u64,
+    pub s3_errors: u64,
+    pub singleflight_joins: u64,
+    pub retries: u64,
+    pub bytes_downloaded: u64,
+    pub prefetch_skips: u64,
+    pub local_cache_io_calls: u64,
+    pub local_cache_handoff_total_ms: f64,
+    pub local_cache_handoff_avg_ms: f64,
+    pub local_cache_handoff_max_ms: f64,
+    pub local_cache_backend_io_total_ms: f64,
+    pub local_cache_backend_io_avg_ms: f64,
+    pub local_cache_backend_io_max_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsPortableAllocatorStats {
     pub current_bytes: u64,
     pub peak_bytes: u64,
@@ -330,6 +348,8 @@ pub struct VfsWritePathObservabilitySnapshot {
     pub dirty_pressure: VfsWritePathDirtyPressureStats,
     #[serde(default)]
     pub upload: VfsUploadStats,
+    #[serde(default)]
+    pub fetch: VfsFetchStats,
     #[serde(default)]
     pub payload_burst: VfsWritePathBurstStats,
     #[serde(default)]
@@ -376,6 +396,9 @@ pub struct VfsUploadStats {
     pub upload_requeues: u64,
     pub canceled_deleted: u64,
     pub canceled_stale: u64,
+    pub canceled_stale_before_put: u64,
+    pub canceled_stale_after_put: u64,
+    pub canceled_stale_after_put_bytes: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
