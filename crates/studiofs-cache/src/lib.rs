@@ -32,7 +32,7 @@ pub use runtime::{
     LocalPayloadBackendConfig as PersistentLocalPayloadBackendConfig, LocalPayloadBackendKind,
     LocalPayloadBackendOpenError as PersistentLocalPayloadBackendError,
     LocalPayloadBackendRuntime as PersistentLocalPayloadBackend, LocalPayloadLayout,
-    LocalPayloadRuntimeDetection, LocalPayloadSyncMode,
+    LocalPayloadRuntimeDetection, LocalPayloadSyncMode, LocalPayloadWriteMode,
 };
 pub use upload_queue::PendingUpload;
 
@@ -173,6 +173,7 @@ fn open_detected_local_payload_backend_budgeted(
     volume_uuid: &str,
     cache_budget_bytes: Option<u64>,
     payload_sync_mode: runtime::LocalPayloadSyncMode,
+    payload_write_mode: runtime::LocalPayloadWriteMode,
 ) -> Result<OpenedLocalPayloadBackend, OpenLocalPayloadBackendError> {
     let cache_root = detection.layout.cache_root.as_path();
     let cache_root_display = cache_root.display().to_string();
@@ -183,6 +184,7 @@ fn open_detected_local_payload_backend_budgeted(
         volume_uuid,
         cache_budget_bytes,
         payload_sync_mode,
+        payload_write_mode,
     )?;
 
     Ok(OpenedLocalPayloadBackend {
@@ -192,26 +194,13 @@ fn open_detected_local_payload_backend_budgeted(
     })
 }
 
-fn open_current_local_payload_backend(
-    cache_root: &Path,
-    cache_root_display: &str,
-    volume_uuid: &str,
-) -> Result<Arc<dyn local::LocalPayloadBackend>, OpenLocalPayloadBackendError> {
-    open_current_local_payload_backend_budgeted(
-        cache_root,
-        cache_root_display,
-        volume_uuid,
-        None,
-        runtime::LocalPayloadSyncMode::Durable,
-    )
-}
-
 fn open_current_local_payload_backend_budgeted(
     cache_root: &Path,
     cache_root_display: &str,
     volume_uuid: &str,
     cache_budget_bytes: Option<u64>,
     payload_sync_mode: runtime::LocalPayloadSyncMode,
+    payload_write_mode: runtime::LocalPayloadWriteMode,
 ) -> Result<Arc<dyn local::LocalPayloadBackend>, OpenLocalPayloadBackendError> {
     let volume_uuid = local::derive_backend_volume_uuid(volume_uuid);
     let mut last_conflict: Option<Box<runtime::LocalPayloadBackendOpenError>> = None;
@@ -221,10 +210,11 @@ fn open_current_local_payload_backend_budgeted(
             cache_root: cache_root.to_path_buf(),
             volume_uuid,
         };
-        match runtime::LocalPayloadBackendRuntime::open_with_budget_and_sync_mode(
+        match runtime::LocalPayloadBackendRuntime::open_with_budget_sync_and_write_mode(
             config,
             cache_budget_bytes,
             payload_sync_mode,
+            payload_write_mode,
         ) {
             Ok(backend) => return Ok(Arc::new(backend) as Arc<dyn local::LocalPayloadBackend>),
             Err(source)
@@ -261,6 +251,7 @@ pub fn open_local_payload_backend(
         volume_uuid,
         None,
         runtime::LocalPayloadSyncMode::Durable,
+        runtime::LocalPayloadWriteMode::Buffered,
     )
 }
 
@@ -286,11 +277,29 @@ pub fn open_local_payload_backend_with_budget_and_sync_mode(
     cache_budget_bytes: u64,
     payload_sync_mode: runtime::LocalPayloadSyncMode,
 ) -> Result<OpenedLocalPayloadBackend, OpenLocalPayloadBackendError> {
+    open_local_payload_backend_with_budget_sync_and_write_mode(
+        cache_root,
+        volume_uuid,
+        cache_budget_bytes,
+        payload_sync_mode,
+        runtime::LocalPayloadWriteMode::Buffered,
+    )
+}
+
+/// Open the selected local backend with explicit budget, sync policy, and write policy.
+pub fn open_local_payload_backend_with_budget_sync_and_write_mode(
+    cache_root: impl AsRef<Path>,
+    volume_uuid: &str,
+    cache_budget_bytes: u64,
+    payload_sync_mode: runtime::LocalPayloadSyncMode,
+    payload_write_mode: runtime::LocalPayloadWriteMode,
+) -> Result<OpenedLocalPayloadBackend, OpenLocalPayloadBackendError> {
     open_local_payload_backend_budgeted(
         cache_root.as_ref(),
         volume_uuid,
         Some(cache_budget_bytes),
         payload_sync_mode,
+        payload_write_mode,
     )
 }
 
@@ -301,11 +310,30 @@ pub fn open_prepared_local_payload_backend_with_budget_and_sync_mode(
     cache_budget_bytes: u64,
     payload_sync_mode: runtime::LocalPayloadSyncMode,
 ) -> Result<OpenedLocalPayloadBackend, OpenLocalPayloadBackendError> {
+    open_prepared_local_payload_backend_with_budget_sync_and_write_mode(
+        prepared,
+        volume_uuid,
+        cache_budget_bytes,
+        payload_sync_mode,
+        runtime::LocalPayloadWriteMode::Buffered,
+    )
+}
+
+/// Open the selected local backend using an already prepared local-cache runtime
+/// with explicit budget, sync policy, and write policy.
+pub fn open_prepared_local_payload_backend_with_budget_sync_and_write_mode(
+    prepared: PreparedLocalPayloadRuntime,
+    volume_uuid: &str,
+    cache_budget_bytes: u64,
+    payload_sync_mode: runtime::LocalPayloadSyncMode,
+    payload_write_mode: runtime::LocalPayloadWriteMode,
+) -> Result<OpenedLocalPayloadBackend, OpenLocalPayloadBackendError> {
     open_detected_local_payload_backend_budgeted(
         prepared.detection,
         volume_uuid,
         Some(cache_budget_bytes),
         payload_sync_mode,
+        payload_write_mode,
     )
 }
 
@@ -314,6 +342,7 @@ fn open_local_payload_backend_budgeted(
     volume_uuid: &str,
     cache_budget_bytes: Option<u64>,
     payload_sync_mode: runtime::LocalPayloadSyncMode,
+    payload_write_mode: runtime::LocalPayloadWriteMode,
 ) -> Result<OpenedLocalPayloadBackend, OpenLocalPayloadBackendError> {
     let cache_root_display = cache_root.display().to_string();
 
@@ -333,10 +362,17 @@ fn open_local_payload_backend_budgeted(
             volume_uuid,
             Some(cache_budget_bytes),
             payload_sync_mode,
+            payload_write_mode,
         ),
         None => {
-            let backend =
-                open_current_local_payload_backend(cache_root, &cache_root_display, volume_uuid)?;
+            let backend = open_current_local_payload_backend_budgeted(
+                cache_root,
+                &cache_root_display,
+                volume_uuid,
+                None,
+                payload_sync_mode,
+                payload_write_mode,
+            )?;
             Ok(OpenedLocalPayloadBackend {
                 detection,
                 backend_kind: runtime::LocalPayloadBackendKind::Current,

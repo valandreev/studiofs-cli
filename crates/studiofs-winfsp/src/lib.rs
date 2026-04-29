@@ -19,8 +19,9 @@ const DEFAULT_DIR_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_VOLUME_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_SECTOR_SIZE: u16 = 4096;
 const DEFAULT_ALLOCATION_UNIT_SIZE: u32 = 1024 * 1024;
+const DEFAULT_MAX_DISPATCHER_THREADS: u32 = 16;
 const DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE: bool = true;
-const DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP: bool = true;
+const DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP: bool = false;
 const DEFAULT_SECTORS_PER_ALLOCATION_UNIT: u16 =
     (DEFAULT_ALLOCATION_UNIT_SIZE / DEFAULT_SECTOR_SIZE as u32) as u16;
 static WINFSP_RUNTIME_DLL_LOAD: OnceLock<Result<(), String>> = OnceLock::new();
@@ -41,6 +42,7 @@ struct WinfspMountOptions {
     volume_info_timeout_ms: u32,
     sector_size: u16,
     sectors_per_allocation_unit: u16,
+    dispatcher_threads: u32,
     allow_open_in_kernel_mode: bool,
     flush_and_purge_on_cleanup: bool,
 }
@@ -192,6 +194,7 @@ fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOp
         DEFAULT_VOLUME_INFO_TIMEOUT_MS,
     );
     let (sector_size, sectors_per_allocation_unit) = parse_geometry_env();
+    let dispatcher_threads = default_dispatcher_threads();
     let allow_open_in_kernel_mode = parse_bool_env(
         "STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE",
         DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE,
@@ -208,9 +211,18 @@ fn parse_mount_options(volume_label: &str) -> Result<WinfspMountOptions, MountOp
         volume_info_timeout_ms,
         sector_size,
         sectors_per_allocation_unit,
+        dispatcher_threads,
         allow_open_in_kernel_mode,
         flush_and_purge_on_cleanup,
     })
+}
+
+fn default_dispatcher_threads() -> u32 {
+    let cpus = std::thread::available_parallelism()
+        .map(|count| count.get() as u32)
+        .unwrap_or(1);
+    cpus.saturating_mul(2)
+        .clamp(1, DEFAULT_MAX_DISPATCHER_THREADS)
 }
 
 fn parse_geometry_env() -> (u16, u16) {
@@ -384,8 +396,8 @@ fn apply_volume_params(
     volume_params.file_info_timeout(options.file_info_timeout_ms);
     volume_params.dir_info_timeout(options.dir_info_timeout_ms);
     volume_params.volume_info_timeout(options.volume_info_timeout_ms);
-    // Match JuiceFS on Windows: ask WinFSP to flush/purge file cache on cleanup
-    // so cached writers cannot leave a long lazy-write tail after CloseHandle.
+    // Match JuiceFS `KeepFileCache`: preserve WinFSP file cache on cleanup.
+    // Write-capable handles opt out of the OS file cache at Create/Open time.
     volume_params.flush_and_purge_on_cleanup(options.flush_and_purge_on_cleanup);
     Ok(())
 }
@@ -509,7 +521,7 @@ this usually means Administrator privileges are required, or WinFSP must be conf
     vfs.set_kernel_invalidator(invalidator);
 
     tracing::info!("mounted StudioFS at {mount_point}, press Ctrl+C to unmount");
-    host.start()
+    host.start_with_threads(options.dispatcher_threads)
         .map_err(|err| std::io::Error::other(format!("failed to start WinFSP host: {err}")))?;
 
     // Block until Ctrl+C or external shutdown event
@@ -642,8 +654,8 @@ mod tests {
         DEFAULT_DIR_INFO_TIMEOUT_MS, DEFAULT_FILE_INFO_TIMEOUT_MS,
         DEFAULT_FLUSH_AND_PURGE_ON_CLEANUP, DEFAULT_SECTOR_SIZE,
         DEFAULT_SECTORS_PER_ALLOCATION_UNIT, DEFAULT_VOLUME_INFO_TIMEOUT_MS, MountOptionError,
-        canonical_drive_mount_point, is_drive_root_mount_point, mount_manager_mount_point,
-        parse_mount_options, winfsp_dll_stem_for_arch,
+        canonical_drive_mount_point, default_dispatcher_threads, is_drive_root_mount_point,
+        mount_manager_mount_point, parse_mount_options, winfsp_dll_stem_for_arch,
     };
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -670,6 +682,7 @@ mod tests {
             std::env::remove_var("STUDIOFS_WINFSP_VOLUME_INFO_TIMEOUT_MS");
             std::env::remove_var("STUDIOFS_WINFSP_SECTOR_SIZE");
             std::env::remove_var("STUDIOFS_WINFSP_ALLOCATION_UNIT_SIZE");
+            std::env::remove_var("STUDIOFS_WINFSP_ALLOW_OPEN_IN_KERNEL_MODE");
             std::env::remove_var("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP");
         }
         let opts = parse_mount_options("  StudioFS  ").expect("options");
@@ -682,6 +695,7 @@ mod tests {
             opts.sectors_per_allocation_unit,
             DEFAULT_SECTORS_PER_ALLOCATION_UNIT
         );
+        assert_eq!(opts.dispatcher_threads, default_dispatcher_threads());
         assert_eq!(
             opts.allow_open_in_kernel_mode,
             DEFAULT_ALLOW_OPEN_IN_KERNEL_MODE
@@ -777,12 +791,12 @@ mod tests {
         // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
         // process environment variables for deterministic parsing behavior.
         unsafe {
-            std::env::set_var("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP", "0");
+            std::env::set_var("STUDIOFS_WINFSP_FLUSH_AND_PURGE_ON_CLEANUP", "1");
         }
 
         let opts = parse_mount_options("StudioFS").expect("options");
         assert!(
-            !opts.flush_and_purge_on_cleanup,
+            opts.flush_and_purge_on_cleanup,
             "WinFSP cleanup flush/purge override should be honored"
         );
 

@@ -1,5 +1,5 @@
 use super::*;
-use studiofs_cache::LocalPayloadSyncMode;
+use studiofs_cache::{LocalPayloadSyncMode, LocalPayloadWriteMode};
 
 const UPLOAD_HOT_BUFFER_CAP_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
@@ -12,6 +12,7 @@ pub(super) struct VfsBootstrapPlan {
     pub(super) minimum_local_backend_budget_bytes: u64,
     pub(super) local_backend_budget_bytes: u64,
     payload_sync_mode: LocalPayloadSyncMode,
+    payload_write_mode: LocalPayloadWriteMode,
     pub(super) access_tracker: AccessTrackerConfig,
     readahead_base_width: u32,
     pub(super) readahead_max_width: u32,
@@ -125,6 +126,7 @@ impl VfsBootstrapPlan {
             minimum_local_backend_budget_bytes,
             local_backend_budget_bytes,
             payload_sync_mode: LocalPayloadSyncMode::Fast,
+            payload_write_mode: LocalPayloadWriteMode::default_for_mount_path(),
             access_tracker,
             readahead_base_width,
             readahead_max_width,
@@ -202,6 +204,7 @@ impl VfsBootstrapPlan {
             write_eager_flush_batch_bytes = self.write_eager_flush_batch_bytes,
             write_eager_flush_drain_chunk_bytes = self.write_eager_flush_drain_chunk_bytes,
             payload_put_concurrency = self.payload_put_concurrency,
+            payload_write_mode = ?self.payload_write_mode,
             local_sync_group_min_bytes = self.local_sync_group_min_bytes,
             max_xattr_bytes = self.max_xattr_bytes,
             dentry_cache_capacity = config.dentry_cache_capacity,
@@ -272,17 +275,21 @@ impl VfsBootstrapResources {
             .map_err(VfsError::Io)?;
 
         let opened_local_backend = match cache_runtime {
-            Some(cache_runtime) => open_prepared_local_payload_backend_with_budget_and_sync_mode(
-                cache_runtime,
-                &plan.format_info.uuid,
-                plan.local_backend_budget_bytes,
-                plan.payload_sync_mode,
-            ),
-            None => open_local_payload_backend_with_budget_and_sync_mode(
+            Some(cache_runtime) => {
+                open_prepared_local_payload_backend_with_budget_sync_and_write_mode(
+                    cache_runtime,
+                    &plan.format_info.uuid,
+                    plan.local_backend_budget_bytes,
+                    plan.payload_sync_mode,
+                    plan.payload_write_mode,
+                )
+            }
+            None => open_local_payload_backend_with_budget_sync_and_write_mode(
                 Path::new(cache_dir),
                 &plan.format_info.uuid,
                 plan.local_backend_budget_bytes,
                 plan.payload_sync_mode,
+                plan.payload_write_mode,
             ),
         }
         .map_err(|source| map_open_local_payload_backend_error(cache_dir, source))?;
@@ -850,6 +857,11 @@ mod tests {
         assert!(
             missing_slash_plan.readahead_max_width >= missing_slash_plan.readahead_base_width,
             "bootstrap plan should preserve at least the configured readahead width"
+        );
+        assert_eq!(
+            missing_slash_plan.payload_write_mode,
+            LocalPayloadWriteMode::default_for_mount_path(),
+            "mount bootstrap should use the platform default payload write path"
         );
     }
 

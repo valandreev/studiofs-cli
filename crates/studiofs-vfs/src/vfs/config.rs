@@ -123,15 +123,16 @@ pub(super) enum LocalSyncTrigger {
 
 pub(super) fn write_path_sync_trigger(
     local_sync_policy: LocalSyncPolicy,
-    _pending_bytes: u64,
-    _group_min_bytes: u64,
+    pending_bytes: u64,
+    group_min_bytes: u64,
 ) -> Option<LocalSyncTrigger> {
     // Strict writes always flush — they guarantee local durability before returning.
-    // Opportunistic writes (the normal write hot path) never trigger sync_data here;
-    // the data lives in the OS page cache and is safe for the upload pipeline to read.
-    // A full sync is deferred to the next explicit flush, fsync, or file close, which
-    // all use Strict policy and will pick up any accumulated pending bytes.
+    // Opportunistic writes group sync_data so the OS page cache drains in bounded
+    // chunks instead of accumulating until a later explicit flush, fsync, or close.
     if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
+        return Some(LocalSyncTrigger::Explicit);
+    }
+    if pending_bytes >= group_min_bytes.max(1) {
         return Some(LocalSyncTrigger::Explicit);
     }
     None
@@ -904,15 +905,15 @@ mod tests {
     }
 
     #[test]
-    fn opportunistic_local_sync_never_triggers_on_write_path() {
-        // Opportunistic writes defer sync_data entirely to the next strict barrier
-        // (flush, fsync, or file close). This keeps fsync off the write hot path.
+    fn opportunistic_local_sync_triggers_after_group_threshold() {
+        // Opportunistic writes group sync_data so the OS page cache drains in
+        // bounded chunks instead of accumulating until a later strict barrier.
         let above_threshold = write_path_sync_trigger(
             LocalSyncPolicy::Opportunistic,
             64 * 1024 * 1024,
             64 * 1024 * 1024,
         );
-        assert_eq!(above_threshold, None);
+        assert_eq!(above_threshold, Some(LocalSyncTrigger::Explicit));
 
         let below_threshold =
             write_path_sync_trigger(LocalSyncPolicy::Opportunistic, 1024, 64 * 1024 * 1024);

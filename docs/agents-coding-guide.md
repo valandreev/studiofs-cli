@@ -107,9 +107,9 @@ Higher priority (lower tier number) must be acquired first:
   pipeline.
 - `fsync` is the strict caller-requested local sync API and must not imply remote publication.
 - WinFSP `cleanup`:
-  - WinFSP `FlushAndPurgeOnCleanup` is enabled by default to match JuiceFS and
-    prevent cached Windows writers from leaving a lazy-write tail after handle
-    cleanup.
+  - WinFSP `FlushAndPurgeOnCleanup` is disabled by default to match JuiceFS
+    `KeepFileCache`; write-capable handles use `Create.Opened.DisableCache` so
+    writes bypass the OS file cache while read-only handles keep read caching.
   - delete + `FspCleanupDelete` finalizes deletion.
   - non-delete StudioFS cleanup callback handling is observational; it should
     not be the ownership point for dirty local persistence.

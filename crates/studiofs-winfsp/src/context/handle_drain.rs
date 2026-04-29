@@ -74,7 +74,39 @@ impl<'a> WinfspHandleDrainFacade<'a> {
     }
 
     pub(super) fn close(&self, ino: Ino, fh: u64) {
-        self.barrier().on_close(HandleDrainRequest { ino, fh });
+        self.context.vfs.note_winfsp_close_callback();
+        if fh == 0 {
+            self.context
+                .callback_barrier_state
+                .clear_deferred_cleanup_hint(ino);
+            return;
+        }
+
+        let outcome = self
+            .context
+            .vfs
+            .release_fh_with_deferred_last_handle_barrier(fh, &self.context.rt);
+        if outcome.closed_last_handle {
+            let hint_was_taken = self
+                .context
+                .callback_barrier_state
+                .take_deferred_cleanup_hint(ino);
+            self.context
+                .vfs
+                .note_winfsp_close_barrier_outcome(outcome.flushed_local_dirty_state);
+            if hint_was_taken && outcome.flushed_local_dirty_state {
+                debug!(
+                    ino,
+                    fh, "close scheduled deferred cleanup barrier on the last handle"
+                );
+            } else if hint_was_taken {
+                trace!(
+                    ino,
+                    fh,
+                    "close observed deferred cleanup hint but no last-handle barrier was needed"
+                );
+            }
+        }
     }
 
     pub(super) fn cleanup_non_delete(&self, ino: Ino, fh: u64) -> studiofs_vfs::VfsResult<()> {
@@ -331,11 +363,8 @@ impl LocalSyncBarrierPort for WinfspLocalSyncBarrierPort<'_> {
     ) -> studiofs_vfs::VfsResult<ExplicitFlushOutcome> {
         let vfs = self.context.vfs.clone();
         self.context.spawn_wait(async move {
-            if request.fh != 0 {
-                vfs.flush_fh_with_outcome(request.fh).await
-            } else {
-                vfs.flush_with_outcome(request.ino).await
-            }
+            vfs.flush_winfsp_writeback_with_outcome(request.ino, request.fh)
+                .await
         })
     }
 }

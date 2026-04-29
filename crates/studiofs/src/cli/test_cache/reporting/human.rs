@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 
 use super::super::result::{
     BenchmarkReport, MountedObservabilityReport, MountedPortableProfileReport,
-    MountedRuntimeReport, MountedWriteDiagnosticsReport,
+    MountedRuntimeReport, MountedWriteDiagnosticsReport, MountedWritebackTimelineReport,
 };
 
 fn format_duration_ms(ms: f64) -> String {
@@ -203,6 +203,54 @@ fn render_mounted_write_diagnostics(out: &mut String, diagnostics: &MountedWrite
     }
 }
 
+fn render_mounted_writeback_timeline(out: &mut String, timeline: &MountedWritebackTimelineReport) {
+    if timeline.samples.is_empty() {
+        return;
+    }
+    out.push('\n');
+    let _ = writeln!(
+        out,
+        "Mounted writeback timeline ({} ms buckets)",
+        timeline.bucket_ms
+    );
+    let Some(last) = timeline.samples.last() else {
+        return;
+    };
+    let max_backpressure_wait_ms = timeline
+        .samples
+        .iter()
+        .map(|sample| sample.backpressure_wait_ms_delta)
+        .max()
+        .unwrap_or_default();
+    let max_local_cache_io_ms = timeline
+        .samples
+        .iter()
+        .map(|sample| sample.local_cache_backend_io_total_ms_delta)
+        .fold(0.0, f64::max);
+    let _ = writeln!(
+        out,
+        "At T+{} ms [{}]: fg {}, payload {}, upload {}, writer {}, staged {}, pending upload {}",
+        last.elapsed_ms,
+        last.phase,
+        format_throughput(last.foreground_write_bytes_per_sec),
+        format_throughput(last.payload_persist_bytes_per_sec),
+        format_throughput(last.upload_completed_bytes_per_sec),
+        format_bytes(last.writer_stack_dirty_bytes),
+        format_bytes(last.pending_persisted_slice_bytes),
+        format_bytes(last.pending_upload_bytes),
+    );
+    let _ = writeln!(
+        out,
+        "Backpressure: last events {} wait {}, worst wait {}; local cache IO last {} calls/{}, worst bucket {}",
+        last.backpressure_events_delta,
+        format_duration_ms(last.backpressure_wait_ms_delta as f64),
+        format_duration_ms(max_backpressure_wait_ms as f64),
+        last.local_cache_io_calls_delta,
+        format_duration_ms(last.local_cache_backend_io_total_ms_delta),
+        format_duration_ms(max_local_cache_io_ms),
+    );
+}
+
 fn render_mounted_portable_profile(out: &mut String, profile: &MountedPortableProfileReport) {
     out.push('\n');
     let _ = writeln!(out, "Mounted portable profile");
@@ -360,6 +408,9 @@ pub(crate) fn render_human_summary(report: &BenchmarkReport) -> String {
     }
     if let Some(diagnostics) = &report.mounted_write_diagnostics {
         render_mounted_write_diagnostics(&mut out, diagnostics);
+    }
+    if let Some(timeline) = &report.mounted_writeback_timeline {
+        render_mounted_writeback_timeline(&mut out, timeline);
     }
     if let Some(portable_profile) = &report.mounted_portable_profile {
         render_mounted_portable_profile(&mut out, portable_profile);
@@ -722,7 +773,8 @@ mod tests {
     use super::*;
     use crate::cli::test_cache::result::{
         LatencyHistogramReport, MountedLocalFirstReadComparisonReport,
-        MountedLocalFirstReadPhaseReport, MountedMemoryReport, OpReport, sample_report,
+        MountedLocalFirstReadPhaseReport, MountedMemoryReport, MountedWritebackTimelineReport,
+        MountedWritebackTimelineSampleReport, OpReport, sample_report,
     };
 
     fn test_latency_histogram() -> LatencyHistogramReport {
@@ -836,6 +888,44 @@ mod tests {
         assert!(summary.contains("Steady dirty"));
         assert!(summary.contains("Peak staged"));
         assert!(summary.contains("Dirty limit"));
+    }
+
+    #[test]
+    fn render_human_summary_includes_writeback_timeline_when_present() {
+        let mut report = sample_report();
+        report.mode = "e2e".to_string();
+        report.mounted_writeback_timeline = Some(MountedWritebackTimelineReport {
+            bucket_ms: 1000,
+            samples: vec![MountedWritebackTimelineSampleReport {
+                elapsed_ms: 1000,
+                phase: "write".to_string(),
+                foreground_write_bytes_per_sec: 1024.0 * 1024.0 * 1024.0,
+                payload_persist_bytes_per_sec: 768.0 * 1024.0 * 1024.0,
+                upload_completed_bytes_per_sec: 256.0 * 1024.0 * 1024.0,
+                writer_stack_dirty_bytes: 64 * 1024 * 1024,
+                pending_persisted_slice_bytes: 128 * 1024 * 1024,
+                pending_upload_bytes: 256 * 1024 * 1024,
+                upload_queue_depth: 4,
+                active_uploads: 2,
+                backpressure_events_delta: 3,
+                backpressure_wait_ms_delta: 25,
+                soft_throttle_events_delta: 2,
+                hard_backpressure_events_delta: 1,
+                materialization_calls_delta: 8,
+                materialization_total_ms_delta: 44.0,
+                local_cache_io_calls_delta: 8,
+                local_cache_backend_io_total_ms_delta: 40.0,
+                local_cache_backend_io_cumulative_max_ms: 12.0,
+            }],
+        });
+
+        let summary = render_human_summary(&report);
+
+        assert!(summary.contains("Mounted writeback timeline"));
+        assert!(summary.contains("At T+1000 ms"));
+        assert!(!summary.contains("Last 1000 ms"));
+        assert!(summary.contains("Backpressure:"));
+        assert!(summary.contains("local cache IO"));
     }
 
     #[test]

@@ -3,7 +3,7 @@ use crate::utils::{IntervalRange, trim_range_to_available_len};
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::time::{Duration, Instant};
 
-const PENDING_SLICE_COMMIT_MAX_AGE: Duration = Duration::from_secs(5);
+const PENDING_SLICE_COMMIT_MAX_AGE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub(super) struct PendingPayload {
@@ -456,6 +456,7 @@ pub(super) struct LocalDirtyState {
     pub(super) fast_backpressure_events: AtomicU64,
     pub(super) fast_backpressure_stall_max_ms: AtomicU64,
     pub(super) hard_backpressure_events: AtomicU64,
+    pub(super) local_sync_unsynced_bytes: AtomicU64,
     pub(super) local_sync_group: tokio::sync::Mutex<LocalSyncGroupState>,
     pub(super) local_sync_gate: tokio::sync::Mutex<()>,
 }
@@ -476,6 +477,7 @@ impl LocalDirtyState {
             fast_backpressure_events: AtomicU64::new(0),
             fast_backpressure_stall_max_ms: AtomicU64::new(0),
             hard_backpressure_events: AtomicU64::new(0),
+            local_sync_unsynced_bytes: AtomicU64::new(0),
             local_sync_group: tokio::sync::Mutex::new(LocalSyncGroupState {
                 pending_bytes: 0,
                 last_sync_at: Instant::now(),
@@ -3485,6 +3487,53 @@ mod tests {
             selected_bytes,
             chunk_size + (chunk_size / 2),
             "aged persisted tail should drain in one wave once uploads are idle"
+        );
+    }
+
+    #[test]
+    fn opportunistic_pending_slice_commit_drains_time_aged_tail_before_five_seconds() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "pending-slice-short-tail-age");
+        let _guard = rt.enter();
+        let ino = rt.block_on(async {
+            let attr = vfs
+                .create(1, b"pending-slice-short-tail-age.txt", 0, 0, 0o644)
+                .expect("create file");
+            let fh = vfs
+                .open_file(attr.ino, OpenFlags::RDWR, false)
+                .expect("open file");
+            vfs.write_fh(fh, attr.ino, 0, b"tail")
+                .await
+                .expect("seed open writer tail");
+            attr.ino
+        });
+
+        let aged_created_at = Instant::now()
+            .checked_sub(Duration::from_millis(1500))
+            .expect("old instant");
+        let persisted = std::collections::BTreeMap::from([(
+            0,
+            vec![PendingDirtySlice {
+                range: studiofs_meta::schema::SliceRange::new(0, vfs.block_size)
+                    .expect("slice range"),
+                block_index: 0,
+                block_offset: 0,
+                seq: 1,
+                object_id: Some(30_000),
+                object_offset: 0,
+                created_at: aged_created_at,
+            }],
+        )]);
+
+        let selected = vfs.select_pending_persisted_local_dirty_slice_commit_wave(
+            ino,
+            persisted,
+            LocalSyncPolicy::Opportunistic,
+        );
+
+        assert!(
+            !selected.is_empty(),
+            "time-aged persisted tail should commit before a five-second burst builds up"
         );
     }
 

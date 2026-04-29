@@ -141,8 +141,8 @@ use studiofs_cache::OpenLocalPayloadBackendError;
 use studiofs_cache::PreparedLocalPayloadRuntime;
 use studiofs_cache::local::{LocalPayloadBackend, LocalPayloadLifecycleState, LocalPayloadPut};
 use studiofs_cache::metrics::{LatencyHistogram, LatencyHistogramSnapshot, MaterializeBatchStats};
-use studiofs_cache::open_local_payload_backend_with_budget_and_sync_mode;
-use studiofs_cache::open_prepared_local_payload_backend_with_budget_and_sync_mode;
+use studiofs_cache::open_local_payload_backend_with_budget_sync_and_write_mode;
+use studiofs_cache::open_prepared_local_payload_backend_with_budget_sync_and_write_mode;
 use studiofs_cache::upload_queue::PendingUpload;
 use studiofs_cache::{CachedStore, CachedStoreConfig};
 use studiofs_data::object::{
@@ -181,6 +181,17 @@ const LOCAL_DIRTY_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
 const DEFERRED_MATERIALIZATION_LINGER_WAIT_MS: u64 = 5;
 const WRITER_STACK_STEADY_DRAIN_QUOTA_BYTES: usize = 4 * 1024 * 1024;
 const DEFERRED_MATERIALIZATION_LINGER_MAX_RETRIES: usize = 6;
+const WRITE_ADMISSION_SAMPLE_MIN_INTERVAL_MS: u64 = 100;
+const WRITE_ADMISSION_RUNWAY_TARGET_MS: u64 = 4_000;
+const WRITE_ADMISSION_MAX_DIRTY_BUDGET_MULTIPLIER: usize = 16;
+const WRITE_ADMISSION_EAGER_BATCH_BUDGET_MULTIPLIER: usize = 64;
+const WRITE_ADMISSION_MAX_DELAY_MS: u64 = 20;
+const WRITE_ADMISSION_EWMA_OLD_WEIGHT: u64 = 3;
+const WRITE_ADMISSION_BUFFER_DELAY_MS: u64 = 10;
+const WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS: u64 = 100;
+const SUSTAINED_WRITE_IDLE_RESET_MS: u64 = 2_000;
+const SUSTAINED_WRITE_DECAY_START_MS: u64 = 1_500;
+const SUSTAINED_WRITE_DECAY_STEP_MS: u64 = 1_500;
 #[cfg(test)]
 const SOFT_DIRTY_PACING_START_NUMERATOR: usize = 9;
 #[cfg(test)]
@@ -213,6 +224,286 @@ const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_HIGH: usize = 512;
 const SOFT_DIRTY_PACING_BUFFERED_WRITE_THRESHOLD_CRITICAL: usize = 1024;
 const WRITE_BUFFER_POOL_MIN_BUFFERS: usize = 4;
 const WRITE_BUFFER_POOL_BUFFER_MULTIPLIER: usize = 2;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WriteAdmissionPressure {
+    writer_stack_dirty_bytes: usize,
+    pending_local_dirty_bytes: usize,
+    pending_persisted_slice_bytes: usize,
+    pending_upload_bytes: usize,
+}
+
+impl WriteAdmissionPressure {
+    fn total_bytes(self) -> usize {
+        self.writer_stack_dirty_bytes
+            .saturating_add(self.pending_local_dirty_bytes)
+            .saturating_add(self.pending_persisted_slice_bytes)
+            .saturating_add(self.pending_upload_bytes)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WriteAdmissionSample {
+    now_ms: u64,
+    pressure_bytes: usize,
+    budget_bytes: usize,
+    next_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WriteAdmissionDecision {
+    delay_ms: u64,
+    ingress_bytes_per_sec: u64,
+    drain_bytes_per_sec: u64,
+    runway_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct WriteAdmissionGovernorStats {
+    ingress_bytes_per_sec: u64,
+    drain_bytes_per_sec: u64,
+    runway_ms: u64,
+    last_delay_ms: u64,
+    pressure_bytes: usize,
+    budget_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct WriteAdmissionGovernor {
+    last_sample_ms: u64,
+    last_pressure_bytes: usize,
+    accepted_since_sample: u64,
+    ingress_bytes_per_sec: u64,
+    drain_bytes_per_sec: u64,
+    last_runway_ms: u64,
+    last_delay_ms: u64,
+    last_observed_pressure_bytes: usize,
+    last_budget_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SustainedWriteState {
+    streak_start_ms: u64,
+    last_write_ms: u64,
+    last_end_offset: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SustainedWriteAdmission {
+    duration_ms: u64,
+    effective_buffer_bytes: usize,
+    pre_drain: bool,
+}
+
+impl SustainedWriteState {
+    fn observe(
+        &mut self,
+        now_ms: u64,
+        offset: u64,
+        len: usize,
+        base_buffer_bytes: usize,
+        drain_chunk_bytes: usize,
+        dirty_bytes_after_write: usize,
+    ) -> SustainedWriteAdmission {
+        let end_offset = offset.saturating_add(len as u64);
+        let idle_gap_ms = now_ms.saturating_sub(self.last_write_ms);
+        let sequential = self.last_write_ms == 0 || offset == self.last_end_offset;
+        if self.last_write_ms == 0 || !sequential || idle_gap_ms > SUSTAINED_WRITE_IDLE_RESET_MS {
+            self.streak_start_ms = now_ms;
+        }
+        self.last_write_ms = now_ms;
+        self.last_end_offset = end_offset;
+
+        let duration_ms = now_ms.saturating_sub(self.streak_start_ms);
+        let effective_buffer_bytes = sustained_write_effective_buffer_bytes(
+            base_buffer_bytes,
+            drain_chunk_bytes,
+            duration_ms,
+        );
+        SustainedWriteAdmission {
+            duration_ms,
+            effective_buffer_bytes,
+            pre_drain: duration_ms >= SUSTAINED_WRITE_DECAY_START_MS
+                && dirty_bytes_after_write > effective_buffer_bytes,
+        }
+    }
+}
+
+impl WriteAdmissionGovernor {
+    fn record_accepted_bytes(&mut self, bytes: usize) {
+        self.accepted_since_sample = self.accepted_since_sample.saturating_add(bytes as u64);
+    }
+
+    fn plan(&mut self, sample: WriteAdmissionSample) -> WriteAdmissionDecision {
+        let budget_bytes = sample.budget_bytes.max(1);
+        let pressure_after_bytes = sample.pressure_bytes.saturating_add(sample.next_bytes);
+        self.last_observed_pressure_bytes = sample.pressure_bytes;
+        self.last_budget_bytes = budget_bytes;
+
+        if self.last_sample_ms == 0 {
+            self.last_sample_ms = sample.now_ms;
+            self.last_pressure_bytes = sample.pressure_bytes;
+            self.last_runway_ms = Self::runway_ms(
+                pressure_after_bytes,
+                budget_bytes,
+                self.ingress_bytes_per_sec,
+                self.drain_bytes_per_sec,
+            );
+            self.last_delay_ms = 0;
+            return self.decision(0);
+        }
+
+        let elapsed_ms = sample.now_ms.saturating_sub(self.last_sample_ms);
+        if elapsed_ms >= WRITE_ADMISSION_SAMPLE_MIN_INTERVAL_MS {
+            let ingress_sample = Self::bytes_per_sec(self.accepted_since_sample, elapsed_ms);
+            let drain_bytes = (self.last_pressure_bytes as u64)
+                .saturating_add(self.accepted_since_sample)
+                .saturating_sub(sample.pressure_bytes as u64);
+            let drain_sample = Self::bytes_per_sec(drain_bytes, elapsed_ms);
+
+            self.ingress_bytes_per_sec =
+                Self::smooth_rate(self.ingress_bytes_per_sec, ingress_sample);
+            self.drain_bytes_per_sec = Self::smooth_rate(self.drain_bytes_per_sec, drain_sample);
+            self.accepted_since_sample = 0;
+            self.last_sample_ms = sample.now_ms;
+            self.last_pressure_bytes = sample.pressure_bytes;
+        }
+
+        let runway_ms = Self::runway_ms(
+            pressure_after_bytes,
+            budget_bytes,
+            self.ingress_bytes_per_sec,
+            self.drain_bytes_per_sec,
+        );
+        let delay_ms = self.delay_ms(sample.next_bytes, budget_bytes, runway_ms);
+        self.last_runway_ms = runway_ms;
+        self.last_delay_ms = delay_ms;
+        self.decision(delay_ms)
+    }
+
+    fn stats(&self) -> WriteAdmissionGovernorStats {
+        WriteAdmissionGovernorStats {
+            ingress_bytes_per_sec: self.ingress_bytes_per_sec,
+            drain_bytes_per_sec: self.drain_bytes_per_sec,
+            runway_ms: if self.last_runway_ms == u64::MAX {
+                0
+            } else {
+                self.last_runway_ms
+            },
+            last_delay_ms: self.last_delay_ms,
+            pressure_bytes: self.last_observed_pressure_bytes,
+            budget_bytes: self.last_budget_bytes,
+        }
+    }
+
+    fn reset_stats(&mut self) {
+        self.last_sample_ms = 0;
+        self.last_pressure_bytes = 0;
+        self.accepted_since_sample = 0;
+        self.ingress_bytes_per_sec = 0;
+        self.drain_bytes_per_sec = 0;
+        self.last_runway_ms = 0;
+        self.last_delay_ms = 0;
+        self.last_observed_pressure_bytes = 0;
+        self.last_budget_bytes = 0;
+    }
+
+    fn decision(&self, delay_ms: u64) -> WriteAdmissionDecision {
+        WriteAdmissionDecision {
+            delay_ms,
+            ingress_bytes_per_sec: self.ingress_bytes_per_sec,
+            drain_bytes_per_sec: self.drain_bytes_per_sec,
+            runway_ms: self.last_runway_ms,
+        }
+    }
+
+    fn delay_ms(&self, next_bytes: usize, budget_bytes: usize, runway_ms: u64) -> u64 {
+        if next_bytes == 0
+            || runway_ms >= WRITE_ADMISSION_RUNWAY_TARGET_MS
+            || self.ingress_bytes_per_sec <= self.drain_bytes_per_sec
+        {
+            return 0;
+        }
+
+        let runway_allowance_bps =
+            Self::bytes_per_sec(budget_bytes as u64, WRITE_ADMISSION_RUNWAY_TARGET_MS).max(1);
+        let allowed_bytes_per_sec = self
+            .drain_bytes_per_sec
+            .saturating_add(runway_allowance_bps)
+            .max(1);
+        if allowed_bytes_per_sec >= self.ingress_bytes_per_sec {
+            return 0;
+        }
+
+        let current_write_ms = Self::transfer_ms(next_bytes as u64, self.ingress_bytes_per_sec);
+        let target_write_ms = Self::transfer_ms(next_bytes as u64, allowed_bytes_per_sec);
+        let delay_ms = target_write_ms.saturating_sub(current_write_ms);
+        delay_ms.clamp(1, WRITE_ADMISSION_MAX_DELAY_MS)
+    }
+
+    fn runway_ms(
+        pressure_bytes: usize,
+        budget_bytes: usize,
+        ingress_bytes_per_sec: u64,
+        drain_bytes_per_sec: u64,
+    ) -> u64 {
+        if ingress_bytes_per_sec <= drain_bytes_per_sec {
+            return u64::MAX;
+        }
+        let net_bytes_per_sec = ingress_bytes_per_sec - drain_bytes_per_sec;
+        let remaining_bytes = budget_bytes.saturating_sub(pressure_bytes) as u64;
+        Self::transfer_ms(remaining_bytes, net_bytes_per_sec)
+    }
+
+    fn transfer_ms(bytes: u64, bytes_per_sec: u64) -> u64 {
+        if bytes == 0 {
+            return 0;
+        }
+        if bytes_per_sec == 0 {
+            return u64::MAX;
+        }
+        let millis = (u128::from(bytes) * 1_000).div_ceil(u128::from(bytes_per_sec));
+        millis.min(u128::from(u64::MAX)) as u64
+    }
+
+    fn bytes_per_sec(bytes: u64, elapsed_ms: u64) -> u64 {
+        if bytes == 0 || elapsed_ms == 0 {
+            return 0;
+        }
+        let rate = (u128::from(bytes) * 1_000).div_ceil(u128::from(elapsed_ms));
+        rate.min(u128::from(u64::MAX)) as u64
+    }
+
+    fn smooth_rate(previous: u64, sample: u64) -> u64 {
+        if previous == 0 {
+            return sample;
+        }
+        let weighted = u128::from(previous)
+            .saturating_mul(u128::from(WRITE_ADMISSION_EWMA_OLD_WEIGHT))
+            .saturating_add(u128::from(sample));
+        let divisor = u128::from(WRITE_ADMISSION_EWMA_OLD_WEIGHT.saturating_add(1));
+        (weighted / divisor).min(u128::from(u64::MAX)) as u64
+    }
+}
+
+fn sustained_write_effective_buffer_bytes(
+    base_buffer_bytes: usize,
+    drain_chunk_bytes: usize,
+    duration_ms: u64,
+) -> usize {
+    let floor = drain_chunk_bytes.max(1);
+    if duration_ms < SUSTAINED_WRITE_DECAY_START_MS {
+        return base_buffer_bytes.max(floor);
+    }
+
+    let steps = duration_ms
+        .saturating_sub(SUSTAINED_WRITE_DECAY_START_MS)
+        .saturating_div(SUSTAINED_WRITE_DECAY_STEP_MS)
+        .saturating_add(1)
+        .min(4);
+    let divisor = 1usize.checked_shl(steps as u32).unwrap_or(usize::MAX);
+    base_buffer_bytes.saturating_div(divisor).max(floor)
+}
 
 // =============================================================================
 // Error Types
@@ -1179,11 +1470,10 @@ fn derive_payload_put_concurrency(block_size: u32, eager_flush_drain_chunk_bytes
 }
 
 fn derive_fast_mode_sync_group_min_bytes(
-    write_eager_flush_batch_bytes: usize,
+    _write_eager_flush_batch_bytes: usize,
     write_eager_flush_drain_chunk_bytes: usize,
 ) -> u64 {
-    let target = (write_eager_flush_drain_chunk_bytes as u64).saturating_mul(4);
-    let target = target.max(write_eager_flush_batch_bytes as u64);
+    let target = write_eager_flush_drain_chunk_bytes as u64;
     target.clamp(
         FAST_MODE_SYNC_GROUP_MIN_BYTES_FLOOR,
         FAST_MODE_SYNC_GROUP_MIN_BYTES_CEIL,
@@ -2075,6 +2365,8 @@ impl VfsState {
             file_lock: FileLockState::new(),
             shutdown: ShutdownState::new(),
             metrics: MetricsState::new(),
+            write_admission_governor: Mutex::new(WriteAdmissionGovernor::default()),
+            sustained_write_streams: Mutex::new(HashMap::new()),
             deferred_materialize_inflight: Mutex::new(HashMap::new()),
             deferred_materialize_reschedule_needed: Mutex::new(HashSet::new()),
         }
@@ -2093,6 +2385,8 @@ struct VfsState {
     file_lock: FileLockState,
     shutdown: ShutdownState,
     metrics: MetricsState,
+    write_admission_governor: Mutex<WriteAdmissionGovernor>,
+    sustained_write_streams: Mutex<HashMap<Ino, SustainedWriteState>>,
     /// Tracks inodes that currently have a deferred materialization task
     /// in-flight.  Used by `write_fh_with_deferred_materialize` to ensure
     /// at most one background materialization per inode at a time, preventing
@@ -2184,6 +2478,19 @@ fn aggressive_materialization_threshold_bytes(max_dirty_bytes: usize) -> usize {
     max_dirty_bytes
         .saturating_div(AGGRESSIVE_MATERIALIZATION_DIRTY_DIVISOR)
         .max(1)
+}
+
+fn write_buffer_admission_delay_ms(
+    writer_stack_dirty_bytes: usize,
+    buffer_budget_bytes: usize,
+) -> Option<u64> {
+    if buffer_budget_bytes == 0 || writer_stack_dirty_bytes <= buffer_budget_bytes {
+        return None;
+    }
+    if writer_stack_dirty_bytes > buffer_budget_bytes.saturating_mul(2) {
+        return Some(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS);
+    }
+    Some(WRITE_ADMISSION_BUFFER_DELAY_MS)
 }
 
 #[cfg(test)]
@@ -3958,6 +4265,7 @@ impl StudioVfs {
 
     pub fn reset_diagnostics_observability(&self) {
         self.state.metrics.reset_diagnostics_observability();
+        self.state.write_admission_governor.lock().reset_stats();
         self.state
             .local_dirty
             .hard_backpressure_events
@@ -4273,7 +4581,7 @@ impl StudioVfs {
         {
             self.debug_write_probe(
                 "H5",
-                "crates/studiofs-vfs/src/vfs.rs:4255",
+                concat!(file!(), ":", line!()),
                 "upload scheduler adaptive penalty changed",
                 serde_json::json!({
                     "current_penalty_ms": current_penalty_ms,
@@ -5153,6 +5461,9 @@ impl StudioVfs {
         persisted_bytes: u64,
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<()> {
+        if persisted_bytes > 0 {
+            self.record_local_sync_unsynced_bytes(persisted_bytes);
+        }
         {
             let mut local_sync_group = self.state.local_dirty.local_sync_group.lock().await;
             let pending_before = local_sync_group.pending_bytes;
@@ -5180,7 +5491,20 @@ impl StudioVfs {
         }
 
         let sync_gate_wait_started = Instant::now();
-        let _sync_gate = self.state.local_dirty.local_sync_gate.lock().await;
+        let _sync_gate = if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+            match self.state.local_dirty.local_sync_gate.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    self.state
+                        .metrics
+                        .payload_store_sync_data_deferred_calls
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+            }
+        } else {
+            self.state.local_dirty.local_sync_gate.lock().await
+        };
         self.record_sync_data_queue_wait(sync_gate_wait_started.elapsed());
         let bytes_to_sync = {
             let mut local_sync_group = self.state.local_dirty.local_sync_group.lock().await;
@@ -5213,6 +5537,7 @@ impl StudioVfs {
                 let mut local_sync_group = self.state.local_dirty.local_sync_group.lock().await;
                 local_sync_group.last_sync_at = Instant::now();
                 drop(local_sync_group);
+                self.record_local_sync_synced_bytes(bytes_to_sync);
                 self.state
                     .metrics
                     .payload_store_sync_data_synced_bytes
@@ -5793,6 +6118,198 @@ impl StudioVfs {
     fn total_pending_write_buffer_bytes(&self) -> usize {
         self.total_pending_local_dirty_bytes()
             .saturating_add(self.state.writer_stack.total_dirty_bytes())
+    }
+
+    fn write_admission_pressure(&self) -> WriteAdmissionPressure {
+        let cached_store_writer_counters = self.cached_store.snapshot_writer_counters();
+        WriteAdmissionPressure {
+            writer_stack_dirty_bytes: self.state.writer_stack.total_dirty_bytes(),
+            pending_local_dirty_bytes: self.total_pending_local_dirty_bytes(),
+            pending_persisted_slice_bytes: self.total_pending_persisted_local_dirty_slice_bytes(),
+            pending_upload_bytes: usize::try_from(
+                cached_store_writer_counters.pending_upload_bytes,
+            )
+            .unwrap_or(usize::MAX),
+        }
+    }
+
+    fn total_write_admission_pressure_bytes(&self) -> usize {
+        self.write_admission_pressure().total_bytes()
+    }
+
+    fn local_sync_unsynced_bytes(&self) -> usize {
+        usize::try_from(
+            self.state
+                .local_dirty
+                .local_sync_unsynced_bytes
+                .load(Ordering::Relaxed),
+        )
+        .unwrap_or(usize::MAX)
+    }
+
+    fn record_local_sync_unsynced_bytes(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.state
+            .local_dirty
+            .local_sync_unsynced_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn record_local_sync_synced_bytes(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let _ = self
+            .state
+            .local_dirty
+            .local_sync_unsynced_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                Some(pending.saturating_sub(bytes))
+            });
+    }
+
+    fn write_admission_budget_bytes(&self) -> usize {
+        let dirty_window = self
+            .max_dirty_bytes()
+            .saturating_mul(WRITE_ADMISSION_MAX_DIRTY_BUDGET_MULTIPLIER);
+        let eager_window = self
+            .write_eager_flush_batch_bytes
+            .saturating_mul(WRITE_ADMISSION_EAGER_BATCH_BUDGET_MULTIPLIER);
+        dirty_window
+            .max(eager_window)
+            .max(self.block_size.max(1) as usize)
+    }
+
+    fn write_admission_buffer_budget_bytes(&self) -> usize {
+        self.max_dirty_bytes().max(self.block_size.max(1) as usize)
+    }
+
+    fn record_write_admission_accepted_bytes(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        self.state
+            .write_admission_governor
+            .lock()
+            .record_accepted_bytes(bytes);
+    }
+
+    fn record_write_admission_wait(&self, waited: Duration) {
+        let waited_ms = waited.as_millis().min(u128::from(u64::MAX)) as u64;
+        if waited_ms == 0 {
+            return;
+        }
+        self.state
+            .metrics
+            .drain_lag_pacing_events
+            .fetch_add(1, Ordering::Relaxed);
+        self.state
+            .metrics
+            .drain_lag_pacing_total_ms
+            .fetch_add(waited_ms, Ordering::Relaxed);
+        self.state
+            .metrics
+            .drain_lag_pacing_max_ms
+            .fetch_max(waited_ms, Ordering::Relaxed);
+    }
+
+    async fn maybe_throttle_write_admission(&self, next_bytes: usize) {
+        if next_bytes == 0 {
+            return;
+        }
+
+        let pressure = self.write_admission_pressure();
+        let buffer_budget_bytes = self.write_admission_buffer_budget_bytes();
+        let writer_stack_dirty_with_next =
+            pressure.writer_stack_dirty_bytes.saturating_add(next_bytes);
+        if write_buffer_admission_delay_ms(writer_stack_dirty_with_next, buffer_budget_bytes)
+            .is_some()
+        {
+            // #region debug log
+            self.debug_write_probe(
+                "H2",
+                concat!(file!(), ":", line!()),
+                "write admission buffer pacing",
+                serde_json::json!({
+                    "delay_ms": WRITE_ADMISSION_BUFFER_DELAY_MS,
+                    "writer_stack_dirty_bytes": pressure.writer_stack_dirty_bytes,
+                    "buffer_budget_bytes": buffer_budget_bytes,
+                    "next_bytes": next_bytes,
+                }),
+            );
+            // #endregion debug log
+
+            let started = Instant::now();
+            tokio::time::sleep(Duration::from_millis(WRITE_ADMISSION_BUFFER_DELAY_MS)).await;
+            self.record_write_admission_wait(started.elapsed());
+        }
+        while self
+            .state
+            .writer_stack
+            .total_dirty_bytes()
+            .saturating_add(next_bytes)
+            > buffer_budget_bytes.saturating_mul(2)
+            && !self.shutdown_requested()
+        {
+            // #region debug log
+            self.debug_write_probe(
+                "H1",
+                concat!(file!(), ":", line!()),
+                "write admission buffer hard pacing",
+                serde_json::json!({
+                    "delay_ms": WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS,
+                    "writer_stack_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),
+                    "buffer_budget_bytes": buffer_budget_bytes,
+                    "next_bytes": next_bytes,
+                }),
+            );
+            // #endregion debug log
+
+            let started = Instant::now();
+            tokio::time::sleep(Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS)).await;
+            self.record_write_admission_wait(started.elapsed());
+        }
+
+        let pressure_bytes = self.total_write_admission_pressure_bytes();
+        let budget_bytes = self.write_admission_budget_bytes();
+        let decision = {
+            let mut governor = self.state.write_admission_governor.lock();
+            governor.plan(WriteAdmissionSample {
+                now_ms: now_unix_millis(),
+                pressure_bytes,
+                budget_bytes,
+                next_bytes,
+            })
+        };
+        if decision.delay_ms == 0 {
+            return;
+        }
+        // #region debug log
+        self.debug_write_probe(
+            "H2",
+            concat!(file!(), ":", line!()),
+            "write admission governor pacing",
+            serde_json::json!({
+                "delay_ms": decision.delay_ms,
+                "ingress_bytes_per_sec": decision.ingress_bytes_per_sec,
+                "drain_bytes_per_sec": decision.drain_bytes_per_sec,
+                "runway_ms": decision.runway_ms,
+                "pressure_bytes": pressure_bytes,
+                "budget_bytes": budget_bytes,
+                "next_bytes": next_bytes,
+            }),
+        );
+        // #endregion debug log
+
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_millis(decision.delay_ms)).await;
+        self.record_write_admission_wait(started.elapsed());
+    }
+
+    fn write_admission_governor_stats(&self) -> WriteAdmissionGovernorStats {
+        self.state.write_admission_governor.lock().stats()
     }
 
     fn writer_stack_steady_drain_quota_bytes(&self) -> usize {
@@ -6558,6 +7075,7 @@ impl StudioVfs {
 
         let landing_zone_stats = self.landing_zone.stats();
         let drain_lag_current_bytes = self.total_landed_write_drain_lag_bytes();
+        let write_admission_stats = self.write_admission_governor_stats();
         let landing_zone_syncs = landing_zone_stats
             .data_syncs
             .saturating_add(landing_zone_stats.manifest_syncs);
@@ -6618,7 +7136,6 @@ impl StudioVfs {
                 .fetch_max(current, Ordering::Relaxed);
             usize::try_from(previous.max(current)).unwrap_or(usize::MAX)
         };
-
         VfsWritePathObservabilitySnapshot {
             publisher_pid: std::process::id(),
             generated_unix_ms: now_unix_millis(),
@@ -6914,6 +7431,13 @@ impl StudioVfs {
                     .metrics
                     .drain_lag_pacing_max_ms
                     .load(Ordering::Relaxed),
+                admission_ingress_bytes_per_sec: write_admission_stats.ingress_bytes_per_sec,
+                admission_drain_bytes_per_sec: write_admission_stats.drain_bytes_per_sec,
+                admission_runway_ms: write_admission_stats.runway_ms,
+                admission_last_delay_ms: write_admission_stats.last_delay_ms,
+                admission_pressure_bytes: write_admission_stats.pressure_bytes,
+                admission_budget_bytes: write_admission_stats.budget_bytes,
+                local_sync_unsynced_bytes: self.local_sync_unsynced_bytes(),
             },
             winfsp_foreground_flushes: VfsWritePathWinfspForegroundFlushStats {
                 cleanup: self

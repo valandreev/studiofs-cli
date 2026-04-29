@@ -84,6 +84,7 @@ pub fn reconcile_startup_state(
 ) -> Result<LocalPayloadStartupReconcileReport, LocalPayloadStartupReconcileError> {
     let batch_recovery = recover_batch_payload_intents(layout, index)?;
     let temp_files_removed = remove_temp_files(layout)?;
+    let shard_temp_files_removed = remove_payload_shard_temp_files(layout)?;
     let stale_index_entries_removed = match mode {
         LocalPayloadStartupReconcileMode::Lightweight => prune_dirty_payloads(layout, index)?,
         LocalPayloadStartupReconcileMode::Full => prune_all_payloads(layout, index)?,
@@ -97,6 +98,7 @@ pub fn reconcile_startup_state(
 
     Ok(LocalPayloadStartupReconcileReport {
         temp_files_removed: temp_files_removed
+            .saturating_add(shard_temp_files_removed)
             .saturating_add(additional_temp_files_removed)
             .saturating_add(batch_recovery.temp_files_removed),
         stale_index_entries_removed,
@@ -350,6 +352,20 @@ fn remove_temp_files(layout: &LocalPayloadLayout) -> Result<u64, io::Error> {
     Ok(removed)
 }
 
+fn remove_payload_shard_temp_files(layout: &LocalPayloadLayout) -> Result<u64, io::Error> {
+    let mut removed = 0_u64;
+    visit_files_recursive(&layout.payload_objects_dir, &mut |file| -> io::Result<()> {
+        let Some(file_name) = file.file_name().and_then(|name| name.to_str()) else {
+            return Ok(());
+        };
+        if file_name.ends_with(".tmp") && remove_file_if_present(file)? {
+            removed = removed.saturating_add(1);
+        }
+        Ok(())
+    })?;
+    Ok(removed)
+}
+
 fn remove_orphan_payloads_and_legacy_temps(
     layout: &LocalPayloadLayout,
     index: &CacheIndex,
@@ -539,6 +555,30 @@ mod tests {
         assert!(!committed_payload_path.exists());
         assert!(!staged_temp_path.exists());
         assert!(!intent_dir.join("batch-0000000000000001.intent").exists());
+    }
+
+    #[test]
+    fn startup_reconcile_lightweight_removes_payload_shard_temp_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        create_v3_marker(&layout);
+
+        let index = CacheIndex::open(&layout.redb_index_path).unwrap();
+        let shard_temp_path = layout
+            .payload_object_path(11)
+            .with_file_name("000000000000000b-staged.tmp");
+        std::fs::create_dir_all(shard_temp_path.parent().unwrap()).unwrap();
+        std::fs::write(&shard_temp_path, b"staged").unwrap();
+
+        let report = reconcile_startup_state(
+            &layout,
+            &index,
+            LocalPayloadStartupReconcileMode::Lightweight,
+        )
+        .unwrap();
+
+        assert_eq!(report.temp_files_removed, 1);
+        assert!(!shard_temp_path.exists());
     }
 
     #[test]
