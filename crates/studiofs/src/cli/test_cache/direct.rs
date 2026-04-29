@@ -618,6 +618,7 @@ pub(super) async fn run_direct(
         mounted_runtime: None,
         mounted_observability: None,
         mounted_write_path_window: None,
+        mounted_writeback_timeline: None,
         mounted_write_diagnostics: None,
         work_root: None,
         writes: phase_telemetry_to_report(&writes, writes_wall),

@@ -84,6 +84,8 @@ pub(super) struct BenchmarkReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) mounted_write_path_window: Option<MountedWritePathWindowReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) mounted_writeback_timeline: Option<MountedWritebackTimelineReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) mounted_write_diagnostics: Option<MountedWriteDiagnosticsReport>,
     pub(super) writes: OpReport,
     pub(super) reads: OpReport,
@@ -302,6 +304,36 @@ pub(super) struct MountedWritePathWindowReport {
     pub(super) before: Option<VfsWritePathObservabilitySnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) after: Option<VfsWritePathObservabilitySnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct MountedWritebackTimelineReport {
+    pub(super) bucket_ms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) samples: Vec<MountedWritebackTimelineSampleReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct MountedWritebackTimelineSampleReport {
+    pub(super) elapsed_ms: u64,
+    pub(super) phase: String,
+    pub(super) foreground_write_bytes_per_sec: f64,
+    pub(super) payload_persist_bytes_per_sec: f64,
+    pub(super) upload_completed_bytes_per_sec: f64,
+    pub(super) writer_stack_dirty_bytes: u64,
+    pub(super) pending_persisted_slice_bytes: u64,
+    pub(super) pending_upload_bytes: u64,
+    pub(super) upload_queue_depth: usize,
+    pub(super) active_uploads: usize,
+    pub(super) backpressure_events_delta: u64,
+    pub(super) backpressure_wait_ms_delta: u64,
+    pub(super) soft_throttle_events_delta: u64,
+    pub(super) hard_backpressure_events_delta: u64,
+    pub(super) materialization_calls_delta: u64,
+    pub(super) materialization_total_ms_delta: f64,
+    pub(super) local_cache_io_calls_delta: u64,
+    pub(super) local_cache_backend_io_total_ms_delta: f64,
+    pub(super) local_cache_backend_io_cumulative_max_ms: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -954,6 +986,7 @@ pub(crate) fn sample_report() -> BenchmarkReport {
             }),
         }),
         mounted_write_path_window: None,
+        mounted_writeback_timeline: None,
         mounted_write_diagnostics: None,
         writes: OpReport {
             operations: 16,

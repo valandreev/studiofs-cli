@@ -145,7 +145,7 @@ mod tests {
     use crate::cli::test_cache::result::{
         MountedMemoryReport, MountedPortableAllocatorReport, MountedPortablePhaseProfileReport,
         MountedPortableProcessReport, MountedPortableProfileReport, MountedWriteDiagnosticsReport,
-        sample_report,
+        MountedWritebackTimelineReport, MountedWritebackTimelineSampleReport, sample_report,
     };
     use chrono::TimeZone;
     use tempfile::tempdir;
@@ -302,6 +302,68 @@ mod tests {
         assert_eq!(diagnostics["payload_persisted_bytes_delta"], 1024);
         assert_eq!(diagnostics["landing_accepted_bytes_delta"], 0);
         assert_eq!(diagnostics["total_accounted_bytes_after"], 512);
+    }
+
+    #[test]
+    fn save_benchmark_report_includes_sfs306_writeback_timeline_surface() {
+        let temp = tempdir().unwrap();
+        let mut report = sample_report();
+        report.mode = "e2e".to_string();
+        report.mounted_writeback_timeline = Some(MountedWritebackTimelineReport {
+            bucket_ms: 1000,
+            samples: vec![MountedWritebackTimelineSampleReport {
+                elapsed_ms: 1000,
+                phase: "write".to_string(),
+                foreground_write_bytes_per_sec: 1_100.0 * 1024.0 * 1024.0,
+                payload_persist_bytes_per_sec: 900.0 * 1024.0 * 1024.0,
+                upload_completed_bytes_per_sec: 300.0 * 1024.0 * 1024.0,
+                writer_stack_dirty_bytes: 64 * 1024 * 1024,
+                pending_persisted_slice_bytes: 128 * 1024 * 1024,
+                pending_upload_bytes: 256 * 1024 * 1024,
+                upload_queue_depth: 4,
+                active_uploads: 2,
+                backpressure_events_delta: 3,
+                backpressure_wait_ms_delta: 25,
+                soft_throttle_events_delta: 2,
+                hard_backpressure_events_delta: 1,
+                materialization_calls_delta: 8,
+                materialization_total_ms_delta: 44.0,
+                local_cache_io_calls_delta: 8,
+                local_cache_backend_io_total_ms_delta: 40.0,
+                local_cache_backend_io_cumulative_max_ms: 12.0,
+            }],
+        });
+        let now = Utc
+            .with_ymd_and_hms(2026, 3, 19, 15, 12, 55)
+            .single()
+            .unwrap();
+
+        let saved =
+            save_benchmark_report_in(&report, Some(Path::new("cache-run.json")), temp.path(), now)
+                .unwrap();
+
+        let content = std::fs::read_to_string(saved).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let timeline = &parsed["mounted_writeback_timeline"];
+        assert_eq!(timeline["bucket_ms"], 1000);
+        assert_eq!(timeline["samples"][0]["phase"], "write");
+        assert_eq!(
+            timeline["samples"][0]["pending_upload_bytes"],
+            256 * 1024 * 1024
+        );
+        assert_eq!(timeline["samples"][0]["backpressure_events_delta"], 3);
+        assert_eq!(
+            timeline["samples"][0]["local_cache_backend_io_total_ms_delta"],
+            40.0
+        );
+        assert_eq!(
+            timeline["samples"][0]["local_cache_backend_io_cumulative_max_ms"],
+            12.0
+        );
+        assert!(
+            timeline["samples"][0]["local_cache_backend_io_max_ms"].is_null(),
+            "bucket-local max should not be serialized from the cumulative VFS max"
+        );
     }
 
     #[test]

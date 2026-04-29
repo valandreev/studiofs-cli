@@ -26,7 +26,8 @@ use super::result::{
     MountedPortableProcessReport, MountedPortableProfileReport, MountedPostUploadIdleReport,
     MountedProcessReport, MountedRuntimeReport, MountedUploadReport, MountedWorkloadShapeReport,
     MountedWriteCallbackReport, MountedWriteDiagnosticsReport, MountedWritePathWindowReport,
-    MountedWriterStateReport, OpReport,
+    MountedWritebackTimelineReport, MountedWritebackTimelineSampleReport, MountedWriterStateReport,
+    OpReport,
 };
 use super::telemetry::{
     PhaseOperationLog, PhaseTelemetry, build_advanced_metrics, phase_telemetry_to_report,
@@ -343,6 +344,7 @@ impl MountedPortableTelemetryAccumulator {
 struct MountedProfileAccumulator {
     memory: MountedMemoryAccumulator,
     portable: MountedPortableTelemetryAccumulator,
+    writeback_timeline: MountedWritebackTimelineAccumulator,
 }
 
 impl MountedProfileAccumulator {
@@ -350,6 +352,7 @@ impl MountedProfileAccumulator {
         Self {
             memory: MountedMemoryAccumulator::new(mount_pid),
             portable: MountedPortableTelemetryAccumulator::new(mount_pid),
+            writeback_timeline: MountedWritebackTimelineAccumulator::new(1000),
         }
     }
 
@@ -367,6 +370,7 @@ impl MountedProfileAccumulator {
         if let Some(allocator) = &snapshot.allocator {
             self.portable.observe_allocator(phase, allocator);
         }
+        self.writeback_timeline.observe(phase, snapshot);
     }
 
     fn into_reports(
@@ -374,8 +378,248 @@ impl MountedProfileAccumulator {
     ) -> (
         Option<MountedMemoryReport>,
         Option<MountedPortableProfileReport>,
+        Option<MountedWritebackTimelineReport>,
     ) {
-        (self.memory.into_report(), self.portable.into_report())
+        (
+            self.memory.into_report(),
+            self.portable.into_report(),
+            self.writeback_timeline.into_report(),
+        )
+    }
+}
+
+struct MountedWritebackTimelineAccumulator {
+    bucket_ms: u64,
+    first_generated_unix_ms: Option<u64>,
+    previous: Option<VfsWritePathObservabilitySnapshot>,
+    active: Option<MountedWritebackTimelineBucket>,
+    samples: Vec<MountedWritebackTimelineSampleReport>,
+}
+
+impl MountedWritebackTimelineAccumulator {
+    fn new(bucket_ms: u64) -> Self {
+        Self {
+            bucket_ms: bucket_ms.max(1),
+            first_generated_unix_ms: None,
+            previous: None,
+            active: None,
+            samples: Vec::new(),
+        }
+    }
+
+    fn observe(&mut self, phase: &str, snapshot: &VfsWritePathObservabilitySnapshot) {
+        let first = *self
+            .first_generated_unix_ms
+            .get_or_insert(snapshot.generated_unix_ms);
+        let Some(previous) = self.previous.as_ref() else {
+            self.previous = Some(snapshot.clone());
+            return;
+        };
+        let delta_ms = snapshot
+            .generated_unix_ms
+            .saturating_sub(previous.generated_unix_ms);
+        if delta_ms == 0 {
+            self.previous = Some(snapshot.clone());
+            return;
+        }
+
+        let elapsed_ms = snapshot.generated_unix_ms.saturating_sub(first);
+        let bucket_end_ms = elapsed_ms
+            .saturating_add(self.bucket_ms - 1)
+            .saturating_div(self.bucket_ms)
+            .saturating_mul(self.bucket_ms)
+            .max(self.bucket_ms);
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.elapsed_ms != bucket_end_ms)
+            && let Some(active) = self.active.take()
+        {
+            self.samples.push(active.into_sample());
+        }
+
+        self.active
+            .get_or_insert_with(|| MountedWritebackTimelineBucket::new(bucket_end_ms, phase))
+            .observe_delta(phase, previous, snapshot, delta_ms);
+        self.previous = Some(snapshot.clone());
+    }
+
+    fn into_report(mut self) -> Option<MountedWritebackTimelineReport> {
+        if let Some(active) = self.active.take() {
+            self.samples.push(active.into_sample());
+        }
+        (!self.samples.is_empty()).then_some(MountedWritebackTimelineReport {
+            bucket_ms: self.bucket_ms,
+            samples: self.samples,
+        })
+    }
+}
+
+struct MountedWritebackTimelineBucket {
+    elapsed_ms: u64,
+    phase: String,
+    duration_ms: u64,
+    foreground_write_bytes_delta: u64,
+    payload_persist_bytes_delta: u64,
+    upload_completed_bytes_delta: u64,
+    writer_stack_dirty_bytes: u64,
+    pending_persisted_slice_bytes: u64,
+    pending_upload_bytes: u64,
+    upload_queue_depth: usize,
+    active_uploads: usize,
+    backpressure_events_delta: u64,
+    backpressure_wait_ms_delta: u64,
+    soft_throttle_events_delta: u64,
+    hard_backpressure_events_delta: u64,
+    materialization_calls_delta: u64,
+    materialization_total_ms_delta: f64,
+    local_cache_io_calls_delta: u64,
+    local_cache_backend_io_total_ms_delta: f64,
+    local_cache_backend_io_cumulative_max_ms: f64,
+}
+
+impl MountedWritebackTimelineBucket {
+    fn new(elapsed_ms: u64, phase: &str) -> Self {
+        Self {
+            elapsed_ms,
+            phase: phase.to_string(),
+            duration_ms: 0,
+            foreground_write_bytes_delta: 0,
+            payload_persist_bytes_delta: 0,
+            upload_completed_bytes_delta: 0,
+            writer_stack_dirty_bytes: 0,
+            pending_persisted_slice_bytes: 0,
+            pending_upload_bytes: 0,
+            upload_queue_depth: 0,
+            active_uploads: 0,
+            backpressure_events_delta: 0,
+            backpressure_wait_ms_delta: 0,
+            soft_throttle_events_delta: 0,
+            hard_backpressure_events_delta: 0,
+            materialization_calls_delta: 0,
+            materialization_total_ms_delta: 0.0,
+            local_cache_io_calls_delta: 0,
+            local_cache_backend_io_total_ms_delta: 0.0,
+            local_cache_backend_io_cumulative_max_ms: 0.0,
+        }
+    }
+
+    fn observe_delta(
+        &mut self,
+        phase: &str,
+        before: &VfsWritePathObservabilitySnapshot,
+        after: &VfsWritePathObservabilitySnapshot,
+        delta_ms: u64,
+    ) {
+        self.phase = phase.to_string();
+        self.duration_ms = self.duration_ms.saturating_add(delta_ms);
+        self.foreground_write_bytes_delta = self.foreground_write_bytes_delta.saturating_add(
+            after
+                .winfsp_write_path
+                .write_bytes
+                .saturating_sub(before.winfsp_write_path.write_bytes),
+        );
+        self.payload_persist_bytes_delta = self.payload_persist_bytes_delta.saturating_add(
+            after
+                .payload_burst
+                .total_bytes
+                .saturating_sub(before.payload_burst.total_bytes),
+        );
+        self.upload_completed_bytes_delta = self.upload_completed_bytes_delta.saturating_add(
+            after
+                .upload
+                .completed_upload_bytes
+                .saturating_sub(before.upload.completed_upload_bytes),
+        );
+        self.writer_stack_dirty_bytes = after.dirty_pressure.writer_stack_dirty_bytes as u64;
+        self.pending_persisted_slice_bytes =
+            after.dirty_pressure.pending_persisted_slice_bytes as u64;
+        self.pending_upload_bytes = after.dirty_pressure.pending_upload_bytes as u64;
+        self.upload_queue_depth = after.upload.pending_uploads;
+        self.active_uploads = after.upload.active_uploads;
+        self.backpressure_events_delta = self.backpressure_events_delta.saturating_add(
+            after
+                .write_backpressure
+                .events
+                .saturating_sub(before.write_backpressure.events),
+        );
+        self.backpressure_wait_ms_delta = self.backpressure_wait_ms_delta.saturating_add(
+            after
+                .write_backpressure
+                .wait_total_ms
+                .saturating_sub(before.write_backpressure.wait_total_ms),
+        );
+        self.soft_throttle_events_delta = self.soft_throttle_events_delta.saturating_add(
+            after
+                .write_backpressure
+                .soft_throttle_events
+                .saturating_sub(before.write_backpressure.soft_throttle_events),
+        );
+        self.hard_backpressure_events_delta = self.hard_backpressure_events_delta.saturating_add(
+            after
+                .write_backpressure
+                .hard_events
+                .saturating_sub(before.write_backpressure.hard_events),
+        );
+        self.materialization_calls_delta = self.materialization_calls_delta.saturating_add(
+            after
+                .payload_persist
+                .calls
+                .saturating_sub(before.payload_persist.calls),
+        );
+        self.materialization_total_ms_delta +=
+            (after.payload_persist.total_ms - before.payload_persist.total_ms).max(0.0);
+        self.local_cache_io_calls_delta = self.local_cache_io_calls_delta.saturating_add(
+            after
+                .local_cache_io
+                .calls
+                .saturating_sub(before.local_cache_io.calls),
+        );
+        self.local_cache_backend_io_total_ms_delta += (after.local_cache_io.backend_io_total_ms
+            - before.local_cache_io.backend_io_total_ms)
+            .max(0.0);
+        self.local_cache_backend_io_cumulative_max_ms = after.local_cache_io.backend_io_max_ms;
+    }
+
+    fn bytes_per_sec(bytes: u64, duration_ms: u64) -> f64 {
+        if duration_ms == 0 {
+            0.0
+        } else {
+            bytes as f64 * 1000.0 / duration_ms as f64
+        }
+    }
+
+    fn into_sample(self) -> MountedWritebackTimelineSampleReport {
+        MountedWritebackTimelineSampleReport {
+            elapsed_ms: self.elapsed_ms,
+            phase: self.phase,
+            foreground_write_bytes_per_sec: Self::bytes_per_sec(
+                self.foreground_write_bytes_delta,
+                self.duration_ms,
+            ),
+            payload_persist_bytes_per_sec: Self::bytes_per_sec(
+                self.payload_persist_bytes_delta,
+                self.duration_ms,
+            ),
+            upload_completed_bytes_per_sec: Self::bytes_per_sec(
+                self.upload_completed_bytes_delta,
+                self.duration_ms,
+            ),
+            writer_stack_dirty_bytes: self.writer_stack_dirty_bytes,
+            pending_persisted_slice_bytes: self.pending_persisted_slice_bytes,
+            pending_upload_bytes: self.pending_upload_bytes,
+            upload_queue_depth: self.upload_queue_depth,
+            active_uploads: self.active_uploads,
+            backpressure_events_delta: self.backpressure_events_delta,
+            backpressure_wait_ms_delta: self.backpressure_wait_ms_delta,
+            soft_throttle_events_delta: self.soft_throttle_events_delta,
+            hard_backpressure_events_delta: self.hard_backpressure_events_delta,
+            materialization_calls_delta: self.materialization_calls_delta,
+            materialization_total_ms_delta: self.materialization_total_ms_delta,
+            local_cache_io_calls_delta: self.local_cache_io_calls_delta,
+            local_cache_backend_io_total_ms_delta: self.local_cache_backend_io_total_ms_delta,
+            local_cache_backend_io_cumulative_max_ms: self.local_cache_backend_io_cumulative_max_ms,
+        }
     }
 }
 
@@ -534,6 +778,7 @@ async fn sample_mounted_profile_during<F, Fut, T>(
     T,
     Option<MountedMemoryReport>,
     Option<MountedPortableProfileReport>,
+    Option<MountedWritebackTimelineReport>,
 )>
 where
     F: FnOnce(MountedPortablePhaseControl) -> Fut,
@@ -543,11 +788,19 @@ where
         spawn_mounted_profile_sampler(mount_pid, metrics_path);
     let result = work(phase_control).await;
     let _ = mounted_profile_stop.send(true);
-    let (mounted_memory, mounted_portable_profile) = mounted_profile_handle
-        .await
-        .map_err(|error| anyhow!("mounted profile sampler panicked: {error}"))?
-        .into_reports();
-    result.map(|value| (value, mounted_memory, mounted_portable_profile))
+    let (mounted_memory, mounted_portable_profile, mounted_writeback_timeline) =
+        mounted_profile_handle
+            .await
+            .map_err(|error| anyhow!("mounted profile sampler panicked: {error}"))?
+            .into_reports();
+    result.map(|value| {
+        (
+            value,
+            mounted_memory,
+            mounted_portable_profile,
+            mounted_writeback_timeline,
+        )
+    })
 }
 
 async fn scan_legacy_pending_upload_artifacts(upload_dir: &Path) -> Result<usize> {
@@ -1688,94 +1941,96 @@ pub(super) async fn run_mounted_end_to_end(
         let order_ref = &order;
         let cache_upload_dir_ref = &cache_upload_dir;
         let write_path_observability_path_ref = &write_path_observability_path;
-        let (measured, mounted_memory, mounted_portable_profile) = sample_mounted_profile_during(
-            mount_pid,
-            write_path_observability_path.as_deref(),
-            move |portable_profile| async move {
-                let started = Instant::now();
-                let started_cpu = process_cpu_time();
-                let started_at =
-                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let (measured, mounted_memory, mounted_portable_profile, mounted_writeback_timeline) =
+            sample_mounted_profile_during(
+                mount_pid,
+                write_path_observability_path.as_deref(),
+                move |portable_profile| async move {
+                    let started = Instant::now();
+                    let started_cpu = process_cpu_time();
+                    let started_at =
+                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-                tracing::info!(
-                    target: "studiofs.cache.profile",
-                    run_id = %params.run_id,
-                    phase = "e2e-write",
-                    "cache benchmark phase start"
-                );
-                portable_profile.set_phase("write");
-                let writes_wall_start = Instant::now();
-                let writes_cpu_start = process_cpu_time();
-                let (writes, writes_by_stream) =
-                    run_mounted_write_phase(params, files_ref, order_ref, size_class_bounds)
-                        .await?;
-                let writes_wall = writes_wall_start.elapsed();
-                let writes_cpu = writes_cpu_start
-                    .and_then(|start_cpu| {
-                        process_cpu_time().map(|end_cpu| end_cpu.saturating_sub(start_cpu))
-                    })
-                    .unwrap_or_default();
+                    tracing::info!(
+                        target: "studiofs.cache.profile",
+                        run_id = %params.run_id,
+                        phase = "e2e-write",
+                        "cache benchmark phase start"
+                    );
+                    portable_profile.set_phase("write");
+                    let writes_wall_start = Instant::now();
+                    let writes_cpu_start = process_cpu_time();
+                    let (writes, writes_by_stream) =
+                        run_mounted_write_phase(params, files_ref, order_ref, size_class_bounds)
+                            .await?;
+                    let writes_wall = writes_wall_start.elapsed();
+                    let writes_cpu = writes_cpu_start
+                        .and_then(|start_cpu| {
+                            process_cpu_time().map(|end_cpu| end_cpu.saturating_sub(start_cpu))
+                        })
+                        .unwrap_or_default();
 
-                let during_upload_observation =
-                    if let Some(upload_dir) = cache_upload_dir_ref.as_deref() {
-                        Some(
-                            wait_for_pending_upload_target(
-                                write_path_observability_path_ref.as_deref(),
-                                mount_pid,
-                                Some(upload_dir),
-                                PendingUploadTarget::Active,
-                                params.during_upload_min_pending,
-                                params.during_upload_timeout,
+                    let during_upload_observation =
+                        if let Some(upload_dir) = cache_upload_dir_ref.as_deref() {
+                            Some(
+                                wait_for_pending_upload_target(
+                                    write_path_observability_path_ref.as_deref(),
+                                    mount_pid,
+                                    Some(upload_dir),
+                                    PendingUploadTarget::Active,
+                                    params.during_upload_min_pending,
+                                    params.during_upload_timeout,
+                                )
+                                .await?,
                             )
-                            .await?,
-                        )
-                    } else {
-                        None
-                    };
+                        } else {
+                            None
+                        };
 
-                tracing::info!(
-                    target: "studiofs.cache.profile",
-                    run_id = %params.run_id,
-                    phase = "e2e-read",
-                    "cache benchmark phase start"
-                );
-                portable_profile.set_phase("during-upload-read");
-                let reads_wall_start = Instant::now();
-                let reads_cpu_start = process_cpu_time();
-                let (reads, reads_by_stream) =
-                    run_mounted_read_phase(params, files_ref, order_ref, size_class_bounds).await?;
-                let reads_wall = reads_wall_start.elapsed();
-                let reads_cpu = reads_cpu_start
-                    .and_then(|start_cpu| {
-                        process_cpu_time().map(|end_cpu| end_cpu.saturating_sub(start_cpu))
+                    tracing::info!(
+                        target: "studiofs.cache.profile",
+                        run_id = %params.run_id,
+                        phase = "e2e-read",
+                        "cache benchmark phase start"
+                    );
+                    portable_profile.set_phase("during-upload-read");
+                    let reads_wall_start = Instant::now();
+                    let reads_cpu_start = process_cpu_time();
+                    let (reads, reads_by_stream) =
+                        run_mounted_read_phase(params, files_ref, order_ref, size_class_bounds)
+                            .await?;
+                    let reads_wall = reads_wall_start.elapsed();
+                    let reads_cpu = reads_cpu_start
+                        .and_then(|start_cpu| {
+                            process_cpu_time().map(|end_cpu| end_cpu.saturating_sub(start_cpu))
+                        })
+                        .unwrap_or_default();
+
+                    let total_wall = Instant::now() - started;
+                    let total_cpu = started_cpu
+                        .and_then(|cpu_start| {
+                            process_cpu_time().map(|cpu_end| cpu_end.saturating_sub(cpu_start))
+                        })
+                        .unwrap_or_default();
+
+                    Ok::<_, anyhow::Error>(MeasuredMountedPhaseResult {
+                        started,
+                        started_at,
+                        writes,
+                        writes_by_stream,
+                        writes_wall,
+                        writes_cpu,
+                        reads,
+                        reads_by_stream,
+                        reads_wall,
+                        reads_cpu,
+                        total_wall,
+                        total_cpu,
+                        during_upload_observation,
                     })
-                    .unwrap_or_default();
-
-                let total_wall = Instant::now() - started;
-                let total_cpu = started_cpu
-                    .and_then(|cpu_start| {
-                        process_cpu_time().map(|cpu_end| cpu_end.saturating_sub(cpu_start))
-                    })
-                    .unwrap_or_default();
-
-                Ok::<_, anyhow::Error>(MeasuredMountedPhaseResult {
-                    started,
-                    started_at,
-                    writes,
-                    writes_by_stream,
-                    writes_wall,
-                    writes_cpu,
-                    reads,
-                    reads_by_stream,
-                    reads_wall,
-                    reads_cpu,
-                    total_wall,
-                    total_cpu,
-                    during_upload_observation,
-                })
-            },
-        )
-        .await?;
+                },
+            )
+            .await?;
         let measured_write_path_after = match write_path_observability_path.as_deref() {
             Some(path) => read_write_path_observability_snapshot(path, mount_pid).await?,
             None => None,
@@ -2008,6 +2263,7 @@ pub(super) async fn run_mounted_end_to_end(
             mounted_observability,
             mounted_write_path_window,
             mounted_write_diagnostics,
+            mounted_writeback_timeline,
             mounted_portable_profile,
             local_first_read_comparison,
             writes: writes_report,
@@ -2223,7 +2479,7 @@ mod tests {
 
         write_snapshot_with_allocator(&metrics_path, mount_pid, 64, 128).await;
         let metrics_path_ref = &metrics_path;
-        let (_, mounted_memory, portable_profile) = sample_mounted_profile_during(
+        let (_, mounted_memory, portable_profile, _) = sample_mounted_profile_during(
             mount_pid,
             Some(&metrics_path),
             move |profile| async move {
@@ -2355,6 +2611,118 @@ mod tests {
 
         assert_eq!(cached_store.staging_bytes, 999);
         assert_eq!(cached_store.staging_throughput_bytes_per_sec, 2048.0);
+    }
+
+    #[test]
+    fn mounted_writeback_timeline_accumulates_second_deltas() {
+        let mut timeline = MountedWritebackTimelineAccumulator::new(1000);
+        let before = VfsWritePathObservabilitySnapshot {
+            generated_unix_ms: 10_000,
+            winfsp_write_path: VfsWritePathWinfspWritePathStats {
+                write_bytes: 10 * 1024 * 1024,
+                ..Default::default()
+            },
+            payload_burst: VfsWritePathBurstStats {
+                total_bytes: 5 * 1024 * 1024,
+                ..Default::default()
+            },
+            payload_persist: VfsWritePathStageLatencyStats {
+                calls: 2,
+                total_ms: 6.0,
+                ..Default::default()
+            },
+            local_cache_io: VfsWritePathLocalCacheIoStats {
+                calls: 2,
+                backend_io_total_ms: 5.0,
+                backend_io_max_ms: 3.0,
+                ..Default::default()
+            },
+            write_backpressure: VfsWritePathBackpressureStats {
+                events: 1,
+                wait_total_ms: 4,
+                soft_throttle_events: 1,
+                hard_events: 0,
+                ..Default::default()
+            },
+            upload: studiofs_vfs::VfsUploadStats {
+                completed_upload_bytes: 1024,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let after = VfsWritePathObservabilitySnapshot {
+            generated_unix_ms: 11_000,
+            winfsp_write_path: VfsWritePathWinfspWritePathStats {
+                write_bytes: 74 * 1024 * 1024,
+                ..Default::default()
+            },
+            payload_burst: VfsWritePathBurstStats {
+                total_bytes: 37 * 1024 * 1024,
+                ..Default::default()
+            },
+            payload_persist: VfsWritePathStageLatencyStats {
+                calls: 10,
+                total_ms: 50.0,
+                ..Default::default()
+            },
+            local_cache_io: VfsWritePathLocalCacheIoStats {
+                calls: 11,
+                backend_io_total_ms: 45.0,
+                backend_io_max_ms: 12.0,
+                ..Default::default()
+            },
+            write_backpressure: VfsWritePathBackpressureStats {
+                events: 4,
+                wait_total_ms: 29,
+                soft_throttle_events: 3,
+                hard_events: 1,
+                ..Default::default()
+            },
+            dirty_pressure: VfsWritePathDirtyPressureStats {
+                writer_stack_dirty_bytes: 64 * 1024 * 1024,
+                pending_persisted_slice_bytes: 128 * 1024 * 1024,
+                pending_upload_bytes: 256 * 1024 * 1024,
+                ..Default::default()
+            },
+            upload: studiofs_vfs::VfsUploadStats {
+                pending_uploads: 4,
+                active_uploads: 2,
+                completed_upload_bytes: 17 * 1024 * 1024 + 1024,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        timeline.observe("write", &before);
+        timeline.observe("write", &after);
+        let report = timeline.into_report().expect("timeline report");
+
+        assert_eq!(report.bucket_ms, 1000);
+        assert_eq!(report.samples.len(), 1);
+        let sample = &report.samples[0];
+        assert_eq!(sample.elapsed_ms, 1000);
+        assert_eq!(sample.phase, "write");
+        assert_eq!(
+            sample.foreground_write_bytes_per_sec,
+            64.0 * 1024.0 * 1024.0
+        );
+        assert_eq!(sample.payload_persist_bytes_per_sec, 32.0 * 1024.0 * 1024.0);
+        assert_eq!(
+            sample.upload_completed_bytes_per_sec,
+            17.0 * 1024.0 * 1024.0
+        );
+        assert_eq!(sample.pending_upload_bytes, 256 * 1024 * 1024);
+        assert_eq!(sample.upload_queue_depth, 4);
+        assert_eq!(sample.active_uploads, 2);
+        assert_eq!(sample.backpressure_events_delta, 3);
+        assert_eq!(sample.backpressure_wait_ms_delta, 25);
+        assert_eq!(sample.soft_throttle_events_delta, 2);
+        assert_eq!(sample.hard_backpressure_events_delta, 1);
+        assert_eq!(sample.materialization_calls_delta, 8);
+        assert_eq!(sample.materialization_total_ms_delta, 44.0);
+        assert_eq!(sample.local_cache_io_calls_delta, 9);
+        assert_eq!(sample.local_cache_backend_io_total_ms_delta, 40.0);
+        assert_eq!(sample.local_cache_backend_io_cumulative_max_ms, 12.0);
     }
 
     #[test]
