@@ -155,6 +155,27 @@ pub enum LocalPayloadSyncMode {
     Fast,
 }
 
+/// Payload-store data write policy for the current local payload object backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LocalPayloadWriteMode {
+    /// Use the platform's normal buffered file writes.
+    #[default]
+    Buffered,
+    /// Prefer Windows unbuffered writes for aligned full payload objects, with
+    /// buffered fallback for payloads that do not satisfy direct-I/O rules.
+    UnbufferedFast,
+}
+
+impl LocalPayloadWriteMode {
+    pub const fn default_for_mount_path() -> Self {
+        if cfg!(windows) {
+            Self::UnbufferedFast
+        } else {
+            Self::Buffered
+        }
+    }
+}
+
 /// Errors returned while opening the current local payload object backend.
 #[derive(Debug, thiserror::Error)]
 pub enum LocalPayloadBackendOpenError {
@@ -250,6 +271,20 @@ impl LocalPayloadBackendRuntime {
         cache_budget_bytes: Option<u64>,
         payload_sync_mode: LocalPayloadSyncMode,
     ) -> Result<Self, LocalPayloadBackendOpenError> {
+        Self::open_with_budget_sync_and_write_mode(
+            config,
+            cache_budget_bytes,
+            payload_sync_mode,
+            LocalPayloadWriteMode::Buffered,
+        )
+    }
+
+    pub fn open_with_budget_sync_and_write_mode(
+        config: LocalPayloadBackendConfig,
+        cache_budget_bytes: Option<u64>,
+        payload_sync_mode: LocalPayloadSyncMode,
+        payload_write_mode: LocalPayloadWriteMode,
+    ) -> Result<Self, LocalPayloadBackendOpenError> {
         let layout = LocalPayloadLayout::from_cache_root(&config.cache_root);
         if !layout.payload_objects_dir.try_exists()?
             || !layout.upload_stage_objects_dir.try_exists()?
@@ -268,13 +303,15 @@ impl LocalPayloadBackendRuntime {
             }
         })?;
 
-        let payload_store =
-            FilePayloadStore::open_with_sync_mode(layout.clone(), payload_sync_mode).map_err(
-                |source| LocalPayloadBackendOpenError::OpenPayloadStore {
-                    cache_root: layout.runtime_root.clone(),
-                    source,
-                },
-            )?;
+        let payload_store = FilePayloadStore::open_with_sync_and_write_mode(
+            layout.clone(),
+            payload_sync_mode,
+            payload_write_mode,
+        )
+        .map_err(|source| LocalPayloadBackendOpenError::OpenPayloadStore {
+            cache_root: layout.runtime_root.clone(),
+            source,
+        })?;
 
         let startup_reconcile_mode = LocalPayloadStartupReconcileMode::from_env();
         let startup_reconcile_report =

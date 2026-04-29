@@ -38,8 +38,6 @@ const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0020;
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x0080;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 const FILE_DIRECTORY_FILE_OPTION: u32 = 0x0000_0001;
-const FILE_WRITE_THROUGH_OPTION: u32 = 0x0000_0002;
-const FILE_NO_INTERMEDIATE_BUFFERING_OPTION: u32 = 0x0000_0008;
 const FILE_READ_DATA_ACCESS: FILE_ACCESS_RIGHTS = 0x0001;
 const FILE_WRITE_DATA_ACCESS: FILE_ACCESS_RIGHTS = 0x0002;
 const FILE_APPEND_DATA_ACCESS: FILE_ACCESS_RIGHTS = 0x0004;
@@ -196,9 +194,7 @@ impl SendConstBuffer {
 /// so `FILE_NO_INTERMEDIATE_BUFFERING` and `FILE_WRITE_THROUGH` no longer
 /// select an alternate read/write data plane. What still matters here is the
 /// actual access mask: treating every Windows handle as RDWR confuses VFS
-/// access tracking, sticky-error reporting, and last-handle release policy. The
-/// stricter write barrier policy for write-through / unbuffered handles is
-/// derived separately from `CreateOptions`.
+/// access tracking, sticky-error reporting, and last-handle release policy.
 fn open_flags_from_access(granted_access: FILE_ACCESS_RIGHTS, _create_options: u32) -> OpenFlags {
     let wants_read = (granted_access & (FILE_READ_DATA_ACCESS | FILE_GENERIC_READ_ACCESS)) != 0;
     let wants_write = (granted_access
@@ -212,12 +208,8 @@ fn open_flags_from_access(granted_access: FILE_ACCESS_RIGHTS, _create_options: u
     }
 }
 
-fn write_local_sync_policy_from_create_options(create_options: u32) -> LocalSyncPolicy {
-    if (create_options & (FILE_WRITE_THROUGH_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_OPTION)) != 0 {
-        LocalSyncPolicy::Strict
-    } else {
-        LocalSyncPolicy::Opportunistic
-    }
+fn write_local_sync_policy_from_create_options(_create_options: u32) -> LocalSyncPolicy {
+    LocalSyncPolicy::Opportunistic
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1656,10 +1648,9 @@ mod tests {
     use super::{
         CreateCallbackKind, FILE_ACTION_MODIFIED, FILE_APPEND_DATA_ACCESS,
         FILE_DIRECTORY_FILE_OPTION, FILE_GENERIC_READ_ACCESS, FILE_GENERIC_WRITE_ACCESS,
-        FILE_NO_INTERMEDIATE_BUFFERING_OPTION, FILE_NOTIFY_CHANGE_ATTRIBUTES,
-        FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
-        FILE_NOTIFY_CHANGE_SIZE, FILE_READ_DATA_ACCESS, FILE_WRITE_DATA_ACCESS,
-        FILE_WRITE_THROUGH_OPTION, FileSizeCallbackAction, STATUS_ACCESS_DENIED, STATUS_DATA_ERROR,
+        FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
+        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_READ_DATA_ACCESS,
+        FILE_WRITE_DATA_ACCESS, FileSizeCallbackAction, STATUS_ACCESS_DENIED, STATUS_DATA_ERROR,
         STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER, STATUS_IO_TIMEOUT,
         STATUS_OBJECT_NAME_NOT_FOUND, StudioFileHandle, StudioFsContext, WinfspKernelInvalidator,
         attr_to_file_info, build_basic_info_setattr_args, build_notify_info,
@@ -1684,6 +1675,9 @@ mod tests {
     use tokio::runtime::Runtime;
     use winfsp::U16CString;
     use winfsp::filesystem::FileSystemContext;
+
+    const FILE_WRITE_THROUGH_OPTION: u32 = 0x0000_0002;
+    const FILE_NO_INTERMEDIATE_BUFFERING_OPTION: u32 = 0x0000_0008;
 
     fn test_format_info(volume_suffix: &str) -> FormatInfo {
         let volume_name = format!("winfsp-test-{volume_suffix}-{}", std::process::id());
@@ -1779,9 +1773,6 @@ mod tests {
 
     #[test]
     fn granted_access_maps_to_expected_open_flags() {
-        const FILE_WRITE_THROUGH_OPTION: u32 = 0x0000_0002;
-        const FILE_NO_INTERMEDIATE_BUFFERING_OPTION: u32 = 0x0000_0008;
-
         let readonly = open_flags_from_access(FILE_READ_DATA_ACCESS, 0);
         assert_eq!(readonly.bits(), OpenFlags::RDONLY.bits());
 
@@ -2621,22 +2612,22 @@ mod tests {
         );
         assert_eq!(
             write_local_sync_policy_from_create_options(FILE_WRITE_THROUGH_OPTION),
-            LocalSyncPolicy::Strict
+            LocalSyncPolicy::Opportunistic
         );
         assert_eq!(
             write_local_sync_policy_from_create_options(FILE_NO_INTERMEDIATE_BUFFERING_OPTION),
-            LocalSyncPolicy::Strict
+            LocalSyncPolicy::Opportunistic
         );
         assert_eq!(
             write_local_sync_policy_from_create_options(
                 FILE_WRITE_THROUGH_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_OPTION
             ),
-            LocalSyncPolicy::Strict
+            LocalSyncPolicy::Opportunistic
         );
     }
 
     #[test]
-    fn write_through_write_callback_commits_local_state_immediately() {
+    fn write_through_write_callback_defers_local_sync_until_flush() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("write_callback_write_through");
         let attr = vfs
             .create(ROOT_INO, b"write-through-callback.txt", 0, 0, 0o644)
@@ -2649,7 +2640,9 @@ mod tests {
             false,
             fh,
             OpenFlags::RDWR,
-            LocalSyncPolicy::Strict,
+            write_local_sync_policy_from_create_options(
+                FILE_WRITE_THROUGH_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_OPTION,
+            ),
         );
         let mut file_info = winfsp::filesystem::FileInfo::default();
         let flush_calls_before = flush_barrier_calls(&vfs);
@@ -2666,17 +2659,30 @@ mod tests {
         )
         .expect("write callback");
 
+        assert_eq!(
+            sync_data_calls(&vfs),
+            sync_calls_before,
+            "write-through / unbuffered WinFSP writes must not call fdatasync from write()"
+        );
+        assert_eq!(
+            flush_barrier_calls(&vfs),
+            flush_calls_before,
+            "write-through / unbuffered WinFSP writes must not commit the local metadata barrier from write()"
+        );
+
+        ctx.run_flush_callback(attr.ino, fh)
+            .expect("flush callback");
         assert!(
             !vfs.inode_has_local_dirty_state(attr.ino),
-            "write-through / unbuffered WinFSP writes should still cross the strict local durable boundary in write()"
+            "explicit flush should still cross the durable local boundary"
         );
         assert!(
             sync_data_calls(&vfs) > sync_calls_before,
-            "strict WinFSP write policy should still force the local payload sync barrier in write()"
+            "explicit flush should still force the local payload sync barrier"
         );
         assert!(
             flush_barrier_calls(&vfs) > flush_calls_before,
-            "strict handle-writer writes should commit materialized slices through the strict local metadata barrier"
+            "explicit flush should still commit materialized slices through the local metadata barrier"
         );
 
         ctx.spawn_wait({

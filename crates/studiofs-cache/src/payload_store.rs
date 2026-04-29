@@ -17,11 +17,11 @@ use parking_lot::Mutex;
 use tracing::warn;
 use uuid::Uuid;
 
-use super::LocalPayloadSyncMode;
 use super::layout::{
     LOCAL_PAYLOAD_BATCH_INTENT_DIR, LOCAL_PAYLOAD_BATCH_INTENT_FILE_EXTENSION, LocalPayloadLayout,
 };
 use super::platform;
+use super::{LocalPayloadSyncMode, LocalPayloadWriteMode};
 
 const TEMP_FILE_CREATE_ATTEMPTS: usize = 32;
 const TEMP_FILE_SUFFIX: &str = ".tmp";
@@ -31,6 +31,7 @@ const READ_FD_CACHE_CAPACITY: usize = 2_048;
 const READ_FD_CACHE_CAPACITY: usize = 16;
 const READ_FD_CACHE_SHARDS: usize = 16;
 const READ_HINT_MIN_LEN: usize = 512 * 1024;
+const FAST_BATCH_STAGING_MAX_CONCURRENCY: usize = 4;
 
 static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 static BATCH_INTENT_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -67,8 +68,11 @@ pub enum FilePayloadStoreError {
 pub struct FilePayloadStore {
     layout: LocalPayloadLayout,
     sync_mode: LocalPayloadSyncMode,
+    write_mode: LocalPayloadWriteMode,
     read_handles: Arc<ReadHandleCache>,
     pending_grouped_sync: Arc<PendingGroupedSync>,
+    #[cfg(test)]
+    write_counters: Arc<PayloadWriteCounters>,
     barrier_counters: Arc<SyncBarrierCounters>,
 }
 
@@ -81,11 +85,20 @@ impl FilePayloadStore {
         layout: LocalPayloadLayout,
         sync_mode: LocalPayloadSyncMode,
     ) -> Result<Self, FilePayloadStoreError> {
+        Self::open_with_sync_and_write_mode(layout, sync_mode, LocalPayloadWriteMode::Buffered)
+    }
+
+    pub fn open_with_sync_and_write_mode(
+        layout: LocalPayloadLayout,
+        sync_mode: LocalPayloadSyncMode,
+        write_mode: LocalPayloadWriteMode,
+    ) -> Result<Self, FilePayloadStoreError> {
         std::fs::create_dir_all(&layout.payload_objects_dir)?;
         std::fs::create_dir_all(&layout.tmp_dir)?;
         Ok(Self {
             layout,
             sync_mode,
+            write_mode,
             read_handles: Arc::new(ReadHandleCache {
                 shards: array::from_fn(|_| Mutex::new(LruCache::new(read_fd_cache_shard_cap()))),
                 hits: AtomicU64::new(0),
@@ -93,6 +106,8 @@ impl FilePayloadStore {
                 evictions: AtomicU64::new(0),
             }),
             pending_grouped_sync: Arc::new(PendingGroupedSync::default()),
+            #[cfg(test)]
+            write_counters: Arc::new(PayloadWriteCounters::default()),
             barrier_counters: Arc::new(SyncBarrierCounters::default()),
         })
     }
@@ -255,7 +270,7 @@ impl FilePayloadStore {
 
         let durable_sync = matches!(self.sync_mode, LocalPayloadSyncMode::Durable);
         let mut prepared_dirs = HashSet::new();
-        let mut staged = Vec::with_capacity(entries.len());
+        let mut prepared = Vec::with_capacity(entries.len());
         for entry in entries {
             let payload_path = self.layout.payload_object_path(entry.object_id);
             let payload_dir = payload_path
@@ -270,19 +285,13 @@ impl FilePayloadStore {
             if prepared_dirs.insert(payload_dir.clone()) {
                 std::fs::create_dir_all(&payload_dir)?;
             }
-            let temp_path = self.write_temp_payload_file(
-                &self.layout.tmp_dir,
-                entry.object_id,
-                entry.data,
-                durable_sync,
-            )?;
-            staged.push(StagedBatchPayload {
+            prepared.push(PreparedBatchPayload {
                 entry: *entry,
                 payload_path,
                 payload_dir,
-                temp_path,
             });
         }
+        let staged = self.stage_batch_payloads(&prepared, durable_sync)?;
 
         let mut renamed_object_ids = Vec::with_capacity(staged.len());
         let mut synced_dirs = HashSet::new();
@@ -320,6 +329,113 @@ impl FilePayloadStore {
         }
         Ok(PayloadBatchCommit {
             intent_path: intent,
+        })
+    }
+
+    fn stage_batch_payloads<'a>(
+        &self,
+        prepared: &[PreparedBatchPayload<'a>],
+        durable_sync: bool,
+    ) -> Result<Vec<StagedBatchPayload<'a>>, FilePayloadStoreError> {
+        let concurrency = batch_staging_concurrency(prepared.len(), durable_sync);
+        if concurrency <= 1 {
+            return prepared
+                .iter()
+                .map(|entry| self.stage_one_batch_payload(entry, durable_sync))
+                .collect();
+        }
+
+        let mut staged = Vec::with_capacity(prepared.len());
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..concurrency)
+                .map(|worker_idx| {
+                    scope.spawn(move || {
+                        #[cfg(test)]
+                        self.write_counters
+                            .staging_worker_starts
+                            .fetch_add(1, Ordering::Relaxed);
+                        let mut unbuffered_scratch = platform::UnbufferedWriteBuffer::new();
+                        let mut worker_staged = Vec::new();
+                        for idx in (worker_idx..prepared.len()).step_by(concurrency) {
+                            worker_staged.push((
+                                idx,
+                                self.stage_one_batch_payload_with_unbuffered_buffer(
+                                    &prepared[idx],
+                                    durable_sync,
+                                    &mut unbuffered_scratch,
+                                )?,
+                            ));
+                        }
+                        Ok::<_, FilePayloadStoreError>(worker_staged)
+                    })
+                })
+                .collect();
+            let mut first_error = None;
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(mut worker_staged)) => staged.append(&mut worker_staged),
+                    Ok(Err(error)) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                    Err(_) => {
+                        if first_error.is_none() {
+                            first_error = Some(FilePayloadStoreError::Io(io::Error::other(
+                                "payload batch staging worker panicked",
+                            )));
+                        }
+                    }
+                }
+            }
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        })?;
+        staged.sort_by_key(|(idx, _)| *idx);
+        Ok(staged
+            .into_iter()
+            .map(|(_, staged_entry)| staged_entry)
+            .collect())
+    }
+
+    fn stage_one_batch_payload<'a>(
+        &self,
+        entry: &PreparedBatchPayload<'a>,
+        durable_sync: bool,
+    ) -> Result<StagedBatchPayload<'a>, FilePayloadStoreError> {
+        let mut unbuffered_scratch = platform::UnbufferedWriteBuffer::new();
+        self.stage_one_batch_payload_with_unbuffered_buffer(
+            entry,
+            durable_sync,
+            &mut unbuffered_scratch,
+        )
+    }
+
+    fn stage_one_batch_payload_with_unbuffered_buffer<'a>(
+        &self,
+        entry: &PreparedBatchPayload<'a>,
+        durable_sync: bool,
+        unbuffered_scratch: &mut platform::UnbufferedWriteBuffer,
+    ) -> Result<StagedBatchPayload<'a>, FilePayloadStoreError> {
+        let temp_dir = if durable_sync {
+            self.layout.tmp_dir.as_path()
+        } else {
+            entry.payload_dir.as_path()
+        };
+        let temp_path = self.write_temp_payload_file_with_unbuffered_buffer(
+            temp_dir,
+            entry.entry.object_id,
+            entry.entry.data,
+            durable_sync,
+            unbuffered_scratch,
+        )?;
+        Ok(StagedBatchPayload {
+            entry: entry.entry,
+            payload_path: entry.payload_path.clone(),
+            payload_dir: entry.payload_dir.clone(),
+            temp_path,
         })
     }
 
@@ -376,6 +492,43 @@ impl FilePayloadStore {
         data: &[u8],
         sync_file_data: bool,
     ) -> Result<PathBuf, FilePayloadStoreError> {
+        let mut unbuffered_scratch = platform::UnbufferedWriteBuffer::new();
+        self.write_temp_payload_file_with_unbuffered_buffer(
+            temp_dir,
+            object_id,
+            data,
+            sync_file_data,
+            &mut unbuffered_scratch,
+        )
+    }
+
+    fn write_temp_payload_file_with_unbuffered_buffer(
+        &self,
+        temp_dir: &Path,
+        object_id: u64,
+        data: &[u8],
+        sync_file_data: bool,
+        unbuffered_scratch: &mut platform::UnbufferedWriteBuffer,
+    ) -> Result<PathBuf, FilePayloadStoreError> {
+        #[cfg(test)]
+        let _staging_probe = self.enter_test_staging_probe();
+
+        if self.write_mode == LocalPayloadWriteMode::UnbufferedFast {
+            if let Some(temp_path) = self.try_write_temp_payload_file_unbuffered(
+                temp_dir,
+                object_id,
+                data,
+                sync_file_data,
+                unbuffered_scratch,
+            )? {
+                return Ok(temp_path);
+            }
+            #[cfg(test)]
+            self.write_counters
+                .unbuffered_write_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
         let (mut temp_file, temp_path) = self.create_temp_file(temp_dir, object_id)?;
         platform::write_all(&mut temp_file, data)?;
         if sync_file_data {
@@ -386,6 +539,66 @@ impl FilePayloadStore {
         }
         drop(temp_file);
         Ok(temp_path)
+    }
+
+    fn try_write_temp_payload_file_unbuffered(
+        &self,
+        temp_dir: &Path,
+        object_id: u64,
+        data: &[u8],
+        sync_file_data: bool,
+        unbuffered_scratch: &mut platform::UnbufferedWriteBuffer,
+    ) -> Result<Option<PathBuf>, FilePayloadStoreError> {
+        if !platform::can_write_unbuffered_payload(data) {
+            return Ok(None);
+        }
+
+        #[cfg(test)]
+        self.write_counters
+            .unbuffered_write_attempts
+            .fetch_add(1, Ordering::Relaxed);
+
+        let (mut temp_file, temp_path) = match self.create_temp_file_with_opener(
+            temp_dir,
+            object_id,
+            platform::create_new_unbuffered_write,
+        ) {
+            Ok(opened) => opened,
+            Err(FilePayloadStoreError::Io(error))
+                if platform::is_unbuffered_io_unsupported_error(&error) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+
+        if let Err(error) =
+            platform::write_all_unbuffered_with_buffer(&mut temp_file, data, unbuffered_scratch)
+        {
+            drop(temp_file);
+            let _ = std::fs::remove_file(&temp_path);
+            if platform::is_unbuffered_io_unsupported_error(&error) {
+                return Ok(None);
+            }
+            return Err(FilePayloadStoreError::Io(error));
+        }
+
+        if sync_file_data {
+            if let Err(error) = platform::sync_data(&temp_file) {
+                drop(temp_file);
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(FilePayloadStoreError::Io(error));
+            }
+            self.barrier_counters
+                .per_put_file_sync_calls
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        drop(temp_file);
+        #[cfg(test)]
+        self.write_counters
+            .unbuffered_write_successes
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(Some(temp_path))
     }
 
     fn commit_staged_batch_payload(
@@ -501,6 +714,56 @@ impl FilePayloadStore {
     }
 
     #[cfg(test)]
+    fn write_mode_snapshot(&self) -> PayloadWriteSnapshot {
+        PayloadWriteSnapshot {
+            unbuffered_write_attempts: self
+                .write_counters
+                .unbuffered_write_attempts
+                .load(Ordering::Relaxed),
+            unbuffered_write_successes: self
+                .write_counters
+                .unbuffered_write_successes
+                .load(Ordering::Relaxed),
+            unbuffered_write_fallbacks: self
+                .write_counters
+                .unbuffered_write_fallbacks
+                .load(Ordering::Relaxed),
+            max_staging_writes: self
+                .write_counters
+                .max_staging_writes
+                .load(Ordering::Relaxed),
+            staging_worker_starts: self
+                .write_counters
+                .staging_worker_starts
+                .load(Ordering::Relaxed),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_test_staging_delay_ms(&self, delay_ms: u64) {
+        self.write_counters
+            .staging_delay_ms
+            .store(delay_ms, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn enter_test_staging_probe(&self) -> TestStagingProbeGuard {
+        let active = self
+            .write_counters
+            .active_staging_writes
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        update_max_atomic(&self.write_counters.max_staging_writes, active);
+        let delay_ms = self.write_counters.staging_delay_ms.load(Ordering::Relaxed);
+        if delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+        TestStagingProbeGuard {
+            counters: Arc::clone(&self.write_counters),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn sync_barrier_snapshot(&self) -> SyncBarrierSnapshot {
         SyncBarrierSnapshot {
             per_put_file_sync_calls: self
@@ -529,16 +792,20 @@ impl FilePayloadStore {
         temp_dir: &Path,
         object_id: u64,
     ) -> Result<(File, PathBuf), FilePayloadStoreError> {
+        self.create_temp_file_with_opener(temp_dir, object_id, platform::create_new_buffered_write)
+    }
+
+    fn create_temp_file_with_opener(
+        &self,
+        temp_dir: &Path,
+        object_id: u64,
+        mut opener: impl FnMut(&Path) -> io::Result<File>,
+    ) -> Result<(File, PathBuf), FilePayloadStoreError> {
         let hex = format!("{object_id:016x}");
         for _ in 0..TEMP_FILE_CREATE_ATTEMPTS {
             let candidate =
                 temp_dir.join(format!("{hex}-{}{}", next_temp_token(), TEMP_FILE_SUFFIX));
-            match OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .read(true)
-                .open(&candidate)
-            {
+            match opener(&candidate) {
                 Ok(file) => return Ok((file, candidate)),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error.into()),
@@ -735,6 +1002,18 @@ struct PendingGroupedSync {
     directories: Mutex<HashSet<PathBuf>>,
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct PayloadWriteCounters {
+    unbuffered_write_attempts: AtomicU64,
+    unbuffered_write_successes: AtomicU64,
+    unbuffered_write_fallbacks: AtomicU64,
+    active_staging_writes: AtomicU64,
+    max_staging_writes: AtomicU64,
+    staging_worker_starts: AtomicU64,
+    staging_delay_ms: AtomicU64,
+}
+
 #[derive(Debug, Default)]
 struct SyncBarrierCounters {
     per_put_file_sync_calls: AtomicU64,
@@ -755,6 +1034,41 @@ pub(crate) struct SyncBarrierSnapshot {
 }
 
 #[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PayloadWriteSnapshot {
+    unbuffered_write_attempts: u64,
+    unbuffered_write_successes: u64,
+    unbuffered_write_fallbacks: u64,
+    max_staging_writes: u64,
+    staging_worker_starts: u64,
+}
+
+#[cfg(test)]
+struct TestStagingProbeGuard {
+    counters: Arc<PayloadWriteCounters>,
+}
+
+#[cfg(test)]
+impl Drop for TestStagingProbeGuard {
+    fn drop(&mut self) {
+        self.counters
+            .active_staging_writes
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+fn update_max_atomic(max: &AtomicU64, value: u64) {
+    let mut current = max.load(Ordering::Relaxed);
+    while value > current {
+        match max.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReadHandleStats {
     hits: u64,
@@ -772,6 +1086,14 @@ fn read_fd_shard_idx(object_id: u64) -> usize {
     let shard_count = u64::try_from(READ_FD_CACHE_SHARDS).unwrap_or(u64::MAX);
     let shard = object_id % shard_count;
     usize::try_from(shard).unwrap_or(0)
+}
+
+fn batch_staging_concurrency(entry_count: usize, durable_sync: bool) -> usize {
+    if durable_sync {
+        1
+    } else {
+        entry_count.clamp(1, FAST_BATCH_STAGING_MAX_CONCURRENCY)
+    }
 }
 
 fn next_temp_token() -> String {
@@ -822,6 +1144,54 @@ mod tests {
 
         let reopened = FilePayloadStore::open(layout).unwrap();
         assert_eq!(reopened.get(42).unwrap().as_ref(), b"payload");
+    }
+
+    #[test]
+    fn unbuffered_fast_mode_roundtrips_aligned_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open_with_sync_and_write_mode(
+            layout,
+            LocalPayloadSyncMode::Fast,
+            LocalPayloadWriteMode::UnbufferedFast,
+        )
+        .unwrap();
+        let payload = vec![0xAB; 4096];
+
+        store.put(4200, &payload).unwrap();
+
+        assert_eq!(store.get(4200).unwrap().as_ref(), payload.as_slice());
+        let writes = store.write_mode_snapshot();
+        if cfg!(windows) {
+            assert_eq!(writes.unbuffered_write_attempts, 1);
+            assert_eq!(
+                writes.unbuffered_write_successes + writes.unbuffered_write_fallbacks,
+                1
+            );
+        } else {
+            assert_eq!(writes.unbuffered_write_attempts, 0);
+            assert_eq!(writes.unbuffered_write_fallbacks, 1);
+        }
+    }
+
+    #[test]
+    fn unbuffered_fast_mode_falls_back_for_unaligned_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store = FilePayloadStore::open_with_sync_and_write_mode(
+            layout,
+            LocalPayloadSyncMode::Fast,
+            LocalPayloadWriteMode::UnbufferedFast,
+        )
+        .unwrap();
+
+        store.put(4201, b"payload").unwrap();
+
+        assert_eq!(store.get(4201).unwrap().as_ref(), b"payload");
+        let writes = store.write_mode_snapshot();
+        assert_eq!(writes.unbuffered_write_attempts, 0);
+        assert_eq!(writes.unbuffered_write_successes, 0);
+        assert_eq!(writes.unbuffered_write_fallbacks, 1);
     }
 
     #[test]
@@ -1089,6 +1459,116 @@ mod tests {
             "grouped sync_data should sync all queued payload files from batched put"
         );
     }
+
+    #[test]
+    fn fast_mode_put_batch_stages_payload_files_concurrently() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store =
+            FilePayloadStore::open_with_sync_mode(layout, LocalPayloadSyncMode::Fast).unwrap();
+        store.set_test_staging_delay_ms(50);
+        let entries = [
+            PayloadBatchEntry {
+                object_id: 8301,
+                data: b"one",
+            },
+            PayloadBatchEntry {
+                object_id: 8302,
+                data: b"two",
+            },
+            PayloadBatchEntry {
+                object_id: 8303,
+                data: b"three",
+            },
+            PayloadBatchEntry {
+                object_id: 8304,
+                data: b"four",
+            },
+        ];
+
+        store.put_batch(&entries).unwrap().complete();
+
+        let writes = store.write_mode_snapshot();
+        assert!(
+            writes.max_staging_writes > 1,
+            "batched payload staging should allow multiple temp-file writes in flight"
+        );
+        assert_eq!(store.get(8301).unwrap().as_ref(), b"one");
+        assert_eq!(store.get(8304).unwrap().as_ref(), b"four");
+    }
+
+    #[test]
+    fn fast_mode_put_batch_uses_bounded_staging_workers_for_large_batches() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store =
+            FilePayloadStore::open_with_sync_mode(layout, LocalPayloadSyncMode::Fast).unwrap();
+        let payloads = [
+            b"payload-0".as_slice(),
+            b"payload-1".as_slice(),
+            b"payload-2".as_slice(),
+            b"payload-3".as_slice(),
+            b"payload-4".as_slice(),
+            b"payload-5".as_slice(),
+            b"payload-6".as_slice(),
+            b"payload-7".as_slice(),
+        ];
+        let entries: Vec<_> = payloads
+            .iter()
+            .enumerate()
+            .map(|(idx, data)| PayloadBatchEntry {
+                object_id: 8350 + idx as u64,
+                data,
+            })
+            .collect();
+
+        store.put_batch(&entries).unwrap().complete();
+
+        let writes = store.write_mode_snapshot();
+        assert!(
+            writes.staging_worker_starts <= FAST_BATCH_STAGING_MAX_CONCURRENCY as u64,
+            "large batches should reuse a bounded worker set instead of spawning one thread per payload"
+        );
+        assert_eq!(store.get(8350).unwrap().as_ref(), b"payload-0");
+        assert_eq!(store.get(8357).unwrap().as_ref(), b"payload-7");
+    }
+
+    #[test]
+    fn fast_mode_put_batch_stages_temp_files_in_payload_shards() {
+        let temp = tempfile::tempdir().unwrap();
+        let layout = LocalPayloadLayout::from_cache_root(temp.path());
+        let store =
+            FilePayloadStore::open_with_sync_mode(layout.clone(), LocalPayloadSyncMode::Fast)
+                .unwrap();
+        let prepared = PreparedBatchPayload {
+            entry: PayloadBatchEntry {
+                object_id: 8401,
+                data: b"payload",
+            },
+            payload_path: layout.payload_object_path(8401),
+            payload_dir: layout
+                .payload_object_path(8401)
+                .parent()
+                .unwrap()
+                .to_path_buf(),
+        };
+        std::fs::create_dir_all(&prepared.payload_dir).unwrap();
+
+        let staged = store.stage_one_batch_payload(&prepared, false).unwrap();
+
+        assert_eq!(
+            staged.temp_path.parent(),
+            Some(prepared.payload_dir.as_path())
+        );
+        assert!(staged.temp_path.exists());
+    }
+}
+
+#[derive(Debug)]
+struct PreparedBatchPayload<'a> {
+    entry: PayloadBatchEntry<'a>,
+    payload_path: PathBuf,
+    payload_dir: PathBuf,
 }
 
 #[derive(Debug)]

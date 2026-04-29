@@ -165,7 +165,7 @@ pub(crate) fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
         snapshot.landing_zone.sync_max_ms
     ));
     out.push_str(&format!(
-        "drain_lag: current={} steady_quota={} soft_pacing_events={} soft_pacing_total_ms={} soft_pacing_max_ms={} admission_ingress={}/s admission_drain={}/s admission_runway_ms={} admission_last_delay_ms={} admission_pressure={} admission_budget={}\n",
+        "drain_lag: current={} steady_quota={} soft_pacing_events={} soft_pacing_total_ms={} soft_pacing_max_ms={} admission_ingress={}/s admission_drain={}/s admission_runway_ms={} admission_last_delay_ms={} admission_pressure={} admission_budget={} local_sync_unsynced={}\n",
         format_bytes(
             u64::try_from(snapshot.drain_lag.current_bytes)
                 .context("drain lag bytes does not fit in u64")
@@ -190,6 +190,10 @@ pub(crate) fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
         format_bytes(
             u64::try_from(snapshot.drain_lag.admission_budget_bytes)
                 .context("admission budget bytes does not fit in u64")?
+        ),
+        format_bytes(
+            u64::try_from(snapshot.drain_lag.local_sync_unsynced_bytes)
+                .context("local sync unsynced bytes does not fit in u64")?
         )
     ));
     out.push_str(&format!(
@@ -398,6 +402,7 @@ mod tests {
                 admission_last_delay_ms: 2,
                 admission_pressure_bytes: 3 * 1024 * 1024 * 1024,
                 admission_budget_bytes: 4 * 1024 * 1024 * 1024,
+                local_sync_unsynced_bytes: 512 * 1024 * 1024,
             },
             ..Default::default()
         };
@@ -413,6 +418,7 @@ mod tests {
         assert!(summary.contains("drain_lag: current=20.0MiB steady_quota=4.0MiB soft_pacing_events=3 soft_pacing_total_ms=9 soft_pacing_max_ms=4"));
         assert!(summary.contains("admission_ingress=1.6GiB/s admission_drain=1.2GiB/s admission_runway_ms=1250 admission_last_delay_ms=2"));
         assert!(summary.contains("admission_pressure=3.0GiB admission_budget=4.0GiB"));
+        assert!(summary.contains("local_sync_unsynced=512.0MiB"));
     }
 
     #[test]

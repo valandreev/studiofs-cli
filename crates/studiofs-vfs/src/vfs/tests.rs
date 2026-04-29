@@ -2004,6 +2004,14 @@ fn cache_runtime_tuning_defaults_match_juicefs_sized_windows() {
 }
 
 #[test]
+fn fast_mode_sync_group_defaults_to_drain_chunk_window() {
+    assert_eq!(
+        derive_fast_mode_sync_group_min_bytes(64 * 1024 * 1024, 32 * 1024 * 1024),
+        32 * 1024 * 1024
+    );
+}
+
+#[test]
 fn soft_dirty_budget_pacing_starts_before_hard_limit() {
     assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 0), None);
     assert_eq!(soft_dirty_budget_pacing_delay_ms(44, 100, 0), None);
@@ -2059,6 +2067,83 @@ fn write_admission_pressure_samples_cached_store_pending_upload_bytes() {
 
     assert_eq!(pressure.pending_upload_bytes, 8);
     assert_eq!(pressure.total_bytes(), 8);
+}
+
+#[test]
+fn write_buffer_admission_paces_like_juicefs_memory_window() {
+    assert_eq!(write_buffer_admission_delay_ms(300, 300), None);
+    assert_eq!(
+        write_buffer_admission_delay_ms(300 * 1024 * 1024 + 1, 300 * 1024 * 1024),
+        Some(WRITE_ADMISSION_BUFFER_DELAY_MS)
+    );
+    assert_eq!(
+        write_buffer_admission_delay_ms(600 * 1024 * 1024 + 1, 300 * 1024 * 1024),
+        Some(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS)
+    );
+}
+
+#[test]
+fn sustained_write_window_decays_to_drain_chunk_for_long_streams() {
+    let base = 300 * 1024 * 1024;
+    let drain = 32 * 1024 * 1024;
+    let mut state = SustainedWriteState::default();
+
+    let first = state.observe(1_000, 0, 4, base, drain, 4);
+    assert_eq!(first.effective_buffer_bytes, base);
+    assert!(!first.pre_drain);
+
+    let half = state.observe(2_500, 4, 4, base, drain, base + 1);
+    assert_eq!(half.effective_buffer_bytes, base / 2);
+    assert!(half.pre_drain);
+
+    let quarter = state.observe(4_000, 8, 4, base, drain, base);
+    assert_eq!(quarter.effective_buffer_bytes, base / 4);
+    assert!(quarter.pre_drain);
+
+    let eighth = state.observe(5_500, 12, 4, base, drain, base);
+    assert_eq!(eighth.effective_buffer_bytes, base / 8);
+    assert!(eighth.pre_drain);
+
+    let floor = state.observe(7_000, 16, 4, base, drain, base);
+    assert_eq!(floor.effective_buffer_bytes, drain);
+    assert!(floor.pre_drain);
+}
+
+#[test]
+fn sustained_write_window_resets_after_idle_or_seek() {
+    let base = 300 * 1024 * 1024;
+    let drain = 32 * 1024 * 1024;
+    let mut state = SustainedWriteState::default();
+
+    assert_eq!(
+        state
+            .observe(1_000, 0, 4, base, drain, base + 1)
+            .effective_buffer_bytes,
+        base
+    );
+    assert_eq!(
+        state
+            .observe(2_500, 4, 4, base, drain, base + 1)
+            .effective_buffer_bytes,
+        base / 2
+    );
+
+    let after_idle = state.observe(
+        2_500 + SUSTAINED_WRITE_IDLE_RESET_MS + 1,
+        8,
+        4,
+        base,
+        drain,
+        base + 1,
+    );
+    assert_eq!(after_idle.duration_ms, 0);
+    assert_eq!(after_idle.effective_buffer_bytes, base);
+    assert!(!after_idle.pre_drain);
+
+    let after_seek = state.observe(4_000, 128, 4, base, drain, base + 1);
+    assert_eq!(after_seek.duration_ms, 0);
+    assert_eq!(after_seek.effective_buffer_bytes, base);
+    assert!(!after_seek.pre_drain);
 }
 
 #[test]
@@ -5330,6 +5415,40 @@ fn opportunistic_local_sync_defers_when_threshold_not_reached() {
 }
 
 #[test]
+fn opportunistic_local_sync_tracks_unsynced_bytes_until_group_sync() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "opportunistic-local-sync-unsynced");
+
+    rt.block_on(async {
+        vfs.maybe_payload_store_sync_data_async(1024, LocalSyncPolicy::Opportunistic)
+            .await
+            .expect("defer opportunistic local sync");
+    });
+
+    assert_eq!(
+        vfs.state
+            .local_dirty
+            .local_sync_unsynced_bytes
+            .load(Ordering::Relaxed),
+        1024
+    );
+
+    rt.block_on(async {
+        vfs.maybe_payload_store_sync_data_async(0, LocalSyncPolicy::Strict)
+            .await
+            .expect("strict local sync");
+    });
+
+    assert_eq!(
+        vfs.state
+            .local_dirty
+            .local_sync_unsynced_bytes
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[test]
 fn opportunistic_local_sync_flushes_when_threshold_reached() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "opportunistic-local-sync-threshold");
@@ -5377,6 +5496,42 @@ fn opportunistic_local_sync_flushes_when_threshold_reached() {
     rt.block_on(async {
         let group = vfs.state.local_dirty.local_sync_group.lock().await;
         assert_eq!(group.pending_bytes, 0);
+    });
+}
+
+#[test]
+fn opportunistic_local_sync_does_not_queue_behind_inflight_sync() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "opportunistic-local-sync-inflight");
+
+    rt.block_on(async {
+        let _held_gate = vfs.state.local_dirty.local_sync_gate.lock().await;
+        let mut group = vfs.state.local_dirty.local_sync_group.lock().await;
+        group.pending_bytes = vfs.local_sync_group_min_bytes;
+        group.last_sync_at = Instant::now();
+        drop(group);
+
+        tokio::time::timeout(Duration::from_millis(25), async {
+            vfs.maybe_payload_store_sync_data_async(1024, LocalSyncPolicy::Opportunistic)
+                .await
+        })
+        .await
+        .expect("opportunistic sync must not wait behind an in-flight sync_data")
+        .expect("opportunistic sync should defer when another sync is in-flight");
+
+        let group = vfs.state.local_dirty.local_sync_group.lock().await;
+        assert!(
+            group.pending_bytes >= vfs.local_sync_group_min_bytes + 1024,
+            "deferred opportunistic sync should leave bytes queued for the next sync pass"
+        );
+        assert_eq!(
+            vfs.state
+                .metrics
+                .payload_store_sync_data_calls
+                .load(Ordering::Relaxed),
+            0,
+            "opportunistic skip should not start a second sync_data while the gate is held"
+        );
     });
 }
 

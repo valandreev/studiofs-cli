@@ -9,7 +9,7 @@ use studiofs_meta::UploadState;
 use studiofs_meta::{
     CURRENT_FORMAT_VERSION, FormatInfo, InodeAttr, MetaFormat, MetadataConfig, RedbMetaEngine,
 };
-use studiofs_vfs::{StudioVfs, VfsConfig};
+use studiofs_vfs::{StudioVfs, VfsConfig, VfsConfigRaw};
 use studiofs_winfsp::mount_and_serve;
 
 fn workspace_root() -> std::path::PathBuf {
@@ -1787,5 +1787,195 @@ fn winfsp_mount_mmap_reader_during_upload_stays_readable_after_finalize_smoke() 
             CloseHandle(mapping).expect("close WinFSP mmap mapping handle");
         }
         drop(reader);
+    });
+}
+
+/// Validates that the write-path hard-backpressure wall is triggered and that
+/// the runtime completes without hanging.
+///
+/// Hypothesis under test:
+/// - **H2**: `write_backpressure.hard_events` increments when
+///   `total_pending_write_buffer_bytes` exceeds `2 × max_dirty_bytes`
+///   (`hard_backpressure_threshold`).
+/// - **H3**: The `local_sync_gate` is exercised under load (`payload_store_sync_data.calls > 0`),
+///   and the queue-wait counters record any contention.
+///
+/// **H2 mechanism**: chunks are 512 KiB, well below `block_size = 4 MiB`. The deferred
+/// materialization task only flushes *complete* blocks, so after each deferred write the
+/// `MountedWriterStack` still holds 512 KiB of dirty bytes. The hard-backpressure guard
+/// (`total_pending_write_buffer_bytes > 2 × max_dirty_bytes = 2 bytes`) fires on the
+/// *next* write, causing it to fall back to the fully-synchronous path. This alternates
+/// every other write, guaranteeing multiple H2 events across the 16-chunk loop.
+///
+/// **H3 mechanism**: `File::sync_all()` maps to `FlushFileBuffers` on Windows. WinFSP
+/// delivers the Flush IRP synchronously to the user-mode filesystem, which calls
+/// `flush_fh_with_outcome`. Because `pending_chunk_slices` is non-empty after the
+/// fallback writes, `local_sync_policy_for_barrier` returns `Strict`, and
+/// `local_sync_barrier_with_outcome(Strict)` calls `payload_store_sync_data_async`
+/// before returning — incrementing `payload_store_sync_data.calls` before `sync_all()`
+/// returns.
+///
+/// Gate-wait telemetry is printed to stderr for offline analysis without failing
+/// the test on timing grounds.
+///
+/// The elapsed-time assertion serves as a hang-guard: if WinFSP dispatch threads
+/// become exhausted waiting on the `local_sync_gate`, the write loop will stall
+/// indefinitely rather than completing within the generous timeout.
+#[test]
+#[ignore = "requires WinFSP runtime + STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1"]
+fn winfsp_mount_write_wall_and_gate_contention_smoke() {
+    use std::io::Write;
+
+    if std::env::var("STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let mount_point = match std::env::var("STUDIOFS_WINFSP_TEST_MOUNT_POINT") {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => {
+            eprintln!(
+                "Skipping WinFSP write-wall gate-contention smoke test: \
+                 set STUDIOFS_WINFSP_TEST_MOUNT_POINT to a free drive letter (for example `Z:`)."
+            );
+            return;
+        }
+    };
+
+    // max_dirty_bytes = 1 byte → hard threshold = 2 bytes.
+    // CHUNK_BYTES = 512 KiB < block_size (4 MiB): the deferred materialization task
+    // sees no complete blocks and flushes nothing, so writer_stack dirty bytes persist
+    // between writes. The hard-backpressure guard fires on every even write.
+    const CHUNK_BYTES: usize = 512 * 1024;
+    const CHUNK_COUNT: usize = 16;
+    const TOTAL_BYTES: usize = CHUNK_BYTES * CHUNK_COUNT;
+    const MAX_ELAPSED_SECS: u64 = 120;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let rt = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
+
+    // Build VFS inline with a 1-byte dirty cap so the hard-backpressure guard
+    // fires on every write after the first deferred-materialize task spawns.
+    // This bypasses make_test_vfs(), which hardcodes 300 MiB via VfsConfig::default().
+    let vfs = {
+        use studiofs_meta::RedbMetaEngine;
+        let db_path = tmp.path().join("meta.redb");
+        let meta = Arc::new(RedbMetaEngine::open(&db_path).expect("open RedbMetaEngine"));
+        meta.init_root(0, 0).expect("init root");
+        let format_info = test_format_info("write_wall_gate_contention");
+        meta.set_format_info(&format_info).expect("set format info");
+        let data_config = DataStoreConfig::from(&format_info);
+        let cache_dir = tmp.path().join("cache");
+        let _guard = rt.enter();
+        let vfs_config = VfsConfigRaw {
+            max_dirty_bytes: Some(1),
+            ..VfsConfigRaw::default()
+        }
+        .validate()
+        .expect("wall test VFS config should validate");
+        let vfs = StudioVfs::new(
+            meta,
+            &data_config,
+            cache_dir.to_str().expect("cache dir str"),
+            64 * 1024 * 1024,
+            32 * 1024 * 1024,
+            vfs_config,
+        )
+        .expect("create wall test vfs");
+        vfs.start().expect("start vfs background workers");
+        vfs
+    };
+
+    let vfs_observer = vfs.clone();
+    let event_name = format!("Local\\StudioFsWriteWallGateSmoke-{}", std::process::id());
+
+    with_winfsp_mount(vfs, rt, mount_point, event_name, |drive_root| {
+        let snapshot_before = vfs_observer.write_path_observability_snapshot();
+
+        let sequential_file =
+            std::path::PathBuf::from(drive_root).join("write-wall-gate-contention.bin");
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&sequential_file)
+            .expect("open write-wall gate-contention file through WinFSP mount");
+
+        let started_at = std::time::Instant::now();
+
+        for chunk_index in 0..CHUNK_COUNT {
+            let fill = b'A' + (chunk_index % 26) as u8;
+            let chunk = vec![fill; CHUNK_BYTES];
+            writer
+                .write_all(&chunk)
+                .expect("write chunk through WinFSP mount (write-wall test)");
+        }
+        writer
+            .flush()
+            .expect("flush write-wall gate-contention writer through WinFSP mount");
+        // `sync_all()` calls `FlushFileBuffers` on Windows. WinFSP delivers the Flush
+        // IRP synchronously to the user-mode filesystem callback, which runs
+        // `flush_fh_with_outcome` with `Strict` policy (inode has pending dirty slices
+        // from the fallback-path materialisations above). This increments
+        // `payload_store_sync_data.calls` *before* `sync_all()` returns, so the
+        // snapshot taken below will always observe delta_sync_calls > 0.
+        writer
+            .sync_all()
+            .expect("sync_all write-wall gate-contention file through WinFSP mount");
+        drop(writer);
+
+        let elapsed = started_at.elapsed();
+        let elapsed_secs = elapsed.as_secs_f64();
+        let throughput_mib_per_sec = (TOTAL_BYTES as f64 / (1024.0 * 1024.0)) / elapsed_secs;
+
+        let snapshot_after = vfs_observer.write_path_observability_snapshot();
+        let delta_hard_events = snapshot_after.write_backpressure.hard_events
+            - snapshot_before.write_backpressure.hard_events;
+        let delta_sync_calls = snapshot_after.payload_store_sync_data.calls
+            - snapshot_before.payload_store_sync_data.calls;
+
+        eprintln!(
+            "write-wall gate-contention smoke: {:.2} MiB in {:.3} s ({:.2} MiB/s) | \
+             hard_backpressure_events=+{delta_hard_events} \
+             sync_calls=+{delta_sync_calls} \
+             queue_wait_max_ms={:.3} \
+             queue_wait_avg_ms={:.3}",
+            TOTAL_BYTES as f64 / (1024.0 * 1024.0),
+            elapsed_secs,
+            throughput_mib_per_sec,
+            snapshot_after.payload_store_sync_data.queue_wait_max_ms,
+            snapshot_after.payload_store_sync_data.queue_wait_avg_ms,
+        );
+
+        // H2: Hard backpressure must fire. With max_dirty_bytes = 1 byte the hard
+        // threshold is 2 bytes, so any pending deferred-materialize bytes trigger
+        // the backpressure guard on the very next write.
+        assert!(
+            delta_hard_events > 0,
+            "expected hard_backpressure_events to increment when writing {} MiB \
+             against a 1-byte dirty cap (hard threshold 2 bytes); \
+             hard_events before={} after={}",
+            TOTAL_BYTES / (1024 * 1024),
+            snapshot_before.write_backpressure.hard_events,
+            snapshot_after.write_backpressure.hard_events,
+        );
+
+        // H3a: The payload_store_sync_data path (fdatasync via local_sync_gate)
+        // must have been exercised during the hard-backpressure fallback writes.
+        assert!(
+            delta_sync_calls > 0,
+            "expected at least one payload_store_sync_data call during hard-backpressure \
+             writes; sync_calls before={} after={}",
+            snapshot_before.payload_store_sync_data.calls,
+            snapshot_after.payload_store_sync_data.calls,
+        );
+
+        // H3b: Hang guard. If WinFSP dispatch threads block indefinitely on the
+        // local_sync_gate the write loop will never return. Exceeding this timeout
+        // indicates a dispatch-thread exhaustion deadlock.
+        assert!(
+            elapsed.as_secs() < MAX_ELAPSED_SECS,
+            "write-wall gate-contention smoke exceeded {MAX_ELAPSED_SECS} s \
+             ({elapsed_secs:.3} s elapsed) — this may indicate a WinFSP \
+             dispatch-thread deadlock via the local_sync_gate",
+        );
     });
 }

@@ -182,6 +182,8 @@ pub struct VfsWritePathDrainLagStats {
     pub admission_pressure_bytes: usize,
     #[serde(default)]
     pub admission_budget_bytes: usize,
+    #[serde(default)]
+    pub local_sync_unsynced_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 use crate::runtime::run_meta;
+use crate::utils::now_unix_millis;
 use crate::{VfsError, VfsMeta};
 
 use std::time::{Duration, Instant};
@@ -131,6 +132,80 @@ impl StudioVfs {
         if let Some(task_lock) = task_lock {
             let _guard = task_lock.lock().await;
         }
+    }
+
+    fn observe_sustained_write_admission(
+        &self,
+        ino: Ino,
+        offset: u64,
+        len: usize,
+    ) -> super::SustainedWriteAdmission {
+        if len == 0 {
+            return super::SustainedWriteAdmission::default();
+        }
+        let dirty_bytes_after_write = self
+            .state
+            .writer_stack
+            .dirty_bytes_for_inode(ino)
+            .saturating_add(len);
+        let mut streams = self.state.sustained_write_streams.lock();
+        streams.entry(ino).or_default().observe(
+            now_unix_millis(),
+            offset,
+            len,
+            self.max_dirty_bytes(),
+            self.write_eager_flush_drain_chunk_bytes,
+            dirty_bytes_after_write,
+        )
+    }
+
+    async fn maybe_pre_drain_sustained_write_buffer(
+        &self,
+        ino: Ino,
+        offset: u64,
+        len: usize,
+        local_sync_policy: LocalSyncPolicy,
+    ) -> VfsResult<()> {
+        if !matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) || len == 0 {
+            return Ok(());
+        }
+        let admission = self.observe_sustained_write_admission(ino, offset, len);
+        if !admission.pre_drain {
+            return Ok(());
+        }
+
+        // #region debug log
+        self.debug_write_probe(
+            "H2",
+            "crates/studiofs-vfs/src/vfs/sync_ops.rs:153",
+            "sustained write pre-drain",
+            serde_json::json!({
+                "ino": ino,
+                "offset": offset,
+                "len": len,
+                "duration_ms": admission.duration_ms,
+                "effective_buffer_bytes": admission.effective_buffer_bytes,
+                "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
+                "total_dirty_bytes": self.state.writer_stack.total_dirty_bytes(),
+            }),
+        );
+        // #endregion debug log
+
+        self.wait_for_deferred_materialization_inflight(ino).await;
+        if self
+            .state
+            .writer_stack
+            .dirty_bytes_for_inode(ino)
+            .saturating_add(len)
+            <= admission.effective_buffer_bytes
+        {
+            return Ok(());
+        }
+
+        let materialize_started = Instant::now();
+        let _materialized = self.materialize_writer_stack_for_inode(ino).await?;
+        self.record_vfs_write_materialize_for_limits(materialize_started.elapsed());
+        Ok(())
     }
 
     pub(super) async fn spawn_deferred_materialization_if_needed(self: &Arc<Self>, ino: Ino) {
@@ -958,6 +1033,8 @@ impl StudioVfs {
         }
         if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
             self.maybe_throttle_write_admission(data.len()).await;
+            self.maybe_pre_drain_sustained_write_buffer(ino, offset, data.len(), local_sync_policy)
+                .await?;
         }
         // ── Acquire per-inode write gate ─────────────────────────────────
         let mut session = Some(
