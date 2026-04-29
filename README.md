@@ -1,6 +1,6 @@
 <div align="center">
   <img src="docs/branding/studiofs-logo-final/png/cat_logo.png" alt="StudioFS logo" width="74" />
-  <h1 style="margin: 10px 0 0; font-size: 2.2rem; line-height: 1.1;">StudioFS</h1>
+  <h1 style="margin: 10px 0 0; font-size: 2.5rem; line-height: 1.1;">StudioFS</h1>
 </div>
 
 
