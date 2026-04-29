@@ -379,9 +379,13 @@ fn workspace_dotenv_var(key: &str) -> Option<String> {
     workspace_dotenv_vars().get(key).cloned()
 }
 
+fn locked_env_var(key: &str) -> Option<String> {
+    let _env_lock = acquire_test_env_lock();
+    std::env::var(key).ok()
+}
+
 fn test_online_env_var(primary: &str, legacy: &str, default: &str) -> String {
-    std::env::var(primary)
-        .ok()
+    locked_env_var(primary)
         .filter(|v| !v.trim().is_empty())
         .or_else(|| workspace_dotenv_var(primary))
         .or_else(|| workspace_dotenv_var(legacy))
@@ -389,8 +393,7 @@ fn test_online_env_var(primary: &str, legacy: &str, default: &str) -> String {
 }
 
 fn test_env_var(key: &str, default: &str) -> String {
-    std::env::var(key)
-        .ok()
+    locked_env_var(key)
         .or_else(|| workspace_dotenv_var(key))
         .unwrap_or_else(|| default.to_string())
 }
@@ -404,26 +407,23 @@ fn online_publish_timeout() -> Duration {
 }
 
 fn parse_env_usize(key: &str) -> Option<usize> {
-    std::env::var(key)
-        .ok()
+    locked_env_var(key)
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
 }
 
 fn parse_env_u64(key: &str) -> Option<u64> {
-    std::env::var(key)
-        .ok()
+    locked_env_var(key)
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|v| *v > 0)
 }
 
 fn parse_env_u64_any(key: &str) -> Option<u64> {
-    std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok())
+    locked_env_var(key).and_then(|v| v.parse::<u64>().ok())
 }
 
 fn parse_env_f64(key: &str) -> Option<f64> {
-    std::env::var(key)
-        .ok()
+    locked_env_var(key)
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| *v > 0.0)
 }
@@ -431,14 +431,14 @@ fn parse_env_f64(key: &str) -> Option<f64> {
 fn test_vfs_config_from_env() -> VfsConfigValidated {
     load_test_env();
     let mut config = VfsConfigRaw::default();
-    if let Ok(v) = std::env::var("STUDIOFS_MAX_DIRTY_BYTES")
+    if let Some(v) = locked_env_var("STUDIOFS_MAX_DIRTY_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
         && let Ok(bytes) = usize::try_from(bytes)
     {
         config.max_dirty_bytes = Some(bytes);
     }
-    if let Ok(v) = std::env::var("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES")
+    if let Some(v) = locked_env_var("STUDIOFS_WRITE_EAGER_FLUSH_BATCH_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
         && let Ok(bytes) = usize::try_from(bytes)
@@ -451,7 +451,7 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     if let Some(secs) = parse_env_u64("STUDIOFS_SHUTDOWN_METADATA_FLUSH_TIMEOUT_SECS") {
         config.shutdown_metadata_flush_timeout_secs = Some(secs);
     }
-    if let Ok(v) = std::env::var("STUDIOFS_PRINCIPAL") {
+    if let Some(v) = locked_env_var("STUDIOFS_PRINCIPAL") {
         let v = v.trim();
         if !v.is_empty() {
             config.principal = Some(v.to_string());
@@ -520,7 +520,7 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     if let Some(ms) = parse_env_u64("STUDIOFS_LOCK_RETRY_MAX_MS") {
         config.lock_retry_max_ms = Some(ms);
     }
-    if let Ok(v) = std::env::var("STUDIOFS_XATTR_MAX_BYTES")
+    if let Some(v) = locked_env_var("STUDIOFS_XATTR_MAX_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
         && let Ok(bytes) = usize::try_from(bytes)
@@ -530,7 +530,7 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     if let Some(value) = parse_env_usize("STUDIOFS_DENTRY_CACHE_CAPACITY") {
         config.dentry_cache_capacity = Some(value);
     }
-    if let Ok(v) = std::env::var("STUDIOFS_DENTRY_CACHE_BYTES")
+    if let Some(v) = locked_env_var("STUDIOFS_DENTRY_CACHE_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
         && let Ok(bytes) = usize::try_from(bytes)
@@ -540,7 +540,7 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     if let Some(value) = parse_env_usize("STUDIOFS_PATH_SHORTCUT_CACHE_CAPACITY") {
         config.path_shortcut_cache_capacity = Some(value);
     }
-    if let Ok(v) = std::env::var("STUDIOFS_PATH_SHORTCUT_CACHE_BYTES")
+    if let Some(v) = locked_env_var("STUDIOFS_PATH_SHORTCUT_CACHE_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
         && let Ok(bytes) = usize::try_from(bytes)
@@ -550,7 +550,7 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
     if let Some(value) = parse_env_usize("STUDIOFS_ATTR_READ_CACHE_CAPACITY") {
         config.attr_read_cache_capacity = Some(value);
     }
-    if let Ok(v) = std::env::var("STUDIOFS_ATTR_READ_CACHE_BYTES")
+    if let Some(v) = locked_env_var("STUDIOFS_ATTR_READ_CACHE_BYTES")
         && let Some(bytes) = parse_size_bytes(&v)
         && bytes > 0
         && let Ok(bytes) = usize::try_from(bytes)
@@ -669,6 +669,7 @@ fn test_vfs_config_from_env() -> VfsConfigValidated {
 
 fn load_test_env() {
     static ONCE: OnceLock<()> = OnceLock::new();
+    let _env_lock = acquire_test_env_lock();
     let _ = ONCE.get_or_init(|| {
         let env_path = workspace_env_path();
         if env_path.exists() {
@@ -992,8 +993,7 @@ fn wait_until_blocking(timeout: Duration, mut cond: impl FnMut() -> bool) -> boo
 #[allow(dead_code)]
 fn pg_dsn() -> Option<String> {
     load_test_env();
-    let raw = std::env::var("STUDIOFS_TEST_PG_DSN")
-        .ok()
+    let raw = locked_env_var("STUDIOFS_TEST_PG_DSN")
         .or_else(|| workspace_dotenv_var("STUDIOFS_TEST_PG_DSN"))
         .filter(|v| !v.trim().is_empty())?;
 
@@ -4497,6 +4497,46 @@ impl ScopedTestEnv {
 }
 
 #[test]
+fn env_read_helpers_wait_for_scoped_env_mutations() {
+    let ready = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (reader_started_tx, reader_started_rx) = std::sync::mpsc::channel();
+
+    let writer_ready = Arc::clone(&ready);
+    let writer_release = Arc::clone(&release);
+    let writer = thread::spawn(move || {
+        let _restore = ScopedEnvVar::capture("STUDIOFS_MAX_DIRTY_BYTES");
+        unsafe {
+            std::env::set_var("STUDIOFS_MAX_DIRTY_BYTES", "1");
+        }
+        writer_ready.wait();
+        writer_release.wait();
+    });
+
+    ready.wait();
+
+    let reader_done = Arc::clone(&done);
+    let reader = thread::spawn(move || {
+        reader_started_tx.send(()).unwrap();
+        let value = parse_env_usize("STUDIOFS_MAX_DIRTY_BYTES");
+        reader_done.store(true, std::sync::atomic::Ordering::Release);
+        value
+    });
+
+    reader_started_rx.recv().unwrap();
+    thread::sleep(Duration::from_millis(50));
+    assert!(
+        !done.load(std::sync::atomic::Ordering::Acquire),
+        "env readers must wait while another test holds a scoped env override"
+    );
+
+    release.wait();
+    writer.join().unwrap();
+    let _ = reader.join().unwrap();
+}
+
+#[test]
 fn new_empty_file_stays_idle_without_pending_incarnation() {
     let _restore_disable = ScopedEnvVar::capture("STUDIOFS_DISABLE_BACKGROUND_SLAB_FLUSH");
     unsafe {
@@ -7090,7 +7130,7 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
                     "upload completion batching must not change the local visible file contents; pending={:?} stats={:?} endpoint={:?}",
                     vfs.pending_uploads_for_inode(ino),
                     vfs.upload_stats(),
-                    std::env::var("STUDIOFS_S3_ENDPOINT").ok(),
+                    locked_env_var("STUDIOFS_S3_ENDPOINT"),
                 );
                 tokio::time::sleep(Duration::from_millis(75)).await;
             }
@@ -7107,7 +7147,7 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
                         "upload completion batching must not change the local visible file contents; pending={:?} stats={:?} endpoint={:?}",
                         vfs.pending_uploads_for_inode(ino),
                         vfs.upload_stats(),
-                        std::env::var("STUDIOFS_S3_ENDPOINT").ok(),
+                        locked_env_var("STUDIOFS_S3_ENDPOINT"),
                     );
                     tokio::time::sleep(Duration::from_millis(75)).await;
                     continue;
@@ -7121,7 +7161,7 @@ fn upload_completion_batching_does_not_change_visibility_contract() {
                     "pending uploads did not drain under sequential completion; pending={:?} stats={:?} endpoint={:?} meta_blocks={:?} live_extents={:?}",
                     vfs.pending_uploads_for_inode(ino),
                     vfs.upload_stats(),
-                    std::env::var("STUDIOFS_S3_ENDPOINT").ok(),
+                    locked_env_var("STUDIOFS_S3_ENDPOINT"),
                     vfs.meta().lookup_payload_slices(ino).ok(),
                     vfs.live_extent_records_for_inode(ino),
                 );
@@ -7652,16 +7692,8 @@ fn twenty_four_hour_soak_no_global_fs_stall() {
         std::env::set_var("STUDIOFS_QOS_COMMIT_SLOTS", "1");
     }
 
-    let iterations = std::env::var("STUDIOFS_SOAK_ITERATIONS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(200);
-    let max_op_ms = std::env::var("STUDIOFS_SOAK_MAX_OP_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(1500);
+    let iterations = parse_env_usize("STUDIOFS_SOAK_ITERATIONS").unwrap_or(200);
+    let max_op_ms = parse_env_u64("STUDIOFS_SOAK_MAX_OP_MS").unwrap_or(1500);
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("meta.redb");
