@@ -6,6 +6,8 @@ use std::path::Path;
 
 #[cfg(windows)]
 const WINDOWS_UNBUFFERED_WRITE_ALIGNMENT: usize = 4096;
+#[cfg(windows)]
+const WINDOWS_VOLUME_PATH_BUFFER_U16: usize = 32_768;
 
 #[derive(Debug, Default)]
 pub struct UnbufferedWriteBuffer {
@@ -92,14 +94,24 @@ pub fn create_new_unbuffered_write(path: &Path) -> io::Result<File> {
 }
 
 /// Return true when this payload can be attempted on the unbuffered write path.
-pub fn can_write_unbuffered_payload(buf: &[u8]) -> bool {
-    can_write_unbuffered_payload_impl(buf)
+pub fn can_write_unbuffered_payload(buf: &[u8], alignment: usize) -> bool {
+    can_write_unbuffered_payload_impl(buf, alignment)
+}
+
+/// Return the required unbuffered-write alignment for files under `path`.
+pub fn unbuffered_write_alignment_for_path(path: &Path) -> usize {
+    unbuffered_write_alignment_for_path_impl(path)
 }
 
 /// Write all bytes to an unbuffered payload file.
 pub fn write_all_unbuffered(file: &mut File, buf: &[u8]) -> io::Result<()> {
     let mut scratch = UnbufferedWriteBuffer::new();
-    write_all_unbuffered_with_buffer(file, buf, &mut scratch)
+    write_all_unbuffered_with_buffer(
+        file,
+        buf,
+        &mut scratch,
+        default_unbuffered_write_alignment(),
+    )
 }
 
 /// Write all bytes to an unbuffered payload file, reusing caller-owned scratch.
@@ -107,8 +119,9 @@ pub fn write_all_unbuffered_with_buffer(
     file: &mut File,
     buf: &[u8],
     scratch: &mut UnbufferedWriteBuffer,
+    alignment: usize,
 ) -> io::Result<()> {
-    write_all_unbuffered_impl(file, buf, scratch)
+    write_all_unbuffered_impl(file, buf, scratch, alignment)
 }
 
 /// Return true when an I/O error is compatible with falling back to buffered writes.
@@ -213,13 +226,34 @@ fn create_new_unbuffered_write_impl(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(not(windows))]
-fn can_write_unbuffered_payload_impl(_buf: &[u8]) -> bool {
+fn can_write_unbuffered_payload_impl(_buf: &[u8], _alignment: usize) -> bool {
     false
 }
 
 #[cfg(windows)]
-fn can_write_unbuffered_payload_impl(buf: &[u8]) -> bool {
-    !buf.is_empty() && buf.len().is_multiple_of(WINDOWS_UNBUFFERED_WRITE_ALIGNMENT)
+fn can_write_unbuffered_payload_impl(buf: &[u8], alignment: usize) -> bool {
+    let alignment = normalized_unbuffered_write_alignment(alignment);
+    !buf.is_empty() && buf.len().is_multiple_of(alignment)
+}
+
+#[cfg(not(windows))]
+fn unbuffered_write_alignment_for_path_impl(_path: &Path) -> usize {
+    1
+}
+
+#[cfg(windows)]
+fn unbuffered_write_alignment_for_path_impl(path: &Path) -> usize {
+    windows_unbuffered_write_alignment_for_path(path).unwrap_or(WINDOWS_UNBUFFERED_WRITE_ALIGNMENT)
+}
+
+#[cfg(not(windows))]
+fn default_unbuffered_write_alignment() -> usize {
+    1
+}
+
+#[cfg(windows)]
+fn default_unbuffered_write_alignment() -> usize {
+    WINDOWS_UNBUFFERED_WRITE_ALIGNMENT
 }
 
 #[cfg(not(windows))]
@@ -227,6 +261,7 @@ fn write_all_unbuffered_impl(
     file: &mut File,
     buf: &[u8],
     _scratch: &mut UnbufferedWriteBuffer,
+    _alignment: usize,
 ) -> io::Result<()> {
     write_all(file, buf)
 }
@@ -236,33 +271,34 @@ fn write_all_unbuffered_impl(
     file: &mut File,
     buf: &[u8],
     scratch: &mut UnbufferedWriteBuffer,
+    alignment: usize,
 ) -> io::Result<()> {
-    if !can_write_unbuffered_payload(buf) {
+    let alignment = normalized_unbuffered_write_alignment(alignment);
+    if !can_write_unbuffered_payload(buf, alignment) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "unbuffered payload writes must be non-empty and 4096-byte aligned",
+            format!("unbuffered payload writes must be non-empty and {alignment}-byte aligned"),
         ));
     }
 
-    if is_windows_unbuffered_ptr_aligned(buf.as_ptr() as usize) {
+    if is_windows_unbuffered_ptr_aligned(buf.as_ptr() as usize, alignment) {
         return write_all(file, buf);
     }
 
-    let aligned = scratch.aligned_copy(buf);
+    let aligned = scratch.aligned_copy(buf, alignment);
     write_all(file, aligned)
 }
 
 #[cfg(windows)]
 impl UnbufferedWriteBuffer {
-    fn aligned_copy(&mut self, buf: &[u8]) -> &[u8] {
-        let required_len = buf
-            .len()
-            .saturating_add(WINDOWS_UNBUFFERED_WRITE_ALIGNMENT - 1);
+    fn aligned_copy(&mut self, buf: &[u8], alignment: usize) -> &[u8] {
+        let alignment = normalized_unbuffered_write_alignment(alignment);
+        let required_len = buf.len().saturating_add(alignment - 1);
         if self.backing.len() < required_len {
             self.backing.resize(required_len, 0);
         }
         let base = self.backing.as_ptr() as usize;
-        let offset = base.next_multiple_of(WINDOWS_UNBUFFERED_WRITE_ALIGNMENT) - base;
+        let offset = base.next_multiple_of(alignment) - base;
         let aligned = &mut self.backing[offset..offset + buf.len()];
         aligned.copy_from_slice(buf);
         aligned
@@ -270,14 +306,87 @@ impl UnbufferedWriteBuffer {
 }
 
 #[cfg(windows)]
-fn is_windows_unbuffered_ptr_aligned(ptr: usize) -> bool {
-    ptr.is_multiple_of(WINDOWS_UNBUFFERED_WRITE_ALIGNMENT)
+fn normalized_unbuffered_write_alignment(alignment: usize) -> usize {
+    alignment.max(WINDOWS_UNBUFFERED_WRITE_ALIGNMENT)
+}
+
+#[cfg(windows)]
+fn is_windows_unbuffered_ptr_aligned(ptr: usize, alignment: usize) -> bool {
+    ptr.is_multiple_of(normalized_unbuffered_write_alignment(alignment))
+}
+
+#[cfg(windows)]
+fn windows_unbuffered_write_alignment_for_path(path: &Path) -> Option<usize> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "GetVolumePathNameW"]
+        fn get_volume_path_name_w(
+            file_name: *const u16,
+            volume_path_name: *mut u16,
+            buffer_length: u32,
+        ) -> i32;
+
+        #[link_name = "GetDiskFreeSpaceW"]
+        fn get_disk_free_space_w(
+            root_path_name: *const u16,
+            sectors_per_cluster: *mut u32,
+            bytes_per_sector: *mut u32,
+            number_of_free_clusters: *mut u32,
+            total_number_of_clusters: *mut u32,
+        ) -> i32;
+    }
+
+    let file_name = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut volume_path = vec![0_u16; WINDOWS_VOLUME_PATH_BUFFER_U16];
+    let volume_path_len = u32::try_from(volume_path.len()).ok()?;
+
+    // SAFETY: Both buffers are valid NUL-terminated UTF-16 buffers for the
+    // duration of the calls. The output buffer length is passed in WCHAR units.
+    let volume_ok = unsafe {
+        get_volume_path_name_w(
+            file_name.as_ptr(),
+            volume_path.as_mut_ptr(),
+            volume_path_len,
+        )
+    };
+    if volume_ok == 0 {
+        return None;
+    }
+
+    let mut sectors_per_cluster = 0_u32;
+    let mut bytes_per_sector = 0_u32;
+    let mut free_clusters = 0_u32;
+    let mut total_clusters = 0_u32;
+    // SAFETY: `volume_path` was filled by GetVolumePathNameW and remains a
+    // valid NUL-terminated UTF-16 root path. All output pointers are valid.
+    let disk_ok = unsafe {
+        get_disk_free_space_w(
+            volume_path.as_ptr(),
+            &mut sectors_per_cluster,
+            &mut bytes_per_sector,
+            &mut free_clusters,
+            &mut total_clusters,
+        )
+    };
+    if disk_ok == 0 || bytes_per_sector == 0 {
+        return None;
+    }
+
+    usize::try_from(bytes_per_sector)
+        .ok()
+        .map(normalized_unbuffered_write_alignment)
 }
 
 #[cfg(test)]
 #[cfg(windows)]
 fn copy_for_unbuffered_test<'a>(scratch: &'a mut UnbufferedWriteBuffer, buf: &[u8]) -> &'a [u8] {
-    scratch.aligned_copy(buf)
+    scratch.aligned_copy(buf, default_unbuffered_write_alignment())
 }
 
 #[cfg(test)]
@@ -487,5 +596,37 @@ mod tests {
             capacity_after_first,
             "same-sized unbuffered writes should reuse scratch backing storage"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unbuffered_payload_length_honors_volume_alignment() {
+        let four_kib = vec![0_u8; 4096];
+        let eight_kib = vec![0_u8; 8192];
+
+        assert!(!can_write_unbuffered_payload(&four_kib, 8192));
+        assert!(can_write_unbuffered_payload(&eight_kib, 8192));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unbuffered_scratch_aligns_to_volume_alignment() {
+        let mut scratch = UnbufferedWriteBuffer::new();
+        let data = vec![0x7A_u8; 8192];
+
+        let aligned = scratch.aligned_copy(&data, 8192);
+
+        assert_eq!(aligned, data);
+        assert!((aligned.as_ptr() as usize).is_multiple_of(8192));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_unbuffered_alignment_for_path_is_at_least_default_alignment() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let alignment = unbuffered_write_alignment_for_path(temp.path());
+
+        assert!(alignment >= WINDOWS_UNBUFFERED_WRITE_ALIGNMENT);
     }
 }

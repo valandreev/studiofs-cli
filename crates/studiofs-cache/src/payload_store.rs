@@ -549,7 +549,8 @@ impl FilePayloadStore {
         sync_file_data: bool,
         unbuffered_scratch: &mut platform::UnbufferedWriteBuffer,
     ) -> Result<Option<PathBuf>, FilePayloadStoreError> {
-        if !platform::can_write_unbuffered_payload(data) {
+        let unbuffered_alignment = platform::unbuffered_write_alignment_for_path(temp_dir);
+        if !platform::can_write_unbuffered_payload(data, unbuffered_alignment) {
             return Ok(None);
         }
 
@@ -572,9 +573,12 @@ impl FilePayloadStore {
             Err(error) => return Err(error),
         };
 
-        if let Err(error) =
-            platform::write_all_unbuffered_with_buffer(&mut temp_file, data, unbuffered_scratch)
-        {
+        if let Err(error) = platform::write_all_unbuffered_with_buffer(
+            &mut temp_file,
+            data,
+            unbuffered_scratch,
+            unbuffered_alignment,
+        ) {
             drop(temp_file);
             let _ = std::fs::remove_file(&temp_path);
             if platform::is_unbuffered_io_unsupported_error(&error) {
