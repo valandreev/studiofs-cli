@@ -4581,7 +4581,7 @@ impl StudioVfs {
         {
             self.debug_write_probe(
                 "H5",
-                "crates/studiofs-vfs/src/vfs.rs:4255",
+                concat!(file!(), ":", line!()),
                 "upload scheduler adaptive penalty changed",
                 serde_json::json!({
                     "current_penalty_ms": current_penalty_ms,
@@ -6230,7 +6230,7 @@ impl StudioVfs {
             // #region debug log
             self.debug_write_probe(
                 "H2",
-                "crates/studiofs-vfs/src/vfs.rs:6118",
+                concat!(file!(), ":", line!()),
                 "write admission buffer pacing",
                 serde_json::json!({
                     "delay_ms": WRITE_ADMISSION_BUFFER_DELAY_MS,
@@ -6256,7 +6256,7 @@ impl StudioVfs {
             // #region debug log
             self.debug_write_probe(
                 "H1",
-                "crates/studiofs-vfs/src/vfs.rs:6139",
+                concat!(file!(), ":", line!()),
                 "write admission buffer hard pacing",
                 serde_json::json!({
                     "delay_ms": WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS,
@@ -6289,7 +6289,7 @@ impl StudioVfs {
         // #region debug log
         self.debug_write_probe(
             "H2",
-            "crates/studiofs-vfs/src/vfs.rs:6062",
+            concat!(file!(), ":", line!()),
             "write admission governor pacing",
             serde_json::json!({
                 "delay_ms": decision.delay_ms,

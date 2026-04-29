@@ -177,7 +177,7 @@ impl StudioVfs {
         // #region debug log
         self.debug_write_probe(
             "H2",
-            "crates/studiofs-vfs/src/vfs/sync_ops.rs:153",
+            concat!(file!(), ":", line!()),
             "sustained write pre-drain",
             serde_json::json!({
                 "ino": ino,
@@ -203,7 +203,7 @@ impl StudioVfs {
         // #region debug log
         self.debug_write_probe(
             "H2",
-            "crates/studiofs-vfs/src/vfs/sync_ops.rs:191",
+            concat!(file!(), ":", line!()),
             "hard backpressure observed on deferred write",
             serde_json::json!({
                 "ino": ino,
@@ -234,7 +234,7 @@ impl StudioVfs {
                     // #region debug log
                     self.debug_write_probe(
                         "H2",
-                        "crates/studiofs-vfs/src/vfs/sync_ops.rs:48",
+                        concat!(file!(), ":", line!()),
                         "deferred materialization already inflight",
                         serde_json::json!({
                             "ino": ino,
@@ -256,7 +256,7 @@ impl StudioVfs {
         // #region debug log
         self.debug_write_probe(
             "H2",
-            "crates/studiofs-vfs/src/vfs/sync_ops.rs:65",
+            concat!(file!(), ":", line!()),
             "deferred materialization scheduled",
             serde_json::json!({
                 "ino": ino,
@@ -330,7 +330,7 @@ impl StudioVfs {
                             // #region debug log
                             vfs.debug_write_probe(
                                 "H1",
-                                "crates/studiofs-vfs/src/vfs/sync_ops.rs:144",
+                                concat!(file!(), ":", line!()),
                                 "deferred writer-stack limit-pass failure",
                                 serde_json::json!({
                                     "ino": ino,
