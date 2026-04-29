@@ -24,7 +24,7 @@ Unlike proprietary SaaS alternatives, StudioFS is **100% open-source and self-ho
 ### ⚠️ Caution
 
 > [!WARNING]
-> Project is in its early stages. Breaking changes may happen.
+> Project is in its early stages. Breaking changes will happen.
 > Use with caution.
 
 
