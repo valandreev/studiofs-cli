@@ -1,4 +1,8 @@
-# StudioFS
+<div align="center">
+  <img src="docs/branding/studiofs-logo-final/png/cat_logo.png" alt="StudioFS logo" width="74" />
+  <h1 style="margin: 10px 0 0; font-size: 2.2rem; line-height: 1.1;">StudioFS</h1>
+</div>
+
 
 An open-source, self-hosted virtual filesystem optimized for VFX and post-production studios. Access and edit large files instantly from the cloud or remote hosted storage. No downloads, no syncing, just pure collaboration.
 
