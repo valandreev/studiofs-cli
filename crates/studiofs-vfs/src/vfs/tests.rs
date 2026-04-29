@@ -2,6 +2,7 @@ use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use studiofs_cache::CachedStoreWriterConfig;
 use studiofs_meta::engine::MetadataAuthorityStatus;
 use studiofs_meta::engine::{MetaInodes, MetaPayloadObjects};
 use studiofs_meta::schema::{
@@ -2014,6 +2015,106 @@ fn soft_dirty_budget_pacing_starts_before_hard_limit() {
     assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 512), Some(3));
     assert_eq!(soft_dirty_budget_pacing_delay_ms(0, 100, 1024), Some(6));
     assert_eq!(soft_dirty_budget_pacing_delay_ms(62, 100, 1024), Some(6));
+}
+
+#[test]
+fn write_admission_pressure_includes_pending_upload_backlog() {
+    let pressure = WriteAdmissionPressure {
+        writer_stack_dirty_bytes: 10,
+        pending_local_dirty_bytes: 20,
+        pending_persisted_slice_bytes: 30,
+        pending_upload_bytes: 40,
+    };
+
+    assert_eq!(pressure.total_bytes(), 100);
+}
+
+#[test]
+fn write_admission_pressure_samples_cached_store_pending_upload_bytes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-pending-upload");
+    let mut writer = vfs
+        .cached_store()
+        .open_writer_slice(CachedStoreWriterConfig {
+            ino: 7,
+            base_offset: 0,
+            first_object_id: 10_000,
+            content_epoch: 1,
+            block_size: 8,
+            page_size: 4,
+            dirty_byte_limit: None,
+            max_buffer_bytes: None,
+            submit_upload: true,
+        });
+
+    writer.write_at(0, b"abcdefgh").expect("write full block");
+    let detached = writer
+        .detach_completed_blocks(1)
+        .expect("detach completed block");
+    vfs.cached_store()
+        .persist_detached_staged_slices(detached)
+        .expect("persist pending upload");
+
+    let pressure = vfs.write_admission_pressure();
+
+    assert_eq!(pressure.pending_upload_bytes, 8);
+    assert_eq!(pressure.total_bytes(), 8);
+}
+
+#[test]
+fn write_admission_governor_throttles_on_short_runway_before_limit() {
+    let mut governor = WriteAdmissionGovernor::default();
+
+    let initial = governor.plan(WriteAdmissionSample {
+        now_ms: 1_000,
+        pressure_bytes: 200,
+        budget_bytes: 1_000,
+        next_bytes: 100,
+    });
+    assert_eq!(initial.delay_ms, 0);
+
+    governor.record_accepted_bytes(600);
+    let decision = governor.plan(WriteAdmissionSample {
+        now_ms: 2_000,
+        pressure_bytes: 700,
+        budget_bytes: 1_000,
+        next_bytes: 100,
+    });
+
+    assert!(
+        decision.delay_ms > 0,
+        "growing pressure with a short runway should gently pace writes before the hard limit"
+    );
+    assert!(decision.runway_ms < WRITE_ADMISSION_RUNWAY_TARGET_MS);
+    assert!(decision.ingress_bytes_per_sec > decision.drain_bytes_per_sec);
+
+    let stats = governor.stats();
+    assert_eq!(stats.pressure_bytes, 700);
+    assert_eq!(stats.budget_bytes, 1_000);
+}
+
+#[test]
+fn write_admission_governor_does_not_throttle_when_drain_keeps_up() {
+    let mut governor = WriteAdmissionGovernor::default();
+
+    let initial = governor.plan(WriteAdmissionSample {
+        now_ms: 1_000,
+        pressure_bytes: 200,
+        budget_bytes: 1_000,
+        next_bytes: 100,
+    });
+    assert_eq!(initial.delay_ms, 0);
+
+    governor.record_accepted_bytes(600);
+    let decision = governor.plan(WriteAdmissionSample {
+        now_ms: 2_000,
+        pressure_bytes: 200,
+        budget_bytes: 1_000,
+        next_bytes: 100,
+    });
+
+    assert_eq!(decision.delay_ms, 0);
+    assert!(decision.drain_bytes_per_sec >= decision.ingress_bytes_per_sec);
 }
 
 #[test]
@@ -5226,6 +5327,57 @@ fn opportunistic_local_sync_defers_when_threshold_not_reached() {
         deferred_after > deferred_before,
         "opportunistic defer should be tracked"
     );
+}
+
+#[test]
+fn opportunistic_local_sync_flushes_when_threshold_reached() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "opportunistic-local-sync-threshold");
+    rt.block_on(async {
+        let mut group = vfs.state.local_dirty.local_sync_group.lock().await;
+        group.pending_bytes = vfs.local_sync_group_min_bytes;
+        group.last_sync_at = Instant::now();
+    });
+
+    let calls_before = vfs
+        .state
+        .metrics
+        .payload_store_sync_data_calls
+        .load(Ordering::Relaxed);
+    let synced_before = vfs
+        .state
+        .metrics
+        .payload_store_sync_data_synced_bytes
+        .load(Ordering::Relaxed);
+
+    rt.block_on(async {
+        vfs.maybe_payload_store_sync_data_async(0, LocalSyncPolicy::Opportunistic)
+            .await
+            .expect("opportunistic threshold local sync");
+    });
+
+    let calls_after = vfs
+        .state
+        .metrics
+        .payload_store_sync_data_calls
+        .load(Ordering::Relaxed);
+    let synced_after = vfs
+        .state
+        .metrics
+        .payload_store_sync_data_synced_bytes
+        .load(Ordering::Relaxed);
+    assert!(
+        calls_after > calls_before,
+        "opportunistic sync should flush when grouped dirty bytes reach the threshold"
+    );
+    assert!(
+        synced_after >= synced_before + vfs.local_sync_group_min_bytes,
+        "opportunistic threshold sync should account for grouped dirty bytes"
+    );
+    rt.block_on(async {
+        let group = vfs.state.local_dirty.local_sync_group.lock().await;
+        assert_eq!(group.pending_bytes, 0);
+    });
 }
 
 #[test]

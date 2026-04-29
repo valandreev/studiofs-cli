@@ -170,6 +170,18 @@ pub struct VfsWritePathDrainLagStats {
     pub soft_pacing_events: u64,
     pub soft_pacing_total_ms: u64,
     pub soft_pacing_max_ms: u64,
+    #[serde(default)]
+    pub admission_ingress_bytes_per_sec: u64,
+    #[serde(default)]
+    pub admission_drain_bytes_per_sec: u64,
+    #[serde(default)]
+    pub admission_runway_ms: u64,
+    #[serde(default)]
+    pub admission_last_delay_ms: u64,
+    #[serde(default)]
+    pub admission_pressure_bytes: usize,
+    #[serde(default)]
+    pub admission_budget_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

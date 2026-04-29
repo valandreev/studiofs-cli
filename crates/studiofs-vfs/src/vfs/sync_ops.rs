@@ -956,6 +956,9 @@ impl StudioVfs {
                 .write_fh_with_local_sync_policy(fh, ino, offset, data, local_sync_policy)
                 .await;
         }
+        if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+            self.maybe_throttle_write_admission(data.len()).await;
+        }
         // ── Acquire per-inode write gate ─────────────────────────────────
         let mut session = Some(
             self.state
@@ -1028,6 +1031,9 @@ impl StudioVfs {
         // Release the gate immediately: data is safe in MountedWriterStack.
         if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
             session = None;
+        }
+        if let Ok(written) = &result {
+            self.record_write_admission_accepted_bytes(*written as usize);
         }
 
         // ── Materialization phase ────────────────────────────────────────
