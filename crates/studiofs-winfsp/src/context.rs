@@ -209,6 +209,10 @@ fn open_flags_from_access(granted_access: FILE_ACCESS_RIGHTS, _create_options: u
 }
 
 fn write_local_sync_policy_from_create_options(_create_options: u32) -> LocalSyncPolicy {
+    // WinFSP callbacks run on a bounded dispatcher pool and `spawn_wait` parks
+    // that dispatcher until the async write completes. Do not let per-open
+    // write-through/no-buffering flags force foreground fdatasync from write();
+    // explicit flush and last-close still own the durable local barrier.
     LocalSyncPolicy::Opportunistic
 }
 

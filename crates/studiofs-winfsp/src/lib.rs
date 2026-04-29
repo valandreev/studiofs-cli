@@ -14,7 +14,7 @@ pub use context::{StudioFsContext, WinfspKernelInvalidator};
 use thiserror::Error;
 use windows::Win32::System::LibraryLoader::LoadLibraryW;
 
-const DEFAULT_FILE_INFO_TIMEOUT_MS: u32 = 1000;
+const DEFAULT_FILE_INFO_TIMEOUT_MS: u32 = u32::MAX;
 const DEFAULT_DIR_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_VOLUME_INFO_TIMEOUT_MS: u32 = 1000;
 const DEFAULT_SECTOR_SIZE: u16 = 4096;
@@ -707,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_mount_options_defaults_to_juicefs_style_file_info_timeout() {
+    fn parse_mount_options_defaults_to_winfsp_cache_manager_file_info_timeout() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         // SAFETY: Tests are single-threaded via `_guard` and temporarily mutate
         // process environment variables for deterministic parsing behavior.
@@ -716,7 +716,7 @@ mod tests {
         }
 
         let opts = parse_mount_options("StudioFS").expect("options");
-        assert_eq!(opts.file_info_timeout_ms, DEFAULT_FILE_INFO_TIMEOUT_MS);
+        assert_eq!(opts.file_info_timeout_ms, u32::MAX);
     }
 
     #[test]
