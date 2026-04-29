@@ -1034,9 +1034,6 @@ impl FileSystemContext for StudioFsContext {
         security_descriptor: Option<&mut [c_void]>,
         resolve_reparse_points: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
-        let _callback_activity =
-            self.vfs
-                .start_winfsp_callback_activity("get_security_by_name", None, None);
         if maybe_hide_non_macos_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
@@ -1057,14 +1054,9 @@ impl FileSystemContext for StudioFsContext {
 
     fn get_security(
         &self,
-        context: &Self::FileContext,
+        _context: &Self::FileContext,
         security_descriptor: Option<&mut [c_void]>,
     ) -> winfsp::Result<u64> {
-        let _callback_activity = self.vfs.start_winfsp_callback_activity(
-            "get_security",
-            Some(context.ino),
-            Some(context.fh),
-        );
         Ok(self.copy_sd_to_buffer(security_descriptor))
     }
 
@@ -1075,7 +1067,6 @@ impl FileSystemContext for StudioFsContext {
         granted_access: FILE_ACCESS_RIGHTS,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
-        let _callback_activity = self.vfs.start_winfsp_callback_activity("open", None, None);
         if maybe_hide_non_macos_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
@@ -1099,9 +1090,6 @@ impl FileSystemContext for StudioFsContext {
     }
 
     fn close(&self, context: Self::FileContext) {
-        let _callback_activity =
-            self.vfs
-                .start_winfsp_callback_activity("close", Some(context.ino), Some(context.fh));
         debug!(ino = context.ino, fh = context.fh, "close");
         self.run_close_callback(context.ino, context.fh);
         drop(context);
@@ -1119,9 +1107,6 @@ impl FileSystemContext for StudioFsContext {
         extra_buffer_is_reparse_point: bool,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
-        let _callback_activity = self
-            .vfs
-            .start_winfsp_callback_activity("create", None, None);
         if maybe_hide_non_macos_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
@@ -1153,11 +1138,6 @@ impl FileSystemContext for StudioFsContext {
         context: &Self::FileContext,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        let _callback_activity = self.vfs.start_winfsp_callback_activity(
-            "get_file_info",
-            Some(context.ino),
-            Some(context.fh),
-        );
         let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
         trace!(ino = context.ino, size = attr.size, "get_file_info");
         *file_info = attr_to_file_info(&attr);
@@ -1170,9 +1150,6 @@ impl FileSystemContext for StudioFsContext {
         buffer: &mut [u8],
         offset: u64,
     ) -> winfsp::Result<u32> {
-        let _callback_activity =
-            self.vfs
-                .start_winfsp_callback_activity("read", Some(context.ino), Some(context.fh));
         // Spawn the async read on a tokio worker thread so the WinFSP
         // dispatch thread doesn't participate in IO polling.
         let ino = context.ino;
@@ -1216,9 +1193,6 @@ impl FileSystemContext for StudioFsContext {
         constrained_io: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<u32> {
-        let _callback_activity =
-            self.vfs
-                .start_winfsp_callback_activity("write", Some(context.ino), Some(context.fh));
         self.vfs.note_winfsp_write_callback();
         let callback_started = Instant::now();
         // Resolve actual write offset.  Prefer the in-memory dirty attr (free)
@@ -1321,11 +1295,6 @@ impl FileSystemContext for StudioFsContext {
         marker: DirMarker,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
-        let _callback_activity = self.vfs.start_winfsp_callback_activity(
-            "read_directory",
-            Some(context.ino),
-            Some(context.fh),
-        );
         // Constant UTF-16 names for "." and ".." — avoids heap allocation.
         const DOT: &[u16] = &[b'.' as u16];
         const DOTDOT: &[u16] = &[b'.' as u16, b'.' as u16];
@@ -1416,11 +1385,6 @@ impl FileSystemContext for StudioFsContext {
         _file_name: &U16CStr,
         delete_file: bool,
     ) -> winfsp::Result<()> {
-        let _callback_activity = self.vfs.start_winfsp_callback_activity(
-            "set_delete",
-            Some(context.ino),
-            Some(context.fh),
-        );
         if delete_file && context.is_dir {
             let healed_orphans = self.heal_directory_orphans_for_delete(context.ino)?;
             let entries = self.vfs.readdir(context.ino).map_err(vfs_to_winfsp_err)?;
@@ -1438,9 +1402,6 @@ impl FileSystemContext for StudioFsContext {
     }
 
     fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
-        let _callback_activity =
-            self.vfs
-                .start_winfsp_callback_activity("cleanup", Some(context.ino), Some(context.fh));
         // Current dirty-handle ordering is:
         //   write/overwrite -> optional flush -> cleanup(non-delete) -> close -> release_fh
         //
@@ -1460,11 +1421,6 @@ impl FileSystemContext for StudioFsContext {
         _extra_buffer: Option<&[u8]>,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        let _callback_activity = self.vfs.start_winfsp_callback_activity(
-            "overwrite",
-            Some(context.ino),
-            Some(context.fh),
-        );
         self.vfs.note_winfsp_overwrite_callback();
         // `Overwrite` is an immediate EOF transition, not a backgroundable
         // flush barrier. Later reads/writes in the same open sequence depend on
@@ -1487,11 +1443,6 @@ impl FileSystemContext for StudioFsContext {
         _last_change_time: u64,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        let _callback_activity = self.vfs.start_winfsp_callback_activity(
-            "set_basic_info",
-            Some(context.ino),
-            Some(context.fh),
-        );
         self.execute_basic_info_callback(
             context.ino,
             build_basic_info_setattr_args(
@@ -1511,11 +1462,6 @@ impl FileSystemContext for StudioFsContext {
         set_allocation_size: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        let _callback_activity = self.vfs.start_winfsp_callback_activity(
-            "set_file_size",
-            Some(context.ino),
-            Some(context.fh),
-        );
         // WinFSP can call this with set_allocation_size=true to reserve capacity
         // without changing logical EOF. We don't track allocation size separately,
         // so treat allocation-size updates as a no-op for file length.
@@ -1533,9 +1479,6 @@ impl FileSystemContext for StudioFsContext {
         _is_directory: bool,
         buffer: &mut [u8],
     ) -> winfsp::Result<u64> {
-        let _callback_activity =
-            self.vfs
-                .start_winfsp_callback_activity("get_reparse_point_by_name", None, None);
         let attr = resolve_path(&self.vfs, file_name)?;
         if attr.kind != FileType::Symlink {
             return Err(winfsp::FspError::from(STATUS_NOT_A_REPARSE_POINT));
@@ -1550,55 +1493,37 @@ impl FileSystemContext for StudioFsContext {
         _file_name: &U16CStr,
         buffer: &mut [u8],
     ) -> winfsp::Result<u64> {
-        let _callback_activity = self.vfs.start_winfsp_callback_activity(
-            "get_reparse_point",
-            Some(context.ino),
-            Some(context.fh),
-        );
         let target = self.vfs.readlink(context.ino).map_err(vfs_to_winfsp_err)?;
         Ok(write_reparse_to_buffer(&target, buffer))
     }
 
     fn set_reparse_point(
         &self,
-        context: &Self::FileContext,
+        _context: &Self::FileContext,
         _file_name: &U16CStr,
         _buffer: &[u8],
     ) -> winfsp::Result<()> {
-        let _callback_activity = self.vfs.start_winfsp_callback_activity(
-            "set_reparse_point",
-            Some(context.ino),
-            Some(context.fh),
-        );
         // Symlinks are created at create() time via extra_buffer_is_reparse_point.
         Err(winfsp::FspError::from(STATUS_UNSUCCESSFUL))
     }
 
     fn delete_reparse_point(
         &self,
-        context: &Self::FileContext,
+        _context: &Self::FileContext,
         _file_name: &U16CStr,
         _buffer: &[u8],
     ) -> winfsp::Result<()> {
-        let _callback_activity = self.vfs.start_winfsp_callback_activity(
-            "delete_reparse_point",
-            Some(context.ino),
-            Some(context.fh),
-        );
         // Reparse points (symlinks) are removed via normal unlink in cleanup.
         Err(winfsp::FspError::from(STATUS_UNSUCCESSFUL))
     }
 
     fn rename(
         &self,
-        context: &Self::FileContext,
+        _context: &Self::FileContext,
         file_name: &U16CStr,
         new_file_name: &U16CStr,
         _replace_if_exists: bool,
     ) -> winfsp::Result<()> {
-        let _callback_activity =
-            self.vfs
-                .start_winfsp_callback_activity("rename", Some(context.ino), Some(context.fh));
         if maybe_hide_non_macos_root_path(&self.vfs, file_name)?
             || maybe_hide_non_macos_root_path(&self.vfs, new_file_name)?
         {
@@ -1628,11 +1553,6 @@ impl FileSystemContext for StudioFsContext {
         context: Option<&Self::FileContext>,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
-        let _callback_activity = self.vfs.start_winfsp_callback_activity(
-            "flush",
-            context.map(|ctx| ctx.ino),
-            context.map(|ctx| ctx.fh),
-        );
         if let Some(ctx) = context {
             self.run_flush_callback(ctx.ino, ctx.fh)
                 .map_err(vfs_to_winfsp_err)?;
@@ -1647,9 +1567,6 @@ impl FileSystemContext for StudioFsContext {
     }
 
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> winfsp::Result<()> {
-        let _callback_activity =
-            self.vfs
-                .start_winfsp_callback_activity("get_volume_info", None, None);
         let st = self.vfs.statfs().map_err(vfs_to_winfsp_err)?;
         out_volume_info.total_size = st.blocks * st.bsize as u64;
         out_volume_info.free_size = st.bfree * st.bsize as u64;

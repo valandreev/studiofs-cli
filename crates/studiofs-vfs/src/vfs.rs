@@ -66,9 +66,9 @@ pub use metrics::{
     VfsForegroundReadProtectionStats, VfsIngressLane, VfsIngressPressure, VfsIngressStats,
     VfsLatencyHistogramSnapshot, VfsNamespaceCacheSnapshot, VfsPortableAllocatorStats,
     VfsRuntimeEvent, VfsSynchronizationStateSnapshot, VfsTransitMemorySnapshot, VfsUploadStats,
-    VfsWinfspCallbackActivityStats, VfsWritePathBackpressureStats, VfsWritePathBurstStats,
-    VfsWritePathCadenceStats, VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats,
-    VfsWritePathEagerFlushStats, VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
+    VfsWritePathBackpressureStats, VfsWritePathBurstStats, VfsWritePathCadenceStats,
+    VfsWritePathDirtyPressureStats, VfsWritePathDrainLagStats, VfsWritePathEagerFlushStats,
+    VfsWritePathLandingZoneStats, VfsWritePathLatencyQuantilesMs,
     VfsWritePathLatencyQuantilesSaturated, VfsWritePathLocalCacheIoStats,
     VfsWritePathObservabilitySnapshot, VfsWritePathStageLatencyStats, VfsWritePathSyncDataStats,
     VfsWritePathTuningStats, VfsWritePathVfsWriteStats, VfsWritePathWinfspCallbackStats,
@@ -1992,165 +1992,6 @@ impl ShutdownState {
     }
 }
 
-#[derive(Clone, Copy)]
-struct WinfspCallbackActivityRecord {
-    kind: &'static str,
-    ino: Option<Ino>,
-    fh: Option<u64>,
-    started: Instant,
-}
-
-#[derive(Default)]
-struct WinfspCallbackActivityState {
-    next_id: u64,
-    active: HashMap<u64, WinfspCallbackActivityRecord>,
-    completed: u64,
-    longest_completed_ms: u64,
-    longest_completed_kind: &'static str,
-    longest_completed_ino: Option<Ino>,
-    longest_completed_fh: Option<u64>,
-}
-
-impl WinfspCallbackActivityState {
-    fn start(
-        &mut self,
-        kind: &'static str,
-        ino: Option<Ino>,
-        fh: Option<u64>,
-        started: Instant,
-    ) -> u64 {
-        self.next_id = self.next_id.wrapping_add(1).max(1);
-        let id = self.next_id;
-        self.active.insert(
-            id,
-            WinfspCallbackActivityRecord {
-                kind,
-                ino,
-                fh,
-                started,
-            },
-        );
-        id
-    }
-
-    fn finish(&mut self, id: u64, finished: Instant) {
-        let Some(record) = self.active.remove(&id) else {
-            return;
-        };
-        let elapsed_ms = duration_ms_u64(finished.duration_since(record.started));
-        self.completed = self.completed.saturating_add(1);
-        if elapsed_ms >= self.longest_completed_ms {
-            self.longest_completed_ms = elapsed_ms;
-            self.longest_completed_kind = record.kind;
-            self.longest_completed_ino = record.ino;
-            self.longest_completed_fh = record.fh;
-        }
-    }
-
-    fn snapshot(&self, now: Instant) -> VfsWinfspCallbackActivityStats {
-        let mut snapshot = VfsWinfspCallbackActivityStats {
-            completed: self.completed,
-            longest_completed_ms: self.longest_completed_ms,
-            longest_completed_kind: self.longest_completed_kind.to_string(),
-            longest_completed_ino: self.longest_completed_ino,
-            longest_completed_fh: self.longest_completed_fh,
-            ..VfsWinfspCallbackActivityStats::default()
-        };
-
-        for record in self.active.values() {
-            snapshot.total_active = snapshot.total_active.saturating_add(1);
-            match winfsp_callback_activity_bucket(record.kind) {
-                WinfspCallbackActivityBucket::Read => {
-                    snapshot.read_active = snapshot.read_active.saturating_add(1);
-                }
-                WinfspCallbackActivityBucket::Write => {
-                    snapshot.write_active = snapshot.write_active.saturating_add(1);
-                }
-                WinfspCallbackActivityBucket::Flush => {
-                    snapshot.flush_active = snapshot.flush_active.saturating_add(1);
-                }
-                WinfspCallbackActivityBucket::Cleanup => {
-                    snapshot.cleanup_active = snapshot.cleanup_active.saturating_add(1);
-                }
-                WinfspCallbackActivityBucket::Close => {
-                    snapshot.close_active = snapshot.close_active.saturating_add(1);
-                }
-                WinfspCallbackActivityBucket::Metadata => {
-                    snapshot.metadata_active = snapshot.metadata_active.saturating_add(1);
-                }
-                WinfspCallbackActivityBucket::Other => {
-                    snapshot.other_active = snapshot.other_active.saturating_add(1);
-                }
-            }
-
-            let elapsed_ms = duration_ms_u64(now.duration_since(record.started));
-            if elapsed_ms >= snapshot.oldest_active_ms {
-                snapshot.oldest_active_ms = elapsed_ms;
-                snapshot.oldest_active_kind = record.kind.to_string();
-                snapshot.oldest_active_ino = record.ino;
-                snapshot.oldest_active_fh = record.fh;
-            }
-        }
-
-        snapshot
-    }
-}
-
-enum WinfspCallbackActivityBucket {
-    Read,
-    Write,
-    Flush,
-    Cleanup,
-    Close,
-    Metadata,
-    Other,
-}
-
-fn winfsp_callback_activity_bucket(kind: &str) -> WinfspCallbackActivityBucket {
-    match kind {
-        "read" => WinfspCallbackActivityBucket::Read,
-        "write" | "overwrite" => WinfspCallbackActivityBucket::Write,
-        "flush" => WinfspCallbackActivityBucket::Flush,
-        "cleanup" => WinfspCallbackActivityBucket::Cleanup,
-        "close" => WinfspCallbackActivityBucket::Close,
-        "get_security_by_name"
-        | "get_security"
-        | "open"
-        | "create"
-        | "get_file_info"
-        | "read_directory"
-        | "set_delete"
-        | "set_basic_info"
-        | "set_file_size"
-        | "get_reparse_point_by_name"
-        | "get_reparse_point"
-        | "set_reparse_point"
-        | "delete_reparse_point"
-        | "rename"
-        | "get_volume_info" => WinfspCallbackActivityBucket::Metadata,
-        _ => WinfspCallbackActivityBucket::Other,
-    }
-}
-
-fn duration_ms_u64(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
-pub struct VfsWinfspCallbackActivityGuard {
-    state: Arc<VfsState>,
-    id: u64,
-}
-
-impl Drop for VfsWinfspCallbackActivityGuard {
-    fn drop(&mut self) {
-        self.state
-            .metrics
-            .winfsp_callback_activity
-            .lock()
-            .finish(self.id, Instant::now());
-    }
-}
-
 struct MetricsState {
     materialize_batch_stats: MaterializeBatchStats,
     ignored_entries: Mutex<IgnoredEntryRegistry>,
@@ -2249,7 +2090,6 @@ struct MetricsState {
     winfsp_flush_callbacks: AtomicU64,
     winfsp_close_callbacks: AtomicU64,
     winfsp_cleanup_flush_fh_callbacks: AtomicU64,
-    winfsp_callback_activity: Mutex<WinfspCallbackActivityState>,
     winfsp_cleanup_barrier_calls: AtomicU64,
     winfsp_flush_barrier_calls: AtomicU64,
     winfsp_close_barrier_calls: AtomicU64,
@@ -2360,7 +2200,6 @@ impl MetricsState {
             winfsp_flush_callbacks: AtomicU64::new(0),
             winfsp_close_callbacks: AtomicU64::new(0),
             winfsp_cleanup_flush_fh_callbacks: AtomicU64::new(0),
-            winfsp_callback_activity: Mutex::new(WinfspCallbackActivityState::default()),
             winfsp_cleanup_barrier_calls: AtomicU64::new(0),
             winfsp_flush_barrier_calls: AtomicU64::new(0),
             winfsp_close_barrier_calls: AtomicU64::new(0),
@@ -6870,24 +6709,6 @@ impl StudioVfs {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn start_winfsp_callback_activity(
-        &self,
-        kind: &'static str,
-        ino: Option<Ino>,
-        fh: Option<u64>,
-    ) -> VfsWinfspCallbackActivityGuard {
-        let id =
-            self.state
-                .metrics
-                .winfsp_callback_activity
-                .lock()
-                .start(kind, ino, fh, Instant::now());
-        VfsWinfspCallbackActivityGuard {
-            state: self.state.clone(),
-            id,
-        }
-    }
-
     pub fn record_winfsp_write_callback_observability(
         &self,
         write_bytes: usize,
@@ -7315,24 +7136,6 @@ impl StudioVfs {
                 .fetch_max(current, Ordering::Relaxed);
             usize::try_from(previous.max(current)).unwrap_or(usize::MAX)
         };
-        let deferred_materialization_inflight =
-            self.state.deferred_materialize_inflight.lock().len();
-        let (local_sync_group_pending_bytes, local_sync_group_locked) =
-            match self.state.local_dirty.local_sync_group.try_lock() {
-                Ok(group) => (
-                    Some(usize::try_from(group.pending_bytes).unwrap_or(usize::MAX)),
-                    false,
-                ),
-                Err(_) => (None, true),
-            };
-        let local_sync_gate_held = self.state.local_dirty.local_sync_gate.try_lock().is_err();
-        let winfsp_callback_activity = self
-            .state
-            .metrics
-            .winfsp_callback_activity
-            .lock()
-            .snapshot(Instant::now());
-
         VfsWritePathObservabilitySnapshot {
             publisher_pid: std::process::id(),
             generated_unix_ms: now_unix_millis(),
@@ -7477,7 +7280,6 @@ impl StudioVfs {
                     .winfsp_cleanup_flush_fh_callbacks
                     .load(Ordering::Relaxed),
             },
-            winfsp_callback_activity,
             winfsp_write_path: VfsWritePathWinfspWritePathStats {
                 write_bytes: winfsp_write_callback_bytes,
                 avg_write_bytes: if self
@@ -7709,10 +7511,6 @@ impl StudioVfs {
                 total_accounted_bytes,
                 dirty_peak_bytes,
                 staged_peak_bytes,
-                deferred_materialization_inflight,
-                local_sync_group_pending_bytes,
-                local_sync_group_locked,
-                local_sync_gate_held,
             },
             upload: upload_stats,
             fetch: VfsFetchStats {

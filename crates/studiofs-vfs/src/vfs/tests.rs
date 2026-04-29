@@ -6721,48 +6721,6 @@ fn winfsp_observability_snapshot_tracks_callback_and_barrier_paths() {
 }
 
 #[test]
-fn winfsp_callback_activity_tracks_active_and_completed_callbacks() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "winfsp-callback-activity");
-
-    let guard = vfs.start_winfsp_callback_activity("flush", Some(123), Some(456));
-
-    let snapshot = vfs.write_path_observability_snapshot();
-    assert_eq!(snapshot.winfsp_callback_activity.total_active, 1);
-    assert_eq!(snapshot.winfsp_callback_activity.flush_active, 1);
-    assert_eq!(
-        snapshot.winfsp_callback_activity.oldest_active_kind,
-        "flush"
-    );
-    assert_eq!(
-        snapshot.winfsp_callback_activity.oldest_active_ino,
-        Some(123)
-    );
-    assert_eq!(
-        snapshot.winfsp_callback_activity.oldest_active_fh,
-        Some(456)
-    );
-
-    drop(guard);
-
-    let snapshot = vfs.write_path_observability_snapshot();
-    assert_eq!(snapshot.winfsp_callback_activity.total_active, 0);
-    assert_eq!(snapshot.winfsp_callback_activity.completed, 1);
-    assert_eq!(
-        snapshot.winfsp_callback_activity.longest_completed_kind,
-        "flush"
-    );
-    assert_eq!(
-        snapshot.winfsp_callback_activity.longest_completed_ino,
-        Some(123)
-    );
-    assert_eq!(
-        snapshot.winfsp_callback_activity.longest_completed_fh,
-        Some(456)
-    );
-}
-
-#[test]
 fn failed_payload_persist_attempts_do_not_count_as_completed_bursts() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-failed-burst");

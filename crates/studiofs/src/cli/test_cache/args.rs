@@ -3,8 +3,6 @@ use clap::{Args, ValueEnum};
 use serde::Serialize;
 use std::path::PathBuf;
 
-pub(super) const DEFAULT_MONITOR_INTERVAL_MS: u64 = 500;
-
 pub(crate) struct TestCacheRunRequest {
     pub(super) target: PathBuf,
     pub(super) block_size: Option<String>,
@@ -24,9 +22,6 @@ pub(crate) struct TestCacheRunRequest {
     pub(super) profile: Option<TestCacheProfileMode>,
     pub(super) json_output: Option<PathBuf>,
     pub(super) full_file_reads: bool,
-    pub(super) monitor_write_path: bool,
-    pub(super) monitor_interval_ms: u64,
-    pub(super) monitor_duration_ms: Option<u64>,
 }
 
 impl From<TestCacheArgs> for TestCacheRunRequest {
@@ -50,9 +45,6 @@ impl From<TestCacheArgs> for TestCacheRunRequest {
             profile: args.profile,
             json_output: args.json_output,
             full_file_reads: false,
-            monitor_write_path: args.monitor_write_path,
-            monitor_interval_ms: args.monitor_interval_ms,
-            monitor_duration_ms: args.monitor_duration_ms,
         }
     }
 }
@@ -134,18 +126,6 @@ pub(crate) struct TestCacheArgs {
     /// Enable on-demand profiling for this benchmark run.
     #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "pyroscope")]
     profile: Option<TestCacheProfileMode>,
-
-    /// Tail live write-path diagnostics for an active mount instead of running a benchmark.
-    #[arg(long)]
-    monitor_write_path: bool,
-
-    /// Sampling interval for --monitor-write-path, in milliseconds.
-    #[arg(long, default_value_t = DEFAULT_MONITOR_INTERVAL_MS)]
-    monitor_interval_ms: u64,
-
-    /// Optional duration for --monitor-write-path, in milliseconds. Omit to run until stopped.
-    #[arg(long)]
-    monitor_duration_ms: Option<u64>,
 }
 
 impl TestCacheArgs {
@@ -193,9 +173,6 @@ mod tests {
                 profile,
                 during_upload_min_pending,
                 during_upload_timeout_ms,
-                monitor_write_path,
-                monitor_interval_ms,
-                monitor_duration_ms,
             }) => {
                 assert_eq!(path, PathBuf::from("/tmp/studiofs-cache"));
                 assert_eq!(workload_repeat, 1);
@@ -214,9 +191,6 @@ mod tests {
                 assert!(l1_limit.is_none());
                 assert!(json_output.is_none());
                 assert!(profile.is_none());
-                assert!(!monitor_write_path);
-                assert_eq!(monitor_interval_ms, DEFAULT_MONITOR_INTERVAL_MS);
-                assert!(monitor_duration_ms.is_none());
             }
             other => panic!("expected TestCache, got {other:?}"),
         }
@@ -273,9 +247,6 @@ mod tests {
                 l1_limit,
                 json_output,
                 profile,
-                monitor_write_path,
-                monitor_interval_ms,
-                monitor_duration_ms,
             }) => {
                 assert_eq!(path, PathBuf::from("Z:\\bench"));
                 assert_eq!(block_size.unwrap(), "4MB");
@@ -297,9 +268,6 @@ mod tests {
                     PathBuf::from("reports/cache-run.json")
                 );
                 assert!(matches!(profile, Some(TestCacheProfileMode::Pyroscope)));
-                assert!(!monitor_write_path);
-                assert_eq!(monitor_interval_ms, DEFAULT_MONITOR_INTERVAL_MS);
-                assert!(monitor_duration_ms.is_none());
             }
             other => panic!("expected TestCache, got {other:?}"),
         }
@@ -342,34 +310,6 @@ mod tests {
                 assert_eq!(workload_repeat, 12);
                 assert_eq!(during_upload_min_pending, 4);
                 assert_eq!(during_upload_timeout_ms, 30_000);
-            }
-            other => panic!("expected TestCache, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_cache_parses_write_path_monitor_flags() {
-        let cli = crate::cli::parse_for_test(&[
-            "test-cache",
-            "Z:\\bench",
-            "--monitor-write-path",
-            "--monitor-interval-ms",
-            "250",
-            "--monitor-duration-ms",
-            "30000",
-        ])
-        .unwrap();
-
-        match cli.command {
-            crate::cli::Commands::TestCache(TestCacheArgs {
-                monitor_write_path,
-                monitor_interval_ms,
-                monitor_duration_ms,
-                ..
-            }) => {
-                assert!(monitor_write_path);
-                assert_eq!(monitor_interval_ms, 250);
-                assert_eq!(monitor_duration_ms, Some(30_000));
             }
             other => panic!("expected TestCache, got {other:?}"),
         }
