@@ -41,8 +41,18 @@ const FILE_DIRECTORY_FILE_OPTION: u32 = 0x0000_0001;
 const FILE_READ_DATA_ACCESS: FILE_ACCESS_RIGHTS = 0x0001;
 const FILE_WRITE_DATA_ACCESS: FILE_ACCESS_RIGHTS = 0x0002;
 const FILE_APPEND_DATA_ACCESS: FILE_ACCESS_RIGHTS = 0x0004;
+#[cfg(test)]
 const FILE_GENERIC_READ_ACCESS: FILE_ACCESS_RIGHTS = 0x0012_0089;
+#[cfg(test)]
 const FILE_GENERIC_WRITE_ACCESS: FILE_ACCESS_RIGHTS = 0x0012_0116;
+#[cfg(test)]
+const FILE_READ_ATTRIBUTES_ACCESS: FILE_ACCESS_RIGHTS = 0x0080;
+#[cfg(test)]
+const FILE_WRITE_ATTRIBUTES_ACCESS: FILE_ACCESS_RIGHTS = 0x0100;
+#[cfg(test)]
+const READ_CONTROL_ACCESS: FILE_ACCESS_RIGHTS = 0x0002_0000;
+#[cfg(test)]
+const SYNCHRONIZE_ACCESS: FILE_ACCESS_RIGHTS = 0x0010_0000;
 
 // ─── NTSTATUS constants ──────────────────────────────────────────────────────
 
@@ -196,10 +206,8 @@ impl SendConstBuffer {
 /// actual access mask: treating every Windows handle as RDWR confuses VFS
 /// access tracking, sticky-error reporting, and last-handle release policy.
 fn open_flags_from_access(granted_access: FILE_ACCESS_RIGHTS, _create_options: u32) -> OpenFlags {
-    let wants_read = (granted_access & (FILE_READ_DATA_ACCESS | FILE_GENERIC_READ_ACCESS)) != 0;
-    let wants_write = (granted_access
-        & (FILE_WRITE_DATA_ACCESS | FILE_APPEND_DATA_ACCESS | FILE_GENERIC_WRITE_ACCESS))
-        != 0;
+    let wants_read = (granted_access & FILE_READ_DATA_ACCESS) != 0;
+    let wants_write = (granted_access & (FILE_WRITE_DATA_ACCESS | FILE_APPEND_DATA_ACCESS)) != 0;
     match (wants_read, wants_write) {
         (true, true) => OpenFlags::RDWR,
         (true, false) => OpenFlags::RDONLY,
@@ -1691,14 +1699,15 @@ mod tests {
         CreateCallbackKind, FILE_ACTION_MODIFIED, FILE_APPEND_DATA_ACCESS,
         FILE_DIRECTORY_FILE_OPTION, FILE_GENERIC_READ_ACCESS, FILE_GENERIC_WRITE_ACCESS,
         FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
-        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_READ_DATA_ACCESS,
-        FILE_WRITE_DATA_ACCESS, FileSizeCallbackAction, STATUS_ACCESS_DENIED, STATUS_DATA_ERROR,
+        FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_READ_ATTRIBUTES_ACCESS,
+        FILE_READ_DATA_ACCESS, FILE_WRITE_ATTRIBUTES_ACCESS, FILE_WRITE_DATA_ACCESS,
+        FileSizeCallbackAction, READ_CONTROL_ACCESS, STATUS_ACCESS_DENIED, STATUS_DATA_ERROR,
         STATUS_EA_TOO_LARGE, STATUS_INVALID_PARAMETER, STATUS_IO_TIMEOUT,
-        STATUS_OBJECT_NAME_NOT_FOUND, StudioFileHandle, StudioFsContext, WinfspKernelInvalidator,
-        attr_to_file_info, build_basic_info_setattr_args, build_notify_info,
-        encode_symlink_reparse, hidden_non_macos_root_path_component, ino_to_windows_path,
-        maybe_hide_non_macos_root_entry, notify_filter_for_kind, open_flags_from_access,
-        resolve_create_callback_kind, resolve_file_size_callback_action,
+        STATUS_OBJECT_NAME_NOT_FOUND, SYNCHRONIZE_ACCESS, StudioFileHandle, StudioFsContext,
+        WinfspKernelInvalidator, attr_to_file_info, build_basic_info_setattr_args,
+        build_notify_info, encode_symlink_reparse, hidden_non_macos_root_path_component,
+        ino_to_windows_path, maybe_hide_non_macos_root_entry, notify_filter_for_kind,
+        open_flags_from_access, resolve_create_callback_kind, resolve_file_size_callback_action,
         should_disable_winfsp_file_cache, unix_nanos_to_filetime, vfs_to_winfsp_err,
         write_local_sync_policy_from_create_options,
     };
@@ -1845,6 +1854,20 @@ mod tests {
             FILE_NO_INTERMEDIATE_BUFFERING_OPTION | FILE_WRITE_THROUGH_OPTION,
         );
         assert_eq!(unbuffered.bits(), OpenFlags::RDONLY.bits());
+    }
+
+    #[test]
+    fn read_handles_with_metadata_access_keep_winfsp_file_cache() {
+        let read_metadata_access = FILE_READ_DATA_ACCESS
+            | FILE_READ_ATTRIBUTES_ACCESS
+            | FILE_WRITE_ATTRIBUTES_ACCESS
+            | READ_CONTROL_ACCESS
+            | SYNCHRONIZE_ACCESS;
+
+        let flags = open_flags_from_access(read_metadata_access, 0);
+
+        assert_eq!(flags.bits(), OpenFlags::RDONLY.bits());
+        assert!(!should_disable_winfsp_file_cache(false, flags));
     }
 
     #[test]
