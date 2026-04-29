@@ -7,6 +7,7 @@
 mod args;
 mod direct;
 mod mode;
+mod monitor;
 mod mounted;
 mod profiling;
 mod progress;
@@ -29,6 +30,7 @@ pub(crate) use args::TestCacheArgs;
 use args::TestCacheRunRequest;
 use direct::run_direct;
 use mode::{ResolvedRunMode, resolve_run_mode};
+use monitor::run_write_path_monitor;
 use mounted::run_mounted_end_to_end;
 use profiling::merge_profile_report;
 use reporting::{render_human_summary, save_benchmark_report};
@@ -103,6 +105,9 @@ pub(crate) fn run_operator_test(target: PathBuf, report: PathBuf) -> Result<()> 
         profile: Some(TestCacheProfileMode::Pyroscope),
         json_output: Some(report),
         full_file_reads: true,
+        monitor_write_path: false,
+        monitor_interval_ms: args::DEFAULT_MONITOR_INTERVAL_MS,
+        monitor_duration_ms: None,
     })
 }
 
@@ -162,7 +167,17 @@ fn run(request: TestCacheRunRequest) -> Result<()> {
         profile,
         json_output,
         full_file_reads,
+        monitor_write_path,
+        monitor_interval_ms,
+        monitor_duration_ms,
     } = request;
+    if monitor_write_path {
+        return run_write_path_monitor(
+            &target,
+            std::time::Duration::from_millis(monitor_interval_ms),
+            monitor_duration_ms.map(std::time::Duration::from_millis),
+        );
+    }
     if io_depth == 0 {
         return Err(anyhow!("--io-depth must be >= 1"));
     }

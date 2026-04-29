@@ -2083,6 +2083,52 @@ fn write_buffer_admission_paces_like_juicefs_memory_window() {
 }
 
 #[test]
+fn write_admission_waits_until_writer_stack_pressure_drops_below_hard_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "admission-waits-hard-window");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"admission-waits-hard-window.bin", 0, 0, 0o644)
+            .unwrap();
+        let fh = vfs.open_file(attr.ino, OpenFlags::RDWR, false).unwrap();
+        let buffer_budget_bytes = vfs.block_size as usize;
+        vfs.set_max_dirty_bytes(buffer_budget_bytes);
+        vfs.state
+            .writer_stack
+            .write_bytes(
+                super::writer_stack::WriterWriteSpec {
+                    fh,
+                    ino: attr.ino,
+                    current_size: 0,
+                    content_epoch: attr.content_epoch,
+                    first_object_id: 0,
+                    offset: 0,
+                },
+                Bytes::from(vec![0xAB; buffer_budget_bytes * 2 + 1]),
+            )
+            .unwrap();
+
+        let admission_vfs = Arc::clone(&vfs);
+        let wait_task =
+            tokio::spawn(async move { admission_vfs.maybe_throttle_write_admission(1).await });
+        tokio::time::sleep(Duration::from_millis(WRITE_ADMISSION_BUFFER_DELAY_MS + 20)).await;
+        assert!(
+            !wait_task.is_finished(),
+            "admission should keep waiting while writer-stack pressure remains above 2x the buffer budget"
+        );
+
+        vfs.state.writer_stack.clear_inode(attr.ino);
+        tokio::time::timeout(Duration::from_millis(WRITE_ADMISSION_BUFFER_HIGH_DELAY_MS * 2), wait_task)
+            .await
+            .expect("admission should unblock after writer-stack pressure drops")
+            .expect("admission task should not panic");
+
+        vfs.release_fh(fh).await.unwrap();
+    });
+}
+
+#[test]
 fn sustained_write_window_decays_to_drain_chunk_for_long_streams() {
     let base = 300 * 1024 * 1024;
     let drain = 32 * 1024 * 1024;
@@ -6672,6 +6718,48 @@ fn winfsp_observability_snapshot_tracks_callback_and_barrier_paths() {
     assert_eq!(snapshot.winfsp_foreground_flushes.flush_skipped_clean, 1);
     assert_eq!(snapshot.winfsp_foreground_flushes.close, 0);
     assert_eq!(snapshot.winfsp_foreground_flushes.close_skipped_clean, 1);
+}
+
+#[test]
+fn winfsp_callback_activity_tracks_active_and_completed_callbacks() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "winfsp-callback-activity");
+
+    let guard = vfs.start_winfsp_callback_activity("flush", Some(123), Some(456));
+
+    let snapshot = vfs.write_path_observability_snapshot();
+    assert_eq!(snapshot.winfsp_callback_activity.total_active, 1);
+    assert_eq!(snapshot.winfsp_callback_activity.flush_active, 1);
+    assert_eq!(
+        snapshot.winfsp_callback_activity.oldest_active_kind,
+        "flush"
+    );
+    assert_eq!(
+        snapshot.winfsp_callback_activity.oldest_active_ino,
+        Some(123)
+    );
+    assert_eq!(
+        snapshot.winfsp_callback_activity.oldest_active_fh,
+        Some(456)
+    );
+
+    drop(guard);
+
+    let snapshot = vfs.write_path_observability_snapshot();
+    assert_eq!(snapshot.winfsp_callback_activity.total_active, 0);
+    assert_eq!(snapshot.winfsp_callback_activity.completed, 1);
+    assert_eq!(
+        snapshot.winfsp_callback_activity.longest_completed_kind,
+        "flush"
+    );
+    assert_eq!(
+        snapshot.winfsp_callback_activity.longest_completed_ino,
+        Some(123)
+    );
+    assert_eq!(
+        snapshot.winfsp_callback_activity.longest_completed_fh,
+        Some(456)
+    );
 }
 
 #[test]

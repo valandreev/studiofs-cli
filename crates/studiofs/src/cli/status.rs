@@ -872,6 +872,7 @@ mod tests {
             payload_store_sync_data: Default::default(),
             local_cache_io: Default::default(),
             winfsp_callbacks: Default::default(),
+            winfsp_callback_activity: Default::default(),
             winfsp_write_path: Default::default(),
             vfs_write_path: Default::default(),
             landing_zone: Default::default(),

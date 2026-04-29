@@ -331,8 +331,8 @@ impl StudioVfs {
     /// barrier for the inode. In durable mode success means the inode crossed
     /// the strict local durable boundary; in fast mode success only means the
     /// inode reached the latest local unpublished state and upload/publish
-    /// remain deferred background work. WinFSP file-scoped `Flush` relies on
-    /// this remaining a foreground dirty-inode drain path.
+    /// remain deferred background work. Platform bridges may call this directly
+    /// or schedule it from their own background drain path.
     pub async fn flush_with_outcome(&self, ino: Ino) -> VfsResult<ExplicitFlushOutcome> {
         self.flush_inode_barrier_with_outcome(ino, StickyErrorPolicy::Ignore)
             .await

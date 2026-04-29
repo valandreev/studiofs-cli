@@ -101,6 +101,44 @@ pub struct VfsWritePathWinfspCallbackStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VfsWinfspCallbackActivityStats {
+    #[serde(default)]
+    pub total_active: u64,
+    #[serde(default)]
+    pub read_active: u64,
+    #[serde(default)]
+    pub write_active: u64,
+    #[serde(default)]
+    pub flush_active: u64,
+    #[serde(default)]
+    pub cleanup_active: u64,
+    #[serde(default)]
+    pub close_active: u64,
+    #[serde(default)]
+    pub metadata_active: u64,
+    #[serde(default)]
+    pub other_active: u64,
+    #[serde(default)]
+    pub oldest_active_ms: u64,
+    #[serde(default)]
+    pub oldest_active_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_active_ino: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_active_fh: Option<u64>,
+    #[serde(default)]
+    pub completed: u64,
+    #[serde(default)]
+    pub longest_completed_ms: u64,
+    #[serde(default)]
+    pub longest_completed_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub longest_completed_ino: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub longest_completed_fh: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VfsWritePathWinfspWritePathStats {
     pub write_bytes: u64,
     pub avg_write_bytes: f64,
@@ -246,6 +284,14 @@ pub struct VfsWritePathDirtyPressureStats {
     pub dirty_peak_bytes: usize,
     #[serde(default)]
     pub staged_peak_bytes: usize,
+    #[serde(default)]
+    pub deferred_materialization_inflight: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_sync_group_pending_bytes: Option<usize>,
+    #[serde(default)]
+    pub local_sync_group_locked: bool,
+    #[serde(default)]
+    pub local_sync_gate_held: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -347,6 +393,8 @@ pub struct VfsWritePathObservabilitySnapshot {
     #[serde(default)]
     pub local_cache_io: VfsWritePathLocalCacheIoStats,
     pub winfsp_callbacks: VfsWritePathWinfspCallbackStats,
+    #[serde(default)]
+    pub winfsp_callback_activity: VfsWinfspCallbackActivityStats,
     #[serde(default)]
     pub winfsp_write_path: VfsWritePathWinfspWritePathStats,
     #[serde(default)]

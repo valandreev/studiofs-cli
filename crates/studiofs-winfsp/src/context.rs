@@ -27,7 +27,7 @@ use winfsp::U16CStr;
 use winfsp::filesystem::DirBuffer;
 use winfsp::filesystem::*;
 use winfsp::notify::{Notifier, NotifyInfo, NotifyingFileSystemContext};
-use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES};
+use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES, FspFileSystemGetOperationContext};
 
 use crate::{ensure_winfsp_runtime_loaded, ensure_winfsp_runtime_loaded_or_panic};
 
@@ -214,6 +214,38 @@ fn write_local_sync_policy_from_create_options(_create_options: u32) -> LocalSyn
     // write-through/no-buffering flags force foreground fdatasync from write();
     // explicit flush and last-close still own the durable local barrier.
     LocalSyncPolicy::Opportunistic
+}
+
+fn should_disable_winfsp_file_cache(is_dir: bool, open_flags: OpenFlags) -> bool {
+    !is_dir && (open_flags.contains(OpenFlags::WRONLY) || open_flags.contains(OpenFlags::RDWR))
+}
+
+fn should_disable_winfsp_file_cache_for_handle(handle: &StudioFileHandle) -> bool {
+    should_disable_winfsp_file_cache(handle.is_dir, handle.open_flags)
+}
+
+fn set_current_winfsp_open_disable_cache(disable_cache: bool) {
+    // SAFETY: WinFSP exposes the current operation context only while a callback
+    // is running on a dispatcher thread. This helper is called only from the
+    // Create/Open callbacks after their response buffer has been prepared, and
+    // it only toggles the documented Create.Opened.DisableCache response bit.
+    unsafe {
+        let operation_context = FspFileSystemGetOperationContext();
+        if operation_context.is_null() {
+            return;
+        }
+
+        let response = (*operation_context).Response;
+        if response.is_null() {
+            return;
+        }
+
+        (*response)
+            .Rsp
+            .Create
+            .Opened
+            .set_DisableCache(u32::from(disable_cache));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1002,6 +1034,9 @@ impl FileSystemContext for StudioFsContext {
         security_descriptor: Option<&mut [c_void]>,
         resolve_reparse_points: impl FnOnce(&U16CStr) -> Option<FileSecurity>,
     ) -> winfsp::Result<FileSecurity> {
+        let _callback_activity =
+            self.vfs
+                .start_winfsp_callback_activity("get_security_by_name", None, None);
         if maybe_hide_non_macos_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
@@ -1022,9 +1057,14 @@ impl FileSystemContext for StudioFsContext {
 
     fn get_security(
         &self,
-        _context: &Self::FileContext,
+        context: &Self::FileContext,
         security_descriptor: Option<&mut [c_void]>,
     ) -> winfsp::Result<u64> {
+        let _callback_activity = self.vfs.start_winfsp_callback_activity(
+            "get_security",
+            Some(context.ino),
+            Some(context.fh),
+        );
         Ok(self.copy_sd_to_buffer(security_descriptor))
     }
 
@@ -1035,6 +1075,7 @@ impl FileSystemContext for StudioFsContext {
         granted_access: FILE_ACCESS_RIGHTS,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
+        let _callback_activity = self.vfs.start_winfsp_callback_activity("open", None, None);
         if maybe_hide_non_macos_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
@@ -1043,18 +1084,24 @@ impl FileSystemContext for StudioFsContext {
         let write_local_sync_policy = write_local_sync_policy_from_create_options(create_options);
         Self::write_open_file_info(file_info, &attr);
         let handle = self.open_file_handle_for_attr(&attr, open_flags, write_local_sync_policy)?;
+        let disable_os_cache = should_disable_winfsp_file_cache_for_handle(&handle);
+        set_current_winfsp_open_disable_cache(disable_os_cache);
 
         debug!(
             ino = attr.ino,
             fh = handle.fh,
             is_dir = handle.is_dir,
             open_flags = open_flags.bits(),
+            disable_os_cache,
             "open"
         );
         Ok(handle)
     }
 
     fn close(&self, context: Self::FileContext) {
+        let _callback_activity =
+            self.vfs
+                .start_winfsp_callback_activity("close", Some(context.ino), Some(context.fh));
         debug!(ino = context.ino, fh = context.fh, "close");
         self.run_close_callback(context.ino, context.fh);
         drop(context);
@@ -1072,6 +1119,9 @@ impl FileSystemContext for StudioFsContext {
         extra_buffer_is_reparse_point: bool,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Self::FileContext> {
+        let _callback_activity = self
+            .vfs
+            .start_winfsp_callback_activity("create", None, None);
         if maybe_hide_non_macos_root_path(&self.vfs, file_name)? {
             return Err(winfsp::FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
@@ -1083,12 +1133,15 @@ impl FileSystemContext for StudioFsContext {
             extra_buffer_is_reparse_point,
         )?;
         let handle = self.execute_create_callback_plan(plan, file_info)?;
+        let disable_os_cache = should_disable_winfsp_file_cache_for_handle(&handle);
+        set_current_winfsp_open_disable_cache(disable_os_cache);
 
         debug!(
             ino = handle.ino,
             is_dir = handle.is_dir,
             fh = handle.fh,
             open_flags = handle.open_flags.bits(),
+            disable_os_cache,
             "create {:?}",
             file_name.to_string_lossy()
         );
@@ -1100,6 +1153,11 @@ impl FileSystemContext for StudioFsContext {
         context: &Self::FileContext,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        let _callback_activity = self.vfs.start_winfsp_callback_activity(
+            "get_file_info",
+            Some(context.ino),
+            Some(context.fh),
+        );
         let attr = self.vfs.getattr(context.ino).map_err(vfs_to_winfsp_err)?;
         trace!(ino = context.ino, size = attr.size, "get_file_info");
         *file_info = attr_to_file_info(&attr);
@@ -1112,6 +1170,9 @@ impl FileSystemContext for StudioFsContext {
         buffer: &mut [u8],
         offset: u64,
     ) -> winfsp::Result<u32> {
+        let _callback_activity =
+            self.vfs
+                .start_winfsp_callback_activity("read", Some(context.ino), Some(context.fh));
         // Spawn the async read on a tokio worker thread so the WinFSP
         // dispatch thread doesn't participate in IO polling.
         let ino = context.ino;
@@ -1155,6 +1216,9 @@ impl FileSystemContext for StudioFsContext {
         constrained_io: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<u32> {
+        let _callback_activity =
+            self.vfs
+                .start_winfsp_callback_activity("write", Some(context.ino), Some(context.fh));
         self.vfs.note_winfsp_write_callback();
         let callback_started = Instant::now();
         // Resolve actual write offset.  Prefer the in-memory dirty attr (free)
@@ -1257,6 +1321,11 @@ impl FileSystemContext for StudioFsContext {
         marker: DirMarker,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
+        let _callback_activity = self.vfs.start_winfsp_callback_activity(
+            "read_directory",
+            Some(context.ino),
+            Some(context.fh),
+        );
         // Constant UTF-16 names for "." and ".." — avoids heap allocation.
         const DOT: &[u16] = &[b'.' as u16];
         const DOTDOT: &[u16] = &[b'.' as u16, b'.' as u16];
@@ -1347,6 +1416,11 @@ impl FileSystemContext for StudioFsContext {
         _file_name: &U16CStr,
         delete_file: bool,
     ) -> winfsp::Result<()> {
+        let _callback_activity = self.vfs.start_winfsp_callback_activity(
+            "set_delete",
+            Some(context.ino),
+            Some(context.fh),
+        );
         if delete_file && context.is_dir {
             let healed_orphans = self.heal_directory_orphans_for_delete(context.ino)?;
             let entries = self.vfs.readdir(context.ino).map_err(vfs_to_winfsp_err)?;
@@ -1364,6 +1438,9 @@ impl FileSystemContext for StudioFsContext {
     }
 
     fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
+        let _callback_activity =
+            self.vfs
+                .start_winfsp_callback_activity("cleanup", Some(context.ino), Some(context.fh));
         // Current dirty-handle ordering is:
         //   write/overwrite -> optional flush -> cleanup(non-delete) -> close -> release_fh
         //
@@ -1383,6 +1460,11 @@ impl FileSystemContext for StudioFsContext {
         _extra_buffer: Option<&[u8]>,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        let _callback_activity = self.vfs.start_winfsp_callback_activity(
+            "overwrite",
+            Some(context.ino),
+            Some(context.fh),
+        );
         self.vfs.note_winfsp_overwrite_callback();
         // `Overwrite` is an immediate EOF transition, not a backgroundable
         // flush barrier. Later reads/writes in the same open sequence depend on
@@ -1405,6 +1487,11 @@ impl FileSystemContext for StudioFsContext {
         _last_change_time: u64,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        let _callback_activity = self.vfs.start_winfsp_callback_activity(
+            "set_basic_info",
+            Some(context.ino),
+            Some(context.fh),
+        );
         self.execute_basic_info_callback(
             context.ino,
             build_basic_info_setattr_args(
@@ -1424,6 +1511,11 @@ impl FileSystemContext for StudioFsContext {
         set_allocation_size: bool,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        let _callback_activity = self.vfs.start_winfsp_callback_activity(
+            "set_file_size",
+            Some(context.ino),
+            Some(context.fh),
+        );
         // WinFSP can call this with set_allocation_size=true to reserve capacity
         // without changing logical EOF. We don't track allocation size separately,
         // so treat allocation-size updates as a no-op for file length.
@@ -1441,6 +1533,9 @@ impl FileSystemContext for StudioFsContext {
         _is_directory: bool,
         buffer: &mut [u8],
     ) -> winfsp::Result<u64> {
+        let _callback_activity =
+            self.vfs
+                .start_winfsp_callback_activity("get_reparse_point_by_name", None, None);
         let attr = resolve_path(&self.vfs, file_name)?;
         if attr.kind != FileType::Symlink {
             return Err(winfsp::FspError::from(STATUS_NOT_A_REPARSE_POINT));
@@ -1455,37 +1550,55 @@ impl FileSystemContext for StudioFsContext {
         _file_name: &U16CStr,
         buffer: &mut [u8],
     ) -> winfsp::Result<u64> {
+        let _callback_activity = self.vfs.start_winfsp_callback_activity(
+            "get_reparse_point",
+            Some(context.ino),
+            Some(context.fh),
+        );
         let target = self.vfs.readlink(context.ino).map_err(vfs_to_winfsp_err)?;
         Ok(write_reparse_to_buffer(&target, buffer))
     }
 
     fn set_reparse_point(
         &self,
-        _context: &Self::FileContext,
+        context: &Self::FileContext,
         _file_name: &U16CStr,
         _buffer: &[u8],
     ) -> winfsp::Result<()> {
+        let _callback_activity = self.vfs.start_winfsp_callback_activity(
+            "set_reparse_point",
+            Some(context.ino),
+            Some(context.fh),
+        );
         // Symlinks are created at create() time via extra_buffer_is_reparse_point.
         Err(winfsp::FspError::from(STATUS_UNSUCCESSFUL))
     }
 
     fn delete_reparse_point(
         &self,
-        _context: &Self::FileContext,
+        context: &Self::FileContext,
         _file_name: &U16CStr,
         _buffer: &[u8],
     ) -> winfsp::Result<()> {
+        let _callback_activity = self.vfs.start_winfsp_callback_activity(
+            "delete_reparse_point",
+            Some(context.ino),
+            Some(context.fh),
+        );
         // Reparse points (symlinks) are removed via normal unlink in cleanup.
         Err(winfsp::FspError::from(STATUS_UNSUCCESSFUL))
     }
 
     fn rename(
         &self,
-        _context: &Self::FileContext,
+        context: &Self::FileContext,
         file_name: &U16CStr,
         new_file_name: &U16CStr,
         _replace_if_exists: bool,
     ) -> winfsp::Result<()> {
+        let _callback_activity =
+            self.vfs
+                .start_winfsp_callback_activity("rename", Some(context.ino), Some(context.fh));
         if maybe_hide_non_macos_root_path(&self.vfs, file_name)?
             || maybe_hide_non_macos_root_path(&self.vfs, new_file_name)?
         {
@@ -1515,6 +1628,11 @@ impl FileSystemContext for StudioFsContext {
         context: Option<&Self::FileContext>,
         file_info: &mut FileInfo,
     ) -> winfsp::Result<()> {
+        let _callback_activity = self.vfs.start_winfsp_callback_activity(
+            "flush",
+            context.map(|ctx| ctx.ino),
+            context.map(|ctx| ctx.fh),
+        );
         if let Some(ctx) = context {
             self.run_flush_callback(ctx.ino, ctx.fh)
                 .map_err(vfs_to_winfsp_err)?;
@@ -1529,6 +1647,9 @@ impl FileSystemContext for StudioFsContext {
     }
 
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> winfsp::Result<()> {
+        let _callback_activity =
+            self.vfs
+                .start_winfsp_callback_activity("get_volume_info", None, None);
         let st = self.vfs.statfs().map_err(vfs_to_winfsp_err)?;
         out_volume_info.total_size = st.blocks * st.bsize as u64;
         out_volume_info.free_size = st.bfree * st.bsize as u64;
@@ -1660,8 +1781,9 @@ mod tests {
         attr_to_file_info, build_basic_info_setattr_args, build_notify_info,
         encode_symlink_reparse, hidden_non_macos_root_path_component, ino_to_windows_path,
         maybe_hide_non_macos_root_entry, notify_filter_for_kind, open_flags_from_access,
-        resolve_create_callback_kind, resolve_file_size_callback_action, unix_nanos_to_filetime,
-        vfs_to_winfsp_err, write_local_sync_policy_from_create_options,
+        resolve_create_callback_kind, resolve_file_size_callback_action,
+        should_disable_winfsp_file_cache, unix_nanos_to_filetime, vfs_to_winfsp_err,
+        write_local_sync_policy_from_create_options,
     };
     use parking_lot::Mutex;
     use std::collections::BTreeSet;
@@ -1752,6 +1874,17 @@ mod tests {
             .calls
     }
 
+    fn wait_until(timeout: std::time::Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let started = std::time::Instant::now();
+        while started.elapsed() < timeout {
+            if condition() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        condition()
+    }
+
     pub(super) fn winfsp_callbacks(
         vfs: &StudioVfs,
     ) -> studiofs_vfs::VfsWritePathWinfspCallbackStats {
@@ -1795,6 +1928,15 @@ mod tests {
             FILE_NO_INTERMEDIATE_BUFFERING_OPTION | FILE_WRITE_THROUGH_OPTION,
         );
         assert_eq!(unbuffered.bits(), OpenFlags::RDONLY.bits());
+    }
+
+    #[test]
+    fn write_capable_file_handles_disable_winfsp_file_cache() {
+        assert!(!should_disable_winfsp_file_cache(false, OpenFlags::RDONLY));
+        assert!(should_disable_winfsp_file_cache(false, OpenFlags::WRONLY));
+        assert!(should_disable_winfsp_file_cache(false, OpenFlags::RDWR));
+        assert!(!should_disable_winfsp_file_cache(true, OpenFlags::WRONLY));
+        assert!(!should_disable_winfsp_file_cache(true, OpenFlags::RDWR));
     }
 
     #[test]
@@ -2368,7 +2510,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_flush_callback_drains_buffered_write_callback_state_and_forces_sync_data() {
+    fn explicit_flush_callback_drains_buffered_write_without_foreground_sync_data() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("write_callback_explicit_flush");
         let attr = vfs
             .create(ROOT_INO, b"buffered-write-flush.txt", 0, 0, 0o644)
@@ -2411,20 +2553,20 @@ mod tests {
             "explicit flush callback should still be observable"
         );
         assert!(
-            barriers_after.flush >= barriers_before.flush,
-            "explicit flush callback should not lose foreground flush accounting"
+            barriers_after.flush > barriers_before.flush,
+            "explicit flush callback should own the WinFSP flush barrier"
         );
         assert!(
-            sync_calls_after > sync_calls_before,
-            "explicit flush or deferred writer-stack drain should force the local payload sync barrier after buffered writes"
+            sync_calls_after == sync_calls_before,
+            "WinFSP writeback flush should not call fdatasync from the dispatcher"
         );
         assert!(
             flush_calls_after > flush_calls_before,
-            "explicit flush or deferred writer-stack drain should commit materialized dirty state through the local metadata barrier"
+            "explicit flush callback should commit buffered dirty state before returning"
         );
         assert!(
             !vfs.inode_has_local_dirty_state(attr.ino),
-            "explicit flush should drain the buffered local dirty state"
+            "explicit flush should drain buffered local dirty state before returning"
         );
 
         ctx.spawn_wait({
@@ -2496,28 +2638,28 @@ mod tests {
 
         ctx.run_flush_callback(attr.ino, fh)
             .expect("explicit flush callback");
+        assert!(
+            !ctx.has_deferred_cleanup_hint(attr.ino),
+            "explicit flush should clear the deferred cleanup hint before returning"
+        );
+        assert!(
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "explicit flush should drain buffered local dirty state before returning"
+        );
         let after_flush_barriers = winfsp_foreground_flushes(&vfs);
         let flush_calls_after = flush_barrier_calls(&vfs);
         let sync_calls_after = sync_data_calls(&vfs);
         assert!(
             after_flush_barriers.flush >= barriers_before.flush,
-            "explicit flush should not lose foreground flush accounting for buffered dirty state"
+            "explicit flush should not lose flush barrier accounting for buffered dirty state"
         );
         assert!(
-            sync_calls_after > sync_calls_before,
-            "explicit flush should force local payload sync after buffered writes"
+            sync_calls_after == sync_calls_before,
+            "WinFSP writeback flush should not force fdatasync after buffered writes"
         );
         assert!(
             flush_calls_after > flush_calls_before,
             "explicit flush should commit buffered dirty state through the metadata barrier"
-        );
-        assert!(
-            !ctx.has_deferred_cleanup_hint(attr.ino),
-            "explicit flush should clear the deferred cleanup hint"
-        );
-        assert!(
-            !vfs.inode_has_local_dirty_state(attr.ino),
-            "explicit flush should drain buffered local dirty state"
         );
         assert_eq!(
             vfs.write_path_observability_snapshot()
@@ -2587,12 +2729,18 @@ mod tests {
             "last-handle close should not lose foreground close accounting for buffered dirty state"
         );
         assert!(
-            flush_barrier_calls(&vfs) >= flush_calls_before,
-            "deferred writer-stack drain or last-handle close should keep local barrier accounting monotonic"
+            flush_barrier_calls(&vfs) == flush_calls_before,
+            "last-handle close must not run the local barrier before returning to WinFSP"
         );
         assert!(
-            !vfs.inode_has_local_dirty_state(attr.ino),
-            "last-handle close should drain buffered local dirty state"
+            vfs.inode_has_local_dirty_state(attr.ino),
+            "last-handle close should leave dirty state to the deferred drain after returning"
+        );
+        assert!(
+            wait_until(std::time::Duration::from_secs(2), || {
+                !vfs.inode_has_local_dirty_state(attr.ino)
+            }),
+            "deferred last-handle close should eventually drain buffered local dirty state"
         );
         assert_eq!(
             vfs.write_path_observability_snapshot()
@@ -2676,13 +2824,14 @@ mod tests {
 
         ctx.run_flush_callback(attr.ino, fh)
             .expect("flush callback");
-        assert!(
-            !vfs.inode_has_local_dirty_state(attr.ino),
-            "explicit flush should still cross the durable local boundary"
+        assert_eq!(
+            sync_data_calls(&vfs),
+            sync_calls_before,
+            "write-through / unbuffered WinFSP writeback flush must not call fdatasync from the dispatcher"
         );
         assert!(
-            sync_data_calls(&vfs) > sync_calls_before,
-            "explicit flush should still force the local payload sync barrier"
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "explicit flush should still cross the local writeback boundary"
         );
         assert!(
             flush_barrier_calls(&vfs) > flush_calls_before,
@@ -2692,6 +2841,55 @@ mod tests {
         ctx.spawn_wait({
             let vfs = vfs.clone();
             async move { vfs.release_fh(fh).await }
+        })
+        .expect("release_fh");
+    }
+
+    #[test]
+    fn foreground_flush_drains_before_handle_close() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("foreground_flush_then_close");
+        let attr = vfs
+            .create(ROOT_INO, b"deferred-flush-then-close.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh1 = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file fh1");
+        let fh2 = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file fh2");
+        let handle = StudioFileHandle::new(attr.ino, false, fh1, OpenFlags::RDWR);
+        let mut file_info = winfsp::filesystem::FileInfo::default();
+
+        <StudioFsContext as FileSystemContext>::write(
+            &ctx,
+            &handle,
+            b"flush-before-close",
+            0,
+            false,
+            false,
+            &mut file_info,
+        )
+        .expect("write callback");
+        assert!(
+            vfs.inode_has_local_dirty_state(attr.ino),
+            "write callback should leave local dirty state for explicit flush"
+        );
+
+        ctx.run_flush_callback(attr.ino, fh1)
+            .expect("flush callback");
+        assert!(
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "explicit flush should drain dirty state before close can release the handle"
+        );
+        ctx.run_close_callback(attr.ino, fh1);
+        assert_eq!(
+            vfs.open_count(attr.ino),
+            1,
+            "closing one handle should leave the second handle open"
+        );
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh2).await }
         })
         .expect("release_fh");
     }

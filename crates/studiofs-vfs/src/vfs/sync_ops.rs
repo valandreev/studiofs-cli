@@ -613,6 +613,76 @@ impl StudioVfs {
         result
     }
 
+    pub fn release_fh_with_deferred_last_handle_barrier(
+        self: &Arc<Self>,
+        fh: u64,
+        runtime: &tokio::runtime::Handle,
+    ) -> ReleaseFhOutcome {
+        let Some(context) = self.close_handle_for_release(fh) else {
+            return ReleaseFhOutcome::default();
+        };
+        let ino = context.ino;
+        let flushed_local_dirty_state = self.inode_has_local_dirty_state(ino);
+        let vfs = Arc::clone(self);
+        self.track_background_task(runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            let session = vfs
+                .state
+                .file_session
+                .enter_op(ino, FileSessionOperation::Release)
+                .await;
+            let result = vfs.release_last_handle_with_outcome(context).await;
+            drop(session);
+            vfs.state.file_session.gc_if_idle(ino);
+            if let Err(error) = result {
+                warn!(
+                    ino,
+                    error = %error,
+                    "deferred last-handle release barrier failed"
+                );
+            }
+        }));
+        ReleaseFhOutcome {
+            closed_last_handle: true,
+            flushed_local_dirty_state,
+        }
+    }
+
+    pub async fn flush_winfsp_writeback_with_outcome(
+        self: &Arc<Self>,
+        ino: Ino,
+        fh: u64,
+    ) -> VfsResult<ExplicitFlushOutcome> {
+        let target_ino = if fh != 0 {
+            self.handle_table.get(fh).map(|open_file| open_file.ino)
+        } else {
+            None
+        }
+        .unwrap_or(ino);
+        let session = self
+            .state
+            .file_session
+            .enter_op(target_ino, FileSessionOperation::Flush)
+            .await;
+        let result: VfsResult<ExplicitFlushOutcome> = async {
+            let outcome = self
+                .local_sync_barrier_with_outcome(
+                    target_ino,
+                    LocalSyncPolicy::Opportunistic,
+                    StickyErrorPolicy::Ignore,
+                    DirtyAttrPersistPolicy::PersistIfPresent,
+                )
+                .await?;
+            Ok(ExplicitFlushOutcome {
+                flushed_local_dirty_state: outcome.had_local_dirty_state,
+            })
+        }
+        .await;
+        drop(session);
+        self.state.file_session.gc_if_idle(target_ino);
+        result
+    }
+
     async fn local_sync_barrier_with_outcome(
         &self,
         ino: Ino,
