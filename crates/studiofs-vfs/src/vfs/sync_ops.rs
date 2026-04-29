@@ -160,7 +160,7 @@ impl StudioVfs {
     }
 
     async fn maybe_pre_drain_sustained_write_buffer(
-        &self,
+        self: &Arc<Self>,
         ino: Ino,
         offset: u64,
         len: usize,
@@ -191,21 +191,29 @@ impl StudioVfs {
         );
         // #endregion debug log
 
-        self.wait_for_deferred_materialization_inflight(ino).await;
-        if self
-            .state
-            .writer_stack
-            .dirty_bytes_for_inode(ino)
-            .saturating_add(len)
-            <= admission.effective_buffer_bytes
-        {
-            return Ok(());
-        }
-
-        let materialize_started = Instant::now();
-        let _materialized = self.materialize_writer_stack_for_inode(ino).await?;
-        self.record_vfs_write_materialize_for_limits(materialize_started.elapsed());
+        self.spawn_deferred_materialization_if_needed(ino).await;
         Ok(())
+    }
+
+    fn record_deferred_write_hard_backpressure(&self, ino: Ino, hard_threshold_bytes: usize) {
+        self.state
+            .local_dirty
+            .hard_backpressure_events
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // #region debug log
+        self.debug_write_probe(
+            "H2",
+            "crates/studiofs-vfs/src/vfs/sync_ops.rs:191",
+            "hard backpressure observed on deferred write",
+            serde_json::json!({
+                "ino": ino,
+                "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
+                "total_dirty_bytes": self.total_pending_write_buffer_bytes(),
+                "hard_threshold_bytes": hard_threshold_bytes,
+                "max_dirty_bytes": self.max_dirty_bytes(),
+            }),
+        );
+        // #endregion debug log
     }
 
     pub(super) async fn spawn_deferred_materialization_if_needed(self: &Arc<Self>, ino: Ino) {
@@ -990,10 +998,10 @@ impl StudioVfs {
     ///   `materialize_writer_stack_for_inode` synchronously.
     /// * Duplicate materialization is safe: the payload store uses last-writer-wins
     ///   for overlapping ranges, and orphaned objects are reclaimed by the janitor.
-    /// * Soft pacing is deliberately not applied on this foreground writeback
-    ///   path. If dirty bytes exceed `2 × max_dirty_bytes` the next write will
-    ///   detect it synchronously via the hard-backpressure guard at the top and
-    ///   block until drain catches up.
+    /// * Soft pacing is deliberately kept bounded on this foreground writeback
+    ///   path. Opportunistic writes never materialize inline under dirty-budget
+    ///   pressure; background materialization catches up while the callback
+    ///   returns after copying data into the writer stack.
     pub async fn write_fh_with_deferred_materialize(
         self: &Arc<Self>,
         fh: u64,
@@ -1009,27 +1017,12 @@ impl StudioVfs {
         let hard_backpressure_threshold =
             super::hard_backpressure_threshold_bytes(self.max_dirty_bytes());
         if self.total_pending_write_buffer_bytes() > hard_backpressure_threshold {
-            self.state
-                .local_dirty
-                .hard_backpressure_events
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // #region debug log
-            self.debug_write_probe(
-                "H2",
-                "crates/studiofs-vfs/src/vfs/sync_ops.rs:688",
-                "hard backpressure fallback engaged",
-                serde_json::json!({
-                    "ino": ino,
-                    "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
-                    "total_dirty_bytes": self.total_pending_write_buffer_bytes(),
-                    "hard_threshold_bytes": hard_backpressure_threshold,
-                    "max_dirty_bytes": self.max_dirty_bytes(),
-                }),
-            );
-            // #endregion debug log
-            return self
-                .write_fh_with_local_sync_policy(fh, ino, offset, data, local_sync_policy)
-                .await;
+            self.record_deferred_write_hard_backpressure(ino, hard_backpressure_threshold);
+            if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
+                return self
+                    .write_fh_with_local_sync_policy(fh, ino, offset, data, local_sync_policy)
+                    .await;
+            }
         }
         if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
             self.maybe_throttle_write_admission(data.len()).await;
@@ -1052,29 +1045,14 @@ impl StudioVfs {
             self.access_tracker,
         );
         if self.total_pending_write_buffer_bytes() > hard_backpressure_threshold {
-            self.state
-                .local_dirty
-                .hard_backpressure_events
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // #region debug log
-            self.debug_write_probe(
-                "H2",
-                "crates/studiofs-vfs/src/vfs/sync_ops.rs:866",
-                "hard backpressure fallback engaged after inode gate wait",
-                serde_json::json!({
-                    "ino": ino,
-                    "per_inode_dirty_bytes": self.state.writer_stack.dirty_bytes_for_inode(ino),
-                    "total_dirty_bytes": self.total_pending_write_buffer_bytes(),
-                    "hard_threshold_bytes": hard_backpressure_threshold,
-                    "max_dirty_bytes": self.max_dirty_bytes(),
-                }),
-            );
-            // #endregion debug log
-            drop(session);
-            self.state.file_session.gc_if_idle(ino);
-            return self
-                .write_fh_with_local_sync_policy(fh, ino, offset, data, local_sync_policy)
-                .await;
+            self.record_deferred_write_hard_backpressure(ino, hard_backpressure_threshold);
+            if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
+                drop(session);
+                self.state.file_session.gc_if_idle(ino);
+                return self
+                    .write_fh_with_local_sync_policy(fh, ino, offset, data, local_sync_policy)
+                    .await;
+            }
         }
         // ── Buffer phase (fast: ~0.1 ms) ────────────────────────────────
         let result = async {

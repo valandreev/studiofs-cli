@@ -3299,9 +3299,10 @@ fn ingress_pressure_counts_buffered_writer_stack_bytes() {
 }
 
 #[test]
-fn deferred_write_rechecks_hard_backpressure_after_waiting_for_inode_gate() {
+fn opportunistic_deferred_write_rechecks_hard_pressure_without_inline_fallback() {
     let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-305-deferred-backpressure-recheck");
+    let (rt, vfs, _meta) =
+        make_unstarted_test_vfs(&tmp, "sfs-306-deferred-backpressure-nonblocking");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
@@ -3376,7 +3377,7 @@ fn deferred_write_rechecks_hard_backpressure_after_waiting_for_inode_gate() {
         queued_write
             .await
             .expect("queued write task should not panic")
-            .expect("queued write should fall back and complete");
+            .expect("queued write should stay deferred and complete");
         vfs.state.deferred_materialize_inflight.lock().remove(&ino);
 
         let snapshot = vfs.write_path_observability_snapshot();
@@ -3385,12 +3386,74 @@ fn deferred_write_rechecks_hard_backpressure_after_waiting_for_inode_gate() {
             "deferred write must re-check hard backpressure after waiting on the inode gate"
         );
         assert!(
-            !vfs.state.writer_stack.has_dirty_writers(ino),
-            "hard fallback should materialize this write inline instead of extending the buffered writer stack"
+            vfs.state.writer_stack.dirty_bytes_for_inode(ino) > 0,
+            "opportunistic deferred writes must stay in the foreground buffer instead of materializing inline under hard pressure"
         );
 
         vfs.release_fh(fh).await.unwrap();
         vfs.release_fh(pressure_fh).await.unwrap();
+    });
+}
+
+#[test]
+fn opportunistic_sustained_pre_drain_schedules_without_inline_materialization() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-306-sustained-pre-drain-nonblocking");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let attr = vfs
+            .create(1, b"sfs-306-sustained-pre-drain.bin", 0, 0, 0o644)
+            .unwrap();
+        let ino = attr.ino;
+        let fh = vfs.open_file(ino, OpenFlags::RDWR, false).unwrap();
+
+        vfs.set_max_dirty_bytes(64 * 1024 * 1024);
+        let seeded_len = 33 * 1024 * 1024;
+        vfs.state
+            .writer_stack
+            .write_bytes(
+                super::writer_stack::WriterWriteSpec {
+                    fh,
+                    ino,
+                    current_size: 0,
+                    content_epoch: attr.content_epoch,
+                    first_object_id: 0,
+                    offset: 0,
+                },
+                Bytes::from(vec![0xCD; seeded_len]),
+            )
+            .expect("seed sustained writer-stack pressure");
+        vfs.state
+            .deferred_materialize_inflight
+            .lock()
+            .insert(ino, Arc::new(tokio::sync::Mutex::new(())));
+        let now = now_unix_millis();
+        vfs.state.sustained_write_streams.lock().insert(
+            ino,
+            SustainedWriteState {
+                streak_start_ms: now.saturating_sub(SUSTAINED_WRITE_DECAY_START_MS),
+                last_write_ms: now.saturating_sub(1),
+                last_end_offset: seeded_len as u64,
+            },
+        );
+
+        vfs.write_fh_with_deferred_materialize(
+            fh,
+            ino,
+            seeded_len as u64,
+            b"x",
+            LocalSyncPolicy::Opportunistic,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            vfs.state.writer_stack.dirty_bytes_for_inode(ino) >= seeded_len,
+            "sustained pre-drain must not materialize buffered data inline on the foreground write"
+        );
+
+        vfs.state.deferred_materialize_inflight.lock().remove(&ino);
+        vfs.release_fh(fh).await.unwrap();
     });
 }
 
