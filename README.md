@@ -1,6 +1,6 @@
 <div align="center">
   <img src="docs/branding/studiofs-logo-final/png/cat_logo.png" alt="StudioFS logo" width="74" />
-  <h1 style="margin: 2px 0 0; font-size: 2.5rem; line-height: 1;">StudioFS</h1>
+  <h1 style="margin: 2px 0 0; font-size: 2.5rem; line-height: 0;">StudioFS</h1>
   <p style="margin: 4px 0 0; font-size: 0.95rem; line-height: 1.2; color: #9aa4b2;">cloud native file system for VFX</p>
 </div>
 
