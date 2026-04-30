@@ -209,6 +209,23 @@ $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'
 cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --test-threads=1
 ```
 
+### WinFSP Write-Through Slow-Cache Validation Plan
+
+SFS-307 changes should be validated on a Windows host with WinFSP installed and
+a deliberately slow cache directory, such as a USB SSD/HDD or a throttled local
+volume. The validation workload is:
+
+1. Mount StudioFS with the slow cache root and normal WinFSP file-cache policy.
+2. Write a multi-GB file sequentially through a handle opened with
+   `FILE_WRITE_THROUGH` or `FILE_NO_INTERMEDIATE_BUFFERING`.
+3. In parallel, issue lightweight metadata/read probes against the mount.
+4. Confirm write throughput degrades instead of hanging permanently, callback
+   latency remains bounded by the local device, `write_through_calls` increases
+   in `winfsp_write_path`, and ordinary read-only handles still benefit from
+   read caching.
+5. Repeat ordinary write/read and cold-read smoke checks after the run to verify
+   the writeback and cold-read paths did not regress.
+
 ### CI smoke workflow
 
 Smoke tests also run in the separate `.github/workflows/smoke.yml` workflow:

@@ -166,7 +166,7 @@ impl StudioVfs {
         len: usize,
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<()> {
-        if !matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) || len == 0 {
+        if !local_sync_policy.is_opportunistic() || len == 0 {
             return Ok(());
         }
         let admission = self.observe_sustained_write_admission(ino, offset, len);
@@ -721,11 +721,11 @@ impl StudioVfs {
         if residual_local_dirty_state {
             self.flush_local_dirty_state(ino, local_sync_policy).await?;
         }
-        if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
+        if local_sync_policy.requires_write_path_durability() {
             self.maybe_payload_store_sync_data_async(
                 materialized_writer_stack_bytes.saturating_add(persisted_slice_bytes_before_flush)
                     as u64,
-                LocalSyncPolicy::Strict,
+                local_sync_policy,
             )
             .await?;
         }
@@ -957,8 +957,8 @@ impl StudioVfs {
         local_sync_policy: LocalSyncPolicy,
     ) -> VfsResult<u32> {
         // `session` is wrapped in Option so we can release it early for opportunistic writes
-        // before local-disk materialization. Strict writes hold the gate through all I/O to
-        // maintain ordering guarantees with concurrent flushes on the same inode.
+        // before local-disk materialization. Durability-required writes hold the gate through
+        // all I/O to maintain ordering guarantees with concurrent flushes on the same inode.
         let mut session = Some(
             self.state
                 .file_session
@@ -1004,31 +1004,36 @@ impl StudioVfs {
             //
             // Duplicate materialization is safe: the local payload store uses last-writer-wins
             // for overlapping block ranges, and orphaned objects are reclaimed by the
-            // background janitor. Strict writes keep the gate to serialize flush/fsync
-            // callers with any concurrent materialization on the same inode.
-            if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+            // background janitor. Durability-required writes keep the gate to serialize
+            // flush/fsync callers with any concurrent materialization on the same inode.
+            if local_sync_policy.is_opportunistic() {
                 session = None;
             }
 
-            if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
+            if local_sync_policy.requires_write_path_durability() {
                 self.wait_for_deferred_materialization_inflight(ino).await;
                 let materialize_strict_started = Instant::now();
-                let strict_result = self.materialize_writer_stack_for_inode(ino).await;
+                // This starts with the target inode, then only drains other dirty
+                // inodes when the global dirty budget still requires it. Using it
+                // as the strict write-through entry point avoids probing the same
+                // inode again in a follow-up limits pass.
+                let strict_result = self.materialize_writer_stack_for_limits(ino).await;
                 self.record_vfs_write_materialize_strict(materialize_strict_started.elapsed());
                 let materialized_bytes = strict_result?;
                 if materialized_bytes > 0 {
                     self.maybe_payload_store_sync_data_async(
                         materialized_bytes as u64,
-                        LocalSyncPolicy::Strict,
+                        local_sync_policy,
                     )
                     .await?;
                 }
             }
+            let dirty_pressure_requires_materialization = self.total_pending_write_buffer_bytes()
+                > self.max_dirty_bytes()
+                || self.state.writer_stack.total_dirty_bytes()
+                    >= self.write_eager_flush_batch_bytes;
             let should_materialize_for_limits =
-                matches!(local_sync_policy, LocalSyncPolicy::Strict)
-                    || self.total_pending_write_buffer_bytes() > self.max_dirty_bytes()
-                    || self.state.writer_stack.total_dirty_bytes()
-                        >= self.write_eager_flush_batch_bytes;
+                local_sync_policy.is_opportunistic() && dirty_pressure_requires_materialization;
             if should_materialize_for_limits {
                 let materialize_for_limits_started = Instant::now();
                 let limits_result = self.materialize_writer_stack_for_limits(ino).await;
@@ -1037,14 +1042,14 @@ impl StudioVfs {
                 );
                 limits_result?;
             }
-            if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
+            if local_sync_policy.requires_write_path_durability() {
                 self.flush_local_dirty_state(ino, local_sync_policy).await?;
             }
             Ok(written)
         }
         .await;
         // For opportunistic writes `session` is already None (gate released above).
-        // For strict writes `session` holds the gate until here.
+        // For durability-required writes `session` holds the gate until here.
         drop(session);
         self.state.file_session.gc_if_idle(ino);
         result
@@ -1088,13 +1093,13 @@ impl StudioVfs {
             super::hard_backpressure_threshold_bytes(self.max_dirty_bytes());
         if self.total_pending_write_buffer_bytes() > hard_backpressure_threshold {
             self.record_deferred_write_hard_backpressure(ino, hard_backpressure_threshold);
-            if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
+            if local_sync_policy.requires_write_path_durability() {
                 return self
                     .write_fh_with_local_sync_policy(fh, ino, offset, data, local_sync_policy)
                     .await;
             }
         }
-        if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+        if local_sync_policy.is_opportunistic() {
             self.maybe_throttle_write_admission(data.len()).await;
             self.maybe_pre_drain_sustained_write_buffer(ino, offset, data.len(), local_sync_policy)
                 .await?;
@@ -1116,7 +1121,7 @@ impl StudioVfs {
         );
         if self.total_pending_write_buffer_bytes() > hard_backpressure_threshold {
             self.record_deferred_write_hard_backpressure(ino, hard_backpressure_threshold);
-            if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
+            if local_sync_policy.requires_write_path_durability() {
                 drop(session);
                 self.state.file_session.gc_if_idle(ino);
                 return self
@@ -1154,7 +1159,7 @@ impl StudioVfs {
         .await;
 
         // Release the gate immediately: data is safe in MountedWriterStack.
-        if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+        if local_sync_policy.is_opportunistic() {
             session = None;
         }
         if let Ok(written) = &result {
@@ -1166,8 +1171,8 @@ impl StudioVfs {
             (Ok(_), LocalSyncPolicy::Opportunistic) => {
                 self.spawn_deferred_materialization_if_needed(ino).await;
             }
-            (Ok(_), LocalSyncPolicy::Strict) => {
-                // Strict: await writer-stack materialization inline.
+            (Ok(_), policy) if policy.requires_write_path_durability() => {
+                // Durability-required: await writer-stack materialization inline.
                 self.wait_for_deferred_materialization_inflight(ino).await;
                 let materialize_strict_started = Instant::now();
                 let materialized_bytes = match self.materialize_writer_stack_for_limits(ino).await {
@@ -1180,15 +1185,6 @@ impl StudioVfs {
                 };
                 self.record_vfs_write_materialize_strict(materialize_strict_started.elapsed());
 
-                let materialize_for_limits_started = Instant::now();
-                if let Err(e) = self.materialize_writer_stack_for_inode(ino).await {
-                    drop(session);
-                    self.state.file_session.gc_if_idle(ino);
-                    return Err(e);
-                }
-                self.record_vfs_write_materialize_for_limits(
-                    materialize_for_limits_started.elapsed(),
-                );
                 if let Err(e) = self.flush_local_dirty_state(ino, local_sync_policy).await {
                     drop(session);
                     self.state.file_session.gc_if_idle(ino);
@@ -1197,7 +1193,7 @@ impl StudioVfs {
                 if let Err(e) = self
                     .maybe_payload_store_sync_data_async(
                         materialized_bytes as u64,
-                        LocalSyncPolicy::Strict,
+                        local_sync_policy,
                     )
                     .await
                 {

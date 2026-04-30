@@ -24,8 +24,8 @@ use windows::Win32::Security::{
     GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR,
 };
 use winfsp::U16CStr;
-use winfsp::filesystem::DirBuffer;
 use winfsp::filesystem::*;
+use winfsp::filesystem::{AsyncFileSystemContext, DirBuffer};
 use winfsp::notify::{Notifier, NotifyInfo, NotifyingFileSystemContext};
 use winfsp_sys::{FILE_ACCESS_RIGHTS, FILE_FLAGS_AND_ATTRIBUTES, FspFileSystemGetOperationContext};
 
@@ -216,11 +216,16 @@ fn open_flags_from_access(granted_access: FILE_ACCESS_RIGHTS, _create_options: u
     }
 }
 
-fn write_local_sync_policy_from_create_options(_create_options: u32) -> LocalSyncPolicy {
-    // WinFSP callbacks run on a bounded dispatcher pool and `spawn_wait` parks
-    // that dispatcher until the async write completes. Do not let per-open
-    // write-through/no-buffering flags force foreground fdatasync from write();
-    // explicit flush and last-close still own the durable local barrier.
+const FILE_WRITE_THROUGH_CREATE_OPTION: u32 = 0x0000_0002;
+const FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION: u32 = 0x0000_0008;
+
+fn write_local_sync_policy_from_create_options(create_options: u32) -> LocalSyncPolicy {
+    if (create_options
+        & (FILE_WRITE_THROUGH_CREATE_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION))
+        != 0
+    {
+        return LocalSyncPolicy::WriteThrough;
+    }
     LocalSyncPolicy::Opportunistic
 }
 
@@ -659,6 +664,22 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
     }
 }
 
+fn pre_write_size_for_winfsp_write(
+    vfs: &StudioVfs,
+    ino: Ino,
+    write_to_eof: bool,
+    constrained_io: bool,
+) -> winfsp::Result<Option<u64>> {
+    if !(write_to_eof || constrained_io) {
+        return Ok(None);
+    }
+    vfs.peek_dirty_attr(ino)
+        .map(Ok)
+        .unwrap_or_else(|| vfs.getattr(ino))
+        .map(|attr| Some(attr.size))
+        .map_err(vfs_to_winfsp_err)
+}
+
 fn is_benign_cleanup_delete_error(e: &studiofs_vfs::VfsError, deleting_dir: bool) -> bool {
     match classify_vfs_error(e) {
         BridgeVfsErrorKind::NotFound => true,
@@ -1000,8 +1021,10 @@ impl StudioFsContext {
     /// This is important because WinFSP uses IOCP with a limited concurrency.
     /// `block_on` makes the current thread drive the future, which can interact
     /// poorly with the tokio IO reactor when called from non-runtime threads.
-    /// Local cache I/O runs inline once inside this runtime boundary, so we
-    /// avoid per-operation blocking-pool hops in the hot read/write path.
+    /// The mounted read/write/readdir hot path uses `AsyncFileSystemContext`
+    /// instead. This helper remains for synchronous WinFSP callbacks such as
+    /// create/open/flush/close and for unit tests that call the sync trait
+    /// surface directly.
     /// Expected operational failures must be propagated as `Result`, not panics.
     fn spawn_wait<F, T>(&self, f: F) -> T
     where
@@ -1205,27 +1228,16 @@ impl FileSystemContext for StudioFsContext {
         let callback_started = Instant::now();
         // Resolve actual write offset.  Prefer the in-memory dirty attr (free)
         // and fall back to the full getattr only when there is no dirty state.
+        let pre_write_size =
+            pre_write_size_for_winfsp_write(&self.vfs, context.ino, write_to_eof, constrained_io)?;
         let actual_offset = if write_to_eof {
-            let attr = self
-                .vfs
-                .peek_dirty_attr(context.ino)
-                .map(Ok)
-                .unwrap_or_else(|| self.vfs.getattr(context.ino))
-                .map_err(vfs_to_winfsp_err)?;
-            attr.size
+            pre_write_size.unwrap_or(offset)
         } else {
             offset
         };
 
         // Constrained I/O: paging writes must not extend the file beyond its current size
-        if constrained_io {
-            let attr = self
-                .vfs
-                .peek_dirty_attr(context.ino)
-                .map(Ok)
-                .unwrap_or_else(|| self.vfs.getattr(context.ino))
-                .map_err(vfs_to_winfsp_err)?;
-            let fsize = attr.size;
+        if constrained_io && let Some(fsize) = pre_write_size {
             if actual_offset >= fsize {
                 return Ok(0);
             }
@@ -1589,6 +1601,121 @@ impl FileSystemContext for StudioFsContext {
     }
 }
 
+impl AsyncFileSystemContext for StudioFsContext {
+    fn read_async(
+        &self,
+        context: &Self::FileContext,
+        buffer: &mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = winfsp::Result<u32>> + Send {
+        let ino = context.ino;
+        let fh = context.fh;
+        let open_flags = context.open_flags;
+        let vfs = self.vfs.clone();
+
+        async move {
+            match vfs.read_into_fh(fh, ino, offset, buffer).await {
+                Ok(n) => {
+                    trace!(ino, fh, offset, n, open_flags = open_flags.bits(), "read");
+                    Ok(n)
+                }
+                Err(e) => Err(vfs_to_winfsp_err(e)),
+            }
+        }
+    }
+
+    fn write_async(
+        &self,
+        context: &Self::FileContext,
+        mut buffer: &[u8],
+        offset: u64,
+        write_to_eof: bool,
+        constrained_io: bool,
+        file_info: &mut FileInfo,
+    ) -> impl std::future::Future<Output = winfsp::Result<u32>> + Send {
+        self.vfs.note_winfsp_write_callback();
+        let callback_started = Instant::now();
+        let ino = context.ino;
+        let fh = context.fh;
+        let open_flags = context.open_flags;
+        let local_sync_policy = context.write_local_sync_policy;
+        let vfs = self.vfs.clone();
+
+        async move {
+            let pre_write_size =
+                pre_write_size_for_winfsp_write(&vfs, ino, write_to_eof, constrained_io)?;
+            let actual_offset = if write_to_eof {
+                pre_write_size.unwrap_or(offset)
+            } else {
+                offset
+            };
+
+            if constrained_io && let Some(fsize) = pre_write_size {
+                if actual_offset >= fsize {
+                    return Ok(0);
+                }
+                let max_len = (fsize - actual_offset) as usize;
+                if buffer.len() > max_len {
+                    buffer = &buffer[..max_len];
+                }
+            }
+
+            let vfs_write_started = Instant::now();
+            let written = vfs
+                .write_fh_with_deferred_materialize(
+                    fh,
+                    ino,
+                    actual_offset,
+                    buffer,
+                    local_sync_policy,
+                )
+                .await
+                .map_err(vfs_to_winfsp_err)?;
+            let vfs_write_elapsed = vfs_write_started.elapsed();
+
+            let post_write_getattr_started = Instant::now();
+            let attr = vfs
+                .peek_dirty_attr(ino)
+                .map(Ok)
+                .unwrap_or_else(|| vfs.getattr(ino))
+                .map_err(vfs_to_winfsp_err)?;
+            *file_info = attr_to_file_info(&attr);
+            let post_write_getattr_elapsed = post_write_getattr_started.elapsed();
+            vfs.record_winfsp_write_callback_observability(
+                buffer.len(),
+                local_sync_policy,
+                callback_started.elapsed(),
+                vfs_write_elapsed,
+                post_write_getattr_elapsed,
+            );
+
+            trace!(
+                ino,
+                fh,
+                offset = actual_offset,
+                written,
+                open_flags = open_flags.bits(),
+                "write"
+            );
+            Ok(written)
+        }
+    }
+
+    async fn read_directory_async(
+        &self,
+        context: &Self::FileContext,
+        pattern: Option<&U16CStr>,
+        marker: DirMarker<'_>,
+        buffer: &mut [u8],
+    ) -> winfsp::Result<u32> {
+        <Self as FileSystemContext>::read_directory(self, context, pattern, marker, buffer)
+    }
+
+    fn spawn_task(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        self.rt.spawn(future);
+    }
+}
+
 // ─── WinFSP Notify (Kernel Cache Invalidation) ──────────────────────────────
 
 /// Windows FILE_NOTIFY_CHANGE_* / FILE_ACTION_* constants.
@@ -1726,7 +1853,7 @@ mod tests {
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
     use winfsp::U16CString;
-    use winfsp::filesystem::FileSystemContext;
+    use winfsp::filesystem::{AsyncFileSystemContext, FileSystemContext};
 
     const FILE_WRITE_THROUGH_OPTION: u32 = 0x0000_0002;
     const FILE_NO_INTERMEDIATE_BUFFERING_OPTION: u32 = 0x0000_0008;
@@ -1822,6 +1949,18 @@ mod tests {
     ) -> studiofs_vfs::VfsWritePathWinfspForegroundFlushStats {
         vfs.write_path_observability_snapshot()
             .winfsp_foreground_flushes
+    }
+
+    #[test]
+    fn studiofs_context_implements_async_winfsp_io_surface() {
+        fn assert_async_context<T>()
+        where
+            T: AsyncFileSystemContext,
+            <T as FileSystemContext>::FileContext: Sync,
+        {
+        }
+
+        assert_async_context::<StudioFsContext>();
     }
 
     #[test]
@@ -2704,22 +2843,22 @@ mod tests {
         );
         assert_eq!(
             write_local_sync_policy_from_create_options(FILE_WRITE_THROUGH_OPTION),
-            LocalSyncPolicy::Opportunistic
+            LocalSyncPolicy::WriteThrough
         );
         assert_eq!(
             write_local_sync_policy_from_create_options(FILE_NO_INTERMEDIATE_BUFFERING_OPTION),
-            LocalSyncPolicy::Opportunistic
+            LocalSyncPolicy::WriteThrough
         );
         assert_eq!(
             write_local_sync_policy_from_create_options(
                 FILE_WRITE_THROUGH_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_OPTION
             ),
-            LocalSyncPolicy::Opportunistic
+            LocalSyncPolicy::WriteThrough
         );
     }
 
     #[test]
-    fn write_through_write_callback_defers_local_sync_until_flush() {
+    fn write_through_write_callback_commits_local_state_immediately() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("write_callback_write_through");
         let attr = vfs
             .create(ROOT_INO, b"write-through-callback.txt", 0, 0, 0o644)
@@ -2752,30 +2891,101 @@ mod tests {
         .expect("write callback");
 
         assert_eq!(
-            sync_data_calls(&vfs),
-            sync_calls_before,
-            "write-through / unbuffered WinFSP writes must not call fdatasync from write()"
+            vfs.open_count(attr.ino),
+            1,
+            "write-through durability must not release the handle"
+        );
+        assert!(
+            sync_data_calls(&vfs) > sync_calls_before,
+            "write-through / unbuffered WinFSP writes must cross a local payload sync barrier"
+        );
+        assert!(
+            flush_barrier_calls(&vfs) > flush_calls_before,
+            "write-through / unbuffered WinFSP writes must commit local metadata before returning"
+        );
+        assert!(
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "write-through / unbuffered WinFSP writes should leave no deferred local dirty state"
+        );
+        let write_path = vfs.write_path_observability_snapshot().winfsp_write_path;
+        assert_eq!(
+            write_path.write_through_calls, 1,
+            "write-through callbacks should be attributed separately from strict writes"
         );
         assert_eq!(
-            flush_barrier_calls(&vfs),
-            flush_calls_before,
-            "write-through / unbuffered WinFSP writes must not commit the local metadata barrier from write()"
+            write_path.strict_calls, 0,
+            "write-through callbacks should not be reported as ordinary strict writes"
         );
+        let sync_calls_after_write = sync_data_calls(&vfs);
+        let flush_calls_after_write = flush_barrier_calls(&vfs);
 
         ctx.run_flush_callback(attr.ino, fh)
             .expect("flush callback");
         assert_eq!(
             sync_data_calls(&vfs),
-            sync_calls_before,
-            "write-through / unbuffered WinFSP writeback flush must not call fdatasync from the dispatcher"
+            sync_calls_after_write,
+            "explicit flush after write-through should be clean"
+        );
+        assert_eq!(
+            flush_barrier_calls(&vfs),
+            flush_calls_after_write,
+            "explicit flush after write-through should not commit another local metadata barrier"
         );
         assert!(
             !vfs.inode_has_local_dirty_state(attr.ino),
-            "explicit flush should still cross the local writeback boundary"
+            "explicit flush after write-through should remain clean"
+        );
+
+        ctx.spawn_wait({
+            let vfs = vfs.clone();
+            async move { vfs.release_fh(fh).await }
+        })
+        .expect("release_fh");
+    }
+
+    #[test]
+    fn write_through_async_write_commits_local_state_immediately() {
+        let (_tmp, vfs, ctx, _queue) = make_test_context("write_async_write_through");
+        let attr = vfs
+            .create(ROOT_INO, b"write-through-async.txt", 0, 0, 0o644)
+            .expect("create");
+        let fh = vfs
+            .open_file(attr.ino, OpenFlags::RDWR, false)
+            .expect("open_file");
+        let handle = StudioFileHandle::new_with_local_sync_policy(
+            attr.ino,
+            false,
+            fh,
+            OpenFlags::RDWR,
+            write_local_sync_policy_from_create_options(FILE_WRITE_THROUGH_OPTION),
+        );
+        let mut file_info = winfsp::filesystem::FileInfo::default();
+        let flush_calls_before = flush_barrier_calls(&vfs);
+        let sync_calls_before = sync_data_calls(&vfs);
+
+        ctx.rt
+            .block_on(AsyncFileSystemContext::write_async(
+                &ctx,
+                &handle,
+                b"durable",
+                0,
+                false,
+                false,
+                &mut file_info,
+            ))
+            .expect("write_async");
+
+        assert!(
+            sync_data_calls(&vfs) > sync_calls_before,
+            "write-through async WinFSP writes must cross a local payload sync barrier"
         );
         assert!(
             flush_barrier_calls(&vfs) > flush_calls_before,
-            "explicit flush should still commit materialized slices through the local metadata barrier"
+            "write-through async WinFSP writes must commit local metadata before completion"
+        );
+        assert!(
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "write-through async WinFSP writes should leave no deferred local dirty state"
         );
 
         ctx.spawn_wait({

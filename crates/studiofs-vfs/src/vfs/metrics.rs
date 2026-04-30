@@ -109,6 +109,10 @@ pub struct VfsWritePathWinfspWritePathStats {
     #[serde(default)]
     pub strict_bytes: u64,
     #[serde(default)]
+    pub write_through_calls: u64,
+    #[serde(default)]
+    pub write_through_bytes: u64,
+    #[serde(default)]
     pub opportunistic_calls: u64,
     #[serde(default)]
     pub opportunistic_bytes: u64,

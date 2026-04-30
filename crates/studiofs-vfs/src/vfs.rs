@@ -2083,6 +2083,8 @@ struct MetricsState {
     winfsp_write_callback_getattr_histogram: LatencyHistogram,
     winfsp_write_callback_strict_calls: AtomicU64,
     winfsp_write_callback_strict_bytes: AtomicU64,
+    winfsp_write_callback_write_through_calls: AtomicU64,
+    winfsp_write_callback_write_through_bytes: AtomicU64,
     winfsp_write_callback_opportunistic_calls: AtomicU64,
     winfsp_write_callback_opportunistic_bytes: AtomicU64,
     winfsp_overwrite_callbacks: AtomicU64,
@@ -2193,6 +2195,8 @@ impl MetricsState {
             winfsp_write_callback_getattr_histogram: LatencyHistogram::default(),
             winfsp_write_callback_strict_calls: AtomicU64::new(0),
             winfsp_write_callback_strict_bytes: AtomicU64::new(0),
+            winfsp_write_callback_write_through_calls: AtomicU64::new(0),
+            winfsp_write_callback_write_through_bytes: AtomicU64::new(0),
             winfsp_write_callback_opportunistic_calls: AtomicU64::new(0),
             winfsp_write_callback_opportunistic_bytes: AtomicU64::new(0),
             winfsp_overwrite_callbacks: AtomicU64::new(0),
@@ -2285,6 +2289,12 @@ impl MetricsState {
             vfs_write_materialize_for_limits_max_ns,
             winfsp_write_callbacks,
             winfsp_write_callback_bytes,
+            winfsp_write_callback_strict_calls,
+            winfsp_write_callback_strict_bytes,
+            winfsp_write_callback_write_through_calls,
+            winfsp_write_callback_write_through_bytes,
+            winfsp_write_callback_opportunistic_calls,
+            winfsp_write_callback_opportunistic_bytes,
             winfsp_write_callback_total_ns,
             winfsp_write_callback_max_ns,
             winfsp_write_callback_vfs_total_ns,
@@ -5491,7 +5501,7 @@ impl StudioVfs {
         }
 
         let sync_gate_wait_started = Instant::now();
-        let _sync_gate = if matches!(local_sync_policy, LocalSyncPolicy::Opportunistic) {
+        let _sync_gate = if local_sync_policy.is_opportunistic() {
             match self.state.local_dirty.local_sync_gate.try_lock() {
                 Ok(guard) => guard,
                 Err(_) => {
@@ -6741,6 +6751,14 @@ impl StudioVfs {
                     .winfsp_write_callback_strict_bytes
                     .fetch_add(write_bytes as u64, Ordering::Relaxed);
             }
+            LocalSyncPolicy::WriteThrough => {
+                metrics
+                    .winfsp_write_callback_write_through_calls
+                    .fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .winfsp_write_callback_write_through_bytes
+                    .fetch_add(write_bytes as u64, Ordering::Relaxed);
+            }
             LocalSyncPolicy::Opportunistic => {
                 metrics
                     .winfsp_write_callback_opportunistic_calls
@@ -7328,6 +7346,16 @@ impl StudioVfs {
                     .state
                     .metrics
                     .winfsp_write_callback_strict_bytes
+                    .load(Ordering::Relaxed),
+                write_through_calls: self
+                    .state
+                    .metrics
+                    .winfsp_write_callback_write_through_calls
+                    .load(Ordering::Relaxed),
+                write_through_bytes: self
+                    .state
+                    .metrics
+                    .winfsp_write_callback_write_through_bytes
                     .load(Ordering::Relaxed),
                 opportunistic_calls: self
                     .state
