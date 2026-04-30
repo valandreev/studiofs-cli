@@ -684,6 +684,7 @@ impl FetchScheduler {
             let payload = self
                 .fetch_fragment_with_retry(object_id, 0, key, class)
                 .await?;
+            validate_single_fragment_payload_len(object_id, payload.len())?;
             let cache_put_start = Instant::now();
             self.payload_store_put_async(object_id, payload.clone(), true)
                 .await?;
@@ -1113,6 +1114,16 @@ fn fetch_transit_budget_bytes(fragment_count: usize) -> usize {
         .max(1)
 }
 
+fn validate_single_fragment_payload_len(object_id: u64, len: usize) -> Result<(), FetchError> {
+    if len > CLOUD_FRAGMENT_SIZE {
+        return Err(FetchError::CorruptFragment {
+            object_id,
+            reason: format!("fragment 0 length {len} exceeds max {CLOUD_FRAGMENT_SIZE}"),
+        });
+    }
+    Ok(())
+}
+
 trait DurationToU64 {
     fn to_nanos_u64(self) -> u64;
 }
@@ -1366,6 +1377,21 @@ mod tests {
             fetch_transit_budget_bytes(2) > 2 * CLOUD_FRAGMENT_SIZE,
             "multi-fragment fetches still need assembled payload plus fragment headroom"
         );
+    }
+
+    #[test]
+    fn single_fragment_payload_validation_rejects_oversized_payload() {
+        let object_id = 0x5151;
+        let err =
+            validate_single_fragment_payload_len(object_id, CLOUD_FRAGMENT_SIZE + 1).unwrap_err();
+
+        assert!(matches!(
+            err,
+            FetchError::CorruptFragment {
+                object_id: found,
+                ..
+            } if found == object_id
+        ));
     }
 
     #[test]
