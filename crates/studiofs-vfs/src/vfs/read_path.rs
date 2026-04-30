@@ -547,6 +547,10 @@ impl<'a> DataReader<'a> {
             return Ok(());
         }
         if matches!(mode, RemoteFetchMode::ForegroundColdRead) && remote_blocks.len() <= 1 {
+            // Keep single-block foreground cold reads on the legacy assembly
+            // path. The eager warmup path is only for multi-block reads where
+            // parallelism can hide S3 latency without adding an extra fetch
+            // stage to the common 4 MiB callback.
             return Ok(());
         }
 

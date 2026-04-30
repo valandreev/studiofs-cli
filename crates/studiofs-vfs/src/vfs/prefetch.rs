@@ -469,6 +469,9 @@ impl StudioVfs {
         let PrefetchHintUpdate::Store(_) = update else {
             return;
         };
+        // The stored range is only for duplicate suppression. Feed the actual
+        // current read range to readahead so the sequential detector sees
+        // forward progress instead of a repeatedly merged historical span.
         let _ = self.prefetch_tx.send(PrefetchWorkItem::ReadHint {
             ino,
             stream_id,
