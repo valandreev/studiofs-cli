@@ -637,7 +637,7 @@ const DEFAULT_JANITOR_LEASE_TTL: Duration = Duration::from_secs(45 * 60);
 // - buffer-size: 300M
 const DEFAULT_READ_BUFFER_MB: u64 = 300;
 // Block-level derived defaults (used as fallback if conversion is unavailable).
-const DEFAULT_PREFETCH_CONCURRENCY: usize = 1;
+const DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
 const DEFAULT_READAHEAD_WIDTH: u32 = 18;
 const DEFAULT_READAHEAD_MIN_PREFETCH: u32 = 1;
 const DEFAULT_READAHEAD_SEQ_STEP: u8 = 4;
@@ -7106,6 +7106,27 @@ impl StudioVfs {
         let fetch_local_cache_backend_max_ns = fetch_metrics
             .local_cache_io_backend_max_ns
             .load(Ordering::Relaxed);
+        let fetch_s3_get_calls = fetch_metrics.s3_get_calls.load(Ordering::Relaxed);
+        let fetch_s3_get_total_ns = fetch_metrics.s3_get_total_ns.load(Ordering::Relaxed);
+        let fetch_s3_get_max_ns = fetch_metrics.s3_get_max_ns.load(Ordering::Relaxed);
+        let fetch_object_decode_calls = fetch_metrics.object_decode_calls.load(Ordering::Relaxed);
+        let fetch_object_decode_total_ns =
+            fetch_metrics.object_decode_total_ns.load(Ordering::Relaxed);
+        let fetch_object_decode_max_ns = fetch_metrics.object_decode_max_ns.load(Ordering::Relaxed);
+        let fetch_assemble_copy_calls = fetch_metrics.assemble_copy_calls.load(Ordering::Relaxed);
+        let fetch_assemble_copy_total_ns =
+            fetch_metrics.assemble_copy_total_ns.load(Ordering::Relaxed);
+        let fetch_assemble_copy_max_ns = fetch_metrics.assemble_copy_max_ns.load(Ordering::Relaxed);
+        let fetch_local_cache_put_calls =
+            fetch_metrics.local_cache_put_calls.load(Ordering::Relaxed);
+        let fetch_local_cache_put_total_ns = fetch_metrics
+            .local_cache_put_total_ns
+            .load(Ordering::Relaxed);
+        let fetch_local_cache_put_max_ns =
+            fetch_metrics.local_cache_put_max_ns.load(Ordering::Relaxed);
+        let fetch_total_calls = fetch_metrics.fetch_total_calls.load(Ordering::Relaxed);
+        let fetch_total_ns = fetch_metrics.fetch_total_ns.load(Ordering::Relaxed);
+        let fetch_total_max_ns = fetch_metrics.fetch_total_max_ns.load(Ordering::Relaxed);
         let pending_upload_bytes =
             usize::try_from(upload_stats.pending_upload_bytes).unwrap_or(usize::MAX);
         let storage_stats = self.local_payload_backend.storage_stats();
@@ -7541,6 +7562,49 @@ impl StudioVfs {
                 },
                 local_cache_backend_io_max_ms: fetch_local_cache_backend_max_ns as f64
                     / 1_000_000.0,
+                s3_get_calls: fetch_s3_get_calls,
+                s3_get_total_ms: fetch_s3_get_total_ns as f64 / 1_000_000.0,
+                s3_get_avg_ms: if fetch_s3_get_calls == 0 {
+                    0.0
+                } else {
+                    (fetch_s3_get_total_ns as f64 / fetch_s3_get_calls as f64) / 1_000_000.0
+                },
+                s3_get_max_ms: fetch_s3_get_max_ns as f64 / 1_000_000.0,
+                object_decode_calls: fetch_object_decode_calls,
+                object_decode_total_ms: fetch_object_decode_total_ns as f64 / 1_000_000.0,
+                object_decode_avg_ms: if fetch_object_decode_calls == 0 {
+                    0.0
+                } else {
+                    (fetch_object_decode_total_ns as f64 / fetch_object_decode_calls as f64)
+                        / 1_000_000.0
+                },
+                object_decode_max_ms: fetch_object_decode_max_ns as f64 / 1_000_000.0,
+                assemble_copy_calls: fetch_assemble_copy_calls,
+                assemble_copy_total_ms: fetch_assemble_copy_total_ns as f64 / 1_000_000.0,
+                assemble_copy_avg_ms: if fetch_assemble_copy_calls == 0 {
+                    0.0
+                } else {
+                    (fetch_assemble_copy_total_ns as f64 / fetch_assemble_copy_calls as f64)
+                        / 1_000_000.0
+                },
+                assemble_copy_max_ms: fetch_assemble_copy_max_ns as f64 / 1_000_000.0,
+                local_cache_put_calls: fetch_local_cache_put_calls,
+                local_cache_put_total_ms: fetch_local_cache_put_total_ns as f64 / 1_000_000.0,
+                local_cache_put_avg_ms: if fetch_local_cache_put_calls == 0 {
+                    0.0
+                } else {
+                    (fetch_local_cache_put_total_ns as f64 / fetch_local_cache_put_calls as f64)
+                        / 1_000_000.0
+                },
+                local_cache_put_max_ms: fetch_local_cache_put_max_ns as f64 / 1_000_000.0,
+                fetch_total_calls,
+                fetch_total_ms: fetch_total_ns as f64 / 1_000_000.0,
+                fetch_total_avg_ms: if fetch_total_calls == 0 {
+                    0.0
+                } else {
+                    (fetch_total_ns as f64 / fetch_total_calls as f64) / 1_000_000.0
+                },
+                fetch_total_max_ms: fetch_total_max_ns as f64 / 1_000_000.0,
             },
             payload_burst: VfsWritePathBurstStats {
                 bursts: payload_burst_count,

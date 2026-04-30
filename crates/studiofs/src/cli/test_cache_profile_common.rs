@@ -222,6 +222,19 @@ pub(crate) fn render_write_path_summary(bytes: &[u8]) -> Result<String> {
         snapshot.fetch.prefetch_skips
     ));
     out.push_str(&format!(
+        "fetch_stages_ms: s3_get_avg={:.2} s3_get_max={:.2} decode_avg={:.2} decode_max={:.2} assemble_copy_avg={:.2} assemble_copy_max={:.2} local_cache_put_avg={:.2} local_cache_put_max={:.2} total_avg={:.2} total_max={:.2}\n",
+        snapshot.fetch.s3_get_avg_ms,
+        snapshot.fetch.s3_get_max_ms,
+        snapshot.fetch.object_decode_avg_ms,
+        snapshot.fetch.object_decode_max_ms,
+        snapshot.fetch.assemble_copy_avg_ms,
+        snapshot.fetch.assemble_copy_max_ms,
+        snapshot.fetch.local_cache_put_avg_ms,
+        snapshot.fetch.local_cache_put_max_ms,
+        snapshot.fetch.fetch_total_avg_ms,
+        snapshot.fetch.fetch_total_max_ms
+    ));
+    out.push_str(&format!(
         "payload_persist_p95_ms: {:.2}\n",
         snapshot.payload_persist.latency_quantiles_ms.p95
     ));

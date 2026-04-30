@@ -136,6 +136,20 @@ fn render_mounted_observability(out: &mut String, observability: &MountedObserva
             fetch.singleflight_joins,
             fetch.prefetch_skips,
         );
+        let _ = writeln!(
+            out,
+            "Fetch stages avg/max: S3 GET {}/{}, decode {}/{}, assemble copy {}/{}, cache put {}/{}, total {}/{}",
+            format_duration_ms(fetch.raw.s3_get_avg_ms),
+            format_duration_ms(fetch.raw.s3_get_max_ms),
+            format_duration_ms(fetch.raw.object_decode_avg_ms),
+            format_duration_ms(fetch.raw.object_decode_max_ms),
+            format_duration_ms(fetch.raw.assemble_copy_avg_ms),
+            format_duration_ms(fetch.raw.assemble_copy_max_ms),
+            format_duration_ms(fetch.raw.local_cache_put_avg_ms),
+            format_duration_ms(fetch.raw.local_cache_put_max_ms),
+            format_duration_ms(fetch.raw.fetch_total_avg_ms),
+            format_duration_ms(fetch.raw.fetch_total_max_ms),
+        );
     }
     if let Some(barriers) = &observability.barriers {
         let _ = writeln!(

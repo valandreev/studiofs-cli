@@ -424,8 +424,19 @@ Operator stance:
 | `--cache-size` | `100GB` | Local data-cache budget |
 | `--read-buffer` | `300MB` | Foreground read-buffer budget |
 | `--readahead` | `18` | Sequential readahead width in blocks |
-| `--prefetch` | `1` | Prefetch concurrency budget |
+| `--prefetch` | `8` | Background prefetch batch concurrency budget |
 | `--principal` / `STUDIOFS_PRINCIPAL` | `*` | Principal used for ACL checks |
+
+For cold sequential reads, leave `--read-buffer` at `300MB` or higher unless
+memory is constrained. The runtime derives the foreground fetch AIMD ceiling
+from `--read-buffer` and block size, so the default 4 MiB block layout starts
+with multiple foreground S3 GETs in flight. `--readahead` controls how far the
+sequential detector looks ahead, while `--prefetch` controls how many
+background prefetch batches may run; foreground reads still have priority
+through fetch reserve slots and the transit-memory budget. The effective
+prefetch reserve is capped to at most half of the current fetch AIMD window so
+the default foreground reserve cannot collapse cold sequential prefetch to only
+one or two active S3 GETs during ramp-up.
 
 The writeback dirty-buffer default is `300MB` (`max_dirty_bytes`), matching the
 JuiceFS default read/write buffer size. StudioFS derives the soft throttle window
@@ -515,8 +526,9 @@ Upload local-I/O tuning notes:
 - adaptive upload penalty is enforced before local-cache read permits are acquired, so throttling creates disk idle gaps before background L2 reads.
 - per-upload foreground cache cost is derived internally from cache budget; there is no separate user-tuned penalty knob.
 - if an upload worker already delayed an op for coalescing, adaptive pre-read sleep is reduced by the already waited delay for that op.
-- fetch transit-budget accounting includes assembled object payload plus bounded in-flight fragment headroom.
+- fetch transit-budget accounting includes assembled object payload plus bounded in-flight fragment headroom. Single-fragment 4 MiB object reads avoid reserving extra assembled-copy headroom.
 - if a single fetch request exceeds the derived transit-memory budget, StudioFS returns a fetch error instead of silently clamping the credit request.
+- fetch observability reports S3 GET, object decode/checksum, assemble/copy, local cache put, and total fetch timings separately.
 - speedometer logs include `foreground_read_p90_present`, `foreground_read_p90_ms`, `foreground_read_window_bytes`, `foreground_read_window_coverage_ms`, and `foreground_read_throughput_bytes_per_sec` for stable parsing even when upload interference is intermittent.
 - upload throttling uses the same foreground-read speedometer plus the dominant access policy's `upload_pressure_boost`, so sequential media reads raise upload penalty faster than random interactive probes without adding a separate scheduler loop.
 - background/emergency pressure-maintenance eviction can switch to bounded batch mode for large reclaim targets to reduce per-block lock/scheduler overhead while preserving lock release between batches.

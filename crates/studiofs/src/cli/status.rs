@@ -720,6 +720,19 @@ pub fn run(
                 snapshot.fetch.prefetch_skips
             );
             println!(
+                "  fetch stages avg/max ms s3_get {}/{} decode {}/{} assemble_copy {}/{} cache_put {}/{} total {}/{}",
+                format_ms(snapshot.fetch.s3_get_avg_ms),
+                format_ms(snapshot.fetch.s3_get_max_ms),
+                format_ms(snapshot.fetch.object_decode_avg_ms),
+                format_ms(snapshot.fetch.object_decode_max_ms),
+                format_ms(snapshot.fetch.assemble_copy_avg_ms),
+                format_ms(snapshot.fetch.assemble_copy_max_ms),
+                format_ms(snapshot.fetch.local_cache_put_avg_ms),
+                format_ms(snapshot.fetch.local_cache_put_max_ms),
+                format_ms(snapshot.fetch.fetch_total_avg_ms),
+                format_ms(snapshot.fetch.fetch_total_max_ms),
+            );
+            println!(
                 "  WinFSP callbacks write/flush/cleanup->flush_fh: {}/{}/{}",
                 snapshot.winfsp_callbacks.write,
                 snapshot.winfsp_callbacks.flush,

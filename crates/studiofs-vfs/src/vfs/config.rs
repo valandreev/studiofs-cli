@@ -835,6 +835,10 @@ mod tests {
             validated.upload_request_timeout_secs,
             defaults.upload_request_timeout_secs
         );
+        assert!(
+            validated.prefetch_concurrency > 1,
+            "default background prefetch should keep multiple batches in flight for cold sequential reads"
+        );
     }
 
     #[test]
