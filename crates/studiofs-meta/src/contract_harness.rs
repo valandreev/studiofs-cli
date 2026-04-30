@@ -1,8 +1,8 @@
 //! Shared Contract/Core fixtures for fast local metadata tests.
 
 use crate::schema::{
-    CURRENT_FORMAT_VERSION, DirEntry, FileType, FormatInfo, InodeAttr, InodeLifecycleState,
-    MetadataConfig, ROOT_INO, RenameAtomicResult,
+    CURRENT_FORMAT_VERSION, FileType, FormatInfo, InodeAttr, InodeLifecycleState, MetadataConfig,
+    ROOT_INO, RenameAtomicResult,
 };
 use crate::{
     MetaError, MetaFormat, MetaFsOps, MetaInodes, MetaNamespace, MetaPayloadObjects, MetaResult,
@@ -259,6 +259,15 @@ impl fmt::Display for ContractInvariantViolation {
 
 impl Error for ContractInvariantViolation {}
 
+struct TreeInvariantState<'a> {
+    diagnostics: &'a mut ContractInvariantDiagnostics,
+    attr_by_ino: &'a BTreeMap<u64, InodeAttr>,
+    visited_dirs: &'a mut BTreeSet<u64>,
+    reachable_inos: &'a mut BTreeSet<u64>,
+    dentry_counts: &'a mut BTreeMap<u64, usize>,
+    direct_subdir_counts: &'a mut BTreeMap<u64, usize>,
+}
+
 /// Temporary local fixture that owns an isolated redb metadata database.
 pub struct ContractCoreFixture {
     root: ContractTempDir,
@@ -406,15 +415,16 @@ impl ContractCoreFixture {
         let mut visited_dirs = BTreeSet::new();
         let mut reachable_inos = BTreeSet::from([ROOT_INO]);
         let mut dentry_counts = BTreeMap::<u64, usize>::new();
-        self.collect_tree(
-            &meta,
+        let mut direct_subdir_counts = BTreeMap::<u64, usize>::new();
+        let mut tree_state = TreeInvariantState {
             diagnostics,
-            ROOT_INO,
-            &attr_by_ino,
-            &mut visited_dirs,
-            &mut reachable_inos,
-            &mut dentry_counts,
-        )?;
+            attr_by_ino: &attr_by_ino,
+            visited_dirs: &mut visited_dirs,
+            reachable_inos: &mut reachable_inos,
+            dentry_counts: &mut dentry_counts,
+            direct_subdir_counts: &mut direct_subdir_counts,
+        };
+        Self::collect_tree_iterative(&meta, &mut tree_state)?;
 
         for attr in attr_by_ino.values() {
             if reachable_inos.contains(&attr.ino) {
@@ -435,6 +445,17 @@ impl ContractCoreFixture {
                     diagnostics.push_violation(format!(
                         "inode {} has nlink={} but {} reachable dentries",
                         attr.ino, attr.nlink, count
+                    ));
+                }
+            }
+
+            if attr.kind == FileType::Directory && reachable_inos.contains(&attr.ino) {
+                let expected_nlink = 2usize
+                    .saturating_add(direct_subdir_counts.get(&attr.ino).copied().unwrap_or(0));
+                if attr.nlink as usize != expected_nlink {
+                    diagnostics.push_violation(format!(
+                        "directory inode {} has nlink={} but expected {}",
+                        attr.ino, attr.nlink, expected_nlink
                     ));
                 }
             }
@@ -474,112 +495,87 @@ impl ContractCoreFixture {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn collect_tree(
-        &self,
+    fn collect_tree_iterative(
         meta: &Arc<RedbMetaEngine>,
-        diagnostics: &mut ContractInvariantDiagnostics,
-        parent: u64,
-        attr_by_ino: &BTreeMap<u64, InodeAttr>,
-        visited_dirs: &mut BTreeSet<u64>,
-        reachable_inos: &mut BTreeSet<u64>,
-        dentry_counts: &mut BTreeMap<u64, usize>,
+        state: &mut TreeInvariantState<'_>,
     ) -> MetaResult<()> {
-        if !visited_dirs.insert(parent) {
-            diagnostics.push_violation(format!("directory cycle detected at inode {parent}"));
-            return Ok(());
-        }
+        let mut pending_dirs = vec![ROOT_INO];
+        let mut queued_dirs = BTreeSet::from([ROOT_INO]);
 
-        let entries = match meta.readdir(parent) {
-            Ok(entries) => entries,
-            Err(err) => {
-                diagnostics
-                    .push_violation(format!("failed to read directory inode {parent}: {err}"));
-                return Ok(());
+        while let Some(parent) = pending_dirs.pop() {
+            if !state.visited_dirs.insert(parent) {
+                state
+                    .diagnostics
+                    .push_violation(format!("directory cycle detected at inode {parent}"));
+                continue;
             }
-        };
 
-        let mut names = BTreeSet::<Vec<u8>>::new();
-        for entry in entries {
-            self.record_entry(
-                meta,
-                diagnostics,
-                parent,
-                entry,
-                attr_by_ino,
-                visited_dirs,
-                reachable_inos,
-                dentry_counts,
-                &mut names,
-            )?;
-        }
-        Ok(())
-    }
+            let entries = match meta.readdir(parent) {
+                Ok(entries) => entries,
+                Err(err) => {
+                    state
+                        .diagnostics
+                        .push_violation(format!("failed to read directory inode {parent}: {err}"));
+                    continue;
+                }
+            };
 
-    #[allow(clippy::too_many_arguments)]
-    fn record_entry(
-        &self,
-        meta: &Arc<RedbMetaEngine>,
-        diagnostics: &mut ContractInvariantDiagnostics,
-        parent: u64,
-        entry: DirEntry,
-        attr_by_ino: &BTreeMap<u64, InodeAttr>,
-        visited_dirs: &mut BTreeSet<u64>,
-        reachable_inos: &mut BTreeSet<u64>,
-        dentry_counts: &mut BTreeMap<u64, usize>,
-        names: &mut BTreeSet<Vec<u8>>,
-    ) -> MetaResult<()> {
-        if !names.insert(entry.name.clone()) {
-            diagnostics.push_violation(format!(
-                "directory inode {parent} contains duplicate name {}",
-                String::from_utf8_lossy(&entry.name)
-            ));
-        }
-        diagnostics.entries.push(ContractDentrySnapshot {
-            parent,
-            name: entry.name.clone(),
-            ino: entry.ino,
-            kind: entry.kind,
-        });
-        *dentry_counts.entry(entry.ino).or_default() += 1;
-        reachable_inos.insert(entry.ino);
+            let mut names = BTreeSet::<Vec<u8>>::new();
+            for entry in entries {
+                if !names.insert(entry.name.clone()) {
+                    state.diagnostics.push_violation(format!(
+                        "directory inode {parent} contains duplicate name {}",
+                        String::from_utf8_lossy(&entry.name)
+                    ));
+                }
+                state.diagnostics.entries.push(ContractDentrySnapshot {
+                    parent,
+                    name: entry.name.clone(),
+                    ino: entry.ino,
+                    kind: entry.kind,
+                });
+                *state.dentry_counts.entry(entry.ino).or_default() += 1;
+                state.reachable_inos.insert(entry.ino);
 
-        let Some(attr) = attr_by_ino.get(&entry.ino) else {
-            diagnostics.push_violation(format!(
-                "dentry parent={} name={} points to missing inode {}",
-                parent,
-                String::from_utf8_lossy(&entry.name),
-                entry.ino
-            ));
-            return Ok(());
-        };
-        if attr.kind != entry.kind {
-            diagnostics.push_violation(format!(
-                "dentry parent={} name={} kind {:?} disagrees with inode {} kind {:?}",
-                parent,
-                String::from_utf8_lossy(&entry.name),
-                entry.kind,
-                entry.ino,
-                attr.kind
-            ));
-        }
-        if attr.kind == FileType::Directory {
-            if attr.parent != parent {
-                diagnostics.push_violation(format!(
-                    "directory inode {} records parent {} but is linked from {}",
-                    attr.ino, attr.parent, parent
-                ));
+                let Some(attr) = state.attr_by_ino.get(&entry.ino) else {
+                    state.diagnostics.push_violation(format!(
+                        "dentry parent={} name={} points to missing inode {}",
+                        parent,
+                        String::from_utf8_lossy(&entry.name),
+                        entry.ino
+                    ));
+                    continue;
+                };
+                if attr.kind != entry.kind {
+                    state.diagnostics.push_violation(format!(
+                        "dentry parent={} name={} kind {:?} disagrees with inode {} kind {:?}",
+                        parent,
+                        String::from_utf8_lossy(&entry.name),
+                        entry.kind,
+                        entry.ino,
+                        attr.kind
+                    ));
+                }
+                if attr.kind == FileType::Directory {
+                    *state.direct_subdir_counts.entry(parent).or_default() += 1;
+                    if attr.parent != parent {
+                        state.diagnostics.push_violation(format!(
+                            "directory inode {} records parent {} but is linked from {}",
+                            attr.ino, attr.parent, parent
+                        ));
+                    }
+                    if state.visited_dirs.contains(&entry.ino) || !queued_dirs.insert(entry.ino) {
+                        state.diagnostics.push_violation(format!(
+                            "directory inode {} is linked more than once or creates a cycle",
+                            entry.ino
+                        ));
+                    } else {
+                        pending_dirs.push(entry.ino);
+                    }
+                }
             }
-            self.collect_tree(
-                meta,
-                diagnostics,
-                entry.ino,
-                attr_by_ino,
-                visited_dirs,
-                reachable_inos,
-                dentry_counts,
-            )?;
         }
+
         Ok(())
     }
 }

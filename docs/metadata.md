@@ -43,6 +43,7 @@ invariants over:
 - the root-reachable namespace tree
 - dentry-to-attribute consistency
 - reachable link counts for regular files and symlinks
+- POSIX-style directory link counts (`2 + direct child directories`)
 - regular-file object graph readability
 - lifecycle rows that still point at live regular-file attrs, except retained
   deleted-before-publish tombstones

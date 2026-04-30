@@ -11,6 +11,8 @@ use studiofs_meta::contract_harness::{
 use studiofs_meta::schema::{InodeAttr, ROOT_INO};
 use studiofs_meta::{MetaError, RedbMetaEngine};
 
+const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// Result type for VFS Contract/Core fixture operations.
 pub type ContractVfsResult<T> = Result<T, ContractVfsHarnessError>;
 
@@ -107,6 +109,7 @@ pub struct ContractVfsFixture {
     cache_size: u64,
     memory_cache_budget_bytes: u64,
     config: VfsConfigValidated,
+    shutdown_timeout: Duration,
     vfs: Option<Arc<StudioVfs>>,
 }
 
@@ -138,11 +141,23 @@ impl ContractVfsFixture {
             cache_size: 64 * 1024 * 1024,
             memory_cache_budget_bytes: 32 * 1024 * 1024,
             config,
+            shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             vfs: None,
         };
         let vfs = fixture.open_vfs()?;
         fixture.vfs = Some(vfs);
         Ok(fixture)
+    }
+
+    /// Set the graceful shutdown drain timeout used by reopen and drop cleanup.
+    pub fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_timeout = timeout;
+        self
+    }
+
+    /// Return the graceful shutdown drain timeout used by reopen and drop cleanup.
+    pub fn shutdown_timeout(&self) -> Duration {
+        self.shutdown_timeout
     }
 
     /// Return the underlying metadata fixture.
@@ -248,7 +263,7 @@ impl ContractVfsFixture {
 
     fn close_vfs(&mut self) {
         if let Some(vfs) = self.vfs.take() {
-            self.runtime.block_on(vfs.shutdown(Duration::ZERO));
+            self.runtime.block_on(vfs.shutdown(self.shutdown_timeout));
             drop(vfs);
         }
     }

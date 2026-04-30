@@ -52,7 +52,9 @@ Repeated `start()` calls are idempotent after the instance is running.
 `StudioVfs` fixture backed by an isolated `RedbMetaEngine` and local cache
 directory. It can reopen both metadata and VFS handles against the same local
 paths and delegates shared invariant checks to
-`studiofs_meta::contract_harness`.
+`studiofs_meta::contract_harness`. Fixture shutdown uses a short graceful drain
+timeout by default and can be overridden with `with_shutdown_timeout(...)` when
+a scenario needs stricter or longer replay/upload cleanup.
 
 This layer is for core API scenarios that must stay independent of Docker,
 PostgreSQL, RustFS, FUSE, and WinFSP. Mounted bridge, infra-backed, randomized,

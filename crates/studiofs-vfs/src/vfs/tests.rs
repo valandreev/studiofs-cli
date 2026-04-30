@@ -154,6 +154,15 @@ fn contract_vfs_harness_reopens_fixture_and_runs_core_invariants() {
         .expect("reopened vfs invariants");
 }
 
+#[test]
+fn contract_vfs_harness_allows_shutdown_grace_timeout_override() {
+    let fixture = ContractVfsFixture::new("vfs-contract-shutdown-timeout")
+        .expect("create vfs contract fixture")
+        .with_shutdown_timeout(Duration::from_millis(100));
+
+    assert_eq!(fixture.shutdown_timeout(), Duration::from_millis(100));
+}
+
 trait FileGraphMetaFixture {
     fn stage_payload_slice(
         &self,
