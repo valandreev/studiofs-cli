@@ -531,15 +531,12 @@ impl MountedWriterStack {
                         .and_then(|chunk| chunk.slices.get(*slice_index))
                         .filter(|slice| slice.seq == *seq)?;
                     let read = slice.writer.read_accepted(claim.start, dst);
-                    debug_assert_eq!(read, dst.len());
-                    if read == 0 {
-                        return None;
-                    }
-                    let end = claim.start.saturating_add(read as u64);
-                    Some(WriterStackReadClaim {
-                        start: claim.start,
-                        end,
-                    })
+                    assert_eq!(
+                        read,
+                        dst.len(),
+                        "writer-stack active source claim must be fully readable"
+                    );
+                    Some(claim)
                 }
             }
         })
