@@ -227,7 +227,7 @@ impl fmt::Display for ContractInvariantDiagnostics {
 #[derive(Debug, Clone)]
 pub struct ContractInvariantViolation {
     label: String,
-    diagnostics: ContractInvariantDiagnostics,
+    diagnostics: Box<ContractInvariantDiagnostics>,
 }
 
 impl ContractInvariantViolation {
@@ -235,7 +235,7 @@ impl ContractInvariantViolation {
     pub fn new(label: impl Into<String>, diagnostics: ContractInvariantDiagnostics) -> Self {
         Self {
             label: label.into(),
-            diagnostics,
+            diagnostics: Box::new(diagnostics),
         }
     }
 
@@ -246,7 +246,7 @@ impl ContractInvariantViolation {
 
     /// Return the collected diagnostics.
     pub fn diagnostics(&self) -> &ContractInvariantDiagnostics {
-        &self.diagnostics
+        self.diagnostics.as_ref()
     }
 }
 
