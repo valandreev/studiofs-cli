@@ -42,10 +42,16 @@ mod supported {
         Active,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct TrayActivity {
+        mode: TrayPulseMode,
+        pending_upload_bytes: Option<u64>,
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum TrayUserEvent {
         Tick,
-        Activity(TrayPulseMode),
+        Activity(TrayActivity),
         MountFinished,
     }
 
@@ -138,6 +144,7 @@ mod supported {
         mode: TrayPulseMode,
         mode_started_at: Instant,
         last_color: Option<[u8; 3]>,
+        pending_upload_bytes: Option<u64>,
     }
 
     impl TrayApp {
@@ -149,6 +156,7 @@ mod supported {
                 mode: TrayPulseMode::Booting,
                 mode_started_at: Instant::now(),
                 last_color: None,
+                pending_upload_bytes: None,
             }
         }
 
@@ -164,7 +172,7 @@ mod supported {
 
             match TrayIconBuilder::new()
                 .with_icon(icon)
-                .with_tooltip(self.tooltip_for(self.mode))
+                .with_tooltip(self.tooltip_for(self.mode, None))
                 .build()
             {
                 Ok(tray_icon) => {
@@ -181,7 +189,17 @@ mod supported {
             }
         }
 
-        fn tooltip_for(&self, mode: TrayPulseMode) -> String {
+        fn tooltip_for(&self, mode: TrayPulseMode, pending_upload_bytes: Option<u64>) -> String {
+            if mode == TrayPulseMode::Active
+                && let Some(pending_upload_bytes) = pending_upload_bytes
+            {
+                return format!(
+                    "StudioFS {}: sync in progress. {} remaining",
+                    self.volume_name,
+                    format_upload_pipeline_pending_uploads(pending_upload_bytes),
+                );
+            }
+
             match mode {
                 TrayPulseMode::Booting => {
                     format!("StudioFS {}: starting mount", self.volume_name)
@@ -204,16 +222,23 @@ mod supported {
             }
         }
 
-        fn set_mode(&mut self, mode: TrayPulseMode) {
-            if self.mode == mode {
+        fn set_activity(&mut self, activity: TrayActivity) {
+            let mode_changed = self.mode != activity.mode;
+            let active_uploads_changed = activity.mode == TrayPulseMode::Active
+                && self.pending_upload_bytes != activity.pending_upload_bytes;
+            if !mode_changed && !active_uploads_changed {
                 return;
             }
 
-            self.mode = mode;
-            self.mode_started_at = Instant::now();
-            self.last_color = None;
+            if mode_changed {
+                self.mode = activity.mode;
+                self.mode_started_at = Instant::now();
+                self.last_color = None;
+            }
+            self.pending_upload_bytes = activity.pending_upload_bytes;
             if let Some(tray_icon) = self.tray_icon.as_ref() {
-                if let Err(error) = tray_icon.set_tooltip(Some(&self.tooltip_for(mode))) {
+                let tooltip = self.tooltip_for(activity.mode, activity.pending_upload_bytes);
+                if let Err(error) = tray_icon.set_tooltip(Some(&tooltip)) {
                     tracing::debug!(error = %error, "failed to update tray tooltip");
                 }
             }
@@ -258,8 +283,8 @@ mod supported {
         fn user_event(&mut self, event_loop: &ActiveEventLoop, event: TrayUserEvent) {
             match event {
                 TrayUserEvent::Tick => self.render_frame(),
-                TrayUserEvent::Activity(mode) => {
-                    self.set_mode(mode);
+                TrayUserEvent::Activity(activity) => {
+                    self.set_activity(activity);
                     self.render_frame();
                 }
                 TrayUserEvent::MountFinished => event_loop.exit(),
@@ -377,24 +402,27 @@ mod supported {
         std::thread::Builder::new()
             .name("studiofs-tray-monitor".to_string())
             .spawn(move || {
-                let mut last_mode = TrayPulseMode::Booting;
                 let mut discovery: Option<LocalDiagnosticsDiscovery> = None;
                 let monitor_started_at = Instant::now();
+                let mut last_activity = TrayActivity {
+                    mode: TrayPulseMode::Booting,
+                    pending_upload_bytes: None,
+                };
 
                 while !stop.load(Ordering::Acquire) {
                     if discovery.is_none() {
                         discovery = find_local_mount_session(process_id, &volume_name);
                     }
 
-                    let next_mode = discovery
+                    let next_activity = discovery
                         .as_ref()
-                        .and_then(current_activity_mode)
-                        .unwrap_or_else(|| fallback_mode(monitor_started_at));
+                        .and_then(current_activity_status)
+                        .unwrap_or_else(|| fallback_activity(monitor_started_at));
 
-                    if next_mode != last_mode {
-                        last_mode = next_mode;
+                    if next_activity != last_activity {
+                        last_activity = next_activity;
                         if proxy
-                            .send_event(TrayUserEvent::Activity(next_mode))
+                            .send_event(TrayUserEvent::Activity(next_activity))
                             .is_err()
                         {
                             break;
@@ -430,25 +458,67 @@ mod supported {
         })
     }
 
-    fn current_activity_mode(discovery: &LocalDiagnosticsDiscovery) -> Option<TrayPulseMode> {
+    fn current_activity_status(discovery: &LocalDiagnosticsDiscovery) -> Option<TrayActivity> {
         let client = LocalDiagnosticsClient::new(discovery.clone());
         let snapshot =
             crate::runtime_bridge::block_on(async move { client.runtime_snapshot().await }).ok()?;
-        Some(activity_mode(&snapshot))
+        Some(activity_status(&snapshot))
     }
 
-    fn activity_mode(snapshot: &DiagnosticsRuntimeSnapshot) -> TrayPulseMode {
+    fn activity_status(snapshot: &DiagnosticsRuntimeSnapshot) -> TrayActivity {
         let pending_metadata_ops = snapshot
             .synchronization
             .state
             .pending_metadata_ops
             .saturating_add(snapshot.synchronization.state.inflight_metadata_ops);
-        if snapshot.upload.pending_uploads > 0
-            || (pending_metadata_ops != 0 && pending_metadata_ops >= 10)
-        {
-            TrayPulseMode::Active
+        let pending_uploads = snapshot.upload.pending_uploads;
+        if pending_uploads > 0 || (pending_metadata_ops != 0 && pending_metadata_ops >= 10) {
+            let pending_upload_bytes = if pending_uploads > 0 {
+                Some(snapshot.upload.pending_upload_bytes)
+            } else {
+                None
+            };
+            TrayActivity {
+                mode: TrayPulseMode::Active,
+                pending_upload_bytes,
+            }
         } else {
-            TrayPulseMode::Idle
+            TrayActivity {
+                mode: TrayPulseMode::Idle,
+                pending_upload_bytes: None,
+            }
+        }
+    }
+
+    fn fallback_activity(monitor_started_at: Instant) -> TrayActivity {
+        if monitor_started_at.elapsed() < DIAGNOSTICS_STARTUP_GRACE {
+            TrayActivity {
+                mode: TrayPulseMode::Booting,
+                pending_upload_bytes: None,
+            }
+        } else {
+            TrayActivity {
+                mode: TrayPulseMode::Unavailable,
+                pending_upload_bytes: None,
+            }
+        }
+    }
+
+    fn format_upload_pipeline_pending_uploads(pending_upload_bytes: u64) -> String {
+        const KB: u64 = 1024;
+        const MB: u64 = 1024 * KB;
+        const GB: u64 = 1024 * MB;
+
+        if pending_upload_bytes == 0 {
+            "0".to_string()
+        } else if pending_upload_bytes >= GB {
+            format!("{:.1}GB", pending_upload_bytes as f64 / GB as f64)
+        } else if pending_upload_bytes >= MB {
+            format!("{}MB", pending_upload_bytes / MB)
+        } else if pending_upload_bytes >= KB {
+            format!("{}KB", pending_upload_bytes / KB)
+        } else {
+            format!("{pending_upload_bytes}B")
         }
     }
 
@@ -473,14 +543,6 @@ mod supported {
         }
 
         found.then_some((min_x, min_y, max_x, max_y))
-    }
-
-    fn fallback_mode(monitor_started_at: Instant) -> TrayPulseMode {
-        if monitor_started_at.elapsed() < DIAGNOSTICS_STARTUP_GRACE {
-            TrayPulseMode::Booting
-        } else {
-            TrayPulseMode::Unavailable
-        }
     }
 
     fn pulse_color(mode: TrayPulseMode, elapsed: Duration) -> [u8; 3] {
@@ -528,21 +590,21 @@ mod supported {
         fn activity_mode_is_active_for_pending_uploads() {
             let mut snapshot = DiagnosticsRuntimeSnapshot::default();
             snapshot.upload.pending_uploads = 1;
-            assert_eq!(activity_mode(&snapshot), TrayPulseMode::Active);
+            assert_eq!(activity_status(&snapshot).mode, TrayPulseMode::Active);
         }
 
         #[test]
         fn activity_mode_is_active_for_pending_metadata_ops() {
             let mut snapshot = DiagnosticsRuntimeSnapshot::default();
             snapshot.synchronization.state.pending_metadata_ops = 10;
-            assert_eq!(activity_mode(&snapshot), TrayPulseMode::Active);
+            assert_eq!(activity_status(&snapshot).mode, TrayPulseMode::Active);
         }
 
         #[test]
         fn activity_mode_is_idle_for_small_metadata_backlog() {
             let mut snapshot = DiagnosticsRuntimeSnapshot::default();
             snapshot.synchronization.state.pending_metadata_ops = 9;
-            assert_eq!(activity_mode(&snapshot), TrayPulseMode::Idle);
+            assert_eq!(activity_status(&snapshot).mode, TrayPulseMode::Idle);
         }
 
         #[test]
@@ -550,24 +612,67 @@ mod supported {
             let mut snapshot = DiagnosticsRuntimeSnapshot::default();
             snapshot.synchronization.state.pending_metadata_ops = 4;
             snapshot.synchronization.state.inflight_metadata_ops = 6;
-            assert_eq!(activity_mode(&snapshot), TrayPulseMode::Active);
+            assert_eq!(activity_status(&snapshot).mode, TrayPulseMode::Active);
         }
 
         #[test]
         fn activity_mode_is_idle_when_synchronized() {
             let snapshot = DiagnosticsRuntimeSnapshot::default();
-            assert_eq!(activity_mode(&snapshot), TrayPulseMode::Idle);
+            assert_eq!(activity_status(&snapshot).mode, TrayPulseMode::Idle);
         }
 
         #[test]
-        fn fallback_mode_starts_as_booting() {
-            assert_eq!(fallback_mode(Instant::now()), TrayPulseMode::Booting);
+        fn fallback_activity_starts_as_booting() {
+            assert_eq!(
+                fallback_activity(Instant::now()).mode,
+                TrayPulseMode::Booting
+            );
         }
 
         #[test]
-        fn fallback_mode_becomes_unavailable_after_grace_period() {
+        fn fallback_activity_becomes_unavailable_after_grace_period() {
             let started_at = Instant::now() - DIAGNOSTICS_STARTUP_GRACE - Duration::from_millis(1);
-            assert_eq!(fallback_mode(started_at), TrayPulseMode::Unavailable);
+            assert_eq!(
+                fallback_activity(started_at).mode,
+                TrayPulseMode::Unavailable
+            );
+        }
+
+        #[test]
+        fn activity_status_keeps_upload_bytes_for_tooltip() {
+            let mut snapshot = DiagnosticsRuntimeSnapshot::default();
+            snapshot.upload.pending_uploads = 2;
+            snapshot.upload.pending_upload_bytes = 7 * 1024 * 1024 * 1024;
+            let activity = activity_status(&snapshot);
+            assert_eq!(activity.mode, TrayPulseMode::Active);
+            assert_eq!(activity.pending_upload_bytes, Some(7 * 1024 * 1024 * 1024));
+        }
+
+        #[test]
+        fn activity_status_shows_no_pending_bytes_when_idle() {
+            let snapshot = DiagnosticsRuntimeSnapshot::default();
+            let activity = activity_status(&snapshot);
+            assert_eq!(activity.mode, TrayPulseMode::Idle);
+            assert_eq!(activity.pending_upload_bytes, None);
+        }
+
+        #[test]
+        fn format_upload_pipeline_pending_uploads_format_gigabytes() {
+            assert_eq!(
+                format_upload_pipeline_pending_uploads(7 * 1024 * 1024 * 1024),
+                "7.0GB"
+            );
+        }
+
+        #[test]
+        fn format_upload_pipeline_pending_uploads_handles_small_values() {
+            assert_eq!(format_upload_pipeline_pending_uploads(0), "0");
+            assert_eq!(format_upload_pipeline_pending_uploads(512), "512B");
+            assert_eq!(format_upload_pipeline_pending_uploads(1536), "1KB");
+            assert_eq!(
+                format_upload_pipeline_pending_uploads(3 * 1024 * 1024),
+                "3MB"
+            );
         }
 
         #[test]
