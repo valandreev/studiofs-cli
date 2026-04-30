@@ -218,6 +218,17 @@ Foreground reads resolve data in this order:
 4. object-store cold fetch for known published payload objects;
 5. zero-fill for holes.
 
+Read-path buffering contract:
+
+- Active writer-state bytes are copied directly into the caller-provided read
+  buffer before the rest of the `DataReader` fallback plan is assembled.
+- The writer-stack claim list records only byte ranges that were satisfied from
+  active writer state. Those ranges are subtracted from local-slice, cache,
+  object-store, and hole resolution so last-writer-wins ordering is preserved.
+- `snapshot_read_spans` remains a snapshot/testing API, but the mounted
+  foreground read path must not allocate a fresh payload `Vec` for each active
+  writer-stack overlap.
+
 Read rules:
 
 - Same-mount reads observe accepted writes immediately.

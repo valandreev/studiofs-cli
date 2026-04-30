@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use parking_lot::Mutex;
+use smallvec::{SmallVec, smallvec};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -20,6 +21,53 @@ pub(super) struct WriterStackReadSpan {
     pub(super) seq: u64,
     pub(super) data: Bytes,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct WriterStackReadClaim {
+    pub(super) start: u64,
+    pub(super) end: u64,
+}
+
+#[derive(Debug, Clone)]
+enum WriterStackReadSource {
+    Materializing {
+        start: u64,
+        end: u64,
+        source_start: u64,
+        seq: u64,
+        data: Bytes,
+    },
+    Active {
+        start: u64,
+        end: u64,
+        seq: u64,
+        chunk_id: ChunkId,
+        slice_index: usize,
+    },
+}
+
+impl WriterStackReadSource {
+    fn start(&self) -> u64 {
+        match self {
+            Self::Materializing { start, .. } | Self::Active { start, .. } => *start,
+        }
+    }
+
+    fn end(&self) -> u64 {
+        match self {
+            Self::Materializing { end, .. } | Self::Active { end, .. } => *end,
+        }
+    }
+
+    fn seq(&self) -> u64 {
+        match self {
+            Self::Materializing { seq, .. } | Self::Active { seq, .. } => *seq,
+        }
+    }
+}
+
+type WriterStackReadClaimList = SmallVec<[WriterStackReadClaim; 8]>;
+type WriterStackReadSourceList = SmallVec<[WriterStackReadSource; 8]>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct FinishedWriterSlice {
@@ -393,6 +441,231 @@ impl MountedWriterStack {
         }
         spans.sort_by_key(|span| std::cmp::Reverse(span.seq));
         spans
+    }
+
+    pub(super) fn snapshot_read_claims(
+        &self,
+        ino: Ino,
+        offset: u64,
+        length: u64,
+    ) -> WriterStackReadClaimList {
+        let Some(end) = offset.checked_add(length) else {
+            return WriterStackReadClaimList::new();
+        };
+        if length == 0 {
+            return WriterStackReadClaimList::new();
+        }
+        let file = {
+            let shard = self.shards[Self::inode_shard_index(ino)].lock();
+            let Some(file) = shard.files.get(&ino) else {
+                return WriterStackReadClaimList::new();
+            };
+            Arc::clone(file)
+        };
+        let file = file.lock();
+        if file.ino != ino {
+            return WriterStackReadClaimList::new();
+        }
+        let mut sources = Self::collect_read_sources(&file, offset, end, self.config.chunk_size);
+        sources.sort_by_key(|source| std::cmp::Reverse(source.seq()));
+        Self::claim_read_sources(&sources, offset, end, |_source, claim| Some(claim))
+    }
+
+    pub(super) fn copy_read_spans_into(
+        &self,
+        ino: Ino,
+        offset: u64,
+        out: &mut [u8],
+    ) -> WriterStackReadClaimList {
+        let Ok(length) = u64::try_from(out.len()) else {
+            return WriterStackReadClaimList::new();
+        };
+        let Some(end) = offset.checked_add(length) else {
+            return WriterStackReadClaimList::new();
+        };
+        if out.is_empty() {
+            return WriterStackReadClaimList::new();
+        }
+        let file = {
+            let shard = self.shards[Self::inode_shard_index(ino)].lock();
+            let Some(file) = shard.files.get(&ino) else {
+                return WriterStackReadClaimList::new();
+            };
+            Arc::clone(file)
+        };
+        let file = file.lock();
+        if file.ino != ino {
+            return WriterStackReadClaimList::new();
+        }
+        let mut sources = Self::collect_read_sources(&file, offset, end, self.config.chunk_size);
+        sources.sort_by_key(|source| std::cmp::Reverse(source.seq()));
+        Self::claim_read_sources(&sources, offset, end, |source, claim| {
+            let dst_start = usize::try_from(claim.start.saturating_sub(offset)).ok()?;
+            let dst_end = usize::try_from(claim.end.saturating_sub(offset)).ok()?;
+            if dst_start >= out.len() || dst_end > out.len() || dst_start >= dst_end {
+                return None;
+            }
+            let dst = &mut out[dst_start..dst_end];
+            match source {
+                WriterStackReadSource::Materializing {
+                    source_start, data, ..
+                } => {
+                    let src_start =
+                        usize::try_from(claim.start.saturating_sub(*source_start)).ok()?;
+                    let src_end = src_start.checked_add(dst.len())?;
+                    if src_end > data.len() {
+                        return None;
+                    }
+                    dst.copy_from_slice(&data.as_ref()[src_start..src_end]);
+                    Some(claim)
+                }
+                WriterStackReadSource::Active {
+                    seq,
+                    chunk_id,
+                    slice_index,
+                    ..
+                } => {
+                    let slice = file
+                        .chunks
+                        .get(chunk_id)
+                        .and_then(|chunk| chunk.slices.get(*slice_index))
+                        .filter(|slice| slice.seq == *seq)?;
+                    let read = slice.writer.read_accepted(claim.start, dst);
+                    assert_eq!(
+                        read,
+                        dst.len(),
+                        "writer-stack active source claim must be fully readable"
+                    );
+                    Some(claim)
+                }
+            }
+        })
+    }
+
+    fn collect_read_sources(
+        file: &FileWriter,
+        offset: u64,
+        end: u64,
+        chunk_size: u32,
+    ) -> WriterStackReadSourceList {
+        let mut sources = WriterStackReadSourceList::new();
+        let start_chunk = chunk_id_from_offset(offset, chunk_size);
+        let end_chunk = chunk_id_from_offset(end.saturating_sub(1), chunk_size);
+        for chunk in file
+            .chunks
+            .range(start_chunk..=end_chunk)
+            .map(|(_, chunk)| chunk)
+        {
+            for (slice_index, slice) in chunk.slices.iter().enumerate() {
+                for materializing in &slice.materializing {
+                    let start = materializing.start.max(offset);
+                    let stop = materializing.end.min(end);
+                    if start >= stop {
+                        continue;
+                    }
+                    sources.push(WriterStackReadSource::Materializing {
+                        start,
+                        end: stop,
+                        source_start: materializing.start,
+                        seq: materializing.seq,
+                        data: materializing.data.clone(),
+                    });
+                }
+                let Some((accepted_start, accepted_end)) = slice.writer.accepted_range() else {
+                    continue;
+                };
+                let start = accepted_start.max(offset);
+                let stop = accepted_end.min(end);
+                if start >= stop {
+                    continue;
+                }
+                sources.push(WriterStackReadSource::Active {
+                    start,
+                    end: stop,
+                    seq: slice.seq,
+                    chunk_id: chunk.chunk_id,
+                    slice_index,
+                });
+            }
+        }
+        sources
+    }
+
+    fn claim_read_sources<F>(
+        sources: &[WriterStackReadSource],
+        offset: u64,
+        end: u64,
+        mut on_claim: F,
+    ) -> WriterStackReadClaimList
+    where
+        F: FnMut(&WriterStackReadSource, WriterStackReadClaim) -> Option<WriterStackReadClaim>,
+    {
+        let mut unresolved = smallvec![WriterStackReadClaim { start: offset, end }];
+        let mut scratch = WriterStackReadClaimList::new();
+        let mut claimed = WriterStackReadClaimList::new();
+        let mut copied = WriterStackReadClaimList::new();
+        for source in sources {
+            if unresolved.is_empty() {
+                break;
+            }
+            let candidate = WriterStackReadClaim {
+                start: source.start(),
+                end: source.end(),
+            };
+            Self::claim_unresolved_read_claims(
+                &mut unresolved,
+                candidate,
+                &mut scratch,
+                &mut claimed,
+            );
+            for claim in claimed.iter().copied() {
+                let Some(copied_claim) = on_claim(source, claim) else {
+                    continue;
+                };
+                if copied_claim.start < copied_claim.end {
+                    copied.push(copied_claim);
+                }
+            }
+        }
+        copied.sort_by_key(|claim| claim.start);
+        copied
+    }
+
+    fn claim_unresolved_read_claims(
+        unresolved: &mut WriterStackReadClaimList,
+        candidate: WriterStackReadClaim,
+        scratch: &mut WriterStackReadClaimList,
+        claimed: &mut WriterStackReadClaimList,
+    ) {
+        scratch.clear();
+        claimed.clear();
+        for range in unresolved.drain(..) {
+            if range.end <= candidate.start || range.start >= candidate.end {
+                scratch.push(range);
+                continue;
+            }
+            if range.start < candidate.start {
+                scratch.push(WriterStackReadClaim {
+                    start: range.start,
+                    end: candidate.start,
+                });
+            }
+            let claim_start = range.start.max(candidate.start);
+            let claim_end = range.end.min(candidate.end);
+            if claim_start < claim_end {
+                claimed.push(WriterStackReadClaim {
+                    start: claim_start,
+                    end: claim_end,
+                });
+            }
+            if candidate.end < range.end {
+                scratch.push(WriterStackReadClaim {
+                    start: candidate.end,
+                    end: range.end,
+                });
+            }
+        }
+        std::mem::swap(unresolved, scratch);
     }
 
     pub(super) fn finish_inode(
@@ -1422,6 +1695,33 @@ mod tests {
         assert_eq!(
             spans[0].block_offset, 0,
             "returned dirty data is already clipped to the span, so assembler offset must be data-relative"
+        );
+    }
+
+    #[test]
+    fn writer_stack_copies_fragmented_read_spans_into_existing_buffer() {
+        let (_dir, stack, _rx) = temp_stack(16, 8);
+
+        stack
+            .write_bytes(write_spec(1, 7, 0, 100), Bytes::from_static(b"hello"))
+            .expect("base write");
+        stack
+            .write_bytes(write_spec(2, 7, 1, 101), Bytes::from_static(b"XYZ"))
+            .expect("overlap write");
+        stack
+            .write_bytes(write_spec(3, 7, 7, 102), Bytes::from_static(b"!"))
+            .expect("sparse tail write");
+
+        let mut out = [0_u8; 8];
+        let claims = stack.copy_read_spans_into(7, 0, &mut out);
+
+        assert_eq!(&out, b"hXYZo\0\0!");
+        assert_eq!(
+            claims
+                .iter()
+                .map(|claim| (claim.start, claim.end))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (1, 4), (4, 5), (7, 8)]
         );
     }
 
