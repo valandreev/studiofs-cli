@@ -761,7 +761,7 @@ impl StudioVfs {
     }
 
     pub(super) async fn background_gc(self: Arc<Self>) {
-        info!("background GC started");
+        debug!("background GC started");
 
         let interval = tokio::time::Duration::from_secs(600);
         let grace_period = 3600i64;
@@ -910,7 +910,7 @@ impl StudioVfs {
     }
 
     pub(super) async fn background_janitor(self: Arc<Self>) {
-        info!(
+        debug!(
             interval_secs = self.janitor_interval.as_secs(),
             grace_secs = self.janitor_skip_newer_than.as_secs(),
             max_deletes = self.janitor_max_deletes_per_run,

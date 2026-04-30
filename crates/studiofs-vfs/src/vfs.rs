@@ -3347,7 +3347,7 @@ impl<'a> StartupReplayCoordinator<'a> {
             self.vfs.queue_epoch_finalization(*ino, *content_epoch);
         }
         if self.queued_epoch_count() > 0 {
-            info!(
+            debug!(
                 queued_epochs = self.queued_epoch_count(),
                 "seeded epoch finalizer queue from metadata"
             );

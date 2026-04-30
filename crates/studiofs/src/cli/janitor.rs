@@ -83,7 +83,7 @@ pub(crate) struct JanitorArgs {
     /// Volume name
     name: String,
 
-    /// Override local cache base directory (defaults to `<meta-dir>/cache`)
+    /// Optional local cache base directory for pending-upload diagnostics.
     #[arg(long)]
     cache_dir: Option<PathBuf>,
 
@@ -151,6 +151,74 @@ fn map_cache_backend_error(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct JanitorLocalCacheState {
     pending_uploads: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JanitorLocalCacheReport {
+    path: PathBuf,
+    state_description: String,
+    pending_uploads: Option<usize>,
+}
+
+struct JanitorStartBanner<'a> {
+    name: &'a str,
+    dry_run: bool,
+    endpoint: &'a str,
+    bucket: &'a str,
+    prefix: &'a str,
+    local_cache_report: Option<&'a JanitorLocalCacheReport>,
+    skip_newer_minutes: u64,
+    max_deletes: u64,
+}
+
+impl JanitorLocalCacheReport {
+    fn from_inspection(
+        path: PathBuf,
+        detection: Option<&LocalPayloadRuntimeDetection>,
+        state: Option<JanitorLocalCacheState>,
+    ) -> Self {
+        Self {
+            path,
+            state_description: describe_cache_layout_state(detection).to_string(),
+            pending_uploads: state.map(|state| state.pending_uploads),
+        }
+    }
+}
+
+fn build_start_banner_lines(banner: JanitorStartBanner<'_>) -> Vec<String> {
+    let mut lines = vec![
+        format!("Janitor started for '{}'", banner.name),
+        format!(
+            "  Mode:       {}",
+            if banner.dry_run { "dry-run" } else { "delete" }
+        ),
+        format!("  Storage:    {} / {}", banner.endpoint, banner.bucket),
+        format!("  Prefix:     {}", banner.prefix),
+        "  Scope:      remote objects only".to_string(),
+    ];
+    if let Some(report) = banner.local_cache_report {
+        lines.push(format!(
+            "  Local cache: {} (diagnostics only)",
+            report.path.display()
+        ));
+        lines.push(format!("  Local cache state: {}", report.state_description));
+        if let Some(pending_uploads) = report.pending_uploads {
+            lines.push(format!("  Local pending uploads: {pending_uploads}"));
+        }
+    }
+    lines.push(format!(
+        "  Grace:      {}",
+        format_minutes(banner.skip_newer_minutes)
+    ));
+    lines.push(format!("  Max delete: {}", banner.max_deletes));
+    lines
+}
+
+fn format_minutes(minutes: u64) -> String {
+    match minutes {
+        1 => "1 minute".to_string(),
+        minutes => format!("{minutes} minutes"),
+    }
 }
 
 fn inspect_local_cache_runtime(
@@ -333,8 +401,17 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
     let format_info = engine.get_format_info()?;
 
     let prefix = normalize_prefix(&format_info);
-    let (cache_path, cache_backend_detection, local_cache_state) =
-        inspect_local_cache_runtime(meta_dir.as_path(), cache_dir.as_deref(), &format_info.uuid)?;
+    let local_cache_report = if let Some(cache_dir) = cache_dir.as_deref() {
+        let (cache_path, detection, local_cache_state) =
+            inspect_local_cache_runtime(meta_dir.as_path(), Some(cache_dir), &format_info.uuid)?;
+        Some(JanitorLocalCacheReport::from_inspection(
+            cache_path,
+            detection.as_ref(),
+            local_cache_state,
+        ))
+    } else {
+        None
+    };
 
     let mut builder = S3::default()
         .endpoint(&format_info.endpoint)
@@ -353,25 +430,18 @@ fn run(request: JanitorRunRequest) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let skip_secs = skip_newer_minutes.saturating_mul(60);
 
-    println!("Janitor started for '{}'", name);
-    println!(
-        "  Mode:      {}",
-        if dry_run { "dry-run" } else { "delete" }
-    );
-    println!("  Prefix:    {}", prefix);
-    println!("  Cache root: {}", cache_path.display());
-    println!(
-        "  Local cache state: {}",
-        describe_cache_layout_state(cache_backend_detection.as_ref())
-    );
-    if let Some(local_cache_state) = local_cache_state {
-        println!(
-            "  Local pending uploads: {}",
-            local_cache_state.pending_uploads
-        );
+    for line in build_start_banner_lines(JanitorStartBanner {
+        name: &name,
+        dry_run,
+        endpoint: &format_info.endpoint,
+        bucket: &format_info.bucket,
+        prefix: &prefix,
+        local_cache_report: local_cache_report.as_ref(),
+        skip_newer_minutes,
+        max_deletes,
+    }) {
+        println!("{line}");
     }
-    println!("  Grace:     {} minutes", skip_newer_minutes);
-    println!("  Max delete: {}", max_deletes);
 
     loop {
         let lock_acquired = engine.try_acquire_global_janitor_lock()?;
@@ -479,6 +549,37 @@ mod tests {
             }
             other => panic!("expected Janitor, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn janitor_start_banner_omits_local_cache_when_not_requested() {
+        let lines = build_start_banner_lines(JanitorStartBanner {
+            name: "test",
+            dry_run: false,
+            endpoint: "https://s3.example",
+            bucket: "studiofs",
+            prefix: "test/objects/",
+            local_cache_report: None,
+            skip_newer_minutes: 1,
+            max_deletes: 100_000,
+        });
+
+        assert_eq!(
+            lines,
+            vec![
+                "Janitor started for 'test'".to_string(),
+                "  Mode:       delete".to_string(),
+                "  Storage:    https://s3.example / studiofs".to_string(),
+                "  Prefix:     test/objects/".to_string(),
+                "  Scope:      remote objects only".to_string(),
+                "  Grace:      1 minute".to_string(),
+                "  Max delete: 100000".to_string(),
+            ]
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains("Cache")),
+            "default janitor banner should not mention local cache paths"
+        );
     }
 
     #[test]

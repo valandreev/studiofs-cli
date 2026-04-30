@@ -1100,19 +1100,22 @@ impl PreparedMount {
             .format_info
             .as_ref()
             .context("foreground mount session is missing format metadata before launch")?;
-        let cache_path_str = &self
+        let foreground = self
             .foreground
             .as_ref()
-            .context("foreground mount session is missing prepared runtime before launch")?
-            .cache_path_str;
-        for line in build_ready_banner_lines(
-            &self.plan.command.name,
-            &self.plan.actual_mount_path,
-            &self.plan.cache_size,
-            cache_path_str,
+            .context("foreground mount session is missing prepared runtime before launch")?;
+        let cache_path_str = &foreground.cache_path_str;
+        let backend_name = foreground.backend.name();
+        for line in build_ready_banner_lines(ReadyBanner {
+            requested_name: &self.plan.command.name,
+            actual_mount_path: &self.plan.actual_mount_path,
+            cache_size: &self.plan.cache_size,
+            cache_path: cache_path_str,
+            backend_name,
+            vfs_config: &self.plan.vfs_config,
             format_info,
-            self.plan.command.snapshot_id.as_deref(),
-        ) {
+            snapshot_id: self.plan.command.snapshot_id.as_deref(),
+        }) {
             println!("{line}");
         }
         Ok(())
@@ -1159,7 +1162,7 @@ impl PreparedMount {
             mut write_path_observability_publisher,
         } = prepared;
         let backend_name = backend.name();
-        info!(
+        debug!(
             backend = backend_name,
             mount_point = %self.plan.actual_mount_path,
             "starting mount backend"
@@ -1255,31 +1258,65 @@ where
     Ok(())
 }
 
-fn build_ready_banner_lines(
-    requested_name: &str,
-    actual_mount_path: &str,
-    cache_size: &str,
-    cache_path_str: &str,
-    format_info: &FormatInfo,
-    snapshot_id: Option<&str>,
-) -> Vec<String> {
+struct ReadyBanner<'a> {
+    requested_name: &'a str,
+    actual_mount_path: &'a str,
+    cache_size: &'a str,
+    cache_path: &'a str,
+    backend_name: &'a str,
+    vfs_config: &'a VfsConfigValidated,
+    format_info: &'a FormatInfo,
+    snapshot_id: Option<&'a str>,
+}
+
+fn build_ready_banner_lines(banner: ReadyBanner<'_>) -> Vec<String> {
     let mut lines = vec![
         format!(
             "✓ Volume '{}' ready to mount at '{}'",
-            requested_name, actual_mount_path
+            banner.requested_name, banner.actual_mount_path
         ),
-        format!("  Cache size:   {cache_size}"),
-        format!("  Cache path:   {cache_path_str}"),
+        format!("  Backend:      {}", banner.backend_name),
+        format!("  Cache size:   {}", banner.cache_size),
+        format!("  Cache path:   {}", banner.cache_path),
         format!(
             "  Storage:      {} / {}",
-            format_info.endpoint, format_info.bucket
+            banner.format_info.endpoint, banner.format_info.bucket
         ),
         "  Invalidation: PostgreSQL sync".to_string(),
+        format!(
+            "  Uploads:      {} {}",
+            banner.vfs_config.upload_worker_count,
+            pluralize("worker", banner.vfs_config.upload_worker_count)
+        ),
+        format!(
+            "  Maintenance:  cleanup every {} (grace {}, max deletes {})",
+            format_duration_secs(banner.vfs_config.janitor_interval_secs),
+            format_duration_secs(banner.vfs_config.janitor_skip_newer_secs),
+            banner.vfs_config.janitor_max_deletes
+        ),
     ];
-    if let Some(snapshot_id) = snapshot_id {
+    if let Some(snapshot_id) = banner.snapshot_id {
         lines.push(format!("  Snapshot:     {snapshot_id} (read-only)"));
     }
     lines
+}
+
+fn format_duration_secs(seconds: u64) -> String {
+    if seconds != 0 && seconds.is_multiple_of(3600) {
+        format!("{}h", seconds / 3600)
+    } else if seconds != 0 && seconds.is_multiple_of(60) {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn pluralize(unit: &str, count: usize) -> String {
+    if count == 1 {
+        unit.to_string()
+    } else {
+        format!("{unit}s")
+    }
 }
 
 fn acquire_mount_lock(actual_mount_path: &str) -> anyhow::Result<utils::MountLockGuard> {
@@ -1418,7 +1455,7 @@ fn resolve_mount_meta_session(
 
     session.format_info = apply_mount_endpoint_override(session.format_info, endpoint);
 
-    info!(
+    debug!(
         "mounting volume '{}' (storage: endpoint={}, bucket={})",
         session.format_info.name, session.format_info.endpoint, session.format_info.bucket
     );
@@ -1805,6 +1842,56 @@ mod tests {
                 validate_endpoint_override(Some(endpoint)).expect_err("invalid endpoint rejected");
             assert!(err.to_string().contains("invalid S3 endpoint"));
         }
+    }
+
+    #[test]
+    fn ready_banner_summarizes_startup_settings_once() {
+        let format_info = FormatInfo::new(
+            "test".to_string(),
+            "test-uuid".to_string(),
+            studiofs_meta::FormatInfoDataStore {
+                endpoint: "https://s3.example".to_string(),
+                bucket: "studiofs".to_string(),
+                access_key: "access-key".to_string(),
+                secret_key: "secret-key".to_string(),
+                region: String::new(),
+            },
+            4,
+        );
+        let vfs_config = VfsConfigRaw {
+            janitor_interval_secs: Some(1800),
+            janitor_skip_newer_secs: Some(900),
+            janitor_max_deletes: Some(500),
+            upload_worker_count: Some(20),
+            ..VfsConfigRaw::default()
+        }
+        .validate()
+        .expect("valid vfs config");
+
+        let lines = build_ready_banner_lines(ReadyBanner {
+            requested_name: "test",
+            actual_mount_path: "Z:",
+            cache_size: "200GB",
+            cache_path: r"E:\cache\test-uuid",
+            backend_name: "WinFSP",
+            vfs_config: &vfs_config,
+            format_info: &format_info,
+            snapshot_id: None,
+        });
+
+        assert_eq!(
+            lines,
+            vec![
+                "✓ Volume 'test' ready to mount at 'Z:'".to_string(),
+                "  Backend:      WinFSP".to_string(),
+                "  Cache size:   200GB".to_string(),
+                r"  Cache path:   E:\cache\test-uuid".to_string(),
+                "  Storage:      https://s3.example / studiofs".to_string(),
+                "  Invalidation: PostgreSQL sync".to_string(),
+                "  Uploads:      20 workers".to_string(),
+                "  Maintenance:  cleanup every 30m (grace 15m, max deletes 500)".to_string(),
+            ]
+        );
     }
 
     #[test]

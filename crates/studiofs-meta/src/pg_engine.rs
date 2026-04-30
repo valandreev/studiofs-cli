@@ -335,6 +335,15 @@ impl PgMetaEngine {
                 "ensure file lock lease schema",
                 move |client| async move {
                     client
+                        .batch_execute("SET client_min_messages TO WARNING")
+                        .await
+                        .map_err(|e| {
+                            MetaError::Storage(format!(
+                                "postgres file lock lease schema notice suppression failed: {}",
+                                Self::format_pg_error(e)
+                            ))
+                        })?;
+                    client
                         .batch_execute(Self::FILE_LOCK_LEASES_SCHEMA_SQL)
                         .await
                         .map_err(|e| {

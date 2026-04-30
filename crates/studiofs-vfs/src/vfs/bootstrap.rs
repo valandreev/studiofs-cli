@@ -294,7 +294,7 @@ impl VfsBootstrapResources {
         }
         .map_err(|source| map_open_local_payload_backend_error(cache_dir, source))?;
         if opened_local_backend.detection.has_runtime_layout() {
-            info!(
+            debug!(
                 cache_root = %opened_local_backend.detection.layout.cache_root.display(),
                 runtime_root = %opened_local_backend.detection.layout.runtime_root.display(),
                 "using current file-per-payload-object local backend under the volume cache root"
