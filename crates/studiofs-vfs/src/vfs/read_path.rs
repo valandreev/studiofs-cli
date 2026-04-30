@@ -1,4 +1,5 @@
 use super::overlay::PendingOverlayBlockSource;
+use super::writer_stack::WriterStackReadClaim;
 use super::{
     ATTR_CACHE_TTL, AccessLevel, ForegroundReadScope, PUBLISHED_READ_PLAN_CACHE_WINDOW_BLOCKS,
     PrefetchBatch, PrefetchReadContext, PublishedReadPlanCacheKey, ReadRequestContext, StudioVfs,
@@ -84,15 +85,34 @@ impl<'a> DataReader<'a> {
     }
 
     async fn read_into(&self, buffer: &mut [u8]) -> VfsResult<usize> {
-        let mut segments = self.build_segments().await?;
+        let writer_stack_claims =
+            self.vfs
+                .state
+                .writer_stack
+                .copy_read_spans_into(self.ino, self.offset, buffer);
+        let mut segments = self.build_segments_excluding(&writer_stack_claims).await?;
         segments.sort_by_key(|segment| segment.range.start());
         Self::log_debug_target_segments(self.vfs, self.ino, self.offset, self.length, &segments);
-        let written = Self::assemble_into(self.vfs, self.offset, &segments, buffer).await?;
+        // Claims are generated inside this read range; track the furthest byte
+        // already satisfied by the direct writer-stack copy.
+        let writer_stack_written = writer_stack_claims
+            .iter()
+            .filter_map(|claim| usize::try_from(claim.end.saturating_sub(self.offset)).ok())
+            .max()
+            .unwrap_or(0);
+        let written = Self::assemble_into(self.vfs, self.offset, &segments, buffer)
+            .await?
+            .max(writer_stack_written);
         Ok(written)
     }
 
     async fn prefetch_only(&self) -> VfsResult<()> {
-        let mut segments = self.build_segments().await?;
+        let writer_stack_claims =
+            self.vfs
+                .state
+                .writer_stack
+                .snapshot_read_claims(self.ino, self.offset, self.length);
+        let mut segments = self.build_segments_excluding(&writer_stack_claims).await?;
         segments.sort_by_key(|segment| segment.range.start());
         Self::populate_missing_remote_blocks(self.vfs, &segments, true).await?;
         Ok(())
@@ -160,7 +180,20 @@ impl<'a> DataReader<'a> {
         payload_refs
     }
 
+    #[cfg(test)]
     async fn build_segments(&self) -> VfsResult<Vec<ReadSegment>> {
+        let writer_stack_claims =
+            self.vfs
+                .state
+                .writer_stack
+                .snapshot_read_claims(self.ino, self.offset, self.length);
+        self.build_segments_excluding(&writer_stack_claims).await
+    }
+
+    async fn build_segments_excluding(
+        &self,
+        writer_stack_claims: &[WriterStackReadClaim],
+    ) -> VfsResult<Vec<ReadSegment>> {
         Self::build_segments_with(
             self.vfs,
             self.ino,
@@ -168,6 +201,7 @@ impl<'a> DataReader<'a> {
             self.length,
             self.pending_content_epoch,
             self.resolved_regular_file_slices,
+            writer_stack_claims,
         )
         .await
     }
@@ -179,6 +213,7 @@ impl<'a> DataReader<'a> {
         length: u64,
         pending_content_epoch: Option<u64>,
         resolved_regular_file_slices: Option<&[ResolvedSliceSpan]>,
+        writer_stack_claims: &[WriterStackReadClaim],
     ) -> VfsResult<Vec<ReadSegment>> {
         if length == 0 {
             return Ok(Vec::new());
@@ -194,31 +229,14 @@ impl<'a> DataReader<'a> {
         let mut segments = Vec::new();
         let pending_upload_index = vfs.snapshot_pending_upload_index();
 
-        let writer_stack_spans = vfs
-            .state
-            .writer_stack
-            .snapshot_read_spans(ino, offset, length);
-        for dirty in writer_stack_spans {
+        for claim in writer_stack_claims {
             if unresolved.is_empty() {
                 break;
             }
-            let Some(dirty_range) = ReadRange::new(dirty.start, dirty.end) else {
+            let Some(dirty_range) = ReadRange::new(claim.start, claim.end) else {
                 continue;
             };
             Self::claim_unresolved_ranges(&mut unresolved, dirty_range, &mut claim_buffers);
-            for overlap in claim_buffers.claimed.iter().copied() {
-                let delta = overlap.start().saturating_sub(dirty.start);
-                let Some(block_offset) = dirty.block_offset.checked_add(delta) else {
-                    continue;
-                };
-                segments.push(ReadSegment {
-                    range: overlap,
-                    source: ReadSegmentSource::Dirty {
-                        data: dirty.data.clone(),
-                        block_offset,
-                    },
-                });
-            }
         }
 
         let dirty_spans = vfs.snapshot_pending_dirty_slice_read_spans(ino, offset, length);
@@ -2320,6 +2338,52 @@ mod tests {
                     && segment.range.start() < 4
                     && segment.range.end() > 2
             }));
+        });
+    }
+
+    #[test]
+    fn data_reader_excludes_writer_stack_claims_from_fallback_segments() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, _meta) = make_test_vfs(&tmp, "writer-stack-direct-read-plan");
+        rt.block_on(async {
+            let attr = vfs
+                .create(ROOT_INO, b"writer-stack-direct-read-plan.bin", 0, 0, 0o644)
+                .expect("create test file");
+            let ino = attr.ino;
+            let fh = vfs.open_file(ino, OpenFlags::RDWR, false).expect("open file");
+
+            vfs.write_fh_with_local_sync_policy(
+                fh,
+                ino,
+                0,
+                b"hello",
+                LocalSyncPolicy::Opportunistic,
+            )
+            .await
+            .expect("write through writer stack");
+            vfs.clear_pending_payloads_for_inode(ino);
+
+            let pending_attr = vfs.getattr(ino).expect("load pending attr");
+            let pending_content_epoch = vfs
+                .refresh_inode_incarnation_state_from_attr(ino, &pending_attr)
+                .pending_incarnation
+                .as_ref()
+                .map(|pending| pending.content_epoch);
+            let segments = DataReader::new(&vfs, ino, 0, 5, pending_content_epoch, None)
+                .build_segments()
+                .await
+                .expect("resolve data reader segments");
+
+            assert!(
+                !segments.iter().any(|segment| {
+                    matches!(&segment.source, ReadSegmentSource::Dirty { .. })
+                        && segment.range.start() < 5
+                        && segment.range.end() > 0
+                }),
+                "writer-stack bytes should be copied into the caller read buffer before fallback segments are assembled: {segments:?}"
+            );
+
+            vfs.release_fh(fh).await.expect("release file");
         });
     }
 

@@ -894,6 +894,17 @@ impl CachedStoreWriterSlice {
         len
     }
 
+    pub fn accepted_range(&self) -> Option<(u64, u64)> {
+        let dirty_bytes = self.dirty_bytes();
+        if dirty_bytes == 0 {
+            return None;
+        }
+        Some((
+            self.active_start,
+            self.active_start.saturating_add(dirty_bytes as u64),
+        ))
+    }
+
     pub fn dirty_bytes(&self) -> usize {
         self.dirty_len
     }
