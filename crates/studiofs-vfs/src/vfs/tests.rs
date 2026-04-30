@@ -6789,6 +6789,52 @@ fn write_path_observability_reports_winfsp_write_callback_breakdown() {
 }
 
 #[test]
+fn reset_diagnostics_observability_clears_winfsp_write_policy_breakdown() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (_rt, vfs, _meta) = make_test_vfs(&tmp, "reset-winfsp-write-policy-breakdown");
+
+    vfs.record_winfsp_write_callback_observability(
+        11,
+        LocalSyncPolicy::Strict,
+        Duration::from_millis(3),
+        Duration::from_millis(2),
+        Duration::from_millis(1),
+    );
+    vfs.record_winfsp_write_callback_observability(
+        13,
+        LocalSyncPolicy::WriteThrough,
+        Duration::from_millis(3),
+        Duration::from_millis(2),
+        Duration::from_millis(1),
+    );
+    vfs.record_winfsp_write_callback_observability(
+        17,
+        LocalSyncPolicy::Opportunistic,
+        Duration::from_millis(3),
+        Duration::from_millis(2),
+        Duration::from_millis(1),
+    );
+
+    let before = vfs.write_path_observability_snapshot();
+    assert_eq!(before.winfsp_write_path.strict_calls, 1);
+    assert_eq!(before.winfsp_write_path.strict_bytes, 11);
+    assert_eq!(before.winfsp_write_path.write_through_calls, 1);
+    assert_eq!(before.winfsp_write_path.write_through_bytes, 13);
+    assert_eq!(before.winfsp_write_path.opportunistic_calls, 1);
+    assert_eq!(before.winfsp_write_path.opportunistic_bytes, 17);
+
+    vfs.reset_diagnostics_observability();
+
+    let after = vfs.write_path_observability_snapshot();
+    assert_eq!(after.winfsp_write_path.strict_calls, 0);
+    assert_eq!(after.winfsp_write_path.strict_bytes, 0);
+    assert_eq!(after.winfsp_write_path.write_through_calls, 0);
+    assert_eq!(after.winfsp_write_path.write_through_bytes, 0);
+    assert_eq!(after.winfsp_write_path.opportunistic_calls, 0);
+    assert_eq!(after.winfsp_write_path.opportunistic_bytes, 0);
+}
+
+#[test]
 fn write_path_observability_reports_vfs_write_stage_breakdown() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (_rt, vfs, _meta) = make_test_vfs(&tmp, "write-path-observability-vfs-breakdown");
