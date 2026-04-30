@@ -1150,6 +1150,64 @@ impl DrainCommitObserverPort for VfsDrainCommitObserver<'_> {
 }
 
 impl<'a> LocalDirtyFlushSession<'a> {
+    fn pending_slices_visible_end(
+        pending_slices: &std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
+    ) -> u64 {
+        pending_slices
+            .iter()
+            .flat_map(|(chunk_id, slices)| {
+                let chunk_start = studiofs_meta::schema::chunk_start_offset(
+                    studiofs_meta::schema::ChunkId(*chunk_id),
+                    studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
+                );
+                slices
+                    .iter()
+                    .map(move |slice| chunk_start.saturating_add(u64::from(slice.range.end)))
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn attr_for_pending_slice_commit(
+        &self,
+        pending_slices: &std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
+        content_epoch: u64,
+        attr_to_persist: Option<InodeAttr>,
+    ) -> VfsResult<Option<InodeAttr>> {
+        // A background slice commit can outlive the dirty-attr snapshot that
+        // advanced EOF; keep metadata size covering any slices made visible.
+        let visible_end = Self::pending_slices_visible_end(pending_slices);
+        if visible_end == 0 {
+            return Ok(attr_to_persist);
+        }
+
+        let had_attr = attr_to_persist.is_some();
+        let mut attr = if let Some(attr) = attr_to_persist {
+            attr
+        } else {
+            self.vfs
+                .sync_meta()
+                .get_attr(self.ino)
+                .map_err(VfsError::Meta)?
+        };
+
+        let mut changed = false;
+        if attr.size < visible_end {
+            attr.size = visible_end;
+            changed = true;
+        }
+        if attr.content_epoch < content_epoch {
+            attr.content_epoch = content_epoch;
+            changed = true;
+        }
+
+        if had_attr || changed {
+            Ok(Some(attr))
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn commit_pending_slice_snapshot(
         &self,
         pending_slices: std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
@@ -1165,6 +1223,8 @@ impl<'a> LocalDirtyFlushSession<'a> {
             &Vec::new(),
             pending_slices.clone(),
         )?;
+        let attr_to_persist =
+            self.attr_for_pending_slice_commit(&pending_slices, content_epoch, attr_to_persist)?;
         let attr_to_clear = attr_to_persist.clone();
         let committed_attr = self
             .drain
@@ -3107,7 +3167,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
-    use studiofs_meta::{MetaFormat, RedbMetaEngine};
+    use studiofs_meta::{MetaFormat, MetaInodes, RedbMetaEngine};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
@@ -3180,6 +3240,44 @@ mod tests {
                 BytesMut::from(data),
             )],
         )
+    }
+
+    #[test]
+    fn pending_slice_commit_without_dirty_attr_extends_visible_size() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-slice-attr-recovery");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"pending-slice-attr-recovery.bin", 0, 0, 0o644)
+                .expect("create file");
+            let ino = attr.ino;
+            let block_size = vfs.block_size;
+            let pending_slices = std::collections::BTreeMap::from([(
+                0,
+                vec![PendingDirtySlice::persisted(
+                    studiofs_meta::schema::SliceRange::new(0, block_size)
+                        .expect("pending slice range"),
+                    0,
+                    0,
+                    41,
+                    9001,
+                    0,
+                )],
+            )]);
+
+            vfs.local_dirty_flush_session(ino)
+                .commit_pending_slice_snapshot(pending_slices, 1, None)
+                .await
+                .expect("commit pending slice without dirty attr");
+
+            let persisted = meta.get_attr(ino).expect("persisted attr");
+            assert_eq!(
+                persisted.size,
+                u64::from(block_size),
+                "metadata size must cover locally committed overlay slices even if dirty_attr was already cleared"
+            );
+        });
     }
 
     #[test]
