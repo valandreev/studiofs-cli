@@ -892,6 +892,42 @@ fn runtime_shutdown_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+fn run_mount_vfs_shutdown(
+    runtime: Runtime,
+    vfs: Arc<StudioVfs>,
+    upload_drain_timeout: Duration,
+) -> anyhow::Result<Runtime> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let shutdown = std::thread::spawn(move || {
+            runtime.block_on(vfs.shutdown(upload_drain_timeout));
+            runtime
+        });
+        return shutdown.join().map_err(|_| {
+            anyhow::anyhow!("mount VFS shutdown runtime thread panicked during unmount")
+        });
+    }
+
+    runtime.block_on(vfs.shutdown(upload_drain_timeout));
+    Ok(runtime)
+}
+
+fn shutdown_mount_runtime(
+    runtime: Runtime,
+    runtime_shutdown_timeout: Duration,
+) -> anyhow::Result<()> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let shutdown = std::thread::spawn(move || {
+            runtime.shutdown_timeout(runtime_shutdown_timeout);
+        });
+        return shutdown
+            .join()
+            .map_err(|_| anyhow::anyhow!("mount runtime shutdown thread panicked during unmount"));
+    }
+
+    runtime.shutdown_timeout(runtime_shutdown_timeout);
+    Ok(())
+}
+
 impl MountSession {
     pub(crate) fn prepare(command: MountCommand) -> anyhow::Result<Self> {
         Self::prepare_with_backend_factory(
@@ -1144,18 +1180,19 @@ impl PreparedMount {
             run_in_foreground: self.plan.run_in_foreground,
         });
         write_path_observability_publisher.stop_and_join();
-        runtime.block_on(vfs.shutdown(shutdown_upload_drain_timeout()));
+        let upload_drain_timeout = shutdown_upload_drain_timeout();
+        let runtime_shutdown_timeout = runtime_shutdown_timeout();
+        let runtime = run_mount_vfs_shutdown(runtime, vfs, upload_drain_timeout)?;
         if let Some(diagnostics_host) = diagnostics_host {
             diagnostics_host.stop();
         }
         if let Some(mut finish_profiling) = profiling.take() {
             finish_profiling();
         }
-        drop(vfs);
         let _ = utils::remove_pid_file(&self.plan.actual_mount_path);
         drop(self.mount_lock.take());
         cleanup_snapshot_mount_db(self.snapshot_mount_db_path.take().as_deref());
-        runtime.shutdown_timeout(runtime_shutdown_timeout());
+        shutdown_mount_runtime(runtime, runtime_shutdown_timeout)?;
 
         serve_result.map_err(|error| anyhow::anyhow!("{backend_name} error: {error}"))?;
         Ok(())
