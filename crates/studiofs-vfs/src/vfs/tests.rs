@@ -3782,6 +3782,75 @@ fn write_fh_routes_mounted_write_through_writer_stack() {
 }
 
 #[test]
+fn write_through_writes_use_single_strict_materialization_stage() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "sfs-307-write-through-single-stage");
+    let _guard = rt.enter();
+    rt.block_on(async {
+        let direct_attr = vfs
+            .create(1, b"sfs-307-write-through-direct.txt", 0, 0, 0o644)
+            .unwrap();
+        let direct_fh = vfs
+            .open_file(direct_attr.ino, OpenFlags::RDWR, false)
+            .unwrap();
+
+        vfs.write_fh_with_local_sync_policy(
+            direct_fh,
+            direct_attr.ino,
+            0,
+            b"direct-write-through",
+            LocalSyncPolicy::WriteThrough,
+        )
+        .await
+        .unwrap();
+
+        let direct_snapshot = vfs.write_path_observability_snapshot();
+        assert_eq!(
+            direct_snapshot.vfs_write_path.materialize_strict.calls, 1,
+            "direct write-through should materialize through the strict stage"
+        );
+        assert_eq!(
+            direct_snapshot.vfs_write_path.materialize_for_limits.calls, 0,
+            "direct write-through below dirty limits should not run a redundant limits pass"
+        );
+
+        let deferred_attr = vfs
+            .create(1, b"sfs-307-write-through-deferred.txt", 0, 0, 0o644)
+            .unwrap();
+        let deferred_fh = vfs
+            .open_file(deferred_attr.ino, OpenFlags::RDWR, false)
+            .unwrap();
+
+        vfs.write_fh_with_deferred_materialize(
+            deferred_fh,
+            deferred_attr.ino,
+            0,
+            b"deferred-write-through",
+            LocalSyncPolicy::WriteThrough,
+        )
+        .await
+        .unwrap();
+
+        let deferred_snapshot = vfs.write_path_observability_snapshot();
+        assert_eq!(
+            deferred_snapshot.vfs_write_path.materialize_strict.calls, 2,
+            "deferred write-through should also materialize through the strict stage"
+        );
+        assert_eq!(
+            deferred_snapshot
+                .vfs_write_path
+                .materialize_for_limits
+                .calls,
+            0,
+            "deferred write-through below dirty limits should not run a redundant limits pass"
+        );
+
+        vfs.release_fh(direct_fh).await.unwrap();
+        vfs.release_fh(deferred_fh).await.unwrap();
+    });
+}
+
+#[test]
 fn write_fh_does_not_allocate_object_ids_before_materialization() {
     let tmp = tempfile::tempdir().unwrap();
     let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-292-write-fh-no-object-ids");

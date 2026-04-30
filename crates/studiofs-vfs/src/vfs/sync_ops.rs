@@ -1013,7 +1013,11 @@ impl StudioVfs {
             if local_sync_policy.requires_write_path_durability() {
                 self.wait_for_deferred_materialization_inflight(ino).await;
                 let materialize_strict_started = Instant::now();
-                let strict_result = self.materialize_writer_stack_for_inode(ino).await;
+                // This starts with the target inode, then only drains other dirty
+                // inodes when the global dirty budget still requires it. Using it
+                // as the strict write-through entry point avoids probing the same
+                // inode again in a follow-up limits pass.
+                let strict_result = self.materialize_writer_stack_for_limits(ino).await;
                 self.record_vfs_write_materialize_strict(materialize_strict_started.elapsed());
                 let materialized_bytes = strict_result?;
                 if materialized_bytes > 0 {
@@ -1024,10 +1028,12 @@ impl StudioVfs {
                     .await?;
                 }
             }
-            let should_materialize_for_limits = local_sync_policy.requires_write_path_durability()
-                || self.total_pending_write_buffer_bytes() > self.max_dirty_bytes()
+            let dirty_pressure_requires_materialization = self.total_pending_write_buffer_bytes()
+                > self.max_dirty_bytes()
                 || self.state.writer_stack.total_dirty_bytes()
                     >= self.write_eager_flush_batch_bytes;
+            let should_materialize_for_limits =
+                local_sync_policy.is_opportunistic() && dirty_pressure_requires_materialization;
             if should_materialize_for_limits {
                 let materialize_for_limits_started = Instant::now();
                 let limits_result = self.materialize_writer_stack_for_limits(ino).await;
@@ -1179,15 +1185,6 @@ impl StudioVfs {
                 };
                 self.record_vfs_write_materialize_strict(materialize_strict_started.elapsed());
 
-                let materialize_for_limits_started = Instant::now();
-                if let Err(e) = self.materialize_writer_stack_for_inode(ino).await {
-                    drop(session);
-                    self.state.file_session.gc_if_idle(ino);
-                    return Err(e);
-                }
-                self.record_vfs_write_materialize_for_limits(
-                    materialize_for_limits_started.elapsed(),
-                );
                 if let Err(e) = self.flush_local_dirty_state(ino, local_sync_policy).await {
                     drop(session);
                     self.state.file_session.gc_if_idle(ino);
