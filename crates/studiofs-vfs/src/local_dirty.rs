@@ -1190,6 +1190,9 @@ impl<'a> LocalDirtyFlushSession<'a> {
                 .get_attr(self.ino)
                 .map_err(VfsError::Meta)?
         };
+        if !had_attr && attr.content_epoch > content_epoch {
+            return Ok(None);
+        }
 
         let mut changed = false;
         if attr.size < visible_end {
@@ -3276,6 +3279,51 @@ mod tests {
                 persisted.size,
                 u64::from(block_size),
                 "metadata size must cover locally committed overlay slices even if dirty_attr was already cleared"
+            );
+        });
+    }
+
+    #[test]
+    fn stale_pending_slice_commit_without_dirty_attr_preserves_newer_size() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-slice-stale-attr");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"pending-slice-stale-attr.bin", 0, 0, 0o644)
+                .expect("create file");
+            let ino = attr.ino;
+            let block_size = vfs.block_size;
+            let mut newer_attr = meta.get_attr(ino).expect("load attr");
+            newer_attr.size = 0;
+            newer_attr.content_epoch = 2;
+            meta.set_attr(&newer_attr).expect("store newer attr");
+            let pending_slices = std::collections::BTreeMap::from([(
+                0,
+                vec![PendingDirtySlice::persisted(
+                    studiofs_meta::schema::SliceRange::new(0, block_size)
+                        .expect("pending slice range"),
+                    0,
+                    0,
+                    41,
+                    9002,
+                    0,
+                )],
+            )]);
+
+            vfs.local_dirty_flush_session(ino)
+                .commit_pending_slice_snapshot(pending_slices, 1, None)
+                .await
+                .expect("commit stale pending slice without dirty attr");
+
+            let persisted = meta.get_attr(ino).expect("persisted attr");
+            assert_eq!(
+                persisted.size, 0,
+                "stale pending slice commits must not grow a newer inode attr"
+            );
+            assert_eq!(
+                persisted.content_epoch, 2,
+                "stale pending slice commits must preserve the newer content epoch"
             );
         });
     }
