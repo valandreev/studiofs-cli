@@ -664,6 +664,22 @@ fn vfs_to_winfsp_err(e: studiofs_vfs::VfsError) -> winfsp::FspError {
     }
 }
 
+fn pre_write_size_for_winfsp_write(
+    vfs: &StudioVfs,
+    ino: Ino,
+    write_to_eof: bool,
+    constrained_io: bool,
+) -> winfsp::Result<Option<u64>> {
+    if !(write_to_eof || constrained_io) {
+        return Ok(None);
+    }
+    vfs.peek_dirty_attr(ino)
+        .map(Ok)
+        .unwrap_or_else(|| vfs.getattr(ino))
+        .map(|attr| Some(attr.size))
+        .map_err(vfs_to_winfsp_err)
+}
+
 fn is_benign_cleanup_delete_error(e: &studiofs_vfs::VfsError, deleting_dir: bool) -> bool {
     match classify_vfs_error(e) {
         BridgeVfsErrorKind::NotFound => true,
@@ -1212,27 +1228,16 @@ impl FileSystemContext for StudioFsContext {
         let callback_started = Instant::now();
         // Resolve actual write offset.  Prefer the in-memory dirty attr (free)
         // and fall back to the full getattr only when there is no dirty state.
+        let pre_write_size =
+            pre_write_size_for_winfsp_write(&self.vfs, context.ino, write_to_eof, constrained_io)?;
         let actual_offset = if write_to_eof {
-            let attr = self
-                .vfs
-                .peek_dirty_attr(context.ino)
-                .map(Ok)
-                .unwrap_or_else(|| self.vfs.getattr(context.ino))
-                .map_err(vfs_to_winfsp_err)?;
-            attr.size
+            pre_write_size.unwrap_or(offset)
         } else {
             offset
         };
 
         // Constrained I/O: paging writes must not extend the file beyond its current size
-        if constrained_io {
-            let attr = self
-                .vfs
-                .peek_dirty_attr(context.ino)
-                .map(Ok)
-                .unwrap_or_else(|| self.vfs.getattr(context.ino))
-                .map_err(vfs_to_winfsp_err)?;
-            let fsize = attr.size;
+        if constrained_io && let Some(fsize) = pre_write_size {
             if actual_offset >= fsize {
                 return Ok(0);
             }
@@ -1637,24 +1642,15 @@ impl AsyncFileSystemContext for StudioFsContext {
         let vfs = self.vfs.clone();
 
         async move {
+            let pre_write_size =
+                pre_write_size_for_winfsp_write(&vfs, ino, write_to_eof, constrained_io)?;
             let actual_offset = if write_to_eof {
-                let attr = vfs
-                    .peek_dirty_attr(ino)
-                    .map(Ok)
-                    .unwrap_or_else(|| vfs.getattr(ino))
-                    .map_err(vfs_to_winfsp_err)?;
-                attr.size
+                pre_write_size.unwrap_or(offset)
             } else {
                 offset
             };
 
-            if constrained_io {
-                let attr = vfs
-                    .peek_dirty_attr(ino)
-                    .map(Ok)
-                    .unwrap_or_else(|| vfs.getattr(ino))
-                    .map_err(vfs_to_winfsp_err)?;
-                let fsize = attr.size;
+            if constrained_io && let Some(fsize) = pre_write_size {
                 if actual_offset >= fsize {
                     return Ok(0);
                 }
