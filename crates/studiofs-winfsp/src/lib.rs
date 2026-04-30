@@ -496,12 +496,15 @@ pub fn mount_and_serve(request: WinfspMountRequest) -> std::io::Result<()> {
     )
     .map_err(|err| std::io::Error::other(format!("failed to initialize WinFSP context: {err}")))?;
 
-    // Use `new_with_timer` so the WinFSP threadpool timer periodically calls
+    // Use `new_with_timer_async` so read/write/readdir can return
+    // STATUS_PENDING and complete from the Tokio runtime without parking
+    // WinFSP dispatcher threads behind local cache I/O. The timer still
+    // periodically calls
     // our `NotifyingFileSystemContext` impl, which sends `FspFileSystemNotify`
     // for metadata-driven invalidations. The const generic (250) is the
     // timer interval in milliseconds — short enough for snappy Explorer
     // refreshes, long enough to batch rapid sequences.
-    let mut host = FileSystemHost::new_with_timer::<Vec<Ino>, 250>(
+    let mut host = FileSystemHost::new_with_timer_async::<Vec<Ino>, 250>(
         FileSystemParams::default_params(volume_params),
         context,
     )
