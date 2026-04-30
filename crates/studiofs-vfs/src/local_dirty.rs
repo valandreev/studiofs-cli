@@ -2705,21 +2705,25 @@ impl StudioVfs {
     pub(super) fn clear_pending_payload(&self, ino: Ino, block_index: u32) {
         let mut pending = self.state.local_dirty.pending_payloads.lock();
         let mut indexes = self.state.local_dirty.pending_payload_indexes.lock();
-        if let Some(removed) = pending.remove(&(ino, block_index)) {
+        let removed = pending.remove(&(ino, block_index));
+        if removed.is_some() {
             if let Some(inode_indexes) = indexes.get_mut(&ino) {
                 inode_indexes.remove(&block_index);
                 if inode_indexes.is_empty() {
                     indexes.remove(&ino);
                 }
             }
-            drop(indexes);
-            drop(pending);
+        }
+        drop(indexes);
+        drop(pending);
+
+        if let Some(removed) = removed {
             self.subtract_pending_local_dirty_bytes(removed.memory_len());
             if let Some(buffer) = removed.recycle_buffer() {
                 self.recycle_write_buffer(buffer);
             }
-            self.clear_pending_dirty_slices_for_block(ino, block_index);
         }
+        self.clear_pending_dirty_slices_for_block(ino, block_index);
     }
 
     fn snapshot_dirty_local_dirty_payloads(&self, ino: Ino) -> Vec<DirtyWriteSnapshot> {
