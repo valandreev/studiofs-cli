@@ -213,6 +213,19 @@ pub struct FetchScheduler {
     transit_memory_budget: Arc<TransitMemoryBudget>,
 }
 
+macro_rules! impl_record_stage {
+    ($fn_name:ident, $calls:ident, $total_ns:ident, $max_ns:ident) => {
+        fn $fn_name(&self, duration: Duration) {
+            Self::record_stage_duration(
+                &self.metrics.$calls,
+                &self.metrics.$total_ns,
+                &self.metrics.$max_ns,
+                duration,
+            );
+        }
+    };
+}
+
 impl FetchScheduler {
     fn record_stage_duration(
         calls: &AtomicU64,
@@ -226,50 +239,31 @@ impl FetchScheduler {
         max.fetch_max(ns, Ordering::Relaxed);
     }
 
-    fn record_s3_get(&self, duration: Duration) {
-        Self::record_stage_duration(
-            &self.metrics.s3_get_calls,
-            &self.metrics.s3_get_total_ns,
-            &self.metrics.s3_get_max_ns,
-            duration,
-        );
-    }
-
-    fn record_object_decode(&self, duration: Duration) {
-        Self::record_stage_duration(
-            &self.metrics.object_decode_calls,
-            &self.metrics.object_decode_total_ns,
-            &self.metrics.object_decode_max_ns,
-            duration,
-        );
-    }
-
-    fn record_assemble_copy(&self, duration: Duration) {
-        Self::record_stage_duration(
-            &self.metrics.assemble_copy_calls,
-            &self.metrics.assemble_copy_total_ns,
-            &self.metrics.assemble_copy_max_ns,
-            duration,
-        );
-    }
-
-    fn record_local_cache_put(&self, duration: Duration) {
-        Self::record_stage_duration(
-            &self.metrics.local_cache_put_calls,
-            &self.metrics.local_cache_put_total_ns,
-            &self.metrics.local_cache_put_max_ns,
-            duration,
-        );
-    }
-
-    fn record_fetch_total(&self, duration: Duration) {
-        Self::record_stage_duration(
-            &self.metrics.fetch_total_calls,
-            &self.metrics.fetch_total_ns,
-            &self.metrics.fetch_total_max_ns,
-            duration,
-        );
-    }
+    impl_record_stage!(record_s3_get, s3_get_calls, s3_get_total_ns, s3_get_max_ns);
+    impl_record_stage!(
+        record_object_decode,
+        object_decode_calls,
+        object_decode_total_ns,
+        object_decode_max_ns
+    );
+    impl_record_stage!(
+        record_assemble_copy,
+        assemble_copy_calls,
+        assemble_copy_total_ns,
+        assemble_copy_max_ns
+    );
+    impl_record_stage!(
+        record_local_cache_put,
+        local_cache_put_calls,
+        local_cache_put_total_ns,
+        local_cache_put_max_ns
+    );
+    impl_record_stage!(
+        record_fetch_total,
+        fetch_total_calls,
+        fetch_total_ns,
+        fetch_total_max_ns
+    );
 
     fn record_local_cache_io(&self, timing: LocalCacheIoTiming) {
         self.metrics
