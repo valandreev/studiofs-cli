@@ -9,7 +9,7 @@ use crate::VfsMeta;
 use crate::runtime::run_meta;
 use crate::utils::{IntervalRange, subtract_claimed_range};
 use bytes::Bytes;
-use futures::future::join_all;
+use futures::{StreamExt, stream};
 use smallvec::{SmallVec, smallvec};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -45,6 +45,12 @@ type ReadBlockList = SmallVec<[u32; 16]>;
 struct ReadClaimBuffers {
     claimed: ReadRangeList,
     scratch: ReadRangeList,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteFetchMode {
+    ForegroundColdRead,
+    BestEffortPrefetch,
 }
 
 impl ReadClaimBuffers {
@@ -100,6 +106,7 @@ impl<'a> DataReader<'a> {
             .filter_map(|claim| usize::try_from(claim.end.saturating_sub(self.offset)).ok())
             .max()
             .unwrap_or(0);
+        Self::fetch_missing_remote_blocks(self.vfs, &segments).await?;
         let written = Self::assemble_into(self.vfs, self.offset, &segments, buffer)
             .await?
             .max(writer_stack_written);
@@ -491,6 +498,26 @@ impl<'a> DataReader<'a> {
         segments: &[ReadSegment],
         prefetch: bool,
     ) -> VfsResult<()> {
+        let mode = if prefetch {
+            RemoteFetchMode::BestEffortPrefetch
+        } else {
+            RemoteFetchMode::ForegroundColdRead
+        };
+        Self::fetch_remote_blocks(vfs, segments, mode).await
+    }
+
+    async fn fetch_missing_remote_blocks(
+        vfs: &StudioVfs,
+        segments: &[ReadSegment],
+    ) -> VfsResult<()> {
+        Self::fetch_remote_blocks(vfs, segments, RemoteFetchMode::ForegroundColdRead).await
+    }
+
+    async fn fetch_remote_blocks(
+        vfs: &StudioVfs,
+        segments: &[ReadSegment],
+        mode: RemoteFetchMode,
+    ) -> VfsResult<()> {
         let mut remote_blocks = BTreeMap::new();
         let mut local_pending = BTreeSet::new();
         for segment in segments {
@@ -514,33 +541,69 @@ impl<'a> DataReader<'a> {
         if remote_blocks.is_empty() {
             return Ok(());
         }
-        let fetches = remote_blocks.into_iter().map(|(object_id, block)| async move {
-            match vfs.fetch_block_for_ref(&block, prefetch).await {
-                Ok(_) => Ok::<(), VfsError>(()),
-                Err(crate::fetch::FetchError::NotFound { ref key }) => {
-                    warn!(
-                        object_id,
-                        key,
-                        block_offset = block.offset,
-                        block_length = block.length,
-                        "populate_missing_remote_blocks: S3 object not found during read prefetch — object missing from S3 (upload not complete or evicted?)"
-                    );
-                    Ok::<(), VfsError>(())
-                }
-                Err(error) => {
+        remote_blocks.retain(|object_id, _| !vfs.local_payload_backend.contains(*object_id));
+        if remote_blocks.is_empty() {
+            return Ok(());
+        }
+        if matches!(mode, RemoteFetchMode::ForegroundColdRead) && remote_blocks.len() <= 1 {
+            return Ok(());
+        }
+
+        let concurrency = match mode {
+            RemoteFetchMode::ForegroundColdRead => vfs
+                .fetch_scheduler()
+                .effective_limit()
+                .max(1)
+                .min(remote_blocks.len()),
+            RemoteFetchMode::BestEffortPrefetch => remote_blocks.len().max(1),
+        };
+
+        let mut fetches = stream::iter(remote_blocks.into_values())
+            .map(|block| async move { Self::fetch_remote_block(vfs, block, mode).await })
+            .buffer_unordered(concurrency);
+        while let Some(result) = fetches.next().await {
+            result?;
+        }
+        Ok(())
+    }
+
+    async fn fetch_remote_block(
+        vfs: &StudioVfs,
+        block: PayloadRef,
+        mode: RemoteFetchMode,
+    ) -> VfsResult<()> {
+        let prefetch = matches!(mode, RemoteFetchMode::BestEffortPrefetch);
+        let result = if prefetch {
+            vfs.fetch_block_for_ref(&block, true).await
+        } else {
+            vfs.fetch_block_for_ref_after_local_miss(&block).await
+        };
+        match result {
+            Ok(_) => Ok::<(), VfsError>(()),
+            Err(crate::fetch::FetchError::NotFound { ref key }) => {
+                warn!(
+                    object_id = block.object_id,
+                    key,
+                    block_offset = block.offset,
+                    block_length = block.length,
+                    prefetch,
+                    "populate_missing_remote_blocks: S3 object not found during remote read warmup"
+                );
+                Ok::<(), VfsError>(())
+            }
+            Err(error) => {
+                if prefetch {
                     debug!(
-                        object_id,
+                        object_id = block.object_id,
                         error = %error,
                         "data reader prefetch failed; falling back to on-demand resolution"
                     );
                     Ok::<(), VfsError>(())
+                } else {
+                    Err(VfsError::Fetch(error))
                 }
             }
-        });
-        for result in join_all(fetches).await {
-            result?;
         }
-        Ok(())
     }
 
     async fn assemble_into(
@@ -1173,6 +1236,7 @@ impl StudioVfs {
             self.upload_fg_read_latency_window,
             access.policy,
         );
+        self.enqueue_prefetch_hint(ino, access.stream_id, access.policy, &blocks_needed);
         let data_reader = DataReader::new(
             self,
             ino,
@@ -1183,7 +1247,6 @@ impl StudioVfs {
         );
         let written = data_reader.read_into(buffer).await?;
 
-        self.enqueue_prefetch_hint(ino, access.stream_id, access.policy, &blocks_needed);
         guard.record_bytes(written as u64);
         Ok(written)
     }
@@ -2499,5 +2562,163 @@ mod tests {
             counting_backend.read_into_calls() > 0,
             "materialized pending local reads should use direct partial read_into()"
         );
+    }
+
+    #[test]
+    fn foreground_cold_read_starts_multiple_missing_remote_fetches_before_first_completes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "foreground-cold-read-parallel");
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"foreground-cold-read-parallel.bin",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create test file");
+            let ino = created.ino;
+            let block_size = u64::from(DEFAULT_BLOCK_SIZE);
+            let object_a = 0x000C_01DA;
+            let object_b = 0x000C_01DB;
+
+            let mut staged_attr = meta.get_attr(ino).expect("load staged attr");
+            staged_attr.size = block_size + 4;
+            staged_attr.committed_size = staged_attr.size;
+            staged_attr.upload_state = MetaUploadState::Ready;
+            meta.set_attr(&staged_attr).expect("persist committed attr");
+            meta.stage_payload_slice(ino, 0, &PayloadRef::new_partial(object_a, 4))
+                .expect("stage first published payload");
+            meta.stage_payload_slice(ino, 1, &PayloadRef::new_partial(object_b, 4))
+                .expect("stage second published payload");
+
+            let scheduler = vfs.fetch_scheduler().clone();
+            let inflight_a = scheduler.test_insert_inflight_fetch(object_a);
+            let inflight_b = scheduler.test_insert_inflight_fetch(object_b);
+            let joins_before = scheduler
+                .metrics
+                .singleflight_joins
+                .load(AtomicOrdering::Relaxed);
+
+            let read_task = tokio::spawn({
+                let vfs = vfs.clone();
+                async move { vfs.read(ino, 0, (block_size + 4) as u32).await }
+            });
+
+            tokio::time::timeout(std::time::Duration::from_millis(250), async {
+                loop {
+                    let joins = scheduler
+                        .metrics
+                        .singleflight_joins
+                        .load(AtomicOrdering::Relaxed);
+                    if joins >= joins_before + 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("foreground cold read should start both missing block fetches concurrently");
+
+            vfs.local_payload_backend()
+                .put(object_a, b"ABCD", false)
+                .expect("seed first fetched payload");
+            vfs.local_payload_backend()
+                .put(object_b, b"WXYZ", false)
+                .expect("seed second fetched payload");
+            let _ = inflight_a.send(true);
+            let _ = inflight_b.send(true);
+
+            let read = read_task
+                .await
+                .expect("read task should join cleanly")
+                .expect("foreground read should complete");
+            assert_eq!(&read[..4], b"ABCD");
+            assert_eq!(&read[read.len() - 4..], b"WXYZ");
+        });
+    }
+
+    #[test]
+    fn sequential_single_block_read_starts_next_prefetch_before_current_fetch_completes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (rt, vfs, meta) = make_test_vfs(&tmp, "sequential-single-block-prefetch-ahead");
+        rt.block_on(async {
+            let created = vfs
+                .create(
+                    ROOT_INO,
+                    b"sequential-single-block-prefetch-ahead.bin",
+                    1000,
+                    1000,
+                    0o644,
+                )
+                .expect("create test file");
+            let ino = created.ino;
+            let block_size = u64::from(DEFAULT_BLOCK_SIZE);
+            let object_0 = 0x5001;
+            let object_1 = 0x5002;
+            let object_2 = 0x5003;
+
+            let mut staged_attr = meta.get_attr(ino).expect("load staged attr");
+            staged_attr.size = block_size.saturating_mul(2).saturating_add(4);
+            staged_attr.committed_size = staged_attr.size;
+            staged_attr.upload_state = MetaUploadState::Ready;
+            meta.set_attr(&staged_attr).expect("persist committed attr");
+            meta.stage_payload_slice(ino, 0, &PayloadRef::new_partial(object_0, 4))
+                .expect("stage first published payload");
+            meta.stage_payload_slice(ino, 1, &PayloadRef::new_partial(object_1, 4))
+                .expect("stage second published payload");
+            meta.stage_payload_slice(ino, 2, &PayloadRef::new_partial(object_2, 4))
+                .expect("stage third published payload");
+
+            vfs.payload_store_put_async(object_0, Bytes::from_static(b"AAAA"), false)
+                .await
+                .expect("seed first local payload");
+            let first_read = vfs.read(ino, 0, 4).await.expect("read first block");
+            assert_eq!(first_read.as_ref(), b"AAAA");
+
+            let scheduler = vfs.fetch_scheduler().clone();
+            let current_fetch = scheduler.test_insert_inflight_fetch(object_1);
+            let next_prefetch = scheduler.test_insert_inflight_fetch(object_2);
+            let joins_before = scheduler
+                .metrics
+                .singleflight_joins
+                .load(AtomicOrdering::Relaxed);
+
+            let read_task = tokio::spawn({
+                let vfs = vfs.clone();
+                async move { vfs.read(ino, block_size, 4).await }
+            });
+
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    let joins = scheduler
+                        .metrics
+                        .singleflight_joins
+                        .load(AtomicOrdering::Relaxed);
+                    if joins >= joins_before + 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("sequential read should start next-block prefetch while the current cold fetch is still pending");
+
+            vfs.local_payload_backend()
+                .put(object_1, b"BBBB", false)
+                .expect("seed current fetched payload");
+            vfs.local_payload_backend()
+                .put(object_2, b"CCCC", false)
+                .expect("seed next prefetched payload");
+            let _ = current_fetch.send(true);
+            let _ = next_prefetch.send(true);
+
+            let read = read_task
+                .await
+                .expect("read task should join cleanly")
+                .expect("foreground read should complete");
+            assert_eq!(read.as_ref(), b"BBBB");
+        });
     }
 }

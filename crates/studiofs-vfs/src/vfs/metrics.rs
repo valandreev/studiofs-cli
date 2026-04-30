@@ -319,6 +319,46 @@ pub struct VfsFetchStats {
     pub local_cache_backend_io_total_ms: f64,
     pub local_cache_backend_io_avg_ms: f64,
     pub local_cache_backend_io_max_ms: f64,
+    #[serde(default)]
+    pub s3_get_calls: u64,
+    #[serde(default)]
+    pub s3_get_total_ms: f64,
+    #[serde(default)]
+    pub s3_get_avg_ms: f64,
+    #[serde(default)]
+    pub s3_get_max_ms: f64,
+    #[serde(default)]
+    pub object_decode_calls: u64,
+    #[serde(default)]
+    pub object_decode_total_ms: f64,
+    #[serde(default)]
+    pub object_decode_avg_ms: f64,
+    #[serde(default)]
+    pub object_decode_max_ms: f64,
+    #[serde(default)]
+    pub assemble_copy_calls: u64,
+    #[serde(default)]
+    pub assemble_copy_total_ms: f64,
+    #[serde(default)]
+    pub assemble_copy_avg_ms: f64,
+    #[serde(default)]
+    pub assemble_copy_max_ms: f64,
+    #[serde(default)]
+    pub local_cache_put_calls: u64,
+    #[serde(default)]
+    pub local_cache_put_total_ms: f64,
+    #[serde(default)]
+    pub local_cache_put_avg_ms: f64,
+    #[serde(default)]
+    pub local_cache_put_max_ms: f64,
+    #[serde(default)]
+    pub fetch_total_calls: u64,
+    #[serde(default)]
+    pub fetch_total_ms: f64,
+    #[serde(default)]
+    pub fetch_total_avg_ms: f64,
+    #[serde(default)]
+    pub fetch_total_max_ms: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

@@ -91,6 +91,21 @@ pub struct FetchMetrics {
     pub local_cache_io_handoff_max_ns: AtomicU64,
     pub local_cache_io_backend_total_ns: AtomicU64,
     pub local_cache_io_backend_max_ns: AtomicU64,
+    pub s3_get_calls: AtomicU64,
+    pub s3_get_total_ns: AtomicU64,
+    pub s3_get_max_ns: AtomicU64,
+    pub object_decode_calls: AtomicU64,
+    pub object_decode_total_ns: AtomicU64,
+    pub object_decode_max_ns: AtomicU64,
+    pub assemble_copy_calls: AtomicU64,
+    pub assemble_copy_total_ns: AtomicU64,
+    pub assemble_copy_max_ns: AtomicU64,
+    pub local_cache_put_calls: AtomicU64,
+    pub local_cache_put_total_ns: AtomicU64,
+    pub local_cache_put_max_ns: AtomicU64,
+    pub fetch_total_calls: AtomicU64,
+    pub fetch_total_ns: AtomicU64,
+    pub fetch_total_max_ns: AtomicU64,
 }
 
 impl FetchMetrics {
@@ -108,6 +123,21 @@ impl FetchMetrics {
             local_cache_io_handoff_max_ns: AtomicU64::new(0),
             local_cache_io_backend_total_ns: AtomicU64::new(0),
             local_cache_io_backend_max_ns: AtomicU64::new(0),
+            s3_get_calls: AtomicU64::new(0),
+            s3_get_total_ns: AtomicU64::new(0),
+            s3_get_max_ns: AtomicU64::new(0),
+            object_decode_calls: AtomicU64::new(0),
+            object_decode_total_ns: AtomicU64::new(0),
+            object_decode_max_ns: AtomicU64::new(0),
+            assemble_copy_calls: AtomicU64::new(0),
+            assemble_copy_total_ns: AtomicU64::new(0),
+            assemble_copy_max_ns: AtomicU64::new(0),
+            local_cache_put_calls: AtomicU64::new(0),
+            local_cache_put_total_ns: AtomicU64::new(0),
+            local_cache_put_max_ns: AtomicU64::new(0),
+            fetch_total_calls: AtomicU64::new(0),
+            fetch_total_ns: AtomicU64::new(0),
+            fetch_total_max_ns: AtomicU64::new(0),
         }
     }
 }
@@ -116,7 +146,7 @@ impl std::fmt::Display for FetchMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "cache_hits={} s3={} errors={} singleflight={} retries={} bytes={} prefetch_skips={} local_cache_io_calls={} local_cache_handoff_max_ms={:.3} local_cache_backend_max_ms={:.3}",
+            "cache_hits={} s3={} errors={} singleflight={} retries={} bytes={} prefetch_skips={} local_cache_io_calls={} local_cache_handoff_max_ms={:.3} local_cache_backend_max_ms={:.3} s3_get_max_ms={:.3} decode_max_ms={:.3} assemble_copy_max_ms={:.3} local_cache_put_max_ms={:.3} fetch_total_max_ms={:.3}",
             self.cache_hits.load(Ordering::Relaxed),
             self.s3_fetches.load(Ordering::Relaxed),
             self.s3_errors.load(Ordering::Relaxed),
@@ -127,6 +157,11 @@ impl std::fmt::Display for FetchMetrics {
             self.local_cache_io_calls.load(Ordering::Relaxed),
             self.local_cache_io_handoff_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
             self.local_cache_io_backend_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            self.s3_get_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            self.object_decode_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            self.assemble_copy_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            self.local_cache_put_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            self.fetch_total_max_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0,
         )
     }
 }
@@ -175,6 +210,63 @@ pub struct FetchScheduler {
 }
 
 impl FetchScheduler {
+    fn record_stage_duration(
+        calls: &AtomicU64,
+        total: &AtomicU64,
+        max: &AtomicU64,
+        duration: Duration,
+    ) {
+        let ns = duration.to_nanos_u64();
+        calls.fetch_add(1, Ordering::Relaxed);
+        total.fetch_add(ns, Ordering::Relaxed);
+        max.fetch_max(ns, Ordering::Relaxed);
+    }
+
+    fn record_s3_get(&self, duration: Duration) {
+        Self::record_stage_duration(
+            &self.metrics.s3_get_calls,
+            &self.metrics.s3_get_total_ns,
+            &self.metrics.s3_get_max_ns,
+            duration,
+        );
+    }
+
+    fn record_object_decode(&self, duration: Duration) {
+        Self::record_stage_duration(
+            &self.metrics.object_decode_calls,
+            &self.metrics.object_decode_total_ns,
+            &self.metrics.object_decode_max_ns,
+            duration,
+        );
+    }
+
+    fn record_assemble_copy(&self, duration: Duration) {
+        Self::record_stage_duration(
+            &self.metrics.assemble_copy_calls,
+            &self.metrics.assemble_copy_total_ns,
+            &self.metrics.assemble_copy_max_ns,
+            duration,
+        );
+    }
+
+    fn record_local_cache_put(&self, duration: Duration) {
+        Self::record_stage_duration(
+            &self.metrics.local_cache_put_calls,
+            &self.metrics.local_cache_put_total_ns,
+            &self.metrics.local_cache_put_max_ns,
+            duration,
+        );
+    }
+
+    fn record_fetch_total(&self, duration: Duration) {
+        Self::record_stage_duration(
+            &self.metrics.fetch_total_calls,
+            &self.metrics.fetch_total_ns,
+            &self.metrics.fetch_total_max_ns,
+            duration,
+        );
+    }
+
     fn record_local_cache_io(&self, timing: LocalCacheIoTiming) {
         self.metrics
             .local_cache_io_calls
@@ -485,6 +577,11 @@ impl FetchScheduler {
         self.aimd.in_flight()
     }
 
+    /// Current effective AIMD concurrency limit.
+    pub fn effective_limit(&self) -> usize {
+        self.aimd.effective_limit()
+    }
+
     /// Log a summary line (call periodically from a background task).
     pub fn log_stats(&self) {
         info!(
@@ -528,6 +625,13 @@ impl FetchScheduler {
         now_millis().saturating_sub(ts) <= duration_to_millis_u64(within)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_insert_inflight_fetch(&self, object_id: u64) -> broadcast::Sender<bool> {
+        let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        self.inflight.insert(object_id, tx.clone());
+        tx
+    }
+
     // ── Internal ────────────────────────────────────────────────────
 
     /// Fetch all remote fragments, decode them, reassemble, and populate cache.
@@ -537,12 +641,19 @@ impl FetchScheduler {
         keys: &[String],
         class: FetchClass,
     ) -> Result<Bytes, FetchError> {
-        let assembled_bytes = keys.len().saturating_mul(CLOUD_FRAGMENT_SIZE);
-        let fragment_window = keys.len().min(MAX_FRAGMENT_FETCH_IN_FLIGHT);
-        let in_flight_headroom_bytes = fragment_window.saturating_mul(CLOUD_FRAGMENT_SIZE);
-        let budget_bytes = assembled_bytes
-            .saturating_add(in_flight_headroom_bytes)
-            .max(1);
+        let total_start = Instant::now();
+        let result = self.do_fetch_with_retry_inner(object_id, keys, class).await;
+        self.record_fetch_total(total_start.elapsed());
+        result
+    }
+
+    async fn do_fetch_with_retry_inner(
+        &self,
+        object_id: u64,
+        keys: &[String],
+        class: FetchClass,
+    ) -> Result<Bytes, FetchError> {
+        let budget_bytes = fetch_transit_budget_bytes(keys.len());
         let budget_limit = self.transit_memory_budget.budget_bytes();
         if budget_bytes > budget_limit {
             return Err(FetchError::TransitBudgetTooSmall {
@@ -572,9 +683,21 @@ impl FetchScheduler {
             }
         };
 
+        if let [key] = keys {
+            let payload = self
+                .fetch_fragment_with_retry(object_id, 0, key, class)
+                .await?;
+            let cache_put_start = Instant::now();
+            self.payload_store_put_async(object_id, payload.clone(), true)
+                .await?;
+            self.record_local_cache_put(cache_put_start.elapsed());
+            return Ok(payload);
+        }
+
         // Fetch fragments concurrently and copy each part into its final offset
         // as soon as it completes to avoid keeping both full `Vec<Bytes>` and
         // final payload in memory at once.
+        let fragment_window = keys.len().min(MAX_FRAGMENT_FETCH_IN_FLIGHT);
         let mut in_flight = futures::stream::iter(keys.iter().cloned().enumerate())
             .map(|(fragment_index, key)| async move {
                 self.fetch_fragment_with_retry(object_id, fragment_index, &key, class)
@@ -595,7 +718,9 @@ impl FetchScheduler {
                     reason: "fragment bounds exceed assembled payload buffer".to_string(),
                 });
             }
+            let copy_start = Instant::now();
             assembled[start..end].copy_from_slice(&part);
+            self.record_assemble_copy(copy_start.elapsed());
             lengths[fragment_index] = part.len();
         }
 
@@ -608,8 +733,10 @@ impl FetchScheduler {
         let payload = Bytes::from(assembled);
 
         // Populate cache (L1 + L2) with the reconstructed logical block.
+        let cache_put_start = Instant::now();
         self.payload_store_put_async(object_id, payload.clone(), true)
             .await?;
+        self.record_local_cache_put(cache_put_start.elapsed());
 
         Ok(payload)
     }
@@ -736,10 +863,12 @@ impl FetchScheduler {
             let req_start = Instant::now();
             let get_result =
                 tokio::time::timeout(self.request_timeout, self.data_store.get_by_key(key)).await;
-            let req_ms = duration_to_millis_u64(req_start.elapsed());
+            let req_elapsed = req_start.elapsed();
+            let req_ms = duration_to_millis_u64(req_elapsed);
 
             match get_result {
                 Ok(Ok(compressed)) => {
+                    self.record_s3_get(req_elapsed);
                     permit.success();
                     self.metrics.s3_fetches.fetch_add(1, Ordering::Relaxed);
                     self.metrics
@@ -758,10 +887,14 @@ impl FetchScheduler {
                     );
 
                     // Decode STFS object payload.
-                    let payload = read_object(compressed)?;
+                    let decode_start = Instant::now();
+                    let payload = read_object(compressed);
+                    self.record_object_decode(decode_start.elapsed());
+                    let payload = payload?;
                     return Ok(payload);
                 }
                 Ok(Err(e)) => {
+                    self.record_s3_get(req_elapsed);
                     // NotFound — data consistency issue, NOT a server
                     // overload signal.  Release the permit neutrally
                     // (drop without calling failure()) so the AIMD
@@ -868,6 +1001,7 @@ impl FetchScheduler {
                     last_err = Some(e);
                 }
                 Err(_elapsed) => {
+                    self.record_s3_get(req_elapsed);
                     // Hard timeout — connection-level issue, NOT server
                     // overload.  Release permit neutrally so AIMD
                     // window stays intact.
@@ -944,7 +1078,7 @@ impl FetchScheduler {
         if limit == 0 {
             return false;
         }
-        let reserve = self.prefetch_reserve_slots.min(limit.saturating_sub(1));
+        let reserve = effective_prefetch_reserve_slots(self.prefetch_reserve_slots, limit);
         self.aimd.in_flight().saturating_add(reserve) < limit
     }
 
@@ -956,11 +1090,30 @@ impl FetchScheduler {
     }
 }
 
+fn effective_prefetch_reserve_slots(configured_reserve: usize, limit: usize) -> usize {
+    if limit <= 1 {
+        return 0;
+    }
+    let half_window = (limit / 2).max(1);
+    configured_reserve.min(limit - 1).min(half_window)
+}
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(duration_to_millis_u64)
         .unwrap_or(0)
+}
+
+fn fetch_transit_budget_bytes(fragment_count: usize) -> usize {
+    let assembled_bytes = fragment_count.saturating_mul(CLOUD_FRAGMENT_SIZE);
+    if fragment_count <= 1 {
+        return assembled_bytes.max(1);
+    }
+    let fragment_window = fragment_count.min(MAX_FRAGMENT_FETCH_IN_FLIGHT);
+    assembled_bytes
+        .saturating_add(fragment_window.saturating_mul(CLOUD_FRAGMENT_SIZE))
+        .max(1)
 }
 
 trait DurationToU64 {
@@ -1208,5 +1361,32 @@ mod tests {
                 "fetcher should do exactly one cache get when rechecking after a confirmed miss"
             );
         });
+    }
+
+    #[test]
+    fn single_fragment_fetch_budget_does_not_reserve_assembled_copy_headroom() {
+        assert_eq!(fetch_transit_budget_bytes(1), CLOUD_FRAGMENT_SIZE);
+        assert!(
+            fetch_transit_budget_bytes(2) > 2 * CLOUD_FRAGMENT_SIZE,
+            "multi-fragment fetches still need assembled payload plus fragment headroom"
+        );
+    }
+
+    #[test]
+    fn default_prefetch_admission_keeps_several_background_slots_available() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (_rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "default-prefetch-admission-slots");
+        let scheduler = vfs.fetch_scheduler().clone();
+
+        let mut permits = Vec::new();
+        while let Some(permit) = scheduler.try_acquire_prefetch_permit() {
+            permits.push(permit);
+        }
+
+        assert!(
+            permits.len() >= 8,
+            "default cold sequential prefetch should be able to fill the configured 8-worker pipeline, got {} permits",
+            permits.len()
+        );
     }
 }

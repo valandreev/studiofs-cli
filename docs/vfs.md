@@ -138,6 +138,16 @@ Foreground reads resolve data in this order:
 The chosen slice view sources payload bytes from the cached store first and
 object storage only when needed.
 
+When a foreground read spans multiple locally-missing published payload objects,
+the read path primes those cold remote blocks concurrently before final buffer
+assembly. The fetch scheduler still owns singleflight deduplication, AIMD
+admission, foreground/background reserve slots, and transit-memory accounting,
+so background prefetch cannot consume the foreground read capacity.
+For 4 MiB single-block sequential reads, the foreground path queues the
+next-read hint before waiting on the current cold fetch; the hint state keeps a
+merged range for duplicate suppression, but the prefetch worker receives the
+actual current read range so the sequential detector sees forward progress.
+
 Per-handle access tracking feeds prefetch and cache-promotion decisions so a
 random reader on one handle does not suppress sequential behavior on another
 handle for the same inode.

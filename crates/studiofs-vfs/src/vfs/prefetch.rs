@@ -466,14 +466,14 @@ impl StudioVfs {
                 "debug target prefetch hint"
             );
         }
-        let PrefetchHintUpdate::Store(stored) = update else {
+        let PrefetchHintUpdate::Store(_) = update else {
             return;
         };
         let _ = self.prefetch_tx.send(PrefetchWorkItem::ReadHint {
             ino,
             stream_id,
-            first_block: stored.first_block,
-            last_block: stored.last_block,
+            first_block: range.first_block,
+            last_block: range.last_block,
             policy,
         });
     }
