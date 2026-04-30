@@ -1705,16 +1705,14 @@ impl AsyncFileSystemContext for StudioFsContext {
         }
     }
 
-    fn read_directory_async(
+    async fn read_directory_async(
         &self,
         context: &Self::FileContext,
         pattern: Option<&U16CStr>,
         marker: DirMarker<'_>,
         buffer: &mut [u8],
-    ) -> impl std::future::Future<Output = winfsp::Result<u32>> + Send {
-        async move {
-            <Self as FileSystemContext>::read_directory(self, context, pattern, marker, buffer)
-        }
+    ) -> winfsp::Result<u32> {
+        <Self as FileSystemContext>::read_directory(self, context, pattern, marker, buffer)
     }
 
     fn spawn_task(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
