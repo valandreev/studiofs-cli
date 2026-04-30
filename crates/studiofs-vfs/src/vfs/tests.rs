@@ -163,6 +163,22 @@ fn contract_vfs_harness_allows_shutdown_grace_timeout_override() {
     assert_eq!(fixture.shutdown_timeout(), Duration::from_millis(100));
 }
 
+#[test]
+fn contract_vfs_harness_drop_inside_tokio_runtime_does_not_panic() {
+    let rt = Runtime::new().expect("outer runtime");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.block_on(async {
+            let _fixture =
+                ContractVfsFixture::new("vfs-contract-drop-in-runtime").expect("create fixture");
+        });
+    }));
+
+    assert!(
+        result.is_ok(),
+        "dropping a contract VFS fixture inside an existing Tokio runtime should not panic"
+    );
+}
+
 trait FileGraphMetaFixture {
     fn stage_payload_slice(
         &self,

@@ -10,6 +10,7 @@ use studiofs_meta::contract_harness::{
 };
 use studiofs_meta::schema::{InodeAttr, ROOT_INO};
 use studiofs_meta::{MetaError, RedbMetaEngine};
+use tokio::runtime::Runtime;
 
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 
@@ -103,7 +104,7 @@ impl ContractVfsOpOutcome {
 /// Local VFS fixture backed by an isolated `RedbMetaEngine` and cache directory.
 pub struct ContractVfsFixture {
     core: ContractCoreFixture,
-    runtime: tokio::runtime::Runtime,
+    runtime: Option<Runtime>,
     data_config: DataStoreConfig,
     cache_dir: PathBuf,
     cache_size: u64,
@@ -129,13 +130,13 @@ impl ContractVfsFixture {
         let core = ContractCoreFixture::new(label)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .worker_threads(2)
+            .worker_threads(1)
             .build()?;
         let data_config = DataStoreConfig::from(core.format_info());
         let cache_dir = core.root_path().join("cache");
         let mut fixture = Self {
             core,
-            runtime,
+            runtime: Some(runtime),
             data_config,
             cache_dir,
             cache_size: 64 * 1024 * 1024,
@@ -176,8 +177,10 @@ impl ContractVfsFixture {
     }
 
     /// Return the Tokio runtime used by the fixture.
-    pub fn runtime(&self) -> &tokio::runtime::Runtime {
-        &self.runtime
+    pub fn runtime(&self) -> &Runtime {
+        self.runtime
+            .as_ref()
+            .expect("contract fixture runtime should be available")
     }
 
     /// Return a clone of the current VFS handle.
@@ -204,6 +207,7 @@ impl ContractVfsFixture {
 
     /// Start VFS background workers for scenarios that need uploader/replay behavior.
     pub fn start(&self) -> ContractVfsResult<()> {
+        let _guard = self.runtime().enter();
         self.vfs().start()?;
         Ok(())
     }
@@ -250,7 +254,7 @@ impl ContractVfsFixture {
 
     fn open_vfs(&self) -> ContractVfsResult<Arc<StudioVfs>> {
         let cache_dir = self.cache_dir.to_string_lossy().into_owned();
-        let _guard = self.runtime.enter();
+        let _guard = self.runtime().enter();
         Ok(StudioVfs::new(
             self.core.meta(),
             &self.data_config,
@@ -263,15 +267,30 @@ impl ContractVfsFixture {
 
     fn close_vfs(&mut self) {
         if let Some(vfs) = self.vfs.take() {
-            self.runtime.block_on(vfs.shutdown(self.shutdown_timeout));
-            drop(vfs);
+            let Some(runtime) = self.runtime.as_ref() else {
+                return;
+            };
+            let shutdown_timeout = self.shutdown_timeout;
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let _ = std::thread::scope(|scope| {
+                    scope
+                        .spawn(move || runtime.block_on(vfs.shutdown(shutdown_timeout)))
+                        .join()
+                });
+            } else {
+                runtime.block_on(vfs.shutdown(shutdown_timeout));
+            }
         }
     }
 }
 
 impl Drop for ContractVfsFixture {
     fn drop(&mut self) {
+        let dropping_inside_runtime = tokio::runtime::Handle::try_current().is_ok();
         self.close_vfs();
+        if dropping_inside_runtime && let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
     }
 }
 

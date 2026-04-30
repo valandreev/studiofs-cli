@@ -14,7 +14,6 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -602,37 +601,26 @@ pub fn contract_format_info(label: &str) -> FormatInfo {
 
 #[derive(Debug)]
 struct ContractTempDir {
-    path: PathBuf,
+    inner: tempfile::TempDir,
 }
 
 impl ContractTempDir {
     fn new(label: &str) -> MetaResult<Self> {
         let safe = sanitize_label(label);
-        let counter = NEXT_FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        let path = std::env::temp_dir()
-            .join("studiofs-contract-core")
-            .join(format!("{safe}-{}-{counter}-{now}", std::process::id()));
-        std::fs::create_dir_all(&path).map_err(|err| {
-            MetaError::Storage(format!(
-                "failed to create contract fixture directory {}: {err}",
-                path.display()
-            ))
-        })?;
-        Ok(Self { path })
+        let prefix = format!("studiofs-contract-core-{safe}-");
+        let inner = tempfile::Builder::new()
+            .prefix(&prefix)
+            .tempdir()
+            .map_err(|err| {
+                MetaError::Storage(format!(
+                    "failed to create contract fixture directory for {safe}: {err}"
+                ))
+            })?;
+        Ok(Self { inner })
     }
 
     fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for ContractTempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        self.inner.path()
     }
 }
 
