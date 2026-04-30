@@ -7,6 +7,8 @@
 
 /// Async adapters for invoking synchronous metadata capabilities from Tokio.
 pub mod async_engine;
+/// Fast Contract/Core fixtures and invariant checks for local tests.
+pub mod contract_harness;
 /// Backend-agnostic metadata contracts shared by all metadata engines.
 pub mod engine;
 /// Internal metadata event-log payloads used for replication and recovery.

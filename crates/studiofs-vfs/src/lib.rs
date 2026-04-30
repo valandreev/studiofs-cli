@@ -6,6 +6,7 @@
 pub mod access;
 pub mod aimd;
 pub mod bridge;
+pub mod contract_harness;
 pub mod fetch;
 pub mod incarnation;
 mod landing_zone;

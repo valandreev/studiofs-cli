@@ -22,6 +22,26 @@ workspace commands below.
 1. Fast local/unit tests (default).
 2. Ignored integration tests with RustFS/S3 + PostgreSQL.
 
+## Contract/Core Harness
+
+Fast contract-level checks that should not require Docker, PostgreSQL, RustFS,
+FUSE, or WinFSP live in the Contract/Core harness:
+
+- `studiofs_meta::contract_harness::ContractCoreFixture` creates isolated
+  `RedbMetaEngine` fixtures, applies deterministic namespace-style operations,
+  reopens the same local metadata path, and runs shared tree/metadata/object
+  graph invariants with diagnostic snapshots.
+- `studiofs_vfs::contract_harness::ContractVfsFixture` layers a `StudioVfs`
+  fixture and local cache directory on top of the same metadata harness, then
+  delegates invariant checks back to the shared runner.
+
+Focused harness checks:
+
+```powershell
+cargo test -p studiofs-meta contract_core_harness_runs_ops_and_reopens_with_invariants -- --nocapture
+cargo test -p studiofs-vfs contract_vfs_harness_reopens_fixture_and_runs_core_invariants -- --nocapture
+```
+
 ## Prerequisites
 
 - Rust toolchain
