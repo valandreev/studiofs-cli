@@ -932,6 +932,7 @@ where
                     return Err(error);
                 }
             };
+        let had_attr_to_persist = attr_to_persist.is_some();
         let committed_attr = match self
             .commit_meta
             .commit_overlay(ino, chunk_slices, attr_to_persist)
@@ -945,6 +946,12 @@ where
                 return Err(error);
             }
         };
+        if had_attr_to_persist && committed_attr.is_none() {
+            self.local_payloads
+                .cleanup_uncommitted(ino, &persisted_blocks, "metadata-stale")
+                .await;
+            return Ok(DrainOutcome { persisted_blocks });
+        }
 
         self.observer
             .on_metadata_committed(ino, committed_attr.as_ref());
@@ -1150,6 +1157,114 @@ impl DrainCommitObserverPort for VfsDrainCommitObserver<'_> {
 }
 
 impl<'a> LocalDirtyFlushSession<'a> {
+    fn pending_slices_visible_end(
+        pending_slices: &std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
+    ) -> u64 {
+        pending_slices
+            .iter()
+            .flat_map(|(chunk_id, slices)| {
+                let chunk_start = studiofs_meta::schema::chunk_start_offset(
+                    studiofs_meta::schema::ChunkId(*chunk_id),
+                    studiofs_meta::schema::DEFAULT_CHUNK_SIZE,
+                );
+                slices
+                    .iter()
+                    .map(move |slice| chunk_start.saturating_add(u64::from(slice.range.end)))
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn pending_slice_commit_is_stale(&self, content_epoch: u64) -> VfsResult<bool> {
+        match self.vfs.sync_meta().get_attr(self.ino) {
+            Ok(attr) => Ok(attr.content_epoch > content_epoch),
+            Err(studiofs_meta::MetaError::InodeNotFound(_)) => Ok(true),
+            Err(error) => Err(VfsError::Meta(error)),
+        }
+    }
+
+    fn pending_slice_object_ids(
+        pending_slices: &std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
+    ) -> Vec<u64> {
+        pending_slices
+            .values()
+            .flat_map(|slices| slices.iter().filter_map(|slice| slice.object_id))
+            .collect()
+    }
+
+    async fn cleanup_stale_pending_slice_objects(
+        &self,
+        pending_slices: &std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
+        stage: &'static str,
+    ) {
+        let object_ids = Self::pending_slice_object_ids(pending_slices);
+        if object_ids.is_empty() {
+            return;
+        }
+        if let Err(error) = self.vfs.payload_store_remove_batch_async(&object_ids).await {
+            warn!(
+                ino = self.ino,
+                stage,
+                object_count = object_ids.len(),
+                error = %error,
+                "local-dirty cleanup of stale pending-slice payload-store entries failed"
+            );
+        }
+        if let Err(error) = self.vfs.upload_stage_remove_batch_async(&object_ids).await {
+            warn!(
+                ino = self.ino,
+                stage,
+                object_count = object_ids.len(),
+                error = %error,
+                "local-dirty cleanup of stale pending-slice upload entries failed"
+            );
+        }
+        self.vfs.upload_hot_remove_batch(&object_ids);
+    }
+
+    fn attr_for_pending_slice_commit(
+        &self,
+        pending_slices: &std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
+        content_epoch: u64,
+        attr_to_persist: Option<InodeAttr>,
+    ) -> VfsResult<Option<InodeAttr>> {
+        // A background slice commit can outlive the dirty-attr snapshot that
+        // advanced EOF; keep metadata size covering any slices made visible.
+        let visible_end = Self::pending_slices_visible_end(pending_slices);
+        if visible_end == 0 {
+            return Ok(attr_to_persist);
+        }
+
+        let had_attr = attr_to_persist.is_some();
+        let mut attr = if let Some(attr) = attr_to_persist {
+            attr
+        } else {
+            self.vfs
+                .sync_meta()
+                .get_attr(self.ino)
+                .map_err(VfsError::Meta)?
+        };
+        if !had_attr && attr.content_epoch > content_epoch {
+            return Ok(None);
+        }
+
+        let mut changed = false;
+        if attr.size < visible_end {
+            attr.size = visible_end;
+            changed = true;
+        }
+        if attr.content_epoch < content_epoch {
+            attr.content_epoch = content_epoch;
+            changed = true;
+        }
+
+        if had_attr || changed {
+            Ok(Some(attr))
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn commit_pending_slice_snapshot(
         &self,
         pending_slices: std::collections::BTreeMap<u64, Vec<PendingDirtySlice>>,
@@ -1160,20 +1275,38 @@ impl<'a> LocalDirtyFlushSession<'a> {
             return Ok(());
         }
 
+        if self.pending_slice_commit_is_stale(content_epoch)? {
+            self.cleanup_stale_pending_slice_objects(&pending_slices, "metadata-precheck")
+                .await;
+            self.vfs
+                .commit_pending_local_dirty_slices(self.ino, &pending_slices);
+            return Ok(());
+        }
+
         let chunk_slices = self.drain.build_overlay_slice_records(
             self.ino,
             &Vec::new(),
             pending_slices.clone(),
         )?;
+        let attr_to_persist =
+            self.attr_for_pending_slice_commit(&pending_slices, content_epoch, attr_to_persist)?;
         let attr_to_clear = attr_to_persist.clone();
         let committed_attr = self
             .drain
             .commit_meta
             .commit_overlay(self.ino, chunk_slices, attr_to_persist)
             .await?;
+        let skipped_stale_commit = attr_to_clear.is_some() && committed_attr.is_none();
         self.drain
             .observer
             .on_metadata_committed(self.ino, committed_attr.as_ref());
+        if skipped_stale_commit {
+            self.cleanup_stale_pending_slice_objects(&pending_slices, "metadata-stale")
+                .await;
+            self.vfs
+                .commit_pending_local_dirty_slices(self.ino, &pending_slices);
+            return Ok(());
+        }
 
         let upload_ops: Vec<_> = pending_slices
             .iter()
@@ -3107,7 +3240,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
     use studiofs_meta::schema::{CURRENT_FORMAT_VERSION, FormatInfo, MetadataConfig};
-    use studiofs_meta::{MetaFormat, RedbMetaEngine};
+    use studiofs_meta::{MetaFormat, MetaInodes, MetaPayloadObjects, RedbMetaEngine};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
@@ -3180,6 +3313,158 @@ mod tests {
                 BytesMut::from(data),
             )],
         )
+    }
+
+    #[test]
+    fn pending_slice_commit_without_dirty_attr_extends_visible_size() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-slice-attr-recovery");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"pending-slice-attr-recovery.bin", 0, 0, 0o644)
+                .expect("create file");
+            let ino = attr.ino;
+            let block_size = vfs.block_size;
+            let pending_slices = std::collections::BTreeMap::from([(
+                0,
+                vec![PendingDirtySlice::persisted(
+                    studiofs_meta::schema::SliceRange::new(0, block_size)
+                        .expect("pending slice range"),
+                    0,
+                    0,
+                    41,
+                    9001,
+                    0,
+                )],
+            )]);
+
+            vfs.local_dirty_flush_session(ino)
+                .commit_pending_slice_snapshot(pending_slices, 1, None)
+                .await
+                .expect("commit pending slice without dirty attr");
+
+            let persisted = meta.get_attr(ino).expect("persisted attr");
+            assert_eq!(
+                persisted.size,
+                u64::from(block_size),
+                "metadata size must cover locally committed overlay slices even if dirty_attr was already cleared"
+            );
+        });
+    }
+
+    #[test]
+    fn stale_pending_slice_commit_without_dirty_attr_preserves_newer_size() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-slice-stale-attr");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"pending-slice-stale-attr.bin", 0, 0, 0o644)
+                .expect("create file");
+            let ino = attr.ino;
+            let block_size = vfs.block_size;
+            let mut newer_attr = meta.get_attr(ino).expect("load attr");
+            newer_attr.size = 0;
+            newer_attr.content_epoch = 2;
+            meta.set_attr(&newer_attr).expect("store newer attr");
+            let pending_slices = std::collections::BTreeMap::from([(
+                0,
+                vec![PendingDirtySlice::persisted(
+                    studiofs_meta::schema::SliceRange::new(0, block_size)
+                        .expect("pending slice range"),
+                    0,
+                    0,
+                    41,
+                    9002,
+                    0,
+                )],
+            )]);
+
+            vfs.local_dirty_flush_session(ino)
+                .commit_pending_slice_snapshot(pending_slices, 1, None)
+                .await
+                .expect("commit stale pending slice without dirty attr");
+
+            let persisted = meta.get_attr(ino).expect("persisted attr");
+            assert_eq!(
+                persisted.size, 0,
+                "stale pending slice commits must not grow a newer inode attr"
+            );
+            assert_eq!(
+                persisted.content_epoch, 2,
+                "stale pending slice commits must preserve the newer content epoch"
+            );
+        });
+    }
+
+    #[test]
+    fn stale_pending_slice_commit_with_dirty_attr_preserves_newer_metadata() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "pending-slice-stale-dirty-attr");
+        let _guard = rt.enter();
+        rt.block_on(async {
+            let attr = vfs
+                .create(1, b"pending-slice-stale-dirty-attr.bin", 0, 0, 0o644)
+                .expect("create file");
+            let ino = attr.ino;
+            let block_size = vfs.block_size;
+            let stale_object_id = 9003;
+            let mut stale_attr = meta.get_attr(ino).expect("load stale attr");
+            stale_attr.size = u64::from(block_size);
+            stale_attr.content_epoch = 1;
+
+            let mut newer_attr = stale_attr.clone();
+            newer_attr.size = 0;
+            newer_attr.content_epoch = 2;
+            meta.set_attr(&newer_attr).expect("store newer attr");
+            vfs.local_payload_backend()
+                .put(stale_object_id, b"stale payload", false)
+                .expect("store stale local payload");
+
+            let pending_slices = std::collections::BTreeMap::from([(
+                0,
+                vec![PendingDirtySlice::persisted(
+                    studiofs_meta::schema::SliceRange::new(0, block_size)
+                        .expect("pending slice range"),
+                    0,
+                    0,
+                    41,
+                    stale_object_id,
+                    0,
+                )],
+            )]);
+
+            vfs.local_dirty_flush_session(ino)
+                .commit_pending_slice_snapshot(pending_slices, 1, Some(stale_attr))
+                .await
+                .expect("commit stale pending slice with dirty attr");
+
+            let persisted = meta.get_attr(ino).expect("persisted attr");
+            assert_eq!(
+                persisted.size, 0,
+                "stale pending slice commits must not restore an older EOF"
+            );
+            assert_eq!(
+                persisted.content_epoch, 2,
+                "stale pending slice commits must preserve the newer content epoch"
+            );
+            let spans = meta
+                .lookup_regular_file_slices(ino, 0, u64::from(block_size))
+                .expect("lookup slices after stale commit");
+            assert!(
+                spans.iter().all(|span| span.payload.is_none()),
+                "stale pending slice commits must not install visible payload slices: {spans:?}"
+            );
+            assert!(
+                vfs.pending_uploads_for_inode(ino).is_empty(),
+                "stale pending slice commits must not enqueue uploads"
+            );
+            assert!(
+                !vfs.local_payload_backend().contains(stale_object_id),
+                "stale pending slice commits must remove uncommitted local payloads"
+            );
+        });
     }
 
     #[test]

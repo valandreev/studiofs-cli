@@ -638,6 +638,47 @@ fn test_flush_regular_file_overlay_slices_with_attr_is_atomic() {
 }
 
 #[test]
+fn test_flush_regular_file_overlay_slices_with_attr_skips_stale_epoch() {
+    let engine = temp_engine();
+    let mut stale_attr = engine
+        .create_file(ROOT_INO, b"overlay-stale-epoch.bin", 1000, 1000, 0o644)
+        .unwrap();
+    let ino = stale_attr.ino;
+    stale_attr.size = 4096;
+    stale_attr.content_epoch = 1;
+
+    let mut newer_attr = stale_attr.clone();
+    newer_attr.size = 0;
+    newer_attr.content_epoch = 2;
+    engine.set_attr(&newer_attr).unwrap();
+
+    let incoming = vec![SliceRecord {
+        slice_id: SliceId::default(),
+        order: SliceOrder::default(),
+        range: SliceRange::new(0, 4096).expect("valid range"),
+        payload: Some(PayloadRef::new_partial(200_002, 4096)),
+        payload_state: PayloadRefState::LocalOnly,
+    }];
+
+    let committed_attr = engine
+        .flush_regular_file_overlay_slices_with_attr(ino, &[(ChunkId(0), incoming)], Some(&stale_attr))
+        .unwrap();
+    assert!(
+        committed_attr.is_none(),
+        "stale overlay commits must be skipped rather than returning a committed attr"
+    );
+
+    let persisted_attr = engine.get_attr(ino).unwrap();
+    assert_eq!(persisted_attr.size, 0);
+    assert_eq!(persisted_attr.content_epoch, 2);
+    let spans = engine.lookup_regular_file_slices(ino, 0, 4096).unwrap();
+    assert!(
+        spans.iter().all(|span| span.payload.is_none()),
+        "stale overlay commits must not install payload slices: {spans:?}"
+    );
+}
+
+#[test]
 fn test_local_slice_batch_commits_with_attr_and_resolves_holes() {
     let engine = temp_engine();
     let mut attr = engine

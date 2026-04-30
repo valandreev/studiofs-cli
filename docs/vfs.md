@@ -46,6 +46,20 @@ the backend boundary without reaching through backend-specific internals.
 
 Repeated `start()` calls are idempotent after the instance is running.
 
+## Contract/Core Test Harness
+
+`studiofs_vfs::contract_harness::ContractVfsFixture` creates a fast local
+`StudioVfs` fixture backed by an isolated `RedbMetaEngine` and local cache
+directory. It can reopen both metadata and VFS handles against the same local
+paths and delegates shared invariant checks to
+`studiofs_meta::contract_harness`. Fixture shutdown uses a short graceful drain
+timeout by default and can be overridden with `with_shutdown_timeout(...)` when
+a scenario needs stricter or longer replay/upload cleanup.
+
+This layer is for core API scenarios that must stay independent of Docker,
+PostgreSQL, RustFS, FUSE, and WinFSP. Mounted bridge, infra-backed, randomized,
+and chaos coverage belongs in the existing higher test layers.
+
 ## ACL Enforcement
 
 VFS enforces effective ACL roles per principal:

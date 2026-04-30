@@ -17,8 +17,8 @@ tokio-postgres.workspace = true
 url.workspace = true
 uuid.workspace = true
 bitflags = { version = "2.4", features = ["serde"] }
+tempfile.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
 dotenvy.workspace = true
 uuid.workspace = true

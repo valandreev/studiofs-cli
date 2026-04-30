@@ -10692,19 +10692,7 @@ fn write_stages_full_blocks_and_buffers_tail_without_buffered_relief() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn test_truncate_to_zero_then_rewrite() {
-    const UNPUBLISHED_PATH_TEST_UPLOAD_DELAY_MS: &str = "60000";
-
-    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
-    unsafe {
-        // Keep this test on the unpublished local-overlay path. With live S3
-        // and zero upload delay, background publication can race the immediate
-        // post-truncate metadata assertion and make the test timing-dependent.
-        std::env::set_var(
-            "STUDIOFS_UPLOAD_DELAY_MS",
-            UNPUBLISHED_PATH_TEST_UPLOAD_DELAY_MS,
-        );
-    }
-    ensure_bucket().await;
+    let _env = setup_offline_sfs121_env();
     let tmp = tempfile::tempdir().unwrap();
     let vfs = make_vfs(&tmp, "trunc-zero-rw");
 
@@ -10715,7 +10703,8 @@ async fn test_truncate_to_zero_then_rewrite() {
     let payload1: Vec<u8> = (0..5 * 1024 * 1024).map(|i| (i % 173) as u8).collect();
     vfs.write(ino, 0, &payload1).await.unwrap();
     vfs.flush(ino).await.unwrap();
-    let _ = wait_until_n_payload_slices(&vfs, ino, 2, Duration::from_secs(15));
+    wait_until_n_payload_slices(&vfs, ino, 2, Duration::from_secs(15))
+        .expect("initial flush should materialize both payload slices before truncate");
 
     // Get old object IDs.
     let old_blocks = vfs.meta().lookup_payload_slices(ino).unwrap();

@@ -621,6 +621,13 @@ impl RedbMetaEngine {
             .db
             .begin_write()
             .map_err(|e| MetaError::Storage(e.to_string()))?;
+        if let Some(attr) = attr {
+            match Self::get_attr_merged_in_write_txn(&txn, ino) {
+                Ok(current) if current.content_epoch > attr.content_epoch => return Ok(None),
+                Ok(_) | Err(MetaError::InodeNotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
         let normalized_attr = if let Some(attr) = attr {
             let mut normalized = attr.clone();
             if normalized.kind == FileType::RegularFile {

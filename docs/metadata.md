@@ -32,6 +32,26 @@ contracts instead of a single god-object surface. Capability traits are opt-in
 per backend (`impl MetaNamespace for ...`, etc.), so incomplete backend
 contracts fail at compile time.
 
+## Contract/Core Test Harness
+
+`studiofs_meta::contract_harness` provides the fast local Contract/Core test
+surface for metadata correctness. It creates isolated `RedbMetaEngine`
+fixtures, owns the temporary redb path, can drop and reopen the same metadata
+database, applies deterministic filesystem-like operations, and runs common
+invariants over:
+
+- the root-reachable namespace tree
+- dentry-to-attribute consistency
+- reachable link counts for regular files and symlinks
+- POSIX-style directory link counts (`2 + direct child directories`)
+- regular-file object graph readability
+- lifecycle rows that still point at live regular-file attrs, except retained
+  deleted-before-publish tombstones
+
+Invariant failures include a diagnostic snapshot of attrs, dentries, object
+graphs, and all violated rules. VFS-level contract tests reuse the same runner
+through `studiofs_vfs::contract_harness`.
+
 ## Capability Dependency Map
 
 `MetaEngine` is retained as the compatibility aggregate for engine factories

@@ -1,4 +1,5 @@
 use super::*;
+use crate::contract_harness::{ContractVfsFixture, ContractVfsOp};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -104,6 +105,78 @@ fn make_test_vfs_with_config(
     let _guard = rt.enter();
     vfs.start().expect("start vfs background workers");
     (rt, vfs, meta)
+}
+
+#[test]
+fn contract_vfs_harness_reopens_fixture_and_runs_core_invariants() {
+    let mut fixture =
+        ContractVfsFixture::new("vfs-contract-harness").expect("create vfs contract fixture");
+
+    let shots = fixture
+        .apply_op(ContractVfsOp::Mkdir {
+            parent: ROOT_INO,
+            name: b"shots".to_vec(),
+            mode: 0o755,
+        })
+        .expect("mkdir through vfs")
+        .created_attr()
+        .expect("dir attr");
+    fixture
+        .apply_op(ContractVfsOp::CreateFile {
+            parent: shots.ino,
+            name: b"take-001.mov".to_vec(),
+            mode: 0o644,
+        })
+        .expect("create through vfs");
+    fixture
+        .apply_op(ContractVfsOp::Rename {
+            parent: shots.ino,
+            name: b"take-001.mov".to_vec(),
+            new_parent: shots.ino,
+            new_name: b"take-final.mov".to_vec(),
+        })
+        .expect("rename through vfs");
+
+    let diagnostics = fixture
+        .assert_invariants("after vfs namespace ops")
+        .expect("vfs invariants");
+    assert!(
+        diagnostics
+            .entries
+            .iter()
+            .any(|entry| entry.name == b"take-final.mov"),
+        "diagnostics should include the renamed VFS dentry: {diagnostics}"
+    );
+
+    fixture.reopen_vfs().expect("reopen vfs fixture");
+    fixture
+        .assert_invariants("after vfs reopen")
+        .expect("reopened vfs invariants");
+}
+
+#[test]
+fn contract_vfs_harness_allows_shutdown_grace_timeout_override() {
+    let fixture = ContractVfsFixture::new("vfs-contract-shutdown-timeout")
+        .expect("create vfs contract fixture")
+        .with_shutdown_timeout(Duration::from_millis(100));
+
+    assert_eq!(fixture.shutdown_timeout(), Duration::from_millis(100));
+}
+
+#[test]
+fn contract_vfs_harness_drop_inside_tokio_runtime_does_not_panic() {
+    let rt = Runtime::new().expect("outer runtime");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.block_on(async {
+            let _fixture =
+                ContractVfsFixture::new("vfs-contract-drop-in-runtime").expect("create fixture");
+        });
+    }));
+
+    assert!(
+        result.is_ok(),
+        "dropping a contract VFS fixture inside an existing Tokio runtime should not panic"
+    );
 }
 
 trait FileGraphMetaFixture {
