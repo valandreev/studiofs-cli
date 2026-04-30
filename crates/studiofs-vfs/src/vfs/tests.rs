@@ -5477,6 +5477,57 @@ fn strict_local_sync_flushes_pending_group_commit_bytes() {
 }
 
 #[test]
+fn write_through_local_sync_flushes_pending_group_commit_bytes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (rt, vfs, _meta) = make_test_vfs(&tmp, "write-through-local-sync-group");
+    rt.block_on(async {
+        let mut group = vfs.state.local_dirty.local_sync_group.lock().await;
+        group.pending_bytes = 4096;
+        group.last_sync_at = Instant::now();
+    });
+
+    let calls_before = vfs
+        .state
+        .metrics
+        .payload_store_sync_data_calls
+        .load(Ordering::Relaxed);
+    let synced_before = vfs
+        .state
+        .metrics
+        .payload_store_sync_data_synced_bytes
+        .load(Ordering::Relaxed);
+
+    rt.block_on(async {
+        vfs.maybe_payload_store_sync_data_async(0, LocalSyncPolicy::WriteThrough)
+            .await
+            .expect("write-through local sync");
+    });
+
+    let calls_after = vfs
+        .state
+        .metrics
+        .payload_store_sync_data_calls
+        .load(Ordering::Relaxed);
+    let synced_after = vfs
+        .state
+        .metrics
+        .payload_store_sync_data_synced_bytes
+        .load(Ordering::Relaxed);
+    assert!(
+        calls_after > calls_before,
+        "write-through sync should force backend sync_data"
+    );
+    assert!(
+        synced_after >= synced_before + 4096,
+        "write-through sync should account for pending group-commit bytes"
+    );
+    rt.block_on(async {
+        let group = vfs.state.local_dirty.local_sync_group.lock().await;
+        assert_eq!(group.pending_bytes, 0);
+    });
+}
+
+#[test]
 fn opportunistic_local_sync_defers_when_threshold_not_reached() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (rt, vfs, _meta) = make_test_vfs(&tmp, "opportunistic-local-sync-group");

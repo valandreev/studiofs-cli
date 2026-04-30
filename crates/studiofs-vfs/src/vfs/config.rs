@@ -55,6 +55,17 @@ pub(super) const CACHE_RUNTIME_HUGE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024 * 102
 pub enum LocalSyncPolicy {
     Opportunistic,
     Strict,
+    WriteThrough,
+}
+
+impl LocalSyncPolicy {
+    pub const fn is_opportunistic(self) -> bool {
+        matches!(self, Self::Opportunistic)
+    }
+
+    pub const fn requires_write_path_durability(self) -> bool {
+        matches!(self, Self::Strict | Self::WriteThrough)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,10 +137,10 @@ pub(super) fn write_path_sync_trigger(
     pending_bytes: u64,
     group_min_bytes: u64,
 ) -> Option<LocalSyncTrigger> {
-    // Strict writes always flush — they guarantee local durability before returning.
+    // Durability-required writes always flush before returning.
     // Opportunistic writes group sync_data so the OS page cache drains in bounded
     // chunks instead of accumulating until a later explicit flush, fsync, or close.
-    if matches!(local_sync_policy, LocalSyncPolicy::Strict) {
+    if local_sync_policy.requires_write_path_durability() {
         return Some(LocalSyncTrigger::Explicit);
     }
     if pending_bytes >= group_min_bytes.max(1) {
@@ -905,6 +916,12 @@ mod tests {
     #[test]
     fn local_sync_policy_strict_always_triggers_sync() {
         let trigger = write_path_sync_trigger(LocalSyncPolicy::Strict, 1, 64 * 1024 * 1024);
+        assert_eq!(trigger, Some(LocalSyncTrigger::Explicit));
+    }
+
+    #[test]
+    fn local_sync_policy_write_through_always_triggers_sync() {
+        let trigger = write_path_sync_trigger(LocalSyncPolicy::WriteThrough, 1, 64 * 1024 * 1024);
         assert_eq!(trigger, Some(LocalSyncTrigger::Explicit));
     }
 

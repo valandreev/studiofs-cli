@@ -216,11 +216,16 @@ fn open_flags_from_access(granted_access: FILE_ACCESS_RIGHTS, _create_options: u
     }
 }
 
-fn write_local_sync_policy_from_create_options(_create_options: u32) -> LocalSyncPolicy {
-    // WinFSP callbacks run on a bounded dispatcher pool and `spawn_wait` parks
-    // that dispatcher until the async write completes. Do not let per-open
-    // write-through/no-buffering flags force foreground fdatasync from write();
-    // explicit flush and last-close still own the durable local barrier.
+const FILE_WRITE_THROUGH_CREATE_OPTION: u32 = 0x0000_0002;
+const FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION: u32 = 0x0000_0008;
+
+fn write_local_sync_policy_from_create_options(create_options: u32) -> LocalSyncPolicy {
+    if (create_options
+        & (FILE_WRITE_THROUGH_CREATE_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_CREATE_OPTION))
+        != 0
+    {
+        return LocalSyncPolicy::WriteThrough;
+    }
     LocalSyncPolicy::Opportunistic
 }
 
@@ -2704,22 +2709,22 @@ mod tests {
         );
         assert_eq!(
             write_local_sync_policy_from_create_options(FILE_WRITE_THROUGH_OPTION),
-            LocalSyncPolicy::Opportunistic
+            LocalSyncPolicy::WriteThrough
         );
         assert_eq!(
             write_local_sync_policy_from_create_options(FILE_NO_INTERMEDIATE_BUFFERING_OPTION),
-            LocalSyncPolicy::Opportunistic
+            LocalSyncPolicy::WriteThrough
         );
         assert_eq!(
             write_local_sync_policy_from_create_options(
                 FILE_WRITE_THROUGH_OPTION | FILE_NO_INTERMEDIATE_BUFFERING_OPTION
             ),
-            LocalSyncPolicy::Opportunistic
+            LocalSyncPolicy::WriteThrough
         );
     }
 
     #[test]
-    fn write_through_write_callback_defers_local_sync_until_flush() {
+    fn write_through_write_callback_commits_local_state_immediately() {
         let (_tmp, vfs, ctx, _queue) = make_test_context("write_callback_write_through");
         let attr = vfs
             .create(ROOT_INO, b"write-through-callback.txt", 0, 0, 0o644)
@@ -2752,30 +2757,49 @@ mod tests {
         .expect("write callback");
 
         assert_eq!(
-            sync_data_calls(&vfs),
-            sync_calls_before,
-            "write-through / unbuffered WinFSP writes must not call fdatasync from write()"
+            vfs.open_count(attr.ino),
+            1,
+            "write-through durability must not release the handle"
+        );
+        assert!(
+            sync_data_calls(&vfs) > sync_calls_before,
+            "write-through / unbuffered WinFSP writes must cross a local payload sync barrier"
+        );
+        assert!(
+            flush_barrier_calls(&vfs) > flush_calls_before,
+            "write-through / unbuffered WinFSP writes must commit local metadata before returning"
+        );
+        assert!(
+            !vfs.inode_has_local_dirty_state(attr.ino),
+            "write-through / unbuffered WinFSP writes should leave no deferred local dirty state"
+        );
+        let write_path = vfs.write_path_observability_snapshot().winfsp_write_path;
+        assert_eq!(
+            write_path.write_through_calls, 1,
+            "write-through callbacks should be attributed separately from strict writes"
         );
         assert_eq!(
-            flush_barrier_calls(&vfs),
-            flush_calls_before,
-            "write-through / unbuffered WinFSP writes must not commit the local metadata barrier from write()"
+            write_path.strict_calls, 0,
+            "write-through callbacks should not be reported as ordinary strict writes"
         );
+        let sync_calls_after_write = sync_data_calls(&vfs);
+        let flush_calls_after_write = flush_barrier_calls(&vfs);
 
         ctx.run_flush_callback(attr.ino, fh)
             .expect("flush callback");
         assert_eq!(
             sync_data_calls(&vfs),
-            sync_calls_before,
-            "write-through / unbuffered WinFSP writeback flush must not call fdatasync from the dispatcher"
+            sync_calls_after_write,
+            "explicit flush after write-through should be clean"
+        );
+        assert_eq!(
+            flush_barrier_calls(&vfs),
+            flush_calls_after_write,
+            "explicit flush after write-through should not commit another local metadata barrier"
         );
         assert!(
             !vfs.inode_has_local_dirty_state(attr.ino),
-            "explicit flush should still cross the local writeback boundary"
-        );
-        assert!(
-            flush_barrier_calls(&vfs) > flush_calls_before,
-            "explicit flush should still commit materialized slices through the local metadata barrier"
+            "explicit flush after write-through should remain clean"
         );
 
         ctx.spawn_wait({

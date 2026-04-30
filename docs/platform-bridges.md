@@ -100,6 +100,11 @@ Implements `winfsp::filesystem::FileSystemContext` trait.
 I/O buffer behavior on Windows callbacks:
 - `read`: WinFSP-provided output buffers are forwarded directly to the VFS `read_into_fh()` data-reader path through a callback-scoped `SendMutBuffer`; `StudioFsContext` does not allocate an intermediate payload buffer for file data reads.
 - `write`: WinFSP-provided input buffers are forwarded directly to `write_fh_with_deferred_materialize()` through a callback-scoped `SendConstBuffer`; `StudioFsContext` does not allocate an intermediate payload buffer before the VFS writer accepts the bytes.
+- Handles opened with Windows `FILE_WRITE_THROUGH` or `FILE_NO_INTERMEDIATE_BUFFERING`
+  are mapped to the explicit `WriteThrough` local sync policy. Ordinary handles
+  remain opportunistic writeback; write-through handles force the submitted bytes
+  through the local payload and metadata durability barrier before the callback
+  returns, without changing remote upload or peer-publication semantics.
 - `read_directory`: per-entry UTF-16 conversion reuses a single `Vec<u16>` buffer and only falls back to lossy replacement semantics for invalid UTF-8 names.
 
 WinFSP callback barrier semantics:
