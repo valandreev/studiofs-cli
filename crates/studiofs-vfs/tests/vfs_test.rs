@@ -10692,6 +10692,13 @@ fn write_stages_full_blocks_and_buffers_tail_without_buffered_relief() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn test_truncate_to_zero_then_rewrite() {
+    let _restore_upload_delay = ScopedEnvVar::capture("STUDIOFS_UPLOAD_DELAY_MS");
+    unsafe {
+        // Keep this test on the unpublished local-overlay path. With live S3
+        // and zero upload delay, background publication can race the immediate
+        // post-truncate metadata assertion and make the test timing-dependent.
+        std::env::set_var("STUDIOFS_UPLOAD_DELAY_MS", "60000");
+    }
     ensure_bucket().await;
     let tmp = tempfile::tempdir().unwrap();
     let vfs = make_vfs(&tmp, "trunc-zero-rw");
