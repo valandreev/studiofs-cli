@@ -170,8 +170,12 @@ impl std::fmt::Display for FetchMetrics {
 // FetchScheduler
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Result broadcast to singleflight waiters: `true` = success, `false` = failure.
-type BroadcastResult = bool;
+/// Result broadcast to singleflight waiters.
+#[derive(Clone, Debug)]
+pub(crate) enum BroadcastResult {
+    Success(Bytes),
+    Failure,
+}
 
 /// Adaptive block fetcher with singleflight dedup and AIMD concurrency.
 pub struct FetchScheduler {
@@ -452,14 +456,14 @@ impl FetchScheduler {
                             Ok(Some(cached)) => {
                                 self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
                                 if let Some((_, tx)) = self.inflight.remove(&object_id) {
-                                    let _ = tx.send(true);
+                                    let _ = tx.send(BroadcastResult::Success(cached.clone()));
                                 }
                                 return Ok(cached);
                             }
                             Ok(None) => {}
                             Err(error) => {
                                 if let Some((_, tx)) = self.inflight.remove(&object_id) {
-                                    let _ = tx.send(false);
+                                    let _ = tx.send(BroadcastResult::Failure);
                                 }
                                 return Err(error);
                             }
@@ -472,19 +476,12 @@ impl FetchScheduler {
                     // to avoid infinite hangs).
                     let recv = tokio::time::timeout(Duration::from_secs(300), rx.recv()).await;
                     match recv {
-                        // Fetcher succeeded — grab from cache.
-                        Ok(Ok(true)) => {
-                            if let Some(cached) = self.payload_store_get_async(object_id).await? {
-                                self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
-                                return Ok(cached);
-                            }
-                            // Rare: cache evicted between notify and our read.
-                            // Fall through to re-enter singleflight as fetcher.
-                            debug!(object_id, "singleflight: cache miss after notify, retrying");
+                        Ok(Ok(BroadcastResult::Success(payload))) => {
+                            return Ok(payload);
                         }
                         // Fetcher failed, channel closed, or timeout.
                         // Become a new fetcher ourselves.
-                        Ok(Ok(false)) | Ok(Err(_)) | Err(_) => {
+                        Ok(Ok(BroadcastResult::Failure)) | Ok(Err(_)) | Err(_) => {
                             debug!(
                                 object_id,
                                 "singleflight: fetcher failed, becoming new fetcher"
@@ -510,9 +507,12 @@ impl FetchScheduler {
         let result = self.do_fetch_with_retry(object_id, keys, class).await;
 
         // Notify waiters before cleanup removes the entry.
-        let success = result.is_ok();
         if let Some((_, tx)) = self.inflight.remove(&object_id) {
-            let _ = tx.send(success);
+            let broadcast_result = match &result {
+                Ok(payload) => BroadcastResult::Success(payload.clone()),
+                Err(_) => BroadcastResult::Failure,
+            };
+            let _ = tx.send(broadcast_result);
         }
         // Defuse cleanup guard — we already removed the entry.
         _cleanup.defuse();
@@ -626,7 +626,10 @@ impl FetchScheduler {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_insert_inflight_fetch(&self, object_id: u64) -> broadcast::Sender<bool> {
+    pub(crate) fn test_insert_inflight_fetch(
+        &self,
+        object_id: u64,
+    ) -> broadcast::Sender<BroadcastResult> {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         self.inflight.insert(object_id, tx.clone());
         tx
@@ -1208,8 +1211,8 @@ impl Drop for InFlightCleanup<'_> {
             // Panic path: remove entry so waiters get Closed.
             let removed = self.inflight.remove(&self.object_id);
             if let Some((_, tx)) = removed {
-                // Send false so waiters know the fetch failed.
-                let _ = tx.send(false);
+                // Tell waiters the fetch failed before the channel closes.
+                let _ = tx.send(BroadcastResult::Failure);
             }
         }
     }
@@ -1274,9 +1277,9 @@ mod tests {
     }
 
     #[test]
-    fn fetch_block_after_local_miss_skips_eager_cache_get_before_waiting() {
+    fn singleflight_waiter_uses_handoff_payload_without_cache_reread() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "skip-eager-cache-get");
+        let (rt, vfs, _meta) = make_unstarted_test_vfs(&tmp, "singleflight-handoff-payload");
 
         rt.block_on(async {
             let scheduler = vfs.fetch_scheduler().clone();
@@ -1311,20 +1314,19 @@ mod tests {
                 "confirmed local misses should not issue an eager whole-block cache get before waiting"
             );
 
-            vfs.local_payload_backend()
-                .put(object_id, b"payload-from-cache", false)
-                .expect("seed cache for waiter");
-            let _ = tx.send(true);
+            let _ = tx.send(BroadcastResult::Success(Bytes::from_static(
+                b"payload-from-singleflight",
+            )));
 
             let data = task
                 .await
                 .expect("fetch task should join cleanly")
-                .expect("waiter should load data from cache after notification");
-            assert_eq!(data.as_ref(), b"payload-from-cache");
+                .expect("waiter should receive the singleflight payload");
+            assert_eq!(data.as_ref(), b"payload-from-singleflight");
             assert_eq!(
                 scheduler.metrics.local_cache_io_calls.load(Ordering::Relaxed),
-                io_calls_before + 1,
-                "waiter should perform exactly one cache get after notification"
+                io_calls_before,
+                "waiter should not spawn a blocking cache reread after singleflight notification"
             );
         });
     }

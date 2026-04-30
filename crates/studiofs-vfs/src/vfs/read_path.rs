@@ -41,6 +41,7 @@ struct ReadSegment {
 
 type ReadRangeList = SmallVec<[ReadRange; 8]>;
 type ReadBlockList = SmallVec<[u32; 16]>;
+const MAX_FOREGROUND_COLD_READ_FETCH_IN_FLIGHT: usize = 64;
 
 struct ReadClaimBuffers {
     claimed: ReadRangeList,
@@ -550,11 +551,10 @@ impl<'a> DataReader<'a> {
         }
 
         let concurrency = match mode {
-            RemoteFetchMode::ForegroundColdRead => vfs
-                .fetch_scheduler()
-                .effective_limit()
-                .max(1)
-                .min(remote_blocks.len()),
+            RemoteFetchMode::ForegroundColdRead => Self::foreground_cold_read_concurrency(
+                vfs.fetch_scheduler().effective_limit(),
+                remote_blocks.len(),
+            ),
             RemoteFetchMode::BestEffortPrefetch => remote_blocks.len().max(1),
         };
 
@@ -565,6 +565,16 @@ impl<'a> DataReader<'a> {
             result?;
         }
         Ok(())
+    }
+
+    fn foreground_cold_read_concurrency(fetch_limit: usize, block_count: usize) -> usize {
+        if block_count == 0 {
+            return 0;
+        }
+        fetch_limit
+            .max(1)
+            .min(block_count)
+            .min(MAX_FOREGROUND_COLD_READ_FETCH_IN_FLIGHT)
     }
 
     async fn fetch_remote_block(
@@ -2627,8 +2637,12 @@ mod tests {
             vfs.local_payload_backend()
                 .put(object_b, b"WXYZ", false)
                 .expect("seed second fetched payload");
-            let _ = inflight_a.send(true);
-            let _ = inflight_b.send(true);
+            let _ = inflight_a.send(crate::fetch::BroadcastResult::Success(Bytes::from_static(
+                b"ABCD",
+            )));
+            let _ = inflight_b.send(crate::fetch::BroadcastResult::Success(Bytes::from_static(
+                b"WXYZ",
+            )));
 
             let read = read_task
                 .await
@@ -2711,8 +2725,12 @@ mod tests {
             vfs.local_payload_backend()
                 .put(object_2, b"CCCC", false)
                 .expect("seed next prefetched payload");
-            let _ = current_fetch.send(true);
-            let _ = next_prefetch.send(true);
+            let _ = current_fetch.send(crate::fetch::BroadcastResult::Success(
+                Bytes::from_static(b"BBBB"),
+            ));
+            let _ = next_prefetch.send(crate::fetch::BroadcastResult::Success(
+                Bytes::from_static(b"CCCC"),
+            ));
 
             let read = read_task
                 .await
@@ -2720,5 +2738,14 @@ mod tests {
                 .expect("foreground read should complete");
             assert_eq!(read.as_ref(), b"BBBB");
         });
+    }
+
+    #[test]
+    fn foreground_cold_read_concurrency_caps_extreme_aimd_windows() {
+        assert_eq!(
+            DataReader::foreground_cold_read_concurrency(1024, 512),
+            64,
+            "foreground cold-prime should not create hundreds of active fetch futures for one oversized read"
+        );
     }
 }
