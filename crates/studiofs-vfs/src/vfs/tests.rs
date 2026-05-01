@@ -136,6 +136,52 @@ fn contract_vfs_harness_reopens_fixture_and_runs_core_invariants() {
             new_name: b"take-final.mov".to_vec(),
         })
         .expect("rename through vfs");
+    fixture
+        .apply_op(ContractVfsOp::CreateFile {
+            parent: shots.ino,
+            name: b"scratch.mov".to_vec(),
+            mode: 0o644,
+        })
+        .expect("create scratch file through vfs");
+    fixture
+        .apply_op(ContractVfsOp::Unlink {
+            parent: shots.ino,
+            name: b"scratch.mov".to_vec(),
+        })
+        .expect("unlink through vfs");
+    fixture
+        .apply_op(ContractVfsOp::Mkdir {
+            parent: shots.ino,
+            name: b"empty".to_vec(),
+            mode: 0o755,
+        })
+        .expect("mkdir empty through vfs");
+    fixture
+        .apply_op(ContractVfsOp::Rmdir {
+            parent: shots.ino,
+            name: b"empty".to_vec(),
+        })
+        .expect("rmdir through vfs");
+
+    let open_unlink = fixture
+        .apply_op(ContractVfsOp::CreateFile {
+            parent: shots.ino,
+            name: b"open-unlink.mov".to_vec(),
+            mode: 0o644,
+        })
+        .expect("create open-unlink file through vfs")
+        .created_attr()
+        .expect("open-unlink attr");
+    let vfs = fixture.vfs();
+    let fh = vfs
+        .open_file(open_unlink.ino, OpenFlags::RDWR, false)
+        .expect("open file handle");
+    fixture
+        .apply_op(ContractVfsOp::Unlink {
+            parent: shots.ino,
+            name: b"open-unlink.mov".to_vec(),
+        })
+        .expect("unlink open file through vfs");
 
     let diagnostics = fixture
         .assert_invariants("after vfs namespace ops")
@@ -147,6 +193,22 @@ fn contract_vfs_harness_reopens_fixture_and_runs_core_invariants() {
             .any(|entry| entry.name == b"take-final.mov"),
         "diagnostics should include the renamed VFS dentry: {diagnostics}"
     );
+    assert!(
+        diagnostics
+            .deferred_deletes
+            .iter()
+            .any(|record| record.ino == open_unlink.ino && record.parent == shots.ino),
+        "diagnostics should explain the open-unlinked VFS inode through deferred delete state: {diagnostics}"
+    );
+
+    fixture
+        .runtime()
+        .block_on(vfs.release_fh(fh))
+        .expect("release open-unlinked file handle");
+    fixture
+        .assert_invariants("after vfs open-unlink release")
+        .expect("released open-unlink invariants");
+    drop(vfs);
 
     fixture.reopen_vfs().expect("reopen vfs fixture");
     fixture
