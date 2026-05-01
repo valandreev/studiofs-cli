@@ -1,3 +1,37 @@
+fn partial_payload_ref(object_id: u64, offset: u32, length: u32) -> PayloadRef {
+    let mut payload = PayloadRef::new_partial(object_id, length);
+    payload.offset = offset;
+    payload
+}
+
+fn resolved_byte_view(
+    spans: &[ResolvedSliceSpan],
+    offset: u64,
+    length: u64,
+    objects: &std::collections::BTreeMap<u64, Vec<u8>>,
+) -> Vec<u8> {
+    let mut view = vec![0; usize::try_from(length).expect("test range fits in memory")];
+    for span in spans {
+        let Some(payload) = span.payload.as_ref() else {
+            continue;
+        };
+        let file_start = chunk_start_offset(span.chunk_id, DEFAULT_CHUNK_SIZE)
+            .checked_add(u64::from(span.range.start))
+            .expect("span file offset fits");
+        let dst_start =
+            usize::try_from(file_start - offset).expect("span starts inside requested view");
+        let payload_len = usize::try_from(payload.length).expect("payload length fits");
+        let dst_end = dst_start + payload_len;
+        let src_start = usize::try_from(payload.offset).expect("payload offset fits");
+        let src_end = src_start + payload_len;
+        let object = objects
+            .get(&payload.object_id)
+            .expect("payload object is available in test map");
+        view[dst_start..dst_end].copy_from_slice(&object[src_start..src_end]);
+    }
+    view
+}
+
 #[test]
 fn test_regular_file_prefix_scan_is_exact_per_inode() {
     let engine = temp_engine();
@@ -732,6 +766,150 @@ fn test_local_slice_batch_commits_with_attr_and_resolves_holes() {
     assert_eq!(spans[3].source, ResolvedSliceSource::OverlayTombstone);
     assert_eq!(spans[4].range, SliceRange::new(40, 64).unwrap());
     assert_eq!(spans[4].source, ResolvedSliceSource::Hole);
+}
+
+#[test]
+fn test_contract_core_slice_graph_resolves_logical_byte_view_after_reopen() {
+    let mut fixture =
+        ContractCoreFixture::new("chunk-slice-byte-view").expect("create contract fixture");
+    let file = fixture
+        .apply_op(ContractCoreOp::CreateFile {
+            parent: ROOT_INO,
+            name: b"byte-view.bin".to_vec(),
+            mode: 0o644,
+        })
+        .expect("create file")
+        .created_attr()
+        .expect("created file attr");
+    let ino = file.ino;
+
+    let query_offset = DEFAULT_CHUNK_SIZE as u64 - 8;
+    let query_len = 48;
+    let tail_start = DEFAULT_CHUNK_SIZE - 8;
+
+    let objects = std::collections::BTreeMap::from([
+        (101, b"0123456789abcdef".to_vec()),
+        (102, b"abcdefghijklmnopqrstuvwxyz012345".to_vec()),
+        (103, b"BASE-HIGH-ORDER".to_vec()),
+        (201, b"OVERLAY-OBJECT-0123456789".to_vec()),
+        (202, b"fragmented-payload".to_vec()),
+    ]);
+
+    let mut chunk0_base = RegularFileChunkState::default();
+    chunk0_base.insert_slice(SliceRecord::new(
+        SliceId(1),
+        SliceOrder(1),
+        SliceRange::new(tail_start, DEFAULT_CHUNK_SIZE).expect("valid chunk0 base"),
+        partial_payload_ref(101, 4, 8),
+    ));
+    let mut chunk0_overlay = RegularFileChunkState::default();
+    chunk0_overlay.insert_slice(SliceRecord::new(
+        SliceId(10),
+        SliceOrder(1),
+        SliceRange::new(tail_start + 4, DEFAULT_CHUNK_SIZE).expect("valid chunk0 overlay"),
+        partial_payload_ref(201, 2, 4),
+    ));
+
+    let mut chunk1_base = RegularFileChunkState::default();
+    chunk1_base.insert_slice(SliceRecord::new(
+        SliceId(1),
+        SliceOrder(1),
+        SliceRange::new(0, 24).expect("valid chunk1 low-order base"),
+        partial_payload_ref(102, 0, 24),
+    ));
+    chunk1_base.insert_slice(SliceRecord::new(
+        SliceId(2),
+        SliceOrder(2),
+        SliceRange::new(8, 16).expect("valid chunk1 high-order base"),
+        partial_payload_ref(103, 4, 8),
+    ));
+
+    let mut chunk1_overlay = RegularFileChunkState::default();
+    chunk1_overlay.insert_slice(SliceRecord::new(
+        SliceId(10),
+        SliceOrder(1),
+        SliceRange::new(4, 12).expect("valid chunk1 overlay data"),
+        partial_payload_ref(201, 6, 8),
+    ));
+    chunk1_overlay.insert_slice(SliceRecord::tombstone(
+        SliceId(11),
+        SliceOrder(2),
+        SliceRange::new(18, 22).expect("valid chunk1 overlay tombstone"),
+    ));
+    chunk1_overlay.insert_slice(SliceRecord::new(
+        SliceId(12),
+        SliceOrder(3),
+        SliceRange::new(24, 28).expect("valid first fragment"),
+        partial_payload_ref(202, 2, 4),
+    ));
+    chunk1_overlay.insert_slice(SliceRecord::new(
+        SliceId(13),
+        SliceOrder(4),
+        SliceRange::new(28, 32).expect("valid second fragment"),
+        partial_payload_ref(202, 6, 4),
+    ));
+
+    {
+        let engine = fixture.meta();
+        let mut attr = engine.get_attr(ino).expect("file attr");
+        attr.size = query_offset + query_len;
+        attr.content_epoch = 1;
+        engine.set_attr(&attr).expect("set file size");
+        set_regular_file_chunk_rows(
+            &engine,
+            ino,
+            &[(ChunkId(0), chunk0_overlay), (ChunkId(1), chunk1_overlay)],
+            &[(ChunkId(0), chunk0_base), (ChunkId(1), chunk1_base)],
+        );
+    }
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&objects[&101][4..8]);
+    expected.extend_from_slice(&objects[&201][2..6]);
+    expected.extend_from_slice(&objects[&102][0..4]);
+    expected.extend_from_slice(&objects[&201][6..14]);
+    expected.extend_from_slice(&objects[&103][8..12]);
+    expected.extend_from_slice(&objects[&102][16..18]);
+    expected.extend_from_slice(&[0; 4]);
+    expected.extend_from_slice(&objects[&102][22..24]);
+    expected.extend_from_slice(&objects[&202][2..6]);
+    expected.extend_from_slice(&objects[&202][6..10]);
+    expected.extend_from_slice(&[0; 8]);
+    assert_eq!(expected.len(), usize::try_from(query_len).unwrap());
+
+    let before_reopen = {
+        let engine = fixture.meta();
+        engine
+            .lookup_regular_file_slices(ino, query_offset, query_len)
+            .expect("resolve before reopen")
+    };
+    assert!(
+        before_reopen
+            .iter()
+            .any(|span| span.source == ResolvedSliceSource::OverlayTombstone),
+        "resolved spans must keep overlay tombstones explicit: {before_reopen:?}"
+    );
+    assert!(
+        before_reopen
+            .iter()
+            .any(|span| span.source == ResolvedSliceSource::Hole),
+        "resolved spans must keep sparse holes explicit: {before_reopen:?}"
+    );
+    assert_eq!(
+        resolved_byte_view(&before_reopen, query_offset, query_len, &objects),
+        expected
+    );
+
+    let reopened = fixture.reopen_meta().expect("reopen metadata fixture");
+    let after_reopen = reopened
+        .lookup_regular_file_slices(ino, query_offset, query_len)
+        .expect("resolve after reopen");
+
+    assert_eq!(after_reopen, before_reopen);
+    assert_eq!(
+        resolved_byte_view(&after_reopen, query_offset, query_len, &objects),
+        expected
+    );
 }
 
 #[test]

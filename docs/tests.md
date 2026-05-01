@@ -168,6 +168,7 @@ The final chunk/slice/payload-object model is directly covered by these focused
 regressions:
 
 - Read/write resolution
+  - `test_contract_core_slice_graph_resolves_logical_byte_view_after_reopen`
   - `test_resolve_chunk_slice_spans_overlay_over_base_with_hole`
   - `test_lookup_regular_file_slices_boundary_spanning_write_is_split_per_chunk`
   - `offline_s3_does_not_break_local_read_after_write`
@@ -196,6 +197,7 @@ Each command below is copy-paste ready and includes the full crate and test
 binary prefix where applicable.
 
 ```bash
+cargo test -p studiofs-meta test_contract_core_slice_graph_resolves_logical_byte_view_after_reopen -- --nocapture
 cargo test -p studiofs-meta test_resolve_chunk_slice_spans_overlay_over_base_with_hole -- --nocapture
 cargo test -p studiofs-meta redb_partial_update_does_not_expose_new_blocks_before_publish -- --nocapture
 cargo test -p studiofs-vfs --test vfs_test offline_s3_does_not_break_local_read_after_write -- --nocapture
