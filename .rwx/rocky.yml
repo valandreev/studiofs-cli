@@ -1,0 +1,103 @@
+on:
+  cli:
+    init:
+      ref: ${{ event.git.sha }}
+base:
+  image: rockylinux:9
+  config: none
+
+tasks:
+  - key: rocky-packages
+    run: |
+      set -euo pipefail
+
+      SUDO=""
+      if [ "$(id -u)" -ne 0 ]; then
+        SUDO="sudo"
+      fi
+
+      $SUDO dnf -y update
+      $SUDO dnf -y install dnf-plugins-core epel-release
+      $SUDO dnf config-manager --set-enabled crb || true
+      $SUDO dnf -y install --allowerasing \
+        ca-certificates \
+        curl \
+        gcc \
+        gcc-c++ \
+        git \
+        gtk3-devel \
+        libappindicator-gtk3-devel \
+        libxdo-devel \
+        make \
+        openssl-devel \
+        pkgconf-pkg-config
+      $SUDO dnf clean all
+
+  - key: code
+    use: rocky-packages
+    run: |
+      set -euo pipefail
+
+      git init .
+      git remote add origin https://github.com/valandreev/studiofs-cli.git
+      git -c credential.helper='!f() { echo username=x-access-token; echo password=$GITHUB_TOKEN; }; f' \
+        fetch --depth 1 origin "${{ init.ref }}"
+      git checkout --detach FETCH_HEAD
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+
+  - key: rust
+    use: rocky-packages
+    run: |
+      set -euo pipefail
+
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain 1.95.0 \
+            --component clippy \
+            --component rustfmt
+      export PATH="$HOME/.cargo/bin:$PATH"
+      rustc --version
+      cargo --version
+
+  - key: cargo-fetch
+    use: [code, rust]
+    filter:
+      - Cargo.lock
+      - Cargo.toml
+      - crates/*/Cargo.toml
+      - crates/*/src/lib.rs
+      - crates/*/src/main.rs
+    run: |
+      set -euo pipefail
+
+      export PATH="$HOME/.cargo/bin:$PATH"
+      cargo fetch --locked
+
+  - key: cargo-test-rocky-workspace
+    use: [code, rust, cargo-fetch]
+    run: |
+      set -euo pipefail
+
+      export PATH="$HOME/.cargo/bin:$PATH"
+      cargo test --workspace --all-targets --exclude studiofs-fuse -- --nocapture
+    env:
+      RUSTFLAGS: "-Dwarnings"
+    agent:
+      cpus: 8
+
+  - key: cargo-test-studiofs-fuse-rocky
+    use: [code, rust, cargo-fetch]
+    run: |
+      set -euo pipefail
+
+      export PATH="$HOME/.cargo/bin:$PATH"
+      cargo test -p studiofs-fuse --lib -- --nocapture
+      cargo test -p studiofs-fuse --test mount_sanity --no-run
+    env:
+      RUSTFLAGS: "-Dwarnings"
+
+  - key: rocky
+    use:
+      - cargo-test-rocky-workspace
+      - cargo-test-studiofs-fuse-rocky
+    run: echo "Rocky Linux checks passed"

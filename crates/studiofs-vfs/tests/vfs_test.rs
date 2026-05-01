@@ -3013,6 +3013,7 @@ fn graceful_shutdown_remount_recovers_new_unpublished_file_before_publish() {
 }
 
 #[test]
+#[ignore = "requires live S3 backend; run with --ignored and valid .env"]
 fn graceful_shutdown_remount_preserves_newer_local_epoch_over_published_base() {
     let _env = ScopedTestEnv::new();
     let tmp = tempfile::tempdir().unwrap();

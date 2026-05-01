@@ -57,12 +57,16 @@ cargo check --workspace
 
 ## CI Matrix
 
-The GitHub Actions workflow (`.github/workflows/rust.yml`) runs four jobs:
+Linux verification runs in RWX (`.rwx/ci.yml`). GitHub Actions
+(`.github/workflows/rust.yml`) remains responsible for hosted macOS and
+Windows verification that RWX does not currently provide, but those workflows
+are manual-only and do not run automatically on PRs.
 
 | Job | Runner | Purpose |
 |-----|--------|---------|
-| **Quality Gates** | `ubuntu-latest` | `cargo fmt`, clippy (workspace + all-features), `cargo doc`, `cargo audit` |
-| **Linux** | `ubuntu-latest` | Workspace tests, SFS-121 targeted VFS fast suite, explicit `studiofs-fuse` Linux unit step |
+| **Quality Gates** | RWX `ubuntu:24.04` | `cargo fmt`, clippy (workspace + all-features), `cargo doc`, `cargo audit` |
+| **Ubuntu Linux** | RWX `ubuntu:24.04` | Workspace tests, local-first VFS fast checks, explicit `studiofs-fuse` Linux unit step |
+| **Rocky Linux** | RWX `rockylinux:9` | Workspace tests, explicit `studiofs-fuse` Linux unit step, `mount_sanity` compile check |
 | **macOS** | `macos-latest` | Clippy + tests — explicit `studiofs-fuse` macOS unit step (exercises `cfg(target_os="macos")` branches) |
 | **Windows** | `windows-latest` | Clippy + tests — explicit `studiofs-winfsp` unit step (exercises `cfg(windows)` code paths) |
 
@@ -72,8 +76,9 @@ are immediately attributable in the CI job log rather than buried inside the
 broad workspace run. Failures that originate from platform-specific code
 should call out the backend step name directly.
 
-Platform jobs depend on Quality Gates to avoid wasting macOS/Windows runner
-minutes when portable checks fail.
+The GitHub-hosted macOS and Windows jobs are independent from RWX. Required
+branch protection should include the RWX Linux gate; hosted macOS and Windows
+Actions can be started manually from the GitHub Actions UI when needed.
 
 ## Tests
 

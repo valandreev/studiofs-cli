@@ -1,0 +1,155 @@
+on:
+  cli:
+    init:
+      ref: ${{ event.git.sha }}
+  github:
+    pull_request:
+      init:
+        ref: ${{ event.git.sha }}
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.0.3
+
+tasks:
+  - key: code
+    call: git/clone 2.0.7
+    with:
+      repository: https://github.com/valandreev/studiofs-cli.git
+      ref: ${{ init.ref }}
+      github-token: ${{ github.token }}
+
+  - key: rust
+    call: rust-lang/install 1.0.7
+    with:
+      rust-version: 1.95.0
+
+  - key: linux-packages
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y libgtk-3-dev libxdo-dev
+      sudo apt-get install -y libappindicator3-dev || sudo apt-get install -y libayatana-appindicator3-dev
+      sudo apt-get clean
+
+  - key: cargo-fmt
+    use: [code, rust]
+    run: cargo fmt --all -- --check
+
+  - key: cargo-fetch
+    use: [code, rust]
+    filter:
+      - Cargo.lock
+      - Cargo.toml
+      - crates/*/Cargo.toml
+      - crates/*/src/lib.rs
+      - crates/*/src/main.rs
+    run: cargo fetch --locked
+
+  - key: cargo-clippy
+    use: [code, rust, linux-packages, cargo-fetch]
+    run: cargo clippy --workspace --all-targets -- -D warnings
+    env:
+      RUSTFLAGS: "-Dwarnings"
+
+  - key: cargo-clippy-all-features
+    use: [code, rust, linux-packages, cargo-fetch]
+    run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+    env:
+      RUSTFLAGS: "-Dwarnings"
+
+  - key: cargo-doc
+    use: [code, rust, linux-packages, cargo-fetch]
+    run: cargo doc --workspace --no-deps
+    env:
+      RUSTFLAGS: "-Dwarnings"
+      RUSTDOCFLAGS: "-Dwarnings"
+
+  - key: cargo-audit-install
+    use: rust
+    run: cargo install --locked cargo-audit
+
+  - key: cargo-audit
+    use: [code, rust, cargo-audit-install]
+    filter:
+      - Cargo.lock
+    run: |
+      cargo audit --json --file ./Cargo.lock > cargo-audit.json || true
+      python3 - <<'PY'
+      import json
+      import sys
+
+      try:
+          with open("cargo-audit.json", encoding="utf-8") as fh:
+              report = json.load(fh)
+      except Exception as exc:
+          print("Failed to parse cargo-audit output:", exc)
+          sys.exit(1)
+
+      if report.get("vulnerabilities", {}).get("found", False):
+          print("VULNERABILITIES FOUND")
+          sys.exit(1)
+
+      warnings = report.get("warnings", {}).get("unmaintained", [])
+      if warnings:
+          print("Unmaintained dependencies (non-fatal):")
+          for warning in warnings:
+              package = warning.get("package") or {}
+              print("-", package.get("name"), package.get("version"))
+
+      sys.exit(0)
+      PY
+
+  - key: quality
+    use:
+      - cargo-fmt
+      - cargo-clippy
+      - cargo-clippy-all-features
+      - cargo-doc
+      - cargo-audit
+    run: echo "Quality gates passed"
+
+  - key: cargo-test-linux-workspace
+    use: [code, rust, linux-packages, cargo-fetch]
+    run: cargo test --workspace --all-targets --exclude studiofs-fuse -- --nocapture
+    env:
+      RUSTFLAGS: "-Dwarnings"
+    agent:
+      cpus: 8
+
+  - key: cargo-test-local-first-offline-vfs-fast
+    use: [code, rust, linux-packages, cargo-fetch]
+    run: |
+      set -euo pipefail
+
+      cargo test -p studiofs-vfs --test vfs_test upload_backlog_progresses_via_persisted_local_payload_reads -- --exact --nocapture
+      cargo test -p studiofs-vfs --test vfs_test warm_cache_sequential_read_bounded_latency_after_write -- --exact --nocapture
+      cargo test -p studiofs-vfs --test vfs_test mixed_workload_concurrent_readers_during_pending_upload_no_errors -- --exact --nocapture
+      cargo test -p studiofs-vfs --test vfs_test handle_aware_read_policy_keeps_sequential_and_random_streams_separate -- --exact --nocapture
+      cargo test -p studiofs-vfs --test vfs_test file_session_flush_ordering_is_deterministic -- --exact --nocapture
+    env:
+      RUSTFLAGS: "-Dwarnings"
+
+  - key: cargo-test-studiofs-fuse-linux
+    use: [code, rust, linux-packages, cargo-fetch]
+    run: cargo test -p studiofs-fuse --lib -- --nocapture
+    env:
+      RUSTFLAGS: "-Dwarnings"
+
+  - key: ubuntu-linux
+    use:
+      - quality
+      - cargo-test-linux-workspace
+      - cargo-test-local-first-offline-vfs-fast
+      - cargo-test-studiofs-fuse-linux
+    run: echo "Ubuntu Linux checks passed"
+
+  - key: rocky-linux
+    call: ${{ run.dir }}/rocky.yml
+    init:
+      ref: ${{ init.ref }}
+
+  - key: linux
+    after:
+      - ubuntu-linux
+      - rocky-linux
+    run: echo "Linux checks passed"

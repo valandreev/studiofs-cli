@@ -2,8 +2,9 @@
 
 ## Verification Matrix
 
-StudioFS runs four CI jobs on every push and PR. All four are intended as
-required gates (enforced via GitHub Branch Protection Rules).
+StudioFS runs Linux PR verification in RWX. GitHub Actions macOS, Windows, and
+smoke workflows are manual-only and can be started from the GitHub Actions UI
+when hosted signal is useful.
 
 The authoritative matrix — what each job checks, what is not covered
 automatically, and the compile/unit/smoke distinctions — lives in
@@ -74,7 +75,7 @@ S3-compatible side unless a test explicitly checks another provider.
 | Full ignored integration suite | `cargo test --workspace --all-targets -- --ignored --nocapture --test-threads=1` |
 | PG metadata suite | `cargo test -p studiofs-meta pg_engine::tests::test_pg_ -- --ignored --nocapture --test-threads=1` |
 | VFS ignored suite | `cargo test -p studiofs-vfs --test vfs_test -- --ignored --nocapture --test-threads=1` |
-| Buffered-first fast suite (no S3) | `cargo test -p studiofs-vfs --test vfs_test sfs121_ -- --nocapture` |
+| Local-first VFS fast checks (no S3) | See [Local-first VFS fast checks](#local-first-vfs-fast-checks-no-s3). |
 | Buffered-first infra suite (S3 required) | `cargo test -p studiofs-vfs --test vfs_test sfs121_ -- --ignored --nocapture --test-threads=1` |
 | CLI surface enforcement | `cargo test -p studiofs -- --nocapture` |
 | Data integration suite | `cargo test -p studiofs-data --test integration_test -- --ignored --nocapture` |
@@ -82,6 +83,19 @@ S3-compatible side unless a test explicitly checks another provider.
 | Dump/Load recovery integration suite | `cargo test -p studiofs --test dump_load_test -- --ignored --nocapture --test-threads=1` |
 | FUSE bridge unit + smoke | `cargo test -p studiofs-fuse -- --nocapture` and `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity -- --ignored --nocapture --test-threads=1` |
 | WinFSP bridge unit + smoke | `cargo test -p studiofs-winfsp -- --nocapture` and `$env:STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS='1'; $env:STUDIOFS_WINFSP_TEST_MOUNT_POINT='Z:'; cargo test -p studiofs-winfsp --test mount_sanity -- --ignored --nocapture --test-threads=1` |
+
+### Local-first VFS fast checks (no S3)
+
+The old `sfs121_` filter only matched comments and helper names, not test
+function names. Run these exact non-ignored local-first VFS checks instead:
+
+```bash
+cargo test -p studiofs-vfs --test vfs_test upload_backlog_progresses_via_persisted_local_payload_reads -- --exact --nocapture
+cargo test -p studiofs-vfs --test vfs_test warm_cache_sequential_read_bounded_latency_after_write -- --exact --nocapture
+cargo test -p studiofs-vfs --test vfs_test mixed_workload_concurrent_readers_during_pending_upload_no_errors -- --exact --nocapture
+cargo test -p studiofs-vfs --test vfs_test handle_aware_read_policy_keeps_sequential_and_random_streams_separate -- --exact --nocapture
+cargo test -p studiofs-vfs --test vfs_test file_session_flush_ordering_is_deterministic -- --exact --nocapture
+```
 
 ### Smoke test descriptions
 
@@ -160,7 +174,7 @@ host — cross-compilation or a Linux-only CI pass does not count.
 
 | Crate | CI step | Runner |
 |-------|---------|--------|
-| `studiofs-fuse` (Linux paths) | `cargo test (studiofs-fuse — Linux paths)` | `ubuntu-latest` |
+| `studiofs-fuse` (Linux paths) | `cargo-test-studiofs-fuse-linux` / `cargo-test-studiofs-fuse-rocky` | RWX `ubuntu:24.04` + `rockylinux:9` |
 | `studiofs-fuse` (macOS paths) | `cargo test (studiofs-fuse — macOS paths)` | `macos-latest` |
 | `studiofs-winfsp` | `cargo test (studiofs-winfsp)` | `windows-latest` |
 
@@ -200,6 +214,7 @@ regressions:
   - `sfs316_publish_queues_displaced_objects_and_reachability_scan_is_idempotent`
   - `sfs316_delete_before_publish_tombstone_does_not_publish_deleted_content`
   - `startup_replay_cancels_ready_inode_stale_pending_upload`
+  - `graceful_shutdown_remount_preserves_newer_local_epoch_over_published_base` *(requires S3 env)*
   - `test_truncate_shrink_then_extend_zero_fills_old_tail`
   - `test_write_at_exact_block_boundary_transition`
 
@@ -279,12 +294,10 @@ Smoke tests also run in the separate `.github/workflows/smoke.yml` workflow:
 | Trigger | Behavior |
 |---------|----------|
 | `workflow_dispatch` | Manual run — all platforms |
-| `schedule` (weekly Mon 4 AM UTC) | Automated regression detection |
-| PR with `smoke-test` label | On-demand PR validation for bridge changes |
 
-The workflow runs independently of the main `rust.yml` pipeline. macOS smoke
-tests use `continue-on-error: true` because the macFUSE system extension may
-not load on hosted runners without a reboot.
+The workflow runs independently of the main `rust.yml` pipeline and never
+starts automatically. macOS smoke tests use `continue-on-error: true` because
+the macFUSE system extension may not load on hosted runners without a reboot.
 
 See [docs/smoke-test-strategy.md](smoke-test-strategy.md) for the full
 strategy document covering hosted vs self-hosted responsibilities.

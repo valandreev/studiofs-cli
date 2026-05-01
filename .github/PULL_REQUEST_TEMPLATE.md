@@ -28,8 +28,8 @@
 
 - [ ] I have explained below how the platform-specific path is verified
 
-**Platform verification:** <!-- e.g. "CI covers this — the macOS job runs
-`cargo test -p studiofs-fuse --lib --tests` which exercises this path." or
-"Validated locally with STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1
+**Platform verification:** <!-- e.g. "Manual GitHub Actions macOS verification
+covers this — the macOS job runs `cargo test -p studiofs-fuse --lib --tests`."
+or "Validated locally with STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1
 cargo test -p studiofs-fuse --test mount_sanity -- --ignored."
 See docs/contributing.md#rules-for-platform-specific-code for the full rules. -->

@@ -10,22 +10,25 @@ is added or changed, and who owns each part of CI.
 
 StudioFS is a cross-platform filesystem product. It targets Linux, macOS, and
 Windows. The CI model reflects that — a green signal from Ubuntu alone is not
-sufficient.
+sufficient. Linux PR verification runs in RWX on Ubuntu and Rocky Linux.
+GitHub Actions remains available for hosted macOS and Windows checks, but those
+workflows are manual-only while Windows work is primarily validated locally.
 
-### What is verified automatically on each push / PR
+### What is verified automatically vs manually
 
-| Check | Linux (`ubuntu-latest`) | macOS (`macos-latest`) | Windows (`windows-latest`) |
-|-------|------------------------|----------------------|----------------------------|
-| `cargo fmt` | ✅ (Quality Gates job) | — | — |
-| `cargo clippy` (workspace) | ✅ (Quality Gates job) | ✅ | ✅ |
-| `cargo clippy` (all features) | ✅ (Quality Gates job) | ✅ | ✅ |
-| `cargo doc` | ✅ (Quality Gates job) | — | — |
-| `cargo audit` ¹ | ✅ (Quality Gates job) | — | — |
-| Workspace unit + compile tests | ✅ | ✅ | ✅ |
-| SFS-121 offline VFS fast suite | ✅ | — | — |
-| `studiofs-fuse` Linux unit tests | ✅ | — | — |
-| `studiofs-fuse` macOS unit + non-mount integration tests | — | ✅ | — |
-| `studiofs-winfsp` unit tests | — | — | ✅ |
+| Check | Linux (RWX Ubuntu + Rocky) | macOS (`macos-latest`) | Windows (`windows-latest`) |
+|-------|----------------------------|----------------------|----------------------------|
+| `cargo fmt` | Auto (RWX Ubuntu quality) | — | — |
+| `cargo clippy` (workspace) | Auto (RWX Ubuntu quality) | Manual GitHub Action | Manual GitHub Action |
+| `cargo clippy` (all features) | Auto (RWX Ubuntu quality) | Manual GitHub Action | Manual GitHub Action |
+| `cargo doc` | Auto (RWX Ubuntu quality) | — | — |
+| `cargo audit` ¹ | Auto (RWX Ubuntu quality) | — | — |
+| Workspace unit + compile tests | Auto (Ubuntu + Rocky) | Manual GitHub Action | Manual GitHub Action |
+| Local-first VFS fast checks | Auto (explicit Ubuntu step; covered by Rocky workspace run) | — | — |
+| `studiofs-fuse` Linux unit tests | Auto (Ubuntu + Rocky) | — | — |
+| `studiofs-fuse` Linux mount-smoke compile check | Auto (Rocky) | — | — |
+| `studiofs-fuse` macOS unit + non-mount integration tests | — | Manual GitHub Action | — |
+| `studiofs-winfsp` unit tests | — | — | Manual GitHub Action |
 
 ### What is NOT verified automatically (manual / self-hosted only)
 
@@ -37,16 +40,16 @@ sufficient.
 
 <a name="footnote-audit"></a>
 ¹ `cargo audit` reads the single workspace `Cargo.lock` and reports
-vulnerabilities regardless of target platform. Running it once on Linux covers
+vulnerabilities regardless of target platform. Running it once in RWX covers
 the full dependency graph, including platform-specific crates such as
 `studiofs-winfsp`. Platform-conditional vulnerabilities (e.g. a Windows-only
 advisory on a `windows-sys` crate) are surfaced in the same audit run.
 
 **Compile/unit/smoke distinctions:**
 
-- **Portable compile + clippy** — `cargo clippy` runs in Quality Gates (Linux), macOS, and Windows jobs. The Linux job does not repeat clippy; compile coverage on Linux comes from the workspace `cargo test` run. Together the three jobs catch API and cfg-gated breakage on all supported targets.
+- **Portable compile + clippy** — `cargo clippy` runs automatically in the RWX Ubuntu quality gate. Hosted macOS and Windows clippy runs are available as manual GitHub Actions. Linux compile coverage comes from RWX Ubuntu and Rocky workspace `cargo test` runs.
 - **Portable unit tests** — the workspace `cargo test` run on each platform. Covers all crates except the platform-specific backend crate, which has a dedicated step.
-- **Platform unit tests** — the named backend step in each platform job (`studiofs-fuse` on Linux and macOS, `studiofs-winfsp` on Windows). This is the primary signal for platform-specific code paths.
+- **Platform unit tests** — the named backend step in each platform lane (`studiofs-fuse` on RWX Ubuntu/Rocky and manual macOS, `studiofs-winfsp` on manual Windows). This is the primary signal for platform-specific code paths.
 - **Platform smoke tests** — `mount_sanity` integration tests marked `#[ignore]`. These include both minimal lifecycle tests (session create/drop) and full I/O tests (mount → write → read → readdir → delete → unmount). Run via the `smoke.yml` workflow or manually on self-hosted runners with the full kernel driver available. Not a PR gate.
 - **Infra integration tests** — all `#[ignore]` tests requiring live S3 + PostgreSQL. Not a PR gate.
 
@@ -56,38 +59,39 @@ advisory on a `windows-sys` crate) are surfaced in the same audit run.
 
 ### Required PR gates
 
-All four jobs are intended to be required for a PR to merge. This is enforced
-via **GitHub Branch Protection Rules** (Settings → Branches → require status
-checks) — it is not a property of the workflow YAML itself. If you administer
-the repository, verify that all four checks are listed as required. The
-dependency graph is:
+The RWX Linux gate is intended to be required for a PR to merge. GitHub Actions
+macOS and Windows jobs are intentionally manual-only and should not be required
+PR gates while this policy is in effect. Required checks are enforced via
+**GitHub Branch Protection Rules** (Settings → Branches → require status
+checks) — it is not a property of the workflow YAML itself. The high-level
+execution model is:
 
 ```
-quality  →  linux
-         →  macos
-         →  windows
-```
+RWX linux  →  ubuntu-linux
+           →  rocky-linux
 
-A `quality` failure short-circuits before consuming macOS or Windows runner minutes.
+Manual GitHub Actions  →  macOS
+                       →  Windows
+```
 
 | Job | Runner | Gate status |
 |-----|--------|-------------|
-| **Quality Gates** | `ubuntu-latest` | Required — blocks all platform jobs |
-| **Linux** | `ubuntu-latest` | Required |
-| **macOS** | `macos-latest` | Required |
-| **Windows** | `windows-latest` | Required |
+| **Linux** | RWX `ubuntu:24.04` + `rockylinux:9` | Required |
+| **macOS** | `macos-latest` | Manual only |
+| **Windows** | `windows-latest` | Manual only |
 
 ### Reading CI failures
 
-- **Quality Gates failed** → fix formatting, clippy, doc, or audit issue. All platform
-  jobs are blocked and have not started; no platform signal to interpret yet.
+- **RWX quality failed** → fix formatting, clippy, doc, or audit issue.
+- **RWX Ubuntu failed** → a regression in portable Linux behavior, Ubuntu package/runtime compatibility, or the explicit local-first VFS fast checks.
+- **RWX Rocky failed** → a regression in Rocky/RHEL-family package/runtime compatibility or a Linux backend compile/unit path that differs from Ubuntu.
 - **Linux failed, platform step** → a regression in a `cfg(target_os = "linux")` path
-  inside `studiofs-fuse` or in portable workspace code. The named step
-  `cargo test (studiofs-fuse — Linux paths)` will identify the failing binary.
-- **macOS failed, platform step** → a regression in a `cfg(target_os = "macos")` path
+  inside `studiofs-fuse`. The named RWX `cargo-test-studiofs-fuse-*` step will
+  identify whether the failure is Ubuntu-only, Rocky-only, or shared.
+- **Manual macOS failed, platform step** → a regression in a `cfg(target_os = "macos")` path
   inside `studiofs-fuse`. The named step
   `cargo test (studiofs-fuse — macOS paths)` will identify it.
-- **Windows failed, platform step** → a regression in `studiofs-winfsp` (the entire
+- **Manual Windows failed, platform step** → a regression in `studiofs-winfsp` (the entire
   crate is `#![cfg(windows)]`). The named step `cargo test (studiofs-winfsp)` will
   identify it.
 - **Platform job failed, workspace step** → a portable regression that only triggers on
@@ -103,19 +107,18 @@ for the exact commands.
 
 ### Smoke test workflow
 
-`.github/workflows/smoke.yml` provides automated backend smoke tests that
-exercise real mount/unmount + file I/O through the platform backends:
+`.github/workflows/smoke.yml` provides manual backend smoke tests that exercise
+real mount/unmount + file I/O through the platform backends:
 
 | Trigger | Behavior |
 |---------|----------|
 | `workflow_dispatch` | Manual run — all platforms |
-| Weekly schedule (Mon 4 AM UTC) | Automated regression detection |
-| PR with `smoke-test` label | On-demand PR validation for bridge changes |
 
-The smoke workflow is **not** a required PR gate. It provides best-effort signal
-on GitHub-hosted runners and reliable signal on self-hosted runners when
-available. macOS smoke tests run with `continue-on-error: true` because the
-macFUSE system extension typically requires a reboot to load on hosted runners.
+The smoke workflow is **not** a required PR gate and never starts
+automatically. It provides best-effort signal on GitHub-hosted runners and
+reliable signal on self-hosted runners when available. macOS smoke tests run
+with `continue-on-error: true` because the macFUSE system extension typically
+requires a reboot to load on hosted runners.
 
 See [docs/smoke-test-strategy.md](smoke-test-strategy.md) for the full strategy
 covering hosted vs self-hosted responsibilities and self-hosted runner contract.
@@ -137,9 +140,9 @@ any other host-OS conditional that routes to platform-specific behavior.
 A PR that adds or meaningfully changes a `cfg`-guarded branch **must** include
 one of the following in the PR description:
 
-- "CI covers this — the macOS job runs `cargo test -p studiofs-fuse --lib --tests` which exercises this path."
+- "Manual GitHub Actions macOS verification covers this — the macOS job runs `cargo test -p studiofs-fuse --lib --tests` which exercises this path."
 - "This path requires a live FUSE mount. I validated locally with `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1 cargo test -p studiofs-fuse --test mount_sanity -- --ignored`."
-- "This path is Windows-only. CI covers it via the `studiofs-winfsp` unit step on `windows-latest`."
+- "This path is Windows-only. I validated it locally, or by manually running the GitHub Actions Windows job, via the `studiofs-winfsp` unit step on `windows-latest`."
 
 Do not say "CI will catch it" without identifying *which* CI step exercises the new path.
 

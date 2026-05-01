@@ -2,7 +2,6 @@ name: Rust CI
 
 on:
   workflow_dispatch:
-  pull_request:
 
 env:
   RUSTFLAGS: "-Dwarnings"
@@ -10,151 +9,20 @@ env:
 
 # ─── Jobs ──────────────────────────────────────────────────────────────
 #
-#  quality   — portable lint, fmt, doc, audit (runs once on Linux)
-#  linux     — workspace tests on Linux; explicit studiofs-fuse Linux unit step
 #  macos     — clippy + tests on macOS; explicit studiofs-fuse macOS unit step
 #  windows   — clippy + tests on Windows; explicit studiofs-winfsp unit step
 #
-# Each platform job has a named step for the backend-specific crate so that
-# regressions in studiofs-fuse (Linux/macOS paths) or studiofs-winfsp clearly
-# identify the failing backend in the CI job log.
+# Linux verification, fmt, docs, audit, and Ubuntu/Rocky coverage run in RWX
+# via .rwx/ci.yml. This GitHub Actions workflow keeps only the hosted macOS
+# and Windows gates that RWX does not currently provide.
 #
-# Platform verification jobs depend on quality so a fmt / clippy / audit
-# failure short-circuits before consuming macOS / Windows runner minutes.
-#
-# All four jobs are intended as required PR gates. This must be enforced via
-# GitHub Branch Protection Rules (Settings → Branches → require status checks);
-# it is not a property of this YAML file. See docs/contributing.md for the
-# full verification matrix, CI ownership rules, and contributor guidance for
-# platform-specific code changes.
+# These jobs are intentionally manual-only. Start them from the GitHub Actions
+# UI when hosted macOS or Windows signal is useful.
 
 jobs:
-  # ─── Quality / Portable Checks ────────────────────────────────────
-  quality:
-    name: Quality Gates
-    runs-on: ubuntu-latest
-    permissions:
-      security-events: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          token: ${{ secrets.REPO_READ_PAT }}
-          fetch-depth: 0
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
-        with:
-          toolchain: stable
-          components: rustfmt, clippy
-
-      - name: Install Linux tray dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxdo-dev
-          sudo apt-get install -y libappindicator3-dev || sudo apt-get install -y libayatana-appindicator3-dev
-
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: cargo fmt
-        run: cargo fmt --all -- --check
-
-      - name: cargo clippy (workspace)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: cargo clippy (all features)
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: cargo doc
-        run: cargo doc --workspace --no-deps
-        env:
-          RUSTDOCFLAGS: "-Dwarnings"
-
-      - name: cargo audit
-        run: |
-          # Install cargo-audit if missing
-          if ! command -v cargo-audit >/dev/null 2>&1; then
-            cargo install --locked cargo-audit
-          fi
-          # Run audit and emit JSON to parse results. Keep non-zero exit temporary
-          # so we can decide failure only on actual vulnerabilities.
-          cargo audit --json --file ./Cargo.lock > cargo-audit.json || true
-          python - <<'PY'
-          import json
-          import sys
-
-          try:
-              with open("cargo-audit.json", encoding="utf-8") as fh:
-                  report = json.load(fh)
-          except Exception as exc:
-              print("Failed to parse cargo-audit output:", exc)
-              sys.exit(1)
-
-          if report.get("vulnerabilities", {}).get("found", False):
-              print("VULNERABILITIES FOUND")
-              sys.exit(1)
-
-          warnings = report.get("warnings", {}).get("unmaintained", [])
-          if warnings:
-              print("Unmaintained dependencies (non-fatal):")
-              for warning in warnings:
-                  package = warning.get("package") or {}
-                  print("-", package.get("name"), package.get("version"))
-
-          sys.exit(0)
-          PY
-
-  # ─── Linux Verification ────────────────────────────────────────────
-  linux:
-    name: Linux
-    needs: quality
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          token: ${{ secrets.REPO_READ_PAT }}
-          fetch-depth: 0
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
-        with:
-          toolchain: stable
-          components: clippy
-
-      - name: Install Linux tray dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxdo-dev
-          sudo apt-get install -y libappindicator3-dev || sudo apt-get install -y libayatana-appindicator3-dev
-
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: cargo test
-        # Exclude studiofs-fuse so the workspace run does not duplicate the
-        # work performed by the explicit named step below. The explicit step
-        # is the sole source of signal for this backend on Linux.
-        run: cargo test --workspace --all-targets --exclude studiofs-fuse -- --nocapture
-
-      - name: cargo test (SFS-121 offline fast suite)
-        # Explicit gate for the SFS-121 buffered-first offline tests.
-        # These are already included in the workspace run above; this step
-        # makes failures immediately attributable to the SFS-121 suite in CI.
-        run: cargo test -p studiofs-vfs --test vfs_test sfs121_ -- --nocapture
-
-      - name: cargo test (studiofs-fuse — Linux paths)
-        # Sole runner for studiofs-fuse on Linux. Runs only lib (unit) tests;
-        # mount-requiring integration tests stay ignored.
-        # cfg(target_os="linux") tests are exercised here;
-        # cfg(target_os="macos") tests are skipped by the compiler-guard.
-        run: cargo test -p studiofs-fuse --lib -- --nocapture
-
   # ─── macOS Verification ────────────────────────────────────────────
   macos:
     name: macOS
-    needs: quality
     runs-on: macos-latest
     steps:
       - name: Checkout
@@ -197,7 +65,6 @@ jobs:
   # ─── Windows Verification ──────────────────────────────────────────
   windows:
     name: Windows
-    needs: quality
     runs-on: windows-latest
     steps:
       - name: Checkout

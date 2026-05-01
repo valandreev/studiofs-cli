@@ -3,22 +3,16 @@ name: Backend Smoke Tests
 # ─── Triggers ──────────────────────────────────────────────────────────
 #
 #  Manual dispatch:       always runs all platforms
-#  Weekly schedule:       Monday 4 AM UTC — regression detection
-#  Pull request:          only when the 'smoke-test' label is present
 #
 #  Smoke tests validate real mount/unmount + file I/O through the
 #  platform backends (FUSE, WinFSP). They are separate from the main
 #  rust.yml pipeline because they require kernel drivers and may be
-#  flaky on hosted runners.
+#  flaky on hosted runners. This workflow is intentionally manual-only.
 #
 #  See docs/smoke-test-strategy.md for the full strategy rationale.
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 4 * * 1" # Monday 4 AM UTC
-  pull_request:
-    types: [labeled, synchronize]
 
 concurrency:
   group: smoke-${{ github.ref }}
@@ -30,35 +24,9 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
-  # ─── Gate ──────────────────────────────────────────────────────────
-  #
-  # On pull_request events, only run if the 'smoke-test' label is present.
-  # On workflow_dispatch and schedule, always run.
-  should-run:
-    name: Check trigger
-    runs-on: ubuntu-latest
-    outputs:
-      run: ${{ steps.check.outputs.run }}
-    steps:
-      - id: check
-        run: |
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
-            if echo "$LABELS" | grep -q 'smoke-test'; then
-              echo "run=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "run=false" >> "$GITHUB_OUTPUT"
-              echo "::notice::Skipping smoke tests — add the 'smoke-test' label to enable"
-            fi
-          else
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          fi
-
   # ─── Linux FUSE ────────────────────────────────────────────────────
   linux-fuse:
     name: Linux FUSE Smoke
-    needs: should-run
-    if: needs.should-run.outputs.run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -103,8 +71,6 @@ jobs:
   # coverage requires a self-hosted runner. See docs/smoke-test-strategy.md.
   macos-fuse:
     name: macOS FUSE Smoke
-    needs: should-run
-    if: needs.should-run.outputs.run == 'true'
     runs-on: macos-latest
     timeout-minutes: 20
     continue-on-error: true
@@ -173,8 +139,6 @@ jobs:
   # ─── Windows WinFSP ───────────────────────────────────────────────
   windows-winfsp:
     name: Windows WinFSP Smoke
-    needs: should-run
-    if: needs.should-run.outputs.run == 'true'
     runs-on: windows-latest
     timeout-minutes: 15
     steps:

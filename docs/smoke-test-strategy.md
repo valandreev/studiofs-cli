@@ -50,7 +50,7 @@ reads for recently written data without an upstream data store.
 | **Mount mode** | `fuser` pure-Rust, no `libfuse3` link |
 | **Mount options** | `FSName`, `AutoUnmount` (no `AllowOther` — avoids needing `user_allow_other` in `/etc/fuse.conf`) |
 | **Feasibility** | **High** — `/dev/fuse` exists on hosted runners, pure-Rust fuser works without root for create+read+write |
-| **Gating** | Nightly schedule, manual dispatch, label-gated PRs |
+| **Gating** | Manual dispatch only |
 
 ### macOS — `macos-latest` (GitHub-hosted)
 
@@ -75,7 +75,7 @@ runner must expose `STUDIOFS_RUN_PLATFORM_BRIDGE_MOUNT_TESTS=1`.
 | **Mount mode** | WinFSP kernel driver (delayed-load DLL) |
 | **Mount point** | Free drive letter, default `Z:` |
 | **Feasibility** | **Medium–High** — `choco install` runs with admin privileges and installs the WinFSP kernel driver. Most GitHub Windows runners allow kernel driver loading. Mount Manager paths (`\\.\Z:`) require Administrator. |
-| **Gating** | Nightly schedule, manual dispatch, label-gated PRs |
+| **Gating** | Manual dispatch only |
 
 ---
 
@@ -95,19 +95,16 @@ This is deliberate:
 | Trigger | Behavior |
 |---------|----------|
 | `workflow_dispatch` | Manual run, all platforms |
-| `schedule` (weekly) | Nightly/weekly signal for regression detection |
-| `pull_request` with `smoke-test` label | On-demand PR validation for platform bridge changes |
 
 #### Job structure
 
 ```
-should-run  →  linux-fuse
-            →  macos-fuse    (continue-on-error)
-            →  windows-winfsp
+linux-fuse
+macos-fuse    (continue-on-error)
+windows-winfsp
 ```
 
-The `should-run` gate checks for the `smoke-test` label on PRs. For manual
-dispatch and scheduled runs, all jobs execute unconditionally.
+Manual dispatch runs all smoke jobs unconditionally.
 
 ### Artifact collection
 
