@@ -42,6 +42,7 @@ cargo test -p studiofs-meta contract_core_harness_runs_ops_and_reopens_with_inva
 cargo test -p studiofs-meta contract_core_harness -- --nocapture
 cargo test -p studiofs-meta sfs314_ -- --nocapture
 cargo test -p studiofs-meta sfs315_ -- --nocapture
+cargo test -p studiofs-meta sfs316_ -- --nocapture
 cargo test -p studiofs-vfs contract_vfs_harness_reopens_fixture_and_runs_core_invariants -- --nocapture
 cargo test -p studiofs-vfs sfs312_ -- --nocapture
 cargo test -p studiofs-vfs local_first_shutdown_reports_and_recovers_memory_only_writer_state -- --nocapture
@@ -196,6 +197,9 @@ regressions:
   - `test_pg_reopen_after_publish_before_local_persist_recovers_without_discover`
   - `test_pg_reopen_after_unpublished_local_create_flushes_without_discover`
   - `sfs315_reopen_consumes_persisted_inode_and_object_headroom_without_pg`
+  - `sfs316_reachability_reports_active_base_overlay_and_snapshot_pins`
+  - `sfs316_publish_queues_displaced_objects_and_reachability_scan_is_idempotent`
+  - `sfs316_delete_before_publish_tombstone_does_not_publish_deleted_content`
   - `startup_replay_cancels_ready_inode_stale_pending_upload`
   - `test_truncate_shrink_then_extend_zero_fills_old_tail`
   - `test_write_at_exact_block_boundary_transition`
