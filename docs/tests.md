@@ -41,6 +41,8 @@ Focused harness checks:
 cargo test -p studiofs-meta contract_core_harness_runs_ops_and_reopens_with_invariants -- --nocapture
 cargo test -p studiofs-meta contract_core_harness -- --nocapture
 cargo test -p studiofs-vfs contract_vfs_harness_reopens_fixture_and_runs_core_invariants -- --nocapture
+cargo test -p studiofs-vfs sfs312_ -- --nocapture
+cargo test -p studiofs-vfs local_first_shutdown_reports_and_recovers_memory_only_writer_state -- --nocapture
 ```
 
 ## Prerequisites
@@ -172,12 +174,17 @@ regressions:
   - `test_resolve_chunk_slice_spans_overlay_over_base_with_hole`
   - `test_lookup_regular_file_slices_boundary_spanning_write_is_split_per_chunk`
   - `offline_s3_does_not_break_local_read_after_write`
+  - `sfs312_write_is_visible_from_writer_state_before_local_durability_boundary`
+  - `local_first_shutdown_reports_and_recovers_memory_only_writer_state`
 
 - Publication and visibility
   - `redb_partial_update_does_not_expose_new_blocks_before_publish`
   - `test_publish_regular_file_overlay_to_base_if_matches_promotes_base_rows`
   - `test_publish_regular_file_overlay_to_base_keeps_sparse_tail_committed_size_below_size`
   - `background_epoch_finalizer_keeps_non_publish_ready_epoch_local_after_restart` *(requires S3 env)*
+  - `sfs312_flush_materializes_local_slice_boundary_without_remote_visibility`
+  - `sfs312_fsync_persists_local_state_without_remote_visibility`
+  - `sfs312_last_handle_release_drains_local_durability_boundary`
 
 - Recovery and replay
   - `test_pg_reopen_after_publish_before_local_persist_recovers_without_discover`

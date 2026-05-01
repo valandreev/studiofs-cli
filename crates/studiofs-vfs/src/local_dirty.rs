@@ -2074,6 +2074,38 @@ impl StudioVfs {
         inos_with_bytes.into_iter().map(|(ino, _)| ino).collect()
     }
 
+    fn append_unique_dirty_inodes(
+        ordered: &mut Vec<Ino>,
+        seen: &mut BTreeSet<Ino>,
+        inodes: impl IntoIterator<Item = Ino>,
+    ) {
+        for ino in inodes {
+            if seen.insert(ino) {
+                ordered.push(ino);
+            }
+        }
+    }
+
+    fn shutdown_dirty_inodes_by_priority(&self) -> Vec<Ino> {
+        let mut ordered = Vec::new();
+        let mut seen = BTreeSet::new();
+        Self::append_unique_dirty_inodes(
+            &mut ordered,
+            &mut seen,
+            self.snapshot_pending_local_dirty_inodes(),
+        );
+        Self::append_unique_dirty_inodes(
+            &mut ordered,
+            &mut seen,
+            self.state.writer_stack.snapshot_dirty_inodes_by_bytes(),
+        );
+        {
+            let dirty_attrs = self.state.namespace.dirty_attrs.lock();
+            Self::append_unique_dirty_inodes(&mut ordered, &mut seen, dirty_attrs.keys().copied());
+        }
+        ordered
+    }
+
     pub(super) fn total_pending_persisted_local_dirty_slice_bytes(&self) -> usize {
         self.state
             .local_dirty
@@ -3208,14 +3240,7 @@ impl StudioVfs {
     }
 
     pub(super) async fn flush_pending_payloads_for_shutdown(&self) {
-        let mut inos: BTreeSet<Ino> = self
-            .snapshot_pending_local_dirty_inodes()
-            .into_iter()
-            .collect();
-        {
-            let dirty_attrs = self.state.namespace.dirty_attrs.lock();
-            inos.extend(dirty_attrs.keys().copied());
-        }
+        let inos = self.shutdown_dirty_inodes_by_priority();
         if inos.is_empty() {
             return;
         }

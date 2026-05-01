@@ -11,6 +11,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::utils::now_unix_millis;
 
+fn shutdown_recoverable_on_restart(
+    dirty_after: usize,
+    local_payload_sync_ok: bool,
+    metadata_flush_outcome: &str,
+) -> bool {
+    dirty_after == 0 && local_payload_sync_ok && metadata_flush_outcome == "success"
+}
+
 impl StudioVfs {
     pub(super) fn track_background_task(&self, handle: JoinHandle<()>) {
         self.state.shutdown.background_tasks.lock().push(handle);
@@ -299,7 +307,7 @@ impl StudioVfs {
 
         // Phase 1: flush pending local dirty state inline into the local backend
         // + metadata so local durability is established before shutdown.
-        let dirty_before = self.total_pending_local_dirty_bytes();
+        let dirty_before = self.total_pending_write_buffer_bytes();
         info!(
             dirty_bytes = dirty_before,
             pending_uploads = self.pending_uploads_snapshot().len(),
@@ -378,9 +386,13 @@ impl StudioVfs {
         // redb::Database::drop() to run cleanly.
         self.sync_meta().prepare_for_close();
         let local_payload_sync_ok = self.persist_cache().await;
-        let dirty_after = self.total_pending_local_dirty_bytes();
+        let dirty_after = self.total_pending_write_buffer_bytes();
         let pending_uploads_after = self.pending_uploads_snapshot().len();
-        let recoverable_on_restart = dirty_after == 0 && local_payload_sync_ok;
+        let recoverable_on_restart = shutdown_recoverable_on_restart(
+            dirty_after,
+            local_payload_sync_ok,
+            metadata_flush_outcome,
+        );
         let shutdown_snapshot = VfsZeroIoShutdownSnapshot {
             generated_unix_ms: now_unix_millis(),
             accepted_local_dirty_bytes_before: dirty_before as u64,
@@ -414,5 +426,19 @@ impl StudioVfs {
             total_ms = t0.elapsed().as_millis() as u64,
             "VFS shutdown: complete"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shutdown_recoverable_on_restart;
+
+    #[test]
+    fn shutdown_recoverability_requires_metadata_flush_success() {
+        assert!(shutdown_recoverable_on_restart(0, true, "success"));
+        assert!(!shutdown_recoverable_on_restart(1, true, "success"));
+        assert!(!shutdown_recoverable_on_restart(0, false, "success"));
+        assert!(!shutdown_recoverable_on_restart(0, true, "timeout"));
+        assert!(!shutdown_recoverable_on_restart(0, true, "failed"));
     }
 }
