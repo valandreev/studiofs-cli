@@ -121,6 +121,15 @@ dummy-endpoint contract.
 See [docs/smoke-test-strategy.md](smoke-test-strategy.md) for the
 complete smoke-test strategy, CI integration, and self-hosted runner contract.
 
+### Real mounted E2E runner contract
+
+The future real E2E runner must follow
+[docs/e2e-runner-contract.md](e2e-runner-contract.md). That contract fixes the
+runner crate boundary, CLI shape, `target/e2e-runs/<run-id>` sandbox layout,
+required artifact names, report schema, preflight gates, cleanup safety rules,
+and the smoke-first scenario rollout. Real E2E runs stay outside the default
+fast suite.
+
 ## Platform-Gated Unit Tests
 
 `studiofs-fuse` and `studiofs-winfsp` contain unit tests that are only

@@ -240,6 +240,7 @@ Project docs live in [docs/](docs/):
 - [docs/development.md](docs/development.md) - local setup, build, and test workflow
 - [docs/contributing.md](docs/contributing.md) - verification matrix, CI ownership, platform-specific code rules
 - [docs/tests.md](docs/tests.md) - test matrix and infra expectations
+- [docs/e2e-runner-contract.md](docs/e2e-runner-contract.md) - real mounted E2E runner contract, artifacts, reports, preflight, and cleanup rules
 - [docs/metadata.md](docs/metadata.md) - local `redb` + PostgreSQL metadata model
 - [docs/cache.md](docs/cache.md) - local cache backend, staged writeback, and upload flow
 - [docs/vfs.md](docs/vfs.md) - filesystem runtime behavior
