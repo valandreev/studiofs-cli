@@ -53,11 +53,8 @@ impl PendingUploadCatalog {
         self.by_inode.contains_key(&ino)
     }
 
-    pub(super) fn ops(&self) -> Vec<PendingUpload> {
-        self.by_inode
-            .values()
-            .flat_map(|ops| ops.iter().cloned())
-            .collect()
+    pub(super) fn ops(&self) -> impl Iterator<Item = &PendingUpload> {
+        self.by_inode.values().flatten()
     }
 
     pub(super) fn ops_for_inode(&self, ino: Ino) -> &[PendingUpload] {

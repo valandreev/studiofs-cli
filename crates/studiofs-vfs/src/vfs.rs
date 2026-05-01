@@ -3127,9 +3127,9 @@ impl<'a> StartupReplayCoordinator<'a> {
             if self.seen_replay_inodes.contains(&op.ino) {
                 continue;
             }
-            let key = pending_upload_key(&op);
+            let key = pending_upload_key(op);
             if !self.valid_pending_uploads.contains(&key) {
-                self.stale_pending_uploads.insert(key, op);
+                self.stale_pending_uploads.insert(key, op.clone());
             }
         }
     }
