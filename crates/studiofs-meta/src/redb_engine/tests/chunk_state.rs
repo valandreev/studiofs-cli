@@ -32,6 +32,11 @@ fn resolved_byte_view(
         let Some(payload) = span.payload.as_ref() else {
             continue;
         };
+        assert_eq!(
+            payload.length,
+            span.range.len(),
+            "resolved span range length does not match payload length: span={span:?}"
+        );
         let dst_start =
             usize::try_from(file_start - offset).expect("span starts inside requested view");
         let payload_len = usize::try_from(payload.length).expect("payload length fits");
