@@ -4805,7 +4805,7 @@ fn write_fh_sub_block_callbacks_batch_completed_blocks_until_flush() {
 #[test]
 fn inode_write_overwrite_updates_current_slice_graph_over_published_base() {
     let tmp = tempfile::tempdir().unwrap();
-    let (rt, vfs, meta) = make_test_vfs(&tmp, "sfs-245-inode-write-overwrite");
+    let (rt, vfs, meta) = make_unstarted_test_vfs(&tmp, "sfs-245-inode-write-overwrite");
     let _guard = rt.enter();
     rt.block_on(async {
         let attr = vfs
